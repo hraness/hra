@@ -4,10 +4,13 @@ import fc from "fast-check";
 
 import {
   commandEnvelopeSchema,
+  localCommandPresetContract,
   LOCAL_COMMAND_REQUEST_VERSION,
   localCommandSchema,
+  type LocalCommand,
 } from "./contracts";
 import { presetRequirements } from "./presets";
+import { WORK_APPLY_REQUEST_VERSION } from "./work";
 import { canTransitionMutation, mutationStateSchema } from "./transitions";
 import { selectByIdOrLabel, utf8Bytes } from "./values";
 
@@ -15,8 +18,8 @@ describe("domain laws", () => {
   test("owns one exact reduced preset mapping", () => {
     expect(presetRequirements).toEqual({
       low: { model: "gpt-5.6-luna", effort: "max" },
-      high: { model: "gpt-6-astra", effort: "max" },
-      ultra: { model: "gpt-6-astra", effort: "ultra" },
+      high: { model: "gpt-5.6-sol", effort: "max" },
+      ultra: { model: "gpt-5.6-sol", effort: "ultra" },
       "fable-max": { model: "claude-fable-5-1", effort: "max" },
       astra: { model: "gpt-6-astra", effort: "provider-default" },
     });
@@ -68,6 +71,197 @@ describe("domain laws", () => {
         version: LOCAL_COMMAND_REQUEST_VERSION,
       }).success).toBe(false);
     }
+  });
+
+  test("fences only local envelopes that can select a rebound Codex preset", () => {
+    const capability = "a".repeat(43);
+    const requestId = "00000000-0000-4000-8000-000000000001";
+    const accountId = `acct_${"a".repeat(32)}`;
+    const projectId = `proj_${"b".repeat(32)}`;
+    const sessionId = `sess_${"c".repeat(32)}`;
+    const parseCommand = (value: unknown): LocalCommand => localCommandSchema.parse(value);
+    const lowOnlyWorkCreate = parseCommand({
+      kind: "work.apply",
+      requestId,
+      operation: {
+        kind: "work.create",
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000001",
+        clientRef: "local-contract-work",
+        coordinatorSessionId: sessionId,
+        objective: "Prove the local rollout contract.",
+        routes: [{ accountId, projectId, preset: "low", fast: false }],
+        tasks: [{
+          clientRef: "local-contract-task",
+          dependsOnRefs: [],
+          dependsOnTaskIds: [],
+          objective: "Run one bounded task.",
+          instructions: "Preserve the immutable Work contract.",
+          criteria: ["The focused contract test passes."],
+          route: { accountId, projectId },
+          preset: "low",
+          fast: false,
+          priority: 0,
+          maxAttempts: 1,
+          requiredReviews: 0,
+          resultKind: "text",
+          minEvidence: 0,
+        }],
+      },
+    });
+    if (lowOnlyWorkCreate.kind !== "work.apply" || lowOnlyWorkCreate.operation.kind !== "work.create") {
+      throw new Error("Expected the Low-only Work creation fixture.");
+    }
+    const declaredHighWorkCreate = parseCommand({
+      ...lowOnlyWorkCreate,
+      operation: {
+        ...lowOnlyWorkCreate.operation,
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000003",
+        clientRef: "local-contract-high-work",
+        routes: [
+          ...lowOnlyWorkCreate.operation.routes,
+          { accountId, projectId, preset: "high", fast: false },
+        ],
+      },
+    });
+    const existingHighRouteTaskAdd = parseCommand({
+      kind: "work.apply",
+      requestId,
+      operation: {
+        kind: "task.addBatch",
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000004",
+        workId: `work_${"f".repeat(32)}`,
+        expectedWorkRevision: 1,
+        coordinatorSessionId: sessionId,
+        coordinatorCapability: `hrac1_${"A".repeat(43)}`,
+        tasks: [{
+          ...lowOnlyWorkCreate.operation.tasks[0],
+          clientRef: "local-contract-added-high-task",
+          preset: "high",
+        }],
+      },
+    });
+    if (
+      existingHighRouteTaskAdd.kind !== "work.apply"
+      || existingHighRouteTaskAdd.operation.kind !== "task.addBatch"
+    ) {
+      throw new Error("Expected the High task-add fixture.");
+    }
+    const existingLowRouteTaskAdd = parseCommand({
+      ...existingHighRouteTaskAdd,
+      operation: {
+        ...existingHighRouteTaskAdd.operation,
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000005",
+        tasks: existingHighRouteTaskAdd.operation.tasks.map((task) => ({
+          ...task,
+          clientRef: "local-contract-added-low-task",
+          preset: "low",
+        })),
+      },
+    });
+    const existingWorkJoin = parseCommand({
+      kind: "work.apply",
+      requestId,
+      operation: {
+        kind: "work.join",
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000002",
+        workId: `work_${"d".repeat(32)}`,
+        coordinatorSessionId: sessionId,
+        coordinatorCapability: `hrac1_${"A".repeat(43)}`,
+        actorSessionId: `sess_${"e".repeat(32)}`,
+      },
+    });
+    const affected = [
+      parseCommand({ kind: "session.start", account: accountId, preset: "high", fast: false, presetContract: 1 }),
+      parseCommand({ kind: "session.start", account: accountId, preset: "ultra", fast: false, presetContract: 1 }),
+      parseCommand({ kind: "session.preset", session: sessionId, preset: "high" }),
+      parseCommand({ kind: "session.switch", session: sessionId, provider: "codex", preset: "ultra", presetContract: 1 }),
+      parseCommand({ kind: "session.switch", session: sessionId, provider: "codex", presetContract: 1 }),
+      declaredHighWorkCreate,
+      existingHighRouteTaskAdd,
+    ];
+    const stable = [
+      parseCommand({ kind: "daemon.status" }),
+      parseCommand({ kind: "daemon.stop" }),
+      parseCommand({ kind: "session.start", account: accountId, preset: "low", fast: false }),
+      parseCommand({ kind: "session.preset", session: sessionId, preset: "low" }),
+      parseCommand({ kind: "session.switch", session: sessionId, provider: "codex", preset: "low" }),
+      parseCommand({ kind: "session.switch", session: sessionId, provider: "claude" }),
+      lowOnlyWorkCreate,
+      existingLowRouteTaskAdd,
+      existingWorkJoin,
+    ];
+    const envelope = (command: LocalCommand, presetContract?: 1 | 2) => ({
+      capability,
+      command,
+      requestId,
+      version: LOCAL_COMMAND_REQUEST_VERSION,
+      ...(presetContract === undefined ? {} : { presetContract }),
+    });
+
+    for (const command of affected) {
+      expect(localCommandPresetContract(command)).toBe(1);
+      expect(localCommandSchema.safeParse({ ...command, presetContract: 1 }).success)
+        .toBe(command.kind === "session.start" || command.kind === "session.switch");
+      expect(commandEnvelopeSchema.safeParse(envelope(command)).success).toBe(false);
+      expect(commandEnvelopeSchema.safeParse(envelope(command, 2)).success).toBe(false);
+      expect(commandEnvelopeSchema.safeParse(envelope(command, 1)).success).toBe(true);
+    }
+    for (const command of stable) {
+      expect(localCommandPresetContract(command)).toBeUndefined();
+      expect(commandEnvelopeSchema.safeParse(envelope(command)).success).toBe(true);
+      expect(commandEnvelopeSchema.safeParse(envelope(command, 1)).success).toBe(false);
+    }
+    const staleAuthoredStart = parseCommand({
+      kind: "session.start",
+      account: accountId,
+      preset: "high",
+      fast: false,
+      presetContract: 2,
+    });
+    expect(commandEnvelopeSchema.safeParse(envelope(staleAuthoredStart, 1)).success).toBe(true);
+    expect(commandEnvelopeSchema.safeParse(envelope(staleAuthoredStart, 2)).success).toBe(false);
+    const staleAuthoredSwitch = parseCommand({
+      kind: "session.switch",
+      session: sessionId,
+      provider: "codex",
+      preset: "high",
+      presetContract: 2,
+    });
+    expect(commandEnvelopeSchema.safeParse(envelope(staleAuthoredSwitch, 1)).success).toBe(true);
+    expect(commandEnvelopeSchema.safeParse(envelope(staleAuthoredSwitch, 2)).success).toBe(false);
+    const currentV2Work = parseCommand({
+      ...declaredHighWorkCreate,
+      requestVersion: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 1,
+    });
+    const staleV2Work = parseCommand({
+      ...declaredHighWorkCreate,
+      requestVersion: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 2,
+    });
+    expect(commandEnvelopeSchema.safeParse(envelope(currentV2Work, 1)).success).toBe(true);
+    expect(commandEnvelopeSchema.safeParse(envelope(staleV2Work, 1)).success).toBe(true);
+    expect(commandEnvelopeSchema.safeParse(envelope(staleV2Work, 2)).success).toBe(false);
+    expect(localCommandSchema.safeParse({
+      ...declaredHighWorkCreate,
+      requestVersion: WORK_APPLY_REQUEST_VERSION,
+    }).success).toBe(false);
+    expect(localCommandSchema.safeParse({
+      ...lowOnlyWorkCreate,
+      requestVersion: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 1,
+    }).success).toBe(false);
+    expect(localCommandSchema.safeParse({
+      ...declaredHighWorkCreate,
+      presetContract: 1,
+    }).success).toBe(false);
+    expect(localCommandSchema.safeParse({
+      kind: "session.start",
+      account: accountId,
+      preset: "low",
+      fast: false,
+      presetContract: 1,
+    }).success).toBe(false);
   });
 
   test("binds the two-phase Claude login completion to one exact terminal outcome", () => {

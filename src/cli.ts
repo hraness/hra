@@ -67,6 +67,8 @@ import {
   containsAbsolutePath,
   createCloudDaemonLifecycle,
   createCloudUuidV7,
+  activeRemoteDerivedCodexSelection,
+  activeRemotePresetSelection,
   cloudDeploymentAuthorityFromEnvironment,
   CloudDeploymentAuthorityError,
   createLocalCloudControlFromEnvironment,
@@ -129,9 +131,10 @@ import {
   sessionIdSchema,
 } from "./domain/values";
 import {
+  WORK_APPLY_REQUEST_LEGACY_VERSION,
+  WORK_APPLY_REQUEST_VERSION,
   WORK_PROTOCOL_REQUEST_MAX_BYTES,
   WORK_PROTOCOL,
-  WORK_PROTOCOL_VERSION,
   workProtocolRequestSchema,
 } from "./domain/work";
 import {
@@ -2800,11 +2803,20 @@ function remotePayload(command: RemoteCliCommand): RemoteCommandPayload | null {
     case "remote.queue": return { kind: "queue", message: command.message };
     case "remote.steer": return { kind: "steer", message: command.message };
     case "remote.stop": return { kind: "stop" };
-    case "remote.preset": return { kind: "set_model", preset: command.preset };
+    case "remote.preset": return {
+      kind: "set_model",
+      ...activeRemotePresetSelection(command.preset),
+    };
     case "remote.provider": return {
       kind: "set_provider",
-      provider: command.provider,
-      ...(command.preset === undefined ? {} : { preset: command.preset }),
+      ...(command.preset === undefined
+        ? command.provider === "codex"
+          ? activeRemoteDerivedCodexSelection()
+          : { provider: command.provider }
+        : {
+            ...activeRemotePresetSelection(command.preset),
+            provider: command.provider,
+          }),
     };
     case "remote.fast": return { enabled: command.enabled, kind: "set_fast" };
   }
@@ -4247,28 +4259,41 @@ const writeWorkProtocolFailure = (
   requestId: string | null,
   error: WorkAgentProtocolError,
   output: Output,
+  version: typeof WORK_APPLY_REQUEST_LEGACY_VERSION | typeof WORK_APPLY_REQUEST_VERSION = WORK_APPLY_REQUEST_VERSION,
 ): void => {
   output.writeStdout(`${safeJson(workAgentProtocolResponseSchema.parse({
     protocol: WORK_PROTOCOL,
-    version: WORK_PROTOCOL_VERSION,
+    version,
     requestId,
     ok: false,
     error,
   }))}\n`);
 };
 
-const admittedWorkRequestCorrelation = (document: unknown): string | null => {
+const admittedWorkRequestCorrelation = (document: unknown): Readonly<{
+  requestId: string;
+  version: typeof WORK_APPLY_REQUEST_LEGACY_VERSION | typeof WORK_APPLY_REQUEST_VERSION;
+}> | null => {
   if (document === null || typeof document !== "object" || Array.isArray(document)) return null;
   const record = document as Readonly<Record<string, unknown>>;
   const keys = Object.keys(record).sort();
+  const version = record.version;
   if (
-    JSON.stringify(keys) !== JSON.stringify(["operation", "protocol", "requestId", "version"])
+    version !== WORK_APPLY_REQUEST_LEGACY_VERSION
+    && version !== WORK_APPLY_REQUEST_VERSION
+  ) return null;
+  const exactKeys = version === WORK_APPLY_REQUEST_LEGACY_VERSION
+    ? ["operation", "protocol", "requestId", "version"]
+    : record.presetContract === undefined
+      ? ["operation", "protocol", "requestId", "version"]
+      : ["operation", "presetContract", "protocol", "requestId", "version"];
+  if (
+    JSON.stringify(keys) !== JSON.stringify(exactKeys)
     || record.protocol !== WORK_PROTOCOL
-    || record.version !== WORK_PROTOCOL_VERSION
     || typeof record.requestId !== "string"
   ) return null;
   const parsed = z.string().uuid().safeParse(record.requestId);
-  return parsed.success ? parsed.data : null;
+  return parsed.success ? { requestId: parsed.data, version } : null;
 };
 
 async function executeWorkApply(
@@ -4307,18 +4332,27 @@ async function executeWorkApply(
   }
   const request = workProtocolRequestSchema.safeParse(document);
   if (!request.success) {
-    writeWorkProtocolFailure(admittedWorkRequestCorrelation(document), {
+    const correlation = admittedWorkRequestCorrelation(document);
+    writeWorkProtocolFailure(correlation?.requestId ?? null, {
       code: "invalid_request",
       message: "The work request document does not match the strict versioned HRA work protocol.",
       recovery: "none",
       retryable: false,
       exitCode: 2,
-    }, output);
+    }, output, correlation?.version ?? WORK_APPLY_REQUEST_VERSION);
     return 2;
   }
   const command = localCommandSchema.parse({
     kind: "work.apply",
     requestId: request.data.requestId,
+    ...(request.data.version === WORK_APPLY_REQUEST_VERSION
+      ? {
+          requestVersion: request.data.version,
+          ...(request.data.presetContract === undefined
+            ? {}
+            : { presetContract: request.data.presetContract }),
+        }
+      : {}),
     operation: request.data.operation,
   });
   if (command.kind !== "work.apply") throw new CliUsageError("The work operation is invalid.");
@@ -4333,12 +4367,12 @@ async function executeWorkApply(
       recovery: "replay_exact_request",
       retryable: true,
       exitCode: 7,
-    }, output);
+    }, output, request.data.version);
     return 7;
   }
   if (!response.ok) {
     const failure = mapWorkFailure(response.error);
-    writeWorkProtocolFailure(request.data.requestId, failure.error, output);
+    writeWorkProtocolFailure(request.data.requestId, failure.error, output, request.data.version);
     return failure.exitCode;
   }
   try {
@@ -4351,7 +4385,7 @@ async function executeWorkApply(
       recovery: "replay_exact_request",
       retryable: true,
       exitCode: 7,
-    }, output);
+    }, output, request.data.version);
     return 7;
   }
   return 0;
@@ -6187,6 +6221,7 @@ export async function main(
         || invocation.command.kind === "session.steer"
         || invocation.command.kind === "session.stop"
         || invocation.command.kind === "session.rename"
+        || invocation.command.kind === "session.switch"
         || invocation.command.kind === "session.task.create"
         || invocation.command.kind === "session.task.edit"
         || invocation.command.kind === "session.task.delete"
@@ -6244,6 +6279,13 @@ export async function main(
         }, json, output);
       }
       if (replayableLocalMutation !== undefined) {
+        const presetContractReplayArguments = (
+          (replayableLocalMutation.kind === "session.start"
+            || replayableLocalMutation.kind === "session.switch")
+          && replayableLocalMutation.presetContract !== undefined
+        )
+          ? ["--preset-contract", String(replayableLocalMutation.presetContract)]
+          : [];
         return renderFailure({
           code: "RECOVERY_REQUIRED",
           details: {
@@ -6251,6 +6293,7 @@ export async function main(
             replayArguments: [
               "--idempotency-key",
               replayableLocalMutation.idempotencyKey,
+              ...presetContractReplayArguments,
             ],
             replayPlacement: "before_double_dash",
             sameKeyReplay: true,

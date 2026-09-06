@@ -2,10 +2,12 @@ import { describe, expect, test } from "bun:test";
 
 import { publicProviderIdentifierSchema } from "../public-provider-identifier";
 import {
+  WORK_APPLY_REQUEST_LEGACY_VERSION,
+  WORK_APPLY_REQUEST_VERSION,
   WORK_OPERATION_CONTRACTS,
   WORK_OPERATION_KINDS,
   WORK_PROTOCOL,
-  WORK_PROTOCOL_VERSION,
+  WORK_PROTOCOL_DESCRIPTION_VERSION,
   WORK_EFFECT_RESOLUTION_LIMIT,
   WORK_EVENT_STREAM_LINE_MAX_BYTES,
   WORK_STREAM_FAILURE_MAX_BYTES,
@@ -94,6 +96,7 @@ describe("queryable HRA work protocol", () => {
       const second = describeWorkProtocol(query);
       expect(workProtocolDocumentSchema.parse(first)).toEqual(first);
       expect(second).toEqual(first);
+      expect(first.version).toBe(WORK_PROTOCOL_DESCRIPTION_VERSION);
       expect(first.contractDigest).toBe(WORK_PROTOCOL_CONTRACT_DIGEST);
       expect(Buffer.byteLength(`${terminalSafeJson({
         ok: true,
@@ -453,7 +456,7 @@ describe("queryable HRA work protocol", () => {
       value: Readonly<Record<string, unknown>>;
     }>;
     expect(semantics.value.idempotency).toBe(
-      "same UUIDv7 plus canonical-equivalent closed operation preserves the durable decision and stable identities/capabilities, performs no new mutation or event, and reprojects mutable public records and workRevision from current state; replay is not byte-identical; retained work.release tombstone replay is the exact stored-result exception",
+      "same UUIDv7 plus canonical-equivalent closed operation and apply-source identity preserves the durable decision and stable identities/capabilities, performs no new mutation or event, and reprojects mutable public records and workRevision from current state; v1 preserves the legacy operation-only digest while v2 binds request version and authored preset contract; replay is not byte-identical; retained work.release tombstone replay is the exact stored-result exception",
     );
     expect(semantics.value.sensitivity).toEqual({
       capability: "bearer authority; never log or expose",
@@ -476,12 +479,23 @@ describe("queryable HRA work protocol", () => {
       value: Readonly<Record<string, unknown>>;
     }>;
     expect(envelopes.value).toMatchObject({
-      applyRequest: {
-        closed: true,
-        required: {
-          protocol: { const: WORK_PROTOCOL },
-          version: { const: WORK_PROTOCOL_VERSION },
-          requestId: "RequestId",
+      applyRequests: {
+        v1: {
+          closed: true,
+          required: {
+            protocol: { const: WORK_PROTOCOL },
+            version: { const: WORK_APPLY_REQUEST_LEGACY_VERSION },
+            requestId: "RequestId",
+          },
+        },
+        v2: {
+          closed: true,
+          required: {
+            protocol: { const: WORK_PROTOCOL },
+            version: { const: WORK_APPLY_REQUEST_VERSION },
+            requestId: "RequestId",
+          },
+          optional: { presetContract: { oneOf: [1, 2] } },
         },
       },
       applySuccess: { closed: true },
@@ -506,7 +520,7 @@ describe("queryable HRA work protocol", () => {
       value: Readonly<{ invariants: readonly string[] }>;
     }>;
     expect(errors.value.invariants).toContain(
-      "effect_unknown always means replay the canonical-equivalent closed operation with the same idempotencyKey; JSON member order is immaterial",
+      "effect_unknown always means replay the canonical-equivalent closed request version, authored preset contract when present, and operation with the same idempotencyKey; JSON member order is immaterial",
     );
 
     expect(workAgentProtocolErrorSchema.safeParse({
@@ -535,7 +549,7 @@ describe("queryable HRA work protocol", () => {
   test("allows nullable correlation only before admission and never on success", () => {
     const preAdmission = {
       protocol: WORK_PROTOCOL,
-      version: WORK_PROTOCOL_VERSION,
+      version: WORK_APPLY_REQUEST_VERSION,
       requestId: null,
       ok: false,
       error: {
@@ -559,7 +573,7 @@ describe("queryable HRA work protocol", () => {
     }).success).toBe(false);
     expect(workAgentProtocolResponseSchema.safeParse({
       protocol: WORK_PROTOCOL,
-      version: WORK_PROTOCOL_VERSION,
+      version: WORK_APPLY_REQUEST_LEGACY_VERSION,
       requestId: null,
       ok: true,
       result: {},

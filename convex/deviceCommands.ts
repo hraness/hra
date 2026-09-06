@@ -28,6 +28,10 @@ import {
   requireDaemonDevice,
   requireDeviceAuthority,
 } from "./authority";
+import {
+  requireCommandExecutorRequestVersion,
+  requireTargetCommandRequestVersion,
+} from "./commandRequestVersion";
 import { commandTerminalRetentionMs } from "./commands";
 import { validateIdempotencyInput } from "./idempotency";
 import {
@@ -80,10 +84,14 @@ const expireLoginResult = makeFunctionReference<
 function terminalCleanupFields(
   command: Readonly<{ requesterAcknowledgedAt?: number }>,
   now: number,
-): Readonly<{ terminalCleanupAfter?: number }> {
-  return command.requesterAcknowledgedAt === undefined
-    ? {}
-    : { terminalCleanupAfter: now + commandTerminalRetentionMs };
+  terminalResultless: boolean,
+): Readonly<{ terminalCleanupAfter?: number; terminalResultless: boolean }> {
+  return {
+    ...(command.requesterAcknowledgedAt === undefined
+      ? {}
+      : { terminalCleanupAfter: now + commandTerminalRetentionMs }),
+    terminalResultless,
+  };
 }
 
 function storedAuthority(value: Readonly<{
@@ -122,11 +130,13 @@ async function deviceCommandByPublicId(
 export const enqueue = mutation({
   args: {
     deadline: v.number(),
+    expectedRequestingDevicePublicId: v.optional(v.string()),
     expectedTargetDevicePublicId: v.string(),
     idempotencyKey: v.string(),
     kind: deviceCommandKind,
     payload: encryptedEnvelope,
     publicId: v.string(),
+    requestCommitmentVersion: v.optional(v.literal(2)),
     requestDigest: v.string(),
   },
   handler: async (ctx, args) => {
@@ -134,6 +144,11 @@ export const enqueue = mutation({
     const now = Date.now();
     if (
       !isUuidV7(args.publicId)
+      || (args.requestCommitmentVersion === 2
+        ? args.expectedRequestingDevicePublicId !== authority.device.publicId
+        : args.expectedRequestingDevicePublicId !== undefined)
+      || (args.expectedRequestingDevicePublicId !== undefined
+        && !isOpaqueIdentifier(args.expectedRequestingDevicePublicId))
       || !isOpaqueIdentifier(args.expectedTargetDevicePublicId)
       || !isDigest(args.requestDigest)
       || parseEncryptedEnvelope(args.payload) === null
@@ -161,9 +176,18 @@ export const enqueue = mutation({
     if (existing.length > 1) rejectAuthority();
     const replay = existing[0];
     if (replay !== undefined) {
-      if (replay.requestDigest !== args.requestDigest) throw new Error("IDEMPOTENCY_CONFLICT");
+      if (
+        replay.requestDigest !== args.requestDigest
+        || replay.requestCommitmentVersion !== args.requestCommitmentVersion
+      ) throw new Error("IDEMPOTENCY_CONFLICT");
       return {
         publicId: replay.publicId,
+        ...(args.requestCommitmentVersion === 2
+          ? {
+              requestCommitmentVersion: 2 as const,
+              requestingDevicePublicId: authority.device.publicId,
+            }
+          : {}),
         replay: true,
         state: replay.state,
         targetDevicePublicId: target.publicId,
@@ -175,6 +199,11 @@ export const enqueue = mutation({
     if (deviceClassOf(target) !== "daemon" || target.status !== "active") {
       throw new Error("DEVICE_COMMAND_TARGET_NOT_EXECUTOR");
     }
+    await requireTargetCommandRequestVersion(ctx, {
+      requestCommitmentVersion: args.requestCommitmentVersion,
+      targetDeviceId: target._id,
+      userId: authority.userId,
+    });
     const duplicatePublicId = await deviceCommandByPublicId(ctx, args.publicId);
     if (duplicatePublicId !== null) rejectAuthority();
     const commandDocument = {
@@ -185,6 +214,9 @@ export const enqueue = mutation({
       nonterminal: true,
       payload: args.payload,
       publicId: args.publicId,
+      ...(args.requestCommitmentVersion === undefined
+        ? {}
+        : { requestCommitmentVersion: args.requestCommitmentVersion }),
       requestDigest: args.requestDigest,
       requestingDeviceId: authority.deviceId,
       // The Convex sync client resolves only after this insert is committed and
@@ -210,6 +242,12 @@ export const enqueue = mutation({
     await ctx.db.insert("securityEvents", securityDocument);
     return {
       publicId: args.publicId,
+      ...(args.requestCommitmentVersion === 2
+        ? {
+            requestCommitmentVersion: 2 as const,
+            requestingDevicePublicId: authority.device.publicId,
+          }
+        : {}),
       replay: false,
       state: "pending" as const,
       targetDevicePublicId: target.publicId,
@@ -224,6 +262,7 @@ function publicDeviceCommand(command: Readonly<{
   kind: DeviceCommandKind;
   payload: Parameters<typeof parseEncryptedEnvelope>[0];
   publicId: string;
+  requestCommitmentVersion?: 2;
   result?: Parameters<typeof parseEncryptedEnvelope>[0];
   resultCode?: string;
   resultConsumedAt?: number;
@@ -240,6 +279,9 @@ function publicDeviceCommand(command: Readonly<{
     kind: command.kind,
     payload: command.payload,
     publicId: command.publicId,
+    ...(command.requestCommitmentVersion === undefined
+      ? {}
+      : { requestCommitmentVersion: command.requestCommitmentVersion }),
     // A single-use result is never returned by an ordinary read. The requester
     // exchanges it once through `consumeResult`; every other reader sees only
     // that it exists and whether it is already spent.
@@ -375,7 +417,10 @@ export const acknowledgeReceipt = mutation({
     const commandPatch = {
       requesterAcknowledgedAt: now,
       ...(terminalStates.includes(command.state)
-        ? { terminalCleanupAfter: now + commandTerminalRetentionMs }
+        ? {
+            terminalCleanupAfter: now + commandTerminalRetentionMs,
+            terminalResultless: command.result === undefined,
+          }
         : {}),
     };
     await adjustCommandQuotaForPatch(ctx, authority.userId, command, commandPatch);
@@ -446,10 +491,15 @@ export const prepare = mutation({
   args: {
     authority: authorityTuple,
     commandPublicId: v.string(),
+    executorRequestVersion: v.optional(v.literal(2)),
     localPhase: v.literal("prepared_no_effect"),
   },
   handler: async (ctx, args) => {
     const current = await requireDeviceCommandExecutionAuthority(ctx, args.commandPublicId);
+    requireCommandExecutorRequestVersion(
+      current.command.requestCommitmentVersion,
+      args.executorRequestVersion,
+    );
     const now = Date.now();
     if (
       (current.command.state === "pending" || current.command.state === "prepared")
@@ -458,7 +508,7 @@ export const prepare = mutation({
       const commandPatch = {
         nonterminal: false,
         state: "expired",
-        ...terminalCleanupFields(current.command, now),
+        ...terminalCleanupFields(current.command, now, true),
         updatedAt: now,
       } as const;
       await adjustCommandQuotaForPatch(
@@ -501,9 +551,17 @@ export const prepare = mutation({
 });
 
 export const markEffectStarted = mutation({
-  args: { authority: authorityTuple, commandPublicId: v.string() },
+  args: {
+    authority: authorityTuple,
+    commandPublicId: v.string(),
+    executorRequestVersion: v.optional(v.literal(2)),
+  },
   handler: async (ctx, args) => {
     const current = await requireDeviceCommandExecutionAuthority(ctx, args.commandPublicId);
+    requireCommandExecutorRequestVersion(
+      current.command.requestCommitmentVersion,
+      args.executorRequestVersion,
+    );
     const now = Date.now();
     const disposition = deviceCommandAuthorityTransitionDisposition({
       boundAuthority: current.command.boundAuthority === undefined
@@ -518,7 +576,7 @@ export const markEffectStarted = mutation({
       const commandPatch = {
         nonterminal: false,
         state: "expired",
-        ...terminalCleanupFields(current.command, now),
+        ...terminalCleanupFields(current.command, now, true),
         updatedAt: now,
       } as const;
       await adjustCommandQuotaForPatch(
@@ -550,6 +608,78 @@ export const markEffectStarted = mutation({
       replay: false,
       state: "effect_started" as const,
     };
+  },
+});
+
+/** Close an authenticated but semantically invalid prepared request. */
+export const failPrepared = mutation({
+  args: {
+    authority: authorityTuple,
+    commandPublicId: v.string(),
+    resultCode: v.string(),
+    resultDigest: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const current = await requireDeviceCommandExecutionAuthority(ctx, args.commandPublicId);
+    const command = current.command;
+    if (!isDigest(args.resultDigest) || !resultCodePattern.test(args.resultCode)) {
+      rejectAuthority();
+    }
+    const bound = command.boundAuthority;
+    if (bound === undefined || !sameDeviceAuthority(storedAuthority(bound), args.authority)) {
+      rejectAuthority();
+    }
+    if (command.state === "failed") {
+      if (
+        command.result !== undefined
+        || command.resultCode !== args.resultCode
+        || command.resultConsumedAt !== undefined
+        || command.resultDigest !== args.resultDigest
+        || command.resultExpiresAt !== undefined
+        || command.resultSingleUse !== undefined
+      ) throw new Error("DEVICE_COMMAND_RESULT_CONFLICT");
+      return { publicId: command.publicId, replay: true, state: "failed" as const };
+    }
+    if (command.state !== "prepared") {
+      throw new Error("DEVICE_COMMAND_TRANSITION_CONFLICT");
+    }
+    const now = Date.now();
+    if (command.deadline <= now) {
+      const commandPatch = {
+        nonterminal: false,
+        state: "expired",
+        ...terminalCleanupFields(command, now, true),
+        updatedAt: now,
+      } as const;
+      await adjustCommandQuotaForPatch(
+        ctx,
+        current.authority.userId,
+        command,
+        commandPatch,
+      );
+      await ctx.db.patch(command._id, commandPatch);
+      return { publicId: command.publicId, replay: false, state: "expired" as const };
+    }
+    const commandPatch = {
+      nonterminal: false,
+      resultCode: args.resultCode,
+      resultDigest: args.resultDigest,
+      state: "failed",
+      ...terminalCleanupFields(command, now, true),
+      updatedAt: now,
+    } as const;
+    await adjustCommandQuotaForPatch(ctx, current.authority.userId, command, commandPatch);
+    await ctx.db.patch(command._id, commandPatch);
+    const securityDocument = {
+      actorDeviceId: current.authority.deviceId,
+      createdAt: now,
+      entityId: command.publicId,
+      event: "command_terminal",
+      userId: current.authority.userId,
+    } as const;
+    await reserveQuotaForInsert(ctx, current.authority.userId, "security", securityDocument);
+    await ctx.db.insert("securityEvents", securityDocument);
+    return { publicId: command.publicId, replay: false, state: "failed" as const };
   },
 });
 
@@ -633,7 +763,7 @@ export const settle = mutation({
       resultCode: args.resultCode,
       resultDigest: args.resultDigest,
       state: args.state,
-      ...terminalCleanupFields(command, now),
+      ...terminalCleanupFields(command, now, args.result === undefined),
       updatedAt: now,
     };
     await adjustCommandQuotaForPatch(ctx, current.authority.userId, command, commandPatch);
@@ -808,7 +938,7 @@ export const recoverEffectStarted = mutation({
       resultCode: args.resultCode,
       resultDigest: args.resultDigest,
       state: args.state,
-      ...terminalCleanupFields(command, now),
+      ...terminalCleanupFields(command, now, true),
       updatedAt: now,
     } as const;
     await adjustCommandQuotaForPatch(ctx, current.authority.userId, command, commandPatch);
@@ -847,7 +977,7 @@ export const cancelPending = mutation({
     const commandPatch = {
       nonterminal: false,
       state: "cancelled",
-      ...terminalCleanupFields(command, now),
+      ...terminalCleanupFields(command, now, true),
       updatedAt: now,
     } as const;
     await adjustCommandQuotaForPatch(ctx, authority.userId, command, commandPatch);

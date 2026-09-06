@@ -528,12 +528,51 @@ describe("bounded cloud retention", () => {
         nonterminal: false,
         publicId: "018bcfe5-6800-7000-8000-000000000005",
         state: "applied",
+        terminalResultless: true,
         updatedAt: now - 60 * 24 * 60 * 60 * 1_000,
       } as const;
       await reserveQuotaForInsert(ctx, userId, "command", unacknowledgedTerminal);
       const unacknowledgedTerminalId = await ctx.db.insert(
         "sessionCommands",
         unacknowledgedTerminal,
+      );
+      const unacknowledgedResultTerminal = {
+        ...base,
+        deadline: now - 1,
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000a",
+        nonterminal: false,
+        publicId: "018bcfe5-6800-7000-8000-00000000000b",
+        result: {
+          algorithm: "A256GCM" as const,
+          ciphertext: "Q".repeat(32),
+          keyVersion: 1,
+          nonce: "Q".repeat(16),
+        },
+        resultCode: "APPLIED",
+        resultDigest: "a".repeat(64),
+        state: "applied",
+        terminalResultless: false,
+        updatedAt: now - 60 * 24 * 60 * 60 * 1_000,
+      } as const;
+      await reserveQuotaForInsert(ctx, userId, "command", unacknowledgedResultTerminal);
+      const unacknowledgedResultTerminalId = await ctx.db.insert(
+        "sessionCommands",
+        unacknowledgedResultTerminal,
+      );
+      const { terminalResultless: removedResultClass, ...legacyResultTerminalBase } =
+        unacknowledgedResultTerminal;
+      expect(removedResultClass).toBe(false);
+      const legacyUnmarkedResultTerminal = {
+        ...legacyResultTerminalBase,
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000c",
+        publicId: "018bcfe5-6800-7000-8000-00000000000d",
+        requestDigest: "b".repeat(64),
+        resultDigest: "c".repeat(64),
+      } as const;
+      await reserveQuotaForInsert(ctx, userId, "command", legacyUnmarkedResultTerminal);
+      const legacyUnmarkedResultTerminalId = await ctx.db.insert(
+        "sessionCommands",
+        legacyUnmarkedResultTerminal,
       );
       const expiredLoginResult = {
         createdAt: now - 10 * 60 * 1_000,
@@ -592,10 +631,12 @@ describe("bounded cloud retention", () => {
       return {
         expiredLoginResultId,
         legacyExpiredLoginResultId,
+        legacyUnmarkedResultTerminalId,
         oldSecurityId,
         oldTerminalId,
         pendingId,
         recentTerminalId,
+        unacknowledgedResultTerminalId,
         unacknowledgedTerminalId,
         userId,
       };
@@ -606,7 +647,7 @@ describe("bounded cloud retention", () => {
       deviceCommandLoginResults: 2,
       expiredPendingCommands: 1,
       securityEvents: 1,
-      terminalCommands: 1,
+      terminalCommands: 3,
     });
     expect(await runtime.run(async (ctx) => {
       const loginResult = await ctx.db.get(ids.expiredLoginResultId);
@@ -626,7 +667,13 @@ describe("bounded cloud retention", () => {
         pending: await ctx.db.get(ids.pendingId),
         loginResult: projectLoginResult(loginResult),
         legacyLoginResult: projectLoginResult(legacyLoginResult),
+        legacyUnmarkedResultTerminal: await ctx.db.get(
+          ids.legacyUnmarkedResultTerminalId,
+        ),
         recentTerminal: await ctx.db.get(ids.recentTerminalId),
+        unacknowledgedResultTerminal: await ctx.db.get(
+          ids.unacknowledgedResultTerminalId,
+        ),
         unacknowledgedTerminal: await ctx.db.get(ids.unacknowledgedTerminalId),
       };
     })).toMatchObject({
@@ -647,24 +694,29 @@ describe("bounded cloud retention", () => {
         resultSingleUse: true,
         state: "applied",
       },
+      legacyUnmarkedResultTerminal: null,
       recentTerminal: { state: "applied" },
-      unacknowledgedTerminal: { state: "applied" },
+      unacknowledgedResultTerminal: { result: expect.any(Object), state: "applied" },
+      unacknowledgedTerminal: null,
     });
     expect(await runtime.run(async (ctx) => {
       const expiredPending = await ctx.db.get(ids.pendingId);
-      const oldTerminal = await ctx.db.get(ids.unacknowledgedTerminalId);
+      const resultTerminal = await ctx.db.get(ids.unacknowledgedResultTerminalId);
       return {
         expiredPendingAcknowledged: expiredPending !== null
           && "requesterAcknowledgedAt" in expiredPending,
         expiredPendingHasCleanup: expiredPending !== null
           && "terminalCleanupAfter" in expiredPending,
-        oldTerminalAcknowledged: oldTerminal !== null
-          && "requesterAcknowledgedAt" in oldTerminal,
+        resultTerminalAcknowledged: resultTerminal !== null
+          && "requesterAcknowledgedAt" in resultTerminal,
+        resultTerminalHasCleanup: resultTerminal !== null
+          && "terminalCleanupAfter" in resultTerminal,
       };
     })).toEqual({
       expiredPendingAcknowledged: false,
       expiredPendingHasCleanup: false,
-      oldTerminalAcknowledged: false,
+      resultTerminalAcknowledged: false,
+      resultTerminalHasCleanup: false,
     });
     const accounting = async () => await runtime.run(async (ctx) => {
       const [sessionCommands, deviceCommands, quota, service] = await Promise.all([

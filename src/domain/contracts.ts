@@ -3,7 +3,19 @@ import { isAbsolute, normalize } from "node:path";
 import { z } from "zod";
 
 import { attachmentReferenceListSchema } from "./attachment-schemas";
-import { adoptableProviderSchema, presetSchema, providerSchema, supportedPresetSchema, supportedProviderSchema } from "./presets";
+import {
+  activePresetBinding,
+  adoptableProviderSchema,
+  isReboundCodexPreset,
+  presetContractSchema,
+  presetSchema,
+  providerSwitchRequiresPresetContract,
+  providerSchema,
+  sharedActiveCodexPresetContract,
+  supportedPresetSchema,
+  supportedProviderSchema,
+  type PresetContract,
+} from "./presets";
 import { interactionResolutionSchema } from "./interactions";
 import { notificationEmailPolicySchema } from "./notification-email";
 import {
@@ -25,12 +37,14 @@ import {
   sessionTaskStatusSchema,
 } from "./session-tasks";
 import {
+  WORK_APPLY_REQUEST_VERSION,
   WORK_EVENT_PAGE_LIMIT,
   WORK_TASK_HISTORY_ITEM_LIMIT,
   WORK_WAIT_MAX_MS,
   workEventCursorWireSchema,
   workIdSchema,
   workOperationSchema,
+  workOperationRequiresPresetContract,
   workTaskIdSchema,
 } from "./work";
 import { workProtocolQuerySchema } from "./work-protocol";
@@ -397,7 +411,16 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     limit: z.number().int().min(1).max(100),
     cursor: z.string().min(1).max(2_048).optional(),
   }).strict(),
-  z.object({ kind: z.literal("session.start"), account: selectorSchema, project: selectorSchema.optional(), provider: supportedProviderSchema.optional(), preset: supportedPresetSchema, fast: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({
+    kind: z.literal("session.start"),
+    account: selectorSchema,
+    project: selectorSchema.optional(),
+    provider: supportedProviderSchema.optional(),
+    preset: supportedPresetSchema,
+    fast: z.boolean(),
+    idempotencyKey: idempotencyKeySchema,
+    presetContract: presetContractSchema.optional(),
+  }).strict(),
   // `attachments` is optional and absent by default, so a message with no
   // attachment serializes exactly as it did before attachments existed. The
   // references name digests in local custody; no path ever crosses this
@@ -440,6 +463,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     session: selectorSchema,
     provider: supportedProviderSchema,
     preset: supportedPresetSchema.optional(),
+    presetContract: presetContractSchema.optional(),
     account: selectorSchema.optional(),
     idempotencyKey: idempotencyKeySchema,
   }).strict(),
@@ -580,6 +604,8 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("work.apply"),
     requestId: z.string().uuid(),
+    requestVersion: z.literal(WORK_APPLY_REQUEST_VERSION).optional(),
+    presetContract: presetContractSchema.optional(),
     operation: workOperationSchema,
   }).strict(),
   z.object({ kind: z.literal("work.snapshot"), work: workIdSchema, actor: sessionIdSchema.optional() }).strict(),
@@ -613,19 +639,130 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     limit: z.number().int().min(1).max(WORK_EVENT_PAGE_LIMIT),
     waitMs: z.number().int().min(0).max(WORK_WAIT_MAX_MS),
   }).strict(),
-]);
+]).superRefine((command, context) => {
+  if (
+    command.kind === "session.start"
+    && !isReboundCodexPreset(command.preset)
+    && command.presetContract !== undefined
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["presetContract"],
+      message: "Only a Codex High or Ultra session start may carry a source preset contract.",
+    });
+  }
+  if (
+    command.kind === "session.switch"
+    && !providerSwitchRequiresPresetContract(command.provider, command.preset)
+    && command.presetContract !== undefined
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["presetContract"],
+      message: "Only a source-sensitive Codex provider switch may carry a source preset contract.",
+    });
+  }
+  if (command.kind !== "work.apply") return;
+  if (command.requestVersion === undefined) {
+    if (command.presetContract !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["presetContract"],
+        message: "A legacy Work apply command must preserve its exact token-free shape.",
+      });
+    }
+    return;
+  }
+  const requiresPresetContract = workOperationRequiresPresetContract(command.operation);
+  if (requiresPresetContract && command.presetContract === undefined) {
+    context.addIssue({
+      code: "custom",
+      path: ["presetContract"],
+      message: "A v2 High/Ultra Work apply command requires its authored preset contract.",
+    });
+  } else if (!requiresPresetContract && command.presetContract !== undefined) {
+    context.addIssue({
+      code: "custom",
+      path: ["presetContract"],
+      message: "A stable v2 Work apply command must not carry a preset contract.",
+    });
+  }
+});
 
 export type LocalCommand = z.infer<typeof localCommandSchema>;
+
+/**
+ * The contract marker required at the local transport boundary for commands
+ * whose meaning can change when the active Codex High/Ultra binding changes.
+ * This build-authored envelope marker is independent from the optional
+ * caller-authored source marker on session.start, session.switch, or Work
+ * apply. That separation lets a current daemon recognize a stale replay
+ * without letting it pass the live
+ * rollout fence, while strict older daemons reject either additive key.
+ */
+export const localCommandPresetContract = (command: LocalCommand): PresetContract | undefined => {
+  if (command.kind === "session.start" || command.kind === "session.preset") {
+    return isReboundCodexPreset(command.preset)
+      ? activePresetBinding(command.preset).contract
+      : undefined;
+  }
+  if (command.kind === "session.switch") {
+    return providerSwitchRequiresPresetContract(command.provider, command.preset)
+      ? sharedActiveCodexPresetContract()
+      : undefined;
+  }
+  if (command.kind !== "work.apply") return undefined;
+  // Routes are immutable and later task additions must reuse an exact
+  // declared route. Fence a new declaration that admits a rebound Codex tier
+  // and a batch that actively adds a task on such a route.
+  return workOperationRequiresPresetContract(command.operation)
+    ? sharedActiveCodexPresetContract()
+    : undefined;
+};
 
 export const commandEnvelopeSchema = z
   .object({
     version: z.literal(LOCAL_COMMAND_REQUEST_VERSION),
     capability: z.string().regex(/^[A-Za-z0-9_-]{43}$/u),
     requestId: z.string().uuid(),
+    presetContract: presetContractSchema.optional(),
     command: localCommandSchema,
   })
   .strict()
   .superRefine((request, context) => {
+    if (
+      ((request.command.kind === "session.start"
+        && isReboundCodexPreset(request.command.preset))
+        || (request.command.kind === "session.switch"
+          && providerSwitchRequiresPresetContract(
+            request.command.provider,
+            request.command.preset,
+          )))
+      && request.command.presetContract === undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["command", "presetContract"],
+        message: "Source-sensitive Codex session commands require an authored source preset contract.",
+      });
+    }
+    const expectedPresetContract = localCommandPresetContract(request.command);
+    if (expectedPresetContract === undefined && request.presetContract !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["presetContract"],
+        message: "This local command must not carry a preset contract marker.",
+      });
+    } else if (
+      expectedPresetContract !== undefined
+      && request.presetContract !== expectedPresetContract
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["presetContract"],
+        message: "This local command requires this build's exact active preset contract.",
+      });
+    }
     if (utf8Bytes(JSON.stringify(request)) > LOCAL_COMMAND_REQUEST_MAX_BYTES) {
       context.addIssue({
         code: "custom",

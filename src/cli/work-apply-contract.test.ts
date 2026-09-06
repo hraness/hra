@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { main } from "../cli";
 import type { LocalCommand } from "../domain/contracts";
 import {
+  WORK_APPLY_REQUEST_LEGACY_VERSION,
+  WORK_APPLY_REQUEST_VERSION,
   WORK_OPERATION_MAX_BYTES,
   WORK_PROTOCOL,
   WORK_PROTOCOL_REQUEST_MAX_BYTES,
@@ -30,9 +32,41 @@ const operation: WorkOperation = {
   coordinatorCapability: capability,
   actorSessionId,
 };
+const reboundOperation: WorkOperation = {
+  kind: "work.create",
+  idempotencyKey,
+  clientRef: "source-bound-work",
+  coordinatorSessionId: actorSessionId,
+  objective: "Preserve the request's model semantics.",
+  routes: [{
+    accountId: `acct_${"4".repeat(32)}`,
+    projectId: `proj_${"5".repeat(32)}`,
+    preset: "high",
+    fast: false,
+  }],
+  tasks: [{
+    clientRef: "source-bound-task",
+    dependsOnRefs: [],
+    dependsOnTaskIds: [],
+    objective: "Prove source-bound admission.",
+    instructions: "Run the focused contract test.",
+    criteria: [],
+    route: {
+      accountId: `acct_${"4".repeat(32)}`,
+      projectId: `proj_${"5".repeat(32)}`,
+    },
+    preset: "high",
+    fast: false,
+    priority: 0,
+    maxAttempts: 1,
+    requiredReviews: 0,
+    resultKind: "text",
+    minEvidence: 0,
+  }],
+};
 const request = {
   protocol: WORK_PROTOCOL,
-  version: WORK_PROTOCOL_VERSION,
+  version: WORK_APPLY_REQUEST_LEGACY_VERSION,
   requestId,
   operation,
 } as const;
@@ -172,7 +206,7 @@ describe("agent-first work apply boundary", () => {
     expect(target.read().stdout.trim().split("\n")).toHaveLength(1);
     expect(JSON.parse(target.read().stdout)).toEqual({
       protocol: WORK_PROTOCOL,
-      version: WORK_PROTOCOL_VERSION,
+      version: WORK_APPLY_REQUEST_VERSION,
       requestId: null,
       ok: false,
       error: {
@@ -196,7 +230,7 @@ describe("agent-first work apply boundary", () => {
       expect(target.read().stderr).toBe("");
       expect(JSON.parse(target.read().stdout)).toEqual({
         protocol: WORK_PROTOCOL,
-        version: WORK_PROTOCOL_VERSION,
+        version: WORK_APPLY_REQUEST_VERSION,
         requestId: null,
         ok: false,
         error: {
@@ -238,15 +272,80 @@ describe("agent-first work apply boundary", () => {
       },
     })).toBe(0);
     expect(commands).toEqual([{ kind: "work.apply", requestId, operation }]);
+    expect(Object.keys(commands[0] ?? {}).sort()).toEqual(["kind", "operation", "requestId"]);
     expect(target.read().stderr).toBe("");
     expect(target.read().stdout.trim().split("\n")).toHaveLength(1);
     expect(JSON.parse(target.read().stdout)).toEqual({
       protocol: WORK_PROTOCOL,
-      version: WORK_PROTOCOL_VERSION,
+      version: WORK_APPLY_REQUEST_LEGACY_VERSION,
       requestId,
       ok: true,
       result,
     });
+  });
+
+  test("carries v2 source identity without rewriting the legacy inner command", async () => {
+    const stableTarget = capture();
+    const stableCommands: LocalCommand[] = [];
+    expect(await main(["work", "apply", "--input-stdin"], stableTarget.output, {
+      isTerminalDescriptor: () => false,
+      readProtectedDocument: () => Promise.resolve({
+        ...request,
+        version: WORK_APPLY_REQUEST_VERSION,
+      }),
+      callDaemon: (command) => {
+        stableCommands.push(command);
+        return Promise.resolve({ ok: true, version: 1, requestId, data: result });
+      },
+    })).toBe(0);
+    expect(stableCommands).toEqual([{
+      kind: "work.apply",
+      requestId,
+      requestVersion: WORK_APPLY_REQUEST_VERSION,
+      operation,
+    }]);
+    expect(JSON.parse(stableTarget.read().stdout)).toMatchObject({
+      protocol: WORK_PROTOCOL,
+      version: WORK_APPLY_REQUEST_VERSION,
+      requestId,
+      ok: true,
+    });
+
+    for (const presetContract of [1, 2] as const) {
+      const target = capture();
+      const commands: LocalCommand[] = [];
+      expect(await main(["work", "apply", "--input-stdin"], target.output, {
+        isTerminalDescriptor: () => false,
+        readProtectedDocument: () => Promise.resolve({
+          protocol: WORK_PROTOCOL,
+          version: WORK_APPLY_REQUEST_VERSION,
+          requestId,
+          presetContract,
+          operation: reboundOperation,
+        }),
+        callDaemon: (command) => {
+          commands.push(command);
+          return Promise.resolve({
+            ok: false,
+            version: 1,
+            requestId,
+            error: { code: "CONFLICT", message: "Fixture stops after source admission." },
+          });
+        },
+      })).toBe(1);
+      expect(commands).toEqual([{
+        kind: "work.apply",
+        requestId,
+        requestVersion: WORK_APPLY_REQUEST_VERSION,
+        presetContract,
+        operation: reboundOperation,
+      }]);
+      expect(JSON.parse(target.read().stdout)).toMatchObject({
+        version: WORK_APPLY_REQUEST_VERSION,
+        requestId,
+        ok: false,
+      });
+    }
   });
 
   test("admits schema-valid operation documents larger than the protected-value ceiling", async () => {
@@ -285,7 +384,7 @@ describe("agent-first work apply boundary", () => {
     });
     const largeRequest = {
       protocol: WORK_PROTOCOL,
-      version: WORK_PROTOCOL_VERSION,
+      version: WORK_APPLY_REQUEST_LEGACY_VERSION,
       requestId,
       operation: largeOperation,
     } as const;
@@ -363,7 +462,7 @@ describe("agent-first work apply boundary", () => {
     expect(target.read().stderr).toBe("");
     expect(JSON.parse(target.read().stdout)).toMatchObject({
       protocol: WORK_PROTOCOL,
-      version: WORK_PROTOCOL_VERSION,
+      version: WORK_APPLY_REQUEST_VERSION,
       requestId: null,
       ok: false,
       error: {
@@ -379,16 +478,20 @@ describe("agent-first work apply boundary", () => {
   test("rejects extra or malformed document fields before daemon dispatch", async () => {
     const secret = "PRIVATE-UNPARSED-WORK-DOCUMENT";
     for (const fixture of [
-      { document: { ...request, unexpected: secret }, expectedRequestId: null },
-      { document: { ...request, operation: { ...operation, unexpected: secret } }, expectedRequestId: requestId },
-      { document: { ...request, operation: { ...operation, idempotencyKey: undefined } }, expectedRequestId: requestId },
-      { document: { ...request, operation: { ...operation, actorSessionId: "worker-one" } }, expectedRequestId: requestId },
+      { document: { ...request, unexpected: secret }, expectedRequestId: null, expectedVersion: WORK_APPLY_REQUEST_VERSION },
+      { document: { ...request, version: WORK_APPLY_REQUEST_VERSION, presetContract: 1 }, expectedRequestId: requestId, expectedVersion: WORK_APPLY_REQUEST_VERSION },
+      { document: { ...request, version: WORK_APPLY_REQUEST_VERSION, operation: reboundOperation }, expectedRequestId: requestId, expectedVersion: WORK_APPLY_REQUEST_VERSION },
+      { document: { ...request, version: WORK_APPLY_REQUEST_VERSION, presetContract: 1, operation: reboundOperation, unexpected: secret }, expectedRequestId: null, expectedVersion: WORK_APPLY_REQUEST_VERSION },
+      { document: { ...request, operation: { ...operation, unexpected: secret } }, expectedRequestId: requestId, expectedVersion: WORK_APPLY_REQUEST_LEGACY_VERSION },
+      { document: { ...request, operation: { ...operation, idempotencyKey: undefined } }, expectedRequestId: requestId, expectedVersion: WORK_APPLY_REQUEST_LEGACY_VERSION },
+      { document: { ...request, operation: { ...operation, actorSessionId: "worker-one" } }, expectedRequestId: requestId, expectedVersion: WORK_APPLY_REQUEST_LEGACY_VERSION },
       {
         document: {
           ...request,
           operation: { kind: "work.join", workId, coordinatorSessionId: actorSessionId, actorSessionId },
         },
         expectedRequestId: requestId,
+        expectedVersion: WORK_APPLY_REQUEST_LEGACY_VERSION,
       },
     ]) {
       const target = capture();
@@ -409,7 +512,7 @@ describe("agent-first work apply boundary", () => {
       expect(target.read().stderr).toBe("");
       expect(JSON.parse(target.read().stdout)).toMatchObject({
         protocol: WORK_PROTOCOL,
-        version: WORK_PROTOCOL_VERSION,
+        version: fixture.expectedVersion,
         requestId: fixture.expectedRequestId,
         ok: false,
         error: {

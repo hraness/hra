@@ -129,6 +129,7 @@ function revokedCommandTerminalFields(
 ) {
   return {
     nonterminal: false,
+    terminalResultless: true,
     terminalCleanupAfter: command.requesterAcknowledgedAt === undefined
       ? undefined
       : now + commandTerminalRetentionMs,

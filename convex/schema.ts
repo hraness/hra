@@ -197,6 +197,7 @@ export default defineSchema({
     .index("by_presence_until", ["presenceUntil"])
     .index("by_user", ["userId"]),
   deviceRegistries: defineTable({
+    commandRequestVersion: v.optional(v.literal(2)),
     createdAt: v.number(),
     deviceId: v.id("devices"),
     devicePublicId: v.string(),
@@ -331,6 +332,7 @@ export default defineSchema({
     nonterminal: v.boolean(),
     payload: encryptedEnvelope,
     publicId: v.string(),
+    requestCommitmentVersion: v.optional(v.literal(2)),
     requestDigest: v.string(),
     requestingDeviceId: v.id("devices"),
     requesterAcknowledgedAt: v.optional(v.number()),
@@ -341,6 +343,7 @@ export default defineSchema({
     state: commandState,
     targetDeviceId: v.id("devices"),
     terminalCleanupAfter: v.optional(v.number()),
+    terminalResultless: v.optional(v.boolean()),
     updatedAt: v.number(),
     userId: v.id("users"),
   })
@@ -353,6 +356,8 @@ export default defineSchema({
     .index("by_state_and_deadline", ["state", "deadline"])
     .index("by_state_and_updated_at", ["state", "updatedAt"])
     .index("by_state_and_cleanup_after", ["state", "terminalCleanupAfter"])
+    .index("by_state_cleanup_after_updated_at", ["state", "terminalCleanupAfter", "updatedAt"])
+    .index("by_state_resultless_updated_at", ["state", "terminalResultless", "updatedAt"])
     .index("by_idempotency", [
       "userId",
       "sessionId",
@@ -378,6 +383,7 @@ export default defineSchema({
     nonterminal: v.boolean(),
     payload: encryptedEnvelope,
     publicId: v.string(),
+    requestCommitmentVersion: v.optional(v.literal(2)),
     requestDigest: v.string(),
     requestingDeviceId: v.id("devices"),
     requesterAcknowledgedAt: v.optional(v.number()),
@@ -396,6 +402,7 @@ export default defineSchema({
     state: commandState,
     targetDeviceId: v.id("devices"),
     terminalCleanupAfter: v.optional(v.number()),
+    terminalResultless: v.optional(v.boolean()),
     updatedAt: v.number(),
     userId: v.id("users"),
   })

@@ -53,9 +53,19 @@ export function useSubmitCommand(): SubmitCommand {
       publicId: commandPublicId,
       sessionPublicId: input.sessionPublicId,
     });
-    const requestDigest = await enqueueRequestDigest(unlocked.key, request);
+    const requestDigest = await enqueueRequestDigest(
+      unlocked.key,
+      request,
+      unlocked.identity.devicePublicId,
+    );
     try {
-      await convex.mutation(enqueueCommand, { ...request, idempotencyKey, requestDigest });
+      await convex.mutation(enqueueCommand, {
+        ...request,
+        expectedRequestingDevicePublicId: unlocked.identity.devicePublicId,
+        idempotencyKey,
+        requestCommitmentVersion: 2,
+        requestDigest,
+      });
     } catch (failure: unknown) {
       report(failure);
       throw failure;

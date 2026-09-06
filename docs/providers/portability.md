@@ -57,7 +57,7 @@ still has a readable conversation.
 ## Switching provider
 
 ```
-hra session switch <session> --provider codex|claude [--preset <preset>] [--account <account>]
+hra session switch <session> --provider codex|claude [--preset <preset>] [--account <account>] [--idempotency-key <uuid>] [--preset-contract <1|2>]
 ```
 
 In order, a switch:
@@ -160,10 +160,41 @@ provable after the fact.
 
 ## The remote surface
 
-`set_provider {provider, preset?}` sits alongside `set_model` in the hosted
-command union (`convex/validators.ts`, `src/cloud/contracts.ts`,
-`src/cloud/payloads.ts`), and the journal, bridge lane, and local-control
-parser all derive their closed unions from that one list.
+`set_provider {provider}` for Claude, `set_provider {provider:
+"codex", presetContract}` when the target Codex preset is daemon-derived,
+`set_provider {provider, preset}` for an unchanged explicit alias, or
+`set_provider {provider, preset, presetContract}` for explicit rebound Codex
+`high | ultra` sits alongside `set_model` in the hosted command union
+(`convex/validators.ts`, `src/cloud/contracts.ts`, `src/cloud/payloads.ts`), and
+the journal, bridge lane, and local-control parser all derive their closed
+unions from that one list.
+
+When a remote command explicitly selects the rebound Codex `high` or `ultra`
+alias, `presetContract` is required and must equal the receiving daemon's active
+immutable binding for that alias. Missing or stale tokens are refused before a
+provider effect, so a browser or CLI from one side of a Sol/Astra rollout cannot
+silently change the meaning selected on the other side. A preset-omitted switch
+to Codex carries the same fence because the daemon derives High or Ultra from
+the source tier; the active High and Ultra aliases must share one contract for
+that shape to be produced or admitted. Explicit stable `low` and `fable-max`
+aliases, plus preset-omitted Claude switches, retain their exact token-free
+shapes.
+
+Local provider switches use an equivalent conditional build fence in the
+strict CLI-to-daemon request envelope. It is present for explicit High or Ultra
+and for a preset-omitted target of Codex, where the persistent daemon derives a
+possibly rebound alias from the source tier. Stable explicit presets and
+preset-omitted Claude targets remain token-free. The build fence is
+checked before the internal `session.switch` command reaches provider-effect
+handling, so a CLI and an already-running daemon from opposite sides of the
+mapping change cannot silently disagree. The command also carries a separate
+caller-authored source contract beside its generated idempotency key, and both
+are returned for uncertain replay. The resolved High or Ultra contract is part
+of the durable switch request identity. A prepared switch from an older
+mapping cannot resume under the newer meaning after restart; stable target
+presets retain their earlier digest shape. Only a source-matched, exact-key
+settled replay returns its historical result without repeating a provider
+effect. Reusing the key with another request identity is a conflict.
 
 Unlike the settings commands, a provider switch is a provider effect, not local
 state, so `src/cloud/daemon-adapters.ts` routes it onto the ordinary execution

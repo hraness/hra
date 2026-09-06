@@ -318,6 +318,7 @@ async function expirePendingCommands(ctx: MutationCtx, now: number, limit: numbe
     const commandPatch = {
       nonterminal: false,
       state: "expired" as const,
+      terminalResultless: true,
       ...(record.requesterAcknowledgedAt === undefined
         ? {}
         : { terminalCleanupAfter: now + cloudRetentionMs.terminalCommand }),
@@ -331,6 +332,48 @@ async function expirePendingCommands(ctx: MutationCtx, now: number, limit: numbe
 
 async function deleteTerminalCommands(ctx: MutationCtx, now: number, limit: number): Promise<number> {
   let remaining = limit;
+  let processed = 0;
+  const resultlessRetentionCutoff = now - cloudRetentionMs.terminalCommand;
+
+  // Current terminal writes classify result-less rows explicitly so this
+  // sweep never scans across preserved encrypted results. Older clients did
+  // not stamp that class. Their unmarked rows are retained for the full
+  // ordinary window, then deleted directly under the same bounded index and
+  // category budget used by every other maintenance class.
+  for (const state of ["applied", "failed", "ambiguous", "cancelled", "expired"] as const) {
+    if (remaining === 0) break;
+    const resultless = await ctx.db.query("sessionCommands")
+      .withIndex("by_state_resultless_updated_at", (builder) => builder
+        .eq("state", state)
+        .eq("terminalResultless", true)
+        .lt("updatedAt", resultlessRetentionCutoff))
+      .take(remaining);
+    for (const record of resultless) {
+      if (record.nonterminal) throw new Error("Maintenance authority is corrupt.");
+      await releaseCommandQuotaForDelete(ctx, record.userId, record);
+      await ctx.db.delete(record._id);
+    }
+    processed += resultless.length;
+    remaining -= resultless.length;
+  }
+
+  for (const state of ["applied", "failed", "ambiguous", "cancelled", "expired"] as const) {
+    if (remaining === 0) break;
+    const legacy = await ctx.db.query("sessionCommands")
+      .withIndex("by_state_resultless_updated_at", (builder) => builder
+        .eq("state", state)
+        .eq("terminalResultless", undefined)
+        .lt("updatedAt", resultlessRetentionCutoff))
+      .take(remaining);
+    for (const record of legacy) {
+      if (record.nonterminal) throw new Error("Maintenance authority is corrupt.");
+      await releaseCommandQuotaForDelete(ctx, record.userId, record);
+      await ctx.db.delete(record._id);
+    }
+    processed += legacy.length;
+    remaining -= legacy.length;
+  }
+
   for (const state of ["applied", "failed", "ambiguous", "cancelled", "expired"] as const) {
     if (remaining === 0) break;
     const records = await ctx.db.query("sessionCommands")
@@ -343,9 +386,10 @@ async function deleteTerminalCommands(ctx: MutationCtx, now: number, limit: numb
       await releaseCommandQuotaForDelete(ctx, record.userId, record);
       await ctx.db.delete(record._id);
     }
+    processed += records.length;
     remaining -= records.length;
   }
-  return limit - remaining;
+  return processed;
 }
 
 /*
@@ -364,6 +408,7 @@ async function expirePendingDeviceCommands(ctx: MutationCtx, now: number, limit:
     const commandPatch = {
       nonterminal: false,
       state: "expired" as const,
+      terminalResultless: true,
       ...(record.requesterAcknowledgedAt === undefined
         ? {}
         : { terminalCleanupAfter: now + cloudRetentionMs.terminalCommand }),

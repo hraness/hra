@@ -3453,11 +3453,13 @@ describe("CLI entry point", () => {
       ["account", "logout", "personal", "--json"],
       ["account", "switch", "personal", "--json"],
       ["session", "start", "personal", "--json"],
+      ["session", "start", "personal", "--provider", "claude", "--json"],
       ["session", "send", "session-1", privatePayload, "--json"],
       ["session", "queue", "session-1", privatePayload, "--json"],
       ["session", "steer", "session-1", privatePayload, "--json"],
       ["session", "stop", "session-1", "--json"],
       ["session", "rename", "session-1", privatePayload, "--json"],
+      ["session", "switch", "session-1", "--provider", "codex", "--preset", "high", "--json"],
       ["session", "task", "create", "session-1", "--name", "review", "--every-minutes", "15", "--json", "--", privatePayload],
       ["session", "task", "edit", "session-1", `stask_${"1".repeat(32)}`, "--revision", "1", "--json", "--", privatePayload],
       ["session", "task", "delete", "session-1", `stask_${"1".repeat(32)}`, "--revision", "1", "--json"],
@@ -3466,12 +3468,17 @@ describe("CLI entry point", () => {
     for (const argv of commands) {
       const captured = capture();
       let generatedKey = "";
+      let authoredPresetContract: 1 | 2 | undefined;
       expect(await main(argv, captured.output, {
         callDaemon: (command) => {
           generatedKey = "idempotencyKey" in command
             && typeof command.idempotencyKey === "string"
             ? command.idempotencyKey
             : "";
+          authoredPresetContract = command.kind === "session.start"
+            || command.kind === "session.switch"
+            ? command.presetContract
+            : undefined;
           throw new LocalDaemonIndeterminateError("mutation response lost");
         },
       })).toBe(7);
@@ -3494,7 +3501,13 @@ describe("CLI entry point", () => {
           code: "RECOVERY_REQUIRED",
           details: {
             idempotencyKey: generatedKey,
-            replayArguments: ["--idempotency-key", generatedKey],
+            replayArguments: [
+              "--idempotency-key",
+              generatedKey,
+              ...(authoredPresetContract === undefined
+                ? []
+                : ["--preset-contract", String(authoredPresetContract)]),
+            ],
             replayPlacement: "before_double_dash",
             sameKeyReplay: true,
           },

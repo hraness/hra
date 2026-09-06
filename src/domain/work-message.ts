@@ -1,5 +1,6 @@
 import {
   WORK_DEPENDENCY_PREVIEW_MAX_BYTES,
+  WORK_APPLY_REQUEST_VERSION,
   WORK_PROTOCOL,
   WORK_PROTOCOL_VERSION,
   WORK_WORKER_BRIEF_MAX_BYTES,
@@ -43,7 +44,7 @@ const encodeBrief = (value: unknown): string => {
 
 const applyRequest = (operation: Readonly<Record<string, unknown>>) => ({
   protocol: WORK_PROTOCOL,
-  version: WORK_PROTOCOL_VERSION,
+  version: WORK_APPLY_REQUEST_VERSION,
   requestId: REQUEST_ID,
   operation,
 });

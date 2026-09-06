@@ -8,6 +8,7 @@ import fc from "fast-check";
 
 import { INTERACTION_MAX_PENDING_MS } from "../domain/interactions.ts";
 import {
+  currentPresetContract,
   legacyPresetContract,
   presetRequirementForContract,
   presetRequirements,
@@ -104,6 +105,17 @@ const capabilities: CodexCapabilitySnapshot = {
       hidden: false,
       supportedReasoningEfforts: ["low", "medium", "high", "max"],
       defaultReasoningEffort: "medium",
+      serviceTiers: [{ id: "priority", name: "Fast", description: "Faster" }],
+      defaultServiceTier: null,
+      isDefault: false,
+    },
+    {
+      id: "gpt-5.6-sol",
+      model: "gpt-5.6-sol",
+      displayName: "GPT-5.6 Sol",
+      hidden: false,
+      supportedReasoningEfforts: ["low", "max", "ultra"],
+      defaultReasoningEffort: "low",
       serviceTiers: [{ id: "priority", name: "Fast", description: "Faster" }],
       defaultServiceTier: null,
       isDefault: false,
@@ -1612,33 +1624,27 @@ describe("runtime capability resolution", () => {
       serviceTier: null,
     });
     expect(resolvePreset(capabilities, "high", presetRequirements.high, true)).toMatchObject({
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       effort: "max",
       serviceTier: "priority",
     });
     expect(resolvePreset(capabilities, "ultra", presetRequirements.ultra, false)).toMatchObject({
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       effort: "ultra",
     });
   });
 
   test("resolves a historical exact tuple without reinterpreting its alias", () => {
     const legacyHigh = presetRequirementForContract("high", legacyPresetContract);
-    const legacyCapabilities: CodexCapabilitySnapshot = {
-      ...capabilities,
-      models: [
-        ...capabilities.models,
-        {
-          ...capabilities.models[1]!,
-          id: "gpt-5.6-sol",
-          model: "gpt-5.6-sol",
-          displayName: "GPT-5.6 Sol",
-        },
-      ],
-    };
-    expect(resolvePreset(legacyCapabilities, "high", legacyHigh, false)).toMatchObject({
+    expect(resolvePreset(capabilities, "high", legacyHigh, false)).toMatchObject({
       alias: "high",
       model: "gpt-5.6-sol",
+      effort: "max",
+    });
+    const astraHigh = presetRequirementForContract("high", currentPresetContract);
+    expect(resolvePreset(capabilities, "high", astraHigh, false)).toMatchObject({
+      alias: "high",
+      model: "gpt-6-astra",
       effort: "max",
     });
     expect(() => resolvePreset(capabilities, "high", {
@@ -1658,12 +1664,12 @@ describe("runtime capability resolution", () => {
   test("never selects a prefixed or suffixed lookalike under catalog reordering", () => {
     const catalog = [
       { ...capabilities.models[0]!, id: "gpt-5.6-luna-mini", model: "gpt-5.6-luna-mini" },
-      { ...capabilities.models[1]!, id: "legacy-gpt-6-astra", model: "legacy-gpt-6-astra" },
+      { ...capabilities.models[2]!, id: "legacy-gpt-6-astra", model: "legacy-gpt-6-astra" },
       ...capabilities.models,
     ];
-    fc.assert(fc.property(fc.shuffledSubarray(catalog, { minLength: 4, maxLength: 4 }), (models) => {
+    fc.assert(fc.property(fc.shuffledSubarray(catalog, { minLength: 5, maxLength: 5 }), (models) => {
       expect(resolvePreset({ ...capabilities, models }, "low", presetRequirements.low, false).model).toBe("gpt-5.6-luna");
-      expect(resolvePreset({ ...capabilities, models }, "high", presetRequirements.high, false).model).toBe("gpt-6-astra");
+      expect(resolvePreset({ ...capabilities, models }, "high", presetRequirements.high, false).model).toBe("gpt-5.6-sol");
     }));
     const lookalikesOnly = {
       ...capabilities,

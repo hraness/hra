@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import { z } from "zod";
 
-import { presetSchema, providerSchema } from "./presets";
+import { presetContractSchema, presetSchema, providerSchema } from "./presets";
 import {
   sessionMessageActorSchema,
   type SessionEvent,
@@ -61,6 +61,7 @@ export const sessionProviderSwitchReceiptSchema = z.object({
   request: z.object({
     accountId: profileIdSchema.nullable(),
     preset: presetSchema.nullable(),
+    presetContract: presetContractSchema.optional(),
     provider: providerSchema,
   }).strict(),
   seed: z.object({

@@ -82,6 +82,8 @@ export {
 } from "../../../src/cloud/projection";
 
 export {
+  activeRemoteDerivedCodexSelection,
+  activeRemotePresetSelection,
   cloudPayloadAad,
   decryptDeviceCommandResult,
   decryptDeviceRegistry,
@@ -100,6 +102,7 @@ export {
   parseRemoteCommandPayload,
   remoteInteractionAnswersFitCommandEnvelope,
   type CloudPayloadAuthority,
+  type ActiveRemotePresetSelection,
   type DeviceCommandPayload,
   type DeviceCommandResultPayload,
   type DeviceRegistryAccount,

@@ -16,10 +16,17 @@ export type InlineContent =
   | { readonly kind: "link"; readonly href: string; readonly label: string }
   | { readonly kind: "text"; readonly value: string };
 
+export interface OrderedListItem {
+  readonly afterCommands?: readonly InlineContent[];
+  readonly commands?: readonly string[];
+  readonly content: readonly InlineContent[];
+}
+
 export type ContentBlock =
   | { readonly kind: "commands"; readonly commands: readonly string[] }
   | { readonly kind: "list"; readonly items: readonly (readonly InlineContent[])[] }
   | { readonly kind: "notice"; readonly label: string; readonly content: readonly InlineContent[] }
+  | { readonly kind: "ordered-list"; readonly items: readonly OrderedListItem[] }
   | { readonly kind: "paragraph"; readonly content: readonly InlineContent[] }
   | { readonly kind: "subheading"; readonly text: string };
 
@@ -157,6 +164,10 @@ const paragraph = (...content: readonly InlineContent[]): ContentBlock => ({
 });
 const list = (...items: readonly (readonly InlineContent[])[]): ContentBlock => ({
   kind: "list",
+  items,
+});
+const orderedList = (...items: readonly OrderedListItem[]): ContentBlock => ({
+  kind: "ordered-list",
   items,
 });
 
@@ -385,7 +396,7 @@ export const publicContent: PublicContent = {
       {
         label: "Start",
         command: "hra session start personal --provider codex --json",
-        detail: "Create an Astra Ultra Codex session under the account profile you name.",
+        detail: "Create a Sol Ultra Codex session under the account profile you name.",
       },
       {
         label: "Inspect",
@@ -529,20 +540,99 @@ export const publicContent: PublicContent = {
         paragraph(
           text("The single install command streams the exact v0.6.0 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.6.0 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation recovers or removes only the proven private stage. Existing trustedDependencies remain unchanged."),
         ),
+        { kind: "subheading", text: "Update runbook" },
         paragraph(
-          text("Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.6.0. For a future update, replace the tagged preflight and release archive references together with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:"),
+          text("Use this sequence to replace an installed release. Resolve every uncertain local mutation that depends on old alias or prepared authority before starting the current daemon, and preserve remote-command evidence for the fail-closed reconciliation below. Replace the tagged preflight URL, release archive URL, expected preflight digest, and expected version together with one exact reviewed immutable tag. Never install a moving branch on a release machine, and never run an older daemon against this state root after the current daemon has started."),
         ),
-        {
-          kind: "commands",
-          commands: [
-            "hra daemon stop",
-            "hra daemon status --json",
-            betaInstallCommand,
-            "hra --version",
-            "hra doctor --offline",
-            "hra daemon start",
-          ],
-        },
+        orderedList(
+          {
+            content: [
+              text("Resolve keyed local mutations under the installed release. For a Codex High or Ultra "),
+              code("session start"),
+              text(", or a source-sensitive provider switch that explicitly or implicitly selects either alias, replay the exact idempotency key using the originating release's own syntax and source evidence. Resolve an affected Work mutation by replaying its exact request document. Continue only when exact replay under the originating release, or that release's documented kind-specific recovery, reaches a terminal settlement. Otherwise the update remains blocked. If that release has no explicit source-contract flag, use only its exact syntax; do not invent an unsupported option or infer an old alias meaning from the new release."),
+            ],
+          },
+          {
+            content: [
+              text("Resolve any uncertain "),
+              code("session preset"),
+              text(" under the installed release. This command has no idempotency key, so repeat it if necessary and inspect the session before updating."),
+            ],
+          },
+          {
+            content: [
+              text("Block the update on any remaining prepared or indeterminate local mutation. HRA exposes no general command to cancel a prepared session start or provider switch, and "),
+              code("session abandon"),
+              text(" applies only to an existing recovery-required session. Retain the originating release and state root until exact replay or its documented recovery reaches a terminal settlement. Do not generate a fresh key or edit SQLite as a workaround."),
+            ],
+          },
+          {
+            content: [
+              text("Reconcile every uncertain CLI session-command enqueue by repeating the exact remote request with its exact idempotency key. Let HRA's durable local outbox reconcile the response, retain every returned session-command ID, and inspect each one with "),
+              code("hra remote command <uuidv7>"),
+              text(". For a browser or device command, use the current tab's retained command handle and idempotency identity, then inspect it through the app or the corresponding hosted query. Never edit or delete the local command journal, local outbox, tab state, or hosted row to force progress."),
+            ],
+          },
+          {
+            content: [text("Stop the daemon and prove that it released authority:")],
+            commands: [
+              "hra daemon stop --json",
+              "hra daemon status --json",
+            ],
+            afterCommands: [
+              text("Require the stop command itself to exit zero; its recovery path is the authority-release proof. Treat a status response containing "),
+              code("data.running: false"),
+              text(" only as a secondary no-listener confirmation. Status alone does not prove authority release. Stop on any stop or recovery error."),
+            ],
+          },
+          {
+            content: [
+              text("Install the exact immutable release, then verify the installed version and offline health. This is the verified repair installation for v0.6.0:"),
+            ],
+            commands: [
+              betaInstallCommand,
+              "hra --version",
+              "hra doctor --offline",
+            ],
+            afterCommands: [
+              text("Require the exact expected version. Before the first current-daemon start, doctor must either succeed or report only the exact pending state-schema migration that names the old and current schema versions. Any other diagnostic stops the update."),
+            ],
+          },
+          {
+            content: [
+              text("Start the current daemon. This is the no-downgrade boundary: after this command begins, never launch an older daemon against the same state root. Prove post-migration health before syncing, then inspect every retained CLI session-command ID:"),
+            ],
+            commands: [
+              "hra daemon start",
+              "hra doctor --offline",
+              "hra sync now",
+              "hra sync status",
+              "hra remote command <uuidv7>",
+            ],
+            afterCommands: [
+              text("Require the post-start doctor command to succeed before sync. Sync status reports projection recovery, not the command outbox. Use retained CLI session-command IDs for remote-command inspection; inspect browser and device commands through the app or corresponding hosted query."),
+            ],
+          },
+          {
+            content: [
+              text("Classify legacy remote commitments from both the local journal and hosted row before retrying. The current daemon never executes a legacy request commitment. An already-hosted terminal row takes precedence: it confirms the hosted result and permits local retirement without replaying a local outcome. Otherwise, if the hosted row remains nonterminal and either side records "),
+              code("effect_started"),
+              text(", close it result-less as "),
+              code("ambiguous"),
+              text(". A legacy local terminal outcome over any hosted nonterminal row is unauthenticated evidence: discard that outcome and close result-less as "),
+              code("LOCAL_EFFECT_RECOVERY_REQUIRED"),
+              text(" ambiguous. A fresh or local-prepared legacy request over hosted "),
+              code("pending"),
+              text(" or "),
+              code("prepared"),
+              text(" row closes as "),
+              code("failed"),
+              text(" with "),
+              code("LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT"),
+              text(". Retry only a failed-before-effect request, only after its initiating client is also current, and use a fresh idempotency key. Retain the new command ID. Never automatically retry an ambiguous command. Each daemon privately publishes its command-request version before processing commands. Fresh requests must exactly match that target: current-to-current and legacy-to-legacy are accepted, while either mixed-version direction is rejected before a command or quota record is written. Exact same-key replay remains available across a later target upgrade or downgrade, but changing versions under one key conflicts. A registry-publication failure skips both command queues for that cycle, and every marker-2 command also requires a current executor marker before prepare or effect start. Hosted operators deploy the additive gate first, then may upgrade daemons and marker-emitting clients independently per target; no all-daemons pause or account-wide legacy drain is required."),
+            ],
+          },
+        ),
         {
           kind: "notice",
           label: "v0.5 upgrade quarantine",
@@ -566,13 +656,15 @@ export const publicContent: PublicContent = {
           code("hra account logout <profile>"),
           text(" for every Codex profile. HRA does not sign Claude Code out; use Claude Code's own authentication flow inside every isolated "),
           code("CLAUDE_CONFIG_DIR"),
-          text(" whose credential should be removed. Stop the daemon, require a successful "),
+          text(" whose credential should be removed. Stop the daemon and require "),
+          code("hra daemon stop --json"),
+          text(" itself to exit zero as the authority-release proof. A successful "),
           code("hra daemon status --json"),
           text(" result whose "),
           code("data.running"),
           text(" is "),
           code("false"),
-          text(" before touching local data."),
+          text(" is only an optional no-listener confirmation before touching local data."),
         ),
         {
           kind: "commands",
@@ -581,7 +673,7 @@ export const publicContent: PublicContent = {
             "hra auth status",
             "hra account list",
             "hra account logout <profile>",
-            "hra daemon stop",
+            "hra daemon stop --json",
             "hra daemon status --json",
           ],
         },
@@ -772,7 +864,7 @@ export const publicContent: PublicContent = {
           ],
         },
         paragraph(
-          text("The frozen source contract defines a narrow local coordination kernel for agents operating several already-existing provider sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex and Claude Code still own their provider-native execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine."),
+          text("The versioned source contract defines a narrow local coordination kernel for agents operating several already-existing provider sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex and Claude Code still own their provider-native execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine."),
         ),
         {
           kind: "commands",
@@ -793,16 +885,25 @@ export const publicContent: PublicContent = {
           code("work watch"),
           text(" emits resumable JSON Lines. "),
           code("work apply"),
-          text(" is the only mutation entry point. It reads one strict "),
+          text(" is the only mutation entry point. It reads one strict version 1 or version 2 request from nonterminal standard input or an explicit file descriptor. Both versions contain "),
           code("{protocol,version,requestId,operation}"),
-          text(" request from nonterminal standard input or an explicit file descriptor. The nested operation carries its UUIDv7 "),
+          text(", and the nested operation carries its UUIDv7 "),
           code("idempotencyKey"),
-          text("; success and failure echo the request ID, and work capabilities are never accepted as argv fields. Same-key replay preserves the durable decision, stable identities, and capabilities without adding a mutation, event, or revision, while mutable public records and the work revision are reprojected from current state. It is not a byte-identical response promise. A retained release tombstone is the exact stored-result exception. "),
+          text(". A version 2 "),
+          code("work.create"),
+          text(" that declares a High or Ultra route, or "),
+          code("task.addBatch"),
+          text(" that adds a High or Ultra task, also carries the caller-authored top-level "),
+          code("presetContract"),
+          text("; version 2 forbids that field on stable operations. Success and failure echo the admitted request ID and version, and work capabilities are never accepted as argv fields. The request version and any authored preset contract are part of changed-intent detection. Same-key replay of the exact request preserves the durable decision, stable identities, and capabilities without adding a mutation, event, or revision, while mutable public records and the work revision are reprojected from current state. It is not a byte-identical response promise. A retained release tombstone is the exact stored-result exception. "),
           code("work protocol"),
-          text(" is queryable by operation, type, or topic. It returns exact field contracts, value syntax, capability semantics, operation kinds, hard bounds, and the closed recovery and process-exit guidance for failures."),
+          text(" is queryable by operation, type, or topic. It returns both accepted apply envelopes, exact field contracts, value syntax, capability semantics, operation kinds, hard bounds, and the closed recovery and process-exit guidance for failures."),
         ),
         paragraph(
           text("Each task carries an exact account ID, project ID, preset, and Fast setting. HRA never chooses another subscription from quota, availability, usage, or incidental ordering. A provider limit blocks or fails that attempt. It does not rotate the task to another account. Explicit tasks on separate accounts may run in parallel."),
+        ),
+        paragraph(
+          text("Each Work also freezes the meaning of its High and Ultra routes when it is created. A fresh affected version 2 request must name the current contract 1 Sol meaning. A fresh affected version 1 request is refused because that format does not identify whether its author meant Sol or Astra; stable version 1 requests remain admissible. An existing contract 2 Work whose coordinator and participating session authorities remain supported keeps Astra for already-declared tasks and remains readable, claimable, reviewable, and settleable. A Work associated with a retired Devin session remains readable but is fenced from mutation and execution. Current tooling does not append a new High or Ultra task to a historical contract 2 Work because the alias now means Sol; create a new Work for a new Sol task graph. Low has the same exact Luna Max meaning under both contracts and remains compatible. Exact same-key replay of an already-applied version 1 or version 2 mutation returns its historical result without adding a task or provider effect. Reusing that key with another version or contract is a conflict, not a request to reinterpret the historical operation."),
         ),
         paragraph(
           text("Readiness is derived from the open work state, time bounds, accepted dependency submissions, and absence of a live or ambiguous attempt. A final assistant message is not completion. The worker submits a bounded structured result and evidence; declared independent reviews and HRA-owned completion gates must accept the exact submission revision."),
@@ -1136,17 +1237,21 @@ export const publicContent: PublicContent = {
         ),
         list(
           [code("low"), text(": Codex Luna Max, currently "), code("gpt-5.6-luna"), text(" with "), code("max"), text(" reasoning.")],
-          [code("high"), text(": Codex Astra Max, currently "), code("gpt-6-astra"), text(" with "), code("max"), text(" reasoning.")],
-          [code("ultra"), text(": Codex Astra Ultra, currently "), code("gpt-6-astra"), text(" with "), code("ultra"), text(" reasoning.")],
+          [code("high"), text(": Codex Sol Max, currently "), code("gpt-5.6-sol"), text(" with "), code("max"), text(" reasoning.")],
+          [code("ultra"), text(": Codex Sol Ultra, currently "), code("gpt-5.6-sol"), text(" with "), code("ultra"), text(" reasoning.")],
           [code("fable-max"), text(": Claude Code Fable, currently "), code("claude-fable-5-1"), text(" with "), code("max"), text(" reasoning.")],
           [code("fast on|off"), text(": a Codex-only, explicit per-turn Fast or Standard overlay. Claude Code refuses Fast instead of ignoring it. A prior Fast value cannot leak into the next turn.")],
         ),
         paragraph(
-          text("New HRA-created Codex sessions and every explicit preset selection use the current mapping above. Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping for "),
+          text("New HRA-created Codex sessions that use "),
           code("high"),
-          text(" and "),
+          text(" or "),
           code("ultra"),
-          text(" until a preset is explicitly selected; metadata edits, restart recovery, and queued work do not reinterpret an established session."),
+          text(", and explicit selections of either preset, use the Sol mapping above. The "),
+          code("low"),
+          text(" and "),
+          code("fable-max"),
+          text(" bindings are unchanged. Codex sessions already bound to historical contract 2 keep their exact Astra model and effort until a preset is explicitly selected; unrelated metadata edits, restart recovery, and queued work do not reinterpret an established session."),
         ),
         paragraph(
           code("hra init"),
@@ -1335,7 +1440,7 @@ export const publicContent: PublicContent = {
             "hra session watch <session> [--cursor <cursor>] [--jsonl]",
             "hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
             "hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]",
-            "hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]",
+            "hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast] [--idempotency-key <uuid> --preset-contract <1|2>]",
             "hra session send|queue|steer <session> [--attach <path>]... <message>",
             "hra session stop|recover|abandon <session>",
             "hra session rename <session> <name>",
@@ -1344,7 +1449,7 @@ export const publicContent: PublicContent = {
             "hra session note set <session> <note>",
             "hra session state <session> [--json]",
             "hra session preset <session> <low|high|ultra|fable-max>",
-            "hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]",
+            "hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>] [--idempotency-key <uuid> --preset-contract <1|2>]",
             "hra session export <session> [--format <trajectory|json>] [--out <path>]",
             "hra session fast <session> <on|off>",
             "hra session project <session> <project>",
@@ -1394,7 +1499,24 @@ export const publicContent: PublicContent = {
           code("--idempotency-key <uuid>"),
           text(" to reuse one after a lost response. If a local mutation response is uncertain, HRA returns the generated key and the exact replay arguments without repeating the command payload. Put those arguments before any "),
           code("--"),
-          text(" delimiter when rerunning the otherwise unchanged command. session recover accepts only exact, kind-specific provider proof. session abandon never retries or deletes provider state and releases only the local recovery authority. Remote mutations require a current UUIDv7 when this option is supplied. With "),
+          text(" delimiter when rerunning the otherwise unchanged command. A source-sensitive Codex "),
+          code("session start"),
+          text(" or provider-switch replay includes both "),
+          code("--idempotency-key"),
+          text(" and its immutable "),
+          code("--preset-contract"),
+          text("; do not omit or change either after an update. The preset-contract option is replay-only and is rejected for stable requests. A source-matched applied request replays its result, an effect-started request remains recovery-required, and a fresh absent or inactive source contract is refused before a provider effect."),
+        ),
+        paragraph(
+          text("An older session-start release did not print the source contract, so its exact historical alias meaning must be supplied explicitly when replaying its key. For a v0.5.0 Codex start that omitted the then-default preset, preserve every other original option and add "),
+          code("--preset high --preset-contract 1"),
+          text("; v0.5.0 High and Ultra both meant Sol. Use "),
+          code("--preset-contract 2"),
+          text(" only for an untagged Astra-era request whose original runtime evidence actually meant Astra. Neither selector can resume a contractless prepared row. Contract 2 cannot authorize a fresh effect under the current Sol binding; contract 1 can authorize the exact Sol request when the key has no stored row, just as a newly generated key can. If the originating meaning cannot be proved, use the retained old release rather than guessing. A contractless prepared row has no supported cancellation or retirement command. It must reach a terminal settlement through exact replay under the originating release, or the update remains blocked. Do not use a fresh key or "),
+          code("session abandon"),
+          text(" as a workaround; that command applies only to an existing recovery-required session and never cancels prepared start or switch authority. "),
+          code("session preset"),
+          text(" has no idempotency-key replay; resolve and inspect it before updating. session recover accepts only exact, kind-specific provider proof. session abandon never retries or deletes provider state and releases only the local recovery authority. Remote mutations require a current UUIDv7 when this option is supplied. With "),
           code("--json"),
           text(", stdout contains one versioned object; diagnostics stay on stderr."),
         ),
@@ -1474,6 +1596,9 @@ const renderMarkdownInline = (content: readonly InlineContent[]): string =>
     })
     .join("");
 
+const indentMarkdownBlock = (value: string, indentation: string): string =>
+  value.split("\n").map((line) => `${indentation}${line}`).join("\n");
+
 const renderMarkdownBlock = (block: ContentBlock, headingLevel: number): string => {
   switch (block.kind) {
     case "commands":
@@ -1482,6 +1607,23 @@ const renderMarkdownBlock = (block: ContentBlock, headingLevel: number): string 
       return block.items.map((item) => `- ${renderMarkdownInline(item)}`).join("\n");
     case "notice":
       return `> **${block.label}.** ${renderMarkdownInline(block.content)}`;
+    case "ordered-list": {
+      return block.items.map((item, index) => {
+        const marker = `${(index + 1).toString()}. `;
+        const indentation = " ".repeat(marker.length);
+        const parts = [`${marker}${renderMarkdownInline(item.content)}`];
+        if (item.commands !== undefined) {
+          parts.push(indentMarkdownBlock(
+            `\`\`\`text\n${item.commands.join("\n")}\n\`\`\``,
+            indentation,
+          ));
+        }
+        if (item.afterCommands !== undefined) {
+          parts.push(indentMarkdownBlock(renderMarkdownInline(item.afterCommands), indentation));
+        }
+        return parts.join("\n\n");
+      }).join("\n\n");
+    }
     case "paragraph":
       return renderMarkdownInline(block.content);
     case "subheading":

@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  activePresetBinding,
+  astraPresetContract,
   assertPresetSupportedByProvider,
   assertSupportedProvider,
   currentPresetContract,
+  devinPresetContract,
   defaultPresetForProvider,
   isAdmittedPresetRequirement,
   isPresetSupportedByProvider,
@@ -13,10 +16,12 @@ import {
   presetForProviderTier,
   presetProviders,
   presetRequirementForContract,
+  presetRequirements,
   presetSchema,
   presetTiers,
   presetsForProvider,
   providerSchema,
+  solCodexPresetContract,
   supportedPresetSchema,
   supportedProviderSchema,
 } from "./presets";
@@ -58,6 +63,49 @@ describe("model presets and providers", () => {
     }
   });
 
+  test("selects supported active bindings while preserving historical Astra decoding", () => {
+    expect(solCodexPresetContract).toBe(legacyPresetContract);
+    expect(astraPresetContract).toBe(currentPresetContract);
+    expect(devinPresetContract).toBe(astraPresetContract);
+    expect(presetRequirements.high).toEqual({
+      model: "gpt-5.6-sol",
+      effort: "max",
+    });
+    expect(presetRequirements.ultra).toEqual({
+      model: "gpt-5.6-sol",
+      effort: "ultra",
+    });
+    expect(presetRequirements.astra).toEqual({
+      model: "gpt-6-astra",
+      effort: "provider-default",
+    });
+    expect(supportedPresetSchema.options.map((preset) => [
+      preset,
+      activePresetBinding(preset),
+    ])).toEqual([
+      ["low", {
+        contract: currentPresetContract,
+        requirement: { model: "gpt-5.6-luna", effort: "max" },
+      }],
+      ["high", {
+        contract: solCodexPresetContract,
+        requirement: { model: "gpt-5.6-sol", effort: "max" },
+      }],
+      ["ultra", {
+        contract: solCodexPresetContract,
+        requirement: { model: "gpt-5.6-sol", effort: "ultra" },
+      }],
+      ["fable-max", {
+        contract: currentPresetContract,
+        requirement: { model: "claude-fable-5-1", effort: "max" },
+      }],
+    ]);
+    expect(activePresetBinding("astra")).toEqual({
+      contract: currentPresetContract,
+      requirement: { model: "gpt-6-astra", effort: "provider-default" },
+    });
+  });
+
   test("versions exact requirements without widening the admitted tuples", () => {
     expect(presetContractSchema.options.map((option) => option.value)).toEqual([
       legacyPresetContract,
@@ -65,6 +113,10 @@ describe("model presets and providers", () => {
     ]);
     expect(presetRequirementForContract("high", legacyPresetContract)).toEqual({
       model: "gpt-5.6-sol",
+      effort: "max",
+    });
+    expect(presetRequirementForContract("high", currentPresetContract)).toEqual({
+      model: "gpt-6-astra",
       effort: "max",
     });
     expect(presetRequirementForContract("ultra", currentPresetContract)).toEqual({

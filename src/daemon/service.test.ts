@@ -49,7 +49,11 @@ import { sessionStatusSchema, type SessionStatus } from "../domain/observation";
 import type { PreparedAttachment } from "../domain/attachments";
 import { AttachmentBlobStore } from "../storage/attachment-store";
 import { ingestAttachments } from "./attachment-ingest";
-import { presetRequirements } from "../domain/presets";
+import {
+  currentPresetContract,
+  legacyPresetContract,
+  presetRequirements,
+} from "../domain/presets";
 import { createQueueId } from "../domain/values";
 import type {
   EffectiveClaudeRuntimeProfile,
@@ -68,7 +72,12 @@ import {
   InMemoryGatewayKeyStore,
   type GatewayKeyPort,
 } from "../storage/gateway-key-custody";
-import { StateStore, type SessionRecord } from "../storage/state-store";
+import {
+  mutationRequestDigest,
+  sessionStartMutationRequest,
+  StateStore,
+  type SessionRecord,
+} from "../storage/state-store";
 import {
   DeterministicProseResponder,
   PROSE_APPROVAL_REPLY,
@@ -105,7 +114,7 @@ const runtimeProfile = (authority: ProfileAuthority): EffectiveRuntimeProfile =>
   processGeneration: authority.generation,
   observedAt: 2_000,
   preset: "high",
-  model: "gpt-6-astra",
+  model: "gpt-5.6-sol",
   reasoningEffort: "max",
   serviceTier: null,
   fast: false,
@@ -1627,6 +1636,70 @@ async function nativeClaudeFixture(
   };
 }
 
+/**
+ * Reconstructs the immutable request and evidence shape emitted by a historical
+ * binary. The current writer correctly cannot create or rewrite this shape, so
+ * the test fixture temporarily removes and then restores the evidence-update
+ * guard around one exact compatibility-row rewrite.
+ */
+function rewriteSessionStartAttemptAsHistoricalFixture(input: Readonly<{
+  idempotencyKey: string;
+  request: unknown;
+  store: StateStore;
+}>): Readonly<{ evidence: Readonly<Record<string, unknown>>; requestDigest: string }> {
+  const attempt = input.store.readMutation(input.idempotencyKey);
+  if (attempt === null) throw new Error("The session-start compatibility fixture is missing its mutation attempt.");
+  const inspector = new Database(input.store.paths.database, { create: false, strict: true });
+  let evidenceUpdateGuardDropped = false;
+  try {
+    const evidenceRow = inspector.query(
+      `SELECT e.evidence_json FROM mutation_effect_evidence e
+       JOIN mutation_attempts m ON m.id=e.attempt_id
+       WHERE m.idempotency_key=?`,
+    ).get(input.idempotencyKey) as { evidence_json: string } | null;
+    if (evidenceRow === null) {
+      throw new Error("The session-start compatibility fixture is missing its effect evidence.");
+    }
+    const parsedEvidence = JSON.parse(evidenceRow.evidence_json) as unknown;
+    if (typeof parsedEvidence !== "object" || parsedEvidence === null || Array.isArray(parsedEvidence)) {
+      throw new Error("The session-start compatibility fixture has invalid effect evidence.");
+    }
+    const contractlessEvidence = { ...(parsedEvidence as Record<string, unknown>) };
+    delete contractlessEvidence.presetContract;
+    const evidence = contractlessEvidence;
+    const evidenceJson = JSON.stringify(evidence);
+    const requestDigest = mutationRequestDigest({
+      authorityGeneration: attempt.authorityGeneration,
+      authorityId: attempt.authorityId,
+      kind: attempt.kind,
+      request: input.request,
+    });
+    inspector.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
+    evidenceUpdateGuardDropped = true;
+    inspector.query(
+      "UPDATE mutation_attempts SET request_digest=? WHERE idempotency_key=?",
+    ).run(requestDigest, input.idempotencyKey);
+    inspector.query(
+      "UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?",
+    ).run(
+      evidenceJson,
+      createHash("sha256").update(evidenceJson).digest("hex"),
+      attempt.id,
+    );
+    return { evidence, requestDigest };
+  } finally {
+    try {
+      if (evidenceUpdateGuardDropped) {
+        inspector.exec(`CREATE TRIGGER IF NOT EXISTS mutation_effect_evidence_immutable_update
+BEFORE UPDATE ON mutation_effect_evidence
+BEGIN SELECT RAISE(ABORT, 'mutation effect evidence is immutable'); END;`);
+      }
+    } finally {
+      inspector.close(false);
+    }
+  }
+}
+
 async function claudeAccountFixture(
   initiallySignedIn = false,
   platform: NodeJS.Platform = "linux",
@@ -1731,7 +1804,7 @@ async function createIdleSession(
   const added = await value.service.execute({ kind: "account.add", label }, { signal }) as { account: { id: string } };
   await value.service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
   await value.service.execute({ kind: "project.add", label: `${label} docs`, path: value.documents }, { signal });
-  const started = await value.service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+  const started = await value.service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
   return { sessionId: started.session.id };
 }
 
@@ -1894,6 +1967,169 @@ describe("HraService personal-session adoption", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
   };
+
+  test.each([
+    ["high", { model: "gpt-5.6-sol", effort: "max" }],
+    ["ultra", { model: "gpt-5.6-sol", effort: "ultra" }],
+  ] as const)(
+    "binds a fresh adopted Codex %s session to Sol contract 1",
+    async (preset, requirement) => {
+      const providerThreadId = `personal-codex-fresh-${preset}-contract`;
+      const value = await preparedPersonalCodexCandidate({
+        label: `Fresh ${preset} contract`,
+        providerThreadId,
+        updatedAt: personalAdoptionNow - 11 * 60_000,
+        liveness: "not_live",
+      });
+      value.store.setDefaultPreset(preset);
+
+      await expect(value.enable()).resolves.toMatchObject({
+        discovery: { provider: "codex", adopted: 1, failed: 0 },
+      });
+
+      expect(value.personalCodex.claimRequests).toHaveLength(1);
+      expect(value.personalCodex.claimRequests[0]).toMatchObject({
+        preset,
+        requirement,
+      });
+      const session = value.store.findSessionByProviderThread(
+        value.accountId,
+        providerThreadId,
+      );
+      if (session === null) throw new Error("Expected the fresh Codex adoption.");
+      expect(value.store.requireSessionPresetRequirement(session.id)).toEqual({
+        preset,
+        requirement,
+      });
+      expect(value.store.latestSessionRuntimeProfile(session.id)).toMatchObject({
+        sourceKind: "session_start",
+        profile: { preset, model: requirement.model, reasoningEffort: requirement.effort },
+      });
+      const inspector = new Database(value.paths.database, { readonly: true, strict: true });
+      try {
+        expect(inspector.query(
+          "SELECT preset_contract FROM sessions WHERE id=?",
+        ).get(session.id)).toEqual({ preset_contract: legacyPresetContract });
+      } finally {
+        inspector.close(false);
+      }
+    },
+  );
+
+  test("preserves an active adopted Astra contract across rediscovery and restart, then rebinds Sol after detach", async () => {
+    const providerThreadId = "personal-codex-historical-astra-contract";
+    const value = await adoptedCodexFixture(
+      "Historical adopted Astra contract",
+      providerThreadId,
+    );
+    const initialAuthority = value.personalCodex.claimRequests[0]?.authority;
+    if (initialAuthority === undefined) throw new Error("Expected initial adoption authority.");
+    const historicalAstraProfile: EffectiveRuntimeProfile = {
+      ...runtimeProfile(initialAuthority),
+      preset: "ultra",
+      model: "gpt-6-astra",
+      reasoningEffort: "ultra",
+    };
+    const writer = new Database(value.paths.database, { strict: true });
+    try {
+      expect(writer.query(
+        "UPDATE sessions SET preset_contract=? WHERE id=?",
+      ).run(currentPresetContract, value.session.id).changes).toBe(1);
+    } finally {
+      writer.close(false);
+    }
+    value.store.recordSessionRuntimeProfile({
+      sessionId: value.session.id,
+      sourceKind: "turn_start",
+      sourceId: "historical-adopted-astra-contract",
+      profile: historicalAstraProfile,
+    });
+    const establishedSession = value.store.requireSession(value.session.id);
+    const establishedProfile = value.store.latestSessionRuntimeProfile(value.session.id);
+    expect(value.store.requireSessionPresetRequirement(value.session.id)).toEqual({
+      preset: "ultra",
+      requirement: { model: "gpt-6-astra", effort: "ultra" },
+    });
+
+    await expect(value.service.execute({
+      kind: "session.adoption.discover",
+      provider: "codex",
+    }, { signal })).resolves.toMatchObject({
+      providers: [{ provider: "codex", adopted: 0 }],
+    });
+    expect(value.personalCodex.claimRequests).toHaveLength(1);
+    expect(value.store.requireSession(value.session.id)).toEqual(establishedSession);
+    expect(value.store.latestSessionRuntimeProfile(value.session.id)).toEqual(establishedProfile);
+
+    await value.service.close();
+    const restartedPersonalCodex = new FakeCodex();
+    restartedPersonalCodex.readProjection = {
+      ...value.personalCodex.readProjection,
+      providerThreadId,
+      status: "idle",
+    };
+    const restarted = new HraService({
+      store: value.store,
+      paths: value.paths,
+      codex: new FakeCodex(),
+      personalCodex: restartedPersonalCodex,
+      personalCodexHome,
+      personalDiscovery: value.discovery,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      eventCursors: value.eventCursors,
+      now: () => personalAdoptionNow,
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    await restarted.settled();
+    expect(restartedPersonalCodex.claimRequests).toHaveLength(0);
+    expect(restartedPersonalCodex.observedThreads).toContain(providerThreadId);
+    expect(value.store.requireSessionPresetRequirement(value.session.id)).toEqual({
+      preset: "ultra",
+      requirement: { model: "gpt-6-astra", effort: "ultra" },
+    });
+    expect(value.store.latestSessionRuntimeProfile(value.session.id)).toEqual(establishedProfile);
+
+    await expect(restarted.execute({
+      kind: "session.adoption.discover",
+      provider: "codex",
+    }, { signal })).resolves.toMatchObject({
+      providers: [{ provider: "codex", adopted: 0 }],
+    });
+    expect(restartedPersonalCodex.claimRequests).toHaveLength(0);
+    expect(value.store.requireSessionPresetRequirement(value.session.id).requirement)
+      .toEqual({ model: "gpt-6-astra", effort: "ultra" });
+
+    value.store.detachPersonalSession({ sessionId: value.session.id, archive: false });
+    value.store.setSessionAdoptionPolicy({ provider: "codex", profileId: null });
+    value.store.setSessionAdoptionPolicy({ provider: "codex", profileId: value.accountId });
+    value.store.setDefaultPreset("high");
+    await expect(restarted.execute({
+      kind: "session.adoption.discover",
+      provider: "codex",
+    }, { signal })).resolves.toMatchObject({
+      providers: [{ provider: "codex", adopted: 1, failed: 0 }],
+    });
+    expect(restartedPersonalCodex.claimRequests).toHaveLength(1);
+    expect(restartedPersonalCodex.claimRequests[0]).toMatchObject({
+      preset: "high",
+      requirement: { model: "gpt-5.6-sol", effort: "max" },
+    });
+    expect(value.store.requireSessionPresetRequirement(value.session.id)).toEqual({
+      preset: "high",
+      requirement: { model: "gpt-5.6-sol", effort: "max" },
+    });
+    const inspector = new Database(value.paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT preset_contract FROM sessions WHERE id=?",
+      ).get(value.session.id)).toEqual({ preset_contract: legacyPresetContract });
+    } finally {
+      inspector.close(false);
+    }
+    await restarted.close();
+  });
 
   test.each([
     ["a deterministically released claim failure", new Error("claim rejected after exact release"), "pending"],
@@ -9366,6 +9602,7 @@ describe("HraService", () => {
       fast: false,
       kind: "session.start",
       preset: "high",
+      presetContract: 1,
     }, { signal }) as { session: { id: `sess_${string}` } };
     const loginKey = "00000000-0000-4000-8000-000000000712";
     const expectedPlatformRefusal = {
@@ -9745,6 +9982,7 @@ describe("HraService", () => {
       account: added.account.id,
       provider: "claude",
       preset: "ultra",
+      presetContract: 1,
       fast: false,
     }, { signal })).rejects.toThrow("does not support the `ultra` model preset");
 
@@ -9772,6 +10010,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
+      presetContract: 1,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
     expect(started.session.id).toMatch(/^sess_/u);
@@ -9789,6 +10028,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
+      presetContract: 1,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
 
@@ -9845,6 +10085,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
+      presetContract: 1,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
     await service.execute({
@@ -10082,6 +10323,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
+      presetContract: 1,
       fast: false,
     }, { signal })).rejects.toMatchObject({
       code: "UNAVAILABLE",
@@ -10684,7 +10926,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Work" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: true }, { signal }) as { session: { id: `sess_${string}` }; effectiveRuntimeProfile: EffectiveRuntimeProfile };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: true }, { signal }) as { session: { id: `sess_${string}` }; effectiveRuntimeProfile: EffectiveRuntimeProfile };
     expect(started.effectiveRuntimeProfile).toMatchObject({ reviewMode: "auto_review", computerUse: true, enabledApps: [{ id: "app.files" }] });
     expect(store.latestSessionRuntimeProfile(started.session.id)).toMatchObject({ revision: 1, sourceKind: "session_start", profile: started.effectiveRuntimeProfile });
     await service.execute({ kind: "session.send", session: started.session.id, message: "hello" }, { signal });
@@ -10702,7 +10944,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Work" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
 
     // The image bytes are assembled here; the repository commits no binary.
     const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
@@ -10752,7 +10994,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Work" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     await expect(service.execute({
       attachments: [{
         byteLength: 7,
@@ -10783,6 +11025,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
+      presetContract: 1,
       fast: false,
     }, { signal }) as { session: { id: string } };
     expect(factsMemory.ensures.length).toBeGreaterThanOrEqual(2);
@@ -10931,7 +11174,6 @@ describe("HraService", () => {
       session: sessionId,
     }, { signal })).rejects.toMatchObject(refusal);
     await expect(value.service.executeRemote({
-      idempotencyKey: "00000000-0000-4000-8000-0000000006c1",
       kind: "session.preset",
       preset: "high",
       session: sessionId,
@@ -11184,6 +11426,7 @@ describe("HraService", () => {
         kind: "session.start",
         account: added.account.id,
         preset: "high",
+        presetContract: 1,
         fast: false,
       }, { signal });
     } catch (error: unknown) {
@@ -13343,7 +13586,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Race" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
     const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
     codex.beforeStartTurnReturn = async () => service.observeCodexFact(authority, { type: "turnStarted", threadId: started.session.providerThreadId, turn: { id: "turn-next", items: [], status: "inProgress", startedAt: 1, completedAt: null, durationMs: null } });
     expect(await service.execute({ kind: "session.send", session: started.session.id, message: "race" }, { signal })).toMatchObject({ session: { state: "active", activeTurnId: "turn-next" } });
@@ -13359,7 +13602,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Review order" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
 
     codex.turnEffectTrace.length = 0;
     await service.execute({ kind: "session.send", session: started.session.id, message: "active" }, { signal });
@@ -13382,7 +13625,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Metadata race" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     let note: Promise<unknown> | undefined;
     let fast: Promise<unknown> | undefined;
     codex.beforeStartTurnReturn = async () => {
@@ -14102,6 +14345,7 @@ describe("HraService", () => {
       fast: false,
       kind: "session.start",
       preset: "high",
+      presetContract: 1,
     }, { signal }) as { session: { id: `sess_${string}` } };
     const unrelatedSessionId = unrelatedStarted.session.id;
     const affectedSession = value.store.requireSession(affectedSessionId);
@@ -14335,7 +14579,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Completion race" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const queued = store.enqueue(started.session.id, "after completion");
     const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
     codex.beforeStartTurnReturn = async () => {
@@ -14356,7 +14600,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Terminal response" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const queued = store.enqueue(started.session.id, "next");
     codex.turnStatus = "completed";
     codex.beforeStartTurnReturn = async () => { delete codex.beforeStartTurnReturn; codex.turnStatus = "inProgress"; };
@@ -14372,7 +14616,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queued completion race" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const first = store.enqueue(started.session.id, "first queued");
     const second = store.enqueue(started.session.id, "second queued");
     const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
@@ -14395,7 +14639,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Coherent show" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     let releaseRead!: () => void;
     let markReadStarted!: () => void;
     const readStarted = new Promise<void>((resolve) => { markReadStarted = resolve; });
@@ -14419,7 +14663,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
     await service.execute({ kind: "session.send", session: started.session.id, message: "first" }, { signal });
     await service.execute({ kind: "session.queue", session: started.session.id, message: "second" }, { signal });
     codex.readProjection = { ...codex.readProjection, status: "idle", providerUpdatedAt: (codex.readProjection.providerUpdatedAt ?? 10) + 1 };
@@ -14437,7 +14681,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue liveness" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     await service.execute({ kind: "session.send", session: started.session.id, message: "active" }, { signal });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "active" });
     const first = await service.execute({ kind: "session.queue", session: started.session.id, message: "fails" }, { signal }) as { queued: { id: `queue_${string}` } };
@@ -14548,7 +14792,7 @@ describe("HraService", () => {
       const added = await service.execute({ kind: "account.add", label: `Transient ${failure}` }, { signal }) as { account: { id: string } };
       await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
       await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
       if (failure === "baseline") codex.readSessionErrorOnce = new Error("transient baseline read");
       else codex.reviewTurnErrorOnce = new Error("transient capability read");
 
@@ -14610,7 +14854,7 @@ describe("HraService", () => {
       const added = await service.execute({ kind: "account.add", label: `Unavailable ${failure.code}` }, { signal }) as { account: { id: string } };
       await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
       await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
       const idempotencyKey = `00000000-0000-4000-8000-${String(730 + index).padStart(12, "0")}`;
       codex.reviewTurnErrorOnce = new CodexError(failure.code, "private provider capability diagnostic");
 
@@ -14636,7 +14880,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Remote rejection" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const idempotencyKey = "00000000-0000-4000-8000-000000000799";
     codex.startTurnErrorOnce = new CodexRemoteError(-32_600, "private provider rejection diagnostic");
 
@@ -14662,7 +14906,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Bounded retry" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     const project = await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal }) as { project: { id: string } };
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     codex.beforeReadSessionReturn = async () => { throw new Error("persistent baseline failure"); };
 
     const queued = await service.execute({ kind: "session.queue", session: started.session.id, message: "bounded retry" }, { signal }) as { queued: { id: `queue_${string}` } };
@@ -14683,7 +14927,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Canonical" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string; title: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string; title: string } };
     const results = await Promise.allSettled([
       service.execute({ kind: "session.send", session: started.session.id, message: "one" }, { signal }),
       service.execute({ kind: "session.send", session: started.session.title, message: "two" }, { signal }),
@@ -14698,7 +14942,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Remote authority" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const session = store.requireSession(started.session.id);
     const profile = store.requireProfile(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("The provider binding is missing.");
@@ -14728,7 +14972,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Remote metadata" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const session = store.requireSession(started.session.id);
     const profile = store.requireProfile(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("The provider binding is missing.");
@@ -14771,7 +15015,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Remote fence" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const session = store.requireSession(started.session.id);
     const profile = store.requireProfile(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("The provider binding is missing.");
@@ -14784,7 +15028,6 @@ describe("HraService", () => {
       .then(() => null, (error: unknown) => error);
     await providerVisible;
     const remote = service.executeRemote({
-      idempotencyKey: "00000000-0000-4000-8000-000000000714",
       kind: "session.preset",
       preset: "ultra",
       session: session.id,
@@ -16177,7 +16420,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue replay" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const command = { kind: "session.queue" as const, session: started.session.id, message: "only once", idempotencyKey: "00000000-0000-4000-8000-000000000103" };
     const first = await service.execute(command, { signal }) as { queued: { id: string } };
     const replay = await service.execute(command, { signal }) as { queued: { id: string } };
@@ -16190,7 +16433,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Effect replay" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
     const send = { kind: "session.send" as const, session: started.session.id, message: "once", idempotencyKey: "00000000-0000-4000-8000-000000000105" };
     const firstSend = await service.execute(send, { signal });
     expect(await service.execute(send, { signal })).toEqual(firstSend);
@@ -16206,7 +16449,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Receipt failure" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
     codex.turnId = "";
     const idempotencyKey = "00000000-0000-4000-8000-000000000107";
     const command = { kind: "session.send" as const, session: started.session.id, message: "ambiguous", idempotencyKey };
@@ -16238,7 +16481,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Runtime receipt" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const originalComplete = store.completeSessionTurnEffect.bind(store);
     store.completeSessionTurnEffect = (() => { throw new Error("simulated receipt storage failure"); }) as StateStore["completeSessionTurnEffect"];
     const key = "00000000-0000-4000-8000-000000000111";
@@ -16256,7 +16499,7 @@ describe("HraService", () => {
       const added = await service.execute({ kind: "account.add", label: `Lost ${operation}` }, { signal }) as { account: { id: string } };
       await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
       await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
+      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
       if (operation === "steer" || operation === "stop") {
         await service.execute({ kind: "session.send", session: started.session.id, message: "activate" }, { signal });
       }
@@ -16297,7 +16540,7 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const originalComplete = store.completeSessionStartEffect.bind(store);
     store.completeSessionStartEffect = (() => { throw new Error("simulated atomic start receipt failure"); }) as StateStore["completeSessionStartEffect"];
-    const command = { kind: "session.start" as const, account: added.account.id, preset: "high" as const, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000401" };
+    const command = { kind: "session.start" as const, account: added.account.id, preset: "high" as const, presetContract: 1 as const, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000401" };
     await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     store.completeSessionStartEffect = originalComplete;
 
@@ -16311,13 +16554,510 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(0);
   });
 
+  test("replays an applied v0.5 Codex high default across restart only under its matching source contract", async () => {
+    const { service, codex, documents, paths, store } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "v0.5 applied start" },
+      { signal },
+    ) as { account: { id: string } };
+    await service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    const project = await service.execute(
+      { kind: "project.add", label: "v0.5 start docs", path: documents },
+      { signal },
+    ) as { project: { id: string } };
+    const key = "00000000-0000-4000-8000-000000000409";
+    const command = {
+      account: added.account.id,
+      fast: false,
+      idempotencyKey: key,
+      kind: "session.start" as const,
+      preset: "high" as const,
+      presetContract: 1 as const,
+    };
+    const first = await service.execute(command, { signal }) as {
+      effectiveRuntimeProfile: EffectiveRuntimeProfile;
+      session: { id: `sess_${string}`; state: string };
+    };
+
+    const profile = store.requireProfileById(added.account.id);
+    // v0.5 resolved an omitted CLI preset to High before dispatch, while its
+    // stored request digest still omitted the then-implicit Codex provider.
+    const releasedRequest = {
+      projectId: project.project.id,
+      preset: "high" as const,
+      fast: false,
+    };
+    const historical = rewriteSessionStartAttemptAsHistoricalFixture({
+      idempotencyKey: key,
+      request: releasedRequest,
+      store,
+    });
+    expect(store.readMutation(key)).toMatchObject({
+      authorityGeneration: profile.processGeneration,
+      requestDigest: historical.requestDigest,
+      evidence: { evidence: historical.evidence },
+      state: "applied",
+    });
+    expect(store.readMutation(key)?.evidence?.evidence).not.toHaveProperty("presetContract");
+    expect(codex.calls.filter((call) => call === "review-session")).toHaveLength(1);
+    expect(codex.calls.filter((call) => call === "start:high")).toHaveLength(1);
+
+    await service.close();
+    expect(store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 1);
+    expect(store.nextDaemonGeneration(`boot_${"b".repeat(32)}`)).toBe(1);
+    expect(store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 2);
+    const restartedCodex = new FakeCodex();
+    const restarted = new HraService({
+      store,
+      paths,
+      codex: restartedCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+
+    const replayCommand = {
+      account: added.account.id,
+      fast: false,
+      idempotencyKey: key,
+      kind: "session.start" as const,
+      preset: "high" as const,
+      presetContract: 1 as const,
+    };
+    const providerCallsBeforeReplay = restartedCodex.calls.length;
+    await expect(restarted.execute({
+      account: replayCommand.account,
+      fast: replayCommand.fast,
+      idempotencyKey: replayCommand.idempotencyKey,
+      kind: replayCommand.kind,
+      preset: replayCommand.preset,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(restartedCodex.calls).toHaveLength(providerCallsBeforeReplay);
+    await expect(restarted.execute({ ...replayCommand, presetContract: 2 }, { signal }))
+      .rejects.toMatchObject({ code: "CONFLICT" });
+    expect(restartedCodex.calls).toHaveLength(providerCallsBeforeReplay);
+    await expect(restarted.execute(replayCommand, { signal })).resolves.toMatchObject({
+      effectiveRuntimeProfile: first.effectiveRuntimeProfile,
+      idempotencyKey: key,
+      session: { id: first.session.id },
+    });
+    expect(restartedCodex.calls.filter((call) => call === "review-session")).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "start:high")).toHaveLength(0);
+    await restarted.close();
+  });
+
+  test("keeps an effect-started v0.5 Codex high start recoverable across authority rebinding", async () => {
+    const { service, documents, paths, store } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "v0.5 unsettled start" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    const project = await service.execute(
+      { kind: "project.add", label: "v0.5 unsettled docs", path: documents },
+      { signal },
+    ) as { project: { id: `proj_${string}` } };
+    const profile = store.requireProfileById(added.account.id);
+    const key = "00000000-0000-4000-8000-000000000415";
+    const attempt = store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: profile.id,
+      idempotencyKey: key,
+      kind: "session.start",
+      request: sessionStartMutationRequest({
+        fast: false,
+        preset: "high",
+        presetContract: 1,
+        projectId: project.project.id,
+        provider: "codex",
+      }),
+    });
+    const effectiveRuntimeProfile = runtimeProfile({
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    });
+    const starting = store.beginSessionStartEffect({
+      attemptId: attempt.id,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      projectId: project.project.id,
+      provider: "codex",
+      providerAuthentication: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        provider: "codex",
+        signedIn: true,
+      },
+      preset: "high",
+      fastEnabled: false,
+      evidence: {
+        kind: "session.start",
+        projectId: project.project.id,
+        clientMessageId: null,
+        messageDigest: null,
+        presetContract: 1,
+        runtimeProfile: effectiveRuntimeProfile,
+      },
+    });
+    const releasedRequest = {
+      projectId: project.project.id,
+      preset: "high" as const,
+      fast: false,
+    };
+    const historical = rewriteSessionStartAttemptAsHistoricalFixture({
+      idempotencyKey: key,
+      request: releasedRequest,
+      store,
+    });
+    expect(store.readMutation(key)).toMatchObject({
+      authorityGeneration: profile.processGeneration,
+      evidence: { evidence: historical.evidence },
+      requestDigest: historical.requestDigest,
+      sessionStartId: starting.id,
+      state: "effect_started",
+    });
+    expect(store.readMutation(key)?.evidence?.evidence).not.toHaveProperty("presetContract");
+
+    await service.close();
+    expect(store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 1);
+    expect(store.isSessionMutationProviderAuthorityCurrent({
+      attemptId: attempt.id,
+      profileId: profile.id,
+      provider: "codex",
+      originGeneration: profile.processGeneration,
+    })).toBe(true);
+    expect(store.nextDaemonGeneration(`boot_${"c".repeat(32)}`)).toBe(1);
+    expect(store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 2);
+    expect(store.isSessionMutationProviderAuthorityCurrent({
+      attemptId: attempt.id,
+      profileId: profile.id,
+      provider: "codex",
+      originGeneration: profile.processGeneration,
+    })).toBe(true);
+    const restartedCodex = new FakeCodex();
+    const restarted = new HraService({
+      store,
+      paths,
+      codex: restartedCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    expect(store.readMutation(key)).toMatchObject({
+      authorityGeneration: profile.processGeneration,
+      authorityId: profile.id,
+      evidence: {
+        evidence: {
+          kind: "session.start",
+          runtimeProfile: {
+            model: "gpt-5.6-sol",
+            reasoningEffort: "max",
+          },
+        },
+      },
+      requestDigest: historical.requestDigest,
+      state: "ambiguous",
+    });
+    expect(store.requireSession(starting.id)).toMatchObject({ state: "recovery_required" });
+
+    const replayCommand = {
+      account: profile.id,
+      fast: false,
+      idempotencyKey: key,
+      kind: "session.start" as const,
+      preset: "high" as const,
+      presetContract: 1 as const,
+    };
+    const providerCallsBeforeReplay = restartedCodex.calls.length;
+    await expect(restarted.execute({ ...replayCommand, presetContract: 2 }, { signal }))
+      .rejects.toMatchObject({ code: "CONFLICT" });
+    expect(restartedCodex.calls).toHaveLength(providerCallsBeforeReplay);
+    await expect(restarted.execute(replayCommand, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(restartedCodex.calls.filter((call) => call === "review-session")).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "start:high")).toHaveLength(0);
+    await restarted.close();
+  });
+
+  test("refuses fresh absent or stale rebound sources before provider contact or mutation preparation", async () => {
+    const { service, codex, documents, store } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "Fresh source admission" },
+      { signal },
+    ) as { account: { id: string } };
+    await service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    const project = await service.execute(
+      { kind: "project.add", label: "Fresh source docs", path: documents },
+      { signal },
+    ) as { project: { id: `proj_${string}` } };
+    const providerCallsBefore = codex.calls.length;
+    const base = {
+      account: added.account.id,
+      fast: false,
+      kind: "session.start" as const,
+      preset: "high" as const,
+    };
+    for (const [idempotencyKey, presetContract] of [
+      ["00000000-0000-4000-8000-00000000040a", undefined],
+      ["00000000-0000-4000-8000-00000000040b", 2],
+    ] as const) {
+      await expect(service.execute({
+        ...base,
+        idempotencyKey,
+        ...(presetContract === undefined ? {} : { presetContract }),
+      }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(store.readMutation(idempotencyKey)).toBeNull();
+      expect(codex.calls).toHaveLength(providerCallsBefore);
+    }
+
+    const currentKey = "00000000-0000-4000-8000-00000000040c";
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: currentKey,
+      presetContract: 1,
+    }, { signal })).resolves.toMatchObject({ session: { state: "idle" } });
+    expect(store.readMutation(currentKey)).toMatchObject({
+      evidence: { evidence: { presetContract: 1 } },
+      requestDigest: mutationRequestDigest({
+        authorityGeneration: store.requireProfileById(added.account.id).processGeneration,
+        authorityId: added.account.id,
+        kind: "session.start",
+        request: sessionStartMutationRequest({
+          fast: false,
+          preset: "high",
+          presetContract: 1,
+          projectId: project.project.id,
+          provider: "codex",
+        }),
+      }),
+      state: "applied",
+    });
+    const providerCallsAfterCurrent = codex.calls.length;
+    await expect(service.execute({
+      ...base,
+      fast: true,
+      idempotencyKey: currentKey,
+      presetContract: 1,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: currentKey,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(codex.calls).toHaveLength(providerCallsAfterCurrent);
+  });
+
+  test("resumes only current prepared rebound starts while preserving historical recovery lookups", async () => {
+    const { service, codex, documents, store } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "Prepared source admission" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    const project = await service.execute(
+      { kind: "project.add", label: "Prepared source docs", path: documents },
+      { signal },
+    ) as { project: { id: `proj_${string}` } };
+    const profile = store.requireProfileById(added.account.id);
+    const prepare = (idempotencyKey: string, presetContract?: 1 | 2) => store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: profile.id,
+      idempotencyKey,
+      kind: "session.start",
+      request: sessionStartMutationRequest({
+        fast: false,
+        preset: "high",
+        ...(presetContract === undefined ? {} : { presetContract }),
+        projectId: project.project.id,
+        provider: "codex",
+      }),
+    });
+    const prepareReleasedV05 = (idempotencyKey: string) => store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: profile.id,
+      idempotencyKey,
+      kind: "session.start",
+      request: {
+        projectId: project.project.id,
+        preset: "high",
+        fast: false,
+      },
+    });
+    const recordHistoricalStartEvidence = (
+      attemptId: string,
+      runtime: EffectiveRuntimeProfile,
+      presetContract?: 1 | 2,
+    ): void => {
+      const evidence = {
+        kind: "session.start",
+        projectId: project.project.id,
+        clientMessageId: null,
+        messageDigest: null,
+        ...(presetContract === undefined ? {} : { presetContract }),
+        runtimeProfile: runtime,
+      };
+      const evidenceJson = JSON.stringify(evidence);
+      const inspector = new Database(store.paths.database, { create: false, strict: true });
+      try {
+        inspector.query(
+          "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)",
+        ).run(
+          attemptId,
+          evidence.kind,
+          evidenceJson,
+          createHash("sha256").update(evidenceJson).digest("hex"),
+          2_000,
+        );
+      } finally {
+        inspector.close(false);
+      }
+    };
+    const base = {
+      account: profile.id,
+      fast: false,
+      kind: "session.start" as const,
+      preset: "high" as const,
+    };
+
+    const legacyPreparedKey = "00000000-0000-4000-8000-00000000040e";
+    prepareReleasedV05(legacyPreparedKey);
+    const stalePreparedKey = "00000000-0000-4000-8000-00000000040f";
+    prepare(stalePreparedKey, 2);
+    const providerCallsBefore = codex.calls.length;
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: legacyPreparedKey,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: legacyPreparedKey,
+      presetContract: 1,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: legacyPreparedKey,
+      presetContract: 2,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: stalePreparedKey,
+      presetContract: 2,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(codex.calls).toHaveLength(providerCallsBefore);
+    expect(store.readMutation(legacyPreparedKey)).toMatchObject({ state: "prepared" });
+    expect(store.readMutation(stalePreparedKey)).toMatchObject({ state: "prepared" });
+
+    const legacyStartedKey = "00000000-0000-4000-8000-000000000410";
+    const legacyStarted = prepare(legacyStartedKey);
+    const historicalAstraProfile = {
+      ...runtimeProfile({
+        id: profile.id,
+        generation: profile.processGeneration,
+        codexHome: "unused",
+        desktopUserData: "unused",
+      }),
+      model: "gpt-6-astra",
+      reasoningEffort: "max" as const,
+    };
+    recordHistoricalStartEvidence(legacyStarted.id, historicalAstraProfile);
+    expect(store.transitionMutation(legacyStarted.id, "prepared", "effect_started")).toBe(true);
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: legacyStartedKey,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(codex.calls).toHaveLength(providerCallsBefore);
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: legacyStartedKey,
+      presetContract: 2,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: legacyStartedKey,
+      presetContract: 1,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store.transitionMutation(
+      legacyStarted.id,
+      "effect_started",
+      "failed",
+      { code: "test_settled" },
+    )).toBe(true);
+
+    const staleStartedKey = "00000000-0000-4000-8000-000000000411";
+    const staleStarted = prepare(staleStartedKey, 2);
+    recordHistoricalStartEvidence(staleStarted.id, historicalAstraProfile, 2);
+    expect(store.transitionMutation(staleStarted.id, "prepared", "effect_started")).toBe(true);
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: staleStartedKey,
+      presetContract: 2,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(store.transitionMutation(
+      staleStarted.id,
+      "effect_started",
+      "failed",
+      { code: "test_settled" },
+    )).toBe(true);
+    expect(codex.calls).toHaveLength(providerCallsBefore);
+
+    const currentPreparedKey = "00000000-0000-4000-8000-000000000412";
+    prepare(currentPreparedKey, 1);
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: currentPreparedKey,
+      presetContract: 1,
+    }, { signal })).resolves.toMatchObject({ session: { preset: "high", state: "idle" } });
+    expect(store.readMutation(currentPreparedKey)).toMatchObject({ state: "applied" });
+    expect(codex.calls.filter((call) => call === "review-session")).toHaveLength(1);
+    expect(codex.calls.filter((call) => call === "start:high")).toHaveLength(1);
+
+    const currentReceipt = store.readMutation(currentPreparedKey)?.result;
+    if (currentReceipt === undefined) throw new Error("Expected the current start receipt.");
+    const staleAppliedKey = "00000000-0000-4000-8000-000000000413";
+    const staleApplied = prepare(staleAppliedKey, 2);
+    expect(store.transitionMutation(staleApplied.id, "prepared", "effect_started")).toBe(true);
+    expect(store.transitionMutation(staleApplied.id, "effect_started", "applied", currentReceipt))
+      .toBe(true);
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: staleAppliedKey,
+      presetContract: 2,
+    }, { signal })).resolves.toMatchObject({ session: { preset: "high", state: "idle" } });
+    const providerCallsAfterStaleReplay = codex.calls.length;
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: staleAppliedKey,
+      presetContract: 1,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(codex.calls).toHaveLength(providerCallsAfterStaleReplay);
+  });
+
   test("quarantines an unbound session-start lost response without blind replay", async () => {
     const { service, codex, documents, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Lost start" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     codex.startSessionError = new IndeterminateCodexEffectError("thread/start", 42);
-    const command = { kind: "session.start" as const, account: added.account.id, preset: "high" as const, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000403" };
+    const command = { kind: "session.start" as const, account: added.account.id, preset: "high" as const, presetContract: 1 as const, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000403" };
     await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     expect(store.listSessions()).toHaveLength(1);
     expect(store.listSessions()[0]).toMatchObject({ state: "recovery_required" });
@@ -16404,7 +17144,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Causal send" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const key = "00000000-0000-4000-8000-000000000405";
     codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 44);
     await expect(service.execute({ kind: "session.send", session: started.session.id, message: "causal", idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED", details: { idempotencyKey: key } });
@@ -16432,7 +17172,7 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     codex.startSessionError = new IndeterminateCodexEffectError("thread/start", 45);
     const key = "00000000-0000-4000-8000-000000000407";
-    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false, idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED", details: { idempotencyKey: key } });
+    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false, idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED", details: { idempotencyKey: key } });
     const [session] = store.listSessions();
     if (session === undefined) throw new Error("Expected a bound start placeholder.");
     expect(await service.execute({ kind: "session.recover", session: session.id }, { signal }).catch((error: unknown) => error)).toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -16442,9 +17182,9 @@ describe("HraService", () => {
       recovery: { resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false },
     });
     expect(store.readMutation(key)).toMatchObject({ state: "reconciled", originalState: "ambiguous", resolution: { kind: "abandoned" } });
-    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false, idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false, idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
     delete codex.startSessionError;
-    expect(await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000408" }, { signal })).toMatchObject({ session: { state: "idle" } });
+    expect(await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000408" }, { signal })).toMatchObject({ session: { state: "idle" } });
     expect(codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(2);
   });
 
@@ -16453,7 +17193,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Status recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
@@ -16474,7 +17214,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Recovery queue" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const pending = store.enqueue(started.session.id, "continue after recovery");
     const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
@@ -16494,7 +17234,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Status abandon" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const pending = store.enqueue(started.session.id, "never dispatched");
     const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
@@ -16552,7 +17292,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Tamper proof" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 46);
     const key = "00000000-0000-4000-8000-000000000409";
     await expect(service.execute({ kind: "session.send", session: started.session.id, message: "tamper", idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -16569,7 +17309,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue readiness" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     store.enqueue(started.session.id, "resume in background");
     let releaseDispatch!: () => void;
     const dispatchGate = new Promise<void>((resolve) => { releaseDispatch = resolve; });
@@ -16637,7 +17377,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Idle queue" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     await service.execute({ kind: "session.queue", session: started.session.id, message: "dispatch now" }, { signal });
     await service.settled();
     expect(store.listQueue(started.session.id)[0]).toMatchObject({ state: "applied" });
@@ -16739,7 +17479,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const queued = store.enqueue(started.session.id, "uncertain");
     store.beginQueueEffect({
       queueId: queued.id,
@@ -16768,7 +17508,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue causal recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 47);
     const queued = await service.execute({ kind: "session.queue", session: started.session.id, message: "uncertain queue" }, { signal }) as { queued: { id: `queue_${string}` } };
     await service.settled();
@@ -16796,7 +17536,7 @@ describe("HraService", () => {
     const { service, documents, store, codex } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Signed out" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal })).rejects.toMatchObject({ code: "INTERACTION_REQUIRED" });
+    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal })).rejects.toMatchObject({ code: "INTERACTION_REQUIRED" });
     await expect(service.execute({ kind: "account.usage", account: added.account.id, refresh: true }, { signal })).rejects.toMatchObject({ code: "INTERACTION_REQUIRED" });
     expect(store.listSessions()).toHaveLength(0);
     expect(codex.calls).toHaveLength(0);
@@ -16809,7 +17549,7 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     codex.startSessionError = new Error("provider rejected before creating a thread");
 
-    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal })).rejects.toThrow("provider rejected");
+    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal })).rejects.toThrow("provider rejected");
 
     expect(store.listSessions()).toHaveLength(0);
     expect(codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(1);
@@ -16820,7 +17560,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Idle steer" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
     const idempotencyKey = "00000000-0000-4000-8000-000000000108";
     const steer = { kind: "session.steer" as const, session: started.session.id, message: "future", idempotencyKey };
     await expect(service.execute(steer, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
@@ -16835,7 +17575,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue failure" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     codex.startTurnError = new Error("provider rejected before effect");
     await service.execute({ kind: "session.queue", session: started.session.id, message: "will fail" }, { signal });
     await service.settled();
@@ -16858,7 +17598,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Logout recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
     const releasesBeforeLogout = codex.releasedAuthorities.length;
     codex.logoutError = new IndeterminateCodexEffectError("account/logout", 43);
     codex.beforeLogoutReturn = async () => {
@@ -17052,7 +17792,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Stale authority" }, { signal }) as { account: { id: `acct_${string}` } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     let releaseProvider!: () => void;
     let signalProviderApplied!: () => void;
     const providerGate = new Promise<void>((resolve) => { releaseProvider = resolve; });
@@ -20761,7 +21501,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Shutdown authority" }, { signal }) as { account: { id: `acct_${string}`; processGeneration: number } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     await service.execute({ kind: "session.send", session: started.session.id, message: "active" }, { signal });
     const queued = await service.execute({ kind: "session.queue", session: started.session.id, message: "must remain queued" }, { signal }) as { queued: { id: string } };
     let releaseFact!: () => void;

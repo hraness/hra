@@ -907,6 +907,8 @@ export const listKeyEnvelopes = query({
   },
 });
 
+// commandRequestVersion is intentionally absent: it is server-internal
+// admission authority, not part of the encrypted registry's public projection.
 function publicRegistry(registry: Readonly<{
   devicePublicId: string;
   envelope: Parameters<typeof parseEncryptedEnvelope>[0];
@@ -941,6 +943,7 @@ function publicRegistry(registry: Readonly<{
 // resolve what the rest of the account has published.
 export const updateRegistry = mutation({
   args: {
+    commandRequestVersion: v.optional(v.literal(2)),
     envelope: encryptedEnvelope,
     expectedRevision: v.number(),
     keyVersion: v.number(),
@@ -991,6 +994,9 @@ export const updateRegistry = mutation({
     if (existing === undefined) {
       if (args.expectedRevision !== 0) throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
       const document = {
+        ...(args.commandRequestVersion === undefined
+          ? {}
+          : { commandRequestVersion: args.commandRequestVersion }),
         createdAt: now,
         deviceId: authority.deviceId,
         devicePublicId: authority.device.publicId,
@@ -1021,6 +1027,10 @@ export const updateRegistry = mutation({
       throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
     }
     const patch = {
+      // Omission is an intentional old-daemon capability signal. Clearing the
+      // field prevents a downgrade from retaining permission for marker-2
+      // commands that the currently running daemon cannot execute.
+      commandRequestVersion: args.commandRequestVersion,
       envelope: args.envelope,
       keyVersion: args.keyVersion,
       // An omitted envelope is an intentional old-daemon capability signal:

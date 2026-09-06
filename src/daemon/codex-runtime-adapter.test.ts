@@ -2000,9 +2000,9 @@ describe("PinnedCodexRuntimeManager", () => {
     const connectionId = "71000000-0000-4000-8000-000000000006";
     const capabilities = (suffix: string): CodexCapabilitySnapshot => ({
       models: [{
-        id: "gpt-6-astra",
-        model: "gpt-6-astra",
-        displayName: "GPT-6 Astra",
+        id: "gpt-5.6-sol",
+        model: "gpt-5.6-sol",
+        displayName: "GPT-5.6 Sol",
         hidden: false,
         supportedReasoningEfforts: ["max", "ultra"],
         defaultReasoningEffort: "max",
@@ -2044,7 +2044,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       resolvePreset: (_snapshot: unknown, alias: string, _requirement: unknown, fast: boolean) => {
         events.push(`resolve:${alias}:${String(fast)}`);
-        return { alias, model: "gpt-6-astra", effort: "max", serviceTier: fast ? "priority" : null, fast };
+        return { alias, model: "gpt-5.6-sol", effort: "max", serviceTier: fast ? "priority" : null, fast };
       },
       startThread: async (input: unknown) => {
         events.push(`thread:${JSON.stringify(input)}`);
@@ -2053,7 +2053,7 @@ describe("PinnedCodexRuntimeManager", () => {
           value: {
             thread: { ...makeThread([]), ephemeral },
             cwd: "/workspace/project",
-            model: "gpt-6-astra",
+            model: "gpt-5.6-sol",
             modelProvider: "openai",
             reasoningEffort: "max",
             serviceTier: "priority",

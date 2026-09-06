@@ -290,7 +290,7 @@ function adoptPersonalCodexSession(
       computerUse: true,
       enabledApps: [],
       fast: false,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       observedAt: 2_000,
       permissionProfile: ":workspace",
       pluginCapability: true,
@@ -3706,13 +3706,14 @@ describe("state-backed cloud daemon adapter", () => {
         authority: authority as CloudLocalCommandAuthority,
         idempotencyKey: "00000000-0000-7000-8000-0000000000a2",
         leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
-        payload: { kind: "set_provider", provider: "codex" },
+        payload: { kind: "set_provider", presetContract: 1, provider: "codex" },
         sessionPublicId: value.sessionId,
         signal,
       })).toEqual({ code: "APPLIED", state: "applied" });
       expect(commands[1]).toEqual({
         idempotencyKey: "00000000-0000-7000-8000-0000000000a2",
         kind: "session.switch",
+        presetContract: 1,
         provider: "codex",
         session: value.sessionId,
       });
@@ -5068,7 +5069,7 @@ describe("settings commands and the device registry", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -5479,6 +5480,7 @@ async function deviceCommandFixture(options: Readonly<{
     accountPublicId: account.id,
     kind: "session_start" as const,
     preset: "ultra" as const,
+    presetContract: 1 as const,
     projectPublicId: project.id,
     prompt: "continue the migration",
     provider: "codex" as const,
@@ -5798,9 +5800,11 @@ describe("device command execution", () => {
       const outcome = await world.adapter.executeDeviceCommand({
         idempotencyKey: "018bcfe5-6800-7000-8000-000000000101",
         payload: {
-          ...world.sessionStart,
           accountPublicId: account.publicId,
+          kind: world.sessionStart.kind,
           preset: "fable-max",
+          projectPublicId: world.sessionStart.projectPublicId,
+          prompt: world.sessionStart.prompt,
           provider: "claude",
         },
         requestingDevicePublicId: "device_browser1",
@@ -5813,6 +5817,7 @@ describe("device command execution", () => {
         preset: "fable-max",
         provider: "claude",
       });
+      expect(world.executed[0]).not.toHaveProperty("presetContract");
       expect(claude.readAccountCalls).toBe(2);
     } finally {
       await world.adapter.close();
@@ -5838,9 +5843,11 @@ describe("device command execution", () => {
       expect(await world.adapter.executeDeviceCommand({
         idempotencyKey: "018bcfe5-6800-7000-8000-000000000102",
         payload: {
-          ...world.sessionStart,
           accountPublicId: address.publicId,
+          kind: world.sessionStart.kind,
           preset: "fable-max",
+          projectPublicId: world.sessionStart.projectPublicId,
+          prompt: world.sessionStart.prompt,
           provider: "claude",
         },
         requestingDevicePublicId: "device_browser1",
@@ -5969,6 +5976,11 @@ describe("device command execution", () => {
       });
       expect(world.executed.map((command) => command.kind))
         .toEqual(["session.start", "session.send"]);
+      expect(world.executed[0]).toMatchObject({
+        kind: "session.start",
+        preset: "ultra",
+        presetContract: 1,
+      });
       // One device command, two local effects, two distinct derived keys.
       const keys = world.executed.map((command) =>
         (command as { idempotencyKey?: string }).idempotencyKey);
@@ -6007,6 +6019,7 @@ describe("device command execution", () => {
           accountPublicId: account.id,
           kind: "session_start",
           preset: "ultra",
+          presetContract: 1,
           projectPublicId: project.id,
           prompt: "continue",
           provider: "codex",

@@ -40,8 +40,14 @@ describe("the menu", () => {
   });
 
   test("offers only presets compatible with the provider after selection", () => {
-    expect(sessionPresetOptionsForProvider("codex").map((option) => option.value))
-      .toEqual(["low", "high", "ultra"]);
+    expect(sessionPresetOptionsForProvider("codex"))
+      .toEqual([
+        { label: "Luna Max", value: "low" },
+        { label: "Codex High", value: "high" },
+        { label: "Codex Ultra", value: "ultra" },
+      ]);
+    expect(sessionPresetOptionsForProvider("codex").map((option) => option.label).join(" "))
+      .not.toMatch(/Sol|Astra/u);
     expect(sessionPresetOptionsForProvider("claude").map((option) => option.value))
       .toEqual(["fable-max"]);
   });
@@ -49,12 +55,13 @@ describe("the menu", () => {
 
 describe("the payload", () => {
   const built = (input: Parameters<typeof buildSetProviderPayload>[0]) =>
-    buildSetProviderPayload(input) as unknown as Readonly<Record<string, unknown>>;
+    buildSetProviderPayload(input);
 
-  test("names the kind and the provider and nothing else", () => {
+  test("names the provider and fences only a derived Codex route", () => {
     expect(built({ provider: "claude" }))
       .toEqual({ kind: setProviderCommandKind, provider: "claude" });
-    expect(built({ provider: "codex" })).toEqual({ kind: "set_provider", provider: "codex" });
+    expect(built({ provider: "codex" }))
+      .toEqual({ kind: "set_provider", presetContract: 1, provider: "codex" });
   });
 
   test("carries a preset only when one was chosen", () => {
@@ -77,7 +84,7 @@ describe("the payload", () => {
     expect(built({ provider: "codex", preset: defaultSessionPresetForProvider("codex") }))
       .toEqual(buildDefaultSetProviderPayload("codex"));
     expect(buildDefaultSetProviderPayload("codex"))
-      .toEqual({ kind: "set_provider", preset: "ultra", provider: "codex" });
+      .toEqual({ kind: "set_provider", preset: "ultra", presetContract: 1, provider: "codex" });
     expect(buildDefaultSetProviderPayload("claude"))
       .toEqual({ kind: "set_provider", preset: "fable-max", provider: "claude" });
   });

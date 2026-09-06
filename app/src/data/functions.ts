@@ -59,22 +59,26 @@ export type WireRegisterArgs = Readonly<{
 
 export type WireEnqueueArgs = Readonly<{
   deadline: number;
+  expectedRequestingDevicePublicId: string;
   expectedTargetDevicePublicId: string;
   idempotencyKey: string;
   kind: string;
   payload: WireEncryptedEnvelope;
   publicId: string;
+  requestCommitmentVersion: 2;
   requestDigest: string;
   sessionPublicId: string;
 }>;
 
 export type WireDeviceEnqueueArgs = Readonly<{
   deadline: number;
+  expectedRequestingDevicePublicId: string;
   expectedTargetDevicePublicId: string;
   idempotencyKey: string;
   kind: string;
   payload: WireEncryptedEnvelope;
   publicId: string;
+  requestCommitmentVersion: 2;
   requestDigest: string;
 }>;
 

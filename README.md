@@ -5,7 +5,7 @@ HRA runs Codex and Claude Code sessions side by side, keeps them alive in a loca
 Status: public beta. The local CLI v0.6.0 is release-ready: Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an open beta.
 
 ```sh
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz d9172bdd61c07d31058e7c8dfd78aa35a1281b40a0a8e523f168d13e65af7465)" = hra-install-safe
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz 1d1f2806ab14016b170993fcbe89d31b1d52659000a8e81581d249328b25f99b)" = hra-install-safe
 ```
 
 ```sh
@@ -24,7 +24,7 @@ Codex on macOS and Linux · Claude Code on Linux · local v0.6.0 release-ready �
 
 ### One request, one account, one session.
 
-1. **Start:** `hra session start personal --provider codex --json`. Create an Astra Ultra Codex session under the account profile you name.
+1. **Start:** `hra session start personal --provider codex --json`. Create a Sol Ultra Codex session under the account profile you name.
 2. **Inspect:** `hra session status <session-id> --json`. Read the session and the cursor where its event stream continues.
 3. **Switch:** `hra session switch <session-id> --provider claude --preset fable-max`. Move the next turns to your signed-in Claude Code profile. The HRA conversation stays intact.
 4. **Direct:** `hra session send <session-id> -- "Review this project."`. Send the next request to that session and provider.
@@ -43,36 +43,70 @@ HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and lo
 
 ```text
 bun --version
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz d9172bdd61c07d31058e7c8dfd78aa35a1281b40a0a8e523f168d13e65af7465)" = hra-install-safe
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz 1d1f2806ab14016b170993fcbe89d31b1d52659000a8e81581d249328b25f99b)" = hra-install-safe
 hra --version
 hra doctor --offline
 ```
 
 The single install command streams the exact v0.6.0 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.6.0 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation recovers or removes only the proven private stage. Existing trustedDependencies remain unchanged.
 
-Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.6.0. For a future update, replace the tagged preflight and release archive references together with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:
+### Update runbook
 
-```text
-hra daemon stop
-hra daemon status --json
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz d9172bdd61c07d31058e7c8dfd78aa35a1281b40a0a8e523f168d13e65af7465)" = hra-install-safe
-hra --version
-hra doctor --offline
-hra daemon start
-```
+Use this sequence to replace an installed release. Resolve every uncertain local mutation that depends on old alias or prepared authority before starting the current daemon, and preserve remote-command evidence for the fail-closed reconciliation below. Replace the tagged preflight URL, release archive URL, expected preflight digest, and expected version together with one exact reviewed immutable tag. Never install a moving branch on a release machine, and never run an older daemon against this state root after the current daemon has started.
+
+1. Resolve keyed local mutations under the installed release. For a Codex High or Ultra `session start`, or a source-sensitive provider switch that explicitly or implicitly selects either alias, replay the exact idempotency key using the originating release's own syntax and source evidence. Resolve an affected Work mutation by replaying its exact request document. Continue only when exact replay under the originating release, or that release's documented kind-specific recovery, reaches a terminal settlement. Otherwise the update remains blocked. If that release has no explicit source-contract flag, use only its exact syntax; do not invent an unsupported option or infer an old alias meaning from the new release.
+
+2. Resolve any uncertain `session preset` under the installed release. This command has no idempotency key, so repeat it if necessary and inspect the session before updating.
+
+3. Block the update on any remaining prepared or indeterminate local mutation. HRA exposes no general command to cancel a prepared session start or provider switch, and `session abandon` applies only to an existing recovery-required session. Retain the originating release and state root until exact replay or its documented recovery reaches a terminal settlement. Do not generate a fresh key or edit SQLite as a workaround.
+
+4. Reconcile every uncertain CLI session-command enqueue by repeating the exact remote request with its exact idempotency key. Let HRA's durable local outbox reconcile the response, retain every returned session-command ID, and inspect each one with `hra remote command <uuidv7>`. For a browser or device command, use the current tab's retained command handle and idempotency identity, then inspect it through the app or the corresponding hosted query. Never edit or delete the local command journal, local outbox, tab state, or hosted row to force progress.
+
+5. Stop the daemon and prove that it released authority:
+
+   ```text
+   hra daemon stop --json
+   hra daemon status --json
+   ```
+
+   Require the stop command itself to exit zero; its recovery path is the authority-release proof. Treat a status response containing `data.running: false` only as a secondary no-listener confirmation. Status alone does not prove authority release. Stop on any stop or recovery error.
+
+6. Install the exact immutable release, then verify the installed version and offline health. This is the verified repair installation for v0.6.0:
+
+   ```text
+   test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz 1d1f2806ab14016b170993fcbe89d31b1d52659000a8e81581d249328b25f99b)" = hra-install-safe
+   hra --version
+   hra doctor --offline
+   ```
+
+   Require the exact expected version. Before the first current-daemon start, doctor must either succeed or report only the exact pending state-schema migration that names the old and current schema versions. Any other diagnostic stops the update.
+
+7. Start the current daemon. This is the no-downgrade boundary: after this command begins, never launch an older daemon against the same state root. Prove post-migration health before syncing, then inspect every retained CLI session-command ID:
+
+   ```text
+   hra daemon start
+   hra doctor --offline
+   hra sync now
+   hra sync status
+   hra remote command <uuidv7>
+   ```
+
+   Require the post-start doctor command to succeed before sync. Sync status reports projection recovery, not the command outbox. Use retained CLI session-command IDs for remote-command inspection; inspect browser and device commands through the app or corresponding hosted query.
+
+8. Classify legacy remote commitments from both the local journal and hosted row before retrying. The current daemon never executes a legacy request commitment. An already-hosted terminal row takes precedence: it confirms the hosted result and permits local retirement without replaying a local outcome. Otherwise, if the hosted row remains nonterminal and either side records `effect_started`, close it result-less as `ambiguous`. A legacy local terminal outcome over any hosted nonterminal row is unauthenticated evidence: discard that outcome and close result-less as `LOCAL_EFFECT_RECOVERY_REQUIRED` ambiguous. A fresh or local-prepared legacy request over hosted `pending` or `prepared` row closes as `failed` with `LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT`. Retry only a failed-before-effect request, only after its initiating client is also current, and use a fresh idempotency key. Retain the new command ID. Never automatically retry an ambiguous command. Each daemon privately publishes its command-request version before processing commands. Fresh requests must exactly match that target: current-to-current and legacy-to-legacy are accepted, while either mixed-version direction is rejected before a command or quota record is written. Exact same-key replay remains available across a later target upgrade or downgrade, but changing versions under one key conflicts. A registry-publication failure skips both command queues for that cycle, and every marker-2 command also requires a current executor marker before prepare or effect start. Hosted operators deploy the additive gate first, then may upgrade daemons and marker-emitting clients independently per target; no all-daemons pause or account-wide legacy drain is required.
 
 > **v0.5 upgrade quarantine.** The first daemon start after a v0.5-to-v0.6 upgrade migrates local state but never infers provider-account authority that v0.5 did not record immutably. Every affected nonterminal session enters recovery_required: pending or prepared effects are cancelled, begun effects remain uncertain, scheduled work pauses, pending interactions expire while begun responses become resolution-unknown, and associated Work execution is retired or fenced. Provider threads and local records are not deleted. This is not a generic automatic-recovery state. Inspect the session first; use `hra session abandon <session>` only when you accept terminalizing HRA's local session with provider state still unknown.
 
 ### Optional full local-data removal
 
-Full local-data removal is a separate destructive operation. While HRA remains installed, complete `hra auth delete --acknowledge-erasure` if `hra auth status` says you are signed in, then wait for `hra auth status` to report terminal deletion. Run `hra account list`, then run `hra account logout <profile>` for every Codex profile. HRA does not sign Claude Code out; use Claude Code's own authentication flow inside every isolated `CLAUDE_CONFIG_DIR` whose credential should be removed. Stop the daemon, require a successful `hra daemon status --json` result whose `data.running` is `false` before touching local data.
+Full local-data removal is a separate destructive operation. While HRA remains installed, complete `hra auth delete --acknowledge-erasure` if `hra auth status` says you are signed in, then wait for `hra auth status` to report terminal deletion. Run `hra account list`, then run `hra account logout <profile>` for every Codex profile. HRA does not sign Claude Code out; use Claude Code's own authentication flow inside every isolated `CLAUDE_CONFIG_DIR` whose credential should be removed. Stop the daemon and require `hra daemon stop --json` itself to exit zero as the authority-release proof. A successful `hra daemon status --json` result whose `data.running` is `false` is only an optional no-listener confirmation before touching local data.
 
 ```text
 hra auth delete --acknowledge-erasure
 hra auth status
 hra account list
 hra account logout <profile>
-hra daemon stop
+hra daemon stop --json
 hra daemon status --json
 ```
 
@@ -170,7 +204,7 @@ hra session task delete <session-id> <task-id> --revision <revision>
 
 > **Local release boundary.** These commands are part of the immutable `v0.6.0` local CLI release candidate and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol.
 
-The frozen source contract defines a narrow local coordination kernel for agents operating several already-existing provider sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex and Claude Code still own their provider-native execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine.
+The versioned source contract defines a narrow local coordination kernel for agents operating several already-existing provider sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex and Claude Code still own their provider-native execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine.
 
 ```text
 hra work protocol [--operation <kind>|--type <name>|--topic <topic>]
@@ -182,9 +216,11 @@ hra work events <work> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..300
 hra work watch <work> [--cursor <cursor>]
 ```
 
-The seven commands are agent-only. Non-streaming commands emit compact JSON without requiring `--json`. `work watch` emits resumable JSON Lines. `work apply` is the only mutation entry point. It reads one strict `{protocol,version,requestId,operation}` request from nonterminal standard input or an explicit file descriptor. The nested operation carries its UUIDv7 `idempotencyKey`; success and failure echo the request ID, and work capabilities are never accepted as argv fields. Same-key replay preserves the durable decision, stable identities, and capabilities without adding a mutation, event, or revision, while mutable public records and the work revision are reprojected from current state. It is not a byte-identical response promise. A retained release tombstone is the exact stored-result exception. `work protocol` is queryable by operation, type, or topic. It returns exact field contracts, value syntax, capability semantics, operation kinds, hard bounds, and the closed recovery and process-exit guidance for failures.
+The seven commands are agent-only. Non-streaming commands emit compact JSON without requiring `--json`. `work watch` emits resumable JSON Lines. `work apply` is the only mutation entry point. It reads one strict version 1 or version 2 request from nonterminal standard input or an explicit file descriptor. Both versions contain `{protocol,version,requestId,operation}`, and the nested operation carries its UUIDv7 `idempotencyKey`. A version 2 `work.create` that declares a High or Ultra route, or `task.addBatch` that adds a High or Ultra task, also carries the caller-authored top-level `presetContract`; version 2 forbids that field on stable operations. Success and failure echo the admitted request ID and version, and work capabilities are never accepted as argv fields. The request version and any authored preset contract are part of changed-intent detection. Same-key replay of the exact request preserves the durable decision, stable identities, and capabilities without adding a mutation, event, or revision, while mutable public records and the work revision are reprojected from current state. It is not a byte-identical response promise. A retained release tombstone is the exact stored-result exception. `work protocol` is queryable by operation, type, or topic. It returns both accepted apply envelopes, exact field contracts, value syntax, capability semantics, operation kinds, hard bounds, and the closed recovery and process-exit guidance for failures.
 
 Each task carries an exact account ID, project ID, preset, and Fast setting. HRA never chooses another subscription from quota, availability, usage, or incidental ordering. A provider limit blocks or fails that attempt. It does not rotate the task to another account. Explicit tasks on separate accounts may run in parallel.
+
+Each Work also freezes the meaning of its High and Ultra routes when it is created. A fresh affected version 2 request must name the current contract 1 Sol meaning. A fresh affected version 1 request is refused because that format does not identify whether its author meant Sol or Astra; stable version 1 requests remain admissible. An existing contract 2 Work whose coordinator and participating session authorities remain supported keeps Astra for already-declared tasks and remains readable, claimable, reviewable, and settleable. A Work associated with a retired Devin session remains readable but is fenced from mutation and execution. Current tooling does not append a new High or Ultra task to a historical contract 2 Work because the alias now means Sol; create a new Work for a new Sol task graph. Low has the same exact Luna Max meaning under both contracts and remains compatible. Exact same-key replay of an already-applied version 1 or version 2 mutation returns its historical result without adding a task or provider effect. Reusing that key with another version or contract is a conflict, not a request to reinterpret the historical operation.
 
 Readiness is derived from the open work state, time bounds, accepted dependency submissions, and absence of a live or ambiguous attempt. A final assistant message is not completion. The worker submits a bounded structured result and evidence; declared independent reviews and HRA-owned completion gates must accept the exact submission revision.
 
@@ -320,12 +356,12 @@ For non-streaming `--json` commands, stdout contains exactly one versioned succe
 HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; `hra session show` displays it with the provider-neutral transcript. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof, and stream formats. Each provider remains authoritative for its native permissions, tools, and hidden runtime state.
 
 - `low`: Codex Luna Max, currently `gpt-5.6-luna` with `max` reasoning.
-- `high`: Codex Astra Max, currently `gpt-6-astra` with `max` reasoning.
-- `ultra`: Codex Astra Ultra, currently `gpt-6-astra` with `ultra` reasoning.
+- `high`: Codex Sol Max, currently `gpt-5.6-sol` with `max` reasoning.
+- `ultra`: Codex Sol Ultra, currently `gpt-5.6-sol` with `ultra` reasoning.
 - `fable-max`: Claude Code Fable, currently `claude-fable-5-1` with `max` reasoning.
 - `fast on|off`: a Codex-only, explicit per-turn Fast or Standard overlay. Claude Code refuses Fast instead of ignoring it. A prior Fast value cannot leak into the next turn.
 
-New HRA-created Codex sessions and every explicit preset selection use the current mapping above. Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping for `high` and `ultra` until a preset is explicitly selected; metadata edits, restart recovery, and queued work do not reinterpret an established session.
+New HRA-created Codex sessions that use `high` or `ultra`, and explicit selections of either preset, use the Sol mapping above. The `low` and `fable-max` bindings are unchanged. Codex sessions already bound to historical contract 2 keep their exact Astra model and effort until a preset is explicitly selected; unrelated metadata edits, restart recovery, and queued work do not reinterpret an established session.
 
 `hra init` reports the required confirmation without changing local state; `hra init --yes` creates your Documents directory when it is absent, verifies that it is a readable, writable, and traversable canonical directory, and accepts it as the default project. Initialization is a one-shot maintenance command: run it before opening the persistent shell. The shell rejects `/init` because its running daemon already owns local state. Codex turns use Codex's `auto_review` path, the exact advertised `:workspace` permission profile, and the selected project as the runtime workspace root. Codex remains authoritative for the profile's effective sandbox, network policy, computer use, plugins, and protected turn inspection. Claude Code runs in its default interactive permission mode under the selected project and maps supported tool-use requests into HRA interactions; it does not expose Codex's permission-profile, app, plugin, or protected turn-inspection surfaces.
 
@@ -473,7 +509,7 @@ hra session status <session> [--json]
 hra session watch <session> [--cursor <cursor>] [--jsonl]
 hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
 hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
-hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]
+hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast] [--idempotency-key <uuid> --preset-contract <1|2>]
 hra session send|queue|steer <session> [--attach <path>]... <message>
 hra session stop|recover|abandon <session>
 hra session rename <session> <name>
@@ -482,7 +518,7 @@ hra session note get|edit|clear <session>
 hra session note set <session> <note>
 hra session state <session> [--json]
 hra session preset <session> <low|high|ultra|fable-max>
-hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]
+hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>] [--idempotency-key <uuid> --preset-contract <1|2>]
 hra session export <session> [--format <trajectory|json>] [--out <path>]
 hra session fast <session> <on|off>
 hra session project <session> <project>
@@ -527,7 +563,9 @@ hra daemon status|stop [--json]
 hra daemon run
 ```
 
-Account, project, and local-session selectors accept an exact ID or an unambiguous case-insensitive label. Cloud-session selectors accept an exact public ID, a unique public-ID prefix, or an exact synced name. Device selectors accept an exact ID or unique prefix. Ambiguity lists candidates and performs no effect. The CLI creates and sends an idempotency key before every provider effect; pass `--idempotency-key <uuid>` to reuse one after a lost response. If a local mutation response is uncertain, HRA returns the generated key and the exact replay arguments without repeating the command payload. Put those arguments before any `--` delimiter when rerunning the otherwise unchanged command. session recover accepts only exact, kind-specific provider proof. session abandon never retries or deletes provider state and releases only the local recovery authority. Remote mutations require a current UUIDv7 when this option is supplied. With `--json`, stdout contains one versioned object; diagnostics stay on stderr.
+Account, project, and local-session selectors accept an exact ID or an unambiguous case-insensitive label. Cloud-session selectors accept an exact public ID, a unique public-ID prefix, or an exact synced name. Device selectors accept an exact ID or unique prefix. Ambiguity lists candidates and performs no effect. The CLI creates and sends an idempotency key before every provider effect; pass `--idempotency-key <uuid>` to reuse one after a lost response. If a local mutation response is uncertain, HRA returns the generated key and the exact replay arguments without repeating the command payload. Put those arguments before any `--` delimiter when rerunning the otherwise unchanged command. A source-sensitive Codex `session start` or provider-switch replay includes both `--idempotency-key` and its immutable `--preset-contract`; do not omit or change either after an update. The preset-contract option is replay-only and is rejected for stable requests. A source-matched applied request replays its result, an effect-started request remains recovery-required, and a fresh absent or inactive source contract is refused before a provider effect.
+
+An older session-start release did not print the source contract, so its exact historical alias meaning must be supplied explicitly when replaying its key. For a v0.5.0 Codex start that omitted the then-default preset, preserve every other original option and add `--preset high --preset-contract 1`; v0.5.0 High and Ultra both meant Sol. Use `--preset-contract 2` only for an untagged Astra-era request whose original runtime evidence actually meant Astra. Neither selector can resume a contractless prepared row. Contract 2 cannot authorize a fresh effect under the current Sol binding; contract 1 can authorize the exact Sol request when the key has no stored row, just as a newly generated key can. If the originating meaning cannot be proved, use the retained old release rather than guessing. A contractless prepared row has no supported cancellation or retirement command. It must reach a terminal settlement through exact replay under the originating release, or the update remains blocked. Do not use a fresh key or `session abandon` as a workaround; that command applies only to an existing recovery-required session and never cancels prepared start or switch authority. `session preset` has no idempotency-key replay; resolve and inspect it before updating. session recover accepts only exact, kind-specific provider proof. session abandon never retries or deletes provider state and releases only the local recovery authority. Remote mutations require a current UUIDv7 when this option is supplied. With `--json`, stdout contains one versioned object; diagnostics stay on stderr.
 
 `interaction show` lists each safe requested permission category and each exact question ID. Complete live command and permission authority is available only through the revision-bound protected `interaction inspect` path described above. A permission grant reads `{"permissions":["<requested-name>"]}` and a question response reads `{"answers":{"<question-id>":{"answers":["<answer>"]}}}` through protected input. Those permission-name and question-answer document shapes are Codex-specific. The live Codex adapter rehydrates selected permission names to their exact private provider values immediately before the response write; those values never enter display, storage, logs, or sync. Claude Code tool-use requests map to HRA's provider-neutral interaction kinds and accept only the response choices that exact callback offers.
 

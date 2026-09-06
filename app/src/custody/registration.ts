@@ -133,8 +133,8 @@ export type EnqueueRequest = Readonly<{
 }>;
 
 /**
- * The digested enqueue request, in the daemon's key order
- * (`src/cloud/local-control.ts:enqueueRemoteCommand`).
+ * The wire enqueue fields, in the daemon's key order. The digest helper also
+ * inserts the authenticated requesting device immediately before the session.
  */
 export function enqueueRequest(input: EnqueueRequest): EnqueueRequest {
   return {
@@ -150,11 +150,20 @@ export function enqueueRequest(input: EnqueueRequest): EnqueueRequest {
 export async function enqueueRequestDigest(
   accountKey: Uint8Array,
   request: EnqueueRequest,
+  requestingDevicePublicId: string,
 ): Promise<string> {
   return await hmacSha256Hex(
     accountKey,
     commandEnqueueDigestPurpose,
-    JSON.stringify(enqueueRequest(request)),
+    JSON.stringify({
+      deadline: request.deadline,
+      expectedTargetDevicePublicId: request.expectedTargetDevicePublicId,
+      kind: request.kind,
+      payload: request.payload,
+      publicId: request.publicId,
+      requestingDevicePublicId,
+      sessionPublicId: request.sessionPublicId,
+    }),
   );
 }
 
@@ -175,8 +184,8 @@ export const deviceCommandEnqueueDigestPurpose = "device-command-enqueue";
 
 /**
  * A device command names a device, never a session, so its digested request
- * has no `sessionPublicId`. The separate digest purpose keeps a session command
- * request from ever verifying as a device command request.
+ * ends with the authenticated requesting device. The separate digest purpose
+ * keeps a session command request from verifying as a device command request.
  */
 export type DeviceEnqueueRequest = Readonly<{
   deadline: number;
@@ -199,11 +208,19 @@ export function deviceEnqueueRequest(input: DeviceEnqueueRequest): DeviceEnqueue
 export async function deviceEnqueueRequestDigest(
   accountKey: Uint8Array,
   request: DeviceEnqueueRequest,
+  requestingDevicePublicId: string,
 ): Promise<string> {
   return await hmacSha256Hex(
     accountKey,
     deviceCommandEnqueueDigestPurpose,
-    JSON.stringify(deviceEnqueueRequest(request)),
+    JSON.stringify({
+      deadline: request.deadline,
+      expectedTargetDevicePublicId: request.expectedTargetDevicePublicId,
+      kind: request.kind,
+      payload: request.payload,
+      publicId: request.publicId,
+      requestingDevicePublicId,
+    }),
   );
 }
 

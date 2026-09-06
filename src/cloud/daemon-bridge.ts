@@ -84,6 +84,7 @@ import {
   parseCloudProjectionRecoveryEntry,
   providerDeletionProjectionRecoveryCode,
   pruneExpiredCloudProjectionRecoveryReceipts,
+  rebindPreparedCloudCommandJournalEntry,
   removeCloudDeviceCommandJournalEntry,
   replaceCloudAttentionNotificationReconciliationDevice,
   setCloudAttentionNotificationPending,
@@ -95,8 +96,6 @@ import {
   transitionCloudProjectionRecovery,
 } from "./daemon-journal";
 import {
-  decryptDeviceCommand,
-  decryptRemoteCommand,
   decryptSessionMetadata,
   encryptDeviceCommandResult,
   encryptDeviceRegistry,
@@ -104,6 +103,8 @@ import {
   encryptNotificationHours,
   encryptSessionMetadata,
   encryptUsageProjection,
+  inspectDeviceCommand,
+  inspectRemoteCommand,
   parseSessionMetadataPayload,
   type DeviceCommandPayload,
   type DeviceCommandResultPayload,
@@ -178,6 +179,17 @@ const maximumPresenceTtlMs = 120_000;
 const peerPresenceRefreshMs = 10_000;
 const authLogoutCustodySlot = "cloud-auth-logout";
 const unreservedPreparedCommandResultCode = "LOCAL_JOURNAL_CAPACITY_BEFORE_EFFECT";
+const invalidPreparedPayloadResultCode = "INVALID_COMMAND_PAYLOAD_BEFORE_EFFECT";
+const legacyRequestCommitmentResultCode = "LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT";
+const missingLocalJournalResultCode = "LOCAL_JOURNAL_EVIDENCE_MISSING_BEFORE_EFFECT";
+const preparedFailureResultCodes = new Set([
+  invalidPreparedPayloadResultCode,
+  legacyRequestCommitmentResultCode,
+  "LOCAL_AUTHORITY_CHANGED_BEFORE_EFFECT",
+  missingLocalJournalResultCode,
+  "PROJECTION_RECOVERY_BLOCKED_BEFORE_EFFECT",
+  unreservedPreparedCommandResultCode,
+]);
 
 function isRuntimeArray(value: unknown): boolean {
   return Array.isArray(value);
@@ -546,9 +558,9 @@ type CloudPresenceResponse = Readonly<{
 
 /*
  * What this process last published to `devices:updateRegistry`: the digest of
- * the projection with its heartbeat removed (so a heartbeat alone is not a
- * change), when it went out, and the revision the server returned, which is
- * the expected revision of the next write.
+ * the projection with its heartbeat removed plus the server-visible command
+ * capability, when it went out, and the revision the server returned, which
+ * is the expected revision of the next write.
  */
 type CloudDeviceRegistryState = Readonly<{
   digest: string;
@@ -778,12 +790,22 @@ type CloudCommand = Readonly<{
   kind: CommandKind;
   payload: EncryptedEnvelope;
   publicId: string;
+  requestCommitmentVersion?: 2;
   // Populated only by `commands:get` (the exact per-command lookup used
-  // before a prepared command's effect starts). Metadata pages never carry
-  // it; nothing in the fair-scheduling scan needs it before that point.
+  // before a prepared command's effect starts). Metadata pages may carry the
+  // server-visible commitment marker, but never this keyed digest.
+  requestDigest?: string;
   requestingDevicePublicId?: string;
+  resultCode?: string;
   sessionPublicId: string;
   state: CommandState;
+  targetDevicePublicId?: string;
+}>;
+
+type ExactCloudCommand = CloudCommand & Readonly<{
+  requestDigest: string;
+  requestingDevicePublicId: string;
+  targetDevicePublicId: string;
 }>;
 
 type CloudCommandMetadata = Omit<CloudCommand, "payload">;
@@ -1391,7 +1413,13 @@ function parseCommandKind(value: unknown): CommandKind | null {
 
 function parseCloudCommand(value: unknown): CloudCommand {
   if (!isRecord(value)) throw new Error("Cloud command response is invalid.");
-  const optional = ["boundAuthority", "requestingDevicePublicId", "result", "resultCode"]
+  const optional = [
+    "boundAuthority",
+    "requestCommitmentVersion",
+    "requestingDevicePublicId",
+    "result",
+    "resultCode",
+  ]
     .filter((key) => Object.hasOwn(value, key));
   if (!hasExactKeys(value, [
     ...optional,
@@ -1417,6 +1445,7 @@ function parseCloudCommand(value: unknown): CloudCommand {
     || kind === null
     || payload === null
     || !isUuidV7(value.publicId)
+    || (value.requestCommitmentVersion !== undefined && value.requestCommitmentVersion !== 2)
     || (value.requestingDevicePublicId !== undefined && !isOpaqueIdentifier(value.requestingDevicePublicId))
     || !isOpaqueIdentifier(value.sessionPublicId)
     || state === null
@@ -1432,9 +1461,11 @@ function parseCloudCommand(value: unknown): CloudCommand {
     kind,
     payload,
     publicId: value.publicId,
+    ...(value.requestCommitmentVersion === 2 ? { requestCommitmentVersion: 2 as const } : {}),
     ...(typeof value.requestingDevicePublicId === "string"
       ? { requestingDevicePublicId: value.requestingDevicePublicId }
       : {}),
+    ...(typeof value.resultCode === "string" ? { resultCode: value.resultCode } : {}),
     sessionPublicId: value.sessionPublicId,
     state,
   };
@@ -1447,14 +1478,117 @@ type CloudDeviceCommand = Readonly<{
   kind: DeviceCommandKind;
   payload: EncryptedEnvelope;
   publicId: string;
+  requestCommitmentVersion?: 2;
   requestDigest?: string;
-  requestingDevicePublicId: string;
+  requestingDevicePublicId?: string;
   resultCode?: string;
   resultConsumed?: boolean;
   resultSingleUse?: true;
   state: CommandState;
   targetDevicePublicId?: string;
 }>;
+
+type ExactCloudDeviceCommand = CloudDeviceCommand & Readonly<{
+  requestDigest: string;
+  requestingDevicePublicId: string;
+  targetDevicePublicId: string;
+}>;
+
+function isResultBearingDeviceCommandTerminal(command: CloudDeviceCommand): boolean {
+  return command.boundAuthority !== undefined
+    && command.resultCode !== undefined
+    && (
+      command.state === "applied"
+      || command.state === "failed"
+      || command.state === "ambiguous"
+    );
+}
+
+type CloudDeviceCommandMetadata = Omit<
+  CloudDeviceCommand,
+  "payload" | "requestDigest" | "requestingDevicePublicId" | "targetDevicePublicId"
+>;
+
+function parseCloudDeviceCommandMetadataPage(value: unknown): Readonly<{
+  continueCursor: string;
+  isDone: boolean;
+  page: readonly CloudDeviceCommandMetadata[];
+}> {
+  const optionalPageFields = isRecord(value)
+    ? ["pageStatus", "splitCursor"].filter((key) => Object.hasOwn(value, key))
+    : [];
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ["continueCursor", "isDone", "page", ...optionalPageFields])
+    || typeof value.continueCursor !== "string"
+    || value.continueCursor.length > 16_384
+    || typeof value.isDone !== "boolean"
+    || !Array.isArray(value.page)
+    || value.page.length > cloudLimits.pageSize
+  ) throw new Error("Cloud device command page is invalid.");
+  const page = value.page.map((entry): CloudDeviceCommandMetadata => {
+    if (!isRecord(entry)) throw new Error("Cloud device command page is invalid.");
+    const optional = [
+      "boundAuthority",
+      "requestCommitmentVersion",
+      "result",
+      "resultCode",
+      "resultConsumed",
+      "resultSingleUse",
+    ]
+      .filter((key) => Object.hasOwn(entry, key));
+    const boundAuthority = entry.boundAuthority === undefined
+      ? undefined
+      : parseAuthorityTuple(entry.boundAuthority);
+    const state = parseCommandState(entry.state);
+    if (
+      !hasExactKeys(entry, [
+        ...optional,
+        "createdAt",
+        "deadline",
+        "kind",
+        "publicId",
+        "state",
+        "updatedAt",
+      ])
+      || (entry.boundAuthority !== undefined && boundAuthority === null)
+      || !isFiniteTimestamp(entry.createdAt)
+      || !isFiniteTimestamp(entry.deadline)
+      || !isFiniteTimestamp(entry.updatedAt)
+      || !isDeviceCommandKind(entry.kind)
+      || !isUuidV7(entry.publicId)
+      || (entry.requestCommitmentVersion !== undefined && entry.requestCommitmentVersion !== 2)
+      || (entry.result !== undefined && parseEncryptedEnvelope(entry.result) === null)
+      || (entry.resultCode !== undefined
+        && (typeof entry.resultCode !== "string"
+          || !/^[A-Z][A-Z0-9_]{0,63}$/u.test(entry.resultCode)))
+      || (entry.resultConsumed !== undefined && typeof entry.resultConsumed !== "boolean")
+      || (entry.resultSingleUse !== undefined && entry.resultSingleUse !== true)
+      || (entry.resultConsumed !== undefined && entry.resultSingleUse !== true)
+      || state === null
+    ) throw new Error("Cloud device command page is invalid.");
+    return {
+      ...(boundAuthority === undefined || boundAuthority === null ? {} : { boundAuthority }),
+      createdAt: entry.createdAt,
+      deadline: entry.deadline,
+      kind: entry.kind,
+      publicId: entry.publicId,
+      ...(entry.requestCommitmentVersion === 2
+        ? { requestCommitmentVersion: 2 as const }
+        : {}),
+      ...(typeof entry.resultCode === "string" ? { resultCode: entry.resultCode } : {}),
+      ...(typeof entry.resultConsumed === "boolean"
+        ? { resultConsumed: entry.resultConsumed }
+        : {}),
+      ...(entry.resultSingleUse === true ? { resultSingleUse: true as const } : {}),
+      state,
+    };
+  });
+  if (new Set(page.map((entry) => entry.publicId)).size !== page.length) {
+    throw new Error("Cloud device command page is invalid.");
+  }
+  return { continueCursor: value.continueCursor, isDone: value.isDone, page };
+}
 
 function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[] {
   if (!Array.isArray(value) || value.length > cloudLimits.pageSize) {
@@ -1464,7 +1598,9 @@ function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[]
     if (!isRecord(entry)) throw new Error("Cloud device command response is invalid.");
     const optional = [
       "boundAuthority",
+      "requestCommitmentVersion",
       "requestDigest",
+      "requestingDevicePublicId",
       "result",
       "resultCode",
       "resultConsumed",
@@ -1484,7 +1620,6 @@ function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[]
         "kind",
         "payload",
         "publicId",
-        "requestingDevicePublicId",
         "state",
         "updatedAt",
       ])
@@ -1494,7 +1629,9 @@ function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[]
       || !isDeviceCommandKind(entry.kind)
       || payload === null
       || !isUuidV7(entry.publicId)
-      || !isOpaqueIdentifier(entry.requestingDevicePublicId)
+      || (entry.requestCommitmentVersion !== undefined && entry.requestCommitmentVersion !== 2)
+      || (entry.requestingDevicePublicId !== undefined
+        && !isOpaqueIdentifier(entry.requestingDevicePublicId))
       || (entry.requestDigest !== undefined && !isDigest(entry.requestDigest))
       || (entry.result !== undefined && parseEncryptedEnvelope(entry.result) === null)
       || (entry.resultCode !== undefined
@@ -1514,8 +1651,13 @@ function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[]
       kind: entry.kind,
       payload,
       publicId: entry.publicId,
+      ...(entry.requestCommitmentVersion === 2
+        ? { requestCommitmentVersion: 2 as const }
+        : {}),
       ...(typeof entry.requestDigest === "string" ? { requestDigest: entry.requestDigest } : {}),
-      requestingDevicePublicId: entry.requestingDevicePublicId,
+      ...(typeof entry.requestingDevicePublicId === "string"
+        ? { requestingDevicePublicId: entry.requestingDevicePublicId }
+        : {}),
       ...(typeof entry.resultCode === "string" ? { resultCode: entry.resultCode } : {}),
       ...(typeof entry.resultConsumed === "boolean"
         ? { resultConsumed: entry.resultConsumed }
@@ -1533,9 +1675,82 @@ function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[]
   return commands;
 }
 
+function requireExactCloudDeviceCommand(
+  command: CloudDeviceCommand | undefined,
+): ExactCloudDeviceCommand {
+  if (
+    command === undefined
+    || command.requestDigest === undefined
+    || command.requestingDevicePublicId === undefined
+    || command.targetDevicePublicId === undefined
+  ) throw new Error("Cloud device command recovery identity is invalid.");
+  return command as ExactCloudDeviceCommand;
+}
+
+async function assertCloudDeviceCommandRequestCommitment(
+  identity: ActiveCloudIdentity,
+  command: ExactCloudDeviceCommand,
+): Promise<void> {
+  if (await cloudDeviceCommandRequestCommitmentVersion(identity, command) !== 3) {
+    throw new Error("Cloud device command recovery identity is invalid.");
+  }
+}
+
+async function cloudDeviceCommandRequestCommitmentVersion(
+  identity: ActiveCloudIdentity,
+  command: ExactCloudDeviceCommand,
+): Promise<1 | 2 | 3> {
+  if (
+    command.targetDevicePublicId !== identity.devicePublicId
+  ) throw new Error("Cloud device command recovery identity is invalid.");
+  const currentDigest = await hmacSha256Hex(
+    identity.accountKey,
+    "device-command-enqueue",
+    JSON.stringify({
+      deadline: command.deadline,
+      expectedTargetDevicePublicId: command.targetDevicePublicId,
+      kind: command.kind,
+      payload: command.payload,
+      publicId: command.publicId,
+      requestingDevicePublicId: command.requestingDevicePublicId,
+    }),
+  );
+  if (command.requestCommitmentVersion === 2) {
+    if (currentDigest === command.requestDigest) return 3;
+    throw new Error("Cloud device command recovery identity is invalid.");
+  }
+  // An absent server marker is never executable. It may be an original legacy
+  // HMAC or the short-lived requester-bound format that predated the marker;
+  // both are authenticated only so the daemon can terminalize them no-effect.
+  if (currentDigest === command.requestDigest) return 2;
+  const legacyDigest = await hmacSha256Hex(
+    identity.accountKey,
+    "device-command-enqueue",
+    JSON.stringify({
+      deadline: command.deadline,
+      expectedTargetDevicePublicId: command.targetDevicePublicId,
+      kind: command.kind,
+      payload: command.payload,
+      publicId: command.publicId,
+    }),
+  );
+  if (legacyDigest === command.requestDigest) return 1;
+  throw new Error("Cloud device command recovery identity is invalid.");
+}
+
+/** Legacy verification is admission evidence only; callers must terminalize without effect. */
+async function assertLegacyCloudDeviceCommandForDisposition(
+  identity: ActiveCloudIdentity,
+  command: ExactCloudDeviceCommand,
+): Promise<void> {
+  if (await cloudDeviceCommandRequestCommitmentVersion(identity, command) === 3) {
+    throw new Error("Cloud device command recovery identity is invalid.");
+  }
+}
+
 function parseCloudCommandMetadata(value: unknown): CloudCommandMetadata {
   if (!isRecord(value)) throw new Error("Cloud command metadata is invalid.");
-  const optional = ["boundAuthority", "result", "resultCode"]
+  const optional = ["boundAuthority", "requestCommitmentVersion", "result", "resultCode"]
     .filter((key) => Object.hasOwn(value, key));
   if (!hasExactKeys(value, [
     ...optional,
@@ -1558,6 +1773,7 @@ function parseCloudCommandMetadata(value: unknown): CloudCommandMetadata {
     || !isFiniteTimestamp(value.deadline)
     || kind === null
     || !isUuidV7(value.publicId)
+    || (value.requestCommitmentVersion !== undefined && value.requestCommitmentVersion !== 2)
     || !isOpaqueIdentifier(value.sessionPublicId)
     || state === null
     || (value.result !== undefined && parseEncryptedEnvelope(value.result) === null)
@@ -1571,6 +1787,8 @@ function parseCloudCommandMetadata(value: unknown): CloudCommandMetadata {
     deadline: value.deadline,
     kind,
     publicId: value.publicId,
+    ...(value.requestCommitmentVersion === 2 ? { requestCommitmentVersion: 2 as const } : {}),
+    ...(typeof value.resultCode === "string" ? { resultCode: value.resultCode } : {}),
     sessionPublicId: value.sessionPublicId,
     state,
   };
@@ -1606,6 +1824,7 @@ function sameCloudCommandMetadata(
     && metadata.state === command.state
     && metadata.deadline === command.deadline
     && metadata.createdAt === command.createdAt
+    && metadata.requestCommitmentVersion === command.requestCommitmentVersion
     && (
       metadata.boundAuthority === undefined
         ? command.boundAuthority === undefined
@@ -1666,17 +1885,85 @@ function parseCloudUsageAccountBinding(value: unknown): CloudUsageAccountBinding
   };
 }
 
-function parseExactCloudCommand(value: unknown): CloudCommand | null {
+function parseExactCloudCommand(value: unknown): ExactCloudCommand | null {
   if (value === null) return null;
   if (
     !isRecord(value)
     || !isDigest(value.requestDigest)
+    || !isOpaqueIdentifier(value.requestingDevicePublicId)
     || !isOpaqueIdentifier(value.targetDevicePublicId)
   ) throw new Error("Cloud command response is invalid.");
   const commandValue = { ...value };
   delete commandValue.requestDigest;
   delete commandValue.targetDevicePublicId;
-  return parseCloudCommand(commandValue);
+  return {
+    ...parseCloudCommand(commandValue),
+    requestDigest: value.requestDigest,
+    requestingDevicePublicId: value.requestingDevicePublicId,
+    targetDevicePublicId: value.targetDevicePublicId,
+  };
+}
+
+async function assertCloudCommandRequestCommitment(
+  identity: ActiveCloudIdentity,
+  command: ExactCloudCommand,
+): Promise<void> {
+  if (await cloudCommandRequestCommitmentVersion(identity, command) !== 3) {
+    throw new Error("Cloud command request commitment is invalid.");
+  }
+}
+
+async function cloudCommandRequestCommitmentVersion(
+  identity: ActiveCloudIdentity,
+  command: ExactCloudCommand,
+): Promise<1 | 2 | 3> {
+  if (command.targetDevicePublicId !== identity.devicePublicId) {
+    throw new Error("Cloud command request commitment is invalid.");
+  }
+  const currentDigest = await hmacSha256Hex(
+    identity.accountKey,
+    "command-enqueue",
+    JSON.stringify({
+      deadline: command.deadline,
+      expectedTargetDevicePublicId: command.targetDevicePublicId,
+      kind: command.kind,
+      payload: command.payload,
+      publicId: command.publicId,
+      requestingDevicePublicId: command.requestingDevicePublicId,
+      sessionPublicId: command.sessionPublicId,
+    }),
+  );
+  if (command.requestCommitmentVersion === 2) {
+    if (currentDigest === command.requestDigest) return 3;
+    throw new Error("Cloud command request commitment is invalid.");
+  }
+  // The marker is the rollout/execution capability. Requester-bound rows from
+  // the pre-marker build remain verifiable but are disposition-only.
+  if (currentDigest === command.requestDigest) return 2;
+  const legacyDigest = await hmacSha256Hex(
+    identity.accountKey,
+    "command-enqueue",
+    JSON.stringify({
+      deadline: command.deadline,
+      expectedTargetDevicePublicId: command.targetDevicePublicId,
+      kind: command.kind,
+      payload: command.payload,
+      publicId: command.publicId,
+      sessionPublicId: command.sessionPublicId,
+    }),
+  );
+  if (legacyDigest === command.requestDigest) return 1;
+  throw new Error("Cloud command request commitment is invalid.");
+}
+
+/** Legacy verification is admission evidence only; callers must terminalize without effect. */
+async function assertLegacyCloudCommandForDisposition(
+  identity: ActiveCloudIdentity,
+  command: ExactCloudCommand,
+): Promise<void> {
+  if (await cloudCommandRequestCommitmentVersion(identity, command) === 3) {
+    throw new Error("Cloud command request commitment is invalid.");
+  }
 }
 
 function authorityOf(lease: CloudLease): AuthorityTuple {
@@ -2212,9 +2499,9 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           );
         } catch (error: unknown) {
           if (signal.aborted) throw error;
-          // The settings projection is auxiliary: a failed publish is
-          // reported and retried next cycle, it never stops command
-          // execution or session sync.
+          // A target must not execute commands until its marker-2 capability
+          // is durably published for this cycle. Unrelated session and usage
+          // projection work remains available below.
           this.#deviceRegistryState = null;
           registryPublicationSucceeded = false;
           result.errors.push(`device registry: ${normalizeError(error)}`);
@@ -2232,22 +2519,37 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           recoveryJournal.state.projectionRecoveries
             .map((entry) => entry.sessionPublicId),
         );
-        const commandResult = await this.#processCommands(
-          identity,
-          headById,
-          leases,
-          projectionRecoveryBlockedSessionIds,
-          signal,
-          result.errors,
-        );
+        let commandResult: Readonly<{
+          applied: number;
+          blockedSessionIds: ReadonlySet<string>;
+          pendingScanComplete: boolean;
+          unsettled: number;
+        }> = {
+          applied: 0,
+          blockedSessionIds: new Set<string>(),
+          pendingScanComplete: false,
+          unsettled: recoveryJournal.state.commands.length,
+        };
+        if (registryPublicationSucceeded) {
+          commandResult = await this.#processCommands(
+            identity,
+            headById,
+            leases,
+            projectionRecoveryBlockedSessionIds,
+            signal,
+            result.errors,
+          );
+        }
         result.commandsApplied = commandResult.applied;
         result.commandsUnsettled = commandResult.unsettled;
-        const deviceCommandResult = await this.#processDeviceCommands(
-          identity,
-          signal,
-          result.errors,
-        );
-        result.commandsApplied += deviceCommandResult.applied;
+        if (registryPublicationSucceeded) {
+          const deviceCommandResult = await this.#processDeviceCommands(
+            identity,
+            signal,
+            result.errors,
+          );
+          result.commandsApplied += deviceCommandResult.applied;
+        }
         try {
           await this.#reconcileAttentionNotifications({
             identity,
@@ -3810,7 +4112,9 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   ): Promise<number | null> {
     const readProjection = this.#local.readDeviceRegistryProjection?.bind(this.#local);
     const readRegistry = this.#local.readDeviceRegistry?.bind(this.#local);
-    if (readProjection === undefined && readRegistry === undefined) return null;
+    if (readProjection === undefined && readRegistry === undefined) {
+      throw new Error("Local device registry source is unavailable.");
+    }
     let payload: DeviceRegistryPayload;
     let notificationEmail: NotificationEmailPolicy | null;
     let notificationHours: NotificationHoursPolicy | null;
@@ -3839,6 +4143,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     }
     await this.#assertDaemonCurrent(signal);
     const digest = await sha256Hex(JSON.stringify({
+      commandRequestVersion: 2,
       notificationEmail,
       notificationHours,
       notificationPolicyRevision,
@@ -3877,6 +4182,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         });
     abortBeforeEffect(signal);
     const response = await this.#mutation("devices:updateRegistry", {
+      commandRequestVersion: 2,
       envelope,
       expectedRevision,
       keyVersion: identity.keyVersion,
@@ -4718,13 +5024,36 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     for (const entry of journalState.deviceCommands.slice(0, maximumDeviceCommandsPerCycle)) {
       abortBeforeEffect(signal);
       try {
+        if (entry.requestCommitmentVersion !== 3) {
+          await this.#disposeLegacyDeviceCommand(entry, identity);
+          continue;
+        }
         if (entry.phase === "terminal") {
+          const retained = await this.#readDeviceCommandRecovery(entry, identity);
+          if (retained === null) {
+            await this.#mutateJournal((state) =>
+              removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+            continue;
+          }
+          if (isResultBearingDeviceCommandTerminal(retained.command)) {
+            // The exact hosted row already owns the terminal result. Its result
+            // takes precedence over a possibly conflicting local receipt, and
+            // replaying a local settle is neither necessary nor permitted.
+            await this.#mutateJournal((state) =>
+              removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+            continue;
+          }
           if (
             entry.kind === "account_login_start"
             && entry.terminalState === "applied"
             && entry.legacyResultMissing === true
           ) {
             await this.#quarantineLegacyLoginTerminal(entry, identity);
+          } else if (
+            entry.terminalState === "failed"
+            && preparedFailureResultCodes.has(entry.resultCode)
+          ) {
+            await this.#failPreparedDeviceTerminal(entry);
           } else {
             await this.#settleOrConfirmRevokedDeviceCommand(entry);
           }
@@ -4749,6 +5078,85 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       }
     }
 
+    if (commandBudgetRemaining > 0) {
+      const nonterminal = parseCloudDeviceCommandMetadataPage(await this.#transport.query(
+        "deviceCommands:listNonterminalForTargetPage",
+        { paginationOpts: { cursor: null, numItems: maximumDeviceCommandsPerCycle } },
+      ));
+      await this.#assertDaemonCurrent(signal);
+      for (const metadata of nonterminal.page) {
+        if (
+          commandBudgetRemaining === 0
+          || journalCommandPublicIds.has(metadata.publicId)
+          || (metadata.state !== "prepared" && metadata.state !== "effect_started")
+        ) continue;
+        commandBudgetRemaining -= 1;
+        try {
+          const exact = requireExactCloudDeviceCommand(parseCloudDeviceCommands([
+            await this.#transport.query("deviceCommands:get", {
+              commandPublicId: metadata.publicId,
+            }),
+          ])[0]);
+          if (
+            exact.publicId !== metadata.publicId
+            || exact.kind !== metadata.kind
+            || exact.state !== metadata.state
+            || exact.boundAuthority === undefined
+            || metadata.boundAuthority === undefined
+            || !sameAuthority(exact.boundAuthority, metadata.boundAuthority)
+          ) throw new Error("Cloud device command changed after recovery discovery.");
+          const requestCommitmentVersion = await cloudDeviceCommandRequestCommitmentVersion(
+            identity,
+            exact,
+          );
+          const entry = exact.state === "prepared"
+            ? {
+                authority: exact.boundAuthority,
+                commandPublicId: exact.publicId,
+                kind: exact.kind,
+                payloadDigest: await sha256Hex(JSON.stringify(exact.payload)),
+                phase: "prepared" as const,
+                requestCommitmentVersion,
+                requestingDevicePublicId: exact.requestingDevicePublicId,
+              }
+            : {
+                authority: exact.boundAuthority,
+                commandPublicId: exact.publicId,
+                kind: exact.kind,
+                payloadDigest: await sha256Hex(JSON.stringify(exact.payload)),
+                phase: "effect_started" as const,
+                requestCommitmentVersion,
+                requestingDevicePublicId: exact.requestingDevicePublicId,
+              };
+          await this.#mutateJournal((state) =>
+            addCloudDeviceCommandJournalEntry(state, entry));
+          journalCommandPublicIds.add(entry.commandPublicId);
+          if (requestCommitmentVersion !== 3) {
+            await this.#disposeLegacyDeviceCommand(entry, identity);
+          } else if (sameAuthority(entry.authority, this.#deviceCommandAuthority())) {
+            if (entry.phase === "prepared") {
+              await this.#failPreparedDeviceCommand(
+                entry,
+                identity,
+                missingLocalJournalResultCode,
+              );
+            } else {
+              await this.#settleIndeterminateDeviceCommand(entry, identity);
+            }
+          } else {
+            await this.#quarantineDeviceCommand(
+              entry,
+              identity,
+              missingLocalJournalResultCode,
+            );
+          }
+        } catch (error: unknown) {
+          errors.push(`device command ${metadata.publicId}: ${normalizeError(error)}`);
+          break;
+        }
+      }
+    }
+
     if (commandBudgetRemaining === 0) return { applied };
     const pending = parseCloudDeviceCommands(
       await this.#transport.query("deviceCommands:listPendingForTarget", {
@@ -4765,30 +5173,45 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       commandBudgetRemaining -= 1;
       abortBeforeEffect(signal);
       try {
+        const exact = requireExactCloudDeviceCommand(parseCloudDeviceCommands([
+          await this.#transport.query("deviceCommands:get", {
+            commandPublicId: command.publicId,
+          }),
+        ])[0]);
+        if (
+          exact.publicId !== command.publicId
+          || exact.state !== "pending"
+        ) throw new Error("Cloud device command changed after pending discovery.");
+        const requestCommitmentVersion = await cloudDeviceCommandRequestCommitmentVersion(
+          identity,
+          exact,
+        );
+        await this.#assertDaemonCurrent(signal);
         const authority = this.#deviceCommandAuthority();
-        const payloadDigest = await sha256Hex(JSON.stringify(command.payload));
+        const payloadDigest = await sha256Hex(JSON.stringify(exact.payload));
         const prepared: CloudDeviceCommandJournalEntry = {
           authority,
-          commandPublicId: command.publicId,
-          kind: command.kind,
+          commandPublicId: exact.publicId,
+          kind: exact.kind,
           payloadDigest,
           phase: "prepared",
-          requestingDevicePublicId: command.requestingDevicePublicId,
+          requestCommitmentVersion,
+          requestingDevicePublicId: exact.requestingDevicePublicId,
         };
         await this.#mutateJournal((state) =>
           addCloudDeviceCommandJournalEntry(state, prepared));
-        if (await this.#prepareDeviceCommand(prepared) === "expired") {
-          await this.#mutateJournal((state) =>
-            removeCloudDeviceCommandJournalEntry(state, command.publicId));
+        if (requestCommitmentVersion !== 3) {
+          await this.#disposeLegacyDeviceCommand(prepared, identity);
           continue;
         }
-        if (await this.#markExecuteAndSettleDeviceCommand(
-          command,
-          prepared,
-          identity,
-          executor,
-          signal,
-        )) applied += 1;
+        if (await this.#prepareDeviceCommand(prepared) === "expired") {
+          await this.#mutateJournal((state) =>
+            removeCloudDeviceCommandJournalEntry(state, exact.publicId));
+          continue;
+        }
+        if (await this.#resumeCurrentDeviceCommand(prepared, identity, executor, signal)) {
+          applied += 1;
+        }
       } catch (error: unknown) {
         errors.push(`device command ${command.publicId}: ${normalizeError(error)}`);
         break;
@@ -4803,6 +5226,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     const claim = await this.#mutation("deviceCommands:prepare", {
       authority: entry.authority,
       commandPublicId: entry.commandPublicId,
+      ...(entry.requestCommitmentVersion === 3 ? { executorRequestVersion: 2 } : {}),
       localPhase: "prepared_no_effect",
     });
     if (
@@ -4813,71 +5237,263 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     return claim.state;
   }
 
-  async #readDeviceCommandRecovery(
-    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" | "effect_started" }>,
+  async #readLegacyDeviceCommandForDisposition(
+    entry: CloudDeviceCommandJournalEntry,
     identity: ActiveCloudIdentity,
-  ): Promise<CloudDeviceCommand> {
+  ): Promise<ExactCloudDeviceCommand | null> {
     const remoteValue = await this.#transport.query("deviceCommands:get", {
       commandPublicId: entry.commandPublicId,
     });
-    const remote = parseCloudDeviceCommands(remoteValue === null ? [] : [remoteValue])[0];
+    if (remoteValue === null) return null;
+    const remote = requireExactCloudDeviceCommand(
+      parseCloudDeviceCommands([remoteValue])[0],
+    );
     if (
-      remote === undefined
-      || remote.publicId !== entry.commandPublicId
+      remote.publicId !== entry.commandPublicId
       || remote.kind !== entry.kind
       || remote.requestingDevicePublicId !== entry.requestingDevicePublicId
-      || remote.requestDigest === undefined
-      || remote.targetDevicePublicId !== identity.devicePublicId
+      || remote.payload.keyVersion !== identity.keyVersion
+      || await sha256Hex(JSON.stringify(remote.payload)) !== entry.payloadDigest
+    ) throw new Error("Legacy cloud device command journal does not match its request.");
+    await assertLegacyCloudDeviceCommandForDisposition(identity, remote);
+    return remote;
+  }
+
+  async #disposeLegacyDeviceCommand(
+    entry: CloudDeviceCommandJournalEntry,
+    identity: ActiveCloudIdentity,
+  ): Promise<void> {
+    const remote = await this.#readLegacyDeviceCommandForDisposition(entry, identity);
+    if (remote === null) {
+      await this.#mutateJournal((state) =>
+        removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+      return;
+    }
+    if (entry.phase === "terminal") {
+      if (isTerminalCommandState(remote.state)) {
+        // The legacy HMAC did not authenticate the requester. A hosted
+        // terminal row is sufficient custody to retire the local journal, but
+        // the local result must never be uploaded or replayed to that
+        // unauthenticated recipient (especially a one-time login handoff).
+        await this.#mutateJournal((state) =>
+          removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+        return;
+      }
+      await this.#closeLegacyDeviceCommandTerminalWithoutResult(entry, remote, identity);
+      return;
+    }
+    if (isTerminalCommandState(remote.state)) {
+      // The hosted terminal is already server-owned. It is sufficient to
+      // retire legacy local custody, but never authorizes replay of a local
+      // outcome or result to the requester omitted by the old commitment.
+      await this.#mutateJournal((state) =>
+        removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+      return;
+    }
+    const effectMayHaveStarted = entry.phase === "effect_started"
+      || remote.state === "effect_started";
+    if (!sameAuthority(entry.authority, this.#deviceCommandAuthority())) {
+      const quarantineEntry = effectMayHaveStarted && entry.phase === "prepared"
+        ? { ...entry, phase: "effect_started" as const }
+        : entry;
+      if (quarantineEntry !== entry) {
+        await this.#mutateJournal((state) =>
+          transitionCloudDeviceCommandJournalEntry(state, quarantineEntry));
+      }
+      await this.#quarantineDeviceCommand(
+        quarantineEntry,
+        identity,
+        legacyRequestCommitmentResultCode,
+      );
+      return;
+    }
+    if (entry.phase === "prepared" && remote.state !== "effect_started") {
+      if (remote.state !== "pending" && remote.state !== "prepared") {
+        throw new Error("Legacy cloud device command recovery state is invalid.");
+      }
+      if (await this.#prepareDeviceCommand(entry) === "expired") {
+        await this.#mutateJournal((state) =>
+          removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+        return;
+      }
+      await this.#failPreparedDeviceCommand(
+        entry,
+        identity,
+        legacyRequestCommitmentResultCode,
+      );
+      return;
+    }
+    if (remote.state !== "prepared" && remote.state !== "effect_started") {
+      throw new Error("Legacy cloud device command recovery state is invalid.");
+    }
+    const effectEntry: Extract<CloudDeviceCommandJournalEntry, { phase: "effect_started" }> = {
+      ...entry,
+      phase: "effect_started",
+    };
+    if (entry.phase !== "effect_started") {
+      await this.#mutateJournal((state) =>
+        transitionCloudDeviceCommandJournalEntry(state, effectEntry));
+    }
+    if (remote.state === "prepared") {
+      const started = await this.#mutation("deviceCommands:markEffectStarted", {
+        authority: effectEntry.authority,
+        commandPublicId: effectEntry.commandPublicId,
+      });
+      if (
+        !isRecord(started)
+        || started.publicId !== effectEntry.commandPublicId
+        || (started.state !== "effect_started" && started.state !== "expired")
+      ) throw new Error("Cloud device command effect-start response is invalid.");
+      if (started.state === "expired") {
+        await this.#mutateJournal((state) =>
+          removeCloudDeviceCommandJournalEntry(state, effectEntry.commandPublicId));
+        return;
+      }
+    }
+    await this.#settleIndeterminateDeviceCommand(effectEntry, identity);
+  }
+
+  async #closeLegacyDeviceCommandTerminalWithoutResult(
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "terminal" }>,
+    remote: ExactCloudDeviceCommand,
+    identity: ActiveCloudIdentity,
+  ): Promise<void> {
+    if (
+      remote.state !== "pending"
+      && remote.state !== "prepared"
+      && remote.state !== "effect_started"
+    ) throw new Error("Legacy cloud device command recovery state is invalid.");
+    const base = {
+      authority: entry.authority,
+      commandPublicId: entry.commandPublicId,
+      kind: entry.kind,
+      payloadDigest: entry.payloadDigest,
+      requestingDevicePublicId: entry.requestingDevicePublicId,
+    };
+    const effectEntry: Extract<CloudDeviceCommandJournalEntry, { phase: "effect_started" }> =
+      entry.requestCommitmentVersion === undefined
+        ? { ...base, phase: "effect_started" }
+        : {
+            ...base,
+            phase: "effect_started",
+            requestCommitmentVersion: entry.requestCommitmentVersion,
+          };
+    if (!sameAuthority(entry.authority, this.#deviceCommandAuthority())) {
+      await this.#quarantineDeviceCommand(effectEntry, identity);
+      return;
+    }
+    if (remote.state === "pending" || remote.state === "prepared") {
+      const preparedEntry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" }> =
+        entry.requestCommitmentVersion === undefined
+          ? { ...base, phase: "prepared" }
+          : {
+              ...base,
+              phase: "prepared",
+              requestCommitmentVersion: entry.requestCommitmentVersion,
+            };
+      if (await this.#prepareDeviceCommand(preparedEntry) === "expired") {
+        await this.#mutateJournal((state) =>
+          removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+        return;
+      }
+      const started = await this.#mutation("deviceCommands:markEffectStarted", {
+        authority: entry.authority,
+        commandPublicId: entry.commandPublicId,
+      });
+      if (
+        !isRecord(started)
+        || started.publicId !== entry.commandPublicId
+        || (started.state !== "effect_started" && started.state !== "expired")
+      ) throw new Error("Cloud device command effect-start response is invalid.");
+      if (started.state === "expired") {
+        await this.#mutateJournal((state) =>
+          removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+        return;
+      }
+    }
+    const resultCode = "LOCAL_EFFECT_RECOVERY_REQUIRED";
+    const terminalState = "ambiguous" as const;
+    const terminal: Extract<CloudDeviceCommandJournalEntry, { phase: "terminal" }> = {
+      ...base,
+      phase: "terminal",
+      resultCode,
+      resultDigest: await hmacSha256Hex(
+        identity.accountKey,
+        "device-command-result",
+        JSON.stringify({ code: resultCode, result: null, state: terminalState }),
+      ),
+      terminalState,
+    };
+    await this.#settleDeviceCommand(terminal);
+    await this.#mutateJournal((state) =>
+      removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+  }
+
+  async #readDeviceCommandRecovery(
+    entry: CloudDeviceCommandJournalEntry,
+    identity: ActiveCloudIdentity,
+  ): Promise<Readonly<{
+    command: ExactCloudDeviceCommand;
+    payload: DeviceCommandPayload | null;
+  }> | null> {
+    const remoteValue = await this.#transport.query("deviceCommands:get", {
+      commandPublicId: entry.commandPublicId,
+    });
+    if (remoteValue === null) return null;
+    const remote = requireExactCloudDeviceCommand(
+      parseCloudDeviceCommands([remoteValue])[0],
+    );
+    if (
+      remote.publicId !== entry.commandPublicId
+      || remote.kind !== entry.kind
+      || remote.requestingDevicePublicId !== entry.requestingDevicePublicId
       || remote.payload.keyVersion !== identity.keyVersion
     ) throw new Error("Cloud device command recovery identity is invalid.");
-    let authenticatedPayload: DeviceCommandPayload;
+    await assertCloudDeviceCommandRequestCommitment(identity, remote);
+    const payloadDigest = await sha256Hex(JSON.stringify(remote.payload));
+    if (payloadDigest !== entry.payloadDigest) {
+      throw new Error("Cloud device command recovery identity is invalid.");
+    }
+
+    if (!isResultBearingDeviceCommandTerminal(remote)) {
+      if (remote.state === "pending") {
+        if (remote.boundAuthority !== undefined) {
+          throw new Error("Cloud device command recovery authority is invalid.");
+        }
+        // Continue through authenticated payload inspection before the caller is
+        // allowed to retire even a result-less terminal recovery record.
+      }
+      else if (remote.boundAuthority !== undefined) {
+        if (!sameAuthority(remote.boundAuthority, entry.authority)) {
+          throw new Error("Cloud device command recovery authority is invalid.");
+        }
+      }
+      // Only a terminal won while the command was still pending can legitimately
+      // have no bound daemon authority. The confirming mutation below must still
+      // prove that exact terminal before local evidence is retired.
+      else if (remote.state !== "cancelled" && remote.state !== "expired") {
+        throw new Error("Cloud device command recovery authority is invalid.");
+      }
+    }
+    let inspected: Awaited<ReturnType<typeof inspectDeviceCommand>>;
     try {
-      authenticatedPayload = await decryptDeviceCommand(remote.payload, identity.accountKey, {
+      inspected = await inspectDeviceCommand(remote.payload, identity.accountKey, {
         entityPublicId: remote.publicId,
         keyVersion: identity.keyVersion,
         kind: "device_command",
         userPublicId: identity.userPublicId,
       });
     } catch {
+      // A ciphertext/key mismatch is authority corruption, not an ordinary
+      // invalid request that may be terminalized by the executor.
       throw new Error("Cloud device command recovery identity is invalid.");
     }
-    const payloadDigest = await sha256Hex(JSON.stringify(remote.payload));
-    const requestDigest = await hmacSha256Hex(
-      identity.accountKey,
-      "device-command-enqueue",
-      JSON.stringify({
-        deadline: remote.deadline,
-        expectedTargetDevicePublicId: identity.devicePublicId,
-        kind: remote.kind,
-        payload: remote.payload,
-        publicId: remote.publicId,
-      }),
-    );
-    if (
-      authenticatedPayload.kind !== remote.kind
-      || payloadDigest !== entry.payloadDigest
-      || requestDigest !== remote.requestDigest
-    ) throw new Error("Cloud device command recovery identity is invalid.");
-
-    if (remote.state === "pending") {
-      if (remote.boundAuthority !== undefined) {
-        throw new Error("Cloud device command recovery authority is invalid.");
-      }
-      return remote;
-    }
-    if (remote.boundAuthority !== undefined) {
-      if (!sameAuthority(remote.boundAuthority, entry.authority)) {
-        throw new Error("Cloud device command recovery authority is invalid.");
-      }
-      return remote;
-    }
-    // Only a terminal won while the command was still pending can legitimately
-    // have no bound daemon authority. The confirming mutation below must still
-    // prove that exact terminal before local evidence is retired.
-    if (remote.state !== "cancelled" && remote.state !== "expired") {
-      throw new Error("Cloud device command recovery authority is invalid.");
-    }
-    return remote;
+    return {
+      command: remote,
+      payload: inspected.kind === "valid" && inspected.payload.kind === remote.kind
+        ? inspected.payload
+        : null,
+    };
   }
 
   async #confirmDeviceCommandTerminalRecovery(
@@ -4930,8 +5546,22 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     executor: CloudDeviceCommandExecutorPort,
     signal: AbortSignal,
   ): Promise<boolean> {
-    const remote = await this.#readDeviceCommandRecovery(entry, identity);
+    const authenticated = await this.#readDeviceCommandRecovery(entry, identity);
+    if (authenticated === null) {
+      await this.#mutateJournal((state) =>
+        removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+      return false;
+    }
+    const remote = authenticated.command;
     await this.#assertDaemonCurrent(signal);
+    if (isResultBearingDeviceCommandTerminal(remote)) {
+      // A hosted recovery or settle may have won after this local phase was
+      // journaled. Terminal hosted state is immutable, so exact authenticated
+      // observation releases local custody without replaying an effect.
+      await this.#mutateJournal((state) =>
+        removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+      return false;
+    }
     if (
       remote.state === "cancelled"
       || remote.state === "expired"
@@ -4959,10 +5589,15 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
         return false;
       }
+      if (authenticated.payload === null) {
+        await this.#failPreparedDeviceCommand(entry, identity);
+        return false;
+      }
       return await this.#markExecuteAndSettleDeviceCommand(
         remote,
         entry,
         identity,
+        authenticated.payload,
         executor,
         signal,
       );
@@ -4977,6 +5612,10 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     if (remote.state !== "prepared") {
       throw new Error("Cloud device command recovery state is invalid.");
     }
+    if (authenticated.payload === null) {
+      await this.#failPreparedDeviceCommand(entry, identity);
+      return false;
+    }
     // The local journal was advanced before the mark mutation. An authoritative
     // hosted `prepared` read therefore proves the mark did not commit and the
     // provider executor could not have been reached.
@@ -4984,18 +5623,88 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       remote,
       entry,
       identity,
+      authenticated.payload,
       executor,
       signal,
     );
   }
 
-  async #markExecuteAndSettleDeviceCommand(
-    command: CloudDeviceCommand,
+  async #failPreparedDeviceCommand(
     entry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" | "effect_started" }>,
     identity: ActiveCloudIdentity,
+    resultCode = invalidPreparedPayloadResultCode,
+  ): Promise<void> {
+    const terminalState = "failed" as const;
+    const resultDigest = await hmacSha256Hex(
+      identity.accountKey,
+      "device-command-result",
+      JSON.stringify({
+        code: resultCode,
+        result: null,
+        state: terminalState,
+      }),
+    );
+    const terminal: CloudDeviceCommandJournalEntry = {
+      ...entry,
+      phase: "terminal",
+      resultCode,
+      resultDigest,
+      terminalState,
+    };
+    await this.#mutateJournal((state) =>
+      transitionCloudDeviceCommandJournalEntry(state, terminal));
+    await this.#failPreparedDeviceTerminal(terminal);
+    await this.#mutateJournal((state) =>
+      removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+  }
+
+  async #failPreparedDeviceTerminal(
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "terminal" }>,
+  ): Promise<void> {
+    try {
+      const failed = await this.#mutation("deviceCommands:failPrepared", {
+        authority: entry.authority,
+        commandPublicId: entry.commandPublicId,
+        resultCode: entry.resultCode,
+        resultDigest: entry.resultDigest,
+      });
+      if (
+        !isRecord(failed)
+        || failed.publicId !== entry.commandPublicId
+        || (failed.state !== "failed" && failed.state !== "expired")
+        || (failed.replay !== undefined && typeof failed.replay !== "boolean")
+      ) throw new Error("Cloud device command prepared-failure response is invalid.");
+    } catch (failureError: unknown) {
+      try {
+        const confirmed = await this.#mutation("deviceCommands:confirmTerminalRecovery", {
+          commandPublicId: entry.commandPublicId,
+          localPhase: "prepared_no_effect",
+          staleAuthority: entry.authority,
+        });
+        if (
+          !isRecord(confirmed)
+          || confirmed.publicId !== entry.commandPublicId
+          || confirmed.replay !== true
+          || (confirmed.state !== "cancelled" && confirmed.state !== "expired")
+        ) throw new Error("Cloud device command terminal recovery confirmation is invalid.");
+      } catch {
+        throw failureError;
+      }
+    }
+  }
+
+  async #markExecuteAndSettleDeviceCommand(
+    command: ExactCloudDeviceCommand,
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" | "effect_started" }>,
+    identity: ActiveCloudIdentity,
+    payload: DeviceCommandPayload,
     executor: CloudDeviceCommandExecutorPort,
     signal: AbortSignal,
   ): Promise<boolean> {
+    await this.#assertDaemonCurrent(signal);
+    if (!sameAuthority(entry.authority, this.#deviceCommandAuthority())) {
+      throw new Error("Cloud device command execution authority changed before effect.");
+    }
     const started: Extract<CloudDeviceCommandJournalEntry, { phase: "effect_started" }> =
       entry.phase === "effect_started" ? entry : { ...entry, phase: "effect_started" };
     if (entry.phase === "prepared") {
@@ -5006,6 +5715,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     const begin = await this.#mutation("deviceCommands:markEffectStarted", {
       authority: started.authority,
       commandPublicId: command.publicId,
+      executorRequestVersion: 2,
     });
     if (
       !isRecord(begin)
@@ -5020,15 +5730,6 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
 
     let outcome: CloudDeviceCommandExecutionResult;
     try {
-      const payload = await decryptDeviceCommand(command.payload, identity.accountKey, {
-        entityPublicId: command.publicId,
-        keyVersion: command.payload.keyVersion,
-        kind: "device_command",
-        userPublicId: identity.userPublicId,
-      });
-      if (payload.kind !== command.kind) {
-        throw new Error("Cloud device command kind is inconsistent.");
-      }
       await this.#assertDaemonCurrent(signal);
       outcome = await this.#requestingDeviceActive(command.requestingDevicePublicId)
         ? await executor.executeDeviceCommand({
@@ -5143,13 +5844,29 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   async #quarantineDeviceCommand(
     entry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" | "effect_started" }>,
     identity: ActiveCloudIdentity,
+    preparedResultCode = "LOCAL_AUTHORITY_CHANGED_BEFORE_EFFECT",
   ): Promise<void> {
+    if (entry.requestCommitmentVersion === 3) {
+      const authenticated = await this.#readDeviceCommandRecovery(entry, identity);
+      if (
+        authenticated === null
+        || isResultBearingDeviceCommandTerminal(authenticated.command)
+      ) {
+        // An exact missing row has no hosted outcome left to publish. An
+        // authenticated hosted result terminal already owns its outcome, even
+        // if a newer boot wrote it under a different fence. Either observation
+        // is sufficient to release only this daemon's local custody.
+        await this.#mutateJournal((state) =>
+          removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+        return;
+      }
+    }
     // `prepared` never began an effect, so it is honestly a failure. An
     // `effect_started` entry may have created a session; the only truthful
     // terminal state a later boot can publish is `ambiguous`.
     const terminalState = entry.phase === "prepared" ? "failed" as const : "ambiguous" as const;
     const resultCode = entry.phase === "prepared"
-      ? "LOCAL_AUTHORITY_CHANGED_BEFORE_EFFECT"
+      ? preparedResultCode
       : "LOCAL_EFFECT_RECOVERY_REQUIRED";
     const resultDigest = await hmacSha256Hex(
       identity.accountKey,
@@ -5326,7 +6043,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     const selectedLaneKeys = new Set<string>();
     for (const [ordinal, command] of nonterminal.entries()) {
       const decisionLane = command.kind === "resolve_interaction";
-      const laneKey = `${command.sessionPublicId} ${decisionLane ? "decision" : "default"}`;
+      const laneKey = `${command.sessionPublicId}\0${decisionLane ? "decision" : "default"}`;
       if (selectedLaneKeys.has(laneKey)) continue;
       selectedLaneKeys.add(laneKey);
       if (
@@ -5341,7 +6058,12 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     let failedFreshAttempts = 0;
     for (const { command } of sessionHeads.slice(0, maximumCommandsPerCycle)) {
       try {
-        const exact = await this.#findCommand(command.sessionPublicId, command.publicId);
+        const found = await this.#findCommandForAdmissionDisposition(
+          identity,
+          command.sessionPublicId,
+          command.publicId,
+        );
+        const exact = found?.command ?? null;
         if (
           exact === null
           || exact.state !== "pending"
@@ -5365,6 +6087,29 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           leases,
         );
         const payloadDigest = await sha256Hex(JSON.stringify(exact.payload));
+        if (found?.requestCommitmentVersion !== 3) {
+          const legacyEntry: CloudCommandJournalEntry = {
+            authority: authorityOf(lease),
+            commandPublicId: command.publicId,
+            kind: command.kind,
+            localAuthorityDigest: await sha256Hex(
+              "hra-control-plane-cloud-command-legacy-request:v1",
+            ),
+            payloadDigest,
+            phase: "prepared",
+            requestCommitmentVersion: found?.requestCommitmentVersion ?? 1,
+            requestingDevicePublicId: exact.requestingDevicePublicId,
+            sessionPublicId: command.sessionPublicId,
+          };
+          await this.#addCommand(legacyEntry);
+          await this.#failPreparedWithoutEffect(
+            legacyEntry,
+            exact,
+            lease,
+            legacyRequestCommitmentResultCode,
+          );
+          continue;
+        }
         const localAuthority = validateLocalCommandAuthority(
           await this.#local.resolveCommandAuthority({
             sessionPublicId: command.sessionPublicId,
@@ -5381,6 +6126,8 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           localAuthorityDigest: await sha256Hex(JSON.stringify(localAuthority)),
           payloadDigest,
           phase: "prepared",
+          requestCommitmentVersion: 3,
+          requestingDevicePublicId: exact.requestingDevicePublicId,
           sessionPublicId: command.sessionPublicId,
         };
         await this.#addCommand(entry);
@@ -5416,7 +6163,12 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         || left.createdAt - right.createdAt);
     for (const command of missingRecovery.slice(0, maximumJournalRecoveriesPerCycle)) {
       try {
-        const exact = await this.#findCommand(command.sessionPublicId, command.publicId);
+        const found = await this.#findCommandForAdmissionDisposition(
+          identity,
+          command.sessionPublicId,
+          command.publicId,
+        );
+        const exact = found?.command ?? null;
         if (
           exact === null
           || !sameCloudCommandMetadata(command, exact)
@@ -5433,6 +6185,8 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           ),
           payloadDigest: await sha256Hex(JSON.stringify(exact.payload)),
           phase: command.state === "effect_started" ? "effect_started" : "prepared",
+          requestCommitmentVersion: found?.requestCommitmentVersion ?? 3,
+          requestingDevicePublicId: exact.requestingDevicePublicId,
           sessionPublicId: command.sessionPublicId,
         };
         await this.#addCommand(entry);
@@ -5455,8 +6209,66 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       .slice(0, maximumJournalRecoveriesPerCycle);
     for (const { entry } of recoveryCandidates) {
       try {
+        if (entry.requestCommitmentVersion !== 3) {
+          const legacy = await this.#findLegacyCommandForDisposition(
+            identity,
+            entry.sessionPublicId,
+            entry.commandPublicId,
+            entry.requestingDevicePublicId,
+          );
+          if (legacy === null) {
+            await this.#removeExactCommand(entry);
+            continue;
+          }
+          if (
+            legacy.kind !== entry.kind
+            || await sha256Hex(JSON.stringify(legacy.payload)) !== entry.payloadDigest
+          ) throw new Error("Legacy cloud command journal does not match its request.");
+          if (entry.phase === "terminal") {
+            if (isTerminalCommandState(legacy.state)) {
+              // The legacy commitment did not authenticate the requester. An
+              // already-hosted terminal is sufficient confirmation to retire
+              // local custody, but never replay the old local outcome.
+              await this.#removeExactCommand(entry);
+            } else {
+              await this.#closeLegacyCommandTerminalWithoutOutcome(
+                identity,
+                entry,
+                legacy,
+                leases,
+              );
+            }
+            continue;
+          }
+          if (isTerminalCommandState(legacy.state)) {
+            await this.#removeExactCommand(entry);
+            continue;
+          }
+          if (entry.phase === "effect_started" || legacy.state === "effect_started") {
+            const effectEntry: Extract<CloudCommandJournalEntry, { phase: "effect_started" }> = {
+              ...entry,
+              phase: "effect_started",
+            };
+            if (entry.phase !== "effect_started") await this.#replaceCommand(effectEntry);
+            await this.#settleEffectStartedAsAmbiguous(identity, effectEntry);
+            continue;
+          }
+          const lease = await this.#leaseForCommand(
+            entry.sessionPublicId,
+            identity,
+            leases,
+          );
+          await this.#failPreparedWithoutEffect(
+            entry,
+            legacy,
+            lease,
+            legacyRequestCommitmentResultCode,
+          );
+          continue;
+        }
         if (entry.phase === "terminal") {
           const remote = await this.#findCommand(
+            identity,
             entry.sessionPublicId,
             entry.commandPublicId,
           );
@@ -5465,17 +6277,42 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
             continue;
           }
           if (
-            (remote.state === "applied"
-              || remote.state === "failed"
+            remote.resultCode === undefined
+            && (remote.state === "cancelled"
+              || remote.state === "expired"
               || remote.state === "ambiguous")
-            && remote.state !== entry.terminalState
-          ) throw new Error("Cloud terminal command recovery changed its outcome.");
-          await this.#settleTerminal(identity, entry);
+          ) {
+            await this.#confirmCommandTerminalRecovery(entry, remote.state);
+            await this.#removeExactCommand(entry);
+            continue;
+          }
+          if (isTerminalCommandState(remote.state)) {
+            // The authenticated hosted row already owns the terminal outcome.
+            // It takes precedence over a possibly conflicting local receipt,
+            // and no execution lease or terminal mutation is needed merely to
+            // release local custody.
+            await this.#removeExactCommand(entry);
+            continue;
+          }
+          await this.#settleTerminal(identity, entry, remote);
           await this.#removeExactCommand(entry);
           continue;
         }
-        const resumed = await this.#findCommand(entry.sessionPublicId, entry.commandPublicId);
-        if (resumed === null || isTerminalCommandState(resumed.state)) {
+        const resumed = await this.#findCommand(
+          identity,
+          entry.sessionPublicId,
+          entry.commandPublicId,
+        );
+        if (resumed === null) {
+          await this.#removeExactCommand(entry);
+          continue;
+        }
+        if (isTerminalCommandState(resumed.state)) {
+          if (
+            resumed.state === "cancelled"
+            || resumed.state === "expired"
+            || (resumed.state === "ambiguous" && resumed.resultCode === undefined)
+          ) await this.#confirmCommandTerminalRecovery(entry, resumed.state);
           await this.#removeExactCommand(entry);
           continue;
         }
@@ -5513,7 +6350,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
             entry,
             resumed,
             lease,
-            "LOCAL_JOURNAL_EVIDENCE_MISSING_BEFORE_EFFECT",
+            missingLocalJournalResultCode,
           );
           continue;
         }
@@ -5568,6 +6405,24 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     return lease;
   }
 
+  async #assertCommandLeaseCurrent(
+    sessionPublicId: string,
+    identity: ActiveCloudIdentity,
+    expected: AuthorityTuple,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#assertDaemonCurrent(signal);
+    const value = await this.#transport.query("leases:current", { sessionPublicId });
+    await this.#assertDaemonCurrent(signal);
+    if (value === null) throw new Error("Cloud execution lease is unavailable before effect.");
+    const lease = parseLease(value);
+    if (
+      lease.devicePublicId !== identity.devicePublicId
+      || lease.leaseUntil <= this.#now()
+      || !sameAuthority(authorityOf(lease), expected)
+    ) throw new Error("Cloud execution lease changed before effect.");
+  }
+
   async #failPreparedWithoutEffect(
     entry: Extract<CloudCommandJournalEntry, { phase: "prepared" }>,
     command: CloudCommand,
@@ -5581,6 +6436,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     const prepared = await this.#mutation("commands:prepare", {
       authority,
       commandPublicId: command.publicId,
+      ...(entry.requestCommitmentVersion === 3 ? { executorRequestVersion: 2 } : {}),
       localPhase: "prepared_no_effect",
     });
     if (
@@ -5602,8 +6458,68 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       terminalState: "failed",
     };
     await this.#replaceCommand(terminal);
-    await this.#settle(terminal);
+    await this.#failPreparedTerminal(terminal);
     await this.#removeExactCommand(terminal);
+  }
+
+  async #failPreparedTerminal(
+    entry: Extract<CloudCommandJournalEntry, { phase: "terminal" }>,
+  ): Promise<void> {
+    try {
+      const failed = await this.#mutation("commands:failPrepared", {
+        authority: entry.authority,
+        commandPublicId: entry.commandPublicId,
+        resultCode: entry.resultCode,
+        resultDigest: entry.resultDigest,
+      });
+      if (
+        !isRecord(failed)
+        || failed.publicId !== entry.commandPublicId
+        || (failed.state !== "failed" && failed.state !== "expired")
+        || (failed.replay !== undefined && typeof failed.replay !== "boolean")
+      ) throw new Error("Cloud command prepared-failure response is invalid.");
+    } catch (failureError: unknown) {
+      try {
+        const confirmed = await this.#mutation("commands:confirmTerminalRecovery", {
+          commandPublicId: entry.commandPublicId,
+          localPhase: "prepared_no_effect",
+          staleAuthority: entry.authority,
+        });
+        if (
+          !isRecord(confirmed)
+          || confirmed.publicId !== entry.commandPublicId
+          || confirmed.replay !== true
+          || (confirmed.state !== "cancelled" && confirmed.state !== "expired")
+        ) throw new Error("Cloud command terminal recovery confirmation is invalid.");
+      } catch {
+        throw failureError;
+      }
+    }
+  }
+
+  async #confirmCommandTerminalRecovery(
+    entry: CloudCommandJournalEntry,
+    expectedState: "ambiguous" | "cancelled" | "expired",
+  ): Promise<void> {
+    const preparedNoEffect = entry.phase === "prepared" || (entry.phase === "terminal"
+      && entry.terminalState === "failed"
+      && preparedFailureResultCodes.has(entry.resultCode));
+    const localPhase = preparedNoEffect ? "prepared_no_effect" as const : "effect_started" as const;
+    const confirmed = await this.#mutation("commands:confirmTerminalRecovery", {
+      commandPublicId: entry.commandPublicId,
+      localPhase,
+      staleAuthority: entry.authority,
+    });
+    const confirmedStateValue = isRecord(confirmed) ? confirmed.state : undefined;
+    const stateMatches = expectedState === "cancelled" || expectedState === "expired"
+      ? confirmedStateValue === expectedState
+      : localPhase === "effect_started" && confirmedStateValue === "ambiguous";
+    if (
+      !isRecord(confirmed)
+      || confirmed.publicId !== entry.commandPublicId
+      || confirmed.replay !== true
+      || !stateMatches
+    ) throw new Error("Cloud command terminal recovery confirmation is invalid.");
   }
 
   async #executePrepared(
@@ -5622,12 +6538,15 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       current?.phase !== "prepared"
       || current.payloadDigest !== payloadDigest
       || current.kind !== command.kind
+      || current.requestCommitmentVersion !== 3
+      || current.requestingDevicePublicId !== command.requestingDevicePublicId
       || current.sessionPublicId !== sessionPublicId
       || current.localAuthorityDigest !== await sha256Hex(JSON.stringify(localAuthority))
     ) throw new Error("Prepared cloud command journal does not match its request.");
     const prepared = await this.#mutation("commands:prepare", {
       authority,
       commandPublicId: command.publicId,
+      executorRequestVersion: 2,
       localPhase: "prepared_no_effect",
     });
     if (
@@ -5650,8 +6569,31 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       await this.#removeCommand(command.publicId);
       return false;
     }
+    let preparedEntry = current;
+    if (!sameAuthority(preparedEntry.authority, authority)) {
+      preparedEntry = { ...preparedEntry, authority };
+      await this.#mutateJournal((state) =>
+        rebindPreparedCloudCommandJournalEntry(state, preparedEntry));
+    }
+    const inspected = await inspectRemoteCommand(command.payload, identity.accountKey, {
+      entityPublicId: command.publicId,
+      keyVersion: command.payload.keyVersion,
+      kind: "command",
+      userPublicId: identity.userPublicId,
+    });
+    if (inspected.kind === "invalid" || inspected.payload.kind !== command.kind) {
+      await this.#failPreparedWithoutEffect(
+        preparedEntry,
+        { ...command, state: "prepared" },
+        lease,
+        invalidPreparedPayloadResultCode,
+      );
+      return false;
+    }
+    const payload = inspected.payload;
+    await this.#assertCommandLeaseCurrent(sessionPublicId, identity, authority, signal);
     const effectEntry: CloudCommandJournalEntry = {
-      ...current,
+      ...preparedEntry,
       authority,
       phase: "effect_started",
     };
@@ -5659,6 +6601,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     const started = await this.#mutation("commands:markEffectStarted", {
       authority,
       commandPublicId: command.publicId,
+      executorRequestVersion: 2,
     });
     if (
       !isRecord(started)
@@ -5677,17 +6620,6 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     }
     let outcome: CloudCommandExecutionResult;
     try {
-      const payload = await decryptRemoteCommand(
-        command.payload,
-        identity.accountKey,
-        {
-          entityPublicId: command.publicId,
-          keyVersion: command.payload.keyVersion,
-          kind: "command",
-          userPublicId: identity.userPublicId,
-        },
-      );
-      if (payload.kind !== command.kind) throw new Error("Cloud command kind is inconsistent.");
       await this.#assertDaemonCurrent(signal);
       // A remote decision is honoured only while the device that requested it
       // is still active; a device revoked after enqueue cannot approve.
@@ -5757,6 +6689,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       await this.#mutation("commands:markEffectStarted", {
         authority: entry.authority,
         commandPublicId: entry.commandPublicId,
+        ...(entry.requestCommitmentVersion === 3 ? { executorRequestVersion: 2 } : {}),
       });
       await this.#settle(terminal);
     } else {
@@ -5770,6 +6703,91 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       });
     }
     await this.#removeCommand(entry.commandPublicId);
+  }
+
+  async #closeLegacyCommandTerminalWithoutOutcome(
+    identity: ActiveCloudIdentity,
+    entry: Extract<CloudCommandJournalEntry, { phase: "terminal" }>,
+    remote: ExactCloudCommand,
+    leases: Map<string, CloudLease>,
+  ): Promise<void> {
+    if (
+      remote.state !== "pending"
+      && remote.state !== "prepared"
+      && remote.state !== "effect_started"
+    ) throw new Error("Legacy cloud command recovery state is invalid.");
+    const lease = await this.#leaseForCommand(entry.sessionPublicId, identity, leases);
+    const liveAuthority = authorityOf(lease);
+    let hostedState = remote.state;
+    let boundAuthority = remote.boundAuthority;
+    if (hostedState === "pending" || hostedState === "prepared") {
+      const prepared = await this.#mutation("commands:prepare", {
+        authority: liveAuthority,
+        commandPublicId: entry.commandPublicId,
+        ...(entry.requestCommitmentVersion === 3 ? { executorRequestVersion: 2 } : {}),
+        localPhase: "prepared_no_effect",
+      });
+      if (
+        !isRecord(prepared)
+        || prepared.publicId !== entry.commandPublicId
+        || (prepared.state !== "prepared" && prepared.state !== "expired")
+      ) throw new Error("Cloud command prepare response is invalid.");
+      if (prepared.state === "expired") {
+        await this.#removeExactCommand(entry);
+        return;
+      }
+      hostedState = "prepared";
+      boundAuthority = liveAuthority;
+    }
+    const outcome = { code: "LOCAL_EFFECT_RECOVERY_REQUIRED", state: "ambiguous" as const };
+    const resultDigest = await sha256Hex(JSON.stringify(outcome));
+    if (boundAuthority === undefined) {
+      throw new Error("Legacy cloud command recovery has no bound authority.");
+    }
+    if (sameAuthority(boundAuthority, liveAuthority)) {
+      if (hostedState === "prepared") {
+        const started = await this.#mutation("commands:markEffectStarted", {
+          authority: liveAuthority,
+          commandPublicId: entry.commandPublicId,
+        });
+        if (
+          !isRecord(started)
+          || started.publicId !== entry.commandPublicId
+          || (started.state !== "effect_started" && started.state !== "expired")
+        ) throw new Error("Cloud command effect-start response is invalid.");
+        if (started.state === "expired") {
+          await this.#removeExactCommand(entry);
+          return;
+        }
+      }
+      const settled = await this.#mutation("commands:settle", {
+        authority: liveAuthority,
+        commandPublicId: entry.commandPublicId,
+        resultCode: outcome.code,
+        resultDigest,
+        state: outcome.state,
+      });
+      if (
+        !isRecord(settled)
+        || settled.publicId !== entry.commandPublicId
+        || settled.state !== "ambiguous"
+      ) throw new Error("Cloud command settlement response is invalid.");
+    } else {
+      const recovered = await this.#mutation("commands:recoverEffectStarted", {
+        commandPublicId: entry.commandPublicId,
+        recoveryAuthority: liveAuthority,
+        resultCode: outcome.code,
+        resultDigest,
+        staleAuthority: boundAuthority,
+        state: outcome.state,
+      });
+      if (
+        !isRecord(recovered)
+        || recovered.publicId !== entry.commandPublicId
+        || recovered.state !== "ambiguous"
+      ) throw new Error("Cloud command recovery response is invalid.");
+    }
+    await this.#removeExactCommand(entry);
   }
 
   async #settle(
@@ -5787,6 +6805,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   async #settleTerminal(
     identity: ActiveCloudIdentity,
     entry: Extract<CloudCommandJournalEntry, { phase: "terminal" }>,
+    remote: ExactCloudCommand,
   ): Promise<void> {
     const leaseValue = await this.#transport.query("leases:current", {
       sessionPublicId: entry.sessionPublicId,
@@ -5804,30 +6823,110 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     if (!sameDaemon || liveLease.leaseUntil <= this.#now()) {
       liveLease = await this.#ensureLease(entry.sessionPublicId, identity);
     }
-    if (sameAuthority(authorityOf(liveLease), entry.authority)) {
-      await this.#settle(entry);
+    const liveAuthority = authorityOf(liveLease);
+    if (sameAuthority(liveAuthority, entry.authority)) {
+      if (
+        entry.terminalState === "failed"
+        && preparedFailureResultCodes.has(entry.resultCode)
+      ) {
+        await this.#failPreparedTerminal(entry);
+      } else {
+        await this.#settle(entry);
+      }
       return;
     }
-    await this.#mutation("commands:recoverEffectStarted", {
+
+    if (
+      entry.terminalState === "failed"
+      && preparedFailureResultCodes.has(entry.resultCode)
+      && (remote.state === "pending" || remote.state === "prepared")
+    ) {
+      const prepared = await this.#mutation("commands:prepare", {
+        authority: liveAuthority,
+        commandPublicId: entry.commandPublicId,
+        ...(entry.requestCommitmentVersion === 3 ? { executorRequestVersion: 2 } : {}),
+        localPhase: "prepared_no_effect",
+      });
+      if (
+        !isRecord(prepared)
+        || prepared.publicId !== entry.commandPublicId
+        || (prepared.state !== "prepared" && prepared.state !== "expired")
+      ) throw new Error("Cloud command prepare response is invalid.");
+      if (prepared.state === "expired") return;
+      await this.#failPreparedTerminal({ ...entry, authority: liveAuthority });
+      return;
+    }
+
+    const outcome = { code: "LOCAL_EFFECT_RECOVERY_REQUIRED", state: "ambiguous" as const };
+    const recovered = await this.#mutation("commands:recoverEffectStarted", {
       commandPublicId: entry.commandPublicId,
-      recoveryAuthority: authorityOf(liveLease),
-      resultCode: entry.resultCode,
-      resultDigest: entry.resultDigest,
+      recoveryAuthority: liveAuthority,
+      resultCode: outcome.code,
+      resultDigest: await sha256Hex(JSON.stringify(outcome)),
       staleAuthority: entry.authority,
-      state: entry.terminalState,
+      state: outcome.state,
     });
+    if (
+      !isRecord(recovered)
+      || recovered.publicId !== entry.commandPublicId
+      || recovered.state !== "ambiguous"
+    ) throw new Error("Cloud command recovery response is invalid.");
   }
 
   async #findCommand(
+    identity: ActiveCloudIdentity,
     sessionPublicId: string,
     commandPublicId: string,
-  ): Promise<CloudCommand | null> {
+  ): Promise<ExactCloudCommand | null> {
     const command = parseExactCloudCommand(await this.#transport.query("commands:get", {
       commandPublicId,
     }));
     if (command !== null && command.sessionPublicId !== sessionPublicId) {
       throw new Error("Cloud command recovery changed its session authority.");
     }
+    if (command !== null) await assertCloudCommandRequestCommitment(identity, command);
+    return command;
+  }
+
+  async #findCommandForAdmissionDisposition(
+    identity: ActiveCloudIdentity,
+    sessionPublicId: string,
+    commandPublicId: string,
+  ): Promise<Readonly<{
+    command: ExactCloudCommand;
+    requestCommitmentVersion: 1 | 2 | 3;
+  }> | null> {
+    const command = parseExactCloudCommand(await this.#transport.query("commands:get", {
+      commandPublicId,
+    }));
+    if (command === null) return null;
+    if (command.sessionPublicId !== sessionPublicId) {
+      throw new Error("Cloud command recovery changed its session authority.");
+    }
+    return {
+      command,
+      requestCommitmentVersion: await cloudCommandRequestCommitmentVersion(identity, command),
+    };
+  }
+
+  async #findLegacyCommandForDisposition(
+    identity: ActiveCloudIdentity,
+    sessionPublicId: string,
+    commandPublicId: string,
+    requestingDevicePublicId?: string,
+  ): Promise<ExactCloudCommand | null> {
+    const command = parseExactCloudCommand(await this.#transport.query("commands:get", {
+      commandPublicId,
+    }));
+    if (command !== null && command.sessionPublicId !== sessionPublicId) {
+      throw new Error("Cloud command recovery changed its session authority.");
+    }
+    if (
+      command !== null
+      && requestingDevicePublicId !== undefined
+      && command.requestingDevicePublicId !== requestingDevicePublicId
+    ) throw new Error("Cloud command recovery changed its requesting device authority.");
+    if (command !== null) await assertLegacyCloudCommandForDisposition(identity, command);
     return command;
   }
 

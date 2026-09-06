@@ -22,6 +22,10 @@ import {
   requireDaemonDevice,
   requireDeviceAuthority,
 } from "./authority";
+import {
+  requireCommandExecutorRequestVersion,
+  requireTargetCommandRequestVersion,
+} from "./commandRequestVersion";
 import { validateIdempotencyInput } from "./idempotency";
 import { requireLiveExecutionLease } from "./leases";
 import {
@@ -39,15 +43,37 @@ import {
 
 const maximumCommandLifetimeMs = 7 * 24 * 60 * 60 * 1_000;
 export const commandTerminalRetentionMs = 30 * 24 * 60 * 60 * 1_000;
+const legacyRequestCommitmentResultCode = "LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT";
 const resultCodePattern = /^[A-Z][A-Z0-9_]{0,63}$/u;
 
 function terminalCleanupFields(
   command: Readonly<{ requesterAcknowledgedAt?: number }>,
   now: number,
-): Readonly<{ terminalCleanupAfter?: number }> {
-  return command.requesterAcknowledgedAt === undefined
-    ? {}
-    : { terminalCleanupAfter: now + commandTerminalRetentionMs };
+  terminalResultless: boolean,
+): Readonly<{ terminalCleanupAfter?: number; terminalResultless: boolean }> {
+  return {
+    ...(command.requesterAcknowledgedAt === undefined
+      ? {}
+      : { terminalCleanupAfter: now + commandTerminalRetentionMs }),
+    terminalResultless,
+  };
+}
+
+function preparedFailureCleanupFields(
+  command: Readonly<{ requesterAcknowledgedAt?: number }>,
+  now: number,
+  resultCode: string,
+): Readonly<{ terminalCleanupAfter?: number; terminalResultless: true }> {
+  // Legacy browser builds never acknowledge session-command receipts. The
+  // dedicated no-effect upgrade failure remains observable for a full normal
+  // retention window, then becomes collectible without weakening retention
+  // for any ordinary unacknowledged result-bearing command.
+  return {
+    ...(resultCode === legacyRequestCommitmentResultCode
+      ? { terminalCleanupAfter: now + commandTerminalRetentionMs }
+      : terminalCleanupFields(command, now, true)),
+    terminalResultless: true,
+  };
 }
 
 function storedAuthority(value: Readonly<{
@@ -86,11 +112,13 @@ async function commandByPublicId(
 export const enqueue = mutation({
   args: {
     deadline: v.number(),
+    expectedRequestingDevicePublicId: v.optional(v.string()),
     expectedTargetDevicePublicId: v.string(),
     idempotencyKey: v.string(),
     kind: commandKind,
     payload: encryptedEnvelope,
     publicId: v.string(),
+    requestCommitmentVersion: v.optional(v.literal(2)),
     requestDigest: v.string(),
     sessionPublicId: v.string(),
   },
@@ -99,6 +127,11 @@ export const enqueue = mutation({
     const now = Date.now();
     if (
       !isUuidV7(args.publicId)
+      || (args.requestCommitmentVersion === 2
+        ? args.expectedRequestingDevicePublicId !== authority.device.publicId
+        : args.expectedRequestingDevicePublicId !== undefined)
+      || (args.expectedRequestingDevicePublicId !== undefined
+        && !isOpaqueIdentifier(args.expectedRequestingDevicePublicId))
       || !isOpaqueIdentifier(args.expectedTargetDevicePublicId)
       || !isOpaqueIdentifier(args.sessionPublicId)
       || !isDigest(args.requestDigest)
@@ -130,7 +163,10 @@ export const enqueue = mutation({
     if (existing.length > 1) rejectAuthority();
     const replay = existing[0];
     if (replay !== undefined) {
-      if (replay.requestDigest !== args.requestDigest) throw new Error("IDEMPOTENCY_CONFLICT");
+      if (
+        replay.requestDigest !== args.requestDigest
+        || replay.requestCommitmentVersion !== args.requestCommitmentVersion
+      ) throw new Error("IDEMPOTENCY_CONFLICT");
       const targetDevice = await ctx.db.get(replay.targetDeviceId);
       if (
         targetDevice?.userId !== authority.userId
@@ -138,6 +174,12 @@ export const enqueue = mutation({
       ) rejectAuthority();
       return {
         publicId: replay.publicId,
+        ...(args.requestCommitmentVersion === 2
+          ? {
+              requestCommitmentVersion: 2 as const,
+              requestingDevicePublicId: authority.device.publicId,
+            }
+          : {}),
         replay: true,
         sessionPublicId: session.publicId,
         state: replay.state,
@@ -155,6 +197,11 @@ export const enqueue = mutation({
       || executionDevice.publicId !== args.expectedTargetDevicePublicId
       || executionDevice.status !== "active"
     ) rejectAuthority();
+    await requireTargetCommandRequestVersion(ctx, {
+      requestCommitmentVersion: args.requestCommitmentVersion,
+      targetDeviceId: session.executionDeviceId,
+      userId: authority.userId,
+    });
     const duplicatePublicId = await commandByPublicId(ctx, args.publicId);
     if (duplicatePublicId !== null) rejectAuthority();
     const commandDocument = {
@@ -165,6 +212,9 @@ export const enqueue = mutation({
       nonterminal: true,
       payload: args.payload,
       publicId: args.publicId,
+      ...(args.requestCommitmentVersion === undefined
+        ? {}
+        : { requestCommitmentVersion: args.requestCommitmentVersion }),
       requestDigest: args.requestDigest,
       requestingDeviceId: authority.deviceId,
       sessionId: session._id,
@@ -186,6 +236,12 @@ export const enqueue = mutation({
     await ctx.db.insert("securityEvents", securityDocument);
     return {
       publicId: args.publicId,
+      ...(args.requestCommitmentVersion === 2
+        ? {
+            requestCommitmentVersion: 2 as const,
+            requestingDevicePublicId: authority.device.publicId,
+          }
+        : {}),
       replay: false,
       sessionPublicId: session.publicId,
       state: "pending" as const,
@@ -216,6 +272,7 @@ function publicCommand(command: Readonly<{
     | "set_gateway_key";
   payload: Parameters<typeof parseEncryptedEnvelope>[0];
   publicId: string;
+  requestCommitmentVersion?: 2;
   result?: Parameters<typeof parseEncryptedEnvelope>[0];
   resultCode?: string;
   state: CommandState;
@@ -230,6 +287,9 @@ function publicCommand(command: Readonly<{
     kind: command.kind,
     payload: command.payload,
     publicId: command.publicId,
+    ...(command.requestCommitmentVersion === undefined
+      ? {}
+      : { requestCommitmentVersion: command.requestCommitmentVersion }),
     sessionPublicId,
     ...(command.result === undefined ? {} : { result: command.result }),
     ...(command.resultCode === undefined ? {} : { resultCode: command.resultCode }),
@@ -247,6 +307,9 @@ function publicCommandMetadata(command: Parameters<typeof publicCommand>[0], ses
     deadline: command.deadline,
     kind: command.kind,
     publicId: command.publicId,
+    ...(command.requestCommitmentVersion === undefined
+      ? {}
+      : { requestCommitmentVersion: command.requestCommitmentVersion }),
     sessionPublicId,
     ...(command.result === undefined ? {} : { result: command.result }),
     ...(command.resultCode === undefined ? {} : { resultCode: command.resultCode }),
@@ -316,6 +379,57 @@ export const get = query({
   },
 });
 
+// A durable local CLI outbox can outlive the device credential that created it.
+// Its public id alone is not authority: require both client-held idempotency
+// proofs before revealing the exact same-user row to a different active
+// device. This query is intentionally read-only; only the original requester
+// may acknowledge the command below.
+export const getForOutboxRecovery = query({
+  args: {
+    commandPublicId: v.string(),
+    idempotencyKey: v.string(),
+    requestDigest: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const authority = await requireDeviceAuthority(ctx);
+    if (
+      !isUuidV7(args.commandPublicId)
+      || !isUuidV7(args.idempotencyKey)
+      || !isDigest(args.requestDigest)
+    ) rejectAuthority();
+    const command = await commandByPublicId(ctx, args.commandPublicId);
+    if (command === null) return null;
+    if (
+      command.userId !== authority.userId
+      || command.idempotencyKey !== args.idempotencyKey
+      || command.requestDigest !== args.requestDigest
+    ) return null;
+    const [session, targetDevice, requestingDevice] = await Promise.all([
+      ctx.db.get(command.sessionId),
+      ctx.db.get(command.targetDeviceId),
+      ctx.db.get(command.requestingDeviceId),
+    ]);
+    if (
+      session?.userId !== authority.userId
+      || targetDevice?.userId !== authority.userId
+      || requestingDevice?.userId !== authority.userId
+    ) return null;
+    return {
+      kind: command.kind,
+      publicId: command.publicId,
+      ...(command.requestCommitmentVersion === undefined
+        ? {}
+        : { requestCommitmentVersion: command.requestCommitmentVersion }),
+      requestDigest: command.requestDigest,
+      requestingDevicePublicId: requestingDevice.publicId,
+      ...(command.resultCode === undefined ? {} : { resultCode: command.resultCode }),
+      sessionPublicId: session.publicId,
+      state: command.state,
+      targetDevicePublicId: targetDevice.publicId,
+    };
+  },
+});
+
 export const acknowledgeReceipt = mutation({
   args: {
     commandPublicId: v.string(),
@@ -348,7 +462,12 @@ export const acknowledgeReceipt = mutation({
       .includes(command.state);
     const commandPatch = {
       requesterAcknowledgedAt: now,
-      ...(terminal ? { terminalCleanupAfter: now + commandTerminalRetentionMs } : {}),
+      ...(terminal
+        ? {
+            terminalCleanupAfter: now + commandTerminalRetentionMs,
+            terminalResultless: command.result === undefined,
+          }
+        : {}),
     };
     await adjustCommandQuotaForPatch(ctx, authority.userId, command, commandPatch);
     await ctx.db.patch(command._id, commandPatch);
@@ -457,6 +576,7 @@ export const prepare = mutation({
   args: {
     authority: authorityTuple,
     commandPublicId: v.string(),
+    executorRequestVersion: v.optional(v.literal(2)),
     localPhase: v.literal("prepared_no_effect"),
   },
   handler: async (ctx, args) => {
@@ -464,6 +584,10 @@ export const prepare = mutation({
       ctx,
       args.commandPublicId,
       args.authority,
+    );
+    requireCommandExecutorRequestVersion(
+      current.command.requestCommitmentVersion,
+      args.executorRequestVersion,
     );
     const now = Date.now();
     if (
@@ -473,7 +597,7 @@ export const prepare = mutation({
       const commandPatch = {
         nonterminal: false,
         state: "expired",
-        ...terminalCleanupFields(current.command, now),
+        ...terminalCleanupFields(current.command, now, true),
         updatedAt: now,
       } as const;
       await adjustCommandQuotaForPatch(
@@ -531,12 +655,20 @@ export const prepare = mutation({
 });
 
 export const markEffectStarted = mutation({
-  args: { authority: authorityTuple, commandPublicId: v.string() },
+  args: {
+    authority: authorityTuple,
+    commandPublicId: v.string(),
+    executorRequestVersion: v.optional(v.literal(2)),
+  },
   handler: async (ctx, args) => {
     const current = await requireCommandExecutionAuthority(
       ctx,
       args.commandPublicId,
       args.authority,
+    );
+    requireCommandExecutorRequestVersion(
+      current.command.requestCommitmentVersion,
+      args.executorRequestVersion,
     );
     const now = Date.now();
     const disposition = commandAuthorityTransitionDisposition({
@@ -555,7 +687,7 @@ export const markEffectStarted = mutation({
       const commandPatch = {
         nonterminal: false,
         state: "expired",
-        ...terminalCleanupFields(current.command, now),
+        ...terminalCleanupFields(current.command, now, true),
         updatedAt: now,
       } as const;
       await adjustCommandQuotaForPatch(
@@ -582,6 +714,153 @@ export const markEffectStarted = mutation({
     );
     await ctx.db.patch(current.command._id, commandPatch);
     return { publicId: current.command.publicId, replay: false, state: "effect_started" as const };
+  },
+});
+
+/**
+ * Close a prepared command whose authenticated payload is deterministically
+ * unusable. This is a distinct pre-effect transition: ordinary settlement is
+ * reserved for commands that crossed `effect_started`.
+ */
+export const failPrepared = mutation({
+  args: {
+    authority: authorityTuple,
+    commandPublicId: v.string(),
+    resultCode: v.string(),
+    resultDigest: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const target = await requireDaemonDevice(ctx);
+    const command = await commandByPublicId(ctx, args.commandPublicId);
+    if (
+      command?.userId !== target.userId
+      || command.targetDeviceId !== target.deviceId
+      || !isDigest(args.resultDigest)
+      || !resultCodePattern.test(args.resultCode)
+    ) rejectAuthority();
+    const session = await ctx.db.get(command.sessionId);
+    if (
+      session?.userId !== target.userId
+      || session.executionDeviceId !== target.deviceId
+    ) rejectAuthority();
+    const bound = command.boundAuthority;
+    if (bound === undefined || !authorityMatches(storedAuthority(bound), args.authority)) {
+      rejectAuthority();
+    }
+    if (command.state === "failed") {
+      if (
+        command.result !== undefined
+        || command.resultCode !== args.resultCode
+        || command.resultDigest !== args.resultDigest
+      ) throw new Error("COMMAND_RESULT_CONFLICT");
+      return { publicId: command.publicId, replay: true, state: "failed" as const };
+    }
+    if (
+      command.state === "expired"
+      && !command.nonterminal
+      && command.result === undefined
+      && command.resultCode === undefined
+      && command.resultDigest === undefined
+    ) {
+      // `failPrepared` itself may have expired the row before its response was
+      // lost. Confirm that exact result-less terminal without reviving a lease.
+      return { publicId: command.publicId, replay: true, state: "expired" as const };
+    }
+    const lease = await requireLiveExecutionLease(ctx, {
+      authority: args.authority,
+      deviceId: target.deviceId,
+      sessionId: session._id,
+      userId: target.userId,
+    });
+    const now = Date.now();
+    if (command.state !== "prepared") throw new Error("COMMAND_TRANSITION_CONFLICT");
+    if (
+      !authorityMatches(storedAuthority(lease), args.authority)
+      || lease.leaseUntil <= now
+    ) rejectAuthority();
+    if (command.deadline <= now) {
+      const commandPatch = {
+        nonterminal: false,
+        state: "expired",
+        ...terminalCleanupFields(command, now, true),
+        updatedAt: now,
+      } as const;
+      await adjustCommandQuotaForPatch(ctx, target.userId, command, commandPatch);
+      await ctx.db.patch(command._id, commandPatch);
+      return { publicId: command.publicId, replay: false, state: "expired" as const };
+    }
+    const commandPatch = {
+      nonterminal: false,
+      resultCode: args.resultCode,
+      resultDigest: args.resultDigest,
+      state: "failed",
+      ...preparedFailureCleanupFields(command, now, args.resultCode),
+      updatedAt: now,
+    } as const;
+    await adjustCommandQuotaForPatch(ctx, target.userId, command, commandPatch);
+    await ctx.db.patch(command._id, commandPatch);
+    const securityDocument = {
+      actorDeviceId: target.deviceId,
+      createdAt: now,
+      entityId: command.publicId,
+      event: "command_terminal",
+      userId: target.userId,
+    } as const;
+    await reserveQuotaForInsert(ctx, target.userId, "security", securityDocument);
+    await ctx.db.insert("securityEvents", securityDocument);
+    return { publicId: command.publicId, replay: false, state: "failed" as const };
+  },
+});
+
+/*
+ * The local journal is written before a hosted terminal transition. Requester
+ * revocation can therefore win after the target has durably recorded either a
+ * no-effect failure or a completed local effect. This mutation changes
+ * nothing: it proves the exact result-less hosted terminal under the original
+ * target and bound authority so the daemon may retire only its local journal.
+ */
+export const confirmTerminalRecovery = mutation({
+  args: {
+    commandPublicId: v.string(),
+    localPhase: v.union(
+      v.literal("prepared_no_effect"),
+      v.literal("effect_started"),
+    ),
+    staleAuthority: authorityTuple,
+  },
+  handler: async (ctx, args) => {
+    const target = await requireDaemonDevice(ctx);
+    if (!isUuidV7(args.commandPublicId)) rejectAuthority();
+    const command = await commandByPublicId(ctx, args.commandPublicId);
+    if (
+      command?.userId !== target.userId
+      || command.targetDeviceId !== target.deviceId
+    ) rejectAuthority();
+    const [session, requester] = await Promise.all([
+      ctx.db.get(command.sessionId),
+      ctx.db.get(command.requestingDeviceId),
+    ]);
+    const terminalMatches = command.state === "cancelled"
+      || command.state === "expired"
+      || (
+        command.state === "ambiguous"
+        && args.localPhase === "effect_started"
+        && requester?.status === "revoked"
+      );
+    const boundMatches = command.boundAuthority === undefined
+      ? args.localPhase === "prepared_no_effect"
+      : authorityMatches(storedAuthority(command.boundAuthority), args.staleAuthority);
+    if (
+      session?.userId !== target.userId
+      || requester?.userId !== target.userId
+      || command.nonterminal
+      || !boundMatches
+      || !terminalMatches
+      || command.result !== undefined
+      || command.resultCode !== undefined
+      || command.resultDigest !== undefined
+    ) throw new Error("COMMAND_TERMINAL_RECOVERY_CONFLICT");
+    return { publicId: command.publicId, replay: true, state: command.state };
   },
 });
 
@@ -649,7 +928,7 @@ export const settle = mutation({
       resultCode: args.resultCode,
       resultDigest: args.resultDigest,
       state: disposition.state,
-      ...terminalCleanupFields(command, now),
+      ...terminalCleanupFields(command, now, args.result === undefined),
       updatedAt: now,
     };
     await adjustCommandQuotaForPatch(ctx, target.userId, command, commandPatch);
@@ -668,10 +947,10 @@ export const settle = mutation({
 });
 
 // A target may crash after durably recording that an effect could have begun.
-// Once its old fence expires, a newer live fence can publish the already
-// durable terminal receipt, or conservatively close an unknown effect as
-// ambiguous, without replaying the provider effect. This is deliberately the
-// only transition that may cross execution fences.
+// Once its old fence expires, a newer live fence may only close that unknown
+// effect as ambiguous, without replaying it or adopting the prior process's
+// claimed outcome. This is deliberately the only transition that may cross
+// execution fences.
 export const recoverEffectStarted = mutation({
   args: {
     commandPublicId: v.string(),
@@ -679,7 +958,7 @@ export const recoverEffectStarted = mutation({
     resultCode: v.string(),
     resultDigest: v.string(),
     staleAuthority: authorityTuple,
-    state: v.union(v.literal("applied"), v.literal("failed"), v.literal("ambiguous")),
+    state: v.literal("ambiguous"),
   },
   handler: async (ctx, args) => {
     const target = await requireDeviceAuthority(ctx);
@@ -700,16 +979,6 @@ export const recoverEffectStarted = mutation({
       bound === undefined
       || !authorityMatches(storedAuthority(bound), args.staleAuthority)
     ) rejectAuthority();
-    if (command.state === args.state) {
-      if (
-        command.resultDigest !== args.resultDigest
-        || command.resultCode !== args.resultCode
-      ) throw new Error("COMMAND_RESULT_CONFLICT");
-      return { publicId: command.publicId, replay: true, state: args.state };
-    }
-    if (command.state !== "prepared" && command.state !== "effect_started") {
-      throw new Error("COMMAND_TRANSITION_CONFLICT");
-    }
     if (args.recoveryAuthority.fence <= args.staleAuthority.fence) rejectAuthority();
     await requireLiveExecutionLease(ctx, {
       authority: args.recoveryAuthority,
@@ -717,13 +986,23 @@ export const recoverEffectStarted = mutation({
       sessionId: session._id,
       userId: target.userId,
     });
+    if (command.state === "ambiguous") {
+      if (
+        command.resultDigest !== args.resultDigest
+        || command.resultCode !== args.resultCode
+      ) throw new Error("COMMAND_RESULT_CONFLICT");
+      return { publicId: command.publicId, replay: true, state: args.state };
+    }
+    if (command.state !== "effect_started") {
+      throw new Error("COMMAND_TRANSITION_CONFLICT");
+    }
     const now = Date.now();
     const commandPatch = {
       nonterminal: false,
       resultCode: args.resultCode,
       resultDigest: args.resultDigest,
       state: args.state,
-      ...terminalCleanupFields(command, now),
+      ...terminalCleanupFields(command, now, true),
       updatedAt: now,
     } as const;
     await adjustCommandQuotaForPatch(ctx, target.userId, command, commandPatch);
@@ -761,7 +1040,7 @@ export const cancelPending = mutation({
     const commandPatch = {
       nonterminal: false,
       state: "cancelled",
-      ...terminalCleanupFields(command, now),
+      ...terminalCleanupFields(command, now, true),
       updatedAt: now,
     } as const;
     await adjustCommandQuotaForPatch(ctx, authority.userId, command, commandPatch);

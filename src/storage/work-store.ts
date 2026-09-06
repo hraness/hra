@@ -2,7 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 
 import type { Database } from "bun:sqlite";
 
-import { currentPresetContract, type Provider } from "../domain/presets";
+import {
+  devinPresetContract,
+  isReboundCodexPreset,
+  sharedActiveCodexPresetContract,
+  type Provider,
+} from "../domain/presets";
 import { isUuidV7 } from "../domain/uuid-v7";
 import { workReadSuccessWireBytes } from "../domain/terminal-json";
 import { workPreparedEffectMessage } from "../domain/work-message";
@@ -14,6 +19,8 @@ import {
 
 import {
   WORK_ACTIVE_LIMIT,
+  WORK_APPLY_REQUEST_LEGACY_VERSION,
+  WORK_APPLY_REQUEST_VERSION,
   WORK_EVIDENCE_LIMIT,
   WORK_EVENT_PAGE_LIMIT,
   WORK_EVENT_PAGE_MAX_BYTES,
@@ -46,6 +53,7 @@ import {
   createWorkSignalId,
   createWorkSubmissionId,
   createWorkTaskId,
+  currentWorkApplyRequestSource,
   workEventBodySchema,
   workEventSchema,
   workEventPageSchema,
@@ -54,6 +62,7 @@ import {
   workNestedEffectReceiptSchema,
   workOperationResultSchema,
   workOperationSchema,
+  workOperationRequiresPresetContract,
   workPollSchema,
   workPreparedEffectSchema,
   workPreparedEffectStatusSchema,
@@ -70,6 +79,7 @@ import {
   type WorkEventPage as DomainWorkEventPage,
   type WorkOperation,
   type WorkOperationResult,
+  type WorkApplyRequestSource,
   type WorkAttemptRecord,
   type WorkAttemptReportRecord,
   type WorkPoll,
@@ -183,6 +193,53 @@ const supportedWorkSessionAuthorityExistsSql = (
   }`,
 );
 
+// Work routes are Codex low/high/ultra. High and Ultra share this active
+// contract, while Low is byte-identical across both frozen contracts.
+const ACTIVE_WORK_PRESET_CONTRACT = sharedActiveCodexPresetContract();
+
+const normalizeWorkApplyRequestSource = (
+  operation: WorkOperation,
+  source: WorkApplyRequestSource | undefined,
+): WorkApplyRequestSource => {
+  const candidate: unknown = source ?? currentWorkApplyRequestSource(operation);
+  if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) {
+    throw new WorkStoreError("ROUTE_MISMATCH");
+  }
+  const record = candidate as Readonly<Record<string, unknown>>;
+  if (record.version === WORK_APPLY_REQUEST_LEGACY_VERSION) {
+    if (Object.keys(record).length !== 1) throw new WorkStoreError("ROUTE_MISMATCH");
+    return { version: WORK_APPLY_REQUEST_LEGACY_VERSION };
+  }
+  if (
+    record.version !== WORK_APPLY_REQUEST_VERSION
+    || Object.keys(record).some((key) => key !== "version" && key !== "presetContract")
+    || (record.presetContract !== undefined
+      && record.presetContract !== 1
+      && record.presetContract !== 2)
+  ) {
+    throw new WorkStoreError("ROUTE_MISMATCH");
+  }
+  return {
+    version: WORK_APPLY_REQUEST_VERSION,
+    ...(record.presetContract === undefined
+      ? {}
+      : { presetContract: record.presetContract }),
+  };
+};
+
+const workApplyRequestDigest = (
+  operation: WorkOperation,
+  source: WorkApplyRequestSource,
+): string => source.version === WORK_APPLY_REQUEST_LEGACY_VERSION
+  ? digestJson(operation)
+  : digestJson({
+      requestVersion: source.version,
+      ...(source.presetContract === undefined
+        ? {}
+        : { presetContract: source.presetContract }),
+      operation,
+    });
+
 export const WORK_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS work_clock (
   singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -247,20 +304,17 @@ BEGIN SELECT RAISE(ABORT,'WORK_RETAINED_LIMIT'); END;
 DROP TRIGGER IF EXISTS work_devin_preset_contract_guard;
 CREATE TRIGGER work_devin_preset_contract_guard
 BEFORE INSERT ON works
-WHEN NEW.preset_contract!=${currentPresetContract} AND EXISTS (
-  SELECT 1 FROM sessions AS s
-  WHERE s.id=NEW.coordinator_session_id AND s.provider_v39='devin'
-)
-BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END;
+WHEN NEW.preset_contract!=${ACTIVE_WORK_PRESET_CONTRACT}
+BEGIN SELECT RAISE(ABORT,'WORK_PRESET_CONTRACT_MISMATCH'); END;
 DROP TRIGGER IF EXISTS work_session_devin_contract_guard;
 CREATE TRIGGER work_session_devin_contract_guard
 BEFORE UPDATE OF provider_v39,preset_contract ON sessions
 WHEN NEW.provider_v39='devin' AND (
-  NEW.preset_contract!=${currentPresetContract}
+  NEW.preset_contract!=${devinPresetContract}
   OR EXISTS (
     SELECT 1 FROM works AS w
-    WHERE w.coordinator_session_id=OLD.id
-      AND w.preset_contract!=${currentPresetContract}
+    WHERE w.coordinator_session_id=NEW.id
+      AND w.preset_contract!=${devinPresetContract}
   )
 )
 BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END;
@@ -1113,6 +1167,39 @@ const exactWorkAuthorityTriggerSql = new Map(
   }),
 );
 
+// Schema v39 shipped these exact contract-2 guards. Current Work routes use
+// the active Codex contract instead, so predecessor admission must compare
+// against frozen v39 SQL rather than deriving history from WORK_SCHEMA_SQL.
+const providerVersion39PresetContractGuardSql = new Map<string, string>([
+  ["work_devin_preset_contract_guard", normalizeWorkSchemaSql(`
+CREATE TRIGGER work_devin_preset_contract_guard
+BEFORE INSERT ON works
+WHEN NEW.preset_contract!=${devinPresetContract} AND EXISTS (
+  SELECT 1 FROM sessions AS s
+  WHERE s.id=NEW.coordinator_session_id AND s.provider_v39='devin'
+)
+BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END
+`)],
+  ["work_session_devin_contract_guard", normalizeWorkSchemaSql(`
+CREATE TRIGGER work_session_devin_contract_guard
+BEFORE UPDATE OF provider_v39,preset_contract ON sessions
+WHEN NEW.provider_v39='devin' AND (
+  NEW.preset_contract!=${devinPresetContract}
+  OR EXISTS (
+    SELECT 1 FROM works AS w
+    WHERE w.coordinator_session_id=OLD.id
+      AND w.preset_contract!=${devinPresetContract}
+  )
+)
+BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END
+  `)],
+]);
+
+const providerVersion40WorkAuthorityTriggerSql = new Map<string, string>(exactWorkAuthorityTriggerSql);
+for (const [name, sql] of providerVersion39PresetContractGuardSql) {
+  providerVersion40WorkAuthorityTriggerSql.set(name, sql);
+}
+
 const providerVersion39AddedAuthorityTriggerNames = new Set([
   "work_coordinator_account_authority_guard",
   "work_member_account_authority_guard",
@@ -1249,7 +1336,10 @@ const requiredWorkTriggers = [
   "work_nested_effect_settlements_no_delete",
 ] as const;
 
-const assertWorkSchemaShape = (database: Database): void => {
+const assertWorkSchemaShape = (
+  database: Database,
+  expectedAuthorityTriggerSql: ReadonlyMap<string, string> = exactWorkAuthorityTriggerSql,
+): void => {
   const foreignKeys = database.query("PRAGMA foreign_keys").get() as { foreign_keys?: unknown } | null;
   if (foreignKeys?.foreign_keys !== 1) throw new Error("WORK_SCHEMA_FOREIGN_KEYS_DISABLED");
   const rows = database.query("PRAGMA table_list").all() as Array<{
@@ -1283,7 +1373,7 @@ const assertWorkSchemaShape = (database: Database): void => {
       row?.type !== "trigger"
       || typeof row.tbl_name !== "string"
       || typeof row.sql !== "string"
-      || normalizeWorkSchemaSql(row.sql) !== exactWorkAuthorityTriggerSql.get(name)
+      || normalizeWorkSchemaSql(row.sql) !== expectedAuthorityTriggerSql.get(name)
     ) throw new Error(`WORK_SCHEMA_STALE_TRIGGER:${name}`);
   }
   const requiredColumns: Readonly<Record<string, readonly string[]>> = {
@@ -1341,12 +1431,20 @@ const assertWorkSchemaShape = (database: Database): void => {
   }
   if (database.query(
     `SELECT 1
-     FROM works AS w
-     JOIN sessions AS s ON s.id=w.coordinator_session_id
-     WHERE s.provider_v39='devin' AND w.preset_contract!=${currentPresetContract}
+     FROM sessions AS s
+     WHERE s.provider_v39='devin' AND s.preset_contract!=${devinPresetContract}
      LIMIT 1`,
   ).get() !== null) {
-    throw new Error("WORK_SCHEMA_DEVIN_PRESET_CONTRACT_INVALID");
+    throw new Error("WORK_SCHEMA_DEVIN_SESSION_PRESET_CONTRACT_INVALID");
+  }
+  if (database.query(
+    `SELECT 1
+     FROM works AS w
+     JOIN sessions AS s ON s.id=w.coordinator_session_id
+     WHERE s.provider_v39='devin' AND w.preset_contract!=${devinPresetContract}
+     LIMIT 1`,
+  ).get() !== null) {
+    throw new Error("WORK_SCHEMA_DEVIN_WORK_PRESET_CONTRACT_INVALID");
   }
   const clock = database.query(
     "SELECT logical_time FROM work_clock WHERE singleton=1",
@@ -1363,6 +1461,13 @@ export function assertWorkSchema(database: Database): void {
   assertWorkSchemaShape(database);
   const integrity = database.query("PRAGMA foreign_key_check").all();
   if (integrity.length !== 0) throw new Error("WORK_SCHEMA_FOREIGN_KEY_VIOLATION");
+}
+
+/** Exact Work authority surface shipped with adoption schema v40. */
+export function assertProviderVersion40WorkSchema(database: Database): void {
+  assertWorkSchemaShape(database, providerVersion40WorkAuthorityTriggerSql);
+  const integrity = database.query("PRAGMA foreign_key_check").all();
+  if (integrity.length !== 0) throw new Error("WORK_SCHEMA_V40_FOREIGN_KEY_VIOLATION");
 }
 
 /**
@@ -1408,7 +1513,8 @@ export function assertProviderVersion39WorkSchema(database: Database): void {
     const row = triggers.get(name);
     const expected = name === "work_signal_member_guard"
       ? providerVersion39SignalMemberGuardSql
-      : exactWorkAuthorityTriggerSql.get(name);
+      : providerVersion39PresetContractGuardSql.get(name)
+        ?? exactWorkAuthorityTriggerSql.get(name);
     if (
       row?.type !== "trigger"
       || typeof row.tbl_name !== "string"
@@ -4683,18 +4789,57 @@ export class WorkStore {
     };
   }
 
-  apply(operationInput: unknown, idempotencyKey?: string): WorkApplyResult {
+  #assertFreshApplySource(
+    operation: WorkOperation,
+    source: WorkApplyRequestSource,
+  ): void {
+    const requiresPresetContract = workOperationRequiresPresetContract(operation);
+    if (!requiresPresetContract) {
+      if (source.version === WORK_APPLY_REQUEST_VERSION && source.presetContract !== undefined) {
+        throw new WorkStoreError("ROUTE_MISMATCH");
+      }
+      return;
+    }
+    if (
+      source.version !== WORK_APPLY_REQUEST_VERSION
+      || source.presetContract !== ACTIVE_WORK_PRESET_CONTRACT
+    ) {
+      throw new WorkStoreError("ROUTE_MISMATCH");
+    }
+  }
+
+  #assertFreshWorkContract(operation: WorkOperation): void {
+    if (
+      operation.kind === "task.addBatch"
+      && operation.tasks.some((task) => isReboundCodexPreset(task.preset))
+      && this.#requireWork(operation.workId).preset_contract !== ACTIVE_WORK_PRESET_CONTRACT
+    ) {
+      throw new WorkStoreError("ROUTE_MISMATCH");
+    }
+  }
+
+  apply(
+    operationInput: unknown,
+    idempotencyKey?: string,
+    sourceInput?: WorkApplyRequestSource,
+  ): WorkApplyResult {
     const operation = workOperationSchema.parse(operationInput);
     if (idempotencyKey !== undefined && idempotencyKey !== operation.idempotencyKey) {
       throw new WorkStoreError("BAD_IDEMPOTENCY_KEY");
     }
+    const source = normalizeWorkApplyRequestSource(operation, sourceInput);
     this.#authorizeOperation(operation);
-    const requestDigest = digestJson(operation);
+    const requestDigest = workApplyRequestDigest(operation, source);
     const releaseReplay = this.#replayReleaseTombstone(operation, requestDigest);
     if (releaseReplay !== null) return releaseReplay;
     this.#assertOperationNotReleased(operation);
     const earlyReplay = this.#replayIntent(operation, requestDigest);
     if (earlyReplay !== null) return earlyReplay;
+    this.#assertFreshApplySource(operation, source);
+    // The immutable Work contract is part of fresh rebound-task admission.
+    // Check it before the recovery sweep so a rejected source cannot expire
+    // leases or otherwise change durable state on its way to rejection.
+    this.#assertFreshWorkContract(operation);
     this.#preverifyOperationEvidence(operation);
     try {
       if (operation.kind !== "work.create") {
@@ -4733,7 +4878,7 @@ export class WorkStore {
             this.#assertIntentCapacity(operation.workId, true);
           }
         }
-        const result = this.#applyFresh(operation);
+        const result = this.#applyFresh(operation, requestDigest);
         if (operation.kind === "work.release") return result;
         const workId = operation.kind === "work.create"
           ? (result as Extract<WorkApplyResult, { kind: "work.create" }>).work.id
@@ -4746,7 +4891,7 @@ export class WorkStore {
     }
   }
 
-  #applyFresh(operation: WorkOperation): WorkApplyResult {
+  #applyFresh(operation: WorkOperation, requestDigest: string): WorkApplyResult {
     switch (operation.kind) {
       case "work.create": {
         const duplicate = this.#database.query(
@@ -4782,7 +4927,7 @@ export class WorkStore {
           operation.clientRef,
           operation.coordinatorSessionId,
           operation.objective,
-          currentPresetContract,
+          ACTIVE_WORK_PRESET_CONTRACT,
           randomUUID(),
           now,
           now,
@@ -5074,7 +5219,7 @@ export class WorkStore {
       case "work.cancel":
         return this.#terminalWork(operation);
       case "work.release":
-        return this.#releaseWork(operation);
+        return this.#releaseWork(operation, requestDigest);
       case "attempt.reconcile":
         return this.#reconcile(operation);
     }
@@ -5958,6 +6103,7 @@ export class WorkStore {
 
   #releaseWork(
     operation: Extract<WorkOperation, { kind: "work.release" }>,
+    releaseRequestDigest: string,
   ): WorkApplyResult {
     const work = this.#requireWork(operation.workId);
     if (!["completed", "failed", "cancelled"].includes(work.state)) {
@@ -5986,7 +6132,6 @@ export class WorkStore {
 
     const now = this.#tick();
     const discardedRecordCounts = this.#discardedRecordCounts(operation.workId);
-    const releaseRequestDigest = digestJson(operation);
     const discardedRecordsDigest = digestJson({
       discardedRecordCounts,
       finalHeadHash: work.head_hash,

@@ -64,13 +64,14 @@ import {
   type CloudPushWakePort,
   type CloudPushWakeSubscriber,
 } from "./push-wake";
-import { hmacSha256Hex, sha256Hex } from "./crypto";
+import { encryptBytes, hmacSha256Hex, sha256Hex } from "./crypto";
 import {
   compareDeviceAuthority,
   deviceCommandRecoveryAdmitted,
   deviceCommandRecoveryReplayAdmitted,
 } from "./device-commands";
 import {
+  cloudPayloadAad,
   decryptDeviceRegistry,
   decryptDeviceCommandResult,
   decryptNotificationEmail,
@@ -93,6 +94,39 @@ function doneLocalSessionPage(
 const usageServerAdmissionMinIntervalMs = 24 * 60 * 60 * 1_000;
 const userPublicId = "user_12345678";
 const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
+const testDeviceRegistry: DeviceRegistryPayload = {
+  accounts: [],
+  daemonVersion: "0.3.0",
+  defaultApprovalMode: "auto:all",
+  defaultPreset: "ultra",
+  heartbeatAt: fixedNow,
+  machineLabel: "Test daemon",
+  projects: [],
+  proseAutorespondConfigured: false,
+  scheduledTasks: [],
+  showThinkingDefault: false,
+  version: 1,
+};
+
+async function encryptAuthenticatedForeignPayload(
+  value: unknown,
+  authority: Readonly<{
+    entityPublicId: string;
+    kind: "command" | "device_command";
+  }>,
+): Promise<EncryptedEnvelope> {
+  const payloadAuthority = {
+    ...authority,
+    keyVersion: 1,
+    userPublicId,
+  } as const;
+  return await encryptBytes(
+    new TextEncoder().encode(JSON.stringify(value)),
+    key,
+    1,
+    cloudPayloadAad(payloadAuthority),
+  );
+}
 
 function uuidV7(sequence: number, now: number = fixedNow): string {
   const timestamp = now.toString(16).padStart(12, "0").slice(-12);
@@ -150,8 +184,9 @@ type FakeCommand = {
   kind: CommandKind;
   payload: EncryptedEnvelope;
   publicId: string;
+  requestCommitmentVersion?: 2;
   requestDigest: string;
-  requestingDevicePublicId?: string;
+  requestingDevicePublicId: string;
   resultCode?: string;
   resultDigest?: string;
   sessionPublicId: string;
@@ -173,6 +208,7 @@ type FakeDeviceCommand = {
   kind: DeviceCommandKind;
   payload: EncryptedEnvelope;
   publicId: string;
+  requestCommitmentVersion?: 2;
   requestDigest: string;
   requestingDevicePublicId: string;
   result?: EncryptedEnvelope;
@@ -185,21 +221,110 @@ type FakeDeviceCommand = {
   updatedAt: number;
 };
 
+async function refreshRemoteCommandRequestDigest(command: FakeCommand): Promise<void> {
+  command.requestCommitmentVersion = 2;
+  command.requestDigest = await hmacSha256Hex(
+    key,
+    "command-enqueue",
+    JSON.stringify({
+      deadline: command.deadline,
+      expectedTargetDevicePublicId: command.targetDevicePublicId,
+      kind: command.kind,
+      payload: command.payload,
+      publicId: command.publicId,
+      requestingDevicePublicId: command.requestingDevicePublicId,
+      sessionPublicId: command.sessionPublicId,
+    }),
+  );
+}
+
+async function refreshLegacyRemoteCommandRequestDigest(command: FakeCommand): Promise<void> {
+  delete command.requestCommitmentVersion;
+  command.requestDigest = await hmacSha256Hex(
+    key,
+    "command-enqueue",
+    JSON.stringify({
+      deadline: command.deadline,
+      expectedTargetDevicePublicId: command.targetDevicePublicId,
+      kind: command.kind,
+      payload: command.payload,
+      publicId: command.publicId,
+      sessionPublicId: command.sessionPublicId,
+    }),
+  );
+}
+
+async function refreshLegacyDeviceCommandRequestDigest(
+  command: FakeDeviceCommand,
+): Promise<void> {
+  delete command.requestCommitmentVersion;
+  command.requestDigest = await hmacSha256Hex(
+    key,
+    "device-command-enqueue",
+    JSON.stringify({
+      deadline: command.deadline,
+      expectedTargetDevicePublicId: command.targetDevicePublicId,
+      kind: command.kind,
+      payload: command.payload,
+      publicId: command.publicId,
+    }),
+  );
+}
+
+async function replaceWithAuthenticatedForeignRemotePayload(
+  command: FakeCommand,
+  value: unknown,
+): Promise<void> {
+  command.payload = await encryptAuthenticatedForeignPayload(value, {
+    entityPublicId: command.publicId,
+    kind: "command",
+  });
+  await refreshRemoteCommandRequestDigest(command);
+}
+
+async function replaceWithAuthenticatedForeignDevicePayload(
+  command: FakeDeviceCommand,
+  value: unknown,
+): Promise<void> {
+  command.payload = await encryptAuthenticatedForeignPayload(value, {
+    entityPublicId: command.publicId,
+    kind: "device_command",
+  });
+  command.requestCommitmentVersion = 2;
+  command.requestDigest = await hmacSha256Hex(
+    key,
+    "device-command-enqueue",
+    JSON.stringify({
+      deadline: command.deadline,
+      expectedTargetDevicePublicId: command.targetDevicePublicId,
+      kind: command.kind,
+      payload: command.payload,
+      publicId: command.publicId,
+      requestingDevicePublicId: command.requestingDevicePublicId,
+    }),
+  );
+}
+
 class FakeCloud {
   now = fixedNow;
   offline = false;
   offlineMessage = "network offline";
   failMarkAfterEffectOnce = false;
   failPrepareOnce = false;
+  failPrepareAfterEffectOnce = false;
   failDeviceMarkAfterEffectOnce = false;
   failDeviceMarkBeforeEffectOnce = false;
   failDevicePrepareAfterEffectOnce = false;
   failDevicePrepareBeforeEffectOnce = false;
+  failDevicePreparedFailureAfterEffectOnce = false;
   failDeviceRecoveryAfterEffectOnce = false;
+  cancelSessionCommandBeforePreparedFailureOnce = false;
+  revokeSessionCommandBeforeSettleOnce = false;
   revokeDeviceCommandAfterMarkOnce = false;
   revokeDeviceCommandBeforeSettleOnce = false;
   failRevokedDeviceCommandConfirmationOnce = false;
   failTerminalRecoveryConfirmationOnce = false;
+  failSessionTerminalRecoveryConfirmationOnce = false;
   failSettleAfterEffectOnce = false;
   failEpochAfterEffectOnce = false;
   failUsageAccountAfterEffectOnce = false;
@@ -236,7 +361,16 @@ class FakeCloud {
   readonly headGetCalls: string[] = [];
   readonly commandGetCalls: string[] = [];
   readonly commandEffectStartCalls: string[] = [];
+  readonly commandPrepareCalls: string[] = [];
+  readonly commandPreparedFailureCalls: string[] = [];
   readonly commandSettleCalls: string[] = [];
+  readonly commandSettleMutations: Readonly<Record<string, unknown>>[] = [];
+  readonly commandTerminalRecoveryCalls: Readonly<Record<string, unknown>>[] = [];
+  readonly deviceCommandEffectStartCalls: string[] = [];
+  readonly deviceCommandPrepareCalls: string[] = [];
+  readonly deviceCommandPreparedFailureCalls: string[] = [];
+  readonly deviceCommandRecoveryCalls: Readonly<Record<string, unknown>>[] = [];
+  readonly deviceCommandSettleCalls: Readonly<Record<string, unknown>>[] = [];
   readonly accounts = new Map<string, {
     encryptedLocalReference: EncryptedEnvelope;
     encryptedMetadata: EncryptedEnvelope;
@@ -282,7 +416,7 @@ class FakeCloud {
       kind: "command",
       userPublicId,
     });
-    this.commands.set(publicId, {
+    const command: FakeCommand = {
       createdAt: this.now,
       deadline: this.now + 60_000,
       kind: payload.kind,
@@ -294,7 +428,9 @@ class FakeCloud {
       state: "pending",
       targetDevicePublicId: head.executionDevicePublicId,
       updatedAt: this.now,
-    });
+    };
+    await refreshRemoteCommandRequestDigest(command);
+    this.commands.set(publicId, command);
   }
 
   async enqueueDeviceCommand(input: Readonly<{
@@ -321,6 +457,7 @@ class FakeCloud {
         kind: input.kind,
         payload: envelope,
         publicId: input.publicId,
+        requestingDevicePublicId: input.requestingDevicePublicId,
       }),
     );
     this.deviceCommands.set(input.publicId, {
@@ -329,6 +466,7 @@ class FakeCloud {
       kind: input.kind,
       payload: envelope,
       publicId: input.publicId,
+      requestCommitmentVersion: 2,
       requestDigest,
       requestingDevicePublicId: input.requestingDevicePublicId,
       state: "pending",
@@ -350,6 +488,9 @@ class FakeCloud {
       kind: command.kind,
       payload: command.payload,
       publicId: command.publicId,
+      ...(command.requestCommitmentVersion === undefined
+        ? {}
+        : { requestCommitmentVersion: command.requestCommitmentVersion }),
       sessionPublicId: command.sessionPublicId,
       ...(command.resultCode === undefined ? {} : { resultCode: command.resultCode }),
       state: command.state,
@@ -363,6 +504,9 @@ class FakeCloud {
       deadline: command.deadline,
       kind: command.kind,
       publicId: command.publicId,
+      ...(command.requestCommitmentVersion === undefined
+        ? {}
+        : { requestCommitmentVersion: command.requestCommitmentVersion }),
       sessionPublicId: command.sessionPublicId,
       ...(command.resultCode === undefined ? {} : { resultCode: command.resultCode }),
       state: command.state,
@@ -377,6 +521,9 @@ class FakeCloud {
       kind: command.kind,
       payload: command.payload,
       publicId: command.publicId,
+      ...(command.requestCommitmentVersion === undefined
+        ? {}
+        : { requestCommitmentVersion: command.requestCommitmentVersion }),
       requestingDevicePublicId: command.requestingDevicePublicId,
       ...(command.singleUseResult === true
         ? {
@@ -388,6 +535,12 @@ class FakeCloud {
       state: command.state,
       updatedAt: command.updatedAt,
     });
+    const publicDeviceCommandMetadata = (command: FakeDeviceCommand) => {
+      const projected = { ...publicDeviceCommand(command) } as Record<string, unknown>;
+      delete projected.payload;
+      delete projected.requestingDevicePublicId;
+      return projected;
+    };
     const publicPresence = (presence: FakePresence | undefined) => ({
       connectionId: presence?.connectionId ?? null,
       lastSeenAt: presence?.lastSeenAt ?? null,
@@ -733,22 +886,35 @@ class FakeCloud {
           };
         }
         if (name === "commands:prepare") {
+          this.commandPrepareCalls.push(args.commandPublicId as string);
           if (this.failPrepareOnce) {
             this.failPrepareOnce = false;
             throw new Error("prepare unavailable");
           }
           const command = this.requireCommand(args.commandPublicId);
+          if (
+            command.requestCommitmentVersion
+            !== (args.executorRequestVersion === 2 ? 2 : undefined)
+          ) throw new Error("COMMAND_EXECUTOR_VERSION_UNSUPPORTED");
           if (command.deadline <= this.now) {
             command.state = "expired";
             return { publicId: command.publicId, replay: false, state: "expired" };
           }
           command.boundAuthority = args.authority as AuthorityTuple;
           command.state = "prepared";
+          if (this.failPrepareAfterEffectOnce) {
+            this.failPrepareAfterEffectOnce = false;
+            throw new Error("lost prepare response");
+          }
           return { publicId: command.publicId, replay: false, state: "prepared" };
         }
         if (name === "commands:markEffectStarted") {
           this.commandEffectStartCalls.push(args.commandPublicId as string);
           const command = this.requireCommand(args.commandPublicId);
+          if (
+            command.requestCommitmentVersion
+            !== (args.executorRequestVersion === 2 ? 2 : undefined)
+          ) throw new Error("COMMAND_EXECUTOR_VERSION_UNSUPPORTED");
           if (command.state === "prepared" && command.deadline <= this.now) {
             command.state = "expired";
             return { publicId: command.publicId, replay: false, state: "expired" };
@@ -760,15 +926,59 @@ class FakeCloud {
           }
           return { publicId: command.publicId, replay: false, state: "effect_started" };
         }
+        if (name === "commands:failPrepared") {
+          this.commandPreparedFailureCalls.push(args.commandPublicId as string);
+          const command = this.requireCommand(args.commandPublicId);
+          const authority = args.authority as AuthorityTuple;
+          if (
+            command.boundAuthority === undefined
+            || !sameAuthorityTuple(command.boundAuthority, authority)
+          ) throw new Error("command authority changed");
+          if (this.cancelSessionCommandBeforePreparedFailureOnce) {
+            this.cancelSessionCommandBeforePreparedFailureOnce = false;
+            command.state = "cancelled";
+            delete command.resultCode;
+            delete command.resultDigest;
+            throw new Error("COMMAND_TRANSITION_CONFLICT");
+          }
+          if (command.state === "failed") {
+            if (
+              command.resultCode !== args.resultCode
+              || command.resultDigest !== args.resultDigest
+            ) throw new Error("result conflict");
+            return { publicId: command.publicId, replay: true, state: "failed" };
+          }
+          if (command.state !== "prepared") throw new Error("COMMAND_TRANSITION_CONFLICT");
+          if (command.deadline <= this.now) {
+            command.state = "expired";
+            return { publicId: command.publicId, replay: false, state: "expired" };
+          }
+          command.state = "failed";
+          command.resultCode = args.resultCode as string;
+          command.resultDigest = args.resultDigest as string;
+          return { publicId: command.publicId, replay: false, state: "failed" };
+        }
         if (name === "commands:settle") {
           this.commandSettleCalls.push(args.commandPublicId as string);
+          this.commandSettleMutations.push(args);
           const command = this.requireCommand(args.commandPublicId);
+          if (this.revokeSessionCommandBeforeSettleOnce) {
+            this.revokeSessionCommandBeforeSettleOnce = false;
+            this.revokedDevices.add(command.requestingDevicePublicId);
+            command.state = "ambiguous";
+            delete command.resultCode;
+            delete command.resultDigest;
+            throw new Error("COMMAND_TRANSITION_CONFLICT");
+          }
           if (command.state === args.state) {
             if (
               command.resultCode !== args.resultCode
               || command.resultDigest !== args.resultDigest
             ) throw new Error("result conflict");
             return { publicId: command.publicId, replay: true, state: command.state };
+          }
+          if (command.state !== "effect_started") {
+            throw new Error("COMMAND_TRANSITION_CONFLICT");
           }
           command.state = args.state as "applied" | "failed" | "ambiguous";
           command.resultCode = args.resultCode as string;
@@ -779,22 +989,68 @@ class FakeCloud {
           }
           return { publicId: command.publicId, replay: false, state: command.state };
         }
+        if (name === "commands:confirmTerminalRecovery") {
+          this.commandTerminalRecoveryCalls.push(args);
+          if (this.failSessionTerminalRecoveryConfirmationOnce) {
+            this.failSessionTerminalRecoveryConfirmationOnce = false;
+            throw new Error("session terminal recovery confirmation unavailable");
+          }
+          const command = this.requireCommand(args.commandPublicId);
+          const localPhase = args.localPhase as "prepared_no_effect" | "effect_started";
+          const staleAuthority = args.staleAuthority as AuthorityTuple;
+          const authorityMatches = command.boundAuthority === undefined
+            ? localPhase === "prepared_no_effect"
+            : sameAuthorityTuple(command.boundAuthority, staleAuthority);
+          const terminalMatches = command.state === "cancelled"
+            || command.state === "expired"
+            || (command.state === "ambiguous"
+              && localPhase === "effect_started"
+              && this.revokedDevices.has(command.requestingDevicePublicId));
+          if (
+            command.targetDevicePublicId !== devicePublicId
+            || !authorityMatches
+            || !terminalMatches
+            || command.resultCode !== undefined
+            || command.resultDigest !== undefined
+          ) throw new Error("COMMAND_TERMINAL_RECOVERY_CONFLICT");
+          return { publicId: command.publicId, replay: true, state: command.state };
+        }
         if (name === "commands:recoverEffectStarted") {
           const command = this.requireCommand(args.commandPublicId);
           const recovery = args.recoveryAuthority as AuthorityTuple;
           const stale = args.staleAuthority as AuthorityTuple;
-          if (recovery.fence <= stale.fence) throw new Error("stale recovery fence");
+          if (
+            args.state !== "ambiguous"
+            || recovery.fence <= stale.fence
+            || command.boundAuthority === undefined
+            || !sameAuthorityTuple(command.boundAuthority, stale)
+          ) throw new Error("stale recovery fence");
+          if (command.state === "ambiguous") {
+            if (
+              command.resultCode !== args.resultCode
+              || command.resultDigest !== args.resultDigest
+            ) throw new Error("result conflict");
+            return { publicId: command.publicId, replay: true, state: command.state };
+          }
+          if (command.state !== "effect_started") {
+            throw new Error("COMMAND_TRANSITION_CONFLICT");
+          }
           command.resultCode = args.resultCode as string;
           command.resultDigest = args.resultDigest as string;
-          command.state = args.state as "applied" | "failed" | "ambiguous";
+          command.state = "ambiguous";
           return { publicId: command.publicId, replay: false, state: command.state };
         }
         if (name === "deviceCommands:prepare") {
+          this.deviceCommandPrepareCalls.push(args.commandPublicId as string);
           if (this.failDevicePrepareBeforeEffectOnce) {
             this.failDevicePrepareBeforeEffectOnce = false;
             throw new Error("device command prepare unavailable");
           }
           const command = this.requireDeviceCommand(args.commandPublicId);
+          if (
+            command.requestCommitmentVersion
+            !== (args.executorRequestVersion === 2 ? 2 : undefined)
+          ) throw new Error("COMMAND_EXECUTOR_VERSION_UNSUPPORTED");
           const requested = args.authority as AuthorityTuple;
           if (
             (command.state === "pending" || command.state === "prepared")
@@ -825,11 +1081,16 @@ class FakeCloud {
           return { publicId: command.publicId, replay: false, state: "prepared" };
         }
         if (name === "deviceCommands:markEffectStarted") {
+          this.deviceCommandEffectStartCalls.push(args.commandPublicId as string);
           if (this.failDeviceMarkBeforeEffectOnce) {
             this.failDeviceMarkBeforeEffectOnce = false;
             throw new Error("device command mark unavailable");
           }
           const command = this.requireDeviceCommand(args.commandPublicId);
+          if (
+            command.requestCommitmentVersion
+            !== (args.executorRequestVersion === 2 ? 2 : undefined)
+          ) throw new Error("COMMAND_EXECUTOR_VERSION_UNSUPPORTED");
           if (command.state === "prepared") command.state = "effect_started";
           if (this.failDeviceMarkAfterEffectOnce) {
             this.failDeviceMarkAfterEffectOnce = false;
@@ -843,7 +1104,39 @@ class FakeCloud {
           }
           return { publicId: command.publicId, replay: false, state: "effect_started" };
         }
+        if (name === "deviceCommands:failPrepared") {
+          this.deviceCommandPreparedFailureCalls.push(args.commandPublicId as string);
+          const command = this.requireDeviceCommand(args.commandPublicId);
+          const authority = args.authority as AuthorityTuple;
+          if (
+            command.boundAuthority === undefined
+            || !sameAuthorityTuple(command.boundAuthority, authority)
+          ) throw new Error("device command authority changed");
+          if (command.state === "failed") {
+            if (
+              command.resultCode !== args.resultCode
+              || command.resultDigest !== args.resultDigest
+            ) throw new Error("device command result conflict");
+            return { publicId: command.publicId, replay: true, state: "failed" };
+          }
+          if (command.state !== "prepared") {
+            throw new Error("DEVICE_COMMAND_TRANSITION_CONFLICT");
+          }
+          if (command.deadline <= this.now) {
+            command.state = "expired";
+            return { publicId: command.publicId, replay: false, state: "expired" };
+          }
+          command.state = "failed";
+          command.resultCode = args.resultCode as string;
+          command.resultDigest = args.resultDigest as string;
+          if (this.failDevicePreparedFailureAfterEffectOnce) {
+            this.failDevicePreparedFailureAfterEffectOnce = false;
+            throw new Error("lost device command prepared-failure response");
+          }
+          return { publicId: command.publicId, replay: false, state: "failed" };
+        }
         if (name === "deviceCommands:settle") {
+          this.deviceCommandSettleCalls.push(args);
           const command = this.requireDeviceCommand(args.commandPublicId);
           if (this.revokeDeviceCommandBeforeSettleOnce) {
             this.revokeDeviceCommandBeforeSettleOnce = false;
@@ -930,6 +1223,7 @@ class FakeCloud {
           return { publicId: command.publicId, replay: true, state: command.state };
         }
         if (name === "deviceCommands:recoverEffectStarted") {
+          this.deviceCommandRecoveryCalls.push(args);
           const command = this.requireDeviceCommand(args.commandPublicId);
           const recovery = args.recoveryAuthority as AuthorityTuple;
           const stale = args.staleAuthority as AuthorityTuple;
@@ -1083,9 +1377,7 @@ class FakeCloud {
             : {
                 ...publicCommand(command),
                 requestDigest: command.requestDigest,
-                ...(command.requestingDevicePublicId === undefined
-                  ? {}
-                  : { requestingDevicePublicId: command.requestingDevicePublicId }),
+                requestingDevicePublicId: command.requestingDevicePublicId,
                 targetDevicePublicId: command.targetDevicePublicId,
               };
         }
@@ -1136,6 +1428,26 @@ class FakeCloud {
             await afterDeviceCommandPendingScan();
           }
           return commands;
+        }
+        if (name === "deviceCommands:listNonterminalForTargetPage") {
+          const commands = [...this.deviceCommands.values()]
+            .filter((command) => !["applied", "failed", "ambiguous", "cancelled", "expired"]
+              .includes(command.state))
+            .map(publicDeviceCommandMetadata);
+          const pagination = args.paginationOpts as Readonly<{
+            cursor: string | null;
+            numItems: number;
+          }>;
+          const start = pagination.cursor === null
+            ? 0
+            : Number.parseInt(pagination.cursor, 10);
+          const page = commands.slice(start, start + pagination.numItems);
+          const next = start + page.length;
+          return {
+            continueCursor: String(next),
+            isDone: next >= commands.length,
+            page,
+          };
         }
         if (name === "deviceCommands:get") {
           const command = this.deviceCommands.get(args.commandPublicId as string);
@@ -1659,6 +1971,32 @@ class CommitThenThrowTerminalRecoveryJournal implements CloudDaemonJournalPort {
   }
 }
 
+class CommitThenThrowCommandAuthorityRebindJournal implements CloudDaemonJournalPort {
+  readonly inner = new MemoryCloudDaemonJournal();
+  #thrown = false;
+
+  read(): Promise<CloudDaemonJournalObservation> {
+    return this.inner.read();
+  }
+
+  async compareAndSwap(
+    expectedGeneration: number | null,
+    state: CloudDaemonJournalInputState,
+  ): Promise<CloudDaemonJournalObservation | null> {
+    const committed = await this.inner.compareAndSwap(expectedGeneration, state);
+    if (
+      committed !== null
+      && !this.#thrown
+      && committed.state.commands.some((entry) =>
+        entry.phase === "prepared" && entry.authority.fence === 2)
+    ) {
+      this.#thrown = true;
+      throw new Error("lost command authority rebind acknowledgement");
+    }
+    return committed;
+  }
+}
+
 function identity(devicePublicId: string): CloudDaemonIdentityPort {
   const activeIdentity: ActiveCloudIdentity = {
     accountKey: key,
@@ -1782,12 +2120,17 @@ function activeIdentity(input: Readonly<{
 
 class RecordingExecutor implements CloudCommandExecutorPort {
   readonly calls: Array<{ idempotencyKey: string; sessionPublicId: string }> = [];
+  throwOnce = false;
 
   async execute(input: { idempotencyKey: string; sessionPublicId: string }) {
     this.calls.push({
       idempotencyKey: input.idempotencyKey,
       sessionPublicId: input.sessionPublicId,
     });
+    if (this.throwOnce) {
+      this.throwOnce = false;
+      throw new Error("the provider connection dropped");
+    }
     return { code: "APPLIED", state: "applied" as const };
   }
 }
@@ -1816,6 +2159,7 @@ function bridge(input: {
   journal?: CloudDaemonJournalPort;
   local: CloudDaemonLocalSourcePort;
   now?: () => number;
+  omitRegistrySource?: boolean;
   optionalSyncBudgetMs?: number;
   pushWake?: CloudPushWakePort;
   randomConnectionUuid?: () => string;
@@ -1823,6 +2167,53 @@ function bridge(input: {
   transport?: CloudTransport;
 }) {
   let uuidSequence = 100;
+  const needsSyntheticRegistrySource = input.omitRegistrySource !== true
+    && input.local.readDeviceRegistry === undefined
+    && input.local.readDeviceRegistryProjection === undefined;
+  const local = needsSyntheticRegistrySource
+    ? new Proxy(input.local, {
+        get(target, property) {
+          if (property === "readDeviceRegistry") {
+            return () => Promise.resolve(testDeviceRegistry);
+          }
+          const value = Reflect.get(target, property, target) as unknown;
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(target)
+            : value;
+        },
+      })
+    : input.local;
+  const upstreamTransport = input.transport ?? input.cloud.connect(input.device);
+  let syntheticRegistryRevision = 0;
+  const transport: CloudTransport = needsSyntheticRegistrySource
+    ? {
+        action: (name, args) => upstreamTransport.action(name, args),
+        mutation: async (name, args) => {
+          if (name !== "devices:updateRegistry") {
+            return await upstreamTransport.mutation(name, args);
+          }
+          if (args.expectedRevision !== syntheticRegistryRevision) {
+            throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
+          }
+          syntheticRegistryRevision += 1;
+          return {
+            devicePublicId: input.device,
+            revision: syntheticRegistryRevision,
+            updatedAt: input.cloud.now,
+          };
+        },
+        query: async (name, args) => {
+          if (name !== "devices:getRegistry") return await upstreamTransport.query(name, args);
+          return syntheticRegistryRevision === 0
+            ? null
+            : {
+                devicePublicId: input.device,
+                revision: syntheticRegistryRevision,
+                updatedAt: input.cloud.now,
+              };
+        },
+      }
+    : upstreamTransport;
   return new LocalCloudDaemonBridge({
     attentionNotificationState: input.attentionNotificationState
       ?? new MemoryCloudAttentionNotificationReconciliation(),
@@ -1843,7 +2234,7 @@ function bridge(input: {
     identity: input.identity ?? identity(input.device),
     journal: input.journal ?? new MemoryCloudDaemonJournal(),
     leaseDurationMs: 5_000,
-    local: input.local,
+    local,
     now: input.now ?? (() => input.cloud.now),
     ...(input.optionalSyncBudgetMs === undefined
       ? {}
@@ -1853,7 +2244,7 @@ function bridge(input: {
       ?? (() => connectionUuid(connectionUuidSequence += 1)),
     randomUuid: () => uuidV7(uuidSequence++, input.cloud.now),
     sessionSyncCursor: input.sessionSyncCursor ?? new MemoryCloudSessionSyncCursor(),
-    transport: input.transport ?? input.cloud.connect(input.device),
+    transport,
   });
 }
 
@@ -3935,6 +4326,177 @@ describe("cloud daemon bridge", () => {
     expect(executor.calls).toHaveLength(1);
   });
 
+  for (const remoteState of ["applied", "failed", "ambiguous"] as const) {
+    test(`retires a conflicting local terminal receipt behind hosted ${remoteState} without leasing or replay`, async () => {
+      const cloud = new FakeCloud();
+      const journal = new MemoryCloudDaemonJournal();
+      const device = "device_11111111";
+      const sessionPublicId = `session_terminal_precedence_${remoteState}`;
+      const commandPublicId = uuidV7(
+        remoteState === "applied" ? 7_214 : remoteState === "failed" ? 7_215 : 7_216,
+      );
+      await installRecoverableHead(cloud, sessionPublicId);
+      await cloud.enqueue(
+        "device_22222222",
+        sessionPublicId,
+        commandPublicId,
+        { kind: "stop" },
+      );
+      const remote = cloud.requireCommand(commandPublicId);
+      const staleAuthority = { bootGeneration: 1, bootId: "boot_terminal1", fence: 4 };
+      remote.boundAuthority = staleAuthority;
+      remote.resultCode = "REMOTE_ALREADY_TERMINAL";
+      remote.resultDigest = "b".repeat(64);
+      remote.state = remoteState;
+      const observed = await journal.read();
+      await journal.compareAndSwap(observed.generation, {
+        ...observed.state,
+        commands: [{
+          authority: staleAuthority,
+          commandPublicId,
+          kind: "stop",
+          localAuthorityDigest: "c".repeat(64),
+          payloadDigest: await sha256Hex(JSON.stringify(remote.payload)),
+          phase: "terminal",
+          requestCommitmentVersion: 3,
+          requestingDevicePublicId: remote.requestingDevicePublicId,
+          resultCode: "APPLIED",
+          resultDigest: "a".repeat(64),
+          sessionPublicId,
+          terminalState: "applied",
+        }],
+      });
+      const inner = cloud.connect(device);
+      const recoveryCalls: string[] = [];
+      const transport: CloudTransport = {
+        action: (name, args) => inner.action(name, args),
+        mutation: async (name, args) => {
+          if (
+            name === "leases:acquire"
+            || name === "commands:prepare"
+            || name === "commands:failPrepared"
+            || name === "commands:settle"
+            || name === "commands:recoverEffectStarted"
+          ) recoveryCalls.push(name);
+          return await inner.mutation(name, args);
+        },
+        query: async (name, args) => {
+          if (name === "leases:current") recoveryCalls.push(name);
+          return await inner.query(name, args);
+        },
+      };
+
+      const result = await bridge({
+        cloud,
+        daemonAuthority: { bootGeneration: 2, bootId: "boot_terminal2", fence: 1 },
+        device,
+        journal,
+        local: new EmptyLocal(),
+        transport,
+      }).cycle(new AbortController().signal);
+
+      expect(result.errors).toEqual([]);
+      expect(recoveryCalls).toEqual([]);
+      expect(cloud.requireCommand(commandPublicId)).toMatchObject({
+        resultCode: "REMOTE_ALREADY_TERMINAL",
+        state: remoteState,
+      });
+      expect((await journal.read()).state.commands).toEqual([]);
+    });
+  }
+
+  test("keeps a prepared failure journal until cancellation is authoritatively confirmed", async () => {
+    const cloud = new FakeCloud();
+    const executor = new RecordingExecutor();
+    const journal = new MemoryCloudDaemonJournal();
+    const sessionPublicId = "session_prepared_cancel";
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      executor,
+      journal,
+      local: new FakeLocal(sessionPublicId, events),
+    });
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    const commandPublicId = uuidV7(7_212);
+    await cloud.enqueue("device_22222222", sessionPublicId, commandPublicId, {
+      kind: "set_model",
+      preset: "ultra",
+      presetContract: 1,
+    });
+    await replaceWithAuthenticatedForeignRemotePayload(
+      cloud.requireCommand(commandPublicId),
+      { kind: "set_model", preset: "ultra" },
+    );
+    cloud.cancelSessionCommandBeforePreparedFailureOnce = true;
+    cloud.failSessionTerminalRecoveryConfirmationOnce = true;
+
+    const interrupted = await daemon.cycle(new AbortController().signal);
+
+    expect(interrupted.errors).toHaveLength(1);
+    expect(executor.calls).toEqual([]);
+    expect(cloud.requireCommand(commandPublicId)).toMatchObject({ state: "cancelled" });
+    expect(cloud.requireCommand(commandPublicId).resultCode).toBeUndefined();
+    expect((await journal.read()).state.commands).toMatchObject([{
+      phase: "terminal",
+      resultCode: "INVALID_COMMAND_PAYLOAD_BEFORE_EFFECT",
+      terminalState: "failed",
+    }]);
+
+    const recovered = await daemon.cycle(new AbortController().signal);
+
+    expect(recovered.errors).toEqual([]);
+    expect(executor.calls).toEqual([]);
+    expect(cloud.commandPreparedFailureCalls).toEqual([commandPublicId]);
+    expect(cloud.commandTerminalRecoveryCalls).toHaveLength(2);
+    expect((await journal.read()).state.commands).toEqual([]);
+  });
+
+  test("retires a local terminal after requester revocation wins session settlement", async () => {
+    const cloud = new FakeCloud();
+    const executor = new RecordingExecutor();
+    const journal = new MemoryCloudDaemonJournal();
+    const sessionPublicId = "session_settle_revoked";
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      executor,
+      journal,
+      local: new FakeLocal(sessionPublicId, events),
+    });
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    const commandPublicId = uuidV7(7_213);
+    await cloud.enqueue(
+      "device_22222222",
+      sessionPublicId,
+      commandPublicId,
+      { kind: "stop" },
+    );
+    cloud.revokeSessionCommandBeforeSettleOnce = true;
+
+    const interrupted = await daemon.cycle(new AbortController().signal);
+
+    expect(interrupted.errors).toHaveLength(1);
+    expect(executor.calls).toHaveLength(1);
+    expect(cloud.requireCommand(commandPublicId)).toMatchObject({ state: "ambiguous" });
+    expect(cloud.requireCommand(commandPublicId).resultCode).toBeUndefined();
+    expect((await journal.read()).state.commands).toMatchObject([{
+      phase: "terminal",
+      terminalState: "applied",
+    }]);
+
+    const recovered = await daemon.cycle(new AbortController().signal);
+
+    expect(recovered.errors).toEqual([]);
+    expect(executor.calls).toHaveLength(1);
+    expect(cloud.commandSettleCalls).toEqual([commandPublicId]);
+    expect(cloud.commandTerminalRecoveryCalls).toMatchObject([{
+      commandPublicId,
+      localPhase: "effect_started",
+    }]);
+    expect((await journal.read()).state.commands).toEqual([]);
+  });
+
   test("rejects a saturated command journal before prepare or local provider effect", async () => {
     const cloud = new FakeCloud();
     const sessionPublicId = "session_capacity_0001";
@@ -4003,6 +4565,7 @@ describe("cloud daemon bridge", () => {
         { kind: "stop" },
       );
       const remote = cloud.requireCommand(commandPublicId);
+      await refreshLegacyRemoteCommandRequestDigest(remote);
       remote.boundAuthority = authority;
       remote.createdAt = fixedNow + index;
       remote.state = "prepared";
@@ -4043,6 +4606,11 @@ describe("cloud daemon bridge", () => {
       state: "failed" as const,
     };
     const expectedResultDigest = await sha256Hex(JSON.stringify(expectedOutcome));
+    const recoveryOutcome = {
+      code: "LOCAL_EFFECT_RECOVERY_REQUIRED",
+      state: "ambiguous" as const,
+    };
+    const recoveryResultDigest = await sha256Hex(JSON.stringify(recoveryOutcome));
     const unsettledByCycle: number[] = [];
 
     for (let cycle = 0; cycle < 30; cycle += 1) {
@@ -4067,16 +4635,23 @@ describe("cloud daemon bridge", () => {
       Array.from({ length: 25 }, (_, index) => 96 - index * 4),
     );
     expect(executor.calls).toEqual([]);
-    expect(cloud.commandEffectStartCalls).toEqual([]);
+    // An unversioned terminal journal cannot prove that a provider effect did
+    // not begin. Move the hosted row through effect-started custody and close
+    // it result-less and ambiguous, without invoking the provider executor or
+    // replaying the legacy local outcome.
+    expect(cloud.commandEffectStartCalls).toEqual(
+      commands.map((entry) => entry.commandPublicId),
+    );
+    expect(cloud.commandPreparedFailureCalls).toEqual([]);
     expect(cloud.commandSettleCalls).toEqual(
       commands.map((entry) => entry.commandPublicId),
     );
     for (const entry of commands) {
       expect(cloud.requireCommand(entry.commandPublicId)).toMatchObject({
         boundAuthority: entry.authority,
-        resultCode: expectedOutcome.code,
-        resultDigest: expectedResultDigest,
-        state: "failed",
+        resultCode: recoveryOutcome.code,
+        resultDigest: recoveryResultDigest,
+        state: "ambiguous",
       });
     }
   });
@@ -4163,11 +4738,15 @@ describe("cloud daemon bridge", () => {
       const publicId = uuidV7(2_000 + index);
       backlogIds.push(publicId);
       await cloud.enqueue("device_22222222", backlogSession, publicId, { kind: "stop" });
-      cloud.requireCommand(publicId).deadline = cloud.now + 24 * 60 * 60 * 1_000;
+      const command = cloud.requireCommand(publicId);
+      command.deadline = cloud.now + 24 * 60 * 60 * 1_000;
+      await refreshRemoteCommandRequestDigest(command);
     }
     const urgentId = uuidV7(3_000);
     await cloud.enqueue("device_22222222", urgentSession, urgentId, { kind: "stop" });
-    cloud.requireCommand(urgentId).deadline = cloud.now + 5 * 60 * 1_000;
+    const urgent = cloud.requireCommand(urgentId);
+    urgent.deadline = cloud.now + 5 * 60 * 1_000;
+    await refreshRemoteCommandRequestDigest(urgent);
 
     await adapter.cycle(new AbortController().signal);
 
@@ -4217,7 +4796,9 @@ describe("cloud daemon bridge", () => {
     });
     const commandPublicId = uuidV7(6_000);
     await cloud.enqueue("device_22222222", urgentSession, commandPublicId, { kind: "stop" });
-    cloud.requireCommand(commandPublicId).deadline = cloud.now + 5 * 60 * 1_000;
+    const command = cloud.requireCommand(commandPublicId);
+    command.deadline = cloud.now + 5 * 60 * 1_000;
+    await refreshRemoteCommandRequestDigest(command);
     const adapter = bridge({
       cloud,
       device: "device_11111111",
@@ -4253,7 +4834,9 @@ describe("cloud daemon bridge", () => {
     });
     const urgentId = uuidV7(6_100);
     await cloud.enqueue("device_22222222", urgentSession, urgentId, { kind: "stop" });
-    cloud.requireCommand(urgentId).deadline = cloud.now + 5 * 60 * 1_000;
+    const urgent = cloud.requireCommand(urgentId);
+    urgent.deadline = cloud.now + 5 * 60 * 1_000;
+    await refreshRemoteCommandRequestDigest(urgent);
     for (let index = 0; index < 31; index += 1) {
       const sessionPublicId = `session_later_stall_${String(index).padStart(2, "0")}`;
       cloud.heads.set(sessionPublicId, {
@@ -4269,7 +4852,9 @@ describe("cloud daemon bridge", () => {
       });
       const commandPublicId = uuidV7(6_200 + index);
       await cloud.enqueue("device_22222222", sessionPublicId, commandPublicId, { kind: "stop" });
-      cloud.requireCommand(commandPublicId).deadline = cloud.now + 24 * 60 * 60 * 1_000;
+      const command = cloud.requireCommand(commandPublicId);
+      command.deadline = cloud.now + 24 * 60 * 60 * 1_000;
+      await refreshRemoteCommandRequestDigest(command);
       cloud.heads.delete(sessionPublicId);
       cloud.failingHeadGets.add(sessionPublicId);
     }
@@ -4306,7 +4891,9 @@ describe("cloud daemon bridge", () => {
     });
     const commandPublicId = uuidV7(4_000);
     await cloud.enqueue("device_22222222", sessionPublicId, commandPublicId, { kind: "stop" });
-    cloud.requireCommand(commandPublicId).deadline = cloud.now + 5 * 60 * 1_000;
+    const command = cloud.requireCommand(commandPublicId);
+    command.deadline = cloud.now + 5 * 60 * 1_000;
+    await refreshRemoteCommandRequestDigest(command);
     const adapter = bridge({
       cloud,
       device,
@@ -4342,7 +4929,9 @@ describe("cloud daemon bridge", () => {
     const commandPublicId = uuidV7(4_100);
     cloud.afterPendingScan = async () => {
       await cloud.enqueue("device_22222222", sessionPublicId, commandPublicId, { kind: "stop" });
-      cloud.requireCommand(commandPublicId).deadline = cloud.now + 5 * 60 * 1_000;
+      const command = cloud.requireCommand(commandPublicId);
+      command.deadline = cloud.now + 5 * 60 * 1_000;
+      await refreshRemoteCommandRequestDigest(command);
     };
     const adapter = bridge({
       cloud,
@@ -4524,14 +5113,14 @@ describe("cloud daemon bridge", () => {
         updatedAt: fixedNow,
       });
     }
-    const payload = await encryptRemoteCommand({ kind: "stop" }, key, {
-      entityPublicId: uuidV7(9_000),
-      keyVersion: 1,
-      kind: "command",
-      userPublicId,
-    });
     for (let index = 0; index < 100; index += 1) {
       const publicId = uuidV7(9_100 + index);
+      const payload = await encryptRemoteCommand({ kind: "stop" }, key, {
+        entityPublicId: publicId,
+        keyVersion: 1,
+        kind: "command",
+        userPublicId,
+      });
       cloud.commands.set(publicId, {
         createdAt: fixedNow + index,
         deadline: fixedNow + 60_000,
@@ -4539,25 +5128,35 @@ describe("cloud daemon bridge", () => {
         payload,
         publicId,
         requestDigest: "d".repeat(64),
+        requestingDevicePublicId: "device_22222222",
         sessionPublicId: otherSession,
         state: "pending",
         targetDevicePublicId: device,
         updatedAt: fixedNow + index,
       });
+      await refreshRemoteCommandRequestDigest(cloud.requireCommand(publicId));
     }
     const lastPublicId = uuidV7(9_999);
+    const lastPayload = await encryptRemoteCommand({ kind: "stop" }, key, {
+      entityPublicId: lastPublicId,
+      keyVersion: 1,
+      kind: "command",
+      userPublicId,
+    });
     cloud.commands.set(lastPublicId, {
       createdAt: fixedNow + 1_000,
       deadline: fixedNow + 60_000,
       kind: "stop",
-      payload,
+      payload: lastPayload,
       publicId: lastPublicId,
       requestDigest: "e".repeat(64),
+      requestingDevicePublicId: "device_22222222",
       sessionPublicId: terminalSession,
       state: "pending",
       targetDevicePublicId: device,
       updatedAt: fixedNow + 1_000,
     });
+    await refreshRemoteCommandRequestDigest(cloud.requireCommand(lastPublicId));
     const adapter = bridge({
       cloud,
       device,
@@ -4567,7 +5166,7 @@ describe("cloud daemon bridge", () => {
     await adapter.cycle(new AbortController().signal);
 
     expect(cloud.requireHead(terminalSession).state).toBe("active");
-    expect(cloud.requireCommand(lastPublicId).state).toBe("ambiguous");
+    expect(cloud.requireCommand(lastPublicId).state).toBe("applied");
   });
 
   test("does not infer command absence when the pending scan is incomplete", async () => {
@@ -4684,6 +5283,163 @@ describe("cloud daemon bridge", () => {
     });
   }
 
+  for (const serverState of ["pending", "prepared", "effect_started"] as const) {
+    test(`drains a legacy ${serverState} session command without a provider effect`, async () => {
+      const cloud = new FakeCloud();
+      const executor = new RecordingExecutor();
+      const journal = new MemoryCloudDaemonJournal();
+      const sessionPublicId = `session_legacy_${serverState}`;
+      cloud.heads.set(sessionPublicId, {
+        compactHeadSequence: 0,
+        createdAt: fixedNow,
+        detailHeadSequence: 0,
+        executionDevicePublicId: "device_11111111",
+        metadataRevision: 0,
+        projectionRevision: 0,
+        publicId: sessionPublicId,
+        state: "idle",
+        updatedAt: fixedNow,
+      });
+      const commandPublicId = uuidV7(
+        serverState === "pending" ? 7_010 : serverState === "prepared" ? 7_011 : 7_012,
+      );
+      await cloud.enqueue(
+        "device_legacy_requester",
+        sessionPublicId,
+        commandPublicId,
+        { kind: "stop" },
+      );
+      const command = cloud.requireCommand(commandPublicId);
+      await refreshLegacyRemoteCommandRequestDigest(command);
+      if (serverState !== "pending") {
+        const staleAuthority = { bootGeneration: 1, bootId: "boot_legacy001", fence: 1 };
+        command.boundAuthority = staleAuthority;
+        command.state = serverState;
+        cloud.leases.set(sessionPublicId, {
+          ...staleAuthority,
+          devicePublicId: "device_11111111",
+          heartbeatFingerprint: "initial",
+          heartbeatSequence: 0,
+          leaseUntil: cloud.now - 1,
+        });
+      }
+      const daemon = bridge({
+        cloud,
+        device: "device_11111111",
+        executor,
+        journal,
+        local: new EmptyLocal(sessionPublicId),
+      });
+
+      const result = await daemon.cycle(new AbortController().signal);
+
+      expect(result.errors).toEqual([]);
+      expect(result.commandsApplied).toBe(0);
+      expect(executor.calls).toEqual([]);
+      expect(cloud.commandEffectStartCalls).toEqual([]);
+      expect(cloud.requireCommand(commandPublicId)).toMatchObject({
+        resultCode: serverState === "effect_started"
+          ? "LOCAL_EFFECT_RECOVERY_REQUIRED"
+          : "LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT",
+        state: serverState === "effect_started" ? "ambiguous" : "failed",
+      });
+      expect((await journal.read()).state.commands).toEqual([]);
+    });
+  }
+
+  for (const serverState of ["pending", "prepared", "effect_started", "terminal"] as const) {
+    test(`discards an absent-marker terminal outcome against hosted ${serverState}`, async () => {
+      const cloud = new FakeCloud();
+      const executor = new RecordingExecutor();
+      const journal = new MemoryCloudDaemonJournal();
+      const sessionPublicId = `session_legacy_terminal_${serverState}`;
+      cloud.heads.set(sessionPublicId, {
+        compactHeadSequence: 0,
+        createdAt: fixedNow,
+        detailHeadSequence: 0,
+        executionDevicePublicId: "device_11111111",
+        metadataRevision: 0,
+        projectionRevision: 0,
+        publicId: sessionPublicId,
+        state: "idle",
+        updatedAt: fixedNow,
+      });
+      const commandPublicId = uuidV7(
+        serverState === "pending"
+          ? 7_020
+          : serverState === "prepared"
+            ? 7_021
+            : serverState === "effect_started"
+              ? 7_022
+              : 7_023,
+      );
+      await cloud.enqueue(
+        "device_substituted_requester",
+        sessionPublicId,
+        commandPublicId,
+        { kind: "stop" },
+      );
+      const command = cloud.requireCommand(commandPublicId);
+      await refreshLegacyRemoteCommandRequestDigest(command);
+      const staleAuthority = { bootGeneration: 1, bootId: "boot_legacy005", fence: 1 };
+      if (serverState === "prepared" || serverState === "effect_started") {
+        command.boundAuthority = staleAuthority;
+        command.state = serverState;
+        cloud.leases.set(sessionPublicId, {
+          ...staleAuthority,
+          devicePublicId: "device_11111111",
+          heartbeatFingerprint: "initial",
+          heartbeatSequence: 0,
+          leaseUntil: cloud.now - 1,
+        });
+      } else if (serverState === "terminal") {
+        command.boundAuthority = staleAuthority;
+        command.resultCode = "REMOTE_ALREADY_TERMINAL";
+        command.resultDigest = "b".repeat(64);
+        command.state = "failed";
+      }
+      const observed = await journal.read();
+      await journal.compareAndSwap(observed.generation, {
+        ...observed.state,
+        commands: [{
+          authority: staleAuthority,
+          commandPublicId,
+          kind: "stop",
+          localAuthorityDigest: "c".repeat(64),
+          payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+          phase: "terminal",
+          resultCode: "APPLIED",
+          resultDigest: "a".repeat(64),
+          sessionPublicId,
+          terminalState: "applied",
+        }],
+      });
+      const daemon = bridge({
+        cloud,
+        daemonAuthority: { bootGeneration: 2, bootId: "boot_legacy006", fence: 1 },
+        device: "device_11111111",
+        executor,
+        journal,
+        local: new EmptyLocal(sessionPublicId),
+      });
+
+      const result = await daemon.cycle(new AbortController().signal);
+
+      expect(result.errors).toEqual([]);
+      expect(result.commandsApplied).toBe(0);
+      expect(executor.calls).toEqual([]);
+      expect(cloud.commandSettleMutations.every((call) =>
+        call.resultCode !== "APPLIED" && call.resultDigest !== "a".repeat(64)))
+        .toBe(true);
+      expect(cloud.requireCommand(commandPublicId)).toMatchObject(
+        serverState === "terminal"
+          ? { resultCode: "REMOTE_ALREADY_TERMINAL", state: "failed" }
+          : { resultCode: "LOCAL_EFFECT_RECOVERY_REQUIRED", state: "ambiguous" },
+      );
+      expect((await journal.read()).state.commands).toEqual([]);
+    });
+  }
+
   test("prepares and executes a server pending command when the local journal is absent", async () => {
     const cloud = new FakeCloud();
     const executor = new RecordingExecutor();
@@ -4718,6 +5474,275 @@ describe("cloud daemon bridge", () => {
 
     expect(executor.calls.map((call) => call.idempotencyKey)).toEqual([commandPublicId]);
     expect(cloud.requireCommand(commandPublicId).state).toBe("applied");
+  });
+
+  for (const [name, tamper] of [
+    ["deadline", async (cloud: FakeCloud, command: FakeCommand) => {
+      void cloud;
+      command.deadline += 1;
+    }],
+    ["kind", async (cloud: FakeCloud, command: FakeCommand) => {
+      void cloud;
+      command.kind = "send";
+    }],
+    ["payload", async (cloud: FakeCloud, command: FakeCommand) => {
+      void cloud;
+      command.payload = await encryptRemoteCommand({ kind: "stop" }, key, {
+        entityPublicId: command.publicId,
+        keyVersion: 1,
+        kind: "command",
+        userPublicId,
+      });
+    }],
+    ["request digest", async (cloud: FakeCloud, command: FakeCommand) => {
+      void cloud;
+      command.requestDigest = "e".repeat(64);
+    }],
+    ["requester", async (cloud: FakeCloud, command: FakeCommand) => {
+      void cloud;
+      command.requestingDevicePublicId = "device_forged_requester";
+    }],
+    ["session", async (cloud: FakeCloud, command: FakeCommand) => {
+      const forgedSessionPublicId = "session_commit_forged";
+      const original = cloud.requireHead(command.sessionPublicId);
+      cloud.heads.set(forgedSessionPublicId, {
+        ...original,
+        publicId: forgedSessionPublicId,
+      });
+      command.sessionPublicId = forgedSessionPublicId;
+    }],
+    ["target", async (cloud: FakeCloud, command: FakeCommand) => {
+      command.targetDevicePublicId = "device_original_target";
+      await refreshRemoteCommandRequestDigest(command);
+      command.targetDevicePublicId = "device_11111111";
+      void cloud;
+    }],
+  ] as const) {
+    test(`rejects a fresh command whose authenticated enqueue ${name} changed`, async () => {
+      const cloud = new FakeCloud();
+      const executor = new RecordingExecutor();
+      const journal = new MemoryCloudDaemonJournal();
+      const sessionPublicId = `session_commit_${name.replace(" ", "_")}`;
+      cloud.heads.set(sessionPublicId, {
+        compactHeadSequence: 0,
+        createdAt: fixedNow,
+        detailHeadSequence: 0,
+        executionDevicePublicId: "device_11111111",
+        metadataRevision: 0,
+        projectionRevision: 0,
+        publicId: sessionPublicId,
+        state: "idle",
+        updatedAt: fixedNow,
+      });
+      const commandPublicId = uuidV7(7_020 + cloud.commands.size);
+      await cloud.enqueue(
+        "device_22222222",
+        sessionPublicId,
+        commandPublicId,
+        { kind: "stop" },
+      );
+      const command = cloud.requireCommand(commandPublicId);
+      await tamper(cloud, command);
+      const daemon = bridge({
+        cloud,
+        device: "device_11111111",
+        executor,
+        journal,
+        local: new EmptyLocal(command.sessionPublicId),
+      });
+
+      const result = await daemon.cycle(new AbortController().signal);
+
+      expect(result.commandsApplied).toBe(0);
+      expect(result.errors.join(" ")).toContain("Cloud command request commitment is invalid");
+      expect(executor.calls).toEqual([]);
+      expect(cloud.commandPrepareCalls).toEqual([]);
+      expect(cloud.commandEffectStartCalls).toEqual([]);
+      expect(cloud.requireCommand(commandPublicId).boundAuthority).toBeUndefined();
+      expect(cloud.requireCommand(commandPublicId).state).toBe("pending");
+      expect((await journal.read()).state.commands).toEqual([]);
+    });
+  }
+
+  test("revalidates the enqueue commitment after a prepared response is lost", async () => {
+    const cloud = new FakeCloud();
+    const executor = new RecordingExecutor();
+    const journal = new MemoryCloudDaemonJournal();
+    const sessionPublicId = "session_commit_restart";
+    cloud.heads.set(sessionPublicId, {
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: "device_11111111",
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    });
+    const commandPublicId = uuidV7(7_030);
+    await cloud.enqueue("device_22222222", sessionPublicId, commandPublicId, { kind: "stop" });
+    cloud.failPrepareAfterEffectOnce = true;
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      executor,
+      journal,
+      local: new EmptyLocal(sessionPublicId),
+    });
+
+    const interrupted = await daemon.cycle(new AbortController().signal);
+    expect(interrupted.errors.join(" ")).toContain("lost prepare response");
+    expect(cloud.requireCommand(commandPublicId).state).toBe("prepared");
+    expect((await journal.read()).state.commands).toMatchObject([{ phase: "prepared" }]);
+    cloud.requireCommand(commandPublicId).deadline += 1;
+
+    const recovered = await daemon.cycle(new AbortController().signal);
+
+    expect(recovered.commandsApplied).toBe(0);
+    expect(recovered.errors.join(" ")).toContain("Cloud command request commitment is invalid");
+    expect(executor.calls).toEqual([]);
+    expect(cloud.commandPrepareCalls).toEqual([commandPublicId]);
+    expect(cloud.commandEffectStartCalls).toEqual([]);
+    expect(cloud.requireCommand(commandPublicId).state).toBe("prepared");
+    expect((await journal.read()).state.commands).toMatchObject([{ phase: "prepared" }]);
+  });
+
+  test("durably rebinds a prepared command before a renewed lease can start its effect", async () => {
+    const cloud = new FakeCloud();
+    const executor = new RecordingExecutor();
+    const journal = new CommitThenThrowCommandAuthorityRebindJournal();
+    const sessionPublicId = "session_command_rebind";
+    const local = new FakeLocal(sessionPublicId, events);
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      executor,
+      journal,
+      local,
+    });
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    const commandPublicId = uuidV7(7_033);
+    await cloud.enqueue("device_22222222", sessionPublicId, commandPublicId, { kind: "stop" });
+    cloud.failPrepareAfterEffectOnce = true;
+
+    const prepared = await daemon.cycle(new AbortController().signal);
+    expect(prepared.errors.join(" ")).toContain("lost prepare response");
+    expect(cloud.requireCommand(commandPublicId)).toMatchObject({
+      boundAuthority: { fence: 1 },
+      state: "prepared",
+    });
+    expect((await journal.read()).state.commands).toMatchObject([{
+      authority: { fence: 1 },
+      phase: "prepared",
+    }]);
+
+    cloud.now += 5_001;
+    const rebound = await daemon.cycle(new AbortController().signal);
+    expect(rebound.errors.join(" ")).toContain("lost command authority rebind acknowledgement");
+    expect(cloud.requireCommand(commandPublicId)).toMatchObject({
+      boundAuthority: { fence: 2 },
+      state: "prepared",
+    });
+    expect((await journal.read()).state.commands).toMatchObject([{
+      authority: { fence: 2 },
+      phase: "prepared",
+    }]);
+    expect(cloud.commandEffectStartCalls).toEqual([]);
+    expect(executor.calls).toEqual([]);
+
+    const recovered = await daemon.cycle(new AbortController().signal);
+    expect(recovered.errors).toEqual([]);
+    expect(recovered.commandsApplied).toBe(1);
+    expect(cloud.commandEffectStartCalls).toEqual([commandPublicId]);
+    expect(executor.calls.map((call) => call.idempotencyKey)).toEqual([commandPublicId]);
+    expect(cloud.requireCommand(commandPublicId).state).toBe("applied");
+    expect((await journal.read()).state.commands).toEqual([]);
+  });
+
+  test("rejects a forged prepared command before rebuilding a lost local journal", async () => {
+    const cloud = new FakeCloud();
+    const executor = new RecordingExecutor();
+    const journal = new MemoryCloudDaemonJournal();
+    const sessionPublicId = "session_commit_lost_journal";
+    cloud.heads.set(sessionPublicId, {
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: "device_11111111",
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    });
+    const commandPublicId = uuidV7(7_031);
+    await cloud.enqueue("device_22222222", sessionPublicId, commandPublicId, { kind: "stop" });
+    const command = cloud.requireCommand(commandPublicId);
+    command.boundAuthority = { bootGeneration: 1, bootId: "boot_12345678", fence: 1 };
+    command.state = "prepared";
+    command.requestDigest = "e".repeat(64);
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      executor,
+      journal,
+      local: new EmptyLocal(sessionPublicId),
+    });
+
+    const result = await daemon.cycle(new AbortController().signal);
+
+    expect(result.commandsApplied).toBe(0);
+    expect(result.errors.join(" ")).toContain("Cloud command request commitment is invalid");
+    expect(executor.calls).toEqual([]);
+    expect(cloud.commandPrepareCalls).toEqual([]);
+    expect(cloud.commandEffectStartCalls).toEqual([]);
+    expect(cloud.requireCommand(commandPublicId).state).toBe("prepared");
+    expect((await journal.read()).state.commands).toEqual([]);
+  });
+
+  test("keeps ciphertext authentication failure as prepared authority corruption", async () => {
+    const cloud = new FakeCloud();
+    const executor = new RecordingExecutor();
+    const journal = new MemoryCloudDaemonJournal();
+    const sessionPublicId = "session_commit_ciphertext";
+    cloud.heads.set(sessionPublicId, {
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: "device_11111111",
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    });
+    const commandPublicId = uuidV7(7_032);
+    await cloud.enqueue("device_22222222", sessionPublicId, commandPublicId, { kind: "stop" });
+    const command = cloud.requireCommand(commandPublicId);
+    command.payload = {
+      ...command.payload,
+      ciphertext: `${command.payload.ciphertext.startsWith("A") ? "B" : "A"}${command.payload.ciphertext.slice(1)}`,
+    };
+    await refreshRemoteCommandRequestDigest(command);
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      executor,
+      journal,
+      local: new EmptyLocal(sessionPublicId),
+    });
+
+    const result = await daemon.cycle(new AbortController().signal);
+
+    expect(result.commandsApplied).toBe(0);
+    expect(result.errors).not.toEqual([]);
+    expect(executor.calls).toEqual([]);
+    expect(cloud.commandPrepareCalls).toEqual([commandPublicId]);
+    expect(cloud.commandPreparedFailureCalls).toEqual([]);
+    expect(cloud.commandEffectStartCalls).toEqual([]);
+    expect(cloud.requireCommand(commandPublicId).state).toBe("prepared");
+    expect((await journal.read()).state.commands).toMatchObject([{ phase: "prepared" }]);
   });
 
   test("honours a remote decision only while its requesting device is active", async () => {
@@ -4764,6 +5789,139 @@ describe("cloud daemon bridge", () => {
         expect(command.state).toBe("applied");
       }
     }
+  });
+
+  for (const [name, kind, foreignPayload] of [
+    ["missing model contract", "set_model", { kind: "set_model", preset: "ultra" }],
+    [
+      "stale model contract",
+      "set_model",
+      { kind: "set_model", preset: "ultra", presetContract: 2 },
+    ],
+    [
+      "wrong model contract",
+      "set_model",
+      { kind: "set_model", preset: "ultra", presetContract: 99 },
+    ],
+    [
+      "missing derived-Codex contract",
+      "set_provider",
+      { kind: "set_provider", provider: "codex" },
+    ],
+    [
+      "stale derived-Codex contract",
+      "set_provider",
+      { kind: "set_provider", presetContract: 2, provider: "codex" },
+    ],
+  ] as const) {
+    test(`fails an authenticated ${name} before the remote effect boundary`, async () => {
+      const cloud = new FakeCloud();
+      const executor = new RecordingExecutor();
+      const journal = new MemoryCloudDaemonJournal();
+      const sessionPublicId = `session_invalid_${kind}`;
+      const daemon = bridge({
+        cloud,
+        device: "device_11111111",
+        executor,
+        journal,
+        local: new FakeLocal(sessionPublicId, events),
+      });
+      expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+      const commandPublicId = uuidV7(7_200 + cloud.commandPreparedFailureCalls.length);
+      await cloud.enqueue(
+        "device_22222222",
+        sessionPublicId,
+        commandPublicId,
+        kind === "set_model"
+          ? { kind, preset: "ultra", presetContract: 1 }
+          : { kind, presetContract: 1, provider: "codex" },
+      );
+      await replaceWithAuthenticatedForeignRemotePayload(
+        cloud.requireCommand(commandPublicId),
+        foreignPayload,
+      );
+
+      const result = await daemon.cycle(new AbortController().signal);
+
+      expect(result.errors).toEqual([]);
+      expect(result.commandsApplied).toBe(0);
+      expect(executor.calls).toEqual([]);
+      expect(cloud.commandEffectStartCalls).toEqual([]);
+      expect(cloud.commandSettleCalls).toEqual([]);
+      expect(cloud.commandPreparedFailureCalls).toEqual([commandPublicId]);
+      expect(cloud.requireCommand(commandPublicId)).toMatchObject({
+        resultCode: "INVALID_COMMAND_PAYLOAD_BEFORE_EFFECT",
+        state: "failed",
+      });
+      expect((await journal.read()).state.commands).toEqual([]);
+    });
+  }
+
+  test("revalidates an invalid remote payload after a lost prepare response", async () => {
+    const cloud = new FakeCloud();
+    const executor = new RecordingExecutor();
+    const journal = new MemoryCloudDaemonJournal();
+    const sessionPublicId = "session_invalid_restart";
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      executor,
+      journal,
+      local: new FakeLocal(sessionPublicId, events),
+    });
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    const commandPublicId = uuidV7(7_210);
+    await cloud.enqueue("device_22222222", sessionPublicId, commandPublicId, {
+      kind: "set_model",
+      preset: "ultra",
+      presetContract: 1,
+    });
+    await replaceWithAuthenticatedForeignRemotePayload(
+      cloud.requireCommand(commandPublicId),
+      { kind: "set_model", preset: "ultra" },
+    );
+    cloud.failPrepareAfterEffectOnce = true;
+
+    const interrupted = await daemon.cycle(new AbortController().signal);
+    expect(interrupted.errors.join(" ")).toContain("lost prepare response");
+    expect(cloud.requireCommand(commandPublicId).state).toBe("prepared");
+    expect((await journal.read()).state.commands).toMatchObject([{ phase: "prepared" }]);
+    expect(executor.calls).toEqual([]);
+
+    const recovered = await daemon.cycle(new AbortController().signal);
+    expect(recovered.errors).toEqual([]);
+    expect(cloud.requireCommand(commandPublicId)).toMatchObject({
+      resultCode: "INVALID_COMMAND_PAYLOAD_BEFORE_EFFECT",
+      state: "failed",
+    });
+    expect(cloud.commandEffectStartCalls).toEqual([]);
+    expect(executor.calls).toEqual([]);
+    expect((await journal.read()).state.commands).toEqual([]);
+  });
+
+  test("keeps a remote executor throw post-boundary and ambiguous", async () => {
+    const cloud = new FakeCloud();
+    const executor = new RecordingExecutor();
+    executor.throwOnce = true;
+    const sessionPublicId = "session_executor_throw";
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      executor,
+      local: new FakeLocal(sessionPublicId, events),
+    });
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    const commandPublicId = uuidV7(7_211);
+    await cloud.enqueue("device_22222222", sessionPublicId, commandPublicId, { kind: "stop" });
+
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+
+    expect(executor.calls).toHaveLength(1);
+    expect(cloud.commandEffectStartCalls).toEqual([commandPublicId]);
+    expect(cloud.requireCommand(commandPublicId)).toMatchObject({
+      resultCode: "LOCAL_EFFECT_INDETERMINATE",
+      state: "ambiguous",
+    });
   });
 
   test("reports an offline cycle without modifying durable command state", async () => {
@@ -4823,7 +5981,7 @@ describe("cloud daemon bridge", () => {
       "device_22222222",
       sessionPublicId,
       commandPublicId,
-      { kind: "set_model", preset: "ultra" },
+      { kind: "set_model", preset: "ultra", presetContract: 1 },
     );
     cloud.failPrepareOnce = true;
     await adapter.cycle(new AbortController().signal);
@@ -4845,11 +6003,13 @@ describe("cloud daemon bridge", () => {
         payload: target.payload,
         publicId,
         requestDigest: "e".repeat(64),
+        requestingDevicePublicId: "device_22222222",
         sessionPublicId,
         state: "applied",
         targetDevicePublicId: "device_11111111",
         updatedAt: cloud.now + index + 1,
       });
+      await refreshRemoteCommandRequestDigest(cloud.requireCommand(publicId));
     }
     local.profileGeneration = 2;
     const changed = await adapter.cycle(new AbortController().signal);
@@ -4884,7 +6044,7 @@ describe("cloud daemon bridge", () => {
       commandPublicId,
       { kind: "send", message: "too late" },
     );
-    cloud.requireCommand(commandPublicId).deadline = cloud.now;
+    cloud.now += 60_000;
 
     const expired = await adapter.cycle(new AbortController().signal);
 
@@ -5074,7 +6234,7 @@ describe("cloud daemon push wake and adaptive cadence", () => {
         "device_22222222",
         sessionPublicId,
         second,
-        { kind: "set_model", preset: "ultra" },
+        { kind: "set_model", preset: "ultra", presetContract: 1 },
       );
       // The wake fires again from inside the very cycle that claims these
       // commands, so the next sleep returns immediately while the one-second
@@ -5283,6 +6443,7 @@ describe("device registry publication", () => {
     const device = "device_registry_1";
     const inner = cloud.connect(device);
     const rows = new Map<string, Readonly<{
+      commandRequestVersion?: 2;
       envelope: EncryptedEnvelope;
       keyVersion: number;
       notificationEmailEnvelope?: EncryptedEnvelope;
@@ -5308,6 +6469,7 @@ describe("device registry publication", () => {
         }
         const revision = expectedRevision + 1;
         rows.set(device, {
+          ...(args.commandRequestVersion === 2 ? { commandRequestVersion: 2 as const } : {}),
           envelope: args.envelope as unknown as EncryptedEnvelope,
           keyVersion: args.keyVersion as number,
           ...(args.notificationEmailEnvelope === undefined
@@ -5348,6 +6510,7 @@ describe("device registry publication", () => {
     expect(world.writes).toEqual([{ expectedRevision: 0 }]);
     const stored = world.rows.get(world.device);
     expect(stored?.revision).toBe(1);
+    expect(stored?.commandRequestVersion).toBe(2);
     expect(await decryptDeviceRegistry(
       stored?.envelope as EncryptedEnvelope,
       key,
@@ -5375,6 +6538,129 @@ describe("device registry publication", () => {
     expect((await daemon.cycle(signal)).errors).toEqual([]);
     expect(world.writes).toHaveLength(3);
     expect(world.rows.get(world.device)?.revision).toBe(3);
+  });
+
+  test("skips both command processors when capability publication fails", async () => {
+    const cloud = new FakeCloud();
+    const device = "device_registry_failure";
+    const sessionPublicId = "session_registry_failure";
+    cloud.heads.set(sessionPublicId, {
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: device,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    });
+    const commandPublicId = uuidV7(7_001);
+    await cloud.enqueue("device_registry_requester", sessionPublicId, commandPublicId, {
+      kind: "stop",
+    });
+    const deviceCommandPublicId = uuidV7(7_002);
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: deviceCommandPublicId,
+      requestingDevicePublicId: "device_registry_requester",
+      targetDevicePublicId: device,
+    });
+    const inner = cloud.connect(device);
+    const transport: CloudTransport = {
+      action: (name, args) => inner.action(name, args),
+      mutation: async (name, args) => {
+        if (name === "devices:updateRegistry") throw new Error("registry unavailable");
+        return await inner.mutation(name, args);
+      },
+      query: async (name, args) => name === "devices:getRegistry"
+        ? null
+        : await inner.query(name, args),
+    };
+    const local: CloudDaemonLocalSourcePort = Object.assign(new EmptyLocal(sessionPublicId), {
+      readDeviceRegistry: () => Promise.resolve({ ...registry, heartbeatAt: fixedNow }),
+    });
+    const executor = new RecordingExecutor();
+    let deviceEffects = 0;
+    const daemon = bridge({
+      cloud,
+      device,
+      deviceExecutor: {
+        async executeDeviceCommand() {
+          deviceEffects += 1;
+          return { code: "APPLIED", state: "applied" as const };
+        },
+      },
+      executor,
+      local,
+      transport,
+    });
+
+    const result = await daemon.cycle(new AbortController().signal);
+    expect(result.commandsApplied).toBe(0);
+    expect(result.errors).toContain("device registry: registry unavailable");
+    expect(executor.calls).toEqual([]);
+    expect(deviceEffects).toBe(0);
+    expect(cloud.requireCommand(commandPublicId).state).toBe("pending");
+    expect(cloud.requireDeviceCommand(deviceCommandPublicId).state).toBe("pending");
+    expect(cloud.deviceCommandPendingListCalls).toBe(0);
+    expect(cloud.sessionHeadListCalls).toBeGreaterThan(0);
+  });
+
+  test("fails closed when no local registry source can publish command capability", async () => {
+    const cloud = new FakeCloud();
+    const device = "device_registry_missing";
+    const sessionPublicId = "session_registry_missing";
+    cloud.heads.set(sessionPublicId, {
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: device,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    });
+    const commandPublicId = uuidV7(7_003);
+    await cloud.enqueue("device_registry_requester", sessionPublicId, commandPublicId, {
+      kind: "stop",
+    });
+    const deviceCommandPublicId = uuidV7(7_004);
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: deviceCommandPublicId,
+      requestingDevicePublicId: "device_registry_requester",
+      targetDevicePublicId: device,
+    });
+    const executor = new RecordingExecutor();
+    let deviceEffects = 0;
+    const result = await bridge({
+      cloud,
+      device,
+      deviceExecutor: {
+        async executeDeviceCommand() {
+          deviceEffects += 1;
+          return { code: "APPLIED", state: "applied" as const };
+        },
+      },
+      executor,
+      local: new EmptyLocal(sessionPublicId),
+      omitRegistrySource: true,
+    }).cycle(new AbortController().signal);
+
+    expect(result.commandsApplied).toBe(0);
+    expect(result.errors).toEqual([
+      "device registry: Local device registry source is unavailable.",
+    ]);
+    expect(executor.calls).toEqual([]);
+    expect(deviceEffects).toBe(0);
+    expect(cloud.requireCommand(commandPublicId).state).toBe("pending");
+    expect(cloud.requireDeviceCommand(deviceCommandPublicId).state).toBe("pending");
+    expect(cloud.deviceCommandPendingListCalls).toBe(0);
+    expect(cloud.sessionHeadListCalls).toBeGreaterThan(0);
   });
 
   test("publishes hours with the registry and makes an older source clear the outer envelope", async () => {
@@ -5606,6 +6892,723 @@ describe("device command execution", () => {
     expect((await journal.read()).state.deviceCommands).toEqual([]);
   });
 
+  test("rejects a forged device-command requester before journal or server prepare", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    const publicId = uuidV7(8_049);
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    cloud.requireDeviceCommand(publicId).requestingDevicePublicId = "device_forged_requester";
+    const daemon = bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    });
+
+    const result = await daemon.cycle(new AbortController().signal);
+
+    expect(result.commandsApplied).toBe(0);
+    expect(result.errors).toEqual([
+      `device command ${publicId}: Cloud device command recovery identity is invalid.`,
+    ]);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.deviceCommandPrepareCalls).toEqual([]);
+    expect(cloud.deviceCommandEffectStartCalls).toEqual([]);
+    expect(cloud.requireDeviceCommand(publicId).state).toBe("pending");
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  for (const fixture of [
+    { phase: "terminal", remoteState: "applied", sequence: 8_230 },
+    { phase: "prepared", remoteState: "failed", sequence: 8_231 },
+    { phase: "effect_started", remoteState: "ambiguous", sequence: 8_232 },
+  ] as const) {
+    test(`retires current ${fixture.phase} device custody behind a newer hosted ${fixture.remoteState} terminal`, async () => {
+      const cloud = new FakeCloud();
+      const journal = new MemoryCloudDaemonJournal();
+      const deviceExecutor = new RecordingDeviceExecutor();
+      const publicId = uuidV7(fixture.sequence);
+      await cloud.enqueueDeviceCommand({
+        kind: "usage_refresh",
+        payload: { kind: "usage_refresh" },
+        publicId,
+        requestingDevicePublicId: "device_browser1",
+      });
+      const command = cloud.requireDeviceCommand(publicId);
+      const staleAuthority = { bootGeneration: 1, bootId: "boot_terminal_old", fence: 1 };
+      const hostedAuthority = { bootGeneration: 2, bootId: "boot_terminal_new", fence: 1 };
+      command.boundAuthority = hostedAuthority;
+      command.resultCode = "REMOTE_ALREADY_TERMINAL";
+      command.resultDigest = "b".repeat(64);
+      command.state = fixture.remoteState;
+      const base = {
+        authority: staleAuthority,
+        commandPublicId: publicId,
+        kind: "usage_refresh" as const,
+        payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+        requestCommitmentVersion: 3 as const,
+        requestingDevicePublicId: "device_browser1",
+      };
+      const entry: CloudDeviceCommandJournalEntry = fixture.phase === "terminal"
+        ? {
+            ...base,
+            phase: "terminal",
+            resultCode: "LOCAL_CONFLICTING_TERMINAL",
+            resultDigest: "a".repeat(64),
+            terminalState: "applied",
+          }
+        : { ...base, phase: fixture.phase };
+      const observed = await journal.read();
+      await journal.compareAndSwap(observed.generation, {
+        ...observed.state,
+        deviceCommands: [entry],
+      });
+
+      const result = await bridge({
+        cloud,
+        daemonAuthority: { bootGeneration: 3, bootId: "boot_terminal_current", fence: 1 },
+        device: "device_daemon1",
+        deviceExecutor,
+        journal,
+        local: new EmptyLocal(),
+      }).cycle(new AbortController().signal);
+
+      expect(result.errors).toEqual([]);
+      expect(deviceExecutor.calls).toEqual([]);
+      expect(cloud.deviceCommandPrepareCalls).toEqual([]);
+      expect(cloud.deviceCommandPreparedFailureCalls).toEqual([]);
+      expect(cloud.deviceCommandEffectStartCalls).toEqual([]);
+      expect(cloud.deviceCommandSettleCalls).toEqual([]);
+      expect(cloud.deviceCommandRecoveryCalls).toEqual([]);
+      expect(cloud.requireDeviceCommand(publicId)).toMatchObject({
+        boundAuthority: hostedAuthority,
+        resultCode: "REMOTE_ALREADY_TERMINAL",
+        resultDigest: "b".repeat(64),
+        state: fixture.remoteState,
+      });
+      expect((await journal.read()).state.deviceCommands).toEqual([]);
+    });
+  }
+
+  for (const serverState of ["pending", "prepared", "effect_started"] as const) {
+    test(`drains a legacy ${serverState} device command without a provider effect`, async () => {
+      const cloud = new FakeCloud();
+      const journal = new MemoryCloudDaemonJournal();
+      const deviceExecutor = new RecordingDeviceExecutor();
+      const publicId = uuidV7(
+        serverState === "pending" ? 8_060 : serverState === "prepared" ? 8_061 : 8_062,
+      );
+      await cloud.enqueueDeviceCommand({
+        kind: "usage_refresh",
+        payload: { kind: "usage_refresh" },
+        publicId,
+        requestingDevicePublicId: "device_legacy_browser",
+      });
+      const command = cloud.requireDeviceCommand(publicId);
+      await refreshLegacyDeviceCommandRequestDigest(command);
+      if (serverState !== "pending") {
+        command.boundAuthority = {
+          bootGeneration: 1,
+          bootId: "boot_legacy001",
+          fence: 1,
+        };
+        command.state = serverState;
+      }
+      const daemon = bridge({
+        cloud,
+        daemonAuthority: { bootGeneration: 2, bootId: "boot_legacy002", fence: 1 },
+        device: "device_daemon1",
+        deviceExecutor,
+        journal,
+        local: new FakeLocal("session_deviceco", events),
+      });
+
+      const result = await daemon.cycle(new AbortController().signal);
+
+      expect(result.errors).toEqual([]);
+      expect(result.commandsApplied).toBe(0);
+      expect(deviceExecutor.calls).toEqual([]);
+      expect(cloud.deviceCommandEffectStartCalls).toEqual([]);
+      expect(cloud.requireDeviceCommand(publicId)).toMatchObject({
+        resultCode: serverState === "effect_started"
+          ? "LOCAL_EFFECT_RECOVERY_REQUIRED"
+          : "LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT",
+        state: serverState === "effect_started" ? "ambiguous" : "failed",
+      });
+      expect((await journal.read()).state.deviceCommands).toEqual([]);
+    });
+  }
+
+  for (const marker of ["v1", "absent"] as const) {
+    for (const serverState of ["applied", "failed", "ambiguous"] as const) {
+      test(`retires ${marker} prepared evidence against hosted ${serverState} without replay`, async () => {
+        const cloud = new FakeCloud();
+        const journal = new MemoryCloudDaemonJournal();
+        const deviceExecutor = new RecordingDeviceExecutor();
+        const publicId = uuidV7(
+          8_100
+            + (marker === "v1" ? 0 : 10)
+            + (serverState === "applied" ? 0 : serverState === "failed" ? 1 : 2),
+        );
+        await cloud.enqueueDeviceCommand({
+          kind: "usage_refresh",
+          payload: { kind: "usage_refresh" },
+          publicId,
+          requestingDevicePublicId: "device_legacy_browser",
+        });
+        const command = cloud.requireDeviceCommand(publicId);
+        await refreshLegacyDeviceCommandRequestDigest(command);
+        const authority = { bootGeneration: 1, bootId: "boot_legacy_terminal", fence: 1 };
+        command.boundAuthority = authority;
+        command.resultCode = "REMOTE_ALREADY_TERMINAL";
+        command.resultDigest = "b".repeat(64);
+        command.state = serverState;
+        const preparedBase = {
+          authority,
+          commandPublicId: publicId,
+          kind: "usage_refresh" as const,
+          payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+          phase: "prepared" as const,
+          requestingDevicePublicId: "device_legacy_browser",
+        };
+        const prepared: CloudDeviceCommandJournalEntry = marker === "v1"
+          ? { ...preparedBase, requestCommitmentVersion: 1 }
+          : preparedBase;
+        const observed = await journal.read();
+        await journal.compareAndSwap(observed.generation, {
+          ...observed.state,
+          deviceCommands: [prepared],
+        });
+        const daemon = bridge({
+          cloud,
+          daemonAuthority: { bootGeneration: 2, bootId: "boot_current_terminal", fence: 1 },
+          device: "device_daemon1",
+          deviceExecutor,
+          journal,
+          local: new FakeLocal("session_deviceco", events),
+        });
+
+        const result = await daemon.cycle(new AbortController().signal);
+
+        expect(result.errors).toEqual([]);
+        expect(deviceExecutor.calls).toEqual([]);
+        expect(cloud.deviceCommandPrepareCalls).toEqual([]);
+        expect(cloud.deviceCommandPreparedFailureCalls).toEqual([]);
+        expect(cloud.deviceCommandEffectStartCalls).toEqual([]);
+        expect(cloud.deviceCommandSettleCalls).toEqual([]);
+        expect(cloud.deviceCommandRecoveryCalls).toEqual([]);
+        expect(cloud.requireDeviceCommand(publicId)).toMatchObject({
+          resultCode: "REMOTE_ALREADY_TERMINAL",
+          resultDigest: "b".repeat(64),
+          state: serverState,
+        });
+        expect((await journal.read()).state.deviceCommands).toEqual([]);
+      });
+    }
+  }
+
+  test("never publishes a legacy terminal login result to a substituted requester", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    const publicId = uuidV7(8_065);
+    await cloud.enqueueDeviceCommand({
+      kind: "account_login_start",
+      payload: {
+        accountPublicId: "acct_primary0001",
+        handoffVersion: 2,
+        kind: "account_login_start",
+      },
+      publicId,
+      requestingDevicePublicId: "device_original_browser",
+    });
+    const command = cloud.requireDeviceCommand(publicId);
+    await refreshLegacyDeviceCommandRequestDigest(command);
+    // The legacy commitment did not bind this field, so a coherently corrupt
+    // hosted tuple could substitute it before the old daemon captured its
+    // journal entry.
+    command.requestingDevicePublicId = "device_substituted_browser";
+    const staleAuthority = { bootGeneration: 1, bootId: "boot_legacy003", fence: 1 };
+    command.boundAuthority = staleAuthority;
+    command.state = "effect_started";
+    const secretResult = await encryptDeviceCommandResult({
+      expiresAt: fixedNow + 60_000,
+      handoffVersion: 2,
+      kind: "account_login_start",
+      loginUrl: "https://auth.openai.com/codex/device",
+      userCode: "SECRET-CODE",
+    }, key, {
+      entityPublicId: publicId,
+      keyVersion: 1,
+      kind: "device_command_result",
+      userPublicId,
+    });
+    const observed = await journal.read();
+    await journal.compareAndSwap(observed.generation, {
+      ...observed.state,
+      deviceCommands: [{
+        authority: staleAuthority,
+        commandPublicId: publicId,
+        kind: "account_login_start",
+        payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+        phase: "terminal",
+        requestCommitmentVersion: 1,
+        requestingDevicePublicId: "device_substituted_browser",
+        result: secretResult,
+        resultCode: "APPLIED",
+        resultDigest: "a".repeat(64),
+        singleUseResult: true,
+        terminalState: "applied",
+      }],
+    });
+    const daemon = bridge({
+      cloud,
+      daemonAuthority: { bootGeneration: 2, bootId: "boot_legacy004", fence: 1 },
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    });
+
+    const result = await daemon.cycle(new AbortController().signal);
+
+    expect(result.errors).toEqual([]);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.deviceCommandSettleCalls.every((call) => call.result === undefined)).toBe(true);
+    expect(cloud.requireDeviceCommand(publicId)).toMatchObject({
+      resultCode: "LOCAL_EFFECT_RECOVERY_REQUIRED",
+      state: "ambiguous",
+    });
+    expect(cloud.requireDeviceCommand(publicId).result).toBeUndefined();
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  for (const marker of ["v1", "absent"] as const) {
+    for (const serverState of ["prepared", "effect_started", "terminal"] as const) {
+      test(`discards a ${marker} device terminal result against hosted ${serverState}`, async () => {
+        const cloud = new FakeCloud();
+        const journal = new MemoryCloudDaemonJournal();
+        const deviceExecutor = new RecordingDeviceExecutor();
+        const publicId = uuidV7(
+          8_070
+            + (marker === "v1" ? 0 : 10)
+            + (serverState === "prepared" ? 0 : serverState === "effect_started" ? 1 : 2),
+        );
+        await cloud.enqueueDeviceCommand({
+          kind: "account_login_start",
+          payload: {
+            accountPublicId: "acct_primary0001",
+            handoffVersion: 2,
+            kind: "account_login_start",
+          },
+          publicId,
+          requestingDevicePublicId: "device_original_browser",
+        });
+        const command = cloud.requireDeviceCommand(publicId);
+        await refreshLegacyDeviceCommandRequestDigest(command);
+        command.requestingDevicePublicId = "device_substituted_browser";
+        const authority = { bootGeneration: 1, bootId: "boot_legacy_matrix", fence: 1 };
+        command.boundAuthority = authority;
+        if (serverState === "terminal") {
+          command.resultCode = "REMOTE_ALREADY_TERMINAL";
+          command.resultDigest = "b".repeat(64);
+          command.state = "failed";
+        } else {
+          command.state = serverState;
+        }
+        const secretResult = await encryptDeviceCommandResult({
+          expiresAt: fixedNow + 60_000,
+          handoffVersion: 2,
+          kind: "account_login_start",
+          loginUrl: "https://auth.openai.com/codex/device",
+          userCode: "SECRET-CODE",
+        }, key, {
+          entityPublicId: publicId,
+          keyVersion: 1,
+          kind: "device_command_result",
+          userPublicId,
+        });
+        const terminalBase = {
+          authority,
+          commandPublicId: publicId,
+          kind: "account_login_start" as const,
+          payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+          phase: "terminal" as const,
+          requestingDevicePublicId: "device_substituted_browser",
+          result: secretResult,
+          resultCode: "APPLIED",
+          resultDigest: "a".repeat(64),
+          singleUseResult: true as const,
+          terminalState: "applied" as const,
+        };
+        const terminal: CloudDeviceCommandJournalEntry = marker === "v1"
+          ? { ...terminalBase, requestCommitmentVersion: 1 }
+          : terminalBase;
+        const observed = await journal.read();
+        await journal.compareAndSwap(observed.generation, {
+          ...observed.state,
+          deviceCommands: [terminal],
+        });
+        const daemon = bridge({
+          cloud,
+          daemonAuthority: authority,
+          device: "device_daemon1",
+          deviceExecutor,
+          journal,
+          local: new FakeLocal("session_deviceco", events),
+        });
+
+        const result = await daemon.cycle(new AbortController().signal);
+
+        expect(result.errors).toEqual([]);
+        expect(deviceExecutor.calls).toEqual([]);
+        if (serverState === "terminal") {
+          expect(cloud.deviceCommandPrepareCalls).toEqual([]);
+          expect(cloud.deviceCommandEffectStartCalls).toEqual([]);
+          expect(cloud.deviceCommandSettleCalls).toEqual([]);
+          expect(cloud.deviceCommandRecoveryCalls).toEqual([]);
+          expect(cloud.requireDeviceCommand(publicId)).toMatchObject({
+            resultCode: "REMOTE_ALREADY_TERMINAL",
+            resultDigest: "b".repeat(64),
+            state: "failed",
+          });
+        } else {
+          expect(cloud.deviceCommandSettleCalls).toHaveLength(1);
+          for (const call of cloud.deviceCommandSettleCalls) {
+            expect(Object.hasOwn(call, "result")).toBe(false);
+            expect(Object.hasOwn(call, "singleUseResult")).toBe(false);
+          }
+          expect(cloud.deviceCommandRecoveryCalls).toEqual([]);
+          expect(cloud.requireDeviceCommand(publicId)).toMatchObject({
+            resultCode: "LOCAL_EFFECT_RECOVERY_REQUIRED",
+            state: "ambiguous",
+          });
+          expect(cloud.requireDeviceCommand(publicId).result).toBeUndefined();
+          expect(cloud.requireDeviceCommand(publicId).singleUseResult).toBeUndefined();
+        }
+        expect((await journal.read()).state.deviceCommands).toEqual([]);
+      });
+    }
+  }
+
+  for (const serverState of ["pending", "prepared"] as const) {
+    test(`quarantines an absent-marker stale terminal over hosted ${serverState} without a result`, async () => {
+      const cloud = new FakeCloud();
+      const journal = new MemoryCloudDaemonJournal();
+      const deviceExecutor = new RecordingDeviceExecutor();
+      const publicId = uuidV7(serverState === "pending" ? 8_090 : 8_091);
+      await cloud.enqueueDeviceCommand({
+        kind: "account_login_start",
+        payload: {
+          accountPublicId: "acct_primary0001",
+          handoffVersion: 2,
+          kind: "account_login_start",
+        },
+        publicId,
+        requestingDevicePublicId: "device_original_browser",
+      });
+      const command = cloud.requireDeviceCommand(publicId);
+      await refreshLegacyDeviceCommandRequestDigest(command);
+      command.requestingDevicePublicId = "device_substituted_browser";
+      const staleAuthority = { bootGeneration: 1, bootId: "boot_legacy_stale", fence: 1 };
+      if (serverState === "prepared") {
+        command.boundAuthority = staleAuthority;
+        command.state = "prepared";
+      }
+      const secretResult = await encryptDeviceCommandResult({
+        expiresAt: fixedNow + 60_000,
+        handoffVersion: 2,
+        kind: "account_login_start",
+        loginUrl: "https://auth.openai.com/codex/device",
+        userCode: "SECRET-CODE",
+      }, key, {
+        entityPublicId: publicId,
+        keyVersion: 1,
+        kind: "device_command_result",
+        userPublicId,
+      });
+      const observed = await journal.read();
+      await journal.compareAndSwap(observed.generation, {
+        ...observed.state,
+        deviceCommands: [{
+          authority: staleAuthority,
+          commandPublicId: publicId,
+          kind: "account_login_start",
+          payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+          phase: "terminal",
+          requestingDevicePublicId: "device_substituted_browser",
+          result: secretResult,
+          resultCode: "APPLIED",
+          resultDigest: "a".repeat(64),
+          singleUseResult: true,
+          terminalState: "applied",
+        }],
+      });
+      const daemon = bridge({
+        cloud,
+        daemonAuthority: { bootGeneration: 2, bootId: "boot_legacy_current", fence: 1 },
+        device: "device_daemon1",
+        deviceExecutor,
+        journal,
+        local: new FakeLocal("session_deviceco", events),
+      });
+
+      const result = await daemon.cycle(new AbortController().signal);
+
+      expect(result.errors).toEqual([]);
+      expect(deviceExecutor.calls).toEqual([]);
+      expect(cloud.deviceCommandSettleCalls).toEqual([]);
+      expect(cloud.deviceCommandRecoveryCalls).toHaveLength(1);
+      for (const call of cloud.deviceCommandRecoveryCalls) {
+        expect(Object.hasOwn(call, "result")).toBe(false);
+        expect(Object.hasOwn(call, "singleUseResult")).toBe(false);
+      }
+      expect(cloud.requireDeviceCommand(publicId)).toMatchObject({
+        resultCode: "LOCAL_EFFECT_RECOVERY_REQUIRED",
+        state: "ambiguous",
+      });
+      expect(cloud.requireDeviceCommand(publicId).result).toBeUndefined();
+      expect(cloud.requireDeviceCommand(publicId).singleUseResult).toBeUndefined();
+      expect((await journal.read()).state.deviceCommands).toEqual([]);
+    });
+  }
+
+  for (const serverState of ["prepared", "effect_started"] as const) {
+    test(`closes a requester-bound ${serverState} device command when its journal is lost`, async () => {
+      const cloud = new FakeCloud();
+      const journal = new MemoryCloudDaemonJournal();
+      const deviceExecutor = new RecordingDeviceExecutor();
+      const publicId = uuidV7(serverState === "prepared" ? 8_063 : 8_064);
+      await cloud.enqueueDeviceCommand({
+        kind: "usage_refresh",
+        payload: { kind: "usage_refresh" },
+        publicId,
+        requestingDevicePublicId: "device_current_browser",
+      });
+      const command = cloud.requireDeviceCommand(publicId);
+      command.boundAuthority = {
+        bootGeneration: 1,
+        bootId: "boot_current01",
+        fence: 1,
+      };
+      command.state = serverState;
+      const daemon = bridge({
+        cloud,
+        daemonAuthority: { bootGeneration: 2, bootId: "boot_current02", fence: 1 },
+        device: "device_daemon1",
+        deviceExecutor,
+        journal,
+        local: new FakeLocal("session_deviceco", events),
+      });
+
+      const result = await daemon.cycle(new AbortController().signal);
+
+      expect(result.errors).toEqual([]);
+      expect(result.commandsApplied).toBe(0);
+      expect(deviceExecutor.calls).toEqual([]);
+      expect(cloud.deviceCommandEffectStartCalls).toEqual([]);
+      expect(cloud.requireDeviceCommand(publicId)).toMatchObject({
+        resultCode: serverState === "prepared"
+          ? "LOCAL_JOURNAL_EVIDENCE_MISSING_BEFORE_EFFECT"
+          : "LOCAL_EFFECT_RECOVERY_REQUIRED",
+        state: serverState === "prepared" ? "failed" : "ambiguous",
+      });
+      expect((await journal.read()).state.deviceCommands).toEqual([]);
+    });
+  }
+
+  test("retires a missing-journal prepared failure after its hosted response is lost", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    const publicId = uuidV7(8_065);
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId,
+      requestingDevicePublicId: "device_current_browser",
+    });
+    const command = cloud.requireDeviceCommand(publicId);
+    command.boundAuthority = {
+      bootGeneration: 1,
+      bootId: "boot_current01",
+      fence: 1,
+    };
+    command.state = "prepared";
+    cloud.failDevicePreparedFailureAfterEffectOnce = true;
+    const daemon = bridge({
+      cloud,
+      daemonAuthority: { bootGeneration: 1, bootId: "boot_current01", fence: 1 },
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    });
+
+    const interrupted = await daemon.cycle(new AbortController().signal);
+
+    expect(interrupted.commandsApplied).toBe(0);
+    expect(interrupted.errors).toHaveLength(1);
+    expect(cloud.requireDeviceCommand(publicId)).toMatchObject({
+      resultCode: "LOCAL_JOURNAL_EVIDENCE_MISSING_BEFORE_EFFECT",
+      state: "failed",
+    });
+    expect((await journal.read()).state.deviceCommands).toHaveLength(1);
+
+    const recovered = await daemon.cycle(new AbortController().signal);
+
+    expect(recovered.errors).toEqual([]);
+    expect(recovered.commandsApplied).toBe(0);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.deviceCommandPreparedFailureCalls).toEqual([publicId]);
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  for (const [name, foreignPayload] of [
+    [
+      "missing contract",
+      {
+        accountPublicId: "acct_primary0001",
+        kind: "session_start",
+        preset: "ultra",
+        projectPublicId: "proj_alpha000001",
+        prompt: "continue",
+        provider: "codex",
+      },
+    ],
+    [
+      "stale contract",
+      {
+        accountPublicId: "acct_primary0001",
+        kind: "session_start",
+        preset: "ultra",
+        presetContract: 2,
+        projectPublicId: "proj_alpha000001",
+        prompt: "continue",
+        provider: "codex",
+      },
+    ],
+    [
+      "wrong contract",
+      {
+        accountPublicId: "acct_primary0001",
+        kind: "session_start",
+        preset: "ultra",
+        presetContract: 99,
+        projectPublicId: "proj_alpha000001",
+        prompt: "continue",
+        provider: "codex",
+      },
+    ],
+  ] as const) {
+    test(`fails an authenticated device session_start with a ${name} before effect`, async () => {
+      const cloud = new FakeCloud();
+      const journal = new MemoryCloudDaemonJournal();
+      const deviceExecutor = new RecordingDeviceExecutor();
+      const publicId = uuidV7(8_050);
+      await cloud.enqueueDeviceCommand({
+        kind: "session_start",
+        payload: {
+          accountPublicId: "acct_primary0001",
+          kind: "session_start",
+          preset: "ultra",
+          presetContract: 1,
+          projectPublicId: "proj_alpha000001",
+          prompt: "continue",
+          provider: "codex",
+        },
+        publicId,
+        requestingDevicePublicId: "device_browser1",
+      });
+      await replaceWithAuthenticatedForeignDevicePayload(
+        cloud.requireDeviceCommand(publicId),
+        foreignPayload,
+      );
+      const daemon = bridge({
+        cloud,
+        device: "device_daemon1",
+        deviceExecutor,
+        journal,
+        local: new FakeLocal("session_deviceco", events),
+      });
+
+      const result = await daemon.cycle(new AbortController().signal);
+
+      expect(result.errors).toEqual([]);
+      expect(result.commandsApplied).toBe(0);
+      expect(deviceExecutor.calls).toEqual([]);
+      expect(cloud.deviceCommandEffectStartCalls).toEqual([]);
+      expect(cloud.deviceCommandPreparedFailureCalls).toEqual([publicId]);
+      expect(cloud.requireDeviceCommand(publicId)).toMatchObject({
+        resultCode: "INVALID_COMMAND_PAYLOAD_BEFORE_EFFECT",
+        state: "failed",
+      });
+      expect((await journal.read()).state.deviceCommands).toEqual([]);
+    });
+  }
+
+  test("revalidates an invalid device payload after a lost prepare response", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    const publicId = uuidV7(8_051);
+    await cloud.enqueueDeviceCommand({
+      kind: "session_start",
+      payload: {
+        accountPublicId: "acct_primary0001",
+        kind: "session_start",
+        preset: "ultra",
+        presetContract: 1,
+        projectPublicId: "proj_alpha000001",
+        prompt: "continue",
+        provider: "codex",
+      },
+      publicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    await replaceWithAuthenticatedForeignDevicePayload(
+      cloud.requireDeviceCommand(publicId),
+      {
+        accountPublicId: "acct_primary0001",
+        kind: "session_start",
+        preset: "ultra",
+        projectPublicId: "proj_alpha000001",
+        prompt: "continue",
+        provider: "codex",
+      },
+    );
+    cloud.failDevicePrepareAfterEffectOnce = true;
+    const daemon = bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    });
+
+    expect((await daemon.cycle(new AbortController().signal)).errors).toHaveLength(1);
+    expect(cloud.requireDeviceCommand(publicId).state).toBe("prepared");
+    expect((await journal.read()).state.deviceCommands).toMatchObject([{ phase: "prepared" }]);
+    expect(deviceExecutor.calls).toEqual([]);
+
+    const recovered = await daemon.cycle(new AbortController().signal);
+    expect(recovered.errors).toEqual([]);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.deviceCommandEffectStartCalls).toEqual([]);
+    expect(cloud.requireDeviceCommand(publicId)).toMatchObject({
+      resultCode: "INVALID_COMMAND_PAYLOAD_BEFORE_EFFECT",
+      state: "failed",
+    });
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
   test("shares one eight-effect cycle budget across recovery and fresh commands", async () => {
     const cloud = new FakeCloud();
     const journal = new MemoryCloudDaemonJournal();
@@ -5631,6 +7634,7 @@ describe("device command execution", () => {
         kind: command.kind,
         payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
         phase: "prepared",
+        requestCommitmentVersion: 3,
         requestingDevicePublicId: command.requestingDevicePublicId,
       });
     }
@@ -5664,6 +7668,112 @@ describe("device command execution", () => {
     expect(cloud.deviceCommandPendingListCalls).toBe(1);
     expect(freshIds.map((publicId) => cloud.requireDeviceCommand(publicId).state))
       .toEqual(Array.from({ length: 8 }, () => "applied"));
+  });
+
+  for (const phase of ["prepared", "effect_started", "terminal"] as const) {
+    test(`retires an exact absent device-command ${phase} journal without publishing an outcome`, async () => {
+      const cloud = new FakeCloud();
+      const journal = new MemoryCloudDaemonJournal();
+      const deviceExecutor = new RecordingDeviceExecutor();
+      const publicId = uuidV7(
+        phase === "prepared" ? 8_200 : phase === "effect_started" ? 8_201 : 8_202,
+      );
+      await cloud.enqueueDeviceCommand({
+        kind: "usage_refresh",
+        payload: { kind: "usage_refresh" },
+        publicId,
+        requestingDevicePublicId: "device_browser1",
+      });
+      const remote = cloud.requireDeviceCommand(publicId);
+      const base = {
+        authority: { bootGeneration: 1, bootId: "boot_12345678", fence: 1 },
+        commandPublicId: publicId,
+        kind: "usage_refresh" as const,
+        payloadDigest: await sha256Hex(JSON.stringify(remote.payload)),
+        requestCommitmentVersion: 3 as const,
+        requestingDevicePublicId: "device_browser1",
+      };
+      const entry: CloudDeviceCommandJournalEntry = phase === "terminal"
+        ? {
+            ...base,
+            phase,
+            resultCode: "APPLIED",
+            resultDigest: "a".repeat(64),
+            terminalState: "applied",
+          }
+        : { ...base, phase };
+      const observed = await journal.read();
+      await journal.compareAndSwap(observed.generation, {
+        ...observed.state,
+        deviceCommands: [entry],
+      });
+      cloud.deviceCommands.delete(publicId);
+
+      const result = await bridge({
+        cloud,
+        daemonAuthority: { bootGeneration: 2, bootId: "boot_absent_recovery", fence: 1 },
+        device: "device_daemon1",
+        deviceExecutor,
+        journal,
+        local: new EmptyLocal(),
+      }).cycle(new AbortController().signal);
+
+      expect(result.errors).toEqual([]);
+      expect(deviceExecutor.calls).toEqual([]);
+      expect(cloud.deviceCommandPrepareCalls).toEqual([]);
+      expect(cloud.deviceCommandEffectStartCalls).toEqual([]);
+      expect(cloud.deviceCommandSettleCalls).toEqual([]);
+      expect(cloud.deviceCommandRecoveryCalls).toEqual([]);
+      expect((await journal.read()).state.deviceCommands).toEqual([]);
+    });
+  }
+
+  test("drains exact absent device-command custody from a full journal before admitting fresh work", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    const absent = Array.from({ length: 16 }, (_, index): CloudDeviceCommandJournalEntry => ({
+      authority: { bootGeneration: 1, bootId: "boot_12345678", fence: 1 },
+      commandPublicId: uuidV7(8_300 + index),
+      kind: "usage_refresh",
+      payloadDigest: "a".repeat(64),
+      phase: "terminal",
+      requestCommitmentVersion: 3,
+      requestingDevicePublicId: "device_browser1",
+      resultCode: "APPLIED",
+      resultDigest: "b".repeat(64),
+      terminalState: "applied",
+    }));
+    const observed = await journal.read();
+    await journal.compareAndSwap(observed.generation, {
+      ...observed.state,
+      deviceCommands: absent,
+    });
+    const freshPublicId = uuidV7(8_400);
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: freshPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    const daemon = bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new EmptyLocal(),
+    });
+
+    const first = await daemon.cycle(new AbortController().signal);
+    expect(first.errors).toEqual([]);
+    expect(deviceExecutor.calls.map((call) => call.idempotencyKey)).toEqual([freshPublicId]);
+    expect(cloud.requireDeviceCommand(freshPublicId).state).toBe("applied");
+    expect((await journal.read()).state.deviceCommands).toEqual(absent.slice(8));
+
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+    expect(cloud.deviceCommandSettleCalls).toHaveLength(1);
+    expect(cloud.deviceCommandRecoveryCalls).toEqual([]);
   });
 
   test("same-boot recovery resumes after prepare committed but its response was lost", async () => {
@@ -6024,6 +8134,7 @@ describe("device command execution", () => {
         requestingDevicePublicId: "device_browser1",
       });
       const command = cloud.requireDeviceCommand(commandPublicId);
+      await refreshLegacyDeviceCommandRequestDigest(command);
       command.boundAuthority = staleAuthority;
       command.resultCode = "APPLIED";
       command.resultDigest = "a".repeat(64);
@@ -6090,6 +8201,7 @@ describe("device command execution", () => {
       requestingDevicePublicId: "device_browser1",
     });
     const command = cloud.requireDeviceCommand(commandPublicId);
+    await refreshLegacyDeviceCommandRequestDigest(command);
     command.boundAuthority = staleAuthority;
     command.state = "effect_started";
     const observed = await journal.read();
@@ -6118,7 +8230,7 @@ describe("device command execution", () => {
     }).cycle(new AbortController().signal);
     expect(result.errors).toEqual([]);
     expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({
-      resultCode: "LOCAL_RESULT_RECOVERY_REQUIRED",
+      resultCode: "LOCAL_EFFECT_RECOVERY_REQUIRED",
       state: "ambiguous",
     });
     expect((await journal.read()).state.deviceCommands).toEqual([]);
@@ -6140,6 +8252,7 @@ describe("device command execution", () => {
       requestingDevicePublicId: "device_browser1",
     });
     const command = cloud.requireDeviceCommand(commandPublicId);
+    await refreshLegacyDeviceCommandRequestDigest(command);
     command.boundAuthority = staleAuthority;
     command.state = "ambiguous";
     cloud.revokedDevices.add(command.requestingDevicePublicId);
@@ -6211,6 +8324,7 @@ describe("device command execution", () => {
         accountPublicId: "acct_primary0001",
         kind: "session_start",
         preset: "ultra",
+        presetContract: 1,
         projectPublicId: "proj_alpha000001",
         prompt: "continue",
         provider: "codex",
@@ -6267,7 +8381,7 @@ describe("device command execution", () => {
   });
 
   for (const hostedState of ["cancelled", "expired"] as const) {
-    test(`a later boot retires a prepared journal after hosted ${hostedState} wins`, async () => {
+    test(`does not journal a command when hosted ${hostedState} wins after discovery`, async () => {
       const cloud = new FakeCloud();
       const journal = new MemoryCloudDaemonJournal();
       const deviceExecutor = new RecordingDeviceExecutor();
@@ -6295,29 +8409,8 @@ describe("device command execution", () => {
       }).cycle(new AbortController().signal);
       expect(first.errors).toHaveLength(1);
       expect(deviceExecutor.calls).toEqual([]);
-      expect((await journal.read()).state.deviceCommands).toMatchObject([{ phase: "prepared" }]);
-
-      cloud.now += cloud.presenceTtlMs + 1;
-      const restarted = bridge({
-        cloud,
-        daemonAuthority: { bootGeneration: 2, bootId: "boot_22345678", fence: 1 },
-        device: "device_daemon1",
-        deviceExecutor,
-        journal,
-        local: new FakeLocal("session_deviceco", events),
-      });
-      if (hostedState === "cancelled") cloud.failTerminalRecoveryConfirmationOnce = true;
-      const second = await restarted.cycle(new AbortController().signal);
-      if (hostedState === "cancelled") {
-        expect(second.errors).toHaveLength(1);
-        expect((await journal.read()).state.deviceCommands).toMatchObject([{ phase: "prepared" }]);
-        expect((await restarted.cycle(new AbortController().signal)).errors).toEqual([]);
-      } else {
-        expect(second.errors).toEqual([]);
-      }
-      expect(deviceExecutor.calls).toEqual([]);
-      expect(cloud.requireDeviceCommand(commandPublicId).state).toBe(hostedState);
       expect((await journal.read()).state.deviceCommands).toEqual([]);
+      expect(cloud.requireDeviceCommand(commandPublicId).state).toBe(hostedState);
     });
   }
 
@@ -6395,6 +8488,7 @@ describe("device command execution", () => {
           kind: "account_login_start",
           payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
           phase,
+          requestCommitmentVersion: 3,
           requestingDevicePublicId: "device_browser1",
         }],
       });
@@ -6440,6 +8534,7 @@ describe("device command execution", () => {
         accountPublicId: "acct_primary0001",
         kind: "session_start",
         preset: "ultra",
+        presetContract: 1,
         projectPublicId: "proj_alpha000001",
         prompt: "continue",
         provider: "codex",
@@ -6460,6 +8555,7 @@ describe("device command execution", () => {
         kind: "session_start",
         payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
         phase: "effect_started",
+        requestCommitmentVersion: 3,
         requestingDevicePublicId: "device_browser1",
       }],
     });
@@ -6913,6 +9009,7 @@ describe("attention notification daemon bridge", () => {
       },
       publicId: deviceCommandPublicId,
       requestingDevicePublicId: "device_attention_requester_12345678",
+      targetDevicePublicId: world.device,
     });
     const deviceExecutor: CloudDeviceCommandExecutorPort = {
       async executeDeviceCommand(input) {

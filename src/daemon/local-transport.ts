@@ -7,6 +7,7 @@ import { basename, dirname, join } from "node:path";
 import {
   commandEnvelopeSchema,
   commandResponseSchema,
+  localCommandPresetContract,
   LOCAL_COMMAND_REQUEST_MAX_BYTES,
   LOCAL_COMMAND_REQUEST_VERSION,
   type CommandResponse,
@@ -619,10 +620,12 @@ export async function callLocalDaemon(input: {
   }
   throwIfClientAborted(input.signal);
   const requestId = randomUUID();
+  const presetContract = localCommandPresetContract(input.command);
   const request = `${JSON.stringify({
     version: LOCAL_COMMAND_REQUEST_VERSION,
     capability,
     requestId,
+    ...(presetContract === undefined ? {} : { presetContract }),
     command: input.command,
   })}\n`;
   return await new Promise<CommandResponse>((resolvePromise, rejectPromise) => {

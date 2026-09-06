@@ -7,7 +7,12 @@ import { join } from "node:path";
 
 import { CLAUDE_PIN, CLAUDE_PIN_MODEL } from "../claude/pin";
 import { IndeterminateCodexEffectError } from "../codex";
-import type { Preset } from "../domain/presets";
+import {
+  currentPresetContract,
+  legacyPresetContract,
+  type Preset,
+  type PresetContract,
+} from "../domain/presets";
 import type {
   EffectiveClaudeRuntimeProfile,
   EffectiveRuntimeProfile,
@@ -22,7 +27,7 @@ import {
   trajectoryRecordSchema,
 } from "../domain/trajectory";
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
-import { StateStore } from "../storage/state-store";
+import { sessionProviderSwitchMutationRequest, StateStore } from "../storage/state-store";
 import {
   ClaudeProcessExitUnprovenError,
   ClaudeSessionObservationError,
@@ -53,7 +58,7 @@ const codexProfile = (
   processGeneration: authority.generation,
   observedAt: 2_000,
   preset,
-  model: preset === "low" ? "gpt-5.6-luna" : "gpt-6-astra",
+  model: preset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
   reasoningEffort: preset === "ultra" ? "ultra" : "max",
   serviceTier: null,
   fast: false,
@@ -535,7 +540,7 @@ async function codexSession(value: Fixture): Promise<Readonly<{
     { signal },
   );
   const started = await value.service.execute(
-    { account: added.account.id, fast: false, kind: "session.start", preset: "high" },
+    { account: added.account.id, fast: false, kind: "session.start", preset: "high", presetContract: 1 },
     { signal },
   ) as { session: { id: `sess_${string}` } };
   return { accountId: added.account.id, sessionId: started.session.id };
@@ -628,6 +633,7 @@ const leaveFinalSwitchCommitUnsettled = async (
   command: Readonly<{
     account?: `acct_${string}`;
     idempotencyKey: string;
+    presetContract?: PresetContract;
     provider: "claude" | "codex";
     session: `sess_${string}`;
   }>,
@@ -1019,6 +1025,66 @@ describe("provider portability", () => {
     expect(value.store.requireSession(sessionId).provider).toBe("codex");
     expect(value.codex.endedThreads).toEqual([]);
     expect(value.claude.calls).toEqual(["read-account"]);
+  });
+
+  test("rejects a target-provider preset mismatch before authentication or durable admission", async () => {
+    const value = await fixture();
+    const { sessionId } = await codexSession(value);
+    value.claude.accountSignedIn = false;
+    const idempotencyKey = crypto.randomUUID();
+
+    const refusal = await value.service.execute(
+      {
+        idempotencyKey,
+        kind: "session.switch",
+        preset: "high",
+        provider: "claude",
+        session: sessionId,
+      },
+      { signal },
+    ).catch((error: unknown) => error);
+
+    expect(refusal).toBeInstanceOf(CommandFailure);
+    expect((refusal as CommandFailure).code).toBe("INVALID_INPUT");
+    expect((refusal as CommandFailure).message).toContain(
+      "does not support the `high` model preset",
+    );
+    expect(value.claude.calls).toEqual([]);
+    expect(value.store.readMutation(idempotencyKey)).toBeNull();
+    expect(value.store.requireSession(sessionId).provider).toBe("codex");
+  });
+
+  test("rejects a changed prepared switch request before target authentication", async () => {
+    const value = await fixture();
+    const { accountId, sessionId } = await codexSession(value);
+    value.claude.accountSignedIn = false;
+    const profile = value.store.requireProfileById(accountId);
+    const idempotencyKey = crypto.randomUUID();
+    value.store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: sessionId,
+      idempotencyKey,
+      kind: "session.switch",
+      request: sessionProviderSwitchMutationRequest({
+        provider: "claude",
+        preset: "fable-max",
+        seedDigest: "0".repeat(64),
+        targetProfileId: profile.id,
+      }),
+    });
+
+    const refusal = await value.service.execute({
+      idempotencyKey,
+      kind: "session.switch",
+      provider: "claude",
+      session: sessionId,
+    }, { signal }).catch((error: unknown) => error);
+
+    expect(refusal).toBeInstanceOf(CommandFailure);
+    expect((refusal as CommandFailure).code).toBe("CONFLICT");
+    expect(value.claude.calls).toEqual([]);
+    expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "prepared" });
+    expect(value.store.requireSession(sessionId).provider).toBe("codex");
   });
 
   test("refuses a switch while the target account has an unsettled Claude login", async () => {
@@ -1414,6 +1480,79 @@ describe("provider portability", () => {
     )).toHaveLength(1);
   });
 
+  test("refuses an inactive Codex switch source before authentication or durable admission", async () => {
+    const value = await fixture();
+    const { sessionId } = await claudeSession(value);
+    const idempotencyKey = crypto.randomUUID();
+    let authenticationReads = 0;
+    const readAccount = value.codex.readAccount.bind(value.codex);
+    Object.defineProperty(value.codex, "readAccount", {
+      configurable: true,
+      value: async () => {
+        authenticationReads += 1;
+        return await readAccount();
+      },
+    });
+    const callsBefore = [...value.codex.calls];
+
+    await expect(value.service.execute({
+      idempotencyKey,
+      kind: "session.switch",
+      presetContract: currentPresetContract,
+      provider: "codex",
+      session: sessionId,
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: expect.stringContaining("inactive provider-switch preset contract"),
+    });
+
+    expect(authenticationReads).toBe(0);
+    expect(value.codex.calls).toEqual(callsBefore);
+    expect(value.store.readMutation(idempotencyKey)).toBeNull();
+  });
+
+  test("binds a Codex switch replay to its caller-authored source contract", async () => {
+    const value = await fixture();
+    const { accountId, sessionId } = await claudeSession(value);
+    await value.service.execute(
+      { account: accountId, deviceCode: false, kind: "account.login" },
+      { signal },
+    );
+    const idempotencyKey = crypto.randomUUID();
+    const command = {
+      idempotencyKey,
+      kind: "session.switch" as const,
+      presetContract: legacyPresetContract,
+      provider: "codex" as const,
+      session: sessionId,
+    };
+
+    await expect(value.service.execute(command, { signal })).resolves.toMatchObject({
+      idempotencyKey,
+      session: { id: sessionId, preset: "ultra", provider: "codex" },
+    });
+    const effectsAfterCommit = {
+      codexCalls: [...value.codex.calls],
+      claudeCalls: [...value.claude.calls],
+    };
+    await expect(value.service.execute(command, { signal })).resolves.toMatchObject({
+      idempotencyKey,
+      session: { id: sessionId, preset: "ultra", provider: "codex" },
+    });
+    expect(value.codex.calls).toEqual(effectsAfterCommit.codexCalls);
+    expect(value.claude.calls).toEqual(effectsAfterCommit.claudeCalls);
+
+    await expect(value.service.execute({
+      ...command,
+      presetContract: currentPresetContract,
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: expect.stringContaining("preset contract"),
+    });
+    expect(value.codex.calls).toEqual(effectsAfterCommit.codexCalls);
+    expect(value.claude.calls).toEqual(effectsAfterCommit.claudeCalls);
+  });
+
   test("replays the durable destination snapshot after a later reverse switch", async () => {
     const value = await fixture();
     const { sessionId } = await codexSession(value);
@@ -1437,6 +1576,7 @@ describe("provider portability", () => {
     await value.service.execute({
       idempotencyKey: crypto.randomUUID(),
       kind: "session.switch",
+      presetContract: legacyPresetContract,
       provider: "codex",
       session: sessionId,
     }, { signal });
@@ -1651,6 +1791,7 @@ describe("provider portability", () => {
       account: targetAccountId,
       idempotencyKey,
       kind: "session.switch",
+      presetContract: legacyPresetContract,
       provider: "codex",
       session: sessionId,
     }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -2186,6 +2327,7 @@ describe("provider portability", () => {
     await leaveFinalSwitchCommitUnsettled(value, {
       account: targetAccountId,
       idempotencyKey,
+      presetContract: legacyPresetContract,
       provider: "codex",
       session: sessionId,
     });
@@ -2874,7 +3016,13 @@ describe("provider portability", () => {
     const value = await fixture();
     const { sessionId } = await codexSession(value);
     const refusal = await value.service.execute(
-      { idempotencyKey: crypto.randomUUID(), kind: "session.switch", provider: "codex", session: sessionId },
+      {
+        idempotencyKey: crypto.randomUUID(),
+        kind: "session.switch",
+        presetContract: legacyPresetContract,
+        provider: "codex",
+        session: sessionId,
+      },
       { signal },
     ).catch((error: unknown) => error);
     expect(refusal).toBeInstanceOf(CommandFailure);

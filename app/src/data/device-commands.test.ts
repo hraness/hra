@@ -19,6 +19,7 @@ const receipt = {
 };
 const enqueueRequest: WireDeviceEnqueueArgs = {
   deadline: 1_760_000_060_000,
+  expectedRequestingDevicePublicId: "device_browser01",
   expectedTargetDevicePublicId: "device_daemon01",
   idempotencyKey: receipt.idempotencyKey,
   kind: "usage_refresh",
@@ -29,6 +30,7 @@ const enqueueRequest: WireDeviceEnqueueArgs = {
     nonce: "AAAAAAAAAAAAAAAA",
   },
   publicId,
+  requestCommitmentVersion: 2,
   requestDigest: receipt.requestDigest,
 };
 

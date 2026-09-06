@@ -8,7 +8,7 @@ Never copy retired HRA v0 data, deployment URLs, deploy keys, authentication key
 
 The provider identity guard pins the intended Convex team to numeric ID `513923` and provider slug `cclrte`. Retired HRA v0 Convex project ID `2680173` and production deployment ID `4677913` remain permanent denylisted safety tombstones; neither may be recreated, renamed into, or selected by this runbook. The current source repository has GitHub repository ID `1343008607`, and the current web project has Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Provider names may change. The team identity and numeric resource IDs do not.
 
-Browser app project. The web app at `app.hra.sh` is a second Vercel project in the same team, separate from the website project above so the two never share an origin, a cache policy, or a Content Security Policy. It has no framework preset, root directory `app`, build command `cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app`, install command `true`, and output directory `dist`. Its tracked ignore command exits nonzero for production so Vercel builds `main` rather than skipping it, while preview deployments remain ignored. The app requires no deployment-secret input: its Convex deployment origin is pinned in source at `app/src/env.ts` and in the `connect-src` allowlist of `app/vercel.json`. It was created on 2026-09-04 as Vercel project `prj_3olYDT29BrwKO9PLByVq9HlgRkdA` (name `hra-app`, team `team_UAd1iD2XogJlbFg4h14mRaPM`, production branch `main`, domain `app.hra.sh`), alongside the website project `prj_8ciIt9t9foE3utG45frRN7cxckjS`.
+Browser app project. The web app at `app.hra.sh` is a second Vercel project in the same team, separate from the website project above so the two never share an origin, a cache policy, or a Content Security Policy. It has no framework preset, root directory `app`, build command `cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app`, install command `true`, and output directory `dist`. Its tracked ignore command exits nonzero for production so Vercel builds `main` rather than skipping it, while preview deployments remain ignored. The app requires no deployment-secret input: its Convex deployment origin is pinned in source at `app/src/env.ts` and in the `connect-src` allowlist of `app/vercel.json`. It was created on 2026-09-04 as Vercel project `prj_3olYDT29BrwKO9PLByVq9HlgRkdA` (name `hra-app`, team `team_UAd1iD2XogJlbFg4h14mRaPM`, production branch `main`, domain `app.hra.sh`), alongside the website project `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Every production build must receive Vercel's exact lowercase 40-character `VERCEL_GIT_COMMIT_SHA`; a missing or malformed value stops the build. The bundle publishes that commit, repository identity, and package version at the no-store path `/.well-known/hra-app.json`, which is excluded from the SPA fallback.
 
 Live projection. Besides the compact stream of completed turns, the daemon streams the current turn's assistant text (and reasoning summaries only when show-thinking is enabled for the session, default off) to the `detail` stream about once per second in redacted, encrypted batches of at most 8 KiB. Detail chunks carry the `live_tail` retention class: each row expires six hours after it is written, a session keeps at most 200 rows, and the `live_tail_chunks` maintenance category sweeps expired rows behind a detail stream epoch so digest-chain verification of the surviving tail stays valid and both the chunk quota and the per-user `live_chunk` resource counter are released. Raw reasoning is never uploaded.
 
@@ -155,6 +155,47 @@ The candidate intent requires its `before` attestation to equal the predecessor 
 There is one exceptional supersession path for a bootstrap intent that cannot deploy its source. Use it only with independent evidence that the failed Convex process stopped determinately before the remote `runPush` mutation boundary, local process cleanup is proven, the exact numeric target is reverified, and a fresh authority read exactly equals the failed intent's recorded `before` attestation. Launching Convex or performing read-only target resolution does not disqualify this path. Any possibility that `runPush` began prohibits it. Keep the failed source-qualified evidence path and its `.intent` unchanged as quarantine evidence. From a newer exact clean fixed commit, choose a different source-qualified evidence path in the same protected release directory and run bootstrap there under the single release authority. Never delete, rename, overwrite, or retry the failed path from the newer checkout. Once the new runtime binds, its non-null attestation makes the old null-before intent inert and any replay of the old path fails closed. An ambiguous mutation boundary, changed or unreadable runtime, unproven cleanup, target drift, reused path, or missing old intent prohibits supersession.
 
 Deployment intents and final documents use canonical SHA-256 JSON, bounded no-follow reads, exclusive mode-`0600` files, descriptor and path identity checks, file and directory sync, and atomic no-replace publication. Retain the `.intent` beside its final evidence until the release is complete.
+
+### Prove the browser app source
+
+After the exact reviewed commit reaches protected `main`, prove the separately
+deployed browser app before treating its controls as part of the release. Use
+authenticated Vercel readbacks to require team
+`team_UAd1iD2XogJlbFg4h14mRaPM`, project
+`prj_3olYDT29BrwKO9PLByVq9HlgRkdA`, production branch `main`, a `READY`
+production deployment whose Git source is repository ID `1343008607` at that
+exact commit, and the `app.hra.sh` alias attached to that deployment. A project
+name, automatic hostname, or successful HTTP response is not a substitute for
+those stable identities.
+
+Fetch `https://app.hra.sh/.well-known/hra-app.json` without an authenticated
+browser session and parse it as strict JSON. Require exactly this document,
+substituting the reviewed commit and release version:
+
+```json
+{
+  "generation": 1,
+  "product": "HRA App",
+  "repository": {
+    "id": 1343008607,
+    "path": "hraness/hra"
+  },
+  "schemaVersion": 1,
+  "source": {
+    "commit": "<EXACT_MERGED_COMMIT>"
+  },
+  "version": "<EXACT_RELEASE_VERSION>"
+}
+```
+
+Require `Cache-Control: no-store`. Read the authenticated alias and deployment
+again after the public marker, and accept the proof only if both provider
+samples and the marker name the same unchanged deployment and commit. A missing
+marker, an HTML fallback, an extra or malformed field, a cached response, a
+commit mismatch, an alias move during the sample, or a non-READY deployment
+stops release acceptance. Keep authentication material and raw provider output
+outside the repository; record only the exact non-secret deployment, commit,
+marker, and observation-time evidence needed by the release receipt.
 
 ## Configure secrets
 
@@ -557,11 +598,113 @@ that finds a command it left at `effect_started` may only close it as
 `ambiguous`. That is what stops a `session_start` that may or may not have run
 from silently starting a second session.
 
+### Request commitment and rolling updates
+
+Every enqueue carries a keyed request commitment over the request fields that
+the execution daemon verifies. The requesting client computes an HMAC-SHA256
+with the account key. Its message is
+`hra-control-plane:<purpose>:v1:<json>`. A session command uses purpose
+`command-enqueue` and the exact JSON object key order shown below. A device
+command uses purpose `device-command-enqueue` and its separate exact order:
+
+```text
+session: {deadline, expectedTargetDevicePublicId, kind, payload, publicId, requestingDevicePublicId, sessionPublicId}
+device:  {deadline, expectedTargetDevicePublicId, kind, payload, publicId, requestingDevicePublicId}
+```
+
+The `v1` in the HMAC message is the fixed keyed-digest framing version. It is
+distinct from hosted request commitment marker 2 and local journal classifier
+3.
+
+The hosted enqueue authenticates the requesting device and stores that exact
+requester with the target, payload, and digest. The daemon fetches the exact
+row and recomputes the commitment from the stored requester. The hosted row
+records wire marker 2. A current local journal entry records
+`requestCommitmentVersion: 3`, meaning it verified that marker-2 requester
+commitment and retained the exact requesting device. Local journal markers 1
+and 2, plus pre-marker entries, are legacy recovery evidence, not current
+execution authority.
+
+Current verification runs first and is the only path that can reach a provider
+effect. If it fails, a daemon may recognize the older HMAC, which omitted
+`requestingDevicePublicId`, only to reach a non-executing terminal disposition.
+That legacy digest is never trusted as requester authority and is never rebound
+to the active browser or device. Apply this decision order:
+
+- An already-hosted terminal row takes precedence. It confirms its hosted
+  result and permits local journal retirement without replaying any local
+  outcome.
+- Otherwise, if the hosted row is nonterminal and either the local journal or
+  hosted row records `effect_started`, the hosted command becomes result-less
+  `ambiguous` and is never retried.
+- A legacy local terminal outcome over a hosted nonterminal row is not trusted.
+  The daemon discards that unauthenticated outcome and closes the hosted row
+  result-less `ambiguous` with `LOCAL_EFFECT_RECOVERY_REQUIRED`.
+- A fresh or local-`prepared` legacy request over a hosted `pending` or
+  `prepared` command becomes `failed` with
+  `LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT` through the table's dedicated
+  `failPrepared` mutation.
+
+Fresh mixed-version requests fail before a command, quota charge, or security
+event is inserted. Each daemon publishes an internal
+`deviceRegistries.commandRequestVersion` marker before command processing. A
+fresh enqueue must exactly match its target: marker 2 matches marker 2, while an
+absent request marker matches an absent registry marker. Exact idempotency replay
+is resolved first, so a committed request remains replayable after its target
+upgrades or downgrades; changing the marker under the same key is still an
+idempotency conflict. The registry marker is not returned by `getRegistry` or
+`listRegistries`. An old daemon's next registry write omits and therefore clears
+the marker. If the current daemon cannot publish its registry, it skips both
+session- and device-command processing for that cycle while unrelated sync may
+continue.
+
+The stored command marker is also checked at `prepare` and
+`markEffectStarted`. A marker-2 row requires the current executor marker before
+either hosted transition, even if a stale registry still advertises marker 2.
+Legacy rows accept only the old-shaped executor marker. The current daemon uses
+those transitions only for its legacy recovery flows; it never promotes that
+evidence to current provider-effect authority. Never edit or delete the local
+journal, local CLI outbox, current tab's retained command handle and idempotency
+identity, registry marker, or hosted row to work around a refusal. The browser
+has no durable outbox; inspect browser and device commands through the app or
+the corresponding hosted query.
+
+Roll out per target rather than globally pausing command writers:
+
+1. Deploy the additive Convex schema, per-target enqueue gate, executor marker
+   checks, exact `get`, session-command `getForOutboxRecovery`, `failPrepared`,
+   and requester-authenticated `enqueue` functions first.
+2. Upgrade daemons independently. A current daemon publishes marker 2 before it
+   processes either command queue. A target becomes eligible for current
+   requests only after that write commits; a downgrade clears eligibility on
+   the next old-shaped registry write.
+3. Deploy marker-emitting browser and CLI clients after the hosted gate. They
+   can immediately address current targets. Current-to-old and old-to-current
+   pairs are rejected before insertion, while old clients and old targets may
+   continue their absent-to-absent protocol during the rollout.
+4. Let current daemons reconcile pre-existing legacy journals, outboxes, and
+   hosted rows through the recovery-only paths above. No account-wide drain or
+   all-daemons-current barrier is required before enabling current writers.
+
+Retain the additive functions, internal target marker, stored requester fields,
+and legacy and version 2 parsing until all local journals and outboxes are
+reconciled and every related hosted row is terminal or expired, and until no
+deployed current client can create or call those recovery surfaces.
+
+Hosted-function rollback and local binary downgrade are separate decisions.
+Stop issuing new commitments before a hosted rollback and keep every recovery
+surface above while rows drain. The current daemon writes local journal schema
+5 and may migrate other local custody state. Once it has started against a
+state root, never launch an older daemon against that root, even if every
+hosted row is terminal or expired. Retain the current binary and recovery
+endpoints while it remains deployed, and then until its local journals and
+outboxes are reconciled.
+
 ### Kinds
 
 | Kind | Payload | Result |
 | --- | --- | --- |
-| `session_start` | `{accountPublicId, projectPublicId, prompt, preset, provider}` | `{sessionPublicId}` |
+| `session_start` | `{accountPublicId, projectPublicId, prompt, preset, presetContract?, provider}`; `presetContract` is required for High or Ultra and absent for stable presets | `{sessionPublicId}` |
 | `account_login_start` | `{accountPublicId,handoffVersion?:2}` | current: `{handoffVersion:2,loginUrl,userCode,expiresAt}`, single use; legacy results remain parser-only during rolling deployment |
 | `account_login_status` | current: `{accountPublicId}`; legacy: none | `{status, instruction}` |
 | `usage_refresh` | none | `{accountsRefreshed}` |

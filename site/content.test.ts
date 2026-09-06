@@ -634,17 +634,146 @@ describe("public content contract", () => {
       expect(surface).toContain("hra daemon stop");
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
-      expect(surface).toContain("Do not install a moving branch");
-      expect(surface).toContain("verified repair installation of v0.6.0");
-      expect(surface).toContain("replace the tagged preflight and release archive references together");
+      expect(surface).toContain("verified repair installation for v0.6.0");
       expect(surface).not.toContain("bun remove --global hra");
       expect(surface).not.toContain("uninstall the package");
     }
-    const updateStart = markdown.indexOf("Before replacing the installed binary");
-    const updateDoctor = markdown.indexOf("hra doctor --offline", updateStart);
-    const updateRestart = markdown.indexOf("hra daemon start", updateStart);
-    expect(updateDoctor).toBeGreaterThan(updateStart);
-    expect(updateRestart).toBeGreaterThan(updateDoctor);
+  });
+
+  test("publishes the ordered update runbook with recovery and mixed-version boundaries", () => {
+    const markdown = renderReadmeMarkdown();
+    const rawHtml = renderSiteHtml();
+    const html = htmlVisibleText(rawHtml);
+    const install = publicContent.sections.find((section) => section.id === "install-and-update");
+    const procedure = install?.blocks.find(
+      (block) => block.kind === "ordered-list",
+    );
+
+    expect(procedure?.kind).toBe("ordered-list");
+    if (procedure?.kind !== "ordered-list") throw new Error("Missing update procedure.");
+    expect(procedure.items).toHaveLength(8);
+    expect(rawHtml).toContain('<ol class="procedure-list"><li><p>Resolve keyed local mutations');
+
+    const claims = [
+      "Update runbook",
+      "Resolve every uncertain local mutation that depends on old alias or prepared authority before starting the current daemon",
+      "preserve remote-command evidence for the fail-closed reconciliation below",
+      "expected preflight digest, and expected version together with one exact reviewed immutable tag",
+      "Never install a moving branch on a release machine",
+      "never run an older daemon against this state root after the current daemon has started",
+      "replay the exact idempotency key using the originating release's own syntax and source evidence",
+      "Resolve an affected Work mutation by replaying its exact request document",
+      "Continue only when exact replay under the originating release",
+      "Otherwise the update remains blocked",
+      "do not invent an unsupported option",
+      "This command has no idempotency key",
+      "Block the update on any remaining prepared or indeterminate local mutation",
+      "HRA exposes no general command to cancel a prepared session start or provider switch",
+      "Do not generate a fresh key or edit SQLite as a workaround",
+      "durable local outbox",
+      "current tab's retained command handle and idempotency identity",
+      "Never edit or delete the local command journal, local outbox, tab state, or hosted row to force progress",
+      "Require the stop command itself to exit zero",
+      "Status alone does not prove authority release",
+      "data.running: false",
+      "report only the exact pending state-schema migration",
+      "This is the no-downgrade boundary",
+      "Require the post-start doctor command to succeed before sync",
+      "Sync status reports projection recovery, not the command outbox",
+      "The current daemon never executes a legacy request commitment",
+      "An already-hosted terminal row takes precedence",
+      "LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT",
+      "if the hosted row remains nonterminal and either side records",
+      "close it result-less as",
+      "LOCAL_EFFECT_RECOVERY_REQUIRED",
+      "Never automatically retry an ambiguous command",
+      "Each daemon privately publishes its command-request version before processing commands",
+      "Fresh requests must exactly match that target",
+      "either mixed-version direction is rejected before a command or quota record is written",
+      "Exact same-key replay remains available across a later target upgrade or downgrade",
+      "A registry-publication failure skips both command queues for that cycle",
+      "no all-daemons pause or account-wide legacy drain is required",
+    ];
+    for (const claim of claims) {
+      expect(markdown).toContain(claim);
+      expect(html).toContain(claim);
+    }
+
+    expect(markdown).toContain([
+      "5. Stop the daemon and prove that it released authority:",
+      "",
+      "   ```text",
+      "   hra daemon stop --json",
+      "   hra daemon status --json",
+      "   ```",
+      "",
+      "   Require the stop command itself to exit zero; its recovery path is the authority-release proof. Treat a status response containing `data.running: false` only as a secondary no-listener confirmation. Status alone does not prove authority release. Stop on any stop or recovery error.",
+    ].join("\n"));
+    expect(markdown).toContain([
+      "7. Start the current daemon. This is the no-downgrade boundary: after this command begins, never launch an older daemon against the same state root. Prove post-migration health before syncing, then inspect every retained CLI session-command ID:",
+      "",
+      "   ```text",
+      "   hra daemon start",
+      "   hra doctor --offline",
+      "   hra sync now",
+      "   hra sync status",
+      "   hra remote command <uuidv7>",
+      "   ```",
+    ].join("\n"));
+    expect(markdown.indexOf("1. Resolve keyed local mutations")).toBeLessThan(
+      markdown.indexOf("8. Classify legacy remote commitments"),
+    );
+    expect(markdown).toContain("A fresh or local-prepared legacy request over hosted `pending` or `prepared` row closes as `failed` with `LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT`.");
+    expect(markdown).toContain("A legacy local terminal outcome over any hosted nonterminal row is unauthenticated evidence");
+    const runbookMarkdown = markdown.slice(
+      markdown.indexOf("### Update runbook"),
+      markdown.indexOf("### Optional full local-data removal"),
+    );
+    expect(runbookMarkdown.match(/^\d+\. /gmu)).toHaveLength(8);
+    const runbookStart = rawHtml.indexOf(">Update runbook</h3>");
+    expect(runbookStart).toBeGreaterThan(0);
+    const runbookHtml = rawHtml.slice(
+      runbookStart,
+      rawHtml.indexOf("Optional full local-data removal"),
+    );
+    expect(runbookHtml.match(/<li>/gu)).toHaveLength(8);
+    expect(htmlVisibleText(runbookHtml)).toMatch(/Stop the daemon[\s\S]+?hra daemon stop --json[\s\S]+?Status alone does not prove authority release/u);
+    expect(markdown).not.toContain("Before replacing the installed binary");
+  });
+
+  test("preserves versioned Work and historical alias-replay guidance on both shared surfaces", () => {
+    const markdown = renderReadmeMarkdown();
+    const html = htmlVisibleText(renderSiteHtml());
+    const claims: readonly (readonly [visible: string, markdown?: string])[] = [
+      ["The versioned source contract defines a narrow local coordination kernel"],
+      ["one strict version 1 or version 2 request"],
+      ["also carries the caller-authored top-level presetContract", "also carries the caller-authored top-level `presetContract`"],
+      ["version 2 forbids that field on stable operations"],
+      ["The request version and any authored preset contract are part of changed-intent detection"],
+      ["Each Work also freezes the meaning of its High and Ultra routes when it is created"],
+      ["A fresh affected version 1 request is refused"],
+      ["An existing contract 2 Work whose coordinator and participating session authorities remain supported keeps Astra for already-declared tasks"],
+      ["A Work associated with a retired Devin session remains readable but is fenced from mutation and execution"],
+      ["Current tooling does not append a new High or Ultra task to a historical contract 2 Work"],
+      ["Reusing that key with another version or contract is a conflict"],
+      [
+        "A source-sensitive Codex session start or provider-switch replay includes both --idempotency-key and its immutable --preset-contract",
+        "A source-sensitive Codex `session start` or provider-switch replay includes both `--idempotency-key` and its immutable `--preset-contract`",
+      ],
+      ["The preset-contract option is replay-only and is rejected for stable requests"],
+      ["An older session-start release did not print the source contract"],
+      ["--preset high --preset-contract 1", "`--preset high --preset-contract 1`"],
+      ["Neither selector can resume a contractless prepared row"],
+      ["If the originating meaning cannot be proved, use the retained old release rather than guessing"],
+      ["A contractless prepared row has no supported cancellation or retirement command"],
+      ["Do not use a fresh key or session abandon as a workaround", "Do not use a fresh key or `session abandon` as a workaround"],
+      ["session preset has no idempotency-key replay", "`session preset` has no idempotency-key replay"],
+    ];
+
+    for (const [visibleClaim, markdownClaim = visibleClaim] of claims) {
+      expect(markdown).toContain(markdownClaim);
+      expect(html).toContain(visibleClaim);
+    }
   });
 
   test("publishes first-session walkthroughs for humans and agents", () => {
@@ -691,10 +820,14 @@ describe("public content contract", () => {
     }
     expect(publicContent.hero.steps[0]).toMatchObject({
       command: "hra session start personal --provider codex --json",
-      detail: "Create an Astra Ultra Codex session under the account profile you name.",
+      detail: "Create a Sol Ultra Codex session under the account profile you name.",
     });
-    expect(markdown).toContain("Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping");
-    expect(html).toContain("Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping");
+    expect(markdown).toContain("New HRA-created Codex sessions that use `high` or `ultra`");
+    expect(html).toContain("New HRA-created Codex sessions that use high or ultra");
+    expect(markdown).toContain("The `low` and `fable-max` bindings are unchanged");
+    expect(markdown).not.toContain("every explicit preset selection use the Sol mapping");
+    expect(markdown).toContain("sessions already bound to historical contract 2 keep their exact Astra model and effort");
+    expect(html).toContain("sessions already bound to historical contract 2 keep their exact Astra model and effort");
     expect(markdown).not.toContain("session start personal --provider codex --preset high");
   });
 

@@ -153,10 +153,20 @@ export function useSubmitDeviceCommand(): SubmitDeviceCommand {
       payload,
       publicId: commandPublicId,
     });
-    const requestDigest = await deviceEnqueueRequestDigest(unlocked.key, request);
+    const requestDigest = await deviceEnqueueRequestDigest(
+      unlocked.key,
+      request,
+      unlocked.identity.devicePublicId,
+    );
     try {
       return await submitPreparedDeviceCommand(
-        { ...request, idempotencyKey, requestDigest },
+        {
+          ...request,
+          expectedRequestingDevicePublicId: unlocked.identity.devicePublicId,
+          idempotencyKey,
+          requestCommitmentVersion: 2,
+          requestDigest,
+        },
         async (args) => await convex.mutation(enqueueDeviceCommand, args),
       );
     } catch (failure: unknown) {

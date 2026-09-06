@@ -58,14 +58,17 @@ import {
   type SessionStatus,
 } from "../domain/observation";
 import {
+  activePresetBinding,
   adoptableProviderSchema,
-  currentPresetContract,
+  isReboundCodexPreset,
   isPresetSupportedByProvider,
   PresetProviderMismatchError,
-  presetRequirementForContract,
   presetsForProvider,
+  presetRequirementForContract,
   presetTiers,
   type AdoptableProvider,
+  providerSwitchRequiresPresetContract,
+  sharedActiveCodexPresetContract,
   type Preset,
   type PresetRequirement,
   type Provider,
@@ -120,6 +123,7 @@ import {
   type UsageVelocityWindow,
 } from "../domain/usage-metrics";
 import {
+  WORK_APPLY_REQUEST_LEGACY_VERSION,
   WORK_TASK_HISTORY_DEFAULT_ITEM_LIMIT,
   workActionCursorPayloadSchema,
   workEventPageSchema,
@@ -129,6 +133,7 @@ import {
   workPreparedEffectStatusSchema,
   workTaskHistoryCursorPayloadSchema,
   type WorkEventPage,
+  type WorkApplyRequestSource,
   type WorkId,
   type WorkOperation,
   type WorkOperationResult,
@@ -158,6 +163,9 @@ import { initializeProfilePaths, profilePaths, type StatePaths } from "../storag
 import { resolveUsableCanonicalProjectDirectory } from "../storage/project-directory";
 import { WorkCapabilityCodec } from "../storage/work-capability";
 import {
+  mutationRequestDigest,
+  sessionProviderSwitchMutationRequest,
+  sessionStartMutationRequest,
   SelectionError,
   StateSecurityScrubRequiredError,
   UnusableProjectRootError,
@@ -1749,6 +1757,14 @@ export class HraService {
         case "work.protocol": return describeWorkProtocol(command.query);
         case "work.apply": return await this.#applyWorkOperation(
           command.operation,
+          command.requestVersion === undefined
+            ? { version: WORK_APPLY_REQUEST_LEGACY_VERSION }
+            : {
+                version: command.requestVersion,
+                ...(command.presetContract === undefined
+                  ? {}
+                  : { presetContract: command.presetContract }),
+              },
           context.signal,
         );
         case "work.snapshot": return this.#readWorkSnapshot(command.work, command.actor);
@@ -10142,12 +10158,13 @@ export class HraService {
   #projectSettledWorkEffect(
     operation: Extract<WorkOperation, { kind: "attempt.dispatch" | "signal.send" }>,
     effect: WorkPreparedEffect,
+    source: WorkApplyRequestSource,
   ): WorkOperationResult {
     const status = this.#work.reprojectPreparedEffect(operation.idempotencyKey);
     this.#assertPreparedEffectBinding(effect, status);
     if (status.state === "accepted") {
       const replay = workOperationResultSchema.parse(
-        this.#work.apply(operation, operation.idempotencyKey),
+        this.#work.apply(operation, operation.idempotencyKey, source),
       );
       if (replay.kind !== "attempt.dispatch" && replay.kind !== "signal.send") {
         throw new CommandFailure("RECOVERY_REQUIRED", "The settled work effect replay changed operation kind.");
@@ -10173,10 +10190,11 @@ export class HraService {
 
   async #applyWorkOperation(
     operation: WorkOperation,
+    source: WorkApplyRequestSource,
     signal: AbortSignal,
   ): Promise<WorkOperationResult> {
     const result = workOperationResultSchema.parse(
-      this.#work.apply(operation, operation.idempotencyKey),
+      this.#work.apply(operation, operation.idempotencyKey, source),
     );
     const workId = result.workId;
     this.#workWaiters.notify(workId);
@@ -10199,7 +10217,7 @@ export class HraService {
     this.#assertPreparedEffectStatusProjection(result.effect, status);
     this.#assertPreparedEffectBinding(effect, status);
     if (status.state !== "prepared") {
-      return this.#projectSettledWorkEffect(operation, effect);
+      return this.#projectSettledWorkEffect(operation, effect, source);
     }
 
     let executionError: unknown;
@@ -10228,7 +10246,7 @@ export class HraService {
       );
     }
     if (executionError instanceof StateSecurityScrubRequiredError) throw executionError;
-    return this.#projectSettledWorkEffect(operation, effect);
+    return this.#projectSettledWorkEffect(operation, effect, source);
   }
 
   #publicInteraction(interaction: InteractionRecord): PublicInteraction {
@@ -11844,12 +11862,19 @@ export class HraService {
             ? {}
             : { sourceProcessIdentity: candidate.sourceProcessIdentity }),
         });
-        const adoptionPreset = this.#store.readDefaultPreset(provider);
-        const adoptionFast = false;
-        const adoptionRequirement = presetRequirementForContract(
-          adoptionPreset,
-          currentPresetContract,
+        const existingPersonalBinding = this.#store.findSessionPersonalRuntimeBinding(
+          provider,
+          candidate.providerThreadId,
         );
+        const existingPersonalSession = existingPersonalBinding?.state === "active"
+          ? this.#store.requireSession(existingPersonalBinding.sessionId)
+          : undefined;
+        const adoptionPreset = existingPersonalSession?.preset
+          ?? this.#store.readDefaultPreset(provider);
+        const adoptionFast = false;
+        const adoptionRequirement = existingPersonalSession === undefined
+          ? activePresetBinding(adoptionPreset).requirement
+          : this.#store.requireSessionPresetRequirement(existingPersonalSession.id).requirement;
         const needsScheduledAgeWaiver = this.#personalCandidateNeedsScheduledAgeWaiver(
           candidate,
         );
@@ -12871,19 +12896,54 @@ export class HraService {
     // port proves, and every later turn, steer, stop, and interaction on this
     // session is routed back to the same port by `sessions.provider`.
     const runtime = this.#sessionRuntime(provider);
-    const requirement = presetRequirementForContract(
-      command.preset,
-      currentPresetContract,
-    );
-    // Prove authentication under the account serializer before the first
-    // durable mutation row or runtime review exists. Storage consumes this
-    // exact profile/provider/generation tuple at the effect boundary.
-    const providerAuthentication = await this.#assertProviderSignedIn(
-      profile,
-      provider,
-      signal,
-    );
+    const presetBinding = activePresetBinding(command.preset);
+    const { requirement } = presetBinding;
+    const reboundPreset = isReboundCodexPreset(command.preset);
+    const authoredPresetContract = command.presetContract;
+    if (!reboundPreset && authoredPresetContract !== undefined) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        "Only a Codex High or Ultra session start may carry a source preset contract.",
+      );
+    }
+    if (reboundPreset && authoredPresetContract === undefined) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "A Codex High or Ultra session start requires a caller-authored preset contract.",
+        command.idempotencyKey === undefined
+          ? undefined
+          : { idempotencyKey: command.idempotencyKey },
+      );
+    }
     const key = command.idempotencyKey ?? randomUUID();
+    const mutationAuthority = {
+      kind: "session.start",
+      authorityId: profile.id,
+      authorityGeneration: profile.processGeneration,
+    } as const;
+    const legacyRequest = {
+      projectId: project.id,
+      provider,
+      preset: command.preset,
+      fast: command.fast,
+    };
+    // The immutable v0.5.0 release (and earlier Codex-only releases) did not
+    // include provider in the session-start mutation digest. Retain that exact
+    // shape only for historical lookup. A contractless prepared row cannot be
+    // resumed because the same digest was emitted under both Sol and Astra.
+    const releasedLegacyRequest = {
+      projectId: project.id,
+      preset: command.preset,
+      fast: command.fast,
+    };
+    const request = sessionStartMutationRequest({
+      projectId: project.id,
+      provider,
+      preset: command.preset,
+      presetContract: authoredPresetContract,
+      fast: command.fast,
+    });
+    const activePresetContract = reboundPreset ? presetBinding.contract : undefined;
     let localSessionId: SessionRecord["id"] | undefined;
     let clientMessageId: MutationAttemptRecord["id"] | undefined;
     let review: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
@@ -12894,20 +12954,128 @@ export class HraService {
     let claudeLaunchIntent: ClaudeProcessLaunchIntentRecord | undefined;
     let providerAccountKey: string | undefined;
     const reservedClaudeProviderThreadId = provider === "claude" ? randomUUID() : undefined;
-    let outcome: z.infer<typeof sessionStartReceiptSchema>;
-    try {
-      outcome = await this.#effect<z.infer<typeof sessionStartReceiptSchema>>({
-      kind: "session.start",
-      authorityId: profile.id,
-      authorityGeneration: profile.processGeneration,
-      request: {
-        projectId: project.id,
+    let outcome: z.infer<typeof sessionStartReceiptSchema> | undefined;
+    const prior = command.idempotencyKey === undefined
+      ? null
+      : this.#store.readMutation(command.idempotencyKey);
+    if (prior !== null) {
+      const sameAuthority = prior.kind === mutationAuthority.kind
+        && prior.authorityId === mutationAuthority.authorityId;
+      // A daemon restart can advance the live profile generation while an
+      // immutable historical attempt keeps the generation that participated
+      // in its digest. Match that stored request against its own authority;
+      // current-authority requirements depend on the attempt state below.
+      const priorMutationAuthority = {
+        kind: mutationAuthority.kind,
+        authorityId: mutationAuthority.authorityId,
+        authorityGeneration: prior.authorityGeneration,
+      } as const;
+      const matchesAuthoredRequest = sameAuthority
+        && prior.requestDigest === mutationRequestDigest({ ...priorMutationAuthority, request });
+      const matchesLegacyRequest = sameAuthority
+        && prior.requestDigest === mutationRequestDigest({
+          ...priorMutationAuthority,
+          request: legacyRequest,
+        });
+      const matchesReleasedLegacyRequest = sameAuthority
+        && provider === "codex"
+        && prior.requestDigest === mutationRequestDigest({
+          ...priorMutationAuthority,
+          request: releasedLegacyRequest,
+        });
+      const matchesHistoricalRequest = matchesLegacyRequest
+        || matchesReleasedLegacyRequest;
+      const historicalSourceMatches = (() => {
+        if (!matchesHistoricalRequest || !reboundPreset) return matchesHistoricalRequest;
+        if (authoredPresetContract === undefined) return true;
+        const evidence = prior.evidence?.evidence;
+        if (evidence === undefined || evidence.kind !== "session.start") return false;
+        if (evidence.presetContract !== undefined) {
+          return evidence.presetContract === authoredPresetContract;
+        }
+        if (evidence.runtimeProfile === undefined) return false;
+        const historicalRequirement = presetRequirementForContract(
+          command.preset,
+          authoredPresetContract,
+        );
+        return evidence.runtimeProfile.model === historicalRequirement.model
+          && evidence.runtimeProfile.reasoningEffort === historicalRequirement.effort;
+      })();
+      const matchesAdmittedReplay = !reboundPreset
+        ? matchesAuthoredRequest || matchesHistoricalRequest
+        : authoredPresetContract === undefined
+          ? matchesHistoricalRequest
+          : matchesAuthoredRequest || historicalSourceMatches;
+      if (!matchesAdmittedReplay) {
+        throw new CommandFailure(
+          "CONFLICT",
+          "That idempotency key names a different session-start request or source contract.",
+          { idempotencyKey: command.idempotencyKey },
+        );
+      }
+      if (prior.state === "applied" || prior.state === "reconciled") {
+        if (prior.result === undefined) {
+          throw new CommandFailure(
+            "CONFLICT",
+            "That session start was explicitly resolved without a replayable result.",
+            { idempotencyKey: command.idempotencyKey },
+          );
+        }
+        outcome = sessionStartReceiptSchema.parse(prior.result);
+      } else if (prior.state === "effect_started" || prior.state === "ambiguous") {
+        if (!this.#store.isSessionMutationProviderAuthorityCurrent({
+          attemptId: prior.id,
+          profileId: profile.id,
+          provider,
+          originGeneration: prior.authorityGeneration,
+        })) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The account generation changed without an exact session-start recovery successor.",
+            { idempotencyKey: command.idempotencyKey },
+          );
+        }
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "session.start has an indeterminate earlier attempt and will not be replayed.",
+          { idempotencyKey: command.idempotencyKey },
+        );
+      } else if (
+        prior.state !== "prepared"
+        || prior.authorityGeneration !== profile.processGeneration
+        || (reboundPreset && (
+          authoredPresetContract !== activePresetContract
+          || matchesHistoricalRequest
+        ))
+      ) {
+        throw new CommandFailure(
+          "CONFLICT",
+          "That session start cannot begin under its authored source contract.",
+          { idempotencyKey: command.idempotencyKey },
+        );
+      }
+    } else if (reboundPreset && authoredPresetContract !== activePresetContract) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "A fresh Codex High or Ultra session start requires this build's active source contract.",
+        { idempotencyKey: key },
+      );
+    }
+    if (outcome === undefined) {
+      // Prove authentication only after source-contract admission and
+      // historical replay classification. Refused stale or absent sources
+      // therefore create no row and make no provider call.
+      const providerAuthentication = await this.#assertProviderSignedIn(
+        profile,
         provider,
-        preset: command.preset,
-        fast: command.fast,
-      },
-      idempotencyKey: key,
-      beginEffect: async (attemptId) => {
+        signal,
+      );
+      try {
+        outcome = await this.#effect<z.infer<typeof sessionStartReceiptSchema>>({
+          ...mutationAuthority,
+          request,
+          idempotencyKey: key,
+          beginEffect: async (attemptId) => {
         clientMessageId = attemptId;
         providerAccountKey = await this.#assertManagedProviderRuntimeAuthority(
           profile,
@@ -12950,6 +13118,7 @@ export class HraService {
             projectId: project.id,
             clientMessageId: null,
             messageDigest: null,
+            ...(authoredPresetContract === undefined ? {} : { presetContract: authoredPresetContract }),
             runtimeProfile: review.effectiveRuntimeProfile,
             conversationAutomationCapability: SESSION_CONVERSATION_AUTOMATION_CAPABILITY,
           },
@@ -12971,8 +13140,8 @@ export class HraService {
             sessionId: local.id,
           });
         }
-      },
-      effect: async () => {
+          },
+          effect: async () => {
         if (localSessionId === undefined || clientMessageId === undefined || review === undefined) throw new Error("Session start effect lost its durable placeholder or runtime-review binding.");
         const runtimeReview = review;
         const local = this.#store.requireSession(localSessionId);
@@ -13108,10 +13277,10 @@ export class HraService {
           throw error;
         }
         return { sessionId: local.id, sourceId: clientMessageId, effectiveRuntimeProfile: startedProjection.effectiveRuntimeProfile };
-      },
-      receipt: (value) => sessionStartReceiptSchema.parse(value),
-      restore: (value) => sessionStartReceiptSchema.parse(value),
-      commit: async (attemptId, _value, receipt) => {
+          },
+          receipt: (value) => sessionStartReceiptSchema.parse(value),
+          restore: (value) => sessionStartReceiptSchema.parse(value),
+          commit: async (attemptId, _value, receipt) => {
         if (localSessionId === undefined || startedProjection === undefined) throw new Error("Session start commit lost its exact provider projection.");
         const local = this.#store.requireSession(localSessionId);
         await this.#assertSessionAccountAuthorityAfterProviderEffect(
@@ -13131,8 +13300,8 @@ export class HraService {
           ...(claudeProcessIdentity === undefined ? {} : { claudeProcessIdentity }),
           receipt,
         });
-      },
-      onAmbiguous: () => {
+          },
+          onAmbiguous: () => {
         if (localSessionId === undefined) return;
         if (startedProjection !== undefined && clientMessageId !== undefined) {
           try {
@@ -13157,10 +13326,11 @@ export class HraService {
           }
         }
         this.#quarantineSession(localSessionId);
-      },
-      });
-    } finally {
-      if (review !== undefined) runtime.discardRuntimeReview(review);
+          },
+        });
+      } finally {
+        if (review !== undefined) runtime.discardRuntimeReview(review);
+      }
     }
     try {
       await this.#ensureFactsMemory(this.#store.requireSession(outcome.sessionId));
@@ -13255,6 +13425,7 @@ export class HraService {
         { idempotencyKey: command.idempotencyKey },
       );
     }
+    this.#assertProviderSwitchSourceContract(command, prior);
     if (prior.result === undefined) {
       throw new CommandFailure(
         "CONFLICT",
@@ -13272,6 +13443,8 @@ export class HraService {
       receipt.request.provider !== command.provider
       || receipt.request.accountId !== requestedAccountId
       || receipt.request.preset !== (command.preset ?? null)
+      || (receipt.request.presetContract !== undefined
+        && receipt.request.presetContract !== command.presetContract)
     ) {
       throw new CommandFailure(
         "CONFLICT",
@@ -13291,6 +13464,109 @@ export class HraService {
         idempotencyKey: command.idempotencyKey,
       },
     };
+  }
+
+  #assertProviderSwitchSourceContract(
+    command: Extract<LocalCommand, { kind: "session.switch" }>,
+    prior: MutationAttemptRecord | null,
+  ): void {
+    const required = providerSwitchRequiresPresetContract(
+      command.provider,
+      command.preset,
+    );
+    const source = command.presetContract;
+    if (!required) {
+      if (source !== undefined) {
+        throw new CommandFailure(
+          "CONFLICT",
+          "That provider switch carries a source contract for a stable route.",
+        );
+      }
+      return;
+    }
+    if (source === undefined) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "That provider switch is missing its caller-authored preset contract.",
+      );
+    }
+    if (prior === null) {
+      if (source !== sharedActiveCodexPresetContract()) {
+        throw new CommandFailure(
+          "CONFLICT",
+          "An inactive provider-switch preset contract cannot authorize a fresh effect.",
+          { presetContract: source },
+        );
+      }
+      return;
+    }
+    if (prior.state === "prepared") {
+      if (source !== sharedActiveCodexPresetContract()) {
+        throw new CommandFailure(
+          "CONFLICT",
+          "An inactive provider-switch preset contract cannot resume a prepared effect.",
+          { idempotencyKey: prior.idempotencyKey, presetContract: source },
+        );
+      }
+      return;
+    }
+    const evidence = prior.evidence?.evidence;
+    if (evidence === undefined || evidence.kind !== "session.switch") {
+      throw new CommandFailure(
+        "CONFLICT",
+        "That provider-switch replay has no source-bound effect evidence.",
+        { idempotencyKey: prior.idempotencyKey },
+      );
+    }
+    const requestedAccountId = command.account === undefined
+      ? null
+      : command.account === evidence.requestedAccountId
+        ? evidence.requestedAccountId
+        : this.#store.requireProfile(command.account).id;
+    if (
+      evidence.targetProvider !== command.provider
+      || evidence.requestedPreset !== (command.preset ?? null)
+      || evidence.requestedAccountId !== requestedAccountId
+    ) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "That idempotency key names a different provider-switch request.",
+        { idempotencyKey: prior.idempotencyKey },
+      );
+    }
+    if (evidence.presetContract !== undefined) {
+      if (evidence.presetContract !== source) {
+        throw new CommandFailure(
+          "CONFLICT",
+          "That idempotency key names a different provider-switch preset contract.",
+          { idempotencyKey: prior.idempotencyKey },
+        );
+      }
+      return;
+    }
+    // Before the caller-authored field existed, effect evidence still bound
+    // a rebound target to its exact reviewed model and effort. Use that
+    // immutable tuple only for historical lookup; a fresh or prepared effect
+    // was already refused above.
+    if (
+      evidence.targetProvider === "codex"
+      && isReboundCodexPreset(evidence.targetPreset)
+    ) {
+      const historicalRequirement = presetRequirementForContract(
+        evidence.targetPreset,
+        source,
+      );
+      if (
+        evidence.runtimeProfile.model !== historicalRequirement.model
+        || evidence.runtimeProfile.reasoningEffort !== historicalRequirement.effort
+      ) {
+        throw new CommandFailure(
+          "CONFLICT",
+          "That idempotency key names a different historical provider-switch preset contract.",
+          { idempotencyKey: prior.idempotencyKey },
+        );
+      }
+    }
   }
 
   async #switchProvider(
@@ -13317,6 +13593,7 @@ export class HraService {
     const prior = command.idempotencyKey === undefined
       ? null
       : this.#store.readMutation(command.idempotencyKey);
+    this.#assertProviderSwitchSourceContract(command, prior);
     if (command.idempotencyKey !== undefined) {
       if (prior !== null) {
         if (prior.kind !== "session.switch" || prior.authorityId !== knownSession.id) {
@@ -13351,6 +13628,8 @@ export class HraService {
             receipt.request.provider !== command.provider
             || receipt.request.accountId !== replayAccountId
             || receipt.request.preset !== (command.preset ?? null)
+            || (receipt.request.presetContract !== undefined
+              && receipt.request.presetContract !== command.presetContract)
           ) {
             throw new CommandFailure(
               "CONFLICT",
@@ -13384,11 +13663,13 @@ export class HraService {
       ? currentProfile
       : this.#store.requireProfileById(requestedAccountId);
     this.#assertEstablishedSessionAccount(currentProfile, session);
-    const providerAuthentication = await this.#assertProviderSignedIn(
-      targetProfile,
-      command.provider,
-      signal,
-    );
+    const preset = command.preset ?? defaultPresetForProviderSwitch(command.provider, session.preset);
+    if (!isPresetSupportedByProvider(command.provider, preset)) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        new PresetProviderMismatchError(command.provider, preset).message,
+      );
+    }
     if (
       session.provider === command.provider
       && targetProfile.id === currentProfile.id
@@ -13413,13 +13694,6 @@ export class HraService {
         `A ${session.state === "terminal" ? "terminal" : "quarantined"} session cannot switch provider.`,
       );
     }
-    const preset = command.preset ?? defaultPresetForProviderSwitch(command.provider, session.preset);
-    if (!isPresetSupportedByProvider(command.provider, preset)) {
-      throw new CommandFailure(
-        "INVALID_INPUT",
-        new PresetProviderMismatchError(command.provider, preset).message,
-      );
-    }
     const project = session.projectId === undefined
       ? undefined
       : this.#store.requireProject(session.projectId);
@@ -13435,11 +13709,43 @@ export class HraService {
     });
 
     const runtime = this.#sessionRuntime(command.provider);
-    const requirement = presetRequirementForContract(
+    const presetBinding = activePresetBinding(preset);
+    const { requirement } = presetBinding;
+    const switchRequest = sessionProviderSwitchMutationRequest({
+      provider: command.provider,
       preset,
-      currentPresetContract,
-    );
+      presetContract: command.presetContract,
+      targetProfileId: targetProfile.id,
+      seedDigest: seed.digest,
+    });
+    const presetContract = switchRequest.presetContract;
     this.#work.assertSessionCanChangeRoute(session.id);
+    if (prior?.state === "prepared") {
+      const expectedRequestDigest = mutationRequestDigest({
+        authorityGeneration: targetProfile.processGeneration,
+        authorityId: session.id,
+        kind: "session.switch",
+        request: switchRequest,
+      });
+      if (
+        prior.authorityGeneration !== targetProfile.processGeneration
+        || prior.requestDigest !== expectedRequestDigest
+      ) {
+        throw new CommandFailure(
+          "CONFLICT",
+          "That prepared provider switch names a different request or target authority.",
+          { idempotencyKey: prior.idempotencyKey },
+        );
+      }
+    }
+    // Authentication may touch the target provider. Keep it behind every
+    // deterministic request, session, project, and Work qualification so an
+    // impossible switch has no provider-visible effect.
+    const providerAuthentication = await this.#assertProviderSignedIn(
+      targetProfile,
+      command.provider,
+      signal,
+    );
     const fromProvider = session.provider;
     const fromPreset = session.preset;
     let sessionReview: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
@@ -13648,12 +13954,7 @@ export class HraService {
         kind: "session.switch",
         authorityId: session.id,
         authorityGeneration: targetProfile.processGeneration,
-        request: {
-          provider: command.provider,
-          preset,
-          targetProfileId: targetProfile.id,
-          seedDigest: seed.digest,
-        },
+        request: switchRequest,
         idempotencyKey: key,
         beginEffect: async (attemptId) => {
           switchAttemptId = attemptId;
@@ -13698,6 +13999,7 @@ export class HraService {
               targetProvider: command.provider,
               ...targetProviderAccountEvidence(),
               targetPreset: preset,
+              ...(presetContract === undefined ? {} : { presetContract }),
               transcriptDigest: transcript.digest,
               seedDigest: seed.digest,
               seedIncludedRecords: seed.includedRecords,
@@ -14004,6 +14306,9 @@ export class HraService {
             request: {
               accountId: requestedAccountId,
               preset: command.preset ?? null,
+              ...(command.presetContract === undefined
+                ? {}
+                : { presetContract: command.presetContract }),
               provider: command.provider,
             },
             seed: {
@@ -15772,6 +16077,9 @@ export class HraService {
       request: {
         accountId: evidence.requestedAccountId,
         preset: evidence.requestedPreset,
+        ...(evidence.presetContract === undefined
+          ? {}
+          : { presetContract: evidence.presetContract }),
         provider: evidence.targetProvider,
       },
       seed: {

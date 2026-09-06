@@ -7,7 +7,15 @@ import { join } from "node:path";
 
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import { renderFailure } from "../cli/render";
-import type { CommandResponse } from "../domain/contracts";
+import {
+  commandResponseSchema,
+  localCommandSchema,
+  type CommandResponse,
+  type LocalCommand,
+} from "../domain/contracts";
+import {
+  WORK_APPLY_REQUEST_VERSION,
+} from "../domain/work";
 import {
   callLocalDaemon,
   callWithSafeAutostart,
@@ -92,6 +100,238 @@ async function gatedFixture(): Promise<{
 const longPoll = { kind: "session.events", session: "sess_a", limit: 1, waitMs: 30_000 } as const;
 const blockingCommand = { kind: "doctor", offline: false } as const;
 
+const localContractAccountId = `acct_${"a".repeat(32)}`;
+const localContractProjectId = `proj_${"b".repeat(32)}`;
+const localContractSessionId = `sess_${"c".repeat(32)}`;
+
+const parseLocalCommand = (value: unknown): LocalCommand => localCommandSchema.parse(value);
+
+const lowOnlyWorkCreateCommand = (): LocalCommand => parseLocalCommand({
+  kind: "work.apply",
+  requestId: randomUUID(),
+  operation: {
+    kind: "work.create",
+    idempotencyKey: "018bcfe5-6800-7000-8000-000000000011",
+    clientRef: "local-transport-contract-work",
+    coordinatorSessionId: localContractSessionId,
+    objective: "Prove the local rollout contract.",
+    routes: [{
+      accountId: localContractAccountId,
+      projectId: localContractProjectId,
+      preset: "low",
+      fast: false,
+    }],
+    tasks: [{
+      clientRef: "local-transport-contract-task",
+      dependsOnRefs: [],
+      dependsOnTaskIds: [],
+      objective: "Run one bounded task.",
+      instructions: "Preserve the immutable Work contract.",
+      criteria: ["The focused contract test passes."],
+      route: { accountId: localContractAccountId, projectId: localContractProjectId },
+      preset: "low",
+      fast: false,
+      priority: 0,
+      maxAttempts: 1,
+      requiredReviews: 0,
+      resultKind: "text",
+      minEvidence: 0,
+    }],
+  },
+});
+
+const declaredHighWorkCreateCommand = (): LocalCommand => {
+  const lowOnly = lowOnlyWorkCreateCommand();
+  if (lowOnly.kind !== "work.apply" || lowOnly.operation.kind !== "work.create") {
+    throw new Error("Expected the Low-only Work creation fixture.");
+  }
+  return parseLocalCommand({
+    ...lowOnly,
+    operation: {
+      ...lowOnly.operation,
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000013",
+      clientRef: "local-transport-contract-high-work",
+      routes: [
+        ...lowOnly.operation.routes,
+        {
+          accountId: localContractAccountId,
+          projectId: localContractProjectId,
+          preset: "high",
+          fast: false,
+        },
+      ],
+    },
+  });
+};
+
+const existingHighRouteTaskAddCommand = (): LocalCommand => {
+  const lowOnly = lowOnlyWorkCreateCommand();
+  if (lowOnly.kind !== "work.apply" || lowOnly.operation.kind !== "work.create") {
+    throw new Error("Expected the Low-only Work creation fixture.");
+  }
+  return parseLocalCommand({
+    kind: "work.apply",
+    requestId: randomUUID(),
+    operation: {
+      kind: "task.addBatch",
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000014",
+      workId: `work_${"f".repeat(32)}`,
+      expectedWorkRevision: 1,
+      coordinatorSessionId: localContractSessionId,
+      coordinatorCapability: `hrac1_${"A".repeat(43)}`,
+      tasks: [{
+        ...lowOnly.operation.tasks[0],
+        clientRef: "local-transport-added-high-task",
+        preset: "high",
+      }],
+    },
+  });
+};
+
+const existingLowRouteTaskAddCommand = (): LocalCommand => {
+  const high = existingHighRouteTaskAddCommand();
+  if (high.kind !== "work.apply" || high.operation.kind !== "task.addBatch") {
+    throw new Error("Expected the High task-add fixture.");
+  }
+  return parseLocalCommand({
+    ...high,
+    operation: {
+      ...high.operation,
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000015",
+      tasks: high.operation.tasks.map((task) => ({
+        ...task,
+        clientRef: "local-transport-added-low-task",
+        preset: "low",
+      })),
+    },
+  });
+};
+
+const existingWorkJoinCommand = (): LocalCommand => parseLocalCommand({
+  kind: "work.apply",
+  requestId: randomUUID(),
+  operation: {
+    kind: "work.join",
+    idempotencyKey: "018bcfe5-6800-7000-8000-000000000012",
+    workId: `work_${"d".repeat(32)}`,
+    coordinatorSessionId: localContractSessionId,
+    coordinatorCapability: `hrac1_${"A".repeat(43)}`,
+    actorSessionId: `sess_${"e".repeat(32)}`,
+  },
+});
+
+const versionedWorkCommand = (
+  command: LocalCommand,
+  presetContract?: 1 | 2,
+): LocalCommand => {
+  if (command.kind !== "work.apply") throw new Error("Expected a Work apply fixture.");
+  return parseLocalCommand({
+    ...command,
+    requestVersion: WORK_APPLY_REQUEST_VERSION,
+    ...(presetContract === undefined ? {} : { presetContract }),
+  });
+};
+
+const sourceSemanticLocalCommands = (): readonly LocalCommand[] => [
+  parseLocalCommand({
+    kind: "session.start",
+    account: localContractAccountId,
+    provider: "codex",
+    preset: "high",
+    fast: false,
+    presetContract: 1,
+  }),
+  parseLocalCommand({
+    kind: "session.preset",
+    session: localContractSessionId,
+    preset: "ultra",
+  }),
+  parseLocalCommand({
+    kind: "session.switch",
+    session: localContractSessionId,
+    provider: "codex",
+    preset: "high",
+    presetContract: 1,
+  }),
+  parseLocalCommand({
+    kind: "session.switch",
+    session: localContractSessionId,
+    provider: "codex",
+    presetContract: 1,
+  }),
+  declaredHighWorkCreateCommand(),
+  existingHighRouteTaskAddCommand(),
+];
+
+const stableLocalCommands = (): readonly LocalCommand[] => [
+  parseLocalCommand({ kind: "daemon.status" }),
+  parseLocalCommand({ kind: "daemon.stop" }),
+  parseLocalCommand({
+    kind: "session.start",
+    account: localContractAccountId,
+    provider: "codex",
+    preset: "low",
+    fast: false,
+  }),
+  parseLocalCommand({
+    kind: "session.preset",
+    session: localContractSessionId,
+    preset: "low",
+  }),
+  parseLocalCommand({
+    kind: "session.switch",
+    session: localContractSessionId,
+    provider: "claude",
+  }),
+  lowOnlyWorkCreateCommand(),
+  existingLowRouteTaskAddCommand(),
+  existingWorkJoinCommand(),
+];
+
+async function callRawLocalDaemon(
+  paths: ReturnType<typeof resolveStatePaths>,
+  envelope: Readonly<Record<string, unknown>>,
+): Promise<CommandResponse> {
+  return await new Promise<CommandResponse>((resolve, reject) => {
+    const socket = createConnection(paths.socket);
+    let received = Buffer.alloc(0);
+    let settled = false;
+    const finish = (operation: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      operation();
+    };
+    const deadline = setTimeout(() => {
+      finish(() => reject(new Error("Timed out waiting for the raw local response.")));
+      socket.destroy();
+    }, 1_000);
+    socket.once("connect", () => socket.write(`${JSON.stringify(envelope)}\n`));
+    socket.on("data", (chunk) => {
+      received = Buffer.concat([
+        received,
+        Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
+      ]);
+      const newline = received.indexOf(0x0a);
+      if (newline < 0) return;
+      try {
+        const response = commandResponseSchema.parse(
+          JSON.parse(received.subarray(0, newline).toString("utf8")) as unknown,
+        );
+        finish(() => resolve(response));
+      } catch (error: unknown) {
+        finish(() => reject(error));
+      } finally {
+        socket.end();
+      }
+    });
+    socket.once("error", (error) => finish(() => reject(error)));
+    socket.once("close", () => finish(() => reject(
+      new Error("The daemon closed without a raw local response."),
+    )));
+  });
+}
+
 describe("local daemon transport", () => {
   test("keeps the default deadline above the complete cold-session budget", () => {
     expect(DEFAULT_LOCAL_REQUEST_DEADLINE_MS).toBe(
@@ -146,6 +386,186 @@ describe("local daemon transport", () => {
       data: { command: "account.list" },
     });
     expect((await readFile(paths.capability, "utf8")).trim()).toHaveLength(43);
+  });
+
+  test("marks source-semantic commands so an older strict daemon rejects them but still serves status and stop", async () => {
+    const paths = await statePaths();
+    const capability = randomBytes(32).toString("base64url");
+    await writeFile(paths.capability, `${capability}\n`, { mode: 0o600 });
+    const requests: Array<Readonly<Record<string, unknown>>> = [];
+    const legacyServer = createServer((socket) => {
+      let received = Buffer.alloc(0);
+      socket.on("data", (chunk) => {
+        received = Buffer.concat([
+          received,
+          Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
+        ]);
+        const newline = received.indexOf(0x0a);
+        if (newline < 0) return;
+        const parsed = JSON.parse(received.subarray(0, newline).toString("utf8")) as unknown;
+        const record = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+          ? parsed as Readonly<Record<string, unknown>>
+          : {};
+        requests.push(record);
+        const command = typeof record.command === "object"
+          && record.command !== null
+          && !Array.isArray(record.command)
+          ? record.command as Readonly<Record<string, unknown>>
+          : {};
+        // This is the prior strict top-level schema: command validation is
+        // also strict, so either an additive envelope key or a v2 Work
+        // command-source key is rejected.
+        const legacyAccepted = JSON.stringify(Object.keys(record).sort())
+            === JSON.stringify(["capability", "command", "requestId", "version"])
+          && record.version === 2
+          && record.capability === capability
+          && typeof record.requestId === "string"
+          && localCommandSchema.safeParse(record.command).success
+          && !(command.kind === "work.apply" && (
+            Object.hasOwn(command, "requestVersion")
+            || Object.hasOwn(command, "presetContract")
+          ));
+        socket.end(`${JSON.stringify(legacyAccepted
+          ? {
+              ok: true,
+              version: 1,
+              requestId: record.requestId,
+              data: { legacyAccepted: true },
+            }
+          : {
+              ok: false,
+              version: 1,
+              requestId: record.requestId,
+              error: {
+                code: "INVALID_INPUT",
+                message: "The local command was rejected as invalid.",
+              },
+            })}\n`);
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      legacyServer.once("error", reject);
+      legacyServer.listen(paths.socket, resolve);
+    });
+    await chmod(paths.socket, 0o600);
+    try {
+      const affected = sourceSemanticLocalCommands();
+      const stable = stableLocalCommands();
+      for (const command of affected) {
+        expect(await callLocalDaemon({ paths, command })).toMatchObject({
+          ok: false,
+          error: { code: "INVALID_INPUT" },
+        });
+      }
+      for (const command of stable) {
+        expect(await callLocalDaemon({ paths, command })).toMatchObject({
+          ok: true,
+          data: { legacyAccepted: true },
+        });
+      }
+      for (const request of requests.slice(0, affected.length)) {
+        expect(request.presetContract).toBe(1);
+      }
+      for (const request of requests.slice(affected.length)) {
+        expect(Object.hasOwn(request, "presetContract")).toBe(false);
+      }
+      const stableV2 = versionedWorkCommand(existingWorkJoinCommand());
+      expect(await callLocalDaemon({ paths, command: stableV2 })).toMatchObject({
+        ok: false,
+        error: { code: "INVALID_INPUT" },
+      });
+      expect(Object.hasOwn(requests.at(-1) ?? {}, "presetContract")).toBe(false);
+    } finally {
+      await new Promise<void>((resolve) => legacyServer.close(() => resolve()));
+      await Promise.all([
+        unlink(paths.socket).catch(() => undefined),
+        unlink(paths.capability).catch(() => undefined),
+      ]);
+    }
+  });
+
+  test("rejects old or stale source-semantic envelopes before handler effects while accepting stable old envelopes", async () => {
+    const paths = await statePaths();
+    const handled: LocalCommand[] = [];
+    const server = await LocalDaemonServer.start({
+      paths,
+      handler: async (command) => {
+        handled.push(command);
+        return { command: command.kind };
+      },
+    });
+    servers.push(server);
+    const capability = (await readFile(paths.capability, "utf8")).trim();
+    const envelope = (
+      command: LocalCommand,
+      presetContract?: 1 | 2,
+    ): Readonly<Record<string, unknown>> => ({
+      version: 2,
+      capability,
+      requestId: randomUUID(),
+      ...(presetContract === undefined ? {} : { presetContract }),
+      command,
+    });
+    const affected = sourceSemanticLocalCommands();
+    for (const command of affected) {
+      expect(await callRawLocalDaemon(paths, envelope(command))).toMatchObject({ ok: false });
+      expect(await callRawLocalDaemon(paths, envelope(command, 2))).toMatchObject({ ok: false });
+    }
+    const oldUnauthoredStart = parseLocalCommand({
+      account: localContractAccountId,
+      fast: false,
+      kind: "session.start",
+      preset: "high",
+      provider: "codex",
+    });
+    expect(await callRawLocalDaemon(paths, envelope(oldUnauthoredStart)))
+      .toMatchObject({ ok: false });
+    expect(await callRawLocalDaemon(paths, envelope(oldUnauthoredStart, 1)))
+      .toMatchObject({ ok: false });
+    expect(handled).toEqual([]);
+
+    for (const command of affected) {
+      expect(await callRawLocalDaemon(paths, envelope(command, 1))).toMatchObject({ ok: true });
+    }
+    const affectedHandled = handled.length;
+    expect(affectedHandled).toBe(affected.length);
+
+    const staleAuthoredStart = parseLocalCommand({
+      ...affected[0]!,
+      presetContract: 2,
+    });
+    expect(await callRawLocalDaemon(paths, envelope(staleAuthoredStart, 1)))
+      .toMatchObject({ ok: true });
+    expect(handled.at(-1)).toEqual(staleAuthoredStart);
+    expect(await callRawLocalDaemon(paths, envelope(staleAuthoredStart, 2)))
+      .toMatchObject({ ok: false });
+
+    const staleAuthoredSwitch = parseLocalCommand({
+      ...affected[2]!,
+      presetContract: 2,
+    });
+    expect(await callRawLocalDaemon(paths, envelope(staleAuthoredSwitch, 1)))
+      .toMatchObject({ ok: true });
+    expect(handled.at(-1)).toEqual(staleAuthoredSwitch);
+    expect(await callRawLocalDaemon(paths, envelope(staleAuthoredSwitch, 2)))
+      .toMatchObject({ ok: false });
+
+    const stable = stableLocalCommands();
+    for (const command of stable) {
+      expect(await callRawLocalDaemon(paths, envelope(command))).toMatchObject({ ok: true });
+    }
+    expect(handled).toHaveLength(affected.length + stable.length + 2);
+    expect(await callRawLocalDaemon(paths, envelope(stable[2]!, 1))).toMatchObject({ ok: false });
+    expect(handled).toHaveLength(affected.length + stable.length + 2);
+
+    const staleV2 = versionedWorkCommand(declaredHighWorkCreateCommand(), 2);
+    expect(await callRawLocalDaemon(paths, envelope(staleV2, 1))).toMatchObject({ ok: true });
+    expect(handled.at(-1)).toEqual(staleV2);
+    expect(await callRawLocalDaemon(paths, envelope(staleV2, 2))).toMatchObject({ ok: false });
+
+    const stableV2 = versionedWorkCommand(existingWorkJoinCommand());
+    expect(await callRawLocalDaemon(paths, envelope(stableV2))).toMatchObject({ ok: true });
+    expect(handled.at(-1)).toEqual(stableV2);
   });
 
   test("keeps daemon.status, daemon.stop, and shutdown admissible under 32 concurrent long polls", async () => {
