@@ -135,7 +135,7 @@ The bootstrap pre-read must positively return the tracked unbound attestation. H
 
 These identity checks detect substitutions visible at their explicit checkpoints. They are not a filesystem sandbox against hostile code already running as the same operating-system user, which could race pathname access after a check or modify an inode in place. Do not run the release operator beside untrusted same-UID code. Authority containment owns provider-process descendants; it does not expand this filesystem boundary.
 
-Deploy the candidate from its exact clean detached commit and bind it to the bootstrap receipt:
+Deploy each candidate from its exact clean detached commit and bind it to the receipt for the deployment that is currently live. The first candidate names the bootstrap receipt. Every later candidate names the immediately preceding candidate receipt:
 
 ```sh
 bun run hosted:deploy -- \
@@ -146,11 +146,11 @@ bun run hosted:deploy -- \
   --deployment-url https://steady-otter-321.convex.cloud \
   --source-commit <N_COMMIT> \
   --phase candidate \
-  --previous-deploy-evidence /protected/release/bootstrap-deploy.json \
-  --evidence-path /protected/release/candidate-deploy.json
+  --previous-deploy-evidence /protected/release/<CURRENT_DEPLOY_RECEIPT>.json \
+  --evidence-path /protected/release/candidate-<N_COMMIT>-deploy.json
 ```
 
-The candidate intent requires its `before` attestation to equal the bootstrap `after` attestation, names the bootstrap evidence digest as its predecessor, advances deployment time and runtime revision, and binds `runtimeSourceCommit` to `N_COMMIT`. A bootstrap may be an earlier clean commit; the candidate must be the release commit. Losing CLI output never authorizes a speculative redeploy. A retry may finalize only when the durable intent, current runtime attestation, fixed target, and prior evidence still match exactly. Drift or an ambiguous provider read is a refusal. An exact completed evidence file replays through read-only attestation and target checks without deploying.
+The candidate intent requires its `before` attestation to equal the predecessor receipt's `after` attestation, requires the predecessor and candidate to name the same fixed target, names the predecessor evidence digest, advances deployment time and runtime revision, and binds `runtimeSourceCommit` to `N_COMMIT`. Choose a new, unused, source-qualified evidence path for every candidate. Never rename or overwrite an earlier receipt. A reviewed exact protected-main commit may be deployed as a candidate before a Git tag, GitHub Release, or npm publication exists. If hosted evidence is cited for a tagged release, the final deployed source commit must equal the tagged commit. When protected `main` advances after a candidate deployment, deploy another candidate from the new exact commit and chain it from the currently live candidate receipt. Do not bootstrap again. Losing CLI output never authorizes a speculative redeploy. A retry may finalize only when the durable intent, current runtime attestation, fixed target, and prior evidence still match exactly. Drift or an ambiguous provider read is a refusal. An exact completed evidence file replays through read-only attestation and target checks without deploying.
 
 There is one exceptional supersession path for a bootstrap intent that cannot deploy its source. Use it only with independent evidence that the failed Convex process stopped determinately before the remote `runPush` mutation boundary, local process cleanup is proven, the exact numeric target is reverified, and a fresh authority read exactly equals the failed intent's recorded `before` attestation. Launching Convex or performing read-only target resolution does not disqualify this path. Any possibility that `runPush` began prohibits it. Keep the failed source-qualified evidence path and its `.intent` unchanged as quarantine evidence. From a newer exact clean fixed commit, choose a different source-qualified evidence path in the same protected release directory and run bootstrap there under the single release authority. Never delete, rename, overwrite, or retry the failed path from the newer checkout. Once the new runtime binds, its non-null attestation makes the old null-before intent inert and any replay of the old path fails closed. An ambiguous mutation boundary, changed or unreadable runtime, unproven cleanup, target drift, reused path, or missing old intent prohibits supersession.
 

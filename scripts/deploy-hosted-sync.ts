@@ -884,14 +884,20 @@ export async function deployHostedSync(
         throw error;
       }
     })();
+    const previous = options.phase === "candidate"
+      ? parseDeployEvidenceFile(options.previousDeployEvidencePath ?? "")
+      : undefined;
+    if (
+      previous !== undefined
+      && canonicalDigest(previous.target) !== canonicalDigest(target)
+    ) throw new HostedDeployError("source_changed");
     if (existingEvidence !== undefined) {
-      const expectedPrevious = options.previousDeployEvidencePath === undefined
-        ? null
-        : parseDeployEvidenceFile(options.previousDeployEvidencePath).selfDigest;
+      const expectedPrevious = previous?.selfDigest ?? null;
       if (
         existingEvidence.sourceCommit !== options.sourceCommit
         || existingEvidence.phase !== options.phase
         || existingEvidence.previousDeployDigest !== expectedPrevious
+        || canonicalDigest(existingEvidence.before) !== canonicalDigest(previous?.after ?? null)
         || canonicalDigest(existingEvidence.target) !== canonicalDigest(target)
         || !sameAttestation(await readAttestation(target), existingEvidence.after)
       ) throw new HostedDeployError("source_changed");
@@ -899,9 +905,6 @@ export async function deployHostedSync(
       await requireExactSource(runner, repositoryRoot, environment, options.sourceCommit);
       return existingEvidence;
     }
-    const previous = options.phase === "candidate"
-      ? parseDeployEvidenceFile(options.previousDeployEvidencePath ?? "")
-      : undefined;
     const before = previous?.after ?? null;
     const previousDeployDigest = previous?.selfDigest ?? null;
     intent = readDeployIntent({
