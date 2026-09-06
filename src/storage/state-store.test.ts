@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { renameSync, symlinkSync } from "node:fs";
 import { chmod, lstat, mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -42,6 +42,7 @@ import {
   type StoredAccountUsageSnapshot,
 } from "../domain/usage-metrics";
 import { utf8Bytes, type ProfileId } from "../domain/values";
+import { initialAutomaticUsagePolicyConfiguration, type AutomaticUsagePolicyConfigurationUpdate } from "../domain/usage-policy";
 import { canTransitionQueue, queueStateSchema, type QueueState } from "../domain/transitions";
 import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 import {
@@ -94,6 +95,371 @@ async function fixture(
   stores.push(store);
   return { store, home };
 }
+
+const dropAutomaticUsagePolicySchema = (database: Database): void => {
+  database.exec(`
+    DROP TRIGGER IF EXISTS automatic_usage_policy_mutation_update_guard;
+    DROP TRIGGER IF EXISTS automatic_usage_policy_mutation_delete_guard;
+    DROP INDEX IF EXISTS automatic_usage_policy_mutations;
+    DROP TABLE IF EXISTS automatic_usage_policy_revisions;
+  `);
+};
+
+describe("automatic usage policy configuration", () => {
+  const command = (expectedAutomaticPolicyRevision = 1): AutomaticUsagePolicyConfigurationUpdate => ({
+    idempotencyKey: randomUUID(), expectedAutomaticPolicyRevision,
+    change: { kind: "set_default", enabled: false },
+  });
+  const pathsFor = (home: string) => resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  const inspect = (home: string) => new Database(pathsFor(home).database, { create: false, strict: true });
+  const reopen = (home: string, readonly = false) => {
+    const store = new StateStore(pathsFor(home), { readonly, now: () => 50 });
+    stores.push(store);
+    return store;
+  };
+  const unrelatedRows = (database: Database) => {
+    const names = database.query(`SELECT name FROM sqlite_master WHERE type='table'
+      AND name NOT LIKE 'sqlite_%' AND name NOT IN ('migrations','automatic_usage_policy_revisions','mutation_attempts') ORDER BY name`)
+      .all() as Array<{ name: string }>;
+    return names.map(({ name }) => {
+      if (!/^[a-z_]+$/u.test(name)) throw new Error("Unexpected fixture table");
+      return [name, database.query(`SELECT * FROM ${name}`).all()];
+    });
+  };
+  const seedUnrelatedState = (store: StateStore) => {
+    const primary = signInProfile(store, "Policy primary", "policy-primary@example.com");
+    const secondary = signInProfile(store, "Policy secondary", "policy-secondary@example.com");
+    for (const profile of [primary, secondary]) store.allocateNextUsageRevision(profile.id);
+    recordUsageForTest(store, primary.id, 1, 1_000, { sentinel: "configuration must preserve usage" });
+    store.updateNotificationHours({ version: 1, expectedRevision: 1, startMinute: 480, endMinute: 1_200, timeZone: "UTC" });
+    store.updateNotificationEmailPolicy({ enabled: true, expectedRevision: store.readNotificationEmailPolicy().revision });
+    for (const provider of ["codex", "claude"] as const) {
+      const accounts = store.listProviderAccounts(provider);
+      const first = accounts[0];
+      if (first === undefined) throw new Error("Missing fixture provider");
+      store.replaceProviderAccountOrder({ provider, expectedOrderRevision: store.readProviderAccountState(provider).orderRevision,
+        providerAccountIds: accounts.toReversed().map((account) => account.id) });
+      store.activateProviderAccount({ provider, expectedPointerRevision: store.readProviderAccountState(provider).pointerRevision, providerAccountId: first.id });
+    }
+    const session = store.createSession({ profileId: primary.id, provider: "codex", preset: "high", fastEnabled: false });
+    store.bindSession({ sessionId: session.id, expectedRevision: session.revision, providerThreadId: "policy-preserved-thread", state: "idle" });
+    store.authorizeAccountRateLimitResetPolicy({ profileId: primary.id, processGeneration: primary.processGeneration,
+      accountFingerprint: resetAccountFingerprint("policy-primary@example.com"), weeklyWindowDurationMinutes: 10_080, weeklyWindowResetsAt: 500_000_000 });
+    store.prepareAccountRateLimitReset({ profileId: primary.id, processGeneration: primary.processGeneration,
+      accountFingerprint: resetAccountFingerprint("policy-primary@example.com"), weeklyWindowResetsAt: 500_000_000, observedUsedPercent: 99 });
+  };
+
+  test("starts at the domain default and changes only configuration and its global receipt", async () => {
+    const { store, home } = await fixture();
+    seedUnrelatedState(store);
+    const database = inspect(home);
+    try {
+      const baseline = unrelatedRows(database);
+      expect(store.readAutomaticUsagePolicyConfiguration()).toEqual(initialAutomaticUsagePolicyConfiguration());
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+      const request = command();
+      expect(store.updateAutomaticUsagePolicyConfiguration(request)).toEqual({
+        ...initialAutomaticUsagePolicyConfiguration(), defaultEnabled: false, automaticPolicyRevision: 2,
+      });
+      expect(store.readMutation(request.idempotencyKey)).toMatchObject({
+        kind: "usage.auto.configure", authorityId: "automatic-usage-policy", authorityGeneration: 1, state: "applied",
+        result: { version: 1, automaticPolicyRevision: 2 },
+      });
+      expect(unrelatedRows(database)).toEqual(baseline);
+      expect(reopen(home, true).readAutomaticUsagePolicyConfiguration()).toEqual(store.readAutomaticUsagePolicyConfiguration());
+    } finally { database.close(false); }
+  });
+
+  test("preserves unaddressed overrides, no-op revisions, ABA fences and historical replay after reopen", async () => {
+    const { store, home } = await fixture();
+    const initial = { ...command(), change: { kind: "set_default", enabled: true } as const };
+    const original = store.updateAutomaticUsagePolicyConfiguration(initial);
+    expect(original.automaticPolicyRevision).toBe(2);
+    const off = store.updateAutomaticUsagePolicyConfiguration(command(2));
+    expect(off.automaticPolicyRevision).toBe(3);
+    for (const provider of ["codex", "claude"] as const) {
+      for (const override of ["on", "off", "inherit"] as const) {
+        const before = store.readAutomaticUsagePolicyConfiguration();
+        const next = store.updateAutomaticUsagePolicyConfiguration({
+          ...command(before.automaticPolicyRevision), change: { kind: "set_override", provider, override },
+        });
+        expect(next.defaultEnabled).toBe(false);
+        expect(next.overrides[provider]).toBe(override);
+        expect(next.overrides[provider === "codex" ? "claude" : "codex"]).toBe(before.overrides[provider === "codex" ? "claude" : "codex"]);
+      }
+    }
+    const before = store.readAutomaticUsagePolicyConfiguration();
+    const head = store.updateAutomaticUsagePolicyConfiguration({
+      ...command(before.automaticPolicyRevision), change: { kind: "set_default", enabled: true },
+    });
+    expect(head).toEqual({ ...initialAutomaticUsagePolicyConfiguration(), automaticPolicyRevision: 10 });
+    expect(() => store.updateAutomaticUsagePolicyConfiguration(command(1))).toThrow("AUTOMATIC_USAGE_POLICY_REVISION_CONFLICT");
+    expect(store.updateAutomaticUsagePolicyConfiguration(initial)).toEqual(original);
+    const opened = reopen(home);
+    expect(opened.updateAutomaticUsagePolicyConfiguration(initial)).toEqual(original);
+    expect(opened.readAutomaticUsagePolicyConfiguration()).toEqual(head);
+  });
+
+  test("uses the global idempotency namespace and never reinterprets a key", async () => {
+    const { store } = await fixture();
+    const collision = command();
+    store.prepareMutation({ idempotencyKey: collision.idempotencyKey, kind: "test.other", authorityId: "test", authorityGeneration: 1, request: {} });
+    expect(() => store.updateAutomaticUsagePolicyConfiguration(collision)).toThrow("IDEMPOTENCY_CONFLICT");
+    const accepted = command();
+    store.updateAutomaticUsagePolicyConfiguration(accepted);
+    expect(() => store.updateAutomaticUsagePolicyConfiguration({ ...accepted, expectedAutomaticPolicyRevision: 2 })).toThrow("IDEMPOTENCY_CONFLICT");
+    expect(() => store.updateAutomaticUsagePolicyConfiguration({ ...accepted, change: { kind: "set_default", enabled: true } })).toThrow("IDEMPOTENCY_CONFLICT");
+    expect(() => store.prepareMutation({ idempotencyKey: accepted.idempotencyKey, kind: "test.other", authorityId: "test", authorityGeneration: 1, request: {} })).toThrow("IDEMPOTENCY_CONFLICT");
+    expect(() => store.prepareMutation({ kind: "usage.auto.configure", authorityId: "automatic-usage-policy", authorityGeneration: 2, request: {} })).toThrow("AUTOMATIC_USAGE_POLICY_CLOSED_API_REQUIRED");
+  });
+
+  test("one current CAS wins across independent stores and a backwards clock cannot regress evidence", async () => {
+    const { store, home } = await fixture();
+    const contender = reopen(home);
+    expect(contender.readAutomaticUsagePolicyConfiguration().automaticPolicyRevision).toBe(1);
+    store.updateAutomaticUsagePolicyConfiguration(command());
+    const rejected = command();
+    expect(() => contender.updateAutomaticUsagePolicyConfiguration(rejected)).toThrow("AUTOMATIC_USAGE_POLICY_REVISION_CONFLICT");
+    expect(contender.readMutation(rejected.idempotencyKey)).toBeNull();
+    expect(contender.updateAutomaticUsagePolicyConfiguration(command(2)).automaticPolicyRevision).toBe(3);
+    const database = inspect(home);
+    try {
+      const times = database.query("SELECT recorded_at FROM automatic_usage_policy_revisions ORDER BY automatic_policy_revision").all() as Array<{ recorded_at: number }>;
+      expect(times[2]?.recorded_at).toBe(times[1]?.recorded_at);
+    } finally { database.close(false); }
+  });
+
+  test.each([
+    { extra: true }, { expectedAutomaticPolicyRevision: 0 }, { expectedAutomaticPolicyRevision: Number.MAX_SAFE_INTEGER + 1 },
+    { idempotencyKey: "not-a-uuid" }, { change: { kind: "set_default", enabled: 1 } },
+    { change: { kind: "set_default", enabled: false, threshold: 99 } },
+    { change: { kind: "set_override", provider: "other", override: "on" } },
+    { change: { kind: "set_override", provider: "codex", override: "enabled" } },
+  ])("rejects a non-closed command without claiming its key: %j", async (invalid) => {
+    const { store, home } = await fixture();
+    const request = { ...command(), ...invalid };
+    expect(() => store.updateAutomaticUsagePolicyConfiguration(request as AutomaticUsagePolicyConfigurationUpdate)).toThrow();
+    expect(store.readAutomaticUsagePolicyConfiguration()).toEqual(initialAutomaticUsagePolicyConfiguration());
+    const database = inspect(home);
+    try {
+      expect(database.query("SELECT 1 FROM mutation_attempts WHERE idempotency_key=?").get(request.idempotencyKey)).toBeNull();
+    } finally { database.close(false); }
+  });
+
+  test.each(["before_intent", "after_intent", "after_revision", "before_receipt", "after_receipt"])("rolls back every row and key after %s failure", async (point) => {
+    const { store, home } = await fixture();
+    const database = inspect(home);
+    const request = command();
+    const boundary = point === "before_intent" ? "BEFORE INSERT ON mutation_attempts WHEN NEW.kind='usage.auto.configure'"
+      : point === "after_intent" ? "AFTER UPDATE ON mutation_attempts WHEN NEW.kind='usage.auto.configure' AND NEW.state='effect_started'"
+        : point === "after_revision" ? "AFTER INSERT ON automatic_usage_policy_revisions WHEN NEW.automatic_policy_revision>1"
+          : `${point === "before_receipt" ? "BEFORE" : "AFTER"} UPDATE ON mutation_attempts WHEN NEW.kind='usage.auto.configure' AND NEW.state='applied'`;
+    try {
+      database.exec(`CREATE TRIGGER test_policy_fault ${boundary} BEGIN SELECT RAISE(ABORT,'test policy fault'); END`);
+      expect(() => store.updateAutomaticUsagePolicyConfiguration(request)).toThrow("test policy fault");
+      expect(store.readMutation(request.idempotencyKey)).toBeNull();
+      expect(store.readAutomaticUsagePolicyConfiguration()).toEqual(initialAutomaticUsagePolicyConfiguration());
+      expect(database.query("SELECT COUNT(*) AS count FROM automatic_usage_policy_revisions").get()).toEqual({ count: 1 });
+      database.exec("DROP TRIGGER test_policy_fault");
+      expect(store.updateAutomaticUsagePolicyConfiguration(request).automaticPolicyRevision).toBe(2);
+      expect(store.updateAutomaticUsagePolicyConfiguration(request).automaticPolicyRevision).toBe(2);
+    } finally { database.close(false); }
+  });
+
+  test("guards immutable revisions and receipts against direct SQL and generic transitions", async () => {
+    const { store, home } = await fixture();
+    const request = command();
+    store.updateAutomaticUsagePolicyConfiguration(request);
+    const attempt = store.readMutation(request.idempotencyKey);
+    if (attempt === null) throw new Error("Missing fixture attempt");
+    const database = inspect(home);
+    try {
+      for (const sql of [
+        "UPDATE automatic_usage_policy_revisions SET default_enabled=1 WHERE automatic_policy_revision=2",
+        "DELETE FROM automatic_usage_policy_revisions WHERE automatic_policy_revision=2",
+        "UPDATE mutation_attempts SET result_json='{}' WHERE kind='usage.auto.configure'",
+        "UPDATE mutation_attempts SET request_digest='" + "f".repeat(64) + "' WHERE kind='usage.auto.configure'",
+        "DELETE FROM mutation_attempts WHERE kind='usage.auto.configure'",
+        "INSERT INTO automatic_usage_policy_revisions SELECT 3,version,default_enabled,codex_override,claude_override,attempt_id,idempotency_key,change_kind,change_provider,change_value,request_digest,configuration_digest,recorded_at FROM automatic_usage_policy_revisions WHERE automatic_policy_revision=2",
+      ]) expect(() => database.exec(sql)).toThrow();
+      expect(() => store.transitionMutation(attempt.id, "applied", "applied", {})).toThrow("receipt-backed");
+      expect(store.updateAutomaticUsagePolicyConfiguration(request).automaticPolicyRevision).toBe(2);
+    } finally { database.close(false); }
+  });
+
+  test.each(["missing_table", "missing_initial", "weakened_guard", "digest", "receipt", "request"])("fails closed on current-schema corruption: %s", async (damage) => {
+    const { store, home } = await fixture();
+    const request = command();
+    store.updateAutomaticUsagePolicyConfiguration(request);
+    const database = inspect(home);
+    try {
+      if (damage === "missing_table") dropAutomaticUsagePolicySchema(database);
+      else if (damage === "weakened_guard") database.exec(`DROP TRIGGER automatic_usage_policy_immutable_update;
+        CREATE TRIGGER automatic_usage_policy_immutable_update BEFORE UPDATE ON automatic_usage_policy_revisions BEGIN SELECT 1; END`);
+      else if (damage === "missing_initial") {
+        const original = (database.query("SELECT sql FROM sqlite_master WHERE name='automatic_usage_policy_immutable_delete'").get() as { sql: string }).sql;
+        database.exec("DROP TRIGGER automatic_usage_policy_immutable_delete; DELETE FROM automatic_usage_policy_revisions");
+        database.exec(original);
+      } else if (damage === "digest") {
+        const original = (database.query("SELECT sql FROM sqlite_master WHERE name='automatic_usage_policy_immutable_update'").get() as { sql: string }).sql;
+        database.exec("DROP TRIGGER automatic_usage_policy_immutable_update");
+        database.query("UPDATE automatic_usage_policy_revisions SET configuration_digest=? WHERE automatic_policy_revision=2").run("f".repeat(64));
+        database.exec(original);
+      } else {
+        const original = (database.query("SELECT sql FROM sqlite_master WHERE name='automatic_usage_policy_mutation_update_guard'").get() as { sql: string }).sql;
+        database.exec("DROP TRIGGER automatic_usage_policy_mutation_update_guard");
+        if (damage === "receipt") database.exec("UPDATE mutation_attempts SET result_json='{}' WHERE kind='usage.auto.configure'");
+        else database.query("UPDATE mutation_attempts SET request_digest=? WHERE kind='usage.auto.configure'").run("f".repeat(64));
+        database.exec(original);
+      }
+      expect(() => store.readAutomaticUsagePolicyConfiguration()).toThrow();
+      expect(() => store.updateAutomaticUsagePolicyConfiguration(request)).toThrow();
+      expect(() => new StateStore(pathsFor(home), { readonly: true })).toThrow();
+      expect(() => new StateStore(pathsFor(home))).toThrow();
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+    } finally { database.close(false); }
+  });
+
+  test("rejects SQL null-intent, wrong authority, changed sibling fields and unsafe revisions", async () => {
+    const { store, home } = await fixture();
+    const database = inspect(home);
+    try {
+      for (const violation of ["null_value", "generation", "sibling", "gap", "unsafe"] as const) {
+        expect(() => database.transaction(() => {
+          const id = `attempt_${"b".repeat(32)}`;
+          const key = randomUUID();
+          const timestamp = (database.query("SELECT recorded_at FROM automatic_usage_policy_revisions").get() as { recorded_at: number }).recorded_at;
+          database.query(`INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at)
+            VALUES(?,?,'usage.auto.configure','automatic-usage-policy',?,?,'prepared',?,?)`)
+            .run(id, key, violation === "generation" ? 2 : 1, "a".repeat(64), timestamp, timestamp);
+          database.query("UPDATE mutation_attempts SET state='effect_started' WHERE id=?").run(id);
+          expect(() => database.query(`INSERT INTO automatic_usage_policy_revisions(
+            automatic_policy_revision,version,default_enabled,codex_override,claude_override,attempt_id,idempotency_key,
+            change_kind,change_provider,change_value,request_digest,configuration_digest,recorded_at
+          ) VALUES(?,1,0,?,'inherit',?,?,'set_default',NULL,?,?,?,?)`)
+            .run(violation === "unsafe" ? Number.MAX_SAFE_INTEGER + 1 : violation === "gap" ? 3 : 2,
+              violation === "sibling" ? "on" : "inherit", id, key, violation === "null_value" ? null : "off",
+              "a".repeat(64), "b".repeat(64), timestamp)).toThrow();
+          throw new Error("rollback fixture intent");
+        })()).toThrow("rollback fixture intent");
+      }
+      expect(store.readAutomaticUsagePolicyConfiguration()).toEqual(initialAutomaticUsagePolicyConfiguration());
+      expect(database.query("SELECT COUNT(*) AS count FROM mutation_attempts WHERE kind='usage.auto.configure'").get()).toEqual({ count: 0 });
+    } finally { database.close(false); }
+  });
+
+  test("refuses relocation of a historical receipt to a different global mutation key", async () => {
+    const { store, home } = await fixture();
+    const request = command();
+    store.updateAutomaticUsagePolicyConfiguration(request);
+    const reassignedKey = randomUUID();
+    const database = inspect(home);
+    try {
+      const guard = (database.query("SELECT sql FROM sqlite_master WHERE name='automatic_usage_policy_mutation_update_guard'").get() as { sql: string }).sql;
+      database.exec("DROP TRIGGER automatic_usage_policy_mutation_update_guard");
+      database.query("UPDATE mutation_attempts SET idempotency_key=? WHERE idempotency_key=?").run(reassignedKey, request.idempotencyKey);
+      database.exec(guard);
+      expect(() => store.updateAutomaticUsagePolicyConfiguration({ ...request, idempotencyKey: reassignedKey })).toThrow("AUTOMATIC_USAGE_POLICY_INVALID");
+      expect(() => store.updateAutomaticUsagePolicyConfiguration(request)).toThrow("AUTOMATIC_USAGE_POLICY_INVALID");
+      expect(() => reopen(home, true)).toThrow("AUTOMATIC_USAGE_POLICY_INVALID");
+      expect(() => reopen(home)).toThrow("AUTOMATIC_USAGE_POLICY_INVALID");
+      expect(database.query("SELECT COUNT(*) AS count FROM automatic_usage_policy_revisions").get()).toEqual({ count: 2 });
+      expect(database.query("SELECT 1 FROM mutation_attempts WHERE idempotency_key=?").get(request.idempotencyKey)).toBeNull();
+    } finally { database.close(false); }
+  });
+
+  test("audits more than two history pages on reopen and rejects tampered old receipts", async () => {
+    const { store, home } = await fixture();
+    const first = command();
+    store.updateAutomaticUsagePolicyConfiguration(first);
+    for (let revision = 2; revision <= 205; revision++) store.updateAutomaticUsagePolicyConfiguration(command(revision));
+    expect(reopen(home, true).readAutomaticUsagePolicyConfiguration().automaticPolicyRevision).toBe(206);
+    expect(store.updateAutomaticUsagePolicyConfiguration(first).automaticPolicyRevision).toBe(2);
+    const database = inspect(home);
+    try {
+      const firstAttempt = store.readMutation(first.idempotencyKey);
+      if (firstAttempt === null) throw new Error("Missing fixture attempt");
+      const plan = database.query("EXPLAIN QUERY PLAN SELECT * FROM automatic_usage_policy_revisions WHERE attempt_id=?")
+        .all(firstAttempt.id) as Array<{ detail: string }>;
+      expect(plan.some((step) => step.detail.includes("INDEX"))).toBe(true);
+      const original = (database.query("SELECT sql FROM sqlite_master WHERE name='automatic_usage_policy_mutation_update_guard'").get() as { sql: string }).sql;
+      database.exec("DROP TRIGGER automatic_usage_policy_mutation_update_guard");
+      database.query("UPDATE mutation_attempts SET result_json='{}' WHERE idempotency_key=?").run(first.idempotencyKey);
+      database.exec(original);
+      expect(() => store.updateAutomaticUsagePolicyConfiguration(first)).toThrow("AUTOMATIC_USAGE_POLICY_INVALID");
+      expect(() => new StateStore(pathsFor(home), { readonly: true })).toThrow("AUTOMATIC_USAGE_POLICY_INVALID");
+      expect(() => new StateStore(pathsFor(home))).toThrow("AUTOMATIC_USAGE_POLICY_INVALID");
+    } finally { database.close(false); }
+  });
+
+  test.each([false, true])("upgrades exact v41 or a valid partial v42 without rewriting prior state (partial=%s)", async (partial) => {
+    const { store, home } = await fixture();
+    seedUnrelatedState(store);
+    const configured = partial ? store.updateAutomaticUsagePolicyConfiguration(command()) : initialAutomaticUsagePolicyConfiguration();
+    const database = inspect(home);
+    try {
+      const baseline = unrelatedRows(database);
+      if (!partial) dropAutomaticUsagePolicySchema(database);
+      else database.exec("DROP TRIGGER automatic_usage_policy_immutable_update");
+      database.exec("DELETE FROM migrations WHERE version=42; PRAGMA user_version=41");
+      expect(() => new StateStore(pathsFor(home), { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:41:42");
+      const migrated = reopen(home);
+      expect(migrated.readAutomaticUsagePolicyConfiguration()).toEqual(configured);
+      expect(unrelatedRows(database)).toEqual(baseline);
+      expect(database.query("SELECT COUNT(*) AS count FROM migrations WHERE version=42").get()).toEqual({ count: 1 });
+      expect(reopen(home).readAutomaticUsagePolicyConfiguration()).toEqual(configured);
+    } finally { database.close(false); }
+  });
+
+  test("refuses a malformed partial v42 schema and rolls back its migration stamp", async () => {
+    const { home } = await fixture();
+    const database = inspect(home);
+    try {
+      dropAutomaticUsagePolicySchema(database);
+      database.exec(`CREATE TABLE automatic_usage_policy_revisions(automatic_policy_revision INTEGER PRIMARY KEY);
+        DELETE FROM migrations WHERE version=42; PRAGMA user_version=41`);
+      expect(() => new StateStore(pathsFor(home))).toThrow();
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(database.query("SELECT COUNT(*) AS count FROM migrations WHERE version=42").get()).toEqual({ count: 0 });
+      expect(database.query("SELECT COUNT(*) AS count FROM automatic_usage_policy_revisions").get()).toEqual({ count: 0 });
+    } finally { database.close(false); }
+  });
+
+  test.each([false, true])("rolls back migration genesis after an interrupted partial authority (retained receipt=%s)", async (retainedReceipt) => {
+    const { store, home } = await fixture();
+    if (retainedReceipt) store.updateAutomaticUsagePolicyConfiguration(command());
+    const database = inspect(home);
+    try {
+      const original = (database.query("SELECT sql FROM sqlite_master WHERE name='automatic_usage_policy_immutable_delete'").get() as { sql: string }).sql;
+      database.exec("DROP TRIGGER automatic_usage_policy_immutable_delete; DELETE FROM automatic_usage_policy_revisions");
+      database.exec(original);
+      database.exec("DELETE FROM migrations WHERE version=42; PRAGMA user_version=41");
+      if (!retainedReceipt) database.exec(`CREATE TRIGGER test_policy_migration_fault AFTER INSERT ON automatic_usage_policy_revisions
+        BEGIN SELECT RAISE(ABORT,'migration fixture fault'); END`);
+      expect(() => new StateStore(pathsFor(home))).toThrow(retainedReceipt ? "AUTOMATIC_USAGE_POLICY_INVALID" : "migration fixture fault");
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(database.query("SELECT COUNT(*) AS count FROM automatic_usage_policy_revisions").get()).toEqual({ count: 0 });
+      expect(database.query("SELECT COUNT(*) AS count FROM migrations WHERE version=42").get()).toEqual({ count: 0 });
+      if (!retainedReceipt) {
+        database.exec("DROP TRIGGER test_policy_migration_fault");
+        expect(reopen(home).readAutomaticUsagePolicyConfiguration()).toEqual(initialAutomaticUsagePolicyConfiguration());
+      }
+    } finally { database.close(false); }
+  });
+
+  test("refuses an orphan current-schema configuration intent on writable and readonly reopen", async () => {
+    const { home } = await fixture();
+    const database = inspect(home);
+    try {
+      database.query(`INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at)
+        VALUES(?,?,'usage.auto.configure','automatic-usage-policy',1,?,'prepared',1000,1000)`)
+        .run(`attempt_${"c".repeat(32)}`, randomUUID(), "a".repeat(64));
+      expect(() => new StateStore(pathsFor(home), { readonly: true })).toThrow("AUTOMATIC_USAGE_POLICY_INVALID");
+      expect(() => new StateStore(pathsFor(home))).toThrow("AUTOMATIC_USAGE_POLICY_INVALID");
+      expect(database.query("SELECT COUNT(*) AS count FROM automatic_usage_policy_revisions").get()).toEqual({ count: 1 });
+    } finally { database.close(false); }
+  });
+});
 
 const dropProviderSwitchVersion35Objects = (database: Database): void => {
   database.exec(`
@@ -647,6 +1013,7 @@ const dropDedicatedSessionSwitchSchema = (database: Database): void => {
 const downgradeProviderAuthoritySchemaToVersion38 = (database: Database): void => {
   database.exec("PRAGMA foreign_keys=OFF");
   try {
+    dropAutomaticUsagePolicySchema(database);
     dropDedicatedSessionSwitchSchema(database);
     database.exec(`
       DROP TRIGGER IF EXISTS mutation_transition_guard;
@@ -725,6 +1092,7 @@ const downgradeProviderAuthoritySchemaToVersion38 = (database: Database): void =
 const downgradeProviderUsageSchemaToVersion39 = (database: Database): void => {
   database.exec("PRAGMA foreign_keys=OFF");
   try {
+    dropAutomaticUsagePolicySchema(database);
     dropDedicatedSessionSwitchSchema(database);
     database.exec(`
       DROP TRIGGER IF EXISTS account_scoped_provider_authorities_insert_guard;
@@ -3343,7 +3711,7 @@ describe("StateStore", () => {
     )).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
     const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT COUNT(*) AS count FROM migrations WHERE version=41",
       ).get()).toEqual({ count: 1 });
@@ -7284,7 +7652,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -11004,7 +11372,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts",
       ).get()).toEqual({ count: 1 });
@@ -12940,7 +13308,7 @@ describe("StateStore", () => {
       ).get() as { sql: string };
       expect(updateGuard.sql).toContain("session switch blocks session mutation");
       expect(openIndex.sql).toContain("reconciliation_required");
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
     } finally {
       inspector.close(false);
     }
@@ -13468,7 +13836,7 @@ describe("StateStore", () => {
        WHERE scope_kind IN ('usage_snapshot','usage_poll_failure','usage_upload_anchor')
        ORDER BY scope_kind,scope_id`,
     ).all();
-    expect(migratedInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+    expect(migratedInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
     migratedInspector.close(false);
     migrated.close();
     stores.splice(stores.indexOf(migrated), 1);
@@ -13485,7 +13853,7 @@ describe("StateStore", () => {
          WHERE scope_kind IN ('usage_snapshot','usage_poll_failure','usage_upload_anchor')
          ORDER BY scope_kind,scope_id`,
       ).all()).toEqual(firstV40Rows);
-      expect(rerunInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(rerunInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
     } finally {
       rerunInspector.close(false);
     }
@@ -14336,8 +14704,8 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
-      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }, { version: 37 }, { version: 38 }, { version: 39 }, { version: 40 }, { version: 41 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }, { version: 37 }, { version: 38 }, { version: 39 }, { version: 40 }, { version: 41 }, { version: 42 }]);
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
         .toContainEqual(expect.objectContaining({ name: "attempt_sequence", type: "INTEGER", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
@@ -14452,7 +14820,7 @@ describe("StateStore", () => {
       .get(session.id);
     legacy.close(false);
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:38:41");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:38:42");
 
     const upgraded = new StateStore(paths, { now: () => 40_000,
       resolveMachineTimeZone: () => { throw new Error("RELEASED_V38_ZONE_MUST_NOT_BE_REPLACED"); },
@@ -14463,7 +14831,7 @@ describe("StateStore", () => {
     expect(upgraded.requireSessionPresetContract(session.id)).toBe(currentPresetContract);
     expect(upgraded.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtime);
     const proof = new Database(paths.database, { readonly: true, strict: true });
-    expect(proof.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+    expect(proof.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
     expect(proof.query("SELECT * FROM sessions WHERE id=?").get(session.id)).toEqual(rows);
     expect(proof.query("SELECT profile_json FROM session_runtime_profiles WHERE session_id=?")
       .get(session.id)).toEqual(runtimeBytes);
@@ -14516,7 +14884,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:37:41");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:37:42");
     const migrated = new StateStore(paths, { now: () => 4_000 });
     stores.push(migrated);
     expect(migrated.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtimeProfile);
@@ -14529,7 +14897,7 @@ describe("StateStore", () => {
       expect(inspector.query(
         "SELECT profile_json FROM session_runtime_profiles WHERE source_id='historical-sol-source'",
       ).get()).toEqual({ profile_json: before });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
     } finally {
       inspector.close(false);
     }
@@ -14573,7 +14941,7 @@ describe("StateStore", () => {
         .toContainEqual(expect.objectContaining({ name: "preset_contract", notnull: 1 }));
       expect(inspector.query("SELECT preset_contract FROM sessions WHERE id=?").get(session.id))
         .toEqual({ preset_contract: legacyPresetContract });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query("SELECT version FROM migrations WHERE version=38").get())
         .toEqual({ version: 38 });
     } finally {
@@ -14673,7 +15041,7 @@ describe("StateStore", () => {
     mainV35.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:41");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:42");
     const migrated = new StateStore(paths, {
       now: () => 8_000,
       resolveMachineTimeZone: () => "UTC",
@@ -14687,7 +15055,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT provider_thread_id,recorded_at FROM session_provider_switch_targets WHERE attempt_id=?",
       ).get(attempt.id)).toEqual({
@@ -14726,7 +15094,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:41");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:42");
     const migrated = new StateStore(paths, {
       now: () => 9_000,
       resolveMachineTimeZone: () => {
@@ -14748,7 +15116,7 @@ describe("StateStore", () => {
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(18);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
     } finally {
       inspector.close(false);
     }
@@ -14772,7 +15140,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:41");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:42");
 
     expect(() => new StateStore(paths))
       .toThrow("ATTENTION_EMAIL_POLICY_MIGRATION_OPT_IN_REFUSED");
@@ -14819,7 +15187,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:41");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:42");
     const migrated = new StateStore(paths, {
       now: () => 12_000,
       resolveMachineTimeZone: () => {
@@ -14847,7 +15215,7 @@ describe("StateStore", () => {
          FROM notification_hours h JOIN attention_email_policy e ON h.singleton=e.singleton`,
       ).get()).toEqual(before);
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(18);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
     } finally {
       inspector.close(false);
     }
@@ -14986,7 +15354,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:41");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:42");
     const unchanged = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
@@ -15044,7 +15412,7 @@ describe("StateStore", () => {
     const schemaInspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(schemaInspector)).toBe(18);
-      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
     } finally {
       schemaInspector.close(false);
     }
@@ -15367,13 +15735,13 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query("PRAGMA table_info(sessions)").all())
         .toContainEqual(expect.objectContaining({ name: "provider", dflt_value: "'codex'" }));
       expect(inspector.query("PRAGMA table_info(autorespond_evidence)").all())
         .toContainEqual(expect.objectContaining({ name: "path" }));
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 41 ORDER BY version",
+        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 42 ORDER BY version",
       ).all()).toEqual([
         { version: 30 },
         { version: 31 },
@@ -15387,6 +15755,7 @@ describe("StateStore", () => {
         { version: 39 },
         { version: 40 },
         { version: 41 },
+        { version: 42 },
       ]);
     } finally {
       inspector.close(false);
@@ -15680,7 +16049,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -15793,7 +16162,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -15897,7 +16266,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -15950,7 +16319,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }]);
@@ -16041,7 +16410,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -16147,7 +16516,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -16239,7 +16608,7 @@ describe("StateStore", () => {
     expect(reopened.listAutorespondEvidence({ sessionId: session.id })).toEqual([expectedEvidence]);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query("SELECT id,path,rule,model FROM autorespond_evidence").get()).toEqual({
         id: 7,
         path: "protocol",
@@ -16348,7 +16717,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -16391,6 +16760,7 @@ describe("StateStore", () => {
         { version: 39, applied_at: 2000 },
         { version: 40, applied_at: 2000 },
         { version: 41, applied_at: 2000 },
+        { version: 42, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
       expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
@@ -16437,7 +16807,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -16457,9 +16827,9 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 42");
+    newer.exec("PRAGMA user_version = 43");
     newer.close(false);
     await chmod(paths.database, 0o600);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:42:41");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:43:42");
   });
 });

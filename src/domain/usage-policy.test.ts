@@ -7,6 +7,7 @@ import {
   providerUsageDigest,
   providerUsageQuotaComponentSchema,
   type CodexQuotaUsage,
+  type CreateClaudeQuotaUsageComponentInput,
 } from "./provider-usage";
 import {
   AUTO_RATE_LIMIT_RESET_USED_PERCENT,
@@ -16,7 +17,9 @@ import {
 } from "./usage-metrics";
 import {
   automaticUsageDecision,
+  automaticUsageDecisionInputSchema,
   automaticUsagePolicyConfigurationSchema,
+  automaticUsagePolicyConfigurationUpdateSchema,
   automaticUsageResetGateSchema,
   classifyProviderUsageAccount,
   followSettledAutomaticPointerMoves,
@@ -91,6 +94,28 @@ function account(id: number, usedPercent: number, options: Readonly<{
 
 const classify = (value: unknown, evaluatedAt = now) => classifyProviderUsageAccount({ account: value, now: evaluatedAt });
 
+function claudeAccount(quota: CreateClaudeQuotaUsageComponentInput["quota"]): UsagePolicyAccount {
+  const authority: ProviderAccountAuthority = {
+    ...authorityFor(1), provider: "claude", providerAccountId: `pact_${"1".repeat(32)}`,
+  };
+  return {
+    authority,
+    readiness: "unverified",
+    authorityMode: "mutation_authoritative",
+    quota: createClaudeQuotaUsageComponent({
+      authority,
+      sessionId: "sess_00000000000000000000000000000001",
+      turnId: "turn-1",
+      sourceEventId: "00000000-0000-4000-8000-000000000001",
+      sourceEventDigest: digest,
+      observationRevision: 2,
+      observedAt: now,
+      receivedAt: now,
+      quota,
+    }),
+  };
+}
+
 function evidence(value: UsagePolicyAccount): AutomaticUsageQuotaEvidence {
   const classification = classify(value);
   if (classification.state !== "available" && classification.state !== "exhausted") {
@@ -140,6 +165,21 @@ function move(from: number, to: number, revision: number): SettledAutomaticPoint
   });
 }
 
+function moveWithProcesses(
+  original: SettledAutomaticPointerMove,
+  source: number,
+  target: number,
+): SettledAutomaticPointerMove {
+  return settledAutomaticPointerMoveSchema.parse({
+    ...original,
+    authority: {
+      ...original.authority,
+      source: { ...original.authority.source, authority: { ...original.authority.source.authority, processGeneration: source } },
+    },
+    target: { ...original.target, authority: { ...original.target.authority, processGeneration: target } },
+  });
+}
+
 function managedSession(): AutomaticUsageManagedSession {
   return {
     sessionId: "sess_00000000000000000000000000000001",
@@ -185,6 +225,43 @@ describe("automatic usage policy configuration", () => {
     const initial = initialAutomaticUsagePolicyConfiguration();
     initial.overrides.codex = "off";
     expect(initialAutomaticUsagePolicyConfiguration().overrides.codex).toBe("inherit");
+  });
+
+  test("configuration updates admit only exact revision-fenced default or provider override changes", () => {
+    const base = {
+      idempotencyKey: "00000000-0000-4000-8000-000000000001",
+      expectedAutomaticPolicyRevision: 1,
+    };
+    for (const enabled of [false, true]) {
+      const input = { ...base, change: { kind: "set_default", enabled } as const };
+      expect(automaticUsagePolicyConfigurationUpdateSchema.parse(input)).toEqual(input);
+    }
+    for (const provider of ["codex", "claude"] as const) {
+      for (const override of ["inherit", "on", "off"] as const) {
+        const input = { ...base, change: { kind: "set_override", provider, override } as const };
+        expect(automaticUsagePolicyConfigurationUpdateSchema.parse(input)).toEqual(input);
+      }
+    }
+    const valid = { ...base, change: { kind: "set_default", enabled: false } as const };
+    for (const patch of [
+      { idempotencyKey: "not-a-uuid" }, { idempotencyKey: null },
+      { expectedAutomaticPolicyRevision: 0 }, { expectedAutomaticPolicyRevision: -1 },
+      { expectedAutomaticPolicyRevision: 1.5 }, { expectedAutomaticPolicyRevision: Number.MAX_SAFE_INTEGER + 1 },
+      { expectedAutomaticPolicyRevision: Number.POSITIVE_INFINITY },
+      { expectedAutomaticPolicyRevision: "1" }, { expectedAutomaticPolicyRevision: undefined },
+      { automaticPolicyRevision: 1 }, { resetPolicyRevision: 1 },
+      { change: { kind: "set_default", enabled: "false" } },
+      { change: { kind: "set_default", enabled: false, provider: "claude" } },
+      { change: { kind: "set_override", provider: "claude", override: "on", enabled: true } },
+      { change: { kind: "set_override", provider: "other", override: "on" } },
+      { change: { kind: "set_override", provider: "claude", override: "auto" } },
+      { change: { kind: "set_override", provider: "codex" } },
+      { change: { kind: "reset", enabled: true } },
+    ]) expect(automaticUsagePolicyConfigurationUpdateSchema.safeParse({ ...valid, ...patch }).success).toBe(false);
+    fc.assert(fc.property(fc.integer({ min: 1, max: Number.MAX_SAFE_INTEGER }), (revision) => {
+      const input = { ...valid, expectedAutomaticPolicyRevision: revision };
+      expect(automaticUsagePolicyConfigurationUpdateSchema.parse(input)).toEqual(input);
+    }));
   });
 });
 
@@ -311,13 +388,108 @@ describe("provider usage classification", () => {
       .toEqual({ state: "unknown", reason: "account_not_ready" });
     expect(classify(value, now + 1)).toMatchObject({ state: "observe_only", exhausted: null, recheckAt: null });
     expect(classify({ ...value, quota: { ...quota, accounting: { totalCostUsd: 1_000_000 } } }).state).toBe("unknown");
-    const input = { ...decisionInput(), provider: "claude", observedSource: authority, accounts: [value], order: [authority.providerAccountId], activeProviderAccountId: authority.providerAccountId, resetGate: null };
+    const input = { ...decisionInput(), provider: "claude", observedSource: authority, accounts: [value], order: [authority.providerAccountId], activeProviderAccountId: authority.providerAccountId, resetPolicyRevision: null, resetGate: null };
     expect(automaticUsageDecision({ ...input, nativeFallback: "armed" })).toEqual({ action: "observe_only", reason: "claude_native_fallback_armed", recheckAt: null });
     expect(automaticUsageDecision(input)).toEqual({ action: "observe_only", reason: "claude_automation_unavailable", recheckAt: null });
+  });
+
+  test("Claude numeric window expiry requires another observation before reporting availability", () => {
+    for (const status of ["allowed", "warning"] as const) {
+      const value = claudeAccount({
+        status: { state: "known", value: status },
+        rateLimitType: "unified",
+        resetsAtMs: null,
+        overageStatus: null,
+        overageDisabledReason: null,
+        isUsingOverage: null,
+        windows: [{ id: "weekly", scope: "account", usedPercent: 99, resetsAtMs: now + 1 }],
+      });
+      expect(classify(value)).toMatchObject({ exhausted: true, recheckAt: now + 1 });
+      expect(classify(value, now + 1)).toMatchObject({ freshness: "fresh", exhausted: null, recheckAt: null });
+    }
+  });
+
+  test("Claude retains live blocking evidence but not availability after any observed boundary expires", () => {
+    for (const firstUsed of [20, 99]) {
+      for (const secondUsed of [20, 99]) {
+        const value = claudeAccount({
+          status: { state: "known", value: "allowed" },
+          rateLimitType: "unified", resetsAtMs: null,
+          overageStatus: null, overageDisabledReason: null, isUsingOverage: null,
+          windows: [
+            { id: "primary", scope: "account", usedPercent: firstUsed, resetsAtMs: now + 1 },
+            { id: "secondary", scope: "account", usedPercent: secondUsed, resetsAtMs: now + 2 },
+          ],
+        });
+        expect(classify(value)).toMatchObject({ exhausted: firstUsed >= 99 || secondUsed >= 99 });
+        expect(classify(value, now + 1)).toMatchObject({
+          exhausted: secondUsed >= 99 ? true : null, recheckAt: secondUsed >= 99 ? now + 2 : null,
+        });
+        expect(classify(value, now + 2)).toMatchObject({ exhausted: null, recheckAt: null });
+      }
+    }
+    const statusOnly = claudeAccount({
+      status: { state: "known", value: "allowed" },
+      rateLimitType: "unified", resetsAtMs: now + 1,
+      overageStatus: null, overageDisabledReason: null, isUsingOverage: null, windows: [],
+    });
+    expect(classify(statusOnly)).toMatchObject({ exhausted: false });
+    expect(classify(statusOnly, now + 1)).toMatchObject({ exhausted: null, recheckAt: null });
   });
 });
 
 describe("automatic usage selector", () => {
+  test("requires provider-owned reset fields without borrowing Codex authority for Claude", () => {
+    const codex = decisionInput();
+    const authority: ProviderAccountAuthority = {
+      ...authorityFor(1), provider: "claude", providerAccountId: `pact_${"1".repeat(32)}`,
+    };
+    const claude: Extract<AutomaticUsageDecisionInput, { provider: "claude" }> = {
+      ...codex, provider: "claude", observedSource: authority,
+      accounts: [], order: [], activeProviderAccountId: null,
+      resetPolicyRevision: null, resetGate: null,
+    };
+    expect(automaticUsageDecisionInputSchema.safeParse(claude).success).toBe(true);
+    expect(automaticUsageDecision(claude)).toEqual({ action: "observe_only", reason: "claude_automation_unavailable", recheckAt: null });
+    for (const invalid of [
+      { ...claude, resetPolicyRevision: 7 },
+      { ...claude, resetGate: codex.resetGate },
+      { ...codex, resetPolicyRevision: null },
+    ]) {
+      expect(automaticUsageDecisionInputSchema.safeParse(invalid).success).toBe(false);
+      expect(automaticUsageDecision(invalid)).toEqual({ action: "reconciliation_required", reason: "invalid_input" });
+    }
+    expect(automaticUsageDecisionInputSchema.safeParse(codex).success).toBe(true);
+    expect(automaticUsageDecisionInputSchema.safeParse({ ...codex, resetGate: null }).success).toBe(true);
+    expect(automaticUsageDecisionInputSchema.safeParse({ ...claude, resetCreditsAvailable: 1 }).success).toBe(false);
+    expect(automaticUsageDecisionInputSchema.safeParse({ ...codex, resetCreditsAvailable: 1 }).success).toBe(false);
+  });
+
+  test("rejects cross-provider source and candidate authority before explaining provider policy", () => {
+    const codex = decisionInput();
+    const claudeSource = claudeAccount({
+      status: { state: "known", value: "allowed" },
+      rateLimitType: "unified", resetsAtMs: now + hour,
+      overageStatus: null, overageDisabledReason: null, isUsingOverage: null, windows: [],
+    });
+    const claude: Extract<AutomaticUsageDecisionInput, { provider: "claude" }> = {
+      ...codex, provider: "claude", observedSource: claudeSource.authority,
+      accounts: [claudeSource], order: [claudeSource.authority.providerAccountId],
+      activeProviderAccountId: claudeSource.authority.providerAccountId,
+      resetPolicyRevision: null, resetGate: null, nativeFallback: "armed",
+    };
+    expect(automaticUsageDecisionInputSchema.safeParse(claude).success).toBe(true);
+    for (const invalid of [
+      { ...claude, observedSource: codex.observedSource },
+      { ...claude, accounts: [claudeSource, account(2, 20)] },
+      { ...codex, observedSource: claudeSource.authority },
+      { ...codex, accounts: [...codex.accounts, claudeSource] },
+    ]) {
+      expect(automaticUsageDecisionInputSchema.safeParse(invalid).success).toBe(false);
+      expect(automaticUsageDecision(invalid)).toEqual({ action: "reconciliation_required", reason: "invalid_input" });
+    }
+  });
+
   test("binds one pointer proposal to exact quota, policy, order and pointer evidence", () => {
     const input = decisionInput();
     expect(automaticUsageDecision(input)).toEqual({
@@ -457,9 +629,60 @@ describe("following settled automatic pointer moves", () => {
     expect(follow([move(1, 2, 5), newerProcess])).toMatchObject({ action: "advance_pointer_revision", target: authorityFor(1) });
   });
 
+  test("rejects backwards process generations within chronological binding history", () => {
+    const first = moveWithProcesses(move(1, 2, 5), 4, 5);
+    for (const moves of [
+      [first, move(2, 3, 6)],
+      [first, moveWithProcesses(move(2, 1, 6), 5, 3)],
+      [first, moveWithProcesses(move(2, 3, 6), 5, 4), moveWithProcesses(move(3, 2, 7), 4, 4)],
+    ]) {
+      expect(follow(moves, 5 + moves.length))
+        .toEqual({ action: "reconciliation_required", reason: "lineage_authority_mismatch" });
+    }
+  });
+
+  test("allows monotonic recorded processes without imposing the current session process on history", () => {
+    const session = managedSession();
+    session.authority.processGeneration = 10;
+    const first = moveWithProcesses(move(1, 2, 5), 4, 5);
+    const followCurrentSession = (moves: readonly SettledAutomaticPointerMove[]) =>
+      followSettledAutomaticPointerMoves({
+        session, moves, throughPointerRevision: 5 + moves.length,
+        configuration: initialAutomaticUsagePolicyConfiguration(),
+      });
+    for (const sourceProcess of [5, 6]) {
+      const second = moveWithProcesses(move(2, 3, 6), sourceProcess, 4);
+      expect(followCurrentSession([first, second]))
+        .toMatchObject({ action: "follow_pointer_moves", target: authorityFor(3) });
+      const roundTrip = moveWithProcesses(move(2, 1, 6), sourceProcess, 5);
+      expect(followCurrentSession([first, roundTrip]))
+        .toMatchObject({ action: "advance_pointer_revision", target: session.authority });
+      const revisited = moveWithProcesses(move(3, 2, 7), 4, sourceProcess + 1);
+      expect(followCurrentSession([first, second, revisited]))
+        .toMatchObject({ action: "follow_pointer_moves", target: { ...authorityFor(2), processGeneration: sourceProcess + 1 } });
+    }
+  });
+
+  test("process history is monotonic across the admitted safe-integer range", () => {
+    const first = move(1, 2, 5);
+    const second = move(2, 3, 6);
+    fc.assert(fc.property(fc.integer({ min: 1, max: Number.MAX_SAFE_INTEGER - 1 }), (generation) => {
+      const history = moveWithProcesses(first, 4, generation);
+      expect(follow([history, moveWithProcesses(second, generation - 1, 4)]))
+        .toEqual({ action: "reconciliation_required", reason: "lineage_authority_mismatch" });
+      expect(follow([history, moveWithProcesses(second, generation, 4)]).action).toBe("follow_pointer_moves");
+      expect(follow([history, moveWithProcesses(second, generation + 1, 4)]).action).toBe("follow_pointer_moves");
+    }));
+  });
+
   test("explicit and Claude sessions stay pinned and current policy can disable following", () => {
     const input = { session: managedSession(), configuration: initialAutomaticUsagePolicyConfiguration(), throughPointerRevision: 7, moves: [move(1, 2, 5), move(2, 3, 6)] };
     expect(followSettledAutomaticPointerMoves({ ...input, session: { ...input.session, routingProvenance: "explicit", appliedPointerRevision: null } })).toEqual({ action: "stay", reason: "explicit_session" });
+    const claudeAuthority: ProviderAccountAuthority = {
+      ...input.session.authority, provider: "claude", providerAccountId: `pact_${"1".repeat(32)}`,
+    };
+    expect(followSettledAutomaticPointerMoves({ ...input, session: { ...input.session, authority: claudeAuthority } }))
+      .toEqual({ action: "stay", reason: "claude_observe_only" });
     expect(followSettledAutomaticPointerMoves({ ...input, configuration: { ...input.configuration, defaultEnabled: false } })).toEqual({ action: "disabled", reason: "policy_disabled" });
     expect(follow([], 5)).toEqual({ action: "stay", reason: "already_applied" });
   });

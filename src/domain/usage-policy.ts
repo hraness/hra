@@ -44,6 +44,22 @@ export type AutomaticUsagePolicyConfiguration = z.infer<
   typeof automaticUsagePolicyConfigurationSchema
 >;
 
+export const automaticUsagePolicyConfigurationUpdateSchema = z.object({
+  idempotencyKey: z.string().uuid(),
+  expectedAutomaticPolicyRevision: revisionSchema,
+  change: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("set_default"), enabled: z.boolean() }).strict(),
+    z.object({
+      kind: z.literal("set_override"),
+      provider: providerSchema,
+      override: automaticUsageOverrideSchema,
+    }).strict(),
+  ]),
+}).strict();
+export type AutomaticUsagePolicyConfigurationUpdate = z.infer<
+  typeof automaticUsagePolicyConfigurationUpdateSchema
+>;
+
 export function initialAutomaticUsagePolicyConfiguration(): AutomaticUsagePolicyConfiguration {
   return {
     version: 1,
@@ -213,12 +229,16 @@ export function classifyProviderUsageAccount(input: Readonly<{
     if (blocked && quota.resetsAtMs !== null && quota.resetsAtMs > now) {
       boundaries.push(quota.resetsAtMs);
     }
+    // Reset expiry invalidates a prior availability observation; it does not
+    // establish that capacity returned. Other live blockers remain evidence.
+    const expired = quota.windows.some((window) => window.resetsAtMs <= now)
+      || (quota.resetsAtMs !== null && quota.resetsAtMs <= now);
     return {
       state: "observe_only",
       reason: "claude_turn_observation",
       freshness,
       exhausted: boundaries.length > 0 ? true
-        : quota.status.state === "known" && !blocked && freshness === "fresh" ? false : null,
+        : quota.status.state === "known" && !blocked && !expired && freshness === "fresh" ? false : null,
       recheckAt: boundaries.length > 0 ? Math.max(...boundaries) : null,
     };
   }
@@ -345,8 +365,7 @@ export type AutomaticUsageDecision =
     }>
   | Readonly<{ action: "wait"; reason: "no_fresh_target"; recheckAt: number; authority: AutomaticUsageDecisionAuthority }>;
 
-export const automaticUsageDecisionInputSchema = z.object({
-  provider: providerSchema,
+const automaticUsageDecisionInputBase = {
   now: unixMillisecondsSchema,
   configuration: automaticUsagePolicyConfigurationSchema,
   observedSource: providerAccountAuthoritySchema,
@@ -354,11 +373,28 @@ export const automaticUsageDecisionInputSchema = z.object({
   orderRevision: revisionSchema,
   activeProviderAccountId: providerAccountIdSchema.nullable(),
   pointerRevision: revisionSchema,
-  resetPolicyRevision: revisionSchema,
   accounts: z.array(usagePolicyAccountSchema).max(AUTOMATIC_USAGE_ACCOUNT_LIMIT),
-  resetGate: automaticUsageResetGateSchema.nullable(),
   nativeFallback: z.enum(["armed", "unavailable", "disabled"]),
-}).strict();
+};
+export const automaticUsageDecisionInputSchema = z.discriminatedUnion("provider", [
+  z.object({
+    ...automaticUsageDecisionInputBase,
+    provider: z.literal("codex"),
+    resetPolicyRevision: revisionSchema,
+    resetGate: automaticUsageResetGateSchema.nullable(),
+  }).strict(),
+  z.object({
+    ...automaticUsageDecisionInputBase,
+    provider: z.literal("claude"),
+    resetPolicyRevision: z.null(),
+    resetGate: z.null(),
+  }).strict(),
+]).superRefine((input, context) => {
+  if (input.observedSource.provider !== input.provider
+    || input.accounts.some((account) => account.authority.provider !== input.provider)) {
+    context.addIssue({ code: "custom", message: "Usage policy authority must belong to the selected provider." });
+  }
+});
 export type AutomaticUsageDecisionInput = z.infer<typeof automaticUsageDecisionInputSchema>;
 
 /** Model ladders are provider data; no current quota input admits model scope. */
@@ -544,12 +580,26 @@ export function followSettledAutomaticPointerMoves(input: Readonly<{
   let lastSettledAt = 0;
   let lastOrderRevision = 0;
   let lastPolicyRevision = 0;
+  // Compare only chronological move evidence. The session's current process
+  // may legitimately be newer than the recorded first source or round trip.
+  const processGenerations = new Map<string, number>();
   for (const move of moves) {
     if (move.authority.pointerRevision !== revision || move.toPointerRevision > through) {
       return { action: "reconciliation_required", reason: "lineage_gap" };
     }
     if (!sameBinding(authority, move.authority.source.authority)) {
       return { action: "reconciliation_required", reason: "lineage_authority_mismatch" };
+    }
+    for (const recordedAuthority of [move.authority.source.authority, move.target.authority]) {
+      const binding = JSON.stringify([
+        recordedAuthority.provider, recordedAuthority.profileId,
+        recordedAuthority.providerAccountId, recordedAuthority.bindingGeneration,
+      ]);
+      const previous = processGenerations.get(binding);
+      if (previous !== undefined && recordedAuthority.processGeneration < previous) {
+        return { action: "reconciliation_required", reason: "lineage_authority_mismatch" };
+      }
+      processGenerations.set(binding, recordedAuthority.processGeneration);
     }
     if (move.authority.evaluatedAt < lastSettledAt
       || move.authority.orderRevision < lastOrderRevision

@@ -133,7 +133,7 @@ const downgradeStateSchema = (databasePath: string): void => {
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("PRAGMA user_version=42");
+    database.exec("PRAGMA user_version=43");
   } finally {
     database.close(false);
   }
@@ -5695,7 +5695,7 @@ describe("CLI entry point", () => {
       });
       expect(started.read().stderr).toBe("");
       expect(daemonStarts).toBe(1);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(41);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(42);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -5719,7 +5719,7 @@ describe("CLI entry point", () => {
         error: {
           code: "RECOVERY_REQUIRED",
           details: { nextCommand: "hra daemon start" },
-          message: "The local state schema needs a migration (35 to 41); start the daemon to migrate it.",
+          message: "The local state schema needs a migration (35 to 42); start the daemon to migrate it.",
         },
         ok: false,
         version: 1,
@@ -5751,14 +5751,14 @@ describe("CLI entry point", () => {
       expect(JSON.parse(captured.read().stdout)).toEqual({
         error: {
           code: "RECOVERY_REQUIRED",
-          message: "This HRA build is older than the local state schema (42 vs 41); install the newer HRA.",
+          message: "This HRA build is older than the local state schema (43 vs 42); install the newer HRA.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
       expect(daemonStarts).toBe(0);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(42);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(43);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -5780,7 +5780,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["The local state schema needs a migration (35 to 41). Run `hra daemon start` to migrate it."],
+          problems: ["The local state schema needs a migration (35 to 42). Run `hra daemon start` to migrate it."],
           state: { database: "invalid", initialized: false },
         },
       });
@@ -5807,7 +5807,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["This HRA build is older than the local state schema (42 vs 41). Install the newer HRA."],
+          problems: ["This HRA build is older than the local state schema (43 vs 42). Install the newer HRA."],
           state: { database: "invalid", initialized: false },
         },
       });

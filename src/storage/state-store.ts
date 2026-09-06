@@ -117,6 +117,13 @@ import {
   type ProviderUsageObservationV2,
 } from "../domain/provider-usage";
 import {
+  automaticUsagePolicyConfigurationSchema,
+  automaticUsagePolicyConfigurationUpdateSchema,
+  initialAutomaticUsagePolicyConfiguration,
+  type AutomaticUsagePolicyConfiguration,
+  type AutomaticUsagePolicyConfigurationUpdate,
+} from "../domain/usage-policy";
+import {
   SESSION_EVENT_MAX_BYTES,
   SESSION_EVENT_PAGE_BYTES,
   SESSION_EVENT_PAGE_LIMIT,
@@ -1337,7 +1344,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 41;
+const currentSchemaVersion = 42;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -5794,6 +5801,271 @@ const assertSchemaVersion41SessionSwitch = (database: Database): void => {
   }
 };
 
+const automaticUsagePolicyMutationKind = "usage.auto.configure";
+const automaticUsagePolicyAuthorityId = "automatic-usage-policy";
+const automaticUsagePolicyDigest = (value: unknown): string =>
+  createHash("sha256").update(JSON.stringify(value)).digest("hex");
+const automaticUsagePolicyRequest = (input: AutomaticUsagePolicyConfigurationUpdate) => ({
+  kind: automaticUsagePolicyMutationKind,
+  authorityId: automaticUsagePolicyAuthorityId,
+  authorityGeneration: input.expectedAutomaticPolicyRevision,
+  request: {
+    expectedAutomaticPolicyRevision: input.expectedAutomaticPolicyRevision,
+    change: input.change,
+  },
+});
+const automaticUsagePolicyReceipt = (configuration: AutomaticUsagePolicyConfiguration) => ({
+  version: 1,
+  automaticPolicyRevision: configuration.automaticPolicyRevision,
+  configurationDigest: automaticUsagePolicyDigest(configuration),
+});
+
+// These objects are deliberately not repaired on a current-schema open. Missing
+// authority must never silently restore an enabled default.
+const schemaVersion42AutomaticUsagePolicyObjects = [
+  {
+    name: "automatic_usage_policy_revisions", type: "table", table: "automatic_usage_policy_revisions",
+    sql: `CREATE TABLE IF NOT EXISTS automatic_usage_policy_revisions (
+      automatic_policy_revision INTEGER PRIMARY KEY CHECK(automatic_policy_revision BETWEEN 1 AND 9007199254740991),
+      version INTEGER NOT NULL CHECK(version=1),
+      default_enabled INTEGER NOT NULL CHECK(default_enabled IN (0,1)),
+      codex_override TEXT NOT NULL CHECK(codex_override IN ('inherit','on','off')),
+      claude_override TEXT NOT NULL CHECK(claude_override IN ('inherit','on','off')),
+      attempt_id TEXT UNIQUE REFERENCES mutation_attempts(id),
+      idempotency_key TEXT UNIQUE CHECK(idempotency_key IS NULL OR (
+        length(idempotency_key)=36 AND substr(idempotency_key,9,1)='-' AND substr(idempotency_key,14,1)='-'
+        AND substr(idempotency_key,19,1)='-' AND substr(idempotency_key,24,1)='-'
+        AND length(replace(idempotency_key,'-',''))=32
+        AND lower(replace(idempotency_key,'-','')) NOT GLOB '*[^0-9a-f]*'
+        AND (lower(idempotency_key) IN ('00000000-0000-0000-0000-000000000000','ffffffff-ffff-ffff-ffff-ffffffffffff')
+          OR (substr(idempotency_key,15,1) GLOB '[1-8]' AND lower(substr(idempotency_key,20,1)) GLOB '[89ab]'))
+      )),
+      change_kind TEXT NOT NULL CHECK(change_kind IN ('initial','set_default','set_override')),
+      change_provider TEXT CHECK(change_provider IN ('codex','claude')),
+      change_value TEXT CHECK(change_value IN ('inherit','on','off')),
+      request_digest TEXT CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
+      configuration_digest TEXT NOT NULL CHECK(length(configuration_digest)=64 AND configuration_digest NOT GLOB '*[^0-9a-f]*'),
+      recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991),
+      CHECK((automatic_policy_revision=1 AND default_enabled=1 AND codex_override='inherit'
+          AND claude_override='inherit' AND change_kind='initial' AND attempt_id IS NULL AND idempotency_key IS NULL
+          AND change_provider IS NULL AND change_value IS NULL AND request_digest IS NULL)
+        OR (automatic_policy_revision>1 AND attempt_id IS NOT NULL AND idempotency_key IS NOT NULL AND request_digest IS NOT NULL
+          AND ((change_kind='set_default' AND change_provider IS NULL AND change_value IS NOT NULL AND change_value IN ('on','off'))
+            OR (change_kind='set_override' AND change_provider IS NOT NULL AND change_value IS NOT NULL))))
+    ) STRICT;`,
+  },
+  {
+    name: "automatic_usage_policy_mutations", type: "index", table: "mutation_attempts",
+    sql: `CREATE INDEX IF NOT EXISTS automatic_usage_policy_mutations ON mutation_attempts(id)
+      WHERE kind='usage.auto.configure';`,
+  },
+  {
+    name: "automatic_usage_policy_insert_guard", type: "trigger", table: "automatic_usage_policy_revisions",
+    sql: `CREATE TRIGGER IF NOT EXISTS automatic_usage_policy_insert_guard
+    BEFORE INSERT ON automatic_usage_policy_revisions
+    WHEN NOT (
+      (NEW.automatic_policy_revision=1 AND NOT EXISTS(SELECT 1 FROM automatic_usage_policy_revisions)
+        AND NEW.configuration_digest='${automaticUsagePolicyDigest(initialAutomaticUsagePolicyConfiguration())}')
+      OR EXISTS(
+        SELECT 1 FROM automatic_usage_policy_revisions previous JOIN mutation_attempts attempt ON attempt.id=NEW.attempt_id
+        WHERE previous.automatic_policy_revision=(SELECT MAX(automatic_policy_revision) FROM automatic_usage_policy_revisions)
+          AND NEW.automatic_policy_revision=previous.automatic_policy_revision+1
+          AND NEW.recorded_at>=previous.recorded_at
+          AND attempt.kind='usage.auto.configure' AND attempt.authority_id='automatic-usage-policy'
+          AND attempt.authority_generation=previous.automatic_policy_revision
+          AND attempt.idempotency_key=NEW.idempotency_key
+          AND attempt.request_digest=NEW.request_digest AND attempt.state='effect_started' AND attempt.result_json IS NULL
+          AND attempt.created_at=NEW.recorded_at AND attempt.updated_at=NEW.recorded_at
+          AND NEW.default_enabled=CASE WHEN NEW.change_kind='set_default' THEN NEW.change_value='on' ELSE previous.default_enabled END
+          AND NEW.codex_override=CASE WHEN NEW.change_provider='codex' THEN NEW.change_value ELSE previous.codex_override END
+          AND NEW.claude_override=CASE WHEN NEW.change_provider='claude' THEN NEW.change_value ELSE previous.claude_override END
+      )
+    ) BEGIN SELECT RAISE(ABORT,'automatic usage policy authority mismatch'); END;`,
+  },
+  ...(["UPDATE", "DELETE"] as const).map((operation) => ({
+    name: `automatic_usage_policy_immutable_${operation.toLowerCase()}`,
+    type: "trigger", table: "automatic_usage_policy_revisions",
+    sql: `CREATE TRIGGER IF NOT EXISTS automatic_usage_policy_immutable_${operation.toLowerCase()}
+      BEFORE ${operation} ON automatic_usage_policy_revisions
+      BEGIN SELECT RAISE(ABORT,'automatic usage policy revisions are immutable'); END;`,
+  })),
+  {
+    name: "automatic_usage_policy_mutation_update_guard", type: "trigger", table: "mutation_attempts",
+    sql: `CREATE TRIGGER IF NOT EXISTS automatic_usage_policy_mutation_update_guard BEFORE UPDATE ON mutation_attempts
+    WHEN (OLD.kind='usage.auto.configure' OR NEW.kind='usage.auto.configure'
+      OR EXISTS(SELECT 1 FROM automatic_usage_policy_revisions WHERE attempt_id=OLD.id)) AND NOT (
+      NEW.id=OLD.id AND NEW.idempotency_key=OLD.idempotency_key AND NEW.kind=OLD.kind
+      AND NEW.authority_id=OLD.authority_id AND NEW.authority_generation=OLD.authority_generation
+      AND NEW.request_digest=OLD.request_digest AND NEW.created_at=OLD.created_at AND NEW.updated_at=OLD.updated_at
+      AND OLD.result_json IS NULL AND (
+        (OLD.state='prepared' AND NEW.state='effect_started' AND NEW.result_json IS NULL
+          AND NOT EXISTS(SELECT 1 FROM automatic_usage_policy_revisions WHERE attempt_id=OLD.id))
+        OR (OLD.state='effect_started' AND NEW.state='applied' AND EXISTS(
+          SELECT 1 FROM automatic_usage_policy_revisions revision WHERE revision.attempt_id=OLD.id
+            AND NEW.result_json=json_object('version',1,'automaticPolicyRevision',revision.automatic_policy_revision,
+              'configurationDigest',revision.configuration_digest)
+        ))
+      )
+    ) BEGIN SELECT RAISE(ABORT,'automatic usage policy mutation is receipt-backed'); END;`,
+  },
+  {
+    name: "automatic_usage_policy_mutation_delete_guard", type: "trigger", table: "mutation_attempts",
+    sql: `CREATE TRIGGER IF NOT EXISTS automatic_usage_policy_mutation_delete_guard BEFORE DELETE ON mutation_attempts
+    WHEN OLD.kind='usage.auto.configure' OR EXISTS(SELECT 1 FROM automatic_usage_policy_revisions WHERE attempt_id=OLD.id)
+    BEGIN SELECT RAISE(ABORT,'automatic usage policy mutation is immutable'); END;`,
+  },
+] as const;
+
+const automaticUsagePolicyRevisionRowSchema = z.object({
+  automatic_policy_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  version: z.literal(1),
+  default_enabled: z.union([z.literal(0), z.literal(1)]),
+  codex_override: z.enum(["inherit", "on", "off"]),
+  claude_override: z.enum(["inherit", "on", "off"]),
+  attempt_id: attemptIdSchema.nullable(),
+  idempotency_key: z.string().uuid().nullable(),
+  change_kind: z.enum(["initial", "set_default", "set_override"]),
+  change_provider: providerSchema.nullable(),
+  change_value: z.enum(["inherit", "on", "off"]).nullable(),
+  request_digest: z.string().regex(/^[0-9a-f]{64}$/u).nullable(),
+  configuration_digest: z.string().regex(/^[0-9a-f]{64}$/u),
+  recorded_at: unixMillisecondsSchema,
+}).strict();
+
+const assertSchemaVersion42AutomaticUsagePolicy = (database: Database): void => {
+  for (const expected of schemaVersion42AutomaticUsagePolicyObjects) {
+    const result = sqliteSchemaObjectRowSchema.safeParse(database.query(
+      "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name=?",
+    ).get(expected.name));
+    if (!result.success || result.data.type !== expected.type || result.data.tbl_name !== expected.table
+      || normalizeSqlStructure(result.data.sql.replace(/\bIF NOT EXISTS\b/giu, ""))
+        !== normalizeSqlStructure(expected.sql.replace(/\bIF NOT EXISTS\b/giu, ""))) {
+      throw new Error(`STATE_SCHEMA_V42_STRUCTURE_INVALID:${expected.name}`);
+    }
+  }
+};
+
+const automaticUsagePolicyRevisionSelect = `SELECT revision.*,json_object(
+  'id',attempt.id,'idempotency_key',attempt.idempotency_key,'kind',attempt.kind,
+  'authority_id',attempt.authority_id,'authority_generation',attempt.authority_generation,
+  'request_digest',attempt.request_digest,'state',attempt.state,'result_json',attempt.result_json,
+  'created_at',attempt.created_at,'updated_at',attempt.updated_at
+) AS mutation_json FROM automatic_usage_policy_revisions revision
+LEFT JOIN mutation_attempts attempt ON attempt.id=revision.attempt_id`;
+
+const parseAutomaticUsagePolicyEntry = (value: unknown) => {
+  const { mutation_json: mutationJson, ...row } = automaticUsagePolicyRevisionRowSchema.extend({
+    mutation_json: z.string(),
+  }).parse(value);
+  const configuration = automaticUsagePolicyConfigurationSchema.parse({
+    version: row.version, defaultEnabled: row.default_enabled === 1,
+    overrides: { codex: row.codex_override, claude: row.claude_override },
+    automaticPolicyRevision: row.automatic_policy_revision,
+  });
+  if (row.configuration_digest !== automaticUsagePolicyDigest(configuration)) throw new Error("invalid revision digest");
+  return { row, configuration, mutationJson };
+};
+
+const validateAutomaticUsagePolicyEntry = (
+  entry: ReturnType<typeof parseAutomaticUsagePolicyEntry>,
+  previous: ReturnType<typeof parseAutomaticUsagePolicyEntry> | null,
+): void => {
+  const { row, configuration } = entry;
+  if (previous === null) {
+    if (JSON.stringify(configuration) !== JSON.stringify(initialAutomaticUsagePolicyConfiguration())
+      || row.attempt_id !== null || row.idempotency_key !== null || row.change_kind !== "initial" || row.change_provider !== null
+      || row.change_value !== null || row.request_digest !== null) throw new Error("invalid initial revision");
+    return;
+  }
+  if (row.automatic_policy_revision !== previous.row.automatic_policy_revision + 1
+    || row.recorded_at < previous.row.recorded_at) throw new Error("invalid revision lineage");
+  const mutation = z.object({
+    id: attemptIdSchema, idempotency_key: z.string().uuid(), kind: z.literal(automaticUsagePolicyMutationKind),
+    authority_id: z.literal(automaticUsagePolicyAuthorityId), authority_generation: z.number().int().positive(),
+    request_digest: z.string(), state: z.literal("applied"), result_json: z.string(),
+    created_at: unixMillisecondsSchema, updated_at: unixMillisecondsSchema,
+  }).strict().parse(JSON.parse(entry.mutationJson));
+  const change = row.change_kind === "set_default" && row.change_provider === null && ["on", "off"].includes(row.change_value ?? "")
+    ? { kind: "set_default", enabled: row.change_value === "on" } as const
+    : { kind: row.change_kind, provider: row.change_provider, override: row.change_value };
+  const request = automaticUsagePolicyConfigurationUpdateSchema.parse({
+    idempotencyKey: mutation.idempotency_key, expectedAutomaticPolicyRevision: previous.configuration.automaticPolicyRevision, change,
+  });
+  const expected = { ...previous.configuration, overrides: { ...previous.configuration.overrides }, automaticPolicyRevision: row.automatic_policy_revision };
+  if (request.change.kind === "set_default") expected.defaultEnabled = request.change.enabled;
+  else expected.overrides[request.change.provider] = request.change.override;
+  if (JSON.stringify(expected) !== JSON.stringify(configuration)
+    || mutation.id !== row.attempt_id || mutation.idempotency_key !== row.idempotency_key
+    || mutation.authority_generation !== previous.configuration.automaticPolicyRevision
+    || mutation.request_digest !== automaticUsagePolicyDigest(automaticUsagePolicyRequest(request))
+    || row.request_digest !== mutation.request_digest || mutation.created_at !== row.recorded_at
+    || mutation.updated_at !== row.recorded_at
+    || mutation.result_json !== JSON.stringify(automaticUsagePolicyReceipt(configuration))) throw new Error("invalid receipt");
+};
+
+// Foreground calls read the indexed head (or exact replay row), its immediate
+// predecessor, and genesis. Immutable SQL guards preserve the already-audited
+// prefix; reopen audits the entire history in fixed-size pages.
+const readAutomaticUsagePolicyEntry = (database: Database, attemptId?: AttemptId) => {
+  assertSchemaVersion42AutomaticUsagePolicy(database);
+  const genesisValue = database.query(`${automaticUsagePolicyRevisionSelect} WHERE revision.automatic_policy_revision=1`).get();
+  if (genesisValue === null) throw new Error("AUTOMATIC_USAGE_POLICY_MISSING");
+  try {
+    const genesis = parseAutomaticUsagePolicyEntry(genesisValue);
+    validateAutomaticUsagePolicyEntry(genesis, null);
+    const value = attemptId === undefined
+      ? database.query(`${automaticUsagePolicyRevisionSelect} ORDER BY revision.automatic_policy_revision DESC LIMIT 1`).get()
+      : database.query(`${automaticUsagePolicyRevisionSelect} WHERE revision.attempt_id=?`).get(attemptId);
+    const entry = parseAutomaticUsagePolicyEntry(value);
+    const previous = entry.row.automatic_policy_revision === 1 ? null : parseAutomaticUsagePolicyEntry(database.query(
+      `${automaticUsagePolicyRevisionSelect} WHERE revision.automatic_policy_revision=?`,
+    ).get(entry.row.automatic_policy_revision - 1));
+    validateAutomaticUsagePolicyEntry(entry, previous);
+    return entry;
+  } catch {
+    throw new Error("AUTOMATIC_USAGE_POLICY_INVALID");
+  }
+};
+
+const auditAutomaticUsagePolicyHistory = (database: Database): void => database.transaction(() => {
+  assertSchemaVersion42AutomaticUsagePolicy(database);
+  try {
+    let previous: ReturnType<typeof parseAutomaticUsagePolicyEntry> | null = null;
+    for (;;) {
+      const values = database.query(`${automaticUsagePolicyRevisionSelect}
+        WHERE revision.automatic_policy_revision>? ORDER BY revision.automatic_policy_revision LIMIT 100`)
+        .all(previous?.row.automatic_policy_revision ?? 0);
+      if (values.length === 0) break;
+      for (const value of values) {
+        const entry = parseAutomaticUsagePolicyEntry(value);
+        validateAutomaticUsagePolicyEntry(entry, previous);
+        previous = entry;
+      }
+    }
+    if (previous === null) throw new Error("missing genesis");
+    if (database.query(`SELECT 1 FROM mutation_attempts attempt WHERE kind='usage.auto.configure'
+      AND NOT EXISTS(SELECT 1 FROM automatic_usage_policy_revisions revision WHERE revision.attempt_id=attempt.id) LIMIT 1`).get() !== null) {
+      throw new Error("orphan configuration mutation");
+    }
+  } catch {
+    throw new Error("AUTOMATIC_USAGE_POLICY_INVALID");
+  }
+})();
+
+const applySchemaVersion42AutomaticUsagePolicy = (database: Database, now: number): void => {
+  for (const object of schemaVersion42AutomaticUsagePolicyObjects) database.exec(object.sql);
+  assertSchemaVersion42AutomaticUsagePolicy(database);
+  if (database.query("SELECT 1 FROM automatic_usage_policy_revisions LIMIT 1").get() === null) {
+    database.query(`INSERT INTO automatic_usage_policy_revisions(
+      automatic_policy_revision,version,default_enabled,codex_override,claude_override,
+      attempt_id,change_kind,change_provider,change_value,request_digest,configuration_digest,recorded_at
+    ) VALUES(1,1,1,'inherit','inherit',NULL,'initial',NULL,NULL,NULL,?,?)`).run(
+      automaticUsagePolicyDigest(initialAutomaticUsagePolicyConfiguration()), now,
+    );
+  }
+  auditAutomaticUsagePolicyHistory(database);
+};
+
 const retireMigratedOrphanCodexUsageAuthorities = (
   database: Database,
   selectedAt: number,
@@ -9073,6 +9345,7 @@ const migrateWritableDatabase = (
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
   }
   if (initialVersion === currentSchemaVersion) {
+    assertSchemaVersion42AutomaticUsagePolicy(database);
     assertCanonicalLabelKeys(database);
     // Audit evidence before startup retention can remove an invalid row.
     // Reapplying additive v36 objects first keeps pre-release partial fixtures
@@ -9600,6 +9873,13 @@ const migrateWritableDatabase = (
       database.exec("PRAGMA user_version = 41");
       version = 41;
     }
+    if (version < 42) {
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      applySchemaVersion42AutomaticUsagePolicy(database, migratedAt);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(42, migratedAt);
+      database.exec("PRAGMA user_version = 42");
+      version = 42;
+    }
 
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
@@ -9661,6 +9941,7 @@ const migrateWritableDatabase = (
     assertProviderAccountAuthority(database);
     assertSchemaVersion40ProviderUsage(database);
     assertSchemaVersion41SessionSwitch(database);
+    auditAutomaticUsagePolicyHistory(database);
     return hasPendingSecurityScrub(database);
   })();
   if (securityScrubPending) completePendingSecurityScrub(database, false, securityScrubCheckpoint);
@@ -12229,6 +12510,7 @@ export class StateStore {
       assertProviderAccountAuthority(this.#database);
       assertSchemaVersion40ProviderUsage(this.#database);
       assertSchemaVersion41SessionSwitch(this.#database);
+      if (this.#readonly) auditAutomaticUsagePolicyHistory(this.#database);
       assertCompositeNotificationPolicy(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
@@ -19782,6 +20064,66 @@ export class StateStore {
     this.assertProviderAccountAuthorityCurrent(parsed.authority);
   }
 
+  readAutomaticUsagePolicyConfiguration(): AutomaticUsagePolicyConfiguration {
+    // One snapshot covers both the append-only ledger and its global receipts.
+    return this.#database.transaction(() => {
+      return readAutomaticUsagePolicyEntry(this.#database).configuration;
+    })();
+  }
+
+  updateAutomaticUsagePolicyConfiguration(
+    input: AutomaticUsagePolicyConfigurationUpdate,
+  ): AutomaticUsagePolicyConfiguration {
+    const parsed = automaticUsagePolicyConfigurationUpdateSchema.parse(input);
+    const requestDigest = automaticUsagePolicyDigest(automaticUsagePolicyRequest(parsed));
+    return this.#database.transaction(() => {
+      const existing = this.readMutation(parsed.idempotencyKey);
+      if (existing !== null && (existing.kind !== automaticUsagePolicyMutationKind
+        || existing.authorityId !== automaticUsagePolicyAuthorityId
+        || existing.authorityGeneration !== parsed.expectedAutomaticPolicyRevision
+        || existing.requestDigest !== requestDigest)) throw new Error("IDEMPOTENCY_CONFLICT");
+      // A matching old key is an immutable receipt, not a command against the
+      // mutable head. Later configuration edits cannot change its result.
+      if (existing !== null) {
+        if (existing.state !== "applied") throw new Error("AUTOMATIC_USAGE_POLICY_REPLAY_INVALID");
+        const original = readAutomaticUsagePolicyEntry(this.#database, existing.id);
+        return original.configuration;
+      }
+      const current = readAutomaticUsagePolicyEntry(this.#database);
+      if (current.configuration.automaticPolicyRevision !== parsed.expectedAutomaticPolicyRevision) {
+        throw new Error("AUTOMATIC_USAGE_POLICY_REVISION_CONFLICT");
+      }
+      if (current.configuration.automaticPolicyRevision === Number.MAX_SAFE_INTEGER) {
+        throw new Error("AUTOMATIC_USAGE_POLICY_REVISION_EXHAUSTED");
+      }
+      const configuration = { ...current.configuration, overrides: { ...current.configuration.overrides },
+        automaticPolicyRevision: current.configuration.automaticPolicyRevision + 1 };
+      if (parsed.change.kind === "set_default") configuration.defaultEnabled = parsed.change.enabled;
+      else configuration.overrides[parsed.change.provider] = parsed.change.override;
+      const recordedAt = Math.max(current.row.recorded_at, unixMillisecondsSchema.parse(this.#now()));
+      const id = createAttemptId();
+      this.#database.query(`INSERT INTO mutation_attempts(
+        id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,'prepared',?,?)`).run(id, parsed.idempotencyKey, automaticUsagePolicyMutationKind,
+        automaticUsagePolicyAuthorityId, parsed.expectedAutomaticPolicyRevision, requestDigest, recordedAt, recordedAt);
+      this.#database.query("UPDATE mutation_attempts SET state='effect_started' WHERE id=? AND state='prepared'").run(id);
+      this.#database.query(`INSERT INTO automatic_usage_policy_revisions(
+        automatic_policy_revision,version,default_enabled,codex_override,claude_override,attempt_id,idempotency_key,
+        change_kind,change_provider,change_value,request_digest,configuration_digest,recorded_at
+      ) VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?)`).run(configuration.automaticPolicyRevision, configuration.defaultEnabled ? 1 : 0,
+        configuration.overrides.codex, configuration.overrides.claude, id, parsed.idempotencyKey, parsed.change.kind,
+        parsed.change.kind === "set_override" ? parsed.change.provider : null,
+        parsed.change.kind === "set_override" ? parsed.change.override : parsed.change.enabled ? "on" : "off",
+        requestDigest, automaticUsagePolicyDigest(configuration), recordedAt);
+      this.#database.query("UPDATE mutation_attempts SET state='applied',result_json=? WHERE id=? AND state='effect_started'")
+        .run(JSON.stringify(automaticUsagePolicyReceipt(configuration)), id);
+      // Validate the complete receipt before commit, including any trigger-
+      // induced failure or incomplete transition, so a retry never owns half an update.
+      readAutomaticUsagePolicyEntry(this.#database, id);
+      return configuration;
+    }).immediate();
+  }
+
   prepareMutation(input: {
     kind: string;
     authorityId: string;
@@ -19790,6 +20132,7 @@ export class StateStore {
     idempotencyKey?: string | undefined;
     providerAuthorities?: readonly ProviderAuthorityEvidence[];
   }): { id: AttemptId; state: MutationState; replay: boolean; result?: unknown } {
+    if (input.kind === automaticUsagePolicyMutationKind) throw new Error("AUTOMATIC_USAGE_POLICY_CLOSED_API_REQUIRED");
     const idempotencyKey = input.idempotencyKey ?? randomUUID();
     const canonical = JSON.stringify({ kind: input.kind, authorityId: input.authorityId, authorityGeneration: input.authorityGeneration, request: input.request });
     const digest = createHash("sha256").update(canonical).digest("hex");

@@ -218,7 +218,7 @@ Automatic management uses a default-enabled baseline and a closed per-provider `
 
 ## Phase 5: Pure exhaustion policy, configuration, and explanations
 
-- **Status:** In progress (pure domain implemented; durable configuration and review corrections next)
+- **Status:** Done on the reviewed task base; next upstream integration requires revalidation
 - **Depends on:** Phase 3; storage work joins after Phase 4
 - **Objective:** Produce one deterministic decision and explanation from a frozen provider-account snapshot and persist revisioned default/per-provider configuration, without performing provider IO.
 - **Scope:** New `src/domain/usage-policy.ts`, schemas, pure selectors, threshold alias, freshness helpers, append-only automatic-policy configuration and revision storage, exhaustive unit and storage tests.
@@ -243,7 +243,7 @@ Automatic management uses a default-enabled baseline and a closed per-provider `
 
 ### Phase 5 configuration contract
 
-Schema 42 adds one immutable configuration-revision table. Revision 1 is the exact domain default; a current-schema database missing it fails closed instead of silently re-enabling automation. A closed local update claims the global mutation key and atomically commits the configuration revision and receipt. Resolve replay before current-state CAS, preserve every unaddressed field, and advance the revision for every accepted new key, including a same-value command. Same-key replay returns its original configuration even after later edits. Validate migration, tampering, rollback, competing CAS, revision exhaustion and receipt integrity independently.
+On the reviewed task base, schema 42 adds one immutable configuration-revision table; upstream convergence will renumber this unpublished migration. Revision 1 is the exact domain default; a current-schema database missing it fails closed instead of silently re-enabling automation. A closed local update claims the global mutation key and atomically commits the configuration revision and receipt. Freeze the original request key independently in the revision so single-table corruption cannot relocate a receipt. Resolve replay before current-state CAS, preserve every unaddressed field, and advance the revision for every accepted new key, including a same-value command. Same-key replay returns its original configuration even after later edits. Validate migration, tampering, rollback, competing CAS, revision exhaustion and receipt integrity independently.
 
 Foreground reads and replay resolve indexed head, genesis and exact receipt rows without loading the history. Reopen validates the immutable prefix in bounded joined pages and rejects orphan configuration intents. Revision exhaustion remains guarded by safe-integer and SQL bounds; an exact maximum-revision fixture must not weaken the contiguous ledger merely to reach an impractical branch.
 
@@ -251,7 +251,7 @@ Threshold and freshness remain code constants. Configuration never edits reset p
 
 ## Phase 6: Supported runtime actions without speculative replay
 
-- **Status:** In progress (pure renderer only; storage/runtime await Phase 5)
+- **Status:** In progress (pure renderer done; storage/runtime await upstream convergence)
 - **Depends on:** Phase 4 for the pure renderer; Phases 4 and 5 for storage and runtime
 - **Objective:** Act on only the policy branches supported by authoritative provider evidence, with one durable coordinator and no HRA-authored replay.
 - **Scope:** Versioned automatic action journal and append-only migration, framed renderer and attachment retention, asynchronous coordinator, existing Codex reset integration, active-pointer movement, managed-session forwarding, Claude native fallback arguments, action evidence and tests.
@@ -389,6 +389,7 @@ The pure byte-budgeted renderer may be implemented and independently tested alon
 
 ## Implementation log
 
+- 2026-09-05, Phase 5 gate passed: the repaired pure policy and usage-metrics suite passed 57 tests with 1,083 assertions. Independent domain review approved expired-Claude evidence, provider-owned reset inputs, cross-provider rejection and chronological process fences. Storage passed all 264 tests with 2,812 assertions, including 33 configuration cases, through `phase5-storage-complete`. Independent review found and reproduced receipt-key relocation; the immutable original key repaired it. Final typecheck, storage/domain and changed-fixture lint, six CLI/service migration fixtures (35 assertions), the narrowed configuration-schema fixture (126 assertions), and diff checks passed. No reset, pointer or provider runtime effect is wired by this phase.
 - 2026-09-05, Phase 6 pure renderer gate passed: the renderer, transcript and attachment suite passed 42 tests with 703 assertions; type-aware lint passed. Independent integration review tightened the complete provider-text bound to 512 KiB after tracing the outgoing JSON frame limit. Maximum multibyte human input, attachment-only input, ordered manifests, BOM decoding, dynamic fences, minimum overflow, exact expanded digests and unchanged manual-v1 bytes are covered. This slice has no provider or storage effects; Phase 6 remains incomplete.
 - 2026-09-05, next upstream convergence identified: main `27d4722` adds Devin and canonical schema-39 `provider_v39`, while adoption has reported ownership of the next migration. Current task-only migration numbers 39–42 are unpublished and must move after the canonical upstream migrations before delivery. General execution authority must admit independent Devin bindings without treating the legacy Codex shadow as identity. Usage configuration, account-quota policy and automatic following remain explicitly limited to Codex and Claude; Devin's supplied context and cost remain informational. Revalidate session, login, interaction, Work, switch and cloud authority after the join before automatic runtime implementation.
 - 2026-09-05, upstream integration gate passed: all 2,525 source tests passed with 124,928 assertions through `hra-upstream-reviewed-src-final` and unchanged child command `bun test ./src --isolate --max-concurrency=1`. Full typecheck passed; full lint and the final changed-file lint passed. Independent review approved exact Claude login authority, provider/thread interaction guards, Codex login successor custody, and dedicated preset/auth contracts. A late regression proved and repaired skipped generic switch evidence and removed-target authority lookup; its focused gate passed 7 tests with 82 assertions. Installer convergence regenerated only the three prescribed checksum lines and its 50-test gate passed. This closes upstream integration for Phase 4; Phase 5 still needs configuration and the reviewed Claude-expiry, reset-input and monotonic-lineage corrections.
