@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { paginationOptsValidator } from "convex/server";
+import { makeFunctionReference, paginationOptsValidator } from "convex/server";
 
 import {
   cloudLimits,
@@ -13,9 +13,12 @@ import {
   type DeviceCommandKind,
 } from "../src/cloud/contracts";
 import { commandTransitionDisposition } from "../src/cloud/commands";
+import { deviceCommandLoginResultLifetimeMs } from "../src/cloud/payloads";
 import {
+  compareDeviceAuthority,
   deviceCommandAuthorityTransitionDisposition,
   deviceCommandRecoveryAdmitted,
+  deviceCommandRecoveryReplayAdmitted,
   sameDeviceAuthority,
   type DeviceCommandAuthorityTransitionDisposition,
 } from "../src/cloud/device-commands";
@@ -66,8 +69,13 @@ const terminalStates: readonly CommandState[] = [
   "expired",
 ];
 
-// Only `account_login_start` returns something a second reader must never see.
+// Only `account_login_start` returns a handoff a second reader must never see.
 const singleUseResultKinds: readonly DeviceCommandKind[] = ["account_login_start"];
+const expireLoginResult = makeFunctionReference<
+  "mutation",
+  Readonly<{ commandPublicId: string; resultExpiresAt: number }>,
+  unknown
+>("maintenance:expireDeviceCommandLoginResult");
 
 function terminalCleanupFields(
   command: Readonly<{ requesterAcknowledgedAt?: number }>,
@@ -179,6 +187,11 @@ export const enqueue = mutation({
       publicId: args.publicId,
       requestDigest: args.requestDigest,
       requestingDeviceId: authority.deviceId,
+      // The Convex sync client resolves only after this insert is committed and
+      // visible to queries. Stamping acknowledgement here removes the
+      // enqueue-success/tab-close gap that could otherwise retain a terminal
+      // row forever when the browser never got to a second mutation.
+      requesterAcknowledgedAt: now,
       state: "pending",
       targetDeviceId: target._id,
       updatedAt: now,
@@ -374,7 +387,7 @@ export const acknowledgeReceipt = mutation({
 /**
  * Exchanges a single-use result exactly once. Only the device that asked for it
  * may read it, the ciphertext is cleared in the same transaction, and a second
- * call reports `spent` rather than replaying the relay URL.
+ * call reports `spent` rather than replaying the URL and one-time user code.
  */
 export const consumeResult = mutation({
   args: { commandPublicId: v.string() },
@@ -391,10 +404,23 @@ export const consumeResult = mutation({
       return { publicId: command.publicId, status: "spent" as const };
     }
     const now = Date.now();
-    const commandPatch = { result: undefined, resultConsumedAt: now, updatedAt: now };
+    // Current rows carry a server-owned settlement deadline. The fallback keeps
+    // already-settled rows from an older schema fail-closed on first exchange.
+    const expiresAt = command.resultExpiresAt
+      ?? command.updatedAt + deviceCommandLoginResultLifetimeMs;
+    const commandPatch = {
+      result: undefined,
+      resultConsumedAt: now,
+      resultExpiresAt: undefined,
+      updatedAt: now,
+    };
     await adjustCommandQuotaForPatch(ctx, authority.userId, command, commandPatch);
     await ctx.db.patch(command._id, commandPatch);
+    if (now >= expiresAt) {
+      return { publicId: command.publicId, status: "expired" as const };
+    }
     return {
+      expiresAt,
       publicId: command.publicId,
       result: command.result,
       status: "released" as const,
@@ -540,6 +566,18 @@ export const settle = mutation({
   handler: async (ctx, args) => {
     const current = await requireDeviceCommandExecutionAuthority(ctx, args.commandPublicId);
     const command = current.command;
+    // v4 daemons encrypted a login relay only while settling it, after their
+    // local terminal journal write. An upgraded daemon may therefore replay
+    // the old digest without ciphertext only when the hosted row already owns
+    // the exact single-use result (or proves it was consumed). This exception
+    // can never admit a new applied transition.
+    const legacyAppliedLoginReplay = command.kind === "account_login_start"
+      && command.state === "applied"
+      && args.state === "applied"
+      && args.result === undefined
+      && args.singleUseResult === undefined
+      && command.resultSingleUse === true
+      && (command.result !== undefined || command.resultConsumedAt !== undefined);
     if (
       !isDigest(args.resultDigest)
       || !resultCodePattern.test(args.resultCode)
@@ -548,9 +586,16 @@ export const settle = mutation({
       // Only an account-linking relay may be marked single use, and a relay
       // result must always be marked so it is never left readable twice.
       || (args.singleUseResult === true && !singleUseResultKinds.includes(command.kind))
+      || args.singleUseResult === false
+      || (args.singleUseResult === true && args.result === undefined)
+      || (args.singleUseResult === true && args.state !== "applied")
       || (args.result !== undefined
         && singleUseResultKinds.includes(command.kind)
         && args.singleUseResult !== true)
+      || (command.kind === "account_login_start"
+        && args.state === "applied"
+        && (args.result === undefined || args.singleUseResult !== true)
+        && !legacyAppliedLoginReplay)
     ) rejectAuthority();
     const bound = command.boundAuthority;
     if (bound === undefined || !sameDeviceAuthority(storedAuthority(bound), args.authority)) {
@@ -565,6 +610,7 @@ export const settle = mutation({
       // erased, and re-presenting the same digest is the proof of sameness.
       if (
         command.resultConsumedAt === undefined
+        && !legacyAppliedLoginReplay
         && JSON.stringify(command.result) !== JSON.stringify(args.result)
       ) throw new Error("DEVICE_COMMAND_RESULT_CONFLICT");
       return { publicId: command.publicId, replay: true, state: args.state };
@@ -572,9 +618,17 @@ export const settle = mutation({
     const transition = commandTransitionDisposition(command.state, args.state);
     if (transition.kind !== "applied") throw new Error("DEVICE_COMMAND_TRANSITION_CONFLICT");
     const now = Date.now();
+    const resultExpiresAt = args.singleUseResult === true
+      ? now + deviceCommandLoginResultLifetimeMs
+      : undefined;
     const commandPatch = {
       ...(args.result === undefined ? {} : { result: args.result }),
-      ...(args.singleUseResult === true ? { resultSingleUse: true } : {}),
+      ...(resultExpiresAt === undefined
+        ? {}
+        : {
+            resultExpiresAt,
+            resultSingleUse: true,
+          }),
       nonterminal: false,
       resultCode: args.resultCode,
       resultDigest: args.resultDigest,
@@ -584,6 +638,12 @@ export const settle = mutation({
     };
     await adjustCommandQuotaForPatch(ctx, current.authority.userId, command, commandPatch);
     await ctx.db.patch(command._id, commandPatch);
+    if (resultExpiresAt !== undefined) {
+      await ctx.scheduler.runAt(resultExpiresAt, expireLoginResult, {
+        commandPublicId: command.publicId,
+        resultExpiresAt,
+      });
+    }
     const securityDocument = {
       actorDeviceId: current.authority.deviceId,
       createdAt: now,
@@ -598,6 +658,89 @@ export const settle = mutation({
 });
 
 /*
+ * Requester revocation may win the race after the target daemon has durably
+ * recorded its local terminal result but before that result is settled here.
+ * Revocation deliberately owns the hosted terminal state in that race. This
+ * read-only mutation lets the still-active target prove the exact result-less
+ * revocation terminal under the authority it originally bound, so it can
+ * retire only its local replay journal without overwriting hosted ambiguity.
+ */
+export const confirmRevokedTerminal = mutation({
+  args: { authority: authorityTuple, commandPublicId: v.string() },
+  handler: async (ctx, args) => {
+    const current = await requireDeviceCommandExecutionAuthority(ctx, args.commandPublicId);
+    const command = current.command;
+    const requester = await ctx.db.get(command.requestingDeviceId);
+    if (
+      command.state !== "ambiguous"
+      || command.nonterminal
+      || command.boundAuthority === undefined
+      || !sameDeviceAuthority(storedAuthority(command.boundAuthority), args.authority)
+      || requester?.userId !== current.authority.userId
+      || requester.status !== "revoked"
+      // Every ordinary settle or recovery terminal carries result evidence.
+      // Its complete absence is the durable signature of device revocation's
+      // effect_started -> ambiguous transition.
+      || command.result !== undefined
+      || command.resultCode !== undefined
+      || command.resultConsumedAt !== undefined
+      || command.resultExpiresAt !== undefined
+      || command.resultDigest !== undefined
+      || command.resultSingleUse !== undefined
+    ) throw new Error("DEVICE_COMMAND_REVOCATION_TERMINAL_CONFLICT");
+    return { publicId: command.publicId, replay: true, state: "ambiguous" as const };
+  },
+});
+
+/*
+ * The local journal is written before each hosted phase transition. A
+ * requester cancellation, hosted expiry, or requester revocation can therefore
+ * terminalize the hosted row while the target still owns only `prepared` or
+ * `effect_started` recovery evidence. The target may retire that evidence only
+ * after this mutation proves the exact result-less terminal. It never changes
+ * hosted state and never authorizes replay of the local effect.
+ */
+export const confirmTerminalRecovery = mutation({
+  args: {
+    commandPublicId: v.string(),
+    localPhase: v.union(
+      v.literal("prepared_no_effect"),
+      v.literal("effect_started"),
+    ),
+    staleAuthority: authorityTuple,
+  },
+  handler: async (ctx, args) => {
+    const current = await requireDeviceCommandExecutionAuthority(ctx, args.commandPublicId);
+    const command = current.command;
+    const requester = await ctx.db.get(command.requestingDeviceId);
+    const bound = command.boundAuthority;
+    const authorityMatches = bound === undefined
+      ? args.localPhase === "prepared_no_effect"
+      : sameDeviceAuthority(storedAuthority(bound), args.staleAuthority);
+    const terminalMatches = command.state === "cancelled"
+      || command.state === "expired"
+      || (
+        command.state === "ambiguous"
+        && args.localPhase === "effect_started"
+        && requester?.status === "revoked"
+      );
+    if (
+      command.nonterminal
+      || requester?.userId !== current.authority.userId
+      || !authorityMatches
+      || !terminalMatches
+      || command.result !== undefined
+      || command.resultCode !== undefined
+      || command.resultConsumedAt !== undefined
+      || command.resultExpiresAt !== undefined
+      || command.resultDigest !== undefined
+      || command.resultSingleUse !== undefined
+    ) throw new Error("DEVICE_COMMAND_TERMINAL_RECOVERY_CONFLICT");
+    return { publicId: command.publicId, replay: true, state: command.state };
+  },
+});
+
+/*
  * A daemon may crash after durably recording that a `session_start` could have
  * begun. A later boot of the same device closes that record without replaying
  * the effect: it may publish `ambiguous` only, so a start that may or may not
@@ -607,6 +750,10 @@ export const settle = mutation({
 export const recoverEffectStarted = mutation({
   args: {
     commandPublicId: v.string(),
+    localPhase: v.optional(v.union(
+      v.literal("prepared_no_effect"),
+      v.literal("effect_started"),
+    )),
     recoveryAuthority: authorityTuple,
     resultCode: v.string(),
     resultDigest: v.string(),
@@ -620,21 +767,35 @@ export const recoverEffectStarted = mutation({
       rejectAuthority();
     }
     const bound = command.boundAuthority;
-    if (
-      bound === undefined
-      || !sameDeviceAuthority(storedAuthority(bound), args.staleAuthority)
-    ) rejectAuthority();
     if (command.state === args.state) {
       if (
-        command.resultDigest !== args.resultDigest
+        bound === undefined
+        || !deviceCommandRecoveryReplayAdmitted({
+          boundAuthority: storedAuthority(bound),
+          recoveryAuthority: args.recoveryAuthority,
+          staleAuthority: args.staleAuthority,
+        })
+        || command.resultDigest !== args.resultDigest
         || command.resultCode !== args.resultCode
       ) throw new Error("DEVICE_COMMAND_RESULT_CONFLICT");
       return { publicId: command.publicId, replay: true, state: args.state };
     }
+    const pendingWithoutAuthority = command.state === "pending" && bound === undefined;
+    if (pendingWithoutAuthority) {
+      const expectedState = args.localPhase === "prepared_no_effect" ? "failed" : "ambiguous";
+      if (
+        (args.localPhase !== "prepared_no_effect" && args.localPhase !== "effect_started")
+        || args.state !== expectedState
+        || compareDeviceAuthority(args.recoveryAuthority, args.staleAuthority) !== "after"
+      ) rejectAuthority();
+    } else if (
+      bound === undefined
+      || !sameDeviceAuthority(storedAuthority(bound), args.staleAuthority)
+    ) rejectAuthority();
     if (command.state !== "prepared" && command.state !== "effect_started") {
-      throw new Error("DEVICE_COMMAND_TRANSITION_CONFLICT");
+      if (!pendingWithoutAuthority) throw new Error("DEVICE_COMMAND_TRANSITION_CONFLICT");
     }
-    if (!deviceCommandRecoveryAdmitted({
+    if (!pendingWithoutAuthority && !deviceCommandRecoveryAdmitted({
       recoveryAuthority: args.recoveryAuthority,
       staleAuthority: args.staleAuthority,
       state: command.state,

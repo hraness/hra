@@ -44,6 +44,7 @@ const sourceCommitPattern = /^[0-9a-f]{40}$/u;
 const maximumBootstrapTableCount = 64;
 
 const boundedCountSchema = z.union([z.literal(0), z.literal(1), z.literal(2)]);
+const boundedOccupancySchema = z.union([z.literal(0), z.literal(1)]);
 
 const bootstrapReadSchema = z.object({
   occupiedTableCount: z.number().int().min(0).max(maximumBootstrapTableCount),
@@ -73,12 +74,25 @@ const admissionSchema = z.object({
   updatedAt: z.number().finite().nonnegative(),
 }).strict();
 
+const attentionInactiveReadSchema = z.object({
+  generation: z.number().int().min(0).safe(),
+  globalState: z.enum(["absent", "disabled", "enabled"]),
+  outboxOccupancy: boundedOccupancySchema,
+  safetyFaultOccupancy: boundedOccupancySchema,
+}).strict().superRefine((value, context) => {
+  if (
+    (value.globalState === "absent" && value.generation !== 0)
+    || (value.globalState !== "absent" && value.generation === 0)
+  ) context.addIssue({ code: "custom", message: "attention_status_incoherent" });
+});
+
 const releaseAttestationFunction = makeFunctionReference<"query", Record<string, never>, unknown>(
   "releaseAttestation:read",
 );
 
 type HostedStatusFailureCode =
   | "admission_status_invalid"
+  | "attention_status_invalid"
   | "bootstrap_status_invalid"
   | "environment_status_invalid"
   | "release_attestation_invalid"
@@ -107,6 +121,13 @@ export type HostedStatusResult = Readonly<{
         state: "frozen" | "open";
       }
   >;
+  attentionNotifications?: Readonly<{
+    generation: number;
+    globalState: "absent" | "disabled" | "enabled";
+    outboxOccupancy: 0 | 1;
+    safetyFaultOccupancy: 0 | 1;
+    state: "inactive" | "not_inactive";
+  }>;
   bootstrap: Readonly<{
     occupiedTableCount: number;
     state: "accepted" | "inconsistent" | "ready" | "uninitialized";
@@ -123,6 +144,7 @@ export type HostedStatusResult = Readonly<{
 }>;
 
 type HostedStatusArguments = Readonly<{
+  requireAttentionInactive: boolean;
   requirePassed: boolean;
   sourceCommit: string;
   target: ConvexTarget;
@@ -136,6 +158,7 @@ export function parseHostedStatusArguments(arguments_: readonly string[]): Hoste
     throw new HostedStatusError("usage_invalid");
   }
   let sourceCommit: string | undefined;
+  let requireAttentionInactive = false;
   let requirePassed = false;
   for (let index = 0; index < parsed.otherArguments.length; index += 1) {
     const argument = parsed.otherArguments[index];
@@ -152,10 +175,14 @@ export function parseHostedStatusArguments(arguments_: readonly string[]): Hoste
       requirePassed = true;
       continue;
     }
+    if (argument === "--require-attention-inactive" && !requireAttentionInactive) {
+      requireAttentionInactive = true;
+      continue;
+    }
     throw new HostedStatusError("usage_invalid");
   }
   if (sourceCommit === undefined) throw new HostedStatusError("usage_invalid");
-  return { requirePassed, sourceCommit, target: parsed.target };
+  return { requireAttentionInactive, requirePassed, sourceCommit, target: parsed.target };
 }
 
 const parseProviderJson = <T>(
@@ -214,6 +241,14 @@ const bootstrapArguments = (deployment: string): readonly string[] => [
   deployment,
 ];
 
+const attentionInactiveArguments = (deployment: string): readonly string[] => [
+  "run",
+  "attentionNotificationControl:inactiveDeploymentStatus",
+  "{}",
+  "--deployment",
+  deployment,
+];
+
 export const parseHostedReleaseAttestation = (value: unknown): ReleaseAttestationRead => {
   const bound = runtimeReleaseAttestationSchema.safeParse(value);
   if (bound.success) {
@@ -247,6 +282,7 @@ const readReleaseAttestation = (
 type HostedStatusOptions = Readonly<{
   authorityFetch?: AuthorityFetcher;
   environment?: Readonly<NodeJS.ProcessEnv>;
+  requireAttentionInactive?: boolean;
   readAttestation?: (target: ConvexTarget) => Promise<ReleaseAttestationRead>;
   runner?: CommandRunner;
   sourceCommit: string;
@@ -367,6 +403,31 @@ export async function readHostedStatus(options: HostedStatusOptions): Promise<Ho
     admission = { state: "inconsistent" };
   }
 
+  let attentionNotifications: HostedStatusResult["attentionNotifications"];
+  if (options.requireAttentionInactive === true) {
+    const attentionResult = await invokeWithTargetChecks(
+      attentionInactiveArguments(target.deploymentName),
+      "hosted-status-attention-inactive-read",
+    );
+    if (attentionResult.exitCode !== 0) {
+      throw new HostedStatusError("attention_status_invalid");
+    }
+    const attentionRead = parseProviderJson(
+      attentionResult.stdout,
+      attentionInactiveReadSchema,
+      "attention_status_invalid",
+    );
+    attentionNotifications = {
+      ...attentionRead,
+      state: attentionRead.globalState === "absent"
+        && attentionRead.generation === 0
+        && attentionRead.outboxOccupancy === 0
+        && attentionRead.safetyFaultOccupancy === 0
+        ? "inactive"
+        : "not_inactive",
+    };
+  }
+
   const runtimeCurrent = releaseAttestation.state === "current"
     && missingRequiredNames.length === 0;
   const preflightPassed = runtimeCurrent
@@ -405,6 +466,7 @@ export async function readHostedStatus(options: HostedStatusOptions): Promise<Ho
                 : "inspect_preflight";
   return {
     admission,
+    ...(attentionNotifications === undefined ? {} : { attentionNotifications }),
     bootstrap: {
       occupiedTableCount: bootstrapRead.occupiedTableCount,
       state: bootstrapRead.state,
@@ -437,17 +499,19 @@ export async function executeHostedStatus(options: ExecuteHostedStatusOptions): 
       ...(options.authorityFetch === undefined ? {} : { authorityFetch: options.authorityFetch }),
       ...(options.environment === undefined ? {} : { environment: options.environment }),
       ...(options.readAttestation === undefined ? {} : { readAttestation: options.readAttestation }),
+      requireAttentionInactive: parsed.requireAttentionInactive,
       ...(options.runner === undefined ? {} : { runner: options.runner }),
       sourceCommit: parsed.sourceCommit,
       target: parsed.target,
       ...(options.verifyTarget === undefined ? {} : { verifyTarget: options.verifyTarget }),
     });
     options.stdout.write(`${JSON.stringify({ ...status, version: 1 })}\n`);
-    return parsed.requirePassed
+    const preflightRequiredButMissing = parsed.requirePassed
       && status.status !== "preflight_passed"
-      && status.status !== "live"
-      ? 1
-      : 0;
+      && status.status !== "live";
+    const inactiveRequiredButMissing = parsed.requireAttentionInactive
+      && status.attentionNotifications?.state !== "inactive";
+    return preflightRequiredButMissing || inactiveRequiredButMissing ? 1 : 0;
   } catch (error: unknown) {
     const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
     if (authorityUnavailable !== undefined) {

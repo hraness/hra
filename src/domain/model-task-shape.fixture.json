@@ -1,0 +1,231 @@
+{
+  "generatedFrom": "synthetic-cases",
+  "rows": [
+    {
+      "caseId": "00000000-0000-4000-8000-000000000001",
+      "caseKind": "ambiguous",
+      "label": "uncertain",
+      "classified": "uncertain",
+      "matchedRule": "input_too_long"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000002",
+      "caseKind": "empty",
+      "label": "uncertain",
+      "classified": "uncertain",
+      "matchedRule": "input_empty"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000003",
+      "caseKind": "ambiguous",
+      "label": "uncertain",
+      "classified": "uncertain",
+      "matchedRule": "input_unsupported_format"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000004",
+      "caseKind": "hostile",
+      "label": "uncertain",
+      "classified": "uncertain",
+      "matchedRule": "classification_directive"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000005",
+      "caseKind": "conflicting",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "conflicting_requirements"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000006",
+      "caseKind": "ordinary",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "open_ended_unknown_cause"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000007",
+      "caseKind": "ordinary",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "open_ended_research"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000008",
+      "caseKind": "ordinary",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "open_ended_comparison"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000009",
+      "caseKind": "ordinary",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "open_ended_design"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000010",
+      "caseKind": "ordinary",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "open_ended_broad_scope"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000011",
+      "caseKind": "ordinary",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "open_ended_conditional_authorship"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000012",
+      "caseKind": "ordinary",
+      "label": "mechanical",
+      "classified": "mechanical",
+      "matchedRule": "mechanical_wait_only"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000013",
+      "caseKind": "ordinary",
+      "label": "mechanical",
+      "classified": "mechanical",
+      "matchedRule": "mechanical_monitor_only"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000014",
+      "caseKind": "ordinary",
+      "label": "mechanical",
+      "classified": "mechanical",
+      "matchedRule": "mechanical_command_only"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000015",
+      "caseKind": "ordinary",
+      "label": "well_defined",
+      "classified": "well_defined",
+      "matchedRule": "well_defined_scope_and_outcome"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000016",
+      "caseKind": "ambiguous",
+      "label": "uncertain",
+      "classified": "uncertain",
+      "matchedRule": "default_uncertain"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000017",
+      "caseKind": "hostile",
+      "label": "uncertain",
+      "classified": "uncertain",
+      "matchedRule": "classification_directive"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000018",
+      "caseKind": "conflicting",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "conflicting_requirements"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000019",
+      "caseKind": "reported_text",
+      "label": "uncertain",
+      "classified": "uncertain",
+      "matchedRule": "default_uncertain"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000020",
+      "caseKind": "reported_text",
+      "label": "well_defined",
+      "classified": "well_defined",
+      "matchedRule": "well_defined_scope_and_outcome"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000021",
+      "caseKind": "ordinary",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "open_ended_unknown_cause"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000022",
+      "caseKind": "ordinary",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "open_ended_research"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000023",
+      "caseKind": "ordinary",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "open_ended_comparison"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000024",
+      "caseKind": "ordinary",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "open_ended_design"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000025",
+      "caseKind": "ordinary",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "open_ended_broad_scope"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000026",
+      "caseKind": "ordinary",
+      "label": "open_ended",
+      "classified": "open_ended",
+      "matchedRule": "open_ended_conditional_authorship"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000027",
+      "caseKind": "ordinary",
+      "label": "mechanical",
+      "classified": "mechanical",
+      "matchedRule": "mechanical_wait_only"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000028",
+      "caseKind": "ordinary",
+      "label": "mechanical",
+      "classified": "mechanical",
+      "matchedRule": "mechanical_monitor_only"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000029",
+      "caseKind": "ordinary",
+      "label": "mechanical",
+      "classified": "mechanical",
+      "matchedRule": "mechanical_command_only"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000030",
+      "caseKind": "ordinary",
+      "label": "well_defined",
+      "classified": "well_defined",
+      "matchedRule": "well_defined_scope_and_outcome"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000031",
+      "caseKind": "empty",
+      "label": "uncertain",
+      "classified": "uncertain",
+      "matchedRule": "input_empty"
+    },
+    {
+      "caseId": "00000000-0000-4000-8000-000000000032",
+      "caseKind": "ambiguous",
+      "label": "uncertain",
+      "classified": "uncertain",
+      "matchedRule": "input_unsupported_format"
+    }
+  ],
+  "vectorDigest": "4edbf3a14ca79e73cb3030c467340ae1f932173337d8a456fe07194c33209f09",
+  "version": 1
+}

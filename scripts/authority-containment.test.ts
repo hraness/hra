@@ -40,6 +40,7 @@ describe("authority containment refusal rendering", () => {
       ["deploy-hosted-sync.ts", 2],
       ["manage-hosted-admission.ts", 2],
       ["manage-hosted-invites.ts", 2],
+      ["migrate-hosted-reply-to.ts", 2],
       ["replace-hosted-convex-target.ts", 2],
       ["hosted-status.ts", 2],
       ["current-project-alias-release.ts", 1],

@@ -9,10 +9,12 @@ import {
 } from "./accountDeletion";
 import { HOSTED_TABLE_LIFECYCLE } from "./lifecyclePolicy";
 import {
+  adjustCommandQuotaForPatch,
   adjustQuotaForPatch,
   initializeUserQuotaAuthority,
   logicalDocumentBytes,
   reserveDeviceQuotaForInsert,
+  reserveNonterminalCommandQuotaForInsert,
   reserveParentAttributedQuotaForInsert,
   reserveQuotaForInsert,
   reserveQuotaForStoredIdentity,
@@ -234,6 +236,62 @@ describe("status-first account deletion", () => {
       } as const;
       await reserveSessionHeadQuotaForInsert(ctx, world.userId, session);
       const sessionId = await ctx.db.insert("sessionHeads", session);
+      const notification = {
+        allowedWindowEnd: Date.now() + 60_000,
+        claimDeadline: Date.now() + 60_000,
+        coalesceAfter: Date.now() - 1,
+        consentLeaseUntil: Date.now() + 60_000,
+        createdAt: Date.now(),
+        executionAuthority: {
+          bootGeneration: 1,
+          bootId: "boot_delete_notification",
+          fence: 1,
+        },
+        globalNotificationGeneration: 1,
+        interactionDeadline: Date.now() + 60_000,
+        interactionId: "interaction_delete_notification",
+        interactionKind: "command_approval",
+        interactionRevision: 1,
+        localNotificationPolicyRevision: 1,
+        nonterminal: true,
+        reconciliationSequence: 1,
+        remoteActions: ["decline"] as ("answer" | "decline")[],
+        sessionId,
+        sessionPublicId: session.publicId,
+        sourceDeviceId: deviceId,
+        state: "pending",
+        updatedAt: Date.now(),
+        userId: world.userId,
+      } as const;
+      await reserveNonterminalCommandQuotaForInsert(ctx, world.userId, notification);
+      const notificationId = await ctx.db.insert("attentionNotificationOutbox", notification);
+      const startedAt = Date.now();
+      const startedPatch = {
+        delivery: {
+          attemptCount: 1,
+          body: { text: "HRA needs your attention", version: 1 as const },
+          bodyDigest: "b".repeat(64),
+          claimedAt: startedAt,
+          deadline: startedAt + 60_000,
+          effectStartedAt: startedAt,
+          firstAttemptAt: startedAt,
+          generation: 1,
+          id: "delivery_delete_notification",
+          idempotencyKey: "01912345-6789-7abc-8def-0123456789c1",
+          lastAttemptAt: startedAt,
+          leaderRowId: notificationId,
+          recipientDigest: "c".repeat(64),
+        },
+        state: "effect_started" as const,
+        updatedAt: startedAt,
+      };
+      await adjustCommandQuotaForPatch(
+        ctx,
+        world.userId,
+        notification,
+        startedPatch,
+      );
+      await ctx.db.patch(notificationId, startedPatch);
       for (let index = 0; index < 205; index += 1) {
         const chunk = {
           authority: { bootGeneration: 1, bootId: "boot_delete_chunks", fence: 1 },
@@ -258,6 +316,16 @@ describe("status-first account deletion", () => {
     });
     await startDeletion(world);
 
+    expect(await world.testRuntime.mutation(drainDeletion, { limit: 200 }))
+      .toMatchObject({ category: "commands_and_leases", kind: "drained", processed: 1 });
+    expect(await world.testRuntime.run(async (ctx) =>
+      await ctx.db.query("attentionNotificationOutbox").collect())).toEqual([]);
+    expect(await world.testRuntime.run(async (ctx) =>
+      await ctx.db.query("storageResourceUsageByUser")
+        .withIndex("by_user_and_resource", (builder) => builder
+          .eq("userId", world.userId)
+          .eq("resource", "nonterminal_command"))
+        .unique())).toMatchObject({ records: 0 });
     expect(await world.testRuntime.mutation(drainDeletion, { limit: 200 }))
       .toMatchObject({ category: "chunks_and_epochs", kind: "advanced", processed: 0 });
     expect(await world.testRuntime.mutation(drainDeletion, { limit: 200 }))
@@ -448,6 +516,8 @@ describe("status-first account deletion", () => {
       .toBe("user_index_immutable_erasure");
     expect(ACCOUNT_DELETION_TABLE_STRATEGY.accountDeletionReceipts)
       .toBe("capability_receipt");
+    expect(ACCOUNT_DELETION_TABLE_STRATEGY.attentionNotificationSafetyFaults)
+      .toBe("user_index_service_quota");
     expect(ACCOUNT_DELETION_SCHEMA_GAPS).toEqual([]);
   });
 

@@ -1,9 +1,29 @@
+import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
-import { isSafePositiveInteger } from "../src/cloud/contracts";
+import { isSafePositiveInteger, isUuidV7 } from "../src/cloud/contracts";
+import { deviceCommandLoginResultLifetimeMs } from "../src/cloud/payloads";
+import { sha256Hex } from "../src/cloud/crypto";
 import { maximumLiveOtpChallenges } from "./authPolicy";
+import {
+  attentionNotificationGroupLimit,
+  attentionNotificationQuarantineRowLimit,
+  attentionNotificationQuotaReservations,
+  attentionNotificationRetryRecoveryMs,
+  latchCorruptAttentionNotificationDelivery,
+  quarantineFaultedAttentionNotificationDelivery,
+  validatedStartedAttentionNotificationGroup,
+} from "./attentionNotifications";
+import {
+  deleteExpiredAttentionNotificationSafetyFaults,
+  readOldestPendingStoredAttentionNotificationSafetyFault,
+  releaseUnusedAttentionNotificationFaultCapacity,
+} from "./attentionNotificationControl";
 import { commandTerminalRetentionMs } from "./commands";
-import { CLOUD_USAGE_SNAPSHOT_RETENTION_MS } from "./lifecyclePolicy";
+import {
+  ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS,
+  CLOUD_USAGE_SNAPSHOT_RETENTION_MS,
+} from "./lifecyclePolicy";
 import {
   adjustCommandQuotaForPatch,
   adjustQuotaForPatch,
@@ -23,6 +43,11 @@ import { beginDetailRetentionEpoch } from "./sessions";
 
 const maximumCleanupBatch = 200;
 const categoryQuantum = 20;
+const expireLoginResult = makeFunctionReference<
+  "mutation",
+  Readonly<{ commandPublicId: string; resultExpiresAt: number }>,
+  unknown
+>("maintenance:expireDeviceCommandLoginResult");
 const maintenanceCategories = [
   "auth_attempts",
   "otp_challenges",
@@ -34,7 +59,12 @@ const maintenanceCategories = [
   "pending_commands",
   "terminal_commands",
   "pending_device_commands",
+  "device_command_login_results",
   "terminal_device_commands",
+  "pending_attention_notifications",
+  "started_attention_notifications",
+  "terminal_attention_notifications",
+  "attention_notification_faults",
   "security_events",
   "usage_snapshots",
   "account_deletion_receipts",
@@ -64,12 +94,17 @@ type CleanupCounts = {
   bindChallenges: number;
   devicePresence: number;
   deviceRevocationJobs: number;
+  deviceCommandLoginResults: number;
+  expiredPendingAttentionNotifications: number;
   expiredPendingCommands: number;
   expiredPendingDeviceCommands: number;
   idempotencyReceipts: number;
   liveTailChunks: number;
   otpChallenges: number;
   securityEvents: number;
+  startedAttentionNotifications: number;
+  terminalAttentionNotifications: number;
+  attentionNotificationFaults: number;
   terminalCommands: number;
   terminalDeviceCommands: number;
   usageSnapshots: number;
@@ -87,7 +122,12 @@ const countField = {
   pending_commands: "expiredPendingCommands",
   terminal_commands: "terminalCommands",
   pending_device_commands: "expiredPendingDeviceCommands",
+  device_command_login_results: "deviceCommandLoginResults",
   terminal_device_commands: "terminalDeviceCommands",
+  pending_attention_notifications: "expiredPendingAttentionNotifications",
+  started_attention_notifications: "startedAttentionNotifications",
+  terminal_attention_notifications: "terminalAttentionNotifications",
+  attention_notification_faults: "attentionNotificationFaults",
   security_events: "securityEvents",
   usage_snapshots: "usageSnapshots",
   account_deletion_receipts: "accountDeletionReceipts",
@@ -309,11 +349,10 @@ async function deleteTerminalCommands(ctx: MutationCtx, now: number, limit: numb
 }
 
 /*
- * Device commands share the session-command lifecycle, so they share its two
- * sweeps: a pending row past its deadline expires, and a terminal row the
- * requester has acknowledged is deleted after the same retention. They get
- * their own maintenance categories rather than being folded into the session
- * sweeps so one table's backlog can never starve the other's.
+ * Device commands share the session-command lifecycle, so a pending row past
+ * its deadline expires and an acknowledged terminal row is later deleted.
+ * Their login handoffs additionally have an independent short-lived result
+ * sweep. Separate categories keep one table or lifecycle from starving another.
  */
 async function expirePendingDeviceCommands(ctx: MutationCtx, now: number, limit: number): Promise<number> {
   const records = await ctx.db.query("deviceCommands")
@@ -336,8 +375,156 @@ async function expirePendingDeviceCommands(ctx: MutationCtx, now: number, limit:
   return records.length;
 }
 
+/*
+ * An account-login result is ciphertext, but it is still a short-lived provider
+ * handoff. Its server-owned settlement deadline is independent of command
+ * acknowledgement and terminal-row retention, so an abandoned browser cannot
+ * leave the handoff stored indefinitely.
+ */
+export const expireDeviceCommandLoginResult = internalMutation({
+  args: {
+    commandPublicId: v.string(),
+    resultExpiresAt: v.number(),
+  },
+  handler: async (ctx, args) => {
+    await requireHardQuotaAuthority(ctx);
+    if (
+      !isUuidV7(args.commandPublicId)
+      || !Number.isSafeInteger(args.resultExpiresAt)
+      || args.resultExpiresAt < 1
+    ) throw new Error("Invalid device-command login-result expiry.");
+    const matches = await ctx.db.query("deviceCommands")
+      .withIndex("by_public_id", (builder) => builder.eq("publicId", args.commandPublicId))
+      .take(2);
+    if (matches.length > 1) throw new Error("Maintenance authority is corrupt.");
+    const record = matches[0];
+    if (record === undefined || record.resultExpiresAt !== args.resultExpiresAt) {
+      return { status: "retired" as const };
+    }
+    const now = Date.now();
+    if (now < args.resultExpiresAt) {
+      await ctx.scheduler.runAt(args.resultExpiresAt, expireLoginResult, args);
+      return { status: "pending" as const };
+    }
+    if (
+      record.kind !== "account_login_start"
+      || record.nonterminal
+      || record.state !== "applied"
+      || record.resultSingleUse !== true
+      || record.result === undefined
+      || record.resultConsumedAt !== undefined
+    ) throw new Error("Maintenance authority is corrupt.");
+    const commandPatch = {
+      result: undefined,
+      resultConsumedAt: now,
+      resultExpiresAt: undefined,
+      updatedAt: now,
+    };
+    await adjustCommandQuotaForPatch(ctx, record.userId, record, commandPatch);
+    await ctx.db.patch(record._id, commandPatch);
+    return { status: "erased" as const };
+  },
+});
+
+async function expireDeviceCommandLoginResults(
+  ctx: MutationCtx,
+  now: number,
+  limit: number,
+): Promise<number> {
+  const expired = await ctx.db.query("deviceCommands")
+    .withIndex("by_single_use_result_expiry", (builder) => builder
+      .eq("resultSingleUse", true)
+      .eq("resultConsumedAt", undefined)
+      .gt("resultExpiresAt", 0)
+      .lte("resultExpiresAt", now))
+    .take(limit);
+  for (const record of expired) {
+    if (
+      record.kind !== "account_login_start"
+      || record.nonterminal
+      || record.state !== "applied"
+      || record.result === undefined
+      || record.resultExpiresAt === undefined
+    ) throw new Error("Maintenance authority is corrupt.");
+    const commandPatch = {
+      result: undefined,
+      resultConsumedAt: now,
+      resultExpiresAt: undefined,
+      updatedAt: now,
+    };
+    await adjustCommandQuotaForPatch(ctx, record.userId, record, commandPatch);
+    await ctx.db.patch(record._id, commandPatch);
+  }
+  const remaining = limit - expired.length;
+  if (remaining === 0) return limit;
+
+  // Rows settled before `resultExpiresAt` existed are backfilled once. An
+  // already-expired row is erased immediately; a still-live row receives both
+  // the server deadline and the same exact scheduled erasure as a new settle.
+  const legacy = await ctx.db.query("deviceCommands")
+    .withIndex("by_single_use_result_expiry", (builder) => builder
+      .eq("resultSingleUse", true)
+      .eq("resultConsumedAt", undefined)
+      .eq("resultExpiresAt", undefined))
+    .take(remaining);
+  for (const record of legacy) {
+    if (
+      record.kind !== "account_login_start"
+      || record.nonterminal
+      || record.result === undefined
+    ) throw new Error("Maintenance authority is corrupt.");
+    const resultExpiresAt = record.updatedAt + deviceCommandLoginResultLifetimeMs;
+    if (!Number.isSafeInteger(resultExpiresAt)) {
+      throw new Error("Maintenance authority is corrupt.");
+    }
+    const erase = record.state !== "applied" || resultExpiresAt <= now;
+    const commandPatch = erase
+      ? {
+          result: undefined,
+          resultConsumedAt: now,
+          resultExpiresAt: undefined,
+          updatedAt: now,
+        }
+      : { resultExpiresAt };
+    await adjustCommandQuotaForPatch(ctx, record.userId, record, commandPatch);
+    await ctx.db.patch(record._id, commandPatch);
+    if (!erase) {
+      await ctx.scheduler.runAt(resultExpiresAt, expireLoginResult, {
+        commandPublicId: record.publicId,
+        resultExpiresAt,
+      });
+    }
+  }
+  return expired.length + legacy.length;
+}
+
 async function deleteTerminalDeviceCommands(ctx: MutationCtx, now: number, limit: number): Promise<number> {
   let remaining = limit;
+  let processed = 0;
+  const legacyRetentionCutoff = now - cloudRetentionMs.terminalCommand;
+
+  // Old web clients could close between enqueue and their separate receipt
+  // acknowledgement, leaving terminal rows without a cleanup deadline. Drain
+  // only rows already older than the ordinary retention window. Direct delete
+  // both avoids quota-growing patches at the hard ceiling and keeps every row
+  // counted against this category's strict budget.
+  for (const state of ["applied", "failed", "ambiguous", "cancelled", "expired"] as const) {
+    if (remaining === 0) break;
+    const legacy = await ctx.db.query("deviceCommands")
+      .withIndex("by_state_cleanup_after_updated_at", (builder) => builder
+        .eq("state", state)
+        .eq("terminalCleanupAfter", undefined)
+        .lt("updatedAt", legacyRetentionCutoff))
+      .take(remaining);
+    for (const record of legacy) {
+      if (record.nonterminal) throw new Error("Maintenance authority is corrupt.");
+      await releaseCommandQuotaForDelete(ctx, record.userId, record);
+      await ctx.db.delete(record._id);
+    }
+    processed += legacy.length;
+    remaining -= legacy.length;
+  }
+
   for (const state of ["applied", "failed", "ambiguous", "cancelled", "expired"] as const) {
     if (remaining === 0) break;
     const records = await ctx.db.query("deviceCommands")
@@ -350,7 +537,168 @@ async function deleteTerminalDeviceCommands(ctx: MutationCtx, now: number, limit
       await releaseCommandQuotaForDelete(ctx, record.userId, record);
       await ctx.db.delete(record._id);
     }
+    processed += records.length;
     remaining -= records.length;
+  }
+  return processed;
+}
+
+async function expirePendingAttentionNotifications(
+  ctx: MutationCtx,
+  now: number,
+  limit: number,
+): Promise<number> {
+  const records = await ctx.db.query("attentionNotificationOutbox")
+    .withIndex("by_state_and_claim_deadline", (builder) => builder
+      .eq("state", "pending")
+      .lt("claimDeadline", now))
+    .take(limit);
+  for (const record of records) {
+    if (record.claimCapacityReservation !== attentionNotificationQuotaReservations.pending) {
+      throw new Error("Maintenance authority is corrupt.");
+    }
+    const patch = {
+      claimCapacityReservation: undefined,
+      nonterminal: false,
+      state: "expired" as const,
+      terminalCleanupAfter: now + ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS,
+      updatedAt: now,
+    };
+    await adjustCommandQuotaForPatch(ctx, record.userId, record, patch);
+    await ctx.db.patch(record._id, patch);
+  }
+  return records.length;
+}
+
+async function closeUnsettledAttentionNotifications(
+  ctx: MutationCtx,
+  now: number,
+  limit: number,
+): Promise<number> {
+  const fault = await readOldestPendingStoredAttentionNotificationSafetyFault(ctx);
+  if (fault !== null) {
+    const quarantine = await quarantineFaultedAttentionNotificationDelivery(
+      ctx,
+      fault.faultId,
+      Math.min(limit, attentionNotificationQuarantineRowLimit),
+    );
+    if (quarantine.deleted > 0) return quarantine.deleted;
+  }
+  const seeds = await ctx.db.query("attentionNotificationOutbox")
+    .withIndex("by_state_and_delivery_deadline", (builder) => builder
+      .eq("state", "effect_started")
+      .lt("delivery.deadline", now))
+    .take(limit);
+  const visited = new Set<string>();
+  let processed = 0;
+  for (const seed of seeds) {
+    const seedDelivery = seed.delivery;
+    if (seedDelivery === undefined || seedDelivery.settledAt !== undefined) {
+      throw new Error("Maintenance authority is corrupt.");
+    }
+    if (visited.has(seedDelivery.id)) continue;
+    visited.add(seedDelivery.id);
+    const records = await ctx.db.query("attentionNotificationOutbox")
+      .withIndex("by_delivery_id", (builder) => builder.eq("delivery.id", seedDelivery.id))
+      .take(attentionNotificationGroupLimit + 1);
+    if (records.length === 0) throw new Error("Maintenance authority is corrupt.");
+    if (records.length > attentionNotificationGroupLimit) {
+      await latchCorruptAttentionNotificationDelivery(ctx, seedDelivery.id);
+      break;
+    }
+    if (records.length > limit - processed) break;
+    const validated = await validatedStartedAttentionNotificationGroup(
+      ctx,
+      seedDelivery.id,
+    );
+    if (validated === null || validated.rows.some((record) =>
+      record.delivery === undefined || record.delivery.deadline >= now)) {
+      await latchCorruptAttentionNotificationDelivery(ctx, seedDelivery.id);
+      break;
+    }
+    const exactRecords = validated.rows;
+    const exactDelivery = exactRecords[0]?.delivery;
+    if (exactDelivery === undefined) throw new Error("Maintenance authority is corrupt.");
+    const settlementSafeAfter = Math.max(
+      exactDelivery.deadline,
+      exactDelivery.effectStartedAt + attentionNotificationRetryRecoveryMs,
+      exactDelivery.nextAttemptAt ?? 0,
+    );
+    if (now <= settlementSafeAfter) continue;
+    const outcomeCode = "unsettled_effect" as const;
+    const outcomeDigest = await sha256Hex([
+      "hra-attention-settlement:v1",
+      seedDelivery.id,
+      String(seedDelivery.generation),
+      outcomeCode,
+    ].join("\u0000"));
+    for (const record of exactRecords) {
+      const delivery = record.delivery;
+      if (delivery === undefined) throw new Error("Maintenance authority is corrupt.");
+      const deliveryWithoutRetry = { ...delivery };
+      Reflect.deleteProperty(deliveryWithoutRetry, "nextAttemptAt");
+      const patch = {
+        claimCapacityReservation: undefined,
+        delivery: {
+          ...deliveryWithoutRetry,
+          outcomeCode,
+          outcomeDigest,
+          settledAt: now,
+        },
+        nonterminal: false,
+        state: "ambiguous" as const,
+        terminalCleanupAfter: now + ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS,
+        updatedAt: now,
+      };
+      await adjustCommandQuotaForPatch(ctx, record.userId, record, patch);
+      await ctx.db.patch(record._id, patch);
+    }
+    const first = exactRecords[0];
+    if (first?.faultCapacityAnchor === undefined) {
+      throw new Error("Maintenance authority is corrupt.");
+    }
+    await releaseUnusedAttentionNotificationFaultCapacity(ctx, {
+      anchorRowId: first.faultCapacityAnchor,
+      deliveryId: exactDelivery.id,
+      userId: first.userId,
+    });
+    processed += exactRecords.length;
+  }
+  return processed;
+}
+
+async function deleteTerminalAttentionNotifications(
+  ctx: MutationCtx,
+  now: number,
+  limit: number,
+): Promise<number> {
+  let remaining = limit;
+  for (const state of [
+    "accepted",
+    "refused",
+    "ambiguous",
+    "cancelled",
+    "expired",
+  ] as const) {
+    if (remaining === 0) break;
+    const records = await ctx.db.query("attentionNotificationOutbox")
+      .withIndex("by_state_and_cleanup_after", (builder) => builder
+        .eq("state", state)
+        .gt("terminalCleanupAfter", 0)
+        .lt("terminalCleanupAfter", now))
+      .take(remaining);
+    let deleted = 0;
+    for (const record of records) {
+      const locators = await ctx.db.query("attentionNotificationSafetyFaults")
+        .withIndex("by_cleanup_row", (builder) => builder.eq("cleanupRowId", record._id))
+        .take(2);
+      if (locators.length > 1) throw new Error("Maintenance authority is corrupt.");
+      if (locators[0]?.quarantineState === "pending") continue;
+      await releaseCommandQuotaForDelete(ctx, record.userId, record);
+      await ctx.db.delete(record._id);
+      deleted += 1;
+    }
+    remaining -= deleted;
   }
   return limit - remaining;
 }
@@ -520,7 +868,12 @@ const handlers = {
   pending_commands: expirePendingCommands,
   terminal_commands: deleteTerminalCommands,
   pending_device_commands: expirePendingDeviceCommands,
+  device_command_login_results: expireDeviceCommandLoginResults,
   terminal_device_commands: deleteTerminalDeviceCommands,
+  pending_attention_notifications: expirePendingAttentionNotifications,
+  started_attention_notifications: closeUnsettledAttentionNotifications,
+  terminal_attention_notifications: deleteTerminalAttentionNotifications,
+  attention_notification_faults: deleteExpiredAttentionNotificationSafetyFaults,
   security_events: deleteExpiredSecurityEvents,
   usage_snapshots: deleteExpiredUsage,
   account_deletion_receipts: deleteExpiredAccountReceipts,
@@ -538,12 +891,17 @@ const emptyCounts = (): CleanupCounts => ({
   bindChallenges: 0,
   devicePresence: 0,
   deviceRevocationJobs: 0,
+  deviceCommandLoginResults: 0,
+  expiredPendingAttentionNotifications: 0,
   expiredPendingCommands: 0,
   expiredPendingDeviceCommands: 0,
   idempotencyReceipts: 0,
   liveTailChunks: 0,
   otpChallenges: 0,
   securityEvents: 0,
+  startedAttentionNotifications: 0,
+  terminalAttentionNotifications: 0,
+  attentionNotificationFaults: 0,
   terminalCommands: 0,
   terminalDeviceCommands: 0,
   usageSnapshots: 0,

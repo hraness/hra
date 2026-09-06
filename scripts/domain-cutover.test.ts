@@ -427,26 +427,19 @@ describe("domain cutover runbook", () => {
     expect(runbook).toContain("--recovery-evidence-fd 5");
     expect(runbook).not.toContain("bun run release:canonical-alias");
     expect(runbook).toContain("--confirm-exact");
-    expect(runbook).toContain("ordinary conversational language");
-    expect(runbook).toContain("in a separate conversational turn");
-    expect(runbook).toContain("they do not need to repeat the machine-generated record");
-    expect(runbook).toContain("immediately preceding presentation of one plan");
-    expect(runbook).toContain("General or standing release approval");
-    expect(runbook).toContain("the user does not need to see, copy, or reproduce it");
+    expect(runbook).toContain("standing authorization for task-owned Hraness delivery");
+    expect(runbook).toContain("Do not ask for a second conversational confirmation");
+    expect(runbook).toContain("fresh plan and passing preflight narrow existing task authority");
+    expect(runbook).toContain("No person needs to see, copy, reproduce, or separately approve");
     expect(runbook).toContain(
-      "the designated custodian passes the exact `requiredConfirmation` value",
+      "designated custodian passes the exact `requiredConfirmation` value",
     );
     expect(runbook).toContain(
-      "the user's literal approval is never passed as the command argument",
+      '`nextAction: "execute_with_machine_token_under_standing_task_authority"`',
     );
-    expect(runbook).toContain(
-      "If another plan has entered the conversation, the plan changed, or the response is ambiguous",
-    );
-    expect(runbook).toContain("approve both` do not authorize this alias change");
-    expect(runbook).toContain(
-      '`nextAction: "obtain_conversational_plan_approval_then_execute_with_machine_token"`',
-    );
-    expect(runbook).toContain("Its result uses `schemaVersion: 2`");
+    expect(runbook).toContain("Its result uses `schemaVersion: 3`");
+    expect(runbook).not.toContain("obtain_conversational_plan_approval_then_execute_with_machine_token");
+    expect(runbook).not.toContain("in a separate conversational turn");
     expect(runbook).not.toContain("confirm_exact_record_then_execute");
     expect(runbook).toContain("automatic restoration");
     expect(runbook).toContain("compensation_failed");
@@ -467,7 +460,7 @@ describe("domain cutover runbook", () => {
     expect(runbook).toContain("unresolved_source_recovery");
     expect(runbook).toContain("8,193 persistent-entry bound");
     expect(runbook).toContain("transient 8,194th hardlink");
-    expect(runbook).toContain("obtain its own separate conversational approval");
+    expect(runbook).toContain("standing task authority may continue to cover it");
     expect(runbook).toContain("HRA v0 is never a fallback");
     expect(runbook).not.toContain("/move");
   });
@@ -483,7 +476,7 @@ describe("domain cutover runbook", () => {
     expect(plan).toContain("The explicit `recover-source` operation never redispatches target");
     expect(plan).toContain("It never treats an Activity record as a substitute for `oldDeploymentId`");
     expect(plan).toContain("persistent bound of 8,193 entries");
-    expect(plan).toContain("Fresh forward transitions retain the separate conversational-plan approval boundary");
+    expect(plan).toContain("Fresh forward transitions retain plan-bound machine-token enforcement without a duplicate conversational approval");
   });
 });
 

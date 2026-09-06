@@ -1,7 +1,10 @@
 import {
+  deviceCommandLoginResultLifetimeMs,
   deviceCommandLimits,
   parseDeviceCommandPayload,
   type DeviceCommandPayload,
+  type DeviceCommandResultPayload,
+  type NotificationHoursUpdate,
 } from "../hra/cloud";
 import type { MachineView } from "./settings-view";
 
@@ -15,7 +18,7 @@ import type { MachineView } from "./settings-view";
 
 export type PresetChoice = "low" | "high" | "ultra";
 
-/** The UI default the plan names: Sol Ultra. */
+/** The UI default the plan names: Astra Ultra. */
 export const defaultSessionStartPreset: PresetChoice = "ultra";
 
 export type SessionStartTarget = Readonly<{
@@ -28,6 +31,25 @@ export type SessionStartTarget = Readonly<{
   provider: "codex" | "claude";
   targetDevicePublicId: string;
 }>;
+
+/** Public picker copy cannot infer OS, so it states Claude's admission boundary beside the choice. */
+export function sessionStartTargetLabel(target: SessionStartTarget): string {
+  const provider = target.provider === "claude"
+    ? "Claude Code (Linux machine only)"
+    : "Codex";
+  return `${target.accountLabel} — ${target.machineLabel} — ${provider}`;
+}
+
+/** The composer repeats the boundary after selection, before any remote provider effect. */
+export function sessionStartTargetHint(target: SessionStartTarget): string {
+  const availability = target.machineOnline
+    ? ""
+    : " (offline; it will run when the machine wakes)";
+  const platform = target.provider === "claude"
+    ? " Claude sessions require a Linux custodian; macOS refuses before launch."
+    : "";
+  return `Starts on ${target.machineLabel}${availability}.${platform}`;
+}
 
 function build(payload: DeviceCommandPayload): DeviceCommandPayload {
   const parsed = parseDeviceCommandPayload(payload);
@@ -58,15 +80,129 @@ export function sessionStartCommand(input: Readonly<{
 }
 
 export function accountLoginStartCommand(accountPublicId: string): DeviceCommandPayload {
-  return build({ accountPublicId, kind: "account_login_start" });
+  return build({ accountPublicId, handoffVersion: 2, kind: "account_login_start" });
 }
 
-export function accountLoginStatusCommand(): DeviceCommandPayload {
-  return build({ kind: "account_login_status" });
+export function accountLoginStatusCommand(accountPublicId: string): DeviceCommandPayload {
+  return build({ accountPublicId, kind: "account_login_status" });
+}
+
+export type AccountLoginActionKind = "account_login_start" | "account_login_status";
+
+export type AccountLoginActionState =
+  | Readonly<{ phase: "idle" }>
+  | Readonly<{ kind: AccountLoginActionKind; phase: "submitting" }>
+  | Readonly<{ commandPublicId: string; phase: "awaiting_login_handoff" }>;
+
+export const initialAccountLoginActionState: AccountLoginActionState = { phase: "idle" };
+
+/**
+ * Claims the account row before enqueueing. This synchronous state is also held
+ * in a ref by the screen, so two clicks from the same React render cannot both
+ * reach the hosted mutation.
+ */
+export function beginAccountLoginAction(
+  state: AccountLoginActionState,
+  kind: AccountLoginActionKind,
+): AccountLoginActionState | null {
+  return state.phase === "idle" ? { kind, phase: "submitting" } : null;
+}
+
+/**
+ * A status read may yield after enqueueing, but a login start keeps custody of
+ * the row until its single-use handoff has been consumed or has expired.
+ */
+export function completeAccountLoginSubmission(
+  state: AccountLoginActionState,
+  commandPublicId: string,
+): AccountLoginActionState {
+  if (state.phase !== "submitting") return state;
+  return state.kind === "account_login_start"
+    ? { commandPublicId, phase: "awaiting_login_handoff" }
+    : initialAccountLoginActionState;
+}
+
+/** Release only the exact login-start handoff that currently owns the row. */
+export function finishAccountLoginHandoff(
+  state: AccountLoginActionState,
+  commandPublicId: string,
+): AccountLoginActionState {
+  return state.phase === "awaiting_login_handoff"
+    && state.commandPublicId === commandPublicId
+    ? initialAccountLoginActionState
+    : state;
+}
+
+/**
+ * Replaces the daemon-clock expiry with the hosted settlement deadline.
+ * Convex owns this timestamp so machine and browser clock skew cannot hide a
+ * freshly released code or extend its five-minute readable window.
+ */
+export function bindHostedLoginResultExpiry(
+  result: DeviceCommandResultPayload,
+  expiresAt: unknown,
+  fallbackExpiresAt?: unknown,
+): DeviceCommandResultPayload | null {
+  const effectiveExpiresAt = Number.isSafeInteger(expiresAt) && (expiresAt as number) > 0
+    ? expiresAt
+    : fallbackExpiresAt;
+  if (
+    result.kind !== "account_login_start"
+    || !Number.isSafeInteger(effectiveExpiresAt)
+    || (effectiveExpiresAt as number) <= 0
+  ) return null;
+  return { ...result, expiresAt: effectiveExpiresAt as number };
+}
+
+/** Server-owned deadline derivable from the public command settlement row. */
+export function hostedLoginHandoffDeadline(settledAt: unknown): number | null {
+  if (!Number.isSafeInteger(settledAt) || (settledAt as number) < 0) return null;
+  const deadline = (settledAt as number) + deviceCommandLoginResultLifetimeMs;
+  return Number.isSafeInteger(deadline) ? deadline : null;
+}
+
+export type HostedLoginHandoffAdmission =
+  | Readonly<{ status: "awaiting_server_clock" }>
+  | Readonly<{ status: "expired_or_invalid" }>
+  | Readonly<{ expiresAt: number; status: "ready" }>;
+
+/**
+ * Admit a single-use result only after the browser clock is server-anchored.
+ * An ahead local clock must not permanently consume or dismiss a fresh code
+ * during the render before `presence:current` establishes its offset.
+ */
+export function admitHostedLoginHandoff(input: Readonly<{
+  now: number;
+  serverClockReady: boolean;
+  settledAt: unknown;
+}>): HostedLoginHandoffAdmission {
+  if (!input.serverClockReady) return { status: "awaiting_server_clock" };
+  const expiresAt = hostedLoginHandoffDeadline(input.settledAt);
+  return expiresAt === null || expiresAt <= input.now
+    ? { status: "expired_or_invalid" }
+    : { expiresAt, status: "ready" };
 }
 
 export function usageRefreshCommand(): DeviceCommandPayload {
   return build({ kind: "usage_refresh" });
+}
+
+/** Strictly parses the browser's `HH:MM` value without normalizing bad fields. */
+export function parseNotificationClockMinute(value: string): number | null {
+  const match = /^(\d{2}):(\d{2})$/u.exec(value);
+  if (match === null) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59
+    ? hour * 60 + minute
+    : null;
+}
+
+/** Machine-local policy revision, deliberately never a registry row revision. */
+export function notificationHoursCommand(input: NotificationHoursUpdate & Readonly<{
+  expectedRevision: number;
+}>): DeviceCommandPayload {
+  return build({ ...input, kind: "set_notification_hours" });
 }
 
 /**
@@ -80,6 +216,7 @@ export function sessionStartTargets(
 ): readonly SessionStartTarget[] {
   const targets: SessionStartTarget[] = [];
   for (const machine of machines) {
+    if (machine.deviceStatus !== "active") continue;
     if (!machine.deviceCommandsAllowed) continue;
     if (machine.projects.length === 0) continue;
     for (const account of machine.accounts) {
@@ -112,6 +249,8 @@ const refusalNotices: Readonly<Record<string, string>> = {
     "Account linking from the browser is off on that machine. Run `hra remote allow account-linking` there first.",
   ACCOUNT_LOGIN_RELAY_UNAVAILABLE:
     "That machine could not relay a login link. Run `hra account login <account>` on the machine instead.",
+  ACCOUNT_LOGIN_NOT_AVAILABLE:
+    "A new login can start only while that account is signed out on the machine.",
   DEVICE_COMMANDS_DENIED:
     "That machine is not accepting commands from other devices. Run `hra remote allow device-commands` there.",
   DEVICE_COMMAND_ACCOUNT_SIGNED_OUT: "That account is signed out on the machine.",
@@ -120,6 +259,10 @@ const refusalNotices: Readonly<Record<string, string>> = {
   DEVICE_COMMAND_PROJECT_UNKNOWN: "That machine no longer has that project.",
   DEVICE_COMMAND_PROVIDER_UNSUPPORTED: "That account is not the provider this request named.",
   REQUESTING_DEVICE_INACTIVE: "This device is no longer active on the account.",
+  LOCAL_NOTIFICATION_HOURS_REVISION_CONFLICT:
+    "Notification hours changed on the machine. Refresh and try again.",
+  LOCAL_NOTIFICATION_HOURS_REVISION_EXHAUSTED:
+    "Notification hours reached their local revision limit and cannot be updated.",
 };
 
 /**

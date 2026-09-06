@@ -30,8 +30,13 @@ describe("hosted public authority policy", () => {
     const discovered = await publicFunctionExports();
     expect(new Set(discovered).size).toBe(discovered.length);
     expect(discovered).toEqual(Object.keys(HOSTED_PUBLIC_FUNCTION_AUTHORITY).sort());
+    expect(HOSTED_PUBLIC_FUNCTION_AUTHORITY["attentionNotifications:authorityStatus"])
+      .toBe("active_daemon_device");
+    expect(HOSTED_PUBLIC_FUNCTION_AUTHORITY["attentionNotifications:reconcile"])
+      .toBe("active_daemon_device");
     expect(Object.values(HOSTED_PUBLIC_FUNCTION_AUTHORITY).every((policy) => [
       "active_device",
+      "active_daemon_device",
       "convex_auth",
       "public_release_attestation",
       "registered_device",
@@ -39,5 +44,20 @@ describe("hosted public authority policy", () => {
       "verified_identity",
       "verified_identity_and_device_signature",
     ].includes(policy))).toBe(true);
+  });
+
+  test("keeps delivery effects behind internal-only functions", async () => {
+    const discovered = await publicFunctionExports();
+    expect(discovered.filter((name) => name.startsWith("attentionNotifications:")))
+      .toEqual([
+        "attentionNotifications:authorityStatus",
+        "attentionNotifications:reconcile",
+      ]);
+    for (const forbidden of [
+      "attentionNotifications:claimNext",
+      "attentionNotifications:settleAttempt",
+      "attentionNotificationDelivery:deliver",
+      "attentionNotificationDelivery:drain",
+    ]) expect(discovered).not.toContain(forbidden);
   });
 });

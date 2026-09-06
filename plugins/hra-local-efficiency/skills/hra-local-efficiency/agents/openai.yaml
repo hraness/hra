@@ -1,6 +1,6 @@
 interface:
   display_name: "HRA Local Efficiency"
-  short_description: "Improve local Codex swarm throughput safely"
-  default_prompt: "Use $hra-local-efficiency to audit and improve this local Hraness Codex swarm without cloud execution."
+  short_description: "Reduce local agent approval friction safely"
+  default_prompt: "Use $hra-local-efficiency to align Codex and Claude approval defaults, repository guidance, and local Hraness swarm throughput without weakening gates or using cloud execution."
 policy:
   allow_implicit_invocation: true

@@ -37,6 +37,9 @@ interface TextOutput {
   readonly path: string;
 }
 
+const emptyBuildEnvironment: Readonly<Record<string, string | undefined>> =
+  Object.freeze({});
+
 const withFinalNewline = (value: string): string =>
   value.endsWith("\n") ? value : `${value}\n`;
 
@@ -95,14 +98,15 @@ const trackedTextOutputs = (repositoryRoot: string): readonly TextOutput[] => [
 const siteTextOutputs = (
   repositoryRoot: string,
   releaseCommit: string,
+  environment: Readonly<Record<string, string | undefined>>,
 ): readonly TextOutput[] => [
   {
     path: join(repositoryRoot, "dist/site/index.html"),
-    content: renderSiteHtml(),
+    content: renderSiteHtml(publicContent, environment),
   },
   {
     path: join(repositoryRoot, "dist/site/privacy/index.html"),
-    content: renderPrivacyHtml(),
+    content: renderPrivacyHtml(publicContent, environment),
   },
   {
     path: join(repositoryRoot, "dist/site/preview/index.html"),
@@ -158,6 +162,9 @@ const designKitFontsStylesPath = fileURLToPath(
 );
 const designKitProductMarketingStylesPath = fileURLToPath(
   import.meta.resolve("@hraness/design-kit/product-marketing.css"),
+);
+const designKitSyntaxHighlightingStylesPath = fileURLToPath(
+  import.meta.resolve("@hraness/design-kit/syntax-highlighting.css"),
 );
 const designKitFontsDirectory = join(dirname(designKitFontsStylesPath), "fonts");
 
@@ -217,14 +224,17 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   if (releaseCommit !== "local" && !/^[0-9a-f]{40}$/u.test(releaseCommit)) {
     throw new Error("Release commit must be a lowercase 40-character Git SHA.");
   }
-  const analyticsProjectToken = resolveHraAnalyticsProjectToken(
-    options.environment ?? process.env,
-  );
+  const environment = options.environment ?? emptyBuildEnvironment;
+  const analyticsProjectToken = resolveHraAnalyticsProjectToken(environment);
   await rm(join(options.repositoryRoot, "dist", "site"), {
     force: true,
     recursive: true,
   });
-  for (const output of siteTextOutputs(options.repositoryRoot, releaseCommit)) {
+  for (const output of siteTextOutputs(
+    options.repositoryRoot,
+    releaseCommit,
+    environment,
+  )) {
     const content = withFinalNewline(output.content);
     await mkdir(dirname(output.path), { recursive: true });
     await writeFile(output.path, content, { encoding: "utf8" });
@@ -252,11 +262,13 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
     productStyles,
     designKitFontsStyles,
     designKitProductMarketingStyles,
+    designKitSyntaxHighlightingStyles,
     siteFooterStyles,
   ] = await Promise.all([
     readFile(join(options.repositoryRoot, "site/styles.css"), "utf8"),
     readFile(designKitFontsStylesPath, "utf8"),
     readFile(designKitProductMarketingStylesPath, "utf8"),
+    readFile(designKitSyntaxHighlightingStylesPath, "utf8"),
     readFile(siteFooterStylesPath, "utf8"),
   ]);
   await cp(designKitFontsDirectory, join(options.repositoryRoot, "dist/site/fonts"), {
@@ -265,7 +277,7 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   });
   await writeFile(
     join(options.repositoryRoot, "dist/site/styles.css"),
-    `${designKitFontsStyles.trim()}\n\n${designKitProductMarketingStyles.trim()}\n\n${productStyles.trimEnd()}\n\n${siteFooterStyles.trim()}\n`,
+    `${designKitFontsStyles.trim()}\n\n${designKitProductMarketingStyles.trim()}\n\n${designKitSyntaxHighlightingStyles.trim()}\n\n${productStyles.trimEnd()}\n\n${siteFooterStyles.trim()}\n`,
     "utf8",
   );
 
@@ -285,6 +297,7 @@ if (import.meta.main) {
   }
   const mismatches = await buildSite({
     check,
+    environment: process.env,
     ...(providerCommit === undefined ? {} : { releaseCommit: providerCommit }),
     repositoryRoot,
   });

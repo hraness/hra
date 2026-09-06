@@ -3100,11 +3100,11 @@ describe("current-project alias CLI", () => {
       expect(JSON.parse(stdout.join(""))).toEqual({
         alias: "hra.sh",
         idempotencyKey: plan.idempotencyKey,
-        nextAction: "obtain_conversational_plan_approval_then_execute_with_machine_token",
+        nextAction: "execute_with_machine_token_under_standing_task_authority",
         observedState: "source",
         reason: "exact_source",
         requiredConfirmation: requiredAliasConfirmation(plan),
-        schemaVersion: 2,
+        schemaVersion: 3,
         sourceDeploymentId: source.deploymentId,
         status: "ready",
         targetDeploymentId: target.deploymentId,

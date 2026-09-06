@@ -26,6 +26,7 @@ import {
 } from "./github-release-retry-policy";
 import { parseGitHubIncludedJsonResponse } from "./release-included-response";
 import { assertReleasePackageReady, releaseArchiveName } from "./release-package-policy";
+import { assertLiveReleaseRepository } from "./release-repository-identity";
 
 const [tag, archiveArgument, checksumArgument] = process.argv.slice(2);
 if (tag === undefined || archiveArgument === undefined || checksumArgument === undefined) {
@@ -122,6 +123,10 @@ function record(value: unknown, label: string): Readonly<Record<string, unknown>
 function readJson(arguments_: string[]): Readonly<Record<string, unknown>> {
   const value = JSON.parse(run(arguments_).stdout.toString("utf8")) as unknown;
   return record(value, `GitHub ${arguments_[1] ?? "command"} response`);
+}
+
+function verifyLivePublicRepository(): void {
+  assertLiveReleaseRepository(readJson(["gh", "api", `/repos/${publicRepository}`]));
 }
 
 function verifyRemoteAnnotatedTag(): void {
@@ -410,6 +415,7 @@ function completeDraftAssets(draft: ExactDraft): ExactDraft {
     current = readExactDraftById(draft.id);
     if (!verifyDraftAssets(current).includes(source)) continue;
     const name = basename(source);
+    verifyLivePublicRepository();
     run([
       "gh", "api", "--method", "POST",
       "--header", "Accept: application/vnd.github+json",
@@ -432,6 +438,7 @@ function completeDraftAssets(draft: ExactDraft): ExactDraft {
 function publishDraft(draft: ExactDraft): number {
   verifyRemoteAnnotatedTag();
   const publishedBody = publishedReleaseBody(releaseIdentity, draft.createdAttempt);
+  verifyLivePublicRepository();
   const published = readJson([
     "gh", "api", "--method", "PATCH",
     `/repos/${publicRepository}/releases/${String(draft.id)}`,
@@ -459,6 +466,7 @@ async function createDraft(): Promise<ExactDraft> {
   if (freshLookup.state !== "missing" || freshDraftIds.length !== 0) {
     throw new Error("GitHub Release provider state changed before draft creation.");
   }
+  verifyLivePublicRepository();
   const created = exactDraft(readJson([
     "gh", "api", "--method", "POST", `/repos/${publicRepository}/releases`,
     "-f", `tag_name=${tag}`, "-f", `name=${expectedTitle}`, "-f", `body=${expectedDraftBody}`,

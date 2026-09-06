@@ -2,26 +2,36 @@
 
 import { isAbsolute, resolve } from "node:path";
 
-import { checkInstallation, type BootstrapOptions } from "./bootstrap";
+import {
+  checkInstallation,
+  claudeAutoModeCapability,
+  resolvedClaudeHome,
+  type BootstrapOptions,
+  type ClaudeAutoModeCapability,
+} from "./bootstrap";
 import { resolveAtetRuntimeRoot } from "./host-run";
 import { resolvedBunBin, resolvedCodexHome } from "./shared";
 
 export type DoctorOptions = {
   readonly bunBin: string;
+  readonly claudeHome: string;
   readonly codexHome: string;
   readonly json: boolean;
 };
 
 export type DoctorReport = {
   readonly bunBin: string;
+  readonly claudeAutoMode: ClaudeAutoModeCapability;
+  readonly claudeHome: string;
   readonly codexHome: string;
   readonly failures: readonly string[];
   readonly ok: boolean;
-  readonly version: 1;
+  readonly version: 3;
 };
 
 export function parseDoctorArguments(arguments_: readonly string[]): DoctorOptions {
   let bunBin = resolvedBunBin();
+  let claudeHome = resolvedClaudeHome();
   let codexHome = resolvedCodexHome();
   let json = false;
   const seen = new Set<string>();
@@ -33,7 +43,7 @@ export function parseDoctorArguments(arguments_: readonly string[]): DoctorOptio
       json = true;
       continue;
     }
-    if (argument === "--codex-home" || argument === "--bun-bin") {
+    if (argument === "--codex-home" || argument === "--claude-home" || argument === "--bun-bin") {
       if (seen.has(argument)) throw new Error(`${argument} may appear only once`);
       seen.add(argument);
       const value = arguments_[index + 1];
@@ -41,13 +51,14 @@ export function parseDoctorArguments(arguments_: readonly string[]): DoctorOptio
         throw new Error(`${argument} requires an absolute path`);
       }
       if (argument === "--codex-home") codexHome = resolve(value);
+      else if (argument === "--claude-home") claudeHome = resolve(value);
       else bunBin = resolve(value);
       index += 1;
       continue;
     }
     throw new Error(`unknown doctor argument: ${argument}`);
   }
-  return { bunBin, codexHome, json };
+  return { bunBin, claudeHome, codexHome, json };
 }
 
 export function doctorReport(
@@ -56,6 +67,7 @@ export function doctorReport(
 ): DoctorReport {
   const bootstrapOptions: BootstrapOptions = {
     bunBin: options.bunBin,
+    claudeHome: options.claudeHome,
     codexHome: options.codexHome,
     installDependency: false,
     mode: "check",
@@ -69,10 +81,12 @@ export function doctorReport(
   }
   return {
     bunBin: options.bunBin,
+    claudeAutoMode: claudeAutoModeCapability(environment),
+    claudeHome: options.claudeHome,
     codexHome: options.codexHome,
     failures,
     ok: failures.length === 0,
-    version: 1,
+    version: 3,
   };
 }
 
@@ -81,8 +95,15 @@ if (import.meta.main) {
     const options = parseDoctorArguments(process.argv.slice(2));
     const report = doctorReport(options);
     if (options.json) console.log(JSON.stringify(report, null, 2));
-    else if (report.ok) console.log("PASS\tHRA local efficiency baseline");
-    else for (const failure of report.failures) console.error(`FAIL\t${failure}`);
+    else {
+      if (!report.claudeAutoMode.available) {
+        console.log(
+          `SKIP\tClaude Auto mode unavailable (${report.claudeAutoMode.reason}); ordinary permission mode unchanged`,
+        );
+      }
+      if (report.ok) console.log("PASS\tHRA local efficiency baseline");
+      else for (const failure of report.failures) console.error(`FAIL\t${failure}`);
+    }
     if (!report.ok) process.exitCode = 1;
   } catch (error: unknown) {
     console.error(`[hra-local-efficiency] ${error instanceof Error ? error.message : String(error)}`);

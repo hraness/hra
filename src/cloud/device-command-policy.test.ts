@@ -67,6 +67,21 @@ describe("device command guards", () => {
     }))).toMatchObject({ notifyFirstSessionStart: false });
   });
 
+  test("admits notification-hour updates through the same local cap without account or session authority", () => {
+    const hours = payload({
+      endMinute: 1_320,
+      expectedRevision: 4,
+      kind: "set_notification_hours",
+      startMinute: 600,
+      timeZone: "America/Puerto_Rico",
+      version: 1,
+    });
+    expect(deviceCommandGuardDecision(input({ accounts: [], payload: hours, projectPublicIds: [] })))
+      .toMatchObject({ kind: "admitted", notifyFirstSessionStart: false });
+    expect(deviceCommandGuardDecision(input({ deviceCommandsAllowed: false, payload: hours })))
+      .toEqual({ code: "DEVICE_COMMANDS_DENIED", kind: "refused" });
+  });
+
   test("the kill switch refuses every kind with DEVICE_COMMANDS_DENIED", () => {
     for (const kind of [sessionStart, payload({ kind: "usage_refresh" })]) {
       expect(deviceCommandGuardDecision(input({
@@ -90,8 +105,26 @@ describe("device command guards", () => {
     }))).toEqual({ code: "ACCOUNT_LINKING_DENIED", kind: "refused" });
     expect(deviceCommandGuardDecision(input({
       accountLinkingAllowed: true,
+      accounts: [{ provider: "codex", publicId: "account_primary", status: "signed_out" }],
       payload: payload({ accountPublicId: "account_primary", kind: "account_login_start" }),
     })).kind).toBe("admitted");
+    expect(deviceCommandGuardDecision(input({
+      accountLinkingAllowed: true,
+      payload: payload({
+        accountPublicId: "account_primary",
+        kind: "account_login_status",
+      }),
+    })).kind).toBe("admitted");
+  });
+
+  test("starts account linking only from the signed-out state", () => {
+    for (const status of ["signed_in", "login_pending", "recovery_required"] as const) {
+      expect(deviceCommandGuardDecision(input({
+        accountLinkingAllowed: true,
+        accounts: [{ provider: "codex", publicId: "account_primary", status }],
+        payload: payload({ accountPublicId: "account_primary", kind: "account_login_start" }),
+      }))).toEqual({ code: "ACCOUNT_LOGIN_NOT_AVAILABLE", kind: "refused" });
+    }
   });
 
   test("addressing is checked against the projected registry", () => {
@@ -105,6 +138,26 @@ describe("device command guards", () => {
     expect(deviceCommandGuardDecision(input({
       accounts: [{ provider: "claude", publicId: "account_primary", status: "signed_in" }],
     }))).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", kind: "refused" });
+    expect(deviceCommandGuardDecision(input({
+      accountLinkingAllowed: true,
+      accounts: [{ provider: "claude", publicId: "account_primary", status: "signed_out" }],
+      payload: payload({ accountPublicId: "account_primary", kind: "account_login_start" }),
+    }))).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", kind: "refused" });
+    expect(deviceCommandGuardDecision(input({
+      accountLinkingAllowed: true,
+      accounts: [{ provider: "claude", publicId: "account_primary", status: "signed_out" }],
+      payload: payload({
+        accountPublicId: "account_primary",
+        kind: "account_login_status",
+      }),
+    }))).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", kind: "refused" });
+    expect(deviceCommandGuardDecision(input({
+      accountLinkingAllowed: true,
+      payload: payload({
+        accountPublicId: "account_missing",
+        kind: "account_login_status",
+      }),
+    }))).toEqual({ code: "DEVICE_COMMAND_ACCOUNT_UNKNOWN", kind: "refused" });
   });
 
   test("the per-day cap refuses at the ceiling and resets on a new day", () => {

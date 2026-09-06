@@ -25,7 +25,11 @@ import {
   type CloudProjectionRecoveryJournalEntry,
 } from "../cloud/daemon-journal";
 import { renderSuccess } from "../cli/render";
-import { localCommandSchema, type LocalCommand } from "../domain/contracts";
+import {
+  localCommandSchema,
+  type LocalCommand,
+  type NotificationEmailHostedAuthority,
+} from "../domain/contracts";
 import {
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
   encodeProtectedInteractionDetailDocument,
@@ -40,7 +44,6 @@ import { sessionStatusSchema, type SessionStatus } from "../domain/observation";
 import type { PreparedAttachment } from "../domain/attachments";
 import { AttachmentBlobStore } from "../storage/attachment-store";
 import { ingestAttachments } from "./attachment-ingest";
-import type { Preset } from "../domain/presets";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
 import {
   SESSION_EVENT_RETAIN_AGE_MS,
@@ -66,7 +69,7 @@ import type {
   HraFactsMemoryLifecyclePort,
   HraFactsMemoryLifecycleReceipt,
 } from "./facts-memory-lifecycle";
-import { CodexSessionObservationError, UnavailableCloudControl, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
+import { CodexSessionObservationError, UnavailableCloudControl, type ClaudeRuntimePort, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
 import { SessionEventCursorCodec } from "./session-event-cursor";
 import { CommandFailure, FACTS_MEMORY_SESSION_TTL_MS, HraService } from "./service";
 import { USAGE_HISTORY_CURSOR_TTL_MS } from "./usage-history-cursor";
@@ -78,7 +81,7 @@ const runtimeProfile = (authority: ProfileAuthority): EffectiveRuntimeProfile =>
   processGeneration: authority.generation,
   observedAt: 2_000,
   preset: "high",
-  model: "gpt-5.6-sol",
+  model: "gpt-6-astra",
   reasoningEffort: "max",
   serviceTier: null,
   fast: false,
@@ -92,6 +95,7 @@ const runtimeProfile = (authority: ProfileAuthority): EffectiveRuntimeProfile =>
 
 class FakeCodex implements CodexRuntimePort {
   readonly provider = "codex" as const;
+  discardRuntimeReview(): void {}
   readonly calls: string[] = [];
   readonly observedThreads: string[] = [];
   readonly freshThreads = new Set<string>();
@@ -203,6 +207,8 @@ class FakeCodex implements CodexRuntimePort {
   listedProjections: readonly CodexSessionProjection[] = [];
   listedNextCursor: string | null = null;
   readonly sessionListRequests: Array<Parameters<CodexRuntimePort["listSessions"]>[0]> = [];
+  readonly sessionReviewRequests: Array<Parameters<CodexRuntimePort["reviewSessionStart"]>[0]> = [];
+  readonly turnReviewRequests: Array<Parameters<CodexRuntimePort["reviewTurnStart"]>[0]> = [];
   loginResult: CodexLoginOutcome = { status: "signed_in", account: { signedIn: true, email: "person@example.com", plan: "Plus" } };
   cancelLoginResult: { status: "canceled" | "not_found" } = { status: "canceled" };
   beforeLoginReturn?: (input: { authority: ProfileAuthority; method: "browser" | "device_code" }) => Promise<void>;
@@ -243,16 +249,17 @@ class FakeCodex implements CodexRuntimePort {
     this.sessionListRequests.push(input);
     return { sessions: this.listedProjections, nextCursor: this.listedNextCursor };
   }
-  async reviewSessionStart(input: { authority: ProfileAuthority; preset: Preset; fast: boolean }): Promise<RuntimeStartReview> {
+  async reviewSessionStart(input: Parameters<CodexRuntimePort["reviewSessionStart"]>[0]): Promise<RuntimeStartReview> {
     this.calls.push("review-session");
+    this.sessionReviewRequests.push(input);
     const base = runtimeProfile(input.authority);
     const effectiveRuntimeProfile = this.runtimeProfileOverride ?? {
       ...base,
       preset: input.preset,
       fast: input.fast,
       serviceTier: input.fast ? "priority" as const : null,
-      model: input.preset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
-      reasoningEffort: input.preset === "ultra" ? "ultra" as const : "max" as const,
+      model: input.requirement.model,
+      reasoningEffort: input.requirement.effort,
     };
     return { reviewId: crypto.randomUUID(), kind: "session_start", effectiveRuntimeProfile };
   }
@@ -307,9 +314,10 @@ class FakeCodex implements CodexRuntimePort {
     await this.beforeReadSessionReturn?.();
     return this.readProjection;
   }
-  async reviewTurnStart(input: { authority: ProfileAuthority; preset: Preset; fast: boolean }): Promise<RuntimeStartReview> {
+  async reviewTurnStart(input: Parameters<CodexRuntimePort["reviewTurnStart"]>[0]): Promise<RuntimeStartReview> {
     this.calls.push("review-turn");
     this.turnEffectTrace.push("review");
+    this.turnReviewRequests.push(input);
     const error = this.reviewTurnErrorOnce;
     delete this.reviewTurnErrorOnce;
     if (error !== undefined) throw error;
@@ -319,8 +327,8 @@ class FakeCodex implements CodexRuntimePort {
       preset: input.preset,
       fast: input.fast,
       serviceTier: input.fast ? "priority" as const : null,
-      model: input.preset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
-      reasoningEffort: input.preset === "ultra" ? "ultra" as const : "max" as const,
+      model: input.requirement.model,
+      reasoningEffort: input.requirement.effort,
     };
     return { reviewId: crypto.randomUUID(), kind: "turn_start", effectiveRuntimeProfile };
   }
@@ -434,6 +442,16 @@ class FakeDaemonAuthority {
 }
 
 class FakeCloud implements CloudControlPort {
+  attentionObservation: NotificationEmailHostedAuthority = { state: "not_observed" };
+  attentionInvalidation: Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  > | null = null;
+  beforeAttentionInvalidation?: (
+    input: Parameters<NonNullable<CloudControlPort[
+      "invalidateAttentionNotificationAuthority"
+    ]>>[0],
+  ) => Promise<void> | void;
   readonly projectionRecoveries: Array<{
     acknowledgeGap: true;
     idempotencyKey: string;
@@ -489,6 +507,21 @@ class FakeCloud implements CloudControlPort {
     return this.statusResult;
   }
   async sync(): Promise<unknown> { return { synced: true }; }
+  async observeAttentionNotificationAuthority(): Promise<NotificationEmailHostedAuthority> {
+    return this.attentionObservation;
+  }
+  async invalidateAttentionNotificationAuthority(input: Parameters<NonNullable<
+    CloudControlPort["invalidateAttentionNotificationAuthority"]
+  >>[0]): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >> {
+    await this.beforeAttentionInvalidation?.(input);
+    if (this.attentionInvalidation === null) {
+      throw new Error("Fake hosted notification invalidation is unavailable.");
+    }
+    return this.attentionInvalidation;
+  }
   async isCompactProjectionRecoveryUnsettled(sessionPublicId: `sess_${string}`): Promise<boolean> {
     await this.beforeProjectionUnsettledSessionReturn?.(sessionPublicId);
     return this.projectionRecoveryBlocker === undefined
@@ -744,9 +777,11 @@ async function fixture(
   now: () => number = Date.now,
   factsMemory?: HraFactsMemoryLifecyclePort,
   autorespond: Readonly<{
+    claude?: ClaudeRuntimePort;
     gatewayKeys?: GatewayKeyPort;
     proseResponder?: ProseResponder;
   }> = {},
+  platform: NodeJS.Platform = "linux",
 ): Promise<{ service: HraService; store: StateStore; codex: FakeCodex; cloud: FakeCloud; daemonAuthority: FakeDaemonAuthority; documents: string; eventCursors: SessionEventCursorCodec; paths: ReturnType<typeof resolveStatePaths> }> {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-")));
   serviceRoots.push(home);
@@ -762,7 +797,89 @@ async function fixture(
   const codex = new FakeCodex();
   const daemonAuthority = new FakeDaemonAuthority();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
-  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }), ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }), now, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
+  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), ...(autorespond.claude === undefined ? {} : { claude: autorespond.claude }), ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }), ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }), now, platform, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
+}
+
+async function claudeAccountFixture(
+  initiallySignedIn = false,
+  platform: NodeJS.Platform = "linux",
+) {
+  let signedIn = initiallySignedIn;
+  let readError: Error | undefined;
+  let readCalls = 0;
+  const providerSessionCalls: string[] = [];
+  const unexpectedInteraction = async (): Promise<never> => {
+    throw new Error("No Claude session interaction expected.");
+  };
+  const claude: ClaudeRuntimePort = {
+    provider: "claude" as const,
+    readAccount: async () => {
+      readCalls += 1;
+      if (readError !== undefined) throw readError;
+      return { readiness: signedIn ? "signed_in" : "signed_out", observedAt: 2_000 };
+    },
+    observeSession: async () => {
+      providerSessionCalls.push("observe-session");
+      throw new Error("Claude session observation was not expected.");
+    },
+    readSession: async () => {
+      providerSessionCalls.push("read-session");
+      throw new Error("Claude session read was not expected.");
+    },
+    reviewSessionStart: async () => {
+      providerSessionCalls.push("review-session-start");
+      throw new Error("Claude session start review was not expected.");
+    },
+    reviewTurnStart: async () => {
+      providerSessionCalls.push("review-turn-start");
+      throw new Error("Claude turn review was not expected.");
+    },
+    startSession: async () => {
+      providerSessionCalls.push("start-session");
+      throw new Error("Claude session start was not expected.");
+    },
+    startTurn: async () => {
+      providerSessionCalls.push("start-turn");
+      throw new Error("Claude turn start was not expected.");
+    },
+    steer: async () => {
+      providerSessionCalls.push("steer");
+      throw new Error("Claude steer was not expected.");
+    },
+    interrupt: async () => {
+      providerSessionCalls.push("interrupt");
+      throw new Error("Claude interrupt was not expected.");
+    },
+    endSession: async () => {
+      providerSessionCalls.push("end-session");
+      throw new Error("Claude session end was not expected.");
+    },
+    interactionAuthority: () => { throw new Error("No Claude session interaction expected."); },
+    discardRuntimeReview: () => undefined,
+    inspectInteractionAuthority: unexpectedInteraction,
+    validateInteractionResolution: unexpectedInteraction,
+    resolveInteraction: unexpectedInteraction,
+    validateInteractionTimeout: unexpectedInteraction,
+    timeoutInteraction: unexpectedInteraction,
+    pinnedVersion: () => CLAUDE_PIN,
+    close: async () => undefined,
+  };
+  const value = await fixture(
+    undefined,
+    new FakeCloud(),
+    () => undefined,
+    Date.now,
+    undefined,
+    { claude },
+    platform,
+  );
+  return {
+    ...value,
+    claudeReadCalls: () => readCalls,
+    providerSessionCalls,
+    setClaudeReadError: (value: Error | undefined) => { readError = value; },
+    setClaudeSignedIn: (value: boolean) => { signedIn = value; },
+  };
 }
 
 async function createIdleSession(
@@ -979,6 +1096,286 @@ const renderJson = (command: LocalCommand, data: unknown): string => {
 };
 
 describe("HraService", () => {
+  test("reports and CAS-updates notification hours with the injected clock only", async () => {
+    let now = Date.parse("2026-09-04T12:30:00.000Z");
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => now,
+    );
+    const approvalBefore = await value.service.execute(
+      { kind: "autorespond.status" },
+      { signal },
+    );
+
+    expect(await value.service.execute({
+      kind: "notification-hours.set",
+      expectedRevision: 1,
+      version: 1,
+      startMinute: 10 * 60,
+      endMinute: 22 * 60,
+      timeZone: "UTC",
+    }, { signal })).toEqual({
+      policy: {
+        version: 1,
+        revision: 2,
+        startMinute: 10 * 60,
+        endMinute: 22 * 60,
+        timeZone: "UTC",
+      },
+      observedAt: now,
+      withinHours: true,
+    });
+
+    now = Date.parse("2026-09-04T22:00:00.000Z");
+    expect(await value.service.execute(
+      { kind: "notification-hours.status" },
+      { signal },
+    )).toEqual({
+      policy: {
+        version: 1,
+        revision: 2,
+        startMinute: 10 * 60,
+        endMinute: 22 * 60,
+        timeZone: "UTC",
+      },
+      observedAt: now,
+      withinHours: false,
+    });
+    expect(await value.service.execute(
+      { kind: "autorespond.status" },
+      { signal },
+    )).toEqual(approvalBefore);
+  });
+
+  test("maps a stale notification-hours revision to a closed conflict", async () => {
+    const value = await fixture();
+    const first = {
+      kind: "notification-hours.set",
+      expectedRevision: 1,
+      version: 1,
+      startMinute: 8 * 60,
+      endMinute: 20 * 60,
+      timeZone: "UTC",
+    } as const;
+    await value.service.execute(first, { signal });
+
+    await expect(value.service.execute({
+      ...first,
+      startMinute: 9 * 60,
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      name: "CommandFailure",
+    });
+    expect(value.store.readNotificationHours()).toEqual({
+      version: 1,
+      revision: 2,
+      startMinute: 8 * 60,
+      endMinute: 20 * 60,
+      timeZone: "UTC",
+    });
+  });
+
+  test("keeps notification email local, default-off, and on the shared revision", async () => {
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => 1_000);
+    expect(await value.service.execute(
+      { kind: "notification-email.status" },
+      { signal },
+    )).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: false, revision: 1, version: 1 },
+    });
+    expect(await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal })).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: true, revision: 2, version: 1 },
+    });
+    expect((await value.service.execute(
+      { kind: "notification-hours.status" },
+      { signal },
+    ) as { policy: { revision: number } }).policy.revision).toBe(2);
+
+    await value.service.execute({
+      kind: "notification-hours.set",
+      expectedRevision: 2,
+      version: 1,
+      startMinute: 480,
+      endMinute: 1_200,
+      timeZone: "UTC",
+    }, { signal });
+    expect(await value.service.execute(
+      { kind: "notification-email.status" },
+      { signal },
+    )).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: true, revision: 3, version: 1 },
+    });
+    expect(await value.service.execute({
+      expectedRevision: 3,
+      kind: "notification-email.disable",
+    }, { signal })).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: false, revision: 4, version: 1 },
+    });
+  });
+
+  test("commits local disable before reporting hosted acknowledgement", async () => {
+    const cloud = new FakeCloud();
+    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal });
+    cloud.beforeAttentionInvalidation = (input) => {
+      expect(value.store.readNotificationEmailPolicy()).toEqual({
+        enabled: false,
+        revision: 3,
+        version: 1,
+      });
+      expect(input.localNotificationPolicyRevision).toBe(3);
+    };
+    cloud.attentionInvalidation = {
+      acknowledgedAt: 61_000,
+      consentLeaseUntil: 61_000,
+      state: "acknowledged",
+    };
+    expect(await value.service.execute({
+      expectedRevision: 2,
+      kind: "notification-email.disable",
+    }, { signal })).toEqual({
+      hostedAuthority: {
+        acknowledgedAt: 61_000,
+        consentLeaseUntil: 61_000,
+        state: "acknowledged",
+      },
+      policy: { enabled: false, revision: 3, version: 1 },
+    });
+  });
+
+  test("returns exact bounded hosted observations for status and enable", async () => {
+    const cloud = new FakeCloud();
+    cloud.attentionObservation = {
+      deviceAuthority: {
+        consentLeaseUntil: 180_000,
+        globalNotificationGeneration: 4,
+        localNotificationPolicyRevision: 1,
+      },
+      globalNotificationGeneration: 4,
+      globalState: "enabled",
+      observedAt: 60_000,
+      state: "observed",
+    };
+    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    expect(await value.service.execute(
+      { kind: "notification-email.status" },
+      { signal },
+    )).toEqual({
+      hostedAuthority: cloud.attentionObservation,
+      policy: { enabled: false, revision: 1, version: 1 },
+    });
+    expect(await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal })).toEqual({
+      hostedAuthority: cloud.attentionObservation,
+      policy: { enabled: true, revision: 2, version: 1 },
+    });
+    for (const attentionObservation of [
+      {
+        acknowledgedAt: 61_000,
+        consentLeaseUntil: 61_000,
+        state: "acknowledged" as const,
+      },
+      {
+        expiresNoLaterThan: 180_000,
+        state: "revocation_pending" as const,
+      },
+      { state: "not_observed" as const },
+    ]) {
+      cloud.attentionObservation = attentionObservation;
+      expect((await value.service.execute(
+        { kind: "notification-email.status" },
+        { signal },
+      ) as { hostedAuthority: unknown }).hostedAuthority).toEqual(attentionObservation);
+    }
+    cloud.attentionObservation = {
+      acknowledgedAt: 61_000,
+      consentLeaseUntil: 61_000,
+      state: "acknowledged",
+    };
+    expect(await value.service.execute({
+      expectedRevision: 2,
+      kind: "notification-email.enable",
+    }, { signal })).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: true, revision: 3, version: 1 },
+    });
+  });
+
+  test("does not invent a revocation deadline when offline after the local commit", async () => {
+    const cloud = new FakeCloud();
+    cloud.beforeAttentionInvalidation = () => {
+      throw new Error("offline");
+    };
+    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal });
+    expect(await value.service.execute({
+      expectedRevision: 2,
+      kind: "notification-email.disable",
+    }, { signal })).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: false, revision: 3, version: 1 },
+    });
+    expect(value.store.readNotificationEmailPolicy().enabled).toBe(false);
+  });
+
+  test("reports revocation pending only from an exact control receipt", async () => {
+    const cloud = new FakeCloud();
+    cloud.attentionInvalidation = {
+      expiresNoLaterThan: 180_000,
+      state: "revocation_pending",
+    };
+    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal });
+    expect(await value.service.execute({
+      expectedRevision: 2,
+      kind: "notification-email.disable",
+    }, { signal })).toEqual({
+      hostedAuthority: cloud.attentionInvalidation,
+      policy: { enabled: false, revision: 3, version: 1 },
+    });
+  });
+
+  test("maps stale notification-email CAS without changing local authority", async () => {
+    const value = await fixture();
+    await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal });
+    await expect(value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.disable",
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: expect.stringContaining("notification-email status"),
+      name: "CommandFailure",
+    });
+    expect(value.store.readNotificationEmailPolicy()).toEqual({
+      enabled: true,
+      revision: 2,
+      version: 1,
+    });
+  });
+
   test("sets the two device-command switches locally and reports them", async () => {
     const value = await fixture();
     expect(await value.service.execute({ kind: "remote.policy-status" }, { signal })).toEqual({
@@ -1270,6 +1667,742 @@ describe("HraService", () => {
       },
     });
     expect(codex.calls).toEqual([]);
+  });
+
+  test("grants Claude foreground login once and accepts a status-versus-complete race", async () => {
+    const value = await claudeAccountFixture();
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Claude private" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    const key = "00000000-0000-4000-8000-000000000701";
+    const prepared = await value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: added.account.id,
+      idempotencyKey: key,
+    }, { signal }) as {
+      login: { attemptId: `attempt_${string}`; providerGeneration: number };
+    };
+    await expect(value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: added.account.id,
+      idempotencyKey: key,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await expect(value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: added.account.id,
+      idempotencyKey: "00000000-0000-4000-8000-000000000702",
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+
+    value.setClaudeSignedIn(true);
+    value.setClaudeReadError(new Error("Claude runtime drift must not hide recovery"));
+    const readsBeforeRecoveryStatus = value.claudeReadCalls();
+    const status = await value.service.execute({
+      kind: "account.show",
+      account: added.account.id,
+      provider: "claude",
+    }, { signal }) as Record<string, unknown> & { account: Record<string, unknown> };
+    expect(status).toMatchObject({
+      account: { id: added.account.id, label: "Claude private" },
+      authentication: { provider: "claude", signedIn: null },
+      providerGeneration: 0,
+      recovery: {
+        required: true,
+        attemptId: prepared.login.attemptId,
+        idempotencyKey: key,
+        abandonCommand: `hra account login-cancel ${added.account.id} --provider claude --attempt-id ${prepared.login.attemptId} --provider-generation 0 --idempotency-key ${key} --acknowledge-child-exited`,
+      },
+    });
+    expect(value.claudeReadCalls()).toBe(readsBeforeRecoveryStatus);
+    expect(Object.keys(status.account).sort()).toEqual(["id", "label"]);
+    expect(value.store.readMutation(key)).toMatchObject({ state: "effect_started" });
+
+    value.setClaudeReadError(undefined);
+    await expect(value.service.execute({
+      kind: "account.claude-login.complete",
+      account: added.account.id,
+      attemptId: prepared.login.attemptId,
+      idempotencyKey: key,
+      providerGeneration: prepared.login.providerGeneration,
+      outcome: { state: "joined", exitCode: 0, interruptedBy: null },
+    }, { signal })).resolves.toMatchObject({
+      authentication: { provider: "claude", signedIn: true },
+      login: { status: "signed_in" },
+    });
+    expect(value.store.readMutation(key)).toMatchObject({ state: "applied" });
+    value.setClaudeSignedIn(false);
+    value.setClaudeReadError(new Error("terminal replay must restore its receipt"));
+    await expect(value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: added.account.id,
+      idempotencyKey: key,
+    }, { signal })).resolves.toMatchObject({
+      authentication: { provider: "claude", signedIn: true },
+      login: { status: "signed_in" },
+    });
+  });
+
+  test("settles a typed not-started Claude launch without wedging the account", async () => {
+    const value = await claudeAccountFixture();
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Claude spawn" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    const key = "00000000-0000-4000-8000-000000000703";
+    const prepared = await value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: added.account.id,
+      idempotencyKey: key,
+    }, { signal }) as { login: { attemptId: `attempt_${string}`; providerGeneration: number } };
+    value.setClaudeReadError(new Error("status unavailable after the no-effect spawn failure"));
+    await expect(value.service.execute({
+      kind: "account.claude-login.complete",
+      account: added.account.id,
+      attemptId: prepared.login.attemptId,
+      idempotencyKey: key,
+      providerGeneration: prepared.login.providerGeneration,
+      outcome: { state: "not_started", reason: "spawn_failed" },
+    }, { signal })).resolves.toMatchObject({
+      authentication: { provider: "claude", signedIn: false },
+      login: { status: "signed_out" },
+    });
+    expect(value.store.readMutation(key)).toMatchObject({ state: "failed" });
+    value.setClaudeSignedIn(true);
+    await expect(value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: added.account.id,
+      idempotencyKey: key,
+    }, { signal })).rejects.toMatchObject({ code: "INTERACTION_REQUIRED" });
+    value.setClaudeReadError(undefined);
+    value.setClaudeSignedIn(false);
+    const interruptedKey = "00000000-0000-4000-8000-000000000704";
+    const interrupted = await value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: added.account.id,
+      idempotencyKey: interruptedKey,
+    }, { signal }) as { login: { attemptId: `attempt_${string}`; providerGeneration: number } };
+    value.setClaudeReadError(new Error("interruption before spawn must not read status"));
+    await expect(value.service.execute({
+      kind: "account.claude-login.complete",
+      account: added.account.id,
+      attemptId: interrupted.login.attemptId,
+      idempotencyKey: interruptedKey,
+      providerGeneration: interrupted.login.providerGeneration,
+      outcome: {
+        state: "not_started",
+        reason: "interrupted_before_spawn",
+        interruptedBy: "SIGINT",
+      },
+    }, { signal })).resolves.toMatchObject({
+      authentication: { provider: "claude", signedIn: false },
+      login: { status: "signed_out" },
+    });
+    expect(value.store.readMutation(interruptedKey)).toMatchObject({ state: "failed" });
+  });
+
+  test("accepts the original joined completion after restart made the Claude launch historical", async () => {
+    const value = await claudeAccountFixture();
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Claude restart" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    const codexBefore = value.store.requireProviderAccountAuthority(added.account.id, "codex");
+    const launchedAuthority = value.store.advanceProviderAccountProcessGeneration({
+      profileId: added.account.id,
+      provider: "claude",
+      expectedProcessGeneration: 0,
+    });
+    const key = "00000000-0000-4000-8000-000000000707";
+    const prepared = await value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: added.account.id,
+      idempotencyKey: key,
+    }, { signal }) as { login: { attemptId: `attempt_${string}`; providerGeneration: number } };
+    expect(prepared.login.providerGeneration).toBe(launchedAuthority.processGeneration);
+    const captured = value.store.readMutationProviderAuthorities(prepared.login.attemptId);
+    expect(captured).toMatchObject([{
+      role: "primary",
+      authority: {
+        profileId: added.account.id,
+        provider: "claude",
+        processGeneration: launchedAuthority.processGeneration,
+      },
+      provenance: "account_claude_login",
+    }]);
+    expect(value.store.nextDaemonGeneration(`boot_${"c".repeat(32)}`)).toBe(1);
+    expect(value.store.requireProviderAccountAuthority(added.account.id, "claude").processGeneration)
+      .toBe(launchedAuthority.processGeneration + 1);
+    expect(value.store.requireProviderAccountAuthority(added.account.id, "codex"))
+      .toEqual(codexBefore);
+    expect(value.store.readMutationProviderAuthorities(prepared.login.attemptId)).toEqual(captured);
+    expect(value.store.recoverEffectStartedMutations()).toEqual({
+      recovered: [prepared.login.attemptId],
+      unresolved: [],
+    });
+    value.setClaudeSignedIn(true);
+    await expect(value.service.execute({
+      kind: "account.show",
+      account: added.account.id,
+      provider: "claude",
+    }, { signal })).resolves.toMatchObject({
+      authentication: { provider: "claude", signedIn: null },
+      recovery: { required: true, attemptId: prepared.login.attemptId },
+    });
+    expect(value.store.readMutation(key)).toMatchObject({ state: "ambiguous" });
+    const complete = {
+      kind: "account.claude-login.complete" as const,
+      account: added.account.id,
+      attemptId: prepared.login.attemptId,
+      idempotencyKey: key,
+      providerGeneration: prepared.login.providerGeneration,
+      outcome: { state: "joined" as const, exitCode: 0, interruptedBy: null },
+    };
+    await expect(value.service.execute(complete, { signal })).resolves.toMatchObject({
+      authentication: { provider: "claude", signedIn: true },
+      login: { status: "signed_in", providerGeneration: launchedAuthority.processGeneration },
+    });
+    expect(value.store.readMutation(key)).toMatchObject({
+      state: "reconciled",
+      originalState: "ambiguous",
+      resolution: { kind: "proven_applied" },
+    });
+    await expect(value.service.execute(complete, { signal })).resolves.toMatchObject({
+      authentication: { provider: "claude", signedIn: true },
+      login: { status: "signed_in" },
+    });
+    value.setClaudeSignedIn(false);
+    value.setClaudeReadError(new Error("resolved replay must restore its receipt"));
+    await expect(value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: added.account.id,
+      idempotencyKey: key,
+    }, { signal })).resolves.toMatchObject({
+      authentication: { provider: "claude", signedIn: true },
+      login: { status: "signed_in" },
+    });
+  });
+
+  test("refuses historical Claude login recovery without its exact immutable authority", async () => {
+    for (const corruption of ["missing", "binding", "provenance"] as const) {
+      const value = await claudeAccountFixture();
+      const added = await value.service.execute(
+        { kind: "account.add", label: "Claude immutable login" },
+        { signal },
+      ) as { account: { id: `acct_${string}` } };
+      value.store.advanceProviderAccountProcessGeneration({
+        profileId: added.account.id,
+        provider: "claude",
+        expectedProcessGeneration: 0,
+      });
+      const key = crypto.randomUUID();
+      const prepared = await value.service.execute({
+        kind: "account.claude-login.prepare",
+        account: added.account.id,
+        idempotencyKey: key,
+      }, { signal }) as { login: { attemptId: `attempt_${string}` } };
+      const readAuthorities = value.store.readMutationProviderAuthorities.bind(value.store);
+      const captured = readAuthorities(prepared.login.attemptId);
+      value.store.nextDaemonGeneration(`boot_${"e".repeat(32)}`);
+      const readsBeforeRecovery = value.claudeReadCalls();
+      Object.defineProperty(value.store, "readMutationProviderAuthorities", {
+        configurable: true,
+        value: (attemptId: Parameters<StateStore["readMutationProviderAuthorities"]>[0]) => {
+          const recorded = readAuthorities(attemptId);
+          if (attemptId !== prepared.login.attemptId) return recorded;
+          if (corruption === "missing") return [];
+          return recorded.map((entry) => corruption === "provenance"
+            ? { ...entry, provenance: "unproved_claude_login" }
+            : {
+                ...entry,
+                authority: {
+                  ...entry.authority,
+                  bindingGeneration: entry.authority.bindingGeneration + 1,
+                },
+              });
+        },
+      });
+      try {
+        expect(value.store.recoverEffectStartedMutations()).toEqual({
+          recovered: [],
+          unresolved: [{
+            id: prepared.login.attemptId,
+            kind: "account.claude-login",
+            authorityId: added.account.id,
+          }],
+        });
+        expect(value.store.readMutation(key)).toMatchObject({ state: "effect_started" });
+        expect(value.claudeReadCalls()).toBe(readsBeforeRecovery);
+        expect(value.providerSessionCalls).toEqual([]);
+      } finally {
+        Object.defineProperty(value.store, "readMutationProviderAuthorities", {
+          configurable: true,
+          value: readAuthorities,
+        });
+      }
+      expect(readAuthorities(prepared.login.attemptId)).toEqual(captured);
+    }
+  });
+
+  test("abandons only one exact unsettled Claude fence after explicit child-exit acknowledgement", async () => {
+    const value = await claudeAccountFixture();
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Claude abandon" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    const launchedAuthority = value.store.advanceProviderAccountProcessGeneration({
+      profileId: added.account.id,
+      provider: "claude",
+      expectedProcessGeneration: 0,
+    });
+    const key = "00000000-0000-4000-8000-000000000709";
+    const prepared = await value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: added.account.id,
+      idempotencyKey: key,
+    }, { signal }) as { login: { attemptId: `attempt_${string}`; providerGeneration: number } };
+    expect(prepared.login.providerGeneration).toBe(launchedAuthority.processGeneration);
+    const captured = value.store.readMutationProviderAuthorities(prepared.login.attemptId);
+    expect(value.store.nextDaemonGeneration(`boot_${"d".repeat(32)}`)).toBe(1);
+    expect(value.store.recoverEffectStartedMutations()).toEqual({
+      recovered: [prepared.login.attemptId],
+      unresolved: [],
+    });
+    value.setClaudeReadError(new Error("abandon must not inspect or mutate Claude"));
+    const readsBeforeAbandon = value.claudeReadCalls();
+    const abandon = {
+      kind: "account.claude-login.abandon" as const,
+      account: added.account.id,
+      attemptId: prepared.login.attemptId,
+      idempotencyKey: key,
+      providerGeneration: launchedAuthority.processGeneration,
+      acknowledgeChildExited: true as const,
+    };
+    await expect(value.service.execute({
+      ...abandon,
+      idempotencyKey: "00000000-0000-4000-8000-000000000710",
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(value.service.execute({
+      ...abandon,
+      providerGeneration: launchedAuthority.processGeneration + 1,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(value.service.execute(abandon, { signal })).resolves.toMatchObject({
+      account: { id: added.account.id, label: "Claude abandon" },
+      login: {
+        status: "abandoned",
+        localOnly: true,
+        credentialAction: "none",
+      },
+    });
+    expect(value.store.readMutation(key)).toMatchObject({
+      state: "reconciled",
+      originalState: "ambiguous",
+      resolution: {
+        kind: "abandoned",
+        evidence: {
+          acknowledgedChildExited: true,
+          credentialAction: "none",
+          localOnly: true,
+        },
+      },
+    });
+    await expect(value.service.execute(abandon, { signal })).resolves.toMatchObject({
+      login: { status: "abandoned" },
+    });
+    await expect(value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: added.account.id,
+      idempotencyKey: key,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(value.service.execute({
+      kind: "account.claude-login.complete",
+      account: added.account.id,
+      attemptId: prepared.login.attemptId,
+      idempotencyKey: key,
+      providerGeneration: launchedAuthority.processGeneration,
+      outcome: { state: "joined", exitCode: 0, interruptedBy: null },
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(value.claudeReadCalls()).toBe(readsBeforeAbandon);
+    expect(value.store.readMutationProviderAuthorities(prepared.login.attemptId)).toEqual(captured);
+  });
+
+  test("refuses Claude login before provider status while a Claude session is starting", async () => {
+    const value = await claudeAccountFixture();
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Claude session owner" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    value.store.createSession({
+      profileId: added.account.id,
+      provider: "claude",
+      preset: "fable-max",
+      fastEnabled: false,
+    });
+    value.setClaudeReadError(new Error("session fence must precede provider status"));
+    await expect(value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: added.account.id,
+      idempotencyKey: "00000000-0000-4000-8000-000000000711",
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      details: { provider: "claude", reason: "active_session", retryable: true },
+    });
+  });
+
+  test("gates new Claude effects on Darwin but preserves exact unresolved login recovery", async () => {
+    const value = await claudeAccountFixture(false, "darwin");
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Darwin Claude" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      account: added.account.id,
+      deviceCode: false,
+      kind: "account.login",
+    }, { signal });
+    await value.service.execute(
+      { kind: "project.add", label: "Darwin docs", path: value.documents },
+      { signal },
+    );
+    const started = await value.service.execute({
+      account: added.account.id,
+      fast: false,
+      kind: "session.start",
+      preset: "high",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const loginKey = "00000000-0000-4000-8000-000000000712";
+    const expectedPlatformRefusal = {
+      code: "UNAVAILABLE",
+      details: {
+        platform: "darwin",
+        provider: "claude",
+        reason: "claude_isolation_acceptance_pending",
+        retryable: false,
+        supportedPlatforms: ["linux"],
+      },
+      message: expect.stringContaining("currently supported only on Linux"),
+    };
+
+    await expect(value.service.execute({
+      account: added.account.id,
+      kind: "account.show",
+      provider: "claude",
+    }, { signal })).rejects.toMatchObject(expectedPlatformRefusal);
+    await expect(value.service.execute({
+      account: added.account.id,
+      idempotencyKey: loginKey,
+      kind: "account.claude-login.prepare",
+    }, { signal })).rejects.toMatchObject(expectedPlatformRefusal);
+    await expect(value.service.execute({
+      account: added.account.id,
+      fast: false,
+      idempotencyKey: "00000000-0000-4000-8000-000000000713",
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal })).rejects.toMatchObject(expectedPlatformRefusal);
+    await expect(value.service.execute({
+      idempotencyKey: "00000000-0000-4000-8000-000000000714",
+      kind: "session.switch",
+      provider: "claude",
+      session: started.session.id,
+    }, { signal })).rejects.toMatchObject(expectedPlatformRefusal);
+    expect(value.claudeReadCalls()).toBe(0);
+    expect(value.store.readMutation(loginKey)).toBeNull();
+    expect(value.store.requireSession(started.session.id)).toMatchObject({
+      provider: "codex",
+      state: "idle",
+    });
+
+    const profile = value.store.requireProfileById(added.account.id);
+    const claudeBefore = value.store.requireProviderAccountAuthority(profile.id, "claude");
+    const claudeAuthority = value.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: claudeBefore.processGeneration,
+      profileId: profile.id,
+      provider: "claude",
+    });
+    expect(claudeAuthority.processGeneration).not.toBe(profile.processGeneration);
+    const recoveryKey = "00000000-0000-4000-8000-000000000715";
+    const attempt = value.store.prepareMutation({
+      authorityGeneration: claudeAuthority.processGeneration,
+      authorityId: profile.id,
+      idempotencyKey: recoveryKey,
+      kind: "account.claude-login",
+      request: { provider: "claude" },
+      providerAuthorities: [{
+        role: "primary",
+        authority: claudeAuthority,
+        provenance: "account_claude_login",
+      }],
+    });
+    value.store.beginClaudeLoginMutationEffect({
+      attemptId: attempt.id,
+      evidence: {
+        baselineSignedIn: false,
+        kind: "account.claude-login",
+        provider: "claude",
+      },
+      profileGeneration: claudeAuthority.processGeneration,
+      profileId: profile.id,
+    });
+    const abandonCommand = `hra account login-cancel ${profile.id} --provider claude --attempt-id ${attempt.id} --provider-generation ${String(claudeAuthority.processGeneration)} --idempotency-key ${recoveryKey} --acknowledge-child-exited`;
+    await expect(value.service.execute({
+      account: profile.id,
+      kind: "account.show",
+      provider: "claude",
+    }, { signal })).resolves.toMatchObject({
+      account: { id: profile.id, label: "Darwin Claude" },
+      authentication: { provider: "claude", signedIn: null },
+      recovery: {
+        abandonCommand,
+        attemptId: attempt.id,
+        idempotencyKey: recoveryKey,
+        providerGeneration: claudeAuthority.processGeneration,
+        required: true,
+      },
+    });
+    expect(value.claudeReadCalls()).toBe(0);
+    await expect(value.service.execute({
+      account: profile.id,
+      attemptId: attempt.id,
+      idempotencyKey: recoveryKey,
+      kind: "account.claude-login.complete",
+      outcome: { state: "joined", exitCode: 0, interruptedBy: null },
+      providerGeneration: claudeAuthority.processGeneration,
+    }, { signal })).rejects.toMatchObject(expectedPlatformRefusal);
+    expect(value.claudeReadCalls()).toBe(0);
+    expect(value.providerSessionCalls).toEqual([]);
+    expect(value.store.readMutation(recoveryKey)).toMatchObject({ state: "effect_started" });
+    await expect(value.service.execute({
+      account: profile.id,
+      acknowledgeChildExited: true,
+      attemptId: attempt.id,
+      idempotencyKey: recoveryKey,
+      kind: "account.claude-login.abandon",
+      providerGeneration: claudeAuthority.processGeneration,
+    }, { signal })).resolves.toMatchObject({
+      login: { localOnly: true, status: "abandoned" },
+    });
+  });
+
+  test("keeps durable Claude state readable on Darwin without resubscribe, dispatch, or effects", async () => {
+    const value = await claudeAccountFixture(false, "darwin");
+    const profile = value.store.createProfile("Darwin upgrade");
+    const idleCreated = value.store.createSession({
+      fastEnabled: false,
+      preset: "fable-max",
+      profileId: profile.id,
+      provider: "claude",
+    });
+    const idle = value.store.bindSession({
+      expectedRevision: idleCreated.revision,
+      providerThreadId: "claude-thread-darwin-idle",
+      sessionId: idleCreated.id,
+      state: "idle",
+    });
+    value.store.appendSessionEvent({
+      accountId: profile.id,
+      body: {
+        actor: "human",
+        omittedCharacters: 0,
+        text: "durable local message",
+        turnId: null,
+        type: "user_message",
+      },
+      providerConnectionId: null,
+      providerGeneration: value.store.requireProviderAccountAuthority(profile.id, "claude").processGeneration,
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "claude"),
+      sessionId: idle.id,
+    });
+    const queued = value.store.enqueue(idle.id, "preserve pending queue");
+    const activeCreated = value.store.createSession({
+      fastEnabled: false,
+      preset: "fable-max",
+      profileId: profile.id,
+      provider: "claude",
+    });
+    const active = value.store.bindSession({
+      activeTurnId: "claude-turn-darwin-active",
+      expectedRevision: activeCreated.revision,
+      providerThreadId: "claude-thread-darwin-active",
+      sessionId: activeCreated.id,
+      state: "active",
+    });
+
+    await value.service.recover();
+    for (let index = 0; index < 8; index += 1) await Promise.resolve();
+    expect(value.providerSessionCalls).toEqual([]);
+    expect(value.store.requireQueue(queued.id)).toMatchObject({ state: "pending" });
+    expect(value.store.requireSession(active.id)).toMatchObject({ state: "active" });
+
+    await expect(value.service.execute({
+      kind: "session.status",
+      session: idle.id,
+    }, { signal })).resolves.toMatchObject({
+      providerObservation: {
+        basis: "local_state",
+        code: "provider_platform_unavailable",
+        state: "unavailable",
+      },
+      session: { id: idle.id },
+    });
+    await expect(value.service.execute({
+      detail: true,
+      kind: "session.show",
+      session: idle.id,
+    }, { signal })).resolves.toMatchObject({
+      providerObservation: {
+        code: "provider_platform_unavailable",
+        state: "unavailable",
+      },
+      session: { id: idle.id, provider: "claude" },
+    });
+    await expect(value.service.execute({
+      kind: "session.events",
+      limit: 20,
+      session: idle.id,
+      waitMs: 0,
+    }, { signal })).resolves.toMatchObject({
+      events: [{ body: { text: "durable local message", type: "user_message" } }],
+    });
+    await expect(value.service.execute({
+      kind: "session.transcript",
+      limit: 20,
+      session: idle.id,
+    }, { signal })).resolves.toMatchObject({
+      records: [{ actor: "human", kind: "user", text: "durable local message" }],
+      sessionId: idle.id,
+    });
+
+    const refusal = {
+      code: "UNAVAILABLE",
+      details: { provider: "claude", reason: "claude_isolation_acceptance_pending" },
+    };
+    const effectKeys = [
+      "00000000-0000-4000-8000-000000000716",
+      "00000000-0000-4000-8000-000000000717",
+      "00000000-0000-4000-8000-000000000718",
+      "00000000-0000-4000-8000-000000000719",
+    ] as const;
+    await expect(value.service.execute({
+      idempotencyKey: effectKeys[0],
+      kind: "session.send",
+      message: "do not send",
+      session: idle.id,
+    }, { signal })).rejects.toMatchObject(refusal);
+    await expect(value.service.execute({
+      idempotencyKey: effectKeys[1],
+      kind: "session.steer",
+      message: "do not steer",
+      session: idle.id,
+    }, { signal })).rejects.toMatchObject(refusal);
+    await expect(value.service.execute({
+      idempotencyKey: effectKeys[2],
+      kind: "session.stop",
+      session: idle.id,
+    }, { signal })).rejects.toMatchObject(refusal);
+    await expect(value.service.execute({
+      idempotencyKey: effectKeys[3],
+      kind: "session.queue",
+      message: "do not queue",
+      session: idle.id,
+    }, { signal })).rejects.toMatchObject(refusal);
+    for (const key of effectKeys) expect(value.store.readMutation(key)).toBeNull();
+    expect(value.store.listQueue(idle.id)).toHaveLength(1);
+
+    const interaction = value.store.admitInteraction({
+      authority: {
+        approvalId: null,
+        connectionId: "10000000-0000-4000-8000-000000000091",
+        itemId: "toolu_darwin",
+        method: "claude/control_request/can_use_tool",
+        ...value.store.requireProviderAccountAuthority(profile.id, "claude"),
+        requestDigest: "a".repeat(64),
+        requestId: { type: "string", value: "darwin-request" },
+        threadId: "claude-thread-darwin-idle",
+        turnId: "claude-turn-darwin",
+      },
+      blocking: true,
+      display: {
+        availableDecisions: ["once", "decline", "cancel"],
+        commandClass: "shell",
+        kind: "command_approval",
+        reason: null,
+        summary: "Do not resolve on Darwin",
+        workingDirectory: null,
+      },
+      kind: "command_approval",
+      publicId: "10000000-0000-4000-8000-000000000092",
+      sessionId: idle.id,
+    }).record;
+    await expect(value.service.execute({
+      expectedRevision: interaction.revision,
+      interaction: interaction.publicId,
+      kind: "interaction.resolve",
+      resolution: { decision: "once", kind: "approval_decision" },
+    }, { signal })).rejects.toMatchObject(refusal);
+    expect(value.store.requireInteraction(interaction.publicId)).toMatchObject({
+      revision: interaction.revision,
+      state: "pending",
+    });
+
+    const recoveryCreated = value.store.createSession({
+      fastEnabled: false,
+      preset: "fable-max",
+      profileId: profile.id,
+      provider: "claude",
+    });
+    const recoveryBound = value.store.bindSession({
+      expectedRevision: recoveryCreated.revision,
+      providerThreadId: "claude-thread-darwin-recovery",
+      sessionId: recoveryCreated.id,
+      state: "idle",
+    });
+    value.store.quarantineSession(recoveryBound.id);
+    await expect(value.service.execute({
+      kind: "session.recover",
+      session: recoveryBound.id,
+    }, { signal })).rejects.toMatchObject(refusal);
+    await expect(value.service.execute({
+      kind: "session.abandon",
+      session: recoveryBound.id,
+    }, { signal })).resolves.toMatchObject({
+      recovery: { providerEffectRetried: false, resolution: "abandoned" },
+      session: { state: "terminal" },
+    });
+    expect(value.providerSessionCalls).toEqual([]);
+  });
+
+  test("validates a supplied Claude login key before signed-in short-circuiting", async () => {
+    const value = await claudeAccountFixture(true);
+    const first = value.store.createProfile("First");
+    const second = value.store.createProfile("Second");
+    const wrongKind = "00000000-0000-4000-8000-000000000705";
+    value.store.prepareMutation({
+      kind: "account.logout",
+      authorityId: first.id,
+      authorityGeneration: first.processGeneration,
+      request: {},
+      idempotencyKey: wrongKind,
+    });
+    await expect(value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: first.id,
+      idempotencyKey: wrongKind,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+
+    const wrongAccount = "00000000-0000-4000-8000-000000000706";
+    value.store.prepareMutation({
+      kind: "account.claude-login",
+      authorityId: first.id,
+      authorityGeneration: first.processGeneration,
+      request: { provider: "claude" },
+      idempotencyKey: wrongAccount,
+    });
+    await expect(value.service.execute({
+      kind: "account.claude-login.prepare",
+      account: second.id,
+      idempotencyKey: wrongAccount,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
   });
 
   test("returns ID-only signed-out recovery guidance for provider operations", async () => {
@@ -2338,6 +3471,39 @@ describe("HraService", () => {
     }]);
   });
 
+  test("refuses local and remote preset changes until session recovery settles", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Recovery preset fence");
+    const quarantined = value.store.quarantineSession(sessionId);
+    const profile = value.store.requireProfileById(quarantined.profileId);
+    if (quarantined.providerThreadId === undefined) throw new Error("Expected provider binding.");
+    const refusal = {
+      code: "RECOVERY_REQUIRED",
+      message: "The session requires recovery before its model preset can change.",
+    };
+
+    await expect(value.service.execute({
+      kind: "session.preset",
+      preset: "high",
+      session: sessionId,
+    }, { signal })).rejects.toMatchObject(refusal);
+    await expect(value.service.executeRemote({
+      idempotencyKey: "00000000-0000-4000-8000-0000000006c1",
+      kind: "session.preset",
+      preset: "high",
+      session: sessionId,
+    }, {
+      ...value.store.requireProviderAccountAuthority(profile.id, quarantined.provider),
+      providerThreadId: quarantined.providerThreadId,
+      sessionId,
+    }, { signal })).rejects.toMatchObject(refusal);
+    expect(value.store.requireSession(sessionId)).toMatchObject({
+      preset: "high",
+      revision: quarantined.revision,
+      state: "recovery_required",
+    });
+  });
+
   test("reactivates stale live memory with a current TTL and does not churn epochs on unchanged resume", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     factsMemory.simulateExpiry = true;
@@ -3316,10 +4482,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }, { version: 37 }]);
+      ).all()).toEqual(Array.from({ length: 17 }, (_, index) => ({ version: index + 25 })));
     } finally {
       inspector.close(false);
     }
@@ -5817,6 +6983,53 @@ describe("HraService", () => {
     await service.settled();
     expect(store.requireQueue(queued.queued.id)).toMatchObject({ state: "applied" });
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
+    expect(codex.turnReviewRequests.at(-1)?.requirement).toEqual({
+      model: "gpt-5.6-sol",
+      effort: "max",
+    });
+    expect(store.latestSessionRuntimeProfile(imported.id)?.profile).toMatchObject({
+      preset: "high",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max",
+    });
+  });
+
+  test("sends an imported session with its legacy exact preset requirement", async () => {
+    const { service, codex, documents, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Imported send" }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Imported send docs", path: documents }, { signal });
+    const project = store.listProjects()[0];
+    if (project === undefined) throw new Error("Expected the imported session project.");
+    const imported = store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(added.account.id, "codex"),
+      projectId: project.id,
+      providerThreadId: "provider-thread-imported-send",
+      title: "Imported send",
+      state: "idle",
+      providerUpdatedAt: 10,
+    });
+    codex.readProjection = {
+      ...codex.readProjection,
+      providerThreadId: "provider-thread-imported-send",
+    };
+    codex.turnStatus = "completed";
+
+    await service.execute({
+      kind: "session.send",
+      session: imported.id,
+      message: "keep the admitted model",
+    }, { signal });
+
+    expect(codex.turnReviewRequests.at(-1)?.requirement).toEqual({
+      model: "gpt-5.6-sol",
+      effort: "max",
+    });
+    expect(store.latestSessionRuntimeProfile(imported.id)?.profile).toMatchObject({
+      preset: "high",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max",
+    });
   });
 
   test("retries bounded pre-evidence baseline and capability failures without replaying a provider effect", async () => {
@@ -6084,6 +7297,34 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(1);
     expect(JSON.stringify(store.readMutation(idempotencyKey)?.result)).not.toContain("ABCD-EFGH");
     expect(JSON.stringify(store.readMutation(idempotencyKey)?.result)).not.toContain("secret=1");
+  });
+
+  test("an explicitly keyed login on a signed-in account has no authority or session effect", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Already linked");
+    const beforeSession = value.store.requireSession(sessionId);
+    const beforeProfile = value.store.requireProfileById(beforeSession.profileId);
+    const loginCalls = value.codex.calls.filter((call) => call.startsWith("login:")).length;
+    const idempotencyKey = "00000000-0000-4000-8000-000000000119";
+
+    await expect(value.service.execute({
+      kind: "account.login",
+      account: beforeProfile.id,
+      deviceCode: true,
+      idempotencyKey,
+    }, { signal })).resolves.toMatchObject({
+      account: {
+        id: beforeProfile.id,
+        processGeneration: beforeProfile.processGeneration,
+        state: "signed_in",
+      },
+      login: { status: "signed_in" },
+    });
+
+    expect(value.store.requireProfileById(beforeProfile.id)).toEqual(beforeProfile);
+    expect(value.store.requireSession(sessionId)).toEqual(beforeSession);
+    expect(value.store.readMutation(idempotencyKey)).toBeNull();
+    expect(value.codex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(loginCalls);
   });
 
   test("returns terminal signed-in evidence when replaying a formerly pending login after provider completion", async () => {
@@ -7018,7 +8259,7 @@ describe("HraService", () => {
     ));
   });
 
-  test("retires a lost pending-login response across daemon rollover before exact read reconciliation", async () => {
+  test("preserves a lost pending-login response across daemon rollover for exact cancellation without replay", async () => {
     const { service, codex, store, paths } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Restart login" }, { signal }) as { account: { id: `acct_${string}` } };
     const idempotencyKey = "00000000-0000-4000-8000-000000000119";
@@ -7047,9 +8288,13 @@ describe("HraService", () => {
     const daemonGeneration = store.nextDaemonGeneration(`boot_${"a".repeat(32)}`);
     expect(store.requireProfile(added.account.id)).toMatchObject({
       processGeneration: 2,
-      state: "recovery_required",
+      state: "login_pending",
     });
-    expect(store.readPendingLoginAuthority(added.account.id, 2)).toBeNull();
+    expect(store.readPendingLoginAuthority(added.account.id, 2)).toMatchObject({
+      attemptId: originalAttempt.id,
+      loginId: "provider-login-restart",
+      processGeneration: 2,
+    });
     expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
 
     const restartedCodex = new FakeCodex();
@@ -7069,21 +8314,49 @@ describe("HraService", () => {
       kind: "account.show",
       account: added.account.id,
     }, { signal })).toMatchObject({
-      account: { processGeneration: 2, state: "signed_out" },
-      recovery: { cleared: true, required: false, resolution: "provider_state_reconciled" },
+      account: { processGeneration: 2, state: "login_pending" },
+      login: {
+        status: "pending",
+        loginId: "provider-login-restart",
+        next: `hra account login-cancel ${added.account.id}`,
+      },
     });
-    await expect(restarted.execute({
+    const replay = await restarted.execute({
       kind: "account.login",
       account: added.account.id,
       deviceCode: true,
       idempotencyKey,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    }, { signal }) as { account: { processGeneration: number }; login: Record<string, unknown> };
+    expect(replay.account.processGeneration).toBe(2);
+    expect(replay.login).toEqual({
+      status: "pending",
+      loginId: "provider-login-restart",
+      next: `hra account login-cancel ${added.account.id}`,
+    });
+    expect(JSON.stringify(replay)).not.toContain("PRIVATE-CODE");
+    expect(JSON.stringify(replay)).not.toContain("private=handoff");
     expect(restartedCodex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(0);
+    expect(() => store.settlePendingLogin({
+      profileId: added.account.id,
+      processGeneration: 2,
+      loginId: "wrong-provider-login",
+      providerStatus: "not_found",
+      provider: { signedIn: false },
+    })).toThrow("LOGIN_CANCEL_AUTHORITY_MISMATCH");
+    expect(await restarted.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+    }, { signal })).toMatchObject({
+      account: { state: "signed_out" },
+      providerStatus: "not_found",
+      status: "canceled",
+    });
+    expect(restartedCodex.calls).toContain(`login-cancel:${added.account.id}:2:provider-login-restart`);
     expect(await restarted.execute({
       kind: "account.login-cancel",
       account: added.account.id,
     }, { signal })).toMatchObject({ status: "already_settled" });
-    expect(restartedCodex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
     const attempt = store.readMutation(idempotencyKey);
     if (attempt === null) throw new Error("Expected the retired login mutation.");
     expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(capturedProviderAuthorities);
@@ -7113,7 +8386,7 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
   });
 
-  test("retires pending-login cancellation authority across an unexpected provider disconnect", async () => {
+  test("preserves exact pending-login cancellation authority across an unexpected provider disconnect", async () => {
     const { service, codex, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Disconnected login" }, { signal }) as { account: { id: `acct_${string}` } };
     codex.loginResult = { status: "pending", loginId: "provider-login-disconnected" };
@@ -7125,25 +8398,30 @@ describe("HraService", () => {
     });
     expect(store.requireProfile(added.account.id)).toMatchObject({
       processGeneration: 2,
-      state: "recovery_required",
+      state: "login_pending",
     });
     expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
-    expect(store.readPendingLoginAuthority(added.account.id, 2)).toBeNull();
+    expect(store.readPendingLoginAuthority(added.account.id, 2)).toMatchObject({
+      loginId: "provider-login-disconnected",
+      processGeneration: 2,
+    });
     codex.accountProjection = { signedIn: false };
     codex.cancelLoginResult = { status: "not_found" };
     await expect(service.execute({
       kind: "account.login-cancel",
       account: added.account.id,
-    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
+    }, { signal })).resolves.toMatchObject({
+      account: { state: "signed_out" },
+      status: "canceled",
+    });
+    expect(codex.calls).toContain(`login-cancel:${added.account.id}:2:provider-login-disconnected`);
     await expect(service.execute({
       kind: "account.show",
       account: added.account.id,
     }, { signal })).resolves.toMatchObject({
       account: { processGeneration: 2, state: "signed_out" },
-      recovery: { cleared: true, required: false, resolution: "provider_state_reconciled" },
     });
-    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
   });
 
   test("rejects an idempotency key reused across account authorities without mutating the second account", async () => {
@@ -7287,7 +8565,7 @@ describe("HraService", () => {
 
     const [session] = store.listSessions();
     expect(session).toMatchObject({ state: "recovery_required" });
-    expect(session?.providerThreadId).toBeUndefined();
+    expect(session?.providerThreadId).toBe("provider-thread");
     if (session === undefined) throw new Error("The quarantined session is missing.");
     await expect(service.execute({ kind: "session.send", session: session.id, message: "must not dispatch", idempotencyKey: "00000000-0000-4000-8000-000000000402" }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -7374,8 +8652,8 @@ describe("HraService", () => {
     await restarted.recover();
     expect(restartedCodex.calls.filter((call) => call === "send")).toHaveLength(0);
 
-    await expect(restarted.execute({ kind: "session.recover", session: started.session.id }, { signal }))
-      .resolves.toMatchObject({
+    expect(await restarted.execute({ kind: "session.recover", session: started.session.id }, { signal }))
+      .toMatchObject({
         idempotencyKey: key,
         session: { state: "active", activeTurnId: "turn-next" },
         recovery: { resolved: true, resolution: "proven_applied", providerEffectRetried: false },
@@ -7389,6 +8667,59 @@ describe("HraService", () => {
     expect(restartedCodex.calls.filter((call) => call === "send")).toHaveLength(0);
     expect(restartedCodex.calls.filter((call) => call === "read")).toHaveLength(1);
     await restarted.close();
+  });
+
+  test("rejects missing or replaced immutable send authority after rollover before a provider read", async () => {
+    for (const corruption of ["missing", "binding"] as const) {
+      const value = await fixture();
+      const { service, codex, documents, store } = value;
+      const added = await service.execute({ kind: "account.add", label: "Fenced rollover" }, { signal }) as { account: { id: `acct_${string}` } };
+      await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+      await service.execute({ kind: "project.add", label: "Fenced docs", path: documents }, { signal });
+      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+      const key = crypto.randomUUID();
+      codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 44);
+      await expect(service.execute({ kind: "session.send", session: started.session.id, message: "immutable", idempotencyKey: key }, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      const attempt = store.readMutation(key);
+      if (attempt === null) throw new Error("Expected the uncertain send.");
+      const readAuthorities = store.readMutationProviderAuthorities.bind(store);
+      const original = readAuthorities(attempt.id);
+      const daemonGeneration = store.nextDaemonGeneration(`boot_${"e".repeat(32)}`);
+      const restartedCodex = new FakeCodex();
+      restartedCodex.readProjection = codex.readProjection;
+      const restarted = new HraService({
+        store,
+        paths: value.paths,
+        codex: restartedCodex,
+        cloud: new FakeCloud(),
+        daemonAuthority: new FakeDaemonAuthority(),
+        daemonGeneration,
+        requestStop: () => undefined,
+      });
+      await restarted.recover();
+      Object.defineProperty(store, "readMutationProviderAuthorities", {
+        configurable: true,
+        value: (attemptId: Parameters<StateStore["readMutationProviderAuthorities"]>[0]) => {
+          const recorded = readAuthorities(attemptId);
+          if (attemptId !== attempt.id) return recorded;
+          return corruption === "missing" ? [] : recorded.map((entry) => ({
+            ...entry,
+            authority: { ...entry.authority, bindingGeneration: entry.authority.bindingGeneration + 1 },
+          }));
+        },
+      });
+      try {
+        await expect(restarted.execute({ kind: "session.recover", session: started.session.id }, { signal }))
+          .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+        expect(restartedCodex.calls.filter((call) => call === "read" || call === "send")).toHaveLength(0);
+        expect(store.requireSession(started.session.id).state).toBe("recovery_required");
+      } finally {
+        Object.defineProperty(store, "readMutationProviderAuthorities", { configurable: true, value: readAuthorities });
+        await restarted.close();
+      }
+      expect(readAuthorities(attempt.id)).toEqual(original);
+    }
   });
 
   test("rejects noncausal recovery proof and releases an unbound start only by explicit abandon", async () => {
@@ -11270,6 +12601,26 @@ describe("HraService", () => {
     expect(() => value.store.requireSessionProviderAuthority(sessionId))
       .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
     await restarted.close();
+  });
+
+  test("quarantines the matching provider when runtime close throws synchronously", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Synchronous close failure");
+    const session = value.store.requireSession(sessionId);
+    const generation = value.store.requireProfileById(session.profileId).processGeneration;
+    let closeCalls = 0;
+    Object.defineProperty(value.codex, "close", {
+      configurable: true,
+      value: () => {
+        closeCalls += 1;
+        throw new Error("synchronous Codex close failure");
+      },
+    });
+
+    await expect(value.service.close()).rejects.toThrow("synchronous Codex close failure");
+    expect(closeCalls).toBe(1);
+    expect(value.store.requireSession(sessionId).state).toBe("recovery_required");
+    expect(value.store.requireProfileById(session.profileId).processGeneration).toBe(generation);
   });
 
   test("crash restart atomically fences the old generation and terminalizes ambiguous interaction states", async () => {

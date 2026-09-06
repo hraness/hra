@@ -1,6 +1,8 @@
 <!-- hra-local-efficiency:start -->
 ## HRA local efficiency
 
+- The bootstrap configures Codex for `on-request` approval with automatic review and a workspace permission boundary. Treat auto-review as the reviewer, not as permission to expand sandbox, network, or repository scope.
+- Treat the user's task request and repository instructions as standing authorization for routine task-owned commits, pushes, pull requests, merges, releases, and deployments after required validation and gates pass. Do not ask for duplicate confirmation. Prefer repository workload identities and OIDC over personal sessions or long-lived credentials.
 - Preserve useful agent fan-out. Do not cap agents merely to reduce their count.
 - Prefer bounded subagents in the current task for research, review, diagnosis, and focused checks when they can safely share one working tree. Create another Codex task or worktree only for independently deliverable divergent edits, an intentionally isolated verification tree, or a different execution environment.
 - Workers own focused validation and report exact commands and results. One integration owner reviews that evidence and runs the repository aggregate/final gate after convergence. Repeat a focused command only when its inputs changed, evidence is missing, or a repair invalidated it.
@@ -13,5 +15,5 @@
 - Keep roots and integrators on the caller-selected model. Bounded independent workers may use Terra or Luna through the installed profiles when their task is mechanical or high-volume; measure repair rate and promote difficult work.
 - At closeout, record the final branch, PR, checks, merge, release, deployment, and production evidence that applies. Archive only conclusively finished tasks; silence is never sufficient evidence. Reclaim only freshly revalidated clean merged worktrees through the guarded exact-path flow.
 - Use `$hra-local-efficiency` for guarded cleanup, stale-task audits, scheduler diagnostics, privacy-safe throughput reports, CI ref audits, validation receipts, and machine adoption. This baseline does not configure or optimize cloud execution.
-- The bootstrap installs a prompt-only rule for the absolute host scheduler. That rule grants no permission; configured Codex approval or auto-review still inspects each complete invocation, and a new Codex task is required after installation or update for the rule to load.
+- The bootstrap installs a prompt-only rule for the absolute host scheduler. That rule grants no permission; Codex auto-review still inspects each complete invocation, and a new Codex task is required after installation or update for configuration and rules to load.
 <!-- hra-local-efficiency:end -->

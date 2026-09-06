@@ -36,6 +36,10 @@ const maximumEvidenceBytes = 256 * 1024;
 export const PROTECTED_EVIDENCE_DESCRIPTOR_MAXIMUM = 0x7fff_ffff;
 const commitSchema = z.string().regex(/^[0-9a-f]{40}$/u);
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
+const packageVersionSchema = z.string()
+  .min(5)
+  .max(128)
+  .regex(/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u);
 const positiveIntegerSchema = z.number().int().positive().safe();
 const timestampSchema = z.number().int().nonnegative().safe();
 const deploymentNameSchema = z.string()
@@ -134,7 +138,7 @@ export const liveAcceptanceEvidenceDocumentSchema = z.object({
   deployEvidenceDigest: digestSchema,
   evidenceDigest: digestSchema,
   kind: z.literal("live-acceptance"),
-  packageVersion: z.literal(HRA_RELEASE_VERSION),
+  packageVersion: packageVersionSchema,
   runId: z.string().uuid(),
   runtimeRevision: z.string().uuid(),
   schemaVersion: z.literal(1),

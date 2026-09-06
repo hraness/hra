@@ -1,8 +1,9 @@
 ---
 name: hra-local-efficiency
 description: >-
-  Install, audit, and operate the Hraness local Codex efficiency baseline across
-  repositories and Macs. Use for Codex swarm throughput, host-wide
+  Install, audit, and operate the Hraness local Codex and Claude Code efficiency
+  and approval-autonomy baseline across repositories and Macs. Use for managed
+  agent permission defaults, repository delivery guidance, Codex swarm throughput, host-wide
   heavyweight-command scheduling, capability lanes, privacy-safe telemetry,
   validation ownership and exact-tree receipts, stale-task reporting, guarded
   Git worktree cleanup, complete-history CI ref isolation, model-lane setup, or
@@ -13,16 +14,25 @@ description: >-
 
 # HRA local efficiency
 
-Keep parallel reasoning. Reduce duplicated validation, conflicting local
-compute, unnecessary checkouts, stale state, and verified disposable disk use.
+Keep parallel reasoning and routine authorized delivery moving without human
+prompt churn. Reduce duplicated validation, conflicting local compute,
+unnecessary checkouts, stale state, and verified disposable disk use while
+preserving sandbox, provider, repository, and release gates.
 
 ## Choose the mode
 
 - **Install or update this Mac:** run `bun run scripts/bootstrap.ts --apply`
-  from this skill directory, then run it again with `--check`.
-- **Inspect this Mac:** run `bun run scripts/workspace-audit.ts` and
-  `bun run scripts/session-audit.ts`. Both are read-only by default. Add
+  from this skill directory, then run it again with `--check`. This manages
+  Codex automatic approval review and workspace permissions plus Claude Code
+  Auto mode and global guidance; it never enables a bypass-permissions mode.
+- **Inspect this Mac:** run `hra-local-efficiency --json` (or
+  `bun run scripts/doctor.ts --json`) to check the managed global Codex and
+  Claude settings, then run `bun run scripts/workspace-audit.ts` and
+  `bun run scripts/session-audit.ts`. All three are read-only. Add
   `--sizes` only when the slower recursive worktree-size estimate is useful.
+  The workspace audit reports each Hraness repository's managed guidance
+  status; use `repo-adoption.ts --apply --root ABSOLUTE-REPO` for each reported
+  `needs-update` repository.
 - **Measure local throughput:** run `hra-throughput-report` for the bounded,
   privacy-safe scheduler history. Treat repeat command digests and silent tasks
   as review heuristics, never as proof of waste or abandonment.
@@ -40,7 +50,9 @@ compute, unnecessary checkouts, stale state, and verified disposable disk use.
   `worktree-cleanup.ts` separately in each owning repository with every approved
   absolute path named through `--remove`.
 - **Adopt or check repository guidance:** use `repo-adoption.ts --check` or
-  `--apply`. It edits only the exact managed policy block in a root `AGENTS.md`.
+  `--apply`. It edits only the exact managed policy block in root `AGENTS.md`
+  and adds an `@AGENTS.md` import to root `CLAUDE.md` while preserving existing
+  Claude-specific guidance.
 - **Audit CI ref isolation:** use `hra-ci-ref-audit --root ABSOLUTE-REPO`. Review
   every candidate; fix only workflows whose complete-history gate can import
   unrelated refs, and preserve the complete-history scan itself.
@@ -52,6 +64,16 @@ runtime in the user's local data directory; it never replaces a global Atet
 package or command.
 
 ## Preserve the invariants
+
+- Treat a user request that places a repository and outcome in scope as
+  standing authorization for routine task-owned commits, pushes, pull requests,
+  merges, releases, and deployments after required gates pass. Do not ask for a
+  second conversational confirmation. Runtime denials, missing credentials, and
+  material product decisions still stop the work.
+- Prefer short-lived repository workload identities, npm trusted publishing,
+  and scoped GitHub App tokens over personal sessions and reusable secrets.
+  Batch unavoidable interactive authentication at the final boundary rather
+  than spreading it across retries or releases.
 
 - Do not cap agent count merely to reduce fan-out. Parallel reasoning and
   independent implementation lanes remain desirable.
@@ -149,10 +171,28 @@ Never bypass the wrapper by running its child directly, remove scheduler or
 recovery state, weaken fail-closed custody, or create an unconditional allow
 rule for `hra-host-run`; it can wrap arbitrary child commands.
 
-The bootstrap manages a prompt-only Codex rule for the absolute installed
-wrapper. The rule makes every complete invocation reviewable but grants no
-permission. Codex loads rule files at task startup, so start a new task after
-installing or updating the baseline.
+The bootstrap sets Codex to `approval_policy = "on-request"`,
+`approvals_reviewer = "auto_review"`, and `default_permissions = ":workspace"`.
+It also manages a prompt-only Codex rule for the absolute installed wrapper.
+The rule makes every complete invocation reviewable but grants no permission.
+Codex loads configuration and rule files at task startup, so start a new task
+after installing or updating the baseline.
+
+When the installed Claude Code is at least 2.1.83 and
+`claude auto-mode config` confirms that the CLI exposes a valid Auto-mode
+configuration surface, the bootstrap sets
+`permissions.defaultMode = "auto"` and inherits its built-in classifier rules
+through `$defaults`. Because explicit allow rules resolve before the Auto
+classifier, the bootstrap removes bare or universal whole-tool allows and every wildcarded
+Bash or PowerShell allow while preserving exact commands, path-bounded
+non-shell allows, and every deny. Claude may apply additional runtime filtering. It
+does not globally declare sibling repositories or the public npm registry
+trusted. The doctor reports the machine capability
+decision. If the CLI does not expose that surface, bootstrap leaves the
+ordinary permission setting untouched. Account, model, and organization
+eligibility is enforced by Claude Code when a session starts rather than
+attested by the configuration command; if that runtime gate refuses Auto mode,
+use the ordinary permission mode and never fall back to bypass permissions.
 
 ## Validation receipts
 
@@ -207,11 +247,14 @@ guarded cleanup.
 
 ## Machine standard
 
-`bootstrap.ts` manages one marked block in the global Codex `AGENTS.md`, two
-optional CLI profiles, a prompt-only host-access rule, a minimal private
-scheduler runtime, and convenience commands. It preserves all content outside
-its markers, leaves exact profile symlinks intact, and refuses conflicting
-unmanaged targets. Use `--check` in automation and after plugin upgrades.
+`bootstrap.ts` manages one marked block in global Codex `AGENTS.md`, three
+top-level Codex permission settings, one marked block in global Claude
+`CLAUDE.md`, Claude's Auto-mode default, bounded environment, and broad-allow
+cleanup, two optional
+CLI profiles, a prompt-only host-access rule, a minimal private scheduler
+runtime, and convenience commands. It preserves unrelated TOML, JSON, Markdown,
+and rule content, leaves exact profile symlinks intact, and refuses unsafe
+targets. Use `--check` in automation and after plugin upgrades.
 
 The HRA repository marketplace is the cross-machine source of truth. Upgrade
 the marketplace and reinstall the plugin, then rerun bootstrap and start a new

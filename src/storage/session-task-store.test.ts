@@ -72,6 +72,8 @@ CREATE TABLE session_switch_attempts (
   original_authority_revision INTEGER,
   source_preset TEXT,
   target_preset TEXT,
+  source_preset_contract INTEGER,
+  target_preset_contract INTEGER,
   stream_epoch TEXT,
   transcript_digest TEXT,
   seed_digest TEXT,

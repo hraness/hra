@@ -296,37 +296,29 @@ describe("terminal-safe CLI boundaries", () => {
         calls += 1;
         throw new Error("must not be called");
       },
-    })).toBe(6);
+    })).toBe(2);
     expect(calls).toBe(0);
     expect(json.read().stderr).toBe("");
     expect(json.read().stdout.length).toBeLessThan(2_048);
     expect(json.read().stdout).not.toContain("\u001b");
     expect(json.read().stdout).not.toContain("\u0007");
     expect(json.read().stdout).not.toContain("\u202e");
+    expect(json.read().stdout).not.toContain("touch nope");
+    expect(json.read().stdout).not.toContain("owned");
     const response = JSON.parse(json.read().stdout) as {
       error: {
         code: string;
-        details: {
-          acknowledgementRequired: string;
-          idempotencyKey: string;
-          nextCommand: string;
-        };
       };
       ok: boolean;
       version: number;
     };
     expect(response).toMatchObject({
       error: {
-        code: "INTERACTION_REQUIRED",
-        details: { acknowledgementRequired: "--acknowledge-gap" },
+        code: "INVALID_INPUT",
       },
       ok: false,
       version: 1,
     });
-    expect(isUuidV7(response.error.details.idempotencyKey)).toBe(true);
-    expect(response.error.details.nextCommand).toContain(
-      `--idempotency-key ${response.error.details.idempotencyKey} --json`,
-    );
   });
 
   test("projection recovery generates a UUIDv7 before transport and exposes bounded append-only evidence", async () => {

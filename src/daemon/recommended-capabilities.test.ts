@@ -35,7 +35,7 @@ const authority = {
 };
 const preset = {
   alias: "high" as const,
-  model: "gpt-5.6-sol",
+  model: "gpt-6-astra",
   effort: "max" as const,
   serviceTier: null,
   fast: false,
@@ -48,7 +48,7 @@ describe("recommended capability projection", () => {
       processGeneration: 7,
       observedAt: 42,
       preset: "high",
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "max",
       serviceTier: null,
       fast: false,

@@ -2,8 +2,11 @@ import { describe, expect, test } from "bun:test";
 
 import fc from "fast-check";
 
+import { localCommandSchema } from "../domain/contracts";
 import {
   CliUsageError,
+  claudeAccountLoginAbandonCommand,
+  claudeAccountLoginCommand,
   completeProtectedAuthLogin,
   deviceMutationReplayCommand,
   completeProtectedInteraction,
@@ -73,6 +76,79 @@ describe("CLI parser", () => {
       kind: "account.login-handoff",
       replayCommand: expect.stringContaining("--handoff-file /absolute/path/to/empty-protected-login.json"),
     });
+    expect(parseCli(["account", "login", "personal", "--provider", "codex"])).toMatchObject({
+      kind: "account.login-handoff",
+      command: { account: "personal", deviceCode: false, kind: "account.login" },
+    });
+  });
+
+  test("keeps Claude login and status in a provider-scoped foreground CLI flow", () => {
+    const generated = parseCli(["account", "login", "personal", "--provider", "claude"]);
+    expect(generated).toMatchObject({
+      command: { account: "personal", kind: "account.claude-login.prepare" },
+      json: false,
+      kind: "account.claude-login",
+    });
+    if (generated.kind !== "account.claude-login") throw new Error("expected Claude login");
+    expect(generated.command.idempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(generated.replayCommand).toContain(generated.command.idempotencyKey);
+
+    const key = "00000000-0000-4000-8000-000000000101";
+    expect(parseCli(["account", "login", " personal ", "--provider", "claude", "--idempotency-key", key, "--json"])).toEqual({
+      command: { account: "personal", idempotencyKey: key, kind: "account.claude-login.prepare" },
+      json: true,
+      kind: "account.claude-login",
+      replayCommand: `hra account login personal --provider claude --idempotency-key ${key}`,
+    });
+    expect(parseCli(["account", "show", "personal", "--provider", "claude", "--json"])).toEqual({
+      command: { account: "personal", kind: "account.show", provider: "claude" },
+      json: true,
+      kind: "command",
+    });
+    expect(parseCli(["account", "show", "personal", "--provider", "codex"])).toEqual({
+      command: { account: "personal", kind: "account.show" },
+      json: false,
+      kind: "command",
+    });
+
+    for (const argv of [
+      ["account", "login", "personal", "--provider", "claude", "--device-code"],
+      ["account", "login", "personal", "--provider", "claude", "--handoff-file", "/private/login.json"],
+      ["account", "login-cancel", "personal", "--provider", "claude"],
+      ["account", "login", "personal", "--provider", "other"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+
+    expect(() => parseCli(["account", "login", "x".repeat(201), "--provider", "claude", "--json"]))
+      .toThrow(CliUsageError);
+    expect(() => parseCli(["account", "login", "bad\nselector", "--provider", "claude", "--json"]))
+      .toThrow("control characters");
+    expect(claudeAccountLoginCommand("work profile; false")).toBe(
+      "hra account login 'work profile; false' --provider claude",
+    );
+
+    const attemptId = `attempt_${"a".repeat(32)}`;
+    const abandon = claudeAccountLoginAbandonCommand("personal", attemptId, key, 7);
+    expect(abandon).toBe(
+      `hra account login-cancel personal --provider claude --attempt-id ${attemptId}`
+      + ` --provider-generation 7 --idempotency-key ${key} --acknowledge-child-exited`,
+    );
+    expect(parseCli(abandon.split(" ").slice(1))).toEqual({
+      command: {
+        acknowledgeChildExited: true,
+        account: "personal",
+        attemptId,
+        idempotencyKey: key,
+        kind: "account.claude-login.abandon",
+        providerGeneration: 7,
+      },
+      json: false,
+      kind: "command",
+    });
+    for (const argv of [
+      ["account", "login-cancel", "personal", "--provider", "claude", "--attempt-id", attemptId, "--provider-generation", "7", "--idempotency-key", key],
+      ["account", "login-cancel", "personal", "--provider", "claude", "--provider-generation", "7", "--idempotency-key", key, "--acknowledge-child-exited"],
+      ["account", "login-cancel", "personal", "--provider", "claude", "--attempt-id", attemptId, "--idempotency-key", key, "--acknowledge-child-exited"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
   });
 
   test("parses exact pending-login cancellation without accepting provider authority on argv", () => {
@@ -180,8 +256,10 @@ describe("CLI parser", () => {
   });
 
   test("chooses a session provider and its default preset", () => {
-    // Unchanged: no `--provider` means Codex with the existing default preset.
     expect(parseCli(["session", "start", "work"])).toMatchObject({
+      command: { kind: "session.start", preset: "ultra", provider: "codex" },
+    });
+    expect(parseCli(["session", "start", "work", "--preset", "high"])).toMatchObject({
       command: { kind: "session.start", preset: "high", provider: "codex" },
     });
     expect(parseCli(["session", "start", "work", "--provider", "claude"])).toMatchObject({
@@ -1512,6 +1590,10 @@ describe("CLI help", () => {
     const note = resolveUsage("session", "note");
     expect(note.usage).toContain("  hra session note get|edit|clear <session>\n  hra session note set <session> <note>");
     expect(note.usage).not.toContain("Examples:");
+
+    const claudeLogin = resolveUsage("account", "login");
+    expect(claudeLogin.usage).toContain("Claude login and status require Linux");
+    expect(claudeLogin.usage).toContain("macOS refuses before launching Claude");
   });
 
   test("falls back without echoing unknown groups or leaves", () => {
@@ -1528,6 +1610,8 @@ describe("CLI help", () => {
     expect(usage).not.toMatch(/[\u2018\u2019\u201c\u201d]/u);
     expect(usage).toContain("  hra help [<group> [<command>]]\n");
     expect(usage).toContain("Run `hra <group> --help` or `hra help <group> [<command>]` for command examples.");
+    expect(usage).toContain("Codex provider commands run on macOS and Linux");
+    expect(usage).toContain("Claude login, status, sessions, and\n  provider switches require Linux");
     for (const group of helpGroupNames) expect(usage).toContain(`hra ${group}`);
   });
 
@@ -1555,7 +1639,7 @@ describe("CLI help", () => {
 });
 
 describe("remote decisions and send-or-steer parsing", () => {
-  test("parses remote resolve and refuses session scope", () => {
+  test("keeps once payload compatibility but advertises only current CLI authority", () => {
     expect(parseCli([
       "remote", "resolve", "sess_a",
       "--interaction", "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b",
@@ -1570,12 +1654,25 @@ describe("remote decisions and send-or-steer parsing", () => {
         session: "sess_a",
       },
     });
+    expect(parseCli([
+      "remote", "resolve", "sess_a",
+      "--interaction", "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b",
+      "--revision", "2",
+      "--decision", "decline",
+    ])).toMatchObject({ command: { decision: "decline", kind: "remote.resolve" } });
     expect(() => parseCli(["remote", "resolve", "sess_a", "--interaction", "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b", "--revision", "2", "--decision", "session"]))
-      .toThrow("once|decline|cancel");
+      .toThrow("--decision decline");
+    expect(() => parseCli(["remote", "resolve", "sess_a", "--interaction", "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b", "--revision", "2", "--decision", "cancel"]))
+      .toThrow("--decision decline");
     expect(() => parseCli(["remote", "resolve", "sess_a", "--interaction", "nope", "--revision", "2", "--decision", "once"]))
       .toThrow("--interaction");
     expect(() => parseCli(["remote", "resolve", "sess_a", "--interaction", "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b", "--revision", "0", "--decision", "once"]))
       .toThrow("--revision");
+
+    const help = usageForGroup("remote");
+    expect(help).toContain("--decision <decline>");
+    expect(help).not.toContain("--decision <once");
+    expect(help).not.toContain("cancel");
   });
 
   test("parses remote send --or-steer", () => {
@@ -1585,6 +1682,145 @@ describe("remote decisions and send-or-steer parsing", () => {
     expect(parseCli(["remote", "send", "sess_a", "plain"])).toMatchObject({
       command: { kind: "remote.send", message: "plain", session: "sess_a" },
     });
+  });
+});
+
+describe("notification-hours parsing", () => {
+  test("parses status and a complete wall-clock CAS update", () => {
+    expect(parseCli(["notification-hours", "status", "--json"])).toEqual({
+      command: { kind: "notification-hours.status" },
+      json: true,
+      kind: "command",
+    });
+    expect(parseCli([
+      "notification-hours",
+      "set",
+      "--end",
+      "06:15",
+      "--timezone",
+      "America/Puerto_Rico",
+      "--revision",
+      "41",
+      "--start",
+      "22:30",
+    ])).toEqual({
+      command: {
+        endMinute: 6 * 60 + 15,
+        expectedRevision: 41,
+        kind: "notification-hours.set",
+        startMinute: 22 * 60 + 30,
+        timeZone: "America/Puerto_Rico",
+        version: 1,
+      },
+      json: false,
+      kind: "command",
+    });
+  });
+
+  test("rejects malformed clocks, zones, revisions, and unsupported authority", () => {
+    for (const clock of ["9:00", "24:00", "12:60", "12:00:00", "-1:00"]) {
+      expect(() => parseCli([
+        "notification-hours", "set",
+        "--start", clock,
+        "--end", "22:00",
+        "--timezone", "UTC",
+        "--revision", "1",
+      ])).toThrow("HH:MM");
+    }
+    for (const argv of [
+      ["notification-hours", "set", "--start", "10:00", "--end", "10:00", "--timezone", "UTC", "--revision", "1"],
+      ["notification-hours", "set", "--start", "10:00", "--end", "22:00", "--timezone", "Not/A_Real_Zone", "--revision", "1"],
+      ["notification-hours", "set", "--start", "10:00", "--end", "22:00", "--timezone", "UTC", "--revision", "0"],
+      ["notification-hours", "set", "--start", "10:00", "--end", "22:00", "--timezone", "UTC", "--revision", "1.5"],
+      ["notification-hours", "set", "--start", "10:00", "--end", "22:00", "--timezone", "UTC", "--revision", "1", "extra"],
+      ["notification-hours", "status", "extra"],
+      ["notification-hours", "replace"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+
+    expect(() => parseCli([
+      "notification-hours",
+      "status",
+      "--idempotency-key",
+      "00000000-0000-4000-8000-000000000203",
+    ])).toThrow("not supported");
+  });
+
+  test("keeps both local notification-hours command documents strict", () => {
+    expect(localCommandSchema.safeParse({
+      kind: "notification-hours.status",
+      extra: true,
+    }).success).toBe(false);
+    expect(localCommandSchema.safeParse({
+      kind: "notification-hours.set",
+      expectedRevision: 1,
+      version: 1,
+      startMinute: 600,
+      endMinute: 1_320,
+      timeZone: "UTC",
+      extra: true,
+    }).success).toBe(false);
+  });
+});
+
+describe("notification-email parsing", () => {
+  test("parses local status, enable, and disable CAS commands", () => {
+    expect(parseCli(["notification-email", "status", "--json"])).toEqual({
+      command: { kind: "notification-email.status" },
+      json: true,
+      kind: "command",
+    });
+    expect(parseCli([
+      "notification-email", "enable", "--revision", "7",
+    ])).toEqual({
+      command: {
+        expectedRevision: 7,
+        kind: "notification-email.enable",
+      },
+      json: false,
+      kind: "command",
+    });
+    expect(parseCli([
+      "notification-email", "disable", "--revision", "8", "--json",
+    ])).toEqual({
+      command: {
+        expectedRevision: 8,
+        kind: "notification-email.disable",
+      },
+      json: true,
+      kind: "command",
+    });
+  });
+
+  test("rejects missing or malformed revisions and unsupported authority", () => {
+    for (const argv of [
+      ["notification-email", "enable"],
+      ["notification-email", "enable", "--revision", "0"],
+      ["notification-email", "disable", "--revision", "1.5"],
+      ["notification-email", "disable", "--revision", "1", "extra"],
+      ["notification-email", "status", "--revision", "1"],
+      ["notification-email", "replace", "--revision", "1"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+    expect(() => parseCli([
+      "notification-email",
+      "status",
+      "--idempotency-key",
+      "00000000-0000-4000-8000-000000000204",
+    ])).toThrow("not supported");
+  });
+
+  test("documents only the local closed command set", () => {
+    const help = usageForGroup("notification-email");
+    expect(help).toContain("notification-email enable|disable --revision <n>");
+    expect(help).toContain("never claims recall");
+    expect(localCommandSchema.safeParse({
+      kind: "notification-email.enable",
+      expectedRevision: 1,
+      enabled: true,
+    }).success).toBe(false);
+    expect(localCommandSchema.safeParse({
+      kind: "notification-email.status",
+      revision: 1,
+    }).success).toBe(false);
   });
 });
 

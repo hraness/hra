@@ -10,6 +10,8 @@ export const SESSION_SWITCH_FENCE_SOURCE = `(
     journal.original_authority_revision,
     journal.source_preset,
     journal.target_preset,
+    journal.source_preset_contract,
+    journal.target_preset_contract,
     journal.stream_epoch,
     journal.transcript_digest,
     journal.seed_digest,

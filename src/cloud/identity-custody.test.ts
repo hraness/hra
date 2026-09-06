@@ -15,6 +15,7 @@ class MemoryCustody implements CloudSecretCustodyPort {
   readonly values = new Map<string, Readonly<{ generation: number; value: string }>>();
 
   read(slot: string): Promise<Readonly<{ generation: number; value: string }> | null> {
+    if (!/^[a-z][a-z0-9-]{0,63}$/u.test(slot)) throw new Error("Invalid secret slot.");
     return Promise.resolve(this.values.get(slot) ?? null);
   }
 
@@ -23,6 +24,7 @@ class MemoryCustody implements CloudSecretCustodyPort {
     expectedGeneration: number | null,
     value: string,
   ): Promise<Readonly<{ generation: number; value: string }> | null> {
+    if (!/^[a-z][a-z0-9-]{0,63}$/u.test(slot)) throw new Error("Invalid secret slot.");
     const current = this.values.get(slot) ?? null;
     if ((current?.generation ?? null) !== expectedGeneration) return Promise.resolve(null);
     const next = { generation: (current?.generation ?? -1) + 1, value };
@@ -31,6 +33,7 @@ class MemoryCustody implements CloudSecretCustodyPort {
   }
 
   clearIfGeneration(slot: string, expectedGeneration: number): Promise<boolean> {
+    if (!/^[a-z][a-z0-9-]{0,63}$/u.test(slot)) throw new Error("Invalid secret slot.");
     const current = this.values.get(slot);
     if (current?.generation !== expectedGeneration) return Promise.resolve(false);
     this.values.delete(slot);
@@ -66,7 +69,7 @@ async function write(
 }
 
 describe("cloud identity-scoped custody", () => {
-  test("preserves isolated A to B to A device, key, state, outbox, and journal authority", async () => {
+  test("preserves isolated A to B to A device, key, state, outbox, journal, and attention authority", async () => {
     const raw = new MemoryCustody();
     const unbound = await IdentityScopedCloudSecretCustody.open(raw);
     expect(unbound.activeUserPublicId).toBeNull();
@@ -86,6 +89,11 @@ describe("cloud identity-scoped custody", () => {
     await write(identityA, "cloud-state", "state-a");
     await write(identityA, "cloud-command-outbox", "outbox-a");
     await write(identityA, "cloud-daemon-journal", "journal-a");
+    await write(
+      identityA,
+      "cloud-attention-notification-reconciliation",
+      "attention-a",
+    );
 
     expect(await identityA.activateIdentity("user_bbbbbbbb")).toEqual({
       restartRequired: true,
@@ -101,6 +109,7 @@ describe("cloud identity-scoped custody", () => {
       "cloud-state",
       "cloud-command-outbox",
       "cloud-daemon-journal",
+      "cloud-attention-notification-reconciliation",
     ]) expect(await identityB.read(slot)).toBeNull();
     await write(identityB, "cloud-device", "device-b");
     await write(identityB, "cloud-account-key", "key-b");
@@ -108,6 +117,11 @@ describe("cloud identity-scoped custody", () => {
     await write(identityB, "cloud-state", "state-b");
     await write(identityB, "cloud-command-outbox", "outbox-b");
     await write(identityB, "cloud-daemon-journal", "journal-b");
+    await write(
+      identityB,
+      "cloud-attention-notification-reconciliation",
+      "attention-b",
+    );
 
     expect((await identityB.activateIdentity("user_aaaaaaaa")).restartRequired).toBe(true);
     const returnedA = await IdentityScopedCloudSecretCustody.open(raw);
@@ -118,6 +132,8 @@ describe("cloud identity-scoped custody", () => {
     expect((await returnedA.read("cloud-state"))?.value).toBe("state-a");
     expect((await returnedA.read("cloud-command-outbox"))?.value).toBe("outbox-a");
     expect((await returnedA.read("cloud-daemon-journal"))?.value).toBe("journal-a");
+    expect((await returnedA.read("cloud-attention-notification-reconciliation"))?.value)
+      .toBe("attention-a");
   });
 
   test("fences one opened identity to its exact selector generation", async () => {
@@ -140,6 +156,35 @@ describe("cloud identity-scoped custody", () => {
       .rejects.toThrow("Cloud identity selection changed; restart HRA.");
     const returnedA = await IdentityScopedCloudSecretCustody.open(raw);
     await returnedA.assertCurrentIdentity("user_aaaaaaaa");
+  });
+
+  test("fences only daemon attention custody before and after selector changes", async () => {
+    const raw = new MemoryCustody();
+    const unbound = await IdentityScopedCloudSecretCustody.open(raw);
+    expect(await unbound.read("cloud-attention-notification-reconciliation")).toBeNull();
+    await unbound.activateIdentity("user_aaaaaaaa");
+
+    const identityA = await IdentityScopedCloudSecretCustody.open(raw);
+    await write(
+      identityA,
+      "cloud-attention-notification-reconciliation",
+      "receipt-a",
+    );
+    await identityA.activateIdentity("user_bbbbbbbb");
+    await expect(identityA.read("cloud-attention-notification-reconciliation"))
+      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+    await expect(identityA.compareAndSwap(
+      "cloud-attention-notification-reconciliation",
+      0,
+      "stale-write",
+    )).rejects.toThrow("Cloud identity selection changed; restart HRA.");
+    await expect(identityA.clearIfGeneration(
+      "cloud-attention-notification-reconciliation",
+      0,
+    )).rejects.toThrow("Cloud identity selection changed; restart HRA.");
+
+    const identityB = await IdentityScopedCloudSecretCustody.open(raw);
+    expect(await identityB.read("cloud-attention-notification-reconciliation")).toBeNull();
   });
 
   test("fails closed on corrupt active identity custody", async () => {

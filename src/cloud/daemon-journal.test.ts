@@ -11,10 +11,13 @@ import {
   cloudProjectionRecoveryReceiptResult,
   cloudProjectionRecoveryWindowMs,
   CloudDaemonJournalRecoveryBlocker,
+  CustodyCloudAttentionNotificationReconciliation,
   completePendingCloudUsageAccount,
   createCloudProjectionRecoveryTerminalReceipt,
   CustodyCloudDaemonJournal,
   CustodyCloudSessionSyncCursor,
+  bindCloudAttentionNotificationReconciliationState,
+  emptyCloudAttentionNotificationReconciliationState,
   emptyCloudDaemonJournal,
   emptyCloudSessionSyncCursor,
   hasUnsettledCompactProjectionRecovery,
@@ -24,14 +27,18 @@ import {
   isProviderBoundCloudProjectionRecoveryLocalAuthority,
   matchesCloudProjectionRecoveryIdentity,
   parseCloudDaemonJournal,
+  parseCloudAttentionNotificationReconciliationState,
   parseCloudSessionSyncCursor,
   parseCloudProjectionRecoveryEntry,
   parseCloudProjectionRecoveryTerminalReceipt,
   providerDeletionProjectionRecoveryCode,
   quarantineUnprovableProviderProjectionRecoveries,
   pruneExpiredCloudProjectionRecoveryReceipts,
+  replaceCloudAttentionNotificationReconciliationDevice,
   sameCloudProjectionRecoveryEntry,
   sameCloudProjectionRecoveryTerminalReceipt,
+  setCloudAttentionNotificationPending,
+  settleCloudAttentionNotificationReconciliation,
   supersedeCloudProjectionRecoveryForProviderDeletion,
   terminalizeUnreservedPreparedCloudCommands,
   transitionCloudProjectionRecovery,
@@ -42,6 +49,7 @@ import {
   type CloudProjectionRecoveryTerminalReceipt,
   type LegacyCloudDaemonJournalState,
   type LegacyCloudDaemonJournalV2State,
+  type LegacyCloudDaemonJournalV4State,
   type LegacyCloudProjectionRecoveryJournalEntry,
   type PendingCloudUsageAccount,
   unprovableProviderAuthorityProjectionRecoveryCode,
@@ -178,7 +186,7 @@ function stateWith(
     projectionRecoveries,
     projectionRecoveryReceipts,
     usageAccounts: [],
-    version: 4,
+    version: 5,
   };
 }
 
@@ -313,7 +321,7 @@ function legacyJournalAtCanonicalBytes(targetBytes: number): LegacyCloudDaemonJo
     projectionRecoveries: [],
     projectionRecoveryReceipts: [],
     usageAccounts: [],
-    version: 4,
+    version: 5,
   });
   const metadataCharacters = metadataCiphertextCharactersForTarget(targetBytes, canonical);
   const state = canonical(metadataCharacters);
@@ -341,7 +349,7 @@ function journalAtBytesWithProviderThread(
     projectionRecoveries: [adjusted],
     projectionRecoveryReceipts: [],
     usageAccounts: [],
-    version: 4,
+    version: 5,
   });
   return build(metadataCiphertextCharactersForTarget(targetBytes, build));
 }
@@ -355,7 +363,7 @@ function journalAtBytesWithReceipt(targetBytes: number): CloudDaemonJournalState
     projectionRecoveries: [],
     projectionRecoveryReceipts: [completed],
     usageAccounts: [],
-    version: 4,
+    version: 5,
   });
   return build(metadataCiphertextCharactersForTarget(targetBytes, build));
 }
@@ -391,7 +399,7 @@ function journalBeforeRecoveryAtAppliedBytes(
     projectionRecoveries: [applied],
     projectionRecoveryReceipts: [],
     usageAccounts: [],
-    version: 4,
+    version: 5,
   });
   const metadataCharacters = metadataCiphertextCharactersForTarget(
     targetBytes,
@@ -433,7 +441,7 @@ function journalBeforeCommandAtTerminalBytes(
     projectionRecoveries: [],
     projectionRecoveryReceipts: [],
     usageAccounts: [],
-    version: 4,
+    version: 5,
   });
   const metadataCharacters = metadataCiphertextCharactersForTarget(
     targetBytes,
@@ -529,7 +537,7 @@ describe("cloud daemon journal", () => {
       projectionRecoveries: [],
       projectionRecoveryReceipts: [],
       usageAccounts: legacy.usageAccounts,
-      version: 4,
+      version: 5,
     });
   });
 
@@ -575,6 +583,46 @@ describe("cloud daemon journal", () => {
     })).toThrow("Cloud daemon journal is corrupt.");
   });
 
+  test("marks a v4 applied login without ciphertext for exact remote reconciliation", () => {
+    const legacy: LegacyCloudDaemonJournalV4State = {
+      commands: [],
+      deviceCommands: [{
+        authority: { bootGeneration: 2, bootId: "boot_12345678", fence: 1 },
+        commandPublicId: uuidV7(102),
+        kind: "account_login_start",
+        payloadDigest: digest("a"),
+        phase: "terminal",
+        requestingDevicePublicId: "device_browser1",
+        resultCode: "APPLIED",
+        resultDigest: digest("b"),
+        terminalState: "applied",
+      }],
+      pendingUsageAccount: null,
+      projectionRecoveries: [],
+      projectionRecoveryReceipts: [],
+      usageAccounts: [],
+      version: 4,
+    };
+
+    const migrated = parseCloudDaemonJournal(legacy);
+    expect(migrated.version).toBe(5);
+    expect(migrated.deviceCommands).toEqual([{
+      authority: { bootGeneration: 2, bootId: "boot_12345678", fence: 1 },
+      commandPublicId: uuidV7(102),
+      kind: "account_login_start",
+      legacyResultMissing: true,
+      payloadDigest: digest("a"),
+      phase: "terminal",
+      requestingDevicePublicId: "device_browser1",
+      resultCode: "APPLIED",
+      resultDigest: digest("b"),
+      terminalState: "applied",
+    }]);
+    expect(() => parseCloudDaemonJournal({ ...legacy, version: 5 })).toThrow(
+      "Cloud daemon journal is corrupt.",
+    );
+  });
+
   test("round-trips every active recovery phase and bounded baseline length", () => {
     fc.assert(fc.property(
       fc.constantFrom("prepared", "effect_started", "applied" as const),
@@ -592,8 +640,19 @@ describe("cloud daemon journal", () => {
   test("crash-journals only the bounded public interaction baseline exactly", () => {
     const baselineInteraction = {
       blocking: true,
+      detailMarkdown: "- Resolve this interaction on the machine.",
+      detailVersion: 2,
+      headline: "Interaction no longer accepts a response",
       interactionId: "70000000-0000-4000-8000-000000000001",
       interactionKind: "mcp_elicitation",
+      label: "MCP form",
+      remotePolicy: {
+        actions: [],
+        deadlineAt: fixedNow + 60_000,
+        questions: [],
+        reasonCodes: ["INTERACTION_NOT_PENDING"],
+        version: 2,
+      },
       revision: 2,
       state: "expired",
       summary: "Interaction state updated",
@@ -799,7 +858,7 @@ describe("cloud daemon journal", () => {
     fc.assert(fc.property(fc.jsonValue(), (value) => {
       try {
         const parsed = parseCloudDaemonJournal(value);
-        expect(parsed.version).toBe(4);
+        expect(parsed.version).toBe(5);
         expect(parseCloudDaemonJournal(jsonClone(parsed))).toEqual(parsed);
       } catch (error: unknown) {
         expect(error).toBeInstanceOf(Error);
@@ -836,7 +895,7 @@ describe("cloud daemon journal", () => {
     };
 
     const migrated = parseCloudDaemonJournal(legacy);
-    expect(migrated.version).toBe(4);
+    expect(migrated.version).toBe(5);
     expect(migrated.projectionRecoveries).toHaveLength(2);
     expect(migrated.projectionRecoveryReceipts).toHaveLength(2);
     expect(migrated.projectionRecoveries.every((entry) =>
@@ -1287,7 +1346,7 @@ describe("cloud daemon journal", () => {
     const atLimitCanonical = parseCloudDaemonJournal(atLimitLegacy);
 
     expect(atLimitLegacy.version).toBe(1);
-    expect(atLimitCanonical.version).toBe(4);
+    expect(atLimitCanonical.version).toBe(5);
     expect(serializedUtf8Bytes(atLimitCanonical)).toBe(productionCustodyMaximumBytes);
 
     const committed = await journal.compareAndSwap(null, atLimitLegacy);
@@ -1317,7 +1376,7 @@ describe("cloud daemon journal", () => {
     );
     const observed = await journal.read();
     expect(observed.generation).toBe(11);
-    expect(observed.state.version).toBe(4);
+    expect(observed.state.version).toBe(5);
     expect(serializedUtf8Bytes(observed.state)).toBeGreaterThan(
       productionCustodyMaximumBytes,
     );
@@ -1338,7 +1397,7 @@ describe("cloud daemon journal", () => {
     const migrated = JSON.parse(
       (await custody.read("cloud-daemon-journal"))?.value ?? "null",
     ) as { version?: unknown };
-    expect(migrated.version).toBe(4);
+    expect(migrated.version).toBe(5);
 
     const oversizedRaw = JSON.stringify(
       legacyJournalAtRawBytes(productionCustodyMaximumBytes + 1),
@@ -1360,7 +1419,7 @@ describe("cloud daemon journal", () => {
     const journal = new CustodyCloudDaemonJournal(custody);
 
     const observed = await journal.read();
-    expect(observed.state.version).toBe(4);
+    expect(observed.state.version).toBe(5);
     expect(observed.state.projectionRecoveries).toHaveLength(1);
     expect(serializedUtf8Bytes(observed.state)).toBeGreaterThan(
       productionCustodyMaximumBytes,
@@ -1831,5 +1890,247 @@ describe("cloud daemon journal", () => {
     ]);
     expect(await reopened.supersedeTerminalCompactProjectionRecoveries())
       .toEqual({ superseded: 0 });
+  });
+
+  test("persists only bounded identity-bound attention reconciliation evidence", async () => {
+    const custody = new MemoryCustody();
+    const writer = new CustodyCloudAttentionNotificationReconciliation(custody);
+    const identityBound = bindCloudAttentionNotificationReconciliationState(
+      emptyCloudAttentionNotificationReconciliationState(),
+      "user_attention_12345678",
+      "device_attention_12345678",
+    );
+    const complete = {
+      allowedWindowEnd: fixedNow + 60_000,
+      candidateCount: 2,
+      expectedGlobalNotificationGeneration: 3,
+      localNotificationPolicyRevision: 4,
+      mode: "complete" as const,
+      reconciliationSequence: 5,
+    };
+    const pending = setCloudAttentionNotificationPending(identityBound, complete);
+    const first = await writer.compareAndSwap(null, pending);
+    expect(first?.generation).toBe(0);
+    const stored = custody.values.get("cloud-attention-notification-reconciliation");
+    expect(stored?.value).not.toContain("interaction_");
+    expect(stored?.value).not.toContain("session_");
+    expect(new TextEncoder().encode(stored?.value).byteLength).toBeLessThanOrEqual(4_096);
+
+    const receipt = {
+      acknowledgedAt: fixedNow,
+      candidateCount: 2,
+      consentLeaseUntil: fixedNow + 60_000,
+      globalNotificationGeneration: 3,
+      localNotificationPolicyRevision: 4,
+      reconciliationSequence: 5,
+      state: "complete" as const,
+    };
+    const settled = settleCloudAttentionNotificationReconciliation(
+      pending,
+      complete,
+      receipt,
+    );
+    expect(await writer.compareAndSwap(first?.generation ?? null, settled)).not.toBeNull();
+    expect((await new CustodyCloudAttentionNotificationReconciliation(custody).read()).state)
+      .toEqual(settled);
+    expect(await writer.compareAndSwap(0, pending)).toBeNull();
+    expect(() => bindCloudAttentionNotificationReconciliationState(
+      settled,
+      "user_other_12345678",
+      "device_attention_12345678",
+    )).toThrow("identity changed");
+  });
+
+  test("rejects corrupt attention custody, invalid receipts, and nonadvancing sequences", async () => {
+    const bound = bindCloudAttentionNotificationReconciliationState(
+      emptyCloudAttentionNotificationReconciliationState(),
+      "user_attention_12345678",
+      "device_attention_12345678",
+    );
+    const invalidation = {
+      localNotificationPolicyRevision: 2,
+      mode: "invalidate" as const,
+      reconciliationSequence: 7,
+    };
+    const pending = setCloudAttentionNotificationPending(bound, invalidation);
+    expect(() => setCloudAttentionNotificationPending(pending, {
+      ...invalidation,
+      reconciliationSequence: 6,
+    })).toThrow("sequence did not advance");
+    expect(() => settleCloudAttentionNotificationReconciliation(
+      pending,
+      invalidation,
+      {
+        acknowledgedAt: fixedNow,
+        consentLeaseUntil: fixedNow + 1,
+        globalNotificationGeneration: 1,
+        localNotificationPolicyRevision: 2,
+        reconciliationSequence: 7,
+        state: "invalidated",
+      },
+    )).toThrow("changed concurrently");
+    expect(() => parseCloudAttentionNotificationReconciliationState({
+      ...bound,
+      extra: true,
+    })).toThrow("is corrupt");
+    expect(() => parseCloudAttentionNotificationReconciliationState({
+      ...bound,
+      devicePublicId: null,
+    })).toThrow("is corrupt");
+
+    const custody = new MemoryCustody();
+    custody.values.set("cloud-attention-notification-reconciliation", {
+      generation: 0,
+      value: "x".repeat(4_097),
+    });
+    await expect(new CustodyCloudAttentionNotificationReconciliation(custody).read())
+      .rejects.toThrow("is corrupt");
+  });
+
+  test("reserves the final attention sequence against foreign complete evidence", () => {
+    const bound = bindCloudAttentionNotificationReconciliationState(
+      emptyCloudAttentionNotificationReconciliationState(),
+      "user_attention_12345678",
+      "device_attention_12345678",
+    );
+    const complete = {
+      allowedWindowEnd: fixedNow + 60_000,
+      candidateCount: 0,
+      expectedGlobalNotificationGeneration: 1,
+      localNotificationPolicyRevision: 1,
+      mode: "complete" as const,
+      reconciliationSequence: Number.MAX_SAFE_INTEGER,
+    };
+    const receipt = {
+      acknowledgedAt: fixedNow,
+      candidateCount: 0,
+      consentLeaseUntil: fixedNow + 60_000,
+      globalNotificationGeneration: 1,
+      localNotificationPolicyRevision: 1,
+      reconciliationSequence: Number.MAX_SAFE_INTEGER,
+      state: "complete" as const,
+    };
+
+    expect(() => parseCloudAttentionNotificationReconciliationState({
+      ...bound,
+      pending: complete,
+    })).toThrow("is corrupt");
+    expect(() => parseCloudAttentionNotificationReconciliationState({
+      ...bound,
+      lastReceipt: { receipt, request: complete },
+    })).toThrow("is corrupt");
+    expect(parseCloudAttentionNotificationReconciliationState({
+      ...bound,
+      pending: {
+        localNotificationPolicyRevision: 1,
+        mode: "invalidate",
+        reconciliationSequence: Number.MAX_SAFE_INTEGER,
+      },
+    }).pending).toMatchObject({
+      mode: "invalidate",
+      reconciliationSequence: Number.MAX_SAFE_INTEGER,
+    });
+  });
+
+  test("resets attention reconciliation only for an explicit same-user replacement device", () => {
+    const user = "user_attention_replacement_12345678";
+    const oldDevice = "device_attention_old_12345678";
+    const newDevice = "device_attention_new_12345678";
+    const bound = bindCloudAttentionNotificationReconciliationState(
+      emptyCloudAttentionNotificationReconciliationState(),
+      user,
+      oldDevice,
+    );
+    const pending = setCloudAttentionNotificationPending(bound, {
+      localNotificationPolicyRevision: 7,
+      mode: "invalidate",
+      reconciliationSequence: 4,
+    });
+    expect(replaceCloudAttentionNotificationReconciliationDevice(
+      pending,
+      user,
+      newDevice,
+    )).toEqual({
+      devicePublicId: newDevice,
+      lastReceipt: null,
+      pending: null,
+      userPublicId: user,
+      version: 1,
+    });
+    expect(() => replaceCloudAttentionNotificationReconciliationDevice(
+      pending,
+      "user_attention_foreign_12345678",
+      newDevice,
+    )).toThrow("identity changed");
+    expect(() => replaceCloudAttentionNotificationReconciliationDevice(
+      pending,
+      user,
+      oldDevice,
+    )).toThrow("device did not change");
+    expect(() => replaceCloudAttentionNotificationReconciliationDevice(
+      emptyCloudAttentionNotificationReconciliationState(),
+      user,
+      newDevice,
+    )).toThrow("identity changed");
+  });
+
+  test("canonical attention reconciliation states round-trip for bounded requests and receipts", () => {
+    fc.assert(fc.property(
+      fc.record({
+        candidateCount: fc.integer({ min: 0, max: 64 }),
+        complete: fc.boolean(),
+        globalGeneration: fc.integer({ min: 1, max: 1_000 }),
+        revision: fc.integer({ min: 1, max: 1_000 }),
+        sequence: fc.integer({ min: 1, max: 1_000_000 }),
+      }),
+      (sample) => {
+        const bound = bindCloudAttentionNotificationReconciliationState(
+          emptyCloudAttentionNotificationReconciliationState(),
+          "user_property_12345678",
+          "device_property_12345678",
+        );
+        const request = sample.complete
+          ? {
+              allowedWindowEnd: fixedNow + 120_000,
+              candidateCount: sample.candidateCount,
+              expectedGlobalNotificationGeneration: sample.globalGeneration,
+              localNotificationPolicyRevision: sample.revision,
+              mode: "complete" as const,
+              reconciliationSequence: sample.sequence,
+            }
+          : {
+              localNotificationPolicyRevision: sample.revision,
+              mode: "invalidate" as const,
+              reconciliationSequence: sample.sequence,
+            };
+        const pending = setCloudAttentionNotificationPending(bound, request);
+        const receipt = sample.complete
+          ? {
+              acknowledgedAt: fixedNow,
+              candidateCount: sample.candidateCount,
+              consentLeaseUntil: fixedNow + 60_000,
+              globalNotificationGeneration: sample.globalGeneration,
+              localNotificationPolicyRevision: sample.revision,
+              reconciliationSequence: sample.sequence,
+              state: "complete" as const,
+            }
+          : {
+              acknowledgedAt: fixedNow,
+              consentLeaseUntil: fixedNow,
+              globalNotificationGeneration: sample.globalGeneration,
+              localNotificationPolicyRevision: sample.revision,
+              reconciliationSequence: sample.sequence,
+              state: "invalidated" as const,
+            };
+        const settled = settleCloudAttentionNotificationReconciliation(
+          pending,
+          request,
+          receipt,
+        );
+        expect(parseCloudAttentionNotificationReconciliationState(
+          jsonClone(settled),
+        )).toEqual(settled);
+      },
+    ), { numRuns: 100 });
   });
 });

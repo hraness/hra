@@ -21,6 +21,7 @@ import { pathToFileURL } from "node:url";
 
 import type { PublicInteraction } from "../src/domain/interactions";
 import type { SessionEvent } from "../src/domain/session-events";
+import { HRA_VERSION } from "../src/version";
 import {
   projectPublicProviderIdentifier,
   projectPublicSessionEventBody,
@@ -60,7 +61,7 @@ const cursorWire = (label: string): string =>
   `hra1.${Buffer.from(`fixture:${label}`).toString("base64url")}.${cursorWireSignature}`;
 const attestation = {
   cloudTargetDigest: "a".repeat(64),
-  packageVersion: "0.1.0",
+  packageVersion: HRA_VERSION,
   sourceRevision: "b".repeat(40),
 } as const;
 
@@ -1080,7 +1081,7 @@ describe("live acceptance release scenario", () => {
       accountIds: [accountA, accountB],
       cloudTargetDigest: "a".repeat(64),
       devicePublicIds: [deviceAId, deviceBId],
-      packageVersion: "0.1.0",
+      packageVersion: HRA_VERSION,
       pluginLifecycleEffectsRejected: ["auth", "disable", "enable", "install"],
       pluginInstallRejected: true,
       presence: ["online", "offline", "online"],

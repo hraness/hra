@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 
-import { presetRequirements } from "../domain/presets.ts";
+import {
+  isAdmittedPresetRequirement,
+  type PresetRequirement,
+} from "../domain/presets.ts";
 import { codexProviderAccountIdSchema } from "../domain/provider-accounts.ts";
 import {
   INTERACTION_MAX_PENDING_MS,
@@ -18,6 +21,7 @@ import {
   type ProtectedInteractionJson,
 } from "../domain/interactions.ts";
 import { PUBLIC_MCP_FORM_SUMMARY } from "../public-provider-identifier.ts";
+import { remoteInteractionAnswerLimits } from "../domain/remote-interaction-contract.ts";
 import {
   containsAbsolutePath,
   containsUnsafeTerminalScalar,
@@ -1781,7 +1785,11 @@ export function parseThreadStatus(value: unknown): CodexThreadStatus {
 const canonicalTextEncoder = new TextEncoder();
 const unsafeDisplayScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 
-const safeDisplayText = (value: unknown, label: string, maximum: number): string => {
+const safeDisplayTextResult = (
+  value: unknown,
+  label: string,
+  maximum: number,
+): Readonly<{ exact: boolean; text: string }> => {
   const source = string(value, label, { max: 4 * 1024 * 1024 });
   let output = "";
   let bytes = 0;
@@ -1792,8 +1800,11 @@ const safeDisplayText = (value: unknown, label: string, maximum: number): string
     output += safeScalar;
     bytes += scalarBytes;
   }
-  return output;
+  return { exact: output === source, text: output };
 };
+
+const safeDisplayText = (value: unknown, label: string, maximum: number): string =>
+  safeDisplayTextResult(value, label, maximum).text;
 
 const nullableSafeDisplayText = (
   value: unknown,
@@ -2135,7 +2146,10 @@ const classifyApprovalCommand = (value: unknown): string => {
 
 const safeInteractionJson = (value: unknown): unknown => {
   const serialized = canonicalJson(value);
-  if (canonicalTextEncoder.encode(serialized).byteLength > 64 * 1024) {
+  if (
+    canonicalTextEncoder.encode(serialized).byteLength
+      > remoteInteractionAnswerLimits.providerJsonBytes
+  ) {
     throw new CodexError("PROTOCOL_LIMIT", "interaction display data exceeded its byte limit");
   }
   return JSON.parse(serialized) as unknown;
@@ -2674,7 +2688,10 @@ export function validateMcpFormSubmission(
   try {
     if (!plainJsonObject(value)) throw invalidMcpFormSubmission();
     const serialized = canonicalJson(value);
-    if (canonicalTextEncoder.encode(serialized).byteLength > 64 * 1024) {
+    if (
+      canonicalTextEncoder.encode(serialized).byteLength
+        > remoteInteractionAnswerLimits.providerJsonBytes
+    ) {
       throw invalidMcpFormSubmission();
     }
     const byName = new Map(fields.map((field) => [field.name, field] as const));
@@ -2844,33 +2861,43 @@ export function parseBrokeredCodexServerRequest(input: {
     if (turnId === null || itemId === null) throw protocol("user input request omitted turn or item context");
     const questions = array(privateParams.questions, "user input questions", (value, index) => {
       const question = record(value, `user input question ${String(index)}`);
-      const options = question.options === null
+      const parsedOptions = question.options === null
         ? null
         : array(question.options, "user input options", (option, optionIndex) => {
             const parsed = record(option, `user input option ${String(optionIndex)}`);
-            const label = safeDisplayText(parsed.label, "user input option label", 512);
-            if (label.length === 0) throw protocol("user input option label is empty after safe rendering");
+            const label = safeDisplayTextResult(parsed.label, "user input option label", 512);
+            const description = safeDisplayTextResult(
+              parsed.description,
+              "user input option description",
+              2_048,
+            );
+            if (label.text.length === 0) throw protocol("user input option label is empty after safe rendering");
             return {
-              label,
-              description: safeDisplayText(parsed.description, "user input option description", 2_048),
+              exact: label.exact && description.exact,
+              option: { description: description.text, label: label.text },
             };
           }, 20);
+      const options = parsedOptions?.map(({ option }) => option) ?? null;
       if (
         options !== null
         && new Set(options.map((option) => option.label)).size !== options.length
       ) throw protocol("user input option labels must be unique");
-      const header = safeDisplayText(question.header, "user input header", 256);
-      const prompt = safeDisplayText(question.question, "user input question", 4_096);
-      if (header.length === 0 || prompt.length === 0) {
+      const header = safeDisplayTextResult(question.header, "user input header", 256);
+      const prompt = safeDisplayTextResult(question.question, "user input question", 4_096);
+      if (header.text.length === 0 || prompt.text.length === 0) {
         throw protocol("user input question text is empty after safe rendering");
       }
+      const remoteAnswerable = header.exact
+        && prompt.exact
+        && (parsedOptions?.every(({ exact }) => exact) ?? true);
       return {
         id: identifier(question.id, "user input question id"),
-        header,
-        question: prompt,
+        header: header.text,
+        question: prompt.text,
         options: options === null ? null : [...options],
         allowsOther: boolean(question.isOther, "user input allows other"),
         secret: boolean(question.isSecret, "user input secret flag"),
+        ...(remoteAnswerable ? { remoteAnswerable: true as const } : {}),
       };
     }, 3);
     if (questions.length < 1) throw protocol("user input request omitted questions");
@@ -2901,7 +2928,7 @@ export function parseBrokeredCodexServerRequest(input: {
   if (mode === "url") {
     throw new CodexError(
       "UNSUPPORTED_CAPABILITY",
-      "MCP URL elicitation requires a protected browser handoff that HRA 0.5.0 does not expose.",
+      "MCP URL elicitation requires a protected browser handoff that HRA 0.6.0 does not expose.",
     );
   }
   if (mode === "openai/form") throw unsupportedMcpForm();
@@ -2994,11 +3021,36 @@ export function compileCodexInteractionResponse(input: {
     if (kind !== "user_input" || resolution.kind !== "user_answers") {
       throw new CodexError("INVALID_INPUT", "user input requires exact question answers");
     }
-    const questions = array(privateParams.questions, "user input questions", (value) => record(value, "user input question"), 3);
-    const expectedIds = new Set(questions.map((question) => identifier(question.id, "user input question id")));
-    const answerIds = Object.keys(resolution.answers);
-    if (answerIds.length !== expectedIds.size || answerIds.some((id) => !expectedIds.has(id))) {
+    const questions = array(privateParams.questions, "user input questions", (value) => {
+      const question = record(value, "user input question");
+      const id = identifier(question.id, "user input question id");
+      const allowsOther = boolean(question.isOther, "user input allows other");
+      const optionLabels = question.options === null
+        ? null
+        : array(question.options, "user input options", (option) => {
+            const parsed = record(option, "user input option");
+            return string(parsed.label, "user input option label", { max: 4 * 1024 * 1024 });
+          }, 20);
+      return { allowsOther, id, optionLabels };
+    }, 3);
+    const expected = new Map(questions.map((question) => [question.id, question] as const));
+    const submitted = new Map(Object.entries(resolution.answers));
+    if (
+      submitted.size !== expected.size
+      || [...submitted.keys()].some((id) => !expected.has(id))
+    ) {
       throw new CodexError("INVALID_INPUT", "answers must match the exact requested question ids");
+    }
+    for (const question of expected.values()) {
+      const answers = submitted.get(question.id)?.answers;
+      if (
+        answers === undefined
+        || (question.optionLabels !== null
+          && !question.allowsOther
+          && answers.some((answer) => !question.optionLabels?.includes(answer)))
+      ) {
+        throw new CodexError("INVALID_INPUT", "answers must match the requested choices");
+      }
     }
     return { answers: safeInteractionJson(resolution.answers) };
   }
@@ -3317,9 +3369,15 @@ export function parseFact(method: string, params: unknown): CodexFact {
 export function resolvePreset(
   snapshot: CodexCapabilitySnapshot,
   alias: PresetAlias,
+  requirement: PresetRequirement,
   fast: boolean,
 ): ResolvedPreset {
-  const requirement = presetRequirements[alias];
+  if (!isAdmittedPresetRequirement(alias, requirement)) {
+    throw new CodexError(
+      "UNSUPPORTED_CAPABILITY",
+      `${alias} requested an unadmitted exact HRA model and reasoning tuple`,
+    );
+  }
   const candidates = snapshot.models.filter((model) => model.model === requirement.model);
   const model = candidates[0];
   if (
@@ -3386,14 +3444,20 @@ function nonnegativeNumber(value: unknown, label: string): number {
   return parsed;
 }
 
-export function validateAuthority(authority: CodexAuthority): CodexAuthority {
+export function validateAuthority(authority: unknown): CodexAuthority {
+  if (!plainJsonObject(authority)) {
+    throw new CodexError("INVALID_INPUT", "Codex provider-account authority is invalid");
+  }
   const profileId = identifier(authority.profileId, "profile id");
-  if (!Number.isSafeInteger(authority.processGeneration) || authority.processGeneration < 1) {
+  if (typeof authority.processGeneration !== "number"
+    || !Number.isSafeInteger(authority.processGeneration) || authority.processGeneration < 1) {
     throw new CodexError("INVALID_INPUT", "process generation must be a positive integer");
   }
+  const providerAccountId = codexProviderAccountIdSchema.safeParse(authority.providerAccountId);
   if (
     authority.provider !== "codex"
-    || !codexProviderAccountIdSchema.safeParse(authority.providerAccountId).success
+    || !providerAccountId.success
+    || typeof authority.bindingGeneration !== "number"
     || !Number.isSafeInteger(authority.bindingGeneration)
     || authority.bindingGeneration < 1
   ) {
@@ -3403,7 +3467,7 @@ export function validateAuthority(authority: CodexAuthority): CodexAuthority {
     profileId,
     processGeneration: authority.processGeneration,
     provider: "codex",
-    providerAccountId: authority.providerAccountId,
+    providerAccountId: providerAccountId.data,
     bindingGeneration: authority.bindingGeneration,
   };
 }

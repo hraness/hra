@@ -24,6 +24,13 @@ import {
 } from "./contracts";
 import type { CloudSecretCustodyPort } from "./local-control";
 import {
+  attentionNotificationCandidateLimit,
+  parseAttentionNotificationReconcileReceipt,
+  type AttentionNotificationCompleteRequest,
+  type AttentionNotificationInvalidateRequest,
+  type AttentionNotificationReconcileReceipt,
+} from "./attention-notifications";
+import {
   compactInteractionDetailOf,
   isCompactInteractionBaselineShape,
   parseCompactSessionEvent,
@@ -35,6 +42,8 @@ const journalSlot = "cloud-daemon-journal";
 // them in a separate bounded CAS slot prevents an opaque provider cursor from
 // consuming the effect-recovery journal's reserved terminal capacity.
 const sessionSyncCursorSlot = "cloud-session-sync-cursor";
+const attentionNotificationReconciliationSlot =
+  "cloud-attention-notification-reconciliation";
 const maximumJournalCommands = 100;
 // Device commands are foreground requests from a browser, one or two at a
 // time. A small ceiling keeps their worst-case terminal reservation from
@@ -45,7 +54,12 @@ const maximumProjectionRecoveryBaselineTurns = 128;
 const maximumProjectionRecoveryBaselineInteractions = 200;
 const maximumSerializedJournalBytes = 65_536;
 const maximumSerializedSessionSyncCursorBytes = 20_480;
+const maximumSerializedAttentionNotificationReconciliationBytes = 4_096;
 const maximumRemoteSessionCursorCharacters = 16_384;
+// The largest valid device-command result is the bounded login URL plus its
+// code and envelope overhead. Reserve a little over the exact current shape so
+// every admitted prepared entry can still become a durable terminal entry.
+const maximumDeviceCommandResultCiphertextCharacters = 4_096;
 const utf8Encoder = new TextEncoder();
 const remoteSessionCursorDigestPattern = /^[0-9a-f]{64}$/u;
 
@@ -135,8 +149,12 @@ export type CloudDeviceCommandJournalEntry = Readonly<{
   | Readonly<{ phase: "effect_started" }>
   | Readonly<{
       phase: "terminal";
+      /** Present only on a migrated v4 login terminal whose ciphertext was not journaled. */
+      legacyResultMissing?: true;
+      result?: EncryptedEnvelope;
       resultCode: string;
       resultDigest: string;
+      singleUseResult?: true;
       terminalState: "applied" | "failed" | "ambiguous";
     }>
 );
@@ -321,6 +339,16 @@ export type CloudDaemonJournalState = Readonly<{
   projectionRecoveries: readonly CloudProjectionRecoveryJournalEntry[];
   projectionRecoveryReceipts: readonly CloudProjectionRecoveryTerminalReceipt[];
   usageAccounts: readonly CloudUsageAccountCursor[];
+  version: 5;
+}>;
+
+export type LegacyCloudDaemonJournalV4State = Readonly<{
+  commands: readonly CloudCommandJournalEntry[];
+  deviceCommands: readonly CloudDeviceCommandJournalEntry[];
+  pendingUsageAccount: PendingCloudUsageAccount | null;
+  projectionRecoveries: readonly CloudProjectionRecoveryJournalEntry[];
+  projectionRecoveryReceipts: readonly CloudProjectionRecoveryTerminalReceipt[];
+  usageAccounts: readonly CloudUsageAccountCursor[];
   version: 4;
 }>;
 
@@ -354,7 +382,8 @@ export type CloudDaemonJournalInputState =
   | CloudDaemonJournalState
   | LegacyCloudDaemonJournalV1State
   | LegacyCloudDaemonJournalV2State
-  | LegacyCloudDaemonJournalV3State;
+  | LegacyCloudDaemonJournalV3State
+  | LegacyCloudDaemonJournalV4State;
 
 export type CloudDaemonJournalObservation = Readonly<{
   generation: number | null;
@@ -400,6 +429,242 @@ export interface CloudSessionSyncCursorPort {
     expectedGeneration: number | null,
     state: CloudSessionSyncCursorState,
   ): Promise<CloudSessionSyncCursorObservation | null>;
+}
+
+export type CloudAttentionNotificationReconciliationRequest =
+  | AttentionNotificationCompleteRequest
+  | AttentionNotificationInvalidateRequest;
+
+export type CloudAttentionNotificationReconciliationReceipt = Readonly<{
+  receipt: AttentionNotificationReconcileReceipt;
+  request: CloudAttentionNotificationReconciliationRequest;
+}>;
+
+export type CloudAttentionNotificationReconciliationState = Readonly<{
+  devicePublicId: string | null;
+  lastReceipt: CloudAttentionNotificationReconciliationReceipt | null;
+  pending: CloudAttentionNotificationReconciliationRequest | null;
+  userPublicId: string | null;
+  version: 1;
+}>;
+
+export type CloudAttentionNotificationReconciliationObservation = Readonly<{
+  generation: number | null;
+  state: CloudAttentionNotificationReconciliationState;
+}>;
+
+export interface CloudAttentionNotificationReconciliationPort {
+  read(): Promise<CloudAttentionNotificationReconciliationObservation>;
+  compareAndSwap(
+    expectedGeneration: number | null,
+    state: CloudAttentionNotificationReconciliationState,
+  ): Promise<CloudAttentionNotificationReconciliationObservation | null>;
+}
+
+export function emptyCloudAttentionNotificationReconciliationState():
+CloudAttentionNotificationReconciliationState {
+  return {
+    devicePublicId: null,
+    lastReceipt: null,
+    pending: null,
+    userPublicId: null,
+    version: 1,
+  };
+}
+
+function parseAttentionNotificationReconciliationRequest(
+  value: unknown,
+): CloudAttentionNotificationReconciliationRequest {
+  if (!isRecord(value) || !isSafePositiveInteger(value.reconciliationSequence)
+    || !isSafePositiveInteger(value.localNotificationPolicyRevision)) {
+    throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  }
+  if (value.mode === "invalidate") {
+    if (!hasExactKeys(value, [
+      "localNotificationPolicyRevision",
+      "mode",
+      "reconciliationSequence",
+    ])) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+    return {
+      localNotificationPolicyRevision: value.localNotificationPolicyRevision,
+      mode: "invalidate",
+      reconciliationSequence: value.reconciliationSequence,
+    };
+  }
+  if (
+    value.mode !== "complete"
+    || !hasExactKeys(value, [
+      "allowedWindowEnd",
+      "candidateCount",
+      "expectedGlobalNotificationGeneration",
+      "localNotificationPolicyRevision",
+      "mode",
+      "reconciliationSequence",
+    ])
+    || !isSafeNonNegativeInteger(value.allowedWindowEnd)
+    || !isSafeNonNegativeInteger(value.candidateCount)
+    || value.candidateCount > attentionNotificationCandidateLimit
+    || !isSafePositiveInteger(value.expectedGlobalNotificationGeneration)
+    || value.reconciliationSequence === Number.MAX_SAFE_INTEGER
+  ) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  return {
+    allowedWindowEnd: value.allowedWindowEnd,
+    candidateCount: value.candidateCount,
+    expectedGlobalNotificationGeneration: value.expectedGlobalNotificationGeneration,
+    localNotificationPolicyRevision: value.localNotificationPolicyRevision,
+    mode: "complete",
+    reconciliationSequence: value.reconciliationSequence,
+  };
+}
+
+function parseAttentionNotificationReconciliationReceipt(
+  value: unknown,
+): CloudAttentionNotificationReconciliationReceipt {
+  if (!isRecord(value) || !hasExactKeys(value, ["receipt", "request"])) {
+    throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  }
+  const request = parseAttentionNotificationReconciliationRequest(value.request);
+  const receipt = parseAttentionNotificationReconcileReceipt(value.receipt, request);
+  if (receipt === null) {
+    throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  }
+  return { receipt, request };
+}
+
+export function parseCloudAttentionNotificationReconciliationState(
+  value: unknown,
+): CloudAttentionNotificationReconciliationState {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, [
+      "devicePublicId",
+      "lastReceipt",
+      "pending",
+      "userPublicId",
+      "version",
+    ])
+    || value.version !== 1
+    || ((value.devicePublicId === null) !== (value.userPublicId === null))
+    || (value.devicePublicId !== null && !isOpaqueIdentifier(value.devicePublicId))
+    || (value.userPublicId !== null && !isOpaqueIdentifier(value.userPublicId))
+  ) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  const pending = value.pending === null
+    ? null
+    : parseAttentionNotificationReconciliationRequest(value.pending);
+  const lastReceipt = value.lastReceipt === null
+    ? null
+    : parseAttentionNotificationReconciliationReceipt(value.lastReceipt);
+  if (
+    value.devicePublicId === null
+    && (pending !== null || lastReceipt !== null)
+  ) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  if (
+    pending !== null
+    && lastReceipt !== null
+    && pending.reconciliationSequence
+      <= lastReceipt.request.reconciliationSequence
+  ) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  const parsed: CloudAttentionNotificationReconciliationState = {
+    devicePublicId: value.devicePublicId,
+    lastReceipt,
+    pending,
+    userPublicId: value.userPublicId,
+    version: 1,
+  };
+  if (
+    utf8Encoder.encode(JSON.stringify(parsed)).byteLength
+      > maximumSerializedAttentionNotificationReconciliationBytes
+  ) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  return parsed;
+}
+
+export function bindCloudAttentionNotificationReconciliationState(
+  state: CloudAttentionNotificationReconciliationState,
+  userPublicId: string,
+  devicePublicId: string,
+): CloudAttentionNotificationReconciliationState {
+  const parsed = parseCloudAttentionNotificationReconciliationState(state);
+  if (!isOpaqueIdentifier(userPublicId) || !isOpaqueIdentifier(devicePublicId)) {
+    throw new Error("Cloud attention notification reconciliation identity is invalid.");
+  }
+  if (parsed.userPublicId === null) {
+    return parseCloudAttentionNotificationReconciliationState({
+      ...parsed,
+      devicePublicId,
+      userPublicId,
+    });
+  }
+  if (
+    parsed.userPublicId !== userPublicId
+    || parsed.devicePublicId !== devicePublicId
+  ) throw new Error("Cloud attention notification reconciliation identity changed.");
+  return parsed;
+}
+
+export function replaceCloudAttentionNotificationReconciliationDevice(
+  state: CloudAttentionNotificationReconciliationState,
+  userPublicId: string,
+  devicePublicId: string,
+): CloudAttentionNotificationReconciliationState {
+  const parsed = parseCloudAttentionNotificationReconciliationState(state);
+  if (!isOpaqueIdentifier(userPublicId) || !isOpaqueIdentifier(devicePublicId)) {
+    throw new Error("Cloud attention notification reconciliation identity is invalid.");
+  }
+  if (parsed.userPublicId !== userPublicId || parsed.devicePublicId === null) {
+    throw new Error("Cloud attention notification reconciliation identity changed.");
+  }
+  if (parsed.devicePublicId === devicePublicId) {
+    throw new Error("Cloud attention notification reconciliation device did not change.");
+  }
+  return parseCloudAttentionNotificationReconciliationState({
+    devicePublicId,
+    lastReceipt: null,
+    pending: null,
+    userPublicId,
+    version: 1,
+  });
+}
+
+export function setCloudAttentionNotificationPending(
+  state: CloudAttentionNotificationReconciliationState,
+  request: CloudAttentionNotificationReconciliationRequest,
+): CloudAttentionNotificationReconciliationState {
+  const parsed = parseCloudAttentionNotificationReconciliationState(state);
+  if (parsed.userPublicId === null) {
+    throw new Error("Cloud attention notification reconciliation identity is unbound.");
+  }
+  const pending = parseAttentionNotificationReconciliationRequest(request);
+  const priorSequence = Math.max(
+    parsed.pending?.reconciliationSequence ?? 0,
+    parsed.lastReceipt?.request.reconciliationSequence ?? 0,
+  );
+  if (pending.reconciliationSequence <= priorSequence) {
+    if (JSON.stringify(parsed.pending) === JSON.stringify(pending)) return parsed;
+    throw new Error("Cloud attention notification reconciliation sequence did not advance.");
+  }
+  return parseCloudAttentionNotificationReconciliationState({ ...parsed, pending });
+}
+
+export function settleCloudAttentionNotificationReconciliation(
+  state: CloudAttentionNotificationReconciliationState,
+  request: CloudAttentionNotificationReconciliationRequest,
+  receipt: AttentionNotificationReconcileReceipt,
+): CloudAttentionNotificationReconciliationState {
+  const parsed = parseCloudAttentionNotificationReconciliationState(state);
+  const canonicalRequest = parseAttentionNotificationReconciliationRequest(request);
+  const canonicalReceipt = parseAttentionNotificationReconcileReceipt(
+    receipt,
+    canonicalRequest,
+  );
+  if (
+    canonicalReceipt === null
+    || JSON.stringify(parsed.pending) !== JSON.stringify(canonicalRequest)
+  ) throw new Error("Cloud attention notification reconciliation changed concurrently.");
+  return parseCloudAttentionNotificationReconciliationState({
+    ...parsed,
+    lastReceipt: { receipt: canonicalReceipt, request: canonicalRequest },
+    pending: null,
+  });
 }
 
 export function emptyCloudSessionSyncCursor(): CloudSessionSyncCursorState {
@@ -583,7 +848,7 @@ export function emptyCloudDaemonJournal(): CloudDaemonJournalState {
     projectionRecoveries: [],
     projectionRecoveryReceipts: [],
     usageAccounts: [],
-    version: 4,
+    version: 5,
   };
 }
 
@@ -598,8 +863,15 @@ function maximumTerminalDeviceCommandEntry(
       fence: Number.MAX_SAFE_INTEGER,
     },
     phase: "terminal",
+    result: {
+      algorithm: "A256GCM",
+      ciphertext: "c".repeat(maximumDeviceCommandResultCiphertextCharacters),
+      keyVersion: Number.MAX_SAFE_INTEGER,
+      nonce: "n".repeat(16),
+    },
     resultCode: "R".repeat(64),
     resultDigest: "f".repeat(64),
+    ...(entry.kind === "account_login_start" ? { singleUseResult: true } : {}),
     terminalState: "ambiguous",
   });
 }
@@ -991,7 +1263,7 @@ export function supersedeCloudProjectionRecoveryForProviderDeletion(
 }
 
 /**
- * Pre-v35 compact-recovery evidence did not name the provider-account binding.
+ * Legacy compact-recovery evidence did not name the provider-account binding.
  * Such an unsettled row is readable, but it cannot safely resume or be rebound:
  * the session's mutable current provider is not historical proof. Convert only
  * those rows to an explicit terminal quarantine receipt before any effect.
@@ -1152,19 +1424,28 @@ function parseCommandKind(value: unknown): CommandKind | null {
   return isCommandKind(value) ? value : null;
 }
 
-function parseDeviceCommand(value: unknown): CloudDeviceCommandJournalEntry {
+function parseDeviceCommand(
+  value: unknown,
+  allowLegacyMissingAppliedLoginResult = false,
+): CloudDeviceCommandJournalEntry {
   if (!isRecord(value)) throw new Error("Cloud daemon journal is corrupt.");
   const terminal = value.phase === "terminal";
+  const hasLegacyResultMissing = terminal && Object.hasOwn(value, "legacyResultMissing");
+  const hasResult = terminal && Object.hasOwn(value, "result");
+  const hasSingleUseResult = terminal && Object.hasOwn(value, "singleUseResult");
   const expected = terminal
     ? [
         "authority",
         "commandPublicId",
         "kind",
+        ...(hasLegacyResultMissing ? ["legacyResultMissing"] : []),
         "payloadDigest",
         "phase",
         "requestingDevicePublicId",
+        ...(hasResult ? ["result"] : []),
         "resultCode",
         "resultDigest",
+        ...(hasSingleUseResult ? ["singleUseResult"] : []),
         "terminalState",
       ]
     : [
@@ -1195,10 +1476,30 @@ function parseDeviceCommand(value: unknown): CloudDeviceCommandJournalEntry {
     requestingDevicePublicId: value.requestingDevicePublicId,
   };
   if (value.phase !== "terminal") return { ...base, phase: value.phase };
+  const result = hasResult
+    ? parseEncryptedEnvelope(value.result, maximumDeviceCommandResultCiphertextCharacters)
+    : undefined;
   if (
     typeof value.resultCode !== "string"
     || !/^[A-Z][A-Z0-9_]{0,63}$/u.test(value.resultCode)
     || !isDigest(value.resultDigest)
+    || (hasResult && result === null)
+    || (hasLegacyResultMissing && value.legacyResultMissing !== true)
+    || (hasLegacyResultMissing
+      && (value.kind !== "account_login_start"
+        || value.terminalState !== "applied"
+        || result !== undefined
+        || hasSingleUseResult))
+    || (hasSingleUseResult && value.singleUseResult !== true)
+    || (hasSingleUseResult && (value.kind !== "account_login_start" || result == null))
+    || (value.kind === "account_login_start"
+      && result !== undefined
+      && value.singleUseResult !== true)
+    || (!allowLegacyMissingAppliedLoginResult
+      && value.kind === "account_login_start"
+      && value.terminalState === "applied"
+      && (result === undefined || value.singleUseResult !== true)
+      && value.legacyResultMissing !== true)
     || (value.terminalState !== "applied"
       && value.terminalState !== "failed"
       && value.terminalState !== "ambiguous")
@@ -1206,8 +1507,11 @@ function parseDeviceCommand(value: unknown): CloudDeviceCommandJournalEntry {
   return {
     ...base,
     phase: value.phase,
+    ...(value.legacyResultMissing === true ? { legacyResultMissing: true as const } : {}),
+    ...(result == null ? {} : { result }),
     resultCode: value.resultCode,
     resultDigest: value.resultDigest,
+    ...(value.singleUseResult === true ? { singleUseResult: true as const } : {}),
     terminalState: value.terminalState,
   };
 }
@@ -1696,10 +2000,12 @@ function parseLegacyCloudProjectionRecoveryEntry(
     throw new Error("Cloud daemon journal is corrupt.");
   }
   const {
-    baselineInteractions: _baselineInteractions,
+    baselineInteractions,
     localAuthority,
     ...legacyFields
   } = parsedBase;
+  // The legacy shape has no interaction-authority baseline.
+  void baselineInteractions;
   const base: LegacyCloudProjectionRecoveryBase = {
     ...legacyFields,
     localAuthority,
@@ -1990,7 +2296,7 @@ function migrateLegacyProjectionRecovery(
   return { ...entry, ...identity };
 }
 
-function journalExactKeys(version: 1 | 2 | 3 | 4): readonly string[] {
+function journalExactKeys(version: 1 | 2 | 3 | 4 | 5): readonly string[] {
   if (version === 1) return ["commands", "pendingUsageAccount", "usageAccounts", "version"];
   if (version === 2) {
     return [
@@ -2015,7 +2321,11 @@ function journalExactKeys(version: 1 | 2 | 3 | 4): readonly string[] {
 function parseCloudDaemonJournalStructure(value: unknown): CloudDaemonJournalState {
   if (
     !isRecord(value)
-    || (value.version !== 1 && value.version !== 2 && value.version !== 3 && value.version !== 4)
+    || (value.version !== 1
+      && value.version !== 2
+      && value.version !== 3
+      && value.version !== 4
+      && value.version !== 5)
     || !hasExactKeys(value, journalExactKeys(value.version))
     || !Array.isArray(value.commands)
     || value.commands.length > maximumJournalCommands
@@ -2024,16 +2334,32 @@ function parseCloudDaemonJournalStructure(value: unknown): CloudDaemonJournalSta
   ) throw new Error("Cloud daemon journal is corrupt.");
   const commands = value.commands.map(parseCommand);
   let deviceCommands: readonly CloudDeviceCommandJournalEntry[] = [];
-  if (value.version === 4) {
+  if (value.version === 4 || value.version === 5) {
     if (
       !Array.isArray(value.deviceCommands)
       || value.deviceCommands.length > maximumJournalDeviceCommands
     ) throw new Error("Cloud daemon journal is corrupt.");
-    deviceCommands = value.deviceCommands.map(parseDeviceCommand);
+    deviceCommands = value.deviceCommands
+      .map((entry) => parseDeviceCommand(entry, value.version === 4))
+      .map((entry): CloudDeviceCommandJournalEntry => {
+        // v4 terminal entries predated durable result ciphertext. Mark that
+        // exact migrated case so restart recovery can reconcile either a
+        // remotely committed relay or an effect whose settlement never landed.
+        if (
+          value.version === 4
+          && entry.kind === "account_login_start"
+          && entry.phase === "terminal"
+          && entry.terminalState === "applied"
+          && (entry.result === undefined || entry.singleUseResult !== true)
+        ) {
+          return { ...entry, legacyResultMissing: true };
+        }
+        return entry;
+      });
   }
   let projectionRecoveries: readonly CloudProjectionRecoveryJournalEntry[] = [];
   let projectionRecoveryReceipts: readonly CloudProjectionRecoveryTerminalReceipt[] = [];
-  if (value.version === 3 || value.version === 4) {
+  if (value.version === 3 || value.version === 4 || value.version === 5) {
     if (
       !Array.isArray(value.projectionRecoveries)
       || value.projectionRecoveries.length > maximumJournalProjectionRecoveries
@@ -2088,7 +2414,7 @@ function parseCloudDaemonJournalStructure(value: unknown): CloudDaemonJournalSta
     projectionRecoveries,
     projectionRecoveryReceipts,
     usageAccounts,
-    version: 4,
+    version: 5,
   };
   return parsed;
 }
@@ -2576,6 +2902,77 @@ export class MemoryCloudSessionSyncCursor implements CloudSessionSyncCursorPort 
   ): Promise<CloudSessionSyncCursorObservation | null> {
     if (expectedGeneration !== this.#generation) return null;
     this.#state = structuredClone(parseCloudSessionSyncCursor(state));
+    this.#generation = this.#generation === null ? 0 : this.#generation + 1;
+    return { generation: this.#generation, state: structuredClone(this.#state) };
+  }
+}
+
+export class CustodyCloudAttentionNotificationReconciliation
+implements CloudAttentionNotificationReconciliationPort {
+  readonly #custody: CloudSecretCustodyPort;
+
+  constructor(custody: CloudSecretCustodyPort) {
+    this.#custody = custody;
+  }
+
+  async read(): Promise<CloudAttentionNotificationReconciliationObservation> {
+    const observation = await this.#custody.read(attentionNotificationReconciliationSlot);
+    if (observation === null) {
+      return {
+        generation: null,
+        state: emptyCloudAttentionNotificationReconciliationState(),
+      };
+    }
+    if (
+      utf8Encoder.encode(observation.value).byteLength
+        > maximumSerializedAttentionNotificationReconciliationBytes
+    ) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(observation.value) as unknown;
+    } catch {
+      throw new Error("Cloud attention notification reconciliation state is corrupt.");
+    }
+    return {
+      generation: observation.generation,
+      state: parseCloudAttentionNotificationReconciliationState(decoded),
+    };
+  }
+
+  async compareAndSwap(
+    expectedGeneration: number | null,
+    state: CloudAttentionNotificationReconciliationState,
+  ): Promise<CloudAttentionNotificationReconciliationObservation | null> {
+    const parsed = parseCloudAttentionNotificationReconciliationState(state);
+    const serialized = JSON.stringify(parsed);
+    const committed = await this.#custody.compareAndSwap(
+      attentionNotificationReconciliationSlot,
+      expectedGeneration,
+      serialized,
+    );
+    return committed === null
+      ? null
+      : { generation: committed.generation, state: parsed };
+  }
+}
+
+export class MemoryCloudAttentionNotificationReconciliation
+implements CloudAttentionNotificationReconciliationPort {
+  #generation: number | null = null;
+  #state = emptyCloudAttentionNotificationReconciliationState();
+
+  async read(): Promise<CloudAttentionNotificationReconciliationObservation> {
+    return { generation: this.#generation, state: structuredClone(this.#state) };
+  }
+
+  async compareAndSwap(
+    expectedGeneration: number | null,
+    state: CloudAttentionNotificationReconciliationState,
+  ): Promise<CloudAttentionNotificationReconciliationObservation | null> {
+    if (expectedGeneration !== this.#generation) return null;
+    this.#state = structuredClone(
+      parseCloudAttentionNotificationReconciliationState(state),
+    );
     this.#generation = this.#generation === null ? 0 : this.#generation + 1;
     return { generation: this.#generation, state: structuredClone(this.#state) };
   }

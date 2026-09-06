@@ -13,6 +13,7 @@ import { publicContent } from "./content.ts";
 import { renderSocialCardPng, renderSocialCardSvg } from "./social-card.ts";
 import { readPngDimensions } from "./social-card-raster.ts";
 import {
+  HRA_MAILING_TURNSTILE_SITEKEY_ENV,
   renderAskAiAboutThis,
   renderHraAnalyticsScript,
   renderHraSiteFooter,
@@ -45,6 +46,19 @@ afterEach(async () => {
 });
 
 describe("static-site build", () => {
+  test("keeps documentation code roles separate from inverse marketing roles", async () => {
+    const styles = await readFile(join(import.meta.dir, "styles.css"), "utf8");
+    expect(styles).toContain(".hra-inline-code {");
+    expect(styles).toContain("overflow-wrap: anywhere;");
+    expect(styles).not.toMatch(/(?:^|\n)code\s*\{/u);
+    expect(styles).toContain("--hraness-marketing-inverse: var(--inverse-background)");
+    expect(styles).toContain("--hraness-marketing-inverse-ink: var(--inverse-foreground)");
+    expect(styles).toContain("--foreground: var(--code-foreground)");
+    expect(styles).toContain("--code-background: #090a0c");
+    expect(styles).toContain("--code-foreground: #fbf8f0");
+    expect(styles).toContain("--inverse-background: #f0ebdf");
+  });
+
   test("renders one crawlable Ask AI row on each public page with exact provider prompts", () => {
     const subjectUrl = "https://hra.sh/privacy/";
     const prompt = `Tell me about ${subjectUrl}`;
@@ -117,6 +131,8 @@ describe("static-site build", () => {
     expect(builtStyles).toContain('./fonts/nebula-sans/NebulaSans-Book.woff2');
     expect(builtStyles).toContain(".hraness-marketing-hero");
     expect(builtStyles).toContain(".hraness-marketing-interface-grid");
+    expect(builtStyles).toContain(".syntax-code");
+    expect(builtStyles).toContain(".syntax-token--command");
     expect(builtStyles).toContain(".hraness-site-footer {");
 
     expect((await readFile(
@@ -171,7 +187,7 @@ describe("static-site build", () => {
     })).rejects.toThrow("Release commit");
   });
 
-  test("fails Production closed without one valid public PostHog token", async () => {
+  test("fails Production closed without valid public analytics and mailing configuration", async () => {
     const validToken = "phc_public_production_token";
     expect(resolveHraAnalyticsProjectToken({ VERCEL_ENV: "preview" })).toBe("");
     expect(resolveHraAnalyticsProjectToken({
@@ -194,6 +210,16 @@ describe("static-site build", () => {
         repositoryRoot: root,
       })).rejects.toThrow(HRA_POSTHOG_PROJECT_TOKEN_ENV);
     }
+
+    const missingTurnstileRoot = await createFixtureRoot();
+    await expect(buildSite({
+      check: false,
+      environment: {
+        [HRA_POSTHOG_PROJECT_TOKEN_ENV]: validToken,
+        VERCEL_ENV: "production",
+      },
+      repositoryRoot: missingTurnstileRoot,
+    })).rejects.toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
   });
 
   test("embeds only the public token in the self-hosted Production bundle", async () => {
@@ -202,6 +228,7 @@ describe("static-site build", () => {
     await buildSite({
       check: false,
       environment: {
+        [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: "1x00000000000000000000AA",
         [HRA_POSTHOG_PROJECT_TOKEN_ENV]: publicToken,
         VERCEL_ENV: "production",
       },
@@ -209,9 +236,14 @@ describe("static-site build", () => {
     });
 
     const analytics = await readFile(join(root, "dist/site/analytics.js"), "utf8");
+    const html = await readFile(join(root, "dist/site/index.html"), "utf8");
     expect(analytics).toContain(publicToken);
     expect(analytics).not.toMatch(/\bphx_[A-Za-z0-9_-]+\b/u);
     expect(analytics).not.toContain("POSTHOG_API_KEY");
+    expect(html).toContain('data-mailing-list="signup"');
+    expect(html).toContain(
+      'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
+    );
   });
 
   test("keeps the hosted identity marker at the fixed release-evidence version", async () => {
@@ -316,7 +348,9 @@ describe("static-site build", () => {
     expect(html.match(/<script[^>]+src=/gu)).toHaveLength(1);
     expect(html).toContain(renderHraAnalyticsScript());
     expect(renderPreviewHtml()).not.toContain(renderHraAnalyticsScript());
-    expect(renderHraSiteFooter("1x00000000000000000000AA")).toContain(
+    expect(renderHraSiteFooter({
+      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: "1x00000000000000000000AA",
+    })).toContain(
       'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
     );
     expect(html).not.toMatch(/<link[^>]+rel="(?:icon|stylesheet)"[^>]+href="https?:\/\//);

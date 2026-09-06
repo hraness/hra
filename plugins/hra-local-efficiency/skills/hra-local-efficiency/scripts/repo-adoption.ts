@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { lstatSync, readFileSync } from "node:fs";
+import type { Stats } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 
 import {
@@ -21,15 +22,38 @@ export type RepositoryAdoptionOptions = {
 
 export type RepositoryAdoptionReport = {
   readonly agentsPath: string;
+  readonly claudePath: string;
   readonly changed: boolean;
   readonly mode: RepositoryAdoptionMode;
   readonly root: string;
   readonly status: "current" | "needs-update" | "updated";
-  readonly version: 1;
+  readonly version: 2;
 };
 
 const startMarker = "<!-- hra-local-efficiency:start -->";
 const endMarker = "<!-- hra-local-efficiency:end -->";
+const claudeStartMarker = "<!-- hra-local-efficiency:claude-import:start -->";
+const claudeEndMarker = "<!-- hra-local-efficiency:claude-import:end -->";
+const claudeImport = "@AGENTS.md";
+
+function withoutInlineCode(line: string): string {
+  let output = "";
+  let delimiterLength = 0;
+  for (let index = 0; index < line.length;) {
+    if (line[index] !== "`") {
+      output += delimiterLength === 0 ? line.charAt(index) : " ";
+      index += 1;
+      continue;
+    }
+    let runLength = 1;
+    while (line[index + runLength] === "`") runLength += 1;
+    if (delimiterLength === 0) delimiterLength = runLength;
+    else if (runLength === delimiterLength) delimiterLength = 0;
+    output += " ".repeat(runLength);
+    index += runLength;
+  }
+  return output;
+}
 
 export function parseRepositoryAdoptionArguments(
   arguments_: readonly string[],
@@ -95,6 +119,68 @@ function expectedAgents(current: string | null): string {
   return replaceManagedBlock(current, repositoryPolicy(), startMarker, endMarker);
 }
 
+function hasActiveClaudeImport(value: string): boolean {
+  let fence: { readonly character: string; readonly length: number } | null = null;
+  for (const rawLine of value.split("\n")) {
+    const line = rawLine.replace(/\r$/u, "");
+    if (fence === null) {
+      const opening = /^ {0,3}(`{3,}|~{3,})/u.exec(line);
+      if (opening !== null) {
+        const marker = opening[1] as string;
+        fence = { character: marker[0] as string, length: marker.length };
+        continue;
+      }
+    } else {
+      const closing = /^ {0,3}(`{3,}|~{3,})[\t ]*$/u.exec(line);
+      if (closing !== null) {
+        const marker = closing[1] as string;
+        if (marker[0] === fence.character && marker.length >= fence.length) {
+          fence = null;
+        }
+      }
+      continue;
+    }
+    if (
+      /(?:^|[^A-Za-z0-9_./-])@AGENTS\.md(?:$|[^A-Za-z0-9_./-])/u
+        .test(withoutInlineCode(line))
+    ) return true;
+  }
+  return false;
+}
+
+function expectedClaude(current: string | null): string {
+  if (current === null) return `${claudeImport}\n`;
+  const starts = occurrences(current, claudeStartMarker);
+  const ends = occurrences(current, claudeEndMarker);
+  if (starts > 1 || ends > 1) {
+    throw new Error("root CLAUDE.md contains duplicate hra-local-efficiency import markers");
+  }
+  if (starts === 0 && ends === 0 && hasActiveClaudeImport(current)) return current;
+  const block = `${claudeStartMarker}\n${claudeImport}\n${claudeEndMarker}\n`;
+  return replaceManagedBlock(current, block, claudeStartMarker, claudeEndMarker);
+}
+
+function guidanceMetadata(path: string, description: string): Stats | null {
+  let metadata: Stats | null = null;
+  try {
+    metadata = lstatSync(path);
+  } catch (error: unknown) {
+    if (
+      typeof error !== "object"
+      || error === null
+      || !("code" in error)
+      || error.code !== "ENOENT"
+    ) throw error;
+  }
+  if (metadata !== null && !metadata.isFile()) {
+    throw new Error(`refusing to replace non-file ${description}: ${path}`);
+  }
+  if (metadata !== null && metadata.nlink !== 1) {
+    throw new Error(`refusing to replace hard-linked ${description}: ${path}`);
+  }
+  return metadata;
+}
+
 export function runRepositoryAdoption(
   options: RepositoryAdoptionOptions,
 ): RepositoryAdoptionReport {
@@ -113,43 +199,40 @@ export function runRepositoryAdoption(
   }
 
   const agentsPath = join(options.root, "AGENTS.md");
-  let agentsMetadata: ReturnType<typeof lstatSync> | null = null;
-  try {
-    agentsMetadata = lstatSync(agentsPath);
-  } catch (error: unknown) {
-    if (
-      typeof error !== "object"
-      || error === null
-      || !("code" in error)
-      || error.code !== "ENOENT"
-    ) throw error;
-  }
-  if (agentsMetadata !== null && !agentsMetadata.isFile()) {
-    throw new Error(`refusing to replace non-file root guidance: ${agentsPath}`);
-  }
-
-  const current = readText(agentsPath);
-  let mode = 0o644;
-  if (agentsMetadata !== null) mode = agentsMetadata.mode & 0o777;
-  const expected = expectedAgents(current);
-  const needsUpdate = current !== expected;
+  const claudePath = join(options.root, "CLAUDE.md");
+  const agentsMetadata = guidanceMetadata(agentsPath, "root guidance");
+  const claudeMetadata = guidanceMetadata(claudePath, "root Claude guidance");
+  const currentAgents = readText(agentsPath);
+  const currentClaude = readText(claudePath);
+  const agentsMode = agentsMetadata === null ? 0o644 : agentsMetadata.mode & 0o777;
+  const claudeMode = claudeMetadata === null ? 0o644 : claudeMetadata.mode & 0o777;
+  const expectedAgentsValue = expectedAgents(currentAgents);
+  const expectedClaudeValue = expectedClaude(currentClaude);
+  const agentsNeedUpdate = currentAgents !== expectedAgentsValue;
+  const claudeNeedsUpdate = currentClaude !== expectedClaudeValue;
+  const needsUpdate = agentsNeedUpdate || claudeNeedsUpdate;
 
   if (options.mode === "apply" && needsUpdate) {
-    writeAtomic(agentsPath, expected, mode);
-    if (readText(agentsPath) !== expected) {
+    if (agentsNeedUpdate) writeAtomic(agentsPath, expectedAgentsValue, agentsMode);
+    if (claudeNeedsUpdate) writeAtomic(claudePath, expectedClaudeValue, claudeMode);
+    if (readText(agentsPath) !== expectedAgentsValue) {
       throw new Error(`root guidance did not converge: ${agentsPath}`);
+    }
+    if (readText(claudePath) !== expectedClaudeValue) {
+      throw new Error(`root Claude guidance did not converge: ${claudePath}`);
     }
   }
 
   return {
     agentsPath,
+    claudePath,
     changed: options.mode === "apply" && needsUpdate,
     mode: options.mode,
     root: options.root,
     status: needsUpdate
       ? options.mode === "apply" ? "updated" : "needs-update"
       : "current",
-    version: 1,
+    version: 2,
   };
 }
 
@@ -158,7 +241,11 @@ if (import.meta.main) {
     const options = parseRepositoryAdoptionArguments(process.argv.slice(2));
     const report = runRepositoryAdoption(options);
     if (options.json) console.log(JSON.stringify(report, null, 2));
-    else console.log(`${report.status.toUpperCase().replace("-", "_")}\t${report.agentsPath}`);
+    else {
+      console.log(
+        `${report.status.toUpperCase().replace("-", "_")}\t${report.agentsPath}\t${report.claudePath}`,
+      );
+    }
     if (report.status === "needs-update") process.exitCode = 1;
   } catch (error: unknown) {
     console.error(`[hra-repo-adoption] ${error instanceof Error ? error.message : String(error)}`);

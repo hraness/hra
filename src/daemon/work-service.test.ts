@@ -53,7 +53,7 @@ const effectiveRuntimeProfile = (
   processGeneration: authority.generation,
   observedAt: 10_000,
   preset,
-  model: "gpt-5.6-sol",
+  model: "gpt-6-astra",
   reasoningEffort: "max",
   serviceTier: fast ? "priority" : null,
   fast,
@@ -67,6 +67,7 @@ const effectiveRuntimeProfile = (
 
 class WorkRuntime implements CodexRuntimePort {
   readonly provider = "codex" as const;
+  discardRuntimeReview(): void {}
   logoutCalls = 0;
   readonly startTurnCalls: Array<Readonly<{
     clientMessageId: string;

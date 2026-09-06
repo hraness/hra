@@ -3,6 +3,7 @@
   "buildCommand": "cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app",
   "cleanUrls": false,
   "framework": null,
+  "ignoreCommand": "test \"$VERCEL_ENV\" != \"production\"",
   "installCommand": "true",
   "outputDirectory": "dist",
   "trailingSlash": false,

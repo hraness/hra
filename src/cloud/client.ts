@@ -37,6 +37,8 @@ export const cloudQueries = [
 
 export const cloudMutations = [
   "accountDeletion:request",
+  "attentionNotifications:authorityStatus",
+  "attentionNotifications:reconcile",
   "devices:register",
   "devices:recoverRegistration",
   "devices:approve",
@@ -62,6 +64,8 @@ export const cloudMutations = [
   "commands:cancelPending",
   "deviceCommands:enqueue",
   "deviceCommands:acknowledgeReceipt",
+  "deviceCommands:confirmRevokedTerminal",
+  "deviceCommands:confirmTerminalRecovery",
   "deviceCommands:consumeResult",
   "deviceCommands:prepare",
   "deviceCommands:markEffectStarted",

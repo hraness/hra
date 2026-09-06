@@ -1,5 +1,23 @@
 export { ClaudeDeltaAssembler, type ClaudeFact } from "./assembler.ts";
 export {
+  parseClaudeAuthStatus,
+  readClaudeAuthStatus,
+  runClaudeForegroundLogin,
+  createClaudeLoginSignalCustody,
+  type ClaudeAuthAccountProjection,
+  type ClaudeAuthStatusProcess,
+  type ClaudeAuthStatusProcessFactory,
+  type ClaudeAuthStatusReader,
+  type ClaudeForegroundLoginProcess,
+  type ClaudeForegroundLoginProcessFactory,
+  type ClaudeForegroundLoginResult,
+  type ClaudeLoginSignal,
+  type ClaudeLoginSignalCustody,
+  type ClaudeLoginSignalSource,
+  type ReadClaudeAuthStatusOptions,
+  type RunClaudeForegroundLoginOptions,
+} from "./auth.ts";
+export {
   ClaudeStreamClient,
   type ClaudeInteractionDecision,
   type ClaudeStreamClientOptions,
@@ -55,11 +73,10 @@ export {
   buildPinnedClaudeRuntimeArgv,
   locateClaudeExecutable,
   resolvePinnedClaudeRuntime,
-  spawnClaudeAuthStatusProbe,
   spawnClaudeVersionProbe,
-  type ClaudeAuthReadiness,
-  type ClaudeAuthStatusProbe,
   type ClaudeVersionProbe,
+  type ClaudeVersionProbeProcess,
+  type ClaudeVersionProbeProcessFactory,
   type PinnedClaudeRuntime,
   type ResolvePinnedClaudeRuntimeOptions,
 } from "./runtime.ts";

@@ -18,7 +18,7 @@ const safePositiveIntegerSchema = z.number().int().positive().max(Number.MAX_SAF
 const utf8Bytes = (value: string): number => new TextEncoder().encode(value).byteLength;
 const compareCanonicalString = (left: string, right: string): number =>
   left === right ? 0 : left < right ? -1 : 1;
-const providerCodeCharacters = /^[A-Za-z0-9_.:+\/-]+$/u;
+const providerCodeCharacters = /^[A-Za-z0-9_.:+/-]+$/u;
 const boundedProviderCodeSchema = z.string().min(1).regex(providerCodeCharacters).refine(
   (value) => utf8Bytes(value) <= 128,
   "Provider code exceeds 128 UTF-8 bytes.",
@@ -331,7 +331,8 @@ export function providerUsageIdempotencyKey(input: Readonly<{
 }
 
 const unsignedComponent = (component: ProviderUsageComponent): Readonly<Record<string, unknown>> => {
-  const { componentDigest: _componentDigest, ...unsigned } = component;
+  const unsigned: Record<string, unknown> = { ...component };
+  delete unsigned.componentDigest;
   return unsigned;
 };
 

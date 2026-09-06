@@ -183,7 +183,12 @@ export const providerObservationSchema = z.discriminatedUnion("state", [
     state: z.literal("unavailable"),
     coverage: z.literal("unavailable"),
     freshness: z.literal("fresh"),
-    code: z.enum(["account_signed_out", "authority_retired", "resume_unavailable"]),
+    code: z.enum([
+      "account_signed_out",
+      "authority_retired",
+      "provider_platform_unavailable",
+      "resume_unavailable",
+    ]),
   }).strict(),
   z.object({
     ...providerObservationBase,

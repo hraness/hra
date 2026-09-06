@@ -3,6 +3,7 @@
 /package.json @0thernet
 /bun.lock @0thernet
 /scripts/check-commit-ci-run.ts @0thernet
+/scripts/create-release-tag.ts @0thernet
 /scripts/check-package.ts @0thernet
 /scripts/check-public-release.ts @0thernet
 /scripts/check-release-package.ts @0thernet
@@ -18,6 +19,7 @@
 /scripts/package-policy.ts @0thernet
 /scripts/publish-github-release.ts @0thernet
 /scripts/publish-npm-release.ts @0thernet
+/scripts/release-repository-identity.ts @0thernet
 /scripts/release-artifact-checksum.ts @0thernet
 /scripts/release-distribution-policy.ts @0thernet
 /scripts/release-package-policy.ts @0thernet

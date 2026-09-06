@@ -5,6 +5,12 @@ import { CODEX_PIN } from "../codex/pin";
 import { ATTACHMENT_MAX_COUNT } from "../domain/attachments";
 import type { LocalCommand } from "../domain/contracts";
 import { localCommandSchema } from "../domain/contracts";
+import { canonicalizeNotificationTimeZone } from "../domain/notification-hours";
+import {
+  DEFAULT_PROVIDER,
+  defaultPresetForProvider,
+  providerSchema,
+} from "../domain/presets";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "../domain/usage-metrics";
 import { createCloudUuidV7, isUuidV7 } from "../domain/uuid-v7";
 import { parseAuthCredentials } from "../cloud/authCredentials";
@@ -131,6 +137,14 @@ export type AccountLoginCliInvocation = Readonly<{
   replayCommand: string;
 }>;
 
+/** Claude owns the foreground interaction; the daemon owns its durable attempt. */
+export type ClaudeAccountAuthCliInvocation = Readonly<{
+  command: Extract<LocalCommand, { kind: "account.claude-login.prepare" }>;
+  json: boolean;
+  kind: "account.claude-login";
+  replayCommand: string;
+}>;
+
 export type InteractionResolveCommand = Extract<LocalCommand, { kind: "interaction.resolve" }>;
 
 export type CliInvocation =
@@ -145,6 +159,7 @@ export type CliInvocation =
   | ProtectedInteractionCliInvocation
   | ProtectedInteractionInspectCliInvocation
   | AccountLoginCliInvocation
+  | ClaudeAccountAuthCliInvocation
   | SessionAttachmentCliInvocation
   | SessionEventFollowCliInvocation
   | SessionEventWatchCliInvocation
@@ -173,7 +188,7 @@ export type RemoteCliCommand =
   | Readonly<{ commandPublicId: string; kind: "remote.command" }>
   | Readonly<{ kind: "remote.send" | "remote.queue" | "remote.steer"; message: string; orSteer?: boolean; session: string }>
   | Readonly<{
-      decision: "once" | "decline" | "cancel";
+      decision: "once" | "decline";
       interaction: string;
       kind: "remote.resolve";
       revision: number;
@@ -215,6 +230,8 @@ Usage:
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
   hra session rename|recover|abandon|archive|unarchive|note|preset|fast|project
+  hra notification-hours status|set
+  hra notification-email status|enable|disable
   hra work protocol|apply|snapshot|task|poll|events|watch
   hra interaction list|show|inspect|decide|grant|answer|submit
   hra remote list|show|command|send|queue|steer|stop|resolve|preset|fast|allow|deny|policy
@@ -237,10 +254,14 @@ Interactive:
 Mutation safety:
   --idempotency-key <uuid>  Reuse after a lost response; changed reuse fails closed.
 
+Platform:
+  Codex provider commands run on macOS and Linux. Claude login, status, sessions, and
+  provider switches require Linux; macOS refuses before launching Claude.
+
 Recommended profiles:
   low         Luna Max        (codex)
-  high        Sol Max         (codex)
-  ultra       Sol Ultra       (codex)
+  high        Astra Max       (codex)
+  ultra       Astra Ultra     (codex)
   fable-max   Claude Fable    (claude)
 
 Run \`hra <group> --help\` or \`hra help <group> [<command>]\` for command examples.`;
@@ -284,19 +305,26 @@ Examples:
 
 Usage:
   hra account add <label>
-  hra account login <profile> [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
-  hra account login-cancel <profile>
+  hra account login <profile> [--provider <codex|claude>] [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
+  hra account login-cancel <profile> [--provider codex]
+  hra account login-cancel <profile> --provider claude --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
   hra account logout <profile>
   hra account list
-  hra account show <profile>
+  hra account show <profile> [--provider <codex|claude>]
   hra account usage [profile] [--refresh]
   hra account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]
   hra account switch <profile>
   hra account switch-recover
 
+Platform:
+  Codex account commands run on macOS and Linux. Claude login and status require Linux;
+  macOS refuses before launching Claude.
+
 Examples:
   hra account add personal
   hra account login personal --device-code --handoff-file /private/path/login.json
+  hra account login personal --provider claude
+  hra account show personal --provider claude
   hra account login-cancel personal
   hra account usage personal --refresh
   hra account usage-history personal --from 2026-08-23T12:00:00Z --json`,
@@ -321,6 +349,30 @@ Usage:
 Examples:
   hra project add --path . --name jungle
   hra project use jungle`,
+  "notification-hours": `HRA notification hours
+
+Usage:
+  hra notification-hours status [--json]
+  hra notification-hours set --start <HH:MM> --end <HH:MM> --timezone <IANA-zone> --revision <n> [--json]
+
+Examples:
+  hra notification-hours status
+  hra notification-hours set --start 10:00 --end 22:00 --timezone America/Puerto_Rico --revision 1`,
+  "notification-email": `HRA attention email notifications
+
+Usage:
+  hra notification-email status [--json]
+  hra notification-email enable|disable --revision <n> [--json]
+
+The setting is local to this machine. Status and enable report only bounded
+hosted observations. Disable commits locally first, then reports whether hosted
+invalidation was acknowledged, remains pending under a returned receipt, or was
+not observed; it never claims recall of a delivery that already started.
+
+Examples:
+  hra notification-email status
+  hra notification-email enable --revision 1
+  hra notification-email disable --revision 2`,
   session: `HRA session
 Session tasks always return to the selected conversation. They never create a standalone task or a new conversation.
 
@@ -354,7 +406,7 @@ Usage:
   hra session task delete <session> <task-id> --revision <n> [--idempotency-key <uuid>]
 
 Examples:
-  hra session start personal --project jungle --preset high
+  hra session start personal --project jungle
   hra session start personal --provider claude --preset fable-max
   hra session switch my-session --provider claude
   hra session export my-session --format trajectory --out ./trajectory.json
@@ -410,7 +462,7 @@ Usage:
   hra remote command <uuidv7>
   hra remote send|queue|steer <cloud-session> <message>
   hra remote stop <cloud-session>
-  hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <once|decline|cancel>
+  hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <decline>
   hra remote preset <cloud-session> <low|high|ultra|fable-max>
   hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]
   hra remote fast <cloud-session> <on|off>
@@ -570,6 +622,7 @@ const uuidV7KeyLifetimeMs = 7 * 24 * 60 * 60 * 1_000;
 const uuidV7KeyFutureSkewMs = 5 * 60 * 1_000;
 const idempotentCommandKinds = new Set<LocalCommand["kind"]>([
   "account.login",
+  "account.claude-login.abandon",
   "account.logout",
   "account.switch",
   "session.start",
@@ -677,6 +730,39 @@ const boundedDecimal = (
     throw new CliUsageError(`${label} must be an integer from ${String(minimum)} to ${String(maximum)}.`);
   }
   return parsed;
+};
+
+const notificationClockMinute = (
+  value: string | undefined,
+  optionName: "--start" | "--end",
+): number => {
+  if (value === undefined) throw new CliUsageError(`Missing notification-hours ${optionName}.`);
+  const match = /^(\d{2}):(\d{2})$/u.exec(value);
+  const hour = Number(match?.[1]);
+  const minute = Number(match?.[2]);
+  if (
+    match === null
+    || !Number.isInteger(hour)
+    || hour < 0
+    || hour > 23
+    || !Number.isInteger(minute)
+    || minute < 0
+    || minute > 59
+  ) {
+    throw new CliUsageError(`Notification-hours ${optionName} must use 24-hour HH:MM from 00:00 through 23:59.`);
+  }
+  return hour * 60 + minute;
+};
+
+const notificationTimeZone = (value: string | undefined): string => {
+  if (value === undefined) throw new CliUsageError("Missing notification-hours --timezone.");
+  try {
+    return canonicalizeNotificationTimeZone(value);
+  } catch {
+    throw new CliUsageError(
+      "Notification-hours --timezone must be a supported explicit IANA time zone.",
+    );
+  }
 };
 
 const utcRfc3339Milliseconds = (value: string | undefined, label: string): number | undefined => {
@@ -792,6 +878,34 @@ export const accountLoginReplayCommand = (
 export const accountLoginCancelCommand = (account: string): string =>
   `hra account login-cancel ${shellArgument(account)}`;
 
+export const claudeAccountLoginCommand = (
+  account: string,
+  idempotencyKey?: string,
+): string => [
+  "hra account login",
+  shellArgument(account),
+  "--provider claude",
+  ...(idempotencyKey === undefined ? [] : ["--idempotency-key", idempotencyKey]),
+].join(" ");
+
+export const claudeAccountLoginAbandonCommand = (
+  account: string,
+  attemptId: string,
+  idempotencyKey: string,
+  providerGeneration: number,
+): string => [
+  "hra account login-cancel",
+  shellArgument(account),
+  "--provider claude",
+  "--attempt-id",
+  shellArgument(attemptId),
+  "--provider-generation",
+  String(providerGeneration),
+  "--idempotency-key",
+  idempotencyKey,
+  "--acknowledge-child-exited",
+].join(" ");
+
 export const deviceMutationReplayCommand = (
   command: Extract<LocalCommand, { kind: "device.approve" | "device.revoke" }>,
   json: boolean,
@@ -879,17 +993,57 @@ const parseAccount = (
   cursor: Cursor,
   idempotencyKey: string | undefined,
   json: boolean,
-): LocalCommand | AccountLoginCliInvocation => {
+): LocalCommand | AccountLoginCliInvocation | ClaudeAccountAuthCliInvocation => {
   const action = take(cursor, "account action");
   switch (action) {
     case "list": finish(cursor); return { kind: "account.list" };
     case "add": { const label = remainder(cursor, "account label"); return command({ kind: "account.add", label }); }
-    case "show": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.show", account }; }
+    case "show": {
+      const provider = option(cursor, "--provider") ?? "codex";
+      const account = take(cursor, "account");
+      finish(cursor);
+      if (provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      if (provider === "claude") {
+        if (idempotencyKey !== undefined) {
+          throw new CliUsageError("--idempotency-key is not supported by Claude account status.");
+        }
+        return command({ kind: "account.show", account, provider: "claude" });
+      }
+      return { kind: "account.show", account };
+    }
     case "login": {
       const deviceCode = flag(cursor, "--device-code");
       const handoffFile = option(cursor, "--handoff-file");
+      const provider = option(cursor, "--provider") ?? "codex";
       const account = take(cursor, "account");
       finish(cursor);
+      if (provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      if (provider === "claude") {
+        if (deviceCode) {
+          throw new CliUsageError("Claude Code does not expose a device-code login. Run the foreground Claude login without --device-code.");
+        }
+        if (handoffFile !== undefined) {
+          throw new CliUsageError("Claude login is a foreground terminal flow and does not accept --handoff-file.");
+        }
+        const parsed = command({
+          kind: "account.claude-login.prepare",
+          account,
+          idempotencyKey: idempotencyKey ?? randomUUID(),
+        });
+        if (parsed.kind !== "account.claude-login.prepare") {
+          throw new CliUsageError("Claude account login command is invalid.");
+        }
+        return {
+          command: parsed,
+          json,
+          kind: "account.claude-login",
+          replayCommand: claudeAccountLoginCommand(parsed.account, parsed.idempotencyKey),
+        };
+      }
       if (handoffFile !== undefined && (!isAbsolute(handoffFile) || resolve(handoffFile) !== handoffFile)) {
         throw new CliUsageError("--handoff-file must be an absolute normalized path to an existing protected file.");
       }
@@ -915,7 +1069,40 @@ const parseAccount = (
         ),
       };
     }
-    case "login-cancel": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.login-cancel", account }; }
+    case "login-cancel": {
+      const provider = option(cursor, "--provider") ?? "codex";
+      if (provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      if (provider === "claude") {
+        const acknowledgeChildExited = flag(cursor, "--acknowledge-child-exited");
+        const attemptId = option(cursor, "--attempt-id");
+        const providerGeneration = boundedDecimal(
+          option(cursor, "--provider-generation"),
+          "Claude provider generation",
+          0,
+          Number.MAX_SAFE_INTEGER,
+        );
+        const account = take(cursor, "account");
+        finish(cursor);
+        if (!acknowledgeChildExited) {
+          throw new CliUsageError("Claude login recovery requires --acknowledge-child-exited after you have confirmed its original foreground child exited.");
+        }
+        if (attemptId === undefined) throw new CliUsageError("Claude login recovery requires --attempt-id from account status.");
+        if (idempotencyKey === undefined) throw new CliUsageError("Claude login recovery requires the exact --idempotency-key from account status.");
+        return command({
+          kind: "account.claude-login.abandon",
+          account,
+          attemptId,
+          idempotencyKey,
+          providerGeneration,
+          acknowledgeChildExited: true,
+        });
+      }
+      const account = take(cursor, "account");
+      finish(cursor);
+      return { kind: "account.login-cancel", account };
+    }
     case "logout": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.logout", account }; }
     case "usage": { const refresh = flag(cursor, "--refresh"); const account = takeOptional(cursor); finish(cursor); return command({ kind: "account.usage", account, refresh }); }
     case "usage-history": {
@@ -1165,13 +1352,12 @@ const parseSession = (
     }
     case "start": {
       const project = option(cursor, "--project");
-      const provider = option(cursor, "--provider") ?? "codex";
-      if (provider !== "codex" && provider !== "claude") {
+      const parsedProvider = providerSchema.safeParse(option(cursor, "--provider") ?? DEFAULT_PROVIDER);
+      if (!parsedProvider.success) {
         throw new CliUsageError("Provider must be `codex` or `claude`.");
       }
-      // The provider chooses the default preset, so an unchanged `hra session
-      // start` keeps its exact Codex behaviour.
-      const preset = option(cursor, "--preset") ?? (provider === "claude" ? "fable-max" : "high");
+      const provider = parsedProvider.data;
+      const preset = option(cursor, "--preset") ?? defaultPresetForProvider(provider);
       const fast = flag(cursor, "--fast");
       const account = take(cursor, "account");
       finish(cursor);
@@ -1596,8 +1782,10 @@ const parseRemote = (cursor: Cursor): RemoteCliCommand => {
       if (revisionValue === undefined || !/^[1-9]\d{0,15}$/u.test(revisionValue) || !Number.isSafeInteger(revision)) {
         throw new CliUsageError("Remote resolve requires --revision <positive integer>.");
       }
-      if (decision !== "once" && decision !== "decline" && decision !== "cancel") {
-        throw new CliUsageError("Remote resolve requires --decision once|decline|cancel.");
+      // `once` remains accepted for payload compatibility with older compact
+      // projections. Current remote policy only advertises actions it grants.
+      if (decision !== "once" && decision !== "decline") {
+        throw new CliUsageError("Remote resolve requires --decision decline.");
       }
       return { decision, interaction, kind: "remote.resolve", revision, session };
     }
@@ -1775,11 +1963,91 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     }
     return { kind: "command", command: { kind: "autorespond.set", mode, ...(session === undefined ? {} : { session }) }, json };
   }
+  if (group === "notification-hours") {
+    if (idempotencyKey !== undefined) {
+      throw new CliUsageError("--idempotency-key is not supported by notification-hours commands.");
+    }
+    const action = take(cursor, "notification-hours action");
+    if (action === "status") {
+      finish(cursor);
+      return {
+        kind: "command",
+        command: { kind: "notification-hours.status" },
+        json,
+      };
+    }
+    if (action !== "set") {
+      throw new CliUsageError(
+        "Unknown notification-hours action. Use `status` or `set`.",
+      );
+    }
+    const startMinute = notificationClockMinute(option(cursor, "--start"), "--start");
+    const endMinute = notificationClockMinute(option(cursor, "--end"), "--end");
+    const timeZone = notificationTimeZone(option(cursor, "--timezone"));
+    const expectedRevision = boundedDecimal(
+      option(cursor, "--revision"),
+      "Notification-hours --revision",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    finish(cursor);
+    return {
+      kind: "command",
+      command: command({
+        kind: "notification-hours.set",
+        expectedRevision,
+        version: 1,
+        startMinute,
+        endMinute,
+        timeZone,
+      }),
+      json,
+    };
+  }
+  if (group === "notification-email") {
+    if (idempotencyKey !== undefined) {
+      throw new CliUsageError("--idempotency-key is not supported by notification-email commands.");
+    }
+    const action = take(cursor, "notification-email action");
+    if (action === "status") {
+      finish(cursor);
+      return {
+        kind: "command",
+        command: { kind: "notification-email.status" },
+        json,
+      };
+    }
+    if (action !== "enable" && action !== "disable") {
+      throw new CliUsageError(
+        "Unknown notification-email action. Use `status`, `enable`, or `disable`.",
+      );
+    }
+    const expectedRevision = boundedDecimal(
+      option(cursor, "--revision"),
+      "Notification-email --revision",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    finish(cursor);
+    return {
+      kind: "command",
+      command: {
+        expectedRevision,
+        kind: action === "enable"
+          ? "notification-email.enable"
+          : "notification-email.disable",
+      },
+      json,
+    };
+  }
   let parsed: LocalCommand;
   let sessionAttach: readonly string[] = [];
   if (group === "account") {
     const account = parseAccount(cursor, idempotencyKey, json);
-    if (account.kind === "account.login-handoff") return account;
+    if (
+      account.kind === "account.login-handoff"
+      || account.kind === "account.claude-login"
+    ) return account;
     parsed = account;
   }
   else if (group === "plugin") parsed = parsePlugin(cursor);

@@ -1,18 +1,54 @@
 :root {
   color-scheme: light dark;
-  --background: #f4f1e9;
+  --background: #fbfaf7;
+  --surface: #ffffff;
+  --foreground: #1b1a17;
+  --muted: #66625a;
+  --rule: rgba(27, 26, 23, 0.12);
+  --line: var(--rule);
+  --link: #1f5eea;
+  --inverse-background: #1b1a17;
+  --inverse-foreground: #f7f3e8;
+  --inverse: var(--inverse-background);
   --code-background: #1a1916;
+  --code-danger: #f2a090;
   --code-foreground: #f7f3e8;
-  --foreground: #161512;
+  --code-info: #a9d5f5;
+  --code-muted: #c2bbad;
+  --code-success: #a9d49a;
+  --code-warning: #efc778;
   --font-sans: "Nebula Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --muted: #5d594f;
-  --rule: #c9c2b3;
-  --surface: #ebe5d8;
-  --link: #69401c;
-  --hraness-site-footer-measure: 74rem;
-  font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
+  --font-text: var(--font-sans);
+  --font-heading: var(--font-sans);
+  --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
+  --hraness-site-accent: #1f5eea;
+  --hraness-site-accent-ink: #ffffff;
+  --hraness-site-footer-measure: 72rem;
+  font-family: var(--font-sans);
   font-synthesis: none;
   line-height: 1.55;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #141310;
+    --surface: #1c1b18;
+    --foreground: #eee9df;
+    --muted: #b3ac9f;
+    --rule: rgba(238, 233, 223, 0.14);
+    --link: #8fb0ff;
+    --inverse-background: #f0ebdf;
+    --inverse-foreground: #171512;
+    --code-background: #090a0c;
+    --code-danger: #ffad9e;
+    --code-foreground: #fbf8f0;
+    --code-info: #acd9ff;
+    --code-muted: #c8c1b5;
+    --code-success: #b4dfa7;
+    --code-warning: #f3ce81;
+    --hraness-site-accent: #8fb0ff;
+    --hraness-site-accent-ink: #0d1a3d;
+  }
 }
 
 * {
@@ -29,12 +65,56 @@ body {
   margin: 0;
 }
 
-main,
+/* Marketing grammar bindings. The product palette above is the source of
+ * truth; the grammar reads it through these roles. */
+:where(.hraness-marketing-page, .hraness-marketing-header) {
+  --hraness-marketing-ink: var(--foreground);
+  --hraness-marketing-muted: var(--muted);
+  --hraness-marketing-background: var(--background);
+  --hraness-marketing-surface: var(--surface);
+  --hraness-marketing-inverse: var(--inverse-background);
+  --hraness-marketing-inverse-ink: var(--inverse-foreground);
+  --hraness-marketing-text-font: var(--font-sans);
+  --hraness-marketing-heading-font: var(--font-sans);
+  --hraness-marketing-mono-font: var(--font-mono);
+  --hraness-marketing-measure: 72rem;
+}
+
+.hraness-marketing-page {
+  padding-block-end: clamp(2rem, 6vw, 4rem);
+}
+
+.hraness-marketing-facts {
+  --hraness-marketing-fact-columns: 4;
+}
+
+.hraness-marketing-pillars {
+  --hraness-marketing-pillar-columns: 3;
+}
+
+.hraness-marketing-hero__example {
+  max-inline-size: 36rem;
+}
+
+.shell-transcript {
+  margin: 0;
+  border-radius: 0;
+}
+
+.install-note {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+/* Ask AI row and project resources */
+
 .hra-ask-ai,
 .project-resources {
   margin-inline: auto;
-  max-width: 74rem;
-  padding-inline: clamp(1rem, 4vw, 3rem);
+  max-width: 72rem;
+  padding-inline: clamp(1.25rem, 4vw, 3rem);
 }
 
 .hra-ask-ai {
@@ -48,10 +128,8 @@ main,
 }
 
 .hra-ask-ai [data-slot="ask-ai-about-this-label"] {
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: 0.85rem;
+  font-weight: 500;
 }
 
 .hra-ask-ai [data-slot="ask-ai-about-this-links"] {
@@ -68,11 +146,11 @@ main,
   min-height: 1.875rem;
   padding: 0 0.625rem;
   border: 1px solid var(--rule);
-  border-radius: 0.25rem;
+  border-radius: 0.5rem;
   color: inherit;
   gap: 0.25rem;
-  font-size: 0.72rem;
-  font-weight: 700;
+  font-size: 0.8rem;
+  font-weight: 500;
   line-height: 1;
   text-decoration: none;
 }
@@ -83,7 +161,7 @@ main,
 }
 
 .hra-ask-ai [data-slot="ask-ai-about-this-link"]:focus-visible {
-  outline: 2px solid currentColor;
+  outline: 2px solid var(--link);
   outline-offset: 2px;
 }
 
@@ -98,107 +176,97 @@ main,
   }
 }
 
-main {
-  padding-block: clamp(3rem, 8vw, 7rem);
+/* Reference documentation below the marketing sections */
+
+.reference {
+  inline-size: min(100%, 72rem);
+  margin-inline: auto;
+  padding-inline: clamp(1.25rem, 4vw, 3rem);
+  padding-block-start: clamp(3rem, 7vw, 5rem);
+  border-block-start: 1px solid var(--rule);
+  scroll-margin-block-start: 4rem;
 }
 
-:where(.hraness-marketing-hero, .hraness-marketing-install) {
-  --hraness-marketing-ink: var(--foreground);
-  --hraness-marketing-muted: var(--muted);
-  --hraness-marketing-line: var(--rule);
-  --hraness-marketing-surface: var(--background);
-  --hraness-marketing-inverse: var(--code-background);
-  --hraness-marketing-inverse-ink: var(--code-foreground);
-  --hraness-marketing-accent: var(--link);
-  --hraness-marketing-text-font: var(--font-sans);
-  --hraness-marketing-heading-font: var(--font-sans);
-  --hraness-marketing-mono-font: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
-  --hraness-marketing-measure: 74rem;
+.reference__intro {
+  display: grid;
+  gap: 0.75rem;
+  max-inline-size: 62ch;
 }
 
-.hraness-marketing-hero__heading {
-  max-inline-size: 10.5ch;
-  letter-spacing: -0.07em;
-  line-height: 0.9;
+.reference__heading {
+  margin: 0;
+  font-size: clamp(1.75rem, 3vw, 2.5rem);
+  font-weight: 500;
+  letter-spacing: -0.012em;
+  line-height: 1.15;
+  text-wrap: balance;
 }
 
-.hraness-marketing-hero__summary {
-  font-size: clamp(1.15rem, 2.25vw, 1.55rem);
-  line-height: 1.35;
-}
-
-.hraness-marketing-proof__heading {
-  max-inline-size: 15ch;
-}
-
-.hraness-marketing-install,
-.hero-notes {
-  margin-block-start: 2.5rem;
-}
-
-h1,
-h2,
-h3,
-p,
-ul,
-pre,
-.notice {
-  max-width: 72ch;
-}
-
-h1 {
-  font-family: var(--font-sans);
-  font-size: clamp(3rem, 11vw, 7rem);
-  letter-spacing: -0.065em;
-  line-height: 0.92;
-  margin: 0 0 2rem;
-}
-
-h2 {
-  font-family: var(--font-sans);
-  font-size: clamp(1.65rem, 4vw, 2.4rem);
-  letter-spacing: -0.03em;
-  line-height: 1.1;
+.reference h2:not(.reference__heading) {
+  font-size: 1.5rem;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
   margin-block: 0 1.25rem;
 }
 
-h3 {
+.reference h3 {
   font-size: 1rem;
+  font-weight: 600;
   margin-block: 2rem 0.5rem;
 }
 
-p,
-li,
-.notice {
-  font-size: clamp(0.96rem, 1.8vw, 1.08rem);
+.reference p,
+.reference li,
+.reference .notice {
+  font-size: 1rem;
 }
 
-a {
+.reference :where(h2, h3, p, ul, pre, .notice) {
+  max-width: 72ch;
+}
+
+/* Site styles sit outside the design-kit cascade layers, so link color is
+ * scoped to prose surfaces and never reaches marketing actions or navigation. */
+:where(.reference, .narrow-page, .hero-notes, .project-resources, .hraness-marketing-question__answer, .hraness-marketing-maker__links, .hraness-marketing-proof-frame__caption) a {
   color: var(--link);
-  text-decoration-thickness: 0.1em;
-  text-underline-offset: 0.2em;
-}
-
-a:hover {
-  text-decoration-thickness: 0.16em;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.16em;
 }
 
 a:focus-visible,
 pre:focus-visible {
-  outline: 0.2rem solid currentcolor;
-  outline-offset: 0.25rem;
+  outline: 2px solid var(--link);
+  outline-offset: 0.2rem;
+  border-radius: 0.2rem;
 }
 
-code {
-  background: color-mix(in srgb, var(--surface), transparent 16%);
-  border-radius: 0.2rem;
-  padding: 0.08em 0.24em;
+.hra-inline-code {
+  background: color-mix(in srgb, var(--foreground) 7%, transparent);
+  border-radius: 0.3rem;
+  font-size: 0.88em;
+  overflow-wrap: anywhere;
+  padding: 0.08em 0.36em;
+}
+
+pre,
+pre code,
+.hra-inline-code {
+  font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
 }
 
 pre {
+  --foreground: var(--code-foreground);
+  --danger: var(--code-danger);
+  --info: var(--code-info);
+  --muted: var(--code-muted);
+  --success: var(--code-success);
+  --warning: var(--code-warning);
   background: var(--code-background);
-  border-radius: 0.45rem;
+  border-radius: 0.625rem;
   color: var(--code-foreground);
+  font-size: 0.85rem;
+  line-height: 1.6;
   margin-block: 0.75rem;
   overflow-x: auto;
   padding: 1rem 1.15rem;
@@ -211,19 +279,31 @@ pre code {
 }
 
 .install-command {
-  font-size: clamp(0.84rem, 2.1vw, 1.08rem);
+  font-size: 0.8rem;
   margin-top: 0;
 }
 
-.init-command {
-  display: inline-block;
-  min-width: min(100%, 24rem);
+.install-checks {
+  display: grid;
+  gap: 0.65rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.install-checks pre {
+  display: block;
+  margin: 0;
+  min-width: 0;
 }
 
 .notice {
-  border-inline-start: 0.28rem solid var(--foreground);
+  border-inline-start: 3px solid var(--link);
   margin-block: 1.5rem;
   padding: 0.75rem 1rem;
+  color: var(--muted);
+}
+
+.notice strong {
+  color: var(--foreground);
 }
 
 .section-nav {
@@ -231,8 +311,19 @@ pre code {
   display: flex;
   flex-wrap: wrap;
   gap: 0.55rem 1.25rem;
-  margin-block: 4rem;
+  margin-block: 2.5rem 0;
   padding-block: 1rem;
+  font-size: 0.92rem;
+}
+
+.section-nav a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.section-nav a:hover {
+  color: var(--foreground);
+  text-decoration: underline;
 }
 
 .section-nav,
@@ -247,6 +338,11 @@ pre code {
   gap: 0 clamp(2rem, 5vw, 6rem);
   grid-template-columns: minmax(12rem, 0.65fr) minmax(0, 1.35fr);
   padding-block: clamp(2.5rem, 6vw, 5rem);
+  scroll-margin-block-start: 4rem;
+}
+
+.documentation-section:first-of-type {
+  border-top: 0;
 }
 
 .documentation-section > h2 {
@@ -265,24 +361,16 @@ pre code {
   grid-column: 2;
 }
 
-.install-checks {
-  display: grid;
-  gap: 0.65rem;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.install-checks pre {
-  display: block;
-  margin: 0;
-  min-width: 0;
+.documentation-section li + li {
+  margin-top: 0.85rem;
 }
 
 .hero-notes {
   max-width: 72ch;
 }
 
-li + li {
-  margin-top: 0.85rem;
+.hero-notes p {
+  margin-block: 0.75rem 0;
 }
 
 .command-list {
@@ -291,11 +379,36 @@ li + li {
 }
 
 .narrow-page {
-  max-width: 68rem;
+  inline-size: min(100%, 68rem);
+  margin-inline: auto;
+  padding: clamp(2rem, 6vw, 4rem) clamp(1.25rem, 4vw, 3rem);
 }
 
 .narrow-page .documentation-section {
-  margin-top: 3rem;
+  border-top: 0;
+  padding-block-start: 0;
+}
+
+.narrow-page h2 {
+  font-size: clamp(1.75rem, 3vw, 2.5rem);
+  font-weight: 500;
+  letter-spacing: -0.012em;
+  line-height: 1.15;
+  margin-block: 0 1.25rem;
+}
+
+.narrow-page h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-block: 2rem 0.5rem;
+}
+
+.narrow-page :where(p, ul, pre, .notice) {
+  max-width: 72ch;
+}
+
+.narrow-page li + li {
+  margin-top: 0.85rem;
 }
 
 .project-resources {
@@ -305,6 +418,8 @@ li + li {
   gap: 1rem 3rem;
   justify-content: space-between;
   padding-block: 2rem 4rem;
+  color: var(--muted);
+  font-size: 0.92rem;
 }
 
 .project-resources p {
@@ -325,12 +440,14 @@ li + li {
   position: fixed;
   top: 1rem;
   transform: translateY(-180%);
-  z-index: 1;
+  z-index: 50;
 }
 
 .skip-link:focus {
   transform: translateY(0);
 }
+
+/* Inert social preview composition */
 
 .preview-page {
   background:
@@ -343,7 +460,7 @@ li + li {
   align-items: center;
   display: flex;
   min-height: 100svh;
-  padding-block: clamp(1.25rem, 6vw, 4rem);
+  padding: clamp(1.25rem, 6vw, 4rem);
 }
 
 .preview-card {
@@ -368,9 +485,8 @@ li + li {
 .preview-eyebrow,
 .preview-status {
   color: var(--muted);
-  font-size: clamp(0.72rem, 1.6vw, 0.9rem);
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  font-size: clamp(0.8rem, 1.6vw, 0.95rem);
+  font-weight: 500;
 }
 
 .preview-eyebrow {
@@ -379,12 +495,16 @@ li + li {
 
 .preview-card h1 {
   font-size: clamp(4.5rem, 17vw, 10rem);
-  margin-bottom: clamp(1.25rem, 3vw, 2rem);
+  font-weight: 500;
+  letter-spacing: -0.04em;
+  line-height: 0.95;
+  margin: 0 0 clamp(1.25rem, 3vw, 2rem);
 }
 
 .preview-summary {
   font-size: clamp(1.1rem, 2.7vw, 1.65rem);
   line-height: 1.35;
+  margin: 0;
   max-width: 42rem;
 }
 
@@ -406,9 +526,8 @@ li + li {
 }
 
 .preview-capabilities strong {
-  font-size: 0.76rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: 0.9rem;
+  font-weight: 600;
 }
 
 .preview-capabilities span {
@@ -439,19 +558,6 @@ li + li {
 
   .preview-capabilities li + li {
     border-top: 1px solid var(--rule);
-  }
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #141310;
-    --code-background: #f0ebdf;
-    --code-foreground: #171512;
-    --foreground: #eee9df;
-    --muted: #b9b2a4;
-    --rule: #474238;
-    --surface: #2a2721;
-    --link: #e5b77e;
   }
 }
 

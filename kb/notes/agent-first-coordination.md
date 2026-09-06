@@ -227,8 +227,8 @@ hra work protocol [--operation <kind>|--type <name>|--topic <topic>]
 hra work apply --input-stdin
 hra work snapshot <work> [--actor <session>]
 hra work task <task> [--history-limit <1..50>] [--history-cursor <cursor>]
-hra work poll <work> [--actor <session>] [--cursor <event-cursor>] [--action-cursor <action-cursor>] [--limit <1-50>] [--wait-ms <0-30000>]
-hra work events <work> [--cursor <cursor>] [--limit <1-200>] [--wait-ms <0-30000>] [--json|--jsonl|--follow]
+hra work poll <work> [--actor <session>] [--cursor <event-cursor>] [--action-cursor <action-cursor>] [--limit <1..50>] [--wait-ms <0..30000>]
+hra work events <work> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
 hra work watch <work> [--cursor <cursor>]
 ```
 

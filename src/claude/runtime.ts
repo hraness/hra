@@ -1,8 +1,6 @@
 import { lstat, realpath } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 
-import { z } from "zod";
-
 import { ClaudeError } from "./errors.ts";
 import {
   CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON,
@@ -25,25 +23,27 @@ export interface PinnedClaudeRuntime {
   readonly argv: readonly [string, ...string[]];
 }
 
+export interface ClaudeVersionProbeProcess {
+  readonly exited: Promise<number>;
+  readonly stdout: AsyncIterable<Uint8Array>;
+  readonly stderr: AsyncIterable<Uint8Array>;
+  terminate(): void;
+  forceTerminate(): void;
+}
+
+export type ClaudeVersionProbeProcessFactory = (input: Readonly<{
+  argv: readonly [string, "--version"];
+  environment: Readonly<Record<string, string>>;
+}>) => ClaudeVersionProbeProcess;
+
 export type ClaudeVersionProbe = (input: {
   readonly executablePath: string;
   readonly configDir: string;
   readonly environment: Readonly<Record<string, string | undefined>>;
-  /** Tests and callers may lower, but never raise, the production bound. */
-  readonly timeoutMs?: number;
+  readonly signal: AbortSignal;
+  readonly deadlineMs: number;
+  readonly processFactory?: ClaudeVersionProbeProcessFactory;
 }) => Promise<string>;
-
-export type ClaudeAuthReadiness = "signed_in" | "signed_out" | "unverified";
-
-export type ClaudeAuthStatusProbe = (input: {
-  readonly executablePath: string;
-  readonly configDir: string;
-  readonly environment?: Readonly<Record<string, string | undefined>>;
-  readonly signal?: AbortSignal;
-  /** Tests and callers may lower, but never raise, the production bounds. */
-  readonly maxOutputBytes?: number;
-  readonly timeoutMs?: number;
-}) => Promise<ClaudeAuthReadiness>;
 
 export interface ResolvePinnedClaudeRuntimeOptions {
   /** Absolute path to the `claude` executable. Located on PATH when omitted. */
@@ -52,22 +52,12 @@ export interface ResolvePinnedClaudeRuntimeOptions {
   readonly configDir: string;
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly probeVersion?: ClaudeVersionProbe;
+  readonly signal?: AbortSignal;
+  readonly versionProbeDeadlineMs?: number;
+  readonly versionProbeProcessFactory?: ClaudeVersionProbeProcessFactory;
 }
 
-const versionPattern = /\b(\d{1,5}\.\d{1,5}\.\d{1,5})\b/u;
 const sha256Pattern = /^[0-9a-f]{64}$/u;
-const CLAUDE_PROBE_TIMEOUT_MS = 5_000;
-const CLAUDE_VERSION_OUTPUT_BYTES = 256;
-const CLAUDE_AUTH_STATUS_OUTPUT_BYTES = 4 * 1_024;
-const claudeSignedOutAuthStatusSchema = z.object({
-  analyticsDisabled: z.boolean(),
-  apiProvider: z.literal("firstParty"),
-  authMethod: z.literal("none"),
-  loggedIn: z.literal(false),
-  // This value is deliberately validated and dropped. It is local path data,
-  // not account identity or readiness evidence.
-  projectsDirectory: z.string().min(1).max(4_096),
-}).strict();
 const hasExactKeys = (
   value: Readonly<Record<string, unknown>>,
   expected: readonly string[],
@@ -143,170 +133,156 @@ export function buildPinnedClaudeRuntimeArgv(input: {
   ];
 }
 
-type BoundedProbeResult = Readonly<{
-  exitCode: number;
-  output: Uint8Array;
-}>;
+// Claude Code currently reports either `x.y.z` or `x.y.z (Claude Code)`, with
+// an optional final line ending. The whole output is the version assertion: accepting
+// a matching substring would let a wrapper, prerelease, or multi-version line
+// masquerade as the pinned executable.
+const versionOutputPattern = /^(\d{1,5}\.\d{1,5}\.\d{1,5})(?: \(Claude Code\))?\r?\n?$/u;
+const VERSION_PROBE_DEADLINE_MS = 5_000;
+const VERSION_PROBE_STDOUT_MAX_BYTES = 512;
+const VERSION_PROBE_STDERR_MAX_BYTES = 4 * 1024;
+const VERSION_PROBE_TERMINATION_GRACE_MS = 250;
+const VERSION_PROBE_FORCE_JOIN_MS = 1_000;
 
-const loweredPositiveBound = (requested: number | undefined, maximum: number): number =>
-  requested === undefined
-    ? maximum
-    : Number.isSafeInteger(requested) && requested > 0
-      ? Math.min(requested, maximum)
-      : maximum;
-
-/**
- * Runs one read-only Claude inspection without retaining provider output past
- * the call. The byte cap is applied before concatenation or UTF-8 decoding,
- * and every timeout, overflow, spawn failure, or non-piped stdout fails
- * closed. An explicit caller cancellation remains cancellation rather than an
- * account observation.
- */
-async function runBoundedClaudeProbe(input: {
-  readonly argv: readonly [string, ...string[]];
-  readonly configDir: string;
-  readonly environment: Readonly<Record<string, string | undefined>>;
-  readonly maxOutputBytes: number;
-  readonly signal?: AbortSignal;
-  readonly timeoutMs: number;
-}): Promise<BoundedProbeResult | null> {
-  input.signal?.throwIfAborted();
-  const env = allowlistedEnvironment(input.environment);
-  env.CLAUDE_CONFIG_DIR = input.configDir;
-  env.NO_COLOR = "1";
-
-  let child: ReturnType<typeof Bun.spawn>;
+const chunks = async function* (
+  stream: ReadableStream<Uint8Array> | number | undefined,
+): AsyncIterable<Uint8Array> {
+  if (stream === undefined || typeof stream === "number") return;
+  const reader = stream.getReader();
   try {
-    child = Bun.spawn([...input.argv], {
-      env,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-  } catch {
-    return null;
-  }
-
-  const stdout = child.stdout;
-  if (stdout === undefined || typeof stdout === "number") {
-    child.kill("SIGKILL");
-    await child.exited.catch(() => undefined);
-    return null;
-  }
-
-  const state: { canceled: boolean; invalid: boolean } = {
-    canceled: false,
-    invalid: false,
-  };
-  const terminate = (): void => {
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // A process that exited between observation and termination is already
-      // in the desired state.
+    let next = await reader.read();
+    while (!next.done) {
+      if (next.value.byteLength > 0) yield next.value;
+      next = await reader.read();
     }
-  };
-  const onAbort = (): void => {
-    state.canceled = true;
-    terminate();
-  };
-  input.signal?.addEventListener("abort", onAbort, { once: true });
-  const timer = setTimeout(() => {
-    state.invalid = true;
-    terminate();
-  }, input.timeoutMs);
-  timer.unref();
-
-  const chunks: Uint8Array[] = [];
-  let byteLength = 0;
-  const reader = stdout.getReader();
-  try {
-    for (;;) {
-      const result = await reader.read();
-      if (result.done) break;
-      if (result.value.byteLength === 0) continue;
-      byteLength += result.value.byteLength;
-      if (byteLength > input.maxOutputBytes) {
-        state.invalid = true;
-        terminate();
-        break;
-      }
-      chunks.push(result.value);
-    }
-    const exitCode = await child.exited;
-    input.signal?.throwIfAborted();
-    if (state.invalid || state.canceled) return null;
-    const output = new Uint8Array(byteLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      output.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return { exitCode, output };
-  } catch {
-    state.invalid = true;
-    terminate();
-    input.signal?.throwIfAborted();
-    return null;
   } finally {
-    clearTimeout(timer);
-    input.signal?.removeEventListener("abort", onAbort);
     reader.releaseLock();
-    if (state.invalid || state.canceled) {
-      terminate();
-      await child.exited.catch(() => undefined);
-    }
-  }
-}
-
-/** Reads `claude --version` inside the isolated home, bounded and non-interactive. */
-export const spawnClaudeVersionProbe: ClaudeVersionProbe = async (input) => {
-  const result = await runBoundedClaudeProbe({
-    argv: [input.executablePath, "--version"],
-    configDir: input.configDir,
-    environment: input.environment,
-    maxOutputBytes: CLAUDE_VERSION_OUTPUT_BYTES,
-    timeoutMs: loweredPositiveBound(input.timeoutMs, CLAUDE_PROBE_TIMEOUT_MS),
-  });
-  if (result === null || result.exitCode !== 0) {
-    throw new ClaudeError("RUNTIME_MISMATCH", "the Claude Code executable did not report a version");
-  }
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(result.output);
-  } catch {
-    throw new ClaudeError("RUNTIME_MISMATCH", "the Claude Code executable did not report a version");
   }
 };
 
-/**
- * Admits only the exact unauthenticated matrix observed from pinned Claude
- * 2.1.260 in a fresh isolated configuration. No authenticated shape has been
- * reviewed, so exit 0 always remains unverified. The parsed object and its
- * path-bearing field are dropped before returning.
- */
-export const spawnClaudeAuthStatusProbe: ClaudeAuthStatusProbe = async (input) => {
-  const result = await runBoundedClaudeProbe({
-    argv: [input.executablePath, "auth", "status", "--json"],
-    configDir: input.configDir,
-    environment: input.environment ?? process.env,
-    maxOutputBytes: loweredPositiveBound(
-      input.maxOutputBytes,
-      CLAUDE_AUTH_STATUS_OUTPUT_BYTES,
-    ),
-    ...(input.signal === undefined ? {} : { signal: input.signal }),
-    timeoutMs: loweredPositiveBound(input.timeoutMs, CLAUDE_PROBE_TIMEOUT_MS),
+const defaultVersionProbeProcess: ClaudeVersionProbeProcessFactory = (input) => {
+  const child = Bun.spawn([...input.argv], {
+    env: input.environment,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
   });
-  if (result === null || result.exitCode !== 1) return "unverified";
+  return {
+    exited: child.exited,
+    stdout: chunks(child.stdout),
+    stderr: chunks(child.stderr),
+    terminate: () => { child.kill("SIGTERM"); },
+    forceTerminate: () => { child.kill("SIGKILL"); },
+  };
+};
 
-  try {
-    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(result.output);
-    const parsed: unknown = JSON.parse(decoded);
-    return claudeSignedOutAuthStatusSchema.safeParse(parsed).success
-      ? "signed_out"
-      : "unverified";
-  } catch {
-    return "unverified";
+const collectVersionOutput = async (
+  stream: AsyncIterable<Uint8Array>,
+  maximumBytes: number,
+): Promise<Uint8Array> => {
+  const values: Uint8Array[] = [];
+  let size = 0;
+  for await (const value of stream) {
+    size += value.byteLength;
+    if (size > maximumBytes) {
+      throw new ClaudeError("PROTOCOL_LIMIT", "Claude version output exceeded its bounded limit.");
+    }
+    values.push(value);
   }
+  const joined = new Uint8Array(size);
+  let offset = 0;
+  for (const value of values) {
+    joined.set(value, offset);
+    offset += value.byteLength;
+  }
+  return joined;
+};
+
+const wait = (milliseconds: number): Promise<"timeout"> => new Promise((resolve) => {
+  const timer = setTimeout(() => resolve("timeout"), milliseconds);
+  timer.unref();
+});
+
+const stopVersionProbe = async (
+  child: ClaudeVersionProbeProcess,
+  exit: Promise<number>,
+  exitResolved: () => boolean,
+  drains: readonly Promise<unknown>[],
+): Promise<void> => {
+  try { child.terminate(); } catch { /* force below */ }
+  await Promise.race([
+    exit.then(() => true, () => true),
+    wait(VERSION_PROBE_TERMINATION_GRACE_MS).then(() => false),
+  ]);
+  if (!exitResolved()) {
+    try { child.forceTerminate(); } catch { /* bounded join remains authoritative */ }
+    await Promise.race([
+      exit.then(() => true, () => true),
+      wait(VERSION_PROBE_FORCE_JOIN_MS).then(() => false),
+    ]);
+  }
+  if (!exitResolved()) {
+    throw new ClaudeError("PROCESS_EXITED", "Claude version probe could not be joined after forced termination.");
+  }
+  const drained = await Promise.race([
+    Promise.allSettled(drains).then(() => true),
+    wait(VERSION_PROBE_FORCE_JOIN_MS).then(() => false),
+  ]);
+  if (!drained) throw new ClaudeError("PROCESS_EXITED", "Claude version probe output could not be drained after termination.");
+};
+
+/** Reads `claude --version` inside the isolated home, bounded and non-interactive. */
+export const spawnClaudeVersionProbe: ClaudeVersionProbe = async (input) => {
+  const env = allowlistedEnvironment(input.environment);
+  env.CLAUDE_CONFIG_DIR = input.configDir;
+  env.NO_COLOR = "1";
+  let child: ClaudeVersionProbeProcess;
+  try {
+    child = (input.processFactory ?? defaultVersionProbeProcess)({
+      argv: [input.executablePath, "--version"],
+      environment: env,
+    });
+  } catch (error: unknown) {
+    throw new ClaudeError("RUNTIME_MISMATCH", "the Claude Code version probe could not be started", { cause: error });
+  }
+  const stdout = collectVersionOutput(child.stdout, VERSION_PROBE_STDOUT_MAX_BYTES);
+  const stderr = collectVersionOutput(child.stderr, VERSION_PROBE_STDERR_MAX_BYTES);
+  let exitResolved = false;
+  const exit = child.exited.then(
+    (code) => { exitResolved = true; return code; },
+    (error: unknown) => { throw error; },
+  );
+  const completion = Promise.all([stdout, stderr, exit]);
+  let abort!: () => void;
+  const aborted = new Promise<"aborted">((resolve) => { abort = () => resolve("aborted"); });
+  input.signal.addEventListener("abort", abort, { once: true });
+  if (input.signal.aborted) abort();
+  let outcome: Awaited<typeof completion>;
+  let stopped = false;
+  try {
+    const settled = await Promise.race([completion, aborted, wait(input.deadlineMs)]);
+    if (settled === "aborted" || settled === "timeout") {
+      await stopVersionProbe(child, exit, () => exitResolved, [stdout, stderr]);
+      stopped = true;
+      throw new ClaudeError(
+        settled === "timeout" ? "TIMEOUT" : "PROCESS_EXITED",
+        settled === "timeout" ? "Claude version probe exceeded its bounded deadline." : "Claude version probe was canceled.",
+      );
+    }
+    outcome = settled;
+  } catch (error: unknown) {
+    if (!stopped) await stopVersionProbe(child, exit, () => exitResolved, [stdout, stderr]);
+    if (error instanceof ClaudeError) throw error;
+    throw new ClaudeError("RUNTIME_MISMATCH", "the Claude Code version probe failed", { cause: error });
+  } finally {
+    input.signal.removeEventListener("abort", abort);
+  }
+  const [output, diagnostic, code] = outcome;
+  void diagnostic;
+  if (code !== 0) {
+    throw new ClaudeError("RUNTIME_MISMATCH", "the Claude Code executable did not report a version");
+  }
+  return new TextDecoder("utf-8", { fatal: true }).decode(output).slice(0, 256);
 };
 
 /**
@@ -328,10 +304,10 @@ export async function locateClaudeExecutable(
 }
 
 /**
- * Resolves and admits the pinned Claude Code executable. HRA refuses to run
- * any other build: the stream-json surface is not a published contract, so a
- * version other than `CLAUDE_PIN` fails closed here rather than being parsed
- * hopefully.
+ * Resolves the Claude Code executable and admits only the pinned self-reported
+ * version. This is a compatibility assertion, not executable provenance: the
+ * stream-json surface is not a published contract, so any other reported
+ * version fails closed here rather than being parsed hopefully.
  */
 export async function resolvePinnedClaudeRuntime(
   options: ResolvePinnedClaudeRuntimeOptions,
@@ -356,8 +332,21 @@ export async function resolvePinnedClaudeRuntime(
   }
 
   const probe = options.probeVersion ?? spawnClaudeVersionProbe;
-  const reported = await probe({ configDir: options.configDir, environment, executablePath });
-  const version = versionPattern.exec(reported)?.[1];
+  const deadlineMs = options.versionProbeDeadlineMs ?? VERSION_PROBE_DEADLINE_MS;
+  if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 60_000) {
+    throw new ClaudeError("INVALID_INPUT", "Claude version probe deadline is invalid");
+  }
+  const reported = await probe({
+    configDir: options.configDir,
+    environment,
+    executablePath,
+    signal: options.signal ?? new AbortController().signal,
+    deadlineMs,
+    ...(options.versionProbeProcessFactory === undefined ? {} : {
+      processFactory: options.versionProbeProcessFactory,
+    }),
+  });
+  const version = versionOutputPattern.exec(reported)?.[1];
   if (version === undefined) {
     throw new ClaudeError("RUNTIME_MISMATCH", "the Claude Code executable reported no exact version");
   }

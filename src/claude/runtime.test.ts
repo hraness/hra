@@ -18,8 +18,8 @@ import {
   buildPinnedClaudeRuntimeArgv,
   locateClaudeExecutable,
   resolvePinnedClaudeRuntime,
-  spawnClaudeAuthStatusProbe,
   spawnClaudeVersionProbe,
+  type ClaudeVersionProbeProcess,
 } from "./runtime";
 
 const roots: string[] = [];
@@ -38,15 +38,6 @@ const fakeExecutable = async (): Promise<Readonly<{ configDir: string; path: str
   const root = await scratch();
   const path = join(root, "claude");
   await writeFile(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-  return { configDir: join(root, "config"), path };
-};
-
-const scriptedExecutable = async (
-  script: string,
-): Promise<Readonly<{ configDir: string; path: string }>> => {
-  const root = await scratch();
-  const path = join(root, "claude");
-  await writeFile(path, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
   return { configDir: join(root, "config"), path };
 };
 
@@ -186,6 +177,18 @@ describe("pinned Claude runtime", () => {
       executablePath: path,
       probeVersion: async () => "unknown build",
     })).rejects.toThrow(ClaudeError);
+    for (const reported of [
+      `${CLAUDE_PIN}-beta`,
+      `wrapper ${CLAUDE_PIN} around 9.9.9`,
+      `${CLAUDE_PIN} (Claude Code) 9.9.9`,
+      ` ${CLAUDE_PIN} (Claude Code)`,
+    ]) {
+      await expect(resolvePinnedClaudeRuntime({
+        configDir,
+        executablePath: path,
+        probeVersion: async () => reported,
+      })).rejects.toThrow("reported no exact version");
+    }
   });
 
   test("requires an absolute config directory and an absolute executable", async () => {
@@ -219,89 +222,6 @@ describe("pinned Claude runtime", () => {
     await expect(locateClaudeExecutable({})).rejects.toThrow(ClaudeError);
   });
 
-  test("keeps every exit-zero authenticated shape unverified", async () => {
-    const { configDir, path } = await scriptedExecutable(`
-if [ "$1:$2:$3" != "auth:status:--json" ] || [ -z "$CLAUDE_CONFIG_DIR" ] || [ -n "$ANTHROPIC_API_KEY" ]; then
-  exit 9
-fi
-printf '%s' '{"analyticsDisabled":false,"apiProvider":"firstParty","authMethod":"claude.ai","loggedIn":true,"projectsDirectory":"/isolated/projects","email":"must-not-escape@example.com","orgId":null,"orgName":null,"subscriptionType":null}'
-`);
-    await expect(spawnClaudeAuthStatusProbe({
-      configDir,
-      environment: { ...process.env, ANTHROPIC_API_KEY: "must-not-reach-child" },
-      executablePath: path,
-    })).resolves.toBe("unverified");
-  });
-
-  test("admits only the exact pinned exit-one signed-out matrix", async () => {
-    const { configDir, path } = await scriptedExecutable(`
-printf '%s' '{"projectsDirectory":"/isolated/projects","loggedIn":false,"authMethod":"none","analyticsDisabled":false,"apiProvider":"firstParty"}'
-exit 1
-`);
-    await expect(spawnClaudeAuthStatusProbe({ configDir, executablePath: path }))
-      .resolves.toBe("signed_out");
-  });
-
-  test("maps shape drift, other exits, oversized, and timed-out auth output to unverified", async () => {
-    const malformed = await scriptedExecutable("printf '%s' '{\"loggedIn\":false}'; exit 1");
-    const nonzero = await scriptedExecutable("printf '%s' '{\"loggedIn\":true}'; exit 7");
-    const extra = await scriptedExecutable("printf '%s' '{\"analyticsDisabled\":false,\"apiProvider\":\"firstParty\",\"authMethod\":\"none\",\"loggedIn\":false,\"projectsDirectory\":\"/isolated/projects\",\"email\":null}'; exit 1");
-    const exitZero = await scriptedExecutable("printf '%s' '{\"analyticsDisabled\":false,\"apiProvider\":\"firstParty\",\"authMethod\":\"none\",\"loggedIn\":false,\"projectsDirectory\":\"/isolated/projects\"}'");
-    const oversized = await scriptedExecutable(`
-printf '%s' '{"loggedIn":true,"padding":"'
-i=0
-while [ "$i" -lt 256 ]; do printf x; i=$((i + 1)); done
-printf '%s' '"}'
-`);
-    const timedOut = await scriptedExecutable("while :; do :; done");
-    await expect(spawnClaudeAuthStatusProbe({
-      configDir: malformed.configDir,
-      executablePath: malformed.path,
-    })).resolves.toBe("unverified");
-    await expect(spawnClaudeAuthStatusProbe({
-      configDir: nonzero.configDir,
-      executablePath: nonzero.path,
-    })).resolves.toBe("unverified");
-    await expect(spawnClaudeAuthStatusProbe({
-      configDir: extra.configDir,
-      executablePath: extra.path,
-    })).resolves.toBe("unverified");
-    await expect(spawnClaudeAuthStatusProbe({
-      configDir: exitZero.configDir,
-      executablePath: exitZero.path,
-    })).resolves.toBe("unverified");
-    await expect(spawnClaudeAuthStatusProbe({
-      configDir: oversized.configDir,
-      executablePath: oversized.path,
-      maxOutputBytes: 64,
-    })).resolves.toBe("unverified");
-    await expect(spawnClaudeAuthStatusProbe({
-      configDir: timedOut.configDir,
-      executablePath: timedOut.path,
-      timeoutMs: 20,
-    })).resolves.toBe("unverified");
-  });
-
-  test("bounds version output and preserves caller cancellation", async () => {
-    const oversized = await scriptedExecutable(`
-i=0
-while [ "$i" -lt 300 ]; do printf x; i=$((i + 1)); done
-`);
-    await expect(spawnClaudeVersionProbe({
-      configDir: oversized.configDir,
-      environment: process.env,
-      executablePath: oversized.path,
-    })).rejects.toThrow("did not report a version");
-
-    const controller = new AbortController();
-    controller.abort(new Error("caller stopped auth refresh"));
-    await expect(spawnClaudeAuthStatusProbe({
-      configDir: oversized.configDir,
-      executablePath: oversized.path,
-      signal: controller.signal,
-    })).rejects.toThrow("caller stopped auth refresh");
-  });
-
   test("keeps the pinned model id equal to the fable-max preset requirement", () => {
     // `src/domain` is the leaf layer and cannot import `src/claude`, so this
     // is where the two spellings are proved identical.
@@ -309,5 +229,76 @@ while [ "$i" -lt 300 ]; do printf x; i=$((i + 1)); done
       effort: CLAUDE_PIN_EFFORT,
       model: CLAUDE_PIN_MODEL,
     });
+  });
+
+  test("terminates and joins an overproducing version probe", async () => {
+    let resolveExit!: (code: number) => void;
+    let resolveStderr!: () => void;
+    let terminated = 0;
+    const stderrDone = new Promise<void>((resolve) => { resolveStderr = resolve; });
+    const process: ClaudeVersionProbeProcess = {
+      exited: new Promise((resolve) => { resolveExit = resolve; }),
+      stdout: (async function* () { yield new Uint8Array(513); })(),
+      stderr: (async function* () { await stderrDone; yield* []; })(),
+      terminate: () => { terminated += 1; resolveStderr(); resolveExit(143); },
+      forceTerminate: () => { throw new Error("graceful termination should join"); },
+    };
+    await expect(spawnClaudeVersionProbe({
+      configDir: "/tmp/claude-config",
+      deadlineMs: 1_000,
+      environment: { PATH: "/usr/bin:/bin" },
+      executablePath: "/test/claude",
+      processFactory: () => process,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "PROTOCOL_LIMIT" });
+    expect(terminated).toBe(1);
+  });
+
+  test("bounds a hung version probe with terminate, force, and an exit join", async () => {
+    let resolveExit!: (code: number) => void;
+    let resolveStreams!: () => void;
+    const trace: string[] = [];
+    const streamsDone = new Promise<void>((resolve) => { resolveStreams = resolve; });
+    const empty = () => (async function* () { await streamsDone; yield* []; })();
+    const process: ClaudeVersionProbeProcess = {
+      exited: new Promise((resolve) => { resolveExit = resolve; }),
+      stdout: empty(),
+      stderr: empty(),
+      terminate: () => { trace.push("terminate"); },
+      forceTerminate: () => {
+        trace.push("force");
+        resolveStreams();
+        resolveExit(137);
+      },
+    };
+    await expect(spawnClaudeVersionProbe({
+      configDir: "/tmp/claude-config",
+      deadlineMs: 1,
+      environment: { PATH: "/usr/bin:/bin" },
+      executablePath: "/test/claude",
+      processFactory: () => process,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "TIMEOUT" });
+    expect(trace).toEqual(["terminate", "force"]);
+  });
+
+  test("does not mistake a rejected version-exit observer for process exit", async () => {
+    const trace: string[] = [];
+    const process: ClaudeVersionProbeProcess = {
+      exited: Promise.reject(new Error("broken version wait")),
+      stdout: (async function* () { yield new TextEncoder().encode(CLAUDE_PIN); })(),
+      stderr: (async function* () { yield new Uint8Array(); })(),
+      terminate: () => { trace.push("terminate"); },
+      forceTerminate: () => { trace.push("force"); },
+    };
+    await expect(spawnClaudeVersionProbe({
+      configDir: "/tmp/claude-config",
+      deadlineMs: 1_000,
+      environment: { PATH: "/usr/bin:/bin" },
+      executablePath: "/test/claude",
+      processFactory: () => process,
+      signal: new AbortController().signal,
+    })).rejects.toThrow("could not be joined after forced termination");
+    expect(trace).toEqual(["terminate", "force"]);
   });
 });

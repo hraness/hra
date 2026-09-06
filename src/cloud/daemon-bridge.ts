@@ -3,6 +3,17 @@ import {
   providerAccountAuthoritySchema,
 } from "../domain/provider-accounts";
 import {
+  attentionNotificationCandidateLimit,
+  parseAttentionNotificationAuthorityStatus,
+  parseAttentionNotificationReconcileReceipt,
+  parseLocalAttentionNotificationSnapshot,
+  type AttentionNotificationAuthorityStatus,
+  type AttentionNotificationCompleteRequest,
+  type AttentionNotificationInvalidateRequest,
+  type AttentionNotificationReconcileReceipt,
+  type LocalAttentionNotificationSnapshot,
+} from "./attention-notifications";
+import {
   createConvexCloudTransport,
   type CloudArgs,
   type CloudMutation,
@@ -43,6 +54,10 @@ import {
 import {
   type CloudCommandJournalEntry,
   type CloudCommandLocalAuthority,
+  type CloudAttentionNotificationReconciliationObservation,
+  type CloudAttentionNotificationReconciliationPort,
+  type CloudAttentionNotificationReconciliationRequest,
+  type CloudAttentionNotificationReconciliationState,
   type CloudDaemonJournalPort,
   type CloudDaemonJournalState,
   type CloudDeviceCommandJournalEntry,
@@ -65,7 +80,9 @@ import {
   completePendingCloudUsageAccount,
   createCloudProjectionRecoveryTerminalReceipt,
   CustodyCloudDaemonJournal,
+  CustodyCloudAttentionNotificationReconciliation,
   CustodyCloudSessionSyncCursor,
+  bindCloudAttentionNotificationReconciliationState,
   hasUnsettledCompactProjectionRecovery,
   hasUnsettledCompactProjectionRecoveryForProfile,
   invalidIdempotencyProjectionRecoveryCode,
@@ -77,6 +94,9 @@ import {
   pruneExpiredCloudProjectionRecoveryReceipts,
   quarantineUnprovableProviderProjectionRecoveries,
   removeCloudDeviceCommandJournalEntry,
+  replaceCloudAttentionNotificationReconciliationDevice,
+  setCloudAttentionNotificationPending,
+  settleCloudAttentionNotificationReconciliation,
   supersedeCloudProjectionRecoveryForProviderDeletion,
   terminalizeUnreservedPreparedCloudCommands,
   transitionCloudCommandJournalEntry,
@@ -89,6 +109,8 @@ import {
   decryptSessionMetadata,
   encryptDeviceCommandResult,
   encryptDeviceRegistry,
+  encryptNotificationEmail,
+  encryptNotificationHours,
   encryptSessionMetadata,
   encryptUsageProjection,
   parseSessionMetadataPayload,
@@ -99,6 +121,10 @@ import {
   type SessionMetadataPayload,
 } from "./payloads";
 import type { SessionEvent } from "../domain/session-events";
+import type { NotificationEmailHostedAuthority } from "../domain/contracts";
+import type { NotificationEmailPolicy } from "../domain/notification-email";
+import type { NotificationHoursPolicy } from "../domain/notification-hours";
+import { notificationHoursAllowedWindowEnd } from "../domain/notification-hours";
 import { assignDetailSequences, LiveBatcher } from "./live-uploader";
 import {
   decryptCompactEvents,
@@ -153,6 +179,8 @@ const defaultLeaseDurationMs = 60_000;
  * live daemon from a stale one without a per-cycle write.
  */
 const deviceRegistryHeartbeatMs = 60_000;
+const attentionNotificationRetryMs = 15_000;
+const attentionNotificationRenewalMs = 60_000;
 const defaultOptionalSyncBudgetMs = 10_000;
 const minimumPresenceCycleTtlMs = 15_000;
 const maximumPresenceTtlMs = 120_000;
@@ -170,6 +198,10 @@ export type ActiveCloudIdentity = Readonly<{
   keyVersion: number;
   userPublicId: string;
 }>;
+
+function captureActiveCloudIdentity(identity: ActiveCloudIdentity): ActiveCloudIdentity {
+  return { ...identity, accountKey: Uint8Array.from(identity.accountKey) };
+}
 
 export type RegisteredCloudIdentity =
   | Readonly<{
@@ -219,6 +251,19 @@ export type CloudLocalUsageSnapshot = Readonly<{
 }>;
 
 export type CloudLocalCommandAuthority = CloudCommandLocalAuthority;
+
+/**
+ * One coherent local read of the encrypted registry and the two fields whose
+ * shared revision fences notification consent. The email switch is required
+ * on this preferred port so the bridge can never mistake a legacy payload for
+ * current consent.
+ */
+export type CloudDeviceRegistryProjection = Readonly<{
+  notificationEmail: NotificationEmailPolicy;
+  notificationHours: NotificationHoursPolicy;
+  notificationPolicyRevision: number;
+  registry: DeviceRegistryPayload;
+}>;
 
 export interface CloudDaemonLocalSourcePort {
   activateCompactProjectionRecovery?(input: Readonly<{
@@ -310,6 +355,18 @@ export interface CloudDaemonLocalSourcePort {
    * the account key and publishes it to `devices:updateRegistry`.
    */
   readDeviceRegistry?(input: Readonly<{ signal: AbortSignal }>): Promise<DeviceRegistryPayload>;
+  /** Absent on an older daemon; publishing then intentionally clears the outer envelope. */
+  readNotificationHours?(input: Readonly<{ signal: AbortSignal }>): Promise<NotificationHoursPolicy>;
+  /** Preferred atomic/shared-revision projection; legacy readers cannot publish email consent. */
+  readDeviceRegistryProjection?(
+    input: Readonly<{ signal: AbortSignal }>,
+  ): Promise<CloudDeviceRegistryProjection>;
+  /** One sanitized, bounded local authority snapshot at the supplied instant. */
+  readAttentionNotificationSnapshot?(input: Readonly<{
+    limit: number;
+    now: number;
+    signal: AbortSignal;
+  }>): Promise<LocalAttentionNotificationSnapshot>;
   recordCompactUploadIntent?(input: Readonly<{
     cacheId: string;
     digest: string;
@@ -355,8 +412,8 @@ export type CloudDeviceCommandExecutionResult = Readonly<{
   /** Settled back to the requester, account-key encrypted, when present. */
   result?: DeviceCommandResultPayload;
   /**
-   * Marks the result readable exactly once. Only the account-linking relay sets
-   * it; the hosted row erases the ciphertext on the requester's first read.
+   * Marks the result readable exactly once. Only the account-linking handoff
+   * sets it; the hosted row erases the ciphertext on the requester's first read.
    */
   singleUseResult?: boolean;
   state: "applied" | "failed" | "ambiguous";
@@ -485,6 +542,11 @@ type CloudDeviceRegistryState = Readonly<{
   revision: number;
 }>;
 
+type AttentionNotificationCadence = Readonly<{
+  fingerprint: string;
+  nextAttemptAt: number;
+}>;
+
 type CloudPresenceState = {
   acknowledged: CloudPresenceRequest | null;
   connectionId: string;
@@ -551,6 +613,16 @@ export type CloudLiveTickResult = Readonly<{
 export interface CloudDaemonBridge {
   close?(): Promise<void>;
   cycle(signal: AbortSignal): Promise<CloudDaemonCycleResult>;
+  observeAttentionNotificationAuthority?(
+    signal: AbortSignal,
+  ): Promise<NotificationEmailHostedAuthority>;
+  invalidateAttentionNotificationAuthority?(input: Readonly<{
+    localNotificationPolicyRevision: number;
+    signal: AbortSignal;
+  }>): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >>;
   /** Uploads coalesced live text for sessions this daemon executes; safe to call every second. */
   liveTick?(signal: AbortSignal): Promise<CloudLiveTickResult>;
   /**
@@ -584,6 +656,7 @@ export interface CloudDaemonBridge {
 }
 
 export type LocalCloudDaemonBridgeOptions = Readonly<{
+  attentionNotificationState: CloudAttentionNotificationReconciliationPort;
   daemonAuthority: Readonly<{ bootGeneration: number; bootId: string }>;
   daemonAuthorityFence: Readonly<{ assertCurrent(): Promise<void> }>;
   deploymentAuthority: CloudDeploymentAuthority;
@@ -604,6 +677,7 @@ export type LocalCloudDaemonBridgeOptions = Readonly<{
 }>;
 
 export type LocalCloudDaemonBridgeEnvironmentOptions = Readonly<{
+  attentionNotificationState?: CloudAttentionNotificationReconciliationPort;
   daemonAuthority: Readonly<{ bootGeneration: number; bootId: string }>;
   daemonAuthorityFence: Readonly<{ assertCurrent(): Promise<void> }>;
   deploymentUrl?: string;
@@ -1359,8 +1433,13 @@ type CloudDeviceCommand = Readonly<{
   kind: DeviceCommandKind;
   payload: EncryptedEnvelope;
   publicId: string;
+  requestDigest?: string;
   requestingDevicePublicId: string;
+  resultCode?: string;
+  resultConsumed?: boolean;
+  resultSingleUse?: true;
   state: CommandState;
+  targetDevicePublicId?: string;
 }>;
 
 function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[] {
@@ -1371,10 +1450,12 @@ function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[]
     if (!isRecord(entry)) throw new Error("Cloud device command response is invalid.");
     const optional = [
       "boundAuthority",
+      "requestDigest",
       "result",
       "resultCode",
       "resultConsumed",
       "resultSingleUse",
+      "targetDevicePublicId",
     ].filter((key) => Object.hasOwn(entry, key));
     const boundAuthority = entry.boundAuthority === undefined
       ? undefined
@@ -1400,6 +1481,16 @@ function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[]
       || payload === null
       || !isUuidV7(entry.publicId)
       || !isOpaqueIdentifier(entry.requestingDevicePublicId)
+      || (entry.requestDigest !== undefined && !isDigest(entry.requestDigest))
+      || (entry.result !== undefined && parseEncryptedEnvelope(entry.result) === null)
+      || (entry.resultCode !== undefined
+        && (typeof entry.resultCode !== "string"
+          || !/^[A-Z][A-Z0-9_]{0,63}$/u.test(entry.resultCode)))
+      || (entry.resultConsumed !== undefined && typeof entry.resultConsumed !== "boolean")
+      || (entry.resultSingleUse !== undefined && entry.resultSingleUse !== true)
+      || (entry.resultConsumed !== undefined && entry.resultSingleUse !== true)
+      || (entry.targetDevicePublicId !== undefined
+        && !isOpaqueIdentifier(entry.targetDevicePublicId))
       || state === null
     ) throw new Error("Cloud device command response is invalid.");
     return {
@@ -1409,8 +1500,17 @@ function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[]
       kind: entry.kind,
       payload,
       publicId: entry.publicId,
+      ...(typeof entry.requestDigest === "string" ? { requestDigest: entry.requestDigest } : {}),
       requestingDevicePublicId: entry.requestingDevicePublicId,
+      ...(typeof entry.resultCode === "string" ? { resultCode: entry.resultCode } : {}),
+      ...(typeof entry.resultConsumed === "boolean"
+        ? { resultConsumed: entry.resultConsumed }
+        : {}),
+      ...(entry.resultSingleUse === true ? { resultSingleUse: true as const } : {}),
       state,
+      ...(typeof entry.targetDevicePublicId === "string"
+        ? { targetDevicePublicId: entry.targetDevicePublicId }
+        : {}),
     };
   });
   if (new Set(commands.map((command) => command.publicId)).size !== commands.length) {
@@ -1760,7 +1860,10 @@ function validateRegisteredIdentity(value: RegisteredCloudIdentity): RegisteredC
     || !isSafePositiveInteger(value.activeIdentity.keyVersion)
     || value.activeIdentity.userPublicId !== value.userPublicId
   ) throw new Error("Cloud registered-device identity is invalid.");
-  return value;
+  return {
+    ...value,
+    activeIdentity: captureActiveCloudIdentity(value.activeIdentity),
+  };
 }
 
 async function presenceRequest(
@@ -2000,6 +2103,7 @@ async function decryptPrivateLocalReference(
 }
 
 export class LocalCloudDaemonBridge implements CloudDaemonBridge {
+  readonly #attentionNotificationState: CloudAttentionNotificationReconciliationPort;
   readonly #daemonAuthority: Readonly<{ bootGeneration: number; bootId: string }>;
   readonly #daemonAuthorityFence: Readonly<{ assertCurrent(): Promise<void> }>;
   readonly #deploymentAuthority: CloudDeploymentAuthority;
@@ -2022,6 +2126,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   #optionalTask: OptionalCloudSyncTask | null = null;
   #presenceState: CloudPresenceState | null = null;
   #deviceRegistryState: CloudDeviceRegistryState | null = null;
+  #attentionNotificationCadence: AttentionNotificationCadence | null = null;
   readonly #projectionRecoverySupersededSessions = new Set<string>();
   #tail: Promise<unknown> = Promise.resolve();
 
@@ -2042,6 +2147,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       !isSafePositiveInteger(options.daemonAuthority.bootGeneration)
       || !isOpaqueIdentifier(options.daemonAuthority.bootId)
     ) throw new Error("Cloud daemon authority is invalid.");
+    this.#attentionNotificationState = options.attentionNotificationState;
     this.#daemonAuthority = options.daemonAuthority;
     this.#daemonAuthorityFence = options.daemonAuthorityFence;
     this.#deploymentAuthority = options.deploymentAuthority;
@@ -2112,14 +2218,20 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           peerDevicePresent: await this.#peerDevicePresent(identity, signal),
         };
         await this.#assertDaemonCurrent(signal);
+        let publishedNotificationPolicyRevision: number | null = null;
+        let registryPublicationSucceeded = true;
         try {
-          await this.#publishDeviceRegistry(identity, signal);
+          publishedNotificationPolicyRevision = await this.#publishDeviceRegistry(
+            identity,
+            signal,
+          );
         } catch (error: unknown) {
           if (signal.aborted) throw error;
           // The settings projection is auxiliary: a failed publish is
           // reported and retried next cycle, it never stops command
           // execution or session sync.
           this.#deviceRegistryState = null;
+          registryPublicationSucceeded = false;
           result.errors.push(`device registry: ${normalizeError(error)}`);
         }
         await this.#assertDaemonCurrent(signal);
@@ -2170,6 +2282,18 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           result.errors,
         );
         result.commandsApplied += deviceCommandResult.applied;
+        try {
+          await this.#reconcileAttentionNotifications({
+            identity,
+            publishedNotificationPolicyRevision,
+            registryPublicationSucceeded,
+            signal,
+          });
+        } catch (error: unknown) {
+          if (signal.aborted) throw error;
+          await this.#assertDaemonCurrent(signal);
+          result.errors.push("attention notifications: reconciliation unavailable.");
+        }
         const previousOptional = this.#optionalTask;
         if (previousOptional !== null) {
           if (previousOptional.state.outcome === null) {
@@ -2406,6 +2530,658 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       return await this.#local.hasActiveTurn?.() ?? false;
     } catch {
       return false;
+    }
+  }
+
+  async observeAttentionNotificationAuthority(
+    signal: AbortSignal,
+  ): Promise<NotificationEmailHostedAuthority> {
+    if (this.#closed) throw new Error("The cloud daemon bridge is closed.");
+    return await this.#exclusive(async () => {
+      await this.#assertDaemonCurrent(signal);
+      let identity: ActiveCloudIdentity;
+      try {
+        identity = captureActiveCloudIdentity(await this.#identity.requireActive(signal));
+      } catch {
+        await this.#assertDaemonCurrent(signal);
+        return await this.#attentionNotificationFallbackWithoutIdentity(signal);
+      }
+      const status = await this.#readAttentionNotificationStatus(signal);
+      if (status === null) {
+        return await this.#attentionNotificationFallback(identity, signal);
+      }
+      await this.#settleObservedInvalidation(identity, status, signal);
+      await this.#assertExactAttentionIdentity(identity, signal);
+      return this.#hostedAttentionNotificationAuthority(status);
+    });
+  }
+
+  async invalidateAttentionNotificationAuthority(input: Readonly<{
+    localNotificationPolicyRevision: number;
+    signal: AbortSignal;
+  }>): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >> {
+    if (this.#closed) throw new Error("The cloud daemon bridge is closed.");
+    if (!isSafePositiveInteger(input.localNotificationPolicyRevision)) {
+      throw new Error("Local notification policy revision is invalid.");
+    }
+    return await this.#exclusive(async () => {
+      await this.#assertDaemonCurrent(input.signal);
+      let identity: ActiveCloudIdentity;
+      try {
+        identity = captureActiveCloudIdentity(
+          await this.#identity.requireActive(input.signal),
+        );
+      } catch {
+        await this.#assertDaemonCurrent(input.signal);
+        return await this.#attentionNotificationFallbackWithoutIdentity(input.signal);
+      }
+      const status = await this.#readAttentionNotificationStatus(input.signal);
+      if (status === null) {
+        return await this.#attentionNotificationFallback(identity, input.signal);
+      }
+      try {
+        if (await this.#settleObservedInvalidation(identity, status, input.signal)) {
+          return await this.#attentionNotificationFallback(identity, input.signal, status);
+        }
+        const revision = await this.#attentionNotificationInvalidationRevision(
+          identity,
+          input.localNotificationPolicyRevision,
+          status,
+          input.signal,
+        );
+        const receipt = await this.#invalidateAttentionNotifications({
+          identity,
+          localNotificationPolicyRevision: revision,
+          signal: input.signal,
+          status,
+        });
+        if (receipt === null) {
+          return await this.#attentionNotificationFallback(identity, input.signal, status);
+        }
+        await this.#assertExactAttentionIdentity(identity, input.signal);
+        return {
+          acknowledgedAt: receipt.acknowledgedAt,
+          consentLeaseUntil: receipt.consentLeaseUntil,
+          state: "acknowledged",
+        };
+      } catch {
+        await this.#assertDaemonCurrent(input.signal);
+        return await this.#attentionNotificationFallback(identity, input.signal, status);
+      }
+    });
+  }
+
+  #hostedAttentionNotificationAuthority(
+    status: AttentionNotificationAuthorityStatus,
+  ): NotificationEmailHostedAuthority {
+    return {
+      deviceAuthority: status.deviceAuthority === null
+        ? null
+        : {
+            consentLeaseUntil: status.deviceAuthority.consentLeaseUntil,
+            globalNotificationGeneration:
+              status.deviceAuthority.globalNotificationGeneration,
+            localNotificationPolicyRevision:
+              status.deviceAuthority.localNotificationPolicyRevision,
+          },
+      globalNotificationGeneration: status.globalNotificationGeneration,
+      globalState: status.safetyFaultState === "latched"
+        ? "safety_latched"
+        : status.enabled ? "enabled" : "disabled",
+      observedAt: status.observedAt,
+      state: "observed",
+    };
+  }
+
+  async #readAttentionNotificationStatus(
+    signal: AbortSignal,
+  ): Promise<AttentionNotificationAuthorityStatus | null> {
+    try {
+      await this.#assertDaemonCurrent(signal);
+      const value = await this.#mutation("attentionNotifications:authorityStatus", {});
+      await this.#assertDaemonCurrent(signal);
+      return parseAttentionNotificationAuthorityStatus(value);
+    } catch {
+      await this.#assertDaemonCurrent(signal);
+      return null;
+    }
+  }
+
+  async #attentionNotificationObservation(
+    identity: ActiveCloudIdentity,
+    signal: AbortSignal,
+    liveStatus?: AttentionNotificationAuthorityStatus,
+  ): Promise<CloudAttentionNotificationReconciliationObservation> {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await this.#assertExactAttentionIdentity(identity, signal);
+      const observed = await this.#attentionNotificationState.read();
+      await this.#assertExactAttentionIdentity(identity, signal);
+      try {
+        return {
+          generation: observed.generation,
+          state: bindCloudAttentionNotificationReconciliationState(
+            observed.state,
+            identity.userPublicId,
+            identity.devicePublicId,
+          ),
+        };
+      } catch (error: unknown) {
+        if (liveStatus === undefined) throw error;
+      }
+      await this.#assertExactAttentionIdentity(identity, signal);
+      const replacement = replaceCloudAttentionNotificationReconciliationDevice(
+        observed.state,
+        identity.userPublicId,
+        identity.devicePublicId,
+      );
+      let committed: CloudAttentionNotificationReconciliationObservation | null;
+      try {
+        committed = await this.#attentionNotificationState.compareAndSwap(
+          observed.generation,
+          replacement,
+        );
+      } finally {
+        await this.#assertExactAttentionIdentity(identity, signal);
+      }
+      if (committed !== null) return committed;
+    }
+    throw new Error("Cloud attention notification reconciliation state changed concurrently.");
+  }
+
+  async #assertExactAttentionIdentity(
+    expected: ActiveCloudIdentity,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#assertDaemonCurrent(signal);
+    const current = await this.#identity.requireActive(signal);
+    await this.#assertDaemonCurrent(signal);
+    if (
+      current.devicePublicId !== expected.devicePublicId
+      || current.userPublicId !== expected.userPublicId
+      || current.keyVersion !== expected.keyVersion
+      || current.accountKey.byteLength !== expected.accountKey.byteLength
+      || !current.accountKey.every((byte, index) => byte === expected.accountKey[index])
+    ) throw new Error("Cloud identity changed during attention reconciliation.");
+  }
+
+  async #mutateAttentionNotificationState(
+    identity: ActiveCloudIdentity,
+    signal: AbortSignal,
+    transform: (
+      state: CloudAttentionNotificationReconciliationState,
+    ) => CloudAttentionNotificationReconciliationState,
+  ): Promise<CloudAttentionNotificationReconciliationObservation> {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const current = await this.#attentionNotificationObservation(identity, signal);
+      const next = transform(current.state);
+      await this.#assertExactAttentionIdentity(identity, signal);
+      let committed: CloudAttentionNotificationReconciliationObservation | null;
+      try {
+        committed = await this.#attentionNotificationState.compareAndSwap(
+          current.generation,
+          next,
+        );
+      } finally {
+        await this.#assertExactAttentionIdentity(identity, signal);
+      }
+      if (committed !== null) return committed;
+    }
+    throw new Error("Cloud attention notification reconciliation state changed concurrently.");
+  }
+
+  async #setAttentionNotificationPending(
+    identity: ActiveCloudIdentity,
+    request: CloudAttentionNotificationReconciliationRequest,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#mutateAttentionNotificationState(identity, signal, (state) =>
+      setCloudAttentionNotificationPending(state, request));
+  }
+
+  async #settleAttentionNotificationReceipt(
+    identity: ActiveCloudIdentity,
+    request: CloudAttentionNotificationReconciliationRequest,
+    receipt: AttentionNotificationReconcileReceipt,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#mutateAttentionNotificationState(identity, signal, (state) =>
+      settleCloudAttentionNotificationReconciliation(state, request, receipt));
+  }
+
+  async #settleObservedInvalidation(
+    identity: ActiveCloudIdentity,
+    status: AttentionNotificationAuthorityStatus,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const observed = await this.#attentionNotificationObservation(identity, signal, status);
+    const pending = observed.state.pending;
+    const authority = status.deviceAuthority;
+    if (
+      pending?.mode !== "invalidate"
+      || authority === null
+      || authority.reconciliationSequence !== pending.reconciliationSequence
+      || authority.localNotificationPolicyRevision
+        !== pending.localNotificationPolicyRevision
+      || authority.consentLeaseUntil > status.observedAt
+    ) return false;
+    const receipt = parseAttentionNotificationReconcileReceipt({
+      acknowledgedAt: authority.consentLeaseUntil,
+      consentLeaseUntil: authority.consentLeaseUntil,
+      globalNotificationGeneration: authority.globalNotificationGeneration,
+      localNotificationPolicyRevision: authority.localNotificationPolicyRevision,
+      reconciliationSequence: authority.reconciliationSequence,
+      state: "invalidated",
+    }, pending);
+    if (receipt === null) return false;
+    await this.#settleAttentionNotificationReceipt(identity, pending, receipt, signal);
+    return true;
+  }
+
+  async #attentionNotificationFallback(
+    identity: ActiveCloudIdentity,
+    signal: AbortSignal,
+    status?: AttentionNotificationAuthorityStatus,
+  ): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >> {
+    if (
+      status?.deviceAuthority !== null
+      && status?.deviceAuthority !== undefined
+      && status.deviceAuthority.consentLeaseUntil > status.observedAt
+    ) {
+      await this.#assertExactAttentionIdentity(identity, signal);
+      return {
+        expiresNoLaterThan: status.deviceAuthority.consentLeaseUntil,
+        state: "revocation_pending",
+      };
+    }
+    try {
+      const state = (await this.#attentionNotificationObservation(identity, signal)).state;
+      await this.#assertExactAttentionIdentity(identity, signal);
+      return this.#attentionNotificationFallbackFromState(state, status);
+    } catch {
+      await this.#assertDaemonCurrent(signal);
+      await this.#assertExactAttentionIdentity(identity, signal);
+      return { state: "not_observed" };
+    }
+  }
+
+  #attentionNotificationFallbackFromState(
+    state: CloudAttentionNotificationReconciliationState,
+    status?: AttentionNotificationAuthorityStatus,
+  ): Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  > {
+    if (state.pending !== null || state.lastReceipt === null) {
+      return { state: "not_observed" };
+    }
+    const receipt = state.lastReceipt.receipt;
+    if (status !== undefined && status.deviceAuthority !== null) {
+      const authority = status.deviceAuthority;
+      const exactAuthority = authority.consentLeaseUntil === receipt.consentLeaseUntil
+        && authority.globalNotificationGeneration
+          === receipt.globalNotificationGeneration
+        && authority.localNotificationPolicyRevision
+          === receipt.localNotificationPolicyRevision
+        && authority.reconciliationSequence === receipt.reconciliationSequence;
+      if (!exactAuthority) return { state: "not_observed" };
+      if (receipt.state === "invalidated" && authority.consentLeaseUntil > status.observedAt) {
+        return { state: "not_observed" };
+      }
+    } else if (status !== undefined && receipt.state === "complete") {
+      return { state: "not_observed" };
+    }
+    return receipt.state === "invalidated"
+      ? {
+          acknowledgedAt: receipt.acknowledgedAt,
+          consentLeaseUntil: receipt.consentLeaseUntil,
+          state: "acknowledged",
+        }
+      : {
+          expiresNoLaterThan: receipt.consentLeaseUntil,
+          state: "revocation_pending",
+        };
+  }
+
+  async #attentionNotificationFallbackWithoutIdentity(signal: AbortSignal): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >> {
+    try {
+      const observed = await this.#attentionNotificationState.read();
+      await this.#assertDaemonCurrent(signal);
+      return this.#attentionNotificationFallbackFromState(observed.state);
+    } catch {
+      await this.#assertDaemonCurrent(signal);
+      return { state: "not_observed" };
+    }
+  }
+
+  #attentionNotificationSequence(
+    state: CloudAttentionNotificationReconciliationState,
+    status: AttentionNotificationAuthorityStatus | null,
+    mode: "complete" | "invalidate",
+  ): number | null {
+    const current = Math.max(
+      status?.deviceAuthority?.reconciliationSequence ?? 0,
+      state.pending?.reconciliationSequence ?? 0,
+      state.lastReceipt?.request.reconciliationSequence ?? 0,
+    );
+    if (current >= Number.MAX_SAFE_INTEGER) return null;
+    const next = current + 1;
+    return mode === "complete" && next >= Number.MAX_SAFE_INTEGER ? null : next;
+  }
+
+  async #attentionNotificationInvalidationRevision(
+    identity: ActiveCloudIdentity,
+    requested: number,
+    status: AttentionNotificationAuthorityStatus | null,
+    signal: AbortSignal,
+  ): Promise<number> {
+    const state = (await this.#attentionNotificationObservation(identity, signal)).state;
+    return Math.max(
+      1,
+      requested,
+      status?.deviceAuthority?.localNotificationPolicyRevision ?? 0,
+      state.pending?.localNotificationPolicyRevision ?? 0,
+      state.lastReceipt?.request.localNotificationPolicyRevision ?? 0,
+    );
+  }
+
+  async #invalidateAttentionNotifications(input: Readonly<{
+    identity: ActiveCloudIdentity;
+    localNotificationPolicyRevision: number;
+    signal: AbortSignal;
+    status: AttentionNotificationAuthorityStatus | null;
+  }>): Promise<Extract<AttentionNotificationReconcileReceipt, { state: "invalidated" }> | null> {
+    try {
+      if (input.status !== null) {
+        await this.#settleObservedInvalidation(input.identity, input.status, input.signal);
+      }
+      const observed = await this.#attentionNotificationObservation(
+        input.identity,
+        input.signal,
+      );
+      const sequence = this.#attentionNotificationSequence(
+        observed.state,
+        input.status,
+        "invalidate",
+      );
+      if (sequence === null) return null;
+      const request: AttentionNotificationInvalidateRequest = {
+        localNotificationPolicyRevision: input.localNotificationPolicyRevision,
+        mode: "invalidate",
+        reconciliationSequence: sequence,
+      };
+      await this.#setAttentionNotificationPending(input.identity, request, input.signal);
+      await this.#assertExactAttentionIdentity(input.identity, input.signal);
+      let value: unknown;
+      try {
+        value = await this.#transport.mutation(
+          "attentionNotifications:reconcile",
+          request,
+        );
+      } finally {
+        await this.#assertExactAttentionIdentity(input.identity, input.signal);
+      }
+      const receipt = parseAttentionNotificationReconcileReceipt(value, request);
+      if (receipt?.state !== "invalidated") return null;
+      await this.#settleAttentionNotificationReceipt(
+        input.identity,
+        request,
+        receipt,
+        input.signal,
+      );
+      return receipt;
+    } catch {
+      await this.#assertExactAttentionIdentity(input.identity, input.signal);
+      return null;
+    }
+  }
+
+  async #reconcileAttentionNotifications(input: Readonly<{
+    identity: ActiveCloudIdentity;
+    publishedNotificationPolicyRevision: number | null;
+    registryPublicationSucceeded: boolean;
+    signal: AbortSignal;
+  }>): Promise<void> {
+    const now = this.#now();
+    if (!isSafeNonNegativeInteger(now)) {
+      throw new Error("Attention notification clock is invalid.");
+    }
+    let snapshot: LocalAttentionNotificationSnapshot | null = null;
+    let sourceState: "absent" | "available" | "invalid" = "absent";
+    const readSnapshot = this.#local.readAttentionNotificationSnapshot?.bind(this.#local);
+    if (readSnapshot !== undefined) {
+      try {
+        snapshot = parseLocalAttentionNotificationSnapshot(await readSnapshot({
+          limit: attentionNotificationCandidateLimit,
+          now,
+          signal: input.signal,
+        }), now);
+        sourceState = snapshot === null ? "invalid" : "available";
+      } catch {
+        await this.#assertDaemonCurrent(input.signal);
+        sourceState = "invalid";
+      }
+    }
+    const fingerprint = await sha256Hex(JSON.stringify({
+      publishedNotificationPolicyRevision: input.publishedNotificationPolicyRevision,
+      registryPublicationSucceeded: input.registryPublicationSucceeded,
+      snapshot: snapshot === null ? null : { ...snapshot, observedAt: 0 },
+      sourceState,
+    }));
+    await this.#assertDaemonCurrent(input.signal);
+    const cadence = this.#attentionNotificationCadence;
+    if (
+      cadence !== null
+      && cadence.fingerprint === fingerprint
+      && now < cadence.nextAttemptAt
+    ) return;
+    this.#attentionNotificationCadence = {
+      fingerprint,
+      nextAttemptAt: now + attentionNotificationRetryMs,
+    };
+
+    const status = await this.#readAttentionNotificationStatus(input.signal);
+    if (status !== null) {
+      await this.#settleObservedInvalidation(input.identity, status, input.signal);
+    }
+    const state = (await this.#attentionNotificationObservation(
+      input.identity,
+      input.signal,
+    )).state;
+    const sourceRevision = snapshot?.notificationPolicyRevision
+      ?? input.publishedNotificationPolicyRevision
+      ?? status?.deviceAuthority?.localNotificationPolicyRevision
+      ?? state.pending?.localNotificationPolicyRevision
+      ?? state.lastReceipt?.request.localNotificationPolicyRevision
+      ?? 1;
+    const invalidate = async (): Promise<void> => {
+      const revision = await this.#attentionNotificationInvalidationRevision(
+        input.identity,
+        sourceRevision,
+        status,
+        input.signal,
+      );
+      const currentState = (await this.#attentionNotificationObservation(
+        input.identity,
+        input.signal,
+      )).state;
+      const liveStatusHasNoActiveAuthority = status === null
+        || status.deviceAuthority === null
+        || status.deviceAuthority.consentLeaseUntil <= status.observedAt;
+      if (
+        currentState.pending === null
+        && (
+          (status?.deviceAuthority !== null
+            && status?.deviceAuthority !== undefined
+            && status.deviceAuthority.localNotificationPolicyRevision >= revision
+            && status.deviceAuthority.consentLeaseUntil <= status.observedAt)
+          || (liveStatusHasNoActiveAuthority
+            && currentState.lastReceipt?.receipt.state === "invalidated"
+            && currentState.lastReceipt.request.localNotificationPolicyRevision >= revision)
+        )
+      ) {
+        this.#attentionNotificationCadence = {
+          fingerprint,
+          nextAttemptAt: now + attentionNotificationRenewalMs,
+        };
+        return;
+      }
+      const receipt = await this.#invalidateAttentionNotifications({
+        identity: input.identity,
+        localNotificationPolicyRevision: revision,
+        signal: input.signal,
+        status,
+      });
+      if (receipt !== null) {
+        this.#attentionNotificationCadence = {
+          fingerprint,
+          nextAttemptAt: now + attentionNotificationRenewalMs,
+        };
+      }
+    };
+
+    if (state.pending !== null) {
+      await invalidate();
+      return;
+    }
+    let allowedWindowEnd: number | null = null;
+    if (snapshot !== null) {
+      try {
+        allowedWindowEnd = notificationHoursAllowedWindowEnd(
+          snapshot.notificationHours,
+          now,
+        );
+      } catch {
+        allowedWindowEnd = null;
+      }
+    }
+    if (
+      status === null
+      || snapshot === null
+      || !input.registryPublicationSucceeded
+      || input.publishedNotificationPolicyRevision === null
+      || input.publishedNotificationPolicyRevision
+        !== snapshot.notificationPolicyRevision
+      || !snapshot.notificationEmail.enabled
+      || snapshot.status !== "complete"
+      || allowedWindowEnd === null
+      || !status.enabled
+      || status.safetyFaultState === "latched"
+    ) {
+      await invalidate();
+      return;
+    }
+
+    const authorityBySession = new Map<string, AuthorityTuple>();
+    try {
+      for (const candidate of snapshot.candidates) {
+        if (authorityBySession.has(candidate.sessionPublicId)) continue;
+        await this.#assertDaemonCurrent(input.signal);
+        const lease = await this.#ensureLease(candidate.sessionPublicId, input.identity);
+        await this.#assertDaemonCurrent(input.signal);
+        if (
+          lease.devicePublicId !== input.identity.devicePublicId
+          || lease.bootGeneration !== this.#daemonAuthority.bootGeneration
+          || lease.bootId !== this.#daemonAuthority.bootId
+          || lease.leaseUntil <= now
+        ) throw new Error("Attention notification lease authority is invalid.");
+        authorityBySession.set(candidate.sessionPublicId, authorityOf(lease));
+      }
+    } catch {
+      await this.#assertDaemonCurrent(input.signal);
+      await invalidate();
+      return;
+    }
+    let confirmed: LocalAttentionNotificationSnapshot | null = null;
+    try {
+      confirmed = parseLocalAttentionNotificationSnapshot(await (readSnapshot as NonNullable<
+        typeof readSnapshot
+      >)({
+        limit: attentionNotificationCandidateLimit,
+        now,
+        signal: input.signal,
+      }), now);
+    } catch {
+      await this.#assertDaemonCurrent(input.signal);
+    }
+    if (confirmed === null || JSON.stringify(confirmed) !== JSON.stringify(snapshot)) {
+      await invalidate();
+      return;
+    }
+    const hostedCandidates = snapshot.candidates.map((candidate) => ({
+      ...candidate,
+      executionAuthority: authorityBySession.get(candidate.sessionPublicId) as AuthorityTuple,
+      remoteActions: [...candidate.remoteActions],
+    }));
+    const observed = await this.#attentionNotificationObservation(
+      input.identity,
+      input.signal,
+    );
+    const sequence = this.#attentionNotificationSequence(observed.state, status, "complete");
+    if (sequence === null) {
+      await invalidate();
+      return;
+    }
+    const request: AttentionNotificationCompleteRequest = {
+      allowedWindowEnd,
+      candidateCount: hostedCandidates.length,
+      expectedGlobalNotificationGeneration: status.globalNotificationGeneration,
+      localNotificationPolicyRevision: snapshot.notificationPolicyRevision,
+      mode: "complete",
+      reconciliationSequence: sequence,
+    };
+    await this.#setAttentionNotificationPending(input.identity, request, input.signal);
+    try {
+      await this.#assertExactAttentionIdentity(input.identity, input.signal);
+      let value: unknown;
+      try {
+        value = await this.#transport.mutation("attentionNotifications:reconcile", {
+          allowedWindowEnd: request.allowedWindowEnd,
+          candidates: hostedCandidates,
+          expectedGlobalNotificationGeneration:
+            request.expectedGlobalNotificationGeneration,
+          localNotificationPolicyRevision: request.localNotificationPolicyRevision,
+          mode: request.mode,
+          reconciliationSequence: request.reconciliationSequence,
+        });
+      } finally {
+        await this.#assertExactAttentionIdentity(input.identity, input.signal);
+      }
+      const receipt = parseAttentionNotificationReconcileReceipt(value, request);
+      if (receipt?.state !== "complete") throw new Error("Attention receipt is invalid.");
+      await this.#settleAttentionNotificationReceipt(
+        input.identity,
+        request,
+        receipt,
+        input.signal,
+      );
+      this.#attentionNotificationCadence = {
+        fingerprint,
+        nextAttemptAt: now + attentionNotificationRenewalMs,
+      };
+    } catch {
+      await this.#assertExactAttentionIdentity(input.identity, input.signal);
+      const recoveryStatus = await this.#readAttentionNotificationStatus(input.signal);
+      const revision = await this.#attentionNotificationInvalidationRevision(
+        input.identity,
+        snapshot.notificationPolicyRevision,
+        recoveryStatus,
+        input.signal,
+      );
+      await this.#invalidateAttentionNotifications({
+        identity: input.identity,
+        localNotificationPolicyRevision: revision,
+        signal: input.signal,
+        status: recoveryStatus,
+      });
     }
   }
 
@@ -3081,19 +3857,50 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   async #publishDeviceRegistry(
     identity: ActiveCloudIdentity,
     signal: AbortSignal,
-  ): Promise<void> {
+  ): Promise<number | null> {
+    const readProjection = this.#local.readDeviceRegistryProjection?.bind(this.#local);
     const readRegistry = this.#local.readDeviceRegistry?.bind(this.#local);
-    if (readRegistry === undefined) return;
-    const payload = await readRegistry({ signal });
+    if (readProjection === undefined && readRegistry === undefined) return null;
+    let payload: DeviceRegistryPayload;
+    let notificationEmail: NotificationEmailPolicy | null;
+    let notificationHours: NotificationHoursPolicy | null;
+    let notificationPolicyRevision: number | undefined;
+    if (readProjection !== undefined) {
+      const projection = await readProjection({ signal });
+      if (
+        !isSafePositiveInteger(projection.notificationPolicyRevision)
+        || projection.notificationEmail.revision !== projection.notificationPolicyRevision
+        || projection.notificationHours.revision !== projection.notificationPolicyRevision
+      ) throw new Error("Local notification policy projection is incoherent.");
+      payload = projection.registry;
+      notificationEmail = projection.notificationEmail;
+      notificationHours = projection.notificationHours;
+      notificationPolicyRevision = projection.notificationPolicyRevision;
+    } else {
+      payload = await (readRegistry as NonNullable<typeof readRegistry>)({ signal });
+      // A legacy source may still publish notification hours for Phase 7, but
+      // it has no coherent composite port and therefore cannot publish email
+      // consent or the server-visible revision fence.
+      notificationEmail = null;
+      const readNotificationHours = this.#local.readNotificationHours?.bind(this.#local);
+      notificationHours = readNotificationHours === undefined
+        ? null
+        : await readNotificationHours({ signal });
+    }
     await this.#assertDaemonCurrent(signal);
-    const digest = await sha256Hex(JSON.stringify({ ...payload, heartbeatAt: 0 }));
+    const digest = await sha256Hex(JSON.stringify({
+      notificationEmail,
+      notificationHours,
+      notificationPolicyRevision,
+      registry: { ...payload, heartbeatAt: 0 },
+    }));
     const now = this.#now();
     const cached = this.#deviceRegistryState;
     if (
       cached !== null
       && cached.digest === digest
       && now - cached.publishedAt < deviceRegistryHeartbeatMs
-    ) return;
+    ) return notificationPolicyRevision ?? null;
     const expectedRevision = cached?.revision ?? await this.#readDeviceRegistryRevision(identity);
     await this.#assertDaemonCurrent(signal);
     const envelope = await encryptDeviceRegistry(payload, identity.accountKey, {
@@ -3102,11 +3909,30 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       kind: "device_registry",
       userPublicId: identity.userPublicId,
     });
+    const notificationHoursEnvelope = notificationHours === null
+      ? undefined
+      : await encryptNotificationHours(notificationHours, identity.accountKey, {
+          entityPublicId: identity.devicePublicId,
+          keyVersion: identity.keyVersion,
+          kind: "notification_hours",
+          userPublicId: identity.userPublicId,
+        });
+    const notificationEmailEnvelope = notificationEmail === null
+      ? undefined
+      : await encryptNotificationEmail(notificationEmail, identity.accountKey, {
+          entityPublicId: identity.devicePublicId,
+          keyVersion: identity.keyVersion,
+          kind: "notification_email",
+          userPublicId: identity.userPublicId,
+        });
     abortBeforeEffect(signal);
     const response = await this.#mutation("devices:updateRegistry", {
       envelope,
       expectedRevision,
       keyVersion: identity.keyVersion,
+      ...(notificationEmailEnvelope === undefined ? {} : { notificationEmailEnvelope }),
+      ...(notificationHoursEnvelope === undefined ? {} : { notificationHoursEnvelope }),
+      ...(notificationPolicyRevision === undefined ? {} : { notificationPolicyRevision }),
     });
     if (
       !isRecord(response)
@@ -3114,6 +3940,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       || !isSafePositiveInteger(response.revision)
     ) throw new Error("Device registry publish response is invalid.");
     this.#deviceRegistryState = { digest, publishedAt: now, revision: response.revision };
+    return notificationPolicyRevision ?? null;
   }
 
   async #readDeviceRegistryRevision(identity: ActiveCloudIdentity): Promise<number> {
@@ -3911,10 +4738,11 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
    * lease, so the fence is this daemon's own boot authority; and there is no
    * session FIFO, so nothing queues behind a prepared head.
    *
-   * Recovery is deliberately one-way. A journal entry left at `effect_started`
-   * by a previous boot describes a `session_start` that may or may not have
-   * created a session. It is closed as `ambiguous` and never re-executed, which
-   * is what stops a start that may have happened from silently starting twice.
+   * Recovery is deliberately one-way across an effect boundary. `prepared`
+   * proves the provider was not called and may resume after an exact hosted
+   * read. `effect_started` may resume only when that read still says `prepared`,
+   * proving the hosted boundary never committed. Once both records say
+   * `effect_started`, the command is closed as `ambiguous` and never re-executed.
    */
   async #processDeviceCommands(
     identity: ActiveCloudIdentity,
@@ -3928,7 +4756,11 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     // run them.
     if (executor === null) return { applied: 0 };
     let applied = 0;
+    let commandBudgetRemaining = maximumDeviceCommandsPerCycle;
     const journalState = (await this.#journal.read()).state;
+    const journalCommandPublicIds = new Set(
+      journalState.deviceCommands.map((entry) => entry.commandPublicId),
+    );
     await this.#assertDaemonCurrent(signal);
 
     // Close every stale entry first, so a crashed effect is quarantined before
@@ -3937,18 +4769,37 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       abortBeforeEffect(signal);
       try {
         if (entry.phase === "terminal") {
-          await this.#settleDeviceCommand(entry);
+          if (
+            entry.kind === "account_login_start"
+            && entry.terminalState === "applied"
+            && entry.legacyResultMissing === true
+          ) {
+            await this.#quarantineLegacyLoginTerminal(entry, identity);
+          } else {
+            await this.#settleOrConfirmRevokedDeviceCommand(entry);
+          }
           await this.#mutateJournal((state) =>
             removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
           continue;
         }
-        if (sameAuthority(entry.authority, this.#deviceCommandAuthority())) continue;
-        await this.#quarantineDeviceCommand(entry);
+        if (sameAuthority(entry.authority, this.#deviceCommandAuthority())) {
+          // Count the attempt before its exact read. Even a failed read or a
+          // fail-closed terminalization consumed this cycle's chance to cross
+          // the provider boundary, so it cannot make room for fresh work.
+          if (commandBudgetRemaining === 0) continue;
+          commandBudgetRemaining -= 1;
+          if (await this.#resumeCurrentDeviceCommand(entry, identity, executor, signal)) {
+            applied += 1;
+          }
+          continue;
+        }
+        await this.#quarantineDeviceCommand(entry, identity);
       } catch (error: unknown) {
         errors.push(`device command ${entry.commandPublicId}: ${normalizeError(error)}`);
       }
     }
 
+    if (commandBudgetRemaining === 0) return { applied };
     const pending = parseCloudDeviceCommands(
       await this.#transport.query("deviceCommands:listPendingForTarget", {
         limit: maximumDeviceCommandsPerCycle,
@@ -3956,6 +4807,12 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     );
     await this.#assertDaemonCurrent(signal);
     for (const command of pending) {
+      // An entry observed at cycle start owns recovery for this exact command.
+      // If recovery retained it after an error, never rediscover the pending row
+      // below and attempt to add or execute it through a second path.
+      if (journalCommandPublicIds.has(command.publicId)) continue;
+      if (commandBudgetRemaining === 0) break;
+      commandBudgetRemaining -= 1;
       abortBeforeEffect(signal);
       try {
         const authority = this.#deviceCommandAuthority();
@@ -3970,86 +4827,313 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         };
         await this.#mutateJournal((state) =>
           addCloudDeviceCommandJournalEntry(state, prepared));
-        const claim = await this.#mutation("deviceCommands:prepare", {
-          authority,
-          commandPublicId: command.publicId,
-          localPhase: "prepared_no_effect",
-        });
-        if (
-          !isRecord(claim)
-          || claim.publicId !== command.publicId
-          || (claim.state !== "prepared" && claim.state !== "expired")
-        ) throw new Error("Cloud device command prepare response is invalid.");
-        if (claim.state === "expired") {
+        if (await this.#prepareDeviceCommand(prepared) === "expired") {
           await this.#mutateJournal((state) =>
             removeCloudDeviceCommandJournalEntry(state, command.publicId));
           continue;
         }
-        const started: CloudDeviceCommandJournalEntry = { ...prepared, phase: "effect_started" };
-        await this.#mutateJournal((state) =>
-          transitionCloudDeviceCommandJournalEntry(state, started));
-        const begin = await this.#mutation("deviceCommands:markEffectStarted", {
-          authority,
-          commandPublicId: command.publicId,
-        });
-        if (
-          !isRecord(begin)
-          || begin.publicId !== command.publicId
-          || (begin.state !== "effect_started" && begin.state !== "expired")
-        ) throw new Error("Cloud device command effect-start response is invalid.");
-        if (begin.state === "expired") {
-          await this.#mutateJournal((state) =>
-            removeCloudDeviceCommandJournalEntry(state, command.publicId));
-          continue;
-        }
-        let outcome: CloudDeviceCommandExecutionResult;
-        try {
-          const payload = await decryptDeviceCommand(command.payload, identity.accountKey, {
-            entityPublicId: command.publicId,
-            keyVersion: command.payload.keyVersion,
-            kind: "device_command",
-            userPublicId: identity.userPublicId,
-          });
-          if (payload.kind !== command.kind) {
-            throw new Error("Cloud device command kind is inconsistent.");
-          }
-          await this.#assertDaemonCurrent(signal);
-          outcome = await executor.executeDeviceCommand({
-            idempotencyKey: command.publicId,
-            payload,
-            requestingDevicePublicId: command.requestingDevicePublicId,
-            signal,
-          });
-          if (!/^[A-Z][A-Z0-9_]{0,63}$/u.test(outcome.code)) {
-            throw new Error("Local device command executor returned an invalid result.");
-          }
-        } catch {
-          outcome = { code: "LOCAL_EFFECT_INDETERMINATE", state: "ambiguous" };
-        }
-        const resultDigest = await sha256Hex(JSON.stringify({
-          code: outcome.code,
-          result: outcome.result ?? null,
-          state: outcome.state,
-        }));
-        const terminal: CloudDeviceCommandJournalEntry = {
-          ...started,
-          phase: "terminal",
-          resultCode: outcome.code,
-          resultDigest,
-          terminalState: outcome.state,
-        };
-        await this.#mutateJournal((state) =>
-          transitionCloudDeviceCommandJournalEntry(state, terminal));
-        await this.#settleDeviceCommand(terminal, identity, outcome);
-        await this.#mutateJournal((state) =>
-          removeCloudDeviceCommandJournalEntry(state, command.publicId));
-        if (outcome.state === "applied") applied += 1;
+        if (await this.#markExecuteAndSettleDeviceCommand(
+          command,
+          prepared,
+          identity,
+          executor,
+          signal,
+        )) applied += 1;
       } catch (error: unknown) {
         errors.push(`device command ${command.publicId}: ${normalizeError(error)}`);
         break;
       }
     }
     return { applied };
+  }
+
+  async #prepareDeviceCommand(
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" }>,
+  ): Promise<"prepared" | "expired"> {
+    const claim = await this.#mutation("deviceCommands:prepare", {
+      authority: entry.authority,
+      commandPublicId: entry.commandPublicId,
+      localPhase: "prepared_no_effect",
+    });
+    if (
+      !isRecord(claim)
+      || claim.publicId !== entry.commandPublicId
+      || (claim.state !== "prepared" && claim.state !== "expired")
+    ) throw new Error("Cloud device command prepare response is invalid.");
+    return claim.state;
+  }
+
+  async #readDeviceCommandRecovery(
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" | "effect_started" }>,
+    identity: ActiveCloudIdentity,
+  ): Promise<CloudDeviceCommand> {
+    const remoteValue = await this.#transport.query("deviceCommands:get", {
+      commandPublicId: entry.commandPublicId,
+    });
+    const remote = parseCloudDeviceCommands(remoteValue === null ? [] : [remoteValue])[0];
+    if (
+      remote === undefined
+      || remote.publicId !== entry.commandPublicId
+      || remote.kind !== entry.kind
+      || remote.requestingDevicePublicId !== entry.requestingDevicePublicId
+      || remote.requestDigest === undefined
+      || remote.targetDevicePublicId !== identity.devicePublicId
+      || remote.payload.keyVersion !== identity.keyVersion
+    ) throw new Error("Cloud device command recovery identity is invalid.");
+    let authenticatedPayload: DeviceCommandPayload;
+    try {
+      authenticatedPayload = await decryptDeviceCommand(remote.payload, identity.accountKey, {
+        entityPublicId: remote.publicId,
+        keyVersion: identity.keyVersion,
+        kind: "device_command",
+        userPublicId: identity.userPublicId,
+      });
+    } catch {
+      throw new Error("Cloud device command recovery identity is invalid.");
+    }
+    const payloadDigest = await sha256Hex(JSON.stringify(remote.payload));
+    const requestDigest = await hmacSha256Hex(
+      identity.accountKey,
+      "device-command-enqueue",
+      JSON.stringify({
+        deadline: remote.deadline,
+        expectedTargetDevicePublicId: identity.devicePublicId,
+        kind: remote.kind,
+        payload: remote.payload,
+        publicId: remote.publicId,
+      }),
+    );
+    if (
+      authenticatedPayload.kind !== remote.kind
+      || payloadDigest !== entry.payloadDigest
+      || requestDigest !== remote.requestDigest
+    ) throw new Error("Cloud device command recovery identity is invalid.");
+
+    if (remote.state === "pending") {
+      if (remote.boundAuthority !== undefined) {
+        throw new Error("Cloud device command recovery authority is invalid.");
+      }
+      return remote;
+    }
+    if (remote.boundAuthority !== undefined) {
+      if (!sameAuthority(remote.boundAuthority, entry.authority)) {
+        throw new Error("Cloud device command recovery authority is invalid.");
+      }
+      return remote;
+    }
+    // Only a terminal won while the command was still pending can legitimately
+    // have no bound daemon authority. The confirming mutation below must still
+    // prove that exact terminal before local evidence is retired.
+    if (remote.state !== "cancelled" && remote.state !== "expired") {
+      throw new Error("Cloud device command recovery authority is invalid.");
+    }
+    return remote;
+  }
+
+  async #confirmDeviceCommandTerminalRecovery(
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" | "effect_started" }>,
+    expectedState: "ambiguous" | "cancelled" | "expired",
+  ): Promise<void> {
+    const confirmed = await this.#mutation("deviceCommands:confirmTerminalRecovery", {
+      commandPublicId: entry.commandPublicId,
+      localPhase: entry.phase === "prepared" ? "prepared_no_effect" : "effect_started",
+      staleAuthority: entry.authority,
+    });
+    if (
+      !isRecord(confirmed)
+      || confirmed.publicId !== entry.commandPublicId
+      || confirmed.replay !== true
+      || confirmed.state !== expectedState
+    ) throw new Error("Cloud device command terminal recovery confirmation is invalid.");
+    await this.#mutateJournal((state) =>
+      removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+  }
+
+  async #settleIndeterminateDeviceCommand(
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" | "effect_started" }>,
+    identity: ActiveCloudIdentity,
+  ): Promise<void> {
+    const resultCode = "LOCAL_EFFECT_RECOVERY_REQUIRED";
+    const terminalState = "ambiguous" as const;
+    const resultDigest = await hmacSha256Hex(
+      identity.accountKey,
+      "device-command-result",
+      JSON.stringify({ code: resultCode, result: null, state: terminalState }),
+    );
+    const terminal: CloudDeviceCommandJournalEntry = {
+      ...entry,
+      phase: "terminal",
+      resultCode,
+      resultDigest,
+      terminalState,
+    };
+    await this.#mutateJournal((state) =>
+      transitionCloudDeviceCommandJournalEntry(state, terminal));
+    await this.#settleOrConfirmRevokedDeviceCommand(terminal);
+    await this.#mutateJournal((state) =>
+      removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+  }
+
+  async #resumeCurrentDeviceCommand(
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" | "effect_started" }>,
+    identity: ActiveCloudIdentity,
+    executor: CloudDeviceCommandExecutorPort,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const remote = await this.#readDeviceCommandRecovery(entry, identity);
+    await this.#assertDaemonCurrent(signal);
+    if (
+      remote.state === "cancelled"
+      || remote.state === "expired"
+      || (remote.state === "ambiguous" && entry.phase === "effect_started")
+    ) {
+      await this.#confirmDeviceCommandTerminalRecovery(entry, remote.state);
+      return false;
+    }
+    if (isTerminalCommandState(remote.state)) {
+      throw new Error("Cloud device command recovery terminal is inconsistent.");
+    }
+
+    if (entry.phase === "prepared") {
+      if (remote.state === "effect_started") {
+        // The hosted boundary advanced without the corresponding local record.
+        // That contradiction can never authorize a provider replay.
+        await this.#settleIndeterminateDeviceCommand(entry, identity);
+        return false;
+      }
+      if (remote.state !== "pending" && remote.state !== "prepared") {
+        throw new Error("Cloud device command recovery state is invalid.");
+      }
+      if (await this.#prepareDeviceCommand(entry) === "expired") {
+        await this.#mutateJournal((state) =>
+          removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+        return false;
+      }
+      return await this.#markExecuteAndSettleDeviceCommand(
+        remote,
+        entry,
+        identity,
+        executor,
+        signal,
+      );
+    }
+
+    if (remote.state === "effect_started") {
+      // This is the ambiguous half-open boundary: a lost mark response and an
+      // executor that began before interruption have the same durable shape.
+      await this.#settleIndeterminateDeviceCommand(entry, identity);
+      return false;
+    }
+    if (remote.state !== "prepared") {
+      throw new Error("Cloud device command recovery state is invalid.");
+    }
+    // The local journal was advanced before the mark mutation. An authoritative
+    // hosted `prepared` read therefore proves the mark did not commit and the
+    // provider executor could not have been reached.
+    return await this.#markExecuteAndSettleDeviceCommand(
+      remote,
+      entry,
+      identity,
+      executor,
+      signal,
+    );
+  }
+
+  async #markExecuteAndSettleDeviceCommand(
+    command: CloudDeviceCommand,
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" | "effect_started" }>,
+    identity: ActiveCloudIdentity,
+    executor: CloudDeviceCommandExecutorPort,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const started: Extract<CloudDeviceCommandJournalEntry, { phase: "effect_started" }> =
+      entry.phase === "effect_started" ? entry : { ...entry, phase: "effect_started" };
+    if (entry.phase === "prepared") {
+      await this.#mutateJournal((state) =>
+        transitionCloudDeviceCommandJournalEntry(state, started));
+    }
+    abortBeforeEffect(signal);
+    const begin = await this.#mutation("deviceCommands:markEffectStarted", {
+      authority: started.authority,
+      commandPublicId: command.publicId,
+    });
+    if (
+      !isRecord(begin)
+      || begin.publicId !== command.publicId
+      || (begin.state !== "effect_started" && begin.state !== "expired")
+    ) throw new Error("Cloud device command effect-start response is invalid.");
+    if (begin.state === "expired") {
+      await this.#mutateJournal((state) =>
+        removeCloudDeviceCommandJournalEntry(state, command.publicId));
+      return false;
+    }
+
+    let outcome: CloudDeviceCommandExecutionResult;
+    try {
+      const payload = await decryptDeviceCommand(command.payload, identity.accountKey, {
+        entityPublicId: command.publicId,
+        keyVersion: command.payload.keyVersion,
+        kind: "device_command",
+        userPublicId: identity.userPublicId,
+      });
+      if (payload.kind !== command.kind) {
+        throw new Error("Cloud device command kind is inconsistent.");
+      }
+      await this.#assertDaemonCurrent(signal);
+      outcome = await this.#requestingDeviceActive(command.requestingDevicePublicId)
+        ? await executor.executeDeviceCommand({
+            idempotencyKey: command.publicId,
+            payload,
+            requestingDevicePublicId: command.requestingDevicePublicId,
+            signal,
+          })
+        : { code: "REQUESTING_DEVICE_INACTIVE", state: "failed" };
+      if (!/^[A-Z][A-Z0-9_]{0,63}$/u.test(outcome.code)) {
+        throw new Error("Local device command executor returned an invalid result.");
+      }
+      if (
+        (outcome.result !== undefined && outcome.result.kind !== command.kind)
+        || (outcome.singleUseResult === true
+          && (command.kind !== "account_login_start" || outcome.result === undefined))
+        || (command.kind === "account_login_start"
+          && outcome.state === "applied"
+          && (outcome.result === undefined || outcome.singleUseResult !== true))
+      ) throw new Error("Local device command executor returned an invalid result.");
+    } catch {
+      outcome = { code: "LOCAL_EFFECT_INDETERMINATE", state: "ambiguous" };
+    }
+    const resultDigest = await hmacSha256Hex(
+      identity.accountKey,
+      "device-command-result",
+      JSON.stringify({
+        code: outcome.code,
+        result: outcome.result ?? null,
+        state: outcome.state,
+      }),
+    );
+    const encryptedResult = outcome.result === undefined
+      ? undefined
+      : await encryptDeviceCommandResult(outcome.result, identity.accountKey, {
+          entityPublicId: command.publicId,
+          keyVersion: identity.keyVersion,
+          kind: "device_command_result",
+          userPublicId: identity.userPublicId,
+        });
+    const terminal: CloudDeviceCommandJournalEntry = {
+      ...started,
+      phase: "terminal",
+      ...(encryptedResult === undefined ? {} : { result: encryptedResult }),
+      resultCode: outcome.code,
+      resultDigest,
+      ...(outcome.singleUseResult === true ? { singleUseResult: true } : {}),
+      terminalState: outcome.state,
+    };
+    await this.#mutateJournal((state) =>
+      transitionCloudDeviceCommandJournalEntry(state, terminal));
+    await this.#settleOrConfirmRevokedDeviceCommand(terminal);
+    await this.#mutateJournal((state) =>
+      removeCloudDeviceCommandJournalEntry(state, command.publicId));
+    return outcome.state === "applied";
   }
 
   #deviceCommandAuthority(): AuthorityTuple {
@@ -4065,30 +5149,50 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
 
   async #settleDeviceCommand(
     entry: Extract<CloudDeviceCommandJournalEntry, { phase: "terminal" }>,
-    identity?: ActiveCloudIdentity,
-    outcome?: CloudDeviceCommandExecutionResult,
   ): Promise<void> {
-    const encrypted = identity === undefined || outcome?.result === undefined
-      ? undefined
-      : await encryptDeviceCommandResult(outcome.result, identity.accountKey, {
-          entityPublicId: entry.commandPublicId,
-          keyVersion: identity.keyVersion,
-          kind: "device_command_result",
-          userPublicId: identity.userPublicId,
-        });
     await this.#mutation("deviceCommands:settle", {
       authority: entry.authority,
       commandPublicId: entry.commandPublicId,
-      ...(encrypted === undefined ? {} : { result: encrypted }),
+      ...(entry.result === undefined ? {} : { result: entry.result }),
       resultCode: entry.resultCode,
       resultDigest: entry.resultDigest,
-      ...(outcome?.singleUseResult === true ? { singleUseResult: true } : {}),
+      ...(entry.singleUseResult === true ? { singleUseResult: true } : {}),
       state: entry.terminalState,
     });
   }
 
+  async #settleOrConfirmRevokedDeviceCommand(
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "terminal" }>,
+  ): Promise<void> {
+    try {
+      await this.#settleDeviceCommand(entry);
+      return;
+    } catch (settleError: unknown) {
+      try {
+        const confirmed = await this.#mutation("deviceCommands:confirmRevokedTerminal", {
+          authority: entry.authority,
+          commandPublicId: entry.commandPublicId,
+        });
+        if (
+          !isRecord(confirmed)
+          || confirmed.publicId !== entry.commandPublicId
+          || confirmed.replay !== true
+          || confirmed.state !== "ambiguous"
+        ) throw new Error("Cloud device command revocation confirmation is invalid.");
+        return;
+      } catch {
+        // Settlement remains the authoritative error unless the server proves
+        // the exact result-less revocation terminal. Network failure, a
+        // different terminal result, or an authority mismatch all retain the
+        // local journal for a later exact replay.
+        throw settleError;
+      }
+    }
+  }
+
   async #quarantineDeviceCommand(
     entry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" | "effect_started" }>,
+    identity: ActiveCloudIdentity,
   ): Promise<void> {
     // `prepared` never began an effect, so it is honestly a failure. An
     // `effect_started` entry may have created a session; the only truthful
@@ -4097,21 +5201,107 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     const resultCode = entry.phase === "prepared"
       ? "LOCAL_AUTHORITY_CHANGED_BEFORE_EFFECT"
       : "LOCAL_EFFECT_RECOVERY_REQUIRED";
-    const resultDigest = await sha256Hex(JSON.stringify({
-      code: resultCode,
-      result: null,
-      state: terminalState,
-    }));
+    const resultDigest = await hmacSha256Hex(
+      identity.accountKey,
+      "device-command-result",
+      JSON.stringify({ code: resultCode, result: null, state: terminalState }),
+    );
+    const localPhase = entry.phase === "prepared" ? "prepared_no_effect" as const : "effect_started" as const;
+    try {
+      const recovered = await this.#mutation("deviceCommands:recoverEffectStarted", {
+        commandPublicId: entry.commandPublicId,
+        localPhase,
+        recoveryAuthority: this.#deviceCommandAuthority(),
+        resultCode,
+        resultDigest,
+        staleAuthority: entry.authority,
+        state: terminalState,
+      });
+      if (
+        !isRecord(recovered)
+        || recovered.publicId !== entry.commandPublicId
+        || typeof recovered.replay !== "boolean"
+        || recovered.state !== terminalState
+      ) throw new Error("Cloud device command recovery response is invalid.");
+    } catch (recoveryError: unknown) {
+      try {
+        const confirmed = await this.#mutation("deviceCommands:confirmTerminalRecovery", {
+          commandPublicId: entry.commandPublicId,
+          localPhase,
+          staleAuthority: entry.authority,
+        });
+        const confirmedState = isRecord(confirmed) ? confirmed.state : undefined;
+        const stateMatches = confirmedState === "cancelled"
+          || confirmedState === "expired"
+          || (localPhase === "effect_started" && confirmedState === "ambiguous");
+        if (
+          !isRecord(confirmed)
+          || confirmed.publicId !== entry.commandPublicId
+          || confirmed.replay !== true
+          || !stateMatches
+        ) throw new Error("Cloud device command terminal recovery confirmation is invalid.");
+      } catch {
+        // A query result is not enough to retire durable effect evidence. If the
+        // server cannot prove the exact result-less terminal, preserve the
+        // journal and the original recovery error for another cycle.
+        throw recoveryError;
+      }
+    }
+    await this.#mutateJournal((state) =>
+      removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+  }
+
+  async #quarantineLegacyLoginTerminal(
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "terminal" }>,
+    identity: ActiveCloudIdentity,
+  ): Promise<void> {
+    const remoteValue = await this.#transport.query("deviceCommands:get", {
+      commandPublicId: entry.commandPublicId,
+    });
+    const remote = parseCloudDeviceCommands(remoteValue === null ? [] : [remoteValue])[0];
+    if (
+      remote === undefined
+      || remote.publicId !== entry.commandPublicId
+      || remote.kind !== "account_login_start"
+    ) throw new Error("Cloud device command recovery response is invalid.");
+    if (remote.state === "applied") {
+      if (
+        remote.resultCode !== entry.resultCode
+        || remote.resultSingleUse !== true
+        || remote.resultConsumed === undefined
+      ) throw new Error("Cloud device command legacy result is unavailable.");
+      await this.#settleDeviceCommand(entry);
+      return;
+    }
+    if (remote.state === "ambiguous") {
+      const confirmed = await this.#mutation("deviceCommands:confirmRevokedTerminal", {
+        authority: entry.authority,
+        commandPublicId: entry.commandPublicId,
+      });
+      if (
+        !isRecord(confirmed)
+        || confirmed.publicId !== entry.commandPublicId
+        || confirmed.replay !== true
+        || confirmed.state !== "ambiguous"
+      ) throw new Error("Cloud device command revocation confirmation is invalid.");
+      return;
+    }
+    const resultCode = "LOCAL_RESULT_RECOVERY_REQUIRED";
+    const terminalState = "ambiguous" as const;
+    const resultDigest = await hmacSha256Hex(
+      identity.accountKey,
+      "device-command-result",
+      JSON.stringify({ code: resultCode, result: null, state: terminalState }),
+    );
     await this.#mutation("deviceCommands:recoverEffectStarted", {
       commandPublicId: entry.commandPublicId,
+      localPhase: "effect_started",
       recoveryAuthority: this.#deviceCommandAuthority(),
       resultCode,
       resultDigest,
       staleAuthority: entry.authority,
       state: terminalState,
     });
-    await this.#mutateJournal((state) =>
-      removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
   }
 
   async #processCommands(
@@ -5119,6 +6309,8 @@ export async function createLocalCloudDaemonBridgeFromEnvironment(
   });
   try {
     return new LocalCloudDaemonBridge({
+      attentionNotificationState: options.attentionNotificationState
+        ?? new CustodyCloudAttentionNotificationReconciliation(fencedCustody),
       daemonAuthority: options.daemonAuthority,
       daemonAuthorityFence: options.daemonAuthorityFence,
       deploymentAuthority,

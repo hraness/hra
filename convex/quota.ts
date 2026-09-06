@@ -588,6 +588,27 @@ export async function reserveServiceQuotaForInsert(
   });
 }
 
+export async function tryReserveServiceQuotaForInserts(
+  ctx: MutationCtx,
+  documents: readonly LogicalDocument[],
+): Promise<boolean> {
+  if (documents.length < 1) corrupt();
+  const logicalBytes = documents.reduce(
+    (total, document) => total + logicalDocumentBytes(document),
+    0,
+  );
+  try {
+    await applyServiceQuotaDelta(ctx, {
+      logicalBytes,
+      records: documents.length,
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof Error && error.message === "QUOTA_EXCEEDED") return false;
+    throw error;
+  }
+}
+
 export async function adjustServiceQuotaForPatch(
   ctx: MutationCtx,
   document: LogicalDocument,
@@ -866,6 +887,8 @@ export const QUOTA_GENESIS_CHARGED_TABLES = [
   "executionLeases",
   "sessionCommands",
   "deviceCommands",
+  "attentionNotificationOutbox",
+  "attentionNotificationSafetyFaults",
   "codexAccounts",
   "deviceAccountBindings",
   "accountUsageSnapshots",
@@ -912,6 +935,8 @@ async function requireGenesisEmpty(ctx: MutationCtx): Promise<void> {
     hasAny(ctx.db.query("executionLeases").take(1)),
     hasAny(ctx.db.query("sessionCommands").take(1)),
     hasAny(ctx.db.query("deviceCommands").take(1)),
+    hasAny(ctx.db.query("attentionNotificationOutbox").take(1)),
+    hasAny(ctx.db.query("attentionNotificationSafetyFaults").take(1)),
     hasAny(ctx.db.query("codexAccounts").take(1)),
     hasAny(ctx.db.query("deviceAccountBindings").take(1)),
     hasAny(ctx.db.query("accountUsageSnapshots").take(1)),
@@ -992,7 +1017,7 @@ export const genesisHostedAuthority = internalMutation({
       || invitePublicIdFromCapabilityDigest(args.capabilityDigest) !== args.publicId
     ) return refuseHostedBootstrap();
 
-    const [serviceRows, controlRows, publicInvites, digestInvites] = await Promise.all([
+    const [serviceRows, controlRows, publicInvites, digestInvites, faults] = await Promise.all([
       ctx.db.query("storageUsageService")
         .withIndex("by_key", (builder) => builder.eq("key", "global"))
         .take(2),
@@ -1006,6 +1031,7 @@ export const genesisHostedAuthority = internalMutation({
         .withIndex("by_capability_digest", (builder) =>
           builder.eq("capabilityDigest", args.capabilityDigest))
         .take(2),
+      ctx.db.query("attentionNotificationSafetyFaults").take(1),
     ]);
     if (serviceRows.length !== 0 || controlRows.length !== 0) {
       const service = serviceRows[0];
@@ -1016,10 +1042,14 @@ export const genesisHostedAuthority = internalMutation({
         || controlRows.length !== 1
         || publicInvites.length !== 1
         || digestInvites.length !== 1
+        || faults.length !== 0
         || service === undefined
         || control === undefined
         || invite === undefined
         || digestInvites[0]?._id !== invite._id
+        || control.attentionNotificationGeneration !== undefined
+        || control.attentionNotificationLastMutationId !== undefined
+        || control.attentionNotifications !== undefined
         || control.authAdmissionGeneration !== 0
         || control.authAdmissions !== "open"
         || control.bootstrapAcceptedAt !== undefined
@@ -1116,7 +1146,7 @@ export const reissueHostedBootstrapInvite = internalMutation({
       || invitePublicIdFromCapabilityDigest(args.capabilityDigest) !== args.publicId
     ) return refuseHostedBootstrap();
 
-    const [serviceRows, controlRows, invites, users] = await Promise.all([
+    const [serviceRows, controlRows, invites, users, faults] = await Promise.all([
       ctx.db.query("storageUsageService")
         .withIndex("by_key", (builder) => builder.eq("key", "global"))
         .take(2),
@@ -1125,6 +1155,7 @@ export const reissueHostedBootstrapInvite = internalMutation({
         .take(2),
       ctx.db.query("authInvites").take(3),
       ctx.db.query("users").take(1),
+      ctx.db.query("attentionNotificationSafetyFaults").take(1),
     ]);
     const service = serviceRows[0];
     const control = controlRows[0];
@@ -1134,6 +1165,7 @@ export const reissueHostedBootstrapInvite = internalMutation({
       || service === undefined
       || control === undefined
       || users.length !== 0
+      || faults.length !== 0
       || invites.length > 1
       || control.bootstrapAcceptedAt !== undefined
       || control.bootstrapCompletedAt === undefined
@@ -1269,6 +1301,8 @@ export const hostedBootstrapStatus = internalQuery({
       executionLeases,
       sessionCommands,
       deviceCommands,
+      attentionNotificationOutbox,
+      attentionNotificationSafetyFaults,
       codexAccounts,
       deviceAccountBindings,
       accountUsageSnapshots,
@@ -1308,6 +1342,8 @@ export const hostedBootstrapStatus = internalQuery({
       ctx.db.query("executionLeases").take(2),
       ctx.db.query("sessionCommands").take(2),
       ctx.db.query("deviceCommands").take(2),
+      ctx.db.query("attentionNotificationOutbox").take(2),
+      ctx.db.query("attentionNotificationSafetyFaults").take(2),
       ctx.db.query("codexAccounts").take(2),
       ctx.db.query("deviceAccountBindings").take(2),
       ctx.db.query("accountUsageSnapshots").take(2),
@@ -1348,6 +1384,8 @@ export const hostedBootstrapStatus = internalQuery({
       executionLeases,
       sessionCommands,
       deviceCommands,
+      attentionNotificationOutbox,
+      attentionNotificationSafetyFaults,
       codexAccounts,
       deviceAccountBindings,
       accountUsageSnapshots,
@@ -1402,6 +1440,9 @@ export const hostedBootstrapStatus = internalQuery({
     const controlValid = (
       control.length === 1
       && controlRow !== undefined
+      && controlRow.attentionNotificationGeneration === undefined
+      && controlRow.attentionNotificationLastMutationId === undefined
+      && controlRow.attentionNotifications === undefined
       && controlRow.authAdmissionGeneration === 0
       && controlRow.authAdmissions === "open"
       && controlRow.lastMutationId === undefined
@@ -1599,6 +1640,7 @@ const directlyAuditableTable = v.union(
   v.literal("sessionStreamEpochs"),
   v.literal("executionLeases"),
   v.literal("sessionCommands"),
+  v.literal("attentionNotificationOutbox"),
   v.literal("codexAccounts"),
   v.literal("deviceAccountBindings"),
   v.literal("accountUsageSnapshots"),
@@ -1613,6 +1655,7 @@ const DIRECT_TABLE_CATEGORY = {
   sessionStreamEpochs: "chunk",
   executionLeases: "session",
   sessionCommands: "command",
+  attentionNotificationOutbox: "command",
   codexAccounts: "account",
   deviceAccountBindings: "account",
   accountUsageSnapshots: "usage",
@@ -1659,6 +1702,10 @@ export const auditDirectTablePage = internalQuery({
             .paginate(paginationOpts);
         case "sessionCommands":
           return await ctx.db.query("sessionCommands")
+            .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "attentionNotificationOutbox":
+          return await ctx.db.query("attentionNotificationOutbox")
             .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
             .paginate(paginationOpts);
         case "codexAccounts":

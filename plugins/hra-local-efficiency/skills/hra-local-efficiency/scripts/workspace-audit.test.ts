@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -72,5 +72,8 @@ describe("workspace audit arguments", () => {
     expect(payload.disk.requiredBytes).toMatch(/^\d+$/u);
     expect(payload.repositories).toHaveLength(1);
     expect(payload.repositories[0]).not.toHaveProperty("remote");
+    expect(payload.repositories[0]).toHaveProperty("guidanceStatus", "needs-update");
+    expect(existsSync(join(repository, "AGENTS.md"))).toBe(false);
+    expect(existsSync(join(repository, "CLAUDE.md"))).toBe(false);
   });
 });

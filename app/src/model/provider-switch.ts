@@ -20,7 +20,7 @@ export const providerSwitchOptions: readonly Readonly<{
   provider: SessionProvider;
 }>[] = Object.freeze([
   { label: "Run on Codex", provider: "codex" },
-  { label: "Run on Claude Code", provider: "claude" },
+  { label: "Run on Claude Code (Linux machine only)", provider: "claude" },
 ]);
 
 /**
@@ -32,7 +32,8 @@ export const providerSwitchOptions: readonly Readonly<{
  */
 export const providerSwitchNote =
   "Switching hands the new provider a summary of the conversation so far, not the other "
-  + "provider's own history.";
+  + "provider's own history. Claude targets require a Linux custodian; macOS refuses "
+  + "before launching Claude.";
 
 export const setProviderCommandKind = "set_provider";
 

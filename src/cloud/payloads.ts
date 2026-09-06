@@ -1,10 +1,14 @@
 import {
   cloudLimits,
   containsAbsolutePath,
+  containsSecretShapedText,
   containsUnsafeTerminalScalar,
   hasExactKeys,
   isOpaqueIdentifier,
   isRecord,
+  isSafePositiveInteger,
+  jsonValueFitsCloudEnvelope,
+  snapshotForeignJson,
   type CommandKind,
   type DeviceCommandKind,
   type EncryptedEnvelope,
@@ -15,7 +19,21 @@ import {
   isAttachmentName,
   type AttachmentMediaType,
 } from "../domain/attachments";
+import {
+  remoteInteractionAnswerLimits,
+  remoteInteractionJsonFitsProviderLimit,
+  remoteInteractionPolicyLimits,
+} from "../domain/remote-interaction-contract";
 import { decryptBytes, encryptBytes } from "./crypto";
+import {
+  parseNotificationEmailPolicy,
+  type NotificationEmailPolicy,
+} from "../domain/notification-email-contract";
+import {
+  parseNotificationHoursPolicy,
+  parseNotificationHoursUpdate,
+  type NotificationHoursPolicy,
+} from "../domain/notification-hours-contract";
 import { isModelPreset, type ModelPreset } from "./projection";
 import {
   parseUsageEncryptedEnvelope,
@@ -39,19 +57,33 @@ function isRemoteInteractionAnswerMap(
 ): value is Readonly<Record<string, Readonly<{ answers: readonly string[] }>>> {
   if (!isRecord(value)) return false;
   const entries = Object.entries(value);
-  if (entries.length < 1 || entries.length > 20) return false;
+  let keys: readonly (string | symbol)[];
+  try {
+    keys = Reflect.ownKeys(value);
+  } catch {
+    return false;
+  }
+  if (
+    entries.length < 1
+    || entries.length > remoteInteractionPolicyLimits.questions
+    || keys.length !== entries.length
+    || keys.some((key) => typeof key !== "string")
+  ) return false;
   return entries.every(([questionId, answer]) =>
     questionId.length >= 1
-    && questionId.length <= 512
+    && questionId.length <= remoteInteractionPolicyLimits.questionIdCharacters
     && isRecord(answer)
     && hasExactKeys(answer, ["answers"])
     && Array.isArray(answer.answers)
-    && answer.answers.length <= 20
+    && answer.answers.length === 1
     && answer.answers.every((entry) =>
       typeof entry === "string"
-      && entry.length <= 16_384
+      && entry.length >= 1
+      && entry.length <= remoteInteractionAnswerLimits.codeUnits
       && !containsAbsolutePath(entry)
-      && !containsUnsafeTerminalScalar(entry, true)));
+      && !containsSecretShapedText(entry)
+      && !containsUnsafeTerminalScalar(entry, true)))
+    && remoteInteractionJsonFitsProviderLimit(value);
 }
 
 export type ResolveInteractionDecisionPayload = Readonly<{
@@ -209,9 +241,10 @@ export type RemoteCommandPayload =
  * named by the `publicId` the device registry already projects, never by a
  * filesystem path, and `containsAbsolutePath` refuses one anyway.
  *
- * `account_login_status` deliberately carries no account: a device relays at
- * most one login at a time, so the poll asks "what is happening on this
- * machine", which also keeps the polled account out of the projection.
+ * Current `account_login_status` requests name the projected account whose
+ * row exposed the action. The account-less shape remains parseable only for a
+ * legacy browser, so a rolling deployment can still ask the older machine-wide
+ * question without widening the current UI's authority.
  */
 export type DeviceCommandPayload =
   | Readonly<{
@@ -222,9 +255,23 @@ export type DeviceCommandPayload =
       prompt: string;
       provider: "codex" | "claude";
     }>
-  | Readonly<{ accountPublicId: string; kind: "account_login_start" }>
+  | Readonly<{
+      accountPublicId: string;
+      /** Absent identifies a legacy requester that the current daemon refuses. */
+      handoffVersion?: 2;
+      kind: "account_login_start";
+    }>
+  | Readonly<{ accountPublicId: string; kind: "account_login_status" }>
   | Readonly<{ kind: "account_login_status" }>
-  | Readonly<{ kind: "usage_refresh" }>;
+  | Readonly<{ kind: "usage_refresh" }>
+  | Readonly<{
+      endMinute: number;
+      expectedRevision: number;
+      kind: "set_notification_hours";
+      startMinute: number;
+      timeZone: string;
+      version: 1;
+    }>;
 
 export type DeviceCommandLoginStatus =
   | "idle"
@@ -235,13 +282,26 @@ export type DeviceCommandLoginStatus =
 
 /**
  * What the daemon settles back to the requesting browser. `account_login_start`
- * returns a relayed provider login URL: it is encrypted under the account key
- * like every other payload, carries its own short expiry, and the hosted row
- * releases it exactly once (`deviceCommands:consumeResult`).
+ * returns the complete provider device-code handoff: it is encrypted under the
+ * account key like every other payload, carries its own short expiry, and the
+ * hosted row releases it exactly once (`deviceCommands:consumeResult`). The
+ * browser replaces the encrypted machine-clock expiry with the hosted
+ * settlement deadline returned by that one-time exchange.
  */
 export type DeviceCommandResultPayload =
   | Readonly<{ kind: "session_start"; sessionPublicId: string }>
-  | Readonly<{ expiresAt: number; kind: "account_login_start"; loginUrl: string }>
+  | Readonly<{
+      expiresAt: number;
+      handoffVersion: 2;
+      kind: "account_login_start";
+      loginUrl: string;
+      userCode: string;
+    }>
+  | Readonly<{
+      expiresAt: number;
+      kind: "account_login_start";
+      loginUrl: string;
+    }>
   | Readonly<{
       instruction: string;
       kind: "account_login_status";
@@ -251,30 +311,25 @@ export type DeviceCommandResultPayload =
 
 export const deviceCommandLimits = Object.freeze({
   instructionCharacters: 512,
-  loginUrlCharacters: 2_048,
+  loginUserCodeCharacters: 38,
   promptCharacters: 16_000,
 } as const);
 
-// The relay is a provider login URL and nothing else: https only, no
-// credentials in the authority, no embedded fragment, and bounded.
+/** Maximum time a hosted Codex login handoff may remain readable. */
+export const deviceCommandLoginResultLifetimeMs = 5 * 60 * 1_000;
+
+// Codex owns the device-code endpoint and currently returns this exact URL.
+// An allowlist at the relay boundary prevents a compromised local response
+// from turning the trusted web handoff into an arbitrary phishing link.
 export function isRelayedLoginUrl(value: unknown): value is string {
-  if (
-    typeof value !== "string"
-    || value.length < 12
-    || value.length > deviceCommandLimits.loginUrlCharacters
-    || containsUnsafeTerminalScalar(value)
-  ) return false;
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
-    return false;
-  }
-  return parsed.protocol === "https:"
-    && parsed.username === ""
-    && parsed.password === ""
-    && parsed.hostname.length > 0
-    && parsed.href === value;
+  return value === "https://auth.openai.com/codex/device";
+}
+
+/** The same closed device-code grammar accepted by the protected CLI handoff. */
+export function isRelayedLoginUserCode(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length <= deviceCommandLimits.loginUserCodeCharacters
+    && /^[A-Z0-9]{4,12}(?:-[A-Z0-9]{4,12}){0,2}$/u.test(value);
 }
 
 export function parseDeviceCommandPayload(value: unknown): DeviceCommandPayload | null {
@@ -314,9 +369,50 @@ export function parseDeviceCommandPayload(value: unknown): DeviceCommandPayload 
     && isOpaqueIdentifier(value.accountPublicId)
   ) return { accountPublicId: value.accountPublicId, kind: value.kind };
   if (
-    (value.kind === "account_login_status" || value.kind === "usage_refresh")
+    value.kind === "account_login_start"
+    && hasExactKeys(value, ["accountPublicId", "handoffVersion", "kind"])
+    && isOpaqueIdentifier(value.accountPublicId)
+    && value.handoffVersion === 2
+  ) {
+    return {
+      accountPublicId: value.accountPublicId,
+      handoffVersion: value.handoffVersion,
+      kind: value.kind,
+    };
+  }
+  if (
+    value.kind === "account_login_status"
+    && hasExactKeys(value, ["accountPublicId", "kind"])
+    && isOpaqueIdentifier(value.accountPublicId)
+  ) {
+    return { accountPublicId: value.accountPublicId, kind: value.kind };
+  }
+  if (
+    value.kind === "account_login_status"
     && hasExactKeys(value, ["kind"])
-  ) return { kind: value.kind };
+  ) return { kind: "account_login_status" };
+  if (
+    value.kind === "usage_refresh"
+    && hasExactKeys(value, ["kind"])
+  ) return { kind: "usage_refresh" };
+  if (value.kind === "set_notification_hours") {
+    if (!hasExactKeys(value, [
+      "endMinute",
+      "expectedRevision",
+      "kind",
+      "startMinute",
+      "timeZone",
+      "version",
+    ]) || !isSafePositiveInteger(value.expectedRevision)) return null;
+    const parsed = parseNotificationHoursUpdate({
+      endMinute: value.endMinute,
+      startMinute: value.startMinute,
+      timeZone: value.timeZone,
+      version: value.version,
+    });
+    if (parsed === null) return null;
+    return { ...parsed, expectedRevision: value.expectedRevision, kind: "set_notification_hours" };
+  }
   return null;
 }
 
@@ -333,6 +429,23 @@ export function parseDeviceCommandResultPayload(
     && hasExactKeys(value, ["kind", "sessionPublicId"])
     && isOpaqueIdentifier(value.sessionPublicId)
   ) return { kind: value.kind, sessionPublicId: value.sessionPublicId };
+  if (
+    value.kind === "account_login_start"
+    && hasExactKeys(value, ["expiresAt", "handoffVersion", "kind", "loginUrl", "userCode"])
+    && Number.isSafeInteger(value.expiresAt)
+    && (value.expiresAt as number) > 0
+    && value.handoffVersion === 2
+    && isRelayedLoginUrl(value.loginUrl)
+    && isRelayedLoginUserCode(value.userCode)
+  ) {
+    return {
+      expiresAt: value.expiresAt as number,
+      handoffVersion: value.handoffVersion,
+      kind: value.kind,
+      loginUrl: value.loginUrl,
+      userCode: value.userCode,
+    };
+  }
   if (
     value.kind === "account_login_start"
     && hasExactKeys(value, ["expiresAt", "kind", "loginUrl"])
@@ -443,12 +556,14 @@ export type CloudPayloadAuthority = Readonly<{
     | "device_command"
     | "device_command_result"
     | "device_registry"
+    | "notification_email"
+    | "notification_hours"
     | "session_metadata"
     | "usage";
   userPublicId: string;
 }>;
 
-export function parseRemoteCommandPayload(value: unknown): RemoteCommandPayload | null {
+function parseRemoteCommandPayloadUnchecked(value: unknown): RemoteCommandPayload | null {
   if (!isRecord(value)) return null;
   if (
     (value.kind === "send" || value.kind === "queue" || value.kind === "steer"
@@ -515,8 +630,11 @@ export function parseRemoteCommandPayload(value: unknown): RemoteCommandPayload 
       hasExactKeys(value, ["answers", "interactionId", "kind", "revision"])
       && isRemoteInteractionAnswerMap(value.answers)
     ) {
+      const answers = Object.fromEntries(Object.entries(value.answers).map(
+        ([questionId, answer]) => [questionId, { answers: [...answer.answers] }],
+      ));
       return {
-        answers: value.answers,
+        answers,
         interactionId: value.interactionId,
         kind: value.kind,
         revision: value.revision as number,
@@ -559,6 +677,33 @@ export function parseRemoteCommandPayload(value: unknown): RemoteCommandPayload 
     && isGatewayKeyShape(value.key)
   ) return { key: value.key, kind: value.kind };
   return null;
+}
+
+/** Parse an untrusted decrypted command without allowing exotic accessors to escape. */
+export function parseRemoteCommandPayload(value: unknown): RemoteCommandPayload | null {
+  const snapshot = snapshotForeignJson(value);
+  if (!snapshot.ok || !jsonValueFitsCloudEnvelope(snapshot.value)) return null;
+  const parsed = parseRemoteCommandPayloadUnchecked(snapshot.value);
+  if (parsed === null) return null;
+  // Returned command records retain null prototypes so optional fields cannot
+  // be supplied later through ambient prototype pollution.
+  const canonical = snapshotForeignJson(parsed);
+  return canonical.ok ? canonical.value as RemoteCommandPayload : null;
+}
+
+/**
+ * Reserve the largest UUID/revision wrapper around an answer map so the app
+ * never offers submission for answers that cannot fit the hosted command.
+ */
+export function remoteInteractionAnswersFitCommandEnvelope(
+  answers: Readonly<Record<string, Readonly<{ answers: readonly string[] }>>>,
+): boolean {
+  return jsonValueFitsCloudEnvelope({
+    answers,
+    interactionId: "00000000-0000-4000-8000-000000000000",
+    kind: "resolve_interaction",
+    revision: Number.MAX_SAFE_INTEGER,
+  });
 }
 
 function isRemoteSessionName(value: unknown): value is string {
@@ -698,7 +843,7 @@ function parseRegistryScheduledTasks(
   return tasks;
 }
 
-export function parseDeviceRegistryPayload(value: unknown): DeviceRegistryPayload | null {
+function parseDeviceRegistryPayloadUnchecked(value: unknown): DeviceRegistryPayload | null {
   if (!isRecord(value)) return null;
   const hasAccountLinking = Object.hasOwn(value, "accountLinkingAllowed");
   const hasDeviceCommands = Object.hasOwn(value, "deviceCommandsAllowed");
@@ -758,6 +903,12 @@ export function parseDeviceRegistryPayload(value: unknown): DeviceRegistryPayloa
   };
 }
 
+/** Parse one immutable accessor-free snapshot of an untrusted registry. */
+export function parseDeviceRegistryPayload(value: unknown): DeviceRegistryPayload | null {
+  const snapshot = snapshotForeignJson(value);
+  return snapshot.ok ? parseDeviceRegistryPayloadUnchecked(snapshot.value) : null;
+}
+
 export function cloudPayloadAad(authority: CloudPayloadAuthority): Uint8Array {
   if (
     !isOpaqueIdentifier(authority.entityPublicId)
@@ -802,10 +953,11 @@ export async function encryptRemoteCommand(
   key: Uint8Array,
   authority: CloudPayloadAuthority,
 ): Promise<EncryptedEnvelope> {
-  if (authority.kind !== "command" || parseRemoteCommandPayload(payload) === null) {
+  const parsed = parseRemoteCommandPayload(payload);
+  if (authority.kind !== "command" || parsed === null) {
     throw new Error("Invalid remote command payload.");
   }
-  return await encryptJson(payload, key, authority);
+  return await encryptJson(parsed, key, authority);
 }
 
 export async function decryptRemoteCommand(
@@ -911,6 +1063,64 @@ export async function decryptDeviceRegistry(
   if (authority.kind !== "device_registry") throw new Error("Invalid device registry authority.");
   const parsed = parseDeviceRegistryPayload(await decryptJson(envelope, key, authority));
   if (parsed === null) throw new Error("Invalid device registry payload.");
+  return parsed;
+}
+
+/** A separate envelope keeps notification hours out of the broad registry projection. */
+export async function encryptNotificationHours(
+  payload: NotificationHoursPolicy,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<EncryptedEnvelope> {
+  const parsed = parseNotificationHoursPolicy(payload);
+  if (authority.kind !== "notification_hours" || parsed === null) {
+    throw new Error("Invalid notification hours payload.");
+  }
+  const envelope = await encryptJson(parsed, key, authority);
+  if (envelope.ciphertext.length > cloudLimits.notificationHoursCiphertextCharacters) {
+    throw new Error("Encrypted notification hours exceeds its closed envelope bound.");
+  }
+  return envelope;
+}
+
+export async function decryptNotificationHours(
+  envelope: EncryptedEnvelope,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<NotificationHoursPolicy> {
+  if (authority.kind !== "notification_hours") throw new Error("Invalid notification hours authority.");
+  const parsed = parseNotificationHoursPolicy(await decryptJson(envelope, key, authority));
+  if (parsed === null) throw new Error("Invalid notification hours payload.");
+  return parsed;
+}
+
+/** A separate envelope preserves byte compatibility for the broad v1 registry. */
+export async function encryptNotificationEmail(
+  payload: NotificationEmailPolicy,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<EncryptedEnvelope> {
+  const parsed = parseNotificationEmailPolicy(payload);
+  if (authority.kind !== "notification_email" || parsed === null) {
+    throw new Error("Invalid notification email payload.");
+  }
+  const envelope = await encryptJson(parsed, key, authority);
+  if (envelope.ciphertext.length > cloudLimits.notificationEmailCiphertextCharacters) {
+    throw new Error("Encrypted notification email policy exceeds its closed envelope bound.");
+  }
+  return envelope;
+}
+
+export async function decryptNotificationEmail(
+  envelope: EncryptedEnvelope,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<NotificationEmailPolicy> {
+  if (authority.kind !== "notification_email") {
+    throw new Error("Invalid notification email authority.");
+  }
+  const parsed = parseNotificationEmailPolicy(await decryptJson(envelope, key, authority));
+  if (parsed === null) throw new Error("Invalid notification email payload.");
   return parsed;
 }
 

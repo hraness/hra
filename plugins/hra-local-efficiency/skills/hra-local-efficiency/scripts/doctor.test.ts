@@ -11,9 +11,16 @@ describe("local-efficiency doctor", () => {
       "--json",
       "--codex-home",
       "/tmp/codex",
+      "--claude-home",
+      "/tmp/claude",
       "--bun-bin",
       "/tmp/bin",
-    ])).toEqual({ bunBin: "/tmp/bin", codexHome: "/tmp/codex", json: true });
+    ])).toEqual({
+      bunBin: "/tmp/bin",
+      claudeHome: "/tmp/claude",
+      codexHome: "/tmp/codex",
+      json: true,
+    });
     expect(() => parseDoctorArguments(["--codex-home", "relative"])).toThrow("absolute");
     expect(() => parseDoctorArguments(["--json", "--json"])).toThrow("only once");
   });
@@ -24,10 +31,21 @@ describe("local-efficiency doctor", () => {
       const modulePath = join(root, "host-resources.js");
       writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
       const report = doctorReport(
-        { bunBin: join(root, "bin"), codexHome: join(root, "codex"), json: true },
+        {
+          bunBin: join(root, "bin"),
+          claudeHome: join(root, "claude"),
+          codexHome: join(root, "codex"),
+          json: true,
+        },
         { HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
       );
       expect(report.ok).toBe(false);
+      expect(report.version).toBe(3);
+      expect(report.claudeAutoMode).toEqual({
+        available: false,
+        reason: "cli_missing",
+        version: null,
+      });
       expect(report.failures).toContain(`global guidance differs: ${join(root, "codex", "AGENTS.md")}`);
     } finally {
       rmSync(root, { recursive: true, force: true });
