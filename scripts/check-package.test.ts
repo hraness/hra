@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { chmod, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -8,6 +9,9 @@ import type { DaemonIdentity } from "../src/daemon/daemon-startup";
 import {
   assertCompleteGitHistoryPublic,
   buildGitHistoryEnvironment,
+  gitHistoryCommandArguments,
+  normalizeGitHistoryPatchForPublicScan,
+  normalizeReviewedSyntheticHistoryPatch,
   packageDependencyCacheDiscoveryEnvironment,
   parsePackageDependencyCache,
   parseGitHistoryCommitList,
@@ -17,6 +21,7 @@ import {
   waitForOwnedInstalledDaemonReady,
   withPackageDependencyCacheCustody,
 } from "./check-package";
+import { assertPublicSensitiveText, assertPublicText } from "./public-text-policy";
 import {
   assertPseudoTerminalSuccess,
   PTY_BEGIN_MARKER,
@@ -112,6 +117,24 @@ const initializeHistoryFixture = async (root: string, body = "base\n"): Promise<
   requireHistoryFixtureGit(root, "commit", "-m", "base");
   return requireHistoryFixtureGit(root, "rev-parse", "HEAD");
 };
+
+const runCanonicalHistoryPatch = (
+  root: string,
+  commit: string,
+  kind: "public_patch" | "sensitive_patch",
+) => Bun.spawnSync(
+  ["/usr/bin/git", "--no-pager", ...gitHistoryCommandArguments({ commit, kind })],
+  {
+    cwd: root,
+    env: buildGitHistoryEnvironment(root, resolve(tmpdir())),
+    killSignal: "SIGKILL",
+    maxBuffer: 32 * 1024 * 1024,
+    stderr: "pipe",
+    stdin: "ignore",
+    stdout: "pipe",
+    timeout: 60_000,
+  },
+);
 
 describe("installed package daemon ownership", () => {
   test("times out delayed receipt publication without losing the exact owned pid", async () => {
@@ -287,6 +310,28 @@ describe("installed package generic command ownership", () => {
     expect(source).toContain('["--no-replace-objects", "rev-parse", "--is-shallow-repository"]');
     expect(source).toContain('"--diff-merges=first-parent"');
     expect(source).toContain('"--text"');
+    for (const renderingArgument of [
+      "core.attributesFile=/dev/null",
+      "core.quotePath=true",
+      "diff.mnemonicPrefix=false",
+      "diff.noprefix=false",
+      "diff.orderFile=/dev/null",
+      "diff.relative=false",
+      "diff.suppressBlankEmpty=false",
+      "--full-index",
+      "--no-color",
+      "--no-renames",
+      "--unified=3",
+      "--inter-hunk-context=0",
+      "--diff-algorithm=myers",
+      "--no-indent-heuristic",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
+      "--output-indicator-new=+",
+      "--output-indicator-old=-",
+      "--output-indicator-context= ",
+      "--submodule=short",
+    ]) expect(source).toContain(JSON.stringify(renderingArgument));
     expect(source).toContain("Bun.spawnSync");
     expect(source).toContain('killSignal: "SIGKILL"');
     expect(source).toContain("gitHistoryScanOutputMaximumBytes");
@@ -312,6 +357,143 @@ describe("installed package generic command ownership", () => {
     ).join("\n")}\n`;
     expect(() => parseGitHistoryCommitList(overBound)).toThrow("over its commit bound");
   });
+
+  test("normalizes only the exact reviewed historical synthetic path evidence", () => {
+    const syntheticPath = ["", "Users", "private", "project", ""].join("/");
+    const originalCommit = "f39747b917b064ff593c58dea2a05e4481319b26";
+    const repairCommit = "313ed3e3e1ddbe5b6464fc098926717f177418a8";
+    const repositoryRoot = resolve(import.meta.dir, "..");
+    const historyPatch = (commit: string, kind: "public_patch" | "sensitive_patch"): string => {
+      const result = runCanonicalHistoryPatch(repositoryRoot, commit, kind);
+      expect(result.exitCode).toBe(0);
+      expect(result.exitedDueToMaxBuffer ?? false).toBe(false);
+      expect(result.exitedDueToTimeout ?? false).toBe(false);
+      expect(result.stderr.byteLength).toBe(0);
+      return result.stdout.toString("utf8");
+    };
+
+    for (const commit of [originalCommit, repairCommit]) {
+      for (const kind of ["sensitive_patch", "public_patch"] as const) {
+        const patch = historyPatch(commit, kind);
+        expect(patch.match(new RegExp(syntheticPath, "gu"))).toHaveLength(1);
+        const normalized = normalizeGitHistoryPatchForPublicScan(commit, kind, patch);
+        expect(normalized).not.toContain(syntheticPath);
+        expect(normalized).toContain("[reviewed-synthetic-absolute-path]");
+        const assertReviewedPatch = kind === "public_patch"
+          ? assertPublicText
+          : assertPublicSensitiveText;
+        expect(() => assertReviewedPatch(normalized, "reviewed history fixture")).not.toThrow();
+        expect(() => normalizeGitHistoryPatchForPublicScan(commit, kind, `${patch}mutation\n`))
+          .toThrow("synthetic-path evidence changed");
+      }
+    }
+
+    const unreviewedCommit = "a".repeat(40);
+    const unreviewedPatch = `before ${syntheticPath} after`;
+    expect(normalizeGitHistoryPatchForPublicScan(
+      unreviewedCommit,
+      "sensitive_patch",
+      unreviewedPatch,
+    )).toBe(unreviewedPatch);
+    expect(() => assertPublicSensitiveText(unreviewedPatch, "unreviewed history fixture"))
+      .toThrow("ABSOLUTE_USER_PATH");
+
+    const duplicatePatch = `${syntheticPath}\n${syntheticPath}\n`;
+    const duplicateDigest = createHash("sha256").update(duplicatePatch, "utf8").digest("hex");
+    expect(() => normalizeReviewedSyntheticHistoryPatch(duplicatePatch, duplicateDigest))
+      .toThrow("synthetic-path evidence changed");
+    for (const missingPatch of [
+      "safe history patch\n",
+      [["", "Users", "private", "other", ""].join("/"), "changed path\n"].join(""),
+    ]) {
+      const missingDigest = createHash("sha256").update(missingPatch, "utf8").digest("hex");
+      expect(() => normalizeReviewedSyntheticHistoryPatch(missingPatch, missingDigest))
+        .toThrow("synthetic-path evidence changed");
+    }
+    expect(() => assertPublicSensitiveText(syntheticPath, "current tree fixture"))
+      .toThrow("ABSOLUTE_USER_PATH");
+
+    const secret = ["sk", "proj", "Z".repeat(24)].join("-");
+    const retainedSensitivePatch = `${syntheticPath}\n${secret}\n`;
+    const retainedDigest = createHash("sha256")
+      .update(retainedSensitivePatch, "utf8")
+      .digest("hex");
+    const normalizedSensitivePatch = normalizeReviewedSyntheticHistoryPatch(
+      retainedSensitivePatch,
+      retainedDigest,
+    );
+    expect(() => assertPublicSensitiveText(normalizedSensitivePatch, "retained history fixture"))
+      .toThrow("SECRET_SHAPE");
+
+    const privateScope = ["@", "unreviewed-scope", "/", "package"].join("");
+    const retainedPublicPatch = `${syntheticPath}\n${privateScope}\n`;
+    const retainedPublicDigest = createHash("sha256")
+      .update(retainedPublicPatch, "utf8")
+      .digest("hex");
+    const normalizedPublicPatch = normalizeReviewedSyntheticHistoryPatch(
+      retainedPublicPatch,
+      retainedPublicDigest,
+    );
+    expect(() => assertPublicText(normalizedPublicPatch, "retained public history fixture"))
+      .toThrow("PRIVATE_SCOPE");
+  });
+
+  test("makes reviewed patch rendering independent of hostile repository configuration", async () => {
+    const root = resolve(await mkdtemp(join(tmpdir(), "hra-history-rendering-")));
+    try {
+      await initializeHistoryFixture(root, "first\n\nsecond\nthird\n");
+      const contextPath = join(root, "context.txt");
+      await writeFile(
+        contextPath,
+        "alpha\nnear-alpha\n\nblank-context\nkeep-five\nkeep-six\nkeep-seven\nkeep-eight\nnear-omega\nomega\n",
+        "utf8",
+      );
+      requireHistoryFixtureGit(root, "add", "context.txt");
+      requireHistoryFixtureGit(root, "commit", "-m", "context base");
+      const source = join(root, "document.txt");
+      const destination = join(root, "\u03c0-document.txt");
+      await rename(source, destination);
+      await writeFile(destination, "first changed\n\nsecond\nthird changed\n", "utf8");
+      await writeFile(
+        contextPath,
+        "alpha changed\nnear-alpha\n\nblank-context\nkeep-five\nkeep-six\nkeep-seven\nkeep-eight\nnear-omega\nomega changed\n",
+        "utf8",
+      );
+      requireHistoryFixtureGit(root, "add", "--all");
+      requireHistoryFixtureGit(root, "commit", "-m", "rendering target");
+      const commit = requireHistoryFixtureGit(root, "rev-parse", "HEAD");
+      const baseline = runCanonicalHistoryPatch(root, commit, "sensitive_patch");
+      expect(baseline.exitCode).toBe(0);
+      expect(baseline.stderr.byteLength).toBe(0);
+
+      for (const [key, value] of [
+        ["color.ui", "always"],
+        ["core.abbrev", "5"],
+        ["core.attributesFile", "/unavailable/hostile-attributes"],
+        ["core.quotePath", "false"],
+        ["diff.algorithm", "histogram"],
+        ["diff.context", "0"],
+        ["diff.indentHeuristic", "true"],
+        ["diff.interHunkContext", "99"],
+        ["diff.mnemonicPrefix", "true"],
+        ["diff.noprefix", "true"],
+        ["diff.orderFile", "/unavailable/hostile-order"],
+        ["diff.renames", "true"],
+        ["diff.relative", "true"],
+        ["diff.submodule", "log"],
+        ["diff.suppressBlankEmpty", "true"],
+      ] as const) requireHistoryFixtureGit(root, "config", key, value);
+
+      const hostile = runCanonicalHistoryPatch(root, commit, "sensitive_patch");
+      expect(hostile.exitCode).toBe(0);
+      expect(hostile.exitedDueToMaxBuffer ?? false).toBe(false);
+      expect(hostile.exitedDueToTimeout ?? false).toBe(false);
+      expect(hostile.stderr.byteLength).toBe(0);
+      expect(hostile.stdout).toEqual(baseline.stdout);
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  }, 30_000);
 
   test("keeps failed history command payloads out of diagnostics", () => {
     const sentinel = ["sk", "proj", "A".repeat(24)].join("-");

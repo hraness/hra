@@ -1225,6 +1225,7 @@ const deviceListScenarioSchema = z.object({
   currentDevicePublicId: z.string().min(1).max(200),
   devices: z.array(z.object({
     current: z.boolean(),
+    fingerprint: z.string().regex(/^[0-9a-f]{4}(?:-[0-9a-f]{4}){7}$/u),
     online: z.boolean(),
     publicId: z.string().min(1).max(200),
     status: z.enum(["pending", "active", "revoked"]),
@@ -2996,11 +2997,12 @@ export async function runLiveAcceptanceScenario(
     deviceA,
     ["device", "list", "--json"],
   ));
-  if (assertDeviceAListAuthority(
+  const pendingDeviceB = assertDeviceAListAuthority(
     listedPending,
     pairA.device.publicId,
     deviceBPublicId,
-  ).status !== "pending") {
+  );
+  if (pendingDeviceB.status !== "pending") {
     throw new ScenarioFailure("device_b_pending_not_visible");
   }
   await executeJsonFailure(deviceB, ["sync", "now", "--json"], { code: "UNAVAILABLE" });
@@ -3020,7 +3022,14 @@ export async function runLiveAcceptanceScenario(
   await operator.progress("device_b_approval");
   const approved = record(await executeJson(
     deviceA,
-    ["device", "approve", deviceBPublicId, "--json"],
+    [
+      "device",
+      "approve",
+      deviceBPublicId,
+      "--fingerprint",
+      pendingDeviceB.fingerprint,
+      "--json",
+    ],
   ), "device_approve");
   const approvedDevice = record(approved.device, "approved_device");
   if (approvedDevice.publicId !== deviceBPublicId || approvedDevice.status !== "active") {

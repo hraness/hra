@@ -70,6 +70,12 @@ const sessionB = `sess_${"6".repeat(32)}`;
 const memorySessionB = `sess_${"9".repeat(32)}`;
 const deviceAId = `device_${"7".repeat(32)}`;
 const deviceBId = `device_${"8".repeat(32)}`;
+const deviceAFingerprint = "0000-1111-2222-3333-4444-5555-6666-7777";
+const deviceBFingerprint = "8888-9999-aaaa-bbbb-cccc-dddd-eeee-ffff";
+const unusedDeployEvidencePath = join(
+  tmpdir(),
+  "hra-live-acceptance-unused-deploy-evidence.json",
+);
 const commandId = "018bcfe5-6800-7000-8000-000000000001";
 const userInteractionId = "10000000-0000-4000-8000-000000000001";
 const permissionInteractionId = "20000000-0000-4000-8000-000000000001";
@@ -572,9 +578,16 @@ class FakeDevice implements LiveAcceptanceDevice {
       return success(command, {
         currentDevicePublicId: deviceAId,
         devices: [
-          { current: true, online: true, publicId: deviceAId, status: "active" },
+          {
+            current: true,
+            fingerprint: deviceAFingerprint,
+            online: true,
+            publicId: deviceAId,
+            status: "active",
+          },
           {
             current: false,
+            fingerprint: deviceBFingerprint,
             online: this.#world.deviceBOnline,
             publicId: deviceBId,
             status: this.#world.deviceBRevoked
@@ -587,6 +600,14 @@ class FakeDevice implements LiveAcceptanceDevice {
       });
     }
     if (command === "device.approve") {
+      expect(argv).toEqual([
+        "device",
+        "approve",
+        deviceBId,
+        "--fingerprint",
+        deviceBFingerprint,
+        "--json",
+      ]);
       this.#world.approved = true;
       return success(command, { device: { publicId: deviceBId, status: "active" } });
     }
@@ -1831,7 +1852,7 @@ describe("live acceptance release scenario", () => {
     const evidence = await startFakeScenario(new FakeWorld(), new FakeOperator()).promise;
     const legacy: Record<string, unknown> = { ...evidence, version: 1 };
     delete legacy.memory;
-    expect(liveAcceptanceEvidenceSchema.parse(legacy)).toEqual(legacy);
+    expect(legacy).toEqual(liveAcceptanceEvidenceSchema.parse(legacy));
     expect(() => parseCurrentLiveAcceptanceEvidence(legacy))
       .toThrow("live_evidence_version_obsolete");
 
@@ -3083,6 +3104,8 @@ describe("live acceptance release scenario", () => {
       process.execPath,
       join(import.meta.dir, "live-acceptance.ts"),
       "--scenario-stdin",
+      "--deploy-evidence",
+      unusedDeployEvidencePath,
     ], {
       cwd: join(import.meta.dir, ".."),
       stdin: "pipe",
@@ -3128,16 +3151,28 @@ describe("live acceptance release scenario", () => {
       calls: 0,
       exitCode: 2,
     })),
-    { label: "terminal configuration on agent stdin", arguments: ["--scenario-stdin"], configuration: {
+    { label: "terminal configuration on agent stdin", arguments: [
+      "--scenario-stdin",
+      "--deploy-evidence",
+      unusedDeployEvidencePath,
+    ], configuration: {
       cloudDeploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
       operator: { kind: "terminal" },
       version: 1,
     }, calls: 0, exitCode: 1 },
-    { label: "invalid scenario configuration", arguments: ["--scenario-stdin"], configuration: {
+    { label: "invalid scenario configuration", arguments: [
+      "--scenario-stdin",
+      "--deploy-evidence",
+      unusedDeployEvidencePath,
+    ], configuration: {
       operator: { kind: "jsonl" },
       version: 1,
     }, calls: 0, exitCode: 1 },
-    { label: "valid agent execution", arguments: ["--scenario-stdin"], configuration: {
+    { label: "valid agent execution", arguments: [
+      "--scenario-stdin",
+      "--deploy-evidence",
+      unusedDeployEvidencePath,
+    ], configuration: {
       cloudDeploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
       operator: { kind: "jsonl" },
       version: 1,
@@ -3256,11 +3291,12 @@ describe("live acceptance release scenario", () => {
       const child = Bun.spawn([
         "/bin/sh",
         "-c",
-        'exec 3< "$1"; exec "$2" "$3" --scenario-fd 3',
+        'exec 3< "$1"; exec "$2" "$3" --scenario-fd 3 --deploy-evidence "$4"',
         "hra-live-acceptance",
         configurationPath,
         process.execPath,
         join(import.meta.dir, "live-acceptance.ts"),
+        unusedDeployEvidencePath,
       ], {
         cwd: join(import.meta.dir, ".."),
         stdin: "ignore",

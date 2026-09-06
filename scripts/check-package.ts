@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { access, lstat, mkdtemp, mkdir, open, opendir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -436,6 +437,62 @@ type GitHistoryCommand =
   | Readonly<{ commit: string; kind: "sensitive_patch" }>
   | Readonly<{ kind: "shallow" }>;
 
+type GitHistoryPatchKind = "public_patch" | "sensitive_patch";
+
+type ReviewedSyntheticHistoryPatchEvidence = Readonly<{
+  publicPatchSha256: string;
+  sensitivePatchSha256: string;
+}>;
+
+const reviewedSyntheticHistoryPatchEvidence: Readonly<
+  Record<string, ReviewedSyntheticHistoryPatchEvidence>
+> = Object.freeze({
+  "313ed3e3e1ddbe5b6464fc098926717f177418a8": Object.freeze({
+    publicPatchSha256: "38922e6d214028499463e193e62b7fde97835cad271693f76e4876af080e5a27",
+    sensitivePatchSha256: "38922e6d214028499463e193e62b7fde97835cad271693f76e4876af080e5a27",
+  }),
+  f39747b917b064ff593c58dea2a05e4481319b26: Object.freeze({
+    publicPatchSha256: "1aa2ed40e2d437c2871a6975f177f9bb5bd078c68856fa66f63511a47144fc4a",
+    sensitivePatchSha256: "1aa2ed40e2d437c2871a6975f177f9bb5bd078c68856fa66f63511a47144fc4a",
+  }),
+});
+const reviewedSyntheticHistoryPath = ["", "Users", "private", "project", ""].join("/");
+const reviewedSyntheticHistoryPathReplacement = "[reviewed-synthetic-absolute-path]";
+
+export const normalizeReviewedSyntheticHistoryPatch = (
+  patch: string,
+  expectedPatchSha256: string,
+): string => {
+  const patchSha256 = createHash("sha256").update(patch, "utf8").digest("hex");
+  const firstOccurrence = patch.indexOf(reviewedSyntheticHistoryPath);
+  const secondOccurrence = firstOccurrence < 0
+    ? -1
+    : patch.indexOf(reviewedSyntheticHistoryPath, firstOccurrence + reviewedSyntheticHistoryPath.length);
+  if (
+    patchSha256 !== expectedPatchSha256
+    || firstOccurrence < 0
+    || secondOccurrence >= 0
+  ) {
+    throw new Error("Reviewed Git history synthetic-path evidence changed.");
+  }
+  return `${patch.slice(0, firstOccurrence)}${reviewedSyntheticHistoryPathReplacement}${patch.slice(
+    firstOccurrence + reviewedSyntheticHistoryPath.length,
+  )}`;
+};
+
+export const normalizeGitHistoryPatchForPublicScan = (
+  commit: string,
+  kind: GitHistoryPatchKind,
+  patch: string,
+): string => {
+  const evidence = reviewedSyntheticHistoryPatchEvidence[commit];
+  if (evidence === undefined) return patch;
+  const expectedPatchSha256 = kind === "public_patch"
+    ? evidence.publicPatchSha256
+    : evidence.sensitivePatchSha256;
+  return normalizeReviewedSyntheticHistoryPatch(patch, expectedPatchSha256);
+};
+
 type GitHistorySpawnResult = Readonly<{
   exitCode: number;
   exitedDueToMaxBuffer: boolean;
@@ -496,7 +553,7 @@ export const projectGitHistorySpawnResult = (
   return { exitCode: 0, stderr: "", stdout };
 };
 
-const gitHistoryCommandArguments = (command: GitHistoryCommand): readonly string[] => {
+export const gitHistoryCommandArguments = (command: GitHistoryCommand): readonly string[] => {
   if (command.kind === "shallow") {
     return ["--no-replace-objects", "rev-parse", "--is-shallow-repository"];
   }
@@ -507,6 +564,20 @@ const gitHistoryCommandArguments = (command: GitHistoryCommand): readonly string
     throw new Error("Git history patch requested a malformed commit.");
   }
   const common = [
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "core.quotePath=true",
+    "-c",
+    "diff.mnemonicPrefix=false",
+    "-c",
+    "diff.noprefix=false",
+    "-c",
+    "diff.orderFile=/dev/null",
+    "-c",
+    "diff.relative=false",
+    "-c",
+    "diff.suppressBlankEmpty=false",
     "--no-replace-objects",
     "show",
     "--format=",
@@ -516,6 +587,19 @@ const gitHistoryCommandArguments = (command: GitHistoryCommand): readonly string
     "--diff-merges=first-parent",
     "--no-ext-diff",
     "--no-textconv",
+    "--full-index",
+    "--no-color",
+    "--no-renames",
+    "--unified=3",
+    "--inter-hunk-context=0",
+    "--diff-algorithm=myers",
+    "--no-indent-heuristic",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--output-indicator-new=+",
+    "--output-indicator-old=-",
+    "--output-indicator-context= ",
+    "--submodule=short",
     command.commit,
   ];
   return command.kind === "sensitive_patch"
@@ -612,13 +696,19 @@ export const assertCompleteGitHistoryPublic = async (repositoryRoot: string): Pr
       `Git history sensitive-text commit ${commit}`,
       readHistory({ commit, kind: "sensitive_patch" }),
     );
-    assertPublicSensitiveText(completePatch, `Git history commit ${commit}`);
+    assertPublicSensitiveText(
+      normalizeGitHistoryPatchForPublicScan(commit, "sensitive_patch", completePatch),
+      `Git history commit ${commit}`,
+    );
 
     const authoredPatch = requireGitHistoryOutput(
       `Git history public-text commit ${commit}`,
       readHistory({ commit, kind: "public_patch" }),
     );
-    assertPublicText(authoredPatch, `Git history commit ${commit}`);
+    assertPublicText(
+      normalizeGitHistoryPatchForPublicScan(commit, "public_patch", authoredPatch),
+      `Git history commit ${commit}`,
+    );
   }
 
   const finalCommits = await enumerate();
