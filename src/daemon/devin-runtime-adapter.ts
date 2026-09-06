@@ -277,6 +277,7 @@ export class PinnedDevinRuntimeManager implements DevinRuntimePort {
   readonly #closedSessionProofs = new Map<string, ProfileAuthority>();
   readonly #reviews = new Map<string, PendingReview>();
   #resolvedRuntime: PinnedDevinRuntime | undefined;
+  #loadSessionCapability: "unknown" | "supported" | "unsupported" = "unknown";
   #state: "open" | "closed" = "open";
 
   constructor(input: {
@@ -328,6 +329,32 @@ export class PinnedDevinRuntimeManager implements DevinRuntimePort {
       throw new DevinError("RUNTIME_MISMATCH", "No Devin CLI runtime has been admitted yet.");
     }
     return this.#resolvedRuntime.version;
+  }
+
+  hasLiveOrLoadableSession(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+  }): boolean {
+    if (this.#state !== "open" || !this.#isCurrent(input.authority)) return false;
+    const existing = this.#sessions.get(input.providerThreadId);
+    if (existing !== undefined) {
+      return authorityMatches(existing.authority, input.authority)
+        && existing.closeState === "open"
+        && existing.custody.exitState === "pending";
+    }
+    if (
+      this.#loadSessionCapability !== "supported"
+      || this.#projectRootFor === undefined
+      || this.#loads.has(input.providerThreadId)
+    ) return false;
+    try {
+      const projectRoot = this.#projectRootFor(input);
+      if (typeof projectRoot !== "string") return false;
+      canonicalProjectRoot(projectRoot);
+      return this.#isCurrent(input.authority);
+    } catch {
+      return false;
+    }
   }
 
   rebindProfileAuthority(input: {
@@ -1059,11 +1086,14 @@ export class PinnedDevinRuntimeManager implements DevinRuntimePort {
       () => { void this.#onProcessExit(session); },
     );
     try {
-      await this.#awaitLaunchCall(
+      const initialization = await this.#awaitLaunchCall(
         session,
         signal,
         client.initialize({ signal }),
       );
+      this.#loadSessionCapability = initialization.loadSession
+        ? "supported"
+        : "unsupported";
       return session;
     } catch (error: unknown) {
       await this.#disposeUnbound(session, error);

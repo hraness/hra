@@ -58,11 +58,44 @@ export interface FactsMemoryBrokerPort {
   }>): Promise<FactsMemoryPurgeReceipt>;
 }
 
+export interface FactsMemoryAttestationLifecyclePort {
+  hasMemoryWorkingAttestationForkFromParent(parentBindingDigest: string): boolean;
+  listMemoryWorkingAttestationForks(
+    limit: number,
+    afterChildSessionId?: string,
+  ): readonly Readonly<{
+    childAuthorityDigest: string;
+    childSessionId: string;
+    parentAuthorityDigest: string;
+    parentHead: Readonly<{
+      headDigest: string;
+      operationSha256: string | null;
+      sequence: number;
+    }>;
+  }>[];
+  finalizeMemoryWorkingPageAttestationFork(input: Readonly<{
+    childBindingDigest: string;
+    childHead: FactsMemoryHead;
+    parentBindingDigest: string;
+    parentHead: FactsMemoryHead;
+  }>): number;
+  reserveMemoryWorkingPageAttestationFork(input: Readonly<{
+    childBindingDigest: string;
+    childSessionId: string;
+    parentBindingDigest: string;
+    parentHead: FactsMemoryHead;
+  }>): Readonly<{ references: number; state: "finalized" | "reserved" }>;
+  purgeMemoryWorkingPageAttestations(input: Readonly<{
+    bindingDigest: string;
+  }>): number;
+}
+
 export type HraFactsMemoryLifecycleReceipt = Readonly<{
   bindingDigest: string;
   epoch: number;
   handleHash: string | null;
   head: FactsMemoryControlRecord["head"];
+  ownerId: string;
   sessionId: string;
   state: FactsMemoryControlRecord["state"];
 }>;
@@ -84,11 +117,16 @@ export interface HraFactsMemoryLifecyclePort {
     ownerId: string;
     parentSessionId: string;
   }>): Promise<HraFactsMemoryLifecycleReceipt>;
+  readSession(sessionId: string): HraFactsMemoryLifecycleReceipt | null;
   resumeSession(input: Readonly<{
     ownerId: string;
     sessionId: string;
   }>): Promise<HraFactsMemoryLifecycleReceipt>;
-  sweepExpired(now: number): Promise<Readonly<{ attempted: number; failed: number; purged: number }>>;
+  sweepExpired(
+    now: number,
+    /** Evaluated under the session lifecycle lock after the expiry record is revalidated. */
+    policy?: Readonly<{ canCleanupSession: (sessionId: string) => boolean }>,
+  ): Promise<Readonly<{ attempted: number; failed: number; purged: number }>>;
 }
 
 const lifecycleReceipt = (record: FactsMemoryControlRecord): HraFactsMemoryLifecycleReceipt => ({
@@ -96,6 +134,7 @@ const lifecycleReceipt = (record: FactsMemoryControlRecord): HraFactsMemoryLifec
   epoch: record.binding.epoch,
   handleHash: record.handleHash,
   head: record.head,
+  ownerId: record.binding.ownerId,
   sessionId: record.binding.sessionId,
   state: record.state,
 });
@@ -159,15 +198,25 @@ const assertPurgeReceipt = (
 export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   readonly #broker: FactsMemoryBrokerPort;
   readonly #control: FactsMemoryControlStore;
+  readonly #attestations: FactsMemoryAttestationLifecyclePort | undefined;
   readonly #tails = new Map<string, Promise<unknown>>();
   #sweepAfterSessionId: string | null = null;
+  #purgedSweepAfterSessionId: string | null = null;
+  #attestationForkSweepAfterSessionId: string | null = null;
 
   constructor(input: Readonly<{
+    attestations?: FactsMemoryAttestationLifecyclePort;
     broker: FactsMemoryBrokerPort;
     control: FactsMemoryControlStore;
   }>) {
+    this.#attestations = input.attestations;
     this.#broker = input.broker;
     this.#control = input.control;
+  }
+
+  readSession(sessionId: string): HraFactsMemoryLifecycleReceipt | null {
+    const record = this.#control.get(sessionId);
+    return record === null ? null : lifecycleReceipt(record);
   }
 
   ensureSession(input: Readonly<{
@@ -180,6 +229,11 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
       if (current !== null && current.binding.ownerId !== input.ownerId) {
         throw new Error("FACTS_MEMORY_AUTHORITY_MISMATCH");
       }
+      if (current?.state === "purged") {
+        this.#attestations?.purgeMemoryWorkingPageAttestations({
+          bindingDigest: current.binding.bindingDigest,
+        });
+      }
       const binding = createFactsMemoryBinding({
         epoch: current?.state === "purged" && current.cleanupReason === "expired"
           ? current.binding.epoch + 1
@@ -187,12 +241,24 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
         ownerId: input.ownerId,
         sessionId: input.sessionId,
       });
+      if (current === null) {
+        this.#attestations?.purgeMemoryWorkingPageAttestations({
+          bindingDigest: binding.bindingDigest,
+        });
+      }
       const record = this.#control.reserve({
         binding,
-        createOperationKey: this.#createOperationKey(binding, "create"),
+        createOperationKey: current !== null && current.binding.epoch === binding.epoch
+          ? current.createOperationKey
+          : this.#createOperationKey(binding, "create"),
         expiresAt: input.expiresAt,
+        ...(current?.parent === null || current?.parent === undefined
+          ? {}
+          : { parent: current.parent }),
       });
-      return lifecycleReceipt(await this.#ensureReserved(record));
+      return lifecycleReceipt(await (record.parent === null
+        ? this.#ensureReserved(record)
+        : this.#ensureForkReserved(record)));
     });
   }
 
@@ -216,7 +282,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
           ownerId: input.ownerId,
           sessionId: input.parentSessionId,
         });
-        return lifecycleReceipt(await this.#ensureReserved(existing));
+        return lifecycleReceipt(await this.#ensureForkReserved(existing));
       });
     }
 
@@ -247,20 +313,40 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
           ownerId: input.ownerId,
           sessionId: input.parentSessionId,
         });
-        return lifecycleReceipt(await this.#ensureReserved(existing));
+        return lifecycleReceipt(await this.#ensureForkReserved(existing));
       }
       const child = createFactsMemoryBinding({
         epoch: 1,
         ownerId: input.ownerId,
         sessionId: input.childSessionId,
       });
-      const reserved = this.#control.reserve({
-        binding: child,
-        createOperationKey: this.#createOperationKey(child, "fork"),
-        expiresAt: childExpiresAt,
-        parent: checkpoint,
+      // A crash before the control reservation can leave only a compact fork
+      // proof. No control row means no Oh child exists, so discard that orphan
+      // before pinning this invocation's exact parent checkpoint.
+      this.#attestations?.purgeMemoryWorkingPageAttestations({
+        bindingDigest: child.bindingDigest,
       });
-      return lifecycleReceipt(await this.#ensureReserved(reserved));
+      this.#attestations?.reserveMemoryWorkingPageAttestationFork({
+        childBindingDigest: child.bindingDigest,
+        childSessionId: child.sessionId,
+        parentBindingDigest: checkpoint.bindingDigest,
+        parentHead: checkpoint.head,
+      });
+      let reserved: FactsMemoryControlRecord;
+      try {
+        reserved = this.#control.reserve({
+          binding: child,
+          createOperationKey: this.#createOperationKey(child, "fork"),
+          expiresAt: childExpiresAt,
+          parent: checkpoint,
+        });
+      } catch (error: unknown) {
+        this.#attestations?.purgeMemoryWorkingPageAttestations({
+          bindingDigest: child.bindingDigest,
+        });
+        throw error;
+      }
+      return lifecycleReceipt(await this.#ensureForkReserved(reserved));
     });
   }
 
@@ -276,12 +362,21 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
       const record = this.#control.requireExact(binding);
       if (record.state !== "active") return lifecycleReceipt(await this.#ensureReserved(record));
       try {
+        if (record.parent !== null) {
+          this.#attestations?.reserveMemoryWorkingPageAttestationFork({
+            childBindingDigest: record.binding.bindingDigest,
+            childSessionId: record.binding.sessionId,
+            parentBindingDigest: record.parent.bindingDigest,
+            parentHead: record.parent.head,
+          });
+        }
         const inspection = await this.#inspect(binding, record.head ?? undefined);
         if (inspection.status === "missing") throw new Error("FACTS_MEMORY_ACTIVE_STORE_MISSING");
-        return lifecycleReceipt(this.#control.refreshHead(
+        const refreshed = this.#control.refreshHead(
           binding,
           assertInspection(binding, inspection.inspection),
-        ));
+        );
+        return lifecycleReceipt(refreshed);
       } catch (error: unknown) {
         this.#markRecoveryRequired(binding);
         throw error;
@@ -303,7 +398,10 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     });
   }
 
-  async sweepExpired(now: number): Promise<Readonly<{ attempted: number; failed: number; purged: number }>> {
+  async sweepExpired(
+    now: number,
+    policy?: Readonly<{ canCleanupSession: (sessionId: string) => boolean }>,
+  ): Promise<Readonly<{ attempted: number; failed: number; purged: number }>> {
     let records = this.#control.listExpired(now, 16, this.#sweepAfterSessionId);
     if (records.length === 0 && this.#sweepAfterSessionId !== null) {
       this.#sweepAfterSessionId = null;
@@ -314,6 +412,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     }
     let failed = 0;
     let purged = 0;
+    let attestationForksInspected = 0;
     for (const record of records) {
       try {
         const result = await this.#serialize(record.binding.sessionId, async () => {
@@ -328,6 +427,9 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
             current.state !== "cleanup_pending"
             && (current.expiresAt > now || current.state === "purged")
           ) return null;
+          if (policy !== undefined && !policy.canCleanupSession(record.binding.sessionId)) {
+            return null;
+          }
           return lifecycleReceipt(await this.#cleanupRecord(
             current,
             current.cleanupReason ?? "expired",
@@ -338,7 +440,60 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
         failed += 1;
       }
     }
-    return { attempted: records.length, failed, purged };
+    if (this.#attestations !== undefined) {
+      let purgedRecords = this.#control.listPurged(16, this.#purgedSweepAfterSessionId);
+      if (purgedRecords.length === 0 && this.#purgedSweepAfterSessionId !== null) {
+        this.#purgedSweepAfterSessionId = null;
+        purgedRecords = this.#control.listPurged(16, null);
+      }
+      if (purgedRecords.length > 0) {
+        this.#purgedSweepAfterSessionId = purgedRecords.at(-1)?.binding.sessionId ?? null;
+      }
+      for (const record of purgedRecords) {
+        try {
+          this.#attestations.purgeMemoryWorkingPageAttestations({
+            bindingDigest: record.binding.bindingDigest,
+          });
+        } catch {
+          failed += 1;
+        }
+      }
+
+      let forks = this.#attestations.listMemoryWorkingAttestationForks(
+        16,
+        this.#attestationForkSweepAfterSessionId ?? undefined,
+      );
+      if (forks.length === 0 && this.#attestationForkSweepAfterSessionId !== null) {
+        this.#attestationForkSweepAfterSessionId = null;
+        forks = this.#attestations.listMemoryWorkingAttestationForks(16);
+      }
+      if (forks.length > 0) {
+        this.#attestationForkSweepAfterSessionId = forks.at(-1)?.childSessionId ?? null;
+      }
+      for (const fork of forks) {
+        attestationForksInspected += 1;
+        try {
+          await this.#serialize(fork.childSessionId, async () => {
+            const current = this.#control.get(fork.childSessionId);
+            if (
+              current !== null
+              && current.state !== "purged"
+              && current.binding.bindingDigest === fork.childAuthorityDigest
+              && current.parent?.bindingDigest === fork.parentAuthorityDigest
+              && current.parent.head.sequence === fork.parentHead.sequence
+              && current.parent.head.operationSha256 === fork.parentHead.operationSha256
+              && current.parent.head.digest === fork.parentHead.headDigest
+            ) return;
+            this.#attestations?.purgeMemoryWorkingPageAttestations({
+              bindingDigest: fork.childAuthorityDigest,
+            });
+          });
+        } catch {
+          failed += 1;
+        }
+      }
+    }
+    return { attempted: records.length + attestationForksInspected, failed, purged };
   }
 
   async #ensureReserved(record: FactsMemoryControlRecord): Promise<FactsMemoryControlRecord> {
@@ -418,6 +573,43 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
       throw error;
     }
     return this.#finalizeActive(binding, receipt);
+  }
+
+  async #ensureForkReserved(record: FactsMemoryControlRecord): Promise<FactsMemoryControlRecord> {
+    if (record.parent === null) throw new Error("FACTS_MEMORY_FORK_NOT_ACTIVE");
+    let reservation: Readonly<{ references: number; state: "finalized" | "reserved" }>;
+    try {
+      reservation = this.#attestations?.reserveMemoryWorkingPageAttestationFork({
+        childBindingDigest: record.binding.bindingDigest,
+        childSessionId: record.binding.sessionId,
+        parentBindingDigest: record.parent.bindingDigest,
+        parentHead: record.parent.head,
+      }) ?? { references: 0, state: "finalized" };
+    } catch (error: unknown) {
+      this.#markRecoveryRequired(record.binding);
+      throw error;
+    }
+    const active = await this.#ensureReserved(record);
+    if (reservation.state === "finalized") return active;
+    try {
+      this.#finalizeForkAttestations(active);
+    } catch (error: unknown) {
+      this.#markRecoveryRequired(active.binding);
+      throw error;
+    }
+    return active;
+  }
+
+  #finalizeForkAttestations(active: FactsMemoryControlRecord): void {
+    if (active.state !== "active" || active.parent === null || active.head === null) {
+      throw new Error("FACTS_MEMORY_FORK_NOT_ACTIVE");
+    }
+    this.#attestations?.finalizeMemoryWorkingPageAttestationFork({
+      childBindingDigest: active.binding.bindingDigest,
+      childHead: active.head,
+      parentBindingDigest: active.parent.bindingDigest,
+      parentHead: active.parent.head,
+    });
   }
 
   #finalizeActive(
@@ -533,14 +725,27 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     const operationKey = sealsExpiredPurge
       ? this.#cleanupOperationKey(binding, reason)
       : exact.cleanupOperationKey ?? this.#cleanupOperationKey(binding, reason);
+    if (
+      exact.state !== "purged"
+      && this.#attestations?.hasMemoryWorkingAttestationForkFromParent(binding.bindingDigest) === true
+    ) throw new Error("FACTS_MEMORY_PARENT_REFERENCED");
     const pending = this.#control.beginCleanup({ binding, operationKey, reason });
-    if (pending.state === "purged") return pending;
+    if (pending.state === "purged") {
+      this.#attestations?.purgeMemoryWorkingPageAttestations({
+        bindingDigest: binding.bindingDigest,
+      });
+      return pending;
+    }
     const purge = assertPurgeReceipt(binding, await this.#broker.purge({
       binding,
       expectedHandleHash: pending.handleHash,
       operationKey: pending.cleanupOperationKey ?? operationKey,
     }));
-    return this.#control.finalizePurged(binding, purge);
+    const purged = this.#control.finalizePurged(binding, purge);
+    this.#attestations?.purgeMemoryWorkingPageAttestations({
+      bindingDigest: binding.bindingDigest,
+    });
+    return purged;
   }
 
   #createOperationKey(binding: FactsMemoryBinding, kind: "create" | "fork"): string {

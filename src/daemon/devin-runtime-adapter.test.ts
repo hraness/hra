@@ -314,6 +314,31 @@ const startTurn = async (
 };
 
 describe("pinned Devin runtime manager", () => {
+  test("admits scheduled execution only for an exact live or proven-loadable authority", async () => {
+    let current = true;
+    let resolveRoot = true;
+    const { manager } = harness({
+      isCurrent: () => current,
+      projectRootFor: ({ providerThreadId }) =>
+        resolveRoot && providerThreadId === "devin-session-1" ? PROJECT_ROOT : undefined,
+    });
+    const input = { authority, providerThreadId: "devin-session-1" } as const;
+
+    // Configuration alone is not proof that the pinned ACP runtime advertises
+    // session/load. The first admitted process establishes that capability.
+    expect(manager.hasLiveOrLoadableSession(input)).toBe(false);
+    const providerThreadId = await startSession(manager);
+    expect(manager.hasLiveOrLoadableSession({ authority, providerThreadId })).toBe(true);
+
+    await manager.endSession({ authority, providerThreadId, signal: signal() });
+    expect(manager.hasLiveOrLoadableSession({ authority, providerThreadId })).toBe(true);
+    resolveRoot = false;
+    expect(manager.hasLiveOrLoadableSession({ authority, providerThreadId })).toBe(false);
+    resolveRoot = true;
+    current = false;
+    expect(manager.hasLiveOrLoadableSession({ authority, providerThreadId })).toBe(false);
+  });
+
   test("reviews the exact pin and Astra argv, then projects a bounded ACP turn", async () => {
     const { facts, launches, manager, processes } = harness();
     const review = await manager.reviewSessionStart({

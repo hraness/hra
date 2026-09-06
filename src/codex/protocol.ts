@@ -6,6 +6,16 @@ import {
   type PresetRequirement,
 } from "../domain/presets.ts";
 import {
+  HRA_HOST_TOOL_MANIFEST,
+  HRA_HOST_TOOL_NAMESPACE,
+  HRA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES,
+  isHraHostToolName,
+  parseHraHostToolRequest,
+  type ConversationAutomationOperation,
+  type ConversationAutomationSchedule,
+  type HraHostToolRequest,
+} from "../domain/host-tools.ts";
+import {
   INTERACTION_MAX_PENDING_MS,
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
   encodeProtectedInteractionDetailDocument,
@@ -263,36 +273,12 @@ export interface CodexAuthority {
   readonly processGeneration: number;
 }
 
-export const HRA_DYNAMIC_TOOL_NAMESPACE = "hra";
+export const HRA_DYNAMIC_TOOL_NAMESPACE = HRA_HOST_TOOL_NAMESPACE;
 export const HRA_CONVERSATION_AUTOMATION_TOOL = "automation_update";
 
-export type ConversationAutomationSchedule = Readonly<{
-  kind: "interval_minutes";
-  minutes: number;
-}>;
+export type { ConversationAutomationOperation, ConversationAutomationSchedule };
 
-export type ConversationAutomationOperation =
-  | Readonly<{
-      mode: "create";
-      name: string;
-      prompt: string;
-      schedule: ConversationAutomationSchedule;
-      paused?: boolean;
-    }>
-  | Readonly<{
-      mode: "update";
-      id: string;
-      revision: number;
-      name?: string;
-      prompt?: string;
-      schedule?: ConversationAutomationSchedule;
-      status?: "active" | "paused";
-    }>
-  | Readonly<{ mode: "view"; id: string }>
-  | Readonly<{ mode: "list" }>
-  | Readonly<{ mode: "delete"; id: string; revision: number }>;
-
-export interface ConversationAutomationToolCall {
+interface HraHostToolCallAuthority {
   readonly authority: CodexAuthority;
   readonly connectionId: string;
   readonly requestId: ProviderRequestId;
@@ -302,95 +288,64 @@ export interface ConversationAutomationToolCall {
   readonly threadId: string;
   readonly turnId: string;
   readonly callId: string;
+}
+
+type ConversationAutomationRequest = Extract<
+  HraHostToolRequest,
+  Readonly<{ tool: "automation_update" }>
+>;
+
+/** One provider callback, bound to the calling thread and a closed host-tool input. */
+export type HraHostToolCall = HraHostToolCallAuthority & (
+  | (ConversationAutomationRequest & Readonly<{
+      /** Compatibility field for the original conversation-automation service. */
+      operation: ConversationAutomationOperation;
+    }>)
+  | Exclude<HraHostToolRequest, ConversationAutomationRequest>
+);
+
+/** Original automation callback shape retained for runtime and fixture compatibility. */
+export interface ConversationAutomationToolCall extends HraHostToolCallAuthority {
   readonly operation: ConversationAutomationOperation;
 }
 
 export type DynamicToolPublicResult = string | Readonly<Record<string, unknown>>;
 
-const intervalMinutesSchema = Object.freeze({
-  type: "object",
-  additionalProperties: false,
-  required: ["kind", "minutes"],
-  properties: {
-    kind: { const: "interval_minutes" },
-    minutes: { type: "integer", minimum: 15, maximum: 10_080 },
-  },
-} as const);
-
 /**
- * The only host tool HRA advertises. Its schema cannot express a destination,
- * so the provider callback's thread is the sole conversation authority.
+ * Codex and Claude declarations are projections of the same reviewed domain
+ * manifest. Provider-private thread and turn fields remain the caller
+ * authority and never appear in a model-supplied input schema.
  */
+export const HRA_HOST_DYNAMIC_TOOLS = Object.freeze([{
+  type: "namespace",
+  name: HRA_DYNAMIC_TOOL_NAMESPACE,
+  description: HRA_HOST_TOOL_MANIFEST.description,
+  tools: Object.freeze(HRA_HOST_TOOL_MANIFEST.tools.map((tool) => Object.freeze({
+    type: "function" as const,
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  }))),
+}] as const);
+
+const conversationAutomationDefinition = HRA_HOST_TOOL_MANIFEST.tools.find(
+  (tool) => tool.name === HRA_CONVERSATION_AUTOMATION_TOOL,
+);
+if (conversationAutomationDefinition === undefined) {
+  throw new Error("The HRA host-tool manifest omitted conversation automation.");
+}
+
+/** Compatibility declaration for runtimes that have not adopted the generic handler. */
 export const HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS = Object.freeze([{
   type: "namespace",
   name: HRA_DYNAMIC_TOOL_NAMESPACE,
   description: "Manage scheduled work only for this current HRA conversation.",
-  tools: [{
-    type: "function",
-    name: HRA_CONVERSATION_AUTOMATION_TOOL,
-    description: "Create, inspect, edit, pause, resume, or delete interval tasks bound to this conversation.",
-    inputSchema: {
-      oneOf: [
-        {
-          type: "object",
-          additionalProperties: false,
-          required: ["mode", "name", "prompt", "schedule"],
-          properties: {
-            mode: { const: "create" },
-            name: { type: "string", minLength: 1, maxLength: 160 },
-            prompt: { type: "string", minLength: 1, maxLength: 262_144 },
-            schedule: intervalMinutesSchema,
-            paused: { type: "boolean" },
-          },
-        },
-        {
-          type: "object",
-          additionalProperties: false,
-          required: ["mode", "id", "revision"],
-          anyOf: [
-            { required: ["name"] },
-            { required: ["prompt"] },
-            { required: ["schedule"] },
-            { required: ["status"] },
-          ],
-          properties: {
-            mode: { const: "update" },
-            id: { type: "string", pattern: "^stask_[0-9a-f]{32}$" },
-            revision: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
-            name: { type: "string", minLength: 1, maxLength: 160 },
-            prompt: { type: "string", minLength: 1, maxLength: 262_144 },
-            schedule: intervalMinutesSchema,
-            status: { enum: ["active", "paused"] },
-          },
-        },
-        {
-          type: "object",
-          additionalProperties: false,
-          required: ["mode", "id"],
-          properties: {
-            mode: { const: "view" },
-            id: { type: "string", pattern: "^stask_[0-9a-f]{32}$" },
-          },
-        },
-        {
-          type: "object",
-          additionalProperties: false,
-          required: ["mode"],
-          properties: { mode: { const: "list" } },
-        },
-        {
-          type: "object",
-          additionalProperties: false,
-          required: ["mode", "id", "revision"],
-          properties: {
-            mode: { const: "delete" },
-            id: { type: "string", pattern: "^stask_[0-9a-f]{32}$" },
-            revision: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
-          },
-        },
-      ],
-    },
-  }],
+  tools: [Object.freeze({
+    type: "function" as const,
+    name: conversationAutomationDefinition.name,
+    description: conversationAutomationDefinition.description,
+    inputSchema: conversationAutomationDefinition.inputSchema,
+  })],
 }] as const);
 
 export interface FencedCodexValue<T> {
@@ -1908,7 +1863,7 @@ const parseCanonicalParams = (value: unknown): Readonly<Record<string, unknown>>
   return Object.freeze(record(JSON.parse(serialized) as unknown, "server request params"));
 };
 
-const assertConversationAutomationExactKeys = (
+const assertHraHostToolExactKeys = (
   value: Readonly<Record<string, unknown>>,
   allowed: ReadonlySet<string>,
   required: readonly string[],
@@ -1921,166 +1876,14 @@ const assertConversationAutomationExactKeys = (
   ) throw protocol(`${label} does not match the closed tool contract`);
 };
 
-const parseConversationAutomationName = (value: unknown): string => {
-  const parsed = string(value, "conversation automation name", { min: 1, max: 160 });
-  if (canonicalTextEncoder.encode(parsed).byteLength > 160) {
-    throw protocol("conversation automation name exceeds its UTF-8 byte limit");
-  }
-  if (/\p{Cc}|\p{Cf}|\p{Cs}/u.test(parsed)) {
-    throw protocol("conversation automation name contains unsupported characters");
-  }
-  return parsed;
-};
-
-const parseConversationAutomationPrompt = (value: unknown): string => {
-  const parsed = string(value, "conversation automation prompt", {
-    min: 1,
-    max: 262_144,
-  });
-  if (canonicalTextEncoder.encode(parsed).byteLength > 262_144) {
-    throw protocol("conversation automation prompt exceeds its UTF-8 byte limit");
-  }
-  return parsed;
-};
-
-const parseConversationAutomationSchedule = (
-  value: unknown,
-): ConversationAutomationSchedule => {
-  const schedule = record(value, "conversation automation schedule");
-  assertConversationAutomationExactKeys(
-    schedule,
-    new Set(["kind", "minutes"]),
-    ["kind", "minutes"],
-    "conversation automation schedule",
-  );
-  const kind = oneOf(
-    schedule.kind,
-    "conversation automation schedule kind",
-    ["interval_minutes"] as const,
-  );
-  const minutes = safeInteger(schedule.minutes, "conversation automation interval");
-  if (minutes < 15 || minutes > 10_080) {
-    throw protocol("conversation automation interval is outside the supported range");
-  }
-  return { kind, minutes };
-};
-
-const parsePositiveRevision = (value: unknown): number => {
-  const revision = safeInteger(value, "conversation automation revision");
-  if (revision < 1) throw protocol("conversation automation revision must be positive");
-  return revision;
-};
-
-const parseConversationAutomationId = (value: unknown): string => {
-  const id = identifier(value, "conversation automation id");
-  if (!/^stask_[0-9a-f]{32}$/u.test(id)) {
-    throw protocol("conversation automation id does not match the public task identity");
-  }
-  return id;
-};
-
-const parseConversationAutomationOperation = (
-  value: unknown,
-): ConversationAutomationOperation => {
-  const operation = record(value, "conversation automation arguments");
-  const mode = oneOf(
-    operation.mode,
-    "conversation automation mode",
-    ["create", "update", "view", "list", "delete"] as const,
-  );
-  if (mode === "create") {
-    assertConversationAutomationExactKeys(
-      operation,
-      new Set(["mode", "name", "prompt", "schedule", "paused"]),
-      ["mode", "name", "prompt", "schedule"],
-      "conversation automation create",
-    );
-    return {
-      mode,
-      name: parseConversationAutomationName(operation.name),
-      prompt: parseConversationAutomationPrompt(operation.prompt),
-      schedule: parseConversationAutomationSchedule(operation.schedule),
-      ...(operation.paused === undefined
-        ? {}
-        : { paused: boolean(operation.paused, "conversation automation paused state") }),
-    };
-  }
-  if (mode === "update") {
-    const patchKeys = ["name", "prompt", "schedule", "status"] as const;
-    assertConversationAutomationExactKeys(
-      operation,
-      new Set(["mode", "id", "revision", ...patchKeys]),
-      ["mode", "id", "revision"],
-      "conversation automation update",
-    );
-    if (!patchKeys.some((key) => Object.hasOwn(operation, key))) {
-      throw protocol("conversation automation update requires a patch");
-    }
-    return {
-      mode,
-      id: parseConversationAutomationId(operation.id),
-      revision: parsePositiveRevision(operation.revision),
-      ...(operation.name === undefined
-        ? {}
-        : { name: parseConversationAutomationName(operation.name) }),
-      ...(operation.prompt === undefined
-        ? {}
-        : {
-            prompt: parseConversationAutomationPrompt(operation.prompt),
-          }),
-      ...(operation.schedule === undefined
-        ? {}
-        : { schedule: parseConversationAutomationSchedule(operation.schedule) }),
-      ...(operation.status === undefined
-        ? {}
-        : {
-            status: oneOf(
-              operation.status,
-              "conversation automation status",
-              ["active", "paused"] as const,
-            ),
-          }),
-    };
-  }
-  if (mode === "view") {
-    assertConversationAutomationExactKeys(
-      operation,
-      new Set(["mode", "id"]),
-      ["mode", "id"],
-      "conversation automation view",
-    );
-    return { mode, id: parseConversationAutomationId(operation.id) };
-  }
-  if (mode === "list") {
-    assertConversationAutomationExactKeys(
-      operation,
-      new Set(["mode"]),
-      ["mode"],
-      "conversation automation list",
-    );
-    return { mode };
-  }
-  assertConversationAutomationExactKeys(
-    operation,
-    new Set(["mode", "id", "revision"]),
-    ["mode", "id", "revision"],
-    "conversation automation delete",
-  );
-  return {
-    mode,
-    id: parseConversationAutomationId(operation.id),
-    revision: parsePositiveRevision(operation.revision),
-  };
-};
-
-export function parseConversationAutomationToolCall(input: {
+export function parseHraHostToolCall(input: {
   readonly authority: CodexAuthority;
   readonly connectionId: string;
   readonly requestId: ProviderRequestId;
   readonly params: unknown;
-}): ConversationAutomationToolCall {
+}): HraHostToolCall {
   const privateParams = parseCanonicalParams(input.params);
-  assertConversationAutomationExactKeys(
+  assertHraHostToolExactKeys(
     privateParams,
     new Set(["threadId", "turnId", "callId", "namespace", "tool", "arguments"]),
     ["threadId", "turnId", "callId", "namespace", "tool", "arguments"],
@@ -2091,11 +1894,19 @@ export function parseConversationAutomationToolCall(input: {
     max: 512,
   });
   const tool = string(privateParams.tool, "dynamic tool name", { min: 1, max: 512 });
-  if (
-    namespace !== HRA_DYNAMIC_TOOL_NAMESPACE
-    || tool !== HRA_CONVERSATION_AUTOMATION_TOOL
-  ) throw new CodexError("UNSUPPORTED_CAPABILITY", "The requested dynamic tool was not advertised by HRA");
-  return {
+  if (namespace !== HRA_DYNAMIC_TOOL_NAMESPACE || !isHraHostToolName(tool)) {
+    throw new CodexError(
+      "UNSUPPORTED_CAPABILITY",
+      "The requested dynamic tool was not advertised by HRA",
+    );
+  }
+  let request: HraHostToolRequest;
+  try {
+    request = parseHraHostToolRequest(tool, privateParams.arguments);
+  } catch {
+    throw protocol("dynamic tool arguments do not match the closed HRA host-tool contract");
+  }
+  const authority = {
     authority: validateAuthority(input.authority),
     connectionId: identifier(input.connectionId, "Codex connection id"),
     requestId: input.requestId,
@@ -2103,11 +1914,28 @@ export function parseConversationAutomationToolCall(input: {
     threadId: identifier(privateParams.threadId, "dynamic tool thread id"),
     turnId: identifier(privateParams.turnId, "dynamic tool turn id"),
     callId: identifier(privateParams.callId, "dynamic tool call id"),
-    operation: parseConversationAutomationOperation(privateParams.arguments),
   };
+  return request.tool === HRA_CONVERSATION_AUTOMATION_TOOL
+    ? { ...authority, ...request, operation: request.input }
+    : { ...authority, ...request };
 }
 
-const DYNAMIC_TOOL_RESULT_MAXIMUM_BYTES = 64 * 1024;
+/** Compatibility parser for callers that only admit the original automation tool. */
+export function parseConversationAutomationToolCall(input: {
+  readonly authority: CodexAuthority;
+  readonly connectionId: string;
+  readonly requestId: ProviderRequestId;
+  readonly params: unknown;
+}): ConversationAutomationToolCall {
+  const call = parseHraHostToolCall(input);
+  if (call.tool !== HRA_CONVERSATION_AUTOMATION_TOOL) {
+    throw new CodexError(
+      "UNSUPPORTED_CAPABILITY",
+      "The requested dynamic tool is not conversation automation",
+    );
+  }
+  return call;
+}
 
 export function serializeDynamicToolPublicResult(value: DynamicToolPublicResult): string {
   const serialized = typeof value === "string"
@@ -2115,7 +1943,7 @@ export function serializeDynamicToolPublicResult(value: DynamicToolPublicResult)
     : canonicalJson(record(value, "dynamic tool public result"));
   if (
     serialized.length === 0
-    || canonicalTextEncoder.encode(serialized).byteLength > DYNAMIC_TOOL_RESULT_MAXIMUM_BYTES
+    || canonicalTextEncoder.encode(serialized).byteLength > HRA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES
   ) throw new CodexError("PROTOCOL_LIMIT", "dynamic tool public result exceeded its byte limit");
   return serialized;
 }

@@ -3,11 +3,15 @@ import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { ClaudeProcess, PinnedClaudeRuntime } from "../claude/index";
+import {
+  ClaudeHostToolBindingAuthority,
+  type ClaudeProcess,
+  type PinnedClaudeRuntime,
+} from "../claude/index";
 import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "../claude/pin";
 import { LiveBatcher } from "../cloud/live-uploader";
 import type { SessionEvent } from "../domain/session-events";
-import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
+import { initializeStatePaths, profilePaths, resolveStatePaths } from "../storage/paths";
 import { StateStore } from "../storage/state-store";
 import { PinnedClaudeRuntimeManager } from "./claude-runtime-adapter";
 import {
@@ -138,6 +142,7 @@ class FakeClaudeProcess implements ClaudeProcess {
     async *[Symbol.asyncIterator]() { /* silent */ },
   };
   terminated = false;
+  onTerminate: (() => void) | undefined;
   #push: ((chunk: Uint8Array) => void) | undefined;
   #finish: (() => void) | undefined;
   #resolveExit: ((code: number) => void) | undefined;
@@ -173,6 +178,7 @@ class FakeClaudeProcess implements ClaudeProcess {
 
   terminate(): void {
     this.terminated = true;
+    this.onTerminate?.();
     this.#finish?.();
     this.#resolveExit?.(0);
   }
@@ -232,9 +238,11 @@ class OfflineCloud extends UnavailableCloudControl {
 const stores: StateStore[] = [];
 const roots: string[] = [];
 const services: HraService[] = [];
+const hostToolAuthorities: ClaudeHostToolBindingAuthority[] = [];
 
 afterEach(async () => {
   await Promise.all(services.splice(0).map(async (service) => { await service.close(); }));
+  await Promise.all(hostToolAuthorities.splice(0).map(async (authority) => { await authority.close(); }));
   for (const store of stores.splice(0)) store.close();
   await Promise.all(roots.splice(0).map(async (root) => rm(root, { force: true, recursive: true })));
 });
@@ -244,6 +252,7 @@ type ClaudeFixture = Readonly<{
   store: StateStore;
   cloud: CloudControlPort;
   documents: string;
+  paths: ReturnType<typeof resolveStatePaths>;
   processes: FakeClaudeProcess[];
 }>;
 
@@ -265,8 +274,10 @@ async function claudeFixture(
   store.setDefaultApprovalMode("manual");
   const processes: FakeClaudeProcess[] = [];
   const reference: { current?: HraService } = {};
+  const hostToolAuthority = new ClaudeHostToolBindingAuthority();
+  hostToolAuthorities.push(hostToolAuthority);
   const claude = new PinnedClaudeRuntimeManager({
-    configDirFor: () => join(home, "claude-config"),
+    configDirFor: (authority) => profilePaths(paths, authority.id).claudeConfigDir,
     isCurrent: (authority) => {
       try {
         const profile = store.requireProfile(authority.id);
@@ -279,6 +290,11 @@ async function claudeFixture(
       fact: async (authority, fact) => {
         await reference.current?.observeClaudeFact(authority, fact);
       },
+    },
+    hostTools: {
+      bindingAuthority: hostToolAuthority,
+      callbackSocketPath: join(paths.runtime, "claude-host-tools.sock"),
+      privateRoot: paths.runtime,
     },
     processFactory: () => {
       const process = new FakeClaudeProcess();
@@ -301,7 +317,7 @@ async function claudeFixture(
   });
   reference.current = service;
   services.push(service);
-  return { cloud, documents, processes, service, store };
+  return { cloud, documents, paths, processes, service, store };
 }
 
 async function authenticatedClaudeAccount(
@@ -373,7 +389,7 @@ describe("Claude sessions on the local authority", () => {
     expect(value.store.readMutation(loginKey)).toMatchObject({ state: "effect_started" });
   });
 
-  test("keeps an idle Claude session owned and usable across a Codex login generation change", async () => {
+  test("terminally retires an idle Claude session before a Codex login generation change", async () => {
     const value = await claudeFixture();
     const account = await authenticatedClaudeAccount(value, "Claude survives Codex login");
     const started = await value.service.execute({
@@ -390,6 +406,10 @@ describe("Claude sessions on the local authority", () => {
 
     const before = value.store.requireProfileById(account);
     expect(before.state).toBe("signed_out");
+    let generationAtTermination: number | undefined;
+    process.onTerminate = () => {
+      generationAtTermination = value.store.requireProfileById(account).processGeneration;
+    };
     await value.service.execute({
       account,
       deviceCode: false,
@@ -403,33 +423,17 @@ describe("Claude sessions on the local authority", () => {
       state: "signed_in",
     });
     expect(value.processes).toEqual([process]);
-    expect(process.terminated).toBe(false);
+    expect(process.terminated).toBe(true);
+    expect(generationAtTermination).toBe(before.processGeneration);
+    expect(value.store.requireSession(started.session.id)).toMatchObject({ state: "terminal" });
     const afterLoginBodies = await eventBodies(value, started.session.id);
-    expect(afterLoginBodies).not.toContainEqual(
-      expect.objectContaining({ type: "gap", reason: "provider_disconnect" }),
-    );
-    expect(afterLoginBodies).not.toContainEqual(
-      expect.objectContaining({ type: "connection", state: "disconnected" }),
-    );
-
-    await value.service.execute({
-      idempotencyKey: crypto.randomUUID(),
-      kind: "session.send",
-      message: "Keep working after the Codex login",
-      session: started.session.id,
-    }, { signal });
-    const stopped = await value.service.execute({
-      idempotencyKey: crypto.randomUUID(),
-      kind: "session.stop",
-      session: started.session.id,
-    }, { signal }) as { stopped: boolean };
-    expect(stopped.stopped).toBe(true);
-    expect(process.written.join("\n")).toContain("Keep working after the Codex login");
-    expect(process.written.some((line) => line.includes("interrupt"))).toBe(true);
-    expect(process.terminated).toBe(false);
+    expect(afterLoginBodies.some((body) =>
+      body.type === "connection" && body.state === "disconnected")).toBe(true);
+    expect(afterLoginBodies.some((body) =>
+      body.type === "session_status" && body.status === "terminal")).toBe(true);
   });
 
-  test("refuses a Codex login before rotating an in-flight Claude authority", async () => {
+  test("refuses a Codex login before rotating a durably active Claude authority", async () => {
     const value = await claudeFixture();
     const account = await authenticatedClaudeAccount(value, "Claude blocks Codex login");
     const started = await value.service.execute({
@@ -443,12 +447,13 @@ describe("Claude sessions on the local authority", () => {
     if (process === undefined) throw new Error("Expected one pinned Claude process.");
     process.emit(initLine);
     await settle();
-    await value.service.execute({
-      idempotencyKey: crypto.randomUUID(),
-      kind: "session.send",
-      message: "Keep this turn in flight",
-      session: started.session.id,
-    }, { signal });
+    let durableSession = value.store.requireSession(started.session.id);
+    durableSession = value.store.setSessionTurnState({
+      activeTurnId: "claude-turn-blocking-account-rotation",
+      expectedRevision: durableSession.revision,
+      sessionId: durableSession.id,
+      state: "active",
+    });
     const before = value.store.requireProfileById(account);
 
     const refusal = await value.service.execute({
@@ -468,15 +473,17 @@ describe("Claude sessions on the local authority", () => {
       expect.objectContaining({ type: "gap", reason: "provider_disconnect" }),
     );
 
-    const stopped = await value.service.execute({
-      idempotencyKey: crypto.randomUUID(),
-      kind: "session.stop",
-      session: started.session.id,
-    }, { signal }) as { stopped: boolean };
-    expect(stopped.stopped).toBe(true);
-    expect(process.written.some((line) => line.includes("interrupt"))).toBe(true);
-    process.emit(resultLine("Stopped cleanly"));
-    await settle();
+    durableSession = value.store.requireSession(durableSession.id);
+    durableSession = value.store.setSessionTurnState({
+      expectedRevision: durableSession.revision,
+      sessionId: durableSession.id,
+      state: "idle",
+    });
+    expect(durableSession.activeTurnId).toBeUndefined();
+    let generationAtTermination: number | undefined;
+    process.onTerminate = () => {
+      generationAtTermination = value.store.requireProfileById(account).processGeneration;
+    };
     await expect(value.service.execute({
       account,
       deviceCode: false,
@@ -485,10 +492,12 @@ describe("Claude sessions on the local authority", () => {
     }, { signal })).resolves.toMatchObject({
       account: { processGeneration: before.processGeneration + 1 },
     });
-    expect(process.terminated).toBe(false);
+    expect(process.terminated).toBe(true);
+    expect(generationAtTermination).toBe(before.processGeneration);
+    expect(value.store.requireSession(started.session.id)).toMatchObject({ state: "terminal" });
   });
 
-  test("keeps an idle Claude session usable when the sibling Codex runtime disconnects", async () => {
+  test("terminally retires idle Claude before a sibling Codex disconnect advances generation", async () => {
     const value = await claudeFixture();
     const account = await authenticatedClaudeAccount(value, "Claude survives Codex disconnect");
     const started = await value.service.execute({
@@ -503,6 +512,10 @@ describe("Claude sessions on the local authority", () => {
     process.emit(initLine);
     await settle();
     const before = value.store.requireProfileById(account);
+    let generationAtTermination: number | undefined;
+    process.onTerminate = () => {
+      generationAtTermination = value.store.requireProfileById(account).processGeneration;
+    };
 
     await value.service.observeCodexFact({
       codexHome: "unused-codex-home",
@@ -517,21 +530,66 @@ describe("Claude sessions on the local authority", () => {
 
     expect(value.store.requireProfileById(account).processGeneration)
       .toBe(before.processGeneration + 1);
-    expect(process.terminated).toBe(false);
-    await value.service.execute({
-      idempotencyKey: crypto.randomUUID(),
-      kind: "session.send",
-      message: "Continue after the Codex disconnect",
-      session: started.session.id,
-    }, { signal });
-    const stopped = await value.service.execute({
-      idempotencyKey: crypto.randomUUID(),
-      kind: "session.stop",
-      session: started.session.id,
-    }, { signal }) as { stopped: boolean };
-    expect(stopped.stopped).toBe(true);
-    expect(process.written.join("\n")).toContain("Continue after the Codex disconnect");
-    expect(process.written.some((line) => line.includes("interrupt"))).toBe(true);
+    expect(process.terminated).toBe(true);
+    expect(generationAtTermination).toBe(before.processGeneration);
+    expect(value.store.requireSession(started.session.id)).toMatchObject({ state: "terminal" });
+    expect((await eventBodies(value, started.session.id)).some((body) =>
+      body.type === "session_status" && body.status === "terminal")).toBe(true);
+  });
+
+  test("restart sees terminal Claude custody when disconnect generation CAS fails", async () => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude disconnect CAS failure");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+    const before = value.store.requireProfileById(account);
+    const originalAdvance = value.store.advanceProfileGenerationWithWorkRetirement
+      .bind(value.store);
+    (value.store as unknown as {
+      advanceProfileGenerationWithWorkRetirement:
+        StateStore["advanceProfileGenerationWithWorkRetirement"];
+    }).advanceProfileGenerationWithWorkRetirement = () => {
+      throw new Error("injected profile generation CAS failure");
+    };
+
+    await value.service.observeCodexFact({
+      codexHome: "unused-codex-home",
+      desktopUserData: "unused-desktop-home",
+      generation: before.processGeneration,
+      id: before.id,
+    }, {
+      connectionId: "21000000-0000-4000-8000-000000000003",
+      reason: "process_exit",
+      type: "providerDisconnected",
+    });
+
+    expect(process.terminated).toBe(true);
+    expect(value.store.requireProfileById(account).processGeneration)
+      .toBe(before.processGeneration);
+    expect(value.store.requireSession(started.session.id)).toMatchObject({ state: "terminal" });
+    const restartVisible = new StateStore(value.paths, { readonly: true });
+    try {
+      expect(restartVisible.requireProfileById(account).processGeneration)
+        .toBe(before.processGeneration);
+      expect(restartVisible.requireSession(started.session.id)).toMatchObject({
+        state: "terminal",
+      });
+    } finally {
+      restartVisible.close();
+      (value.store as unknown as {
+        advanceProfileGenerationWithWorkRetirement:
+          StateStore["advanceProfileGenerationWithWorkRetirement"];
+      }).advanceProfileGenerationWithWorkRetirement = originalAdvance;
+    }
   });
 
   test("refuses Fast enable locally and remotely before metadata changes", async () => {

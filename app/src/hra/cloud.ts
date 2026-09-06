@@ -72,6 +72,7 @@ export {
   type CompactRemoteInteractionQuestion,
   type CompactRemoteInteractionReasonCode,
   type CompactMessageActor,
+  type CompactMessageActorKind,
   type CompactSessionEvent,
   type DetailSessionEvent,
   type GitAction,

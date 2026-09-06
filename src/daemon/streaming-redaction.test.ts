@@ -480,6 +480,26 @@ describe("SessionEventStreamRedactor", () => {
     expect(redactor.activeStreamCount).toBe(0);
   });
 
+  test("flushes provider text before an out-of-band steer message without ending item custody", () => {
+    const redactor = createRedactor();
+    redactor.accept(start("active-item"));
+    expect(redactor.accept(assistant("active-item", "assistant before steer"))).toEqual([]);
+
+    const flushed = redactor.flushSession({
+      accountId,
+      providerConnectionId: connectionId,
+      providerGeneration: 3,
+      sessionId,
+    });
+    expect(texts(flushed, "active-item")).toBe("assistant before steer");
+    expect(redactor.activeStreamCount).toBe(0);
+
+    expect(redactor.accept(assistant("active-item", "assistant after steer"))).toEqual([]);
+    const completed = redactor.accept(complete("active-item"));
+    expect(texts(completed, "active-item")).toBe("assistant after steer");
+    expect(JSON.stringify([...flushed, ...completed])).not.toContain("[protected]");
+  });
+
   test("sanitizes complete plan and interaction prose without changing closed decisions", () => {
     const display = sanitizeInteractionDisplay({
       kind: "user_input",

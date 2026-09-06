@@ -22,7 +22,8 @@ obeys the bounds and redaction rules that already governed the event stream
 the projection's `forbiddenDetailKeyPattern`).
 
 - `user_message`, exactly what HRA sent to the provider, with the actor that
-  authored it: `human`, `autorespond`, or `provider_switch` for a handoff seed.
+  authored it: `human`, `autorespond`, `peer_session`, or `provider_switch` for
+  a handoff seed.
   It is written after the provider accepted the message, so the transcript
   never claims HRA sent something the provider rejected. Text is capped at
   16,384 characters and the remainder is stated as an exact
@@ -115,6 +116,10 @@ A switch is refused, with no effect, when:
   Claude). With no `--preset`, the switch keeps the session's tier when the
   target has one and otherwise takes the target's highest;
 - the target is Claude and the custodian daemon is not running on Linux;
+- `--account` selects another HRA profile after the session has acquired its
+  working-memory authority. HRA does not transfer that account-bound working
+  lane in this release, so it refuses before either provider is touched. A
+  same-profile Codex, Claude Code, or Devin switch remains supported;
 - the session already runs that provider, preset, and account.
 
 ### What a switch preserves, and what it cannot
@@ -124,6 +129,12 @@ assistant said, what its reasoning summaries said, which tools were called and
 whether they succeeded, and the switch boundary itself. Also the session's
 identity, its project, its note, its title, its queue, its session tasks, and
 its event stream; the session id never changes.
+
+The session's expiring working-memory authority is also preserved when the
+provider changes inside the same HRA account profile. Its current-project
+canonical memory is project-scoped and is selected again through the same HRA
+coordinator. Cross-account working-memory transfer is not implemented; start a
+new session under the target account instead.
 
 **Not preserved, and not recoverable:**
 
@@ -158,6 +169,14 @@ conversation more than its beginning. The omission count in the header is the
 truth about what was dropped, and the same count plus the seed's digest are
 recorded on the `provider_switched` event, so what the new provider was told is
 provable after the fact.
+
+Codex and Claude Code start with HRA's current static preamble and closed
+host-tool binding. The initial Devin ACP adapter does not bind either surface in
+this release, so a switch to Devin transfers the bounded handoff seed as an
+ordinary text prompt only. The owner can still use HRA's memory and policy CLI
+against that session. Devin accepts a new message while idle and a durable
+queued message for later delivery, but ACP v1 has no unambiguous in-turn steer;
+`hra session steer` therefore refuses an active Devin turn without an effect.
 
 ## The remote surface
 

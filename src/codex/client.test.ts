@@ -5,7 +5,7 @@ import { CodexAppServerClient, type CodexAppServerClientOptions } from "./client
 import { CodexError } from "./errors.ts";
 import type { CodexProcess } from "./process.ts";
 import {
-  HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
+  HRA_HOST_DYNAMIC_TOOLS,
   type CodexFact,
   type FencedCodexValue,
 } from "./protocol.ts";
@@ -1084,6 +1084,16 @@ describe("CodexAppServerClient", () => {
       process: successfulFake(codexHome),
       onConversationAutomationToolResponseWritten: () => undefined,
     })).toThrow("conversation automation requires paired call and response-written callbacks");
+    expect(() => createClient({
+      ...base,
+      process: successfulFake(codexHome),
+      onHraHostToolCall: async () => ({ scope: "session" }),
+    })).toThrow("HRA host tools require paired call and response-written callbacks");
+    expect(() => createClient({
+      ...base,
+      process: successfulFake(codexHome),
+      onHraHostToolResponseWritten: () => undefined,
+    })).toThrow("HRA host tools require paired call and response-written callbacks");
   });
 
   test("routes the exact conversation automation tool and wakes only after the response write", async () => {
@@ -1149,6 +1159,69 @@ describe("CodexAppServerClient", () => {
     expect(calls[1]?.requestDigest).toBe(calls[0]?.requestDigest);
     expect(process.writes.filter((frame) =>
       (frame as { id?: unknown }).id === "tool-request")).toHaveLength(2);
+    await client.close();
+  });
+
+  test("routes every admitted dynamic tool through the generic HRA callback", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const calls: unknown[] = [];
+    const written: unknown[] = [];
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onHraHostToolCall: async (call) => {
+        calls.push(call);
+        return { accepted: true, tool: call.tool };
+      },
+      onHraHostToolResponseWritten: (call) => {
+        written.push(call);
+      },
+    });
+    await client.initialize();
+    process.respond({
+      id: "peer-tool",
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-2",
+        namespace: "hra",
+        tool: "session_message",
+        arguments: {
+          sessionId: `sess_${"a".repeat(32)}`,
+          expectedRevision: 2,
+          delivery: "queue",
+          message: "Please verify the plan.",
+          reason: "Independent review",
+        },
+      },
+    });
+    await waitFor(() => written.length === 1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      tool: "session_message",
+      input: {
+        expectedRevision: 2,
+        delivery: "queue",
+        message: "Please verify the plan.",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    expect(process.writes.at(-1)).toEqual({
+      id: "peer-tool",
+      result: {
+        contentItems: [{
+          type: "inputText",
+          text: "{\"accepted\":true,\"tool\":\"session_message\"}",
+        }],
+        success: true,
+      },
+    });
     await client.close();
   });
 
@@ -3208,12 +3281,13 @@ describe("CodexAppServerClient", () => {
       expectedCodexHome: codexHome,
       experimentalApi: true,
       isAuthorityCurrent: () => true,
-      onConversationAutomationToolCall: async () => ({ scope: "conversation" }),
-      onConversationAutomationToolResponseWritten: () => undefined,
+      onHraHostToolCall: async () => ({ scope: "conversation" }),
+      onHraHostToolResponseWritten: () => undefined,
     });
     await client.initialize();
     const result = await client.startThread({
       cwd: "/workspace/project",
+      developerInstructions: "Static HRA preamble.",
       preset: { alias: "high", model: "gpt-6-astra", effort: "max", serviceTier: null, fast: false },
       policy: { review: "auto_review", permissionProfile: ":workspace", writableRoots: ["/workspace/project"] },
     });
@@ -3230,9 +3304,10 @@ describe("CodexAppServerClient", () => {
         approvalPolicy: "on-request",
         approvalsReviewer: "auto_review",
         config: { model_reasoning_effort: "max" },
+        developerInstructions: "Static HRA preamble.",
         ephemeral: false,
         historyMode: "paginated",
-        dynamicTools: HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
+        dynamicTools: HRA_HOST_DYNAMIC_TOOLS,
       },
     });
     await client.close();
@@ -3271,6 +3346,7 @@ describe("CodexAppServerClient", () => {
     await client.initialize();
     await expect(client.startThread({
       cwd: "/workspace/project",
+      developerInstructions: "Static HRA preamble.",
       preset: { alias: "high", model: "gpt-6-astra", effort: "max", serviceTier: null, fast: false },
       policy: { review: "auto_review", permissionProfile: ":workspace", writableRoots: ["/workspace/project"] },
     })).rejects.toMatchObject({ code: "INDETERMINATE_EFFECT", operation: "thread/start" });
@@ -3322,9 +3398,18 @@ describe("CodexAppServerClient", () => {
       onConversationAutomationToolResponseWritten: () => undefined,
     });
     await client.initialize();
-    await client.resumeThread("thread-legacy");
+    await client.resumeThread("thread-legacy", "Static HRA preamble.");
     expect(process.writes.at(-1)).toEqual({
       id: 3,
+      method: "thread/resume",
+      params: {
+        threadId: "thread-legacy",
+        developerInstructions: "Static HRA preamble.",
+      },
+    });
+    await client.resumeThread("thread-legacy");
+    expect(process.writes.at(-1)).toEqual({
+      id: 4,
       method: "thread/resume",
       params: { threadId: "thread-legacy" },
     });

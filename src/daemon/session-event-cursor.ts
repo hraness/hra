@@ -19,7 +19,12 @@ import {
   type WorkTaskHistoryCursorPayload,
   type WorkTaskId,
 } from "../domain/work";
-import { profileIdSchema, sessionIdSchema, unixMillisecondsSchema } from "../domain/values";
+import {
+  profileIdSchema,
+  projectIdSchema,
+  sessionIdSchema,
+  unixMillisecondsSchema,
+} from "../domain/values";
 import {
   projectPublicProviderIdentifier,
   type PublicProviderIdentifier,
@@ -104,6 +109,7 @@ const sessionListBrentPower = (pageCount: number): number => {
 export const sessionListCursorFilterSchema = z.object({
   accountId: profileIdSchema,
   providerGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  includeArchived: z.boolean(),
   limit: z.number().int().min(1).max(100),
 }).strict();
 
@@ -114,6 +120,7 @@ export const sessionListCursorPayloadSchema = z.object({
   type: z.literal("session_list"),
   accountId: profileIdSchema,
   providerGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  includeArchived: z.boolean(),
   limit: z.number().int().min(1).max(100),
   providerCursor: sessionListProviderCursorSchema,
   checkpointDigest: sessionListProviderCursorDigestSchema,
@@ -163,6 +170,7 @@ export const compositeSessionListCursorPayloadSchema = z.object({
   type: z.literal("session_list_composite"),
   accountId: profileIdSchema,
   providerGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  includeArchived: z.boolean(),
   limit: z.number().int().min(1).max(100),
   continuation: compositeSessionListContinuationSchema,
 }).strict().superRefine((value, context) => {
@@ -183,7 +191,9 @@ export type CompositeSessionListCursorPayload = z.infer<typeof compositeSessionL
 export const localSessionListCursorFilterSchema = z.object({
   accountId: profileIdSchema,
   accountGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  includeArchived: z.boolean(),
   limit: z.number().int().min(1).max(100),
+  scope: z.enum(["all_local", "claude_before_codex"]),
 }).strict();
 
 export type LocalSessionListCursorFilter = z.infer<typeof localSessionListCursorFilterSchema>;
@@ -193,12 +203,36 @@ export const localSessionListCursorPayloadSchema = z.object({
   type: z.literal("session_list_local"),
   accountId: profileIdSchema,
   accountGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  includeArchived: z.boolean(),
   limit: z.number().int().min(1).max(100),
+  scope: z.enum(["all_local", "claude_before_codex"]),
   afterCreatedAt: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
   afterSessionId: sessionIdSchema,
 }).strict();
 
 export type LocalSessionListCursorPayload = z.infer<typeof localSessionListCursorPayloadSchema>;
+
+export const peerSessionListCursorFilterSchema = z.object({
+  actorSessionId: sessionIdSchema,
+  projectId: projectIdSchema,
+  actorPolicyRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  limit: z.number().int().min(1).max(50),
+}).strict();
+
+export type PeerSessionListCursorFilter = z.infer<typeof peerSessionListCursorFilterSchema>;
+
+export const peerSessionListCursorPayloadSchema = z.object({
+  version: z.literal(1),
+  type: z.literal("peer_session_list"),
+  actorSessionId: sessionIdSchema,
+  projectId: projectIdSchema,
+  actorPolicyRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  limit: z.number().int().min(1).max(50),
+  afterCreatedAt: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
+  afterSessionId: sessionIdSchema,
+}).strict();
+
+export type PeerSessionListCursorPayload = z.infer<typeof peerSessionListCursorPayloadSchema>;
 
 const canonicalPayload = (payload: SessionEventCursorPayload): string => JSON.stringify({
   version: payload.version,
@@ -226,6 +260,7 @@ const canonicalSessionListPayload = (payload: SessionListCursorPayload): string 
   type: payload.type,
   accountId: payload.accountId,
   providerGeneration: payload.providerGeneration,
+  includeArchived: payload.includeArchived,
   limit: payload.limit,
   providerCursor: payload.providerCursor,
   checkpointDigest: payload.checkpointDigest,
@@ -258,6 +293,7 @@ const canonicalCompositeSessionListPayload = (
   type: payload.type,
   accountId: payload.accountId,
   providerGeneration: payload.providerGeneration,
+  includeArchived: payload.includeArchived,
   limit: payload.limit,
   continuation: canonicalCompositeSessionListContinuation(payload.continuation),
 });
@@ -269,6 +305,21 @@ const canonicalLocalSessionListPayload = (
   type: payload.type,
   accountId: payload.accountId,
   accountGeneration: payload.accountGeneration,
+  includeArchived: payload.includeArchived,
+  limit: payload.limit,
+  scope: payload.scope,
+  afterCreatedAt: payload.afterCreatedAt,
+  afterSessionId: payload.afterSessionId,
+});
+
+const canonicalPeerSessionListPayload = (
+  payload: PeerSessionListCursorPayload,
+): string => JSON.stringify({
+  version: payload.version,
+  type: payload.type,
+  actorSessionId: payload.actorSessionId,
+  projectId: payload.projectId,
+  actorPolicyRevision: payload.actorPolicyRevision,
   limit: payload.limit,
   afterCreatedAt: payload.afterCreatedAt,
   afterSessionId: payload.afterSessionId,
@@ -328,6 +379,7 @@ const sameSessionListFilter = (
   expected: SessionListCursorFilter,
 ): boolean => actual.accountId === expected.accountId
   && actual.providerGeneration === expected.providerGeneration
+  && actual.includeArchived === expected.includeArchived
   && actual.limit === expected.limit;
 
 const sameLocalSessionListFilter = (
@@ -335,6 +387,16 @@ const sameLocalSessionListFilter = (
   expected: LocalSessionListCursorFilter,
 ): boolean => actual.accountId === expected.accountId
   && actual.accountGeneration === expected.accountGeneration
+  && actual.includeArchived === expected.includeArchived
+  && actual.limit === expected.limit
+  && actual.scope === expected.scope;
+
+const samePeerSessionListFilter = (
+  actual: PeerSessionListCursorFilter,
+  expected: PeerSessionListCursorFilter,
+): boolean => actual.actorSessionId === expected.actorSessionId
+  && actual.projectId === expected.projectId
+  && actual.actorPolicyRevision === expected.actorPolicyRevision
   && actual.limit === expected.limit;
 
 const sessionListProviderCursorDigest = (providerCursor: string): string =>
@@ -583,7 +645,9 @@ export class SessionEventCursorCodec {
       type: "session_list_local",
       accountId: input.accountId,
       accountGeneration: input.accountGeneration,
+      includeArchived: input.includeArchived,
       limit: input.limit,
+      scope: input.scope,
       afterCreatedAt: input.afterCreatedAt,
       afterSessionId: input.afterSessionId,
     });
@@ -639,6 +703,7 @@ export class SessionEventCursorCodec {
       type: "session_list_composite",
       accountId: input.accountId,
       providerGeneration: input.providerGeneration,
+      includeArchived: input.includeArchived,
       limit: input.limit,
       continuation: input.continuation,
     });
@@ -684,6 +749,64 @@ export class SessionEventCursorCodec {
     return parsed.data;
   }
 
+  encodePeerSessionList(
+    input: PeerSessionListCursorFilter & Readonly<{
+      afterCreatedAt: number;
+      afterSessionId: string;
+    }>,
+  ): string {
+    const payload = peerSessionListCursorPayloadSchema.parse({
+      version: 1,
+      type: "peer_session_list",
+      actorSessionId: input.actorSessionId,
+      projectId: input.projectId,
+      actorPolicyRevision: input.actorPolicyRevision,
+      limit: input.limit,
+      afterCreatedAt: input.afterCreatedAt,
+      afterSessionId: input.afterSessionId,
+    });
+    return this.#encodeCanonical(
+      canonicalPeerSessionListPayload(payload),
+      "Peer session-list cursor",
+    );
+  }
+
+  decodePeerSessionList(
+    cursor: string,
+    expectedFilter: PeerSessionListCursorFilter,
+  ): PeerSessionListCursorPayload {
+    const expected = peerSessionListCursorFilterSchema.parse(expectedFilter);
+    const envelope = this.#decodeEnvelope(cursor, "Peer session-list cursor");
+    if (
+      typeof envelope.value !== "object"
+      || envelope.value === null
+      || !("type" in envelope.value)
+      || envelope.value.type !== "peer_session_list"
+    ) {
+      throw new SessionEventCursorError(
+        "Another HRA cursor type cannot be used as a peer session-list cursor.",
+        "type_mismatch",
+      );
+    }
+    const parsed = peerSessionListCursorPayloadSchema.safeParse(envelope.value);
+    if (
+      !parsed.success
+      || canonicalPeerSessionListPayload(parsed.data) !== envelope.payloadJson
+    ) {
+      throw new SessionEventCursorError(
+        "Peer session-list cursor payload is not canonical.",
+        "noncanonical",
+      );
+    }
+    if (!samePeerSessionListFilter(parsed.data, expected)) {
+      throw new SessionEventCursorError(
+        "Peer session-list cursor filters do not match this actor and project.",
+        "filter_mismatch",
+      );
+    }
+    return parsed.data;
+  }
+
   advanceCompositeSessionList(
     input: SessionListCursorFilter & Readonly<{
       providerCursor: string;
@@ -693,6 +816,7 @@ export class SessionEventCursorCodec {
     const filter = sessionListCursorFilterSchema.parse({
       accountId: input.accountId,
       providerGeneration: input.providerGeneration,
+      includeArchived: input.includeArchived,
       limit: input.limit,
     });
     const priorProviderState = input.prior?.continuation.phase === "provider"
@@ -718,6 +842,7 @@ export class SessionEventCursorCodec {
     const filter = sessionListCursorFilterSchema.parse({
       accountId: input.accountId,
       providerGeneration: input.providerGeneration,
+      includeArchived: input.includeArchived,
       limit: input.limit,
     });
     const providerCursor = sessionListProviderCursorSchema.safeParse(input.providerCursor);

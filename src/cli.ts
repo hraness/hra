@@ -94,6 +94,7 @@ import {
 } from "./cloud/index";
 import { allowlistedEnvironment, resolvePinnedCodexRuntime } from "./codex/index";
 import {
+  ClaudeHostToolBindingAuthority,
   createClaudeLoginSignalCustody,
   resolvePinnedClaudeRuntime,
   runClaudeForegroundLogin,
@@ -174,6 +175,10 @@ import {
   waitForDaemonReady,
   type DaemonIdentity,
 } from "./daemon/daemon-startup";
+import {
+  ClaudeHostToolCallbackServer,
+  claudeHostToolCallbackSocketPath,
+} from "./daemon/claude-host-tool-transport";
 import { PinnedClaudeRuntimeManager } from "./daemon/claude-runtime-adapter";
 import { PinnedCodexRuntimeManager } from "./daemon/codex-runtime-adapter";
 import { PinnedDevinRuntimeManager } from "./daemon/devin-runtime-adapter";
@@ -3197,6 +3202,8 @@ export async function runDaemon(
   let codex: PinnedCodexRuntimeManager | undefined;
   let claude: PinnedClaudeRuntimeManager | undefined;
   let devin: PinnedDevinRuntimeManager | undefined;
+  let claudeHostToolAuthority: ClaudeHostToolBindingAuthority | undefined;
+  let claudeHostToolServer: ClaudeHostToolCallbackServer | undefined;
   let service: HraService | undefined;
   let server: LocalDaemonServer | undefined;
   let cloudAdapter: StateBackedCloudDaemonAdapter | undefined;
@@ -3217,6 +3224,7 @@ export async function runDaemon(
     if (usagePoller !== undefined) usagePollerShutdown ??= usagePoller.close();
     if (service !== undefined) serviceShutdown = service.close();
     else daemonAuthority?.close();
+    claudeHostToolServer?.beginShutdown();
     server?.beginShutdown(new Error("Daemon shutdown was requested."));
     resolveStop();
   };
@@ -3227,6 +3235,7 @@ export async function runDaemon(
   // shutdown path and publish a closed failure receipt instead of letting the
   // runtime print the raw error and exit without one.
   let unhandledRejectionError: Error | undefined;
+  let claudeHostToolTransportError: Error | undefined;
   const onUnhandledRejection = () => {
     unhandledRejectionError ??= new Error("The daemon stopped after an unhandled promise rejection in an owned background task.");
     requestStop();
@@ -3267,6 +3276,31 @@ export async function runDaemon(
     const activeDaemonAuthority = daemonAuthority;
     checkpointBoot();
     const serviceReference: { current?: HraService } = {};
+    claudeHostToolAuthority = new ClaudeHostToolBindingAuthority();
+    const activeClaudeHostToolAuthority = claudeHostToolAuthority;
+    claudeHostToolServer = await ClaudeHostToolCallbackServer.start({
+      paths,
+      authority: activeClaudeHostToolAuthority,
+      onFatalError: () => {
+        claudeHostToolTransportError ??= new Error(
+          "The daemon stopped after the Claude host-tool callback transport failed.",
+        );
+        requestStop();
+      },
+      handler: {
+        call: async (call) => {
+          const runtime = claude;
+          if (runtime === undefined) throw new Error("The Claude runtime is unavailable during host-tool execution.");
+          return await runtime.handleSessionHostToolCall(call);
+        },
+        responseWritten: async (receipt) => {
+          const runtime = claude;
+          if (runtime === undefined) throw new Error("The Claude runtime is unavailable during host-tool settlement.");
+          await runtime.handleSessionHostToolResponseWritten(receipt);
+        },
+      },
+    });
+    const activeClaudeHostToolServer = claudeHostToolServer;
     codex = new PinnedCodexRuntimeManager({
       ...(installation.kind === "live_acceptance"
         ? {
@@ -3287,15 +3321,15 @@ export async function runDaemon(
         account: async (authority, account) => {
           await serviceReference.current?.observeCodexAccount(authority, account);
         },
-        conversationAutomation: async (authority, call) => {
+        hraHostTool: async (authority, call) => {
           const current = serviceReference.current;
           if (current === undefined) {
-            throw new Error("The HRA service is unavailable during conversation automation.");
+            throw new Error("The HRA service is unavailable during host-tool execution.");
           }
-          return await current.handleConversationAutomationToolCall(authority, call);
+          return await current.handleHraHostToolCall(authority, call);
         },
-        conversationAutomationResponseWritten: (authority, call) => {
-          serviceReference.current?.notifyConversationAutomationToolResponseWritten(
+        hraHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyHraHostToolResponseWritten(
             authority,
             call,
           );
@@ -3320,9 +3354,24 @@ export async function runDaemon(
         }
       },
       observer: {
+        hraHostTool: async (authority, call) => {
+          const current = serviceReference.current;
+          if (current === undefined) {
+            throw new Error("The HRA service is unavailable during host-tool execution.");
+          }
+          return await current.handleHraHostToolCall(authority, call);
+        },
+        hraHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyHraHostToolResponseWritten(authority, call);
+        },
         fact: async (authority, fact) => {
           await serviceReference.current?.observeClaudeFact(authority, fact);
         },
+      },
+      hostTools: {
+        bindingAuthority: activeClaudeHostToolAuthority,
+        callbackSocketPath: claudeHostToolCallbackSocketPath(paths),
+        privateRoot: paths.runtime,
       },
     });
     // Devin owns its credentials and native sessions. HRA gives the pinned ACP
@@ -3358,6 +3407,9 @@ export async function runDaemon(
         return activeStore.requireProject(session.projectId).rootPath;
       },
     });
+    if (activeClaudeHostToolServer.path !== claudeHostToolCallbackSocketPath(paths)) {
+      throw new Error("Claude host-tool callback transport path changed during daemon startup.");
+    }
     const cloudEnvironment = installation.cloudEnvironment;
     const cloudStartup = await resolveDaemonCloudStartup({
       environment: cloudEnvironment,
@@ -3543,13 +3595,29 @@ export async function runDaemon(
     }
     checkpointBoot();
     factsMemoryControl = new FactsMemoryControlStore(paths.factsMemoryControl);
-    const { OhSqliteFactsMemoryEngine } = await import("./storage/oh-facts-memory-engine");
+    const [
+      { OhSqliteFactsMemoryEngine },
+      { HraOhMemoryCoordinator },
+    ] = await Promise.all([
+      import("./storage/oh-facts-memory-engine"),
+      import("./daemon/memory-coordinator"),
+    ]);
+    const memoryEngine = new OhSqliteFactsMemoryEngine({
+      forkAttestations: activeStore,
+    });
     const factsMemory = new HraFactsMemoryLifecycle({
+      attestations: activeStore,
       broker: new LocalFactsMemoryBroker({
-        engine: new OhSqliteFactsMemoryEngine(),
+        engine: memoryEngine,
         root: paths.factsMemorySessions,
       }),
       control: factsMemoryControl,
+    });
+    const memory = new HraOhMemoryCoordinator({
+      engine: memoryEngine,
+      factsMemory,
+      paths,
+      store: activeStore,
     });
     const desktop = process.platform === "darwin" && installation.desktopSwitching
       ? (() => {
@@ -3576,6 +3644,7 @@ export async function runDaemon(
       usageHistoryCursors,
       workCapabilities,
       factsMemory,
+      memory,
       gatewayKeys,
       proseResponder: new AiGatewayProseResponder({
         readKey: async () => await gatewayKeys.read(),
@@ -3640,6 +3709,9 @@ export async function runDaemon(
     checkpointBoot();
     await daemonLock.publish({ state: "ready", generation, bootId });
     await stopped;
+    if (claudeHostToolTransportError !== undefined) {
+      throw claudeHostToolTransportError;
+    }
     await daemonLock.publish({ state: "stopping", generation, bootId });
   } catch (error: unknown) {
     if (!(error instanceof DaemonBootInterruptedError)) runError = error;
@@ -3648,6 +3720,7 @@ export async function runDaemon(
     if (usagePoller !== undefined) usagePollerShutdown ??= usagePoller.close();
     if (service !== undefined) serviceShutdown ??= service.close();
     else daemonAuthority?.close();
+    claudeHostToolServer?.beginShutdown();
     server?.beginShutdown(new Error("Daemon lifetime ended."));
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
@@ -3721,6 +3794,12 @@ export async function runDaemon(
         if (error instanceof DaemonJoinDeadlineError) runError = error;
         else cleanupErrors.push(error);
       }
+    }
+    if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && claudeHostToolServer !== undefined) {
+      try { await claudeHostToolServer.close(); } catch (error: unknown) { cleanupErrors.push(error); }
+    }
+    if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && claudeHostToolAuthority !== undefined) {
+      try { await claudeHostToolAuthority.close(); } catch (error: unknown) { cleanupErrors.push(error); }
     }
 
     if (runError instanceof DaemonJoinDeadlineError || runError instanceof LocalDaemonShutdownTimeoutError) {

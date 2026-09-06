@@ -279,6 +279,104 @@ describe("CLI parser", () => {
     expect(parseCli(["session", "send", "session", "hello", "from", "the", "CLI"])).toMatchObject({ command: { message: "hello from the CLI" } });
   });
 
+  test("parses the closed owner memory surface and generates replayable mutation keys", () => {
+    const continuation = "memc_0123456789abcdef0123456789abcdef";
+    expect(parseCli(["memory", "status", "release"])).toEqual({
+      command: { kind: "memory.status", session: "release" },
+      json: false,
+      kind: "command",
+    });
+    expect(parseCli(["memory", "list", "release", "--continuation", continuation, "--json"]))
+      .toEqual({
+        command: {
+          kind: "memory.query",
+          session: "release",
+          value: { continuation, mode: "list" },
+        },
+        json: true,
+        kind: "command",
+      });
+    expect(parseCli(["memory", "get", "release", "architecture.boundary"]))
+      .toMatchObject({
+        command: {
+          kind: "memory.query",
+          session: "release",
+          value: { key: "architecture.boundary", mode: "get" },
+        },
+      });
+    expect(parseCli(["memory", "search", "release", "--", "--authority", "boundary"]))
+      .toMatchObject({
+        command: {
+          kind: "memory.query",
+          session: "release",
+          value: { mode: "search", text: "--authority boundary" },
+        },
+      });
+    expect(parseCli([
+      "memory", "explain", "release", `memq_${"1".repeat(32)}`, "3",
+    ])).toMatchObject({
+      command: {
+        kind: "memory.explain",
+        session: "release",
+        value: { queryId: `memq_${"1".repeat(32)}`, row: 3 },
+      },
+    });
+
+    const remembered = parseCli([
+      "memory", "remember", "release", "preferences.review",
+      "--title", "Review style",
+      "--summary", "Prefer adversarial review.",
+      "--language", "en",
+      "--", "Challenge", "plans", "before", "execution.",
+    ]);
+    expect(remembered).toMatchObject({
+      command: {
+        kind: "memory.remember",
+        session: "release",
+        value: {
+          body: "Challenge plans before execution.",
+          key: "preferences.review",
+          language: "en",
+          summary: "Prefer adversarial review.",
+          title: "Review style",
+        },
+      },
+    });
+    if (remembered.kind !== "command" || remembered.command.kind !== "memory.remember") return;
+    expect(remembered.command.idempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
+
+    const shareKey = "00000000-0000-4000-8000-000000000501";
+    expect(parseCli([
+      "memory", "share", "release", "preferences.review",
+      "--reason", "Reusable project convention",
+      "--idempotency-key", shareKey,
+    ])).toEqual({
+      command: {
+        kind: "memory.share",
+        session: "release",
+        idempotencyKey: shareKey,
+        value: { key: "preferences.review", reason: "Reusable project convention" },
+      },
+      json: false,
+      kind: "command",
+    });
+  });
+
+  test("rejects widened or incoherent owner memory arguments before daemon admission", () => {
+    for (const argv of [
+      ["memory", "status", "release", "--continuation", "token"],
+      ["memory", "get", "release", "Not A Key"],
+      ["memory", "search", "release"],
+      ["memory", "explain", "release", "query", "0"],
+      ["memory", "explain", "release", `memq_${"1".repeat(32)}`, "256"],
+      ["memory", "remember", "release", "preferences.review", "--summary", "summary", "body"],
+      ["memory", "remember", "release", "preferences.review", "--title", "title", "body"],
+      ["memory", "share", "release", "preferences.review"],
+      ["memory", "list", "release", "--idempotency-key", "00000000-0000-4000-8000-000000000502"],
+      ["memory", "purge", "release"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+  });
+
   test("collects repeated --attach paths and leaves the message untouched", () => {
     // No `--attach` means the exact command the parser always produced.
     expect(parseCli(["session", "send", "s", "hello"])).toMatchObject({
@@ -1117,6 +1215,48 @@ describe("CLI parser", () => {
     ])).toThrow(CliUsageError);
     expect(() => parseCli(["sync", "projection", "reset", "sess_12345678"]))
       .toThrow(CliUsageError);
+  });
+
+  test("parses exact peer-policy reads and compare-and-set updates", () => {
+    expect(parseCli(["session", "peer-policy", "get", "release", "--json"]))
+      .toEqual({
+        command: { kind: "session.peer-policy.get", session: "release" },
+        json: true,
+        kind: "command",
+      });
+    expect(parseCli([
+      "session",
+      "peer-policy",
+      "set",
+      "release",
+      "inspect",
+      "--revision",
+      "7",
+    ])).toEqual({
+      command: {
+        expectedRevision: 7,
+        kind: "session.peer-policy.set",
+        mode: "inspect",
+        session: "release",
+      },
+      json: false,
+      kind: "command",
+    });
+
+    for (const argv of [
+      ["session", "peer-policy", "set", "release", "off"],
+      ["session", "peer-policy", "set", "release", "on", "--revision", "1"],
+      ["session", "peer-policy", "set", "release", "coordinate", "--revision", "0"],
+      ["session", "peer-policy", "get", "release", "--revision", "1"],
+      ["session", "peer-policy", "get", "release", "extra"],
+      ["session", "peer-policy", "replace", "release"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+
+    expect(resolveUsage("session", "peer-policy").usage).toContain([
+      "Usage:",
+      "  hra session peer-policy get <session> [--json]",
+      "  hra session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]",
+    ].join("\n"));
   });
 
   test("parses bounded session status, event pages, follow mode, and interactions", () => {

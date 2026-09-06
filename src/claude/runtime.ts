@@ -1,6 +1,7 @@
 import { lstat, realpath } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 
+import { HRA_SESSION_PREAMBLE } from "../domain/hra-preamble.ts";
 import { ClaudeError } from "./errors.ts";
 import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "./pin.ts";
 import { allowlistedEnvironment } from "./process.ts";
@@ -46,6 +47,11 @@ export interface ResolvePinnedClaudeRuntimeOptions {
   readonly signal?: AbortSignal;
   readonly versionProbeDeadlineMs?: number;
   readonly versionProbeProcessFactory?: ClaudeVersionProbeProcessFactory;
+}
+
+export interface ClaudeHostToolRuntimeOptions {
+  /** Absolute path to the private, session-specific MCP configuration. */
+  readonly mcpConfigPath: string;
 }
 
 // Claude Code currently reports either `x.y.z` or `x.y.z (Claude Code)`, with
@@ -148,6 +154,7 @@ const stopVersionProbe = async (
 
 /** Reads `claude --version` inside the isolated home, bounded and non-interactive. */
 export const spawnClaudeVersionProbe: ClaudeVersionProbe = async (input) => {
+  input.signal.throwIfAborted();
   const env = allowlistedEnvironment(input.environment);
   env.CLAUDE_CONFIG_DIR = input.configDir;
   env.NO_COLOR = "1";
@@ -192,6 +199,7 @@ export const spawnClaudeVersionProbe: ClaudeVersionProbe = async (input) => {
   } finally {
     input.signal.removeEventListener("abort", abort);
   }
+  input.signal.throwIfAborted();
   const [output, diagnostic, code] = outcome;
   void diagnostic;
   if (code !== 0) {
@@ -227,12 +235,15 @@ export async function locateClaudeExecutable(
 export async function resolvePinnedClaudeRuntime(
   options: ResolvePinnedClaudeRuntimeOptions,
 ): Promise<PinnedClaudeRuntime> {
+  const signal = options.signal ?? new AbortController().signal;
+  signal.throwIfAborted();
   assertPinnedClaudeMatrices();
   if (!isAbsolute(options.configDir)) {
     throw new ClaudeError("INVALID_INPUT", "CLAUDE_CONFIG_DIR must be an absolute path");
   }
   const environment = options.environment ?? process.env;
   const requested = options.executablePath ?? (await locateClaudeExecutable(environment));
+  signal.throwIfAborted();
   if (!isAbsolute(requested)) {
     throw new ClaudeError("INVALID_INPUT", "the Claude Code executable path must be absolute");
   }
@@ -241,7 +252,9 @@ export async function resolvePinnedClaudeRuntime(
       cause: error,
     });
   });
+  signal.throwIfAborted();
   const stat = await lstat(executablePath);
+  signal.throwIfAborted();
   if (!stat.isFile()) {
     throw new ClaudeError("RUNTIME_MISMATCH", "the Claude Code executable is not a regular file");
   }
@@ -255,12 +268,13 @@ export async function resolvePinnedClaudeRuntime(
     configDir: options.configDir,
     environment,
     executablePath,
-    signal: options.signal ?? new AbortController().signal,
+    signal,
     deadlineMs,
     ...(options.versionProbeProcessFactory === undefined ? {} : {
       processFactory: options.versionProbeProcessFactory,
     }),
   });
+  signal.throwIfAborted();
   const version = versionOutputPattern.exec(reported)?.[1];
   if (version === undefined) {
     throw new ClaudeError("RUNTIME_MISMATCH", "the Claude Code executable reported no exact version");
@@ -283,10 +297,43 @@ export async function resolvePinnedClaudeRuntime(
       CLAUDE_PIN_MODEL,
       "--effort",
       CLAUDE_PIN_EFFORT,
+      "--append-system-prompt",
+      HRA_SESSION_PREAMBLE.text,
+      "--system-prompt-snapshot",
+      "on",
     ],
     effort: CLAUDE_PIN_EFFORT,
     executablePath,
     model: CLAUDE_PIN_MODEL,
     version: CLAUDE_PIN,
+  };
+}
+
+/**
+ * Adds the one session-specific MCP configuration to an admitted runtime.
+ * The configuration contains only a stdio bridge command and the path of a
+ * private binding file; the capability itself never appears in argv.
+ */
+export function withClaudeHostToolRuntime(
+  runtime: PinnedClaudeRuntime,
+  options: ClaudeHostToolRuntimeOptions,
+): PinnedClaudeRuntime {
+  if (!isAbsolute(options.mcpConfigPath) || options.mcpConfigPath.includes("\0")) {
+    throw new ClaudeError("INVALID_INPUT", "the Claude MCP configuration path must be absolute");
+  }
+  if (
+    runtime.argv.includes("--mcp-config")
+    || runtime.argv.includes("--strict-mcp-config")
+  ) {
+    throw new ClaudeError("INVALID_INPUT", "the Claude runtime already has an MCP configuration");
+  }
+  return {
+    ...runtime,
+    argv: [
+      ...runtime.argv,
+      "--mcp-config",
+      options.mcpConfigPath,
+      "--strict-mcp-config",
+    ],
   };
 }

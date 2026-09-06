@@ -251,9 +251,14 @@ async function fixture(): Promise<Readonly<{
 function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, input: Readonly<{
   fast: boolean;
   preset: "low" | "high" | "ultra";
-}>): Readonly<{ attemptId: `attempt_${string}`; profile: Parameters<StateStore["recordSessionRuntimeProfile"]>[0]["profile"] }> {
+}>): Readonly<{
+  attemptId: `attempt_${string}`;
+  message: string;
+  profile: Parameters<StateStore["recordSessionRuntimeProfile"]>[0]["profile"];
+}> {
   const session = value.store.requireSession(value.sessionId);
   const profile = value.store.requireProfileById(session.profileId);
+  const message = "fixture";
   const runtime = {
     profileId: profile.id,
     processGeneration: profile.processGeneration,
@@ -274,7 +279,7 @@ function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, inp
     authorityGeneration: profile.processGeneration,
     authorityId: session.id,
     kind: "session.send",
-    request: { message: "fixture" },
+    request: { message },
   });
   value.store.beginSessionMutationEffect({
     attemptId: attempt.id,
@@ -282,14 +287,15 @@ function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, inp
       baseline: { activeTurnId: null, providerUpdatedAt: session.providerUpdatedAt ?? null, status: "idle" },
       clientMessageId: attempt.id,
       kind: "session.send",
-      messageDigest: "a".repeat(64),
+      messageDigest: sha256(message),
       providerThreadId: session.providerThreadId ?? "thread_0001",
       runtimeProfile: runtime,
     },
     profileGeneration: profile.processGeneration,
     sessionId: session.id,
+    message,
   });
-  return { attemptId: attempt.id as `attempt_${string}`, profile: runtime };
+  return { attemptId: attempt.id as `attempt_${string}`, message, profile: runtime };
 }
 
 async function materializeScheduledTaskQueue(
@@ -362,9 +368,13 @@ async function materializeScheduledTaskQueue(
     },
   });
   value.store.completeQueueEffect({
+    accountId: profile.id,
     queueId: occurrence.queue.id,
     expectedEvidenceDigest: evidence.digest,
     expectedSessionRevision: current.revision,
+    message: input.prompt,
+    providerConnectionId: null,
+    providerGeneration: profile.processGeneration,
     applyResponseState: false,
     turnId: input.turnId,
     turnStatus: "completed",
@@ -458,7 +468,6 @@ class FakeClaude implements ClaudeRuntimePort {
   endSession(): Promise<void> { return Promise.resolve(); }
   #unused(): never { throw new Error("unused"); }
   pinnedVersion(): string { return this.#unused(); }
-  rebindProfileAuthority(): void {}
   interactionAuthority(): never { return this.#unused(); }
   readAccount(): Promise<CodexAccountProjection> {
     this.readAccountCalls += 1;
@@ -600,9 +609,13 @@ describe("state-backed cloud daemon adapter", () => {
       sessionId: bound.id,
     });
     value.store.completeQueueEffect({
+      accountId: profile.id,
       applyResponseState: false,
       expectedEvidenceDigest: evidence.digest,
       expectedSessionRevision: bound.revision,
+      message: "Summarise the diff",
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration,
       queueId: queued.id,
       receipt: { turnId: "turn_claude_1" },
       runtimeProfile: claudeProfile,
@@ -782,9 +795,13 @@ describe("state-backed cloud daemon adapter", () => {
       sessionId: bound.id,
     });
     value.store.completeQueueEffect({
+      accountId: profile.id,
       applyResponseState: false,
       expectedEvidenceDigest: evidence.digest,
       expectedSessionRevision: bound.revision,
+      message: "Implement the bounded change",
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration,
       queueId: queued.id,
       receipt: { turnId: "turn_devin_1" },
       runtimeProfile: devinProfile,
@@ -989,6 +1006,76 @@ describe("state-backed cloud daemon adapter", () => {
     } finally {
       await adapter.close();
       value.store.close();
+    }
+  });
+
+  test("keeps every non-owner message compatible with the released actor field", async () => {
+    const cases = [
+      { actorKind: undefined, messageActor: "autorespond" as const, text: "Continue after the recorded answer." },
+      { actorKind: "peer_session" as const, messageActor: "peer_session" as const, text: "Check the peer result." },
+      { actorKind: "provider_switch" as const, messageActor: "provider_switch" as const, text: "Continue from the provider-neutral handoff." },
+    ];
+    for (const actorCase of cases) {
+      const value = await fixture();
+      const sourceId = "attempt_00000000-0000-4000-8000-0000000000a1";
+      value.codex.projection = {
+        ...value.codex.projection,
+        messages: [{
+          clientId: sourceId,
+          role: "user",
+          text: actorCase.text,
+          turnId: "turn_handoff_0001",
+        }],
+        turnSummaries: [{
+          actions: [],
+          files: [],
+          id: "turn_handoff_0001",
+          omittedActions: 0,
+          omittedFiles: 0,
+          runtimeMs: 25,
+          status: "completed",
+        }],
+      };
+      const lookups: string[] = [];
+      const classify = value.store.sessionMessageActorForSource.bind(value.store);
+      Object.defineProperty(value.store, "sessionMessageActorForSource", {
+        configurable: true,
+        value: (sessionId: SessionId, candidateSourceId: string) => {
+          lookups.push(candidateSourceId);
+          return candidateSourceId === sourceId
+            ? actorCase.messageActor
+            : classify(sessionId, candidateSourceId);
+        },
+      });
+      const adapter = new StateBackedCloudDaemonAdapter({
+        codex: value.codex,
+        executeRemote: () => Promise.resolve({}),
+        paths: value.paths,
+        store: value.store,
+      });
+      try {
+        const signal = new AbortController().signal;
+        await adapter.listSessions({ limit: 25, signal });
+        const projected = await adapter.readCompactEvents({
+          afterSequence: 0,
+          limit: 128,
+          sessionPublicId: value.sessionId,
+          signal,
+        });
+        expect(lookups).toContain(sourceId);
+        expect(projected.events[0]).toEqual({
+          actor: "autorespond",
+          ...(actorCase.actorKind === undefined ? {} : { actorKind: actorCase.actorKind }),
+          kind: "user_message",
+          sequence: 1,
+          text: actorCase.text,
+          turnId: "turn_handoff_0001",
+        });
+        expect(JSON.stringify(projected.events)).not.toContain("provider_switched");
+      } finally {
+        await adapter.close();
+        value.store.close();
+      }
     }
   });
 
@@ -2097,9 +2184,13 @@ describe("state-backed cloud daemon adapter", () => {
     const value = await fixture();
     const binding = beginTurnProfileBinding(value, { fast: false, preset: "high" });
     value.store.completeSessionTurnEffect({
+      accountId: binding.profile.profileId,
       applyResponseState: false,
       attemptId: binding.attemptId,
       expectedSessionRevision: value.store.requireSession(value.sessionId).revision,
+      message: binding.message,
+      providerConnectionId: null,
+      providerGeneration: binding.profile.processGeneration,
       receipt: { turnId: "turn_0001" },
       runtimeProfile: binding.profile,
       sessionId: value.sessionId as `sess_${string}`,
@@ -2157,9 +2248,13 @@ describe("state-backed cloud daemon adapter", () => {
       await adapter.listSessions({ limit: 25, signal });
       expect((await adapter.readCompactEvents({ afterSequence: 0, limit: 128, sessionPublicId: value.sessionId, signal })).events).toEqual([]);
       value.store.completeSessionTurnEffect({
+        accountId: binding.profile.profileId,
         applyResponseState: false,
         attemptId: binding.attemptId,
         expectedSessionRevision: value.store.requireSession(value.sessionId).revision,
+        message: binding.message,
+        providerConnectionId: null,
+        providerGeneration: binding.profile.processGeneration,
         receipt: { turnId: "turn_0001" },
         runtimeProfile: binding.profile,
         sessionId: value.sessionId as `sess_${string}`,

@@ -160,8 +160,8 @@ export interface SessionRuntimePort<Profile> {
   /** Releases a review that never reached its matching start effect. */
   discardRuntimeReview(review: RuntimeStartReviewOf<Profile>): void;
   startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReviewOf<Profile>; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: Profile }>;
-  observeSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<CodexSessionObservation>;
-  readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection>;
+  observeSession(input: { authority: ProfileAuthority; providerThreadId: string; developerInstructions?: string; signal: AbortSignal }): Promise<CodexSessionObservation>;
+  readSession(input: { authority: ProfileAuthority; providerThreadId: string; developerInstructions?: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection>;
   /**
    * Release this runtime's hold on one provider thread without deleting it.
    * `hra session switch` calls it on the provider a session is leaving, so a
@@ -217,17 +217,27 @@ export interface SessionRuntimePort<Profile> {
 export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRuntimeProfile> {
   readonly provider: "claude";
   readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
-  /**
-   * Rebinds live, quiescent Claude processes when only the sibling Codex
-   * account generation changes. The daemon calls this synchronously after
-   * the durable generation CAS, before another provider fact can run.
-   */
-  rebindProfileAuthority(input: {
-    profileId: ProfileId;
-    expectedGeneration: number;
-    nextGeneration: number;
-  }): void;
   pinnedVersion(): string;
+  /** Current-daemon execution authority used before scheduled work becomes durable. */
+  hasLiveSession?(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+  }): boolean;
+  /** True while any process, private binding, or launch review retains this exact authority. */
+  hasRetainedProfileAuthority?(input: {
+    authority: ProfileAuthority;
+  }): boolean;
+  /** Release all processes and private bindings owned by one superseded generation. */
+  retireProfileAuthority?(input: {
+    authority: ProfileAuthority;
+    signal: AbortSignal;
+  }): Promise<void>;
+  /** Activate the already-provisioned private binding after the local thread commit. */
+  activateSessionHostTools?(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+    signal: AbortSignal;
+  }): Promise<void>;
   /**
    * The exact durable authority one pending Claude control request binds.
    * Codex publishes its own request authority on the notification; Claude's
@@ -244,6 +254,11 @@ export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRun
 export interface DevinRuntimePort extends SessionRuntimePort<EffectiveDevinRuntimeProfile> {
   readonly provider: "devin";
   readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
+  /** Synchronous scheduler fence: exact live writer, or proven ACP load support plus an exact local root. */
+  hasLiveOrLoadableSession?(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+  }): boolean;
   rebindProfileAuthority(input: {
     profileId: ProfileId;
     expectedGeneration: number;
@@ -423,9 +438,26 @@ export class UnavailableClaudeRuntime implements ClaudeRuntimePort {
     );
   }
   interactionAuthority(): ProviderInteractionAuthority { return this.#unavailable(); }
+  hasLiveSession(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+  }): boolean {
+    void input;
+    return false;
+  }
+  hasRetainedProfileAuthority(input: { authority: ProfileAuthority }): boolean {
+    void input;
+    return false;
+  }
+  async retireProfileAuthority(input: {
+    authority: ProfileAuthority;
+    signal: AbortSignal;
+  }): Promise<void> {
+    input.signal.throwIfAborted();
+  }
+  activateSessionHostTools(): Promise<never> { return Promise.reject(this.#unavailable()); }
   pinnedVersion(): string { return this.#unavailable(); }
   readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  rebindProfileAuthority(): void {}
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
   discardRuntimeReview(): void {}
   startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
@@ -463,6 +495,7 @@ export class UnavailableDevinRuntime implements DevinRuntimePort {
   interactionAuthority(): ProviderInteractionAuthority { return this.#unavailable(); }
   pinnedVersion(): string { return this.#unavailable(); }
   readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  hasLiveOrLoadableSession(): boolean { return false; }
   rebindProfileAuthority(): void {}
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
   discardRuntimeReview(): void {}

@@ -16,6 +16,7 @@ import {
   SessionTaskStore,
   SessionTaskStoreError,
   assertSessionTaskSchema,
+  type SessionTaskExecutionAuthority,
   type SessionTaskStoreErrorCode,
 } from "./session-task-store";
 
@@ -44,6 +45,8 @@ CREATE TABLE sessions (
   id TEXT PRIMARY KEY,
   profile_id TEXT NOT NULL REFERENCES profiles(id),
   project_id TEXT REFERENCES projects(id),
+  provider TEXT NOT NULL DEFAULT 'codex',
+  provider_v39 TEXT NOT NULL DEFAULT 'codex',
   provider_thread_id TEXT,
   state TEXT NOT NULL
 ) STRICT;
@@ -76,6 +79,7 @@ type Fixture = Readonly<{
 }>;
 
 function fixture(input: Readonly<{
+  isExecutionAuthorityLive?: (authority: SessionTaskExecutionAuthority) => boolean;
   resolveProjectDirectory?: (root: string) => Promise<string | null>;
 }> = {}): Fixture {
   const database = new Database(":memory:", { strict: true });
@@ -101,6 +105,9 @@ function fixture(input: Readonly<{
   const now = { value: 1_000 };
   const store = new SessionTaskStore(database, {
     now: () => now.value,
+    ...(input.isExecutionAuthorityLive === undefined
+      ? {}
+      : { isExecutionAuthorityLive: input.isExecutionAuthorityLive }),
     resolveProjectDirectory: input.resolveProjectDirectory ?? (async (root) => root),
   });
   return { database, now, otherSessionId, sessionId, store };
@@ -892,6 +899,154 @@ describe("SessionTaskStore due materialization", () => {
     expect(await unusable.store.materializeDue({
       now: unusableTask.nextDueAt ?? dueAt,
     })).toEqual([]);
+  });
+
+  test("uses provider-specific readiness for signed-out Codex and authenticated Claude sessions", async () => {
+    const codex = fixture();
+    const codexTask = createTask(codex);
+    codex.database.query("UPDATE profiles SET state='signed_out'").run();
+    expect(codex.store.nextDueAt()).toBeNull();
+    expect(await codex.store.materializeDue({ now: codexTask.nextDueAt ?? 0 })).toEqual([]);
+
+    for (const profileState of ["signed_out", "login_pending"] as const) {
+      const claude = fixture({ isExecutionAuthorityLive: () => true });
+      const claudeTask = createTask(claude);
+      claude.database.query("UPDATE sessions SET provider_v39='claude'").run();
+      claude.database.query("UPDATE profiles SET state=?").run(profileState);
+      expect(claude.store.nextDueAt()).toBe(claudeTask.nextDueAt);
+      await expect(claude.store.materializeDue({
+        now: claudeTask.nextDueAt ?? 0,
+      })).resolves.toMatchObject([{
+        task: { id: claudeTask.id },
+        queue: { sessionId: claude.sessionId },
+      }]);
+    }
+  });
+
+  test("does not commit a due Claude occurrence without this daemon's exact live binding", async () => {
+    const unproven = fixture();
+    const unprovenTask = createTask(unproven);
+    unproven.database.query("UPDATE sessions SET provider_v39='claude'").run();
+    expect(await unproven.store.materializeDue({
+      now: unprovenTask.nextDueAt ?? 0,
+    })).toEqual([]);
+    expect(unproven.store.listOccurrences(unproven.sessionId, unprovenTask.id)).toEqual([]);
+
+    let authorityState: "error" | "closed" | "live" = "error";
+    const seen: SessionTaskExecutionAuthority[] = [];
+    const value = fixture({
+      isExecutionAuthorityLive: (authority) => {
+        seen.push(authority);
+        if (authorityState === "error") throw new Error("authority proof unavailable");
+        return authority.provider !== "claude" || authorityState === "live";
+      },
+    });
+    const created = createTask(value);
+    value.database.query("UPDATE sessions SET provider_v39='claude'").run();
+    value.database.query("UPDATE profiles SET state='signed_out'").run();
+    const dueAt = created.nextDueAt ?? 0;
+
+    await expect(value.store.materializeDue({ now: dueAt }))
+      .rejects.toThrow("authority proof unavailable");
+    authorityState = "closed";
+    expect(await value.store.materializeDue({ now: dueAt })).toEqual([]);
+    expect(value.store.listOccurrences(value.sessionId, created.id)).toEqual([]);
+    expect(value.store.require(value.sessionId, created.id).nextDueAt).toBe(dueAt);
+    expect(value.database.query("SELECT COUNT(*) AS count FROM queue_entries").get())
+      .toEqual({ count: 0 });
+    expect(seen.at(-1)).toMatchObject({
+      processGeneration: 1,
+      provider: "claude",
+      providerThreadId: `thread-${value.sessionId}`,
+      sessionId: value.sessionId,
+    });
+
+    authorityState = "live";
+    await expect(value.store.materializeDue({ now: dueAt })).resolves.toMatchObject([{
+      occurrence: { taskId: created.id },
+      queue: { sessionId: value.sessionId },
+    }]);
+  });
+
+  test("requires positive exact-generation Devin authority and rechecks it at commit", async () => {
+    const unproven = fixture();
+    const unprovenTask = createTask(unproven);
+    unproven.database.query("UPDATE sessions SET provider_v39='devin'").run();
+    unproven.database.query("UPDATE profiles SET state='signed_out'").run();
+    expect(unproven.store.nextDueAt()).toBe(unprovenTask.nextDueAt);
+    expect(await unproven.store.materializeDue({
+      now: unprovenTask.nextDueAt ?? 0,
+    })).toEqual([]);
+    expect(unproven.store.require(unproven.sessionId, unprovenTask.id).nextDueAt)
+      .toBe(unprovenTask.nextDueAt);
+
+    const loadableAuthorities: SessionTaskExecutionAuthority[] = [];
+    const loadable = fixture({
+      isExecutionAuthorityLive: (authority) => {
+        loadableAuthorities.push(authority);
+        return authority.provider === "devin";
+      },
+    });
+    const loadableTask = createTask(loadable);
+    loadable.database.query("UPDATE sessions SET provider_v39='devin'").run();
+    loadable.database.query("UPDATE profiles SET state='login_pending'").run();
+    await expect(loadable.store.materializeDue({
+      now: loadableTask.nextDueAt ?? 0,
+    })).resolves.toMatchObject([{
+      occurrence: { taskId: loadableTask.id },
+      queue: { sessionId: loadable.sessionId },
+    }]);
+    expect(loadableAuthorities).toHaveLength(2);
+    expect(loadableAuthorities[0]).toMatchObject({
+      processGeneration: 1,
+      provider: "devin",
+      providerThreadId: `thread-${loadable.sessionId}`,
+      sessionId: loadable.sessionId,
+    });
+
+    let oracleCalls = 0;
+    const closedDuringReview = fixture({
+      isExecutionAuthorityLive: (authority) => {
+        expect(authority.provider).toBe("devin");
+        oracleCalls += 1;
+        return oracleCalls === 1;
+      },
+    });
+    const closedTask = createTask(closedDuringReview);
+    closedDuringReview.database.query("UPDATE sessions SET provider_v39='devin'").run();
+    expect(await closedDuringReview.store.materializeDue({
+      now: closedTask.nextDueAt ?? 0,
+    })).toEqual([]);
+    expect(oracleCalls).toBe(2);
+    expect(closedDuringReview.store.listOccurrences(
+      closedDuringReview.sessionId,
+      closedTask.id,
+    )).toEqual([]);
+
+    const seenGenerations: number[] = [];
+    let generationFixture: Fixture | undefined;
+    const generationChanged = fixture({
+      isExecutionAuthorityLive: (authority) => {
+        seenGenerations.push(authority.processGeneration);
+        return authority.processGeneration === 1;
+      },
+      resolveProjectDirectory: async (root) => {
+        generationFixture?.database.query(
+          "UPDATE profiles SET process_generation=2",
+        ).run();
+        return root;
+      },
+    });
+    generationFixture = generationChanged;
+    const generationTask = createTask(generationChanged);
+    generationChanged.database.query("UPDATE sessions SET provider_v39='devin'").run();
+    expect(await generationChanged.store.materializeDue({
+      now: generationTask.nextDueAt ?? 0,
+    })).toEqual([]);
+    expect(seenGenerations).toEqual([1, 2]);
+    expect(generationChanged.database.query(
+      "SELECT COUNT(*) AS count FROM queue_entries",
+    ).get()).toEqual({ count: 0 });
   });
 
   test("rolls back queue allocation, occurrence, and due advance as one unit", async () => {

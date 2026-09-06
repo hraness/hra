@@ -167,6 +167,47 @@ describe("domain laws", () => {
     expect(localCommandSchema.safeParse(abandon).success).toBe(false);
   });
 
+  test("keeps owner memory commands on the same closed values as provider memory tools", () => {
+    const idempotencyKey = "00000000-0000-4000-8000-000000000101";
+    const remember = {
+      kind: "memory.remember",
+      session: "release",
+      idempotencyKey,
+      value: {
+        key: "architecture.boundary",
+        title: "Authority boundary",
+        summary: "The coordinator owns memory access.",
+        body: "Neither client selects an Oh store.",
+      },
+    };
+    expect(localCommandSchema.safeParse(remember).success).toBe(true);
+    expect(localCommandSchema.safeParse({
+      kind: "memory.query",
+      session: "release",
+      value: { mode: "get", key: "architecture.boundary" },
+    }).success).toBe(true);
+    expect(localCommandSchema.safeParse({
+      kind: "memory.explain",
+      session: "release",
+      value: { queryId: `memq_${"a".repeat(32)}`, row: 0 },
+    }).success).toBe(true);
+    for (const widened of [
+      { ...remember, idempotencyKey: undefined },
+      { ...remember, value: { ...remember.value, path: "/tmp/oh.sqlite" } },
+      { ...remember, value: { ...remember.value, key: "Not A Key" } },
+      {
+        kind: "memory.query",
+        session: "release",
+        value: { mode: "list", programId: "arbitrary" },
+      },
+      {
+        kind: "memory.status",
+        session: "release",
+        authorityDigest: "a".repeat(64),
+      },
+    ]) expect(localCommandSchema.safeParse(widened).success).toBe(false);
+  });
+
   test("terminal mutation states are absorbing", () => {
     fc.assert(
       fc.property(fc.constantFrom("applied", "failed", "ambiguous", "cancelled", "reconciled"), fc.constantFrom(...mutationStateSchema.options), (from, to) => {

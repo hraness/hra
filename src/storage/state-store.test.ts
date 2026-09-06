@@ -22,6 +22,7 @@ import {
   SESSION_EVENT_MAX_BYTES,
   SESSION_EVENT_PUBLIC_MAX_BYTES,
   SESSION_EVENT_RETAIN_AGE_MS,
+  SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
 } from "../domain/session-events";
 import {
   accountUsageCounterSamples,
@@ -40,6 +41,15 @@ import {
 import { initializeProfilePaths, initializeStatePaths, resolveStatePaths } from "./paths";
 import {
   ATTENTION_NOTIFICATION_SNAPSHOT_LIMIT,
+  CONTROL_PLANE_RECONCILIATION_BATCH_LIMIT,
+  MEMORY_SUBMISSION_RETAIN_AGE_MS,
+  PEER_SESSION_ACTION_RETAIN_AGE_MS,
+  PEER_SESSION_HOP_LIMIT,
+  PEER_SESSION_HOURLY_ACTION_LIMIT,
+  PEER_SESSION_HOURLY_DISTINCT_TARGET_LIMIT,
+  PEER_SESSION_PROJECT_HOURLY_ACTION_LIMIT,
+  PEER_SESSION_RATE_WINDOW_MS,
+  PEER_SESSION_RETAINED_ACTION_LIMIT,
   USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
   USAGE_CLOUD_UPLOAD_ANCHOR_COUNT,
   USAGE_LOCAL_RETAIN_AGE_MS,
@@ -50,6 +60,7 @@ import {
   StateStore,
   type MachineTimeZoneResolver,
   type SecurityScrubCheckpointPolicy,
+  type SessionRecord,
 } from "./state-store";
 import { WORK_SCHEMA_SQL } from "./work-store";
 
@@ -65,6 +76,7 @@ afterEach(() => {
 
 async function fixture(
   options: Readonly<{
+    now?: () => number;
     resolveMachineTimeZone?: MachineTimeZoneResolver;
     securityScrubCheckpoint?: SecurityScrubCheckpointPolicy;
   }> = {},
@@ -73,7 +85,7 @@ async function fixture(
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const store = new StateStore(paths, {
-    now: (() => { let value = 1_000; return () => value++; })(),
+    now: options.now ?? (() => { let value = 1_000; return () => value++; })(),
     resolveMachineTimeZone: () => "America/Puerto_Rico",
     ...options,
   });
@@ -84,6 +96,9 @@ async function fixture(
 const dropProviderAuthorityObjectsForLegacyFeatureFixture = (database: Database): void => {
   database.exec(`
     PRAGMA foreign_keys=OFF;
+    DROP TRIGGER IF EXISTS session_provider_switch_session_update_guard;
+    DROP TRIGGER IF EXISTS session_provider_switch_session_delete_guard;
+    DROP TABLE IF EXISTS session_provider_switches;
     DROP TABLE session_mutation_authority_rebinds_v39;
     DROP TABLE session_provider_switch_source_releases;
     DROP TABLE session_provider_switch_seed_results;
@@ -292,6 +307,29 @@ async function prepareSignedOutSessionStart(
 const usageFingerprint = "a".repeat(64);
 const resetAccountFingerprint = (email: string): string =>
   createHash("sha256").update(email.trim().toLowerCase()).digest("hex");
+const testDigest = (value: string): string =>
+  createHash("sha256").update(value, "utf8").digest("hex");
+const peerIdempotencyKey = (index: number): string =>
+  `20000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+const codexRuntimeProfile = (
+  profile: Readonly<{ id: string; processGeneration: number }>,
+  observedAt = 2_000,
+) => ({
+  profileId: profile.id,
+  processGeneration: profile.processGeneration,
+  observedAt,
+  preset: "high" as const,
+  model: "gpt-6-astra",
+  reasoningEffort: "max" as const,
+  serviceTier: null,
+  fast: false,
+  approvalPolicy: "on-request" as const,
+  reviewMode: "auto_review" as const,
+  permissionProfile: ":workspace" as const,
+  computerUse: true as const,
+  pluginCapability: true as const,
+  enabledApps: [],
+});
 
 const prepareAuthorizedReset = (
   store: StateStore,
@@ -912,6 +950,7 @@ describe("StateStore", () => {
       attemptId: attempt.id,
       sessionId: session.id,
       profileGeneration: profile.processGeneration,
+      message: "legacy recovery",
       evidence: {
         baseline: { activeTurnId: null, providerUpdatedAt: 10, status: "idle" },
         clientMessageId: attempt.id,
@@ -942,10 +981,23 @@ describe("StateStore", () => {
         title: "Legacy recovery preset",
       },
       receipt: { turnId: "turn-legacy-recovery-preset" },
+      message: "legacy recovery",
       resolution: "proven_applied",
       resolutionEvidence: { providerUpdatedAt: 11, source: "thread/read" },
     });
     expect(recovered.state).toBe("idle");
+    expect(recovered.messageEvent).toMatchObject({
+      appended: true,
+      event: {
+        body: {
+          type: "user_message",
+          actor: "human",
+          text: "legacy recovery",
+        },
+      },
+    });
+    expect(store.readSessionMessageEventSource(session.id, attempt.id))
+      .toMatchObject({ actor: "human", sourceKind: "mutation" });
     expect(store.runtimeProfileForTurn(session.id, "turn-legacy-recovery-preset"))
       .toEqual(runtimeProfile);
     expect(store.requireSessionPresetRequirement(session.id).requirement)
@@ -1528,12 +1580,13 @@ describe("StateStore", () => {
       attemptId: send.id,
       sessionId: session.id,
       profileGeneration: profile.processGeneration,
+      message: "uncertain",
       evidence: {
         kind: "session.send",
         providerThreadId: "thread-restart",
         baseline: { providerUpdatedAt: 10, status: "idle", activeTurnId: null },
         clientMessageId: send.id,
-        messageDigest: "a".repeat(64),
+        messageDigest: createHash("sha256").update("uncertain").digest("hex"),
       },
     });
     expect(() => store.prepareMutation({
@@ -1848,6 +1901,18 @@ describe("StateStore", () => {
       preset: "high",
       fastEnabled: false,
       evidence: { kind: "session.start", projectId: project.id, clientMessageId: null, messageDigest: null },
+      hostCapabilities: {
+        preambleVersion: 1,
+        preambleDigest: "a".repeat(64),
+        manifestVersion: 1,
+        manifestDigest: "b".repeat(64),
+      },
+    });
+    expect(store.requireSessionHostCapabilityBinding(session.id)).toMatchObject({
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
     });
     expect(store.readMutation("00000000-0000-4000-8000-000000000610")).toMatchObject({
       state: "effect_started",
@@ -1949,6 +2014,303 @@ describe("StateStore", () => {
       providerThreadId: "thread-successor-lineage",
       state: "recovery_required",
     });
+  });
+
+  test("completes a journaled provider switch through successor generations and attributes its seed", async () => {
+    const { store } = await fixture();
+    const source = signInProfile(store, "Switch successor source", "switch-source@example.com");
+    const target = signInProfile(store, "Switch successor target", "switch-target@example.com");
+    const created = store.createSession({
+      profileId: source.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const session = store.bindSession({
+      sessionId: created.id,
+      expectedRevision: created.revision,
+      providerThreadId: "thread-switch-successor-source",
+      state: "idle",
+    });
+    const targetRuntime = codexRuntimeProfile(target, 2_100);
+    const seedText = "Continue after the provider switch.";
+    const seedDigest = createHash("sha256")
+      .update("hra:session-transcript-seed:v1\0", "utf8")
+      .update(seedText, "utf8")
+      .digest("hex");
+    const hostCapabilities = {
+      preambleVersion: 1,
+      preambleDigest: testDigest("switch preamble"),
+      manifestVersion: 1,
+      manifestDigest: testDigest("switch manifest"),
+    };
+    const journal = store.beginSessionProviderSwitch({
+      idempotencyKey: peerIdempotencyKey(71_000),
+      request: {
+        sessionId: session.id,
+        provider: "codex",
+        requestedPreset: "high",
+        targetProfileId: target.id,
+      },
+      source: {
+        profileId: source.id,
+        processGeneration: source.processGeneration,
+        provider: "codex",
+        preset: "high",
+        providerThreadId: "thread-switch-successor-source",
+        sessionRevision: session.revision,
+      },
+      target: {
+        profileId: target.id,
+        processGeneration: target.processGeneration,
+        provider: "codex",
+        preset: "high",
+        review: {
+          reviewId: "71000000-0000-4000-8000-000000000001",
+          kind: "session_start",
+          effectiveRuntimeProfile: targetRuntime,
+        },
+      },
+      fastEnabled: false,
+      hostCapabilities,
+      transcriptDigest: testDigest("switch transcript"),
+      seed: {
+        text: seedText,
+        digest: seedDigest,
+        includedRecords: 1,
+        omittedRecords: 0,
+      },
+    });
+    store.recordJournaledSessionProviderSwitchTarget({
+      attemptId: journal.attemptId,
+      providerThreadId: "thread-switch-successor-target",
+      state: "idle",
+      runtimeProfile: targetRuntime,
+    });
+    store.beginSessionProviderSwitchSourceRelease(journal.attemptId);
+    store.recordJournaledSessionProviderSwitchSourceReleased(journal.attemptId);
+
+    const workStore = {
+      prepareProfileAuthorityChange: () => [],
+    } as unknown as Parameters<StateStore["advanceProfileGenerationWithWorkRetirement"]>[2];
+    const nextSource = store.advanceProfileGenerationWithWorkRetirement(
+      source.id,
+      source.processGeneration,
+      workStore,
+      { preserveSessionMutationAuthorities: true },
+    ).profile;
+    const nextTarget = store.advanceProfileGenerationWithWorkRetirement(
+      target.id,
+      target.processGeneration,
+      workStore,
+      { preserveSessionMutationAuthorities: true },
+    ).profile;
+    expect(nextSource.processGeneration).toBe(source.processGeneration + 1);
+    expect(nextTarget.processGeneration).toBe(target.processGeneration + 1);
+    expect(store.isJournaledSessionProviderSwitchAuthorityCurrent(journal.attemptId)).toBe(true);
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths);
+    stores.push(restarted);
+    const completed = restarted.completeJournaledSessionProviderSwitch(journal.attemptId);
+    expect(completed.phase).toBe("applied");
+    expect(restarted.requireSession(session.id)).toMatchObject({
+      profileId: target.id,
+      providerThreadId: "thread-switch-successor-target",
+      state: "idle",
+    });
+    expect(restarted.latestSessionRuntimeProfile(session.id)?.profile)
+      .toEqual(targetRuntime);
+    const switchedEvent = restarted.listSessionEvents({
+      sessionId: session.id,
+      afterSequence: 0,
+    }).events.find((event) => event.body.type === "provider_switched");
+    expect(switchedEvent).toMatchObject({
+      accountId: target.id,
+      providerGeneration: nextTarget.processGeneration,
+      body: { type: "provider_switched" },
+    });
+
+    restarted.beginSessionProviderSwitchSeed(journal.attemptId);
+    const seedAttempt = restarted.prepareMutation({
+      kind: "session.send",
+      authorityId: session.id,
+      authorityGeneration: nextTarget.processGeneration,
+      request: { message: seedText },
+      idempotencyKey: journal.seed.idempotencyKey,
+    });
+    const currentTargetRuntime = {
+      ...targetRuntime,
+      processGeneration: nextTarget.processGeneration,
+      observedAt: 2_200,
+    };
+    const seedEvidence = restarted.beginSessionMutationEffect({
+      attemptId: seedAttempt.id,
+      sessionId: session.id,
+      profileGeneration: nextTarget.processGeneration,
+      message: seedText,
+      evidence: {
+        kind: "session.send",
+        providerThreadId: "thread-switch-successor-target",
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: seedAttempt.id,
+        messageDigest: testDigest(seedText),
+        runtimeProfile: currentTargetRuntime,
+      },
+    });
+    expect(seedEvidence.evidence).toMatchObject({ messageActor: "provider_switch" });
+    const switchedSession = restarted.requireSession(session.id);
+    const seedEvent = restarted.completeSessionTurnEffect({
+      attemptId: seedAttempt.id,
+      sessionId: session.id,
+      accountId: target.id,
+      providerGeneration: nextTarget.processGeneration,
+      providerConnectionId: null,
+      expectedSessionRevision: switchedSession.revision,
+      applyResponseState: false,
+      turnId: "turn-switch-successor-seed",
+      turnStatus: "completed",
+      runtimeProfile: currentTargetRuntime,
+      message: seedText,
+      receipt: { turnId: "turn-switch-successor-seed" },
+    });
+    expect(seedEvent.event.body).toMatchObject({
+      type: "user_message",
+      actor: "provider_switch",
+      text: seedText,
+    });
+    expect(restarted.sessionMessageActorForSource(session.id, seedAttempt.id))
+      .toBe("provider_switch");
+    expect(restarted.finishSessionProviderSwitchSeed({
+      attemptId: journal.attemptId,
+      state: "applied",
+      turnId: "turn-switch-successor-seed",
+      finalResult: { turnId: "turn-switch-successor-seed" },
+    }).seed.state).toBe("applied");
+  });
+
+  test("journaled Codex to Devin switches atomically remove the host capability binding", async () => {
+    const { store } = await fixture();
+    const source = signInProfile(store, "Codex switch source", "codex-source@example.com");
+    const target = signInProfile(store, "Devin switch target", "devin-target@example.com");
+    const created = store.createSession({
+      profileId: source.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const session = store.bindSession({
+      sessionId: created.id,
+      expectedRevision: created.revision,
+      providerThreadId: "thread-codex-source",
+      state: "idle",
+    });
+    const sourceHostCapabilities = {
+      preambleVersion: 1,
+      preambleDigest: testDigest("source Codex preamble"),
+      manifestVersion: 1,
+      manifestDigest: testDigest("source Codex manifest"),
+    };
+    store.bindSessionHostCapabilities({
+      sessionId: session.id,
+      ...sourceHostCapabilities,
+    });
+    const targetRuntime = {
+      devinVersion: "3000.6.14" as const,
+      isolatedHome: true as const,
+      model: "gpt-6-astra" as const,
+      observedAt: 2_300,
+      preset: "astra" as const,
+      processGeneration: target.processGeneration,
+      profileId: target.id,
+      protocolVersion: 1 as const,
+      reasoningEffort: "provider-default" as const,
+    };
+    const seedText = "Continue in the reviewed Devin target.";
+    const journal = store.beginSessionProviderSwitch({
+      idempotencyKey: peerIdempotencyKey(71_001),
+      providerAuthentication: {
+        profileId: target.id,
+        processGeneration: target.processGeneration,
+        provider: "devin",
+        signedIn: true,
+      },
+      request: {
+        sessionId: session.id,
+        provider: "devin",
+        requestedPreset: "astra",
+        targetProfileId: target.id,
+      },
+      source: {
+        profileId: source.id,
+        processGeneration: source.processGeneration,
+        provider: "codex",
+        preset: "high",
+        providerThreadId: "thread-codex-source",
+        sessionRevision: session.revision,
+        hostCapabilities: sourceHostCapabilities,
+      },
+      target: {
+        profileId: target.id,
+        processGeneration: target.processGeneration,
+        provider: "devin",
+        preset: "astra",
+        review: {
+          reviewId: "71001000-0000-4000-8000-000000000001",
+          kind: "session_start",
+          effectiveRuntimeProfile: targetRuntime,
+        },
+      },
+      fastEnabled: false,
+      transcriptDigest: testDigest("Codex to Devin transcript"),
+      seed: {
+        text: seedText,
+        digest: createHash("sha256")
+          .update("hra:session-transcript-seed:v1\0", "utf8")
+          .update(seedText, "utf8")
+          .digest("hex"),
+        includedRecords: 1,
+        omittedRecords: 0,
+      },
+    });
+    expect(journal.hostCapabilities).toBeUndefined();
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        `SELECT target_provider,target_preset,target_provider_v40,target_preset_v40,
+                target_preamble_version_v40,target_preamble_digest_v40,
+                target_manifest_version_v40,target_manifest_digest_v40
+         FROM session_provider_switches WHERE attempt_id=?`,
+      ).get(journal.attemptId)).toEqual({
+        target_provider: "codex",
+        target_preset: "ultra",
+        target_provider_v40: "devin",
+        target_preset_v40: "astra",
+        target_preamble_version_v40: null,
+        target_preamble_digest_v40: null,
+        target_manifest_version_v40: null,
+        target_manifest_digest_v40: null,
+      });
+    } finally {
+      inspector.close(false);
+    }
+
+    store.recordJournaledSessionProviderSwitchTarget({
+      attemptId: journal.attemptId,
+      providerThreadId: "thread-devin-target",
+      state: "idle",
+      runtimeProfile: targetRuntime,
+    });
+    store.beginSessionProviderSwitchSourceRelease(journal.attemptId);
+    store.recordJournaledSessionProviderSwitchSourceReleased(journal.attemptId);
+    expect(store.completeJournaledSessionProviderSwitch(journal.attemptId).phase).toBe("applied");
+    expect(store.requireSession(session.id)).toMatchObject({
+      preset: "astra",
+      profileId: target.id,
+      provider: "devin",
+      providerThreadId: "thread-devin-target",
+    });
+    expect(store.readSessionHostCapabilityBinding(session.id)).toBeNull();
   });
 
   test("advances a terminal generation-zero unresolved session start on consecutive restarts", async () => {
@@ -2606,6 +2968,12 @@ describe("StateStore", () => {
       transcriptDigest,
       turnId: "claude-turn",
     };
+    const targetHostCapabilities = {
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
+    };
     expect(() => store.completeSessionProviderSwitch({
       attemptId: switchAttempt.id,
       expectedSessionRevision: before.revision,
@@ -2613,6 +2981,7 @@ describe("StateStore", () => {
       profileId: claudeAccount.id,
       provider: "claude",
       providerThreadId: "claude-thread",
+      hostCapabilities: targetHostCapabilities,
       receipt: { ...switchReceipt, turnId: "wrong-turn" },
       runtimeProfile: claudeProfile,
       seedTurnId: "claude-turn",
@@ -2627,6 +2996,7 @@ describe("StateStore", () => {
       profileId: claudeAccount.id,
       provider: "claude",
       providerThreadId: "claude-thread",
+      hostCapabilities: targetHostCapabilities,
       receipt: switchReceipt,
       runtimeProfile: claudeProfile,
       seedTurnId: "claude-turn",
@@ -2640,6 +3010,7 @@ describe("StateStore", () => {
       profileId: claudeAccount.id,
       provider: "claude",
       providerThreadId: "claude-thread",
+      hostCapabilities: targetHostCapabilities,
       receipt: switchReceipt,
       runtimeProfile: claudeProfile,
       seedTurnId: "claude-turn",
@@ -2669,6 +3040,12 @@ describe("StateStore", () => {
         },
       },
       state: "applied",
+    });
+    expect(store.requireSessionHostCapabilityBinding(started.id)).toMatchObject({
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
     });
 
     // A preset the target cannot run is refused before anything is written.
@@ -2996,6 +3373,12 @@ describe("StateStore", () => {
       profileId: account.id,
       provider: "codex",
       providerThreadId: "codex-target-thread",
+      hostCapabilities: {
+        preambleVersion: 1,
+        preambleDigest: "c".repeat(64),
+        manifestVersion: 1,
+        manifestDigest: "d".repeat(64),
+      },
       receipt: {
         from: { account: account.id, preset: "astra", provider: "devin" },
         providerThreadId: "codex-target-thread",
@@ -3028,6 +3411,113 @@ describe("StateStore", () => {
         result: { from: { provider: "devin" }, session: { provider: "codex" } },
         state: "applied",
       });
+    expect(store.requireSessionHostCapabilityBinding(started.id)).toMatchObject({
+      preambleDigest: "c".repeat(64),
+      manifestDigest: "d".repeat(64),
+    });
+
+    const returnAttempt = store.prepareMutation({
+      authorityGeneration: account.processGeneration,
+      authorityId: started.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006b4",
+      kind: "session.switch",
+      request: { preset: "astra", provider: "devin" },
+    });
+    const returnSeedText = "Continue after switching back to Devin.";
+    const returnSeedDigest = createHash("sha256")
+      .update("hra:session-transcript-seed:v1\0", "utf8")
+      .update(returnSeedText, "utf8")
+      .digest("hex");
+    const returnTranscriptDigest = createHash("sha256")
+      .update("Codex source switch transcript")
+      .digest("hex");
+    store.beginSessionProviderSwitchEffect({
+      attemptId: returnAttempt.id,
+      evidence: {
+        daemonGeneration: 0,
+        kind: "session.switch",
+        requestedAccountId: null,
+        requestedPreset: "astra",
+        runtimeProfile: devinProfile,
+        seedDigest: returnSeedDigest,
+        seedIncludedRecords: 1,
+        seedOmittedRecords: 0,
+        sourcePreset: "high",
+        sourceProcessGeneration: account.processGeneration,
+        sourceProfileId: account.id,
+        sourceProvider: "codex",
+        sourceProviderThreadId: "codex-target-thread",
+        targetPreset: "astra",
+        targetProcessGeneration: account.processGeneration,
+        targetProfileId: account.id,
+        targetProvider: "devin",
+        transcriptDigest: returnTranscriptDigest,
+      },
+      providerAuthentication: {
+        profileId: account.id,
+        processGeneration: account.processGeneration,
+        provider: "devin",
+        signedIn: true,
+      },
+      sessionId: started.id,
+    });
+    store.recordSessionProviderSwitchTarget({
+      attemptId: returnAttempt.id,
+      providerThreadId: "devin-return-thread",
+      sessionId: started.id,
+    });
+    store.recordSessionProviderSwitchSeedIntent({
+      attemptId: returnAttempt.id,
+      providerThreadId: "devin-return-thread",
+      runtimeProfile: devinProfile,
+      seedText: returnSeedText,
+      sessionId: started.id,
+    });
+    store.recordSessionProviderSwitchSeedResult({
+      attemptId: returnAttempt.id,
+      providerThreadId: "devin-return-thread",
+      runtimeProfile: devinProfile,
+      sessionId: started.id,
+      turnId: "devin-return-seed-turn",
+      turnStatus: "completed",
+    });
+    store.recordSessionProviderSwitchSourceReleased({
+      attemptId: returnAttempt.id,
+      sessionId: started.id,
+    });
+    const beforeReturn = store.requireSession(started.id);
+    expect(store.completeSessionProviderSwitch({
+      attemptId: returnAttempt.id,
+      expectedSessionRevision: beforeReturn.revision,
+      preset: "astra",
+      profileId: account.id,
+      provider: "devin",
+      providerThreadId: "devin-return-thread",
+      receipt: {
+        from: { account: account.id, preset: "high", provider: "codex" },
+        providerThreadId: "devin-return-thread",
+        request: { accountId: null, preset: "astra", provider: "devin" },
+        seed: {
+          digest: returnSeedDigest,
+          includedRecords: 1,
+          omittedRecords: 0,
+          status: "completed",
+        },
+        sessionId: started.id,
+        to: { account: account.id, preset: "astra", provider: "devin" },
+        transcriptDigest: returnTranscriptDigest,
+        turnId: "devin-return-seed-turn",
+      },
+      runtimeProfile: devinProfile,
+      seedTurnId: "devin-return-seed-turn",
+      sessionId: started.id,
+      state: "idle",
+    })).toMatchObject({
+      preset: "astra",
+      provider: "devin",
+      providerThreadId: "devin-return-thread",
+    });
+    expect(store.readSessionHostCapabilityBinding(started.id)).toBeNull();
   });
 
   test("refuses a session-start evidence row whose profile names another provider", async () => {
@@ -3510,12 +4000,16 @@ describe("StateStore", () => {
     }
     store.completeQueueEffect({
       queueId: applied.queued.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
       expectedEvidenceDigest: applied.evidence.digest,
       expectedSessionRevision: session.revision,
       applyResponseState: false,
       turnId: "turn-queue-body-custody",
       turnStatus: "completed",
       runtimeProfile: runtime,
+      message: "applied queue body sentinel",
       receipt: { turnId: "turn-queue-body-custody" },
     });
     expect(store.requireQueue(applied.queued.id)).toMatchObject({
@@ -3799,7 +4293,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -4556,12 +5050,13 @@ describe("StateStore", () => {
       attemptId: sendAttempt.id,
       sessionId: sendSession.id,
       profileGeneration: profile.processGeneration,
+      message: "send",
       evidence: {
         kind: "session.send",
         providerThreadId: "thread-send-cas",
         baseline: { providerUpdatedAt: 10, status: "idle", activeTurnId: null },
         clientMessageId: sendAttempt.id,
-        messageDigest: "a".repeat(64),
+        messageDigest: createHash("sha256").update("send").digest("hex"),
         runtimeProfile: runtime,
       },
     });
@@ -4569,11 +5064,15 @@ describe("StateStore", () => {
     expect(() => store.completeSessionTurnEffect({
       attemptId: sendAttempt.id,
       sessionId: sendSession.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
       expectedSessionRevision: sendSession.revision,
       applyResponseState: true,
       turnId: "turn-send-cas",
       turnStatus: "inProgress",
       runtimeProfile: runtime,
+      message: "send",
       receipt: { turnId: "turn-send-cas" },
     })).toThrow("SESSION_TURN_STATE_CAS_CONFLICT");
     expect(store.readMutation(sendKey)).toMatchObject({ state: "effect_started" });
@@ -4602,17 +5101,276 @@ describe("StateStore", () => {
     store.updateSessionMetadata({ sessionId: queueSession.id, expectedRevision: queueSession.revision, fastEnabled: true });
     expect(() => store.completeQueueEffect({
       queueId: queue.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
       expectedEvidenceDigest: queueEvidence.digest,
       expectedSessionRevision: queueSession.revision,
       applyResponseState: true,
       turnId: "turn-queue-cas",
       turnStatus: "inProgress",
       runtimeProfile: runtime,
+      message: "queued",
       receipt: { turnId: "turn-queue-cas" },
     })).toThrow("QUEUE_EFFECT_SESSION_CAS_CONFLICT");
     expect(store.requireQueue(queue.id)).toMatchObject({ state: "dispatching" });
     expect(store.latestSessionRuntimeProfile(queueSession.id)).toBeNull();
     expect(store.requireSession(queueSession.id)).toMatchObject({ state: "idle", fastEnabled: true });
+  });
+
+  test("commits sanitized send, steer, and queue message events with their effect receipts", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Atomic message events", "atomic-events@example.com");
+    const runtime = codexRuntimeProfile(profile);
+    const bind = (
+      thread: string,
+      state: "active" | "idle",
+      activeTurnId?: string,
+    ) => {
+      const created = store.createSession({
+        profileId: profile.id,
+        preset: "high",
+        fastEnabled: false,
+      });
+      return store.bindSession({
+        sessionId: created.id,
+        expectedRevision: created.revision,
+        providerThreadId: thread,
+        state,
+        ...(activeTurnId === undefined ? {} : { activeTurnId }),
+      });
+    };
+
+    const sendSession = bind("thread-atomic-send", "idle");
+    const sendMessage = `/Users/private/project/${"x".repeat(
+      SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
+    )}`;
+    const sendKey = peerIdempotencyKey(70_001);
+    const sendAttempt = store.prepareMutation({
+      kind: "session.send",
+      authorityId: sendSession.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: sendMessage },
+      idempotencyKey: sendKey,
+    });
+    store.beginSessionMutationEffect({
+      attemptId: sendAttempt.id,
+      sessionId: sendSession.id,
+      profileGeneration: profile.processGeneration,
+      message: sendMessage,
+      evidence: {
+        kind: "session.send",
+        providerThreadId: "thread-atomic-send",
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: sendAttempt.id,
+        messageDigest: testDigest(sendMessage),
+        runtimeProfile: runtime,
+      },
+    });
+    expect(store.bumpAutorespondCounter(sendSession.id)).toBe(1);
+    expect(store.bumpAutorespondCounter(sendSession.id)).toBe(2);
+    expect(() => store.completeSessionTurnEffect({
+      attemptId: sendAttempt.id,
+      sessionId: sendSession.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      expectedSessionRevision: sendSession.revision,
+      applyResponseState: false,
+      turnId: "turn-atomic-send",
+      turnStatus: "completed",
+      runtimeProfile: runtime,
+      message: `${sendMessage}changed`,
+      receipt: { turnId: "turn-atomic-send" },
+    })).toThrow("SESSION_MESSAGE_DIGEST_MISMATCH");
+    expect(store.readMutation(sendKey)?.state).toBe("effect_started");
+    expect(store.readSessionMessageEventSource(sendSession.id, sendAttempt.id)).toBeNull();
+    expect(store.listSessionEvents({ sessionId: sendSession.id, afterSequence: 0 }).events)
+      .toEqual([]);
+    expect(store.latestSessionRuntimeProfile(sendSession.id)).toBeNull();
+    expect(store.readAutorespondBudgets(sendSession.id).consecutive).toBe(2);
+
+    const sent = store.completeSessionTurnEffect({
+      attemptId: sendAttempt.id,
+      sessionId: sendSession.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      expectedSessionRevision: sendSession.revision,
+      applyResponseState: false,
+      turnId: "turn-atomic-send",
+      turnStatus: "completed",
+      runtimeProfile: runtime,
+      message: sendMessage,
+      receipt: { turnId: "turn-atomic-send" },
+    });
+    expect(sent).toMatchObject({
+      appended: true,
+      event: {
+        body: {
+          type: "user_message",
+          actor: "human",
+          text: "[local-path]",
+          omittedCharacters: sendMessage.length
+            - SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
+        },
+      },
+    });
+    expect(store.readAutorespondBudgets(sendSession.id).consecutive).toBe(0);
+    expect(store.bumpAutorespondCounter(sendSession.id)).toBe(1);
+    expect(store.appendSessionUserMessageEventOnce({
+      sourceId: sendAttempt.id,
+      sessionId: sendSession.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      turnId: "turn-atomic-send",
+      message: sendMessage,
+    })).toEqual({ ...sent, appended: false });
+    expect(store.readAutorespondBudgets(sendSession.id).consecutive).toBe(1);
+
+    const steerSession = bind("thread-atomic-steer", "active", "turn-atomic-steer");
+    const steerMessage = "sk_testabcdefgh";
+    const steerKey = peerIdempotencyKey(70_002);
+    const steerAttempt = store.prepareMutation({
+      kind: "session.steer",
+      authorityId: steerSession.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: steerMessage },
+      idempotencyKey: steerKey,
+    });
+    store.beginSessionMutationEffect({
+      attemptId: steerAttempt.id,
+      sessionId: steerSession.id,
+      profileGeneration: profile.processGeneration,
+      message: steerMessage,
+      evidence: {
+        kind: "session.steer",
+        providerThreadId: "thread-atomic-steer",
+        baseline: {
+          providerUpdatedAt: null,
+          status: "active",
+          activeTurnId: "turn-atomic-steer",
+        },
+        activeTurnId: "turn-atomic-steer",
+        clientMessageId: steerAttempt.id,
+        messageDigest: testDigest(steerMessage),
+      },
+    });
+    expect(store.completeSessionSteerEffect({
+      attemptId: steerAttempt.id,
+      sessionId: steerSession.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      turnId: "turn-atomic-steer",
+      message: steerMessage,
+      receipt: { steered: true, activeTurnId: "turn-atomic-steer" },
+    })).toMatchObject({
+      appended: true,
+      event: { body: { type: "user_message", actor: "human", text: "[protected]" } },
+    });
+
+    const queueSession = bind("thread-atomic-queue", "idle");
+    const queueMessage = "line one\nright\u202Eleft\u0000done";
+    const queue = store.enqueue(queueSession.id, queueMessage);
+    const queueEvidence = store.beginQueueEffect({
+      queueId: queue.id,
+      sessionId: queueSession.id,
+      profileGeneration: profile.processGeneration,
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: queue.id,
+        sessionId: queueSession.id,
+        providerThreadId: "thread-atomic-queue",
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: queue.id,
+        messageDigest: testDigest(queueMessage),
+        runtimeProfile: runtime,
+      },
+    });
+    expect(store.completeQueueEffect({
+      queueId: queue.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      expectedEvidenceDigest: queueEvidence.digest,
+      expectedSessionRevision: queueSession.revision,
+      applyResponseState: false,
+      turnId: "turn-atomic-queue",
+      turnStatus: "completed",
+      runtimeProfile: runtime,
+      message: queueMessage,
+      receipt: { turnId: "turn-atomic-queue" },
+    })).toMatchObject({
+      appended: true,
+      event: {
+        body: {
+          type: "user_message",
+          actor: "human",
+          text: "line one\nright�left�done",
+        },
+      },
+    });
+
+    const cutoffSecrets = [
+      ["aws", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"],
+      ["google", `AIza${"Sy".repeat(17)}A`],
+      ["npm", `npm_${"Ab9".repeat(12)}`],
+    ] as const;
+    for (const [index, [name, secret]] of cutoffSecrets.entries()) {
+      const cutoffMessage = `${" ".repeat(
+        SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS - secret.length + 1,
+      )}${secret} tail`;
+      expect(cutoffMessage.slice(0, SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS))
+        .toEndWith(secret.slice(0, -1));
+      const cutoffSession = bind(`thread-atomic-cutoff-${name}`, "idle");
+      const cutoffKey = peerIdempotencyKey(70_010 + index);
+      const cutoffAttempt = store.prepareMutation({
+        kind: "session.send",
+        authorityId: cutoffSession.id,
+        authorityGeneration: profile.processGeneration,
+        request: { message: cutoffMessage },
+        idempotencyKey: cutoffKey,
+      });
+      store.beginSessionMutationEffect({
+        attemptId: cutoffAttempt.id,
+        sessionId: cutoffSession.id,
+        profileGeneration: profile.processGeneration,
+        message: cutoffMessage,
+        evidence: {
+          kind: "session.send",
+          providerThreadId: `thread-atomic-cutoff-${name}`,
+          baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+          clientMessageId: cutoffAttempt.id,
+          messageDigest: testDigest(cutoffMessage),
+          runtimeProfile: runtime,
+        },
+      });
+      const cutoffResult = store.completeSessionTurnEffect({
+        attemptId: cutoffAttempt.id,
+        sessionId: cutoffSession.id,
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: null,
+        expectedSessionRevision: cutoffSession.revision,
+        applyResponseState: false,
+        turnId: `turn-atomic-cutoff-${name}`,
+        turnStatus: "completed",
+        runtimeProfile: runtime,
+        message: cutoffMessage,
+        receipt: { turnId: `turn-atomic-cutoff-${name}` },
+      });
+      if (cutoffResult.event.body.type !== "user_message") {
+        throw new Error("Expected a cutoff user-message event.");
+      }
+      expect(cutoffResult.event.body.text).toContain("[protected]");
+      expect(cutoffResult.event.body.text).not.toContain(secret.slice(0, -1));
+      expect(cutoffResult.event.body.omittedCharacters).toBe(
+        cutoffMessage.length - SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
+      );
+    }
   });
 
   test("reports whether any session is mid-turn as a cloud cadence hint", async () => {
@@ -6945,7 +7703,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       expect(inspector.query(
         "SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts",
       ).get()).toEqual({ count: 1 });
@@ -8599,8 +9357,8 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
-      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }, { version: 37 }, { version: 38 }, { version: 39 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }, { version: 37 }, { version: 38 }, { version: 39 }, { version: 40 }]);
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
         .toContainEqual(expect.objectContaining({ name: "attempt_sequence", type: "INTEGER", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
@@ -8707,6 +9465,14 @@ describe("StateStore", () => {
       pluginCapability: true,
       enabledApps: [],
     });
+    const legacyBinding = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      legacyBinding.query(
+        "UPDATE sessions SET preset_contract=? WHERE id=?",
+      ).run(legacyPresetContract, session.id);
+    } finally {
+      legacyBinding.close(false);
+    }
     store.recordSessionRuntimeProfile({
       sessionId: session.id,
       sourceKind: "turn_start",
@@ -8725,7 +9491,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:37:39");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:37:40");
     const migrated = new StateStore(paths, { now: () => 4_000 });
     stores.push(migrated);
     expect(migrated.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtimeProfile);
@@ -8738,7 +9504,7 @@ describe("StateStore", () => {
       expect(inspector.query(
         "SELECT profile_json FROM session_runtime_profiles WHERE source_id='historical-sol-source'",
       ).get()).toEqual({ profile_json: before });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
     } finally {
       inspector.close(false);
     }
@@ -8793,7 +9559,7 @@ describe("StateStore", () => {
         DROP TRIGGER work_signal_member_guard;
         DROP TABLE session_mutation_authority_rebinds_v39;
         ALTER TABLE sessions DROP COLUMN provider_v39;
-        DELETE FROM migrations WHERE version=39;
+        DELETE FROM migrations WHERE version IN (39,40);
         PRAGMA user_version=38;
       `);
       expect(legacy.query("PRAGMA table_info(sessions)").all())
@@ -8819,7 +9585,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       expect(inspector.query(
         "SELECT id,provider,provider_v39 FROM sessions ORDER BY id",
       ).all()).toEqual([
@@ -8880,7 +9646,7 @@ describe("StateStore", () => {
       ).run(legacyPresetContract, session.id);
       partial.exec(`
         PRAGMA ignore_check_constraints=OFF;
-        DELETE FROM migrations WHERE version=39;
+        DELETE FROM migrations WHERE version IN (39,40);
         PRAGMA user_version=38;
       `);
     } finally {
@@ -8953,7 +9719,7 @@ describe("StateStore", () => {
         .toContainEqual(expect.objectContaining({ name: "preset_contract", notnull: 1 }));
       expect(inspector.query("SELECT preset_contract FROM sessions WHERE id=?").get(session.id))
         .toEqual({ preset_contract: legacyPresetContract });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       expect(inspector.query("SELECT version FROM migrations WHERE version=38").get())
         .toEqual({ version: 38 });
       expect(inspector.query("SELECT version FROM migrations WHERE version=39").get())
@@ -9048,13 +9814,13 @@ describe("StateStore", () => {
     mainV35.exec(`
       DROP TABLE attention_email_policy;
       DROP TABLE notification_hours;
-      DELETE FROM migrations WHERE version IN (36,37,38,39);
+      DELETE FROM migrations WHERE version IN (36,37,38,39,40);
       PRAGMA user_version=35;
     `);
     mainV35.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:39");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:40");
     const migrated = new StateStore(paths, {
       now: () => 8_000,
       resolveMachineTimeZone: () => "UTC",
@@ -9068,7 +9834,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       expect(inspector.query(
         "SELECT provider_thread_id,recorded_at FROM session_provider_switch_targets WHERE attempt_id=?",
       ).get(attempt.id)).toEqual({
@@ -9076,13 +9842,14 @@ describe("StateStore", () => {
         recorded_at: 7_350,
       });
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 35 AND 39 ORDER BY version",
+        "SELECT version FROM migrations WHERE version BETWEEN 35 AND 40 ORDER BY version",
       ).all()).toEqual([
         { version: 35 },
         { version: 36 },
         { version: 37 },
         { version: 38 },
         { version: 39 },
+        { version: 40 },
       ]);
     } finally {
       inspector.close(false);
@@ -9106,14 +9873,14 @@ describe("StateStore", () => {
     dropProviderAuthorityObjectsForLegacyFeatureFixture(legacy);
     legacy.exec(`
       DROP TABLE attention_email_policy;
-      DELETE FROM migrations WHERE version IN (36,37,38,39);
+      DELETE FROM migrations WHERE version IN (36,37,38,39,40);
       PRAGMA user_version=35;
     `);
     expect(providerSwitchSchemaObjectCount(legacy)).toBe(0);
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:39");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:40");
     const migrated = new StateStore(paths, {
       now: () => 9_000,
       resolveMachineTimeZone: () => {
@@ -9134,8 +9901,8 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(providerSwitchSchemaObjectCount(inspector)).toBe(32);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
     } finally {
       inspector.close(false);
     }
@@ -9153,13 +9920,13 @@ describe("StateStore", () => {
 
     const legacy = new Database(paths.database, { create: false, strict: true });
     legacy.exec(`
-      DELETE FROM migrations WHERE version IN (37,38,39);
+      DELETE FROM migrations WHERE version IN (37,38,39,40);
       PRAGMA user_version=36;
     `);
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:39");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:40");
 
     expect(() => new StateStore(paths))
       .toThrow("ATTENTION_EMAIL_POLICY_MIGRATION_OPT_IN_REFUSED");
@@ -9196,7 +9963,7 @@ describe("StateStore", () => {
 
     const legacy = new Database(paths.database, { create: false, strict: true });
     dropProviderAuthorityObjectsForLegacyFeatureFixture(legacy);
-    legacy.exec("DELETE FROM migrations WHERE version IN (37,38,39); PRAGMA user_version=36;");
+    legacy.exec("DELETE FROM migrations WHERE version IN (37,38,39,40); PRAGMA user_version=36;");
     const before = legacy.query(
       `SELECT h.start_minute,h.end_minute,h.time_zone,h.revision AS hours_revision,
               e.enabled,e.revision AS email_revision,e.created_at,e.updated_at
@@ -9206,7 +9973,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:39");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:40");
     const migrated = new StateStore(paths, {
       now: () => 12_000,
       resolveMachineTimeZone: () => {
@@ -9233,8 +10000,8 @@ describe("StateStore", () => {
                 e.enabled,e.revision AS email_revision,e.created_at,e.updated_at
          FROM notification_hours h JOIN attention_email_policy e ON h.singleton=e.singleton`,
       ).get()).toEqual(before);
-      expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(providerSwitchSchemaObjectCount(inspector)).toBe(32);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
     } finally {
       inspector.close(false);
     }
@@ -9254,7 +10021,7 @@ describe("StateStore", () => {
     dropProviderAuthorityObjectsForLegacyFeatureFixture(lookalike);
     lookalike.exec(`
       CREATE INDEX attention_email_policy_untrusted ON attention_email_policy(enabled);
-      DELETE FROM migrations WHERE version IN (37,38,39);
+      DELETE FROM migrations WHERE version IN (37,38,39,40);
       PRAGMA user_version=36;
     `);
     lookalike.close(false);
@@ -9367,13 +10134,13 @@ describe("StateStore", () => {
     legacy.exec(`
       DROP TABLE attention_email_policy;
       DROP TABLE notification_hours;
-      DELETE FROM migrations WHERE version BETWEEN 35 AND 39;
+      DELETE FROM migrations WHERE version BETWEEN 35 AND 40;
       PRAGMA user_version=34;
     `);
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:39");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:40");
     const unchanged = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
@@ -9430,8 +10197,8 @@ describe("StateStore", () => {
     expect(readonly.readNotificationHours().timeZone).toBe("Asia/Tokyo");
     const schemaInspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(providerSwitchSchemaObjectCount(schemaInspector)).toBe(21);
-      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(providerSwitchSchemaObjectCount(schemaInspector)).toBe(32);
+      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
     } finally {
       schemaInspector.close(false);
     }
@@ -9447,7 +10214,7 @@ describe("StateStore", () => {
     legacy.exec(`
       DROP TABLE attention_email_policy;
       DROP TABLE notification_hours;
-      DELETE FROM migrations WHERE version BETWEEN 35 AND 39;
+      DELETE FROM migrations WHERE version BETWEEN 35 AND 40;
       PRAGMA user_version=34;
     `);
     legacy.close(false);
@@ -9754,13 +10521,13 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       expect(inspector.query("PRAGMA table_info(sessions)").all())
         .toContainEqual(expect.objectContaining({ name: "provider", dflt_value: "'codex'" }));
       expect(inspector.query("PRAGMA table_info(autorespond_evidence)").all())
         .toContainEqual(expect.objectContaining({ name: "path" }));
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 39 ORDER BY version",
+        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 40 ORDER BY version",
       ).all()).toEqual([
         { version: 30 },
         { version: 31 },
@@ -9772,6 +10539,7 @@ describe("StateStore", () => {
         { version: 37 },
         { version: 38 },
         { version: 39 },
+        { version: 40 },
       ]);
     } finally {
       inspector.close(false);
@@ -10065,7 +10833,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -10173,7 +10941,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -10288,7 +11056,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -10345,7 +11113,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }]);
@@ -10433,7 +11201,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -10539,7 +11307,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -10631,7 +11399,7 @@ describe("StateStore", () => {
     expect(reopened.listAutorespondEvidence({ sessionId: session.id })).toEqual([expectedEvidence]);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       expect(inspector.query("SELECT id,path,rule,model FROM autorespond_evidence").get()).toEqual({
         id: 7,
         path: "protocol",
@@ -10740,7 +11508,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -10781,6 +11549,7 @@ describe("StateStore", () => {
         { version: 37, applied_at: 2000 },
         { version: 38, applied_at: 2000 },
         { version: 39, applied_at: 2000 },
+        { version: 40, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
       expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
@@ -10827,7 +11596,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -10842,14 +11611,2759 @@ describe("StateStore", () => {
     }
   });
 
+  test("binds immutable host capabilities and keeps project memory authority content-free", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "memory-project");
+    await mkdir(root);
+    const project = await store.createProject("Memory project", root);
+    const profile = signInProfile(store, "Memory account", "memory@example.com");
+    const session = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+
+    expect(store.requirePeerSessionPolicy(session.id)).toMatchObject({
+      mode: "coordinate",
+      revision: 1,
+    });
+    expect(store.setPeerSessionPolicy({
+      sessionId: session.id,
+      expectedRevision: 1,
+      mode: "inspect",
+    })).toMatchObject({ mode: "inspect", revision: 2 });
+    expect(() => store.setPeerSessionPolicy({
+      sessionId: session.id,
+      expectedRevision: 1,
+      mode: "off",
+    })).toThrow("PEER_SESSION_POLICY_REVISION_CONFLICT");
+
+    expect(() => store.bindSessionHostCapabilities({
+      sessionId: session.id,
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
+    })).toThrow("SESSION_HOST_CAPABILITY_ADOPTION_MID_TURN");
+    const idleSession = store.bindSession({
+      sessionId: session.id,
+      expectedRevision: session.revision,
+      providerThreadId: "thread-capability-idle",
+      state: "idle",
+    });
+    const capability = store.bindSessionHostCapabilities({
+      sessionId: idleSession.id,
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
+    });
+    expect(store.bindSessionHostCapabilities({
+      sessionId: session.id,
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
+    })).toEqual(capability);
+    expect(() => store.bindSessionHostCapabilities({
+      sessionId: session.id,
+      preambleVersion: 2,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
+    })).toThrow("SESSION_HOST_CAPABILITY_BINDING_CONFLICT");
+    const active = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    store.setSessionTurnState({
+      sessionId: active.id,
+      expectedRevision: active.revision,
+      state: "active",
+      activeTurnId: "turn-mid-adoption",
+    });
+    expect(() => store.bindSessionHostCapabilities({
+      sessionId: active.id,
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
+    })).toThrow("SESSION_HOST_CAPABILITY_ADOPTION_MID_TURN");
+
+    const emptyHead = {
+      sequence: 0,
+      operationSha256: null,
+      headDigest: "c".repeat(64),
+    } as const;
+    const initialized = store.initializeProjectMemoryAuthority({
+      projectId: project.id,
+      authorityDigest: "d".repeat(64),
+      bindingDigest: "e".repeat(64),
+      head: emptyHead,
+    });
+    expect(store.initializeProjectMemoryAuthority({
+      projectId: project.id,
+      authorityDigest: "d".repeat(64),
+      bindingDigest: "e".repeat(64),
+      head: emptyHead,
+    })).toEqual(initialized);
+    const nextHead = {
+      sequence: 1,
+      operationSha256: "f".repeat(64),
+      headDigest: "1".repeat(64),
+    } as const;
+    const advanced = store.compareAndSwapProjectMemoryHead({
+      projectId: project.id,
+      expectedRevision: initialized.revision,
+      expectedHead: emptyHead,
+      nextHead,
+    });
+    expect(advanced).toMatchObject({ head: nextHead, revision: 2, syncState: "local_only" });
+    const settled = store.recordProjectMemorySyncObservation({
+      projectId: project.id,
+      expectedRevision: advanced.revision,
+      expectedHead: nextHead,
+      state: "settled",
+      exchangeHead: nextHead,
+    });
+    expect(settled).toMatchObject({
+      revision: 3,
+      syncState: "settled",
+      lastExchangeHead: nextHead,
+    });
+
+    const memoryRequestDigest = testDigest("memory request");
+    const memoryContentDigest = testDigest("PRIVATE MEMORY CONTENT");
+    const memoryKeyDigest = testDigest("private:key");
+    const memoryWorkingBindingDigest = testDigest("private working binding");
+    const memoryRecordDigest = testDigest("private memory record");
+    const memoryAttestationDigest = testDigest("private memory attestation");
+    const workingRemember = store.prepareMemorySubmission({
+      actorSessionId: session.id,
+      projectId: project.id,
+      kind: "remember",
+      requestDigest: memoryRequestDigest,
+      contentDigest: memoryContentDigest,
+      keyDigest: memoryKeyDigest,
+      workingBindingDigest: memoryWorkingBindingDigest,
+      workingEpoch: 1,
+      expectedHead: emptyHead,
+      idempotencyKey: peerIdempotencyKey(7_999),
+    }).record;
+    store.bindMemorySubmissionEffect({
+      submissionId: workingRemember.id,
+      effectRecordSha256: memoryRecordDigest,
+      attestationSha256: memoryAttestationDigest,
+      operationId: "memory_remember_private",
+    });
+    store.beginMemorySubmission(workingRemember.id);
+    store.settleMemorySubmission({
+      submissionId: workingRemember.id,
+      expectedState: "effect_started",
+      state: "applied",
+      outcomeCode: "remember_committed",
+      resultHead: nextHead,
+      receiptDigest: testDigest("private remember receipt"),
+    });
+
+    const prepared = store.prepareMemorySubmission({
+      actorSessionId: session.id,
+      projectId: project.id,
+      kind: "share",
+      requestDigest: memoryRequestDigest,
+      contentDigest: memoryContentDigest,
+      keyDigest: memoryKeyDigest,
+      workingBindingDigest: memoryWorkingBindingDigest,
+      workingEpoch: 1,
+      expectedHead: nextHead,
+      idempotencyKey: peerIdempotencyKey(8_000),
+    });
+    expect(store.prepareMemorySubmission({
+      actorSessionId: session.id,
+      projectId: project.id,
+      kind: "share",
+      requestDigest: memoryRequestDigest,
+      contentDigest: memoryContentDigest,
+      keyDigest: memoryKeyDigest,
+      workingBindingDigest: memoryWorkingBindingDigest,
+      workingEpoch: 1,
+      expectedHead: nextHead,
+      idempotencyKey: peerIdempotencyKey(8_000),
+    })).toMatchObject({ replay: true, record: { id: prepared.record.id } });
+    const invariantWriter = new Database(store.paths.database, { create: false, strict: true });
+    invariantWriter.exec("PRAGMA foreign_keys=ON");
+    expect(() => invariantWriter.query(
+      `UPDATE memory_submissions
+       SET result_head_operation_sha256=? WHERE id=?`,
+    ).run("9".repeat(64), prepared.record.id)).toThrow();
+    expect(() => invariantWriter.query(
+      `UPDATE project_memory_authorities
+       SET head_sequence=0,head_operation_sha256=NULL,head_digest=?,revision=revision+1
+       WHERE project_id=?`,
+    ).run(emptyHead.headDigest, project.id)).toThrow();
+    expect(() => invariantWriter.query(
+      "DELETE FROM session_host_capability_bindings WHERE session_id=?",
+    ).run(idleSession.id)).toThrow();
+    invariantWriter.close(false);
+    store.bindMemorySubmissionEffect({
+      submissionId: prepared.record.id,
+      effectRecordSha256: memoryRecordDigest,
+      attestationSha256: memoryAttestationDigest,
+      operationId: "memory_adopt_private",
+      sourceHead: nextHead,
+      nominationSha256: testDigest("private memory nomination"),
+    });
+    store.beginMemorySubmission(prepared.record.id);
+    const resultHead = {
+      sequence: 2,
+      operationSha256: "2".repeat(64),
+      headDigest: "3".repeat(64),
+    } as const;
+    expect(store.settleMemorySubmission({
+      submissionId: prepared.record.id,
+      expectedState: "effect_started",
+      state: "applied",
+      outcomeCode: "share_adopted",
+      resultHead,
+      receiptDigest: "4".repeat(64),
+    })).toMatchObject({ state: "applied", resultHead });
+    expect(store.readProjectMemoryAuthority(project.id)).toMatchObject({
+      head: resultHead,
+      lastExchangeHead: nextHead,
+      syncState: "local_only",
+    });
+
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      const retained = JSON.stringify({
+        authority: inspector.query("SELECT * FROM project_memory_authorities").get(),
+        capability: inspector.query("SELECT * FROM session_host_capability_bindings").get(),
+        submission: inspector.query("SELECT * FROM memory_submissions").get(),
+      });
+      expect(retained).not.toContain("PRIVATE MEMORY CONTENT");
+      expect(retained).not.toContain("private:key");
+      expect(retained).not.toContain(root);
+    } finally {
+      inspector.close(false);
+    }
+
+    const currentAuthority = store.readProjectMemoryAuthority(project.id);
+    if (currentAuthority === null) throw new Error("Expected project memory authority.");
+    const frozen = store.recordProjectMemorySyncObservation({
+      projectId: project.id,
+      expectedRevision: currentAuthority.revision,
+      expectedHead: currentAuthority.head,
+      state: "error",
+      diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
+    });
+    expect(() => store.recordProjectMemorySyncObservation({
+      projectId: project.id,
+      expectedRevision: frozen.revision,
+      expectedHead: frozen.head,
+      state: "local_only",
+    })).toThrow("PROJECT_MEMORY_SYNC_FROZEN");
+    const thawWriter = new Database(store.paths.database, { create: false, strict: true });
+    thawWriter.exec("PRAGMA foreign_keys=ON");
+    expect(() => thawWriter.query(
+      `UPDATE project_memory_authorities
+       SET sync_state='local_only',diagnostic_code=NULL,revision=revision+1
+       WHERE project_id=?`,
+    ).run(project.id)).toThrow();
+    thawWriter.close(false);
+  });
+
+  test("keeps compact page attestations across journal GC and releases them with exact lane refs", async () => {
+    let now = 10_000;
+    const { store, home } = await fixture({ now: () => now });
+    const root = join(home, "memory-attestation-retention");
+    await mkdir(root);
+    const project = await store.createProject("Memory attestation retention", root);
+    const profile = signInProfile(store, "Memory attestation retention", "attest@example.com");
+    const actor = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const emptyHead = {
+      sequence: 0,
+      operationSha256: null,
+      headDigest: testDigest("attestation canonical empty"),
+    } as const;
+    const authorityDigest = testDigest("attestation canonical authority");
+    store.initializeProjectMemoryAuthority({
+      projectId: project.id,
+      authorityDigest,
+      bindingDigest: testDigest("attestation canonical binding"),
+      head: emptyHead,
+    });
+    const workingBindingDigest = testDigest("attestation working binding");
+    const remember = (
+      index: number,
+      expectedHead: typeof emptyHead | Readonly<{
+        sequence: number;
+        operationSha256: string;
+        headDigest: string;
+      }>,
+    ) => {
+      const keyDigest = testDigest(`attestation key ${String(index)}`);
+      const contentDigest = testDigest(`attestation content ${String(index)}`);
+      const effectRecordSha256 = testDigest(`attestation record ${String(index)}`);
+      const attestationSha256 = testDigest(`attestation evidence ${String(index)}`);
+      const record = store.prepareMemorySubmission({
+        actorSessionId: actor.id,
+        projectId: project.id,
+        kind: "remember",
+        requestDigest: testDigest(`attestation request ${String(index)}`),
+        contentDigest,
+        keyDigest,
+        workingBindingDigest,
+        workingEpoch: 1,
+        expectedHead,
+        idempotencyKey: peerIdempotencyKey(60_000 + index),
+      }).record;
+      store.bindMemorySubmissionEffect({
+        submissionId: record.id,
+        effectRecordSha256,
+        attestationSha256,
+        operationId: `memory_attestation_${String(index)}`,
+      });
+      store.beginMemorySubmission(record.id);
+      const resultHead = {
+        sequence: expectedHead.sequence + 1,
+        operationSha256: testDigest(`attestation operation ${String(index)}`),
+        headDigest: testDigest(`attestation head ${String(index)}`),
+      };
+      store.settleMemorySubmission({
+        submissionId: record.id,
+        expectedState: "effect_started",
+        state: "applied",
+        outcomeCode: "remember_committed",
+        resultHead,
+        receiptDigest: testDigest(`attestation receipt ${String(index)}`),
+      });
+      return {
+        attestationSha256,
+        contentDigest,
+        effectRecordSha256,
+        idempotencyKey: record.idempotencyKey,
+        keyDigest,
+        resultHead,
+      };
+    };
+    const first = remember(0, emptyHead);
+    const second = remember(1, first.resultHead);
+    expect(store.findMemoryPageAttestation(first.attestationSha256)).toMatchObject({
+      actorSessionId: actor.id,
+      projectId: project.id,
+      keyDigest: first.keyDigest,
+    });
+    expect(store.isMemoryPageAttestationReferenced({
+      attestationSha256: first.attestationSha256,
+      authorityDigest: workingBindingDigest,
+      keyDigest: first.keyDigest,
+      lane: "working",
+      projectId: project.id,
+    })).toBe(true);
+
+    const share = store.prepareMemorySubmission({
+      actorSessionId: actor.id,
+      projectId: project.id,
+      kind: "share",
+      requestDigest: testDigest("attestation share request"),
+      contentDigest: first.contentDigest,
+      keyDigest: first.keyDigest,
+      workingBindingDigest,
+      workingEpoch: 1,
+      expectedHead: emptyHead,
+      idempotencyKey: peerIdempotencyKey(60_100),
+    }).record;
+    store.bindMemorySubmissionEffect({
+      submissionId: share.id,
+      effectRecordSha256: first.effectRecordSha256,
+      attestationSha256: first.attestationSha256,
+      operationId: "memory_adopt_attestation",
+      sourceHead: second.resultHead,
+      nominationSha256: testDigest("attestation nomination"),
+    });
+    store.beginMemorySubmission(share.id);
+    const canonicalHead = {
+      sequence: 1,
+      operationSha256: testDigest("attestation canonical operation"),
+      headDigest: testDigest("attestation canonical head"),
+    } as const;
+    store.settleMemorySubmission({
+      submissionId: share.id,
+      expectedState: "effect_started",
+      state: "applied",
+      outcomeCode: "share_adopted",
+      resultHead: canonicalHead,
+      receiptDigest: testDigest("attestation share receipt"),
+    });
+    expect(store.isMemoryPageAttestationReferenced({
+      attestationSha256: first.attestationSha256,
+      authorityDigest,
+      keyDigest: first.keyDigest,
+      lane: "canonical",
+      projectId: project.id,
+    })).toBe(true);
+
+    const childBindingDigest = testDigest("attestation child binding");
+    const childSessionId = `sess_${"f".repeat(32)}`;
+    const childHead = {
+      sequence: 1,
+      operationSha256: testDigest("attestation child fork operation"),
+      digest: testDigest("attestation child fork head"),
+    } as const;
+    const parentHead = {
+      sequence: second.resultHead.sequence,
+      operationSha256: second.resultHead.operationSha256,
+      digest: second.resultHead.headDigest,
+    } as const;
+    expect(store.reserveMemoryWorkingPageAttestationFork({
+      childBindingDigest,
+      childSessionId,
+      parentBindingDigest: workingBindingDigest,
+      parentHead,
+    })).toEqual({ references: 2, state: "reserved" });
+    expect(store.hasMemoryWorkingAttestationForkFromParent(workingBindingDigest)).toBe(true);
+    const third = remember(2, second.resultHead);
+    expect(store.reserveMemoryWorkingPageAttestationFork({
+      childBindingDigest,
+      childSessionId,
+      parentBindingDigest: workingBindingDigest,
+      parentHead,
+    })).toEqual({ references: 0, state: "reserved" });
+    expect(store.finalizeMemoryWorkingPageAttestationFork({
+      childBindingDigest,
+      childHead,
+      parentBindingDigest: workingBindingDigest,
+      parentHead,
+    })).toBe(0);
+    expect(store.hasMemoryWorkingAttestationForkFromParent(workingBindingDigest)).toBe(false);
+    expect(store.reserveMemoryWorkingPageAttestationFork({
+      childBindingDigest,
+      childSessionId,
+      parentBindingDigest: workingBindingDigest,
+      parentHead,
+    })).toEqual({ references: 0, state: "finalized" });
+    expect(store.finalizeMemoryWorkingPageAttestationFork({
+      childBindingDigest,
+      childHead,
+      parentBindingDigest: workingBindingDigest,
+      parentHead,
+    })).toBe(0);
+    expect(store.readMemoryWorkingAttestationHead(childBindingDigest)).toMatchObject({
+      authorityDigest: childBindingDigest,
+      forkParentAuthorityDigest: workingBindingDigest,
+      forkParentHead: second.resultHead,
+      head: {
+        sequence: childHead.sequence,
+        operationSha256: childHead.operationSha256,
+        headDigest: childHead.digest,
+      },
+      origin: "fork",
+    });
+    now += MEMORY_SUBMISSION_RETAIN_AGE_MS + 1;
+    const pruningAdmission = store.prepareMemorySubmission({
+      actorSessionId: actor.id,
+      projectId: project.id,
+      kind: "remember",
+      requestDigest: testDigest("attestation pruning request"),
+      contentDigest: testDigest("attestation pruning content"),
+      keyDigest: testDigest("attestation pruning key"),
+      workingBindingDigest,
+      workingEpoch: 1,
+      expectedHead: third.resultHead,
+      idempotencyKey: peerIdempotencyKey(60_200),
+    }).record;
+    store.cancelPreparedMemorySubmission(pruningAdmission.id);
+    expect(store.readMemorySubmissionByIdempotencyKey(first.idempotencyKey)).toBeNull();
+    expect(store.findMemoryPageAttestation(first.attestationSha256)).not.toBeNull();
+    expect(store.findMemoryPageAttestation(second.attestationSha256)).not.toBeNull();
+    expect(store.findMemoryPageAttestation(third.attestationSha256)).not.toBeNull();
+
+    expect(store.purgeMemoryWorkingPageAttestations({
+      bindingDigest: workingBindingDigest,
+    })).toBe(3);
+    expect(store.findMemoryPageAttestation(second.attestationSha256)).not.toBeNull();
+    expect(store.findMemoryPageAttestation(third.attestationSha256)).toBeNull();
+    expect(store.purgeMemoryWorkingPageAttestations({
+      bindingDigest: childBindingDigest,
+    })).toBe(2);
+    expect(store.findMemoryPageAttestation(second.attestationSha256)).toBeNull();
+    expect(store.findMemoryPageAttestation(first.attestationSha256)).not.toBeNull();
+  });
+
+  test("pages only actor-authorized visible same-project peers in stable creation order", async () => {
+    const { store, home } = await fixture({ now: () => 4_000 });
+    const firstRoot = join(home, "peer-directory-a");
+    const secondRoot = join(home, "peer-directory-b");
+    await mkdir(firstRoot);
+    await mkdir(secondRoot);
+    const firstProject = await store.createProject("Peer directory A", firstRoot);
+    const secondProject = await store.createProject("Peer directory B", secondRoot);
+    const profile = signInProfile(store, "Peer directory account", "directory@example.com");
+    const create = (projectId: typeof firstProject.id, title: string) => store.createSession({
+      profileId: profile.id,
+      projectId,
+      title,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actorBase = create(firstProject.id, "Actor private note never projected");
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "peer-directory-turn",
+    });
+    const visible = [
+      create(firstProject.id, "Visible one"),
+      create(firstProject.id, "Visible two"),
+    ];
+    const off = create(firstProject.id, "Hidden by policy");
+    store.setPeerSessionPolicy({
+      sessionId: off.id,
+      expectedRevision: 1,
+      mode: "off",
+    });
+    const archived = create(firstProject.id, "Hidden by archive");
+    store.setSessionArchived(archived.id, true);
+    create(secondProject.id, "Hidden by project");
+
+    expect(() => store.listPeerProjectSessionPage({
+      actorSessionId: actor.id,
+      actorTurnId: "wrong-turn",
+      after: null,
+      limit: 1,
+    })).toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+
+    const expected = visible.map((session) => session.id).sort();
+    const first = store.listPeerProjectSessionPage({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      after: null,
+      limit: 1,
+    });
+    expect(first.sessions.map((session) => session.id)).toEqual(expected.slice(0, 1));
+    expect(first.nextPosition).not.toBeNull();
+    expect(Object.keys(first.sessions[0] ?? {}).sort()).toEqual([
+      "active",
+      "createdAt",
+      "id",
+      "policy",
+      "policyRevision",
+      "preset",
+      "provider",
+      "revision",
+      "state",
+      "title",
+      "updatedAt",
+    ]);
+    const second = store.listPeerProjectSessionPage({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      after: first.nextPosition,
+      limit: 1,
+    });
+    expect(second.sessions.map((session) => session.id)).toEqual(expected.slice(1));
+    expect(second.nextPosition).toBeNull();
+
+    const policy = store.requirePeerSessionPolicy(actor.id);
+    store.setPeerSessionPolicy({
+      sessionId: actor.id,
+      expectedRevision: policy.revision,
+      mode: "off",
+    });
+    expect(() => store.listPeerProjectSessionPage({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      after: null,
+      limit: 50,
+    })).toThrow("PEER_SESSION_POLICY_REFUSED");
+    expect(() => store.listPeerProjectSessionPage({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      after: null,
+      limit: 51,
+    })).toThrow();
+  });
+
+  test("admits peer queues idempotently and preserves attributed provenance across restart", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "peer-project");
+    await mkdir(root);
+    const project = await store.createProject("Peer project", root);
+    const profile = signInProfile(store, "Peer account", "peer@example.com");
+    const actor = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const activeActor = store.setSessionTurnState({
+      sessionId: actor.id,
+      expectedRevision: actor.revision,
+      state: "active",
+      activeTurnId: "actor-turn-without-sensitive-bytes",
+    });
+    const targetBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.bindSession({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      providerThreadId: "thread-peer-begin-authority",
+      state: "idle",
+    });
+    const message = "PRIVATE PEER MESSAGE BODY";
+    const request = {
+      actorSessionId: activeActor.id,
+      actorTurnId: activeActor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "queue" as const,
+      requestDigest: testDigest("PRIVATE PEER REQUEST AND REASON"),
+      messageDigest: testDigest(message),
+      reasonDigest: testDigest("PRIVATE PEER REASON"),
+      idempotencyKey: peerIdempotencyKey(9_000),
+      message,
+    };
+    const admitted = store.admitPeerSessionAction(request);
+    expect(admitted).toMatchObject({
+      replay: false,
+      action: {
+        actorPolicyRevision: 1,
+        delivery: "queue",
+        hop: 1,
+        projectId: project.id,
+        state: "queued",
+        targetPolicyRevision: 1,
+      },
+      queue: {
+        messageActor: "peer_session",
+        peerActionId: admitted.action.id,
+        state: "pending",
+      },
+    });
+    expect(store.admitPeerSessionAction(request)).toMatchObject({
+      replay: true,
+      action: { id: admitted.action.id },
+      queue: { id: admitted.queue?.id },
+    });
+    expect(() => store.admitPeerSessionAction({
+      ...request,
+      reasonDigest: testDigest("changed reason"),
+    })).toThrow("PEER_SESSION_IDEMPOTENCY_CONFLICT");
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      const peerLedger = JSON.stringify(
+        inspector.query("SELECT * FROM peer_session_actions WHERE id=?").get(admitted.action.id),
+      );
+      expect(peerLedger).not.toContain(message);
+      expect(peerLedger).not.toContain("PRIVATE PEER REASON");
+      expect(peerLedger).not.toContain("actor-turn-without-sensitive-bytes");
+      expect(peerLedger).not.toContain(root);
+    } finally {
+      inspector.close(false);
+    }
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths);
+    stores.push(restarted);
+    expect(restarted.requireQueue(admitted.queue!.id)).toMatchObject({
+      message,
+      messageActor: "peer_session",
+      peerActionId: admitted.action.id,
+      state: "pending",
+    });
+    expect(restarted.transitionQueue(admitted.queue!.id, "pending", "cancelled")).toBe(true);
+    expect(restarted.requirePeerSessionAction(admitted.action.id)).toMatchObject({
+      state: "cancelled",
+    });
+  });
+
+  test("attaches a queued peer action to the accepted target turn transactionally", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "peer-queue-effect");
+    await mkdir(root);
+    const project = await store.createProject("Peer queue effect", root);
+    const profile = signInProfile(store, "Peer queue effect", "peer-queue@example.com");
+    const actorBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-source",
+    });
+    const targetBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.bindSession({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      providerThreadId: "thread-peer-target",
+      state: "idle",
+    });
+    const message = "queued attributed coordination";
+    const admitted = store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "queue",
+      requestDigest: testDigest("queue effect request"),
+      messageDigest: testDigest(message),
+      reasonDigest: testDigest("queue effect reason"),
+      idempotencyKey: peerIdempotencyKey(9_100),
+      message,
+    });
+    const runtime = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      observedAt: 2_000,
+      preset: "high" as const,
+      model: "gpt-6-astra",
+      reasoningEffort: "max" as const,
+      serviceTier: null,
+      fast: false,
+      approvalPolicy: "on-request" as const,
+      reviewMode: "auto_review" as const,
+      permissionProfile: ":workspace" as const,
+      computerUse: true as const,
+      pluginCapability: true as const,
+      enabledApps: [],
+    };
+    const evidence = store.beginQueueEffect({
+      queueId: admitted.queue!.id,
+      sessionId: target.id,
+      profileGeneration: profile.processGeneration,
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: admitted.queue!.id,
+        sessionId: target.id,
+        providerThreadId: "thread-peer-target",
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: admitted.queue!.id,
+        messageDigest: testDigest(message),
+        runtimeProfile: runtime,
+      },
+    });
+    expect(store.requirePeerSessionAction(admitted.action.id).state).toBe("effect_started");
+    store.completeQueueEffect({
+      queueId: admitted.queue!.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      expectedEvidenceDigest: evidence.digest,
+      expectedSessionRevision: target.revision,
+      applyResponseState: true,
+      turnId: "turn-peer-target",
+      turnStatus: "inProgress",
+      runtimeProfile: runtime,
+      message,
+      receipt: { turnId: "turn-peer-target" },
+    });
+    expect(store.requirePeerSessionAction(admitted.action.id)).toMatchObject({
+      state: "applied",
+      targetTurnDigest: testDigest("turn-peer-target"),
+      resultDigest: testDigest(JSON.stringify({ turnId: "turn-peer-target" })),
+    });
+    expect(store.readPeerSessionTurnOrigins({
+      sessionId: target.id,
+      turnId: "turn-peer-target",
+    }).map((action) => action.id)).toEqual([admitted.action.id]);
+  });
+
+  test("reconciles ambiguous peer queues as proven applied or abandoned across restart", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "peer-queue-recovery");
+    await mkdir(root);
+    const project = await store.createProject("Peer queue recovery", root);
+    const profile = signInProfile(store, "Peer queue recovery", "peer-recovery@example.com");
+    const actorBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-recovery-source",
+    });
+    const runtime = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      observedAt: 2_000,
+      preset: "high" as const,
+      model: "gpt-6-astra",
+      reasoningEffort: "max" as const,
+      serviceTier: null,
+      fast: false,
+      approvalPolicy: "on-request" as const,
+      reviewMode: "auto_review" as const,
+      permissionProfile: ":workspace" as const,
+      computerUse: true as const,
+      pluginCapability: true as const,
+      enabledApps: [],
+    };
+    const prepare = (index: number) => {
+      const providerThreadId = `thread-peer-recovery-${String(index)}`;
+      const targetBase = store.createSession({
+        profileId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fastEnabled: false,
+      });
+      const target = store.bindSession({
+        sessionId: targetBase.id,
+        expectedRevision: targetBase.revision,
+        providerThreadId,
+        state: "idle",
+      });
+      const message = `peer recovery message ${String(index)}`;
+      const admitted = store.admitPeerSessionAction({
+        actorSessionId: actor.id,
+        actorTurnId: actor.activeTurnId!,
+        targetSessionId: target.id,
+        expectedTargetRevision: target.revision,
+        delivery: "queue",
+        requestDigest: testDigest(`peer recovery request ${String(index)}`),
+        messageDigest: testDigest(message),
+        reasonDigest: testDigest(`peer recovery reason ${String(index)}`),
+        idempotencyKey: peerIdempotencyKey(45_000 + index),
+        message,
+      });
+      const evidence = store.beginQueueEffect({
+        queueId: admitted.queue!.id,
+        sessionId: target.id,
+        profileGeneration: profile.processGeneration,
+        evidence: {
+          kind: "queue.dispatch",
+          queueId: admitted.queue!.id,
+          sessionId: target.id,
+          providerThreadId,
+          profileGeneration: profile.processGeneration,
+          baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+          clientMessageId: admitted.queue!.id,
+          messageDigest: testDigest(message),
+          runtimeProfile: runtime,
+        },
+      });
+      expect(store.requirePeerSessionAction(admitted.action.id).state).toBe("effect_started");
+      return { action: admitted.action, evidence, providerThreadId, queue: admitted.queue!, target };
+    };
+
+    const proven = prepare(0);
+    store.markQueueEffectAmbiguous(proven.queue.id, proven.evidence.digest);
+    expect(store.requirePeerSessionAction(proven.action.id).state).toBe("ambiguous");
+    const recovered = store.resolveQueueEffect({
+      queueId: proven.queue.id,
+      expectedEvidenceDigest: proven.evidence.digest,
+      resolution: "proven_applied",
+      resolutionEvidence: { source: "exact_provider_turn" },
+      receipt: { turnId: "turn-peer-recovered" },
+      provider: {
+        providerThreadId: proven.providerThreadId,
+        title: "Recovered applied peer queue",
+        status: "idle",
+      },
+    });
+    expect(recovered.messageEvent).toMatchObject({
+      appended: true,
+      event: {
+        body: {
+          type: "user_message",
+          actor: "peer_session",
+          text: "peer recovery message 0",
+        },
+      },
+    });
+    expect(store.requirePeerSessionAction(proven.action.id)).toMatchObject({
+      state: "applied",
+      targetTurnDigest: testDigest("turn-peer-recovered"),
+      resultDigest: testDigest(JSON.stringify({ turnId: "turn-peer-recovered" })),
+    });
+    expect(store.readPeerSessionTurnOrigins({
+      sessionId: proven.target.id,
+      turnId: "turn-peer-recovered",
+    }).map((action) => action.id)).toEqual([proven.action.id]);
+
+    const abandoned = prepare(1);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths);
+    stores.push(restarted);
+    expect(restarted.recoverDispatchingQueueEffects()).toEqual({
+      recovered: [abandoned.queue.id],
+      unresolved: [],
+    });
+    expect(restarted.requirePeerSessionAction(abandoned.action.id).state).toBe("ambiguous");
+    restarted.resolveQueueEffect({
+      queueId: abandoned.queue.id,
+      expectedEvidenceDigest: abandoned.evidence.digest,
+      resolution: "abandoned",
+      resolutionEvidence: { source: "exact_provider_absence" },
+      provider: {
+        providerThreadId: abandoned.providerThreadId,
+        title: "Recovered abandoned peer queue",
+        status: "idle",
+      },
+    });
+    expect(restarted.requirePeerSessionAction(abandoned.action.id)).toMatchObject({
+      state: "failed",
+      resultDigest: testDigest(JSON.stringify({ source: "exact_provider_absence" })),
+    });
+  });
+
+  test("refuses peer self, scope, policy, stale revision, and target-state violations distinctly", async () => {
+    const { store, home } = await fixture();
+    const firstRoot = join(home, "peer-refusal-a");
+    const secondRoot = join(home, "peer-refusal-b");
+    await mkdir(firstRoot);
+    await mkdir(secondRoot);
+    const firstProject = await store.createProject("Peer refusal A", firstRoot);
+    const secondProject = await store.createProject("Peer refusal B", secondRoot);
+    const profile = signInProfile(store, "Peer refusal", "peer-refusal@example.com");
+    const create = (projectId: typeof firstProject.id) => store.createSession({
+      profileId: profile.id,
+      projectId,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actorBase = create(firstProject.id);
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-refusal-actor",
+    });
+    const target = create(firstProject.id);
+    const otherProject = create(secondProject.id);
+    let key = 10_000;
+    const attempt = (overrides: Partial<Parameters<StateStore["admitPeerSessionAction"]>[0]> = {}) =>
+      store.admitPeerSessionAction({
+        actorSessionId: actor.id,
+        actorTurnId: actor.activeTurnId!,
+        targetSessionId: target.id,
+        expectedTargetRevision: target.revision,
+        delivery: "queue",
+        requestDigest: testDigest(`refusal request ${String(key)}`),
+        messageDigest: testDigest("refusal message"),
+        reasonDigest: testDigest("refusal reason"),
+        idempotencyKey: peerIdempotencyKey(key++),
+        message: "refusal message",
+        ...overrides,
+      });
+    expect(() => attempt({ targetSessionId: actor.id, expectedTargetRevision: actor.revision }))
+      .toThrow("PEER_SESSION_SELF_REFUSED");
+    expect(() => attempt({
+      targetSessionId: otherProject.id,
+      expectedTargetRevision: otherProject.revision,
+    })).toThrow("PEER_SESSION_PROJECT_REFUSED");
+    store.setPeerSessionPolicy({ sessionId: target.id, expectedRevision: 1, mode: "off" });
+    expect(() => attempt()).toThrow("PEER_SESSION_POLICY_REFUSED");
+    store.setPeerSessionPolicy({ sessionId: target.id, expectedRevision: 2, mode: "coordinate" });
+    expect(() => attempt({ expectedTargetRevision: target.revision + 1 }))
+      .toThrow("PEER_SESSION_REVISION_CONFLICT");
+    expect(() => attempt({ actorTurnId: "not-the-active-turn" }))
+      .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+    const activeTarget = store.setSessionTurnState({
+      sessionId: target.id,
+      expectedRevision: target.revision,
+      state: "active",
+      activeTurnId: "turn-refusal-target",
+    });
+    expect(() => store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: activeTarget.id,
+      expectedTargetRevision: activeTarget.revision,
+      delivery: "send",
+      requestDigest: testDigest("active target request"),
+      messageDigest: testDigest("active target message"),
+      reasonDigest: testDigest("active target reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+    })).toThrow("PEER_SESSION_TARGET_STATE_REFUSED");
+  });
+
+  test("unions every turn origin and refuses cycles and the ninth peer hop", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "peer-causal");
+    await mkdir(root);
+    const project = await store.createProject("Peer causal", root);
+    const profile = signInProfile(store, "Peer causal", "peer-causal@example.com");
+    const sessions = Array.from({ length: 11 }, (_, index) => {
+      const created = store.createSession({
+        profileId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fastEnabled: false,
+      });
+      return store.setSessionTurnState({
+        sessionId: created.id,
+        expectedRevision: created.revision,
+        state: "active",
+        activeTurnId: `turn-causal-${String(index)}`,
+      });
+    });
+    let key = 20_000;
+    const steer = (from: number, to: number) => {
+      const actor = sessions[from]!;
+      const target = sessions[to]!;
+      const action = store.admitPeerSessionAction({
+        actorSessionId: actor.id,
+        actorTurnId: actor.activeTurnId!,
+        targetSessionId: target.id,
+        expectedTargetRevision: target.revision,
+        delivery: "steer",
+        requestDigest: testDigest(`causal request ${String(key)}`),
+        messageDigest: testDigest(`causal message ${String(key)}`),
+        reasonDigest: testDigest(`causal reason ${String(key)}`),
+        idempotencyKey: peerIdempotencyKey(key++),
+      }).action;
+      store.beginPeerSessionActionEffect(action.id);
+      return store.settlePeerSessionAction({
+        actionId: action.id,
+        expectedState: "effect_started",
+        state: "applied",
+        targetTurnId: target.activeTurnId!,
+        resultDigest: testDigest(`causal receipt ${String(key)}`),
+      });
+    };
+    const chain = [];
+    for (let index = 0; index < PEER_SESSION_HOP_LIMIT; index += 1) {
+      chain.push(steer(index, index + 1));
+    }
+    expect(chain.map((action) => action.hop)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(() => steer(8, 9)).toThrow("PEER_SESSION_HOP_LIMIT_REFUSED");
+    expect(() => steer(1, 0)).toThrow("PEER_SESSION_CYCLE_REFUSED");
+
+    const independent = steer(9, 2);
+    expect(store.readPeerSessionTurnOrigins({
+      sessionId: sessions[2]!.id,
+      turnId: sessions[2]!.activeTurnId!,
+    })).toHaveLength(2);
+    expect(() => steer(2, 9)).toThrow("PEER_SESSION_CYCLE_REFUSED");
+    const unioned = steer(2, 10);
+    expect(unioned).toMatchObject({
+      hop: 3,
+      parentActionIds: expect.arrayContaining([chain[1]!.id, independent.id]),
+      rootActionIds: expect.arrayContaining([chain[0]!.id, independent.id]),
+    });
+  });
+
+  test("enforces atomic hourly peer action and distinct-target boundaries without charging replay", async () => {
+    let now = 1_000;
+    const { store, home } = await fixture({ now: () => now });
+    const root = join(home, "peer-budgets");
+    await mkdir(root);
+    const project = await store.createProject("Peer budgets", root);
+    const profile = signInProfile(store, "Peer budgets", "peer-budgets@example.com");
+    const actorBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-budget-actor",
+    });
+    const targetBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.setSessionTurnState({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      state: "idle",
+    });
+    const send = (index: number, targetSession = target) => store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: targetSession.id,
+      expectedTargetRevision: targetSession.revision,
+      delivery: "send",
+      requestDigest: testDigest(`rate request ${String(index)}`),
+      messageDigest: testDigest(`rate message ${String(index)}`),
+      reasonDigest: testDigest("rate reason"),
+      idempotencyKey: peerIdempotencyKey(30_000 + index),
+    });
+    const first = send(0);
+    expect(send(0)).toMatchObject({ replay: true, action: { id: first.action.id } });
+    for (let index = 1; index < PEER_SESSION_HOURLY_ACTION_LIMIT; index += 1) send(index);
+    expect(() => send(PEER_SESSION_HOURLY_ACTION_LIMIT))
+      .toThrow("PEER_SESSION_RATE_LIMIT_REFUSED");
+
+    const fanoutActorBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const fanoutActor = store.setSessionTurnState({
+      sessionId: fanoutActorBase.id,
+      expectedRevision: fanoutActorBase.revision,
+      state: "active",
+      activeTurnId: "turn-fanout-actor",
+    });
+    expect(() => store.admitPeerSessionAction({
+      actorSessionId: fanoutActor.id,
+      actorTurnId: fanoutActor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "send",
+      requestDigest: testDigest("aggregate project rate request"),
+      messageDigest: testDigest("aggregate project rate message"),
+      reasonDigest: testDigest("aggregate project rate reason"),
+      idempotencyKey: peerIdempotencyKey(39_999),
+    })).toThrow("PEER_SESSION_RATE_LIMIT_REFUSED");
+    expect(PEER_SESSION_PROJECT_HOURLY_ACTION_LIMIT).toBe(PEER_SESSION_HOURLY_ACTION_LIMIT);
+    const isolatedRoot = join(home, "peer-budgets-isolated");
+    await mkdir(isolatedRoot);
+    const isolatedProject = await store.createProject("Peer budgets isolated", isolatedRoot);
+    const isolatedActorBase = store.createSession({
+      profileId: profile.id,
+      projectId: isolatedProject.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const isolatedActor = store.setSessionTurnState({
+      sessionId: isolatedActorBase.id,
+      expectedRevision: isolatedActorBase.revision,
+      state: "active",
+      activeTurnId: "turn-isolated-budget-actor",
+    });
+    const isolatedTarget = store.createSession({
+      profileId: profile.id,
+      projectId: isolatedProject.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    expect(store.admitPeerSessionAction({
+      actorSessionId: isolatedActor.id,
+      actorTurnId: isolatedActor.activeTurnId!,
+      targetSessionId: isolatedTarget.id,
+      expectedTargetRevision: isolatedTarget.revision,
+      delivery: "queue",
+      requestDigest: testDigest("isolated aggregate rate request"),
+      messageDigest: testDigest("isolated aggregate rate message"),
+      reasonDigest: testDigest("isolated aggregate rate reason"),
+      idempotencyKey: peerIdempotencyKey(39_998),
+      message: "isolated aggregate rate message",
+    })).toMatchObject({ replay: false });
+    now += PEER_SESSION_RATE_WINDOW_MS + 1;
+    const targets = Array.from(
+      { length: PEER_SESSION_HOURLY_DISTINCT_TARGET_LIMIT + 1 },
+      () => store.createSession({
+        profileId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fastEnabled: false,
+      }),
+    );
+    const queue = (index: number) => {
+      const message = `fanout message ${String(index)}`;
+      return store.admitPeerSessionAction({
+        actorSessionId: fanoutActor.id,
+        actorTurnId: fanoutActor.activeTurnId!,
+        targetSessionId: targets[index]!.id,
+        expectedTargetRevision: targets[index]!.revision,
+        delivery: "queue",
+        requestDigest: testDigest(`fanout request ${String(index)}`),
+        messageDigest: testDigest(message),
+        reasonDigest: testDigest("fanout reason"),
+        idempotencyKey: peerIdempotencyKey(40_000 + index),
+        message,
+      });
+    };
+    for (let index = 0; index < PEER_SESSION_HOURLY_DISTINCT_TARGET_LIMIT; index += 1) {
+      queue(index);
+    }
+    expect(() => queue(PEER_SESSION_HOURLY_DISTINCT_TARGET_LIMIT))
+      .toThrow("PEER_SESSION_FANOUT_LIMIT_REFUSED");
+  });
+
+  test("retains exact peer replay for seven days then atomically compacts terminal queue provenance", async () => {
+    let now = 10_000;
+    const { store, home } = await fixture({ now: () => now });
+    const root = join(home, "peer-retention-terminal");
+    await mkdir(root);
+    const project = await store.createProject("Peer retention terminal", root);
+    const profile = signInProfile(store, "Peer retention terminal", "peer-retention@example.com");
+    const actorBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-retention-old",
+    });
+    const targetBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.setSessionTurnState({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      state: "idle",
+    });
+    const message = "terminal peer retention message";
+    const oldRequest = {
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "queue" as const,
+      requestDigest: testDigest("terminal peer retention request"),
+      messageDigest: testDigest(message),
+      reasonDigest: testDigest("terminal peer retention reason"),
+      idempotencyKey: peerIdempotencyKey(54_000),
+      message,
+    };
+    const old = store.admitPeerSessionAction(oldRequest);
+    expect(store.transitionQueue(old.queue!.id, "pending", "cancelled")).toBe(true);
+    const idleActor = store.setSessionTurnState({
+      sessionId: actor.id,
+      expectedRevision: actor.revision,
+      state: "idle",
+    });
+
+    now += PEER_SESSION_ACTION_RETAIN_AGE_MS;
+    const currentActor = store.setSessionTurnState({
+      sessionId: idleActor.id,
+      expectedRevision: idleActor.revision,
+      state: "active",
+      activeTurnId: "turn-peer-retention-current",
+    });
+    expect(store.admitPeerSessionAction(oldRequest)).toMatchObject({
+      replay: true,
+      action: { id: old.action.id },
+      queue: { id: old.queue!.id },
+    });
+    const admitFresh = (index: number) => store.admitPeerSessionAction({
+      actorSessionId: currentActor.id,
+      actorTurnId: currentActor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "send",
+      requestDigest: testDigest(`terminal retention fresh request ${String(index)}`),
+      messageDigest: testDigest(`terminal retention fresh message ${String(index)}`),
+      reasonDigest: testDigest("terminal retention fresh reason"),
+      idempotencyKey: peerIdempotencyKey(54_001 + index),
+    });
+    admitFresh(0);
+    expect(store.requirePeerSessionAction(old.action.id).state).toBe("cancelled");
+
+    now += 1;
+    const injector = new Database(store.paths.database, { create: false, strict: true });
+    injector.exec(`
+      CREATE TRIGGER peer_retention_test_abort
+      BEFORE DELETE ON peer_session_actions
+      BEGIN SELECT RAISE(ABORT, 'test peer retention abort'); END;
+    `);
+    injector.close(false);
+    expect(() => admitFresh(1)).toThrow("test peer retention abort");
+    expect(store.requireQueue(old.queue!.id)).toMatchObject({
+      messageActor: "peer_session",
+      peerActionId: old.action.id,
+      state: "cancelled",
+    });
+    expect(store.readPeerSessionActionByIdempotencyKey(peerIdempotencyKey(54_002))).toBeNull();
+    const repair = new Database(store.paths.database, { create: false, strict: true });
+    repair.exec("DROP TRIGGER peer_retention_test_abort;");
+    repair.close(false);
+
+    expect(admitFresh(1)).toMatchObject({ replay: false });
+    expect(() => store.requirePeerSessionAction(old.action.id)).toThrow("PEER_SESSION_NOT_FOUND");
+    expect(store.requireQueue(old.queue!.id)).toMatchObject({
+      messageActor: "peer_session",
+      state: "cancelled",
+    });
+    expect(store.requireQueue(old.queue!.id)).not.toHaveProperty("peerActionId");
+    expect(store.isPeerSessionMessageSource(target.id, old.queue!.id)).toBe(true);
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      inspector.close(false);
+    }
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths, { now: () => now });
+    stores.push(restarted);
+    expect(restarted.requireQueue(old.queue!.id)).toMatchObject({
+      messageActor: "peer_session",
+      state: "cancelled",
+    });
+    expect(restarted.requireQueue(old.queue!.id)).not.toHaveProperty("peerActionId");
+    expect(restarted.isPeerSessionMessageSource(target.id, old.queue!.id)).toBe(true);
+  });
+
+  test("pins unsettled actions and recursively required causal roots beyond the retention window", async () => {
+    let now = 20_000;
+    const { store, home } = await fixture({ now: () => now });
+    const root = join(home, "peer-retention-pins");
+    await mkdir(root);
+    const project = await store.createProject("Peer retention pins", root);
+    const profile = signInProfile(store, "Peer retention pins", "peer-retention-pins@example.com");
+    const createActive = (turnId: string) => {
+      const created = store.createSession({
+        profileId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fastEnabled: false,
+      });
+      return store.setSessionTurnState({
+        sessionId: created.id,
+        expectedRevision: created.revision,
+        state: "active",
+        activeTurnId: turnId,
+      });
+    };
+    const first = createActive("turn-peer-retention-first");
+    const second = createActive("turn-peer-retention-second");
+    const third = createActive("turn-peer-retention-third");
+    const maintainer = createActive("turn-peer-retention-maintainer");
+    const pendingTargetBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const pendingTarget = store.setSessionTurnState({
+      sessionId: pendingTargetBase.id,
+      expectedRevision: pendingTargetBase.revision,
+      state: "idle",
+    });
+    let key = 55_000;
+    const steer = (actor: typeof first, target: typeof first) => {
+      const action = store.admitPeerSessionAction({
+        actorSessionId: actor.id,
+        actorTurnId: actor.activeTurnId!,
+        targetSessionId: target.id,
+        expectedTargetRevision: target.revision,
+        delivery: "steer",
+        requestDigest: testDigest(`retention causal request ${String(key)}`),
+        messageDigest: testDigest(`retention causal message ${String(key)}`),
+        reasonDigest: testDigest("retention causal reason"),
+        idempotencyKey: peerIdempotencyKey(key++),
+      }).action;
+      store.beginPeerSessionActionEffect(action.id);
+      return store.settlePeerSessionAction({
+        actionId: action.id,
+        expectedState: "effect_started",
+        state: "applied",
+        targetTurnId: target.activeTurnId!,
+        resultDigest: testDigest(`retention causal result ${action.id}`),
+      });
+    };
+    const rootAction = steer(first, second);
+    const descendant = steer(second, third);
+    expect(descendant.parentActionIds).toContain(rootAction.id);
+    const actorPinned = store.admitPeerSessionAction({
+      actorSessionId: maintainer.id,
+      actorTurnId: maintainer.activeTurnId!,
+      targetSessionId: pendingTarget.id,
+      expectedTargetRevision: pendingTarget.revision,
+      delivery: "send",
+      requestDigest: testDigest("active actor retention request"),
+      messageDigest: testDigest("active actor retention message"),
+      reasonDigest: testDigest("active actor retention reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+    }).action;
+    store.beginPeerSessionActionEffect(actorPinned.id);
+    store.settlePeerSessionAction({
+      actionId: actorPinned.id,
+      expectedState: "effect_started",
+      state: "failed",
+      resultDigest: testDigest("active actor retention failed result"),
+    });
+    const unresolvedKey = peerIdempotencyKey(key++);
+    const unresolvedMessage = "unresolved evidence retention message";
+    const unresolvedPinned = store.admitPeerSessionAction({
+      actorSessionId: first.id,
+      actorTurnId: first.activeTurnId!,
+      targetSessionId: pendingTarget.id,
+      expectedTargetRevision: pendingTarget.revision,
+      delivery: "send",
+      requestDigest: testDigest("unresolved evidence retention request"),
+      messageDigest: testDigest(unresolvedMessage),
+      reasonDigest: testDigest("unresolved evidence retention reason"),
+      idempotencyKey: unresolvedKey,
+    }).action;
+    store.prepareMutation({
+      kind: "session.send",
+      authorityId: pendingTarget.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: unresolvedMessage },
+      idempotencyKey: unresolvedKey,
+    });
+    store.beginPeerSessionActionEffect(unresolvedPinned.id);
+    store.settlePeerSessionAction({
+      actionId: unresolvedPinned.id,
+      expectedState: "effect_started",
+      state: "failed",
+      resultDigest: testDigest("unresolved evidence outer result"),
+    });
+    const pendingMessage = "unsettled retention queue";
+    const pending = store.admitPeerSessionAction({
+      actorSessionId: first.id,
+      actorTurnId: first.activeTurnId!,
+      targetSessionId: pendingTarget.id,
+      expectedTargetRevision: pendingTarget.revision,
+      delivery: "queue",
+      requestDigest: testDigest("unsettled retention request"),
+      messageDigest: testDigest(pendingMessage),
+      reasonDigest: testDigest("unsettled retention reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+      message: pendingMessage,
+    });
+    const idleFirst = store.setSessionTurnState({
+      sessionId: first.id,
+      expectedRevision: first.revision,
+      state: "idle",
+    });
+    store.setSessionTurnState({
+      sessionId: second.id,
+      expectedRevision: second.revision,
+      state: "idle",
+    });
+
+    now += PEER_SESSION_ACTION_RETAIN_AGE_MS + 1;
+    store.admitPeerSessionAction({
+      actorSessionId: maintainer.id,
+      actorTurnId: maintainer.activeTurnId!,
+      targetSessionId: idleFirst.id,
+      expectedTargetRevision: idleFirst.revision,
+      delivery: "send",
+      requestDigest: testDigest("retention maintenance request"),
+      messageDigest: testDigest("retention maintenance message"),
+      reasonDigest: testDigest("retention maintenance reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+    });
+    expect(store.requirePeerSessionAction(rootAction.id).state).toBe("applied");
+    expect(store.requirePeerSessionAction(descendant.id)).toMatchObject({
+      state: "applied",
+      parentActionIds: [rootAction.id],
+      rootActionIds: [rootAction.id],
+    });
+    expect(store.requirePeerSessionAction(pending.action.id).state).toBe("queued");
+    expect(store.requirePeerSessionAction(actorPinned.id).state).toBe("failed");
+    expect(store.requirePeerSessionAction(unresolvedPinned.id).state).toBe("failed");
+    expect(store.readMutation(unresolvedKey)).toMatchObject({ state: "prepared" });
+    expect(() => store.admitPeerSessionAction({
+      actorSessionId: third.id,
+      actorTurnId: third.activeTurnId!,
+      targetSessionId: idleFirst.id,
+      expectedTargetRevision: idleFirst.revision,
+      delivery: "send",
+      requestDigest: testDigest("retention cycle request"),
+      messageDigest: testDigest("retention cycle message"),
+      reasonDigest: testDigest("retention cycle reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+    })).toThrow("PEER_SESSION_CYCLE_REFUSED");
+
+    const idleThird = store.setSessionTurnState({
+      sessionId: third.id,
+      expectedRevision: third.revision,
+      state: "idle",
+    });
+    store.admitPeerSessionAction({
+      actorSessionId: maintainer.id,
+      actorTurnId: maintainer.activeTurnId!,
+      targetSessionId: idleThird.id,
+      expectedTargetRevision: idleThird.revision,
+      delivery: "send",
+      requestDigest: testDigest("retention closed-subgraph maintenance request"),
+      messageDigest: testDigest("retention closed-subgraph maintenance message"),
+      reasonDigest: testDigest("retention closed-subgraph maintenance reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+    });
+    expect(() => store.requirePeerSessionAction(rootAction.id)).toThrow("PEER_SESSION_NOT_FOUND");
+    expect(() => store.requirePeerSessionAction(descendant.id)).toThrow("PEER_SESSION_NOT_FOUND");
+
+    const reactivatedThird = store.setSessionTurnState({
+      sessionId: idleThird.id,
+      expectedRevision: idleThird.revision,
+      state: "active",
+      activeTurnId: third.activeTurnId!,
+    });
+    const postCompaction = store.admitPeerSessionAction({
+      actorSessionId: reactivatedThird.id,
+      actorTurnId: reactivatedThird.activeTurnId!,
+      targetSessionId: idleFirst.id,
+      expectedTargetRevision: idleFirst.revision,
+      delivery: "send",
+      requestDigest: testDigest("retention post-compaction request"),
+      messageDigest: testDigest("retention post-compaction message"),
+      reasonDigest: testDigest("retention post-compaction reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+    }).action;
+    expect(postCompaction).toMatchObject({
+      hop: 1,
+      parentActionIds: [],
+      rootActionIds: [postCompaction.id],
+    });
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths, { now: () => now });
+    stores.push(restarted);
+    expect(restarted.listUnsettledPeerSessionActions(10).map((action) => action.id))
+      .toContain(pending.action.id);
+    expect(restarted.requireQueue(pending.queue!.id)).toMatchObject({
+      messageActor: "peer_session",
+      peerActionId: pending.action.id,
+      state: "pending",
+    });
+    expect(restarted.requirePeerSessionAction(unresolvedPinned.id).state).toBe("failed");
+    expect(restarted.readMutation(unresolvedKey)).toMatchObject({ state: "prepared" });
+  });
+
+  test("keeps protected peer capacity fail-closed with a seven-day aggregate-rate envelope", async () => {
+    expect(PEER_SESSION_PROJECT_HOURLY_ACTION_LIMIT * 24 * 7).toBe(20_160);
+    expect(
+      PEER_SESSION_RETAINED_ACTION_LIMIT
+        - PEER_SESSION_PROJECT_HOURLY_ACTION_LIMIT * 24 * 7,
+    ).toBe(4_840);
+
+    const { store, home } = await fixture({ now: () => 30_000 });
+    const root = join(home, "peer-retention-capacity");
+    await mkdir(root);
+    const project = await store.createProject("Peer retention capacity", root);
+    const profile = signInProfile(store, "Peer retention capacity", "peer-retention-capacity@example.com");
+    const actorBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-retention-capacity",
+    });
+    const targetBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.setSessionTurnState({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      state: "idle",
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const seed = new Database(paths.database, { create: false, strict: true });
+    seed.exec(`
+      PRAGMA foreign_keys=ON;
+      DROP TRIGGER peer_session_action_retained_quota;
+      WITH RECURSIVE counter(value) AS (
+        SELECT 1
+        UNION ALL
+        SELECT value+1 FROM counter WHERE value<${String(PEER_SESSION_RETAINED_ACTION_LIMIT)}
+      )
+      INSERT INTO peer_session_actions(
+        id,idempotency_key,actor_session_id,actor_turn_digest,project_id,
+        actor_policy_revision,target_session_id,target_expected_revision,
+        target_policy_revision,delivery,request_digest,message_digest,reason_digest,
+        state,hop,target_turn_digest,result_digest,created_at,updated_at
+      )
+      SELECT
+        'peer_' || printf('%032x',value),
+        '30000000-0000-4000-8000-' || printf('%012x',value),
+        '${actor.id}','${testDigest(actor.activeTurnId!)}','${project.id}',
+        1,'${target.id}',${String(target.revision)},1,'send',
+        '${testDigest("capacity request")}',
+        '${testDigest("capacity message")}',
+        '${testDigest("capacity reason")}',
+        'prepared',1,NULL,NULL,1,1
+      FROM counter;
+    `);
+    seed.close(false);
+    const filled = new StateStore(paths, { now: () => 30_000 });
+    stores.push(filled);
+    expect(() => filled.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "send",
+      requestDigest: testDigest("capacity refused request"),
+      messageDigest: testDigest("capacity refused message"),
+      reasonDigest: testDigest("capacity refused reason"),
+      idempotencyKey: peerIdempotencyKey(56_000),
+    })).toThrow("PEER_SESSION_RETENTION_LIMIT_REFUSED");
+  });
+
+  test("lists bounded unsettled peer and memory effects across restart for reconciliation", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "control-plane-reconciliation");
+    await mkdir(root);
+    const project = await store.createProject("Control plane reconciliation", root);
+    const profile = signInProfile(store, "Control plane reconciliation", "reconcile@example.com");
+    const actorBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-reconciliation-actor",
+    });
+    const secondRoot = join(home, "control-plane-reconciliation-second");
+    await mkdir(secondRoot);
+    const secondProject = await store.createProject(
+      "Control plane reconciliation second",
+      secondRoot,
+    );
+    const secondActor = store.createSession({
+      profileId: profile.id,
+      projectId: secondProject.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const targetBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.setSessionTurnState({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      state: "idle",
+    });
+    const admit = (index: number, delivery: "send" | "queue") => {
+      const message = `reconciliation message ${String(index)}`;
+      return store.admitPeerSessionAction({
+        actorSessionId: actor.id,
+        actorTurnId: actor.activeTurnId!,
+        targetSessionId: target.id,
+        expectedTargetRevision: target.revision,
+        delivery,
+        requestDigest: testDigest(`reconciliation request ${String(index)}`),
+        messageDigest: testDigest(message),
+        reasonDigest: testDigest(`reconciliation reason ${String(index)}`),
+        idempotencyKey: peerIdempotencyKey(50_000 + index),
+        ...(delivery === "queue" ? { message } : {}),
+      });
+    };
+    const ambiguousPeer = admit(0, "send").action;
+    store.beginPeerSessionActionEffect(ambiguousPeer.id);
+    store.settlePeerSessionAction({
+      actionId: ambiguousPeer.id,
+      expectedState: "effect_started",
+      state: "ambiguous",
+      resultDigest: testDigest("crash observation peer"),
+    });
+    const preparedPeer = admit(1, "send").action;
+    const queuedPeer = admit(2, "queue").action;
+    const appliedPeer = admit(3, "send").action;
+    store.beginPeerSessionActionEffect(appliedPeer.id);
+    store.settlePeerSessionAction({
+      actionId: appliedPeer.id,
+      expectedState: "effect_started",
+      state: "applied",
+      targetTurnId: "turn-reconciliation-applied",
+      resultDigest: testDigest("applied peer receipt"),
+    });
+
+    const emptyHead = {
+      sequence: 0,
+      operationSha256: null,
+      headDigest: testDigest("reconciliation empty head"),
+    } as const;
+    store.initializeProjectMemoryAuthority({
+      projectId: project.id,
+      authorityDigest: testDigest("reconciliation authority"),
+      bindingDigest: testDigest("reconciliation binding"),
+      head: emptyHead,
+    });
+    store.initializeProjectMemoryAuthority({
+      projectId: secondProject.id,
+      authorityDigest: testDigest("reconciliation second authority"),
+      bindingDigest: testDigest("reconciliation second binding"),
+      head: emptyHead,
+    });
+    const prepareMemory = (
+      index: number,
+      memoryActor = actor,
+      memoryProject = project,
+    ) => {
+      const record = store.prepareMemorySubmission({
+        actorSessionId: memoryActor.id,
+        projectId: memoryProject.id,
+        kind: "remember",
+        requestDigest: testDigest(`memory reconciliation request ${String(index)}`),
+        contentDigest: testDigest(`memory reconciliation content ${String(index)}`),
+        keyDigest: testDigest(`memory reconciliation key ${String(index)}`),
+        workingBindingDigest: testDigest("memory reconciliation working binding"),
+        workingEpoch: 1,
+        expectedHead: emptyHead,
+        idempotencyKey: peerIdempotencyKey(51_000 + index),
+      }).record;
+      return store.bindMemorySubmissionEffect({
+        submissionId: record.id,
+        effectRecordSha256: testDigest(`memory reconciliation record ${String(index)}`),
+        attestationSha256: testDigest(`memory reconciliation attestation ${String(index)}`),
+        operationId: `memory_reconciliation_${String(index)}`,
+      });
+    };
+    const ambiguousMemory = prepareMemory(0);
+    store.beginMemorySubmission(ambiguousMemory.id);
+    store.settleMemorySubmission({
+      submissionId: ambiguousMemory.id,
+      expectedState: "effect_started",
+      state: "ambiguous",
+    });
+    expect(() => prepareMemory(1)).toThrow("MEMORY_RECOVERY_REQUIRED");
+    const preparedMemory = prepareMemory(1, secondActor, secondProject);
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths);
+    stores.push(restarted);
+    expect(restarted.listUnsettledPeerSessionActions(1).map((action) => action.id))
+      .toEqual([ambiguousPeer.id]);
+    expect(restarted.listUnsettledPeerSessionActions(3).map((action) => action.id))
+      .toEqual([ambiguousPeer.id, preparedPeer.id, queuedPeer.id]);
+    expect(restarted.listUnsettledMemorySubmissions(1).map((submission) => submission.id))
+      .toEqual([ambiguousMemory.id]);
+    expect(restarted.listUnsettledMemorySubmissions(2).map((submission) => submission.id))
+      .toEqual([ambiguousMemory.id, preparedMemory.id]);
+    expect(restarted.settlePeerSessionAction({
+      actionId: ambiguousPeer.id,
+      expectedState: "ambiguous",
+      state: "failed",
+    }).state).toBe("failed");
+    expect(restarted.settleMemorySubmission({
+      submissionId: ambiguousMemory.id,
+      expectedState: "ambiguous",
+      state: "failed",
+      outcomeCode: "remember_not_applied",
+    }).state).toBe("failed");
+    expect(() => restarted.listUnsettledPeerSessionActions(0)).toThrow();
+    expect(() => restarted.listUnsettledMemorySubmissions(
+      CONTROL_PLANE_RECONCILIATION_BATCH_LIMIT + 1,
+    )).toThrow();
+  });
+
+  test("revalidates direct peer authority at replay and begin and joins its nested mutation exactly", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "peer-begin-authority");
+    await mkdir(root);
+    const project = await store.createProject("Peer begin authority", root);
+    const profile = signInProfile(store, "Peer begin authority", "peer-begin@example.com");
+    const actorBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-begin",
+    });
+    const targetBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.setSessionTurnState({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      state: "idle",
+    });
+    const key = peerIdempotencyKey(52_000);
+    const request = {
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "send" as const,
+      requestDigest: testDigest("peer begin request"),
+      messageDigest: testDigest("peer begin message"),
+      reasonDigest: testDigest("peer begin reason"),
+      idempotencyKey: key,
+    };
+    const action = store.admitPeerSessionAction(request).action;
+    expect(() => store.prepareMutation({
+      kind: "session.send",
+      authorityId: target.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: "different peer begin message" },
+      idempotencyKey: key,
+    })).toThrow("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
+    expect(store.readMutation(key)).toBeNull();
+    expect(store.requirePeerSessionAction(action.id).state).toBe("prepared");
+    const attempt = store.prepareMutation({
+      kind: "session.send",
+      authorityId: target.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: "peer begin message" },
+      idempotencyKey: key,
+    });
+    expect(() => store.beginSessionMutationEffect({
+      attemptId: attempt.id,
+      sessionId: target.id,
+      profileGeneration: profile.processGeneration,
+      message: "different peer begin message",
+      evidence: {
+        kind: "session.send",
+        providerThreadId: "thread-peer-begin-authority",
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: attempt.id,
+        messageDigest: testDigest("different peer begin message"),
+        runtimeProfile: codexRuntimeProfile(profile),
+        messageActor: "peer_session",
+      },
+    })).toThrow("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
+    expect(store.readMutation(key)?.state).toBe("prepared");
+    expect(store.readMutation(key)?.evidence).toBeUndefined();
+    expect(store.requirePeerSessionAction(action.id).state).toBe("prepared");
+    expect(store.readPeerSessionDirectMessageSource(key)).not.toBeNull();
+    expect(store.readPeerSessionMutationJoin(key)).toMatchObject({
+      action: { id: action.id },
+      attempt: { id: attempt.id },
+    });
+
+    const steerTargetBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const steerTarget = store.bindSession({
+      sessionId: steerTargetBase.id,
+      expectedRevision: steerTargetBase.revision,
+      providerThreadId: "thread-peer-begin-steer",
+      state: "active",
+      activeTurnId: "turn-peer-begin-steer",
+    });
+    const steerMessage = "peer steer message";
+    const steerMismatch = "different peer steer message";
+    const steerKey = peerIdempotencyKey(52_002);
+    const steerAction = store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: steerTarget.id,
+      expectedTargetRevision: steerTarget.revision,
+      delivery: "steer",
+      requestDigest: testDigest("peer steer request"),
+      messageDigest: testDigest(steerMessage),
+      reasonDigest: testDigest("peer steer reason"),
+      idempotencyKey: steerKey,
+    }).action;
+    expect(() => store.prepareMutation({
+      kind: "session.steer",
+      authorityId: steerTarget.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: steerMismatch },
+      idempotencyKey: steerKey,
+    })).toThrow("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
+    const steerAttempt = store.prepareMutation({
+      kind: "session.steer",
+      authorityId: steerTarget.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: steerMessage },
+      idempotencyKey: steerKey,
+    });
+    expect(() => store.beginSessionMutationEffect({
+      attemptId: steerAttempt.id,
+      sessionId: steerTarget.id,
+      profileGeneration: profile.processGeneration,
+      message: steerMismatch,
+      evidence: {
+        kind: "session.steer",
+        providerThreadId: "thread-peer-begin-steer",
+        baseline: {
+          providerUpdatedAt: null,
+          status: "active",
+          activeTurnId: "turn-peer-begin-steer",
+        },
+        activeTurnId: "turn-peer-begin-steer",
+        clientMessageId: steerAttempt.id,
+        messageDigest: testDigest(steerMismatch),
+        messageActor: "peer_session",
+      },
+    })).toThrow("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
+    expect(store.readMutation(steerKey)?.state).toBe("prepared");
+    expect(store.readMutation(steerKey)?.evidence).toBeUndefined();
+    expect(store.requirePeerSessionAction(steerAction.id).state).toBe("prepared");
+
+    const queueTargetBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const queueTarget = store.bindSession({
+      sessionId: queueTargetBase.id,
+      expectedRevision: queueTargetBase.revision,
+      providerThreadId: "thread-peer-begin-queue",
+      state: "idle",
+    });
+    const queueMessage = "peer queue message";
+    const queueMismatch = "different peer queue message";
+    const queued = store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: queueTarget.id,
+      expectedTargetRevision: queueTarget.revision,
+      delivery: "queue",
+      requestDigest: testDigest("peer queue request"),
+      messageDigest: testDigest(queueMessage),
+      reasonDigest: testDigest("peer queue reason"),
+      idempotencyKey: peerIdempotencyKey(52_003),
+      message: queueMessage,
+    });
+    expect(() => store.beginQueueEffect({
+      queueId: queued.queue!.id,
+      sessionId: queueTarget.id,
+      profileGeneration: profile.processGeneration,
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: queued.queue!.id,
+        sessionId: queueTarget.id,
+        providerThreadId: "thread-peer-begin-queue",
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: queued.queue!.id,
+        messageDigest: testDigest(queueMismatch),
+        runtimeProfile: codexRuntimeProfile(profile),
+      },
+    })).toThrow("QUEUE_EFFECT_AUTHORITY_CHANGED");
+    expect(store.requireQueue(queued.queue!.id).state).toBe("pending");
+    expect(store.readQueueEffect(queued.queue!.id)).toBeNull();
+    expect(store.requirePeerSessionAction(queued.action.id).state).toBe("queued");
+
+    // Model a pre-fix/corrupt join whose queue still holds A but whose action
+    // digest claims B. The action/evidence comparison must fail independently
+    // of the queue/body comparison and roll the evidence insert back.
+    const queueCorruptor = new Database(store.paths.database, { create: false, strict: true });
+    const transitionTrigger = z.object({ sql: z.string() }).strict().parse(
+      queueCorruptor.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='peer_session_action_transition_guard'",
+      ).get(),
+    );
+    queueCorruptor.exec("DROP TRIGGER peer_session_action_transition_guard");
+    queueCorruptor.query(
+      "UPDATE peer_session_actions SET message_digest=? WHERE id=?",
+    ).run(testDigest(queueMismatch), queued.action.id);
+    queueCorruptor.exec(transitionTrigger.sql);
+    queueCorruptor.close(false);
+    expect(() => store.beginQueueEffect({
+      queueId: queued.queue!.id,
+      sessionId: queueTarget.id,
+      profileGeneration: profile.processGeneration,
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: queued.queue!.id,
+        sessionId: queueTarget.id,
+        providerThreadId: "thread-peer-begin-queue",
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: queued.queue!.id,
+        messageDigest: testDigest(queueMessage),
+        runtimeProfile: codexRuntimeProfile(profile),
+      },
+    })).toThrow("QUEUE_PEER_ACTION_AUTHORITY_CHANGED");
+    expect(store.requireQueue(queued.queue!.id).state).toBe("pending");
+    expect(store.readQueueEffect(queued.queue!.id)).toBeNull();
+    expect(store.requirePeerSessionAction(queued.action.id).state).toBe("queued");
+
+    const mismatchedSteerEvidence = {
+      kind: "session.steer" as const,
+      providerThreadId: "thread-peer-begin-steer",
+      baseline: {
+        providerUpdatedAt: null,
+        status: "active" as const,
+        activeTurnId: "turn-peer-begin-steer",
+      },
+      activeTurnId: "turn-peer-begin-steer",
+      clientMessageId: steerAttempt.id,
+      messageDigest: testDigest(steerMismatch),
+      messageActor: "peer_session" as const,
+    };
+    const mismatchedCanonical = JSON.stringify(mismatchedSteerEvidence);
+    const joinInjector = new Database(store.paths.database, { create: false, strict: true });
+    joinInjector.query(
+      `INSERT INTO mutation_effect_evidence(
+         attempt_id,kind,evidence_json,evidence_digest,recorded_at
+       ) VALUES (?,?,?,?,?)`,
+    ).run(
+      steerAttempt.id,
+      "session.steer",
+      mismatchedCanonical,
+      testDigest(mismatchedCanonical),
+      2_000,
+    );
+    joinInjector.query(
+      "UPDATE mutation_attempts SET state='effect_started' WHERE id=? AND state='prepared'",
+    ).run(steerAttempt.id);
+    joinInjector.close(false);
+    expect(() => store.readPeerSessionMutationJoin(steerKey))
+      .toThrow("PEER_SESSION_MUTATION_JOIN_INVALID");
+    expect(store.requirePeerSessionAction(steerAction.id).state).toBe("prepared");
+
+    expect(store.beginPeerSessionActionEffect(action.id).state).toBe("effect_started");
+    // A crash after the outer begin but before the exact same-key nested begin
+    // is resumable without rewriting either ledger.
+    expect(store.beginPeerSessionActionEffect(action.id).state).toBe("effect_started");
+    store.settlePeerSessionAction({
+      actionId: action.id,
+      expectedState: "effect_started",
+      state: "ambiguous",
+    });
+    expect(store.beginPeerSessionActionEffect(action.id).state).toBe("ambiguous");
+    const crashInjector = new Database(store.paths.database, { create: false, strict: true });
+    crashInjector.query(
+      "UPDATE mutation_attempts SET state='effect_started' WHERE id=? AND state='prepared'",
+    ).run(attempt.id);
+    crashInjector.close(false);
+    expect(() => store.beginPeerSessionActionEffect(action.id))
+      .toThrow("PEER_SESSION_NESTED_MUTATION_NOT_RESUMABLE");
+    store.setPeerSessionPolicy({
+      sessionId: target.id,
+      expectedRevision: 1,
+      mode: "inspect",
+    });
+    expect(() => store.admitPeerSessionAction(request))
+      .toThrow("PEER_SESSION_POLICY_REVISION_CONFLICT");
+    expect(() => store.beginPeerSessionActionEffect(action.id))
+      .toThrow("PEER_SESSION_POLICY_REVISION_CONFLICT");
+    expect(store.requirePeerSessionAction(action.id).state).toBe("ambiguous");
+  });
+
+  test("retains direct peer attribution through compaction and cancels provably unstarted joins", async () => {
+    let now = 40_000;
+    const { store, home } = await fixture({ now: () => now++ });
+    const root = join(home, "peer-direct-retention");
+    await mkdir(root);
+    const project = await store.createProject("Peer direct retention", root);
+    const profile = signInProfile(store, "Peer direct retention", "peer-direct@example.com");
+    const actorBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    let actor: SessionRecord = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-direct-origin",
+    });
+    const createTarget = (thread: string) => {
+      const created = store.createSession({
+        profileId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fastEnabled: false,
+      });
+      return store.bindSession({
+        sessionId: created.id,
+        expectedRevision: created.revision,
+        providerThreadId: thread,
+        state: "idle",
+      });
+    };
+    const target = createTarget("thread-peer-direct-retained");
+    const message = "retained peer message";
+    const key = peerIdempotencyKey(72_000);
+    const request = {
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "send" as const,
+      requestDigest: testDigest("retained peer request"),
+      messageDigest: testDigest(message),
+      reasonDigest: testDigest("retained peer reason"),
+      idempotencyKey: key,
+    };
+    const action = store.admitPeerSessionAction(request).action;
+    const attempt = store.prepareMutation({
+      kind: "session.send",
+      authorityId: target.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message },
+      idempotencyKey: key,
+    });
+    const runtime = codexRuntimeProfile(profile);
+    const evidence = store.beginSessionMutationEffect({
+      attemptId: attempt.id,
+      sessionId: target.id,
+      profileGeneration: profile.processGeneration,
+      message,
+      evidence: {
+        kind: "session.send",
+        providerThreadId: "thread-peer-direct-retained",
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: attempt.id,
+        messageDigest: testDigest(message),
+        runtimeProfile: runtime,
+      },
+    });
+    expect(evidence.evidence).toMatchObject({ messageActor: "peer_session" });
+    expect(store.requirePeerSessionAction(action.id).state).toBe("effect_started");
+    expect(store.readPeerSessionDirectMessageSource(key)).toBeNull();
+    const appended = store.completeSessionTurnEffect({
+      attemptId: attempt.id,
+      sessionId: target.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      expectedSessionRevision: target.revision,
+      applyResponseState: false,
+      turnId: "turn-peer-direct-target",
+      turnStatus: "completed",
+      runtimeProfile: runtime,
+      message,
+      receipt: { turnId: "turn-peer-direct-target" },
+    });
+    expect(appended.event.body).toMatchObject({
+      type: "user_message",
+      actor: "peer_session",
+      text: message,
+    });
+    store.settlePeerSessionAction({
+      actionId: action.id,
+      expectedState: "effect_started",
+      state: "applied",
+      targetTurnId: "turn-peer-direct-target",
+      resultDigest: testDigest("retained peer result"),
+    });
+
+    actor = store.setSessionTurnState({
+      sessionId: actor.id,
+      expectedRevision: actor.revision,
+      state: "idle",
+    });
+    actor = store.setSessionTurnState({
+      sessionId: actor.id,
+      expectedRevision: actor.revision,
+      state: "active",
+      activeTurnId: "turn-peer-direct-next",
+    });
+    now += PEER_SESSION_ACTION_RETAIN_AGE_MS + 1;
+    const cleanupMessage = "new peer message";
+    store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "send",
+      requestDigest: testDigest("new peer request"),
+      messageDigest: testDigest(cleanupMessage),
+      reasonDigest: testDigest("new peer reason"),
+      idempotencyKey: peerIdempotencyKey(72_001),
+    });
+    expect(() => store.requirePeerSessionAction(action.id)).toThrow("PEER_SESSION_NOT_FOUND");
+    expect(store.sessionMessageActorForSource(target.id, attempt.id)).toBe("peer_session");
+    expect(store.readPeerSessionMutationJoin(key)).toMatchObject({
+      action: null,
+      attempt: { id: attempt.id, state: "applied" },
+    });
+    expect(() => store.admitPeerSessionAction(request))
+      .toThrow("PEER_SESSION_IDEMPOTENCY_CONFLICT");
+
+    const crashTarget = createTarget("thread-peer-direct-crash");
+    const crashKey = peerIdempotencyKey(72_002);
+    const crashAction = store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: crashTarget.id,
+      expectedTargetRevision: crashTarget.revision,
+      delivery: "send",
+      requestDigest: testDigest("crash peer request"),
+      messageDigest: testDigest("crash peer message"),
+      reasonDigest: testDigest("crash peer reason"),
+      idempotencyKey: crashKey,
+    }).action;
+    store.beginPeerSessionActionEffect(crashAction.id);
+    store.settlePeerSessionAction({
+      actionId: crashAction.id,
+      expectedState: "effect_started",
+      state: "ambiguous",
+    });
+    store.updateSessionMetadata({
+      sessionId: crashTarget.id,
+      expectedRevision: crashTarget.revision,
+      note: "revision moved before provider dispatch",
+    });
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths, { now: () => now++ });
+    stores.push(restarted);
+    const cancelled = restarted.cancelUnstartedPeerSessionDirectAction({
+      actionId: crashAction.id,
+      diagnosticCode: "PEER_SESSION_PROVIDER_EFFECT_NOT_STARTED",
+    });
+    expect(cancelled.state).toBe("cancelled");
+    expect(restarted.readMutation(crashKey)).toMatchObject({
+      state: "cancelled",
+      result: { providerEffectStarted: false },
+    });
+    expect(restarted.readPeerSessionDirectMessageSource(crashKey)).toBeNull();
+    expect(restarted.cancelUnstartedPeerSessionDirectAction({
+      actionId: crashAction.id,
+      diagnosticCode: "PEER_SESSION_PROVIDER_EFFECT_NOT_STARTED",
+    })).toEqual(cancelled);
+
+    const preparedBase = restarted.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const preparedTarget = restarted.bindSession({
+      sessionId: preparedBase.id,
+      expectedRevision: preparedBase.revision,
+      providerThreadId: "thread-peer-direct-prepared",
+      state: "idle",
+    });
+    const preparedKey = peerIdempotencyKey(72_003);
+    const preparedAction = restarted.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: preparedTarget.id,
+      expectedTargetRevision: preparedTarget.revision,
+      delivery: "send",
+      requestDigest: testDigest("prepared peer envelope"),
+      messageDigest: testDigest("prepared peer message"),
+      reasonDigest: testDigest("prepared peer reason"),
+      idempotencyKey: preparedKey,
+    }).action;
+    restarted.prepareMutation({
+      kind: "session.send",
+      authorityId: preparedTarget.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: "prepared peer message" },
+      idempotencyKey: preparedKey,
+    });
+    restarted.beginPeerSessionActionEffect(preparedAction.id);
+    expect(restarted.cancelUnstartedPeerSessionDirectAction({
+      actionId: preparedAction.id,
+      diagnosticCode: "PEER_SESSION_PROVIDER_EFFECT_NOT_STARTED",
+    }).state).toBe("cancelled");
+    expect(restarted.readMutation(preparedKey)?.state).toBe("cancelled");
+  });
+
+  test("requires peer queue effect evidence and quarantines missing-evidence restart state", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "peer-queue-evidence");
+    await mkdir(root);
+    const project = await store.createProject("Peer queue evidence", root);
+    const profile = signInProfile(store, "Peer queue evidence", "peer-queue-evidence@example.com");
+    const actorBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-queue-evidence",
+    });
+    const targetBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.bindSession({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      providerThreadId: "thread-peer-queue-evidence",
+      state: "idle",
+    });
+    const message = "evidence must precede dispatch";
+    const admitted = store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "queue",
+      requestDigest: testDigest("peer queue evidence request"),
+      messageDigest: testDigest(message),
+      reasonDigest: testDigest("peer queue evidence reason"),
+      idempotencyKey: peerIdempotencyKey(52_001),
+      message,
+    });
+    expect(() => store.transitionQueue(admitted.queue!.id, "pending", "dispatching"))
+      .toThrow("PEER_QUEUE_EFFECT_EVIDENCE_REQUIRED");
+    const injector = new Database(store.paths.database, { create: false, strict: true });
+    injector.exec("PRAGMA foreign_keys=ON; DROP TRIGGER queue_peer_effect_evidence_guard;");
+    injector.query("UPDATE queue_entries SET state='dispatching' WHERE id=?")
+      .run(admitted.queue!.id);
+    injector.close(false);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths);
+    stores.push(restarted);
+    expect(restarted.recoverDispatchingQueueEffects()).toEqual({
+      recovered: [],
+      unresolved: [admitted.queue!.id],
+    });
+    expect(restarted.requireQueue(admitted.queue!.id).state).toBe("ambiguous");
+    expect(restarted.requirePeerSessionAction(admitted.action.id).state).toBe("ambiguous");
+    expect(restarted.requireSession(target.id).state).toBe("recovery_required");
+  });
+
+  test("atomically advances only share memory heads and recovers started control effects with cursors", async () => {
+    const { store, home } = await fixture({ now: () => 7_000 });
+    const root = join(home, "memory-control-cas");
+    await mkdir(root);
+    const project = await store.createProject("Memory control CAS", root);
+    const profile = signInProfile(store, "Memory control CAS", "memory-control@example.com");
+    const actorBase = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-memory-control",
+    });
+    const head = { sequence: 0, operationSha256: null, headDigest: testDigest("empty") } as const;
+    store.initializeProjectMemoryAuthority({
+      projectId: project.id,
+      authorityDigest: testDigest("authority"),
+      bindingDigest: testDigest("binding"),
+      head,
+    });
+    const remember = store.prepareMemorySubmission({
+      actorSessionId: actor.id,
+      projectId: project.id,
+      kind: "remember",
+      requestDigest: testDigest("remember request"),
+      contentDigest: testDigest("remember content"),
+      keyDigest: testDigest("remember key"),
+      workingBindingDigest: testDigest("memory control working binding"),
+      workingEpoch: 1,
+      expectedHead: head,
+      idempotencyKey: peerIdempotencyKey(52_002),
+    }).record;
+    store.bindMemorySubmissionEffect({
+      submissionId: remember.id,
+      effectRecordSha256: testDigest("memory control remember record"),
+      attestationSha256: testDigest("memory control remember attestation"),
+      operationId: "memory_control_remember",
+    });
+    store.beginMemorySubmission(remember.id);
+    const advancedHead = {
+      sequence: 1,
+      operationSha256: testDigest("share operation"),
+      headDigest: testDigest("share head"),
+    } as const;
+    const skippedHead = {
+      sequence: 2,
+      operationSha256: testDigest("skipped remember operation"),
+      headDigest: testDigest("skipped remember head"),
+    } as const;
+    expect(() => store.settleMemorySubmission({
+      submissionId: remember.id,
+      expectedState: "effect_started",
+      state: "applied",
+      outcomeCode: "remember_committed",
+      resultHead: skippedHead,
+      receiptDigest: testDigest("remember receipt"),
+    })).toThrow("MEMORY_SUBMISSION_OUTCOME_STATE_MISMATCH");
+    expect(store.readProjectMemoryAuthority(project.id)?.head).toEqual(head);
+    expect(store.settleMemorySubmission({
+      submissionId: remember.id,
+      expectedState: "effect_started",
+      state: "applied",
+      outcomeCode: "remember_committed",
+      resultHead: advancedHead,
+      receiptDigest: testDigest("remember receipt"),
+    })).toMatchObject({ state: "applied", resultHead: advancedHead });
+    expect(store.readProjectMemoryAuthority(project.id)?.head).toEqual(head);
+    const share = store.prepareMemorySubmission({
+      actorSessionId: actor.id,
+      projectId: project.id,
+      kind: "share",
+      requestDigest: testDigest("share request"),
+      contentDigest: remember.contentDigest,
+      keyDigest: remember.keyDigest,
+      workingBindingDigest: testDigest("memory control working binding"),
+      workingEpoch: 1,
+      expectedHead: head,
+      idempotencyKey: peerIdempotencyKey(52_003),
+    }).record;
+    store.bindMemorySubmissionEffect({
+      submissionId: share.id,
+      effectRecordSha256: testDigest("memory control remember record"),
+      attestationSha256: testDigest("memory control remember attestation"),
+      operationId: "memory_adopt_control_share",
+      sourceHead: advancedHead,
+      nominationSha256: testDigest("memory control nomination"),
+    });
+    store.beginMemorySubmission(share.id);
+    expect(store.recoverStartedControlPlaneEffects()).toEqual({
+      peerActionIds: [],
+      memorySubmissionIds: [share.id],
+    });
+    expect(() => store.beginMemorySubmission(
+      share.id,
+      peerIdempotencyKey(99_999),
+    )).toThrow("MEMORY_SUBMISSION_IDEMPOTENCY_CONFLICT");
+    expect(store.beginMemorySubmission(share.id, share.idempotencyKey).state)
+      .toBe("ambiguous");
+    expect(store.listUnsettledMemorySubmissionsPage({ limit: 1 }).records).toHaveLength(1);
+    store.settleMemorySubmission({
+      submissionId: share.id,
+      expectedState: "ambiguous",
+      state: "applied",
+      outcomeCode: "share_adopted",
+      resultHead: advancedHead,
+      receiptDigest: testDigest("share receipt"),
+    });
+    expect(store.readProjectMemoryAuthority(project.id)).toMatchObject({
+      head: advancedHead,
+      syncState: "local_only",
+    });
+  });
+
+  test("upgrades a frozen upstream-v39 schema to attributed v40 state", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Upstream v39 peer migration");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const queue = store.enqueue(session.id, "legacy human queue");
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    legacy.exec(`
+      PRAGMA foreign_keys=OFF;
+      DROP TRIGGER IF EXISTS queue_peer_action_transition;
+      DROP TRIGGER IF EXISTS queue_peer_effect_evidence_guard;
+      DROP TRIGGER IF EXISTS queue_peer_inbound_quota_guard;
+      DROP TRIGGER IF EXISTS queue_peer_provenance_immutable;
+      DROP TRIGGER IF EXISTS queue_peer_provenance_insert_guard;
+      DROP TRIGGER IF EXISTS session_peer_policy_default;
+      DROP TRIGGER IF EXISTS session_provider_switch_session_update_guard;
+      DROP TRIGGER IF EXISTS session_provider_switch_session_delete_guard;
+      DROP TRIGGER IF EXISTS session_message_event_source_event_delete;
+      DROP INDEX IF EXISTS queue_peer_action;
+      DROP TABLE IF EXISTS session_message_event_sources;
+      ALTER TABLE queue_entries DROP COLUMN peer_action_id;
+      ALTER TABLE queue_entries DROP COLUMN message_actor;
+      DROP TABLE IF EXISTS session_provider_switches;
+      DROP TABLE IF EXISTS peer_session_direct_message_sources;
+      DROP TABLE IF EXISTS peer_session_turn_origins;
+      DROP TABLE IF EXISTS peer_session_action_roots;
+      DROP TABLE IF EXISTS peer_session_action_visits;
+      DROP TABLE IF EXISTS peer_session_action_parents;
+      DROP TABLE IF EXISTS peer_session_actions;
+      DROP TABLE IF EXISTS session_peer_policies;
+      DROP TABLE IF EXISTS memory_page_attestation_refs;
+      DROP TABLE IF EXISTS memory_working_attestation_forks;
+      DROP TABLE IF EXISTS memory_working_attestation_heads;
+      DROP TABLE IF EXISTS memory_page_attestations;
+      DROP TABLE IF EXISTS memory_submissions;
+      DROP TABLE IF EXISTS project_memory_authorities;
+      DROP TABLE IF EXISTS session_host_capability_bindings;
+      DELETE FROM migrations WHERE version=40;
+      PRAGMA user_version=39;
+      PRAGMA foreign_keys=ON;
+    `);
+    legacy.close(false);
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:40");
+    const migrated = new StateStore(paths, { now: () => 9_000 });
+    stores.push(migrated);
+    expect(migrated.requireQueue(queue.id)).toMatchObject({
+      messageActor: "human",
+      state: "pending",
+    });
+    expect(migrated.requireQueue(queue.id)).not.toHaveProperty("peerActionId");
+    expect(migrated.requirePeerSessionPolicy(session.id)).toMatchObject({
+      mode: "coordinate",
+      revision: 1,
+    });
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("SELECT applied_at FROM migrations WHERE version=40").get())
+        .toEqual({ applied_at: 9_000 });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("converges a pre-release feature-v39 journal without losing recovery evidence", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Feature v39 journal",
+      "feature-v39-journal@example.com",
+    );
+    const created = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const session = store.bindSession({
+      sessionId: created.id,
+      expectedRevision: created.revision,
+      providerThreadId: "feature-v39-source-thread",
+      state: "idle",
+    });
+    const targetRuntime = codexRuntimeProfile(profile, 7_100);
+    const seedText = "Preserve the pre-release provider-switch journal.";
+    const journal = store.beginSessionProviderSwitch({
+      idempotencyKey: peerIdempotencyKey(79_000),
+      request: {
+        sessionId: session.id,
+        provider: "codex",
+        requestedPreset: "high",
+        targetProfileId: profile.id,
+      },
+      source: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        provider: "codex",
+        preset: "high",
+        providerThreadId: "feature-v39-source-thread",
+        sessionRevision: session.revision,
+      },
+      target: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        provider: "codex",
+        preset: "high",
+        review: {
+          reviewId: "79000000-0000-4000-8000-000000000001",
+          kind: "session_start",
+          effectiveRuntimeProfile: targetRuntime,
+        },
+      },
+      fastEnabled: false,
+      hostCapabilities: {
+        preambleVersion: 1,
+        preambleDigest: testDigest("feature v39 preamble"),
+        manifestVersion: 1,
+        manifestDigest: testDigest("feature v39 manifest"),
+      },
+      transcriptDigest: testDigest("feature v39 transcript"),
+      seed: {
+        text: seedText,
+        digest: createHash("sha256")
+          .update("hra:session-transcript-seed:v1\0", "utf8")
+          .update(seedText, "utf8")
+          .digest("hex"),
+        includedRecords: 1,
+        omittedRecords: 0,
+      },
+    });
+    const request = {
+      sessionId: session.id,
+      provider: "codex" as const,
+      requestedPreset: "high" as const,
+      targetProfileId: profile.id,
+    };
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    legacy.exec(`
+      DROP TRIGGER session_provider_switch_v40_authority_guard;
+      DROP TRIGGER session_provider_switch_v40_authority_immutable;
+      ALTER TABLE session_provider_switches DROP COLUMN authority_contract_v40;
+      ALTER TABLE session_provider_switches DROP COLUMN target_manifest_digest_v40;
+      ALTER TABLE session_provider_switches DROP COLUMN target_manifest_version_v40;
+      ALTER TABLE session_provider_switches DROP COLUMN target_preamble_digest_v40;
+      ALTER TABLE session_provider_switches DROP COLUMN target_preamble_version_v40;
+      ALTER TABLE session_provider_switches DROP COLUMN target_preset_v40;
+      ALTER TABLE session_provider_switches DROP COLUMN target_provider_v40;
+      ALTER TABLE session_provider_switches DROP COLUMN source_preset_v40;
+      ALTER TABLE session_provider_switches DROP COLUMN source_provider_v40;
+      DROP TRIGGER work_devin_preset_contract_guard;
+      DROP TRIGGER work_session_devin_contract_guard;
+      DROP TRIGGER work_attempt_route_guard;
+      DROP TRIGGER work_session_attempt_authority_guard;
+      DROP TRIGGER work_profile_attempt_authority_guard;
+      DROP TRIGGER work_signal_member_guard;
+      DROP TABLE session_mutation_authority_rebinds_v39;
+      ALTER TABLE sessions DROP COLUMN provider_v39;
+      DELETE FROM migrations WHERE version=40;
+      PRAGMA user_version=39;
+    `);
+    expect(legacy.query("PRAGMA table_info(session_provider_switches)").all())
+      .not.toContainEqual(expect.objectContaining({ name: "authority_contract_v40" }));
+    expect(legacy.query("PRAGMA table_info(sessions)").all())
+      .not.toContainEqual(expect.objectContaining({ name: "provider_v39" }));
+    legacy.close(false);
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:40");
+    const migrated = new StateStore(paths, { now: () => 7_200 });
+    stores.push(migrated);
+    expect(migrated.readSessionProviderSwitchReplay({
+      idempotencyKey: journal.idempotencyKey,
+      request,
+    })).toMatchObject({
+      attemptId: journal.attemptId,
+      journalDigest: journal.journalDigest,
+      source: { provider: "codex", preset: "high" },
+      target: { provider: "codex", preset: "high" },
+    });
+    expect(migrated.requireSession(session.id)).toMatchObject({ provider: "codex" });
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        `SELECT source_provider_v40,target_provider_v40,authority_contract_v40
+         FROM session_provider_switches WHERE attempt_id=?`,
+      ).get(journal.attemptId)).toEqual({
+        source_provider_v40: "codex",
+        target_provider_v40: "codex",
+        authority_contract_v40: 1,
+      });
+    } finally {
+      inspector.close(false);
+    }
+    migrated.close();
+    stores.splice(stores.indexOf(migrated), 1);
+    const reopened = new StateStore(paths, { readonly: true });
+    stores.push(reopened);
+    expect(reopened.readSessionProviderSwitchReplay({
+      idempotencyKey: journal.idempotencyKey,
+      request,
+    })?.journalDigest).toBe(journal.journalDigest);
+  });
+
+  test("readonly open requires the exact v40 peer and memory guards", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const weakened = new Database(paths.database, { create: false, strict: true });
+    weakened.exec(`
+      DROP TRIGGER queue_peer_effect_evidence_guard;
+      CREATE TRIGGER queue_peer_effect_evidence_guard
+      BEFORE UPDATE OF state ON queue_entries
+      BEGIN SELECT 1; END;
+    `);
+    weakened.close(false);
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+    const repaired = new StateStore(paths);
+    stores.push(repaired);
+    repaired.close();
+    stores.splice(stores.indexOf(repaired), 1);
+    const readonly = new StateStore(paths, { readonly: true });
+    stores.push(readonly);
+  });
+
+  test("readonly open rejects a missing v40 authority trigger and index", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const weakened = new Database(paths.database, { create: false, strict: true });
+    weakened.exec(`
+      DROP TRIGGER session_host_capability_binding_immutable;
+      DROP INDEX memory_submissions_project_recent;
+    `);
+    weakened.close(false);
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+    const repaired = new StateStore(paths);
+    stores.push(repaired);
+    repaired.close();
+    stores.splice(stores.indexOf(repaired), 1);
+    const readonly = new StateStore(paths, { readonly: true });
+    stores.push(readonly);
+  });
+
+  test("readonly open rejects a weakened previously unaudited v40 guard", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const weakened = new Database(paths.database, { create: false, strict: true });
+    weakened.exec(`
+      DROP TRIGGER session_peer_policy_transition_guard;
+      CREATE TRIGGER session_peer_policy_transition_guard
+      BEFORE UPDATE ON session_peer_policies
+      BEGIN SELECT 1; END;
+    `);
+    weakened.close(false);
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+  });
+
   test("rejects databases written by a newer schema version", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-newer-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 40");
+    newer.exec("PRAGMA user_version = 41");
     newer.close(false);
     await chmod(paths.database, 0o600);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:40:39");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:41:40");
   });
 });

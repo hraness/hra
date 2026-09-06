@@ -130,6 +130,7 @@ import {
   type CompactRemoteInteractionPolicy,
   type CompactAttachment,
   type CompactMessageActor,
+  type CompactMessageActorKind,
   type CompactSessionEvent,
   type GitAction,
   type ModelPreset,
@@ -184,6 +185,7 @@ type LocalExecuteRemote = (
 type CompactSessionEventBody =
   | Readonly<{
       actor?: CompactMessageActor;
+      actorKind?: CompactMessageActorKind;
       attachments?: readonly CompactAttachment[];
       kind: "user_message" | "assistant_message";
       text: string;
@@ -1065,6 +1067,9 @@ function compactSessionEventBody(event: CompactSessionEvent): CompactSessionEven
     return {
       ...(event.kind === "user_message" && event.actor !== undefined
         ? { actor: event.actor }
+        : {}),
+      ...(event.kind === "user_message" && event.actorKind !== undefined
+        ? { actorKind: event.actorKind }
         : {}),
       ...(event.kind === "user_message" && event.attachments !== undefined
         ? { attachments: event.attachments }
@@ -2382,11 +2387,16 @@ function completedProjectionTurns(
     const text = scheduledTaskSource
       ? scheduledTaskPromptProjectionMarker
       : boundedText(message.text, 64_000);
-    // A user message HRA authored on the human's behalf is labelled so the web
-    // grid can tell an autoresponse from something the human actually typed.
-    const autorespondAuthored = message.role === "user"
-      && message.clientId !== undefined
-      && store.isAutorespondMessageSource(session.id, message.clientId);
+    // Resolve authorship from the one storage-owned source classifier. The
+    // legacy actor stays `autorespond` for every non-owner host message so the
+    // released v0.5 reader accepts it. New readers refine the label through an
+    // additive actorKind key that old readers ignore.
+    const messageActor = message.role === "user" && message.clientId !== undefined
+      ? store.sessionMessageActorForSource(session.id, message.clientId)
+      : null;
+    const actorKind = messageActor === "peer_session" || messageActor === "provider_switch"
+      ? messageActor
+      : null;
     // The manifest is local custody, keyed by the client message id the turn
     // was dispatched under. It names each file and its size; the bytes never
     // leave this machine.
@@ -2394,7 +2404,8 @@ function completedProjectionTurns(
       ? store.messageAttachmentManifest(session.id, message.clientId)
       : [];
     messages.push({
-      ...(autorespondAuthored ? { actor: "autorespond" as const } : {}),
+      ...(messageActor === null || messageActor === "human" ? {} : { actor: "autorespond" }),
+      ...(actorKind === null ? {} : { actorKind }),
       ...(manifest.length === 0 ? {} : { attachments: manifest }),
       kind: message.role === "user" ? "user_message" : "assistant_message",
       text,

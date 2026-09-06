@@ -146,6 +146,28 @@ describe("session transcript", () => {
     });
   });
 
+  test("preserves peer-session authorship in transcripts and rendered seeds", () => {
+    reset();
+    const transcript = buildSessionTranscript({
+      sessionId,
+      events: [
+        event({
+          type: "user_message",
+          turnId: turn,
+          actor: "peer_session",
+          text: "Check the repaired invariant.",
+          omittedCharacters: 0,
+        }),
+      ],
+    });
+    expect(transcript.records[0]).toMatchObject({ actor: "peer_session", kind: "user" });
+    expect(renderTranscriptSeed({
+      transcript,
+      fromProvider: "codex",
+      toProvider: "claude",
+    }).text).toContain("User (peer session): Check the repaired invariant.");
+  });
+
   test("renders a bounded handoff seed that keeps the end of the conversation", () => {
     reset();
     const events = Array.from({ length: 40 }, (_unused, index) => event({

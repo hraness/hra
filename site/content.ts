@@ -134,7 +134,7 @@ export interface PublicContent {
     readonly url: string;
   };
   readonly productName: string;
-  /** Provider order stated the same way everywhere. */
+  /** Provider availability and its main capability limit, stated the same way everywhere. */
   readonly providerRoadmap: string;
   /** The exact immutable CLI release installed by the public command. */
   readonly releaseVersion: string;
@@ -416,8 +416,8 @@ export const publicContent: PublicContent = {
       },
       {
         label: "Sessions",
-        value: "Live and durable",
-        detail: "The local daemon keeps running after a terminal exits.",
+        value: "Live, locally recorded",
+        detail: "The daemon keeps sessions alive after a terminal exits and stores their provider-neutral transcript.",
       },
       {
         label: "Interfaces",
@@ -456,7 +456,7 @@ export const publicContent: PublicContent = {
     },
     {
       question: "What does the release candidate include?",
-      answer: [text(`The v${releaseVersion} local CLI release candidate runs Codex on macOS and Linux and Claude Code on Linux. It becomes public only after immutable GitHub and npm release admission. Hosted sync is live as an ${hostedBetaLabel}.`)],
+      answer: [text(`The v${releaseVersion} local CLI release candidate runs Codex and Devin on macOS and Linux and Claude Code on Linux. It becomes public only after immutable GitHub and npm release admission. Hosted sync is live as an ${hostedBetaLabel}.`)],
     },
     {
       question: "Does HRA use my API keys or provider subscription?",
@@ -468,7 +468,7 @@ export const publicContent: PublicContent = {
     },
     {
       question: "What if the terminal closes?",
-      answer: [text("The local daemon keeps the session alive. Reopen the shell, select the account and session, and continue. Claude Code sessions cannot be resumed after the daemon that started them exits.")],
+      answer: [text("The local daemon keeps the session alive. Reopen the shell, select the account and session, and continue. Claude Code sessions cannot be resumed after the daemon that started them exits. Devin reloads an exact native session only when its ACP initialization advertised that capability.")],
     },
     {
       question: "Which platforms are supported?",
@@ -775,6 +775,13 @@ export const publicContent: PublicContent = {
           code("hra session queue"),
           text(" to send the message after the current prompt completes, or stop the turn before sending another message. HRA never sends concurrent prompts to one Devin session."),
         ),
+        paragraph(
+          text("The initial Devin ACP adapter is text-only and does not bind HRA's static session preamble or closed host-tool server. A Devin session can receive ordinary owner or peer "),
+          code("send"),
+          text(" and "),
+          code("queue"),
+          text(" messages under the same authority checks, and an owner can use the separate HRA memory CLI for that session. The Devin model cannot originate HRA memory, peer-session, or conversation-automation tool calls in this release."),
+        ),
         { kind: "subheading", text: "Scheduled work in the same conversation" },
         paragraph(
           text("Attach a recurring whole-minute interval to an existing session with "),
@@ -1014,16 +1021,28 @@ export const publicContent: PublicContent = {
             text(" and XDG roots for Devin. Each provider owns its authentication state; HRA never copies or parses provider credentials."),
           ],
           [
-            text("Usage with provenance: account identity, quota, rate-limit, and token snapshots include their provider source time and freshness. A bounded source-ordered 24-hour ledger supports safe human and JSON pagination without returning raw provider payloads."),
+            text("Codex usage with provenance: account identity, quota, rate-limit, and token snapshots include their provider source time and freshness. A bounded source-ordered 24-hour ledger supports safe human and JSON pagination without returning raw provider payloads."),
           ],
           [
-            text("Compact sessions: list sessions, read user and final assistant messages, inspect elapsed time plus bounded observed file and Git actions, then open one turn for full provider-visible detail."),
+            text("Compact sessions: list sessions, read provider-neutral user and final assistant messages, and inspect elapsed time plus bounded observed file and Git actions. Protected full-turn inspection remains Codex-only."),
           ],
           [
-            text("Durable controls: send, queue, steer, stop, rename, and keep one editable note per session. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing."),
+            text("Durable controls: send, queue, stop, and keep one editable note per session. Codex and Claude Code can steer an active turn; Devin ACP cannot, so Devin steering refuses without an effect. Provider-native rename remains Codex-only. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing."),
           ],
           [
             text("Named projects: a project is a canonical directory that may contain several repositories. Changing it affects future turns only."),
+          ],
+          [
+            text("Stable working and shared project memory: a project-bound session writes to its expiring working lane, reads that lane together with durable project memory, and shares one attested page only through conflict-checked adoption. Codex and Claude Code models use closed HRA tools in this release; the Devin ACP adapter does not yet bind HRA's static preamble or host-tool server. Owners use "),
+            code("hra memory status|list|get|search|explain|remember|share"),
+            text(". See "),
+            link("working and project memory", "https://github.com/hraness/hra/blob/main/docs/facts-memory.md"),
+            text(" for the authority and recovery boundaries."),
+          ],
+          [
+            text("Attributed peer coordination: each session owns a revocable "),
+            code("off|inspect|coordinate"),
+            text(" policy. Bound Codex and Claude Code tools can list, inspect, and message only bounded same-project peers; every action retains actor and lineage without granting session administration or approval authority. Devin sessions remain valid peer targets, but Devin cannot originate these model tool calls in this release."),
           ],
           [
             text("Agent work coordination: the frozen beta contract specifies bounded local task graphs, fenced attempts, structured submissions, independent reviews, signals, and a resumable work event stream for exact existing sessions."),
@@ -1031,6 +1050,25 @@ export const publicContent: PublicContent = {
           [
             text("Optional encrypted sync: paired devices share a bounded session projection and submit commands to the one machine holding the execution lease."),
           ],
+        ),
+        { kind: "subheading", text: "Peer coordination boundary" },
+        paragraph(
+          text("Peer coordination is separate from Work. It creates no Work, task, attempt, review, or signal membership. The actor and target must be distinct current sessions in the same project. Inspection requires neither policy to be "),
+          code("off"),
+          text("; messaging requires both exact current policy revisions to remain "),
+          code("coordinate"),
+          text(". Changing either policy revokes stale inspection and mutation authority."),
+        ),
+        paragraph(
+          code("send"),
+          text(" starts a new turn only for an idle target. "),
+          code("queue"),
+          text(" records bounded untrusted input for later delivery and works for an active target, including Devin. "),
+          code("steer"),
+          text(" addresses one exact active turn and is supported by Codex and Claude Code; Devin ACP refuses it. Peer input cannot resolve approvals, answer protected questions, administer a session, or inherit an identity."),
+        ),
+        paragraph(
+          text("HRA refuses self-addressing, stale target revisions, causal cycles, and a ninth hop. It admits at most 120 new peer actions per actor and per project in a rolling hour, at most 16 distinct targets per actor in that hour, and at most 64 unsettled inbound queue entries or 1 MiB of their text per target. Complete replay and causal evidence remains for at least seven days. Protected recovery ancestry is never pruned to make room, and the 25,000-action project cap fails closed when protected rows consume it."),
         ),
       ],
     },
@@ -1161,7 +1199,7 @@ export const publicContent: PublicContent = {
       heading: "Presets and permissions",
       blocks: [
         paragraph(
-          text("HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; "),
+          text("HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. For Codex, that refresh includes model, reasoning effort, Fast service tier, permission profile, computer-use capability, and accessible apps. For Claude, HRA admits only the pinned Fable profile and reviewed host-tool boundary. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; "),
           code("hra session show"),
           text(` displays it with the provider-neutral transcript. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof, and stream formats. Devin profiles include exact CLI ${publicPins.devin}, ACP v1, model `),
           code("gpt-6-astra"),
@@ -1366,6 +1404,13 @@ export const publicContent: PublicContent = {
             "hra session watch <session> [--cursor <cursor>] [--jsonl]",
             "hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
             "hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]",
+            "hra memory status <session> [--json]",
+            "hra memory list <session> [--continuation <token>] [--json]",
+            "hra memory get <session> <key> [--continuation <token>] [--json]",
+            "hra memory search <session> [--continuation <token>] <text> [--json]",
+            "hra memory explain <session> <query-id> <row> [--json]",
+            "hra memory remember <session> <key> --title <title> --summary <summary> [--language <tag>] [--idempotency-key <uuid>] [--json] -- <body>",
+            "hra memory share <session> <key> --reason <reason> [--idempotency-key <uuid>] [--json]",
             "hra session start <account> [--project <project>] [--provider <codex|claude|devin>] [--preset <low|high|ultra|fable-max|astra>] [--fast]",
             "hra session send|queue|steer <session> [--attach <path>]... <message>",
             "hra session stop|recover|abandon <session>",
@@ -1374,11 +1419,13 @@ export const publicContent: PublicContent = {
             "hra session note get|edit|clear <session>",
             "hra session note set <session> <note>",
             "hra session state <session> [--json]",
+            "hra session peer-policy get <session> [--json]",
+            "hra session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]",
             "hra session preset <session> <low|high|ultra|fable-max|astra>",
-            "hra session switch <session> --provider <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>] [--account <account>]",
-            "hra session export <session> [--format <trajectory|json>] [--out <path>]",
             "hra session fast <session> <on|off>",
             "hra session project <session> <project>",
+            "hra session switch <session> --provider <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>] [--account <account>]",
+            "hra session export <session> [--format <trajectory|json>] [--out <path>]",
             "hra session task list <session>",
             "hra session task show <session> <task-id>",
             "hra session task create <session> --name <name> --every-minutes <15..10080> [--paused] [--idempotency-key <uuid>] -- <prompt>",

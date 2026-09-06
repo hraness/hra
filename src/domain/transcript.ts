@@ -440,7 +440,13 @@ export const buildSessionTranscript = (input: Readonly<{
 export const TRANSCRIPT_SEED_HEADER = "[HRA provider handoff]";
 
 const actorLabel = (actor: SessionMessageActor): string =>
-  actor === "human" ? "User" : actor === "autorespond" ? "User (autorespond)" : "User (handoff)";
+  actor === "human"
+    ? "User"
+    : actor === "autorespond"
+      ? "User (autorespond)"
+      : actor === "peer_session"
+        ? "User (peer session)"
+        : "User (handoff)";
 
 const seedLine = (record: TranscriptRecord): string => {
   switch (record.kind) {

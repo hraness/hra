@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "archiveBytes": 808632,
+    "archiveName": "hraness-hra-0.5.0.tgz",
+    "archiveSha256": "d0d958a95b15989f639e60ba90a2abefa7d01a3c54af601c300657d365f39063",
+    "archiveSRI": "sha512-lpiJw1nEDc1CKVpnbtvw4+3+3DZAAKDJ2rvP0VZCwfzatP3gEMh6iTQNQjvZn1z4kyKCQcwo//cRg3/HLyz27Q==",
+    "packageName": "@hraness/hra",
+    "stateStoreSha256": "9c40a3a616f308c7387ba2861e3307624f75019aed79608626a0a7325e04caad",
+    "tag": "v0.5.0",
+    "tagCommit": "846f5c99f573f97ce99f1f23ac1ea45d93e63042",
+    "version": "0.5.0"
+  },
+  "state": {
+    "databaseRelativePath": "control-plane.sqlite",
+    "expectedRows": {
+      "migrations": {
+        "first": 1,
+        "last": 33,
+        "count": 33
+      },
+      "profiles": [
+        {
+          "id": "acct_498357cf263c43ab83b081db8d983419",
+          "label": "Released fixture account",
+          "state": "signed_out",
+          "process_generation": 0
+        }
+      ],
+      "projects": [
+        {
+          "id": "proj_a906d3ab8b014e2f9a5ee4d4b4944d66",
+          "label": "Released fixture project",
+          "root_path": "/fixture/hra-v0.5.0/project",
+          "is_default": 1
+        }
+      ],
+      "sessions": [
+        {
+          "id": "sess_cc26edccb4ea451b8f0f3333b58cba93",
+          "profile_id": "acct_498357cf263c43ab83b081db8d983419",
+          "project_id": "proj_a906d3ab8b014e2f9a5ee4d4b4944d66",
+          "title": "Released fixture session",
+          "provider": "codex",
+          "preset": "high",
+          "state": "starting",
+          "revision": 1
+        }
+      ],
+      "queueEntries": [
+        {
+          "id": "queue_076d90eb993c499cab62d43d7fffdf0b",
+          "session_id": "sess_cc26edccb4ea451b8f0f3333b58cba93",
+          "message": "Preserve this released queue entry",
+          "state": "pending",
+          "enqueue_sequence": 1
+        }
+      ],
+      "queueSequenceAuthority": {
+        "next_sequence": 2
+      }
+    },
+    "releasedSchemaVersion": 33,
+    "rootDirectories": [
+      "facts-memory-sessions",
+      "profiles",
+      "profiles/acct_498357cf263c43ab83b081db8d983419",
+      "profiles/acct_498357cf263c43ab83b081db8d983419/codex-home",
+      "profiles/acct_498357cf263c43ab83b081db8d983419/desktop-user-data",
+      "runtime"
+    ],
+    "sqlBytes": 112527,
+    "sqlSha256": "32c637eee1d213d3a3e48519adeecefe372cf0a5966b39210f656fba25433ce2",
+    "walCheckpoint": {
+      "busy": 0,
+      "log": 0,
+      "checkpointed": 0
+    }
+  },
+  "downgradeProof": {
+    "probedNewerSchemaVersion": 35,
+    "releasedReadonlyError": "STATE_SCHEMA_NEWER:35:33"
+  }
+}

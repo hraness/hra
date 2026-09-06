@@ -93,6 +93,14 @@ prompt completes, or stop the turn before sending another message. HRA never
 sends two concurrent prompts to one Devin session. The initial Devin adapter is
 text-only, so it also refuses attachments.
 
+The initial adapter also does not bind HRA's static session preamble or closed
+host-tool server on `session/new` or `session/load`. Devin receives only the
+ordinary text prompt supplied for the turn, so its model cannot originate HRA
+memory, peer-session, or conversation-automation tool calls in this release. A
+Devin session can still receive an owner or peer `send` while idle and a bounded
+`queue` message for later delivery, and the owner-facing `hra memory` commands
+can address its host-owned working and project memory.
+
 ## Usage and limits
 
 An ACP `usage_update` reports current context occupancy as `used` and context

@@ -16,14 +16,21 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
-import { createOhSqliteStoreAuthorityV1 } from "@hraness/oh/sqlite";
+import { OH_MEMORY_LIMITS_V1 } from "@hraness/oh/memory";
 import {
+  createOhSqliteStoreAuthorityV1,
+  openOhSqliteDatabase,
+  type OhSqliteDatabase,
+} from "@hraness/oh/sqlite";
+import {
+  OH_CANONICAL_STORE_PROFILE_V1,
   OH_WORKING_STORE_PROFILE_V1,
   parseOhHeadV1,
   parseOhHeadRefV1,
   parseOhStoreBindingV1,
   type OhHeadV1,
   type OhStoreAuthorityV1,
+  type OhStoreV1,
 } from "@hraness/oh/store";
 import { z } from "zod";
 
@@ -56,9 +63,43 @@ const metadataMaximumBytes = 16 * 1024;
 const hostActorId = "hra.memory.host";
 
 export const HRA_OH_FACTS_MEMORY_LIMITS_V1 = Object.freeze({
-  forkSnapshotBytes: 8 * 1024 * 1024,
-  sqliteLogicalBytes: 96 * 1024 * 1024,
+  forkSnapshotBytes: OH_MEMORY_LIMITS_V1.snapshotBytesPerLane,
+  // Oh persists an operation, its live records, search documents, and FTS
+  // materialization. Keep bounded room for that storage amplification while
+  // retaining a hard local database-plus-WAL ceiling.
+  sqliteLogicalBytes: 16 * OH_MEMORY_LIMITS_V1.snapshotBytesPerLane,
 });
+
+export class OhFactsMemoryCustodyError extends Error {
+  constructor(
+    readonly lane: "canonical" | "working",
+    code: string,
+    cause: unknown,
+  ) {
+    super(code, { cause });
+    this.name = "OhFactsMemoryCustodyError";
+  }
+}
+
+const custodyError = (
+  lane: "canonical" | "working",
+  error: unknown,
+): Error => {
+  if (error instanceof OhFactsMemoryCustodyError) return error;
+  const code = error instanceof Error ? error.message : "";
+  if (new Set([
+    "FACTS_MEMORY_OH_DATABASE_BUSY",
+    "FACTS_MEMORY_OH_DATABASE_TOO_LARGE",
+    "FACTS_MEMORY_OH_DATABASE_LIMIT_UNAVAILABLE",
+  ]).has(code)) return error instanceof Error ? error : new Error(code);
+  const stableCode = code.startsWith(`FACTS_MEMORY_OH_${lane.toUpperCase()}_`)
+    ? code
+    : `FACTS_MEMORY_OH_${lane.toUpperCase()}_INTEGRITY_ERROR`;
+  return new OhFactsMemoryCustodyError(lane, stableCode, error);
+};
+
+const sqliteWalHeaderBytes = 32;
+const sqliteWalFrameHeaderBytes = 24;
 
 const adapterMetadataSchema = z.object({
   adapterDigest: factsMemoryDigestSchema,
@@ -157,7 +198,7 @@ const digestParts = (domain: string, parts: readonly string[]): string => {
   return digest.digest("hex");
 };
 
-const digestOhHead = (head: OhHeadV1): string => digestParts("hra-oh-head-v1", [
+export const digestOhHead = (head: OhHeadV1): string => digestParts("hra-oh-head-v1", [
   String(head.generation),
   head.graphRevisionSha256 ?? "empty",
   head.operationSha256 ?? "empty",
@@ -166,7 +207,7 @@ const digestOhHead = (head: OhHeadV1): string => digestParts("hra-oh-head-v1", [
   String(head.v),
 ]);
 
-const projectOhHead = (value: unknown): FactsMemoryHead => {
+export const projectOhHead = (value: unknown): FactsMemoryHead => {
   const head = parseOhHeadV1(value);
   if (head === null) throw new Error("FACTS_MEMORY_OH_HEAD_INVALID");
   return factsMemoryHeadSchema.parse({
@@ -300,6 +341,131 @@ const checkpointsEqual = (
 
 const errorCode = (error: unknown): string | null =>
   error instanceof Error && "code" in error ? String(error.code) : null;
+
+const asSqlitePragmaInteger = (value: unknown, key: string): number => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("FACTS_MEMORY_OH_DATABASE_LIMIT_UNAVAILABLE");
+  }
+  const integer = (value as Record<string, unknown>)[key];
+  if (!Number.isSafeInteger(integer) || (integer as number) < 0) {
+    throw new Error("FACTS_MEMORY_OH_DATABASE_LIMIT_UNAVAILABLE");
+  }
+  return integer as number;
+};
+
+const maximumBoundedSqlitePages = (pageSize: number): number => {
+  if (!Number.isSafeInteger(pageSize) || pageSize <= 0) {
+    throw new Error("FACTS_MEMORY_OH_DATABASE_LIMIT_UNAVAILABLE");
+  }
+  // With cache spilling disabled, one transaction writes at most one WAL
+  // frame per database page. Reserving both the main page and its largest WAL
+  // frame keeps the durable database plus WAL below the public byte ceiling,
+  // including a checkpointed WAL file that retains its high-water size.
+  const pages = Math.floor(
+    (HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes - sqliteWalHeaderBytes)
+      / (2 * pageSize + sqliteWalFrameHeaderBytes),
+  );
+  if (pages < 1) throw new Error("FACTS_MEMORY_OH_DATABASE_LIMIT_UNAVAILABLE");
+  return pages;
+};
+
+const configureBoundedSqliteDatabase = (
+  database: OhSqliteDatabase,
+  directory: string,
+): void => {
+  const checkpoint = database.query<{
+    busy: number;
+    checkpointed: number;
+    log: number;
+  }, []>("PRAGMA wal_checkpoint(TRUNCATE)").get();
+  if (checkpoint === null || checkpoint.busy !== 0) {
+    throw new Error("FACTS_MEMORY_OH_DATABASE_BUSY");
+  }
+  assertBoundedLogicalDatabase(directory);
+
+  const pageSize = asSqlitePragmaInteger(
+    database.query<{ page_size: number }, []>("PRAGMA page_size").get(),
+    "page_size",
+  );
+  const maximumPages = maximumBoundedSqlitePages(pageSize);
+  const configuredMaximum = asSqlitePragmaInteger(
+    database.query<Record<string, number>, []>(
+      `PRAGMA max_page_count = ${String(maximumPages)}`,
+    ).get(),
+    "max_page_count",
+  );
+  const currentPages = asSqlitePragmaInteger(
+    database.query<{ page_count: number }, []>("PRAGMA page_count").get(),
+    "page_count",
+  );
+  if (configuredMaximum !== maximumPages || currentPages > maximumPages) {
+    throw new Error("FACTS_MEMORY_OH_DATABASE_TOO_LARGE");
+  }
+
+  // A dirty page may otherwise be spilled to the WAL and written again in the
+  // same transaction, invalidating the one-frame-per-page bound above.
+  database.exec("PRAGMA cache_spill = OFF");
+  database.exec("PRAGMA wal_autocheckpoint = 1");
+};
+
+const translateSqliteCapacityError = (error: unknown): never => {
+  if (errorCode(error) === "SQLITE_FULL") {
+    throw new Error("FACTS_MEMORY_OH_DATABASE_TOO_LARGE", { cause: error });
+  }
+  throw error;
+};
+
+const guardOhStoreCapacity = (store: OhStoreV1): OhStoreV1 => {
+  const guarded: OhStoreV1 = {
+    binding: store.binding,
+    changesSince: async (from, options) => await store.changesSince(from, options),
+    close: async () => await store.close(),
+    commit: async (input) => {
+      try {
+        return await store.commit(input);
+      } catch (error: unknown) {
+        return translateSqliteCapacityError(error);
+      }
+    },
+    exportDependencyClosure: async (input) => await store.exportDependencyClosure(input),
+    head: async () => await store.head(),
+    snapshot: async (options) => await store.snapshot(options),
+    verify: async () => await store.verify(),
+  };
+  return Object.freeze(guarded);
+};
+
+const createBoundedOhAuthority = (input: Readonly<{
+  directory: string;
+  profile: typeof OH_CANONICAL_STORE_PROFILE_V1 | typeof OH_WORKING_STORE_PROFILE_V1;
+  realmId: string;
+  spaceId: string;
+}>): OhStoreAuthorityV1 => {
+  const database = openOhSqliteDatabase(join(input.directory, databaseName));
+  try {
+    enforcePrivateSqliteFiles(input.directory);
+    configureBoundedSqliteDatabase(database, input.directory);
+    const authority = createOhSqliteStoreAuthorityV1({
+      database,
+      profile: input.profile,
+      realmId: input.realmId,
+      spaceId: input.spaceId,
+    });
+    return Object.freeze({
+      host: authority.host,
+      store: guardOhStoreCapacity(authority.store),
+    });
+  } catch (error: unknown) {
+    try {
+      database.close();
+    } catch {
+      // Preserve the capacity, integrity, or profile failure that rejected the
+      // authority. No caller received a store handle.
+    }
+    if (errorCode(error) === "SQLITE_FULL") return translateSqliteCapacityError(error);
+    throw error;
+  }
+};
 
 const assertPrivateDirectory = (directory: string): void => {
   if (!isAbsolute(directory) || resolve(directory) !== directory) {
@@ -712,16 +878,188 @@ const makeReceipt = (input: Readonly<{
   });
 };
 
+export type OpenOhMemoryStore = Readonly<{
+  bindingSha256: OhStoreV1["binding"]["bindingSha256"];
+  expectedHead: OhHeadV1;
+  store: OhStoreV1;
+}>;
+
+export type OpenOhMemoryStores = Readonly<{
+  canonical: OpenOhMemoryStore;
+  working: OpenOhMemoryStore;
+}>;
+
+export type OhMemoryStoreOperationResult<T> = Readonly<{
+  canonicalHead: OhHeadV1;
+  result: T;
+  workingHead: OhHeadV1;
+}>;
+
 /**
- * Exact public Oh v0.2.7 working-profile adapter. Every Oh handle is host-owned,
+ * Exact public Oh stable-memory working-profile adapter. Every Oh handle is host-owned,
  * directory-scoped, and closed before this lifecycle port resolves.
  */
 export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
+  readonly #forkAttestations: Readonly<{
+    finalizeMemoryWorkingPageAttestationFork(input: Readonly<{
+      childBindingDigest: string;
+      childHead: FactsMemoryHead;
+      parentBindingDigest: string;
+      parentHead: FactsMemoryHead;
+    }>): number;
+  }>;
   readonly #now: () => number;
   readonly #tails = new Map<string, Promise<unknown>>();
 
-  constructor(options: Readonly<{ now?: () => number }> = {}) {
+  constructor(options: Readonly<{
+    forkAttestations: Readonly<{
+      finalizeMemoryWorkingPageAttestationFork(input: Readonly<{
+        childBindingDigest: string;
+        childHead: FactsMemoryHead;
+        parentBindingDigest: string;
+        parentHead: FactsMemoryHead;
+      }>): number;
+    }>;
+    now?: () => number;
+  }>) {
+    this.#forkAttestations = options.forkAttestations;
     this.#now = options.now ?? Date.now;
+  }
+
+  /**
+   * Opens the exact working and project-canonical authorities under one
+   * directory-ordered lock. The callback owns no locator and both stores are
+   * verified and closed before this method resolves.
+   */
+  withMemoryStores<T>(input: Readonly<{
+    canonical: Readonly<{
+      directory: string;
+      expectedHead?: FactsMemoryHead;
+      realmId: string;
+      spaceId: string;
+    }>;
+    working: Readonly<{
+      binding: FactsMemoryBinding;
+      directory: string;
+      expectedHandleHash: string;
+      expectedHead: FactsMemoryHead;
+    }>;
+  }>, operation: (stores: OpenOhMemoryStores) => Promise<T>): Promise<OhMemoryStoreOperationResult<T>> {
+    const binding = factsMemoryBindingSchema.parse(input.working.binding);
+    const expectedWorkingHead = factsMemoryHeadSchema.parse(input.working.expectedHead);
+    const expectedHandleHash = factsMemoryDigestSchema.parse(input.working.expectedHandleHash);
+    const expectedCanonicalHead = input.canonical.expectedHead === undefined
+      ? undefined
+      : factsMemoryHeadSchema.parse(input.canonical.expectedHead);
+    const workingDirectory = input.working.directory;
+    const canonicalDirectory = input.canonical.directory;
+    if (workingDirectory === canonicalDirectory) throw new Error("FACTS_MEMORY_OH_AUTHORITY_ALIAS");
+    return this.#serializeDirectories([workingDirectory, canonicalDirectory], async () => {
+      assertPrivateDirectory(workingDirectory);
+      assertPrivateDirectory(canonicalDirectory);
+      const metadata = readMetadataFile(join(workingDirectory, adapterMetadataName));
+      if (metadata === null) throw new Error("FACTS_MEMORY_OH_METADATA_MISSING");
+      this.#assertMetadataBinding(metadata, binding);
+
+      const working = await this.#open(binding, workingDirectory, true);
+      let canonical: OhStoreAuthorityV1 | undefined;
+      let completed: OhMemoryStoreOperationResult<T> | undefined;
+      let operationFailed = false;
+      let operationError: unknown;
+      try {
+        this.#assertMetadataAuthority(metadata, binding, working);
+        if (metadata.handleHash !== expectedHandleHash) {
+          throw new Error("FACTS_MEMORY_OH_HANDLE_MISMATCH");
+        }
+        const workingVerification = await this.#verifyBounded(working, workingDirectory);
+        const currentWorkingHead = projectOhHead(workingVerification.head);
+        if (JSON.stringify(currentWorkingHead) !== JSON.stringify(expectedWorkingHead)) {
+          throw new Error("FACTS_MEMORY_OH_WORKING_HEAD_CONFLICT");
+        }
+
+        let pinnedCanonicalHead: OhHeadV1;
+        try {
+          canonical = await this.#openCanonical({
+            directory: canonicalDirectory,
+            realmId: input.canonical.realmId,
+            spaceId: input.canonical.spaceId,
+          });
+          const canonicalVerification = await this.#verifyBounded(canonical, canonicalDirectory);
+          pinnedCanonicalHead = canonicalVerification.head;
+          if (expectedCanonicalHead !== undefined) {
+            const currentCanonicalHead = projectOhHead(canonicalVerification.head);
+            if (currentCanonicalHead.sequence < expectedCanonicalHead.sequence) {
+              throw new Error("FACTS_MEMORY_OH_CANONICAL_HEAD_REGRESSION");
+            }
+            if (currentCanonicalHead.sequence === expectedCanonicalHead.sequence) {
+              if (JSON.stringify(currentCanonicalHead) !== JSON.stringify(expectedCanonicalHead)) {
+                throw new Error("FACTS_MEMORY_OH_CANONICAL_HEAD_EQUIVOCATION");
+              }
+            } else {
+              const pinned = await canonical.store.snapshot({
+                head: ohHeadRef(expectedCanonicalHead),
+                maximumRecords: maximumForkRecords,
+              });
+              if (JSON.stringify(projectOhHead(pinned.head)) !== JSON.stringify(expectedCanonicalHead)) {
+                throw new Error("FACTS_MEMORY_OH_CANONICAL_HEAD_EQUIVOCATION");
+              }
+              pinnedCanonicalHead = pinned.head;
+            }
+          }
+        } catch (error: unknown) {
+          throw custodyError("canonical", error);
+        }
+
+        const result = await operation({
+          canonical: {
+            bindingSha256: canonical.store.binding.bindingSha256,
+            expectedHead: pinnedCanonicalHead,
+            store: canonical.store,
+          },
+          working: {
+            bindingSha256: working.store.binding.bindingSha256,
+            expectedHead: workingVerification.head,
+            store: working.store,
+          },
+        });
+        const [finalCanonical, finalWorking] = await Promise.all([
+          this.#verifyBounded(canonical, canonicalDirectory)
+            .catch((error: unknown) => { throw custodyError("canonical", error); }),
+          this.#verifyBounded(working, workingDirectory)
+            .catch((error: unknown) => { throw custodyError("working", error); }),
+        ]);
+        completed = {
+          canonicalHead: finalCanonical.head,
+          result,
+          workingHead: finalWorking.head,
+        };
+      } catch (error: unknown) {
+        operationFailed = true;
+        operationError = error;
+      }
+      const closeOperations: Promise<void>[] = [working.store.close()];
+      if (canonical !== undefined) closeOperations.push(canonical.store.close());
+      const closed = await Promise.allSettled(closeOperations);
+      const closeErrors: unknown[] = [];
+      for (const outcome of closed) {
+        if (outcome.status === "rejected") closeErrors.push(outcome.reason as unknown);
+      }
+      if (operationFailed) {
+        if (closeErrors.length > 0) {
+          throw new AggregateError(
+            [operationError, ...closeErrors],
+            "Oh memory operation and authority cleanup both failed.",
+          );
+        }
+        throw operationError;
+      }
+      if (closeErrors.length > 0) {
+        if (closeErrors.length === 1) throw closeErrors[0];
+        throw new AggregateError(closeErrors, "Failed to close Oh memory authorities.");
+      }
+      if (completed === undefined) throw new Error("FACTS_MEMORY_OH_OPERATION_INCOMPLETE");
+      return completed;
+    });
   }
 
   create(input: Readonly<{
@@ -802,14 +1140,18 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
       if (existing !== null) {
         this.#assertCreation(existing, binding, operationKey, parent);
         await this.#inspectComplete(binding, directory, existing);
-        return receiptFromMetadata(existing);
+        const receipt = receiptFromMetadata(existing);
+        this.#finalizeForkAttestations(binding, receipt.head, parent);
+        return receipt;
       }
       const pending = readPendingMetadataFile(join(directory, adapterMetadataPendingName));
       if (pending.status === "complete") {
         this.#assertCreation(pending.metadata, binding, operationKey, parent);
         await this.#inspectComplete(binding, directory, pending.metadata);
+        const receipt = receiptFromMetadata(pending.metadata);
+        this.#finalizeForkAttestations(binding, receipt.head, parent);
         publishMetadata(directory, pending.metadata);
-        return receiptFromMetadata(pending.metadata);
+        return receipt;
       }
 
       const parentBinding = factsMemoryBindingSchema.parse({
@@ -867,6 +1209,7 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
           handleHash,
           head: initialHead,
         });
+        this.#finalizeForkAttestations(binding, receipt.head, parent);
         metadata = this.#metadata({
           binding,
           createKind: "fork",
@@ -994,8 +1337,8 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
     if (requireExisting && !existsSync(path)) throw new Error("FACTS_MEMORY_OH_DATABASE_MISSING");
     enforcePrivateSqliteFiles(directory);
     assertBoundedLogicalDatabase(directory);
-    const authority = createOhSqliteStoreAuthorityV1({
-      path,
+    const authority = createBoundedOhAuthority({
+      directory,
       profile: OH_WORKING_STORE_PROFILE_V1,
       realmId: `hra:${binding.bindingDigest}`,
       spaceId: this.#spaceId(binding),
@@ -1017,6 +1360,42 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
         await authority.store.close();
       } catch (closeError: unknown) {
         throw new AggregateError([error, closeError], "Failed to close rejected Oh authority.");
+      }
+      throw error;
+    }
+  }
+
+  async #openCanonical(input: Readonly<{
+    directory: string;
+    realmId: string;
+    spaceId: string;
+  }>): Promise<OhStoreAuthorityV1> {
+    assertPrivateDirectory(input.directory);
+    enforcePrivateSqliteFiles(input.directory);
+    assertBoundedLogicalDatabase(input.directory);
+    const authority = createBoundedOhAuthority({
+      directory: input.directory,
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId: input.realmId,
+      spaceId: input.spaceId,
+    });
+    try {
+      enforcePrivateSqliteFiles(input.directory);
+      assertBoundedLogicalDatabase(input.directory);
+      const persisted = parseOhStoreBindingV1(authority.store.binding);
+      if (
+        persisted === null
+        || persisted.profile.profileSha256 !== OH_CANONICAL_STORE_PROFILE_V1.profileSha256
+        || persisted.realmId !== input.realmId
+        || persisted.spaceId !== input.spaceId
+        || authority.host.binding.bindingSha256 !== persisted.bindingSha256
+      ) throw new Error("FACTS_MEMORY_OH_CANONICAL_BINDING_MISMATCH");
+      return authority;
+    } catch (error: unknown) {
+      try {
+        await authority.store.close();
+      } catch (closeError: unknown) {
+        throw new AggregateError([error, closeError], "Failed to close rejected Oh canonical authority.");
       }
       throw error;
     }
@@ -1118,6 +1497,19 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
 
   #handleHash(binding: FactsMemoryBinding, ohBindingSha256: string): string {
     return digestParts("hra-oh-handle-v1", [binding.bindingDigest, ohBindingSha256]);
+  }
+
+  #finalizeForkAttestations(
+    binding: FactsMemoryBinding,
+    childHead: FactsMemoryHead,
+    parent: FactsMemoryCheckpoint,
+  ): void {
+    this.#forkAttestations.finalizeMemoryWorkingPageAttestationFork({
+      childBindingDigest: binding.bindingDigest,
+      childHead,
+      parentBindingDigest: parent.bindingDigest,
+      parentHead: parent.head,
+    });
   }
 
   #spaceId(binding: FactsMemoryBinding): string {

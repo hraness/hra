@@ -7,6 +7,16 @@ import type { AttachmentManifestEntry } from "../model/attachments";
 import { turnSummaryLine } from "../model/session-view";
 import type { TranscriptEntry } from "../model/transcript";
 
+type UserMessageActor = Extract<TranscriptEntry, { kind: "user" }>["actor"];
+
+const userMessageActorLabel: Readonly<Record<UserMessageActor, string>> = {
+  autorespond: "autorespond",
+  human: "you",
+  peer_session: "peer session",
+  provider_switch: "provider handoff",
+  unknown: "other sender",
+};
+
 /**
  * A closed assistant message. Memoised on its text, which never changes once
  * the compact stream has written it, so a delta arriving in the turn below
@@ -29,14 +39,14 @@ const UserBubble = memo(function UserBubble({
   attachments,
   text,
 }: Readonly<{
-  actor: "human" | "autorespond";
+  actor: UserMessageActor;
   attachments: readonly AttachmentManifestEntry[] | null;
   text: string;
 }>): ReactNode {
   return (
     <div className="flex flex-col items-end gap-1">
       <span className="text-[0.7rem] tracking-wide text-ink-muted uppercase">
-        {actor === "autorespond" ? "autorespond" : "you"}
+        {userMessageActorLabel[actor]}
       </span>
       <div className="max-w-[85%] rounded-lg rounded-tr-sm border border-line bg-surface-input px-3 py-2 text-sm break-words whitespace-pre-wrap">
         {text}

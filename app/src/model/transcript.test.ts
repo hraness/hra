@@ -76,6 +76,37 @@ describe("deriveTranscript", () => {
     expect(entries[0]).toMatchObject({ actor: "autorespond", kind: "user" });
   });
 
+  test("labels peer-session messages by their actor", () => {
+    const entries = deriveTranscript(
+      [userMessage(1, "check this", { actor: "autorespond", actorKind: "peer_session" })],
+      { streamingText: "", turnId: null },
+    );
+    expect(entries[0]).toMatchObject({ actor: "peer_session", kind: "user" });
+  });
+
+  test("labels provider-switch handoff seeds by their actor", () => {
+    const entries = deriveTranscript(
+      [userMessage(1, "Continue from this handoff", {
+        actor: "autorespond",
+        actorKind: "provider_switch",
+      })],
+      { streamingText: "", turnId: null },
+    );
+    expect(entries[0]).toMatchObject({ actor: "provider_switch", kind: "user" });
+  });
+
+  test("keeps an unknown actor kind neutral and never labels it as the owner", () => {
+    const entries = deriveTranscript(
+      [userMessage(1, "Message from a future host actor", {
+        actor: "autorespond",
+        actorKind: "unknown",
+      })],
+      { streamingText: "", turnId: null },
+    );
+    expect(entries[0]).toMatchObject({ actor: "unknown", kind: "user" });
+    expect(entries[0]).not.toMatchObject({ actor: "human" });
+  });
+
   test("appends the live text for a turn the compact stream has not closed", () => {
     const entries = deriveTranscript(
       [userMessage(1, "go")],

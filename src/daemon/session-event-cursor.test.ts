@@ -5,7 +5,7 @@ import fc from "fast-check";
 
 import { sessionEventCursorWireSchema } from "../domain/session-events";
 import { createWorkId, createWorkTaskId, workEventCursorWireSchema } from "../domain/work";
-import { createSessionId } from "../domain/values";
+import { createProjectId, createSessionId } from "../domain/values";
 import {
   HRA_CURSOR_MAX_BYTES,
   SessionEventCursorCodec,
@@ -423,6 +423,7 @@ describe("SessionEventCursorCodec", () => {
     const filter = {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 7,
+      includeArchived: false,
       limit: 37,
     };
     const first = codec.advanceSessionList({ ...filter, providerCursor: "provider-page-2" });
@@ -453,17 +454,19 @@ describe("SessionEventCursorCodec", () => {
     expect(Buffer.byteLength(second, "utf8")).toBeLessThanOrEqual(HRA_CURSOR_MAX_BYTES);
   });
 
-  test("binds session-list cursors to the immutable account generation and exact limit", () => {
+  test("binds provider session-list cursors to generation, archive filter, and limit", () => {
     const codec = new SessionEventCursorCodec(FIXED_KEY);
     const filter = {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 3,
+      includeArchived: false,
       limit: 50,
     };
     const cursor = codec.advanceSessionList({ ...filter, providerCursor: "provider-next" });
     for (const mismatch of [
       { ...filter, accountId: "acct_11111111111111111111111111111111" as const },
       { ...filter, providerGeneration: 4 },
+      { ...filter, includeArchived: true },
       { ...filter, limit: 49 },
     ]) {
       expectCursorRejection(() => codec.decodeSessionList(cursor, mismatch), "filter_mismatch");
@@ -475,7 +478,9 @@ describe("SessionEventCursorCodec", () => {
     const filter = {
       accountId: "acct_00000000000000000000000000000000" as const,
       accountGeneration: 0,
+      includeArchived: false,
       limit: 37,
+      scope: "all_local" as const,
     };
     const cursor = codec.encodeLocalSessionList({
       ...filter,
@@ -494,7 +499,9 @@ describe("SessionEventCursorCodec", () => {
     for (const mismatch of [
       { ...filter, accountId: "acct_22222222222222222222222222222222" as const },
       { ...filter, accountGeneration: 1 },
+      { ...filter, includeArchived: true },
       { ...filter, limit: 36 },
+      { ...filter, scope: "claude_before_codex" as const },
     ]) {
       expectCursorRejection(
         () => codec.decodeLocalSessionList(cursor, mismatch),
@@ -517,11 +524,59 @@ describe("SessionEventCursorCodec", () => {
     );
   });
 
+  test("binds peer directory pages to the exact actor, project, policy revision, and limit", () => {
+    const codec = new SessionEventCursorCodec(FIXED_KEY);
+    const filter = {
+      actorSessionId: createSessionId(),
+      projectId: createProjectId(),
+      actorPolicyRevision: 3,
+      limit: 20,
+    };
+    const cursor = codec.encodePeerSessionList({
+      ...filter,
+      afterCreatedAt: 12_345,
+      afterSessionId: createSessionId(),
+    });
+    expect(codec.decodePeerSessionList(cursor, filter)).toMatchObject({
+      version: 1,
+      type: "peer_session_list",
+      ...filter,
+      afterCreatedAt: 12_345,
+    });
+    for (const mismatch of [
+      { ...filter, actorSessionId: createSessionId() },
+      { ...filter, projectId: createProjectId() },
+      { ...filter, actorPolicyRevision: 4 },
+      { ...filter, limit: 19 },
+    ]) {
+      expectCursorRejection(
+        () => codec.decodePeerSessionList(cursor, mismatch),
+        "filter_mismatch",
+      );
+    }
+    const eventCursor = codec.encode({
+      version: 1,
+      sessionId: filter.actorSessionId,
+      streamEpoch: crypto.randomUUID(),
+      sequence: 1,
+    });
+    expectCursorRejection(
+      () => codec.decodePeerSessionList(eventCursor, filter),
+      "type_mismatch",
+    );
+  });
+
   test("keeps provider and local session-list cursor authorities disjoint", () => {
     const codec = new SessionEventCursorCodec(FIXED_KEY);
     const accountId = "acct_00000000000000000000000000000000" as const;
-    const localFilter = { accountId, accountGeneration: 2, limit: 10 };
-    const providerFilter = { accountId, providerGeneration: 2, limit: 10 };
+    const localFilter = {
+      accountId,
+      accountGeneration: 2,
+      includeArchived: false,
+      limit: 10,
+      scope: "claude_before_codex" as const,
+    };
+    const providerFilter = { accountId, providerGeneration: 2, includeArchived: false, limit: 10 };
     const local = codec.encodeLocalSessionList({
       ...localFilter,
       afterCreatedAt: 1,
@@ -546,6 +601,7 @@ describe("SessionEventCursorCodec", () => {
     const filter = {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 1,
+      includeArchived: false,
       limit: 100,
     };
     const initialCursor = codec.advanceSessionList({
@@ -580,6 +636,7 @@ describe("SessionEventCursorCodec", () => {
     const filter = {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 1,
+      includeArchived: false,
       limit: 100,
     };
     const first = codec.decodeSessionList(
@@ -624,6 +681,7 @@ describe("SessionEventCursorCodec", () => {
     const filter = {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 1,
+      includeArchived: false,
       limit: 100,
     };
     const prefix = Array.from({ length: 73 }, (_, index) => `prefix-${String(index)}`);
@@ -658,6 +716,7 @@ describe("SessionEventCursorCodec", () => {
     const filter = {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 5,
+      includeArchived: false,
       limit: 23,
     };
     fc.assert(fc.property(
@@ -706,6 +765,7 @@ describe("SessionEventCursorCodec", () => {
     const filter = {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 2,
+      includeArchived: false,
       limit: 10,
     };
     const eventCursor = codec.encode({
@@ -725,9 +785,18 @@ describe("SessionEventCursorCodec", () => {
       () => codec.decodeInteraction(cursor, { scope: { type: "global" }, pending: false }),
       "type_mismatch",
     );
-    const replacement = cursor.at(-1) === "A" ? "B" : "A";
+    const parts = cursor.split(".");
+    const encodedPayload = parts[1];
+    const signature = parts[2];
+    if (encodedPayload === undefined || signature === undefined) {
+      throw new Error("Expected a signed provider session-list cursor.");
+    }
+    const replacement = signature[0] === "A" ? "B" : "A";
     expectCursorRejection(
-      () => codec.decodeSessionList(`${cursor.slice(0, -1)}${replacement}`, filter),
+      () => codec.decodeSessionList(
+        `hra1.${encodedPayload}.${replacement}${signature.slice(1)}`,
+        filter,
+      ),
       "invalid_signature",
     );
 
