@@ -1,11 +1,11 @@
 # HRA
-[![npm version](https://img.shields.io/npm/v/%40hraness%2Fhra)](https://www.npmjs.com/package/@hraness/hra) [![provenance: sigstore](https://img.shields.io/badge/provenance-sigstore-2e7d32)](https://www.npmjs.com/package/@hraness/hra#provenance) [![CI](https://img.shields.io/github/actions/workflow/status/hraness/hra/ci.yml?branch=main&label=CI)](https://github.com/hraness/hra/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/npm/l/%40hraness%2Fhra)](https://github.com/hraness/hra/blob/main/LICENSE) [![Bun 1.3.14](https://img.shields.io/badge/Bun-1.3.14-14151a)](https://bun.sh) [![runtime: Codex 0.153.2](https://img.shields.io/badge/runtime-Codex%200.153.2-0b5fa5)](https://www.npmjs.com/package/@openai/codex/v/0.153.2) [![runtime: Claude Code 2.1.260](https://img.shields.io/badge/runtime-Claude%20Code%202.1.260-6f42c1)](https://github.com/hraness/hra/blob/main/docs/providers/claude.md)\
-HRA runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.
+[![npm version](https://img.shields.io/npm/v/%40hraness%2Fhra)](https://www.npmjs.com/package/@hraness/hra) [![provenance: sigstore](https://img.shields.io/badge/provenance-sigstore-2e7d32)](https://www.npmjs.com/package/@hraness/hra#provenance) [![CI](https://img.shields.io/github/actions/workflow/status/hraness/hra/ci.yml?branch=main&label=CI)](https://github.com/hraness/hra/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/npm/l/%40hraness%2Fhra)](https://github.com/hraness/hra/blob/main/LICENSE) [![Bun 1.3.14](https://img.shields.io/badge/Bun-1.3.14-14151a)](https://bun.sh) [![runtime: Codex 0.153.2](https://img.shields.io/badge/runtime-Codex%200.153.2-0b5fa5)](https://www.npmjs.com/package/@openai/codex/v/0.153.2) [![runtime: Claude Code 2.1.260](https://img.shields.io/badge/runtime-Claude%20Code%202.1.260-6f42c1)](https://github.com/hraness/hra/blob/main/docs/providers/claude.md) [![runtime: Devin CLI 3000.6.14](https://img.shields.io/badge/runtime-Devin%20CLI%203000.6.14-5936b4)](https://github.com/hraness/hra/blob/main/docs/providers/devin.md)\
+HRA runs Codex, Claude Code, and Devin sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.
 
-Status: public beta. The local CLI v0.6.0 is release-ready: Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an open beta.
+Status: public beta. The local CLI v0.6.0 is release-ready; current source runs Codex and Devin on macOS and Linux and Claude Code on Linux; hosted sync is live as an open beta.
 
 ```sh
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz 53a13acc4c60baf19da95f469229e3d5269cb9cbe099962480e164fe7cc98731)" = hra-install-safe
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz 61dcd716e2272c4c3d94d565ac1a9aab3dc99780813316a822f594938cf456e2)" = hra-install-safe
 ```
 
 ```sh
@@ -16,11 +16,11 @@ hra doctor --offline
 hra init --yes
 ```
 
-## One terminal for every Codex and Claude Code session
+## One terminal for every Codex, Claude Code, and Devin session
 
 HRA keeps sessions alive behind a local daemon, isolates each account, and lets you or your agent direct any of them from a shell or JSON. Sync between machines is optional and encrypted.
 
-Codex on macOS and Linux · Claude Code on Linux · local v0.6.0 release-ready · hosted sync live (open beta)
+Codex and Devin on macOS and Linux · Claude Code on Linux · local v0.6.0 release-ready · hosted sync live (open beta)
 
 ### One request, one account, one session.
 
@@ -31,19 +31,19 @@ Codex on macOS and Linux · Claude Code on Linux · local v0.6.0 release-ready �
 
 > **Immutable local CLI release candidate; hosted sync live as an open beta.** The exact install command below works once GitHub exposes the immutable `v0.6.0` GitHub Release and its verified archive. The website and optional hosted sync are live; the candidate becomes public only after exact admission.
 
-HRA is one Bun CLI plus a local daemon. It isolates Codex and Claude Code profiles, gives both providers one compact session interface, and optionally syncs encrypted provider-neutral projections and commands across your enrolled machines.
+HRA is one Bun CLI plus a local daemon. It isolates Codex, Claude Code, and Devin profiles, gives all three providers one compact session interface, and optionally syncs encrypted provider-neutral projections and commands across your enrolled machines.
 
-HRA is short for harness: the control plane that keeps Codex and Claude Code sessions working together, and [hraness.com](https://hraness.com/) explains the parent brand. The Hraness organization maintains HRA and publishes it under the MIT license.
+HRA is short for harness: the control plane that keeps Codex, Claude Code, and Devin sessions working together, and [hraness.com](https://hraness.com/) explains the parent brand. The Hraness organization maintains HRA and publishes it under the MIT license.
 
 [GitHub](https://github.com/hraness/hra) · [Documentation](https://github.com/hraness/hra#command-reference) · [Security](https://github.com/hraness/hra/blob/main/SECURITY.md) · [Privacy](https://github.com/hraness/hra/blob/main/PRIVACY.md)
 
 ## Install and update
 
-HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install one reviewed immutable tag, then verify the binary before initialization:
+HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms. Devin effects also run on both platforms when the separately installed Devin CLI reports exactly 3000.6.14. Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install one reviewed immutable tag, then verify the binary before initialization:
 
 ```text
 bun --version
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz 53a13acc4c60baf19da95f469229e3d5269cb9cbe099962480e164fe7cc98731)" = hra-install-safe
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz 61dcd716e2272c4c3d94d565ac1a9aab3dc99780813316a822f594938cf456e2)" = hra-install-safe
 hra --version
 hra doctor --offline
 ```
@@ -55,7 +55,7 @@ Before replacing the installed binary, stop the persistent daemon and confirm th
 ```text
 hra daemon stop
 hra daemon status --json
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz 53a13acc4c60baf19da95f469229e3d5269cb9cbe099962480e164fe7cc98731)" = hra-install-safe
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz 61dcd716e2272c4c3d94d565ac1a9aab3dc99780813316a822f594938cf456e2)" = hra-install-safe
 hra --version
 hra doctor --offline
 hra daemon start
@@ -74,7 +74,7 @@ hra daemon stop
 hra daemon status --json
 ```
 
-> **Permanent local-data loss.** HRA deliberately has no recursive local-delete command. The exact state directory is `$HOME/Library/Application Support/HRA Control Plane v1` on macOS and `$HOME/.local/state/hra-control-plane-v1` on Linux. After every prerequisite above, a human who explicitly accepts permanent loss of all local provider profiles, Codex credential stores, Claude Code configuration directories, sessions, ledgers, encryption keys, device credentials, and recovery evidence may move only the exact platform directory to Trash. Claude Code may also own credentials outside that directory, including provider-managed system credential storage; sign out through Claude Code before deletion. Do not move or remove the state directory's parent. Inspect the trashed directory before emptying Trash.
+> **Permanent local-data loss.** HRA deliberately has no recursive local-delete command. The exact state directory is `$HOME/Library/Application Support/HRA Control Plane v1` on macOS and `$HOME/.local/state/hra-control-plane-v1` on Linux. After every prerequisite above, a human who explicitly accepts permanent loss of all local provider profiles, Codex credential stores, Claude Code configuration directories, Devin HOME and XDG directories, sessions, ledgers, encryption keys, device credentials, and recovery evidence may move only the exact platform directory to Trash. Claude Code may also own credentials outside that directory, including provider-managed system credential storage; sign out through Claude Code before deletion. Do not move or remove the state directory's parent. Inspect the trashed directory before emptying Trash.
 
 An agent must resolve the canonical exact state-directory path, present that path and the permanent-loss consequences to the user, and obtain explicit destructive approval before moving or removing it. An install, update, or daemon-stop request does not authorize local-data removal.
 
@@ -83,6 +83,7 @@ An agent must resolve the canonical exact state-directory path, present that pat
 ```text
 hra account add personal
 hra account login personal --provider codex --device-code
+hra account login personal --provider devin
 hra account usage personal --refresh
 hra account usage-history personal --limit 50 --json
 ```
@@ -90,6 +91,8 @@ hra account usage-history personal --limit 50 --json
 Account login is always a dedicated one-shot invocation, including while the persistent shell is running. For Codex, use `hra account login personal --provider codex --device-code` in a foreground TTY for app-server's device-code path. That terminal displays the code and verification URL directly. An opted-in registered machine can also receive a versioned web request that always selects device-code mode; HRA accepts only the pinned Codex device URL and a separate closed code, encrypts them to the account key, and lets only the requesting browser read the handoff once before its five-minute hosted expiry. HRA keeps the resulting provider state inside that profile's isolated `CODEX_HOME` without copying `auth.json`.
 
 On Linux, `hra account login personal --provider claude` launches a realpath-resolved Claude Code executable only after its exact self-reported version matches HRA's pin, in the foreground inside that profile's isolated `CLAUDE_CONFIG_DIR`. Claude owns its prompts and browser handoff. HRA gives it the terminal, joins the exact child, and reports only whether Claude says it is signed in; HRA never opens or copies a Claude credential. Claude exposes no HRA device-code, handoff-file, or web-linking protocol. New Claude effects are refused on macOS pending authenticated isolated-Keychain and detached-read acceptance.
+
+`hra account login personal --provider devin` requires a foreground terminal and the exact separately installed Devin CLI 3000.6.14. HRA launches `devin auth login` with five distinct private profile directories for `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME`. Add `--manual-token-flow` to request Devin's own `--force-manual-token-flow` login path. Devin owns every credential in that boundary. HRA never opens, parses, copies, or uploads it and reports only whether `devin auth status` says the isolated profile is signed in. Devin exposes no HRA device-code, handoff-file, JSON, or web-linking login path.
 
 For a Codex login, JSON and noninteractive callers must create an empty mode-0600 file under a canonical current-user-owned mode-0700 directory, then pass its absolute canonical path:
 
@@ -103,11 +106,15 @@ If the first pending-login handoff is lost or the daemon restarts before complet
 
 If a Claude foreground parent or daemon fails after launch, `hra account show personal --provider claude` retains the one-child fence even if Claude reports signed in. After confirming that original child has exited, use the exact attempt, generation, and idempotency key in the reported acknowledged `hra account login-cancel` command to release only the local fence. That recovery does not stop Claude or read, change, or delete a credential.
 
+Devin foreground login uses the same one-child recovery fence. If its parent or daemon fails after launch, `hra account show personal --provider devin` returns the exact acknowledged cancellation command. Confirm that the original child has exited before running it. Recovery releases only HRA's local fence and does not stop Devin or read, change, or delete its credential.
+
 `hra account usage` is Codex-only and keeps the latest snapshot and 1-, 5-, and 15-minute observed token velocity. `hra account usage-history <profile>` reads the retained 24-hour local ledger in durable source order. Use UTC RFC3339 `--from` and `--through` bounds plus the returned opaque cursor for later pages; a cursor freezes that account and range and expires after five minutes. History rows contain only derived token observations or closed poll-failure codes; raw provider payloads are never returned.
 
 HRA automatically spends one available earned Codex rate-limit reset when a fresh read shows the exact seven-day Codex window at 99 percent used or higher. It records a private idempotency key before dispatch, retries only that key after an uncertain response, and rereads limits after every closed outcome. A successful redemption is latched to that weekly window, so a stale usage snapshot cannot spend another credit. Rate-limit notifications wake a coalesced authoritative read; the staggered 50-to-70-second poll remains the fallback. `hra account usage` reports the most recent local reset attempt with its source weekly-window boundary and suppresses a prior identity's snapshot after an account change. Credit IDs, descriptions, private keys, and account fingerprints never enter that reset status or its cloud projection.
 
-HRA cloud identity is separate from every Codex or Claude Code account. Use the email-code flow below only after a hosted or self-managed Convex deployment has been configured.
+Devin ACP session usage reports current context occupancy and capacity, plus cumulative provider cost only when Devin supplies it. HRA records those facts without interpreting them as an account allowance, remaining balance, billing settlement, or reset window. Devin ACP and `devin auth status` expose no documented machine-readable account allowance or reset operation, so `hra account show personal --provider devin` reports allowance `unknown` with source `devin_acp`. HRA never submits Devin's human-facing usage commands as hidden turns and never applies a Codex reset credit to Devin.
+
+HRA cloud identity is separate from every provider account. Use the email-code flow below only after a hosted or self-managed Convex deployment has been configured.
 
 ## First session
 
@@ -139,15 +146,18 @@ hra session interactions <session-id> --pending --json
 
 If the event stream reports a blocking interaction, read its exact ID and revision, inspect the live authority through the protected path, and resolve only the interaction kind you received. Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form. The protected interaction commands and input documents are defined below.
 
-### Claude Code and provider switching
+### Claude Code, Devin, and provider switching
 
-Start directly with Claude Code by selecting its provider and reviewed preset, or move an idle session between providers. A switch preserves HRA's provider-neutral conversation record but starts a fresh provider-native runtime; it refuses an active turn, an unsettled provider effect, an unsigned target profile, or a preset that belongs to the other provider. Claude Code sessions cannot be resumed after the daemon that started them exits.
+Start directly with Claude Code or Devin by selecting its provider and reviewed preset, or move an idle session among providers. A switch preserves HRA's provider-neutral conversation record but starts a fresh provider-native runtime; it refuses an active turn, an unsettled provider effect, an unsigned target profile, or a preset that belongs to another provider. Claude Code sessions cannot be resumed after the daemon that started them exits. Devin uses exact ACP v1 session loading after restart only when its initialization advertised that capability.
 
 ```text
 hra session start personal --provider claude --preset fable-max --json
+hra session start personal --provider devin --preset astra --json
 hra session switch <session-id> --provider claude --preset fable-max
 hra session export <session-id> --format json
 ```
+
+ACP v1 has no in-turn steer method, so `hra session steer` refuses an active Devin turn. Use `hra session queue` to send the message after the current prompt completes, or stop the turn before sending another message. HRA never sends concurrent prompts to one Devin session.
 
 ### Scheduled work in the same conversation
 
@@ -166,7 +176,7 @@ hra session task delete <session-id> <task-id> --revision <revision>
 
 > **Local release boundary.** These commands are part of the immutable `v0.6.0` local CLI release candidate and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol.
 
-The frozen source contract defines a narrow local coordination kernel for agents operating several already-existing provider sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex and Claude Code still own their provider-native execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine.
+The frozen source contract defines a narrow local coordination kernel for agents operating several already-existing provider sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex, Claude Code, and Devin still own their provider-native execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine.
 
 ```text
 hra work protocol [--operation <kind>|--type <name>|--topic <topic>]
@@ -220,7 +230,7 @@ hra sync status
 
 Each login reads exactly one JSON document. Request a code for an existing identity with `{"email":"you@example.com"}`, create a new identity with `{"email":"you@example.com","invite":"<identity-invite>"}`, or verify a requested code with `{"email":"you@example.com","code":"12345678"}`. No other keys or combinations are accepted. A TTY prompt hides the document; agents should pass a private descriptor with `--input-fd <fd>`. The document is never an argument.
 
-The CLI stores HRA's revocable device credential, workspace encryption key, and local signing authority as immutable generations below its private state root. Custody directories are current-user-owned mode-0700 directories, values are single-link mode-0600 files, and reads use bounded no-follow descriptors. The detached Bun daemon never opens a Keychain prompt. HRA forces both pinned Codex credential stores to file mode and verifies their effective settings, so Codex credentials remain separately owned by each profile's isolated `CODEX_HOME`. Claude Code receives that profile's isolated `CLAUDE_CONFIG_DIR`; HRA treats the whole directory as Claude's authentication boundary and never reads, copies, or forwards its credentials. Provider-managed system credential storage remains owned by the provider runtime.
+The CLI stores HRA's revocable device credential, workspace encryption key, and local signing authority as immutable generations below its private state root. Custody directories are current-user-owned mode-0700 directories, values are single-link mode-0600 files, and reads use bounded no-follow descriptors. The detached Bun daemon never opens a Keychain prompt. HRA forces both pinned Codex credential stores to file mode and verifies their effective settings, so Codex credentials remain separately owned by each profile's isolated `CODEX_HOME`. Claude Code receives that profile's isolated `CLAUDE_CONFIG_DIR`; HRA treats the whole directory as Claude's authentication boundary and never reads, copies, or forwards its credentials. Devin receives distinct private `HOME` and four XDG roots; HRA passes those paths to the CLI but never opens, copies, or forwards Devin's credential. Provider-managed credential storage remains owned by the provider runtime.
 
 After successful email verification, the daemon automatically registers the current installation before it reads cloud data. The first registered device becomes active and creates the client-side encryption key. A later verified installation is registered as pending and may report presence, but it has no synchronized data, execution, or key authority.
 
@@ -247,7 +257,7 @@ Cloud-account erasure is an explicit and irreversible fallback, not the default 
 
 ## Features
 
-- Isolated provider profiles: each named profile has its own user-only `CODEX_HOME` for Codex and `CLAUDE_CONFIG_DIR` for Claude Code. Each provider owns its authentication state; HRA never copies or parses provider credentials.
+- Isolated provider profiles: each named profile has its own user-only `CODEX_HOME` for Codex and `CLAUDE_CONFIG_DIR` for Claude Code, plus distinct private `HOME` and XDG roots for Devin. Each provider owns its authentication state; HRA never copies or parses provider credentials.
 - Usage with provenance: account identity, quota, rate-limit, and token snapshots include their provider source time and freshness. A bounded source-ordered 24-hour ledger supports safe human and JSON pagination without returning raw provider payloads.
 - Compact sessions: list sessions, read user and final assistant messages, inspect elapsed time plus bounded observed file and Git actions, then open one turn for full provider-visible detail.
 - Durable controls: send, queue, steer, stop, rename, and keep one editable note per session. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing.
@@ -270,7 +280,7 @@ hra status --json
 
 ### Session observation
 
-`hra session status <session> --json` returns status version 2. HRA produces one typed provider-observation result, attempting the bound provider's reviewed observation path only when the current local state makes one applicable, then reads the session, event cut, interactions, and queue from one local SQLite transaction. Codex supports a native app-server observation read; Claude Code status uses HRA's live provider-neutral projection because provider-side session listing and resume are not implemented. Execution, attention, provider, and queue remain separate axes, so a headline state cannot hide a recovery condition, pending interaction, response in flight, or queued work. Pending and response-in-flight counts are exact. The result includes at most 10 bounded safe summaries for pending interactions and excludes the session note and private provider thread binding. Every provider turn and item identifier becomes a secret-keyed opaque public alias before status, event, or interaction output. Public observation schemas accept only that exact alias form. The same local installation key keeps aliases coherent across surfaces and daemon restarts without making low-entropy provider IDs guessable from public output. If an existing installation loses that key, HRA refuses to replace it and directs the operator to restore the original local secret.
+`hra session status <session> --json` returns status version 2. HRA produces one typed provider-observation result, attempting the bound provider's reviewed observation path only when the current local state makes one applicable, then reads the session, event cut, interactions, and queue from one local SQLite transaction. Codex supports a native app-server observation read. Claude Code and Devin status use HRA's live provider-neutral projection; Claude exposes no admitted provider-side session listing or resume, while Devin reloads an exact native session only when its ACP initialization advertises that capability. Execution, attention, provider, and queue remain separate axes, so a headline state cannot hide a recovery condition, pending interaction, response in flight, or queued work. Pending and response-in-flight counts are exact. The result includes at most 10 bounded safe summaries for pending interactions and excludes the session note and private provider thread binding. Every provider turn and item identifier becomes a secret-keyed opaque public alias before status, event, or interaction output. Public observation schemas accept only that exact alias form. The same local installation key keeps aliases coherent across surfaces and daemon restarts without making low-entropy provider IDs guessable from public output. If an existing installation loses that key, HRA refuses to replace it and directs the operator to restore the original local secret.
 
 `hra session state <session> --json` returns the daemon's latest classification of who must act next: working, needs approval, needs an answer, needs a human action, done, done with followups, done with caveats, or aborted, with an attention flag, a short reason, and a monotonic revision. The daemon classifies the final assistant text of every completed turn with ordered lexical rules in which human-action cues beat approval cues, so a login or a code from email never reads as consent, and it reclassifies when a provider interaction is requested or resolved. The same classification is appended to the session event stream as a `session_state` event.
 
@@ -312,17 +322,18 @@ For non-streaming `--json` commands, stdout contains exactly one versioned succe
 
 ## Presets and permissions
 
-HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; `hra session show` displays it with the provider-neutral transcript. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof, and stream formats. Each provider remains authoritative for its native permissions, tools, and hidden runtime state.
+HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; `hra session show` displays it with the provider-neutral transcript. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof, and stream formats. Devin profiles include exact CLI 3000.6.14, ACP v1, model `gpt-6-astra`, provider-default reasoning, and isolated-home proof. Each provider remains authoritative for its native permissions, tools, and hidden runtime state.
 
 - `low`: Codex Luna Max, currently `gpt-5.6-luna` with `max` reasoning.
 - `high`: Codex Astra Max, currently `gpt-6-astra` with `max` reasoning.
 - `ultra`: Codex Astra Ultra, currently `gpt-6-astra` with `ultra` reasoning.
 - `fable-max`: Claude Code Fable, currently `claude-fable-5-1` with `max` reasoning.
-- `fast on|off`: a Codex-only, explicit per-turn Fast or Standard overlay. Claude Code refuses Fast instead of ignoring it. A prior Fast value cannot leak into the next turn.
+- `astra`: Devin GPT-6 Astra, exactly `gpt-6-astra` with provider-default reasoning. It is the default preset for Devin.
+- `fast on|off`: a Codex-only, explicit per-turn Fast or Standard overlay. Claude Code and Devin refuse Fast instead of ignoring it. A prior Fast value cannot leak into the next turn.
 
 New HRA-created Codex sessions and every explicit preset selection use the current mapping above. Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping for `high` and `ultra` until a preset is explicitly selected; metadata edits, restart recovery, and queued work do not reinterpret an established session.
 
-`hra init` reports the required confirmation without changing local state; `hra init --yes` creates your Documents directory when it is absent, verifies that it is a readable, writable, and traversable canonical directory, and accepts it as the default project. Initialization is a one-shot maintenance command: run it before opening the persistent shell. The shell rejects `/init` because its running daemon already owns local state. Codex turns use Codex's `auto_review` path, the exact advertised `:workspace` permission profile, and the selected project as the runtime workspace root. Codex remains authoritative for the profile's effective sandbox, network policy, computer use, plugins, and protected turn inspection. Claude Code runs in its default interactive permission mode under the selected project and maps supported tool-use requests into HRA interactions; it does not expose Codex's permission-profile, app, plugin, or protected turn-inspection surfaces.
+`hra init` reports the required confirmation without changing local state; `hra init --yes` creates your Documents directory when it is absent, verifies that it is a readable, writable, and traversable canonical directory, and accepts it as the default project. Initialization is a one-shot maintenance command: run it before opening the persistent shell. The shell rejects `/init` because its running daemon already owns local state. Codex turns use Codex's `auto_review` path, the exact advertised `:workspace` permission profile, and the selected project as the runtime workspace root. Codex remains authoritative for the profile's effective sandbox, network policy, computer use, plugins, and protected turn inspection. Claude Code runs in its default interactive permission mode under the selected project and maps supported tool-use requests into HRA interactions. Devin runs the exact `devin acp --model gpt-6-astra` process and maps its offered permission choices into HRA interactions. Neither provider exposes Codex's permission-profile, app, plugin, or protected turn-inspection surfaces.
 
 ## Plugin discovery
 
@@ -345,7 +356,7 @@ HRA never copies `auth.json`, swaps one token, changes Keychain blindly, rotates
 
 ## Sessions across machines
 
-The machine that created a provider session remains its only executor in v1. It must be online with its HRA daemon running and must hold the current execution lease before a remote command can affect Codex or Claude Code. Other paired machines never execute that provider session through one of their own local provider profiles.
+The machine that created a provider session remains its only executor in v1. It must be online with its HRA daemon running and must hold the current execution lease before a remote command can affect Codex, Claude Code, or Devin. Other paired machines never execute that provider session through one of their own local provider profiles.
 
 Paired machines can read the encrypted projection and submit bounded send, queue, steer, stop, preset, provider-switch, and Codex Fast commands. The origin daemon claims each command by lease generation and idempotency key. Commands remain pending within their deadline while the origin machine is offline; another machine cannot take over or become a second provider writer.
 
@@ -358,8 +369,8 @@ hra remote command <uuidv7>
 hra remote send <cloud-session> <message>
 hra remote queue|steer <cloud-session> <message>
 hra remote stop <cloud-session>
-hra remote preset <cloud-session> <low|high|ultra|fable-max>
-hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]
+hra remote preset <cloud-session> <low|high|ultra|fable-max|astra>
+hra remote provider <cloud-session> <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>]
 hra remote fast <cloud-session> <on|off>
 hra remote allow|deny <device-commands|account-linking>
 hra remote policy
@@ -381,13 +392,13 @@ Session names and notes sync as encrypted metadata, but v1 does not execute remo
 
 ## Privacy
 
-Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code configuration and credentials, and local execution continue to work without it. HRA identity is separate from every provider account.
+Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code configuration and credentials, Devin configuration and credentials, and local execution continue to work without it. HRA identity is separate from every provider account.
 
 ### Encrypted before upload
 
 - User messages and final assistant display text.
 - Session names, notes, queued messages, and steering input.
-- Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not projected. HRA validates one bounded Claude Code authentication-status response transiently, reduces it to signedIn, and never retains, returns, projects, or uploads the identity or usage fields; it never opens or parses a Claude credential file.
+- Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not projected. HRA validates one bounded Claude Code authentication-status response transiently, reduces it to signedIn, and never retains, returns, projects, or uploads the identity or usage fields; it never opens or parses a Claude credential file. Devin account identity and allowance are not projected. HRA reports only local signed-in readiness and records provider-supplied session context and cost facts in the neutral session stream.
 - Turn timing, observed model and tier, and provider usage summaries.
 - Bounded observed file and Git metadata, without unbounded filesystem paths.
 - Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.
@@ -396,8 +407,8 @@ Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code 
 
 ### Never uploaded
 
-- Codex or Claude Code credentials, provider profile or configuration files, plugin credentials, OAuth access or refresh tokens, authorization codes, PKCE verifiers, provider cookies, or the private device code.
-- Raw Codex app-server or Claude Code stream requests or responses.
+- Codex, Claude Code, or Devin credentials; provider profile or configuration files; plugin credentials; OAuth access or refresh tokens; authorization codes; PKCE verifiers; provider cookies; or the private device code.
+- Raw Codex app-server, Claude Code stream, or Devin ACP requests or responses.
 - Raw reasoning, hidden chain of thought, or approval secrets.
 - Provider-internal login and request IDs, permission values, MCP field contracts, protected answers, or response digests.
 - Environment variables, arbitrary command output, or unbounded filesystem paths.
@@ -416,7 +427,7 @@ Device credentials are bearer credentials, not hardware-bound proofs. Connection
 
 Compact-projection recovery is append-only. It preserves every older encrypted cloud chunk, opens a new stream epoch, and keeps the acknowledged unsynced interval visible as a recovery gap until authenticated account deletion.
 
-Codex activity remains subject to OpenAI's service and privacy terms. Claude Code activity remains subject to Anthropic's service and privacy terms.
+Codex activity remains subject to OpenAI's service and privacy terms. Claude Code activity remains subject to Anthropic's service and privacy terms. Devin activity remains subject to Cognition's service and privacy terms.
 
 > **Hosted sync status.** The hosted sync endpoint is live as an open beta. Authenticated account deletion and capability-only progress recovery are implemented and pass deterministic hostile tests. Anyone can create an identity with an email address and a one-time code; an invitation is optional.
 
@@ -439,12 +450,13 @@ hra device key-loss --acknowledge-no-key-holders
 hra device approve <device-id-or-prefix> --fingerprint <value> [--idempotency-key <uuidv7>] [--json]
 hra device revoke <device-id-or-prefix> [--idempotency-key <uuidv7>] [--json]
 hra account add <label>
-hra account login <profile> [--provider <codex|claude>] [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
+hra account login <profile> [--provider <codex|claude|devin>] [--device-code|--manual-token-flow] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
 hra account login-cancel <profile> [--provider codex]
 hra account login-cancel <profile> --provider claude --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
+hra account login-cancel <profile> --provider devin --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
 hra account logout <profile>
 hra account list
-hra account show <profile> [--provider <codex|claude>]
+hra account show <profile> [--provider <codex|claude|devin>]
 hra account usage [profile] [--refresh]
 hra account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]
 hra account switch <profile>
@@ -460,7 +472,7 @@ hra session status <session> [--json]
 hra session watch <session> [--cursor <cursor>] [--jsonl]
 hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
 hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
-hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]
+hra session start <account> [--project <project>] [--provider <codex|claude|devin>] [--preset <low|high|ultra|fable-max|astra>] [--fast]
 hra session send|queue|steer <session> [--attach <path>]... <message>
 hra session stop|recover|abandon <session>
 hra session rename <session> <name>
@@ -468,8 +480,8 @@ hra session archive|unarchive <session>
 hra session note get|edit|clear <session>
 hra session note set <session> <note>
 hra session state <session> [--json]
-hra session preset <session> <low|high|ultra|fable-max>
-hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]
+hra session preset <session> <low|high|ultra|fable-max|astra>
+hra session switch <session> --provider <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>] [--account <account>]
 hra session export <session> [--format <trajectory|json>] [--out <path>]
 hra session fast <session> <on|off>
 hra session project <session> <project>
@@ -501,8 +513,8 @@ hra remote send|queue|steer <cloud-session> <message>
 hra remote send --or-steer <cloud-session> <message>
 hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <decline>
 hra remote stop <cloud-session>
-hra remote preset <cloud-session> <low|high|ultra|fable-max>
-hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]
+hra remote preset <cloud-session> <low|high|ultra|fable-max|astra>
+hra remote provider <cloud-session> <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>]
 hra remote fast <cloud-session> <on|off>
 hra remote allow|deny <device-commands|account-linking>
 hra remote policy
@@ -516,7 +528,7 @@ hra daemon run
 
 Account, project, and local-session selectors accept an exact ID or an unambiguous case-insensitive label. Cloud-session selectors accept an exact public ID, a unique public-ID prefix, or an exact synced name. Device selectors accept an exact ID or unique prefix. Ambiguity lists candidates and performs no effect. The CLI creates and sends an idempotency key before every provider effect; pass `--idempotency-key <uuid>` to reuse one after a lost response. If a local mutation response is uncertain, HRA returns the generated key and the exact replay arguments without repeating the command payload. Put those arguments before any `--` delimiter when rerunning the otherwise unchanged command. session recover accepts only exact, kind-specific provider proof. session abandon never retries or deletes provider state and releases only the local recovery authority. Remote mutations require a current UUIDv7 when this option is supplied. With `--json`, stdout contains one versioned object; diagnostics stay on stderr.
 
-`interaction show` lists each safe requested permission category and each exact question ID. Complete live command and permission authority is available only through the revision-bound protected `interaction inspect` path described above. A permission grant reads `{"permissions":["<requested-name>"]}` and a question response reads `{"answers":{"<question-id>":{"answers":["<answer>"]}}}` through protected input. Those permission-name and question-answer document shapes are Codex-specific. The live Codex adapter rehydrates selected permission names to their exact private provider values immediately before the response write; those values never enter display, storage, logs, or sync. Claude Code tool-use requests map to HRA's provider-neutral interaction kinds and accept only the response choices that exact callback offers.
+`interaction show` lists each safe requested permission category and each exact question ID. Complete live command and permission authority is available only through the revision-bound protected `interaction inspect` path described above. A permission grant reads `{"permissions":["<requested-name>"]}` and a question response reads `{"answers":{"<question-id>":{"answers":["<answer>"]}}}` through protected input. Those permission-name and question-answer document shapes are Codex-specific. The live Codex adapter rehydrates selected permission names to their exact private provider values immediately before the response write; those values never enter display, storage, logs, or sync. Claude Code tool-use requests and Devin ACP permission requests map to HRA's provider-neutral interaction kinds and accept only the response choices that exact callback offers.
 
 Every admitted callback carries a local deadline anchored when the provider delivered it. HRA caps the pending interval at 30 minutes and honors a shorter valid provider interval, including an immediate zero interval. At the deadline it writes one provider-neutral timeout error through the same write-ahead ledger, never invents an answer or grant, and quarantines the provider generation if the write may have escaped. `interaction show` displays the safe local deadline; nested remote policy version 2 carries the same absolute deadline so readers can suppress an expired control, while the daemon remains authoritative.
 
@@ -524,11 +536,11 @@ For a standard MCP form, interaction show returns the exact public field contrac
 
 Projection recovery uses the local-session selector rules. It requires `--acknowledge-gap` and a canonical UUIDv7; the CLI generates a current key when it is omitted. A stored exact key remains the only admissible replay while recovery is unsettled. Inside the seven-day window, a prepared replay renews its lease and can apply. After the window, replay reconciles immutable committed lineage or safely settles known-no-effect authority as rejected; status then determines whether to retry with a fresh generated key.
 
-The beta does not expose destructive local profile or project deletion. `account logout` asks Codex app-server to remove that profile's Codex login while HRA preserves its local session history. HRA does not implement Claude Code sign-out; use Claude Code's own authentication flow inside the isolated profile.
+The beta does not expose destructive local profile or project deletion. `account logout` asks Codex app-server to remove that profile's Codex login while HRA preserves its local session history. HRA does not implement Claude Code or Devin sign-out; use each provider's own authentication flow inside its isolated profile.
 
 ## Authority boundaries
 
-Codex app-server and Claude Code remain authoritative for their provider-native authentication, sessions, execution, tools, approvals, models, and hidden runtime state; Codex additionally owns its plugin, usage, and native transcript surfaces. HRA owns isolated profiles, the durable provider-neutral conversation record and commands, process generations, local projections, optional encrypted sync, and recovery records. The frozen work contract assigns local coordination records to HRA rather than either provider runtime.
+Codex app-server, Claude Code, and Devin ACP remain authoritative for their provider-native authentication, sessions, execution, tools, approvals, models, and hidden runtime state. Codex additionally owns its plugin, account allowance, reset, and native transcript surfaces. HRA owns isolated profiles, the durable provider-neutral conversation record and commands, process generations, local projections, optional encrypted sync, and recovery records. The frozen work contract assigns local coordination records to HRA rather than any provider runtime.
 
 Cloud service availability is not required for local provider authentication, local execution, local work coordination, local recovery, or reading local sessions. Provider accounts remain independent subscriptions. HRA does not pool quota or replay a limited turn under another account or provider. SQLite remains the local work execution authority; Turso is deferred and non-authoritative.
 

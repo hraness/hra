@@ -2285,8 +2285,11 @@ export async function resumeLiveAcceptanceCleanup(
   await run.cleanup(options);
 }
 
+const isProtectedRecoveryDescriptor = (fd: number): boolean =>
+  Number.isSafeInteger(fd) && fd >= 3 && fd <= 255 && !isatty(fd);
+
 export function readLiveAcceptanceRecoveryReceiptFromFd(fd: number): LiveAcceptanceRecoveryReceipt {
-  if (!Number.isSafeInteger(fd) || fd < 3 || fd > 255 || isatty(fd)) {
+  if (!isProtectedRecoveryDescriptor(fd)) {
     throw new LiveAcceptanceError("input_invalid");
   }
   const maximum = 32 * 1024;
@@ -2581,6 +2584,7 @@ const persistLiveAcceptanceEvidence = (
 export const liveAcceptanceMain = async (
   arguments_: readonly string[] = Bun.argv.slice(2),
   options: Readonly<{
+    recoverProcessJournal?: typeof recoverBoundedProcessJournal;
     readRuntimeAttestation?: LiveRuntimeAttestationReader;
     sourceAttestation?: typeof liveAcceptanceSourceAttestation;
   }> = {},
@@ -2592,36 +2596,39 @@ export const liveAcceptanceMain = async (
     process.stderr.write("hra live acceptance: invalid evidence output\n");
     return 2;
   }
-  try {
-    await recoverBoundedProcessJournal();
-  } catch (error: unknown) {
-    if (isBoundedProcessCleanupUnprovenError(error)) {
-      await writeStandardOutputFrame({
-        code: "process_cleanup_unproven",
-        ok: false,
-        phase: error.phase,
-        processGroupId: error.processGroupId,
-        processes: error.processes,
-        recoveryPaths: error.recoveryPaths,
-        status: "recovery_required",
-        version: 1,
-      }).catch(() => undefined);
-      return 75;
+  const recoverBeforeLiveEffect = async (): Promise<number | null> => {
+    try {
+      await (options.recoverProcessJournal ?? recoverBoundedProcessJournal)();
+      return null;
+    } catch (error: unknown) {
+      if (isBoundedProcessCleanupUnprovenError(error)) {
+        await writeStandardOutputFrame({
+          code: "process_cleanup_unproven",
+          ok: false,
+          phase: error.phase,
+          processGroupId: error.processGroupId,
+          processes: error.processes,
+          recoveryPaths: error.recoveryPaths,
+          status: "recovery_required",
+          version: 1,
+        }).catch(() => undefined);
+        return 75;
+      }
+      if (isBoundedProcessRecoveryJournalError(error)) {
+        await writeStandardOutputFrame({
+          code: "process_recovery_journal_blocked",
+          ok: false,
+          reason: error.reason,
+          recoveryPaths: error.recoveryPaths,
+          status: "recovery_required",
+          version: 1,
+        }).catch(() => undefined);
+        return 75;
+      }
+      process.stderr.write("hra live acceptance: process recovery journal unavailable\n");
+      return 1;
     }
-    if (isBoundedProcessRecoveryJournalError(error)) {
-      await writeStandardOutputFrame({
-        code: "process_recovery_journal_blocked",
-        ok: false,
-        reason: error.reason,
-        recoveryPaths: error.recoveryPaths,
-        status: "recovery_required",
-        version: 1,
-      }).catch(() => undefined);
-      return 75;
-    }
-    process.stderr.write("hra live acceptance: process recovery journal unavailable\n");
-    return 1;
-  }
+  };
   const scenarioArguments = parsedOutput.scenarioArguments;
   if (scenarioArguments.length === 2 && scenarioArguments[0] === "--resume-fd") {
     if (parsedOutput.evidenceOutput !== undefined) {
@@ -2629,19 +2636,26 @@ export const liveAcceptanceMain = async (
       return 2;
     }
     const rawFd = scenarioArguments[1];
-    if (rawFd === undefined || !/^[0-9]+$/u.test(rawFd)) {
+    const fd = Number(rawFd);
+    if (rawFd === undefined || !/^[0-9]+$/u.test(rawFd) || !isProtectedRecoveryDescriptor(fd)) {
       process.stderr.write("hra live acceptance: invalid protected descriptor\n");
       return 2;
     }
+    let receipt: LiveAcceptanceRecoveryReceipt;
+    try {
+      receipt = readLiveAcceptanceRecoveryReceiptFromFd(fd);
+    } catch {
+      process.stderr.write("hra live acceptance: invalid protected recovery receipt\n");
+      return 1;
+    }
+    const recoveryExit = await recoverBeforeLiveEffect();
+    if (recoveryExit !== null) return recoveryExit;
     const resumeAbort = new AbortController();
     const stopResume = () => resumeAbort.abort(new LiveAcceptanceError("operator_interrupted"));
     process.once("SIGINT", stopResume);
     process.once("SIGTERM", stopResume);
     try {
-      await resumeLiveAcceptanceCleanup(
-        readLiveAcceptanceRecoveryReceiptFromFd(Number(rawFd)),
-        { signal: resumeAbort.signal },
-      );
+      await resumeLiveAcceptanceCleanup(receipt, { signal: resumeAbort.signal });
       await writeStandardOutputFrame({ ok: true, status: "cleanup_complete", version: 1 });
       return 0;
     } catch {
@@ -2710,6 +2724,10 @@ export const liveAcceptanceMain = async (
     const operator = standardScenario?.operator
       ?? scenarioModule.createLiveAcceptanceScenarioOperator(configuration);
     scenarioOperator = operator;
+    // Validate the selected operator before touching machine process custody.
+    // Invalid input must not contend with or reconcile an unrelated live run.
+    const recoveryExit = await recoverBeforeLiveEffect();
+    if (recoveryExit !== null) return recoveryExit;
     const attestation = await (options.sourceAttestation ?? liveAcceptanceSourceAttestation)(
       configuration.cloudDeploymentUrl,
     );

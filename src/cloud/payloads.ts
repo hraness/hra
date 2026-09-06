@@ -35,6 +35,7 @@ import {
   type NotificationHoursPolicy,
 } from "../domain/notification-hours-contract";
 import { isModelPreset, type ModelPreset } from "./projection";
+import { presetProviders, providerSchema, type Provider } from "../domain/presets";
 import {
   parseUsageEncryptedEnvelope,
   parseUsageProjection,
@@ -51,6 +52,9 @@ const uuidPattern =
 function isInteractionId(value: unknown): value is string {
   return typeof value === "string" && uuidPattern.test(value);
 }
+
+const isProvider = (value: unknown): value is Provider =>
+  providerSchema.safeParse(value).success;
 
 function isRemoteInteractionAnswerMap(
   value: unknown,
@@ -221,7 +225,7 @@ export type RemoteCommandPayload =
    * account is deliberately absent — choosing an account is user-directed and
    * stays on the machine that holds the credentials.
    */
-  | Readonly<{ kind: "set_provider"; preset?: ModelPreset; provider: "codex" | "claude" }>
+  | Readonly<{ kind: "set_provider"; preset?: ModelPreset; provider: Provider }>
   | Readonly<{ enabled: boolean; kind: "set_fast" }>
   | ResolveInteractionDecisionPayload
   | ResolveInteractionAnswersPayload
@@ -250,10 +254,10 @@ export type DeviceCommandPayload =
   | Readonly<{
       accountPublicId: string;
       kind: "session_start";
-      preset: "low" | "high" | "ultra";
+      preset: ModelPreset;
       projectPublicId: string;
       prompt: string;
-      provider: "codex" | "claude";
+      provider: Provider;
     }>
   | Readonly<{
       accountPublicId: string;
@@ -346,8 +350,9 @@ export function parseDeviceCommandPayload(value: unknown): DeviceCommandPayload 
     ])
     && isOpaqueIdentifier(value.accountPublicId)
     && isOpaqueIdentifier(value.projectPublicId)
-    && (value.preset === "low" || value.preset === "high" || value.preset === "ultra")
-    && (value.provider === "codex" || value.provider === "claude")
+    && isModelPreset(value.preset)
+    && isProvider(value.provider)
+    && presetProviders[value.preset] === value.provider
     && typeof value.prompt === "string"
     && value.prompt.length >= 1
     && value.prompt.length <= deviceCommandLimits.promptCharacters
@@ -495,7 +500,7 @@ export type SessionMetadataPayload = Readonly<{
 
 export type DeviceRegistryAccount = Readonly<{
   label: string;
-  provider: "codex" | "claude";
+  provider: Provider;
   publicId: string;
   status: "login_pending" | "recovery_required" | "signed_in" | "signed_out";
 }>;
@@ -594,15 +599,18 @@ function parseRemoteCommandPayloadUnchecked(value: unknown): RemoteCommandPayloa
   ) return { kind: value.kind, preset: value.preset };
   if (
     value.kind === "set_provider"
-    && (value.provider === "codex" || value.provider === "claude")
+    && isProvider(value.provider)
     && (
       (hasExactKeys(value, ["kind", "provider"]) && value.preset === undefined)
       || (hasExactKeys(value, ["kind", "preset", "provider"]) && isModelPreset(value.preset))
     )
   ) {
-    return isModelPreset(value.preset)
-      ? { kind: value.kind, preset: value.preset, provider: value.provider }
-      : { kind: value.kind, provider: value.provider };
+    if (isModelPreset(value.preset)) {
+      return presetProviders[value.preset] === value.provider
+        ? { kind: value.kind, preset: value.preset, provider: value.provider }
+        : null;
+    }
+    return { kind: value.kind, provider: value.provider };
   }
   if (
     value.kind === "set_fast"
@@ -783,7 +791,7 @@ function parseRegistryAccounts(value: unknown): readonly DeviceRegistryAccount[]
       !isRecord(entry)
       || !hasExactKeys(entry, ["label", "provider", "publicId", "status"])
       || !isRegistryLabel(entry.label)
-      || (entry.provider !== "codex" && entry.provider !== "claude")
+      || !isProvider(entry.provider)
       || !isOpaqueIdentifier(entry.publicId)
       || (entry.status !== "login_pending"
         && entry.status !== "recovery_required"

@@ -10,7 +10,7 @@ export { HRA_INSTALL_ARCHIVE_URL, HRA_INSTALL_BUN_VERSION };
 export const HRA_INSTALL_PREFLIGHT_SOURCE_URL =
   "https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts";
 export const HRA_INSTALL_PREFLIGHT_SOURCE_SHA256 =
-  "53a13acc4c60baf19da95f469229e3d5269cb9cbe099962480e164fe7cc98731";
+  "61dcd716e2272c4c3d94d565ac1a9aab3dc99780813316a822f594938cf456e2";
 export const HRA_INSTALL_PREFLIGHT_SUCCESS = HRA_INSTALL_SUCCESS;
 export const HRA_INSTALL_PREFLIGHT_LOADER = [
   "const[a,h]=process.argv.slice(1);",

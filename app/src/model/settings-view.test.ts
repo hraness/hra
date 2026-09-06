@@ -31,6 +31,7 @@ function registry(overrides: Partial<DeviceRegistryPayload> = {}): DeviceRegistr
     accounts: [
       { label: "work", provider: "codex", publicId: "acct_one", status: "signed_in" },
       { label: "personal", provider: "claude", publicId: "acct_two", status: "signed_out" },
+      { label: "build", provider: "devin", publicId: "acct_three", status: "login_pending" },
     ],
     daemonVersion: "0.3.0",
     defaultApprovalMode: "auto:all",
@@ -146,7 +147,11 @@ describe("toMachineView", () => {
     expect(view.notificationPolicyRevision).toBe(4);
     expect(view.revision).toBe(7);
     expect(view.online).toBe(true);
-    expect(view.accounts.map((account) => account.label)).toEqual(["work", "personal"]);
+    expect(view.accounts.map((account) => [account.label, account.provider, account.status])).toEqual([
+      ["work", "codex", "signed_in"],
+      ["personal", "claude", "signed_out"],
+      ["build", "devin", "login_pending"],
+    ]);
     expect(view.projects.map((project) => project.label)).toEqual(["hra"]);
   });
 
@@ -277,6 +282,7 @@ describe("machine and task ordering", () => {
     expect(rows.map((row) => [row.label, row.machineLabel, row.status])).toEqual([
       ["work", "studio", "signed_in"],
       ["personal", "studio", "signed_out"],
+      ["build", "studio", "login_pending"],
     ]);
   });
 
@@ -292,6 +298,7 @@ describe("machine and task ordering", () => {
           accountLinkingAllowed && deviceCommandsAllowed,
         );
         expect(accountBrowserLoginAllowed(rows[1]!)).toBe(false);
+        expect(accountBrowserLoginAllowed(rows[2]!)).toBe(false);
       }
     }
   });

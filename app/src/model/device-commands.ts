@@ -4,6 +4,7 @@ import {
   parseDeviceCommandPayload,
   type DeviceCommandPayload,
   type DeviceCommandResultPayload,
+  type ModelPreset,
   type NotificationHoursUpdate,
 } from "../hra/cloud";
 import type { MachineView } from "./settings-view";
@@ -16,10 +17,16 @@ import type { MachineView } from "./settings-view";
  * that adds or drops a field fails here rather than at the machine.
  */
 
-export type PresetChoice = "low" | "high" | "ultra";
+export type PresetChoice = ModelPreset;
 
 /** The UI default the plan names: Astra Ultra. */
 export const defaultSessionStartPreset: PresetChoice = "ultra";
+
+export type SessionStartProvider = "codex" | "claude" | "devin";
+
+export const defaultSessionStartPresetForProvider = (
+  provider: SessionStartProvider,
+): PresetChoice => provider === "claude" ? "fable-max" : provider === "devin" ? "astra" : "ultra";
 
 export type SessionStartTarget = Readonly<{
   accountLabel: string;
@@ -28,7 +35,7 @@ export type SessionStartTarget = Readonly<{
   machineLabel: string;
   machineOnline: boolean;
   projects: readonly Readonly<{ label: string; publicId: string }>[];
-  provider: "codex" | "claude";
+  provider: SessionStartProvider;
   targetDevicePublicId: string;
 }>;
 
@@ -36,7 +43,7 @@ export type SessionStartTarget = Readonly<{
 export function sessionStartTargetLabel(target: SessionStartTarget): string {
   const provider = target.provider === "claude"
     ? "Claude Code (Linux machine only)"
-    : "Codex";
+    : target.provider === "devin" ? "Devin" : "Codex";
   return `${target.accountLabel} — ${target.machineLabel} — ${provider}`;
 }
 
@@ -62,7 +69,7 @@ export function sessionStartCommand(input: Readonly<{
   preset: PresetChoice;
   projectPublicId: string;
   prompt: string;
-  provider: "codex" | "claude";
+  provider: SessionStartProvider;
 }>): DeviceCommandPayload {
   const prompt = input.prompt.trim();
   if (prompt.length === 0) throw new Error("A new session needs a prompt.");

@@ -1,12 +1,12 @@
 import { z } from "zod";
 
 /** Every provider HRA can drive. A session binds exactly one for its life. */
-export const providerSchema = z.enum(["codex", "claude"]);
+export const providerSchema = z.enum(["codex", "claude", "devin"]);
 export type Provider = z.infer<typeof providerSchema>;
 
 export const DEFAULT_PROVIDER = "codex" satisfies Provider;
 
-export const presetSchema = z.enum(["low", "high", "ultra", "fable-max"]);
+export const presetSchema = z.enum(["low", "high", "ultra", "fable-max", "astra"]);
 export type Preset = z.infer<typeof presetSchema>;
 
 /**
@@ -36,7 +36,7 @@ export type PresetContract = z.infer<typeof presetContractSchema>;
 
 export type PresetRequirement = Readonly<{
   model: string;
-  effort: "max" | "ultra";
+  effort: "max" | "ultra" | "provider-default";
 }>;
 
 const legacyPresetRequirements = {
@@ -44,7 +44,7 @@ const legacyPresetRequirements = {
   high: { model: "gpt-5.6-sol", effort: "max" },
   ultra: { model: "gpt-5.6-sol", effort: "ultra" },
   "fable-max": { model: "claude-fable-5-1", effort: "max" },
-} as const satisfies Record<Preset, PresetRequirement>;
+} as const satisfies Partial<Record<Preset, PresetRequirement>>;
 
 const currentPresetRequirements = {
   low: { model: "gpt-5.6-luna", effort: "max" },
@@ -54,21 +54,33 @@ const currentPresetRequirements = {
   // is spelled here rather than imported because `src/domain` is the leaf
   // layer; `src/claude/pin.test.ts` proves the two stay equal.
   "fable-max": { model: "claude-fable-5-1", effort: "max" },
+  // Devin ACP selects this exact model family but exposes no separate
+  // reasoning-effort flag, so the reviewed profile records that fact rather
+  // than inventing a provider setting.
+  astra: { model: "gpt-6-astra", effort: "provider-default" },
 } as const satisfies Record<Preset, PresetRequirement>;
 
-const presetRequirementsByContract = {
-  [legacyPresetContract]: legacyPresetRequirements,
-  [currentPresetContract]: currentPresetRequirements,
-} as const satisfies Record<PresetContract, Record<Preset, PresetRequirement>>;
+const presetRequirementsByContract: Readonly<
+  Record<PresetContract, Partial<Readonly<Record<Preset, PresetRequirement>>>>
+> = Object.freeze({
+  [legacyPresetContract]: Object.freeze(legacyPresetRequirements),
+  [currentPresetContract]: Object.freeze(currentPresetRequirements),
+});
 
 /** Current requirements used for every new or explicitly selected preset. */
 export const presetRequirements = currentPresetRequirements;
 
+type ContractRequirement<P extends Preset, C extends PresetContract> =
+  C extends typeof currentPresetContract
+    ? PresetRequirement
+    : P extends "astra" ? undefined : PresetRequirement;
+
 /** Resolve one alias under its durable, session-owned interpretation. */
-export const presetRequirementForContract = (
-  preset: Preset,
-  contract: PresetContract,
-): PresetRequirement => presetRequirementsByContract[contract][preset];
+export const presetRequirementForContract = <
+  P extends Preset,
+  C extends PresetContract,
+>(preset: P, contract: C): ContractRequirement<P, C> =>
+  presetRequirementsByContract[contract][preset] as ContractRequirement<P, C>;
 
 /**
  * Historical runtime documents remain admissible only when they carry one of
@@ -78,8 +90,10 @@ export const isAdmittedPresetRequirement = (
   preset: Preset,
   requirement: PresetRequirement,
 ): boolean => [legacyPresetContract, currentPresetContract].some((contract) => {
-  const admitted = presetRequirementForContract(preset, contract);
-  return admitted.model === requirement.model && admitted.effort === requirement.effort;
+  const admitted = presetRequirementsByContract[contract][preset];
+  return admitted !== undefined
+    && admitted.model === requirement.model
+    && admitted.effort === requirement.effort;
 });
 
 export const presetProviders = {
@@ -87,6 +101,7 @@ export const presetProviders = {
   high: "codex",
   ultra: "codex",
   "fable-max": "claude",
+  astra: "devin",
 } as const satisfies Record<Preset, Provider>;
 
 /** The presets a given provider owns, as a type. */
@@ -97,6 +112,7 @@ export type ProviderPreset<P extends Provider> = {
 const defaultPresetsByProvider = {
   claude: "fable-max",
   codex: "ultra",
+  devin: "astra",
 } as const satisfies { readonly [P in Provider]: ProviderPreset<P> };
 
 /** The preset a new session uses when its provider was chosen but no preset was. */
@@ -109,6 +125,7 @@ export const presetTiers = {
   high: "high",
   ultra: "ultra",
   "fable-max": "ultra",
+  astra: "ultra",
 } as const satisfies Record<Preset, PresetTier>;
 
 const presetsByProviderTier: Readonly<
@@ -116,6 +133,7 @@ const presetsByProviderTier: Readonly<
 > = Object.freeze({
   claude: Object.freeze({ ultra: "fable-max" }),
   codex: Object.freeze({ high: "high", low: "low", ultra: "ultra" }),
+  devin: Object.freeze({ ultra: "astra" }),
 });
 
 /** Presets a provider supports, in the union's declaration order. */

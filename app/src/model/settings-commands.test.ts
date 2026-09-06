@@ -57,6 +57,9 @@ describe("machine default builders", () => {
       expect(accepted(payload)).toEqual(payload);
       expect(presetLabels[preset].length).toBeGreaterThan(0);
     }
+    expect(presetLabels.high).toBe("Astra Max");
+    expect(presetLabels.ultra).toBe("Astra Ultra");
+    expect(presetLabels.astra).toBe("Devin Astra");
   });
 
   test("Fast is an explicit session command in both directions", () => {
@@ -111,6 +114,7 @@ describe("machine default builders", () => {
   test("preset labels name the actual model and effort", () => {
     expect(presetLabels).toEqual({
       "fable-max": "Fable Max",
+      astra: "Devin Astra",
       high: "Astra Max",
       low: "Luna Max",
       ultra: "Astra Ultra",

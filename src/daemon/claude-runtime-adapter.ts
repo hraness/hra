@@ -315,7 +315,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     // any identity-bearing status fields into its account model.
     const configDir = await this.#configDirFor(input.authority);
     this.#assertLaunchAuthority(input.authority, input.signal);
-    const runtime = await this.#admitRuntime(configDir);
+    const runtime = await this.#admitRuntime(configDir, input.signal);
     this.#assertLaunchAuthority(input.authority, input.signal);
     this.#resolvedRuntime = runtime;
     const account = await this.#readAuthStatus({
@@ -559,9 +559,9 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
   }
 
   /** Widens the runtime-resolution failure into one actionable instruction. */
-  async #admitRuntime(configDir: string): Promise<PinnedClaudeRuntime> {
+  async #admitRuntime(configDir: string, signal: AbortSignal): Promise<PinnedClaudeRuntime> {
     try {
-      return await this.#resolveRuntime({ configDir } satisfies ResolvePinnedClaudeRuntimeOptions);
+      return await this.#resolveRuntime({ configDir, signal } satisfies ResolvePinnedClaudeRuntimeOptions);
     } catch (error: unknown) {
       const detail = error instanceof ClaudeError ? error.message : "it could not be admitted";
       throw new ClaudeError(
@@ -767,7 +767,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     const configDir = await this.#configDirFor(input.authority);
     this.#assertLaunchAuthority(input.authority, input.signal);
     if (input.kind === "session_start") this.#assertNoUnboundSessionChild();
-    const runtime = await this.#admitRuntime(configDir);
+    const runtime = await this.#admitRuntime(configDir, input.signal);
     this.#assertLaunchAuthority(input.authority, input.signal);
     if (input.kind === "session_start") this.#assertNoUnboundSessionChild();
     this.#resolvedRuntime = runtime;

@@ -160,6 +160,61 @@ const startTurn = async (
 };
 
 describe("pinned Claude runtime manager", () => {
+  test.each(["account", "session review", "turn review"] as const)(
+    "cancels an in-flight version probe during %s admission",
+    async (operation) => {
+      const controller = new AbortController();
+      let markProbeStarted!: () => void;
+      const probeStarted = new Promise<void>((resolve) => { markProbeStarted = resolve; });
+      let releaseProbe!: () => void;
+      let probeCanceled = false;
+      let authReads = 0;
+      const { manager, processes } = harness({
+        readAuthStatus: async () => {
+          authReads += 1;
+          return { signedIn: true };
+        },
+        resolveRuntime: (input) => new Promise((resolve, reject) => {
+          const abort = () => {
+            probeCanceled = true;
+            reject(new Error("Version probe canceled after cleanup"));
+          };
+          input.signal?.addEventListener("abort", abort, { once: true });
+          releaseProbe = () => {
+            input.signal?.removeEventListener("abort", abort);
+            resolve(runtime);
+          };
+          markProbeStarted();
+        }),
+      });
+      const review = {
+        authority,
+        fast: false,
+        preset: "fable-max" as const,
+        projectRoot: PROJECT_ROOT,
+        signal: controller.signal,
+      };
+      const pending = operation === "account"
+        ? manager.readAccount({ authority, signal: controller.signal })
+        : operation === "session review"
+          ? manager.reviewSessionStart(review)
+          : manager.reviewTurnStart({ ...review, providerThreadId: "claude-session-1" });
+      void pending.catch(() => undefined);
+      try {
+        await probeStarted;
+        controller.abort();
+        expect(probeCanceled).toBe(true);
+        await expect(pending).rejects.toMatchObject({ code: "RUNTIME_MISMATCH" });
+        expect(authReads).toBe(0);
+        expect(processes).toHaveLength(0);
+      } finally {
+        releaseProbe();
+        await pending.catch(() => undefined);
+        await manager.close();
+      }
+    },
+  );
+
   test("reports Claude's isolated auth status rather than inferring it from sessions", async () => {
     let signedIn = false;
     const reads: Readonly<{ configDir: string; signal: AbortSignal }>[] = [];

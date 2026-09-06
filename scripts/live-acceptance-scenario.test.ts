@@ -30,6 +30,7 @@ import { DEFAULT_CLOUD_DEPLOYMENT_URL } from "../src/cloud/identity-custody";
 import { safeLiveAcceptanceCommandDigest } from "../src/codex/protocol";
 import {
   LIVE_ACCEPTANCE_CONTROL_FD,
+  liveAcceptanceRecoveryReceiptSchema,
   type LiveAcceptanceCliResult,
   type LiveAcceptanceDevice,
   type LiveAcceptanceDeviceName,
@@ -2303,6 +2304,141 @@ describe("live acceptance release scenario", () => {
       version: 1,
     })}\n`);
     expect(stderr).toContain("startup failed safely");
+  });
+
+  type RecoveryBoundaryCase = Readonly<{
+    arguments: readonly string[];
+    calls: number;
+    configuration: Readonly<Record<string, unknown>> | null;
+    exitCode: number;
+    label: string;
+    receipt?: "valid" | "malformed" | "schema-invalid" | "empty" | "oversized" | "closed";
+  }>;
+
+  test.each<RecoveryBoundaryCase>([
+    { label: "invalid arguments", arguments: [], configuration: null, calls: 0, exitCode: 2 },
+    { label: "invalid resume descriptor", arguments: ["--resume-fd", "invalid"], configuration: null, calls: 0, exitCode: 2 },
+    ...["0", "1", "2", "256", "9007199254740992"].map((descriptor) => ({
+      label: `out-of-range resume descriptor ${descriptor}`,
+      arguments: ["--resume-fd", descriptor],
+      configuration: null,
+      calls: 0,
+      exitCode: 2,
+    })),
+    { label: "terminal configuration on agent stdin", arguments: ["--scenario-stdin"], configuration: {
+      cloudDeploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
+      operator: { kind: "terminal" },
+      version: 1,
+    }, calls: 0, exitCode: 1 },
+    { label: "invalid scenario configuration", arguments: ["--scenario-stdin"], configuration: {
+      operator: { kind: "jsonl" },
+      version: 1,
+    }, calls: 0, exitCode: 1 },
+    { label: "valid agent execution", arguments: ["--scenario-stdin"], configuration: {
+      cloudDeploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
+      operator: { kind: "jsonl" },
+      version: 1,
+    }, calls: 1, exitCode: 75 },
+    { label: "resume execution", arguments: ["--resume-fd", "3"], configuration: null, receipt: "valid", calls: 1, exitCode: 75 },
+    ...(["malformed", "schema-invalid", "empty", "oversized", "closed"] as const).map((receipt) => ({
+      label: `${receipt} recovery receipt`,
+      arguments: ["--resume-fd", "3"],
+      configuration: null,
+      receipt,
+      calls: 0,
+      exitCode: 1,
+    })),
+    { label: "closed maximum resume descriptor", arguments: ["--resume-fd", "255"], configuration: null, calls: 0, exitCode: 1 },
+  ])("validates $label before the recovery boundary and preserves valid-run refusal", async (input) => {
+    const directory = await mkdtemp(join(tmpdir(), "hra-recovery-input-"));
+    try {
+      const receiptKind = input.receipt;
+      const receiptPath = receiptKind === undefined ? null : join(directory, "receipt.json");
+      if (receiptPath !== null) {
+        const identity = (path: string) => ({ device: 0, inode: 1, mode: 0o700, owner: 0, path });
+        const receipt = liveAcceptanceRecoveryReceiptSchema.parse({
+          checkpoint: "prepared",
+          createdAt: 1,
+          expectedHomeDirectory: join(directory, "home"),
+          phase: "prepared",
+          receiptPath,
+          resources: ["device_a", "device_b", "project_a", "project_b"].map((role) => ({
+            identity: identity(join(directory, "run", role)),
+            role,
+            status: "active",
+          })),
+          runId: "10000000-0000-4000-8000-000000000001",
+          runRoot: identity(join(directory, "run")),
+          updatedAt: 1,
+          version: 1,
+          workers: [],
+        });
+        const contents = receiptKind === "malformed" ? "private-invalid-receipt"
+          : receiptKind === "schema-invalid" ? '{"private-invalid-receipt":true}'
+            : receiptKind === "empty" ? ""
+              : receiptKind === "oversized" ? "x".repeat(32 * 1024 + 1)
+                : JSON.stringify(receipt);
+        await writeFile(receiptPath, contents, { mode: 0o600 });
+      }
+      const program = [
+        'import { closeSync, openSync } from "node:fs";',
+        `import { liveAcceptanceMain } from ${JSON.stringify(pathToFileURL(join(import.meta.dir, "live-acceptance.ts")).href)};`,
+        `import { BoundedProcessRecoveryJournalError } from ${JSON.stringify(pathToFileURL(join(import.meta.dir, "bounded-process.ts")).href)};`,
+        `const arguments_ = ${JSON.stringify(input.arguments)};`,
+        `const receiptPath = ${JSON.stringify(receiptPath)};`,
+        "const receiptFd = receiptPath === null ? null : openSync(receiptPath, 'r');",
+        "if (receiptFd !== null) arguments_[1] = String(receiptFd);",
+        `if (${JSON.stringify(receiptKind === "closed")} && receiptFd !== null) closeSync(receiptFd);`,
+        "if (arguments_[1] === '255') { try { closeSync(255); } catch {} }",
+        "let recoveryCalls = 0;",
+        "try { process.exitCode = await liveAcceptanceMain(arguments_, {",
+        "  recoverProcessJournal: async () => {",
+        "    recoveryCalls += 1;",
+        "    throw new BoundedProcessRecoveryJournalError([], 'concurrent_invocation');",
+        "  },",
+        `}); } finally { if (receiptFd !== null && ${JSON.stringify(receiptKind !== "closed")}) closeSync(receiptFd); }`,
+        "process.stderr.write(`recoveryCalls=${recoveryCalls}\\n`);",
+      ].join("\n");
+      const child = Bun.spawn([process.execPath, "--eval", program], {
+        cwd: join(import.meta.dir, ".."),
+        stdin: "pipe",
+        stderr: "pipe",
+        stdout: "pipe",
+      });
+      if (input.configuration !== null) {
+        await child.stdin.write(`${JSON.stringify(input.configuration)}\n`);
+      }
+      await child.stdin.end();
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      expect({ exitCode, stdout, stderr }).toMatchObject({ exitCode: input.exitCode });
+      expect(stderr).toContain(`recoveryCalls=${input.calls}\n`);
+      if (input.calls === 1) {
+        expect(stdout).toBe(`${JSON.stringify({
+          code: "process_recovery_journal_blocked",
+          ok: false,
+          reason: "concurrent_invocation",
+          recoveryPaths: [],
+          status: "recovery_required",
+          version: 1,
+        })}\n`);
+      } else if (input.exitCode === 1 && input.arguments[0] === "--resume-fd") {
+        expect(stdout).toBe("");
+        expect(stderr).toContain("invalid protected recovery receipt");
+        expect(stderr).not.toContain("private-invalid-receipt");
+        expect(stderr).not.toContain(directory);
+      } else if (input.exitCode === 1) {
+        expect(stdout).toBe(`${JSON.stringify({ ok: false, status: "startup_failed", version: 1 })}\n`);
+        expect(stderr).toContain("startup failed safely");
+      } else {
+        expect(stdout).toBe("");
+      }
+    } finally {
+      await rm(directory, { force: false, recursive: true });
+    }
   });
 
   test("the executable rejects JSONL configuration from terminal descriptor mode", async () => {

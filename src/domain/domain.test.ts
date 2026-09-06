@@ -18,6 +18,7 @@ describe("domain laws", () => {
       high: { model: "gpt-6-astra", effort: "max" },
       ultra: { model: "gpt-6-astra", effort: "ultra" },
       "fable-max": { model: "claude-fable-5-1", effort: "max" },
+      astra: { model: "gpt-6-astra", effort: "provider-default" },
     });
   });
 
@@ -118,6 +119,52 @@ describe("domain laws", () => {
       ...base,
       acknowledgeChildExited: false,
     }).success).toBe(false);
+  });
+
+  test("binds Devin foreground login to an explicit flow and exact terminal authority", () => {
+    const account = `acct_${"a".repeat(32)}`;
+    const attemptId = `attempt_${"b".repeat(32)}`;
+    const idempotencyKey = "00000000-0000-4000-8000-000000000303";
+    expect(localCommandSchema.safeParse({
+      account,
+      idempotencyKey,
+      kind: "account.devin-login.prepare",
+      manualTokenFlow: true,
+    }).success).toBe(true);
+    expect(localCommandSchema.safeParse({
+      account,
+      idempotencyKey,
+      kind: "account.devin-login.prepare",
+    }).success).toBe(false);
+
+    const completion = {
+      account,
+      attemptId,
+      idempotencyKey,
+      kind: "account.devin-login.complete",
+      providerGeneration: 7,
+    } as const;
+    for (const outcome of [
+      { state: "joined", exitCode: 0, interruptedBy: null },
+      { state: "not_started", reason: "spawn_failed" },
+      { state: "not_started", reason: "preflight_stale" },
+      { state: "not_started", reason: "interrupted_before_spawn", interruptedBy: "SIGTERM" },
+    ]) expect(localCommandSchema.safeParse({ ...completion, outcome }).success).toBe(true);
+    expect(localCommandSchema.safeParse({
+      ...completion,
+      outcome: { state: "joined", exitCode: 0, interruptedBy: null, token: "forbidden" },
+    }).success).toBe(false);
+
+    const abandon = {
+      account,
+      attemptId,
+      idempotencyKey,
+      kind: "account.devin-login.abandon",
+      providerGeneration: 7,
+    } as const;
+    expect(localCommandSchema.safeParse({ ...abandon, acknowledgeChildExited: true }).success)
+      .toBe(true);
+    expect(localCommandSchema.safeParse(abandon).success).toBe(false);
   });
 
   test("terminal mutation states are absorbing", () => {

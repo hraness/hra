@@ -54,14 +54,19 @@ describe("browser account login controls", () => {
     expect(markup.match(/disabled=""/gu)).toHaveLength(2);
   });
 
-  test("never renders browser login actions for Claude", () => {
-    expect(renderToStaticMarkup(
-      <AccountBrowserLoginControls
-        account={{ ...account(true, true), provider: "claude" }}
-        busy={false}
-        onStart={() => undefined}
-        onStatus={() => undefined}
-      />,
-    )).toBe("");
+  test("never renders browser login actions for provider-owned CLI login", () => {
+    for (const provider of ["claude", "devin"] as const) {
+      const markup = renderToStaticMarkup(
+        <AccountBrowserLoginControls
+          account={{ ...account(true, true), provider }}
+          busy={false}
+          onStart={() => undefined}
+          onStatus={() => undefined}
+        />,
+      );
+      expect(markup).toBe("");
+      expect(markup).not.toContain("Link here");
+      expect(markup).not.toContain("Check status");
+    }
   });
 });

@@ -31,6 +31,7 @@ import { navigate } from "../routing/router";
 import { sessionRoute, settingsRoute } from "../routing/route";
 import {
   defaultSessionStartPreset,
+  defaultSessionStartPresetForProvider,
   deviceCommandNotice,
   sessionStartCommand,
   sessionStartTargetHint,
@@ -59,11 +60,24 @@ function sameSummary(left: SessionCardSummary, right: SessionCardSummary): boole
     && left.title === right.title;
 }
 
-const presetOptions: readonly Readonly<{ label: string; value: PresetChoice }>[] = [
+const codexPresetOptions: readonly Readonly<{ label: string; value: PresetChoice }>[] = [
   { label: presetLabels.low, value: "low" },
   { label: presetLabels.high, value: "high" },
   { label: presetLabels.ultra, value: "ultra" },
 ];
+const claudePresetOptions: readonly Readonly<{ label: string; value: PresetChoice }>[] = [
+  { label: presetLabels["fable-max"], value: "fable-max" },
+];
+const devinPresetOptions: readonly Readonly<{ label: string; value: PresetChoice }>[] = [
+  { label: presetLabels.astra, value: "astra" },
+];
+
+const presetOptionsForProvider = (
+  provider: "codex" | "claude" | "devin",
+): readonly Readonly<{ label: string; value: PresetChoice }>[] =>
+  provider === "claude"
+    ? claudePresetOptions
+    : provider === "devin" ? devinPresetOptions : codexPresetOptions;
 
 /** The card under the pointer during a drag, resolved from the DOM. */
 function cardUnderPointer(clientX: number, clientY: number): string | null {
@@ -177,6 +191,9 @@ export function GridScreen({
       ?? null,
     [targetKey, targets],
   );
+  const presetOptions = startTarget === null
+    ? codexPresetOptions
+    : presetOptionsForProvider(startTarget.provider);
   // The picker follows the registry: an account or project that disappears
   // between renders is replaced rather than left addressing something gone.
   const project = useMemo(
@@ -185,6 +202,12 @@ export function GridScreen({
       ?? null,
     [projectPublicId, startTarget],
   );
+
+  useEffect(() => {
+    if (startTarget === null) return;
+    if (presetOptions.some((option) => option.value === preset)) return;
+    setPreset(defaultSessionStartPresetForProvider(startTarget.provider));
+  }, [preset, presetOptions, startTarget]);
 
   // Once the started session shows up in the grid, the command notice has done
   // its job and the composer goes quiet again.

@@ -34,6 +34,10 @@ import {
   type ClaudeLoginSignal,
   type ClaudeLoginSignalSource,
 } from "./claude/index";
+import {
+  DEVIN_PIN,
+  DEVIN_PIN_MODEL,
+} from "./devin/index";
 import { ShellTerminalCoordinator } from "./cli/shell-terminal";
 import {
   CloudDaemonJournalRecoveryBlocker,
@@ -90,6 +94,13 @@ const cliClaudeRuntime = {
   version: CLAUDE_PIN,
 } as const;
 
+const cliDevinRuntime = {
+  argv: ["/test/devin", "acp", "--model", DEVIN_PIN_MODEL] as const,
+  executablePath: "/test/devin",
+  model: DEVIN_PIN_MODEL,
+  version: DEVIN_PIN,
+} as const;
+
 class CliClaudeLoginSignalSource implements ClaudeLoginSignalSource {
   readonly listeners = new Map<ClaudeLoginSignal, Set<() => void>>();
 
@@ -110,15 +121,16 @@ class CliClaudeLoginSignalSource implements ClaudeLoginSignalSource {
 
 // An install written by the released main build: the notification migrations are
 // absent and `user_version` still names the provider-switch schema it stamped.
-// A writable open must carry that v35 authority forward to v38.
+// A writable open must carry that v35 authority through the routing and Devin
+// migrations to v39.
 const downgradeStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
     database.exec(`
+      DROP TABLE session_mutation_authority_rebinds_v39;
       DROP TABLE attention_email_policy;
       DROP TABLE notification_hours;
-      DELETE FROM migrations WHERE version=37;
-      DELETE FROM migrations WHERE version=36;
+      DELETE FROM migrations WHERE version>=36;
       PRAGMA user_version=35;
     `);
   } finally {
@@ -131,7 +143,7 @@ const downgradeStateSchema = (databasePath: string): void => {
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("PRAGMA user_version=39");
+    database.exec("PRAGMA user_version=40");
   } finally {
     database.close(false);
   }
@@ -3130,6 +3142,138 @@ describe("CLI entry point", () => {
     }
   });
 
+  test("runs Devin's pinned foreground login in all five isolated directories", async () => {
+    const { installation, runRoot } = await upgradeFixture("devin-account-login");
+    const accountId = `acct_${"d".repeat(32)}` as const;
+    const attemptId = `attempt_${"e".repeat(32)}` as const;
+    const idempotencyKey = "00000000-0000-4000-8000-000000000321";
+    const calls: LocalCommand[] = [];
+    let preflights = 0;
+    let loginDirectories: Readonly<{
+      home: string;
+      configHome: string;
+      dataHome: string;
+      cacheHome: string;
+      stateHome: string;
+    }> | undefined;
+    const captured = capture();
+    try {
+      expect(await main([
+        "account",
+        "login",
+        "Personal",
+        "--provider",
+        "devin",
+        "--manual-token-flow",
+        "--idempotency-key",
+        idempotencyKey,
+      ], captured.output, {
+        installation,
+        interactive: true,
+        isTerminalDescriptor: () => true,
+        callDaemon: async (command) => {
+          calls.push(command);
+          if (command.kind === "account.show") {
+            return {
+              data: {
+                account: { id: accountId, label: "Personal" },
+                authentication: { provider: "devin", signedIn: false },
+                nextCommand: `hra account login ${accountId} --provider devin`,
+                providerGeneration: 7,
+                usage: {
+                  allowance: "unknown",
+                  reason: "Devin exposes no account allowance or reset window.",
+                  source: "devin_acp",
+                },
+              },
+              ok: true as const,
+              requestId: crypto.randomUUID(),
+              version: 1 as const,
+            };
+          }
+          if (command.kind === "account.devin-login.prepare") {
+            return {
+              data: {
+                account: { id: accountId, label: "Personal" },
+                authentication: { provider: "devin", signedIn: false },
+                login: {
+                  status: "launch_granted",
+                  attemptId,
+                  idempotencyKey,
+                  providerGeneration: 7,
+                },
+              },
+              ok: true as const,
+              requestId: crypto.randomUUID(),
+              version: 1 as const,
+            };
+          }
+          if (command.kind !== "account.devin-login.complete") throw new Error("Unexpected command.");
+          return {
+            data: {
+              account: { id: accountId, label: "Personal" },
+              authentication: { provider: "devin", signedIn: true },
+              login: {
+                status: "signed_in",
+                attemptId,
+                idempotencyKey,
+                providerGeneration: 7,
+              },
+            },
+            ok: true as const,
+            requestId: crypto.randomUUID(),
+            version: 1 as const,
+          };
+        },
+        runDevinForegroundLogin: async ({ directories, manualTokenFlow, stdio }) => {
+          loginDirectories = directories;
+          expect(manualTokenFlow).toBe(true);
+          expect(stdio).toEqual({ stderr: 2, stdin: 0, stdout: 1 });
+          return { state: "joined", exitCode: 0, interruptedBy: null };
+        },
+        resolveDevinRuntime: async () => {
+          preflights += 1;
+          return cliDevinRuntime;
+        },
+      })).toBe(0);
+      expect(calls).toEqual([
+        { account: "Personal", kind: "account.show", provider: "devin" },
+        {
+          account: "Personal",
+          idempotencyKey,
+          kind: "account.devin-login.prepare",
+          manualTokenFlow: true,
+        },
+        {
+          account: accountId,
+          attemptId,
+          idempotencyKey,
+          kind: "account.devin-login.complete",
+          outcome: { state: "joined", exitCode: 0, interruptedBy: null },
+          providerGeneration: 7,
+        },
+      ]);
+      expect(loginDirectories).toEqual({
+        home: join(installation.paths.profiles, accountId, "devin-home"),
+        configHome: join(installation.paths.profiles, accountId, "devin-config"),
+        dataHome: join(installation.paths.profiles, accountId, "devin-data"),
+        cacheHome: join(installation.paths.profiles, accountId, "devin-cache"),
+        stateHome: join(installation.paths.profiles, accountId, "devin-state"),
+      });
+      expect(preflights).toBe(2);
+      if (loginDirectories === undefined) throw new Error("Devin login did not receive directories.");
+      for (const directory of Object.values(loginDirectories)) {
+        expect((await lstat(directory)).mode & 0o077).toBe(0);
+      }
+      expect(captured.read()).toEqual({
+        stderr: "",
+        stdout: "Devin is signed in for Personal.\n",
+      });
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
+    }
+  });
+
   test("preflights Claude even across a signed-in-to-grant race and completes the exact attempt", async () => {
     const { installation, runRoot } = await upgradeFixture("claude-account-login");
     const accountId = `acct_${"1".repeat(32)}` as const;
@@ -5622,7 +5766,7 @@ describe("CLI entry point", () => {
       });
       expect(started.read().stderr).toBe("");
       expect(daemonStarts).toBe(1);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(38);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(39);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -5646,7 +5790,7 @@ describe("CLI entry point", () => {
         error: {
           code: "RECOVERY_REQUIRED",
           details: { nextCommand: "hra daemon start" },
-          message: "The local state schema needs a migration (35 to 38); start the daemon to migrate it.",
+          message: "The local state schema needs a migration (35 to 39); start the daemon to migrate it.",
         },
         ok: false,
         version: 1,
@@ -5678,14 +5822,14 @@ describe("CLI entry point", () => {
       expect(JSON.parse(captured.read().stdout)).toEqual({
         error: {
           code: "RECOVERY_REQUIRED",
-          message: "This HRA build is older than the local state schema (39 vs 38); install the newer HRA.",
+          message: "This HRA build is older than the local state schema (40 vs 39); install the newer HRA.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
       expect(daemonStarts).toBe(0);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(39);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(40);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -5707,7 +5851,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["The local state schema needs a migration (35 to 38). Run `hra daemon start` to migrate it."],
+          problems: ["The local state schema needs a migration (35 to 39). Run `hra daemon start` to migrate it."],
           state: { database: "invalid", initialized: false },
         },
       });
@@ -5734,7 +5878,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["This HRA build is older than the local state schema (39 vs 38). Install the newer HRA."],
+          problems: ["This HRA build is older than the local state schema (40 vs 39). Install the newer HRA."],
           state: { database: "invalid", initialized: false },
         },
       });

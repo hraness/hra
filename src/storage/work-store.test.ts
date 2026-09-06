@@ -98,6 +98,7 @@ CREATE TABLE sessions(
   profile_id TEXT NOT NULL REFERENCES profiles(id),
   project_id TEXT NOT NULL REFERENCES projects(id),
   provider TEXT NOT NULL DEFAULT 'codex',
+  provider_v39 TEXT NOT NULL DEFAULT 'codex',
   preset TEXT NOT NULL,
   preset_contract INTEGER NOT NULL DEFAULT 2 CHECK(preset_contract IN (1,2)),
   fast_enabled INTEGER NOT NULL,
@@ -517,7 +518,7 @@ describe("WorkStore schema and atomic plans", () => {
     databases.push(database);
     database.exec("PRAGMA foreign_keys=ON;");
     const legacyParentSchema = parentSchema.replace(
-      "  provider TEXT NOT NULL DEFAULT 'codex',\n",
+      "  provider_v39 TEXT NOT NULL DEFAULT 'codex',\n",
       "",
     );
     expect(legacyParentSchema).not.toBe(parentSchema);
@@ -525,10 +526,10 @@ describe("WorkStore schema and atomic plans", () => {
     database.exec(WORK_SCHEMA_SQL);
 
     expect(() => assertWorkSchema(database)).toThrow(
-      "WORK_SCHEMA_STALE:sessions.provider",
+      "WORK_SCHEMA_STALE:sessions.provider_v39",
     );
     expect(() => assertReadonlyWorkSchema(database)).toThrow(
-      "WORK_SCHEMA_STALE:sessions.provider",
+      "WORK_SCHEMA_STALE:sessions.provider_v39",
     );
   });
 
@@ -677,14 +678,14 @@ describe("WorkStore claims, fences, and prepared effects", () => {
       "UPDATE sessions SET preset='low',preset_contract=1 WHERE id=?",
     ).run(value.actorSessionId);
 
-    value.database.query("UPDATE sessions SET provider='claude' WHERE id=?")
+    value.database.query("UPDATE sessions SET provider_v39='claude' WHERE id=?")
       .run(value.actorSessionId);
     expect(() => claim(value, {
       workId: created.work.id,
       taskId: created.tasks[0]!.id,
       revision: created.tasks[0]!.revision,
     })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
-    value.database.query("UPDATE sessions SET provider='codex' WHERE id=?")
+    value.database.query("UPDATE sessions SET provider_v39='codex' WHERE id=?")
       .run(value.actorSessionId);
 
     const claimed = claim(value, {
@@ -718,7 +719,7 @@ describe("WorkStore claims, fences, and prepared effects", () => {
     const value = fixture();
     value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
       .run(value.accountId);
-    value.database.query("UPDATE sessions SET provider='claude',preset='ultra' WHERE profile_id=?")
+    value.database.query("UPDATE sessions SET provider_v39='claude',preset='ultra' WHERE profile_id=?")
       .run(value.accountId);
 
     const created = createWork(value, [taskSpec(value, "claude-tier-collision", {
@@ -758,7 +759,7 @@ describe("WorkStore claims, fences, and prepared effects", () => {
     });
 
     expect(() => value.database.query(
-      "UPDATE sessions SET provider='claude' WHERE id=?",
+      "UPDATE sessions SET provider_v39='claude' WHERE id=?",
     ).run(value.actorSessionId)).toThrow("WORK_SESSION_ATTEMPT_AUTHORITY");
 
     const dispatchKey = randomUUID();
@@ -775,7 +776,7 @@ describe("WorkStore claims, fences, and prepared effects", () => {
       mode: "send",
     });
     value.database.exec("DROP TRIGGER work_session_attempt_authority_guard");
-    value.database.query("UPDATE sessions SET provider='claude' WHERE id=?")
+    value.database.query("UPDATE sessions SET provider_v39='claude' WHERE id=?")
       .run(value.actorSessionId);
     expect(value.store.authorizePreparedEffect(dispatchKey)).toMatchObject({
       disposition: "settled",
