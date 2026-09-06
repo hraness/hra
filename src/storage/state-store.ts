@@ -197,7 +197,7 @@ import { SESSION_CONVERSATION_AUTOMATION_CAPABILITY } from "../domain/session-ta
 import { SESSION_SWITCH_BLOCKING_PREDICATE, SESSION_SWITCH_FENCE_SOURCE } from "./session-switch-fence";
 import { AttachmentBlobStore, ATTACHMENT_BLOB_SWEEP_GRACE_MS, parseAttachmentCleanupCandidate,
   type AttachmentCleanupCandidate, type AttachmentCleanupPort } from "./attachment-store";
-import { AttachmentCustodyError, applyAttachmentCustodySchema, auditAttachmentCustody, assertAttachmentCustodySchema, assertAttachmentDaemon,
+import { AttachmentCustodyError, applyAttachmentCustodySchema, auditAttachmentCustody, assertAttachmentCustodySchema, assertAttachmentDaemon, attachmentDaemonSchema,
   assertLiveAttachmentClosure, attachmentInputProof, attachmentMutationProtectedSql, attachmentReferencesDigest,
   bindAttachmentParent, hasUnknownAttachmentCustody, hasAttachmentCustodyArtifacts, initialEmptyAttachmentInput, insertEmptyAttachmentInput,
   parseAttachmentInput, readAttachmentParent, readAttachmentSet, reconcileAttachmentTerminals, reconcileLiveAttachmentTerminals, releaseAttachmentSet,
@@ -28947,18 +28947,56 @@ export class StateStore {
     return this.#prepareOwnedSessionSend(input);
   }
 
-  prepareOwnedSessionSendWithCustody(input: { request: SessionSendRequest; daemonGeneration: number; bootId: string }): SessionSendOwnerHistory & {
+  /** Retain input before blob reads without choosing an execution mode or
+   * creating an owner. The request digest is derived here, never caller authority.
+   * The caller releases its invocation reservation if final admission fails. */
+  reserveOriginalSessionSendIngress(input: { request: SessionSendRequest; daemonGeneration: number; bootId: string }):
+    { kind: "owned"; history: SessionSendOwnerHistory } | { kind: "empty" } | ({ kind: "reserved" } & AttachmentReservation) {
+    const parsed = attachmentDaemonSchema.extend({ request: sessionSendRequestSchema }).strict().parse(input);
+    const { request } = parsed;
+    const fingerprint = fingerprintSessionSendRequest(request);
+    return this.#database.transaction(() => {
+      const existing = classifySessionSendOwnership(this.#database, { idempotencyKey: request.idempotencyKey });
+      if (existing.kind === "owned") {
+        if (JSON.stringify(existing.owner.fingerprint) !== JSON.stringify(fingerprint)) throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
+        readAttachmentParent(this.#database, existing.owner.attemptId);
+        return { kind: "owned" as const, history: existing };
+      }
+      if (existing.kind === "legacy") throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
+      const session = this.requireSession(request.session);
+      const captured = this.requireCapturedSessionProviderAuthority(session.id);
+      if (session.providerThreadId === undefined || session.state === "terminal") throw new SessionSendOwnershipError("SESSION_SEND_SOURCE_CHANGED");
+      const daemon = { daemonGeneration: parsed.daemonGeneration, bootId: parsed.bootId };
+      assertAttachmentDaemon(this.#database, daemon);
+      const providerAuthority = baseProviderAccountAuthority(captured);
+      this.assertProviderAccountAuthorityCurrent(providerAuthority);
+      if (request.attachments.length === 0) return { kind: "empty" as const };
+      return { kind: "reserved" as const, ...reserveAttachmentSet(this.#database, {
+        kind: "session.send", sessionId: session.id, idempotencyKey: request.idempotencyKey,
+        message: request.message, attachments: request.attachments, providerAuthority, ...daemon,
+      }, this.#now(), fingerprint.requestDigest) };
+    }).immediate();
+  }
+
+  prepareOwnedSessionSendWithCustody(input: { request: SessionSendRequest; daemonGeneration: number; bootId: string;
+    reservation?: AttachmentReservation }): SessionSendOwnerHistory & {
     replayed: boolean; custody: { kind: "empty" } | { kind: "mutation_owned"; custodyId: string; custodyDigest: string };
   } {
+    const parsed = attachmentDaemonSchema.extend({ request: sessionSendRequestSchema,
+      reservation: z.object({ reservationId: z.string().regex(/^custody_[a-f0-9]{32}$/u),
+        reservationDigest: z.string().regex(/^[a-f0-9]{64}$/u) }).strict().optional(),
+    }).strict().parse(input);
     return this.#database.transaction(() => {
-      const history = this.#prepareOwnedSessionSend(input.request, { daemonGeneration: input.daemonGeneration, bootId: input.bootId });
+      const history = this.#prepareOwnedSessionSend(parsed.request,
+        { daemonGeneration: parsed.daemonGeneration, bootId: parsed.bootId }, parsed.reservation);
       const parent = readAttachmentParent(this.#database, history.owner.attemptId);
       return { ...history, custody: parent.custody === null ? { kind: "empty" as const }
         : { kind: "mutation_owned" as const, custodyId: parent.custody.origin.id, custodyDigest: parent.custody.digest } };
     }).immediate();
   }
 
-  #prepareOwnedSessionSend(input: SessionSendRequest, daemon?: AttachmentDaemon): SessionSendOwnerHistory & { replayed: boolean } {
+  #prepareOwnedSessionSend(input: SessionSendRequest, daemon?: AttachmentDaemon,
+    reservation?: AttachmentReservation): SessionSendOwnerHistory & { replayed: boolean } {
     const request = sessionSendRequestSchema.parse(input);
     const fingerprint = fingerprintSessionSendRequest(request);
     return this.#database.transaction(() => {
@@ -28968,6 +29006,27 @@ export class StateStore {
         if (JSON.stringify(existing.owner.fingerprint) !== JSON.stringify(fingerprint)) throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
         const parent = readAttachmentParent(this.#database, existing.owner.attemptId);
         if (daemon !== undefined && fingerprint.attachmentCount > 0 && parent.format !== "retained_v1") throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
+        if (reservation !== undefined) {
+          if (daemon === undefined) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_INVALID_INPUT");
+          // A retained exact token is historical receipt identity, including
+          // after terminal release. A losing invocation may release only its
+          // independently proved unbound hold, never the winner's custody.
+          if (parent.custody?.origin.id !== reservation.reservationId
+            || parent.custody.digest !== reservation.reservationDigest) {
+            const redundant = readAttachmentSet(this.#database, reservation.reservationId);
+            const proof = attachmentInputProof({
+              kind: "session.send", sessionId: existing.owner.sessionId, idempotencyKey: request.idempotencyKey,
+              message: request.message, attachments: request.attachments, providerAuthority: existing.owner.sourceAuthority, ...daemon,
+            }, fingerprint.requestDigest);
+            if (redundant.digest !== reservation.reservationDigest || redundant.parentAttemptId !== null
+              || JSON.stringify(redundant.origin.input) !== JSON.stringify(proof)) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
+            // Losing the response after releasing this exact hold must not
+            // make the original key unusable. Validated released history is
+            // inert, including across boot; only a live release needs the
+            // current daemon fence and creates a disposition.
+            if (redundant.releasedBy === null) releaseAttachmentSet(this.#database, reservation, daemon, this.#now());
+          }
+        }
         return { ...existing, replayed: true };
       }
       if (existing.kind === "legacy") throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
@@ -28980,8 +29039,15 @@ export class StateStore {
       if (pending.count >= 64) throw new SessionSendOwnershipError("SESSION_SEND_OWNER_LIMIT");
       const inputDescription = { kind: "session.send" as const, sessionId: session.id, idempotencyKey: request.idempotencyKey,
         message: request.message, attachments: request.attachments, providerAuthority: baseProviderAccountAuthority(captured) };
+      if (reservation !== undefined) {
+        if (daemon === undefined || request.attachments.length === 0) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_INVALID_INPUT");
+        assertAttachmentDaemon(this.#database, daemon);
+        this.assertProviderAccountAuthorityCurrent(inputDescription.providerAuthority);
+        const retained = requireAttachmentReservation(this.#database, reservation, { ...inputDescription, ...daemon }, fingerprint.requestDigest);
+        if (retained.parentAttemptId !== null) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
+      }
       const reserved = daemon !== undefined && request.attachments.length > 0
-        ? reserveAttachmentSet(this.#database, { ...inputDescription, ...daemon }, this.#now(), fingerprint.requestDigest) : null;
+        ? reservation ?? reserveAttachmentSet(this.#database, { ...inputDescription, ...daemon }, this.#now(), fingerprint.requestDigest) : null;
       const initial = request.attachments.length === 0 ? initialEmptyAttachmentInput(inputDescription, fingerprint.requestDigest)
         : reserved === null ? undefined : { format: "retained_v1" as const, custodyId: reserved.reservationId, digest: reserved.reservationDigest };
       const record = insertSessionSendOwner(this.#database, {
