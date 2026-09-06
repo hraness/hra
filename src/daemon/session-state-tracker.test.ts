@@ -64,6 +64,31 @@ describe("session state tracker", () => {
     expect(resolved).toMatchObject({ state: "done" });
   });
 
+  test("clears interaction attention back to working while the turn remains active", () => {
+    const tracker = new SessionStateTracker(() => 1);
+    tracker.observe("sess_active", { type: "turn_started", turnId: turn });
+    const requested = tracker.observe(
+      "sess_active",
+      { type: "interaction_requested", interactionId: "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5c", interactionKind: "user_input", summary: "Which one?", blocking: true, revision: 1 },
+      { pendingInteraction: { kind: "user_input" } },
+    );
+    expect(requested).toMatchObject({ state: "needs_answer", attention: true });
+
+    const anotherPending = tracker.observe(
+      "sess_active",
+      { type: "interaction_state", interactionId: "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5c", state: "resolved", revision: 2 },
+      { pendingInteraction: { kind: "command_approval" }, autorespondWillAct: false },
+    );
+    expect(anotherPending).toMatchObject({ state: "needs_approval", attention: true });
+
+    const resolved = tracker.observe(
+      "sess_active",
+      { type: "interaction_state", interactionId: "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5d", state: "resolved", revision: 2 },
+      {},
+    );
+    expect(resolved).toMatchObject({ state: "working", attention: false });
+  });
+
   test("seeding keeps revisions monotonic across restarts", () => {
     const tracker = new SessionStateTracker(() => 1);
     tracker.seed("sess_f", {

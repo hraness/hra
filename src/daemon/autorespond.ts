@@ -1,16 +1,16 @@
 /*
  * Autorespond policy for brokered provider approvals.
  *
- * When a session runs in an `auto:*` approval mode, HRA answers command,
- * file-change, and (under `auto:all`) permission approvals immediately with
- * the accept decision at `once` scope. Session scope is never granted by the
- * policy, questions and MCP forms are never answered here, and every action
- * is bounded by a consecutive counter that only a human message resets plus
- * hourly and daily budgets. The decision is pure; the controller applies it
- * through the daemon's ordinary resolve path and records evidence.
+ * When a session runs in `auto:all`, HRA answers command and permission
+ * approvals immediately with the accept decision at `once` scope.
+ * `auto:workspace` remains fail-closed until adapters can attest exact private
+ * authority against a bound project root. File changes, questions, and MCP
+ * forms are never answered here. Every action is bounded by a consecutive
+ * counter that only a human message resets plus hourly and daily budgets. The
+ * decision is pure; the controller applies it through the daemon's ordinary
+ * resolve path and records evidence.
  */
 
-import { permissionCategoryIsNetworkOrExternal } from "../domain/interactions";
 import type { ApprovalMode, InteractionDisplay, InteractionKind } from "../domain/interactions";
 
 export const AUTORESPOND_CONSECUTIVE_LIMIT = 3;
@@ -31,15 +31,15 @@ export type AutorespondEscalation =
   | "manual_mode"
   | "not_an_approval"
   | "decision_unavailable"
-  | "network_or_external"
+  | "protected_authority_required"
   | "consecutive_limit"
   | "hourly_budget"
   | "daily_budget";
 
 /*
- * Bounded class label for evidence and for the `auto:workspace` gate. Command
- * approvals carry a provider command class; permission approvals are classed
- * by their requested permission names; unknown shapes are `unknown`.
+ * Bounded evidence label only. Command approvals carry a provider command
+ * class and permission approvals carry their requested presentation names;
+ * neither label supplies approval authority.
  */
 export function approvalClassOf(display: InteractionDisplay): string {
   switch (display.kind) {
@@ -60,16 +60,6 @@ export function permissionNamesOf(display: InteractionDisplay): string[] {
     : [];
 }
 
-/*
- * The category test itself lives in `src/domain/interactions.ts` so the remote
- * decision verifier refuses exactly the categories this gate escalates.
- */
-export function isNetworkOrExternalPermission(display: Extract<InteractionDisplay, { kind: "permission_approval" }>): boolean {
-  if (display.requested.length === 0) return true;
-  return display.requested.some((permission) =>
-    permissionCategoryIsNetworkOrExternal(permission.name));
-}
-
 export function decideAutorespond(input: Readonly<{
   budgets: AutorespondBudgets;
   display: InteractionDisplay;
@@ -84,12 +74,25 @@ export function decideAutorespond(input: Readonly<{
     && input.kind !== "permission_approval"
   ) return { action: "escalate", code: "not_an_approval", approvalClass };
   if (input.display.kind !== input.kind) return { action: "escalate", code: "not_an_approval", approvalClass };
+  // The pinned provider callback does not expose exact affected paths. Keep
+  // the interaction pending for an informed local decline instead of trying
+  // an acceptance that the live resolution verifier will refuse.
+  if (input.display.kind === "file_change_approval") {
+    return { action: "escalate", code: "protected_authority_required", approvalClass };
+  }
+  if (input.display.kind === "command_approval" && input.mode === "auto:workspace") {
+    return { action: "escalate", code: "protected_authority_required", approvalClass };
+  }
   if (input.display.kind === "permission_approval") {
     if (input.display.requested.length === 0) {
       return { action: "escalate", code: "decision_unavailable", approvalClass };
     }
-    if (input.mode === "auto:workspace" && isNetworkOrExternalPermission(input.display)) {
-      return { action: "escalate", code: "network_or_external", approvalClass };
+    // Requested category names are sanitised presentation data, not proof of
+    // the exact paths, tool input, or environment the grant authorises. Until
+    // provider adapters return a bound workspace-local attestation, the
+    // workspace mode must fail closed for every permission grant.
+    if (input.mode === "auto:workspace") {
+      return { action: "escalate", code: "protected_authority_required", approvalClass };
     }
   } else if (!input.display.availableDecisions.includes("once")) {
     return { action: "escalate", code: "decision_unavailable", approvalClass };
