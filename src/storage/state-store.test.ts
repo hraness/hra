@@ -9142,6 +9142,8 @@ describe("StateStore", () => {
     const legacy = new Database(paths.database, { create: false, strict: true });
     try {
       legacy.exec(`
+        DROP TRIGGER work_attempt_route_guard;
+        DROP TRIGGER work_session_attempt_authority_guard;
         DROP TRIGGER work_profile_attempt_authority_guard;
         DROP TRIGGER work_signal_member_guard;
         ALTER TABLE sessions DROP COLUMN provider;
