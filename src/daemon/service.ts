@@ -7752,6 +7752,7 @@ export class HraService {
       preset,
       currentPresetContract,
     );
+    this.#work.assertSessionCanChangeRoute(session.id);
     const fromProvider = session.provider;
     const fromPreset = session.preset;
     let sessionReview: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
@@ -7793,6 +7794,10 @@ export class HraService {
               signal,
             }),
           );
+          // Work claims do not share the session mutation tail. Recheck after
+          // the asynchronous review; the reverse SQLite trigger makes this
+          // transition atomic with a competing claim insert.
+          this.#work.assertSessionCanChangeRoute(session.id);
           this.#store.beginSessionProviderSwitchEffect({
             attemptId,
             sessionId: session.id,

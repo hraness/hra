@@ -667,8 +667,28 @@ WHEN NOT EXISTS (
       s.preset_contract=w.preset_contract
       OR NEW.preset='low'
     )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM mutation_attempts AS sm
+      LEFT JOIN mutation_resolutions AS sr ON sr.attempt_id=sm.id
+      WHERE sm.authority_id=s.id AND sm.kind='session.switch'
+        AND sm.state IN ('effect_started','ambiguous')
+        AND sr.attempt_id IS NULL
+    )
 )
 BEGIN SELECT RAISE(ABORT,'WORK_ATTEMPT_ROUTE_MISMATCH'); END;
+DROP TRIGGER IF EXISTS work_session_switch_attempt_authority_guard;
+CREATE TRIGGER work_session_switch_attempt_authority_guard
+BEFORE UPDATE OF state ON mutation_attempts
+WHEN OLD.kind='session.switch'
+  AND OLD.state='prepared'
+  AND NEW.state='effect_started'
+  AND EXISTS (
+    SELECT 1 FROM work_attempts AS a
+    WHERE a.worker_session_id=OLD.authority_id
+      AND a.state IN ('claimed','dispatching','running','recovery_required')
+  )
+BEGIN SELECT RAISE(ABORT,'WORK_SESSION_SWITCH_ATTEMPT_AUTHORITY'); END;
 DROP TRIGGER IF EXISTS work_session_attempt_authority_guard;
 CREATE TRIGGER work_session_attempt_authority_guard
 BEFORE UPDATE OF profile_id,project_id,provider,preset,fast_enabled,preset_contract ON sessions
@@ -960,6 +980,7 @@ const requiredWorkTriggers = [
   "work_attempt_no_delete",
   "work_attempt_state_guard",
   "work_attempt_route_guard",
+  "work_session_switch_attempt_authority_guard",
   "work_session_attempt_authority_guard",
   "work_profile_attempt_authority_guard",
   "work_attempt_reports_no_update",
@@ -3553,6 +3574,14 @@ export class WorkStore {
            s.preset_contract=w.preset_contract
            OR s.preset='low'
          )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM mutation_attempts AS sm
+           LEFT JOIN mutation_resolutions AS sr ON sr.attempt_id=sm.id
+           WHERE sm.authority_id=s.id AND sm.kind='session.switch'
+             AND sm.state IN ('effect_started','ambiguous')
+             AND sr.attempt_id IS NULL
+         )
          AND s.state IN ('active','idle') AND p.state='signed_in'`,
     ).get(
       task.work_id,
@@ -3692,6 +3721,16 @@ export class WorkStore {
          AND (? IS NULL OR s.provider=?)
        LIMIT 1`,
     ).get(profileId, provider ?? null, provider ?? null) as { present: number } | null;
+    if (live !== null) throw new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
+  }
+
+  assertSessionCanChangeRoute(sessionId: string): void {
+    const live = this.#database.query(
+      `SELECT 1 AS present FROM work_attempts
+       WHERE worker_session_id=?
+         AND state IN ('claimed','dispatching','running','recovery_required')
+       LIMIT 1`,
+    ).get(sessionId) as { present: number } | null;
     if (live !== null) throw new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
   }
 
