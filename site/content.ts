@@ -1,6 +1,5 @@
 import packageJson from "../package.json";
 import { CLAUDE_PIN } from "../src/claude/pin";
-import { DEVIN_PIN } from "../src/devin/pin";
 import { buildHraGlobalInstallCommand } from "../src/install-preflight";
 
 export type EndpointAvailability = "beta-not-yet-live" | "live" | "release-ready";
@@ -200,14 +199,14 @@ const links = {
 
 const privacyBlocks: readonly ContentBlock[] = [
   paragraph(
-    text("Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code configuration and credentials, Devin configuration and credentials, and local execution continue to work without it. HRA identity is separate from every provider account."),
+    text("Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code configuration and credentials, and local execution continue to work without it. HRA identity is separate from every provider account."),
   ),
   { kind: "subheading", text: "Encrypted before upload" },
   list(
     [text("User messages and final assistant display text.")],
     [text("Session names, notes, queued messages, and steering input.")],
-    [text("Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not projected. For managed profiles, HRA validates one bounded Claude Code authentication-status response transiently, reduces it to signedIn, and never retains, returns, projects, or uploads the identity or usage fields. Personal-home Claude adoption transiently reads bounded account, email, and organization identity metadata and retains only a one-way local authority key. Raw Claude identity fields and that private authority key are never publicly returned, projected, or uploaded; HRA never opens or parses a Claude credential file. Devin account identity and allowance are not projected. HRA reports only local signed-in readiness and records provider-supplied session context and cost facts in the neutral session stream.")],
-    [text("Codex and Claude Code personal-session adoption status: whether discovery is enabled and bounded pending, adopted, and fenced counts. Candidate identities and records are never included. Devin has no personal-home adoption surface.")],
+    [text("Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not projected. For managed profiles, HRA validates one bounded Claude Code authentication-status response transiently, reduces it to signedIn, and never retains, returns, projects, or uploads the identity or usage fields. Personal-home Claude adoption transiently reads bounded account, email, and organization identity metadata and retains only a one-way local authority key. Raw Claude identity fields and that private authority key are never publicly returned, projected, or uploaded; HRA never opens or parses a Claude credential file.")],
+    [text("Codex and Claude Code personal-session adoption status: whether discovery is enabled and bounded pending, adopted, and fenced counts. Candidate identities and records are never included.")],
     [text("Turn timing, observed model and tier, and provider usage summaries.")],
     [text("Bounded observed file and Git metadata, without unbounded filesystem paths.")],
     [text("Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.")],
@@ -216,8 +215,8 @@ const privacyBlocks: readonly ContentBlock[] = [
   ),
   { kind: "subheading", text: "Never uploaded" },
   list(
-    [text("Codex, Claude Code, or Devin credentials; provider profile or configuration files; plugin credentials; OAuth access or refresh tokens; authorization codes; PKCE verifiers; provider cookies; or the private device code.")],
-    [text("Raw Codex app-server, Claude Code stream, or Devin ACP requests or responses.")],
+    [text("Codex or Claude Code credentials; provider profile or configuration files; plugin credentials; OAuth access or refresh tokens; authorization codes; PKCE verifiers; provider cookies; or the private device code.")],
+    [text("Raw Codex app-server or Claude Code stream requests or responses.")],
     [text("Personal-home adoption candidate identities or records, personal-runtime bindings, process identities, schedule-source metadata, provider-home provenance, provider-account authority hashes, or the automation id, firing time, and instructions from an exact Codex Desktop heartbeat envelope. Such an envelope is replaced with generic protected text before session content is projected.")],
     [text("Raw reasoning, hidden chain of thought, or approval secrets.")],
     [text("Provider-internal login and request IDs, permission values, MCP field contracts, protected answers, or response digests.")],
@@ -245,7 +244,7 @@ const privacyBlocks: readonly ContentBlock[] = [
     text("Compact-projection recovery is append-only. It preserves every older encrypted cloud chunk, opens a new stream epoch, and keeps the acknowledged unsynced interval visible as a recovery gap until authenticated account deletion."),
   ),
   paragraph(
-    text("Codex activity remains subject to OpenAI's service and privacy terms. Claude Code activity remains subject to Anthropic's service and privacy terms. Devin activity remains subject to Cognition's service and privacy terms."),
+    text("Codex activity remains subject to OpenAI's service and privacy terms. Claude Code activity remains subject to Anthropic's service and privacy terms."),
   ),
   {
     kind: "notice",
@@ -268,8 +267,8 @@ const betaInstallCommand = buildHraGlobalInstallCommand(
 );
 
 const productName = "HRA";
-const tagline = "Control plane for Codex, Claude Code, and Devin";
-const providerRoadmap = "Codex, Claude Code, and Devin.";
+const tagline = "Control plane for Codex and Claude Code";
+const providerRoadmap = "Codex and Claude Code, side by side.";
 const releaseVersion = "0.6.0";
 
 /** Public runtime pins come from their authoritative source modules. */
@@ -277,7 +276,6 @@ export const publicPins = {
   bun: packageJson.engines.bun,
   claude: CLAUDE_PIN,
   codex: packageJson.dependencies["@openai/codex"],
-  devin: DEVIN_PIN,
 } as const;
 
 const shieldsLabel = (value: string): string =>
@@ -321,11 +319,6 @@ const badges: readonly Badge[] = [
     href: "https://github.com/hraness/hra/blob/main/docs/providers/claude.md",
     image: staticBadge("runtime", `Claude Code ${publicPins.claude}`, "6f42c1"),
   },
-  {
-    alt: `runtime: Devin CLI ${publicPins.devin}`,
-    href: "https://github.com/hraness/hra/blob/main/docs/providers/devin.md",
-    image: staticBadge("runtime", `Devin CLI ${publicPins.devin}`, "5936b4"),
-  },
 ];
 
 export const publicContent: PublicContent = {
@@ -333,16 +326,16 @@ export const publicContent: PublicContent = {
   tagline,
   providerRoadmap,
   releaseVersion,
-  thesis: `${productName} runs Codex, Claude Code, and Devin sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.`,
+  thesis: `${productName} runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.`,
   description: `${tagline} in current source; v${releaseVersion} is release-ready. Run provider sessions side by side through one durable CLI.`,
-  statusLine: `Status: public beta. The local CLI v${releaseVersion} is release-ready; current source runs Codex and Devin on macOS and Linux and Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}.`,
+  statusLine: `Status: public beta. The local CLI v${releaseVersion} is release-ready: Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}.`,
   badges,
   maintainer: {
     name: "Hraness",
     url: links.hraness,
   },
   socialCard: {
-    alt: `${productName} · Codex + Claude Code + Devin · v${releaseVersion} release-ready · hra.sh`,
+    alt: `${productName} · Codex + Claude Code · v${releaseVersion} release-ready · hra.sh`,
     height: 630,
     path: "/social-card.png",
     width: 1200,
@@ -361,10 +354,10 @@ export const publicContent: PublicContent = {
   links,
   hero: {
     eyebrow: tagline,
-    heading: "One terminal for every Codex, Claude Code, and Devin session",
+    heading: "One terminal for every Codex and Claude Code session",
     summary: "HRA keeps sessions alive behind a local daemon, isolates each account, and lets you or your agent direct any of them from a shell or JSON. Sync between machines is optional and encrypted.",
     example: "Ask your agent to start a Codex session on your work account, then hand the next turn to Claude Code without losing the conversation.",
-    boundary: `Codex and Devin on macOS and Linux · Claude Code on Linux · local v${releaseVersion} release-ready · hosted sync live (${hostedBetaLabel})`,
+    boundary: `Codex on macOS and Linux · Claude Code on Linux · local v${releaseVersion} release-ready · hosted sync live (${hostedBetaLabel})`,
     primaryAction: {
       href: "#install-command",
       label: "Install HRA",
@@ -414,7 +407,7 @@ export const publicContent: PublicContent = {
       {
         label: "Accounts",
         value: "Isolated profiles",
-        detail: "Codex uses its own CODEX_HOME, Claude Code its own CLAUDE_CONFIG_DIR, and Devin its own HOME and XDG roots per profile.",
+        detail: "Codex uses its own CODEX_HOME per profile; Claude Code uses its own CLAUDE_CONFIG_DIR.",
       },
       {
         label: "Sessions",
@@ -436,7 +429,7 @@ export const publicContent: PublicContent = {
   trust: [
     {
       label: "Your provider credentials stay with the provider",
-      detail: "HRA launches managed Codex, Claude Code, and Devin sessions inside isolated profiles. Opted-in Codex and Claude Code personal-session adoption uses existing provider credentials without copying or parsing them. HRA never reads, copies, or forwards a Claude or Devin credential.",
+      detail: "HRA launches managed Codex and Claude Code sessions inside isolated profiles. Opted-in Codex and Claude Code personal-session adoption uses existing provider credentials without copying or parsing them. HRA never reads, copies, or forwards a Claude credential.",
     },
     {
       label: "Local by default",
@@ -454,7 +447,7 @@ export const publicContent: PublicContent = {
   questions: [
     {
       question: "Does HRA need an account?",
-      answer: [text("No. Install the CLI, add a Codex profile, or sign into Claude Code or Devin inside its isolated profile and start a session. An HRA cloud identity is only needed for optional sync between machines.")],
+      answer: [text("No. Install the CLI, add a Codex profile or sign into Claude Code inside its isolated directory, and start a session. An HRA cloud identity is only needed for optional sync between machines.")],
     },
     {
       question: "What does the release candidate include?",
@@ -499,10 +492,10 @@ export const publicContent: PublicContent = {
       ],
     },
     paragraph(
-      text("HRA is one Bun CLI plus a local daemon. It isolates Codex, Claude Code, and Devin profiles, gives all three providers one compact session interface, and optionally syncs encrypted provider-neutral projections and commands across your enrolled machines."),
+      text("HRA is one Bun CLI plus a local daemon. It isolates Codex and Claude Code profiles, gives both providers one compact session interface, and optionally syncs encrypted provider-neutral projections and commands across your enrolled machines."),
     ),
     paragraph(
-      text("HRA is short for harness: the control plane that keeps Codex, Claude Code, and Devin sessions working together, and "),
+      text("HRA is short for harness: the control plane that keeps Codex and Claude Code sessions working together, and "),
       link("hraness.com", links.hraness),
       text(" explains the parent brand. The Hraness organization maintains HRA and publishes it under the MIT license."),
     ),
@@ -522,7 +515,7 @@ export const publicContent: PublicContent = {
       heading: "Install and update",
       blocks: [
         paragraph(
-          text(`HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms. Devin effects also run on both platforms when the separately installed Devin CLI reports exactly ${publicPins.devin}. Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install one reviewed immutable tag, then verify the binary before initialization:`),
+          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install one reviewed immutable tag, then verify the binary before initialization:"),
         ),
         {
           kind: "commands",
@@ -600,7 +593,7 @@ export const publicContent: PublicContent = {
             code("$HOME/Library/Application Support/HRA Control Plane v1"),
             text(" on macOS and "),
             code("$HOME/.local/state/hra-control-plane-v1"),
-            text(" on Linux. After every prerequisite above, a human who explicitly accepts permanent loss of all local provider profiles, Codex credential stores, Claude Code configuration directories, Devin HOME and XDG directories, sessions, ledgers, encryption keys, device credentials, and recovery evidence may move only the exact platform directory to Trash. Claude Code may also own credentials outside that directory, including provider-managed system credential storage; sign out through Claude Code before deletion. Do not move or remove the state directory's parent. Inspect the trashed directory before emptying Trash."),
+            text(" on Linux. After every prerequisite above, a human who explicitly accepts permanent loss of all local provider profiles, Codex credential stores, Claude Code configuration directories, sessions, ledgers, encryption keys, device credentials, and recovery evidence may move only the exact platform directory to Trash. Claude Code may also own credentials outside that directory, including provider-managed system credential storage; sign out through Claude Code before deletion. Do not move or remove the state directory's parent. Inspect the trashed directory before emptying Trash."),
           ],
         },
         paragraph(
@@ -617,7 +610,6 @@ export const publicContent: PublicContent = {
           commands: [
             "hra account add personal",
             "hra account login personal --provider codex --device-code",
-            "hra account login personal --provider devin",
             "hra account usage personal --refresh",
             "hra account usage-history personal --limit 50 --json",
           ],
@@ -637,28 +629,6 @@ export const publicContent: PublicContent = {
           text(" launches a realpath-resolved Claude Code executable only after its exact self-reported version matches HRA's pin, in the foreground inside that profile's isolated "),
           code("CLAUDE_CONFIG_DIR"),
           text(". Claude owns its prompts and browser handoff. HRA gives it the terminal, joins the exact child, and reports only whether Claude says it is signed in; HRA never opens or copies a Claude credential. Claude exposes no HRA device-code, handoff-file, or web-linking protocol. New Claude effects are refused on macOS pending authenticated isolated-Keychain and detached-read acceptance."),
-        ),
-        paragraph(
-          code("hra account login personal --provider devin"),
-          text(` requires a foreground terminal and the exact separately installed Devin CLI ${publicPins.devin}. HRA launches `),
-          code("devin auth login"),
-          text(" with five distinct private profile directories for "),
-          code("HOME"),
-          text(", "),
-          code("XDG_CONFIG_HOME"),
-          text(", "),
-          code("XDG_DATA_HOME"),
-          text(", "),
-          code("XDG_CACHE_HOME"),
-          text(", and "),
-          code("XDG_STATE_HOME"),
-          text(". Add "),
-          code("--manual-token-flow"),
-          text(" to request Devin's own "),
-          code("--force-manual-token-flow"),
-          text(" login path. Devin owns every credential in that boundary. HRA never opens, parses, copies, or uploads it and reports only whether "),
-          code("devin auth status"),
-          text(" says the isolated profile is signed in. Devin exposes no HRA device-code, handoff-file, JSON, or web-linking login path."),
         ),
         paragraph(
           text("For a Codex login, JSON and noninteractive callers must create an empty mode-0600 file under a canonical current-user-owned mode-0700 directory, then pass its absolute canonical path:"),
@@ -687,11 +657,6 @@ export const publicContent: PublicContent = {
           text(" command to release only the local fence. That recovery does not stop Claude or read, change, or delete a credential."),
         ),
         paragraph(
-          text("Devin foreground login uses the same one-child recovery fence. If its parent or daemon fails after launch, "),
-          code("hra account show personal --provider devin"),
-          text(" returns the exact acknowledged cancellation command. Confirm that the original child has exited before running it. Recovery releases only HRA's local fence and does not stop Devin or read, change, or delete its credential."),
-        ),
-        paragraph(
           code("hra account usage"),
           text(" is Codex-only and keeps the latest snapshot and 1-, 5-, and 15-minute observed token velocity. "),
           code("hra account usage-history <profile>"),
@@ -707,18 +672,7 @@ export const publicContent: PublicContent = {
           text(" reports the most recent local reset attempt with its source weekly-window boundary and suppresses a prior identity's snapshot after an account change. Credit IDs, descriptions, private keys, and account fingerprints never enter that reset status or its cloud projection."),
         ),
         paragraph(
-          text("Devin ACP session usage reports current context occupancy and capacity, plus cumulative provider cost only when Devin supplies it. HRA records those facts without interpreting them as an account allowance, remaining balance, billing settlement, or reset window. Devin ACP and "),
-          code("devin auth status"),
-          text(" expose no documented machine-readable account allowance or reset operation, so "),
-          code("hra account show personal --provider devin"),
-          text(" reports allowance "),
-          code("unknown"),
-          text(" with source "),
-          code("devin_acp"),
-          text(". HRA never submits Devin's human-facing usage commands as hidden turns and never applies a Codex reset credit to Devin."),
-        ),
-        paragraph(
-          text("HRA cloud identity is separate from every provider account. Use the email-code flow below only after a hosted or self-managed Convex deployment has been configured."),
+          text("HRA cloud identity is separate from every Codex or Claude Code account. Use the email-code flow below only after a hosted or self-managed Convex deployment has been configured."),
         ),
       ],
     },
@@ -766,28 +720,25 @@ export const publicContent: PublicContent = {
         paragraph(
           text("If the event stream reports a blocking interaction, read its exact ID and revision, inspect the live authority through the protected path, and resolve only the interaction kind you received. Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form. The protected interaction commands and input documents are defined below."),
         ),
-        { kind: "subheading", text: "Claude Code, Devin, and provider switching" },
         paragraph(
-          text("Start directly with Claude Code or Devin by selecting its provider and reviewed preset, or move an idle session among providers. A switch preserves HRA's provider-neutral conversation record but starts a fresh provider-native runtime; it refuses an active turn, an unsettled provider effect, an unsigned target profile, or a preset that belongs to another provider. If a Claude controller is no longer available, HRA can recover the exact conversation with "),
+          text("Devin support has been removed because its supported CLI integration cannot provide verified remaining account quota and reset times. Existing Devin history is read-only and provider-owned credentials are preserved. "),
+          link("Retired-provider compatibility and local login-fence cleanup", "https://github.com/hraness/hra/blob/main/docs/providers/devin.md"),
+          text(" remain documented; no new Devin login or session can start."),
+        ),
+        { kind: "subheading", text: "Claude Code and provider switching" },
+        paragraph(
+          text("Start directly with Claude Code by selecting its provider and reviewed preset, or move an idle session between providers. A switch preserves HRA's provider-neutral conversation record but starts a fresh provider-native runtime; it refuses an active turn, an unsettled provider effect, an unsigned target profile, or a preset that belongs to another provider. If a Claude controller is no longer available, HRA can recover the exact conversation with "),
           code("--resume"),
-          text(" only after prior-process exit or an already-completed exact process release is proven. Ambiguous custody stays fenced in recovery without launching another process. Devin uses exact ACP v1 session loading after restart only when its initialization advertised that capability."),
+          text(" only after prior-process exit or an already-completed exact process release is proven. Ambiguous custody stays fenced in recovery without launching another process."),
         ),
         {
           kind: "commands",
           commands: [
             "hra session start personal --provider claude --preset fable-max --json",
-            "hra session start personal --provider devin --preset astra --json",
             "hra session switch <session-id> --provider claude --preset fable-max",
             "hra session export <session-id> --format json",
           ],
         },
-        paragraph(
-          text("ACP v1 has no in-turn steer method, so "),
-          code("hra session steer"),
-          text(" refuses an active Devin turn. Use "),
-          code("hra session queue"),
-          text(" to send the message after the current prompt completes, or stop the turn before sending another message. HRA never sends concurrent prompts to one Devin session."),
-        ),
         { kind: "subheading", text: "Scheduled work in the same conversation" },
         paragraph(
           text("Attach a recurring whole-minute interval to an existing session with "),
@@ -821,10 +772,7 @@ export const publicContent: PublicContent = {
           ],
         },
         paragraph(
-          text("The frozen source contract defines a narrow local coordination kernel for agents operating several already-existing provider sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex, Claude Code, and Devin still own their provider-native execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine."),
-        ),
-        paragraph(
-          text("A Devin session can participate in Work coordination records and provider-neutral signal delivery, but it cannot own or execute a Work attempt. Work attempt routes remain Codex-only."),
+          text("The frozen source contract defines a narrow local coordination kernel for agents operating several already-existing provider sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex and Claude Code still own their provider-native execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine."),
         ),
         {
           kind: "commands",
@@ -952,9 +900,7 @@ export const publicContent: PublicContent = {
           code("CODEX_HOME"),
           text(". Claude Code receives that profile's isolated "),
           code("CLAUDE_CONFIG_DIR"),
-          text("; HRA treats the whole directory as Claude's authentication boundary and never reads, copies, or forwards its credentials. Devin receives distinct private "),
-          code("HOME"),
-          text(" and four XDG roots; HRA passes those paths to the CLI but never opens, copies, or forwards Devin's credential. Explicitly adopted Codex and Claude Code personal sessions use credentials already owned by the user's personal provider home without copying or parsing them. Provider-managed credential storage remains owned by the provider runtime."),
+          text("; HRA treats the whole directory as Claude's authentication boundary and never reads, copies, or forwards its credentials. Explicitly adopted Codex and Claude Code personal sessions use credentials already owned by the user's personal provider home without copying or parsing them. Provider-managed credential storage remains owned by the provider runtime."),
         ),
         paragraph(
           text("After successful email verification, the daemon automatically registers the current installation before it reads cloud data. The first registered device becomes active and creates the client-side encryption key. A later verified installation is registered as pending and may report presence, but it has no synchronized data, execution, or key authority."),
@@ -1025,9 +971,7 @@ export const publicContent: PublicContent = {
             code("CODEX_HOME"),
             text(" for Codex and "),
             code("CLAUDE_CONFIG_DIR"),
-            text(" for Claude Code, plus distinct private "),
-            code("HOME"),
-            text(" and XDG roots for Devin. Each provider owns its authentication state; HRA never copies or parses provider credentials."),
+            text(" for Claude Code. Each provider owns its authentication state; HRA never copies or parses provider credentials."),
           ],
           [
             text("Usage with provenance: account identity, quota, rate-limit, and token snapshots include their provider source time and freshness. A bounded source-ordered 24-hour ledger supports safe human and JSON pagination without returning raw provider payloads."),
@@ -1085,7 +1029,7 @@ export const publicContent: PublicContent = {
           code("hra session status <session> --json"),
           text(" returns status version 2. HRA produces one typed provider-observation result, attempting the bound provider's reviewed observation path only when the current local state makes one applicable, then reads the session, event cut, interactions, and queue from one local SQLite transaction. Codex supports a native app-server observation read. Claude Code uses its live provider-neutral projection while the exact controller is present. If that controller is absent, HRA may establish "),
           code("--resume"),
-          text(" for the exact conversation only after prior-process exit or an already-completed exact process release is proven; ambiguous custody fails closed as recovery required. Devin status also uses HRA's live provider-neutral projection and reloads an exact native session only when its ACP initialization advertised that capability. Execution, attention, provider, and queue remain separate axes, so a headline state cannot hide a recovery condition, pending interaction, response in flight, or queued work. Pending and response-in-flight counts are exact. The result includes at most 10 bounded safe summaries for pending interactions and excludes the session note and private provider thread binding. Every provider turn and item identifier becomes a secret-keyed opaque public alias before status, event, or interaction output. Public observation schemas accept only that exact alias form. The same local installation key keeps aliases coherent across surfaces and daemon restarts without making low-entropy provider IDs guessable from public output. If an existing installation loses that key, HRA refuses to replace it and directs the operator to restore the original local secret."),
+          text(" for the exact conversation only after prior-process exit or an already-completed exact process release is proven; ambiguous custody fails closed as recovery required. Retired Devin sessions use local history only and cannot execute. Execution, attention, provider, and queue remain separate axes, so a headline state cannot hide a recovery condition, pending interaction, response in flight, or queued work. Pending and response-in-flight counts are exact. The result includes at most 10 bounded safe summaries for pending interactions and excludes the session note and private provider thread binding. Every provider turn and item identifier becomes a secret-keyed opaque public alias before status, event, or interaction output. Public observation schemas accept only that exact alias form. The same local installation key keeps aliases coherent across surfaces and daemon restarts without making low-entropy provider IDs guessable from public output. If an existing installation loses that key, HRA refuses to replace it and directs the operator to restore the original local secret."),
         ),
         paragraph(
           code("hra session state <session> --json"),
@@ -1188,17 +1132,14 @@ export const publicContent: PublicContent = {
         paragraph(
           text("HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; "),
           code("hra session show"),
-          text(` displays it with the provider-neutral transcript. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof, and stream formats. Devin profiles include exact CLI ${publicPins.devin}, ACP v1, model `),
-          code("gpt-6-astra"),
-          text(", provider-default reasoning, and isolated-home proof. Each provider remains authoritative for its native permissions, tools, and hidden runtime state."),
+          text(" displays it with the provider-neutral transcript. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof, and stream formats. Each provider remains authoritative for its native permissions, tools, and hidden runtime state."),
         ),
         list(
           [code("low"), text(": Codex Luna Max, currently "), code("gpt-5.6-luna"), text(" with "), code("max"), text(" reasoning.")],
           [code("high"), text(": Codex Astra Max, currently "), code("gpt-6-astra"), text(" with "), code("max"), text(" reasoning.")],
           [code("ultra"), text(": Codex Astra Ultra, currently "), code("gpt-6-astra"), text(" with "), code("ultra"), text(" reasoning.")],
           [code("fable-max"), text(": Claude Code Fable, currently "), code("claude-fable-5-1"), text(" with "), code("max"), text(" reasoning.")],
-          [code("astra"), text(": Devin GPT-6 Astra, exactly "), code("gpt-6-astra"), text(" with provider-default reasoning. It is the default preset for Devin.")],
-          [code("fast on|off"), text(": a Codex-only, explicit per-turn Fast or Standard overlay. Claude Code and Devin refuse Fast instead of ignoring it. A prior Fast value cannot leak into the next turn.")],
+          [code("fast on|off"), text(": a Codex-only, explicit per-turn Fast or Standard overlay. Claude Code refuses Fast instead of ignoring it. A prior Fast value cannot leak into the next turn.")],
         ),
         paragraph(
           text("New HRA-created Codex sessions and every explicit preset selection use the current mapping above. Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping for "),
@@ -1217,9 +1158,7 @@ export const publicContent: PublicContent = {
           code("auto_review"),
           text(" path, the exact advertised "),
           code(":workspace"),
-          text(" permission profile, and the selected project as the runtime workspace root. Codex remains authoritative for the profile's effective sandbox, network policy, computer use, plugins, and protected turn inspection. Claude Code runs in its default interactive permission mode under the selected project and maps supported tool-use requests into HRA interactions. Devin runs the exact "),
-          code("devin acp --model gpt-6-astra"),
-          text(" process and maps its offered permission choices into HRA interactions. Neither provider exposes Codex's permission-profile, app, plugin, or protected turn-inspection surfaces."),
+          text(" permission profile, and the selected project as the runtime workspace root. Codex remains authoritative for the profile's effective sandbox, network policy, computer use, plugins, and protected turn inspection. Claude Code runs in its default interactive permission mode under the selected project and maps supported tool-use requests into HRA interactions; it does not expose Codex's permission-profile, app, plugin, or protected turn-inspection surfaces."),
         ),
       ],
     },
@@ -1271,7 +1210,7 @@ export const publicContent: PublicContent = {
       heading: "Sessions across machines",
       blocks: [
         paragraph(
-          text("The machine that created a provider session remains its only executor in v1. It must be online with its HRA daemon running and must hold the current execution lease before a remote command can affect Codex, Claude Code, or Devin. Other paired machines never execute that provider session through one of their own local provider profiles."),
+          text("The machine that created a provider session remains its only executor in v1. It must be online with its HRA daemon running and must hold the current execution lease before a remote command can affect Codex or Claude Code. Other paired machines never execute that provider session through one of their own local provider profiles."),
         ),
         paragraph(
           text("Paired machines can read the encrypted projection and submit bounded send, queue, steer, stop, preset, provider-switch, and Codex Fast commands. The origin daemon claims each command by lease generation and idempotency key. Commands remain pending within their deadline while the origin machine is offline; another machine cannot take over or become a second provider writer."),
@@ -1293,8 +1232,8 @@ export const publicContent: PublicContent = {
             "hra remote send <cloud-session> <message>",
             "hra remote queue|steer <cloud-session> <message>",
             "hra remote stop <cloud-session>",
-            "hra remote preset <cloud-session> <low|high|ultra|fable-max|astra>",
-            "hra remote provider <cloud-session> <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>]",
+            "hra remote preset <cloud-session> <low|high|ultra|fable-max>",
+            "hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
             "hra remote fast <cloud-session> <on|off>",
             "hra remote allow|deny <device-commands|account-linking>",
             "hra remote policy",
@@ -1369,13 +1308,14 @@ export const publicContent: PublicContent = {
             "hra device approve <device-id-or-prefix> --fingerprint <value> [--idempotency-key <uuidv7>] [--json]",
             "hra device revoke <device-id-or-prefix> [--idempotency-key <uuidv7>] [--json]",
             "hra account add <label>",
-            "hra account login <profile> [--provider <codex|claude|devin>] [--device-code|--manual-token-flow] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]",
+            "hra account login <profile> [--provider <codex|claude>] [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]",
             "hra account login-cancel <profile> [--provider codex]",
             "hra account login-cancel <profile> --provider claude --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited",
             "hra account login-cancel <profile> --provider devin --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited",
             "hra account logout <profile>",
             "hra account list",
-            "hra account show <profile> [--provider <codex|claude|devin>]",
+            "hra account show <profile> [--provider <codex|claude>]",
+            "hra account show <profile> --provider devin  (retired local history and cleanup only)",
             "hra account usage [profile] [--refresh]",
             "hra account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]",
             "hra account switch <profile>",
@@ -1395,7 +1335,7 @@ export const publicContent: PublicContent = {
             "hra session watch <session> [--cursor <cursor>] [--jsonl]",
             "hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
             "hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]",
-            "hra session start <account> [--project <project>] [--provider <codex|claude|devin>] [--preset <low|high|ultra|fable-max|astra>] [--fast]",
+            "hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]",
             "hra session send|queue|steer <session> [--attach <path>]... <message>",
             "hra session stop|recover|abandon <session>",
             "hra session rename <session> <name>",
@@ -1403,8 +1343,8 @@ export const publicContent: PublicContent = {
             "hra session note get|edit|clear <session>",
             "hra session note set <session> <note>",
             "hra session state <session> [--json]",
-            "hra session preset <session> <low|high|ultra|fable-max|astra>",
-            "hra session switch <session> --provider <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>] [--account <account>]",
+            "hra session preset <session> <low|high|ultra|fable-max>",
+            "hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]",
             "hra session export <session> [--format <trajectory|json>] [--out <path>]",
             "hra session fast <session> <on|off>",
             "hra session project <session> <project>",
@@ -1436,8 +1376,8 @@ export const publicContent: PublicContent = {
             "hra remote send --or-steer <cloud-session> <message>",
             "hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <decline>",
             "hra remote stop <cloud-session>",
-            "hra remote preset <cloud-session> <low|high|ultra|fable-max|astra>",
-            "hra remote provider <cloud-session> <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>]",
+            "hra remote preset <cloud-session> <low|high|ultra|fable-max>",
+            "hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
             "hra remote fast <cloud-session> <on|off>",
             "hra remote allow|deny <device-commands|account-linking>",
             "hra remote policy",
@@ -1466,7 +1406,7 @@ export const publicContent: PublicContent = {
           code('{"permissions":["<requested-name>"]}'),
           text(" and a question response reads "),
           code('{"answers":{"<question-id>":{"answers":["<answer>"]}}}'),
-          text(" through protected input. Those permission-name and question-answer document shapes are Codex-specific. The live Codex adapter rehydrates selected permission names to their exact private provider values immediately before the response write; those values never enter display, storage, logs, or sync. Claude Code tool-use requests and Devin ACP permission requests map to HRA's provider-neutral interaction kinds and accept only the response choices that exact callback offers."),
+          text(" through protected input. Those permission-name and question-answer document shapes are Codex-specific. The live Codex adapter rehydrates selected permission names to their exact private provider values immediately before the response write; those values never enter display, storage, logs, or sync. Claude Code tool-use requests map to HRA's provider-neutral interaction kinds and accept only the response choices that exact callback offers."),
         ),
         paragraph(
           text("Every admitted callback carries a local deadline anchored when the provider delivered it. HRA caps the pending interval at 30 minutes and honors a shorter valid provider interval, including an immediate zero interval. At the deadline it writes one provider-neutral timeout error through the same write-ahead ledger, never invents an answer or grant, and quarantines the provider generation if the write may have escaped. "),
@@ -1486,7 +1426,7 @@ export const publicContent: PublicContent = {
         paragraph(
           text("The beta does not expose destructive local profile or project deletion. "),
           code("account logout"),
-          text(" asks Codex app-server to remove that profile's Codex login while HRA preserves its local session history. HRA does not implement Claude Code or Devin sign-out; use each provider's own authentication flow inside its isolated profile."),
+          text(" asks Codex app-server to remove that profile's Codex login while HRA preserves its local session history. HRA does not implement Claude Code sign-out; use Claude Code's own authentication flow inside the isolated profile."),
         ),
       ],
     },
@@ -1495,7 +1435,7 @@ export const publicContent: PublicContent = {
       heading: "Authority boundaries",
       blocks: [
         paragraph(
-          text("Codex app-server, Claude Code, and Devin ACP remain authoritative for their provider-native authentication, sessions, execution, tools, approvals, models, and hidden runtime state. Codex additionally owns its plugin, account allowance, reset, and native transcript surfaces. HRA owns isolated profiles, the durable provider-neutral conversation record and commands, process generations, local projections, optional encrypted sync, and recovery records. The frozen work contract assigns local coordination records to HRA rather than any provider runtime."),
+          text("Codex app-server and Claude Code remain authoritative for their provider-native authentication, sessions, execution, tools, approvals, models, and hidden runtime state; Codex additionally owns its plugin, usage, and native transcript surfaces. HRA owns isolated profiles, the durable provider-neutral conversation record and commands, process generations, local projections, optional encrypted sync, and recovery records. The frozen work contract assigns local coordination records to HRA rather than either provider runtime."),
         ),
         paragraph(
           text("Cloud service availability is not required for local provider authentication, local execution, local work coordination, local recovery, or reading local sessions. Provider accounts remain independent subscriptions. HRA does not pool quota or replay a limited turn under another account or provider. SQLite remains the local work execution authority; Turso is deferred and non-authoritative."),

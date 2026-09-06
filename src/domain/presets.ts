@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-/** Every provider HRA can drive. A session binds exactly one for its life. */
+/** Historical provider identities. Retired providers remain readable, never executable. */
 export const providerSchema = z.enum(["codex", "claude", "devin"]);
 export type Provider = z.infer<typeof providerSchema>;
 
@@ -8,10 +8,27 @@ export type Provider = z.infer<typeof providerSchema>;
 export const adoptableProviderSchema = z.enum(["codex", "claude"]);
 export type AdoptableProvider = z.infer<typeof adoptableProviderSchema>;
 
-export const DEFAULT_PROVIDER = "codex" satisfies Provider;
+/** Providers admitted for new effects. Do not use historical schemas for admission. */
+export const supportedProviderSchema = z.enum(["codex", "claude"]);
+export type SupportedProvider = z.infer<typeof supportedProviderSchema>;
 
+export const DEFAULT_PROVIDER = "codex" satisfies SupportedProvider;
+
+/** Historical aliases, including those found only in retired provider records. */
 export const presetSchema = z.enum(["low", "high", "ultra", "fable-max", "astra"]);
 export type Preset = z.infer<typeof presetSchema>;
+export const supportedPresetSchema = z.enum(["low", "high", "ultra", "fable-max"]);
+export type SupportedPreset = z.infer<typeof supportedPresetSchema>;
+
+export const isSupportedProvider = (provider: Provider): provider is SupportedProvider =>
+  supportedProviderSchema.safeParse(provider).success;
+
+export const isSupportedPreset = (preset: Preset): preset is SupportedPreset =>
+  supportedPresetSchema.safeParse(preset).success;
+
+export function assertSupportedProvider(provider: Provider): asserts provider is SupportedProvider {
+  if (!isSupportedProvider(provider)) throw new Error(`PROVIDER_RETIRED:${provider}`);
+}
 
 /**
  * The durable storage encoding of a preset. `sessions.preset` and
@@ -58,9 +75,7 @@ const currentPresetRequirements = {
   // is spelled here rather than imported because `src/domain` is the leaf
   // layer; `src/claude/pin.test.ts` proves the two stay equal.
   "fable-max": { model: "claude-fable-5-1", effort: "max" },
-  // Devin ACP selects this exact model family but exposes no separate
-  // reasoning-effort flag, so the reviewed profile records that fact rather
-  // than inventing a provider setting.
+  // Retained only to decode the exact runtime tuple already stored by v39.
   astra: { model: "gpt-6-astra", effort: "provider-default" },
 } as const satisfies Record<Preset, PresetRequirement>;
 
@@ -71,7 +86,7 @@ const presetRequirementsByContract: Readonly<
   [currentPresetContract]: Object.freeze(currentPresetRequirements),
 });
 
-/** Current requirements used for every new or explicitly selected preset. */
+/** Contract-2 requirements, including retired aliases for historical readers. */
 export const presetRequirements = currentPresetRequirements;
 
 type ContractRequirement<P extends Preset, C extends PresetContract> =
@@ -119,7 +134,7 @@ const defaultPresetsByProvider = {
   devin: "astra",
 } as const satisfies { readonly [P in Provider]: ProviderPreset<P> };
 
-/** The preset a new session uses when its provider was chosen but no preset was. */
+/** Historical default mapping; new sessions must first admit a supported provider. */
 export const defaultPresetForProvider = <P extends Provider>(
   provider: P,
 ): (typeof defaultPresetsByProvider)[P] => defaultPresetsByProvider[provider];
@@ -140,7 +155,7 @@ const presetsByProviderTier: Readonly<
   devin: Object.freeze({ ultra: "astra" }),
 });
 
-/** Presets a provider supports, in the union's declaration order. */
+/** Historically mapped presets, in declaration order; not an admission check. */
 export const presetsForProvider = (provider: Provider): readonly Preset[] =>
   presetSchema.options.filter((preset) => presetProviders[preset] === provider);
 

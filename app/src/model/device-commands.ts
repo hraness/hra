@@ -4,7 +4,7 @@ import {
   parseDeviceCommandPayload,
   type DeviceCommandPayload,
   type DeviceCommandResultPayload,
-  type ModelPreset,
+  type SupportedPreset,
   type NotificationHoursUpdate,
 } from "../hra/cloud";
 import type { MachineView } from "./settings-view";
@@ -17,16 +17,16 @@ import type { MachineView } from "./settings-view";
  * that adds or drops a field fails here rather than at the machine.
  */
 
-export type PresetChoice = ModelPreset;
+export type PresetChoice = SupportedPreset;
 
 /** The UI default the plan names: Astra Ultra. */
 export const defaultSessionStartPreset: PresetChoice = "ultra";
 
-export type SessionStartProvider = "codex" | "claude" | "devin";
+export type SessionStartProvider = "codex" | "claude";
 
 export const defaultSessionStartPresetForProvider = (
   provider: SessionStartProvider,
-): PresetChoice => provider === "claude" ? "fable-max" : provider === "devin" ? "astra" : "ultra";
+): PresetChoice => provider === "claude" ? "fable-max" : "ultra";
 
 export type SessionStartTarget = Readonly<{
   accountLabel: string;
@@ -43,7 +43,7 @@ export type SessionStartTarget = Readonly<{
 export function sessionStartTargetLabel(target: SessionStartTarget): string {
   const provider = target.provider === "claude"
     ? "Claude Code (Linux machine only)"
-    : target.provider === "devin" ? "Devin" : "Codex";
+    : "Codex";
   return `${target.accountLabel} — ${target.machineLabel} — ${provider}`;
 }
 
@@ -227,6 +227,7 @@ export function sessionStartTargets(
     if (!machine.deviceCommandsAllowed) continue;
     if (machine.projects.length === 0) continue;
     for (const account of machine.accounts) {
+      if (account.provider === "devin") continue;
       if (account.status !== "signed_in") continue;
       targets.push({
         accountLabel: account.label,

@@ -68,6 +68,7 @@ import {
 } from "../domain/observation";
 import {
   assertPresetSupportedByProvider,
+  assertSupportedProvider,
   currentPresetContract,
   legacyPresetContract,
   presetForProviderTier,
@@ -79,6 +80,7 @@ import {
   adoptableProviderSchema,
   providerSchema,
   type AdoptableProvider,
+  supportedPresetSchema,
   type Preset,
   type PresetRequirement,
   type Provider,
@@ -204,9 +206,9 @@ const codexProviderAccountAuthorityKeyForEmail = (email: string): string =>
 const profileStateAllowsProviderSessionAuthority = (
   provider: Provider,
   state: ProfileRecord["state"],
-): boolean => provider === "claude" || provider === "devin"
+): boolean => provider === "claude"
   ? state === "signed_in" || state === "signed_out"
-  : state === "signed_in";
+  : provider === "codex" && state === "signed_in";
 const sessionAdoptionProviderThreadIdSchema = z.string().min(1).max(200);
 const sessionAdoptionProviderProjectRootSchema = z.string().min(1).refine(
   // Personal provider homes are supported on Darwin/Linux; keep the runtime
@@ -9145,7 +9147,8 @@ export class StateStore {
     const now = this.#now();
     const title = input.title === undefined ? "Untitled session" : titleSchema.parse(input.title);
     const provider = providerSchema.parse(input.provider ?? "codex");
-    const preset = presetSchema.parse(input.preset);
+    assertSupportedProvider(provider);
+    const preset = supportedPresetSchema.parse(input.preset);
     assertPresetSupportedByProvider(provider, preset);
     const create = this.#database.transaction(() => {
       this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id, input.profileId, input.projectId ?? null, title, legacySessionProviderShadow(provider), provider, presetTiers[preset], currentPresetContract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
@@ -9399,7 +9402,7 @@ export class StateStore {
   }
 
   setDefaultPreset(preset: Preset): void {
-    const parsed = presetSchema.parse(preset);
+    const parsed = supportedPresetSchema.parse(preset);
     const result = this.#database.query("UPDATE daemon_state SET default_preset=? WHERE singleton=1").run(presetTiers[parsed]);
     if (result.changes !== 1) throw new Error("DAEMON_STATE_MISSING");
   }
@@ -9428,7 +9431,7 @@ export class StateStore {
       : providerSchema.parse(input.excludedProvider);
     const archiveClause = input.includeArchived === true ? "" : " AND s.archived_at IS NULL";
     const accountAuthorityClause = input.requireCurrentAccountAuthority === true
-      ? ` AND EXISTS (
+      ? ` AND s.provider_v39 IN ('codex','claude') AND EXISTS (
            SELECT 1
            FROM profiles p
            LEFT JOIN session_provider_account_authorities pa
@@ -9639,6 +9642,7 @@ export class StateStore {
        LEFT JOIN session_provider_account_authorities pa
          ON pa.session_id=s.id AND pa.provider=s.provider_v39
        WHERE s.id=? AND s.profile_id=?
+         AND s.provider_v39 IN ('codex','claude')
          AND NOT EXISTS(
            SELECT 1 FROM provider_runtime_account_revocations r
            WHERE r.profile_id=s.profile_id
@@ -13335,11 +13339,8 @@ export class StateStore {
       providerAccountKey: providerAccountAuthorityKeySchema.optional(),
       conversationAutomationEnabled: z.boolean().optional(),
     }).strict().parse(input);
-    if (parsed.provider === "devin") {
-      if (parsed.providerAccountKey !== undefined) {
-        throw new Error("SESSION_IMPORT_DEVIN_ACCOUNT_KEY_FORBIDDEN");
-      }
-    } else if (
+    assertSupportedProvider(parsed.provider);
+    if (
       parsed.providerAccountKey === undefined
       || !providerAccountAuthorityKeyMatchesProvider(
         parsed.provider,
@@ -13357,9 +13358,7 @@ export class StateStore {
         ...(parsed.projectId === undefined ? {} : { projectId: parsed.projectId }),
         title: parsed.title,
         preset: parsed.preset,
-        presetContract: parsed.provider === "devin"
-          ? currentPresetContract
-          : legacyPresetContract,
+        presetContract: legacyPresetContract,
         fastEnabled: parsed.fastEnabled,
         state: parsed.state,
         ...(parsed.activeTurnId === undefined ? {} : { activeTurnId: parsed.activeTurnId }),
@@ -14139,6 +14138,9 @@ export class StateStore {
 
   updateSessionMetadata(input: { sessionId: SessionId; expectedRevision: number; title?: string; note?: string; preset?: Preset; fastEnabled?: boolean; projectId?: ProjectId | null }): SessionRecord {
     const current = this.requireSession(input.sessionId);
+    if (input.preset !== undefined || input.fastEnabled !== undefined || input.projectId !== undefined) {
+      assertSupportedProvider(current.provider);
+    }
     const currentPresetBinding = this.#requireSessionPresetBinding(current.id);
     if (current.revision !== input.expectedRevision) throw new Error("Session metadata revision conflict.");
     // An unsettled provider effect owns the exact runtime profile it reviewed.
@@ -14150,7 +14152,7 @@ export class StateStore {
     }
     const title = input.title === undefined ? current.title : titleSchema.parse(input.title);
     const note = input.note === undefined ? current.note : noteSchema.parse(input.note);
-    const preset = input.preset === undefined ? current.preset : presetSchema.parse(input.preset);
+    const preset = input.preset === undefined ? current.preset : supportedPresetSchema.parse(input.preset);
     // A preset the session's provider cannot run is refused, never ignored.
     assertPresetSupportedByProvider(current.provider, preset);
     const fast = input.fastEnabled === undefined ? current.fastEnabled : input.fastEnabled;
@@ -14207,17 +14209,14 @@ export class StateStore {
     const profileId = profileIdSchema.parse(input.profileId);
     const expectedTargetProfileGeneration = z.number().int().nonnegative()
       .parse(input.expectedTargetProfileGeneration);
-    const preset = presetSchema.parse(input.preset);
+    assertSupportedProvider(provider);
+    const preset = supportedPresetSchema.parse(input.preset);
     assertPresetSupportedByProvider(provider, preset);
     const runtimeProfile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
     const providerAccountKey = input.providerAccountKey === undefined
       ? undefined
       : providerAccountAuthorityKeySchema.parse(input.providerAccountKey);
-    if (provider === "devin") {
-      if (providerAccountKey !== undefined) {
-        throw new Error("SESSION_PROVIDER_SWITCH_DEVIN_ACCOUNT_KEY_FORBIDDEN");
-      }
-    } else if (
+    if (
       providerAccountKey === undefined
       || !providerAccountAuthorityKeyMatchesProvider(provider, providerAccountKey)
     ) {
@@ -14251,6 +14250,7 @@ export class StateStore {
         throw new Error("SESSION_PROVIDER_SWITCH_TARGET_AUTHORITY_CHANGED");
       }
       const sourceSession = this.requireSession(sessionId);
+      assertSupportedProvider(sourceSession.provider);
       const sourceProviderAuthority = this.readSessionProviderAccountAuthority(sessionId);
       const expectedSessionRevision = z.number().int().positive().parse(
         input.expectedSessionRevision,
@@ -14260,11 +14260,8 @@ export class StateStore {
         || sourceSession.state === "recovery_required"
         || sourceSession.state === "terminal"
       ) throw new Error("SESSION_PROVIDER_SWITCH_CAS_CONFLICT");
-      if (
-        sourceSession.provider === "devin"
-          ? sourceProviderAuthority !== null
-          : sourceProviderAuthority === null
-            || sourceProviderAuthority.provider !== sourceSession.provider
+      if (sourceProviderAuthority === null
+        || sourceProviderAuthority.provider !== sourceSession.provider
       ) throw new Error("SESSION_PROVIDER_SWITCH_SOURCE_ACCOUNT_AUTHORITY_MISSING");
       const personalBindingRow = this.#database.query(
         `SELECT * FROM session_personal_runtime_bindings
@@ -14302,13 +14299,11 @@ export class StateStore {
           throw new Error("SESSION_PROVIDER_SWITCH_PERSONAL_CANDIDATE_MISSING");
         }
       }
-      if (sourceSession.provider !== "devin") {
-        const retiredProviderAuthority = this.#database.query(
-          "DELETE FROM session_provider_account_authorities WHERE session_id=?",
-        ).run(sessionId);
-        if (retiredProviderAuthority.changes !== 1) {
-          throw new Error("SESSION_PROVIDER_SWITCH_SOURCE_ACCOUNT_AUTHORITY_CONFLICT");
-        }
+      const retiredProviderAuthority = this.#database.query(
+        "DELETE FROM session_provider_account_authorities WHERE session_id=?",
+      ).run(sessionId);
+      if (retiredProviderAuthority.changes !== 1) {
+        throw new Error("SESSION_PROVIDER_SWITCH_SOURCE_ACCOUNT_AUTHORITY_CONFLICT");
       }
       const authority = z.object({
         authority_id: sessionIdSchema,
@@ -14425,14 +14420,12 @@ export class StateStore {
       // count. The session predicate still names one exact id and revision, so
       // any positive count proves the CAS landed while zero proves it did not.
       if (bound.changes < 1) throw new Error("SESSION_PROVIDER_SWITCH_CAS_CONFLICT");
-      if (provider !== "devin" && providerAccountKey !== undefined) {
-        this.#bindSessionProviderAccountAuthorityLocked({
-          sessionId,
-          provider,
-          runtimeScope: "managed",
-          accountKey: providerAccountKey,
-        }, now);
-      }
+      this.#bindSessionProviderAccountAuthorityLocked({
+        sessionId,
+        provider,
+        runtimeScope: "managed",
+        accountKey: providerAccountKey,
+      }, now);
       let expectedReboundRevision = expectedSessionRevision + 1;
       if (input.state === "active") {
         const activated = this.#database.query(
@@ -14842,6 +14835,7 @@ export class StateStore {
   }
 
   #enqueuePrepared(sessionId: SessionId, message: string): QueueRecord {
+    assertSupportedProvider(this.requireSession(sessionId).provider);
     const id = createQueueId();
     const now = this.#now();
     const sequenceRow = this.#database.query(
@@ -14993,6 +14987,7 @@ export class StateStore {
     const digest = digestJson(evidence);
     const now = this.#now();
     const begin = this.#database.transaction(() => {
+      assertSupportedProvider(this.requireSession(sessionId).provider);
       const authority = z.object({
         queue_state: z.literal("pending"),
         queue_session_id: sessionIdSchema,
@@ -15576,6 +15571,7 @@ export class StateStore {
       ) throw new Error("IDEMPOTENCY_CONFLICT");
       return { id: existing.id, state: existing.state, replay: true, ...(existing.result === undefined ? {} : { result: existing.result }) };
     }
+    if (input.kind === "account.devin-login") assertSupportedProvider("devin");
     const unsettled = this.#database
       .query(`SELECT m.id FROM mutation_attempts m
               LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
@@ -15615,6 +15611,7 @@ export class StateStore {
     const digest = createHash("sha256").update(canonical).digest("hex");
     const now = this.#now();
     const begin = this.#database.transaction(() => {
+      assertSupportedProvider(this.requireSession(parsedSessionId).provider);
       const authority = z.object({
         kind: z.string(),
         authority_id: sessionIdSchema,
@@ -15675,16 +15672,13 @@ export class StateStore {
     const parsedProfileId = profileIdSchema.parse(input.profileId);
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
     const parsedProjectId = projectIdSchema.parse(input.projectId);
-    const parsedPreset = presetSchema.parse(input.preset);
     const parsedProvider = providerSchema.parse(input.provider ?? "codex");
+    assertSupportedProvider(parsedProvider);
+    const parsedPreset = supportedPresetSchema.parse(input.preset);
     const providerAccountKey = input.providerAccountKey === undefined
       ? undefined
       : providerAccountAuthorityKeySchema.parse(input.providerAccountKey);
-    if (parsedProvider === "devin") {
-      if (providerAccountKey !== undefined) {
-        throw new Error("SESSION_START_DEVIN_ACCOUNT_KEY_FORBIDDEN");
-      }
-    } else if (
+    if (
       providerAccountKey === undefined
       || !providerAccountAuthorityKeyMatchesProvider(parsedProvider, providerAccountKey)
     ) {
@@ -15747,14 +15741,12 @@ export class StateStore {
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", legacySessionProviderShadow(parsedProvider), parsedProvider, presetTiers[parsedPreset], currentPresetContract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(sessionId, now);
-      if (parsedProvider !== "devin") {
-        this.#bindSessionProviderAccountAuthorityLocked({
+      this.#bindSessionProviderAccountAuthorityLocked({
           sessionId,
           provider: parsedProvider,
           runtimeScope: "managed",
-          accountKey: providerAccountKey as string,
-        }, now);
-      }
+          accountKey: providerAccountKey,
+      }, now);
       if (!this.sessionAccountAuthorityMatches(sessionId, parsedProfileId)) {
         throw new Error("SESSION_START_ACCOUNT_AUTHORITY_MISMATCH");
       }
@@ -15781,11 +15773,9 @@ export class StateStore {
     const attemptId = attemptIdSchema.parse(input.attemptId);
     const sessionId = sessionIdSchema.parse(input.sessionId);
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
-    if (evidence.targetProvider === "devin") {
-      if (evidence.targetProviderAccountKey !== undefined) {
-        throw new Error("SESSION_PROVIDER_SWITCH_DEVIN_ACCOUNT_KEY_FORBIDDEN");
-      }
-    } else if (
+    assertSupportedProvider(evidence.sourceProvider);
+    assertSupportedProvider(evidence.targetProvider);
+    if (
       evidence.targetProviderAccountKey === undefined
       || !providerAccountAuthorityKeyMatchesProvider(
         evidence.targetProvider,
@@ -15824,6 +15814,7 @@ export class StateStore {
     const digest = digestJson(evidence);
     const now = this.#now();
     const record = this.#database.transaction(() => {
+      assertSupportedProvider(this.requireSession(sessionId).provider);
       const authority = z.object({
         daemon_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
         kind: z.literal("session.switch"),
@@ -15882,13 +15873,11 @@ export class StateStore {
           )
         )
       ) throw new Error("SESSION_PROVIDER_SWITCH_AUTHORITY_CHANGED");
-      const targetRevocation = evidence.targetProvider === "devin"
-        ? null
-        : this.readProviderRuntimeAccountRevocation({
-            profileId: evidence.targetProfileId,
-            provider: evidence.targetProvider,
-            runtimeScope: "managed",
-          });
+      const targetRevocation = this.readProviderRuntimeAccountRevocation({
+        profileId: evidence.targetProfileId,
+        provider: evidence.targetProvider,
+        runtimeScope: "managed",
+      });
       if (
         targetRevocation?.profileGeneration === evidence.targetProcessGeneration
         && (
@@ -17177,187 +17166,6 @@ export class StateStore {
       if (inserted.changes !== 1) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
     });
     abandon.immediate();
-    return result;
-  }
-
-  /**
-   * Durably consumes the one-time permission to launch Devin's foreground
-   * login inside the profile's isolated provider home. The generic mutation
-   * attempt remains the provider-specific fence and no credential is read.
-   */
-  beginDevinLoginMutationEffect(input: {
-    attemptId: AttemptId;
-    profileId: ProfileId;
-    profileGeneration: number;
-    evidence: Extract<MutationEffectEvidence, { kind: "account.devin-login" }>;
-  }): MutationEffectEvidenceRecord {
-    const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
-    const parsedProfileId = profileIdSchema.parse(input.profileId);
-    const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
-    const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
-    const canonical = JSON.stringify(evidence);
-    const digest = createHash("sha256").update(canonical).digest("hex");
-    const now = this.#now();
-    const begin = this.#database.transaction(() => {
-      const row = z.object({
-        kind: z.literal("account.devin-login"),
-        authority_id: profileIdSchema,
-        authority_generation: z.number().int().nonnegative(),
-        state: z.literal("prepared"),
-        process_generation: z.number().int().nonnegative(),
-        profile_state: profileStateSchema,
-      }).strict().parse(this.#database.query(
-        `SELECT m.kind,m.authority_id,m.authority_generation,m.state,
-                p.process_generation,p.state AS profile_state
-         FROM mutation_attempts m JOIN profiles p ON p.id=m.authority_id
-         WHERE m.id=?`,
-      ).get(parsedAttemptId));
-      if (
-        row.authority_id !== parsedProfileId
-        || row.authority_generation !== parsedGeneration
-        || row.process_generation !== parsedGeneration
-        || row.profile_state === "removed"
-      ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-      this.#database.query(
-        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)",
-      ).run(parsedAttemptId, evidence.kind, canonical, digest, now);
-      const changed = this.#database.query(
-        "UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'",
-      ).run(now, parsedAttemptId);
-      if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-    });
-    begin.immediate();
-    return { attemptId: parsedAttemptId, digest, evidence, recordedAt: now };
-  }
-
-  settleDevinLoginMutation(input: {
-    attemptId: AttemptId;
-    idempotencyKey: string;
-    profileId: ProfileId;
-    profileGeneration: number;
-    signedIn: boolean;
-    outcome:
-      | Readonly<{ state: "joined"; exitCode: number; interruptedBy: "SIGINT" | "SIGTERM" | null }>
-      | Readonly<{ state: "not_started"; reason: "spawn_failed" }>
-      | Readonly<{ state: "not_started"; reason: "preflight_stale" }>
-      | Readonly<{ state: "not_started"; reason: "interrupted_before_spawn"; interruptedBy: "SIGINT" | "SIGTERM" }>;
-  }): Readonly<{
-    accountId: ProfileId;
-    attemptId: AttemptId;
-    idempotencyKey: string;
-    providerGeneration: number;
-    signedIn: boolean;
-    outcome:
-      | Readonly<{ state: "joined"; exitCode: number; interruptedBy: "SIGINT" | "SIGTERM" | null }>
-      | Readonly<{ state: "not_started"; reason: "spawn_failed" }>
-      | Readonly<{ state: "not_started"; reason: "preflight_stale" }>
-      | Readonly<{ state: "not_started"; reason: "interrupted_before_spawn"; interruptedBy: "SIGINT" | "SIGTERM" }>;
-  }> {
-    const parsed = z.object({
-      attemptId: attemptIdSchema,
-      idempotencyKey: z.string().uuid(),
-      profileId: profileIdSchema,
-      profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-      signedIn: z.boolean(),
-      outcome: z.union([
-        z.object({
-          state: z.literal("joined"),
-          exitCode: z.number().int().nonnegative().max(255),
-          interruptedBy: z.enum(["SIGINT", "SIGTERM"]).nullable(),
-        }).strict(),
-        z.object({ state: z.literal("not_started"), reason: z.literal("spawn_failed") }).strict(),
-        z.object({ state: z.literal("not_started"), reason: z.literal("preflight_stale") }).strict(),
-        z.object({
-          state: z.literal("not_started"),
-          reason: z.literal("interrupted_before_spawn"),
-          interruptedBy: z.enum(["SIGINT", "SIGTERM"]),
-        }).strict(),
-      ]),
-    }).strict().parse(input);
-    if (parsed.outcome.state === "not_started" && parsed.signedIn) {
-      throw new Error("DEVIN_LOGIN_NO_EFFECT_STATUS_CONFLICT");
-    }
-    const result = {
-      accountId: parsed.profileId,
-      attemptId: parsed.attemptId,
-      idempotencyKey: parsed.idempotencyKey,
-      providerGeneration: parsed.profileGeneration,
-      signedIn: parsed.signedIn,
-      outcome: parsed.outcome,
-    } as const;
-    const now = this.#now();
-    const settle = this.#database.transaction(() => {
-      const row = z.object({
-        id: attemptIdSchema,
-        idempotency_key: z.string().uuid(),
-        kind: z.literal("account.devin-login"),
-        authority_id: profileIdSchema,
-        authority_generation: z.number().int().nonnegative(),
-        state: z.enum(["effect_started", "applied", "failed", "ambiguous"]),
-        result_json: z.string().nullable(),
-        profile_state: profileStateSchema,
-        evidence_json: z.string(),
-        evidence_digest: sha256Schema,
-        resolution_kind: mutationResolutionKindSchema.nullable(),
-        receipt_json: z.string().nullable(),
-      }).strict().parse(this.#database.query(
-        `SELECT m.id,m.idempotency_key,m.kind,m.authority_id,m.authority_generation,
-                m.state,m.result_json,p.state AS profile_state,e.evidence_json,e.evidence_digest,
-                r.resolution_kind,r.receipt_json
-         FROM mutation_attempts m
-         JOIN profiles p ON p.id=m.authority_id
-         JOIN mutation_effect_evidence e ON e.attempt_id=m.id
-         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
-         WHERE m.idempotency_key=?`,
-      ).get(parsed.idempotencyKey));
-      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
-      if (
-        row.id !== parsed.attemptId
-        || row.authority_id !== parsed.profileId
-        || row.authority_generation !== parsed.profileGeneration
-        || row.profile_state === "removed"
-        || evidence.kind !== "account.devin-login"
-        || digestJson(evidence) !== row.evidence_digest
-      ) throw new Error("DEVIN_LOGIN_AUTHORITY_MISMATCH");
-      if (row.resolution_kind !== null) {
-        const prior = row.receipt_json === null ? null : JSON.parse(row.receipt_json) as unknown;
-        if (
-          row.resolution_kind === "abandoned"
-          || JSON.stringify(prior) !== JSON.stringify(result)
-        ) throw new Error("DEVIN_LOGIN_TERMINAL_OUTCOME_CONFLICT");
-        return;
-      }
-      if (row.state === "applied" || row.state === "failed") {
-        const prior = row.result_json === null ? null : JSON.parse(row.result_json) as unknown;
-        if (JSON.stringify(prior) !== JSON.stringify(result)) {
-          throw new Error("DEVIN_LOGIN_TERMINAL_OUTCOME_CONFLICT");
-        }
-        return;
-      }
-      if (row.state === "ambiguous") {
-        const inserted = this.#database.query(
-          "INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)",
-        ).run(
-          parsed.attemptId,
-          parsed.signedIn ? "proven_applied" : "provider_state_reconciled",
-          JSON.stringify({
-            source: "account.devin-login.complete",
-            signedIn: parsed.signedIn,
-            outcome: parsed.outcome,
-          }),
-          JSON.stringify(result),
-          now,
-        );
-        if (inserted.changes !== 1) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
-        return;
-      }
-      const target = parsed.signedIn ? "applied" : "failed";
-      const changed = this.#database.query(
-        "UPDATE mutation_attempts SET state=?,result_json=?,updated_at=? WHERE id=? AND state='effect_started'",
-      ).run(target, JSON.stringify(result), now, parsed.attemptId);
-      if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-    });
-    settle.immediate();
     return result;
   }
 

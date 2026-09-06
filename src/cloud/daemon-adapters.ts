@@ -43,6 +43,8 @@ import {
   deviceRegistryLimits,
   isRelayedLoginUserCode,
   isRelayedLoginUrl,
+  parseDeviceCommandPayload,
+  parseRemoteCommandPayload,
   type DeviceCommandLoginStatus,
   type DeviceCommandPayload,
   type DeviceRegistryAccount,
@@ -630,6 +632,7 @@ export function deviceRegistryAccountAddress(input:
   | Readonly<{ kind: "local"; profileId: string; provider: Provider }>
   | Readonly<{ kind: "public"; publicId: string }>): DeviceRegistryAccountAddress | null {
   if (input.kind === "local") {
+    if (input.provider === "devin") return null;
     const profileId = profileIdSchema.safeParse(input.profileId);
     if (!profileId.success) return null;
     const publicId = input.provider === "codex"
@@ -1004,6 +1007,7 @@ function parseRecoveryObservedInteractionIds(value: unknown): readonly string[] 
 }
 
 function terminalSessionState(session: SessionRecord): "active" | "idle" | "terminal" | null {
+  if (session.provider === "devin") return "terminal";
   if (session.state === "active") return "active";
   if (session.state === "idle") return "idle";
   if (session.state === "terminal") return "terminal";
@@ -1014,9 +1018,8 @@ function terminalSessionState(session: SessionRecord): "active" | "idle" | "term
  * Every provider session remains subordinate to its exact durable provider
  * account authority. Managed Claude sessions also use the accepted platform
  * boundary, while an adopted session can use its exact active personal-runtime
- * binding. Devin has no personal-home route and is admitted only through its
- * native managed-session authority. A detaching or detached binding never
- * reopens provider authority.
+ * binding. Devin is retired and has no provider authority. A detaching or
+ * detached binding never reopens provider authority.
  */
 function profileAllowsEstablishedSession(
   store: StateStore,
@@ -1033,7 +1036,7 @@ function profileAllowsEstablishedSession(
   switch (session.provider) {
     case "codex": return true;
     case "claude": return platform === "linux" || usesPersonalRuntime;
-    case "devin": return true;
+    case "devin": return false;
   }
 }
 
@@ -2523,7 +2526,7 @@ export type CloudProviderAccountProjectionReader = (
   input: Readonly<{
     processGeneration: number;
     profileId: ProfileRecord["id"];
-    provider: "claude" | "devin";
+    provider: "claude";
     signal: AbortSignal;
   }>,
 ) => Promise<Readonly<{ signedIn: boolean }>>;
@@ -2609,13 +2612,13 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     observedAt: number;
     signedIn: boolean | null;
   }>();
-  readonly #accountObservationTasks = new Map<"claude" | "devin", {
+  readonly #accountObservationTasks = new Map<"claude", {
     controller: AbortController;
     key: string;
     task: Promise<void>;
   }>();
-  readonly #accountObservationCursors = new Map<"claude" | "devin", ProfileId>();
-  readonly #accountObservationCleanupFailures = new Set<"claude" | "devin">();
+  readonly #accountObservationCursors = new Map<"claude", ProfileId>();
+  readonly #accountObservationCleanupFailures = new Set<"claude">();
   #accountObservationsClosed = false;
   #closeTask: Promise<void> | null = null;
   #cache: CloudProjectionCache | null;
@@ -3187,12 +3190,13 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         session,
         this.#platform,
       );
-      if (profile.state === "signed_in" && !canReadProvider && !detachedArchiveHead) continue;
+      const retired = session.provider === "devin";
+      if (profile.state === "signed_in" && !canReadProvider && !detachedArchiveHead && !retired) continue;
       // Detach retires provider authority before it archives the local row. The
       // archived head is the cloud tombstone for a session that was projected
       // before detach, so it must remain publishable without reopening that
       // retired provider authority.
-      let includeHead = canReadProvider || detachedArchiveHead;
+      let includeHead = canReadProvider || detachedArchiveHead || retired;
       if (cache !== null) {
         if (!canReadProvider) {
           try {
@@ -3272,6 +3276,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
           // unarchived session's metadata keeps its pre-archive bytes and
           // does not force a metadata update on every existing session.
           ...(session.archivedAt === undefined ? {} : { archived: true }),
+          ...(retired ? { retiredProvider: "devin" as const } : {}),
           name: boundedName(session.title),
           note: boundedNote(session.note),
         },
@@ -3381,7 +3386,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
    */
   #startAccountObservation(
     profile: ProfileRecord,
-    provider: "claude" | "devin",
+    provider: "claude",
     signal: AbortSignal,
   ): void {
     const readProjection = this.#readProviderAccountProjectionForCloud;
@@ -3449,10 +3454,10 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       .filter((profile) => profile.state !== "removed")
       .slice(0, deviceRegistryLimits.accounts);
     const accounts: DeviceRegistryAccount[] = [];
-    const providers: readonly ("claude" | "devin")[] =
+    const providers: readonly "claude"[] =
       this.#readProviderAccountProjectionForCloud === undefined
         ? []
-        : ["claude", "devin"];
+        : ["claude"];
     const currentKeys = new Set(profiles.flatMap((profile) =>
       providers.map((provider) => `${provider}_${profile.id}`)));
     for (const key of this.#accountObservations.keys()) {
@@ -3468,7 +3473,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     // profile retains Codex's historical raw id and every sibling-provider row
     // whose runtime proves an auth state; the 100-row protocol cap never leaves
     // a selected profile with only Codex because an earlier provider tier filled
-    // the array. At most two slots remain unused when the next complete group
+    // the array. At most one slot remains unused when the next complete group
     // would cross the bound.
     for (const profile of profiles) {
       if (profile.state === "removed") continue;
@@ -3805,8 +3810,18 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     signal: AbortSignal;
   }>): Promise<CloudCommandExecutionResult> {
     if (input.signal.aborted) throw input.signal.reason;
+    // Reject stale provider selections even for an already-decoded command.
+    // Other kinds retain their existing, more specific refusal codes below.
+    if (
+      (input.payload.kind === "set_provider" || input.payload.kind === "set_model"
+        || input.payload.kind === "set_default_preset")
+      && parseRemoteCommandPayload(input.payload) === null
+    ) {
+      return { code: "COMMAND_PAYLOAD_INVALID", state: "failed" };
+    }
     try {
       const session = this.#store.requireSession(input.sessionPublicId);
+      if (session.provider === "devin") return { code: "PROVIDER_RETIRED", state: "failed" };
       const profile = this.#store.requireProfileById(session.profileId);
       if (
         session.id !== input.sessionPublicId
@@ -3981,6 +3996,9 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     const policy = this.#store.readDeviceCommandPolicy();
     if (!policy.deviceCommandsAllowed) {
       return { code: "DEVICE_COMMANDS_DENIED", state: "failed" };
+    }
+    if (parseDeviceCommandPayload(input.payload) === null) {
+      return { code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", state: "failed" };
     }
     if (
       (input.payload.kind === "account_login_start"

@@ -1,7 +1,7 @@
 {
   "name": "@hraness/hra",
   "version": "0.6.0",
-  "description": "Control plane for Codex, Claude Code, and Devin in current source; v0.6.0 is release-ready. Run provider sessions side by side through one durable CLI.",
+  "description": "Control plane for Codex and Claude Code in current source; v0.6.0 is release-ready. Run provider sessions side by side through one durable CLI.",
   "license": "MIT",
   "publishConfig": {
     "access": "public",
@@ -82,7 +82,6 @@
     "multi-account"
   ],
   "dependencies": {
-    "@agentclientprotocol/sdk": "1.4.0",
     "@hraness/oh": "0.2.7",
     "@openai/codex": "0.153.2",
     "convex": "1.45.0",

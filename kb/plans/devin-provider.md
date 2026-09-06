@@ -1,5 +1,26 @@
 # Devin provider and Astra defaults
 
+## Superseded: provider removal
+
+On 2026-09-06 the user made verified remaining account quota and reset reporting
+a condition of provider support. Current official CLI/ACP documentation does not
+provide that surface for an ordinary signed-in CLI account. The integration below
+is superseded by removal, not a supported feature or an active rollout plan.
+
+Removal deletes runtime/ACP dependencies and active CLI, cloud, and UI selection.
+Historical v39 authority and later migrations remain append-only; stored Devin
+history is readable but cannot acquire execution authority. Provider-owned
+credentials are not inspected or deleted. An exact acknowledged cleanup command
+remains only for historical login fences. Codex and Claude functionality and
+separately owned model defaults remain unchanged.
+
+Acceptance requires parser rejection of new Devin operations, zero runtime
+dispatch for old rows or commands, preserved mixed-provider history and login
+cleanup, focused regressions, independent review, and the repository final gate.
+Implementation and validation are in progress.
+
+The rest of this file records the superseded implementation evidence.
+
 ## Status
 
 Implementation complete on `codex/devin-provider-astra-20260905`, rebased onto

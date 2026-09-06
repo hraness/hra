@@ -10,11 +10,11 @@ import {
   adoptableProviderSchema,
   DEFAULT_PROVIDER,
   defaultPresetForProvider,
-  presetSchema,
-  providerSchema,
   type AdoptableProvider,
-  type Preset,
-  type Provider,
+  supportedPresetSchema,
+  supportedProviderSchema,
+  type SupportedPreset,
+  type SupportedProvider,
 } from "../domain/presets";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "../domain/usage-metrics";
 import { createCloudUuidV7, isUuidV7 } from "../domain/uuid-v7";
@@ -150,14 +150,6 @@ export type ClaudeAccountAuthCliInvocation = Readonly<{
   replayCommand: string;
 }>;
 
-/** Devin owns the foreground interaction; the daemon owns its durable attempt. */
-export type DevinAccountAuthCliInvocation = Readonly<{
-  command: Extract<LocalCommand, { kind: "account.devin-login.prepare" }>;
-  json: boolean;
-  kind: "account.devin-login";
-  replayCommand: string;
-}>;
-
 export type InteractionResolveCommand = Extract<LocalCommand, { kind: "interaction.resolve" }>;
 
 export type CliInvocation =
@@ -173,7 +165,6 @@ export type CliInvocation =
   | ProtectedInteractionInspectCliInvocation
   | AccountLoginCliInvocation
   | ClaudeAccountAuthCliInvocation
-  | DevinAccountAuthCliInvocation
   | SessionAttachmentCliInvocation
   | SessionEventFollowCliInvocation
   | SessionEventWatchCliInvocation
@@ -209,11 +200,11 @@ export type RemoteCliCommand =
       session: string;
     }>
   | Readonly<{ kind: "remote.stop"; session: string }>
-  | Readonly<{ kind: "remote.preset"; preset: Preset; session: string }>
+  | Readonly<{ kind: "remote.preset"; preset: SupportedPreset; session: string }>
   | Readonly<{
       kind: "remote.provider";
-      preset?: Preset;
-      provider: Provider;
+      preset?: SupportedPreset;
+      provider: SupportedProvider;
       session: string;
     }>
   | Readonly<{ enabled: boolean; kind: "remote.fast"; session: string }>;
@@ -273,7 +264,7 @@ Mutation safety:
   --idempotency-key <uuid>  Reuse after a lost response; changed reuse fails closed.
 
 Platform:
-  Codex and Devin provider commands run on macOS and Linux. Claude login, status,
+  Codex provider commands run on macOS and Linux. Claude login, status,
   sessions, and provider switches require Linux; macOS refuses before launching Claude.
 
 Recommended profiles:
@@ -281,7 +272,6 @@ Recommended profiles:
   high        Astra Max       (codex)
   ultra       Astra Ultra     (codex)
   fable-max   Claude Fable    (claude)
-  astra       GPT-6 Astra     (devin)
 
 Run \`hra <group> --help\` or \`hra help <group> [<command>]\` for command examples.`;
 
@@ -324,27 +314,28 @@ Examples:
 
 Usage:
   hra account add <label>
-  hra account login <profile> [--provider <codex|claude|devin>] [--device-code|--manual-token-flow] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
+  hra account login <profile> [--provider <codex|claude>] [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
   hra account login-cancel <profile> [--provider codex]
   hra account login-cancel <profile> --provider claude --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
   hra account login-cancel <profile> --provider devin --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
+    Retired-provider cleanup only; does not launch, stop, or authenticate Devin.
   hra account logout <profile>
   hra account list
-  hra account show <profile> [--provider <codex|claude|devin>]
+  hra account show <profile> [--provider <codex|claude>]
+  hra account show <profile> --provider devin  (retired local history and cleanup only)
   hra account usage [profile] [--refresh]
   hra account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]
   hra account switch <profile>
   hra account switch-recover
 
 Platform:
-  Codex and Devin account commands run on macOS and Linux. Claude login and status
+  Codex account commands run on macOS and Linux. Claude login and status
   require Linux; macOS refuses before launching Claude.
 
 Examples:
   hra account add personal
   hra account login personal --device-code --handoff-file /private/path/login.json
   hra account login personal --provider claude
-  hra account login personal --provider devin --manual-token-flow
   hra account show personal --provider claude
   hra account login-cancel personal
   hra account usage personal --refresh
@@ -408,7 +399,7 @@ Usage:
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
-  hra session start <account> [--project <project>] [--provider <codex|claude|devin>] [--preset <low|high|ultra|fable-max|astra>] [--fast]
+  hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]
   hra session send|queue|steer <session> [--attach <path>]... <message>
   hra session stop|recover|abandon <session>
   hra session archive|unarchive <session>
@@ -419,8 +410,8 @@ Usage:
   hra session rename <session> <name>
   hra session note get|edit|clear <session>
   hra session note set <session> <note>
-  hra session preset <session> <low|high|ultra|fable-max|astra>
-  hra session switch <session> --provider <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>] [--account <account>]
+  hra session preset <session> <low|high|ultra|fable-max>
+  hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]
   hra session export <session> [--format <trajectory|json>] [--out <path>]
   hra session fast <session> <on|off>
   hra session project <session> <project>
@@ -435,7 +426,6 @@ Examples:
   hra session start personal --provider claude --preset fable-max
   hra session adoption enable personal --provider codex
   hra session discover --provider codex
-  hra session start personal --provider devin --preset astra
   hra session switch my-session --provider claude
   hra session export my-session --format trajectory --out ./trajectory.json
   hra session watch my-session
@@ -491,8 +481,8 @@ Usage:
   hra remote send|queue|steer <cloud-session> <message>
   hra remote stop <cloud-session>
   hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <decline>
-  hra remote preset <cloud-session> <low|high|ultra|fable-max|astra>
-  hra remote provider <cloud-session> <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>]
+  hra remote preset <cloud-session> <low|high|ultra|fable-max>
+  hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]
   hra remote fast <cloud-session> <on|off>
   hra remote allow|deny <device-commands|account-linking>
   hra remote policy
@@ -740,11 +730,11 @@ const repeatedOption = (cursor: Cursor, name: string, limit: number): readonly s
   }
 };
 
-const selectedProvider = (value: string | undefined): Provider => {
+const selectedProvider = (value: string | undefined): SupportedProvider => {
   if (value === undefined) throw new CliUsageError("Missing value for --provider.");
-  const parsed = providerSchema.safeParse(value);
+  const parsed = supportedProviderSchema.safeParse(value);
   if (!parsed.success) {
-    throw new CliUsageError(`Provider must be one of: ${providerSchema.options.map((entry) => `\`${entry}\``).join(", ")}.`);
+    throw new CliUsageError(`Provider must be one of: ${supportedProviderSchema.options.map((entry) => `\`${entry}\``).join(", ")}.`);
   }
   return parsed.data;
 };
@@ -760,10 +750,10 @@ const selectedAdoptableProvider = (value: string | undefined): AdoptableProvider
   return parsed.data;
 };
 
-const selectedPreset = (value: string): Preset => {
-  const parsed = presetSchema.safeParse(value);
+const selectedPreset = (value: string): SupportedPreset => {
+  const parsed = supportedPresetSchema.safeParse(value);
   if (!parsed.success) {
-    throw new CliUsageError(`Preset must be one of: ${presetSchema.options.map((entry) => `\`${entry}\``).join(", ")}.`);
+    throw new CliUsageError(`Preset must be one of: ${supportedPresetSchema.options.map((entry) => `\`${entry}\``).join(", ")}.`);
   }
   return parsed.data;
 };
@@ -963,18 +953,6 @@ export const claudeAccountLoginAbandonCommand = (
   "--acknowledge-child-exited",
 ].join(" ");
 
-export const devinAccountLoginCommand = (
-  account: string,
-  manualTokenFlow: boolean,
-  idempotencyKey?: string,
-): string => [
-  "hra account login",
-  shellArgument(account),
-  "--provider devin",
-  ...(manualTokenFlow ? ["--manual-token-flow"] : []),
-  ...(idempotencyKey === undefined ? [] : ["--idempotency-key", idempotencyKey]),
-].join(" ");
-
 export const devinAccountLoginAbandonCommand = (
   account: string,
   attemptId: string,
@@ -1080,13 +1058,15 @@ const parseAccount = (
   cursor: Cursor,
   idempotencyKey: string | undefined,
   json: boolean,
-): LocalCommand | AccountLoginCliInvocation | ClaudeAccountAuthCliInvocation | DevinAccountAuthCliInvocation => {
+): LocalCommand | AccountLoginCliInvocation | ClaudeAccountAuthCliInvocation => {
   const action = take(cursor, "account action");
   switch (action) {
     case "list": finish(cursor); return { kind: "account.list" };
     case "add": { const label = remainder(cursor, "account label"); return command({ kind: "account.add", label }); }
     case "show": {
-      const provider = selectedProvider(option(cursor, "--provider") ?? "codex");
+      const requestedProvider = option(cursor, "--provider") ?? "codex";
+      // Retired-provider inspection exposes local history and pending cleanup only.
+      const provider = requestedProvider === "devin" ? "devin" : selectedProvider(requestedProvider);
       const account = take(cursor, "account");
       finish(cursor);
       if (provider !== "codex") {
@@ -1099,7 +1079,6 @@ const parseAccount = (
     }
     case "login": {
       const deviceCode = flag(cursor, "--device-code");
-      const manualTokenFlow = flag(cursor, "--manual-token-flow");
       const handoffFile = option(cursor, "--handoff-file");
       const provider = selectedProvider(option(cursor, "--provider") ?? "codex");
       const account = take(cursor, "account");
@@ -1107,9 +1086,6 @@ const parseAccount = (
       if (provider === "claude") {
         if (deviceCode) {
           throw new CliUsageError("Claude Code does not expose a device-code login. Run the foreground Claude login without --device-code.");
-        }
-        if (manualTokenFlow) {
-          throw new CliUsageError("--manual-token-flow is available only for Devin login.");
         }
         if (handoffFile !== undefined) {
           throw new CliUsageError("Claude login is a foreground terminal flow and does not accept --handoff-file.");
@@ -1128,36 +1104,6 @@ const parseAccount = (
           kind: "account.claude-login",
           replayCommand: claudeAccountLoginCommand(parsed.account, parsed.idempotencyKey),
         };
-      }
-      if (provider === "devin") {
-        if (deviceCode) {
-          throw new CliUsageError("Devin CLI does not expose a device-code login. Use --manual-token-flow for its headless token handoff.");
-        }
-        if (handoffFile !== undefined) {
-          throw new CliUsageError("Devin login is a foreground terminal flow and does not accept --handoff-file.");
-        }
-        const parsed = command({
-          kind: "account.devin-login.prepare",
-          account,
-          idempotencyKey: idempotencyKey ?? randomUUID(),
-          manualTokenFlow,
-        });
-        if (parsed.kind !== "account.devin-login.prepare") {
-          throw new CliUsageError("Devin account login command is invalid.");
-        }
-        return {
-          command: parsed,
-          json,
-          kind: "account.devin-login",
-          replayCommand: devinAccountLoginCommand(
-            parsed.account,
-            parsed.manualTokenFlow,
-            parsed.idempotencyKey,
-          ),
-        };
-      }
-      if (manualTokenFlow) {
-        throw new CliUsageError("--manual-token-flow is available only for Devin login.");
       }
       if (handoffFile !== undefined && (!isAbsolute(handoffFile) || resolve(handoffFile) !== handoffFile)) {
         throw new CliUsageError("--handoff-file must be an absolute normalized path to an existing protected file.");
@@ -1185,7 +1131,9 @@ const parseAccount = (
       };
     }
     case "login-cancel": {
-      const provider = selectedProvider(option(cursor, "--provider") ?? "codex");
+      const requestedProvider = option(cursor, "--provider") ?? "codex";
+      // The sole retired-provider mutation acknowledges an existing child has exited.
+      const provider = requestedProvider === "devin" ? "devin" : selectedProvider(requestedProvider);
       if (provider !== "codex") {
         const acknowledgeChildExited = flag(cursor, "--acknowledge-child-exited");
         const attemptId = option(cursor, "--attempt-id");
@@ -1474,7 +1422,7 @@ const parseSession = (
     case "start": {
       const project = option(cursor, "--project");
       const provider = selectedProvider(option(cursor, "--provider") ?? DEFAULT_PROVIDER);
-      const preset = option(cursor, "--preset") ?? defaultPresetForProvider(provider);
+      const preset = selectedPreset(option(cursor, "--preset") ?? defaultPresetForProvider(provider));
       const fast = flag(cursor, "--fast");
       const account = take(cursor, "account");
       finish(cursor);
@@ -1542,7 +1490,7 @@ const parseSession = (
     case "recover": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.recover", session }; }
     case "abandon": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.abandon", session }; }
     case "note": return parseSessionNote(cursor);
-    case "preset": { const session = take(cursor, "session"); const preset = take(cursor, "preset"); finish(cursor); return command({ kind: "session.preset", session, preset }); }
+    case "preset": { const session = take(cursor, "session"); const preset = selectedPreset(take(cursor, "preset")); finish(cursor); return command({ kind: "session.preset", session, preset }); }
     case "export": {
       const format = option(cursor, "--format") ?? "trajectory";
       const out = option(cursor, "--out");
@@ -1573,7 +1521,7 @@ const parseSession = (
         kind: "session.switch",
         session,
         provider: selected,
-        ...(preset === undefined ? {} : { preset }),
+        ...(preset === undefined ? {} : { preset: selectedPreset(preset) }),
         ...(account === undefined ? {} : { account }),
       });
     }
@@ -2187,7 +2135,6 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     if (
       account.kind === "account.login-handoff"
       || account.kind === "account.claude-login"
-      || account.kind === "account.devin-login"
     ) return account;
     parsed = account;
   }

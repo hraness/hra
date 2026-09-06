@@ -30,12 +30,13 @@ import {
   observedAccountTokenVelocity,
   type StoredAccountUsageSnapshot,
 } from "../domain/usage-metrics";
-import { createAttemptId, utf8Bytes } from "../domain/values";
+import { createAttemptId, createQueueId, utf8Bytes } from "../domain/values";
 import { canTransitionQueue, queueStateSchema, type QueueState } from "../domain/transitions";
 import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 import { presetRequirements } from "../domain/presets";
 import {
   effectiveClaudeRuntimeProfileSchema,
+  effectiveDevinRuntimeProfileSchema,
   effectiveRuntimeProfileSchema,
 } from "../domain/runtime-profile";
 import { initializeProfilePaths, initializeStatePaths, resolveStatePaths } from "./paths";
@@ -189,6 +190,39 @@ async function fixture(
   stores.push(store);
   return { store, home };
 }
+
+/** Exact v39 storage fixture, never an admission path for a new Devin session. */
+const seedLegacyDevinSession = (
+  store: StateStore,
+  input: Parameters<StateStore["createSession"]>[0],
+) => {
+  const session = store.createSession({ ...input, provider: "codex", preset: "ultra" });
+  const database = new Database(store.paths.database, { create: false, strict: true });
+  try {
+    database.query("UPDATE sessions SET provider_v39='devin' WHERE id=?").run(session.id);
+  } finally {
+    database.close(false);
+  }
+  return store.requireSession(session.id);
+};
+
+/** A pending send retained from a build that still admitted this provider. */
+const seedLegacyDevinQueue = (store: StateStore, sessionId: Parameters<StateStore["enqueue"]>[0]) => {
+  const id = createQueueId();
+  const database = new Database(store.paths.database, { create: false, strict: true });
+  try {
+    database.transaction(() => {
+      const sequence = z.object({ sequence: z.number().int().positive() }).parse(database.query(
+        "UPDATE queue_sequence_authority SET next_sequence=next_sequence+1 WHERE singleton=1 RETURNING next_sequence-1 AS sequence",
+      ).get()).sequence;
+      database.query("INSERT INTO queue_entries(id,session_id,message,state,enqueue_sequence,created_at,updated_at) VALUES (?,?,'legacy pending send','pending',?,1000,1000)")
+        .run(id, sessionId, sequence);
+    }).immediate();
+  } finally {
+    database.close(false);
+  }
+  return store.requireQueue(id);
+};
 
 const dropProviderSwitchProgressSchema = (database: Database): void => {
   database.exec(`
@@ -6385,6 +6419,124 @@ describe("StateStore", () => {
     })).toThrow("CLAUDE_LOGIN_NOT_UNSETTLED");
   });
 
+  test("retains cleanup-only terminalization of exact quiescent historical Devin authority", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Devin relink");
+    const created = seedLegacyDevinSession(store, {
+      fastEnabled: false,
+      preset: "astra",
+      profileId: profile.id,
+      provider: "devin",
+    });
+    let session = store.bindSession({
+      expectedRevision: created.revision,
+      providerThreadId: "devin-thread-relink",
+      sessionId: created.id,
+      state: "idle",
+    });
+    const input = {
+      accountId: profile.id,
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration,
+      sessionId: session.id,
+    } as const;
+
+    expect(store.canReleaseIdleDevinSessionForAccountLogin({
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+    })).toBe(true);
+    expect(store.canReleaseIdleClaudeSessionForAccountLogin({
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+    })).toBe(false);
+    session = store.setSessionTurnState({
+      activeTurnId: "devin-turn-relink",
+      expectedRevision: session.revision,
+      sessionId: session.id,
+      state: "active",
+    });
+    expect(store.canReleaseIdleDevinSessionForAccountLogin({
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+    })).toBe(false);
+    expect(() => store.terminalizeIdleDevinSessionForAccountLogin(input))
+      .toThrow("DEVIN_LOGIN_SESSION_NOT_QUIESCENT");
+    session = store.setSessionTurnState({
+      expectedRevision: session.revision,
+      sessionId: session.id,
+      state: "idle",
+    });
+    expect(() => store.enqueue(session.id, "new send is forbidden")).toThrow("PROVIDER_RETIRED:devin");
+    const queued = seedLegacyDevinQueue(store, session.id);
+    expect(store.canReleaseIdleDevinSessionForAccountLogin({
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+    })).toBe(false);
+    expect(() => store.terminalizeIdleDevinSessionForAccountLogin(input))
+      .toThrow("DEVIN_LOGIN_SESSION_NOT_QUIESCENT");
+    expect(store.requireSession(session.id)).toMatchObject({ state: "idle" });
+    expect(store.requireQueue(queued.id)).toMatchObject({ state: "pending" });
+
+    expect(store.transitionQueue(queued.id, "pending", "cancelled")).toBe(true);
+    expect(store.terminalizeIdleDevinSessionForAccountLogin(input)).toMatchObject({
+      changed: true,
+      event: {
+        body: { activeTurnId: null, status: "terminal", type: "session_status" },
+      },
+      interactions: [],
+      session: { provider: "devin", state: "terminal" },
+    });
+  });
+
+  test("retains exact legacy Devin login authority for acknowledged abandonment only", async () => {
+    const { store, home } = await fixture();
+    const profile = store.createProfile("Legacy Devin foreground auth");
+    const key = "00000000-0000-4000-8000-000000000617";
+    const attemptId = createAttemptId();
+    const evidence = { kind: "account.devin-login", provider: "devin", baselineSignedIn: false };
+    const evidenceJson = JSON.stringify(evidence);
+    const request = { kind: "account.devin-login", authorityId: profile.id,
+      authorityGeneration: profile.processGeneration, request: { provider: "devin" } };
+    const database = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      database.transaction(() => {
+        database.query("INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,?,?,?,?,'prepared',1000,1000)")
+          .run(attemptId, key, request.kind, profile.id, profile.processGeneration,
+            createHash("sha256").update(JSON.stringify(request)).digest("hex"));
+        database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,1000)")
+          .run(attemptId, request.kind, evidenceJson, createHash("sha256").update(evidenceJson).digest("hex"));
+        database.query("UPDATE mutation_attempts SET state='effect_started' WHERE id=?").run(attemptId);
+      }).immediate();
+    } finally {
+      database.close(false);
+    }
+    expect(store.readMutation(key)).toMatchObject({ state: "effect_started", evidence: { evidence } });
+    expect(store.providerAuthorityAdvanceBlocker(profile.id, "devin")).toBe("unsettled_authority");
+    expect(store.providerAuthorityAdvanceBlocker(profile.id, "codex")).toBe("unsettled_authority");
+    expect(() => store.nextProfileGeneration(profile.id)).toThrow("DEVIN_LOGIN_AUTHORITY_UNSETTLED");
+    store.close();
+
+    const restarted = new StateStore(resolveStatePaths({ homeDirectory: home, platform: "darwin" }));
+    stores.push(restarted);
+    restarted.nextDaemonGeneration(`boot_${"d".repeat(32)}`);
+    expect(restarted.recoverEffectStartedMutations()).toEqual({ recovered: [attemptId], unresolved: [] });
+    const abandon = { attemptId, idempotencyKey: key, profileId: profile.id,
+      profileGeneration: profile.processGeneration, acknowledgeChildExited: true as const };
+    expect(() => restarted.abandonDevinLoginMutation({ ...abandon, profileGeneration: profile.processGeneration + 1 }))
+      .toThrow("DEVIN_LOGIN_AUTHORITY_MISMATCH");
+    expect(restarted.abandonDevinLoginMutation(abandon)).toMatchObject({ acknowledgedChildExited: true });
+    expect(restarted.abandonDevinLoginMutation(abandon)).toMatchObject({ acknowledgedChildExited: true });
+    expect(restarted.readMutation(key)).toMatchObject({
+      state: "reconciled", originalState: "ambiguous", resolution: { kind: "abandoned" }, evidence: { evidence },
+    });
+    expect(restarted.providerAuthorityAdvanceBlocker(profile.id, "devin")).toBeNull();
+    expect(() => restarted.prepareMutation({ ...request, idempotencyKey: "00000000-0000-4000-8000-000000000618" }))
+      .toThrow("PROVIDER_RETIRED:devin");
+  });
   test("classifies effect-started authorities at restart and rejects new keys", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Restart recovery", "restart@example.com");
@@ -9066,6 +9218,91 @@ describe("StateStore", () => {
       .toBe("gpt-5.6-sol");
   });
 
+  test("keeps mixed v39 history readable while rejecting new retired-provider effects", async () => {
+    const { store } = await fixture();
+    const account = signInProfile(store, "Mixed provider archive", "archive@example.com");
+    const codex = store.createSession({ profileId: account.id, preset: "high", fastEnabled: false });
+    const claude = store.createSession({ profileId: account.id, provider: "claude", preset: "fable-max", fastEnabled: false });
+    const created = seedLegacyDevinSession(store, { profileId: account.id, preset: "astra", fastEnabled: false });
+    const devin = store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
+      providerThreadId: "legacy-devin-thread", state: "idle" });
+    expect(store.sessionAccountAuthorityMatches(devin.id, account.id)).toBe(false);
+    expect(store.listLocalSessionPage({ profileId: account.id, after: null, limit: 10,
+      requireCurrentAccountAuthority: true }).sessions).not.toContainEqual(devin);
+    expect(store.listLocalSessionPage({ profileId: account.id, after: null, limit: 10 }).sessions)
+      .toContainEqual(devin);
+    const runtimeProfile = effectiveDevinRuntimeProfileSchema.parse({
+      profileId: account.id, processGeneration: account.processGeneration, observedAt: 1000,
+      preset: "astra", model: "gpt-6-astra", reasoningEffort: "provider-default",
+      devinVersion: "3000.6.14", protocolVersion: 1, isolatedHome: true,
+    });
+    const archivedProfile = store.recordSessionRuntimeProfile({
+      sessionId: devin.id, sourceKind: "session_start", sourceId: "legacy-devin-start", profile: runtimeProfile,
+    });
+    const usage = store.appendSessionEvent({
+      sessionId: devin.id, accountId: account.id, providerGeneration: account.processGeneration,
+      providerConnectionId: null, body: { type: "token_usage", turnId: null, inputTokens: null,
+        cachedInputTokens: null, outputTokens: null, reasoningOutputTokens: null, totalTokens: 42,
+        modelContextWindow: 200000, providerCost: { amount: 0.5, currency: "USD" } },
+    });
+    const queue = seedLegacyDevinQueue(store, devin.id);
+    const mutation = store.prepareMutation({
+      kind: "session.send", authorityId: devin.id, authorityGeneration: account.processGeneration,
+      request: { message: "rejected" }, idempotencyKey: "00000000-0000-4000-8000-0000000006b3",
+    });
+    expect(() => store.createSession({ profileId: account.id, provider: "devin", preset: "astra", fastEnabled: false }))
+      .toThrow("PROVIDER_RETIRED:devin");
+    expect(() => store.upsertProviderSession({ profileId: account.id, provider: "devin",
+      providerThreadId: "rejected-import", title: "Rejected import", preset: "astra",
+      fastEnabled: false, state: "idle" })).toThrow("PROVIDER_RETIRED:devin");
+    expect(() => store.setDefaultPreset("astra")).toThrow();
+    expect(() => store.enqueue(devin.id, "rejected")).toThrow("PROVIDER_RETIRED:devin");
+    expect(() => store.updateSessionMetadata({ sessionId: devin.id, expectedRevision: devin.revision, preset: "astra" }))
+      .toThrow("PROVIDER_RETIRED:devin");
+    expect(() => store.beginSessionMutationEffect({
+      attemptId: mutation.id, sessionId: devin.id, profileGeneration: account.processGeneration,
+      evidence: { kind: "session.send", providerThreadId: "legacy-devin-thread",
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: mutation.id, messageDigest: "a".repeat(64), runtimeProfile },
+    })).toThrow("PROVIDER_RETIRED:devin");
+    expect(() => store.beginQueueEffect({
+      queueId: queue.id, sessionId: devin.id, profileGeneration: account.processGeneration,
+      evidence: { kind: "queue.dispatch", queueId: queue.id, sessionId: devin.id,
+        providerThreadId: "legacy-devin-thread", profileGeneration: account.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: queue.id, messageDigest: "a".repeat(64), runtimeProfile },
+    })).toThrow("PROVIDER_RETIRED:devin");
+    expect(store.readMutation("00000000-0000-4000-8000-0000000006b3")).toMatchObject({ state: "prepared" });
+    expect(store.requireQueue(queue.id)).toMatchObject({ state: "pending", message: "legacy pending send" });
+    const inspect = () => {
+      const database = new Database(store.paths.database, { readonly: true, strict: true });
+      try {
+        return {
+          version: database.query("PRAGMA user_version").get(),
+          sessions: database.query("SELECT id,provider,provider_v39,preset,preset_contract FROM sessions ORDER BY id").all(),
+          profiles: database.query("SELECT profile_json FROM session_runtime_profiles ORDER BY session_id,revision").all(),
+          events: database.query("SELECT * FROM session_events WHERE session_id=? ORDER BY sequence").all(devin.id),
+          mutations: database.query("SELECT * FROM mutation_attempts ORDER BY id").all(),
+          queue: database.query("SELECT * FROM queue_entries ORDER BY id").all(),
+        };
+      } finally { database.close(false); }
+    };
+    const before = inspect();
+    store.close();
+    const reopened = new StateStore(store.paths, { now: () => 2000 });
+    stores.push(reopened);
+    expect(reopened.requireSession(codex.id).provider).toBe("codex");
+    expect(reopened.requireSession(claude.id).provider).toBe("claude");
+    expect(reopened.requireSession(devin.id)).toMatchObject({ provider: "devin", preset: "astra" });
+    expect(reopened.latestSessionRuntimeProfile(devin.id)).toEqual(archivedProfile);
+    expect(reopened.listSessionEvents({ sessionId: devin.id, afterSequence: null, limit: 10, now: 2000 }).events).toContainEqual(usage);
+    expect(inspect()).toEqual(before);
+    const readonly = new StateStore(store.paths, { readonly: true });
+    stores.push(readonly);
+    expect(readonly.requireSession(devin.id).provider).toBe("devin");
+    expect(readonly.latestSessionRuntimeProfile(devin.id)?.profile).toEqual(runtimeProfile);
+    expect(inspect()).toEqual(before);
+  });
   test("refuses a session-start evidence row whose profile names another provider", async () => {
     const { store, home } = await fixture();
     const profile = signInProfile(store, "Mismatch", "mismatch@example.com");
@@ -9345,7 +9582,7 @@ describe("StateStore", () => {
     expect(store.transitionQueue(first.id, "dispatching", "failed")).toBe(true);
     expect(store.nextPendingQueue(session.id)?.id).toBe(second.id);
     expect(() => store.enqueue(`sess_${"f".repeat(32)}`, "must roll back"))
-      .toThrow("session provider account authority is not current");
+      .toThrow(SelectionError);
     const third = store.enqueue(session.id, "third");
 
     const inspector = new Database(paths.database, { create: false, strict: true });
@@ -15702,7 +15939,7 @@ describe("StateStore", () => {
   test("migrates the exact protected-main provider-v39 predecessor to adoption v40", async () => {
     const { store } = await fixture();
     const profile = store.createProfile("Provider v39 Devin");
-    const session = store.createSession({
+    const session = seedLegacyDevinSession(store, {
       profileId: profile.id,
       provider: "devin",
       preset: "astra",

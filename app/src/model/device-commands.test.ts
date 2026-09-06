@@ -87,7 +87,6 @@ describe("device command builders", () => {
     expect(defaultSessionStartPreset).toBe("ultra");
     expect(defaultSessionStartPresetForProvider("codex")).toBe("ultra");
     expect(defaultSessionStartPresetForProvider("claude")).toBe("fable-max");
-    expect(defaultSessionStartPresetForProvider("devin")).toBe("astra");
   });
 
   test("builds a session start that the daemon parser accepts", () => {
@@ -111,7 +110,6 @@ describe("device command builders", () => {
     const providerPresets = [
       ["codex", "high"],
       ["claude", "fable-max"],
-      ["devin", "astra"],
     ] as const;
     for (const [provider, preset] of providerPresets) {
       expect(accepted(sessionStartCommand({
@@ -127,14 +125,18 @@ describe("device command builders", () => {
       ["codex", "astra"],
       ["claude", "ultra"],
       ["devin", "fable-max"],
+      ["devin", "astra"],
     ] as const) {
-      expect(() => sessionStartCommand({
+      const stale = {
         accountPublicId: `acct_${provider}00001`,
         preset,
         projectPublicId: "proj_alpha000001",
         prompt: "continue",
         provider,
-      })).toThrow("The device command payload is not valid.");
+      };
+      expect(() => sessionStartCommand(
+        stale as unknown as Parameters<typeof sessionStartCommand>[0],
+      )).toThrow("The device command payload is not valid.");
     }
   });
 
@@ -366,14 +368,12 @@ describe("session start targets", () => {
     expect(sessionStartTargetLabel(codex)).toBe("Work — Studio — Codex");
     expect(sessionStartTargetHint(codex)).not.toContain("Linux custodian");
 
-    const devin = sessionStartTargets([machine({
+    const retiredTargets = sessionStartTargets([machine({
       accounts: [
         { label: "Build", provider: "devin", publicId: "acct_devin000001", status: "signed_in" },
       ],
-    })])[0];
-    if (devin === undefined) throw new Error("expected Devin target");
-    expect(sessionStartTargetLabel(devin)).toBe("Build — Studio — Devin");
-    expect(sessionStartTargetHint(devin)).not.toContain("Linux custodian");
+    })]);
+    expect(retiredTargets).toEqual([]);
   });
 });
 
