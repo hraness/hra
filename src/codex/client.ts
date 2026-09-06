@@ -19,6 +19,7 @@ import {
   IndeterminateCodexEffectError,
 } from "./errors.ts";
 import { JsonLineDecoder } from "./jsonl.ts";
+import { CodexConnectionEffects } from "./session-effects.ts";
 import { record, safeInteger, string } from "./parse.ts";
 import type { CodexProcess } from "./process.ts";
 import {
@@ -122,9 +123,6 @@ interface PendingRequest {
   readonly bypassAccountAuthorityBarrier: boolean;
   readonly parseAndResolve: (value: unknown, authority: CodexAuthority) => void;
   readonly reject: (reason: unknown) => void;
-  readonly timeout: ReturnType<typeof setTimeout>;
-  readonly signal?: AbortSignal;
-  readonly onAbort?: () => void;
   dispatched: boolean;
   responseReceived: boolean;
 }
@@ -311,11 +309,7 @@ export class CodexAppServerClient {
   readonly #pending = new Map<number, PendingRequest>();
   readonly #serverRequests = new Map<string, PendingServerRequest>();
   readonly #dynamicRequestDigests = new Map<string, string>();
-  readonly #inboundDynamicRequests = new Set<Promise<void>>();
-  readonly #inboundServerRequests = new Set<Promise<void>>();
-  readonly #inboundResponseSettlements = new Set<Promise<void>>();
-  #factTail: Promise<void> = Promise.resolve();
-  #writeTail: Promise<void> = Promise.resolve();
+  readonly #effects = new CodexConnectionEffects();
   readonly #writeQueue: PendingFrameWrite[] = [];
   #writeDrainActive = false;
   #writeBarrierWake: (() => void) | null = null;
@@ -1179,25 +1173,7 @@ export class CodexAppServerClient {
     this.#failPending(new CodexError("PROCESS_EXITED", "Codex is shutting down"));
     this.#emitDisconnected("closed");
 
-    let terminated = false;
-    try {
-      this.#process.terminate();
-      terminated = await resolvesWithin(this.#process.exited, this.#shutdownTermGraceMs);
-    } catch {
-      this.#onSafeDiagnostic("Codex TERM failed; forcing process termination");
-    }
-    if (!terminated) {
-      try {
-        this.#process.forceTerminate();
-      } catch {
-        this.#onSafeDiagnostic("Codex force termination failed");
-      }
-    }
-
-    const inboundDynamicRequests = Promise.all([...this.#inboundDynamicRequests]);
-    const inboundServerRequests = Promise.all([...this.#inboundServerRequests]);
-    const inboundResponseSettlements = Promise.all([...this.#inboundResponseSettlements]);
-    const [
+    const {
       exitSettled,
       readSettled,
       factsSettled,
@@ -1205,17 +1181,11 @@ export class CodexAppServerClient {
       inboundSettled,
       serverRequestsSettled,
       responsesSettled,
-    ] = await Promise.all([
-      resolvesWithin(this.#process.exited, this.#shutdownSettlementMs),
-      this.#readTask === null
-        ? Promise.resolve(true)
-        : settlesWithin(this.#readTask, this.#shutdownSettlementMs),
-      settlesWithin(this.#factTail, this.#shutdownSettlementMs),
-      settlesWithin(this.#writeTail, this.#shutdownSettlementMs),
-      settlesWithin(inboundDynamicRequests, this.#shutdownSettlementMs),
-      settlesWithin(inboundServerRequests, this.#shutdownSettlementMs),
-      settlesWithin(inboundResponseSettlements, this.#shutdownSettlementMs),
-    ]);
+    } = await this.#effects.shutdown(this.#process, this.#readTask, {
+      termGraceMs: this.#shutdownTermGraceMs,
+      settlementMs: this.#shutdownSettlementMs,
+      diagnostic: this.#onSafeDiagnostic,
+    });
     if (!exitSettled) this.#onSafeDiagnostic("Codex process exit did not settle after termination");
     if (!readSettled) this.#onSafeDiagnostic("Codex stdout did not settle after termination");
     if (!factsSettled) this.#onSafeDiagnostic("HRA fact delivery did not settle after Codex termination");
@@ -1235,6 +1205,7 @@ export class CodexAppServerClient {
         "Codex process exit could not be proven after force termination",
       );
     }
+    await this.#effects.close();
     this.#state = "closed";
   }
 
@@ -1294,43 +1265,31 @@ export class CodexAppServerClient {
       throw new CodexError("PROCESS_EXITED", "Codex is shutting down");
     }
     const id = this.#allocateRequestId();
-    let exactPending: PendingRequest | undefined;
-    const promise = new Promise<FencedCodexValue<T>>((resolvePromise, rejectPromise) => {
-      const timeout = setTimeout(() => {
+    const completion = this.#effects.completion<FencedCodexValue<T>>("requests", {
+      deadlineMs: descriptor.deadlineMs,
+      ...(signal === undefined ? {} : { signal }),
+      onDeadline: () => {
         const pending = this.#takePending(id);
         if (pending === undefined) return;
-        if (descriptor.lostResponse === "reconcile" && pending.dispatched) {
-          rejectPromise(new IndeterminateCodexEffectError(descriptor.method, id));
-        } else {
-          rejectPromise(new CodexError("TIMEOUT", `${descriptor.method} timed out`));
-        }
-      }, descriptor.deadlineMs);
-      const onAbort = signal === undefined
-        ? undefined
-        : () => {
-          const pending = this.#takePending(id);
-          if (pending !== undefined) pending.reject(abortReason(signal));
-        };
-      exactPending = {
-        id,
-        descriptor,
-        bypassAccountAuthorityBarrier,
-        parseAndResolve: (value, authority) => {
-          resolvePromise({ authority, value: parse(value) });
-        },
-        reject: rejectPromise,
-        timeout,
-        ...(signal === undefined ? {} : { signal }),
-        ...(onAbort === undefined ? {} : { onAbort }),
-        dispatched: false,
-        responseReceived: false,
-      };
-      this.#pending.set(id, exactPending);
-      if (signal !== undefined && onAbort !== undefined) {
-        signal.addEventListener("abort", onAbort, { once: true });
-        if (signal.aborted) onAbort();
-      }
+        pending.reject(descriptor.lostResponse === "reconcile" && pending.dispatched
+          ? new IndeterminateCodexEffectError(descriptor.method, id)
+          : new CodexError("TIMEOUT", `${descriptor.method} timed out`));
+      },
+      onAbort: () => { this.#takePending(id); },
     });
+    const exactPending: PendingRequest = {
+      id,
+      descriptor,
+      bypassAccountAuthorityBarrier,
+      parseAndResolve: (value, authority) => {
+        completion.succeed({ authority, value: parse(value) });
+      },
+      reject: completion.reject,
+      dispatched: false,
+      responseReceived: false,
+    };
+    this.#pending.set(id, exactPending);
+    const promise = completion.start();
 
     try {
       const write = this.#writeFrame(
@@ -1342,7 +1301,7 @@ export class CodexAppServerClient {
           bypassAccountAuthorityBarrier,
           beforeWrite: () => {
             throwIfAborted(signal);
-            if (exactPending === undefined || this.#pending.get(id) !== exactPending) {
+            if (this.#pending.get(id) !== exactPending) {
               throw new CodexError("TIMEOUT", `${descriptor.method} expired before dispatch`);
             }
             exactPending.dispatched = true;
@@ -1473,9 +1432,9 @@ export class CodexAppServerClient {
 
   async #readLoop(): Promise<void> {
     try {
-      for await (const chunk of this.#process.stdout) {
+      await this.#effects.read(this.#process.stdout, async chunk => {
         for (const message of this.#decoder.push(chunk)) await this.#handleMessage(message);
-      }
+      }, () => { this.#onSafeDiagnostic("Codex stdout iterator cleanup failed"); });
       for (const message of this.#decoder.finish()) await this.#handleMessage(message);
       if (this.#state !== "closing" && this.#state !== "closed") {
         const error = new CodexError("PROCESS_EXITED", "Codex stdout reached EOF");
@@ -1531,24 +1490,24 @@ export class CodexAppServerClient {
     if (this.#state !== "ready") return;
     if (message.id !== undefined) {
       if (method === "item/tool/call") {
-        if (this.#inboundDynamicRequests.size >= INBOUND_DYNAMIC_REQUEST_LIMIT) {
+        if (this.#effects.count("dynamic") >= INBOUND_DYNAMIC_REQUEST_LIMIT) {
           this.#quarantineConnection("Codex exceeded the bounded dynamic-tool request limit");
           return;
         }
         this.#trackInboundDynamicRequest(
-          this.#handleConversationAutomationToolCall(
+          () => this.#handleConversationAutomationToolCall(
             message.id,
             message.params ?? {},
           ),
         );
         return;
       }
-      if (this.#inboundServerRequests.size >= INBOUND_DYNAMIC_REQUEST_LIMIT) {
+      if (this.#effects.count("server") >= INBOUND_DYNAMIC_REQUEST_LIMIT) {
         this.#quarantineConnection("Codex exceeded the bounded server-request handling limit");
         return;
       }
       this.#trackInboundServerRequest(
-        this.#handleServerRequest(message.id, method, message.params ?? {}),
+        () => this.#handleServerRequest(message.id, method, message.params ?? {}),
       );
       return;
     }
@@ -1589,12 +1548,11 @@ export class CodexAppServerClient {
     pending.responseReceived = true;
     const deferForAccountAuthority = !pending.bypassAccountAuthorityBarrier
       && this.#accountAuthorityWriteBarrier !== null;
-    const settlement = this.#settleResponse(message, pending, id);
     if (deferForAccountAuthority) {
-      this.#trackInboundResponseSettlement(settlement);
+      this.#trackInboundResponseSettlement(() => this.#settleResponse(message, pending, id));
       return;
     }
-    await settlement;
+    await this.#settleResponse(message, pending, id);
   }
 
   async #settleResponse(
@@ -1689,21 +1647,12 @@ export class CodexAppServerClient {
     );
   }
 
-  #trackInboundResponseSettlement(task: Promise<void>): void {
-    const tracked = task.then(
-      () => undefined,
-      (error: unknown) => {
-        if (this.#state !== "ready") return;
-        this.#onSafeDiagnostic(
-          error instanceof Error
-            ? `Codex response settlement failed: ${error.name}`
-            : "Codex response settlement failed",
-        );
-      },
-    );
-    this.#inboundResponseSettlements.add(tracked);
-    void tracked.then(() => {
-      this.#inboundResponseSettlements.delete(tracked);
+  #trackInboundResponseSettlement(task: () => Promise<void>): void {
+    this.#effects.track("responses", task, (error) => {
+      if (this.#state !== "ready") return;
+      this.#onSafeDiagnostic(error instanceof Error
+        ? `Codex response settlement failed: ${error.name}`
+        : "Codex response settlement failed");
     });
   }
 
@@ -1816,39 +1765,25 @@ export class CodexAppServerClient {
     }
   }
 
-  #trackInboundDynamicRequest(task: Promise<void>): void {
-    const tracked = task.then(
-      () => undefined,
-      () => {
-        if (this.#state !== "ready") return;
-        try {
-          this.#quarantineConnection("HRA dynamic-tool request handling failed");
-        } catch {
-          this.#onSafeDiagnostic("HRA could not terminate a failed dynamic-tool connection");
-        }
-      },
-    );
-    this.#inboundDynamicRequests.add(tracked);
-    void tracked.then(() => {
-      this.#inboundDynamicRequests.delete(tracked);
+  #trackInboundDynamicRequest(task: () => Promise<void>): void {
+    this.#effects.track("dynamic", task, () => {
+      if (this.#state !== "ready") return;
+      try {
+        this.#quarantineConnection("HRA dynamic-tool request handling failed");
+      } catch {
+        this.#onSafeDiagnostic("HRA could not terminate a failed dynamic-tool connection");
+      }
     });
   }
 
-  #trackInboundServerRequest(task: Promise<void>): void {
-    const tracked = task.then(
-      () => undefined,
-      () => {
-        if (this.#state !== "ready") return;
-        try {
-          this.#quarantineConnection("Codex server-request handling failed");
-        } catch {
-          this.#onSafeDiagnostic("HRA could not terminate a failed server-request connection");
-        }
-      },
-    );
-    this.#inboundServerRequests.add(tracked);
-    void tracked.then(() => {
-      this.#inboundServerRequests.delete(tracked);
+  #trackInboundServerRequest(task: () => Promise<void>): void {
+    this.#effects.track("server", task, () => {
+      if (this.#state !== "ready") return;
+      try {
+        this.#quarantineConnection("Codex server-request handling failed");
+      } catch {
+        this.#onSafeDiagnostic("HRA could not terminate a failed server-request connection");
+      }
     });
   }
 
@@ -2054,18 +1989,14 @@ export class CodexAppServerClient {
 
   #enqueueFact(fact: CodexFact, accountAuthoritySignaled = false): Promise<void> {
     if (!accountAuthoritySignaled) this.#signalAccountAuthority(fact);
-    const task = this.#factTail.then(async () => {
+    return this.#effects.fact(async () => {
       if (!(await this.#authorityIsCurrent())) return;
       await this.#onFact({ authority: this.#authority, value: fact });
+    }, (error) => {
+      this.#onSafeDiagnostic(error instanceof Error
+        ? `HRA fact observer failed: ${error.name}`
+        : "HRA fact observer failed");
     });
-    this.#factTail = task.catch((error: unknown) => {
-      this.#onSafeDiagnostic(
-        error instanceof Error
-          ? `HRA fact observer failed: ${error.name}`
-          : "HRA fact observer failed",
-      );
-    });
-    return task;
   }
 
   #signalAccountAuthority(fact: CodexFact): boolean {
@@ -2124,14 +2055,10 @@ export class CodexAppServerClient {
       throw new CodexError("PROTOCOL_LIMIT", "outbound Codex frame exceeded its byte limit");
     }
     const bytes = this.#encoder.encode(`${serialized}\n`);
-    let resolveWrite!: () => void;
-    let rejectWrite!: (reason?: unknown) => void;
-    const write = new Promise<void>((resolve, reject) => {
-      resolveWrite = resolve;
-      rejectWrite = reject;
-    });
-    const settled = write.catch(() => undefined);
-    this.#writeTail = Promise.all([this.#writeTail, settled]).then(() => undefined);
+    const completion = this.#effects.completion<undefined>("writes");
+    const write = completion.start();
+    // The request owns the rejection; shutdown joins the connection's fiber set.
+    void write.catch(() => undefined);
     this.#writeQueue.push({
       bytes,
       bypassAccountAuthorityBarrier:
@@ -2140,8 +2067,8 @@ export class CodexAppServerClient {
       ...(options.beforeWriteAsync === undefined
         ? {}
         : { beforeWriteAsync: options.beforeWriteAsync }),
-      resolve: resolveWrite,
-      reject: rejectWrite,
+      resolve: () => { completion.succeed(undefined); },
+      reject: completion.reject,
     });
     this.#wakeWriteBarrier();
     this.#startWriteDrain();
@@ -2296,10 +2223,6 @@ export class CodexAppServerClient {
     const pending = this.#pending.get(id);
     if (pending === undefined) return undefined;
     this.#pending.delete(id);
-    clearTimeout(pending.timeout);
-    if (pending.signal !== undefined && pending.onAbort !== undefined) {
-      pending.signal.removeEventListener("abort", pending.onAbort);
-    }
     return pending;
   }
 
@@ -2481,40 +2404,4 @@ function boundedShutdownDuration(value: number, label: string): number {
     throw new CodexError("INVALID_INPUT", `${label} must be between 1 and 30000 milliseconds`);
   }
   return value;
-}
-
-async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<false>((resolveTimeout) => {
-    timer = setTimeout(() => resolveTimeout(false), timeoutMs);
-  });
-  try {
-    return await Promise.race([
-      promise.then(
-        () => true as const,
-        () => true as const,
-      ),
-      timeout,
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
-async function resolvesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<false>((resolveTimeout) => {
-    timer = setTimeout(() => resolveTimeout(false), timeoutMs);
-  });
-  try {
-    return await Promise.race([
-      promise.then(
-        () => true as const,
-        () => false as const,
-      ),
-      timeout,
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
 }

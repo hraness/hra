@@ -1,5 +1,6 @@
 # Contents
 
+- `check-effect-architecture.ts` and its paired fixtures constrain the reviewed Effect programs; `check-codex-effect-architecture.ts` owns the Codex module-role policy.
 - Build scripts compile the CLI and generate the static website.
 - Check scripts verify package contents, README parity, dependencies, release metadata, and the absence of file-level import cycles under `src/`.
 - `check-security-primitives.ts` compares per-file counts of load-bearing security primitives against the reviewed `security-primitives.json` table; a count changes only with a deliberate `--update` after review.
