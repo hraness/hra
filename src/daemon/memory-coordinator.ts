@@ -31,7 +31,12 @@ import {
   ohProjectionVariableV1,
   type OhProjectionTermV1,
 } from "@hraness/oh/projection";
-import { parseOhHeadRefV1, parseOhHeadV1, type OhHeadV1 } from "@hraness/oh/store";
+import {
+  isOhOperationSizeError,
+  parseOhHeadRefV1,
+  parseOhHeadV1,
+  type OhHeadV1,
+} from "@hraness/oh/store";
 
 import {
   type HraMemoryExplainInput,
@@ -39,15 +44,32 @@ import {
   type HraMemoryRememberInput,
   type HraMemoryShareInput,
 } from "../domain/host-tools.ts";
+import {
+  memoryPageContentDigest,
+  memoryPageKeyDigest,
+  memoryPagePhysicalKey,
+  memoryPageUserKey,
+} from "../domain/memory-page.ts";
 import { createFactsMemoryBinding, type FactsMemoryHead } from "../domain/facts-memory.ts";
+import {
+  createPortableProjectMemoryCanonicalIdentity,
+  deriveProjectMemoryCanonicalIdentity,
+  HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
+  PROJECT_MEMORY_DESTINATION_PURPOSE,
+  PROJECT_MEMORY_EMPTY_HEAD,
+} from "../domain/project-memory.ts";
 import { projectIdSchema, sessionIdSchema } from "../domain/values.ts";
 import { factsMemorySessionDirectory } from "../storage/local-facts-memory-broker.ts";
 import {
   digestOhHead,
+  inspectOhCanonicalDatabaseForRecovery,
+  OhCanonicalDatabaseInspectionError,
   OhFactsMemoryCustodyError,
   projectOhHead,
   type OhMemoryStoreOperationResult,
+  type OhSqliteDatabaseFileIdentity,
   type OhSqliteFactsMemoryEngine,
+  type OhWorkingMemoryStoreOperationResult,
   type OpenOhMemoryStores,
 } from "../storage/oh-facts-memory-engine.ts";
 import { ensurePrivateDirectory, type StatePaths } from "../storage/paths.ts";
@@ -59,6 +81,8 @@ import {
   type StateStore,
 } from "../storage/state-store.ts";
 import type { HraFactsMemoryLifecyclePort } from "./facts-memory-lifecycle.ts";
+import type { HraCanonicalMemorySyncPort } from "./canonical-memory-sync.ts";
+import { ProjectMemorySerialExecutor } from "./project-memory-serial.ts";
 
 const MEMORY_QUERY_CACHE_LIMIT = 128;
 const MEMORY_QUERY_CACHE_BYTES = 32 * 1024 * 1024;
@@ -75,7 +99,6 @@ const MEMORY_INDEX_TOKEN_LIMIT = 12;
 const MEMORY_PAGE_RELATION = "hra.memory.page";
 const MEMORY_TOKEN_RELATION = "hra.memory.token";
 const MEMORY_NOMINATION_ID = "hra.memory.share";
-const MEMORY_DESTINATION_PURPOSE = "hra.project.canonical";
 const MEMORY_SNAPSHOT_RECORD_LIMIT = 8_192;
 const MAX_DATE_MILLISECONDS = 8_640_000_000_000_000;
 const MEMORY_SEARCH_POLICY = Object.freeze({
@@ -94,6 +117,7 @@ export type HraMemoryRefusalCode =
   | "MEMORY_QUERY_EXPIRED"
   | "MEMORY_RECOVERY_REQUIRED"
   | "MEMORY_SEARCH_TERM_LIMIT"
+  | "MEMORY_SESSION_REFUSED"
   | "MEMORY_SHARE_ATTESTATION_REFUSED"
   | "MEMORY_SHARE_CLOSURE_REFUSED";
 
@@ -133,14 +157,12 @@ export interface HraMemoryPort {
   close(): Promise<void>;
 }
 
-type MemoryContext = Readonly<{
+type MemoryQueryScope = "composite" | "working";
+
+type WorkingMemoryContext = Readonly<{
   actorId: string;
   actorSessionId: string;
   canonicalAuthorityId: string;
-  canonicalDirectory: string;
-  canonicalRealmId: string;
-  canonicalSpaceId: string;
-  control: ProjectMemoryAuthorityRecord | null;
   projectId: string;
   working: Readonly<{
     binding: ReturnType<typeof createFactsMemoryBinding>;
@@ -151,6 +173,21 @@ type MemoryContext = Readonly<{
   workingAuthorityId: string;
 }>;
 
+type MemoryContext = WorkingMemoryContext & Readonly<{
+  canonicalDirectory: string;
+  canonicalExpectedDatabaseFile?: OhSqliteDatabaseFileIdentity;
+  canonicalRealmId: string;
+  canonicalRequireExisting: boolean;
+  canonicalSpaceId: string;
+  control: ProjectMemoryAuthorityRecord;
+}>;
+
+const isCompositeMemoryContext = (
+  context: WorkingMemoryContext,
+): context is MemoryContext =>
+  Object.hasOwn(context, "control")
+  && Object.hasOwn(context, "canonicalDirectory");
+
 type CachedQuery = Readonly<{
   actorSessionId: string;
   bytes: number;
@@ -159,13 +196,14 @@ type CachedQuery = Readonly<{
   expiresAtMonotonic: number;
   projectId: string;
   rows: readonly Readonly<Record<string, unknown>>[];
+  scope: MemoryQueryScope;
   workingBindingDigest: string;
 }>;
 
 type GetDataset = Readonly<{
   actorSessionId: string;
   bytes: number;
-  canonicalHead: ProjectMemoryHeadRef;
+  canonicalHead: ProjectMemoryHeadRef | null;
   conflicts: Readonly<Record<string, unknown>>;
   createdAt: number;
   explanations: readonly Readonly<Record<string, unknown>>[];
@@ -175,6 +213,7 @@ type GetDataset = Readonly<{
   pageQueryIds: Map<number, string>;
   projectId: string;
   rows: readonly Readonly<Record<string, unknown>>[];
+  scope: MemoryQueryScope;
   workingBindingDigest: string;
   workingHead: ProjectMemoryHeadRef;
 }>;
@@ -395,8 +434,7 @@ const memoryIndexTokens = (input: Readonly<{
   return [...selected].sort();
 };
 
-const userKey = (recordKey: string): string | null =>
-  recordKey.startsWith("edition:") ? recordKey.slice("edition:".length) : null;
+const userKey = memoryPageUserKey;
 
 const MEMORY_FACT_EXTRACTOR: OhMemoryFactExtractorV1 = Object.freeze({
   extractorId: "hra.memory.page",
@@ -448,17 +486,11 @@ const MEMORY_FACT_EXTRACTOR: OhMemoryFactExtractorV1 = Object.freeze({
 const codecs = (): OhRecordCodecRegistry => new OhRecordCodecRegistry()
   .register(OH_MEMORY_PAGE_RECORD_CODEC_V1);
 
-const physicalKey = (key: string): string => `edition:${key}`;
+const physicalKey = memoryPagePhysicalKey;
 
-const memoryContentDigest = (value: HraMemoryRememberInput): string => canonicalSha256({
-  body: value.body,
-  language: value.language ?? null,
-  summary: value.summary,
-  title: value.title,
-  v: 1,
-});
+const memoryContentDigest = memoryPageContentDigest;
 
-const memoryKeyDigest = (key: string): string => canonicalSha256({ key, v: 1 });
+const memoryKeyDigest = memoryPageKeyDigest;
 
 const memoryAttestationSha256 = (input: Readonly<{
   actorId: string;
@@ -549,6 +581,19 @@ const factsHeadsEqual = (
   && left.operationSha256 === right.operationSha256
   && left.digest === right.digest;
 
+const retryableMemoryStoreFailure = (error: unknown): boolean => {
+  if (error instanceof AggregateError) {
+    return error.errors.some((entry) => retryableMemoryStoreFailure(entry));
+  }
+  if (!(error instanceof Error)) return false;
+  if (new Set([
+    "FACTS_MEMORY_OH_DATABASE_BUSY",
+    "FACTS_MEMORY_OH_DATABASE_LIMIT_UNAVAILABLE",
+    "FACTS_MEMORY_OH_DATABASE_UNAVAILABLE",
+  ]).has(error.message)) return true;
+  return error.cause !== undefined && retryableMemoryStoreFailure(error.cause);
+};
+
 const canonicalCustodyFailure = (error: unknown): boolean => {
   if (error instanceof AggregateError) {
     return error.errors.some((entry) => canonicalCustodyFailure(entry));
@@ -560,6 +605,7 @@ const canonicalCustodyFailure = (error: unknown): boolean => {
     "FACTS_MEMORY_OH_CANONICAL_HEAD_EQUIVOCATION",
     "FACTS_MEMORY_OH_CANONICAL_HEAD_REGRESSION",
     "FACTS_MEMORY_OH_CANONICAL_INTEGRITY_ERROR",
+    "FACTS_MEMORY_OH_CANONICAL_MULTIPLE_SPACES_REFUSED",
     "PROJECT_MEMORY_AUTHORITY_CONFLICT",
     "PROJECT_MEMORY_HEAD_CONFLICT",
     "PROJECT_MEMORY_UNBOUND_NONEMPTY_AUTHORITY",
@@ -762,6 +808,9 @@ const shareSubmissionResult = (
       },
     };
   }
+  if (record.outcomeCode === "share_too_large") {
+    return { ...base, code: "MEMORY_SHARE_TOO_LARGE" };
+  }
   return {
     ...base,
     code: record.state === "cancelled"
@@ -785,7 +834,8 @@ type MemoryRecoveryResolution =
         nominatedRecordSha256: string;
       }>;
       kind: "settle";
-      outcomeCode: "remember_not_applied" | "share_conflict" | "share_not_applied";
+      outcomeCode: "remember_not_applied" | "share_conflict" | "share_not_applied"
+        | "share_too_large";
       state: "failed";
     }>
   | Readonly<{
@@ -848,7 +898,8 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
   readonly #getDatasets = new Map<string, GetDataset>();
   #getBytes = 0;
   readonly #store: StateStore;
-  readonly #tails = new Map<string, Promise<unknown>>();
+  readonly #sync: HraCanonicalMemorySyncPort | undefined;
+  readonly #projectSerial: ProjectMemorySerialExecutor;
   readonly #workingTtlMs: number;
   #closed = false;
 
@@ -859,7 +910,9 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     monotonicNow?: () => number;
     now?: () => number;
     paths: StatePaths;
+    projectSerial?: ProjectMemorySerialExecutor;
     store: StateStore;
+    sync?: HraCanonicalMemorySyncPort;
     workingTtlMs?: number;
   }>) {
     this.#continuationKey = Uint8Array.from(input.continuationKey ?? randomBytes(32));
@@ -871,7 +924,9 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     this.#monotonicNow = input.monotonicNow ?? (() => performance.now());
     this.#now = input.now ?? Date.now;
     this.#paths = input.paths;
+    this.#projectSerial = input.projectSerial ?? new ProjectMemorySerialExecutor();
     this.#store = input.store;
+    this.#sync = input.sync;
     this.#workingTtlMs = input.workingTtlMs ?? MEMORY_WORKING_TTL_MS;
   }
 
@@ -891,12 +946,21 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         }
         if (current.state !== "effect_started" && current.state !== "ambiguous") continue;
         try {
-          await this.#withProject(current.actorSessionId, async (context) => {
-            if (context.projectId !== current.projectId) {
-              throw new Error("MEMORY_SUBMISSION_PROJECT_CHANGED");
-            }
-            await this.#recoverSubmission(context, current.id);
-          });
+          if (current.kind === "remember") {
+            await this.#withWorkingProject(current.actorSessionId, async (context) => {
+              if (context.projectId !== current.projectId) {
+                throw new Error("MEMORY_SUBMISSION_PROJECT_CHANGED");
+              }
+              await this.#recoverRememberSubmission(context, current.id);
+            }, { allowNonoperationalSession: true });
+          } else {
+            await this.#withProject(current.actorSessionId, async (context) => {
+              if (context.projectId !== current.projectId) {
+                throw new Error("MEMORY_SUBMISSION_PROJECT_CHANGED");
+              }
+              await this.#recoverSubmission(context, current.id);
+            }, { allowNonoperationalSession: true });
+          }
         } catch {
           this.#markAmbiguous(current, current.state);
         }
@@ -904,6 +968,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       if (page.nextCursor === undefined) break;
       after = page.nextCursor;
     }
+    await this.#sync?.recover();
   }
 
   async status(input: Readonly<{
@@ -939,7 +1004,9 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         sessionId: currentSession.id,
         projectId,
         canonical: {
-          initialized: control !== null,
+          initialized: control?.physicalState === "initialized",
+          physicalState: control?.physicalState ?? null,
+          identityContract: control?.identityContract ?? null,
           authorityDigest: control?.authorityDigest ?? null,
           bindingDigest: control?.bindingDigest ?? null,
           expectedHead: control === null ? null : publicHead(control.head),
@@ -989,12 +1056,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       };
     };
     if (projectId === null) return read();
-    const prior = this.#tails.get(projectId) ?? Promise.resolve();
-    const current = prior.catch(() => undefined).then(read);
-    this.#tails.set(projectId, current);
-    return await current.finally(() => {
-      if (this.#tails.get(projectId) === current) this.#tails.delete(projectId);
-    });
+    return await this.#projectSerial.run(projectId, async () => read());
   }
 
   remember(input: Readonly<{
@@ -1006,11 +1068,12 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     const actorSessionId = sessionIdSchema.parse(input.actorSessionId);
     const contentDigest = memoryContentDigest(input.value);
     const keyDigest = memoryKeyDigest(input.value.key);
-    return this.#withProject(actorSessionId, async (context) => {
+    return this.#withWorkingProject(actorSessionId, async (context) => {
+      const attempt = { cancelPreparedOnFailure: false };
       let submission: MemorySubmissionRecord | undefined;
       let expectedState: "effect_started" | "ambiguous" | undefined;
       try {
-        const opened = await this.#withStores(context, async (stores, control) => {
+        const opened = await this.#withWorkingStores(context, async (stores) => {
           const prepared = this.#prepareSubmission({
             actorSessionId,
             contentDigest,
@@ -1023,11 +1086,12 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             workingBindingDigest: context.working.binding.bindingDigest,
             workingEpoch: context.working.binding.epoch,
           });
+          attempt.cancelPreparedOnFailure = !prepared.replay;
           submission = prepared.record;
           if (prepared.record.state !== "prepared"
             && prepared.record.state !== "effect_started"
             && prepared.record.state !== "ambiguous") {
-            return { control, terminal: prepared.record } as const;
+            return { terminal: prepared.record } as const;
           }
           if (prepared.record.state !== "prepared") {
             throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
@@ -1096,7 +1160,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             operationId,
             submissionId: prepared.record.id,
           });
-          const begun = this.#store.beginMemorySubmission(
+          const begun = this.#beginSubmission(
             prepared.record.id,
             input.idempotencyKey,
           );
@@ -1121,12 +1185,8 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
           if (receipt.operationSha256 !== receipt.head.operationSha256) {
             throw new Error("MEMORY_REMEMBER_RECEIPT_HEAD_MISMATCH");
           }
-          return { control, recordSha256: record.recordSha256, receipt, terminal: null } as const;
+          return { recordSha256: record.recordSha256, receipt, terminal: null } as const;
         });
-        const observedCanonicalHead = toProjectHead(opened.canonicalHead);
-        if (!projectHeadsEqual(observedCanonicalHead, opened.result.control.head)) {
-          this.#recordCanonicalDivergence(context.projectId);
-        }
         if (opened.result.terminal !== null) {
           return rememberSubmissionResult(opened.result.terminal, true, input.value.key);
         }
@@ -1161,17 +1221,23 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         }
         return rememberSubmissionResult(settled, false, input.value.key);
       } catch (error: unknown) {
-        if (expectedState === undefined && submission?.state === "prepared") {
+        if (
+          attempt.cancelPreparedOnFailure
+          && expectedState === undefined
+          && submission?.state === "prepared"
+        ) {
           try {
             this.#store.cancelPreparedMemorySubmission(submission.id);
           } catch {
             // Keep the primary pre-effect failure.
           }
-        } else {
+        } else if (submission?.state !== "prepared") {
           this.#markAmbiguous(submission, expectedState);
-          const recoveryContext = await this.#context(context.actorSessionId).catch(() => null);
+          const recoveryContext = await this.#workingContext(context.actorSessionId, true)
+            .catch(() => null);
           if (recoveryContext !== null) {
-            await this.#recoverSubmission(recoveryContext, submission?.id).catch(() => undefined);
+            await this.#recoverRememberSubmission(recoveryContext, submission?.id)
+              .catch(() => undefined);
           }
         }
         throw error;
@@ -1184,54 +1250,57 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     value: HraMemoryQueryInput;
   }>): Promise<Readonly<Record<string, unknown>>> {
     const actorSessionId = sessionIdSchema.parse(input.actorSessionId);
-    const getKey = input.value.mode === "get" ? input.value.key : null;
-    const getContinuation = input.value.mode === "get" ? input.value.continuation : undefined;
-    return this.#withProject(actorSessionId, async (context) => {
-      this.#assertProjectRecovered(context.projectId);
+    const scope = input.value.scope ?? "composite";
+    const execute = async (context: WorkingMemoryContext) =>
+      await this.#queryScoped(context, actorSessionId, input.value, scope);
+    return scope === "working"
+      ? this.#withWorkingProject(actorSessionId, execute)
+      : this.#withProject(actorSessionId, execute);
+  }
+
+  async #queryScoped(
+    context: WorkingMemoryContext,
+    actorSessionId: string,
+    value: HraMemoryQueryInput,
+    scope: MemoryQueryScope,
+  ): Promise<Readonly<Record<string, unknown>>> {
+      if (scope === "composite") this.#assertProjectRecovered(context.projectId);
+      const getKey = value.mode === "get" ? value.key : null;
+      const getContinuation = value.mode === "get" ? value.continuation : undefined;
       if (getKey !== null && getContinuation !== undefined) {
-        const opened = await this.#withStores(context, async () =>
-          await this.#continueGet(context, getKey, getContinuation));
-        const control = this.#store.readProjectMemoryAuthority(context.projectId);
-        const observedCanonicalHead = toProjectHead(opened.canonicalHead);
-        if (control === null || !projectHeadsEqual(observedCanonicalHead, control.head)) {
-          this.#recordCanonicalDivergence(context.projectId);
-          throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
-        }
-        if (!projectHeadsEqual(toProjectHead(opened.workingHead), {
-          headDigest: context.working.expectedHead.digest,
-          operationSha256: context.working.expectedHead.operationSha256,
-          sequence: context.working.expectedHead.sequence,
-        })) throw new HraMemoryRefusalError("MEMORY_CONTINUATION_REFUSED");
+        const opened = await this.#withQueryStores(context, scope, async () =>
+          await this.#continueGet(context, getKey, getContinuation, scope));
+        this.#assertQueryAuthorityUnchanged(context, scope, opened);
         return opened.result;
       }
       try {
-        const opened = await this.#withStores(context, async (stores, control) => {
+        const opened = await this.#withQueryStores(context, scope, async (stores) => {
           const authority = await this.#authority(context, stores, this.#now());
-          const tokens = input.value.mode === "search"
-            ? memoryQueryTokens(input.value.text)
+          const tokens = value.mode === "search"
+            ? memoryQueryTokens(value.text)
             : [];
           if (tokens.length > MEMORY_QUERY_TOKEN_LIMIT) {
             throw new HraMemoryRefusalError("MEMORY_SEARCH_TERM_LIMIT");
           }
           if (
-            input.value.mode === "search"
+            value.mode === "search"
             && tokens.length === 0
-            && input.value.continuation !== undefined
+            && value.continuation !== undefined
           ) throw new HraMemoryRefusalError("MEMORY_CONTINUATION_REFUSED");
-          if (input.value.mode === "search" && tokens.length === 0) {
-            return { control, emptySearch: true, explanations: [], query: null } as const;
+          if (value.mode === "search" && tokens.length === 0) {
+            return { emptySearch: true, explanations: [], query: null } as const;
           }
-          const programId = input.value.mode === "list"
+          const programId = value.mode === "list"
             ? "hra.memory.list"
-            : input.value.mode === "get"
+            : value.mode === "get"
               ? "hra.memory.get"
               : `hra.memory.search-${String(tokens.length)}`;
-          const bindings: Record<string, JsonPrimitive> = input.value.mode === "get"
-            ? { lookup_key: input.value.key }
+          const bindings: Record<string, JsonPrimitive> = value.mode === "get"
+            ? { lookup_key: value.key }
             : Object.fromEntries(tokens.map((token, index) => [`token${index + 1}`, token]));
-          const continuation = input.value.mode === "get"
+          const continuation = value.mode === "get"
             ? null
-            : input.value.continuation ?? null;
+            : value.continuation ?? null;
           const query = await authority.agent.query({
             bindings,
             continuation,
@@ -1245,9 +1314,8 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
               token: query.explainCapability.token,
               v: 2,
             }))));
-          if (input.value.mode !== "get") {
+          if (value.mode !== "get") {
             return {
-              control,
               emptySearch: false,
               explanations,
               materialized: null,
@@ -1263,6 +1331,9 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             const lane = metadata.lane;
             if (lane !== "canonical" && lane !== "working") {
               throw new Error("MEMORY_RESULT_LANE_INVALID");
+            }
+            if (scope === "working" && lane !== "working") {
+              throw new Error("MEMORY_WORKING_ONLY_RESULT_LANE_INVALID");
             }
             const selected = stores[lane];
             const snapshot = await selected.store.snapshot({
@@ -1297,7 +1368,6 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             });
           }
           return {
-            control,
             emptySearch: false,
             explanations: materializedExplanations,
             materialized: materializedRows,
@@ -1305,29 +1375,26 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             tokens,
           } as const;
         });
-        const observedCanonicalHead = toProjectHead(opened.canonicalHead);
-        if (!projectHeadsEqual(observedCanonicalHead, opened.result.control.head)) {
-          this.#recordCanonicalDivergence(context.projectId);
-          throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
-        }
-        const canonicalHead = opened.result.control.head;
+        this.#assertQueryAuthorityUnchanged(context, scope, opened);
+        const canonicalHead = opened.control?.head ?? null;
+        const authorityFields = this.#queryAuthorityFields(context, scope, opened.control);
         const workingHead = toProjectHead(opened.workingHead);
         if (opened.result.emptySearch) {
           return {
             version: 1,
             ok: true,
-            mode: input.value.mode,
+            mode: value.mode,
             queryId: null,
             rows: [],
             continuation: null,
             matchedTokens: [],
             searchPolicy: MEMORY_SEARCH_POLICY,
-            canonicalHead: publicHead(canonicalHead),
+            ...authorityFields,
             workingHead: publicHead(workingHead),
           };
         }
         const result = opened.result.query;
-        if (input.value.mode === "get") {
+        if (value.mode === "get") {
           const dataset = this.#createGetDataset({
             actorSessionId,
             canonicalHead,
@@ -1336,6 +1403,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             explanations: opened.result.explanations,
             key: getKey ?? (() => { throw new Error("MEMORY_GET_KEY_LOST"); })(),
             rows: opened.result.materialized ?? [],
+            scope,
             workingHead,
           });
           return this.#getPage(context, dataset, 0);
@@ -1343,6 +1411,9 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         const id = queryId();
         const rows = result.rows.map((row, rowIndex) => {
           const metadata = metadataRow(row.values);
+          if (scope === "working" && metadata.lane !== "working") {
+            throw new Error("MEMORY_WORKING_ONLY_RESULT_LANE_INVALID");
+          }
           return {
             row: rowIndex,
             ...this.#annotateProvenance(
@@ -1355,20 +1426,20 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             supportCount: row.supportCount,
           };
         });
-        this.#cacheQuery(id, context, opened.result.explanations);
+        this.#cacheQuery(id, context, opened.result.explanations, scope);
         return {
           version: 1,
           ok: true,
-          mode: input.value.mode,
+          mode: value.mode,
           queryId: id,
           rows,
           continuation: result.continuation,
           page: result.page,
           conflicts: result.conflicts,
-          ...(input.value.mode === "search"
+          ...(value.mode === "search"
             ? { matchedTokens: opened.result.tokens, searchPolicy: MEMORY_SEARCH_POLICY }
             : {}),
-          canonicalHead: publicHead(canonicalHead),
+          ...authorityFields,
           workingHead: publicHead(workingHead),
         };
       } catch (error: unknown) {
@@ -1377,7 +1448,39 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         }
         throw error;
       }
-    });
+  }
+
+  #assertQueryAuthorityUnchanged(
+    context: WorkingMemoryContext,
+    scope: MemoryQueryScope,
+    opened: Readonly<{
+      canonicalHead: OhHeadV1 | null;
+      control: ProjectMemoryAuthorityRecord | null;
+      workingHead: OhHeadV1;
+    }>,
+  ): void {
+    if (scope === "composite") {
+      if (opened.control === null || opened.canonicalHead === null) {
+        throw new Error("MEMORY_CANONICAL_QUERY_AUTHORITY_MISSING");
+      }
+      const observedCanonicalHead = toProjectHead(opened.canonicalHead);
+      if (!this.#canonicalHeadMatchesControlOrAuthorizedPull(
+        context.projectId,
+        opened.control.bindingDigest,
+        observedCanonicalHead,
+        opened.control.head,
+      )) {
+        this.#recordCanonicalDivergence(context.projectId);
+        throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+      }
+    } else if (opened.control !== null || opened.canonicalHead !== null) {
+      throw new Error("MEMORY_WORKING_ONLY_CANONICAL_EXPOSURE");
+    }
+    if (!projectHeadsEqual(toProjectHead(opened.workingHead), {
+      headDigest: context.working.expectedHead.digest,
+      operationSha256: context.working.expectedHead.operationSha256,
+      sequence: context.working.expectedHead.sequence,
+    })) throw new HraMemoryRefusalError("MEMORY_CONTINUATION_REFUSED");
   }
 
   async explain(input: Readonly<{
@@ -1387,39 +1490,114 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     if (this.#closed) throw new Error("MEMORY_COORDINATOR_CLOSED");
     const actorSessionId = sessionIdSchema.parse(input.actorSessionId);
     this.#pruneQueries();
-    const query = this.#queries.get(input.value.queryId);
-    const explanation = query?.rows[input.value.row];
-    const session = this.#store.requireSession(actorSessionId);
-    if (
-      query === undefined
-      || query.actorSessionId !== actorSessionId
-      || session.projectId !== query.projectId
-      || query.expiresAtMonotonic <= this.#monotonicNow()
-      || explanation === undefined
-    ) throw new HraMemoryRefusalError("MEMORY_QUERY_EXPIRED");
-    const context = await this.#context(actorSessionId);
-    this.#assertProjectRecovered(context.projectId);
-    if (context.working.binding.bindingDigest !== query.workingBindingDigest) {
-      throw new HraMemoryRefusalError("MEMORY_QUERY_EXPIRED");
-    }
-    return {
-      version: 1,
-      ok: true,
-      queryId: input.value.queryId,
-      row: input.value.row,
-      explanation,
+    const cached = this.#queries.get(input.value.queryId);
+    const scope: MemoryQueryScope = cached?.actorSessionId === actorSessionId
+      ? cached.scope
+      : "composite";
+    const execute = async (context: WorkingMemoryContext) => {
+      this.#pruneQueries();
+      const query = this.#queries.get(input.value.queryId);
+      const explanation = query?.rows[input.value.row];
+      if (
+        query === undefined
+        || query.actorSessionId !== actorSessionId
+        || query.projectId !== context.projectId
+        || query.expiresAtMonotonic <= this.#monotonicNow()
+        || explanation === undefined
+      ) throw new HraMemoryRefusalError("MEMORY_QUERY_EXPIRED");
+      if (query.scope === "composite") this.#assertProjectRecovered(context.projectId);
+      if (context.working.binding.bindingDigest !== query.workingBindingDigest) {
+        throw new HraMemoryRefusalError("MEMORY_QUERY_EXPIRED");
+      }
+      return {
+        version: 1,
+        ok: true,
+        queryId: input.value.queryId,
+        row: input.value.row,
+        explanation,
+        ...this.#queryAuthorityFields(
+          context,
+          query.scope,
+          isCompositeMemoryContext(context) ? context.control : null,
+        ),
+      };
     };
+    return scope === "working"
+      ? this.#withWorkingProject(actorSessionId, execute)
+      : this.#withProject(actorSessionId, execute);
   }
 
-  share(input: Readonly<{
+  async share(input: Readonly<{
     actorSessionId: string;
     idempotencyKey: string;
     requestDigest: string;
     value: HraMemoryShareInput;
   }>): Promise<Readonly<Record<string, unknown>>> {
     const actorSessionId = sessionIdSchema.parse(input.actorSessionId);
+    const initialSession = this.#store.requireSession(actorSessionId);
+    if (initialSession.state === "terminal") {
+      throw new HraMemoryRefusalError("MEMORY_SESSION_REFUSED");
+    }
+    if (initialSession.state === "recovery_required") {
+      throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+    }
+    if (initialSession.projectId === undefined) {
+      throw new HraMemoryRefusalError("MEMORY_PROJECT_REFUSED");
+    }
+    const initialProjectId = projectIdSchema.parse(initialSession.projectId);
+    const contentDigest = canonicalSha256({ reason: input.value.reason, v: 1 });
     const keyDigest = memoryKeyDigest(input.value.key);
-    return this.#withProject(actorSessionId, async (context) => {
+    const retained = this.#store.readMemorySubmissionByIdempotencyKey(input.idempotencyKey);
+    if (
+      retained !== null
+      && retained.state !== "prepared"
+      && retained.state !== "effect_started"
+      && retained.state !== "ambiguous"
+    ) {
+      // A terminal row is the complete effect receipt. Validate every durable
+      // actor/project/request/content/key binding through the same transaction
+      // used by ordinary replay, but do not require hosted availability or
+      // reopen Oh merely to return a response that was already settled.
+      const replay = this.#prepareSubmission({
+        actorSessionId,
+        contentDigest,
+        expectedHead: retained.expectedHead,
+        idempotencyKey: input.idempotencyKey,
+        keyDigest,
+        kind: "share",
+        projectId: initialProjectId,
+        requestDigest: input.requestDigest,
+        workingBindingDigest: retained.workingBindingDigest,
+        workingEpoch: retained.workingEpoch,
+      });
+      if (
+        !replay.replay
+        || replay.record.state === "prepared"
+        || replay.record.state === "effect_started"
+        || replay.record.state === "ambiguous"
+      ) throw new Error("MEMORY_SUBMISSION_TERMINAL_REPLAY_LOST");
+      return shareSubmissionResult(replay.record, true, input.value.key);
+    }
+    const initialAttachment = this.#store.readCanonicalMemoryHostedAttachment(initialProjectId);
+    const initialAuthority = this.#store.readProjectMemoryAuthority(initialProjectId);
+    if (
+      this.#quarantinedProjects.has(initialProjectId)
+      || initialAttachment?.state === "conflict"
+      || initialAttachment?.state === "error"
+      || initialAuthority?.syncState === "conflict"
+      || initialAuthority?.syncState === "error"
+    ) throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+    if (
+      initialAttachment !== null
+      && initialAttachment.state !== "detached"
+      && this.#sync === undefined
+    ) throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+    await this.#sync?.synchronizeProject({
+      projectId: initialProjectId,
+      reason: "before_canonical_mutation",
+    });
+    const result = await this.#withProject(actorSessionId, async (context) => {
+      const attempt = { cancelPreparedOnFailure: false };
       let submission: MemorySubmissionRecord | undefined;
       let expectedState: "effect_started" | "ambiguous" | undefined;
       try {
@@ -1428,7 +1606,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             input.idempotencyKey,
           );
           if (priorSubmission === null) {
-            this.#assertProjectRecovered(context.projectId);
+            this.#assertCanonicalMutationAvailable(context.projectId);
             const observedHead = parseOhHeadV1(await stores.canonical.store.head());
             if (observedHead === null) throw new Error("MEMORY_CANONICAL_HEAD_INVALID");
             const observedProjectHead = toProjectHead(observedHead);
@@ -1439,7 +1617,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
           }
           const prepared = this.#prepareSubmission({
             actorSessionId,
-            contentDigest: canonicalSha256({ reason: input.value.reason, v: 1 }),
+            contentDigest,
             expectedHead: control.head,
             idempotencyKey: input.idempotencyKey,
             keyDigest,
@@ -1449,11 +1627,17 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             workingBindingDigest: context.working.binding.bindingDigest,
             workingEpoch: context.working.binding.epoch,
           });
+          attempt.cancelPreparedOnFailure = priorSubmission === null && !prepared.replay;
           submission = prepared.record;
           if (prepared.record.state !== "prepared"
             && prepared.record.state !== "effect_started"
             && prepared.record.state !== "ambiguous") {
-            return { conflict: null, receipt: null, terminal: prepared.record } as const;
+            return {
+              conflict: null,
+              receipt: null,
+              sizeRefusal: null,
+              terminal: prepared.record,
+            } as const;
           }
           if (prepared.record.state !== "prepared") {
             throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
@@ -1461,6 +1645,13 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
           if (control.syncState === "conflict" || control.syncState === "error") {
             throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
           }
+          // A prepared share is replayable, but it is not yet authorized to
+          // cross a hosted-sync fence. Recheck after loading that durable row:
+          // a sync intent may have won after preparation and before dispatch.
+          if (this.#store.isCanonicalMemoryMutationFenced(context.projectId)) {
+            throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+          }
+          this.#assertHostedCanonicalHeadCurrent(context.projectId);
           if (!projectHeadsEqual(prepared.record.expectedHead, control.head)) {
             throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
           }
@@ -1509,7 +1700,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             sourceHead,
             submissionId: prepared.record.id,
           });
-          const begun = this.#store.beginMemorySubmission(
+          const begun = this.#beginSubmission(
             prepared.record.id,
             input.idempotencyKey,
           );
@@ -1521,23 +1712,66 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
               nomination,
               v: 1,
             });
-            return { conflict: null, pageRecordSha256: page.recordSha256,
-              receipt, terminal: null } as const;
+            return {
+              conflict: null,
+              pageRecordSha256: page.recordSha256,
+              receipt,
+              sizeRefusal: null,
+              terminal: null,
+            } as const;
           } catch (error: unknown) {
+            if (isOhOperationSizeError(error)) {
+              return {
+                conflict: null,
+                receipt: null,
+                sizeRefusal: error,
+                terminal: null,
+              } as const;
+            }
             if (!(error instanceof OhMemoryAdoptionConflictError)) throw error;
-            return { conflict: error.conflict, receipt: null, terminal: null } as const;
+            return {
+              conflict: error.conflict,
+              receipt: null,
+              sizeRefusal: null,
+              terminal: null,
+            } as const;
           }
         });
         const canonicalHead = toProjectHead(opened.canonicalHead);
         if (opened.result.terminal !== null) {
           const control = this.#store.readProjectMemoryAuthority(context.projectId);
-          if (control !== null && !projectHeadsEqual(canonicalHead, control.head)) {
+          if (
+            control !== null
+            && !this.#canonicalHeadMatchesControlOrAuthorizedPull(
+              context.projectId,
+              control.bindingDigest,
+              canonicalHead,
+              control.head,
+            )
+          ) {
             this.#recordCanonicalDivergence(context.projectId);
           }
           return shareSubmissionResult(opened.result.terminal, true, input.value.key);
         }
         if (submission === undefined || expectedState === undefined) {
           throw new Error("MEMORY_SUBMISSION_STATE_LOST");
+        }
+        if (opened.result.sizeRefusal !== null) {
+          if (
+            opened.result.sizeRefusal.maximumOperationBytes
+              !== HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES
+            || !projectHeadsEqual(canonicalHead, submission.expectedHead)
+          ) {
+            this.#recordCanonicalDivergence(context.projectId);
+            throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+          }
+          const failed = this.#store.settleMemorySubmission({
+            expectedState,
+            outcomeCode: "share_too_large",
+            state: "failed",
+            submissionId: submission.id,
+          });
+          return shareSubmissionResult(failed, false, input.value.key);
         }
         if (opened.result.conflict !== null) {
           const conflictRecord = opened.result.conflict.conflicts[0];
@@ -1583,22 +1817,41 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         }
         return shareSubmissionResult(settled, false, input.value.key);
       } catch (error: unknown) {
-        if (expectedState === undefined && submission?.state === "prepared") {
+        if (
+          attempt.cancelPreparedOnFailure
+          && expectedState === undefined
+          && submission?.state === "prepared"
+        ) {
           try {
             this.#store.cancelPreparedMemorySubmission(submission.id);
           } catch {
             // Keep the primary pre-effect failure.
           }
-        } else {
+        } else if (submission?.state !== "prepared") {
           this.#markAmbiguous(submission, expectedState);
-          const recoveryContext = await this.#context(context.actorSessionId).catch(() => null);
+          const recoveryContext = await this.#context(context.actorSessionId, true)
+            .catch(() => null);
           if (recoveryContext !== null) {
             await this.#recoverSubmission(recoveryContext, submission?.id).catch(() => undefined);
           }
         }
         throw error;
       }
-    });
+    }, { expectedProjectId: initialProjectId });
+    const durableShare = this.#store.readMemorySubmissionByIdempotencyKey(
+      input.idempotencyKey,
+    );
+    if (
+      durableShare?.kind === "share"
+      && durableShare.state === "applied"
+      && durableShare.outcomeCode === "share_adopted"
+    ) {
+      this.#sync?.scheduleProject({
+        projectId: initialProjectId,
+        reason: "after_canonical_mutation",
+      });
+    }
+    return result;
   }
 
   async close(): Promise<void> {
@@ -1610,7 +1863,8 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     this.#getDatasets.clear();
     this.#getBytes = 0;
     this.#quarantinedProjects.clear();
-    await Promise.allSettled(this.#tails.values());
+    await this.#sync?.close();
+    await this.#projectSerial.drain();
   }
 
   forgetSession(actorSessionId: string): void {
@@ -1637,12 +1891,80 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     }
   }
 
+  #assertCanonicalMutationAvailable(projectId: string): void {
+    const parsed = projectIdSchema.parse(projectId);
+    this.#assertProjectRecovered(parsed);
+    if (this.#store.isCanonicalMemoryMutationFenced(parsed)) {
+      throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+    }
+    this.#assertHostedCanonicalHeadCurrent(parsed);
+  }
+
+  /**
+   * A hosted pre-sync finishes before the share can acquire the project tail.
+   * Another queued share may advance local canonical memory in that interval,
+   * or a bounded foreground sync may stop while the remote is still ahead.
+   * Requiring the three durable heads to agree inside the mutation critical
+   * section closes both windows without holding the serial executor over I/O.
+   */
+  #assertHostedCanonicalHeadCurrent(projectId: string): void {
+    const parsed = projectIdSchema.parse(projectId);
+    const attachment = this.#store.readCanonicalMemoryHostedAttachment(parsed);
+    if (attachment === null || attachment.state === "detached") return;
+    if (attachment.state !== "attached") {
+      throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+    }
+    if (this.#sync === undefined) {
+      throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+    }
+    const authority = this.#store.readProjectMemoryAuthority(parsed);
+    if (
+      authority === null
+      || authority.syncState !== "settled"
+      || authority.lastExchangeHead === undefined
+      || !projectHeadsEqual(authority.head, authority.lastExchangeHead)
+      || !projectHeadsEqual(authority.head, attachment.remote.head)
+    ) {
+      throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+    }
+  }
+
+  /**
+   * A pulled operation is physically committed before its control-plane head
+   * can be settled. During that narrow crash window readers and working-memory
+   * writes stay pinned to the old canonical snapshot. Accept only the exact
+   * one-step descendant that the durable pull journal authorized before import;
+   * every other physical/control mismatch remains canonical divergence.
+   */
+  #canonicalHeadMatchesControlOrAuthorizedPull(
+    projectId: string,
+    canonicalBindingDigest: string,
+    observedHead: ProjectMemoryHeadRef,
+    controlHead: ProjectMemoryHeadRef,
+  ): boolean {
+    return this.#store.isCanonicalMemoryPhysicalHeadAuthorized({
+      canonicalBindingDigest,
+      controlHead,
+      observedHead,
+      projectId: projectIdSchema.parse(projectId),
+    });
+  }
+
   #recordCanonicalDivergence(projectId: string): void {
     const parsed = projectIdSchema.parse(projectId);
     this.#quarantinedProjects.add(parsed);
     try {
       const current = this.#store.readProjectMemoryAuthority(parsed);
       if (current === null || current.syncState === "conflict" || current.syncState === "error") return;
+      if (current.physicalState === "reserved") {
+        this.#store.rejectReservedProjectMemoryAuthority({
+          diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
+          expectedHead: current.head,
+          expectedRevision: current.revision,
+          projectId: current.projectId,
+        });
+        return;
+      }
       this.#store.recordProjectMemorySyncObservation({
         diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
         expectedHead: current.head,
@@ -1671,7 +1993,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
   }
 
   #isAttestedMetadata(
-    context: MemoryContext,
+    context: WorkingMemoryContext,
     metadata: ReturnType<typeof metadataRow>,
   ): boolean {
     if (metadata.lane !== "working" && metadata.lane !== "canonical") return false;
@@ -1680,7 +2002,14 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       metadata.provenance.attestationSha256,
     );
     const authorityDigest = this.#memoryLaneAuthorityDigest(context, metadata.lane);
-    if (attestation === null || authorityDigest === null) return false;
+    if (attestation === null || authorityDigest === null) {
+      return metadata.lane === "canonical"
+        && this.#isPortableCanonicalProof(
+          context,
+          metadata.recordSha256,
+          keyDigest,
+        );
+    }
     const sourceActorId = `hra.session.${attestation.actorSessionId.replace("sess_", "sess-")}`;
     const expectedAttestation = memoryAttestationSha256({
       actorId: sourceActorId,
@@ -1695,7 +2024,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       workingBindingDigest: attestation.workingBindingDigest,
       workingEpoch: attestation.workingEpoch,
     });
-    return attestation.projectId === context.projectId
+    const locallyAttested = attestation.projectId === context.projectId
       && attestation.keyDigest === keyDigest
       && attestation.effectRecordSha256 === metadata.recordSha256
       && attestation.attestationSha256 === metadata.provenance.attestationSha256
@@ -1709,10 +2038,16 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         lane: metadata.lane,
         projectId: context.projectId,
       });
+    return locallyAttested || (metadata.lane === "canonical"
+      && this.#isPortableCanonicalProof(
+        context,
+        metadata.recordSha256,
+        keyDigest,
+      ));
   }
 
   #isAttestedPage(
-    context: MemoryContext,
+    context: WorkingMemoryContext,
     page: OhMemoryPageRecordV1,
     keyDigest: string,
     lane: "working" | "canonical",
@@ -1725,8 +2060,6 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       page.value.provenance.attestationSha256,
     );
     const authorityDigest = this.#memoryLaneAuthorityDigest(context, lane);
-    if (attestation === null || authorityDigest === null) return false;
-    const sourceActorId = `hra.session.${attestation.actorSessionId.replace("sess_", "sess-")}`;
     const contentDigest = memoryContentDigest({
       body: page.value.body,
       key,
@@ -1734,6 +2067,16 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       summary: page.value.summary,
       title: page.value.title,
     });
+    if (attestation === null || authorityDigest === null) {
+      return lane === "canonical"
+        && this.#isPortableCanonicalProof(
+          context,
+          page.recordSha256,
+          keyDigest,
+          contentDigest,
+        );
+    }
+    const sourceActorId = `hra.session.${attestation.actorSessionId.replace("sess_", "sess-")}`;
     const expectedAttestation = memoryAttestationSha256({
       actorId: sourceActorId,
       actorSessionId: attestation.actorSessionId,
@@ -1747,7 +2090,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       workingBindingDigest: attestation.workingBindingDigest,
       workingEpoch: attestation.workingEpoch,
     });
-    return attestation.projectId === context.projectId
+    const locallyAttested = attestation.projectId === context.projectId
       && attestation.keyDigest === keyDigest
       && attestation.contentDigest === contentDigest
       && attestation.effectRecordSha256 === page.recordSha256
@@ -1762,14 +2105,75 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         lane,
         projectId: context.projectId,
       });
+    return locallyAttested || (lane === "canonical"
+      && this.#isPortableCanonicalProof(
+        context,
+        page.recordSha256,
+        keyDigest,
+        contentDigest,
+      ));
+  }
+
+  #isPortableCanonicalProof(
+    context: WorkingMemoryContext,
+    recordSha256: string,
+    keyDigest: string,
+    contentDigest?: string,
+  ): boolean {
+    const authority = this.#store.readProjectMemoryAuthority(context.projectId);
+    return authority?.identityContract === 2
+      && authority.physicalState === "initialized"
+      && this.#store.isCanonicalMemoryPortableAdoptionProofReferenced({
+        bindingDigest: authority.bindingDigest,
+        ...(contentDigest === undefined ? {} : { contentDigest }),
+        keyDigest,
+        projectId: context.projectId,
+        recordSha256,
+      });
   }
 
   #memoryLaneAuthorityDigest(
-    context: MemoryContext,
+    context: WorkingMemoryContext,
     lane: "working" | "canonical",
   ): string | null {
     if (lane === "working") return context.working.binding.bindingDigest;
     return this.#store.readProjectMemoryAuthority(context.projectId)?.authorityDigest ?? null;
+  }
+
+  async #recoverRememberSubmission(
+    context: WorkingMemoryContext,
+    submissionId: string | undefined,
+  ): Promise<void> {
+    if (submissionId === undefined) return;
+    let submission = this.#store.requireMemorySubmission(submissionId);
+    if (submission.state === "prepared") {
+      this.#store.cancelPreparedMemorySubmission(submission.id);
+      return;
+    }
+    if (
+      submission.kind !== "remember"
+      || (submission.state !== "effect_started" && submission.state !== "ambiguous")
+      || submission.projectId !== context.projectId
+      || submission.workingBindingDigest !== context.working.binding.bindingDigest
+      || submission.workingEpoch !== context.working.binding.epoch
+    ) return;
+
+    const opened = await this.#withWorkingStores(context, async (stores) =>
+      await this.#inspectRememberRecovery(context, stores, submission));
+    const resolution = opened.result;
+    if (resolution.kind === "unresolved") return;
+
+    submission = this.#store.requireMemorySubmission(submission.id);
+    if (submission.state !== "effect_started" && submission.state !== "ambiguous") return;
+    this.#store.settleMemorySubmission({
+      expectedState: submission.state,
+      outcomeCode: resolution.outcomeCode,
+      state: resolution.state,
+      submissionId: submission.id,
+      ...(resolution.state === "applied"
+        ? { receiptDigest: resolution.receiptDigest, resultHead: resolution.resultHead }
+        : {}),
+    });
   }
 
   async #recoverSubmission(
@@ -1784,25 +2188,29 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     }
     if (submission.state !== "effect_started" && submission.state !== "ambiguous") return;
     if (
+      submission.kind !== "share"
+      ||
       submission.projectId !== context.projectId
       || submission.workingBindingDigest !== context.working.binding.bindingDigest
       || submission.workingEpoch !== context.working.binding.epoch
     ) return;
 
     const opened = await this.#withStores(context, async (stores, control) => ({
-      controlHead: control.head,
-      resolution: submission.kind === "remember"
-        ? await this.#inspectRememberRecovery(context, stores, submission)
-        : await this.#inspectShareRecovery(context, stores, submission),
+      control,
+      resolution: await this.#inspectShareRecovery(context, stores, submission),
     }));
     const resolution = opened.result.resolution;
     const finalCanonicalHead = toProjectHead(opened.canonicalHead);
-    const recoveredExpectedAdoption = submission.kind === "share"
-      && resolution.kind === "settle"
+    const recoveredExpectedAdoption = resolution.kind === "settle"
       && resolution.outcomeCode === "share_adopted"
       && projectHeadsEqual(finalCanonicalHead, resolution.resultHead);
     if (
-      !projectHeadsEqual(finalCanonicalHead, opened.result.controlHead)
+      !this.#canonicalHeadMatchesControlOrAuthorizedPull(
+        context.projectId,
+        opened.result.control.bindingDigest,
+        finalCanonicalHead,
+        opened.result.control.head,
+      )
       && !recoveredExpectedAdoption
     ) {
       this.#recordCanonicalDivergence(context.projectId);
@@ -1815,8 +2223,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     }
 
     if (
-      submission.kind === "share"
-      && resolution.outcomeCode !== "share_adopted"
+      resolution.outcomeCode !== "share_adopted"
       && !projectHeadsEqual(finalCanonicalHead, submission.expectedHead)
     ) {
       this.#recordCanonicalDivergence(context.projectId);
@@ -1838,15 +2245,14 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         : {}),
     });
     if (
-      settled.kind === "share"
-      && settled.outcomeCode === "share_adopted"
+      settled.outcomeCode === "share_adopted"
       && settled.resultHead !== undefined
       && !projectHeadsEqual(finalCanonicalHead, settled.resultHead)
     ) this.#recordCanonicalDivergence(context.projectId);
   }
 
   async #inspectRememberRecovery(
-    context: MemoryContext,
+    context: WorkingMemoryContext,
     stores: OpenOhMemoryStores,
     submission: MemorySubmissionRecord,
   ): Promise<MemoryRecoveryResolution> {
@@ -1976,7 +2382,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       ? null
       : {
           closure: sourceClosure,
-          destinationPurpose: MEMORY_DESTINATION_PURPOSE,
+          destinationPurpose: PROJECT_MEMORY_DESTINATION_PURPOSE,
           nominationId: MEMORY_NOMINATION_ID,
           source: {
             authorityId: context.workingAuthorityId,
@@ -2113,7 +2519,10 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     };
   }
 
-  async #context(actorSessionId: string): Promise<MemoryContext> {
+  async #workingContext(
+    actorSessionId: string,
+    allowNonoperationalSession = false,
+  ): Promise<WorkingMemoryContext> {
     if (this.#closed) throw new Error("MEMORY_COORDINATOR_CLOSED");
     const session = this.#store.requireSession(sessionIdSchema.parse(actorSessionId));
     if (session.projectId === undefined) {
@@ -2126,6 +2535,19 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       ownerId: session.profileId,
       sessionId: session.id,
     });
+    const currentSession = this.#store.requireSession(session.id);
+    if (
+      currentSession.profileId !== session.profileId
+      || currentSession.projectId !== projectId
+    ) throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+    if (!allowNonoperationalSession) {
+      if (currentSession.state === "terminal") {
+        throw new HraMemoryRefusalError("MEMORY_SESSION_REFUSED");
+      }
+      if (currentSession.state === "recovery_required") {
+        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+      }
+    }
     if (lifecycle.state !== "active" || lifecycle.handleHash === null || lifecycle.head === null) {
       throw new Error("MEMORY_WORKING_AUTHORITY_UNAVAILABLE");
     }
@@ -2137,21 +2559,10 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     if (binding.bindingDigest !== lifecycle.bindingDigest) {
       throw new Error("MEMORY_WORKING_BINDING_MISMATCH");
     }
-    const projectDigest = canonicalSha256({ projectId, v: 1 });
-    const canonicalRoot = await ensurePrivateDirectory(this.#paths.projectMemory);
-    const canonicalDirectory = resolve(join(canonicalRoot, projectDigest));
-    if (relative(canonicalRoot, canonicalDirectory) !== projectDigest) {
-      throw new Error("MEMORY_PROJECT_PATH_ESCAPE");
-    }
-    await ensurePrivateDirectory(canonicalDirectory);
     return {
       actorId: `hra.session.${session.id.replace("sess_", "sess-")}`,
       actorSessionId: session.id,
-      canonicalAuthorityId: `hra.memory.canonical.${projectDigest}`,
-      canonicalDirectory,
-      canonicalRealmId: `hra:project-memory:${projectDigest}`,
-      canonicalSpaceId: `hra:project:${projectDigest}`,
-      control: this.#store.readProjectMemoryAuthority(projectId),
+      canonicalAuthorityId: `hra.memory.working_only.${binding.bindingDigest}`,
       projectId,
       working: {
         binding,
@@ -2160,6 +2571,83 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         expectedHead: lifecycle.head,
       },
       workingAuthorityId: `hra.memory.working.${binding.bindingDigest}`,
+    };
+  }
+
+  async #context(
+    actorSessionId: string,
+    allowNonoperationalSession = false,
+  ): Promise<MemoryContext> {
+    const workingContext = await this.#workingContext(
+      actorSessionId,
+      allowNonoperationalSession,
+    );
+    const { projectId } = workingContext;
+    const projectDigest = canonicalSha256({ projectId, v: 1 });
+    const canonicalRoot = resolve(this.#paths.projectMemory);
+    const canonicalDirectory = resolve(join(canonicalRoot, projectDigest));
+    if (relative(canonicalRoot, canonicalDirectory) !== projectDigest) {
+      throw new Error("MEMORY_PROJECT_PATH_ESCAPE");
+    }
+    let control = this.#store.readProjectMemoryAuthority(projectId);
+    let databaseInspection: ReturnType<typeof inspectOhCanonicalDatabaseForRecovery>;
+    try {
+      databaseInspection = inspectOhCanonicalDatabaseForRecovery(canonicalDirectory);
+    } catch (error: unknown) {
+      if (error instanceof OhCanonicalDatabaseInspectionError
+        && error.failure === "unsafe") {
+        control ??= this.#store.reserveLegacyProjectMemoryAuthorityForRecovery(projectId);
+        this.#recordCanonicalDivergence(projectId);
+        throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+      }
+      if (error instanceof OhCanonicalDatabaseInspectionError) {
+        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+      }
+      throw error;
+    }
+    if (control === null) {
+      control = databaseInspection.state === "present"
+        ? this.#store.reserveLegacyProjectMemoryAuthorityForRecovery(projectId)
+        : (() => {
+            const candidate = createPortableProjectMemoryCanonicalIdentity(projectId);
+            return this.#store.reserveProjectMemoryAuthority({
+              canonicalSpaceId: candidate.canonicalSpaceId,
+              head: PROJECT_MEMORY_EMPTY_HEAD,
+              identityContract: candidate.identityContract,
+              projectId,
+            });
+          })();
+    }
+    if (control.physicalState === "rejected") {
+      this.#quarantinedProjects.add(projectId);
+      throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+    }
+    const canonicalRequireExisting = control.physicalState === "initialized"
+      || control.identityContract === 1;
+    if (canonicalRequireExisting && databaseInspection.state !== "present") {
+      this.#recordCanonicalDivergence(projectId);
+      throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+    }
+    if (!canonicalRequireExisting) {
+      await ensurePrivateDirectory(canonicalRoot);
+      await ensurePrivateDirectory(canonicalDirectory);
+    }
+    const canonicalIdentity = deriveProjectMemoryCanonicalIdentity({
+      canonicalSpaceId: control.canonicalSpaceId,
+      identityContract: control.identityContract,
+      projectId,
+    });
+    return {
+      ...workingContext,
+      canonicalAuthorityId: canonicalIdentity.canonicalAuthorityId,
+      canonicalDirectory,
+      ...(databaseInspection.state === "present"
+        ? { canonicalExpectedDatabaseFile: databaseInspection.file }
+        : {}),
+      canonicalRealmId: canonicalIdentity.canonicalRealmId,
+      canonicalRequireExisting,
+      canonicalSpaceId: canonicalIdentity.canonicalSpaceId,
+      control,
     };
   }
 
@@ -2174,37 +2662,34 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       return await this.#engine.withMemoryStores({
         canonical: {
           directory: context.canonicalDirectory,
-          ...(context.control === null ? {} : { expectedHead: toFactsHead(context.control.head) }),
+          ...(context.canonicalExpectedDatabaseFile === undefined
+            ? {}
+            : { expectedDatabaseFile: context.canonicalExpectedDatabaseFile }),
+          expectedHead: toFactsHead(context.control.head),
           realmId: context.canonicalRealmId,
+          requireExisting: context.canonicalRequireExisting,
+          requireVacant: context.control.physicalState === "reserved",
           spaceId: context.canonicalSpaceId,
         },
         working: context.working,
       }, async (stores) => {
         let control = context.control;
         const physicalHead = toProjectHead(stores.canonical.expectedHead);
-        const bindingDigest = stores.canonical.bindingSha256;
-        const authorityDigest = canonicalSha256({
-          bindingDigest,
-          projectId: context.projectId,
-          purpose: MEMORY_DESTINATION_PURPOSE,
-          v: 1,
-        });
-        if (control === null) {
-          if (physicalHead.sequence !== 0) {
-            throw new Error("PROJECT_MEMORY_UNBOUND_NONEMPTY_AUTHORITY");
-          }
-          control = this.#store.initializeProjectMemoryAuthority({
-            authorityDigest,
-            bindingDigest,
-            head: physicalHead,
-            projectId: context.projectId,
-          });
-        }
         if (
-          control.authorityDigest !== authorityDigest
-          || control.bindingDigest !== bindingDigest
+          control.bindingDigest !== stores.canonical.bindingSha256
           || !projectHeadsEqual(control.head, physicalHead)
         ) throw new Error("PROJECT_MEMORY_AUTHORITY_CONFLICT");
+        if (control.physicalState === "reserved") {
+          const actualHead = toProjectHead(await stores.canonical.store.head());
+          if (!projectHeadsEqual(control.head, actualHead)) {
+            throw new Error("PROJECT_MEMORY_UNBOUND_NONEMPTY_AUTHORITY");
+          }
+          control = this.#store.markProjectMemoryAuthorityInitialized({
+            expectedHead: control.head,
+            expectedRevision: control.revision,
+            projectId: control.projectId,
+          });
+        }
         return await operation(stores, control);
       });
     } catch (error: unknown) {
@@ -2212,12 +2697,105 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         this.#recordCanonicalDivergence(context.projectId);
         throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
       }
+      if (retryableMemoryStoreFailure(error)) {
+        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+      }
       throw error;
     }
   }
 
+  async #withWorkingStores<T>(
+    context: WorkingMemoryContext,
+    operation: (stores: OpenOhMemoryStores) => Promise<T>,
+  ): Promise<OhWorkingMemoryStoreOperationResult<T>> {
+    try {
+      return await this.#engine.withWorkingMemoryStore(
+        context.working,
+        async (stores) => await operation({
+          canonical: stores.ephemeralCanonical,
+          working: stores.working,
+        }),
+      );
+    } catch (error: unknown) {
+      if (retryableMemoryStoreFailure(error)) {
+        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+      }
+      throw error;
+    }
+  }
+
+  async #withQueryStores<T>(
+    context: WorkingMemoryContext,
+    scope: MemoryQueryScope,
+    operation: (stores: OpenOhMemoryStores) => Promise<T>,
+  ): Promise<Readonly<{
+    canonicalHead: OhHeadV1 | null;
+    control: ProjectMemoryAuthorityRecord | null;
+    result: T;
+    workingHead: OhHeadV1;
+  }>> {
+    if (scope === "working") {
+      const opened = await this.#withWorkingStores(context, operation);
+      return {
+        canonicalHead: null,
+        control: null,
+        result: opened.result,
+        workingHead: opened.workingHead,
+      };
+    }
+    if (!isCompositeMemoryContext(context)) {
+      throw new Error("MEMORY_CANONICAL_CONTEXT_REQUIRED");
+    }
+    const opened = await this.#withStores(context, async (stores, control) => ({
+      control,
+      result: await operation(stores),
+    }));
+    return {
+      canonicalHead: opened.canonicalHead,
+      control: opened.result.control,
+      result: opened.result.result,
+      workingHead: opened.workingHead,
+    };
+  }
+
+  #queryAuthorityFields(
+    context: WorkingMemoryContext,
+    scope: MemoryQueryScope,
+    control: ProjectMemoryAuthorityRecord | null,
+  ): Readonly<Record<string, unknown>> {
+    if (scope === "composite") {
+      if (control === null) throw new Error("MEMORY_CANONICAL_CONTROL_REQUIRED");
+      return {
+        canonical: {
+          diagnosticCode: control.diagnosticCode ?? null,
+          frozen: false,
+          included: true,
+          syncState: control.syncState,
+        },
+        canonicalHead: publicHead(control.head),
+        scope,
+      };
+    }
+    const observed = this.#store.readProjectMemoryAuthority(context.projectId);
+    const processQuarantined = this.#quarantinedProjects.has(context.projectId);
+    const frozen = processQuarantined
+      || observed?.syncState === "conflict"
+      || observed?.syncState === "error";
+    return {
+      canonical: {
+        diagnosticCode: observed?.diagnosticCode
+          ?? (processQuarantined ? "MEMORY_CANONICAL_PROCESS_QUARANTINED" : null),
+        frozen,
+        included: false,
+        syncState: observed?.syncState ?? null,
+      },
+      canonicalHead: null,
+      scope,
+    };
+  }
+
   async #authority(
-    context: MemoryContext,
+    context: WorkingMemoryContext,
     stores: OpenOhMemoryStores,
     clockMs: number,
   ) {
@@ -2235,9 +2813,10 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       extractors: [MEMORY_FACT_EXTRACTOR],
       monotonicNow: this.#monotonicNow,
       nominationRoutes: [{
-        destinationPurpose: MEMORY_DESTINATION_PURPOSE,
+        destinationPurpose: PROJECT_MEMORY_DESTINATION_PURPOSE,
         nominationId: MEMORY_NOMINATION_ID,
       }],
+      maximumCanonicalOperationBytes: HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
       now: () => new Date(clockMs),
       programs: MEMORY_PROGRAMS,
       working: {
@@ -2261,39 +2840,63 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     workingBindingDigest: string;
     workingEpoch: number;
   }>) {
-    const existing = this.#store.readMemorySubmissionByIdempotencyKey(input.idempotencyKey);
-    if (existing !== null) {
+    return this.#withSubmissionActorFence(() => {
+      const existing = this.#store.readMemorySubmissionByIdempotencyKey(input.idempotencyKey);
+      if (existing !== null) {
+        return this.#store.prepareMemorySubmission({
+          actorSessionId: sessionIdSchema.parse(input.actorSessionId),
+          contentDigest: input.contentDigest,
+          expectedHead: existing.expectedHead,
+          idempotencyKey: input.idempotencyKey,
+          keyDigest: input.keyDigest,
+          kind: input.kind,
+          projectId: projectIdSchema.parse(input.projectId),
+          requestDigest: input.requestDigest,
+          workingBindingDigest: existing.workingBindingDigest,
+          workingEpoch: existing.workingEpoch,
+        });
+      }
+      const unsettled = this.#store.readUnsettledMemorySubmissionForProject(
+        projectIdSchema.parse(input.projectId),
+      );
+      if (unsettled !== null) {
+        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+      }
       return this.#store.prepareMemorySubmission({
         actorSessionId: sessionIdSchema.parse(input.actorSessionId),
         contentDigest: input.contentDigest,
-        expectedHead: existing.expectedHead,
+        expectedHead: input.expectedHead,
         idempotencyKey: input.idempotencyKey,
         keyDigest: input.keyDigest,
         kind: input.kind,
         projectId: projectIdSchema.parse(input.projectId),
         requestDigest: input.requestDigest,
-        workingBindingDigest: existing.workingBindingDigest,
-        workingEpoch: existing.workingEpoch,
+        workingBindingDigest: input.workingBindingDigest,
+        workingEpoch: input.workingEpoch,
       });
-    }
-    const unsettled = this.#store.readUnsettledMemorySubmissionForProject(
-      projectIdSchema.parse(input.projectId),
-    );
-    if (unsettled !== null) {
-      throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
-    }
-    return this.#store.prepareMemorySubmission({
-      actorSessionId: sessionIdSchema.parse(input.actorSessionId),
-      contentDigest: input.contentDigest,
-      expectedHead: input.expectedHead,
-      idempotencyKey: input.idempotencyKey,
-      keyDigest: input.keyDigest,
-      kind: input.kind,
-      projectId: projectIdSchema.parse(input.projectId),
-      requestDigest: input.requestDigest,
-      workingBindingDigest: input.workingBindingDigest,
-      workingEpoch: input.workingEpoch,
     });
+  }
+
+  #beginSubmission(submissionId: string, idempotencyKey: string): MemorySubmissionRecord {
+    return this.#withSubmissionActorFence(() =>
+      this.#store.beginMemorySubmission(submissionId, idempotencyKey));
+  }
+
+  #withSubmissionActorFence<T>(operation: () => T): T {
+    try {
+      return operation();
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message === "MEMORY_SUBMISSION_ACTOR_TERMINAL") {
+        throw new HraMemoryRefusalError("MEMORY_SESSION_REFUSED");
+      }
+      if (
+        error instanceof Error
+        && error.message === "MEMORY_SUBMISSION_ACTOR_RECOVERY_REQUIRED"
+      ) {
+        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+      }
+      throw error;
+    }
   }
 
   #markAmbiguous(
@@ -2317,8 +2920,9 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
 
   #cacheQuery(
     id: string,
-    context: MemoryContext,
+    context: WorkingMemoryContext,
     rows: readonly Readonly<Record<string, unknown>>[],
+    scope: MemoryQueryScope,
     sharedDatasetId?: string,
   ): void {
     this.#pruneQueries();
@@ -2360,6 +2964,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       expiresAtMonotonic: this.#monotonicNow() + MEMORY_QUERY_EXPLANATION_TTL_MS,
       projectId: context.projectId,
       rows,
+      scope,
       workingBindingDigest: context.working.binding.bindingDigest,
     });
     this.#queryBytes += bytes;
@@ -2383,12 +2988,13 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
 
   #createGetDataset(input: Readonly<{
     actorSessionId: string;
-    canonicalHead: ProjectMemoryHeadRef;
+    canonicalHead: ProjectMemoryHeadRef | null;
     conflicts: Readonly<Record<string, unknown>>;
-    context: MemoryContext;
+    context: WorkingMemoryContext;
     explanations: readonly Readonly<Record<string, unknown>>[];
     key: string;
     rows: readonly Readonly<Record<string, unknown>>[];
+    scope: MemoryQueryScope;
     workingHead: ProjectMemoryHeadRef;
   }>): GetDataset {
     this.#pruneQueries();
@@ -2433,6 +3039,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       pageQueryIds: new Map<number, string>(),
       projectId: input.context.projectId,
       rows: input.rows,
+      scope: input.scope,
       workingBindingDigest: input.context.working.binding.bindingDigest,
       workingHead: input.workingHead,
     };
@@ -2442,9 +3049,10 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
   }
 
   async #continueGet(
-    context: MemoryContext,
+    context: WorkingMemoryContext,
     key: string,
     token: string,
+    scope: MemoryQueryScope,
   ): Promise<Readonly<Record<string, unknown>>> {
     this.#pruneQueries();
     const continuation = this.#getContinuations.get(token);
@@ -2457,20 +3065,25 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       || dataset.actorSessionId !== context.actorSessionId
       || dataset.projectId !== context.projectId
       || dataset.key !== key
+      || dataset.scope !== scope
       || dataset.workingBindingDigest !== context.working.binding.bindingDigest
       || !projectHeadsEqual(dataset.workingHead, {
         headDigest: context.working.expectedHead.digest,
         operationSha256: context.working.expectedHead.operationSha256,
         sequence: context.working.expectedHead.sequence,
       })
-      || context.control === null
-      || !projectHeadsEqual(dataset.canonicalHead, context.control.head)
+      || (scope === "composite" && (
+        dataset.canonicalHead === null
+        || !isCompositeMemoryContext(context)
+        || !projectHeadsEqual(dataset.canonicalHead, context.control.head)
+      ))
+      || (scope === "working" && dataset.canonicalHead !== null)
     ) throw new HraMemoryRefusalError("MEMORY_CONTINUATION_REFUSED");
     return this.#getPage(context, dataset, continuation.offset);
   }
 
   #getPage(
-    context: MemoryContext,
+    context: WorkingMemoryContext,
     dataset: GetDataset,
     offset: number,
   ): Readonly<Record<string, unknown>> {
@@ -2480,7 +3093,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     const explanations = dataset.explanations.slice(offset, offset + pageSize);
     const id = dataset.pageQueryIds.get(offset) ?? queryId();
     dataset.pageQueryIds.set(offset, id);
-    this.#cacheQuery(id, context, explanations, dataset.id);
+    this.#cacheQuery(id, context, explanations, dataset.scope, dataset.id);
     const endExclusive = offset + rows.length;
     let continuation: string | null = null;
     if (endExclusive < dataset.rows.length) {
@@ -2506,7 +3119,11 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         totalRows: dataset.rows.length,
       },
       conflicts: dataset.conflicts,
-      canonicalHead: publicHead(dataset.canonicalHead),
+      ...this.#queryAuthorityFields(
+        context,
+        dataset.scope,
+        isCompositeMemoryContext(context) ? context.control : null,
+      ),
       workingHead: publicHead(dataset.workingHead),
     };
   }
@@ -2582,27 +3199,114 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     return true;
   }
 
-  #withProject<T>(actorSessionId: string, operation: (context: MemoryContext) => Promise<T>): Promise<T> {
+  #withProject<T>(
+    actorSessionId: string,
+    operation: (context: MemoryContext) => Promise<T>,
+    options: Readonly<{
+      allowNonoperationalSession?: boolean;
+      expectedProjectId?: string;
+    }> = {},
+  ): Promise<T> {
+    return this.#withProjectContext(
+      actorSessionId,
+      async () => await this.#context(
+        actorSessionId,
+        options.allowNonoperationalSession === true,
+      ),
+      operation,
+      options,
+    );
+  }
+
+  #withWorkingProject<T>(
+    actorSessionId: string,
+    operation: (context: WorkingMemoryContext) => Promise<T>,
+    options: Readonly<{
+      allowNonoperationalSession?: boolean;
+      expectedProjectId?: string;
+    }> = {},
+  ): Promise<T> {
+    return this.#withProjectContext(
+      actorSessionId,
+      async () => await this.#workingContext(
+        actorSessionId,
+        options.allowNonoperationalSession === true,
+      ),
+      operation,
+      options,
+    );
+  }
+
+  #withProjectContext<T, Context extends WorkingMemoryContext>(
+    actorSessionId: string,
+    contextFor: () => Promise<Context>,
+    operation: (context: Context) => Promise<T>,
+    options: Readonly<{
+      allowNonoperationalSession?: boolean;
+      expectedProjectId?: string;
+    }> = {},
+  ): Promise<T> {
     const session = this.#store.requireSession(sessionIdSchema.parse(actorSessionId));
+    if (options.allowNonoperationalSession !== true) {
+      if (session.state === "terminal") {
+        return Promise.reject(new HraMemoryRefusalError("MEMORY_SESSION_REFUSED"));
+      }
+      if (session.state === "recovery_required") {
+        return Promise.reject(new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED"));
+      }
+    }
     if (session.projectId === undefined) {
       return Promise.reject(new HraMemoryRefusalError("MEMORY_PROJECT_REFUSED"));
     }
     const key = projectIdSchema.parse(session.projectId);
-    const prior = this.#tails.get(key) ?? Promise.resolve();
-    const current = prior.catch(() => undefined).then(async () => {
-      const context = await this.#context(actorSessionId);
-      // The tail key and the physical canonical authority must describe the
-      // same project. A queued operation may not follow a concurrent session
-      // project change onto a different authority while still holding the old
-      // project's serialization position.
+    const expectedProjectId = options.expectedProjectId === undefined
+      ? undefined
+      : projectIdSchema.parse(options.expectedProjectId);
+    if (expectedProjectId !== undefined && key !== expectedProjectId) {
+      return Promise.reject(new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED"));
+    }
+    return this.#projectSerial.run(key, async () => {
+      const currentSession = this.#store.requireSession(sessionIdSchema.parse(actorSessionId));
+      if (
+        currentSession.projectId !== key
+        || (expectedProjectId !== undefined && currentSession.projectId !== expectedProjectId)
+      ) {
+        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+      }
+      if (options.allowNonoperationalSession !== true) {
+        if (currentSession.state === "terminal") {
+          throw new HraMemoryRefusalError("MEMORY_SESSION_REFUSED");
+        }
+        if (currentSession.state === "recovery_required") {
+          throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+        }
+      }
+      const context = await contextFor();
+      // The tail key and selected memory authority must describe the same
+      // project. A queued operation may not follow a concurrent project move
+      // while still holding the old project's serialization position.
       if (context.projectId !== key) {
         throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
       }
+      // Context selection opens the working-memory lifecycle asynchronously.
+      // Revalidate the durable actor after that boundary so a concurrent
+      // terminalization or quarantine cannot use the previously selected
+      // handle to enter an operation.
+      const selectedSession = this.#store.requireSession(
+        sessionIdSchema.parse(actorSessionId),
+      );
+      if (selectedSession.projectId !== key) {
+        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+      }
+      if (options.allowNonoperationalSession !== true) {
+        if (selectedSession.state === "terminal") {
+          throw new HraMemoryRefusalError("MEMORY_SESSION_REFUSED");
+        }
+        if (selectedSession.state === "recovery_required") {
+          throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+        }
+      }
       return await operation(context);
-    });
-    this.#tails.set(key, current);
-    return current.finally(() => {
-      if (this.#tails.get(key) === current) this.#tails.delete(key);
     });
   }
 }

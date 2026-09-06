@@ -236,7 +236,7 @@ Usage:
   hra plugin list <account> [--project <project>] [--refresh]
   hra plugin show <account> <plugin> [--project <project>] [--refresh]
   hra project add|list|use
-  hra memory status|list|get|search|explain|remember|share
+  hra memory status|list|get|search|explain|remember|share|hosted
   hra session list|show|status|watch|start|send|queue|steer|stop|peer-policy
   hra session task list|show|create|edit|delete
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
@@ -392,17 +392,23 @@ Examples:
   memory: `HRA memory
 
 Memory is selected by an HRA session. Reads combine that session's working
-lane with its current project's shared canonical lane; writes never accept a
-store path, authority, head, rule, or purge capability from the caller.
+lane with its current project's shared canonical lane by default. Add
+--working-only to read the session lane without opening canonical custody.
+Writes never accept a store path, authority, head, rule, or purge capability.
 
 Usage:
   hra memory status <session> [--json]
-  hra memory list <session> [--continuation <token>] [--json]
-  hra memory get <session> <key> [--continuation <token>] [--json]
-  hra memory search <session> [--continuation <token>] <text> [--json]
+  hra memory list <session> [--working-only] [--continuation <token>] [--json]
+  hra memory get <session> <key> [--working-only] [--continuation <token>] [--json]
+  hra memory search <session> [--working-only] [--continuation <token>] <text> [--json]
   hra memory explain <session> <query-id> <row> [--json]
   hra memory remember <session> <key> --title <title> --summary <summary> [--language <tag>] [--idempotency-key <uuid>] [--json] -- <body>
   hra memory share <session> <key> --reason <reason> [--idempotency-key <uuid>] [--json]
+  hra memory hosted list [--json]
+  hra memory hosted create <project> [--idempotency-key <uuid>] [--json]
+  hra memory hosted attach <project> <hosted-space-id> [--json]
+  hra memory hosted detach <project> --generation <n> [--json]
+  hra memory hosted sync <project> [--json]
 
 The remember command changes only the selected session's expiring working lane.
 The share command explicitly nominates its exact attested working page for
@@ -416,7 +422,9 @@ Examples:
   hra memory search my-session -- "authority boundary"
   hra memory explain my-session memq_0123456789abcdef0123456789abcdef 0
   hra memory remember my-session preferences.review --title "Review style" --summary "Prefer adversarial review." -- "Challenge implementation plans before execution."
-  hra memory share my-session preferences.review --reason "Reusable project convention"`,
+  hra memory share my-session preferences.review --reason "Reusable project convention"
+  hra memory hosted create jungle
+  hra memory hosted list`,
   session: `HRA session
 Session tasks always return to the selected conversation. They never create a standalone task or a new conversation.
 
@@ -686,6 +694,7 @@ const idempotentCommandKinds = new Set<LocalCommand["kind"]>([
   "session.task.delete",
   "memory.remember",
   "memory.share",
+  "memory.hosted.create",
   "device.approve",
   "device.revoke",
 ]);
@@ -1311,10 +1320,63 @@ const parseMemory = (
 ): LocalCommand => {
   const action = take(cursor, "memory action");
   const continuation = option(cursor, "--continuation");
+  const workingOnly = flag(cursor, "--working-only");
+  if (action === "hosted") {
+    if (continuation !== undefined || workingOnly) {
+      throw new CliUsageError("Memory hosted commands do not accept query continuation or working-only scope.");
+    }
+    const hostedAction = take(cursor, "hosted memory action");
+    if (hostedAction === "list") {
+      finish(cursor);
+      return { kind: "memory.hosted.list" };
+    }
+    if (hostedAction === "create") {
+      const project = take(cursor, "project");
+      finish(cursor);
+      return command({
+        kind: "memory.hosted.create",
+        project,
+        idempotencyKey: idempotencyKey ?? randomUUID(),
+      });
+    }
+    if (hostedAction === "attach") {
+      const project = take(cursor, "project");
+      const hostedSpaceId = take(cursor, "hosted memory space ID");
+      finish(cursor);
+      return command({ kind: "memory.hosted.attach", project, hostedSpaceId });
+    }
+    if (hostedAction === "detach") {
+      const generation = option(cursor, "--generation");
+      const project = take(cursor, "project");
+      finish(cursor);
+      if (generation === undefined) {
+        throw new CliUsageError("Memory hosted detach requires --generation <n>.");
+      }
+      return command({
+        kind: "memory.hosted.detach",
+        project,
+        expectedGeneration: boundedDecimal(
+          generation,
+          "hosted memory attachment generation",
+          1,
+          Number.MAX_SAFE_INTEGER,
+        ),
+      });
+    }
+    if (hostedAction === "sync") {
+      const project = take(cursor, "project");
+      finish(cursor);
+      return { kind: "memory.hosted.sync", project };
+    }
+    throw new CliUsageError(
+      "Unknown hosted memory action. Run `hra memory --help` for supported actions.",
+    );
+  }
   if (action === "status") {
     if (continuation !== undefined) {
       throw new CliUsageError("--continuation is not supported by memory status.");
     }
+    if (workingOnly) throw new CliUsageError("--working-only is supported only by memory list, get, and search.");
     const session = take(cursor, "session");
     finish(cursor);
     return { kind: "memory.status", session };
@@ -1325,7 +1387,11 @@ const parseMemory = (
     return command({
       kind: "memory.query",
       session,
-      value: { mode: "list", ...(continuation === undefined ? {} : { continuation }) },
+      value: {
+        mode: "list",
+        ...(workingOnly ? { scope: "working" as const } : {}),
+        ...(continuation === undefined ? {} : { continuation }),
+      },
     });
   }
   if (action === "get") {
@@ -1335,7 +1401,12 @@ const parseMemory = (
     return command({
       kind: "memory.query",
       session,
-      value: { mode: "get", key, ...(continuation === undefined ? {} : { continuation }) },
+      value: {
+        mode: "get",
+        key,
+        ...(workingOnly ? { scope: "working" as const } : {}),
+        ...(continuation === undefined ? {} : { continuation }),
+      },
     });
   }
   if (action === "search") {
@@ -1346,12 +1417,16 @@ const parseMemory = (
       value: {
         mode: "search",
         text: remainder(cursor, "search text"),
+        ...(workingOnly ? { scope: "working" as const } : {}),
         ...(continuation === undefined ? {} : { continuation }),
       },
     });
   }
   if (continuation !== undefined) {
     throw new CliUsageError(`--continuation is not supported by memory ${action}.`);
+  }
+  if (workingOnly) {
+    throw new CliUsageError("--working-only is supported only by memory list, get, and search.");
   }
   if (action === "explain") {
     const session = take(cursor, "session");

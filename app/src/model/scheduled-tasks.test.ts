@@ -41,6 +41,8 @@ function machine(
     deviceStatus: "active",
     heartbeatAt: now,
     label,
+    memorySummary: null,
+    memorySummaryFreshness: "unsupported",
     notificationHours: null,
     notificationHoursStatus: "unsupported",
     notificationPolicyFreshness: "unsupported",

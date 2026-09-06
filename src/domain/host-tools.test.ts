@@ -27,7 +27,7 @@ describe("HRA host-tool contract", () => {
       version: 1,
     });
     expect(HRA_HOST_TOOL_MANIFEST_DIGEST).toBe(
-      "af8c5ab03006ae53f99455ba8d82994e3c74ab3db5f67ecff29ec0453417d186",
+      "7296805460d8183c93187fe3b0564322a9f9f5f815a96ec2a4cb9774f81edaea",
     );
     expect(digestHraHostToolManifest(HRA_HOST_TOOL_MANIFEST)).toBe(
       HRA_HOST_TOOL_MANIFEST_DIGEST,
@@ -81,7 +81,7 @@ describe("HRA host-tool contract", () => {
         body: "Models provide content but never store locators.",
         language: "en",
       }],
-      ["memory_query", { mode: "search", text: "authority" }],
+      ["memory_query", { mode: "search", scope: "working", text: "authority" }],
       ["memory_explain", { queryId: `memq_${"c".repeat(32)}`, row: 0 }],
       ["memory_share", { key: "architecture.memory-boundary", reason: "Reusable decision" }],
     ] as const;
@@ -122,6 +122,10 @@ describe("HRA host-tool contract", () => {
     expect(() => parseHraHostToolRequest("memory_query", {
       mode: "get",
       key: "../not-a-path",
+    })).toThrow(TypeError);
+    expect(() => parseHraHostToolRequest("memory_query", {
+      mode: "list",
+      scope: "canonical",
     })).toThrow(TypeError);
     expect(() => parseHraHostToolRequest("future_tool", {})).toThrow(TypeError);
   });
@@ -186,7 +190,7 @@ describe("HRA static session preamble", () => {
       version: 1,
     });
     expect(HRA_SESSION_PREAMBLE_DIGEST).toBe(
-      "cd9c0c766fe249fbea2791b31c9d56aba9399e0ca617c03e3087d0903685abd2",
+      "82281603a0c06959eb464d70262ad287c393da6604280f25e37a37014c1b90a7",
     );
     for (const name of HRA_HOST_TOOL_NAMES) expect(HRA_SESSION_PREAMBLE_TEXT).toContain(name);
     expect(HRA_SESSION_PREAMBLE_TEXT).toContain(

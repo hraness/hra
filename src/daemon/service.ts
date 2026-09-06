@@ -189,10 +189,12 @@ import {
   type SessionTaskStore,
 } from "../storage/session-task-store";
 import { DaemonAuthoritySafetyError, type DaemonAuthorityFence } from "./daemon-lock";
+import type { HraCanonicalMemorySyncPort } from "./canonical-memory-sync";
 import type { HraFactsMemoryLifecyclePort } from "./facts-memory-lifecycle";
-import type {
-  HraMemoryPort,
-  HraMemoryRefusalCode,
+import {
+  HraMemoryRefusalError,
+  type HraMemoryPort,
+  type HraMemoryRefusalCode,
 } from "./memory-coordinator";
 import { commandFailureBrand } from "./local-transport";
 import {
@@ -1012,6 +1014,7 @@ const HRA_MEMORY_REFUSAL_CODES = new Set<HraMemoryRefusalCode>([
   "MEMORY_QUERY_EXPIRED",
   "MEMORY_RECOVERY_REQUIRED",
   "MEMORY_SEARCH_TERM_LIMIT",
+  "MEMORY_SESSION_REFUSED",
   "MEMORY_SHARE_ATTESTATION_REFUSED",
   "MEMORY_SHARE_CLOSURE_REFUSED",
 ]);
@@ -1066,10 +1069,20 @@ export class HraService {
   readonly #proseAutorespondedTurns = new Map<string, string>();
   readonly #factsMemory: HraFactsMemoryLifecyclePort | undefined;
   readonly #memory: HraMemoryPort | undefined;
+  readonly #beforeMemoryClose: (() => Promise<void>) | undefined;
+  readonly #canonicalMemorySync: HraCanonicalMemorySyncPort | undefined;
   readonly #daemonGeneration: number;
   readonly #platform: NodeJS.Platform;
   readonly #now: () => number;
   readonly #mutationTails = new Map<string, Promise<unknown>>();
+  /*
+   * Provider deletion is a runtime callback and can be emitted by an operation
+   * that already owns the session tail. Keep the narrower memory lifetime
+   * visible so deletion can wait for memory without waiting on an arbitrary
+   * reentrant provider operation.
+   */
+  readonly #sessionMemoryOperations = new Map<SessionRecord["id"], Promise<unknown>>();
+  readonly #pendingProviderThreadDeletions = new Set<SessionRecord["id"]>();
   readonly #background = new Set<Promise<unknown>>();
   readonly #operations = new Set<Promise<void>>();
   readonly #projectionRecoveriesInFlight = new Set<string>();
@@ -1113,6 +1126,8 @@ export class HraService {
     eventWaiters?: SessionEventWaiters;
     factsMemory?: HraFactsMemoryLifecyclePort;
     memory?: HraMemoryPort;
+    beforeMemoryClose?: () => Promise<void>;
+    canonicalMemorySync?: HraCanonicalMemorySyncPort;
     gatewayKeys?: GatewayKeyPort;
     proseResponder?: ProseResponder;
     workWaiters?: WorkEventWaiters;
@@ -1177,6 +1192,8 @@ export class HraService {
     this.#proseResponder = input.proseResponder;
     this.#factsMemory = input.factsMemory;
     this.#memory = input.memory;
+    this.#beforeMemoryClose = input.beforeMemoryClose;
+    this.#canonicalMemorySync = input.canonicalMemorySync;
     this.#daemonGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
       .parse(input.daemonGeneration ?? 0);
     this.#platform = input.platform ?? process.platform;
@@ -1318,6 +1335,45 @@ export class HraService {
         case "project.list": return { projects: this.#store.listProjects() };
         case "project.add": return { project: await this.#addProject(command.label, command.path) };
         case "project.use": return { project: this.#store.setDefaultProject(this.#store.requireProject(command.project).id) };
+        case "memory.hosted.list": {
+          const sync = this.#requireCanonicalMemorySyncPort();
+          return { spaces: await sync.listHostedSpaces() };
+        }
+        case "memory.hosted.create": {
+          const sync = this.#requireCanonicalMemorySyncPort();
+          const project = this.#store.requireProject(command.project);
+          return await sync.createHostedSpace({
+            idempotencyKey: command.idempotencyKey,
+            projectId: project.id,
+          });
+        }
+        case "memory.hosted.attach": {
+          const sync = this.#requireCanonicalMemorySyncPort();
+          const project = this.#store.requireProject(command.project);
+          return {
+            attachment: await sync.attachHostedSpace({
+              hostedSpaceId: command.hostedSpaceId,
+              projectId: project.id,
+            }),
+            projectId: project.id,
+          };
+        }
+        case "memory.hosted.detach": {
+          const sync = this.#requireCanonicalMemorySyncPort();
+          const project = this.#store.requireProject(command.project);
+          return {
+            attachment: await sync.detachHostedSpace({
+              expectedGeneration: command.expectedGeneration,
+              projectId: project.id,
+            }),
+            projectId: project.id,
+          };
+        }
+        case "memory.hosted.sync": {
+          const sync = this.#requireCanonicalMemorySyncPort();
+          const project = this.#store.requireProject(command.project);
+          return await sync.synchronizeProject({ projectId: project.id, reason: "owner" });
+        }
         case "memory.status": {
           const memory = this.#requireMemoryPort();
           const session = this.#store.requireSession(command.session);
@@ -1332,7 +1388,8 @@ export class HraService {
           const session = this.#store.requireSession(command.session);
           return await this.#serializeSessionAuthority(session, async () => {
             const current = this.#store.requireSession(session.id);
-            const result = await memory.query({ actorSessionId: current.id, value: command.value });
+            const result = await this.#withSessionMemoryOperation(current.id, async () =>
+              await memory.query({ actorSessionId: current.id, value: command.value }));
             return { ...result, sessionId: current.id };
           });
         }
@@ -1341,7 +1398,8 @@ export class HraService {
           const session = this.#store.requireSession(command.session);
           return await this.#serializeSessionAuthority(session, async () => {
             const current = this.#store.requireSession(session.id);
-            const result = await memory.explain({ actorSessionId: current.id, value: command.value });
+            const result = await this.#withSessionMemoryOperation(current.id, async () =>
+              await memory.explain({ actorSessionId: current.id, value: command.value }));
             return { ...result, sessionId: current.id };
           });
         }
@@ -1350,12 +1408,13 @@ export class HraService {
           const session = this.#store.requireSession(command.session);
           return await this.#serializeSessionAuthority(session, async () => {
             const current = this.#store.requireSession(session.id);
-            const result = await memory.remember({
-              actorSessionId: current.id,
-              idempotencyKey: command.idempotencyKey,
-              requestDigest: ownerMemoryRequestDigest(command, current.id),
-              value: command.value,
-            });
+            const result = await this.#withSessionMemoryOperation(current.id, async () =>
+              await memory.remember({
+                actorSessionId: current.id,
+                idempotencyKey: command.idempotencyKey,
+                requestDigest: ownerMemoryRequestDigest(command, current.id),
+                value: command.value,
+              }));
             return {
               ...result,
               idempotencyKey: command.idempotencyKey,
@@ -1368,12 +1427,13 @@ export class HraService {
           const session = this.#store.requireSession(command.session);
           return await this.#serializeSessionAuthority(session, async () => {
             const current = this.#store.requireSession(session.id);
-            const result = await memory.share({
-              actorSessionId: current.id,
-              idempotencyKey: command.idempotencyKey,
-              requestDigest: ownerMemoryRequestDigest(command, current.id),
-              value: command.value,
-            });
+            const result = await this.#withSessionMemoryOperation(current.id, async () =>
+              await memory.share({
+                actorSessionId: current.id,
+                idempotencyKey: command.idempotencyKey,
+                requestDigest: ownerMemoryRequestDigest(command, current.id),
+                value: command.value,
+              }));
             return {
               ...result,
               idempotencyKey: command.idempotencyKey,
@@ -1633,6 +1693,24 @@ export class HraService {
         case "session.project": {
           const project = this.#store.requireProject(command.project);
           const session = await this.#updateSession(command.session, (current) => {
+            if (current.state !== "idle" || current.activeTurnId !== undefined) {
+              throw new CommandFailure(
+                "CONFLICT",
+                "A session project can change only while the session is idle. Stop or finish the active turn, then retry so provider, peer, and memory authority move together.",
+                { sessionId: current.id, state: current.state },
+              );
+            }
+            if (current.projectId !== project.id && current.provider !== "codex") {
+              throw new CommandFailure(
+                "CONFLICT",
+                `A live ${current.provider} session cannot change projects because its provider runtime remains bound to the original working directory. Start a new session in the target project instead.`,
+                {
+                  provider: current.provider,
+                  reason: "provider_project_rebind_unsupported",
+                  sessionId: current.id,
+                },
+              );
+            }
             const unsettled = this.#store.readUnsettledMemorySubmissionForSession(current.id);
             if (unsettled !== null) {
               throw new CommandFailure(
@@ -1838,6 +1916,12 @@ export class HraService {
             throw new CommandFailure(
               "CONFLICT",
               "The selected session is not bound to a project, so it has no project memory authority.",
+              details,
+            );
+          case "MEMORY_SESSION_REFUSED":
+            throw new CommandFailure(
+              "CONFLICT",
+              "A terminal session cannot create, query, explain, remember, or share working memory.",
               details,
             );
           case "MEMORY_SEARCH_TERM_LIMIT":
@@ -2902,38 +2986,42 @@ export class HraService {
           const memory = this.#requireMemoryPort();
           return await this.#serializeSessionAuthority(actor, async () => {
             const currentActor = this.#requireHraHostToolActor(authority, call);
-            return await memory.remember({
-              actorSessionId: currentActor.id,
-              idempotencyKey: hraHostToolIdempotencyKey(authority, call),
-              requestDigest: call.requestDigest,
-              value: call.input,
-            });
+            return await this.#withSessionMemoryOperation(currentActor.id, async () =>
+              await memory.remember({
+                actorSessionId: currentActor.id,
+                idempotencyKey: hraHostToolIdempotencyKey(authority, call),
+                requestDigest: call.requestDigest,
+                value: call.input,
+              }));
           });
         }
         case "memory_query": {
           const memory = this.#requireMemoryPort();
           return await this.#serializeSessionAuthority(actor, async () => {
             const currentActor = this.#requireHraHostToolActor(authority, call);
-            return await memory.query({ actorSessionId: currentActor.id, value: call.input });
+            return await this.#withSessionMemoryOperation(currentActor.id, async () =>
+              await memory.query({ actorSessionId: currentActor.id, value: call.input }));
           });
         }
         case "memory_explain": {
           const memory = this.#requireMemoryPort();
           return await this.#serializeSessionAuthority(actor, async () => {
             const currentActor = this.#requireHraHostToolActor(authority, call);
-            return await memory.explain({ actorSessionId: currentActor.id, value: call.input });
+            return await this.#withSessionMemoryOperation(currentActor.id, async () =>
+              await memory.explain({ actorSessionId: currentActor.id, value: call.input }));
           });
         }
         case "memory_share": {
           const memory = this.#requireMemoryPort();
           return await this.#serializeSessionAuthority(actor, async () => {
             const currentActor = this.#requireHraHostToolActor(authority, call);
-            return await memory.share({
-              actorSessionId: currentActor.id,
-              idempotencyKey: hraHostToolIdempotencyKey(authority, call),
-              requestDigest: call.requestDigest,
-              value: call.input,
-            });
+            return await this.#withSessionMemoryOperation(currentActor.id, async () =>
+              await memory.share({
+                actorSessionId: currentActor.id,
+                idempotencyKey: hraHostToolIdempotencyKey(authority, call),
+                requestDigest: call.requestDigest,
+                value: call.input,
+              }));
           });
         }
       }
@@ -2962,6 +3050,45 @@ export class HraService {
       throw error;
     }
     return this.#memory;
+  }
+
+  #requireCanonicalMemorySyncPort(): HraCanonicalMemorySyncPort {
+    if (this.#canonicalMemorySync === undefined) {
+      throw new CommandFailure(
+        "UNAVAILABLE",
+        "Hosted memory is unavailable because this daemon has no active enrolled cloud authority.",
+        { reason: "canonical_memory_cloud_authority_unavailable" },
+      );
+    }
+    return this.#canonicalMemorySync;
+  }
+
+  async #withSessionMemoryOperation<T>(
+    actorSessionId: SessionRecord["id"],
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const actor = this.#store.requireSession(actorSessionId);
+    if (
+      actor.state === "terminal"
+      || this.#pendingProviderThreadDeletions.has(actorSessionId)
+    ) {
+      throw new HraMemoryRefusalError("MEMORY_SESSION_REFUSED");
+    }
+    if (actor.state === "recovery_required") {
+      throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+    }
+    if (this.#sessionMemoryOperations.has(actorSessionId)) {
+      throw new Error("SESSION_MEMORY_OPERATION_CONCURRENT");
+    }
+    const active = Promise.resolve().then(operation);
+    this.#sessionMemoryOperations.set(actorSessionId, active);
+    try {
+      return await active;
+    } finally {
+      if (this.#sessionMemoryOperations.get(actorSessionId) === active) {
+        this.#sessionMemoryOperations.delete(actorSessionId);
+      }
+    }
   }
 
   #requireHraHostToolActor(
@@ -3191,16 +3318,46 @@ export class HraService {
       }
       throw error;
     }
-    const message = renderPeerSessionMessage({
-      actorSessionId: actor.id,
-      actorTurnId: this.#eventCursors.projectPublicProviderIdentifier(call.turnId),
-      reason: call.input.reason,
-      message: call.input.message,
-    });
     const idempotencyKey = hraHostToolIdempotencyKey(authority, call);
     return await this.#serializePeerSessionAuthorities(actor, target, async () => {
+      // The initial check only selects the authority locks. Account state,
+      // process generation, turn authority, and the admitted host binding can
+      // all change while this call waits for them, so no replay or new effect
+      // may proceed on that stale observation.
+      const currentActor = this.#requireHraHostToolActor(authority, call);
+      const currentTarget = this.#store.requireSession(target.id);
+      if (currentTarget.profileId !== target.profileId) {
+        // The acquired account lock belongs to the pre-switch profile. A
+        // retry will resolve and lock the target's current account rather
+        // than inspecting or mutating it under stale serialization keys.
+        throw new PeerSessionRefusalError("PEER_SESSION_REVISION_CONFLICT");
+      }
+      const message = renderPeerSessionMessage({
+        actorSessionId: currentActor.id,
+        actorTurnId: this.#eventCursors.projectPublicProviderIdentifier(call.turnId),
+        reason: call.input.reason,
+        message: call.input.message,
+      });
+      const existingAction = this.#store.readPeerSessionActionByIdempotencyKey(idempotencyKey);
+      if (
+        existingAction === null
+        || ["prepared", "queued", "effect_started", "ambiguous"].includes(existingAction.state)
+      ) {
+        const targetProfile = this.#store.requireProfileById(
+          currentTarget.profileId,
+          { includeRemoved: true },
+        );
+        try {
+          this.#assertEstablishedSessionAccount(targetProfile, currentTarget);
+        } catch (error: unknown) {
+          if (error instanceof CommandFailure) {
+            return { version: 1, ok: false, code: error.code };
+          }
+          throw error;
+        }
+      }
       const admission = this.#store.admitPeerSessionAction({
-        actorSessionId: actor.id,
+        actorSessionId: currentActor.id,
         actorTurnId: call.turnId,
         targetSessionId: target.id,
         expectedTargetRevision: call.input.expectedRevision,
@@ -3214,7 +3371,6 @@ export class HraService {
       if (call.input.delivery === "queue") {
         const queued = admission.queue;
         if (queued === undefined) throw new Error("PEER_SESSION_QUEUE_ADMISSION_LOST");
-        const currentTarget = this.#store.requireSession(target.id);
         if (queued.state === "pending" && currentTarget.state === "idle") {
           this.#scheduleQueueDispatch(currentTarget);
         }
@@ -3233,7 +3389,7 @@ export class HraService {
         };
       }
       let currentAction = admission.replay
-        ? this.#reconcileDirectPeerSessionAction(admission.action)
+        ? this.#reconcileDirectPeerSessionAction(admission.action, "live")
         : admission.action;
       const joinedAttempt = this.#store.readMutation(idempotencyKey);
       if (
@@ -3324,6 +3480,7 @@ export class HraService {
       } catch (error: unknown) {
         let current = this.#reconcileDirectPeerSessionAction(
           this.#store.requirePeerSessionAction(admission.action.id),
+          "live",
         );
         if (current.state === "prepared") {
           current = this.#store.cancelUnstartedPeerSessionDirectAction({
@@ -3332,11 +3489,14 @@ export class HraService {
           });
         }
         if (current.state === "effect_started") {
+          const nestedAttempt = this.#store.readMutation(current.idempotencyKey);
           current = this.#store.settlePeerSessionAction({
             actionId: current.id,
             expectedState: current.state,
             state: "ambiguous",
-            resultDigest: digestText(JSON.stringify({ code: "EFFECT_OUTCOME_UNSETTLED" })),
+            ...(nestedAttempt?.state === "prepared"
+              ? {}
+              : { resultDigest: digestText(JSON.stringify({ code: "EFFECT_OUTCOME_UNSETTLED" })) }),
           });
         }
         if (error instanceof CommandFailure) {
@@ -3359,13 +3519,18 @@ export class HraService {
         limit: 100,
         ...(after === undefined ? {} : { after }),
       });
-      for (const action of page.records) this.#reconcileDirectPeerSessionAction(action);
+      for (const action of page.records) {
+        this.#reconcileDirectPeerSessionAction(action, "restart");
+      }
       if (page.nextCursor === undefined) return;
       after = page.nextCursor;
     }
   }
 
-  #reconcileDirectPeerSessionAction(action: PeerSessionActionRecord): PeerSessionActionRecord {
+  #reconcileDirectPeerSessionAction(
+    action: PeerSessionActionRecord,
+    phase: "live" | "restart",
+  ): PeerSessionActionRecord {
     if (action.delivery === "queue") return action;
     const attempt = this.#store.readMutation(action.idempotencyKey);
     if (attempt === null) {
@@ -3381,7 +3546,15 @@ export class HraService {
     if (action.state === "applied" || action.state === "failed" || action.state === "cancelled") {
       return action;
     }
-    if (attempt.state === "prepared" || attempt.state === "effect_started" || attempt.state === "ambiguous") {
+    if (attempt.state === "prepared") {
+      return phase === "restart"
+        ? this.#store.cancelUnstartedPeerSessionDirectAction({
+            actionId: action.id,
+            diagnosticCode: "PEER_SESSION_PROVIDER_EFFECT_NOT_STARTED",
+          })
+        : action;
+    }
+    if (attempt.state === "effect_started" || attempt.state === "ambiguous") {
       return action;
     }
     if (action.state !== "effect_started" && action.state !== "ambiguous") {
@@ -3888,7 +4061,7 @@ export class HraService {
     ) return;
     this.#ensureSessionProviderConnection(authority, session, fact.connectionId);
     if (fact.type === "threadDeleted") {
-      await this.#applyProviderThreadDeletion(authority, fact, session);
+      await this.#applyOrDeferProviderThreadDeletion(authority, fact, session);
       return;
     }
     const event = this.#eventBodyForCodexFact(fact, session);
@@ -3934,13 +4107,62 @@ export class HraService {
     }
   }
 
-  async #applyProviderThreadDeletion(
+  async #applyOrDeferProviderThreadDeletion(
     authority: ProfileAuthority,
     fact: Extract<CodexFact, { type: "threadDeleted" }>,
     expected: SessionRecord,
   ): Promise<void> {
+    if (this.#pendingProviderThreadDeletions.has(expected.id)) return;
+    const memoryOperation = this.#sessionMemoryOperations.get(expected.id);
+    if (memoryOperation === undefined) {
+      await this.#applyProviderThreadDeletion(authority, fact, expected);
+      return;
+    }
+
+    // The provider may be waiting for this callback while the actor's memory
+    // tool call owns the ordinary session tail. Persist terminal authority and
+    // supersede hosted recovery immediately, but leave the working directory
+    // intact until the already-admitted memory operation releases its handles.
+    this.#pendingProviderThreadDeletions.add(expected.id);
+    let applied = false;
+    try {
+      applied = await this.#applyProviderThreadDeletion(
+        authority,
+        fact,
+        expected,
+        { deferMemoryCleanup: true },
+      );
+    } catch (error: unknown) {
+      this.#pendingProviderThreadDeletions.delete(expected.id);
+      throw error;
+    }
+    if (!applied) {
+      this.#pendingProviderThreadDeletions.delete(expected.id);
+      return;
+    }
+    const deletion = memoryOperation.catch(() => undefined).then(async () => {
+      await this.#cleanupTerminalFactsMemory(this.#store.requireSession(expected.id));
+      this.#pendingProviderThreadDeletions.delete(expected.id);
+    });
+    const tracked = deletion.then(
+      () => undefined,
+      (error: unknown) => {
+        if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+        else this.#scheduleStop();
+      },
+    );
+    this.#background.add(tracked);
+    void tracked.then(() => this.#background.delete(tracked));
+  }
+
+  async #applyProviderThreadDeletion(
+    authority: ProfileAuthority,
+    fact: Extract<CodexFact, { type: "threadDeleted" }>,
+    expected: SessionRecord,
+    options: Readonly<{ deferMemoryCleanup?: boolean }> = {},
+  ): Promise<boolean> {
     const current = this.#store.findSessionByProviderThread(authority.id, fact.threadId);
-    if (current === null || current.id !== expected.id) return;
+    if (current === null || current.id !== expected.id) return false;
     this.#persistSessionEventWrites(this.#eventRedactor.interruptSession({
       sessionId: current.id,
       accountId: authority.id,
@@ -3956,13 +4178,16 @@ export class HraService {
     });
     if (terminal.event !== undefined) this.#eventWaiters.notify(current.id);
     for (const interaction of terminal.interactions) this.#appendInteractionState(interaction);
-    await this.#cleanupTerminalFactsMemory(this.#store.requireSession(current.id));
+    if (options.deferMemoryCleanup !== true) {
+      await this.#cleanupTerminalFactsMemory(this.#store.requireSession(current.id));
+    }
     this.#sessionProviderConnections.delete(current.id);
     this.#sessionObservationFailures.delete(current.id);
     this.#sessionResubscriptionConnections.delete(current.id);
     this.#sessionsAwaitingResubscription.delete(current.id);
     await this.#cloud.supersedeCompactProjectionRecoveryForProviderDeletion(current.id);
     await this.#daemonAuthority.assertCurrent();
+    return true;
   }
 
   /*
@@ -4824,6 +5049,7 @@ export class HraService {
     await this.#drainOwnedWork();
     let memoryError: unknown;
     try {
+      await this.#beforeMemoryClose?.();
       await this.#memory?.close();
     } catch (error: unknown) {
       memoryError = error;
@@ -9520,7 +9746,8 @@ export class HraService {
     }
     const requirement = presetRequirementForContract(target.preset, target.presetContract);
     if (
-      runtimeProfile.model !== requirement.model
+      requirement === undefined
+      || runtimeProfile.model !== requirement.model
       || runtimeProfile.reasoningEffort !== requirement.effort
     ) {
       throw this.#journaledProviderSwitchFailure(
@@ -10718,7 +10945,20 @@ export class HraService {
     const task = this.#serializeSessionAuthority(session, async () => this.#dispatchNextQueue(session.id, authorityFor(this.#paths, profile)));
     const tracked = task.then(
       () => undefined,
-      (error: unknown) => this.recordBackgroundDiagnostic("queue_dispatch_failed", error),
+      (error: unknown) => {
+        // A switch that wins after scheduling is an expected loss of the
+        // captured account lock, not a reason to strand the durable queue.
+        // Retry only after the stale task has released its locks and only
+        // under the newly observed exact session authority.
+        if (error instanceof CommandFailure && error.code === "CONFLICT") {
+          const current = this.#store.requireSession(session.id);
+          if (current.profileId !== session.profileId && current.state === "idle") {
+            this.#scheduleQueueDispatch(current);
+            return;
+          }
+        }
+        this.recordBackgroundDiagnostic("queue_dispatch_failed", error);
+      },
     );
     this.#background.add(tracked);
     void tracked.then(() => this.#background.delete(tracked));
@@ -11740,7 +11980,7 @@ export class HraService {
 
   #reconcilePeerSessionMutation(idempotencyKey: string): void {
     const action = this.#store.readPeerSessionActionByIdempotencyKey(idempotencyKey);
-    if (action !== null) this.#reconcileDirectPeerSessionAction(action);
+    if (action !== null) this.#reconcileDirectPeerSessionAction(action, "live");
   }
 
   #proveSessionMutation(
@@ -12128,21 +12368,17 @@ export class HraService {
     profile: ProfileRecord,
     session: Pick<SessionRecord, "provider">,
   ): boolean {
-    switch (session.provider) {
-      case "codex": return profile.state === "signed_in";
-      case "claude": return this.#platform === "linux";
-      case "devin": return true;
-    }
+    return this.#isProviderAccountReady(profile, session.provider);
   }
 
-  /** Established non-Codex sessions ignore Codex auth state; Claude still requires Linux custody. */
+  /** Established non-Codex sessions ignore Codex login state after shared profile fences. */
   #assertEstablishedSessionAccount(
     profile: ProfileRecord,
     session: Pick<SessionRecord, "provider">,
   ): void {
+    this.#assertProviderAccountReady(profile, session.provider);
     switch (session.provider) {
       case "codex":
-        if (!this.#profileAllowsEstablishedSession(profile, session)) this.#assertSignedIn(profile);
         return;
       case "claude":
         this.#assertClaudeIsolationAccepted();
@@ -12287,6 +12523,13 @@ export class HraService {
   async #dispatchNextQueue(sessionId: SessionRecord["id"], authority: ProfileAuthority): Promise<void> {
     const session = this.#store.requireSession(sessionId);
     if (session.state !== "idle" || session.providerThreadId === undefined) return;
+    if (session.profileId !== authority.id) {
+      // A provider switch won before this background owner reached the
+      // session lock. Requeue under the current account instead of allowing
+      // an equal process-generation number to alias the stale profile.
+      this.#scheduleQueueDispatch(session);
+      return;
+    }
     const admittedProfile = this.#store.requireProfile(session.profileId);
     if (!this.#profileAllowsEstablishedSession(admittedProfile, session)) return;
     const boundSession: BoundSessionRecord = { ...session, providerThreadId: session.providerThreadId };
@@ -12299,6 +12542,13 @@ export class HraService {
     let evidence: ReturnType<StateStore["beginQueueEffect"]> | undefined;
     let providerApplied = false;
     try {
+      if (this.#store.cancelRevokedPendingPeerQueue(queued.id) !== null) {
+        this.#queuePreEffectRetryCounts.delete(queued.id);
+        this.#wakeSessionTaskPump();
+        const observed = this.#store.requireSession(session.id);
+        if (observed.state === "idle") this.#scheduleQueueDispatch(observed);
+        return;
+      }
       const signal = new AbortController().signal;
       const profile = this.#store.requireProfile(session.profileId);
       if (
@@ -12396,6 +12646,13 @@ export class HraService {
       }
       await this.#daemonAuthority.assertCurrent();
       if (evidence === undefined) {
+        if (this.#store.cancelRevokedPendingPeerQueue(queued.id) !== null) {
+          this.#queuePreEffectRetryCounts.delete(queued.id);
+          this.#wakeSessionTaskPump();
+          const observed = this.#store.requireSession(session.id);
+          if (observed.state === "idle") this.#scheduleQueueDispatch(observed);
+          return;
+        }
         if (this.#isRetryableQueuePreEffectError(error)) this.#scheduleQueuePreEffectRetry(session, queued.id);
         return;
       }
@@ -12628,8 +12885,21 @@ export class HraService {
     operation: () => Promise<T> | T,
     options: Readonly<{ allowDuringProjectionRecovery?: boolean }> = {},
   ): Promise<T> {
+    const admittedProfileIds = new Set(profileIds);
     return await this.#serializeProfileAuthorities(profileIds, async () =>
       this.#serialize(`session:${session.id}`, async () => {
+        // A completed cross-account switch can move this session while the
+        // caller waits for its captured account lock. Equal numeric process
+        // generations from different profiles are never equivalent authority.
+        // Recovery callers name every profile whose journal they can safely
+        // reconcile; ordinary callers admit only the captured profile.
+        const current = this.#store.requireSession(session.id);
+        if (!admittedProfileIds.has(current.profileId)) {
+          throw new CommandFailure(
+            "CONFLICT",
+            "This session changed accounts while the operation waited for authority. Retry against its current account binding.",
+          );
+        }
         if (options.allowDuringProjectionRecovery !== true) {
           const unsettled = await this.#cloud.isCompactProjectionRecoveryUnsettled(session.id);
           await this.#daemonAuthority.assertCurrent();

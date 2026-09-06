@@ -415,6 +415,26 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("project.add"), label: labelSchema, path: projectPathSchema }).strict(),
   z.object({ kind: z.literal("project.use"), project: selectorSchema }).strict(),
   z.object({ kind: z.literal("memory.status"), session: selectorSchema }).strict(),
+  z.object({ kind: z.literal("memory.hosted.list") }).strict(),
+  z.object({
+    kind: z.literal("memory.hosted.create"),
+    project: selectorSchema,
+    idempotencyKey: requiredIdempotencyKeySchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("memory.hosted.attach"),
+    project: selectorSchema,
+    hostedSpaceId: z.string().regex(/^memory_[A-Za-z0-9_-]{32}$/u),
+  }).strict(),
+  z.object({
+    kind: z.literal("memory.hosted.detach"),
+    project: selectorSchema,
+    expectedGeneration: positiveRevisionSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("memory.hosted.sync"),
+    project: selectorSchema,
+  }).strict(),
   z.object({
     kind: z.literal("memory.query"),
     session: selectorSchema,

@@ -17,6 +17,7 @@ import {
   cloudLimits,
   cloudPayloadAad,
   decryptDeviceRegistry,
+  decryptMemorySummary,
   decryptNotificationEmail,
   decryptNotificationHours,
   isFiniteTimestamp,
@@ -28,6 +29,7 @@ import {
   type CloudPayloadAuthority,
   type DeviceRegistryPayload,
   type EncryptedEnvelope,
+  type MemorySummaryPayload,
   type NotificationEmailPolicy,
   type NotificationHoursPolicy,
 } from "../hra/cloud";
@@ -45,6 +47,11 @@ export type RegistryRow = Readonly<{
   devicePublicId: string;
   envelope: EncryptedEnvelope;
   keyVersion: number;
+  /** Optional read-only memory/peer supervision, never part of registry v1. */
+  memorySummaryEnvelope: EncryptedEnvelope | null;
+  memorySummaryEnvelopeStatus: "absent" | "invalid" | "present";
+  memorySummaryRevision: number | null;
+  memorySummaryUpdatedAt: number | null;
   /** Optional companion projection so the broad registry stays v1-compatible. */
   notificationEmailEnvelope: EncryptedEnvelope | null;
   notificationEmailEnvelopeStatus: "absent" | "invalid" | "present";
@@ -74,6 +81,27 @@ export function parseRegistryRow(input: unknown): RegistryRow | null {
     cloudLimits.registryCiphertextCharacters,
   );
   if (envelope === null || envelope.keyVersion !== value.keyVersion) return null;
+  const hasMemorySummaryEnvelope = Object.hasOwn(value, "memorySummaryEnvelope");
+  const hasMemorySummaryRevision = Object.hasOwn(value, "memorySummaryRevision");
+  const hasMemorySummaryUpdatedAt = Object.hasOwn(value, "memorySummaryUpdatedAt");
+  const memorySummaryEnvelope = !hasMemorySummaryEnvelope
+    ? null
+    : parseEncryptedEnvelope(
+        value.memorySummaryEnvelope,
+        cloudLimits.memorySummaryCiphertextCharacters,
+      );
+  const memorySummaryRevisionValid = hasMemorySummaryRevision
+    && isSafePositiveInteger(value.memorySummaryRevision);
+  const memorySummaryUpdatedAtValid = hasMemorySummaryUpdatedAt
+    && isSafePositiveInteger(value.memorySummaryUpdatedAt);
+  const memorySummaryMetadataValid = hasMemorySummaryRevision === hasMemorySummaryUpdatedAt
+    && (!hasMemorySummaryRevision
+      || (memorySummaryRevisionValid && memorySummaryUpdatedAtValid));
+  const memorySummaryEnvelopeValid = hasMemorySummaryEnvelope
+    && memorySummaryEnvelope !== null
+    && memorySummaryEnvelope.keyVersion === value.keyVersion
+    && memorySummaryRevisionValid
+    && memorySummaryUpdatedAtValid;
   const notificationEmailEnvelope = value.notificationEmailEnvelope === undefined
     ? null
     : parseEncryptedEnvelope(
@@ -90,10 +118,24 @@ export function parseRegistryRow(input: unknown): RegistryRow | null {
   const hasNotificationPolicyRevision = Object.hasOwn(value, "notificationPolicyRevision");
   const notificationPolicyRevisionValid = hasNotificationPolicyRevision
     && isSafePositiveInteger(value.notificationPolicyRevision);
+  let memorySummaryEnvelopeStatus: RegistryRow["memorySummaryEnvelopeStatus"] = "absent";
+  if (!memorySummaryMetadataValid || (hasMemorySummaryEnvelope && !memorySummaryEnvelopeValid)) {
+    memorySummaryEnvelopeStatus = "invalid";
+  } else if (hasMemorySummaryEnvelope) {
+    memorySummaryEnvelopeStatus = "present";
+  }
   return {
     devicePublicId: value.devicePublicId,
     envelope,
     keyVersion: value.keyVersion,
+    memorySummaryEnvelope: memorySummaryEnvelopeValid ? memorySummaryEnvelope : null,
+    memorySummaryEnvelopeStatus,
+    memorySummaryRevision: memorySummaryMetadataValid && memorySummaryRevisionValid
+      ? value.memorySummaryRevision as number
+      : null,
+    memorySummaryUpdatedAt: memorySummaryMetadataValid && memorySummaryUpdatedAtValid
+      ? value.memorySummaryUpdatedAt as number
+      : null,
     notificationEmailEnvelope: notificationEmailEnvelopeValid
       ? notificationEmailEnvelope
       : null,
@@ -127,6 +169,10 @@ export function notificationHoursAuthority(input: Parameters<typeof registryAuth
 
 export function notificationEmailAuthority(input: Parameters<typeof registryAuthority>[0]): CloudPayloadAuthority {
   return { ...registryAuthority(input), kind: "notification_email" };
+}
+
+export function memorySummaryAuthority(input: Parameters<typeof registryAuthority>[0]): CloudPayloadAuthority {
+  return { ...registryAuthority(input), kind: "memory_summary" };
 }
 
 export function parseRegistryRows(value: unknown): readonly RegistryRow[] {
@@ -163,6 +209,10 @@ export function notificationEmailAad(input: Parameters<typeof registryAuthority>
   return cloudPayloadAad(notificationEmailAuthority(input));
 }
 
+export function memorySummaryAad(input: Parameters<typeof registryAuthority>[0]): Uint8Array {
+  return cloudPayloadAad(memorySummaryAuthority(input));
+}
+
 export type DeviceRegistries = Readonly<{
   error: string | null;
   loading: boolean;
@@ -175,6 +225,8 @@ export type RegistryProjection = Readonly<{
   notificationHoursStatus: "available" | "unreadable" | "unsupported";
   notificationPolicyFreshness: "current" | "stale" | "unreadable" | "unsupported";
   notificationPolicyRevision: number | null;
+  memorySummary: MemorySummaryPayload | null;
+  memorySummaryStatus: "available" | "unreadable" | "unsupported";
   registry: DeviceRegistryPayload;
 }>;
 
@@ -238,8 +290,20 @@ export function notificationEmailProjection(input: Readonly<{
   };
 }
 
-function cacheKey(row: RegistryRow): string {
-  return `${row.devicePublicId}:${row.revision}`;
+/**
+ * Both companion fences participate in cache identity. When Convex publishes
+ * a new summary without touching the broad registry revision, the old
+ * projection immediately becomes a cache miss instead of remaining visible
+ * while the replacement decrypt is in flight.
+ */
+export function registryProjectionCacheKey(row: RegistryRow): string {
+  return [
+    row.devicePublicId,
+    row.revision,
+    row.memorySummaryEnvelopeStatus,
+    row.memorySummaryRevision ?? 0,
+    row.memorySummaryUpdatedAt ?? 0,
+  ].join(":");
 }
 
 /**
@@ -260,6 +324,29 @@ export async function decryptRegistryProjection(input: Readonly<{
       userPublicId: input.userPublicId,
     }),
   );
+  let memorySummary: MemorySummaryPayload | null = null;
+  let memorySummaryStatus: RegistryProjection["memorySummaryStatus"] = "unsupported";
+  if (input.row.memorySummaryEnvelopeStatus === "invalid") {
+    memorySummaryStatus = "unreadable";
+  } else if (
+    input.row.memorySummaryEnvelopeStatus === "present"
+    && input.row.memorySummaryEnvelope !== null
+  ) {
+    try {
+      memorySummary = await decryptMemorySummary(
+        input.row.memorySummaryEnvelope,
+        input.key,
+        memorySummaryAuthority({
+          devicePublicId: input.row.devicePublicId,
+          keyVersion: input.row.keyVersion,
+          userPublicId: input.userPublicId,
+        }),
+      );
+      memorySummaryStatus = "available";
+    } catch {
+      memorySummaryStatus = "unreadable";
+    }
+  }
   let notificationEmail: NotificationEmailPolicy | null = null;
   let notificationEmailStatus: "available" | "unreadable" | "unsupported" = "unsupported";
   if (input.row.notificationEmailEnvelopeStatus === "invalid") {
@@ -316,6 +403,8 @@ export async function decryptRegistryProjection(input: Readonly<{
     }),
     notificationHours,
     notificationHoursStatus,
+    memorySummary,
+    memorySummaryStatus,
     registry,
   };
 }
@@ -362,8 +451,9 @@ export function useDeviceRegistries(): DeviceRegistries {
           if (
             projection.notificationHoursStatus === "unreadable"
             || projection.notificationPolicyFreshness === "unreadable"
+            || projection.memorySummaryStatus === "unreadable"
           ) failures += 1;
-          next.set(cacheKey(row), projection);
+          next.set(registryProjectionCacheKey(row), projection);
         } catch (failure: unknown) {
           report(failure);
           failures += 1;
@@ -373,7 +463,7 @@ export function useDeviceRegistries(): DeviceRegistries {
       setPayloads(next);
       setError(failures === 0
         ? null
-        : `${failures} machine setting${failures === 1 ? "" : "s"} could not be read.`);
+        : `${failures} machine projection${failures === 1 ? "" : "s"} could not be read.`);
     })();
     return () => { run.cancel(); };
   }, [key, keyVersion, report, rows, userPublicId]);
@@ -384,7 +474,7 @@ export function useDeviceRegistries(): DeviceRegistries {
       { online: row.online, status: row.status },
     ]));
     return sortMachines(rows.flatMap((row) => {
-      const projection = payloads.get(cacheKey(row));
+      const projection = payloads.get(registryProjectionCacheKey(row));
       if (projection === undefined) return [];
       return [toMachineView({
         device: devices.get(row.devicePublicId) ?? null,
@@ -395,6 +485,8 @@ export function useDeviceRegistries(): DeviceRegistries {
         notificationPolicyFreshness: projection.notificationPolicyFreshness,
         notificationPolicyRevision: projection.notificationPolicyRevision,
         attentionEmailEnabled: projection.attentionEmailEnabled,
+        memorySummary: projection.memorySummary,
+        memorySummaryStatus: projection.memorySummaryStatus,
         payload: projection.registry,
         revision: row.revision,
         updatedAt: row.updatedAt,

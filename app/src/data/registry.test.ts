@@ -9,11 +9,13 @@ import {
 } from "../hra/cloud";
 import {
   decryptRegistryProjection,
+  memorySummaryAad,
   notificationEmailAad,
   notificationHoursAad,
   parseRegistryRow,
   parseRegistryRows,
   registryAad,
+  registryProjectionCacheKey,
   type RegistryRow,
 } from "./registry";
 
@@ -74,6 +76,11 @@ describe("notification policy registry compatibility", () => {
     };
     expect(parseRow(base).notificationEmailEnvelopeStatus).toBe("absent");
     expect(parseRow(base).notificationHoursEnvelopeStatus).toBe("absent");
+    expect(parseRow(base).memorySummaryEnvelopeStatus).toBe("absent");
+    expect(parseRow(base)).toMatchObject({
+      memorySummaryRevision: null,
+      memorySummaryUpdatedAt: null,
+    });
     expect(parseRow(base).notificationPolicyRevisionStatus).toBe("absent");
     expect(parseRow({
       ...base,
@@ -91,6 +98,30 @@ describe("notification policy registry compatibility", () => {
       ...base,
       notificationHoursEnvelope: { ...envelope, keyVersion: 2 },
     }).notificationHoursEnvelopeStatus).toBe("invalid");
+    expect(parseRow({
+      ...base,
+      memorySummaryEnvelope: { ...envelope, ciphertext: "not base64!" },
+      memorySummaryRevision: 1,
+      memorySummaryUpdatedAt: 2,
+    }).memorySummaryEnvelopeStatus).toBe("invalid");
+    expect(parseRow({
+      ...base,
+      memorySummaryEnvelope: { ...envelope, keyVersion: 2 },
+      memorySummaryRevision: 1,
+      memorySummaryUpdatedAt: 2,
+    }).memorySummaryEnvelopeStatus).toBe("invalid");
+    expect(parseRow({ ...base, memorySummaryEnvelope: { ...envelope } }))
+      .toMatchObject({ memorySummaryEnvelopeStatus: "invalid", memorySummaryRevision: null });
+    expect(parseRow({ ...base, memorySummaryRevision: 1 }))
+      .toMatchObject({ memorySummaryEnvelopeStatus: "invalid", memorySummaryRevision: null });
+    expect(parseRow({ ...base, memorySummaryRevision: 1, memorySummaryUpdatedAt: 0 }))
+      .toMatchObject({ memorySummaryEnvelopeStatus: "invalid", memorySummaryRevision: null });
+    expect(parseRow({ ...base, memorySummaryRevision: 1, memorySummaryUpdatedAt: 2 }))
+      .toMatchObject({
+        memorySummaryEnvelopeStatus: "absent",
+        memorySummaryRevision: 1,
+        memorySummaryUpdatedAt: 2,
+      });
     expect(parseRow({ ...base, notificationPolicyRevision: 2 }))
       .toMatchObject({ notificationPolicyRevision: 2, notificationPolicyRevisionStatus: "present" });
     expect(parseRow({ ...base, notificationPolicyRevision: 0 }))
@@ -197,6 +228,85 @@ describe("notification policy registry compatibility", () => {
       notificationHoursStatus: "unreadable",
       registry: { machineLabel: "Studio" },
     });
+  });
+
+  test("decrypts memory supervision independently and fails its corruption closed", async () => {
+    const key = randomKeyBytes();
+    const authority = { devicePublicId, keyVersion: 1, userPublicId } as const;
+    const envelope = await encryptedJson(registryPayload(), key, registryAad(authority));
+    const digest = (scalar: string) => scalar.repeat(64);
+    const memorySummary = {
+      coverage: { peerActions: "complete", peerPolicies: "complete", spaces: "complete" },
+      observedAt: 1_760_000_000_000,
+      peerActions: [],
+      peerPolicies: [],
+      spaces: [{
+        bindingDigest: digest("a"),
+        canonicalSpaceId: `hra:project:space-${"b".repeat(32)}`,
+        enrollment: "not_enrolled",
+        head: { digest: digest("c"), operationSha256: null, sequence: 0 },
+        lastExchangeAt: null,
+        projectLabel: "HRA",
+        recentRecords: [],
+        recordCount: 0,
+        remoteHead: null,
+        syncStatus: "local_only",
+      }],
+      version: 1,
+    } as const;
+    const memorySummaryEnvelope = await encryptedJson(
+      memorySummary,
+      key,
+      memorySummaryAad(authority),
+    );
+    const row = parseRow({
+      devicePublicId,
+      envelope,
+      keyVersion: 1,
+      memorySummaryEnvelope,
+      memorySummaryRevision: 1,
+      memorySummaryUpdatedAt: 2,
+      revision: 1,
+      updatedAt: 1,
+    });
+    expect(await decryptRegistryProjection({ key, row, userPublicId })).toMatchObject({
+      memorySummary,
+      memorySummaryStatus: "available",
+      registry: { machineLabel: "Studio" },
+    });
+    const first = memorySummaryEnvelope.ciphertext[0] === "A" ? "B" : "A";
+    expect(await decryptRegistryProjection({
+      key,
+      row: parseRow({
+        devicePublicId,
+        envelope,
+        keyVersion: 1,
+        memorySummaryEnvelope: {
+          ...memorySummaryEnvelope,
+          ciphertext: first + memorySummaryEnvelope.ciphertext.slice(1),
+        },
+        memorySummaryRevision: 2,
+        memorySummaryUpdatedAt: 3,
+        revision: 1,
+        updatedAt: 1,
+      }),
+      userPublicId,
+    })).toMatchObject({
+      memorySummary: null,
+      memorySummaryStatus: "unreadable",
+      registry: { machineLabel: "Studio" },
+    });
+    const replaced = parseRow({
+      devicePublicId,
+      envelope,
+      keyVersion: 1,
+      memorySummaryEnvelope,
+      memorySummaryRevision: 2,
+      memorySummaryUpdatedAt: 3,
+      revision: 1,
+      updatedAt: 1,
+    });
+    expect(registryProjectionCacheKey(replaced)).not.toBe(registryProjectionCacheKey(row));
   });
 
   test("shows email consent only when the composite revision is current", async () => {

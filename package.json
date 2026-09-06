@@ -83,7 +83,7 @@
   ],
   "dependencies": {
     "@agentclientprotocol/sdk": "1.4.0",
-    "@hraness/oh": "0.2.7",
+    "@hraness/oh": "0.4.1",
     "@openai/codex": "0.153.2",
     "convex": "1.45.0",
     "zod": "4.4.3"

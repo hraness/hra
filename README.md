@@ -264,7 +264,7 @@ Cloud-account erasure is an explicit and irreversible fallback, not the default 
 - Compact sessions: list sessions, read provider-neutral user and final assistant messages, and inspect elapsed time plus bounded observed file and Git actions. Protected full-turn inspection remains Codex-only.
 - Durable controls: send, queue, stop, and keep one editable note per session. Codex and Claude Code can steer an active turn; Devin ACP cannot, so Devin steering refuses without an effect. Provider-native rename remains Codex-only. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing.
 - Named projects: a project is a canonical directory that may contain several repositories. Changing it affects future turns only.
-- Stable working and shared project memory: a project-bound session writes to its expiring working lane, reads that lane together with durable project memory, and shares one attested page only through conflict-checked adoption. Codex and Claude Code models use closed HRA tools in this release; the Devin ACP adapter does not yet bind HRA's static preamble or host-tool server. Owners use `hra memory status|list|get|search|explain|remember|share`. See [working and project memory](https://github.com/hraness/hra/blob/main/docs/facts-memory.md) for the authority and recovery boundaries.
+- Stable working and shared project memory: a project-bound session writes to its expiring working lane, reads that lane together with durable project memory, and shares one attested page only through conflict-checked adoption. Codex and Claude Code models use closed HRA tools in this release; the Devin ACP adapter does not yet bind HRA's static preamble or host-tool server. Owners use `hra memory status|list|get|search|explain|remember|share` and explicitly enroll canonical project memory through `hra memory hosted list|create|attach|detach|sync`. Hosted memory is opt-in and does not upload the working lane. See [working and project memory](https://github.com/hraness/hra/blob/main/docs/facts-memory.md) for the authority, quota, and recovery boundaries.
 - Attributed peer coordination: each session owns a revocable `off|inspect|coordinate` policy. Bound Codex and Claude Code tools can list, inspect, and message only bounded same-project peers; every action retains actor and lineage without granting session administration or approval authority. Devin sessions remain valid peer targets, but Devin cannot originate these model tool calls in this release.
 - Agent work coordination: the frozen beta contract specifies bounded local task graphs, fenced attempts, structured submissions, independent reviews, signals, and a resumable work event stream for exact existing sessions.
 - Optional encrypted sync: paired devices share a bounded session projection and submit commands to the one machine holding the execution lease.
@@ -408,13 +408,15 @@ Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code 
 
 ### Encrypted before upload
 
-- User messages and final assistant display text.
+- User messages and final assistant display text. This includes peer-session messages and their supplied reasons when HRA records them as transcript messages.
 - Session names, notes, queued messages, and steering input.
 - Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not projected. HRA validates one bounded Claude Code authentication-status response transiently, reduces it to signedIn, and never retains, returns, projects, or uploads the identity or usage fields; it never opens or parses a Claude credential file. Devin account identity and allowance are not projected. HRA reports only local signed-in readiness and records provider-supplied session context and cost facts in the neutral session stream.
 - Turn timing, observed model and tier, and provider usage summaries.
 - Bounded observed file and Git metadata, without unbounded filesystem paths.
 - Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.
 - Remote-command input and results that fit the closed command protocol.
+- Canonical Oh operations, including their page records and provenance, terminal-head proofs, portable adoption proofs, and hosted-space descriptors for projects the owner explicitly enrolls in hosted memory.
+- A bounded read-only memory summary containing portable space and project labels, exact head and sync metadata, record counts and recent record keys, effective peer policies, and content-free recent peer-action state. Authenticated coverage markers distinguish complete from bounded selections. This summary excludes page bodies, peer message text, action reasons, raw local project or session IDs, paths, and Oh operation bytes.
 - For an explicitly requested Codex web login, the provider HTTPS verification URL and separate one-time user code. HRA encrypts both to the account key before upload, lets only the requesting browser read them once, and deletes the hosted handoff on that read or after five minutes.
 
 ### Never uploaded
@@ -424,8 +426,9 @@ Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code 
 - Raw reasoning, hidden chain of thought, or approval secrets.
 - Provider-internal login and request IDs, permission values, MCP field contracts, protected answers, or response digests.
 - Environment variables, arbitrary command output, or unbounded filesystem paths.
+- Working-memory Oh records and database bytes; canonical operations or page bodies outside their encrypted operation envelopes; and local Oh database paths.
 
-The sync service necessarily sees the verified HRA email address, device identifiers, record types, revisions, ciphertext sizes, timestamps, and execution-lease or command lifecycle metadata. It cannot decrypt session content without a paired device key. Email access alone does not recover that key.
+The sync service necessarily sees the verified HRA email address, device identifiers, opaque hosted-space identifiers, record types, revisions and key versions, ciphertext sizes, timestamps, execution-lease or command lifecycle metadata, and canonical-memory sequences plus keyed head tokens. It cannot decrypt session or memory content without a paired device key. Email access alone does not recover that key.
 
 A browser device holds the account key and decrypted projection only in that tab's memory by default. HRA does not programmatically write decrypted provider or session text to the clipboard, but browser extensions, accessibility APIs, screenshots, and explicit user selection can observe rendered text.
 
@@ -485,12 +488,17 @@ hra session watch <session> [--cursor <cursor>] [--jsonl]
 hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
 hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
 hra memory status <session> [--json]
-hra memory list <session> [--continuation <token>] [--json]
-hra memory get <session> <key> [--continuation <token>] [--json]
-hra memory search <session> [--continuation <token>] <text> [--json]
+hra memory list <session> [--working-only] [--continuation <token>] [--json]
+hra memory get <session> <key> [--working-only] [--continuation <token>] [--json]
+hra memory search <session> [--working-only] [--continuation <token>] <text> [--json]
 hra memory explain <session> <query-id> <row> [--json]
 hra memory remember <session> <key> --title <title> --summary <summary> [--language <tag>] [--idempotency-key <uuid>] [--json] -- <body>
 hra memory share <session> <key> --reason <reason> [--idempotency-key <uuid>] [--json]
+hra memory hosted list [--json]
+hra memory hosted create <project> [--idempotency-key <uuid>] [--json]
+hra memory hosted attach <project> <hosted-space-id> [--json]
+hra memory hosted detach <project> --generation <n> [--json]
+hra memory hosted sync <project> [--json]
 hra session start <account> [--project <project>] [--provider <codex|claude|devin>] [--preset <low|high|ultra|fable-max|astra>] [--fast]
 hra session send|queue|steer <session> [--attach <path>]... <message>
 hra session stop|recover|abandon <session>

@@ -20,6 +20,15 @@ import {
   type FactsMemoryHead,
 } from "../domain/facts-memory";
 import {
+  deriveProjectMemoryCanonicalIdentity,
+  legacyProjectMemorySpaceId,
+  PROJECT_MEMORY_EMPTY_HEAD,
+  projectMemoryCanonicalSpaceIdSchema,
+  projectMemoryIdentityContractSchema,
+  type ProjectMemoryIdentityContract,
+} from "../domain/project-memory";
+import { canonicalMemoryCiphertextLimits } from "../domain/canonical-memory-sync";
+import {
   attachmentDigestSchema,
   attachmentMediaTypeSchema,
   attachmentNameSchema,
@@ -710,6 +719,9 @@ export const PEER_SESSION_DIRECT_MESSAGE_SOURCE_LIMIT = PEER_SESSION_RETAINED_AC
 export const MEMORY_SUBMISSION_RETAINED_PROJECT_LIMIT = 10_000;
 /** Exact replay and local attestation evidence is retained for at least 30 days. */
 export const MEMORY_SUBMISSION_RETAIN_AGE_MS = 30 * 24 * 60 * 60_000;
+export const CANONICAL_MEMORY_SYNC_RETAINED_PROJECT_LIMIT = 10_000;
+/** Settled hosted-sync replay evidence is retained for at least 30 days. */
+export const CANONICAL_MEMORY_SYNC_RETAIN_AGE_MS = 30 * 24 * 60 * 60_000;
 export const MEMORY_PAGE_ATTESTATION_AUTHORITY_LIMIT = 8_192;
 
 export const peerSessionPolicyModeSchema = z.enum(["off", "inspect", "coordinate"]);
@@ -783,7 +795,7 @@ export type PeerSessionDirectMessageSourceRecord = Readonly<{
 }>;
 
 export type SessionMessageEventSourceRecord = Readonly<{
-  sourceId: AttemptId | QueueId;
+  sourceId: string;
   sourceKind: "mutation" | "queue";
   sessionId: SessionId;
   actor: SessionMessageActor;
@@ -808,6 +820,11 @@ export const projectMemorySyncStateSchema = z.enum([
   "conflict",
   "error",
 ]);
+export const projectMemoryPhysicalStateSchema = z.enum([
+  "reserved",
+  "initialized",
+  "rejected",
+]);
 export const memorySubmissionKindSchema = z.enum(["remember", "share"]);
 export const memorySubmissionStateSchema = z.enum([
   "prepared",
@@ -820,8 +837,201 @@ export const memorySubmissionStateSchema = z.enum([
 
 const memorySubmissionIdSchema = z.string().regex(/^memsub_[0-9a-f]{32}$/u);
 const memoryDiagnosticCodeSchema = z.string().regex(/^[A-Z][A-Z0-9_]{0,79}$/u);
+const canonicalMemoryHostedCreateIntentIdSchema = z.string()
+  .regex(/^cmcreate_[0-9a-f]{32}$/u);
+const canonicalMemorySyncIntentIdSchema = z.string().regex(/^cmsync_[0-9a-f]{32}$/u);
+const canonicalMemoryHostedSpaceIdSchema = z.string().regex(/^memory_[A-Za-z0-9_-]{32}$/u);
+const canonicalMemoryDigestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
+const canonicalMemoryHeadTokenSchema = canonicalMemoryDigestSchema;
+const canonicalMemoryEnvelopeBase64UrlSchema = z.string().regex(/^[A-Za-z0-9_-]+$/u);
+
+export const canonicalMemoryHostedAttachmentStateSchema = z.enum([
+  "attached",
+  "detached",
+  "conflict",
+  "error",
+]);
+export const canonicalMemoryHostedCreateIntentStateSchema = z.enum([
+  "allocating",
+  "key_staged",
+  "prepared",
+  "effect_started",
+  "winner_observed",
+  "settled",
+  "conflict",
+  "error",
+]);
+export const canonicalMemorySyncDirectionSchema = z.enum(["pull", "push"]);
+export const canonicalMemorySyncIntentStateSchema = z.enum([
+  "prepared",
+  "effect_started",
+  "response_observed",
+  "settled",
+  "conflict",
+  "error",
+]);
+
+export type CanonicalMemoryHostedAttachmentState = z.infer<
+  typeof canonicalMemoryHostedAttachmentStateSchema
+>;
+export type CanonicalMemoryHostedCreateIntentState = z.infer<
+  typeof canonicalMemoryHostedCreateIntentStateSchema
+>;
+export type CanonicalMemorySyncDirection = z.infer<
+  typeof canonicalMemorySyncDirectionSchema
+>;
+export type CanonicalMemorySyncIntentState = z.infer<
+  typeof canonicalMemorySyncIntentStateSchema
+>;
+
+export type CanonicalMemoryEncryptedEnvelope = Readonly<{
+  algorithm: "A256GCM";
+  ciphertext: string;
+  keyVersion: number;
+  nonce: string;
+}>;
+
+export type CanonicalMemoryHostedCreateRequest = Readonly<{
+  bindingPolicy: "one_project_one_space";
+  encryptedDescriptor: CanonicalMemoryEncryptedEnvelope;
+  genesisHeadProof: CanonicalMemoryEncryptedEnvelope;
+  genesisToken: string;
+  identityContract: 2;
+  keyVersion: number;
+  spaceId: string;
+  wrappedSpaceKey: CanonicalMemoryEncryptedEnvelope;
+}>;
+
+export type CanonicalMemoryHostedCreateWinner = CanonicalMemoryHostedCreateRequest & Readonly<{
+  replay: boolean;
+  revision: number;
+}>;
+
+export type CanonicalMemoryHostedCreateIntentRecord = Readonly<{
+  accountBindingDigest: string;
+  authorityHead: ProjectMemoryHeadRef;
+  authorityRevision: number;
+  canonicalBindingDigest: string;
+  createdAt: number;
+  diagnosticCode?: string;
+  effectStartedAt?: number;
+  id: string;
+  idempotencyKey: string;
+  keyVersion?: number;
+  projectId: ProjectId;
+  remoteSpaceId: string;
+  request?: CanonicalMemoryHostedCreateRequest;
+  requestDigest?: string;
+  settledAt?: number;
+  state: CanonicalMemoryHostedCreateIntentState;
+  updatedAt: number;
+  winnerDigest?: string;
+  winnerObservedAt?: number;
+  winnerReplay?: boolean;
+  winnerRevision?: number;
+  wrappedSpaceKey?: CanonicalMemoryEncryptedEnvelope;
+}>;
+
+export type CanonicalMemoryHostedCreateAllocation = Readonly<{
+  record: CanonicalMemoryHostedCreateIntentRecord;
+  replay: boolean;
+}>;
+
+export type CanonicalMemoryHostedRemoteObservation = Readonly<{
+  genesisToken: string;
+  head: ProjectMemoryHeadRef;
+  headProofDigest: string;
+  headToken: string;
+  keyVersion: number;
+  revision: number;
+}>;
+
+export type CanonicalMemoryHostedAttachmentRecord = Readonly<{
+  accountBindingDigest: string;
+  canonicalBindingDigest: string;
+  createdAt: number;
+  diagnosticCode?: string;
+  generation: number;
+  projectId: ProjectId;
+  remote: CanonicalMemoryHostedRemoteObservation;
+  remoteSpaceId: string;
+  revision: number;
+  state: CanonicalMemoryHostedAttachmentState;
+  updatedAt: number;
+}>;
+
+export type CanonicalMemorySyncOperation = Readonly<{
+  adoptionProof: CanonicalMemoryEncryptedEnvelope | null;
+  genesisToken: string;
+  headToken: string;
+  operation: CanonicalMemoryEncryptedEnvelope;
+  priorToken: string;
+  sequence: number;
+  terminalHeadProof: CanonicalMemoryEncryptedEnvelope;
+}>;
+
+export type CanonicalMemorySyncSpoolOperation = CanonicalMemorySyncOperation & Readonly<{
+  operationDigest: string;
+}>;
+
+export type CanonicalMemorySyncIntentRecord = Readonly<{
+  attachmentGeneration: number;
+  attachmentRevision: number;
+  authorityRevision: number;
+  canonicalBindingDigest: string;
+  createdAt: number;
+  diagnosticCode?: string;
+  direction: CanonicalMemorySyncDirection;
+  effectStartedAt?: number;
+  id: string;
+  idempotencyKey: string;
+  localHead: ProjectMemoryHeadRef;
+  localHeadToken: string;
+  projectId: ProjectId;
+  remoteObservation: CanonicalMemoryHostedRemoteObservation;
+  requestDigest: string;
+  requestOperation?: CanonicalMemorySyncSpoolOperation;
+  responseDigest?: string;
+  responseObservation?: CanonicalMemoryHostedRemoteObservation;
+  responseOperation?: CanonicalMemorySyncSpoolOperation;
+  responseObservedAt?: number;
+  resultHead?: ProjectMemoryHeadRef;
+  settledAt?: number;
+  state: CanonicalMemorySyncIntentState;
+  updatedAt: number;
+}>;
+
+export type CanonicalMemorySyncPreparation = Readonly<{
+  record: CanonicalMemorySyncIntentRecord;
+  replay: boolean;
+}>;
+
+/**
+ * Durable, ID-free provenance admitted for one canonical Oh operation.
+ *
+ * The local project id is only the control-plane lookup key; every field that
+ * crosses devices is portable and is independently bound to the canonical
+ * space, exact operation, record, key, content, and source receipt.
+ */
+export type CanonicalMemoryPortableAdoptionProof = Readonly<{
+  bindingDigest: string;
+  canonicalSpaceId: string;
+  contentDigest: string;
+  keyDigest: string;
+  operationSha256: string;
+  recordSha256: string;
+  sequence: number;
+  sourceReceiptSha256: string;
+}>;
+
+export type CanonicalMemoryPortableAdoptionProofRecord =
+  CanonicalMemoryPortableAdoptionProof & Readonly<{
+    createdAt: number;
+    projectId: ProjectId;
+  }>;
 
 export type ProjectMemorySyncState = z.infer<typeof projectMemorySyncStateSchema>;
+export type ProjectMemoryPhysicalState = z.infer<typeof projectMemoryPhysicalStateSchema>;
 export type MemorySubmissionKind = z.infer<typeof memorySubmissionKindSchema>;
 export type MemorySubmissionState = z.infer<typeof memorySubmissionStateSchema>;
 
@@ -832,6 +1042,10 @@ export const projectMemoryHeadRefSchema = z.object({
 }).strict().refine(
   (head) => (head.sequence === 0) === (head.operationSha256 === null),
   "A memory head has no operation only at sequence zero.",
+).refine(
+  (head) => head.sequence !== 0
+    || head.headDigest === PROJECT_MEMORY_EMPTY_HEAD.headDigest,
+  "The empty memory head has one exact digest.",
 );
 
 export type ProjectMemoryHeadRef = z.infer<typeof projectMemoryHeadRefSchema>;
@@ -843,6 +1057,7 @@ export const memorySubmissionOutcomeCodeSchema = z.enum([
   "share_already_present",
   "share_conflict",
   "share_not_applied",
+  "share_too_large",
 ]);
 export type MemorySubmissionOutcomeCode = z.infer<typeof memorySubmissionOutcomeCodeSchema>;
 
@@ -854,6 +1069,10 @@ export type MemorySubmissionConflictEvidence = Readonly<{
 
 export type ProjectMemoryAuthorityRecord = Readonly<{
   projectId: ProjectId;
+  identityContract: ProjectMemoryIdentityContract;
+  canonicalSpaceId: string;
+  physicalState: ProjectMemoryPhysicalState;
+  initializedAt?: number;
   authorityDigest: string;
   bindingDigest: string;
   head: ProjectMemoryHeadRef;
@@ -1034,6 +1253,10 @@ const mapSessionMessageEventSource = (
 
 const projectMemoryAuthorityRowSchema = z.object({
   project_id: projectIdSchema,
+  identity_contract: projectMemoryIdentityContractSchema,
+  canonical_space_id: projectMemoryCanonicalSpaceIdSchema,
+  physical_state: projectMemoryPhysicalStateSchema,
+  initialized_at: unixMillisecondsSchema.nullable(),
   authority_digest: z.string().regex(/^[a-f0-9]{64}$/u),
   binding_digest: z.string().regex(/^[a-f0-9]{64}$/u),
   head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -1048,6 +1271,157 @@ const projectMemoryAuthorityRowSchema = z.object({
   diagnostic_code: memoryDiagnosticCodeSchema.nullable(),
   created_at: unixMillisecondsSchema,
   updated_at: unixMillisecondsSchema,
+}).strict();
+const legacyProjectMemoryAuthorityRowSchema = projectMemoryAuthorityRowSchema.omit({
+  canonical_space_id: true,
+  identity_contract: true,
+  initialized_at: true,
+  physical_state: true,
+});
+
+const canonicalMemoryHostedCreateIntentRowSchema = z.object({
+  id: canonicalMemoryHostedCreateIntentIdSchema,
+  idempotency_key: z.string().uuid(),
+  project_id: projectIdSchema,
+  state: canonicalMemoryHostedCreateIntentStateSchema,
+  authority_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  canonical_binding_digest: canonicalMemoryDigestSchema,
+  authority_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  authority_head_operation_sha256: canonicalMemoryDigestSchema.nullable(),
+  authority_head_digest: canonicalMemoryDigestSchema,
+  account_binding_digest: canonicalMemoryDigestSchema,
+  remote_space_id: canonicalMemoryHostedSpaceIdSchema,
+  space_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  wrapped_key_algorithm: z.literal("A256GCM").nullable(),
+  wrapped_key_ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(canonicalMemoryCiphertextLimits.terminalHeadProof).nullable(),
+  wrapped_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  wrapped_key_nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16).nullable(),
+  descriptor_algorithm: z.literal("A256GCM").nullable(),
+  descriptor_ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(canonicalMemoryCiphertextLimits.terminalHeadProof).nullable(),
+  descriptor_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  descriptor_nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16).nullable(),
+  genesis_proof_algorithm: z.literal("A256GCM").nullable(),
+  genesis_proof_ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(canonicalMemoryCiphertextLimits.terminalHeadProof).nullable(),
+  genesis_proof_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  genesis_proof_nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16).nullable(),
+  genesis_token: canonicalMemoryHeadTokenSchema.nullable(),
+  request_digest: canonicalMemoryDigestSchema.nullable(),
+  effect_started_at: unixMillisecondsSchema.nullable(),
+  winner_digest: canonicalMemoryDigestSchema.nullable(),
+  winner_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  winner_replay: z.union([z.literal(0), z.literal(1)]).nullable(),
+  winner_observed_at: unixMillisecondsSchema.nullable(),
+  settled_at: unixMillisecondsSchema.nullable(),
+  diagnostic_code: memoryDiagnosticCodeSchema.nullable(),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const canonicalMemoryHostedAttachmentRowSchema = z.object({
+  project_id: projectIdSchema,
+  remote_space_id: canonicalMemoryHostedSpaceIdSchema,
+  account_binding_digest: canonicalMemoryDigestSchema,
+  canonical_binding_digest: canonicalMemoryDigestSchema,
+  generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  state: canonicalMemoryHostedAttachmentStateSchema,
+  genesis_token: canonicalMemoryHeadTokenSchema,
+  remote_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  remote_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  remote_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  remote_head_operation_sha256: canonicalMemoryDigestSchema.nullable(),
+  remote_head_digest: canonicalMemoryDigestSchema,
+  remote_head_token: canonicalMemoryHeadTokenSchema,
+  remote_head_proof_digest: canonicalMemoryDigestSchema,
+  diagnostic_code: memoryDiagnosticCodeSchema.nullable(),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const canonicalMemorySyncIntentRowSchema = z.object({
+  id: canonicalMemorySyncIntentIdSchema,
+  idempotency_key: z.string().uuid(),
+  project_id: projectIdSchema,
+  direction: canonicalMemorySyncDirectionSchema,
+  state: canonicalMemorySyncIntentStateSchema,
+  attachment_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  attachment_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  authority_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  canonical_binding_digest: canonicalMemoryDigestSchema,
+  local_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  local_head_operation_sha256: canonicalMemoryDigestSchema.nullable(),
+  local_head_digest: canonicalMemoryDigestSchema,
+  local_head_token: canonicalMemoryHeadTokenSchema,
+  remote_genesis_token: canonicalMemoryHeadTokenSchema,
+  remote_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  remote_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  remote_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  remote_head_operation_sha256: canonicalMemoryDigestSchema.nullable(),
+  remote_head_digest: canonicalMemoryDigestSchema,
+  remote_head_token: canonicalMemoryHeadTokenSchema,
+  remote_head_proof_digest: canonicalMemoryDigestSchema,
+  request_digest: canonicalMemoryDigestSchema,
+  effect_started_at: unixMillisecondsSchema.nullable(),
+  response_digest: canonicalMemoryDigestSchema.nullable(),
+  response_genesis_token: canonicalMemoryHeadTokenSchema.nullable(),
+  response_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  response_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  response_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  response_head_operation_sha256: canonicalMemoryDigestSchema.nullable(),
+  response_head_digest: canonicalMemoryDigestSchema.nullable(),
+  response_head_token: canonicalMemoryHeadTokenSchema.nullable(),
+  response_head_proof_digest: canonicalMemoryDigestSchema.nullable(),
+  response_observed_at: unixMillisecondsSchema.nullable(),
+  result_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  result_head_operation_sha256: canonicalMemoryDigestSchema.nullable(),
+  result_head_digest: canonicalMemoryDigestSchema.nullable(),
+  settled_at: unixMillisecondsSchema.nullable(),
+  diagnostic_code: memoryDiagnosticCodeSchema.nullable(),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const canonicalMemorySyncSpoolRowSchema = z.object({
+  intent_id: canonicalMemorySyncIntentIdSchema,
+  phase: z.enum(["request", "response"]),
+  genesis_token: canonicalMemoryHeadTokenSchema,
+  prior_token: canonicalMemoryHeadTokenSchema,
+  head_token: canonicalMemoryHeadTokenSchema,
+  sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  adoption_proof_algorithm: z.literal("A256GCM").nullable(),
+  adoption_proof_ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(canonicalMemoryCiphertextLimits.adoptionProof).nullable(),
+  adoption_proof_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+    .nullable(),
+  adoption_proof_nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16).nullable(),
+  operation_algorithm: z.literal("A256GCM"),
+  operation_ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(canonicalMemoryCiphertextLimits.operation),
+  operation_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  operation_nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16),
+  proof_algorithm: z.literal("A256GCM"),
+  proof_ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(canonicalMemoryCiphertextLimits.terminalHeadProof),
+  proof_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  proof_nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16),
+  operation_digest: canonicalMemoryDigestSchema,
+  created_at: unixMillisecondsSchema,
+}).strict();
+
+const canonicalMemoryPortableAdoptionProofRowSchema = z.object({
+  project_id: projectIdSchema,
+  canonical_space_id: projectMemoryCanonicalSpaceIdSchema,
+  canonical_binding_digest: canonicalMemoryDigestSchema,
+  sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  operation_sha256: canonicalMemoryDigestSchema,
+  record_sha256: canonicalMemoryDigestSchema,
+  key_digest: canonicalMemoryDigestSchema,
+  content_digest: canonicalMemoryDigestSchema,
+  source_receipt_sha256: canonicalMemoryDigestSchema,
+  created_at: unixMillisecondsSchema,
 }).strict();
 
 const memorySubmissionRowSchema = z.object({
@@ -1246,7 +1620,9 @@ const memorySubmissionOutcomeShapeIsValid = (input: Readonly<{
   if (input.state === "failed") {
     return input.resultHead === undefined && (input.kind === "remember"
       ? input.outcomeCode === "remember_not_applied"
-      : input.outcomeCode === "share_conflict" || input.outcomeCode === "share_not_applied");
+      : input.outcomeCode === "share_conflict"
+        || input.outcomeCode === "share_not_applied"
+        || input.outcomeCode === "share_too_large");
   }
   return input.resultHead === undefined && input.outcomeCode === undefined;
 };
@@ -1273,6 +1649,15 @@ const mapPeerSessionPolicy = (value: unknown): PeerSessionPolicyRecord => {
 
 const mapProjectMemoryAuthority = (value: unknown): ProjectMemoryAuthorityRecord => {
   const row = projectMemoryAuthorityRowSchema.parse(value);
+  const identity = deriveProjectMemoryCanonicalIdentity({
+    canonicalSpaceId: row.canonical_space_id,
+    identityContract: row.identity_contract,
+    projectId: row.project_id,
+  });
+  if (
+    identity.authorityDigest !== row.authority_digest
+    || identity.bindingDigest !== row.binding_digest
+  ) throw new Error("PROJECT_MEMORY_AUTHORITY_IDENTITY_INVALID");
   const head = projectMemoryHeadRefSchema.parse({
     sequence: row.head_sequence,
     operationSha256: row.head_operation_sha256,
@@ -1285,7 +1670,22 @@ const mapProjectMemoryAuthority = (value: unknown): ProjectMemoryAuthorityRecord
   ];
   const hasExchange = exchangeFields.every((field) => field !== null);
   if (
-    (!hasExchange && exchangeFields.some((field) => field !== null))
+    (row.physical_state === "initialized") !== (row.initialized_at !== null)
+    || (row.physical_state === "reserved" && (
+      head.sequence !== PROJECT_MEMORY_EMPTY_HEAD.sequence
+      || head.operationSha256 !== PROJECT_MEMORY_EMPTY_HEAD.operationSha256
+      || head.headDigest !== PROJECT_MEMORY_EMPTY_HEAD.headDigest
+      || hasExchange
+    ))
+    || (row.physical_state === "rejected" && (
+      head.sequence !== PROJECT_MEMORY_EMPTY_HEAD.sequence
+      || head.operationSha256 !== PROJECT_MEMORY_EMPTY_HEAD.operationSha256
+      || head.headDigest !== PROJECT_MEMORY_EMPTY_HEAD.headDigest
+      || row.sync_state !== "error"
+      || row.diagnostic_code === null
+      || hasExchange
+    ))
+    || (!hasExchange && exchangeFields.some((field) => field !== null))
     || (row.last_exchange_sequence === null && row.last_exchange_operation_sha256 !== null)
     || (row.last_exchange_sequence === 0 && row.last_exchange_operation_sha256 !== null)
     || (row.last_exchange_sequence !== null
@@ -1308,6 +1708,10 @@ const mapProjectMemoryAuthority = (value: unknown): ProjectMemoryAuthorityRecord
   ) throw new Error("PROJECT_MEMORY_AUTHORITY_INVALID");
   return {
     projectId: row.project_id,
+    identityContract: row.identity_contract,
+    canonicalSpaceId: row.canonical_space_id,
+    physicalState: row.physical_state,
+    ...(row.initialized_at === null ? {} : { initializedAt: row.initialized_at }),
     authorityDigest: row.authority_digest,
     bindingDigest: row.binding_digest,
     head,
@@ -1317,6 +1721,698 @@ const mapProjectMemoryAuthority = (value: unknown): ProjectMemoryAuthorityRecord
     ...(lastExchangeHead === undefined ? {} : { lastExchangeHead }),
     ...(row.diagnostic_code === null ? {} : { diagnosticCode: row.diagnostic_code }),
     createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+};
+
+const parseCanonicalMemoryEncryptedEnvelope = (
+  value: unknown,
+  maximumCiphertextCharacters: number,
+): CanonicalMemoryEncryptedEnvelope => z.object({
+  algorithm: z.literal("A256GCM"),
+  ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(maximumCiphertextCharacters),
+  keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16),
+}).strict().parse(value);
+
+const sameCanonicalMemoryEncryptedEnvelope = (
+  left: CanonicalMemoryEncryptedEnvelope,
+  right: CanonicalMemoryEncryptedEnvelope,
+): boolean => left.ciphertext === right.ciphertext
+  && left.keyVersion === right.keyVersion
+  && left.nonce === right.nonce;
+
+const parseCanonicalMemoryHostedCreateRequest = (
+  value: CanonicalMemoryHostedCreateRequest,
+): CanonicalMemoryHostedCreateRequest => {
+  const parsed = z.object({
+    bindingPolicy: z.literal("one_project_one_space"),
+    encryptedDescriptor: z.unknown(),
+    genesisHeadProof: z.unknown(),
+    genesisToken: canonicalMemoryHeadTokenSchema,
+    identityContract: z.literal(2),
+    keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    spaceId: canonicalMemoryHostedSpaceIdSchema,
+    wrappedSpaceKey: z.unknown(),
+  }).strict().parse(value);
+  const encryptedDescriptor = parseCanonicalMemoryEncryptedEnvelope(
+    parsed.encryptedDescriptor,
+    canonicalMemoryCiphertextLimits.terminalHeadProof,
+  );
+  const genesisHeadProof = parseCanonicalMemoryEncryptedEnvelope(
+    parsed.genesisHeadProof,
+    canonicalMemoryCiphertextLimits.terminalHeadProof,
+  );
+  const wrappedSpaceKey = parseCanonicalMemoryEncryptedEnvelope(
+    parsed.wrappedSpaceKey,
+    canonicalMemoryCiphertextLimits.terminalHeadProof,
+  );
+  if (
+    encryptedDescriptor.keyVersion !== parsed.keyVersion
+    || genesisHeadProof.keyVersion !== parsed.keyVersion
+  ) throw new TypeError("CANONICAL_MEMORY_HOSTED_CREATE_REQUEST_INVALID");
+  return {
+    bindingPolicy: parsed.bindingPolicy,
+    encryptedDescriptor,
+    genesisHeadProof,
+    genesisToken: parsed.genesisToken,
+    identityContract: parsed.identityContract,
+    keyVersion: parsed.keyVersion,
+    spaceId: parsed.spaceId,
+    wrappedSpaceKey,
+  };
+};
+
+const parseCanonicalMemoryHostedCreateWinner = (
+  value: CanonicalMemoryHostedCreateWinner,
+): CanonicalMemoryHostedCreateWinner => {
+  const parsed = z.object({
+    bindingPolicy: z.literal("one_project_one_space"),
+    encryptedDescriptor: z.unknown(),
+    genesisHeadProof: z.unknown(),
+    genesisToken: canonicalMemoryHeadTokenSchema,
+    identityContract: z.literal(2),
+    keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    replay: z.boolean(),
+    revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    spaceId: canonicalMemoryHostedSpaceIdSchema,
+    wrappedSpaceKey: z.unknown(),
+  }).strict().parse(value);
+  const request = parseCanonicalMemoryHostedCreateRequest({
+    bindingPolicy: parsed.bindingPolicy,
+    encryptedDescriptor: parsed.encryptedDescriptor as CanonicalMemoryEncryptedEnvelope,
+    genesisHeadProof: parsed.genesisHeadProof as CanonicalMemoryEncryptedEnvelope,
+    genesisToken: parsed.genesisToken,
+    identityContract: parsed.identityContract,
+    keyVersion: parsed.keyVersion,
+    spaceId: parsed.spaceId,
+    wrappedSpaceKey: parsed.wrappedSpaceKey as CanonicalMemoryEncryptedEnvelope,
+  });
+  return { ...request, replay: parsed.replay, revision: parsed.revision };
+};
+
+const canonicalMemoryHostedCreateRequestDigest = (
+  request: CanonicalMemoryHostedCreateRequest,
+): string => digestJson({
+  contract: "hra.canonical-memory.hosted-create-request.v1",
+  request,
+});
+
+const canonicalMemoryHostedCreateWinnerDigest = (
+  request: CanonicalMemoryHostedCreateRequest,
+  revision: number,
+  replay: boolean,
+): string => digestJson({
+  contract: "hra.canonical-memory.hosted-create-winner.v1",
+  replay,
+  request,
+  revision,
+});
+
+const canonicalMemoryHostedHeadProofDigest = (
+  envelope: CanonicalMemoryEncryptedEnvelope,
+): string => digestJson({
+  contract: "hra.canonical-memory.encrypted-head-proof.v1",
+  envelope,
+});
+
+const mapCanonicalMemoryHostedCreateIntent = (
+  value: unknown,
+): CanonicalMemoryHostedCreateIntentRecord => {
+  const row = canonicalMemoryHostedCreateIntentRowSchema.parse(value);
+  const authorityHead = projectMemoryHeadRefSchema.parse({
+    sequence: row.authority_head_sequence,
+    operationSha256: row.authority_head_operation_sha256,
+    headDigest: row.authority_head_digest,
+  });
+  const wrappedParts = [
+    row.space_key_version,
+    row.wrapped_key_algorithm,
+    row.wrapped_key_ciphertext,
+    row.wrapped_key_version,
+    row.wrapped_key_nonce,
+  ];
+  const hasWrappedKey = wrappedParts.every((part) => part !== null);
+  if (!hasWrappedKey && wrappedParts.some((part) => part !== null)) {
+    throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_INVALID");
+  }
+  const wrappedSpaceKey = !hasWrappedKey
+    ? undefined
+    : parseCanonicalMemoryEncryptedEnvelope({
+        algorithm: row.wrapped_key_algorithm,
+        ciphertext: row.wrapped_key_ciphertext,
+        keyVersion: row.wrapped_key_version,
+        nonce: row.wrapped_key_nonce,
+      }, canonicalMemoryCiphertextLimits.terminalHeadProof);
+  const preparedParts = [
+    row.descriptor_algorithm,
+    row.descriptor_ciphertext,
+    row.descriptor_key_version,
+    row.descriptor_nonce,
+    row.genesis_proof_algorithm,
+    row.genesis_proof_ciphertext,
+    row.genesis_proof_key_version,
+    row.genesis_proof_nonce,
+    row.genesis_token,
+    row.request_digest,
+  ];
+  const hasPreparedRequest = preparedParts.every((part) => part !== null);
+  if (!hasPreparedRequest && preparedParts.some((part) => part !== null)) {
+    throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_INVALID");
+  }
+  const request = !hasPreparedRequest || wrappedSpaceKey === undefined
+    ? undefined
+    : parseCanonicalMemoryHostedCreateRequest({
+        bindingPolicy: "one_project_one_space",
+        encryptedDescriptor: {
+          algorithm: row.descriptor_algorithm as "A256GCM",
+          ciphertext: row.descriptor_ciphertext as string,
+          keyVersion: row.descriptor_key_version as number,
+          nonce: row.descriptor_nonce as string,
+        },
+        genesisHeadProof: {
+          algorithm: row.genesis_proof_algorithm as "A256GCM",
+          ciphertext: row.genesis_proof_ciphertext as string,
+          keyVersion: row.genesis_proof_key_version as number,
+          nonce: row.genesis_proof_nonce as string,
+        },
+        genesisToken: row.genesis_token as string,
+        identityContract: 2,
+        keyVersion: row.space_key_version as number,
+        spaceId: row.remote_space_id,
+        wrappedSpaceKey,
+      });
+  if (
+    hasPreparedRequest !== (request !== undefined)
+    || (request !== undefined
+      && row.request_digest !== canonicalMemoryHostedCreateRequestDigest(request))
+  ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_INVALID");
+  const winnerParts = [
+    row.winner_digest,
+    row.winner_revision,
+    row.winner_replay,
+    row.winner_observed_at,
+  ];
+  const hasWinner = winnerParts.every((part) => part !== null);
+  if (
+    (!hasWinner && winnerParts.some((part) => part !== null))
+    || (hasWinner && (
+      request === undefined
+      || row.effect_started_at === null
+      || row.winner_digest !== canonicalMemoryHostedCreateWinnerDigest(
+        request,
+        row.winner_revision as number,
+        row.winner_replay === 1,
+      )
+    ))
+  ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_INVALID");
+  const isTerminalFailure = row.state === "conflict" || row.state === "error";
+  if (
+    (row.state === "allocating" && (hasWrappedKey || request !== undefined
+      || row.effect_started_at !== null || hasWinner))
+    || (row.state === "key_staged" && (!hasWrappedKey || request !== undefined
+      || row.effect_started_at !== null || hasWinner))
+    || (row.state === "prepared" && (request === undefined
+      || row.effect_started_at !== null || hasWinner))
+    || (row.state === "effect_started" && (request === undefined
+      || row.effect_started_at === null || hasWinner))
+    || (row.state === "winner_observed" && !hasWinner)
+    || (row.state === "settled" && !hasWinner)
+    || (isTerminalFailure && row.diagnostic_code === null)
+    || (!isTerminalFailure && row.diagnostic_code !== null)
+    || ((row.state === "settled" || isTerminalFailure) !== (row.settled_at !== null))
+  ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_INVALID");
+  return {
+    accountBindingDigest: row.account_binding_digest,
+    authorityHead,
+    authorityRevision: row.authority_revision,
+    canonicalBindingDigest: row.canonical_binding_digest,
+    createdAt: row.created_at,
+    ...(row.diagnostic_code === null ? {} : { diagnosticCode: row.diagnostic_code }),
+    ...(row.effect_started_at === null ? {} : { effectStartedAt: row.effect_started_at }),
+    id: row.id,
+    idempotencyKey: row.idempotency_key,
+    ...(row.space_key_version === null ? {} : { keyVersion: row.space_key_version }),
+    projectId: row.project_id,
+    remoteSpaceId: row.remote_space_id,
+    ...(request === undefined ? {} : { request, requestDigest: row.request_digest as string }),
+    ...(row.settled_at === null ? {} : { settledAt: row.settled_at }),
+    state: row.state,
+    updatedAt: row.updated_at,
+    ...(row.winner_digest === null ? {} : { winnerDigest: row.winner_digest }),
+    ...(row.winner_observed_at === null
+      ? {}
+      : { winnerObservedAt: row.winner_observed_at }),
+    ...(row.winner_replay === null ? {} : { winnerReplay: row.winner_replay === 1 }),
+    ...(row.winner_revision === null ? {} : { winnerRevision: row.winner_revision }),
+    ...(wrappedSpaceKey === undefined ? {} : { wrappedSpaceKey }),
+  };
+};
+
+const parseCanonicalMemorySyncSpoolOperation = (
+  value: CanonicalMemorySyncOperation,
+): CanonicalMemorySyncSpoolOperation => {
+  const parsed = z.object({
+    adoptionProof: z.unknown(),
+    genesisToken: canonicalMemoryHeadTokenSchema,
+    headToken: canonicalMemoryHeadTokenSchema,
+    operation: z.unknown(),
+    priorToken: canonicalMemoryHeadTokenSchema,
+    sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    terminalHeadProof: z.unknown(),
+  }).strict().parse(value);
+  const adoptionProof = parsed.adoptionProof === null
+    ? null
+    : parseCanonicalMemoryEncryptedEnvelope(
+        parsed.adoptionProof,
+        canonicalMemoryCiphertextLimits.adoptionProof,
+      );
+  const operation = parseCanonicalMemoryEncryptedEnvelope(
+    parsed.operation,
+    canonicalMemoryCiphertextLimits.operation,
+  );
+  const terminalHeadProof = parseCanonicalMemoryEncryptedEnvelope(
+    parsed.terminalHeadProof,
+    canonicalMemoryCiphertextLimits.terminalHeadProof,
+  );
+  if (
+    parsed.genesisToken === parsed.headToken
+    || parsed.priorToken === parsed.headToken
+    || (adoptionProof !== null && adoptionProof.keyVersion !== operation.keyVersion)
+    || operation.keyVersion !== terminalHeadProof.keyVersion
+  ) throw new TypeError("CANONICAL_MEMORY_SYNC_SPOOL_INVALID");
+  const normalized = { ...parsed, adoptionProof, operation, terminalHeadProof };
+  return {
+    ...normalized,
+    operationDigest: digestJson({
+      contract: "hra.canonical-memory.operation-envelope.v1",
+      operation: normalized,
+    }),
+  };
+};
+
+const canonicalMemoryWireOperation = (
+  operation: CanonicalMemorySyncSpoolOperation,
+): CanonicalMemorySyncOperation => ({
+  adoptionProof: operation.adoptionProof,
+  genesisToken: operation.genesisToken,
+  headToken: operation.headToken,
+  operation: operation.operation,
+  priorToken: operation.priorToken,
+  sequence: operation.sequence,
+  terminalHeadProof: operation.terminalHeadProof,
+});
+
+const canonicalMemorySpoolOperationWithoutPhase = (
+  operation: CanonicalMemorySyncSpoolOperation & Readonly<{ phase: "request" | "response" }>,
+): CanonicalMemorySyncSpoolOperation => ({
+  ...canonicalMemoryWireOperation(operation),
+  operationDigest: operation.operationDigest,
+});
+
+const mapCanonicalMemoryPortableAdoptionProof = (
+  value: unknown,
+): CanonicalMemoryPortableAdoptionProofRecord => {
+  const row = canonicalMemoryPortableAdoptionProofRowSchema.parse(value);
+  return {
+    bindingDigest: row.canonical_binding_digest,
+    canonicalSpaceId: row.canonical_space_id,
+    contentDigest: row.content_digest,
+    createdAt: row.created_at,
+    keyDigest: row.key_digest,
+    operationSha256: row.operation_sha256,
+    projectId: row.project_id,
+    recordSha256: row.record_sha256,
+    sequence: row.sequence,
+    sourceReceiptSha256: row.source_receipt_sha256,
+  };
+};
+
+const parseCanonicalMemoryPortableAdoptionProof = (
+  value: unknown,
+): CanonicalMemoryPortableAdoptionProof => z.object({
+  bindingDigest: canonicalMemoryDigestSchema,
+  canonicalSpaceId: projectMemoryCanonicalSpaceIdSchema,
+  contentDigest: canonicalMemoryDigestSchema,
+  keyDigest: canonicalMemoryDigestSchema,
+  operationSha256: canonicalMemoryDigestSchema,
+  recordSha256: canonicalMemoryDigestSchema,
+  sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  sourceReceiptSha256: canonicalMemoryDigestSchema,
+}).strict().parse(value);
+
+const sameCanonicalMemorySyncOperation = (
+  left: CanonicalMemorySyncSpoolOperation | undefined,
+  right: CanonicalMemorySyncSpoolOperation | undefined,
+): boolean => left === undefined || right === undefined
+  ? left === right
+  : left.operationDigest === right.operationDigest
+    && JSON.stringify(canonicalMemoryWireOperation(left))
+      === JSON.stringify(canonicalMemoryWireOperation(right));
+
+const canonicalMemorySyncRequestDigest = (input: Readonly<{
+  direction: CanonicalMemorySyncDirection;
+  localHead: ProjectMemoryHeadRef;
+  localHeadToken: string;
+  remote: CanonicalMemoryHostedRemoteObservation;
+  remoteSpaceId: string;
+  requestOperation?: CanonicalMemorySyncSpoolOperation;
+}>): string => input.direction === "push" && input.requestOperation !== undefined
+  ? digestJson({
+      contract: "hra.canonical-memory.push-request.v1",
+      expectedKeyVersion: input.remote.keyVersion,
+      expectedRevision: input.remote.revision,
+      operations: [canonicalMemoryWireOperation(input.requestOperation)],
+      spaceId: input.remoteSpaceId,
+    })
+  : digestJson({
+      afterHeadToken: input.localHeadToken,
+      afterSequence: input.localHead.sequence,
+      contract: "hra.canonical-memory.pull-request.v1",
+      expectedGenesisToken: input.remote.genesisToken,
+      expectedKeyVersion: input.remote.keyVersion,
+      limit: 1,
+      spaceId: input.remoteSpaceId,
+      terminalHeadToken: input.remote.headToken,
+      terminalSequence: input.remote.head.sequence,
+    });
+
+const canonicalMemorySyncResponseDigest = (input: Readonly<{
+  direction: CanonicalMemorySyncDirection;
+  operation?: CanonicalMemorySyncSpoolOperation;
+  remote: CanonicalMemoryHostedRemoteObservation;
+}>): string => digestJson({
+  contract: "hra.canonical-memory.response-observation.v1",
+  direction: input.direction,
+  operation: input.operation === undefined
+    ? null
+    : canonicalMemoryWireOperation(input.operation),
+  remote: input.remote,
+});
+
+const sameProjectMemoryHead = (
+  left: ProjectMemoryHeadRef,
+  right: ProjectMemoryHeadRef,
+): boolean => left.sequence === right.sequence
+  && left.operationSha256 === right.operationSha256
+  && left.headDigest === right.headDigest;
+
+const sameCanonicalMemoryRemoteObservation = (
+  left: CanonicalMemoryHostedRemoteObservation,
+  right: CanonicalMemoryHostedRemoteObservation,
+): boolean => left.genesisToken === right.genesisToken
+  && sameProjectMemoryHead(left.head, right.head)
+  && left.headProofDigest === right.headProofDigest
+  && left.headToken === right.headToken
+  && left.keyVersion === right.keyVersion
+  && left.revision === right.revision;
+
+const parseCanonicalMemoryRemoteObservation = (
+  value: CanonicalMemoryHostedRemoteObservation,
+): CanonicalMemoryHostedRemoteObservation => {
+  const parsed = z.object({
+    genesisToken: canonicalMemoryHeadTokenSchema,
+    head: projectMemoryHeadRefSchema,
+    headProofDigest: canonicalMemoryDigestSchema,
+    headToken: canonicalMemoryHeadTokenSchema,
+    keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  }).strict().parse(value);
+  if (
+    (parsed.head.sequence === 0 && parsed.headToken !== parsed.genesisToken)
+    || (parsed.head.sequence > 0 && parsed.headToken === parsed.genesisToken)
+  ) throw new TypeError("CANONICAL_MEMORY_REMOTE_OBSERVATION_INVALID");
+  return parsed;
+};
+
+const mapCanonicalMemoryHostedAttachment = (
+  value: unknown,
+): CanonicalMemoryHostedAttachmentRecord => {
+  const row = canonicalMemoryHostedAttachmentRowSchema.parse(value);
+  const remote = parseCanonicalMemoryRemoteObservation({
+    genesisToken: row.genesis_token,
+    head: {
+      sequence: row.remote_head_sequence,
+      operationSha256: row.remote_head_operation_sha256,
+      headDigest: row.remote_head_digest,
+    },
+    headProofDigest: row.remote_head_proof_digest,
+    headToken: row.remote_head_token,
+    keyVersion: row.remote_key_version,
+    revision: row.remote_revision,
+  });
+  if (
+    ((row.state === "conflict" || row.state === "error")
+      !== (row.diagnostic_code !== null))
+  ) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_INVALID");
+  return {
+    accountBindingDigest: row.account_binding_digest,
+    canonicalBindingDigest: row.canonical_binding_digest,
+    createdAt: row.created_at,
+    ...(row.diagnostic_code === null ? {} : { diagnosticCode: row.diagnostic_code }),
+    generation: row.generation,
+    projectId: row.project_id,
+    remote,
+    remoteSpaceId: row.remote_space_id,
+    revision: row.revision,
+    state: row.state,
+    updatedAt: row.updated_at,
+  };
+};
+
+const mapCanonicalMemorySyncSpoolOperation = (
+  value: unknown,
+): CanonicalMemorySyncSpoolOperation & Readonly<{ phase: "request" | "response" }> => {
+  const row = canonicalMemorySyncSpoolRowSchema.parse(value);
+  const adoptionProofParts = [
+    row.adoption_proof_algorithm,
+    row.adoption_proof_ciphertext,
+    row.adoption_proof_key_version,
+    row.adoption_proof_nonce,
+  ];
+  const hasAdoptionProof = adoptionProofParts.every((part) => part !== null);
+  if (
+    (!hasAdoptionProof && adoptionProofParts.some((part) => part !== null))
+    || row.genesis_token === row.head_token
+    || row.prior_token === row.head_token
+    || (hasAdoptionProof && row.adoption_proof_key_version !== row.operation_key_version)
+    || row.operation_key_version !== row.proof_key_version
+  ) throw new Error("CANONICAL_MEMORY_SYNC_SPOOL_INVALID");
+  const operation = {
+    phase: row.phase,
+    adoptionProof: !hasAdoptionProof
+      ? null
+      : {
+          algorithm: row.adoption_proof_algorithm as "A256GCM",
+          ciphertext: row.adoption_proof_ciphertext as string,
+          keyVersion: row.adoption_proof_key_version as number,
+          nonce: row.adoption_proof_nonce as string,
+        },
+    genesisToken: row.genesis_token,
+    headToken: row.head_token,
+    operation: {
+      algorithm: row.operation_algorithm,
+      ciphertext: row.operation_ciphertext,
+      keyVersion: row.operation_key_version,
+      nonce: row.operation_nonce,
+    },
+    operationDigest: row.operation_digest,
+    priorToken: row.prior_token,
+    sequence: row.sequence,
+    terminalHeadProof: {
+      algorithm: row.proof_algorithm,
+      ciphertext: row.proof_ciphertext,
+      keyVersion: row.proof_key_version,
+      nonce: row.proof_nonce,
+    },
+  };
+  const wireOperation = canonicalMemoryWireOperation(operation);
+  const { operationDigest } = operation;
+  if (operationDigest !== digestJson({
+    contract: "hra.canonical-memory.operation-envelope.v1",
+    operation: wireOperation,
+  })) throw new Error("CANONICAL_MEMORY_SYNC_SPOOL_INVALID");
+  return operation;
+};
+
+const mapCanonicalMemorySyncIntent = (
+  value: unknown,
+  spoolValues: readonly unknown[],
+  remoteSpaceId: string,
+): CanonicalMemorySyncIntentRecord => {
+  const row = canonicalMemorySyncIntentRowSchema.parse(value);
+  const parsedRemoteSpaceId = canonicalMemoryHostedSpaceIdSchema.parse(remoteSpaceId);
+  const localHead = projectMemoryHeadRefSchema.parse({
+    sequence: row.local_head_sequence,
+    operationSha256: row.local_head_operation_sha256,
+    headDigest: row.local_head_digest,
+  });
+  const remoteObservation = parseCanonicalMemoryRemoteObservation({
+    genesisToken: row.remote_genesis_token,
+    head: {
+      sequence: row.remote_head_sequence,
+      operationSha256: row.remote_head_operation_sha256,
+      headDigest: row.remote_head_digest,
+    },
+    headProofDigest: row.remote_head_proof_digest,
+    headToken: row.remote_head_token,
+    keyVersion: row.remote_key_version,
+    revision: row.remote_revision,
+  });
+  if (
+    (localHead.sequence === 0 && row.local_head_token !== remoteObservation.genesisToken)
+    || (localHead.sequence > 0 && row.local_head_token === remoteObservation.genesisToken)
+  ) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+  const spool = spoolValues.map(mapCanonicalMemorySyncSpoolOperation);
+  const requestSpool = spool.find((operation) => operation.phase === "request");
+  const responseSpool = spool.find((operation) => operation.phase === "response");
+  const requestOperation = requestSpool === undefined
+    ? undefined
+    : canonicalMemorySpoolOperationWithoutPhase(requestSpool);
+  const responseOperation = responseSpool === undefined
+    ? undefined
+    : canonicalMemorySpoolOperationWithoutPhase(responseSpool);
+  if (
+    spool.length !== new Set(spool.map((operation) => operation.phase)).size
+    || (row.direction === "push") !== (requestOperation !== undefined)
+    || (row.direction === "push" && responseOperation !== undefined)
+    || requestOperation?.genesisToken !== undefined
+      && requestOperation.genesisToken !== remoteObservation.genesisToken
+    || (requestOperation !== undefined && (
+      requestOperation.sequence !== remoteObservation.head.sequence + 1
+      || requestOperation.priorToken !== remoteObservation.headToken
+      || requestOperation.operation.keyVersion !== remoteObservation.keyVersion
+      || requestOperation.sequence > localHead.sequence
+      || (requestOperation.sequence === localHead.sequence
+        && requestOperation.headToken !== row.local_head_token)
+    ))
+    || (responseOperation !== undefined && (
+      row.direction !== "pull"
+      || responseOperation.genesisToken !== remoteObservation.genesisToken
+      || responseOperation.sequence !== localHead.sequence + 1
+      || responseOperation.priorToken !== row.local_head_token
+      || responseOperation.operation.keyVersion !== remoteObservation.keyVersion
+      || responseOperation.sequence > remoteObservation.head.sequence
+    ))
+  ) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+
+  const responseCore = [
+    row.response_digest,
+    row.response_genesis_token,
+    row.response_revision,
+    row.response_key_version,
+    row.response_head_sequence,
+    row.response_head_digest,
+    row.response_head_token,
+    row.response_head_proof_digest,
+    row.response_observed_at,
+  ];
+  const hasResponse = responseCore.every((field) => field !== null);
+  if (
+    (!hasResponse && responseCore.some((field) => field !== null))
+    || (row.response_head_sequence === null && row.response_head_operation_sha256 !== null)
+  ) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+  const responseObservation = !hasResponse
+    ? undefined
+    : parseCanonicalMemoryRemoteObservation({
+        genesisToken: canonicalMemoryHeadTokenSchema.parse(row.response_genesis_token),
+        head: {
+          sequence: z.number().int().nonnegative().parse(row.response_head_sequence),
+          operationSha256: row.response_head_operation_sha256,
+          headDigest: canonicalMemoryDigestSchema.parse(row.response_head_digest),
+        },
+        headProofDigest: canonicalMemoryDigestSchema.parse(row.response_head_proof_digest),
+        headToken: canonicalMemoryHeadTokenSchema.parse(row.response_head_token),
+        keyVersion: z.number().int().positive().parse(row.response_key_version),
+        revision: z.number().int().positive().parse(row.response_revision),
+      });
+  if (row.request_digest !== canonicalMemorySyncRequestDigest({
+    direction: row.direction,
+    localHead,
+    localHeadToken: row.local_head_token,
+    remote: remoteObservation,
+    remoteSpaceId: parsedRemoteSpaceId,
+    ...(requestOperation === undefined ? {} : { requestOperation }),
+  })) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+  if (
+    responseObservation !== undefined
+    && row.response_digest !== canonicalMemorySyncResponseDigest({
+      direction: row.direction,
+      remote: responseObservation,
+      ...(responseOperation === undefined ? {} : { operation: responseOperation }),
+    })
+  ) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+  const hasResult = row.result_head_sequence !== null && row.result_head_digest !== null;
+  if (
+    hasResult !== (row.result_head_sequence !== null || row.result_head_digest !== null)
+    || (row.result_head_sequence === null && row.result_head_operation_sha256 !== null)
+  ) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+  const resultHead = !hasResult
+    ? undefined
+    : projectMemoryHeadRefSchema.parse({
+        sequence: row.result_head_sequence,
+        operationSha256: row.result_head_operation_sha256,
+        headDigest: row.result_head_digest,
+      });
+  const responseRequired = row.state === "response_observed" || row.state === "settled";
+  const responseForbidden = row.state === "prepared" || row.state === "effect_started";
+  const terminalState = row.state === "settled"
+    || row.state === "conflict"
+    || row.state === "error";
+  const authorizedPullResult = resultHead !== undefined
+    && row.direction === "pull"
+    && responseOperation !== undefined
+    && responseObservation !== undefined
+    && resultHead.sequence === localHead.sequence + 1
+    && resultHead.sequence === responseOperation.sequence
+    && resultHead.sequence <= responseObservation.head.sequence
+    && (resultHead.sequence !== responseObservation.head.sequence
+      || sameProjectMemoryHead(resultHead, responseObservation.head));
+  const settledWithoutImport = row.state === "settled"
+    && resultHead !== undefined
+    && responseOperation === undefined
+    && sameProjectMemoryHead(resultHead, localHead);
+  if (
+    (row.effect_started_at !== null) !== (row.state !== "prepared")
+    || (responseRequired && !hasResponse)
+    || (responseForbidden && hasResponse)
+    || (row.state === "settled" && resultHead === undefined)
+    || terminalState !== (row.settled_at !== null)
+    || ((row.state === "conflict" || row.state === "error")
+      !== (row.diagnostic_code !== null))
+    || ((row.state === "conflict" || row.state === "error") && row.settled_at === null)
+    || (resultHead !== undefined && !authorizedPullResult && !settledWithoutImport)
+    || ((row.state === "prepared" || row.state === "effect_started")
+      && resultHead !== undefined)
+    || (!hasResponse && responseOperation !== undefined)
+  ) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+  return {
+    attachmentGeneration: row.attachment_generation,
+    attachmentRevision: row.attachment_revision,
+    authorityRevision: row.authority_revision,
+    canonicalBindingDigest: row.canonical_binding_digest,
+    createdAt: row.created_at,
+    ...(row.diagnostic_code === null ? {} : { diagnosticCode: row.diagnostic_code }),
+    direction: row.direction,
+    ...(row.effect_started_at === null ? {} : { effectStartedAt: row.effect_started_at }),
+    id: row.id,
+    idempotencyKey: row.idempotency_key,
+    localHead,
+    localHeadToken: row.local_head_token,
+    projectId: row.project_id,
+    remoteObservation,
+    requestDigest: row.request_digest,
+    ...(requestOperation === undefined ? {} : { requestOperation }),
+    ...(row.response_digest === null ? {} : { responseDigest: row.response_digest }),
+    ...(responseObservation === undefined ? {} : { responseObservation }),
+    ...(responseOperation === undefined ? {} : { responseOperation }),
+    ...(row.response_observed_at === null
+      ? {}
+      : { responseObservedAt: row.response_observed_at }),
+    ...(resultHead === undefined ? {} : { resultHead }),
+    ...(row.settled_at === null ? {} : { settledAt: row.settled_at }),
+    state: row.state,
     updatedAt: row.updated_at,
   };
 };
@@ -1880,6 +2976,9 @@ const mapSessionProviderSwitch = (value: unknown): SessionProviderSwitchRecord =
     row.source_preset_v40,
     row.source_preset_contract,
   );
+  if (targetRequirement === undefined || sourceRequirement === undefined) {
+    throw new Error("SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_MISMATCH");
+  }
   if (
     (row.target_preamble_version_v40 === null) !== (row.target_preamble_digest_v40 === null)
     || (row.target_preamble_version_v40 === null) !== (row.target_manifest_version_v40 === null)
@@ -2088,7 +3187,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 40;
+const currentSchemaVersion = 41;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -4264,6 +5363,52 @@ const assertSchemaVersion39ProviderAuthority = (database: Database): void => {
  * provider-switch recovery journal are schema v40. v39 belongs exclusively
  * to the upstream/main Devin provider-authority migration above.
  */
+const legacyProjectMemoryAuthoritiesTableSql = `
+CREATE TABLE IF NOT EXISTS project_memory_authorities (
+  project_id TEXT PRIMARY KEY REFERENCES projects(id),
+  authority_digest TEXT NOT NULL CHECK(length(authority_digest) = 64 AND authority_digest NOT GLOB '*[^a-f0-9]*'),
+  binding_digest TEXT NOT NULL CHECK(length(binding_digest) = 64 AND binding_digest NOT GLOB '*[^a-f0-9]*'),
+  head_sequence INTEGER NOT NULL CHECK(head_sequence BETWEEN 0 AND 9007199254740991),
+  head_operation_sha256 TEXT CHECK(head_operation_sha256 IS NULL OR (length(head_operation_sha256) = 64 AND head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  head_digest TEXT NOT NULL CHECK(length(head_digest) = 64 AND head_digest NOT GLOB '*[^a-f0-9]*'),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  sync_state TEXT NOT NULL CHECK(sync_state IN ('local_only','settled','conflict','error')),
+  last_exchange_at INTEGER CHECK(last_exchange_at IS NULL OR last_exchange_at >= 0),
+  last_exchange_sequence INTEGER CHECK(last_exchange_sequence IS NULL OR last_exchange_sequence BETWEEN 0 AND 9007199254740991),
+  last_exchange_operation_sha256 TEXT CHECK(last_exchange_operation_sha256 IS NULL OR (length(last_exchange_operation_sha256) = 64 AND last_exchange_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  last_exchange_head_digest TEXT CHECK(last_exchange_head_digest IS NULL OR (length(last_exchange_head_digest) = 64 AND last_exchange_head_digest NOT GLOB '*[^a-f0-9]*')),
+  diagnostic_code TEXT CHECK(
+    diagnostic_code IS NULL
+    OR (
+      diagnostic_code GLOB '[A-Z]*'
+      AND diagnostic_code NOT GLOB '*[^A-Z0-9_]*'
+      AND length(diagnostic_code) BETWEEN 1 AND 80
+    )
+  ),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+  CHECK((head_sequence = 0) = (head_operation_sha256 IS NULL)),
+  CHECK(
+    (last_exchange_at IS NULL) = (last_exchange_sequence IS NULL)
+    AND (last_exchange_at IS NULL) = (last_exchange_head_digest IS NULL)
+    AND (last_exchange_sequence IS NOT NULL OR last_exchange_operation_sha256 IS NULL)
+    AND (
+      last_exchange_sequence IS NULL
+      OR ((last_exchange_sequence = 0) = (last_exchange_operation_sha256 IS NULL))
+    )
+  ),
+  CHECK((sync_state IN ('conflict','error')) = (diagnostic_code IS NOT NULL)),
+  CHECK(
+    sync_state != 'settled'
+    OR (
+      last_exchange_at IS NOT NULL
+      AND last_exchange_sequence=head_sequence
+      AND last_exchange_operation_sha256 IS head_operation_sha256
+      AND last_exchange_head_digest=head_digest
+    )
+  )
+) STRICT;`;
+
 const schemaVersion40PeerSessions = `
 CREATE TABLE IF NOT EXISTS session_peer_policies (
   session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
@@ -4605,9 +5750,21 @@ WHEN NOT EXISTS (
   JOIN peer_session_actions parent ON parent.id=NEW.parent_action_id
   WHERE child.id=NEW.action_id
     AND child.actor_session_id=parent.target_session_id
+    AND child.project_id=parent.project_id
     AND child.hop>parent.hop
 )
 BEGIN SELECT RAISE(ABORT, 'invalid peer session action parent'); END;
+DROP TRIGGER IF EXISTS peer_session_action_root_insert_guard;
+CREATE TRIGGER peer_session_action_root_insert_guard
+BEFORE INSERT ON peer_session_action_roots
+WHEN NOT EXISTS (
+  SELECT 1 FROM peer_session_actions child
+  JOIN peer_session_actions root ON root.id=NEW.root_action_id
+  WHERE child.id=NEW.action_id
+    AND child.project_id=root.project_id
+    AND root.hop=1
+)
+BEGIN SELECT RAISE(ABORT, 'invalid peer session action root'); END;
 DROP TRIGGER IF EXISTS peer_session_action_turn_origin_insert_guard;
 CREATE TRIGGER peer_session_action_turn_origin_insert_guard
 BEFORE INSERT ON peer_session_turn_origins
@@ -4681,6 +5838,22 @@ BEFORE UPDATE ON session_host_capability_bindings
 BEGIN SELECT RAISE(ABORT, 'session host capability binding is immutable'); END;
 CREATE TABLE IF NOT EXISTS project_memory_authorities (
   project_id TEXT PRIMARY KEY REFERENCES projects(id),
+  identity_contract INTEGER NOT NULL CHECK(identity_contract IN (1,2)),
+  canonical_space_id TEXT NOT NULL CHECK(
+    (
+      identity_contract=1
+      AND length(canonical_space_id)=76
+      AND canonical_space_id GLOB 'hra:project:*'
+      AND substr(canonical_space_id,13) NOT GLOB '*[^a-f0-9]*'
+    ) OR (
+      identity_contract=2
+      AND length(canonical_space_id)=50
+      AND canonical_space_id GLOB 'hra:project:space-*'
+      AND substr(canonical_space_id,19) NOT GLOB '*[^a-f0-9]*'
+    )
+  ),
+  physical_state TEXT NOT NULL CHECK(physical_state IN ('reserved','initialized','rejected')),
+  initialized_at INTEGER CHECK(initialized_at IS NULL OR initialized_at >= 0),
   authority_digest TEXT NOT NULL CHECK(length(authority_digest) = 64 AND authority_digest NOT GLOB '*[^a-f0-9]*'),
   binding_digest TEXT NOT NULL CHECK(length(binding_digest) = 64 AND binding_digest NOT GLOB '*[^a-f0-9]*'),
   head_sequence INTEGER NOT NULL CHECK(head_sequence BETWEEN 0 AND 9007199254740991),
@@ -4702,7 +5875,10 @@ CREATE TABLE IF NOT EXISTS project_memory_authorities (
   ),
   created_at INTEGER NOT NULL CHECK(created_at >= 0),
   updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+  CHECK((physical_state='initialized') = (initialized_at IS NOT NULL)),
+  CHECK(initialized_at IS NULL OR (initialized_at >= created_at AND initialized_at <= updated_at)),
   CHECK((head_sequence = 0) = (head_operation_sha256 IS NULL)),
+  CHECK(head_sequence != 0 OR head_digest = '${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'),
   CHECK(
     (last_exchange_at IS NULL) = (last_exchange_sequence IS NULL)
     AND (last_exchange_at IS NULL) = (last_exchange_head_digest IS NULL)
@@ -4712,7 +5888,41 @@ CREATE TABLE IF NOT EXISTS project_memory_authorities (
       OR ((last_exchange_sequence = 0) = (last_exchange_operation_sha256 IS NULL))
     )
   ),
+  CHECK(
+    last_exchange_sequence IS NULL
+    OR last_exchange_sequence != 0
+    OR last_exchange_head_digest = '${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'
+  ),
   CHECK((sync_state IN ('conflict','error')) = (diagnostic_code IS NOT NULL)),
+  CHECK(
+    physical_state!='reserved'
+    OR (
+      head_sequence=0
+      AND head_operation_sha256 IS NULL
+      AND head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'
+      AND sync_state='local_only'
+      AND last_exchange_at IS NULL
+      AND last_exchange_sequence IS NULL
+      AND last_exchange_operation_sha256 IS NULL
+      AND last_exchange_head_digest IS NULL
+      AND diagnostic_code IS NULL
+    )
+  ),
+  CHECK(
+    physical_state!='rejected'
+    OR (
+      initialized_at IS NULL
+      AND head_sequence=0
+      AND head_operation_sha256 IS NULL
+      AND head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'
+      AND sync_state='error'
+      AND last_exchange_at IS NULL
+      AND last_exchange_sequence IS NULL
+      AND last_exchange_operation_sha256 IS NULL
+      AND last_exchange_head_digest IS NULL
+      AND diagnostic_code IS NOT NULL
+    )
+  ),
   CHECK(
     sync_state != 'settled'
     OR (
@@ -4723,6 +5933,8 @@ CREATE TABLE IF NOT EXISTS project_memory_authorities (
     )
   )
 ) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS project_memory_authorities_space_unique
+  ON project_memory_authorities(canonical_space_id);
 CREATE TABLE IF NOT EXISTS memory_submissions (
   id TEXT PRIMARY KEY CHECK(id GLOB 'memsub_[0-9a-f]*' AND length(id) = 39),
   idempotency_key TEXT NOT NULL UNIQUE CHECK(length(idempotency_key) BETWEEN 1 AND 64),
@@ -4748,7 +5960,7 @@ CREATE TABLE IF NOT EXISTS memory_submissions (
   result_head_operation_sha256 TEXT CHECK(result_head_operation_sha256 IS NULL OR (length(result_head_operation_sha256) = 64 AND result_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
   result_head_digest TEXT CHECK(result_head_digest IS NULL OR (length(result_head_digest) = 64 AND result_head_digest NOT GLOB '*[^a-f0-9]*')),
   receipt_digest TEXT CHECK(receipt_digest IS NULL OR (length(receipt_digest) = 64 AND receipt_digest NOT GLOB '*[^a-f0-9]*')),
-  outcome_code TEXT CHECK(outcome_code IS NULL OR outcome_code IN ('remember_committed','remember_not_applied','share_adopted','share_already_present','share_conflict','share_not_applied')),
+  outcome_code TEXT CHECK(outcome_code IS NULL OR outcome_code IN ('remember_committed','remember_not_applied','share_adopted','share_already_present','share_conflict','share_not_applied','share_too_large')),
   conflict_actual_head_sequence INTEGER CHECK(conflict_actual_head_sequence IS NULL OR conflict_actual_head_sequence BETWEEN 0 AND 9007199254740991),
   conflict_actual_head_operation_sha256 TEXT CHECK(conflict_actual_head_operation_sha256 IS NULL OR (length(conflict_actual_head_operation_sha256) = 64 AND conflict_actual_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
   conflict_actual_head_digest TEXT CHECK(conflict_actual_head_digest IS NULL OR (length(conflict_actual_head_digest) = 64 AND conflict_actual_head_digest NOT GLOB '*[^a-f0-9]*')),
@@ -4821,7 +6033,7 @@ CREATE TABLE IF NOT EXISTS memory_submissions (
           AND result_head_sequence=expected_head_sequence
           AND result_head_operation_sha256 IS expected_head_operation_sha256
           AND result_head_digest=expected_head_digest)
-        OR (state='failed' AND outcome_code IN ('share_conflict','share_not_applied'))
+        OR (state='failed' AND outcome_code IN ('share_conflict','share_not_applied','share_too_large'))
       )
     )
   ),
@@ -4933,6 +6145,8 @@ DROP TRIGGER IF EXISTS project_memory_authority_insert_guard;
 CREATE TRIGGER project_memory_authority_insert_guard
 BEFORE INSERT ON project_memory_authorities
 WHEN NEW.revision!=1
+  OR NEW.physical_state!='reserved'
+  OR NEW.initialized_at IS NOT NULL
   OR NEW.sync_state!='local_only'
   OR NEW.last_exchange_at IS NOT NULL
   OR NEW.last_exchange_sequence IS NOT NULL
@@ -4945,6 +6159,43 @@ CREATE TRIGGER project_memory_authority_transition_guard
 BEFORE UPDATE ON project_memory_authorities
 WHEN NOT (
   NEW.project_id=OLD.project_id
+  AND NEW.identity_contract=OLD.identity_contract
+  AND NEW.canonical_space_id=OLD.canonical_space_id
+  AND (
+    (
+      OLD.physical_state='reserved'
+      AND NEW.physical_state='initialized'
+      AND NEW.initialized_at IS NOT NULL
+      AND NEW.head_sequence=OLD.head_sequence
+      AND NEW.head_operation_sha256 IS OLD.head_operation_sha256
+      AND NEW.head_digest=OLD.head_digest
+      AND NEW.sync_state=OLD.sync_state
+      AND NEW.last_exchange_at IS OLD.last_exchange_at
+      AND NEW.last_exchange_sequence IS OLD.last_exchange_sequence
+      AND NEW.last_exchange_operation_sha256 IS OLD.last_exchange_operation_sha256
+      AND NEW.last_exchange_head_digest IS OLD.last_exchange_head_digest
+      AND NEW.diagnostic_code IS OLD.diagnostic_code
+    )
+    OR (
+      OLD.physical_state='reserved'
+      AND NEW.physical_state='rejected'
+      AND NEW.initialized_at IS NULL
+      AND NEW.head_sequence=OLD.head_sequence
+      AND NEW.head_operation_sha256 IS OLD.head_operation_sha256
+      AND NEW.head_digest=OLD.head_digest
+      AND NEW.sync_state='error'
+      AND NEW.last_exchange_at IS OLD.last_exchange_at
+      AND NEW.last_exchange_sequence IS OLD.last_exchange_sequence
+      AND NEW.last_exchange_operation_sha256 IS OLD.last_exchange_operation_sha256
+      AND NEW.last_exchange_head_digest IS OLD.last_exchange_head_digest
+      AND NEW.diagnostic_code IS NOT NULL
+    )
+    OR (
+      OLD.physical_state='initialized'
+      AND NEW.physical_state='initialized'
+      AND NEW.initialized_at=OLD.initialized_at
+    )
+  )
   AND NEW.authority_digest=OLD.authority_digest
   AND NEW.binding_digest=OLD.binding_digest
   AND NEW.revision=OLD.revision+1
@@ -5067,7 +6318,7 @@ WHEN NOT (
   AND (
     NEW.state!='failed'
     OR (OLD.kind='remember' AND NEW.outcome_code='remember_not_applied')
-    OR (OLD.kind='share' AND NEW.outcome_code IN ('share_conflict','share_not_applied'))
+    OR (OLD.kind='share' AND NEW.outcome_code IN ('share_conflict','share_not_applied','share_too_large'))
   )
 )
 BEGIN SELECT RAISE(ABORT, 'illegal memory submission transition'); END;
@@ -5809,7 +7060,126 @@ const applySchemaVersion40ProviderSwitchAuthority = (database: Database): void =
   database.exec(schemaVersion40ProviderSwitchAuthority);
 };
 
+const projectMemoryAuthoritiesTableSql = (): string => {
+  const marker = "CREATE TABLE IF NOT EXISTS project_memory_authorities";
+  const start = schemaVersion40PeerSessions.indexOf(marker);
+  const end = schemaVersion40PeerSessions.indexOf(") STRICT;", start);
+  if (start < 0 || end < 0) throw new Error("STATE_SCHEMA_V40_DEFINITION_INVALID");
+  return schemaVersion40PeerSessions.slice(start, end + ") STRICT;".length);
+};
+
+const repairLegacyProjectMemoryAuthorities = (database: Database): void => {
+  const observed = database.query(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='project_memory_authorities'",
+  ).get();
+  if (observed === null) return;
+  const hasContract = hasTableColumn(database, "project_memory_authorities", "identity_contract");
+  const hasSpace = hasTableColumn(database, "project_memory_authorities", "canonical_space_id");
+  const hasPhysicalState = hasTableColumn(
+    database,
+    "project_memory_authorities",
+    "physical_state",
+  );
+  const hasInitializedAt = hasTableColumn(
+    database,
+    "project_memory_authorities",
+    "initialized_at",
+  );
+  if (hasContract && hasSpace && hasPhysicalState && hasInitializedAt) return;
+  if (hasContract || hasSpace || hasPhysicalState || hasInitializedAt) {
+    throw new Error("PROJECT_MEMORY_AUTHORITY_MIGRATION_INVALID");
+  }
+  const observedSql = z.object({ sql: z.string() }).strict().parse(observed).sql;
+  if (normalizeSqlStructure(observedSql.replace(/\bIF NOT EXISTS\b/giu, ""))
+    !== normalizeSqlStructure(
+      legacyProjectMemoryAuthoritiesTableSql.replace(/\bIF NOT EXISTS\b/giu, ""),
+    )) throw new Error("PROJECT_MEMORY_AUTHORITY_MIGRATION_INVALID");
+
+  const migrated = (() => {
+    try {
+      const rows = legacyProjectMemoryAuthorityRowSchema.array().parse(
+        database.query("SELECT * FROM project_memory_authorities ORDER BY project_id").all(),
+      );
+      return rows.map((row) => {
+        projectMemoryHeadRefSchema.parse({
+          headDigest: row.head_digest,
+          operationSha256: row.head_operation_sha256,
+          sequence: row.head_sequence,
+        });
+        if (row.last_exchange_sequence !== null) {
+          projectMemoryHeadRefSchema.parse({
+            headDigest: row.last_exchange_head_digest,
+            operationSha256: row.last_exchange_operation_sha256,
+            sequence: row.last_exchange_sequence,
+          });
+        }
+        const identity = deriveProjectMemoryCanonicalIdentity({
+          canonicalSpaceId: legacyProjectMemorySpaceId(row.project_id),
+          identityContract: 1,
+          projectId: row.project_id,
+        });
+        if (
+          identity.authorityDigest !== row.authority_digest
+          || identity.bindingDigest !== row.binding_digest
+        ) throw new Error("PROJECT_MEMORY_AUTHORITY_MIGRATION_INVALID");
+        return { identity, row };
+      });
+    } catch (cause: unknown) {
+      if (
+        cause instanceof Error
+        && cause.message === "PROJECT_MEMORY_AUTHORITY_MIGRATION_INVALID"
+      ) throw cause;
+      throw new Error("PROJECT_MEMORY_AUTHORITY_MIGRATION_INVALID", { cause });
+    }
+  })();
+
+  database.transaction(() => {
+    for (const trigger of [
+      "memory_page_attestation_ref_insert_guard",
+      "memory_page_attestation_ref_update_guard",
+      "project_memory_authority_delete_guard",
+      "project_memory_authority_insert_guard",
+      "project_memory_authority_transition_guard",
+    ]) database.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+    database.exec("DROP TABLE project_memory_authorities");
+    database.exec(projectMemoryAuthoritiesTableSql());
+    const insert = database.query(
+      `INSERT INTO project_memory_authorities(
+         project_id,identity_contract,canonical_space_id,physical_state,initialized_at,
+         authority_digest,binding_digest,
+         head_sequence,head_operation_sha256,head_digest,revision,sync_state,
+         last_exchange_at,last_exchange_sequence,last_exchange_operation_sha256,
+         last_exchange_head_digest,diagnostic_code,created_at,updated_at
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    );
+    for (const { identity, row } of migrated) {
+      insert.run(
+        row.project_id,
+        identity.identityContract,
+        identity.canonicalSpaceId,
+        "initialized",
+        row.created_at,
+        row.authority_digest,
+        row.binding_digest,
+        row.head_sequence,
+        row.head_operation_sha256,
+        row.head_digest,
+        row.revision,
+        row.sync_state,
+        row.last_exchange_at,
+        row.last_exchange_sequence,
+        row.last_exchange_operation_sha256,
+        row.last_exchange_head_digest,
+        row.diagnostic_code,
+        row.created_at,
+        row.updated_at,
+      );
+    }
+  }).immediate();
+};
+
 const applySchemaVersion40PeerSessions = (database: Database): void => {
+  repairLegacyProjectMemoryAuthorities(database);
   database.exec(schemaVersion40PeerSessions);
   database.query(
     `INSERT OR IGNORE INTO peer_session_direct_message_sources(
@@ -5842,6 +7212,984 @@ const applySchemaVersion40PeerSessions = (database: Database): void => {
   ).run();
   database.exec(schemaVersion40QueuePeerProvenance);
   applySchemaVersion40ProviderSwitchAuthority(database);
+};
+
+/*
+ * Hosted canonical memory is an additive v41 control-plane journal. It stores
+ * only opaque routing identifiers, public heads/digests, and already-encrypted
+ * operation envelopes. Portable descriptor/proof plaintext, data keys,
+ * credentials, and project paths never cross this boundary.
+ */
+const schemaVersion41CanonicalMemorySync = `
+CREATE TABLE IF NOT EXISTS project_memory_hosted_attachments (
+  project_id TEXT PRIMARY KEY REFERENCES project_memory_authorities(project_id),
+  remote_space_id TEXT NOT NULL UNIQUE CHECK(
+    length(remote_space_id)=39
+    AND remote_space_id GLOB 'memory_[A-Za-z0-9_-]*'
+    AND remote_space_id NOT GLOB '*[^A-Za-z0-9_-]*'
+  ),
+  account_binding_digest TEXT NOT NULL CHECK(length(account_binding_digest)=64 AND account_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  canonical_binding_digest TEXT NOT NULL CHECK(length(canonical_binding_digest)=64 AND canonical_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 9007199254740991),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  state TEXT NOT NULL CHECK(state IN ('attached','detached','conflict','error')),
+  genesis_token TEXT NOT NULL CHECK(length(genesis_token)=64 AND genesis_token NOT GLOB '*[^a-f0-9]*'),
+  remote_revision INTEGER NOT NULL CHECK(remote_revision BETWEEN 1 AND 9007199254740991),
+  remote_key_version INTEGER NOT NULL CHECK(remote_key_version BETWEEN 1 AND 9007199254740991),
+  remote_head_sequence INTEGER NOT NULL CHECK(remote_head_sequence BETWEEN 0 AND 9007199254740991),
+  remote_head_operation_sha256 TEXT CHECK(remote_head_operation_sha256 IS NULL OR (length(remote_head_operation_sha256)=64 AND remote_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  remote_head_digest TEXT NOT NULL CHECK(length(remote_head_digest)=64 AND remote_head_digest NOT GLOB '*[^a-f0-9]*'),
+  remote_head_token TEXT NOT NULL CHECK(length(remote_head_token)=64 AND remote_head_token NOT GLOB '*[^a-f0-9]*'),
+  remote_head_proof_digest TEXT NOT NULL CHECK(length(remote_head_proof_digest)=64 AND remote_head_proof_digest NOT GLOB '*[^a-f0-9]*'),
+  diagnostic_code TEXT CHECK(diagnostic_code IS NULL OR (
+    diagnostic_code GLOB '[A-Z]*'
+    AND diagnostic_code NOT GLOB '*[^A-Z0-9_]*'
+    AND length(diagnostic_code) BETWEEN 1 AND 80
+  )),
+  created_at INTEGER NOT NULL CHECK(created_at>=0),
+  updated_at INTEGER NOT NULL CHECK(updated_at>=created_at),
+  CHECK((remote_head_sequence=0)=(remote_head_operation_sha256 IS NULL)),
+  CHECK(remote_head_sequence!=0 OR remote_head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'),
+  CHECK((remote_head_sequence=0 AND remote_head_token=genesis_token)
+     OR (remote_head_sequence>0 AND remote_head_token!=genesis_token)),
+  CHECK((state IN ('conflict','error'))=(diagnostic_code IS NOT NULL))
+) STRICT;
+CREATE TABLE IF NOT EXISTS project_memory_hosted_create_intents (
+  id TEXT PRIMARY KEY CHECK(id GLOB 'cmcreate_[0-9a-f]*' AND length(id)=41),
+  idempotency_key TEXT NOT NULL UNIQUE CHECK(length(idempotency_key)=36),
+  project_id TEXT NOT NULL REFERENCES project_memory_authorities(project_id),
+  state TEXT NOT NULL CHECK(state IN (
+    'allocating','key_staged','prepared','effect_started','winner_observed',
+    'settled','conflict','error'
+  )),
+  authority_revision INTEGER NOT NULL CHECK(authority_revision BETWEEN 1 AND 9007199254740991),
+  canonical_binding_digest TEXT NOT NULL CHECK(length(canonical_binding_digest)=64 AND canonical_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  authority_head_sequence INTEGER NOT NULL CHECK(authority_head_sequence BETWEEN 0 AND 9007199254740991),
+  authority_head_operation_sha256 TEXT CHECK(authority_head_operation_sha256 IS NULL OR (length(authority_head_operation_sha256)=64 AND authority_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  authority_head_digest TEXT NOT NULL CHECK(length(authority_head_digest)=64 AND authority_head_digest NOT GLOB '*[^a-f0-9]*'),
+  account_binding_digest TEXT NOT NULL CHECK(length(account_binding_digest)=64 AND account_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  remote_space_id TEXT NOT NULL CHECK(
+    length(remote_space_id)=39
+    AND remote_space_id GLOB 'memory_[A-Za-z0-9_-]*'
+    AND remote_space_id NOT GLOB '*[^A-Za-z0-9_-]*'
+  ),
+  space_key_version INTEGER CHECK(space_key_version IS NULL OR space_key_version BETWEEN 1 AND 9007199254740991),
+  wrapped_key_algorithm TEXT CHECK(wrapped_key_algorithm IS NULL OR wrapped_key_algorithm='A256GCM'),
+  wrapped_key_ciphertext TEXT CHECK(wrapped_key_ciphertext IS NULL OR (
+    length(wrapped_key_ciphertext) BETWEEN 22 AND ${String(canonicalMemoryCiphertextLimits.terminalHeadProof)}
+    AND wrapped_key_ciphertext NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  wrapped_key_version INTEGER CHECK(wrapped_key_version IS NULL OR wrapped_key_version BETWEEN 1 AND 9007199254740991),
+  wrapped_key_nonce TEXT CHECK(wrapped_key_nonce IS NULL OR (
+    length(wrapped_key_nonce)=16 AND wrapped_key_nonce NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  descriptor_algorithm TEXT CHECK(descriptor_algorithm IS NULL OR descriptor_algorithm='A256GCM'),
+  descriptor_ciphertext TEXT CHECK(descriptor_ciphertext IS NULL OR (
+    length(descriptor_ciphertext) BETWEEN 22 AND ${String(canonicalMemoryCiphertextLimits.terminalHeadProof)}
+    AND descriptor_ciphertext NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  descriptor_key_version INTEGER CHECK(descriptor_key_version IS NULL OR descriptor_key_version BETWEEN 1 AND 9007199254740991),
+  descriptor_nonce TEXT CHECK(descriptor_nonce IS NULL OR (
+    length(descriptor_nonce)=16 AND descriptor_nonce NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  genesis_proof_algorithm TEXT CHECK(genesis_proof_algorithm IS NULL OR genesis_proof_algorithm='A256GCM'),
+  genesis_proof_ciphertext TEXT CHECK(genesis_proof_ciphertext IS NULL OR (
+    length(genesis_proof_ciphertext) BETWEEN 22 AND ${String(canonicalMemoryCiphertextLimits.terminalHeadProof)}
+    AND genesis_proof_ciphertext NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  genesis_proof_key_version INTEGER CHECK(genesis_proof_key_version IS NULL OR genesis_proof_key_version BETWEEN 1 AND 9007199254740991),
+  genesis_proof_nonce TEXT CHECK(genesis_proof_nonce IS NULL OR (
+    length(genesis_proof_nonce)=16 AND genesis_proof_nonce NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  genesis_token TEXT CHECK(genesis_token IS NULL OR (length(genesis_token)=64 AND genesis_token NOT GLOB '*[^a-f0-9]*')),
+  request_digest TEXT CHECK(request_digest IS NULL OR (length(request_digest)=64 AND request_digest NOT GLOB '*[^a-f0-9]*')),
+  effect_started_at INTEGER CHECK(effect_started_at IS NULL OR effect_started_at>=created_at),
+  winner_digest TEXT CHECK(winner_digest IS NULL OR (length(winner_digest)=64 AND winner_digest NOT GLOB '*[^a-f0-9]*')),
+  winner_revision INTEGER CHECK(winner_revision IS NULL OR winner_revision BETWEEN 1 AND 9007199254740991),
+  winner_replay INTEGER CHECK(winner_replay IS NULL OR winner_replay IN (0,1)),
+  winner_observed_at INTEGER CHECK(winner_observed_at IS NULL OR (
+    effect_started_at IS NOT NULL AND winner_observed_at>=effect_started_at
+  )),
+  settled_at INTEGER CHECK(settled_at IS NULL OR settled_at>=created_at),
+  diagnostic_code TEXT CHECK(diagnostic_code IS NULL OR (
+    diagnostic_code GLOB '[A-Z]*'
+    AND diagnostic_code NOT GLOB '*[^A-Z0-9_]*'
+    AND length(diagnostic_code) BETWEEN 1 AND 80
+  )),
+  created_at INTEGER NOT NULL CHECK(created_at>=0),
+  updated_at INTEGER NOT NULL CHECK(updated_at>=created_at),
+  CHECK((authority_head_sequence=0)=(authority_head_operation_sha256 IS NULL)),
+  CHECK(authority_head_sequence!=0 OR authority_head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'),
+  CHECK(
+    (space_key_version IS NULL AND wrapped_key_algorithm IS NULL
+      AND wrapped_key_ciphertext IS NULL AND wrapped_key_version IS NULL
+      AND wrapped_key_nonce IS NULL)
+    OR
+    (space_key_version IS NOT NULL AND wrapped_key_algorithm IS NOT NULL
+      AND wrapped_key_ciphertext IS NOT NULL AND wrapped_key_version IS NOT NULL
+      AND wrapped_key_nonce IS NOT NULL)
+  ),
+  CHECK(
+    (descriptor_algorithm IS NULL AND descriptor_ciphertext IS NULL
+      AND descriptor_key_version IS NULL AND descriptor_nonce IS NULL
+      AND genesis_proof_algorithm IS NULL AND genesis_proof_ciphertext IS NULL
+      AND genesis_proof_key_version IS NULL AND genesis_proof_nonce IS NULL
+      AND genesis_token IS NULL AND request_digest IS NULL)
+    OR
+    (space_key_version IS NOT NULL AND descriptor_algorithm IS NOT NULL
+      AND descriptor_ciphertext IS NOT NULL AND descriptor_key_version=space_key_version
+      AND descriptor_nonce IS NOT NULL AND genesis_proof_algorithm IS NOT NULL
+      AND genesis_proof_ciphertext IS NOT NULL
+      AND genesis_proof_key_version=space_key_version
+      AND genesis_proof_nonce IS NOT NULL AND genesis_token IS NOT NULL
+      AND request_digest IS NOT NULL)
+  ),
+  CHECK(
+    (winner_digest IS NULL AND winner_revision IS NULL
+      AND winner_replay IS NULL AND winner_observed_at IS NULL)
+    OR
+    (request_digest IS NOT NULL AND effect_started_at IS NOT NULL
+      AND winner_digest IS NOT NULL AND winner_revision IS NOT NULL
+      AND winner_replay IS NOT NULL AND winner_observed_at IS NOT NULL)
+  ),
+  CHECK(effect_started_at IS NULL OR request_digest IS NOT NULL),
+  CHECK((state IN ('settled','conflict','error'))=(settled_at IS NOT NULL)),
+  CHECK((state IN ('conflict','error'))=(diagnostic_code IS NOT NULL)),
+  CHECK(
+    (state='allocating' AND space_key_version IS NULL)
+    OR (state='key_staged' AND space_key_version IS NOT NULL AND request_digest IS NULL)
+    OR (state='prepared' AND request_digest IS NOT NULL AND effect_started_at IS NULL)
+    OR (state='effect_started' AND effect_started_at IS NOT NULL AND winner_digest IS NULL)
+    OR (state='winner_observed' AND winner_digest IS NOT NULL)
+    OR (state='settled' AND winner_digest IS NOT NULL)
+    OR state IN ('conflict','error')
+  )
+) STRICT;
+CREATE TABLE IF NOT EXISTS project_memory_sync_intents (
+  id TEXT PRIMARY KEY CHECK(id GLOB 'cmsync_[0-9a-f]*' AND length(id)=39),
+  idempotency_key TEXT NOT NULL UNIQUE CHECK(length(idempotency_key)=36),
+  project_id TEXT NOT NULL REFERENCES project_memory_hosted_attachments(project_id),
+  direction TEXT NOT NULL CHECK(direction IN ('pull','push')),
+  state TEXT NOT NULL CHECK(state IN ('prepared','effect_started','response_observed','settled','conflict','error')),
+  attachment_generation INTEGER NOT NULL CHECK(attachment_generation BETWEEN 1 AND 9007199254740991),
+  attachment_revision INTEGER NOT NULL CHECK(attachment_revision BETWEEN 1 AND 9007199254740991),
+  authority_revision INTEGER NOT NULL CHECK(authority_revision BETWEEN 1 AND 9007199254740991),
+  canonical_binding_digest TEXT NOT NULL CHECK(length(canonical_binding_digest)=64 AND canonical_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  local_head_sequence INTEGER NOT NULL CHECK(local_head_sequence BETWEEN 0 AND 9007199254740991),
+  local_head_operation_sha256 TEXT CHECK(local_head_operation_sha256 IS NULL OR (length(local_head_operation_sha256)=64 AND local_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  local_head_digest TEXT NOT NULL CHECK(length(local_head_digest)=64 AND local_head_digest NOT GLOB '*[^a-f0-9]*'),
+  local_head_token TEXT NOT NULL CHECK(length(local_head_token)=64 AND local_head_token NOT GLOB '*[^a-f0-9]*'),
+  remote_genesis_token TEXT NOT NULL CHECK(length(remote_genesis_token)=64 AND remote_genesis_token NOT GLOB '*[^a-f0-9]*'),
+  remote_revision INTEGER NOT NULL CHECK(remote_revision BETWEEN 1 AND 9007199254740991),
+  remote_key_version INTEGER NOT NULL CHECK(remote_key_version BETWEEN 1 AND 9007199254740991),
+  remote_head_sequence INTEGER NOT NULL CHECK(remote_head_sequence BETWEEN 0 AND 9007199254740991),
+  remote_head_operation_sha256 TEXT CHECK(remote_head_operation_sha256 IS NULL OR (length(remote_head_operation_sha256)=64 AND remote_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  remote_head_digest TEXT NOT NULL CHECK(length(remote_head_digest)=64 AND remote_head_digest NOT GLOB '*[^a-f0-9]*'),
+  remote_head_token TEXT NOT NULL CHECK(length(remote_head_token)=64 AND remote_head_token NOT GLOB '*[^a-f0-9]*'),
+  remote_head_proof_digest TEXT NOT NULL CHECK(length(remote_head_proof_digest)=64 AND remote_head_proof_digest NOT GLOB '*[^a-f0-9]*'),
+  request_digest TEXT NOT NULL CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^a-f0-9]*'),
+  effect_started_at INTEGER CHECK(effect_started_at IS NULL OR effect_started_at>=created_at),
+  response_digest TEXT CHECK(response_digest IS NULL OR (length(response_digest)=64 AND response_digest NOT GLOB '*[^a-f0-9]*')),
+  response_genesis_token TEXT CHECK(response_genesis_token IS NULL OR (length(response_genesis_token)=64 AND response_genesis_token NOT GLOB '*[^a-f0-9]*')),
+  response_revision INTEGER CHECK(response_revision IS NULL OR response_revision BETWEEN 1 AND 9007199254740991),
+  response_key_version INTEGER CHECK(response_key_version IS NULL OR response_key_version BETWEEN 1 AND 9007199254740991),
+  response_head_sequence INTEGER CHECK(response_head_sequence IS NULL OR response_head_sequence BETWEEN 0 AND 9007199254740991),
+  response_head_operation_sha256 TEXT CHECK(response_head_operation_sha256 IS NULL OR (length(response_head_operation_sha256)=64 AND response_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  response_head_digest TEXT CHECK(response_head_digest IS NULL OR (length(response_head_digest)=64 AND response_head_digest NOT GLOB '*[^a-f0-9]*')),
+  response_head_token TEXT CHECK(response_head_token IS NULL OR (length(response_head_token)=64 AND response_head_token NOT GLOB '*[^a-f0-9]*')),
+  response_head_proof_digest TEXT CHECK(response_head_proof_digest IS NULL OR (length(response_head_proof_digest)=64 AND response_head_proof_digest NOT GLOB '*[^a-f0-9]*')),
+  response_observed_at INTEGER CHECK(response_observed_at IS NULL OR response_observed_at>=created_at),
+  result_head_sequence INTEGER CHECK(result_head_sequence IS NULL OR result_head_sequence BETWEEN 0 AND 9007199254740991),
+  result_head_operation_sha256 TEXT CHECK(result_head_operation_sha256 IS NULL OR (length(result_head_operation_sha256)=64 AND result_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  result_head_digest TEXT CHECK(result_head_digest IS NULL OR (length(result_head_digest)=64 AND result_head_digest NOT GLOB '*[^a-f0-9]*')),
+  settled_at INTEGER CHECK(settled_at IS NULL OR settled_at>=created_at),
+  diagnostic_code TEXT CHECK(diagnostic_code IS NULL OR (
+    diagnostic_code GLOB '[A-Z]*'
+    AND diagnostic_code NOT GLOB '*[^A-Z0-9_]*'
+    AND length(diagnostic_code) BETWEEN 1 AND 80
+  )),
+  created_at INTEGER NOT NULL CHECK(created_at>=0),
+  updated_at INTEGER NOT NULL CHECK(updated_at>=created_at),
+  CHECK((local_head_sequence=0)=(local_head_operation_sha256 IS NULL)),
+  CHECK(local_head_sequence!=0 OR local_head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'),
+  CHECK((local_head_sequence=0 AND local_head_token=remote_genesis_token)
+     OR (local_head_sequence>0 AND local_head_token!=remote_genesis_token)),
+  CHECK((remote_head_sequence=0)=(remote_head_operation_sha256 IS NULL)),
+  CHECK(remote_head_sequence!=0 OR remote_head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'),
+  CHECK((remote_head_sequence=0 AND remote_head_token=remote_genesis_token)
+     OR (remote_head_sequence>0 AND remote_head_token!=remote_genesis_token)),
+  CHECK((direction='push' AND local_head_sequence>remote_head_sequence)
+     OR (direction='pull' AND local_head_sequence<=remote_head_sequence)),
+  CHECK(
+    (response_digest IS NULL AND response_genesis_token IS NULL
+      AND response_revision IS NULL AND response_key_version IS NULL
+      AND response_head_sequence IS NULL AND response_head_operation_sha256 IS NULL
+      AND response_head_digest IS NULL AND response_head_token IS NULL
+      AND response_head_proof_digest IS NULL AND response_observed_at IS NULL)
+    OR
+    (response_digest IS NOT NULL AND response_genesis_token IS NOT NULL
+      AND response_revision IS NOT NULL AND response_key_version IS NOT NULL
+      AND response_head_sequence IS NOT NULL AND response_head_digest IS NOT NULL
+      AND response_head_token IS NOT NULL AND response_head_proof_digest IS NOT NULL
+      AND response_observed_at IS NOT NULL
+      AND ((response_head_sequence=0)=(response_head_operation_sha256 IS NULL))
+      AND (response_head_sequence!=0 OR response_head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}')
+      AND ((response_head_sequence=0 AND response_head_token=response_genesis_token)
+        OR (response_head_sequence>0 AND response_head_token!=response_genesis_token)))
+  ),
+  CHECK(
+    (result_head_sequence IS NULL AND result_head_operation_sha256 IS NULL AND result_head_digest IS NULL)
+    OR
+    (result_head_sequence IS NOT NULL AND result_head_digest IS NOT NULL
+      AND ((result_head_sequence=0)=(result_head_operation_sha256 IS NULL))
+      AND (result_head_sequence!=0 OR result_head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'))
+  ),
+  CHECK(
+    (state='prepared' AND effect_started_at IS NULL AND response_digest IS NULL
+      AND result_head_sequence IS NULL AND settled_at IS NULL AND diagnostic_code IS NULL)
+    OR
+    (state='effect_started' AND effect_started_at IS NOT NULL AND response_digest IS NULL
+      AND result_head_sequence IS NULL AND settled_at IS NULL AND diagnostic_code IS NULL)
+    OR
+    (state='response_observed' AND effect_started_at IS NOT NULL AND response_digest IS NOT NULL
+      AND (direction='pull' OR result_head_sequence IS NULL)
+      AND settled_at IS NULL AND diagnostic_code IS NULL)
+    OR
+    (state='settled' AND effect_started_at IS NOT NULL AND response_digest IS NOT NULL
+      AND result_head_sequence IS NOT NULL AND settled_at IS NOT NULL AND diagnostic_code IS NULL)
+    OR
+    (state IN ('conflict','error') AND effect_started_at IS NOT NULL
+      AND (direction='pull' OR result_head_sequence IS NULL)
+      AND settled_at IS NOT NULL AND diagnostic_code IS NOT NULL)
+  ),
+  CHECK(effect_started_at IS NULL OR effect_started_at<=updated_at),
+  CHECK(response_observed_at IS NULL OR (response_observed_at>=effect_started_at AND response_observed_at<=updated_at)),
+  CHECK(settled_at IS NULL OR (settled_at>=effect_started_at AND settled_at<=updated_at))
+) STRICT;
+CREATE TABLE IF NOT EXISTS project_memory_sync_spool (
+  intent_id TEXT NOT NULL REFERENCES project_memory_sync_intents(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+  phase TEXT NOT NULL CHECK(phase IN ('request','response')),
+  genesis_token TEXT NOT NULL CHECK(length(genesis_token)=64 AND genesis_token NOT GLOB '*[^a-f0-9]*'),
+  prior_token TEXT NOT NULL CHECK(length(prior_token)=64 AND prior_token NOT GLOB '*[^a-f0-9]*'),
+  head_token TEXT NOT NULL CHECK(length(head_token)=64 AND head_token NOT GLOB '*[^a-f0-9]*'),
+  sequence INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 9007199254740991),
+  adoption_proof_algorithm TEXT CHECK(adoption_proof_algorithm IS NULL OR adoption_proof_algorithm='A256GCM'),
+  adoption_proof_ciphertext TEXT CHECK(adoption_proof_ciphertext IS NULL OR (
+    length(adoption_proof_ciphertext) BETWEEN 22 AND ${String(canonicalMemoryCiphertextLimits.adoptionProof)}
+    AND adoption_proof_ciphertext NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  adoption_proof_key_version INTEGER CHECK(adoption_proof_key_version IS NULL OR adoption_proof_key_version BETWEEN 1 AND 9007199254740991),
+  adoption_proof_nonce TEXT CHECK(adoption_proof_nonce IS NULL OR (
+    length(adoption_proof_nonce)=16 AND adoption_proof_nonce NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  operation_algorithm TEXT NOT NULL CHECK(operation_algorithm='A256GCM'),
+  operation_ciphertext TEXT NOT NULL CHECK(
+    length(operation_ciphertext) BETWEEN 22 AND ${String(canonicalMemoryCiphertextLimits.operation)}
+    AND operation_ciphertext NOT GLOB '*[^A-Za-z0-9_-]*'
+  ),
+  operation_key_version INTEGER NOT NULL CHECK(operation_key_version BETWEEN 1 AND 9007199254740991),
+  operation_nonce TEXT NOT NULL CHECK(length(operation_nonce)=16 AND operation_nonce NOT GLOB '*[^A-Za-z0-9_-]*'),
+  proof_algorithm TEXT NOT NULL CHECK(proof_algorithm='A256GCM'),
+  proof_ciphertext TEXT NOT NULL CHECK(
+    length(proof_ciphertext) BETWEEN 22 AND ${String(canonicalMemoryCiphertextLimits.terminalHeadProof)}
+    AND proof_ciphertext NOT GLOB '*[^A-Za-z0-9_-]*'
+  ),
+  proof_key_version INTEGER NOT NULL CHECK(proof_key_version BETWEEN 1 AND 9007199254740991),
+  proof_nonce TEXT NOT NULL CHECK(length(proof_nonce)=16 AND proof_nonce NOT GLOB '*[^A-Za-z0-9_-]*'),
+  operation_digest TEXT NOT NULL CHECK(length(operation_digest)=64 AND operation_digest NOT GLOB '*[^a-f0-9]*'),
+  created_at INTEGER NOT NULL CHECK(created_at>=0),
+  PRIMARY KEY(intent_id,phase),
+  CHECK(prior_token!=head_token AND genesis_token!=head_token),
+  CHECK(operation_key_version=proof_key_version),
+  CHECK(
+    (adoption_proof_algorithm IS NULL AND adoption_proof_ciphertext IS NULL
+      AND adoption_proof_key_version IS NULL AND adoption_proof_nonce IS NULL)
+    OR
+    (adoption_proof_algorithm IS NOT NULL AND adoption_proof_ciphertext IS NOT NULL
+      AND adoption_proof_key_version IS NOT NULL AND adoption_proof_nonce IS NOT NULL
+      AND adoption_proof_key_version=operation_key_version)
+  )
+) STRICT;
+CREATE TABLE IF NOT EXISTS project_memory_portable_adoption_proofs (
+  project_id TEXT NOT NULL REFERENCES project_memory_authorities(project_id),
+  canonical_space_id TEXT NOT NULL CHECK(
+    length(canonical_space_id)=50
+    AND canonical_space_id GLOB 'hra:project:space-*'
+    AND substr(canonical_space_id,19) NOT GLOB '*[^a-f0-9]*'
+  ),
+  canonical_binding_digest TEXT NOT NULL CHECK(length(canonical_binding_digest)=64 AND canonical_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  sequence INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 9007199254740991),
+  operation_sha256 TEXT NOT NULL CHECK(length(operation_sha256)=64 AND operation_sha256 NOT GLOB '*[^a-f0-9]*'),
+  record_sha256 TEXT NOT NULL CHECK(length(record_sha256)=64 AND record_sha256 NOT GLOB '*[^a-f0-9]*'),
+  key_digest TEXT NOT NULL CHECK(length(key_digest)=64 AND key_digest NOT GLOB '*[^a-f0-9]*'),
+  content_digest TEXT NOT NULL CHECK(length(content_digest)=64 AND content_digest NOT GLOB '*[^a-f0-9]*'),
+  source_receipt_sha256 TEXT NOT NULL CHECK(length(source_receipt_sha256)=64 AND source_receipt_sha256 NOT GLOB '*[^a-f0-9]*'),
+  created_at INTEGER NOT NULL CHECK(created_at>=0),
+  PRIMARY KEY(project_id,operation_sha256),
+  UNIQUE(project_id,sequence)
+) STRICT;
+CREATE INDEX IF NOT EXISTS project_memory_sync_intents_project_recent
+  ON project_memory_sync_intents(project_id,created_at DESC,id);
+CREATE INDEX IF NOT EXISTS project_memory_sync_intents_project_settled
+  ON project_memory_sync_intents(project_id,updated_at,id) WHERE state='settled';
+CREATE UNIQUE INDEX IF NOT EXISTS project_memory_sync_intents_one_unresolved_project
+  ON project_memory_sync_intents(project_id)
+  WHERE state IN ('prepared','effect_started','response_observed');
+CREATE INDEX IF NOT EXISTS project_memory_hosted_create_intents_project_recent
+  ON project_memory_hosted_create_intents(project_id,created_at DESC,id);
+CREATE UNIQUE INDEX IF NOT EXISTS project_memory_hosted_create_intents_remote_space
+  ON project_memory_hosted_create_intents(remote_space_id);
+CREATE UNIQUE INDEX IF NOT EXISTS project_memory_hosted_create_intents_one_unresolved_project
+  ON project_memory_hosted_create_intents(project_id)
+  WHERE state IN ('allocating','key_staged','prepared','effect_started','winner_observed');
+CREATE INDEX IF NOT EXISTS project_memory_portable_adoption_proofs_record
+  ON project_memory_portable_adoption_proofs(
+    project_id,canonical_binding_digest,record_sha256,key_digest,content_digest
+  );
+DROP TRIGGER IF EXISTS project_memory_portable_adoption_proof_insert_guard;
+CREATE TRIGGER project_memory_portable_adoption_proof_insert_guard
+BEFORE INSERT ON project_memory_portable_adoption_proofs
+WHEN NOT EXISTS (
+  SELECT 1 FROM project_memory_authorities authority
+  WHERE authority.project_id=NEW.project_id
+    AND authority.identity_contract=2
+    AND authority.physical_state='initialized'
+    AND authority.canonical_space_id=NEW.canonical_space_id
+    AND authority.binding_digest=NEW.canonical_binding_digest
+    AND authority.head_sequence=NEW.sequence
+    AND authority.head_operation_sha256=NEW.operation_sha256
+)
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory portable adoption proof'); END;
+DROP TRIGGER IF EXISTS project_memory_portable_adoption_proof_update_guard;
+CREATE TRIGGER project_memory_portable_adoption_proof_update_guard
+BEFORE UPDATE ON project_memory_portable_adoption_proofs
+BEGIN SELECT RAISE(ABORT, 'canonical memory portable adoption proof is immutable'); END;
+DROP TRIGGER IF EXISTS project_memory_portable_adoption_proof_delete_guard;
+CREATE TRIGGER project_memory_portable_adoption_proof_delete_guard
+BEFORE DELETE ON project_memory_portable_adoption_proofs
+BEGIN SELECT RAISE(ABORT, 'canonical memory portable adoption proof is permanent'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_create_intent_insert_guard;
+CREATE TRIGGER project_memory_hosted_create_intent_insert_guard
+BEFORE INSERT ON project_memory_hosted_create_intents
+WHEN NEW.state!='allocating'
+  OR NOT EXISTS (
+    SELECT 1 FROM project_memory_authorities authority
+    WHERE authority.project_id=NEW.project_id
+      AND authority.identity_contract=2
+      AND authority.physical_state!='rejected'
+      AND authority.sync_state NOT IN ('conflict','error')
+      AND authority.binding_digest=NEW.canonical_binding_digest
+      AND authority.revision=NEW.authority_revision
+      AND authority.head_sequence=NEW.authority_head_sequence
+      AND authority.head_operation_sha256 IS NEW.authority_head_operation_sha256
+      AND authority.head_digest=NEW.authority_head_digest
+  )
+  OR EXISTS (
+    SELECT 1 FROM project_memory_hosted_attachments attachment
+    WHERE attachment.project_id=NEW.project_id
+  )
+  OR EXISTS (
+    SELECT 1 FROM project_memory_sync_intents intent
+    WHERE intent.project_id=NEW.project_id
+      AND intent.state IN ('prepared','effect_started','response_observed')
+  )
+  OR EXISTS (
+    SELECT 1 FROM memory_submissions submission
+    WHERE submission.project_id=NEW.project_id AND submission.kind='share'
+      AND submission.state IN ('prepared','effect_started','ambiguous')
+  )
+  OR EXISTS (
+    SELECT 1 FROM project_memory_hosted_create_intents create_intent
+    WHERE create_intent.project_id=NEW.project_id
+      AND create_intent.state IN (
+        'allocating','key_staged','prepared','effect_started','winner_observed'
+      )
+  )
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory hosted create intent'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_create_intent_transition_guard;
+CREATE TRIGGER project_memory_hosted_create_intent_transition_guard
+BEFORE UPDATE ON project_memory_hosted_create_intents
+WHEN NOT (
+  NEW.id=OLD.id AND NEW.idempotency_key=OLD.idempotency_key
+  AND NEW.project_id=OLD.project_id
+  AND NEW.authority_revision=OLD.authority_revision
+  AND NEW.canonical_binding_digest=OLD.canonical_binding_digest
+  AND NEW.authority_head_sequence=OLD.authority_head_sequence
+  AND NEW.authority_head_operation_sha256 IS OLD.authority_head_operation_sha256
+  AND NEW.authority_head_digest=OLD.authority_head_digest
+  AND NEW.account_binding_digest=OLD.account_binding_digest
+  AND NEW.remote_space_id=OLD.remote_space_id
+  AND NEW.created_at=OLD.created_at AND NEW.updated_at>=OLD.updated_at
+  AND (
+    (OLD.state='allocating' AND NEW.state='key_staged'
+      AND NEW.space_key_version IS NOT NULL
+      AND NEW.wrapped_key_algorithm IS NOT NULL
+      AND NEW.wrapped_key_ciphertext IS NOT NULL
+      AND NEW.wrapped_key_version IS NOT NULL
+      AND NEW.wrapped_key_nonce IS NOT NULL
+      AND NEW.descriptor_algorithm IS NULL AND NEW.descriptor_ciphertext IS NULL
+      AND NEW.descriptor_key_version IS NULL AND NEW.descriptor_nonce IS NULL
+      AND NEW.genesis_proof_algorithm IS NULL
+      AND NEW.genesis_proof_ciphertext IS NULL
+      AND NEW.genesis_proof_key_version IS NULL
+      AND NEW.genesis_proof_nonce IS NULL AND NEW.genesis_token IS NULL
+      AND NEW.request_digest IS NULL AND NEW.effect_started_at IS NULL
+      AND NEW.winner_digest IS NULL AND NEW.winner_revision IS NULL
+      AND NEW.winner_replay IS NULL AND NEW.winner_observed_at IS NULL
+      AND NEW.settled_at IS NULL AND NEW.diagnostic_code IS NULL)
+    OR
+    (OLD.state='key_staged' AND NEW.state='prepared'
+      AND NEW.space_key_version=OLD.space_key_version
+      AND NEW.wrapped_key_algorithm=OLD.wrapped_key_algorithm
+      AND NEW.wrapped_key_ciphertext=OLD.wrapped_key_ciphertext
+      AND NEW.wrapped_key_version=OLD.wrapped_key_version
+      AND NEW.wrapped_key_nonce=OLD.wrapped_key_nonce
+      AND NEW.descriptor_algorithm IS NOT NULL
+      AND NEW.descriptor_ciphertext IS NOT NULL
+      AND NEW.descriptor_key_version=OLD.space_key_version
+      AND NEW.descriptor_nonce IS NOT NULL
+      AND NEW.genesis_proof_algorithm IS NOT NULL
+      AND NEW.genesis_proof_ciphertext IS NOT NULL
+      AND NEW.genesis_proof_key_version=OLD.space_key_version
+      AND NEW.genesis_proof_nonce IS NOT NULL AND NEW.genesis_token IS NOT NULL
+      AND NEW.request_digest IS NOT NULL AND NEW.effect_started_at IS NULL
+      AND NEW.winner_digest IS NULL AND NEW.winner_revision IS NULL
+      AND NEW.winner_replay IS NULL AND NEW.winner_observed_at IS NULL
+      AND NEW.settled_at IS NULL AND NEW.diagnostic_code IS NULL)
+    OR
+    (OLD.state='prepared' AND NEW.state='effect_started'
+      AND NEW.space_key_version=OLD.space_key_version
+      AND NEW.wrapped_key_algorithm=OLD.wrapped_key_algorithm
+      AND NEW.wrapped_key_ciphertext=OLD.wrapped_key_ciphertext
+      AND NEW.wrapped_key_version=OLD.wrapped_key_version
+      AND NEW.wrapped_key_nonce=OLD.wrapped_key_nonce
+      AND NEW.descriptor_algorithm=OLD.descriptor_algorithm
+      AND NEW.descriptor_ciphertext=OLD.descriptor_ciphertext
+      AND NEW.descriptor_key_version=OLD.descriptor_key_version
+      AND NEW.descriptor_nonce=OLD.descriptor_nonce
+      AND NEW.genesis_proof_algorithm=OLD.genesis_proof_algorithm
+      AND NEW.genesis_proof_ciphertext=OLD.genesis_proof_ciphertext
+      AND NEW.genesis_proof_key_version=OLD.genesis_proof_key_version
+      AND NEW.genesis_proof_nonce=OLD.genesis_proof_nonce
+      AND NEW.genesis_token=OLD.genesis_token
+      AND NEW.request_digest=OLD.request_digest
+      AND NEW.effect_started_at IS NOT NULL
+      AND NEW.winner_digest IS NULL AND NEW.winner_revision IS NULL
+      AND NEW.winner_replay IS NULL AND NEW.winner_observed_at IS NULL
+      AND NEW.settled_at IS NULL AND NEW.diagnostic_code IS NULL)
+    OR
+    (OLD.state='effect_started' AND NEW.state='winner_observed'
+      AND NEW.space_key_version=OLD.space_key_version
+      AND NEW.wrapped_key_algorithm=OLD.wrapped_key_algorithm
+      AND NEW.wrapped_key_ciphertext=OLD.wrapped_key_ciphertext
+      AND NEW.wrapped_key_version=OLD.wrapped_key_version
+      AND NEW.wrapped_key_nonce=OLD.wrapped_key_nonce
+      AND NEW.descriptor_algorithm=OLD.descriptor_algorithm
+      AND NEW.descriptor_ciphertext=OLD.descriptor_ciphertext
+      AND NEW.descriptor_key_version=OLD.descriptor_key_version
+      AND NEW.descriptor_nonce=OLD.descriptor_nonce
+      AND NEW.genesis_proof_algorithm=OLD.genesis_proof_algorithm
+      AND NEW.genesis_proof_ciphertext=OLD.genesis_proof_ciphertext
+      AND NEW.genesis_proof_key_version=OLD.genesis_proof_key_version
+      AND NEW.genesis_proof_nonce=OLD.genesis_proof_nonce
+      AND NEW.genesis_token=OLD.genesis_token
+      AND NEW.request_digest=OLD.request_digest
+      AND NEW.effect_started_at=OLD.effect_started_at
+      AND NEW.winner_digest IS NOT NULL AND NEW.winner_revision IS NOT NULL
+      AND NEW.winner_replay IS NOT NULL AND NEW.winner_observed_at IS NOT NULL
+      AND NEW.settled_at IS NULL AND NEW.diagnostic_code IS NULL)
+    OR
+    (OLD.state='winner_observed' AND NEW.state='settled'
+      AND NEW.space_key_version=OLD.space_key_version
+      AND NEW.wrapped_key_algorithm=OLD.wrapped_key_algorithm
+      AND NEW.wrapped_key_ciphertext=OLD.wrapped_key_ciphertext
+      AND NEW.wrapped_key_version=OLD.wrapped_key_version
+      AND NEW.wrapped_key_nonce=OLD.wrapped_key_nonce
+      AND NEW.descriptor_algorithm=OLD.descriptor_algorithm
+      AND NEW.descriptor_ciphertext=OLD.descriptor_ciphertext
+      AND NEW.descriptor_key_version=OLD.descriptor_key_version
+      AND NEW.descriptor_nonce=OLD.descriptor_nonce
+      AND NEW.genesis_proof_algorithm=OLD.genesis_proof_algorithm
+      AND NEW.genesis_proof_ciphertext=OLD.genesis_proof_ciphertext
+      AND NEW.genesis_proof_key_version=OLD.genesis_proof_key_version
+      AND NEW.genesis_proof_nonce=OLD.genesis_proof_nonce
+      AND NEW.genesis_token=OLD.genesis_token
+      AND NEW.request_digest=OLD.request_digest
+      AND NEW.effect_started_at=OLD.effect_started_at
+      AND NEW.winner_digest=OLD.winner_digest
+      AND NEW.winner_revision=OLD.winner_revision
+      AND NEW.winner_replay=OLD.winner_replay
+      AND NEW.winner_observed_at=OLD.winner_observed_at
+      AND NEW.settled_at IS NOT NULL AND NEW.diagnostic_code IS NULL)
+    OR
+    (OLD.state IN ('allocating','key_staged','prepared','effect_started','winner_observed')
+      AND NEW.state IN ('conflict','error')
+      AND NEW.space_key_version IS OLD.space_key_version
+      AND NEW.wrapped_key_algorithm IS OLD.wrapped_key_algorithm
+      AND NEW.wrapped_key_ciphertext IS OLD.wrapped_key_ciphertext
+      AND NEW.wrapped_key_version IS OLD.wrapped_key_version
+      AND NEW.wrapped_key_nonce IS OLD.wrapped_key_nonce
+      AND NEW.descriptor_algorithm IS OLD.descriptor_algorithm
+      AND NEW.descriptor_ciphertext IS OLD.descriptor_ciphertext
+      AND NEW.descriptor_key_version IS OLD.descriptor_key_version
+      AND NEW.descriptor_nonce IS OLD.descriptor_nonce
+      AND NEW.genesis_proof_algorithm IS OLD.genesis_proof_algorithm
+      AND NEW.genesis_proof_ciphertext IS OLD.genesis_proof_ciphertext
+      AND NEW.genesis_proof_key_version IS OLD.genesis_proof_key_version
+      AND NEW.genesis_proof_nonce IS OLD.genesis_proof_nonce
+      AND NEW.genesis_token IS OLD.genesis_token
+      AND NEW.request_digest IS OLD.request_digest
+      AND NEW.effect_started_at IS OLD.effect_started_at
+      AND NEW.winner_digest IS OLD.winner_digest
+      AND NEW.winner_revision IS OLD.winner_revision
+      AND NEW.winner_replay IS OLD.winner_replay
+      AND NEW.winner_observed_at IS OLD.winner_observed_at
+      AND NEW.settled_at IS NOT NULL AND NEW.diagnostic_code IS NOT NULL)
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory hosted create transition'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_create_intent_delete_guard;
+CREATE TRIGGER project_memory_hosted_create_intent_delete_guard
+BEFORE DELETE ON project_memory_hosted_create_intents
+BEGIN SELECT RAISE(ABORT, 'canonical memory hosted create intent is immutable'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_attachment_insert_guard;
+CREATE TRIGGER project_memory_hosted_attachment_insert_guard
+BEFORE INSERT ON project_memory_hosted_attachments
+WHEN NEW.state!='attached' OR NEW.generation!=1 OR NEW.revision!=1
+  OR NOT EXISTS (
+    SELECT 1 FROM project_memory_authorities authority
+    WHERE authority.project_id=NEW.project_id
+      AND authority.identity_contract=2
+      AND authority.physical_state!='rejected'
+      AND authority.sync_state NOT IN ('conflict','error')
+      AND authority.binding_digest=NEW.canonical_binding_digest
+  )
+  OR EXISTS (
+    SELECT 1 FROM project_memory_hosted_create_intents intent
+    WHERE intent.project_id=NEW.project_id
+      AND intent.state IN ('allocating','key_staged','prepared','effect_started','winner_observed')
+  )
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory hosted attachment'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_attachment_transition_guard;
+CREATE TRIGGER project_memory_hosted_attachment_transition_guard
+BEFORE UPDATE ON project_memory_hosted_attachments
+WHEN NOT (
+  NEW.project_id=OLD.project_id
+  AND NEW.remote_space_id=OLD.remote_space_id
+  AND NEW.account_binding_digest=OLD.account_binding_digest
+  AND NEW.canonical_binding_digest=OLD.canonical_binding_digest
+  AND NEW.created_at=OLD.created_at
+  AND NEW.revision=OLD.revision+1
+  AND NEW.updated_at>=OLD.updated_at
+  AND NEW.genesis_token=OLD.genesis_token
+  AND (
+    (OLD.state='attached' AND NEW.state='detached'
+      AND NEW.generation=OLD.generation+1
+      AND NEW.remote_revision=OLD.remote_revision
+      AND NEW.remote_key_version=OLD.remote_key_version
+      AND NEW.remote_head_sequence=OLD.remote_head_sequence
+      AND NEW.remote_head_operation_sha256 IS OLD.remote_head_operation_sha256
+      AND NEW.remote_head_digest=OLD.remote_head_digest
+      AND NEW.remote_head_token=OLD.remote_head_token
+      AND NEW.remote_head_proof_digest=OLD.remote_head_proof_digest
+      AND NEW.diagnostic_code IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM project_memory_sync_intents intent
+        WHERE intent.project_id=OLD.project_id
+          AND intent.state IN ('prepared','effect_started','response_observed')
+      ))
+    OR
+    (OLD.state='detached' AND NEW.state='attached'
+      AND NEW.generation=OLD.generation+1
+      AND NEW.diagnostic_code IS NULL
+      AND NEW.remote_revision=OLD.remote_revision
+      AND NEW.remote_key_version=OLD.remote_key_version
+      AND NEW.remote_head_sequence>=OLD.remote_head_sequence
+      AND (NEW.remote_head_sequence!=OLD.remote_head_sequence OR (
+        NEW.remote_head_operation_sha256 IS OLD.remote_head_operation_sha256
+        AND NEW.remote_head_digest=OLD.remote_head_digest
+        AND NEW.remote_head_token=OLD.remote_head_token
+        AND NEW.remote_head_proof_digest=OLD.remote_head_proof_digest)))
+    OR
+    (OLD.state='attached' AND NEW.state='attached'
+      AND NEW.generation=OLD.generation
+      AND NEW.diagnostic_code IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM project_memory_sync_intents intent
+        WHERE intent.project_id=OLD.project_id
+          AND intent.state IN ('prepared','effect_started','response_observed')
+      )
+      AND NEW.remote_revision=OLD.remote_revision
+      AND NEW.remote_key_version=OLD.remote_key_version
+      AND NEW.remote_head_sequence>=OLD.remote_head_sequence
+      AND (NEW.remote_head_sequence!=OLD.remote_head_sequence OR (
+        NEW.remote_head_operation_sha256 IS OLD.remote_head_operation_sha256
+        AND NEW.remote_head_digest=OLD.remote_head_digest
+        AND NEW.remote_head_token=OLD.remote_head_token
+        AND NEW.remote_head_proof_digest=OLD.remote_head_proof_digest)))
+    OR
+    (OLD.state='attached' AND NEW.state IN ('conflict','error')
+      AND NEW.generation=OLD.generation
+      AND NEW.remote_revision=OLD.remote_revision
+      AND NEW.remote_key_version=OLD.remote_key_version
+      AND NEW.remote_head_sequence=OLD.remote_head_sequence
+      AND NEW.remote_head_operation_sha256 IS OLD.remote_head_operation_sha256
+      AND NEW.remote_head_digest=OLD.remote_head_digest
+      AND NEW.remote_head_token=OLD.remote_head_token
+      AND NEW.remote_head_proof_digest=OLD.remote_head_proof_digest
+      AND NEW.diagnostic_code IS NOT NULL)
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory hosted attachment transition'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_attachment_delete_guard;
+CREATE TRIGGER project_memory_hosted_attachment_delete_guard
+BEFORE DELETE ON project_memory_hosted_attachments
+BEGIN SELECT RAISE(ABORT, 'canonical memory hosted attachment is permanent'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_spool_insert_guard;
+CREATE TRIGGER project_memory_sync_spool_insert_guard
+BEFORE INSERT ON project_memory_sync_spool
+WHEN EXISTS (SELECT 1 FROM project_memory_sync_intents intent WHERE intent.id=NEW.intent_id)
+  AND NOT EXISTS (
+    SELECT 1 FROM project_memory_sync_intents intent
+    WHERE intent.id=NEW.intent_id
+      AND ((NEW.phase='request' AND intent.direction='push' AND intent.state='prepared')
+        OR (NEW.phase='response' AND intent.direction='pull' AND intent.state='effect_started'))
+  )
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory sync spool insertion'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_spool_update_guard;
+CREATE TRIGGER project_memory_sync_spool_update_guard
+BEFORE UPDATE ON project_memory_sync_spool
+BEGIN SELECT RAISE(ABORT, 'canonical memory sync spool is immutable'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_spool_delete_guard;
+CREATE TRIGGER project_memory_sync_spool_delete_guard
+BEFORE DELETE ON project_memory_sync_spool
+WHEN EXISTS (SELECT 1 FROM project_memory_sync_intents intent WHERE intent.id=OLD.intent_id)
+BEGIN SELECT RAISE(ABORT, 'canonical memory sync spool is immutable'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_intent_insert_guard;
+CREATE TRIGGER project_memory_sync_intent_insert_guard
+BEFORE INSERT ON project_memory_sync_intents
+WHEN NEW.state!='prepared'
+  OR EXISTS (
+    SELECT 1 FROM project_memory_hosted_create_intents create_intent
+    WHERE create_intent.project_id=NEW.project_id
+      AND create_intent.state IN (
+        'allocating','key_staged','prepared','effect_started','winner_observed'
+      )
+  )
+  OR NOT EXISTS (
+    SELECT 1 FROM project_memory_hosted_attachments attachment
+    WHERE attachment.project_id=NEW.project_id
+      AND attachment.state='attached'
+      AND attachment.generation=NEW.attachment_generation
+      AND attachment.revision=NEW.attachment_revision
+      AND attachment.canonical_binding_digest=NEW.canonical_binding_digest
+      AND attachment.genesis_token=NEW.remote_genesis_token
+      AND attachment.remote_revision=NEW.remote_revision
+      AND attachment.remote_key_version=NEW.remote_key_version
+      AND attachment.remote_head_sequence=NEW.remote_head_sequence
+      AND attachment.remote_head_operation_sha256 IS NEW.remote_head_operation_sha256
+      AND attachment.remote_head_digest=NEW.remote_head_digest
+      AND attachment.remote_head_token=NEW.remote_head_token
+      AND attachment.remote_head_proof_digest=NEW.remote_head_proof_digest
+  )
+  OR NOT EXISTS (
+    SELECT 1 FROM project_memory_authorities authority
+    WHERE authority.project_id=NEW.project_id
+      AND authority.physical_state='initialized'
+      AND authority.sync_state NOT IN ('conflict','error')
+      AND authority.binding_digest=NEW.canonical_binding_digest
+      AND authority.revision=NEW.authority_revision
+      AND authority.head_sequence=NEW.local_head_sequence
+      AND authority.head_operation_sha256 IS NEW.local_head_operation_sha256
+      AND authority.head_digest=NEW.local_head_digest
+  )
+  OR EXISTS (
+    SELECT 1 FROM memory_submissions submission
+    WHERE submission.project_id=NEW.project_id AND submission.kind='share'
+      AND submission.state IN ('prepared','effect_started','ambiguous')
+  )
+  OR ((NEW.direction='push') != (
+    SELECT COUNT(*)=1 FROM project_memory_sync_spool spool
+    WHERE spool.intent_id=NEW.id AND spool.phase='request'
+  ))
+  OR EXISTS (SELECT 1 FROM project_memory_sync_spool spool WHERE spool.intent_id=NEW.id AND spool.phase='response')
+  OR (NEW.direction='push' AND NOT EXISTS (
+    SELECT 1 FROM project_memory_sync_spool spool
+    WHERE spool.intent_id=NEW.id AND spool.phase='request'
+      AND spool.genesis_token=NEW.remote_genesis_token
+      AND spool.sequence=NEW.remote_head_sequence+1
+      AND spool.prior_token=NEW.remote_head_token
+      AND spool.operation_key_version=NEW.remote_key_version
+      AND spool.sequence<=NEW.local_head_sequence
+      AND (spool.sequence!=NEW.local_head_sequence OR spool.head_token=NEW.local_head_token)
+  ))
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory sync intent'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_intent_transition_guard;
+CREATE TRIGGER project_memory_sync_intent_transition_guard
+BEFORE UPDATE ON project_memory_sync_intents
+WHEN NOT (
+  NEW.id=OLD.id AND NEW.idempotency_key=OLD.idempotency_key
+  AND NEW.project_id=OLD.project_id AND NEW.direction=OLD.direction
+  AND NEW.attachment_generation=OLD.attachment_generation
+  AND NEW.attachment_revision=OLD.attachment_revision
+  AND NEW.authority_revision=OLD.authority_revision
+  AND NEW.canonical_binding_digest=OLD.canonical_binding_digest
+  AND NEW.local_head_sequence=OLD.local_head_sequence
+  AND NEW.local_head_operation_sha256 IS OLD.local_head_operation_sha256
+  AND NEW.local_head_digest=OLD.local_head_digest
+  AND NEW.local_head_token=OLD.local_head_token
+  AND NEW.remote_genesis_token=OLD.remote_genesis_token
+  AND NEW.remote_revision=OLD.remote_revision
+  AND NEW.remote_key_version=OLD.remote_key_version
+  AND NEW.remote_head_sequence=OLD.remote_head_sequence
+  AND NEW.remote_head_operation_sha256 IS OLD.remote_head_operation_sha256
+  AND NEW.remote_head_digest=OLD.remote_head_digest
+  AND NEW.remote_head_token=OLD.remote_head_token
+  AND NEW.remote_head_proof_digest=OLD.remote_head_proof_digest
+  AND NEW.request_digest=OLD.request_digest AND NEW.created_at=OLD.created_at
+  AND NEW.updated_at>=OLD.updated_at
+  AND (
+    (OLD.state='prepared' AND NEW.state='effect_started'
+      AND NEW.effect_started_at IS NOT NULL)
+    OR
+    (OLD.state='effect_started' AND NEW.state='response_observed'
+      AND NEW.effect_started_at=OLD.effect_started_at
+      AND NEW.result_head_sequence IS NULL
+      AND NEW.result_head_operation_sha256 IS NULL
+      AND NEW.result_head_digest IS NULL
+      AND NEW.response_digest IS NOT NULL
+      AND NEW.response_genesis_token=OLD.remote_genesis_token
+        AND ((OLD.direction='push'
+          AND NEW.response_revision=OLD.remote_revision
+          AND NEW.response_key_version=OLD.remote_key_version
+          AND NEW.response_head_sequence=OLD.remote_head_sequence+1
+          AND NOT EXISTS (SELECT 1 FROM project_memory_sync_spool spool WHERE spool.intent_id=OLD.id AND spool.phase='response'))
+        OR (OLD.direction='pull'
+          AND NEW.response_revision=OLD.remote_revision
+          AND NEW.response_key_version=OLD.remote_key_version
+          AND NEW.response_head_sequence=OLD.remote_head_sequence
+          AND NEW.response_head_operation_sha256 IS OLD.remote_head_operation_sha256
+          AND NEW.response_head_digest=OLD.remote_head_digest
+          AND NEW.response_head_token=OLD.remote_head_token
+          AND NEW.response_head_proof_digest=OLD.remote_head_proof_digest
+          AND ((OLD.remote_head_sequence=OLD.local_head_sequence
+              AND NOT EXISTS (SELECT 1 FROM project_memory_sync_spool spool WHERE spool.intent_id=OLD.id AND spool.phase='response'))
+            OR (OLD.remote_head_sequence>OLD.local_head_sequence
+              AND EXISTS (
+                SELECT 1 FROM project_memory_sync_spool spool
+                WHERE spool.intent_id=OLD.id AND spool.phase='response'
+                  AND spool.genesis_token=OLD.remote_genesis_token
+                  AND spool.prior_token=OLD.local_head_token
+                  AND spool.sequence=OLD.local_head_sequence+1
+                  AND spool.sequence<=OLD.remote_head_sequence
+                  AND spool.operation_key_version=OLD.remote_key_version
+                  AND (spool.sequence!=OLD.remote_head_sequence OR spool.head_token=OLD.remote_head_token)
+              ))))))
+    OR
+    (OLD.state='response_observed' AND NEW.state='response_observed'
+      AND OLD.direction='pull'
+      AND NEW.effect_started_at=OLD.effect_started_at
+      AND NEW.response_digest=OLD.response_digest
+      AND NEW.response_genesis_token=OLD.response_genesis_token
+      AND NEW.response_revision=OLD.response_revision
+      AND NEW.response_key_version=OLD.response_key_version
+      AND NEW.response_head_sequence=OLD.response_head_sequence
+      AND NEW.response_head_operation_sha256 IS OLD.response_head_operation_sha256
+      AND NEW.response_head_digest=OLD.response_head_digest
+      AND NEW.response_head_token=OLD.response_head_token
+      AND NEW.response_head_proof_digest=OLD.response_head_proof_digest
+      AND NEW.response_observed_at=OLD.response_observed_at
+      AND OLD.result_head_sequence IS NULL
+      AND OLD.result_head_operation_sha256 IS NULL
+      AND OLD.result_head_digest IS NULL
+      AND NEW.result_head_sequence=OLD.local_head_sequence+1
+      AND NEW.result_head_sequence<=OLD.response_head_sequence
+      AND NEW.result_head_operation_sha256 IS NOT NULL
+      AND NEW.result_head_digest IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM project_memory_sync_spool spool
+        WHERE spool.intent_id=OLD.id AND spool.phase='response'
+          AND spool.sequence=NEW.result_head_sequence
+      )
+      AND NEW.settled_at IS NULL AND NEW.diagnostic_code IS NULL)
+    OR
+    (OLD.state='response_observed' AND NEW.state='settled'
+      AND NEW.effect_started_at=OLD.effect_started_at
+      AND NEW.response_digest=OLD.response_digest
+      AND NEW.response_genesis_token=OLD.response_genesis_token
+      AND NEW.response_revision=OLD.response_revision
+      AND NEW.response_key_version=OLD.response_key_version
+      AND NEW.response_head_sequence=OLD.response_head_sequence
+      AND NEW.response_head_operation_sha256 IS OLD.response_head_operation_sha256
+      AND NEW.response_head_digest=OLD.response_head_digest
+      AND NEW.response_head_token=OLD.response_head_token
+      AND NEW.response_head_proof_digest=OLD.response_head_proof_digest
+      AND NEW.response_observed_at=OLD.response_observed_at
+      AND NEW.result_head_sequence IS NOT NULL
+      AND (
+        (OLD.direction='push'
+          AND OLD.result_head_sequence IS NULL
+          AND NEW.result_head_sequence=OLD.local_head_sequence
+          AND NEW.result_head_operation_sha256 IS OLD.local_head_operation_sha256
+          AND NEW.result_head_digest=OLD.local_head_digest)
+        OR
+        (OLD.direction='pull' AND NOT EXISTS (
+            SELECT 1 FROM project_memory_sync_spool spool
+            WHERE spool.intent_id=OLD.id AND spool.phase='response'
+          )
+          AND OLD.result_head_sequence IS NULL
+          AND NEW.result_head_sequence=OLD.local_head_sequence
+          AND NEW.result_head_operation_sha256 IS OLD.local_head_operation_sha256
+          AND NEW.result_head_digest=OLD.local_head_digest)
+        OR
+        (OLD.direction='pull' AND EXISTS (
+            SELECT 1 FROM project_memory_sync_spool spool
+            WHERE spool.intent_id=OLD.id AND spool.phase='response'
+          )
+          AND NEW.result_head_sequence=OLD.result_head_sequence
+          AND NEW.result_head_operation_sha256 IS OLD.result_head_operation_sha256
+          AND NEW.result_head_digest=OLD.result_head_digest)
+      )
+      AND NEW.settled_at IS NOT NULL)
+    OR
+    (OLD.state IN ('prepared','effect_started','response_observed')
+      AND NEW.state IN ('conflict','error')
+      AND NEW.effect_started_at IS NOT NULL
+      AND NEW.response_digest IS OLD.response_digest
+      AND NEW.response_genesis_token IS OLD.response_genesis_token
+      AND NEW.response_revision IS OLD.response_revision
+      AND NEW.response_key_version IS OLD.response_key_version
+      AND NEW.response_head_sequence IS OLD.response_head_sequence
+      AND NEW.response_head_operation_sha256 IS OLD.response_head_operation_sha256
+      AND NEW.response_head_digest IS OLD.response_head_digest
+      AND NEW.response_head_token IS OLD.response_head_token
+      AND NEW.response_head_proof_digest IS OLD.response_head_proof_digest
+      AND NEW.response_observed_at IS OLD.response_observed_at
+      AND NEW.result_head_sequence IS OLD.result_head_sequence
+      AND NEW.result_head_operation_sha256 IS OLD.result_head_operation_sha256
+      AND NEW.result_head_digest IS OLD.result_head_digest
+      AND NEW.settled_at IS NOT NULL AND NEW.diagnostic_code IS NOT NULL)
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory sync intent transition'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_intent_delete_guard;
+CREATE TRIGGER project_memory_sync_intent_delete_guard
+BEFORE DELETE ON project_memory_sync_intents
+WHEN OLD.state!='settled'
+BEGIN SELECT RAISE(ABORT, 'unsettled canonical memory sync intent is immutable'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_intent_retained_quota;
+CREATE TRIGGER project_memory_sync_intent_retained_quota
+BEFORE INSERT ON project_memory_sync_intents
+WHEN (SELECT COUNT(*) FROM project_memory_sync_intents WHERE project_id=NEW.project_id)>=${String(CANONICAL_MEMORY_SYNC_RETAINED_PROJECT_LIMIT)}
+BEGIN SELECT RAISE(ABORT, 'canonical memory sync retained quota exceeded'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_create_authority_fence;
+CREATE TRIGGER project_memory_hosted_create_authority_fence
+BEFORE UPDATE ON project_memory_authorities
+WHEN EXISTS (
+  SELECT 1 FROM project_memory_hosted_create_intents intent
+  WHERE intent.project_id=OLD.project_id
+    AND intent.state IN (
+      'allocating','key_staged','prepared','effect_started','winner_observed'
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'canonical memory mutation fenced by hosted create'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_authority_fence;
+CREATE TRIGGER project_memory_sync_authority_fence
+BEFORE UPDATE ON project_memory_authorities
+WHEN EXISTS (
+  SELECT 1 FROM project_memory_sync_intents intent
+  WHERE intent.project_id=OLD.project_id
+    AND intent.state IN ('prepared','effect_started','response_observed')
+)
+BEGIN SELECT RAISE(ABORT, 'canonical memory mutation fenced by hosted sync'); END;
+DROP TRIGGER IF EXISTS canonical_memory_sync_share_fence;
+CREATE TRIGGER canonical_memory_sync_share_fence
+BEFORE INSERT ON memory_submissions
+WHEN NEW.kind='share' AND (
+  EXISTS (
+    SELECT 1 FROM project_memory_authorities authority
+    WHERE authority.project_id=NEW.project_id
+      AND authority.sync_state IN ('conflict','error')
+  )
+  OR EXISTS (
+    SELECT 1 FROM project_memory_hosted_create_intents create_intent
+    WHERE create_intent.project_id=NEW.project_id
+      AND create_intent.state IN (
+        'allocating','key_staged','prepared','effect_started','winner_observed'
+      )
+  )
+  OR EXISTS (
+    SELECT 1 FROM project_memory_hosted_attachments attachment
+    WHERE attachment.project_id=NEW.project_id
+      AND (
+        attachment.state IN ('conflict','error')
+        OR EXISTS (
+          SELECT 1 FROM project_memory_sync_intents intent
+          WHERE intent.project_id=attachment.project_id
+            AND intent.state IN ('prepared','effect_started','response_observed')
+        )
+      )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'canonical memory mutation fenced by hosted sync'); END;
+`;
+
+const applySchemaVersion41CanonicalMemorySync = (database: Database): void => {
+  database.exec(schemaVersion41CanonicalMemorySync);
+};
+
+const schemaVersion41Objects = [
+  { name: "project_memory_hosted_attachments", table: "project_memory_hosted_attachments", type: "table" },
+  { name: "project_memory_hosted_create_intents", table: "project_memory_hosted_create_intents", type: "table" },
+  { name: "project_memory_sync_intents", table: "project_memory_sync_intents", type: "table" },
+  { name: "project_memory_sync_spool", table: "project_memory_sync_spool", type: "table" },
+  { name: "project_memory_portable_adoption_proofs", table: "project_memory_portable_adoption_proofs", type: "table" },
+  { name: "project_memory_hosted_create_intents_project_recent", table: "project_memory_hosted_create_intents", type: "index" },
+  { name: "project_memory_hosted_create_intents_remote_space", table: "project_memory_hosted_create_intents", type: "index" },
+  { name: "project_memory_hosted_create_intents_one_unresolved_project", table: "project_memory_hosted_create_intents", type: "index" },
+  { name: "project_memory_sync_intents_project_recent", table: "project_memory_sync_intents", type: "index" },
+  { name: "project_memory_sync_intents_project_settled", table: "project_memory_sync_intents", type: "index" },
+  { name: "project_memory_sync_intents_one_unresolved_project", table: "project_memory_sync_intents", type: "index" },
+  { name: "project_memory_portable_adoption_proofs_record", table: "project_memory_portable_adoption_proofs", type: "index" },
+  { name: "project_memory_portable_adoption_proof_insert_guard", table: "project_memory_portable_adoption_proofs", type: "trigger" },
+  { name: "project_memory_portable_adoption_proof_update_guard", table: "project_memory_portable_adoption_proofs", type: "trigger" },
+  { name: "project_memory_portable_adoption_proof_delete_guard", table: "project_memory_portable_adoption_proofs", type: "trigger" },
+  { name: "project_memory_hosted_create_intent_insert_guard", table: "project_memory_hosted_create_intents", type: "trigger" },
+  { name: "project_memory_hosted_create_intent_transition_guard", table: "project_memory_hosted_create_intents", type: "trigger" },
+  { name: "project_memory_hosted_create_intent_delete_guard", table: "project_memory_hosted_create_intents", type: "trigger" },
+  { name: "project_memory_hosted_attachment_insert_guard", table: "project_memory_hosted_attachments", type: "trigger" },
+  { name: "project_memory_hosted_attachment_transition_guard", table: "project_memory_hosted_attachments", type: "trigger" },
+  { name: "project_memory_hosted_attachment_delete_guard", table: "project_memory_hosted_attachments", type: "trigger" },
+  { name: "project_memory_sync_spool_insert_guard", table: "project_memory_sync_spool", type: "trigger" },
+  { name: "project_memory_sync_spool_update_guard", table: "project_memory_sync_spool", type: "trigger" },
+  { name: "project_memory_sync_spool_delete_guard", table: "project_memory_sync_spool", type: "trigger" },
+  { name: "project_memory_sync_intent_insert_guard", table: "project_memory_sync_intents", type: "trigger" },
+  { name: "project_memory_sync_intent_transition_guard", table: "project_memory_sync_intents", type: "trigger" },
+  { name: "project_memory_sync_intent_delete_guard", table: "project_memory_sync_intents", type: "trigger" },
+  { name: "project_memory_sync_intent_retained_quota", table: "project_memory_sync_intents", type: "trigger" },
+  { name: "project_memory_hosted_create_authority_fence", table: "project_memory_authorities", type: "trigger" },
+  { name: "project_memory_sync_authority_fence", table: "project_memory_authorities", type: "trigger" },
+  { name: "canonical_memory_sync_share_fence", table: "memory_submissions", type: "trigger" },
+] as const;
+
+const schemaVersion41ObjectSql = (object: (typeof schemaVersion41Objects)[number]): string => {
+  const markers = object.type === "table"
+    ? [`CREATE TABLE IF NOT EXISTS ${object.name}`]
+    : object.type === "index"
+      ? [
+        `CREATE INDEX IF NOT EXISTS ${object.name}`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS ${object.name}`,
+      ]
+      : [`CREATE TRIGGER ${object.name}`];
+  const start = markers.reduce((found, marker) => {
+    const candidate = schemaVersion41CanonicalMemorySync.indexOf(marker);
+    if (candidate < 0) return found;
+    return found < 0 ? candidate : Math.min(found, candidate);
+  }, -1);
+  const terminator = object.type === "table" ? ") STRICT;" : object.type === "index" ? ";" : "END;";
+  const end = schemaVersion41CanonicalMemorySync.indexOf(terminator, start);
+  if (start < 0 || end < 0) throw new Error("STATE_SCHEMA_V41_DEFINITION_INVALID");
+  return schemaVersion41CanonicalMemorySync.slice(start, end + terminator.length);
 };
 
 const schemaVersion40Objects = [
@@ -5880,6 +8228,7 @@ const schemaVersion40Objects = [
   { name: "peer_session_action_transition_guard", table: "peer_session_actions", type: "trigger", source: schemaVersion40PeerSessions },
   { name: "peer_session_action_delete_guard", table: "peer_session_actions", type: "trigger", source: schemaVersion40PeerSessions },
   { name: "peer_session_action_parent_insert_guard", table: "peer_session_action_parents", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_root_insert_guard", table: "peer_session_action_roots", type: "trigger", source: schemaVersion40PeerSessions },
   { name: "peer_session_action_turn_origin_insert_guard", table: "peer_session_turn_origins", type: "trigger", source: schemaVersion40PeerSessions },
   { name: "peer_session_action_parents_immutable_update", table: "peer_session_action_parents", type: "trigger", source: schemaVersion40PeerSessions },
   { name: "peer_session_action_parents_immutable_delete", table: "peer_session_action_parents", type: "trigger", source: schemaVersion40PeerSessions },
@@ -5892,6 +8241,7 @@ const schemaVersion40Objects = [
   { name: "session_host_capability_bindings", table: "session_host_capability_bindings", type: "table", source: schemaVersion40PeerSessions },
   { name: "session_host_capability_binding_immutable", table: "session_host_capability_bindings", type: "trigger", source: schemaVersion40PeerSessions },
   { name: "project_memory_authorities", table: "project_memory_authorities", type: "table", source: schemaVersion40PeerSessions },
+  { name: "project_memory_authorities_space_unique", table: "project_memory_authorities", type: "index", source: schemaVersion40PeerSessions },
   { name: "memory_submissions", table: "memory_submissions", type: "table", source: schemaVersion40PeerSessions },
   { name: "memory_page_attestations", table: "memory_page_attestations", type: "table", source: schemaVersion40PeerSessions },
   { name: "memory_working_attestation_heads", table: "memory_working_attestation_heads", type: "table", source: schemaVersion40PeerSessions },
@@ -6473,6 +8823,167 @@ const assertSchemaVersion40Objects = (database: Database): void => {
        )
      LIMIT 1`,
   ).get() !== null) throw new Error("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+  try {
+    for (const row of database.query(
+      "SELECT * FROM project_memory_authorities ORDER BY project_id",
+    ).all()) mapProjectMemoryAuthority(row);
+  } catch (cause: unknown) {
+    throw new Error("STATE_SCHEMA_V40_MEMORY_AUTHORITY_INVALID", { cause });
+  }
+};
+
+const assertSchemaVersion41Objects = (database: Database): void => {
+  const names = schemaVersion41Objects.map((object) => `'${object.name}'`).join(",");
+  const rows = database.query(
+    `SELECT type,name,tbl_name,sql FROM sqlite_master
+     WHERE name IN (${names}) ORDER BY name`,
+  ).all().map((row) => sqliteSchemaObjectRowSchema.parse(row));
+  if (rows.length !== schemaVersion41Objects.length) {
+    throw new Error("STATE_SCHEMA_V41_STRUCTURE_INVALID");
+  }
+  for (const expected of schemaVersion41Objects) {
+    const observed = rows.find((row) => row.name === expected.name);
+    const observedSql = observed?.sql.replace(/\bIF NOT EXISTS\b/giu, "");
+    const expectedSql = schemaVersion41ObjectSql(expected)
+      .replace(/\bIF NOT EXISTS\b/giu, "");
+    if (
+      observed === undefined
+      || observed.type !== expected.type
+      || observed.tbl_name !== expected.table
+      || normalizeSqlStructure(observedSql ?? "") !== normalizeSqlStructure(expectedSql)
+    ) throw new Error("STATE_SCHEMA_V41_STRUCTURE_INVALID");
+  }
+  try {
+    for (const row of database.query(
+      "SELECT * FROM project_memory_hosted_create_intents ORDER BY created_at,id",
+    ).all()) {
+      const intent = mapCanonicalMemoryHostedCreateIntent(row);
+      const authorityRow = database.query(
+        "SELECT * FROM project_memory_authorities WHERE project_id=?",
+      ).get(intent.projectId);
+      if (authorityRow === null) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_AUTHORITY_MISSING");
+      }
+      const authority = mapProjectMemoryAuthority(authorityRow);
+      const attachmentRow = database.query(
+        "SELECT * FROM project_memory_hosted_attachments WHERE project_id=?",
+      ).get(intent.projectId);
+      const attachment = attachmentRow === null
+        ? null
+        : mapCanonicalMemoryHostedAttachment(attachmentRow);
+      const unresolved = [
+        "allocating",
+        "key_staged",
+        "prepared",
+        "effect_started",
+        "winner_observed",
+      ].includes(intent.state);
+      if (unresolved) {
+        if (
+          authority.identityContract !== 2
+          || authority.physicalState === "rejected"
+          || authority.syncState === "conflict"
+          || authority.syncState === "error"
+          || authority.bindingDigest !== intent.canonicalBindingDigest
+          || authority.revision !== intent.authorityRevision
+          || !sameProjectMemoryHead(authority.head, intent.authorityHead)
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_AUTHORITY_INVALID");
+      }
+      if (unresolved && attachment !== null) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_ATTACHMENT_INVALID");
+      }
+      if (intent.state === "settled") {
+        if (
+          authority.identityContract !== 2
+          || authority.physicalState === "rejected"
+          || authority.bindingDigest !== intent.canonicalBindingDigest
+          || authority.revision < intent.authorityRevision
+          || attachment === null
+          || intent.request === undefined
+          || intent.winnerRevision === undefined
+          || attachment.remoteSpaceId !== intent.remoteSpaceId
+          || attachment.accountBindingDigest !== intent.accountBindingDigest
+          || attachment.canonicalBindingDigest !== intent.canonicalBindingDigest
+          || attachment.remote.genesisToken !== intent.request.genesisToken
+          || attachment.remote.keyVersion !== intent.request.keyVersion
+          || attachment.remote.revision !== intent.winnerRevision
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_SETTLEMENT_INVALID");
+      } else if (!unresolved) {
+        if (
+          attachment !== null
+          || authority.bindingDigest !== intent.canonicalBindingDigest
+          || !sameProjectMemoryHead(authority.head, intent.authorityHead)
+          || authority.revision !== intent.authorityRevision + 1
+          || authority.syncState !== intent.state
+          || authority.diagnosticCode !== intent.diagnosticCode
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_FAILURE_INVALID");
+      }
+    }
+    for (const row of database.query(
+      "SELECT * FROM project_memory_hosted_attachments ORDER BY project_id",
+    ).all()) mapCanonicalMemoryHostedAttachment(row);
+    for (const row of database.query(
+      "SELECT * FROM project_memory_sync_intents ORDER BY created_at,id",
+    ).all()) {
+      const parsed = canonicalMemorySyncIntentRowSchema.parse(row);
+      const attachment = z.object({
+        remote_space_id: canonicalMemoryHostedSpaceIdSchema,
+      }).strict().parse(database.query(
+        "SELECT remote_space_id FROM project_memory_hosted_attachments WHERE project_id=?",
+      ).get(parsed.project_id));
+      mapCanonicalMemorySyncIntent(row, database.query(
+        "SELECT * FROM project_memory_sync_spool WHERE intent_id=? ORDER BY phase",
+      ).all(parsed.id), attachment.remote_space_id);
+    }
+    for (const row of database.query(
+      "SELECT * FROM project_memory_portable_adoption_proofs ORDER BY project_id,sequence",
+    ).all()) {
+      const proof = mapCanonicalMemoryPortableAdoptionProof(row);
+      const authorityRow = database.query(
+        "SELECT * FROM project_memory_authorities WHERE project_id=?",
+      ).get(proof.projectId);
+      if (authorityRow === null) {
+        throw new Error("CANONICAL_MEMORY_PORTABLE_ADOPTION_PROOF_AUTHORITY_MISSING");
+      }
+      const authority = mapProjectMemoryAuthority(authorityRow);
+      if (
+        authority.identityContract !== 2
+        || authority.physicalState !== "initialized"
+        || authority.canonicalSpaceId !== proof.canonicalSpaceId
+        || authority.bindingDigest !== proof.bindingDigest
+        || authority.head.sequence < proof.sequence
+      ) throw new Error("CANONICAL_MEMORY_PORTABLE_ADOPTION_PROOF_AUTHORITY_INVALID");
+    }
+  } catch (cause: unknown) {
+    throw new Error("STATE_SCHEMA_V41_CANONICAL_MEMORY_SYNC_INVALID", { cause });
+  }
+  if (database.query(
+    `SELECT 1
+     FROM project_memory_sync_intents intent
+     JOIN project_memory_hosted_attachments attachment
+       ON attachment.project_id=intent.project_id
+     LEFT JOIN project_memory_authorities authority
+       ON authority.project_id=intent.project_id
+     WHERE (
+       intent.state IN ('prepared','effect_started','response_observed')
+       AND (
+         attachment.state!='attached'
+         OR attachment.generation!=intent.attachment_generation
+         OR attachment.revision!=intent.attachment_revision
+         OR attachment.canonical_binding_digest!=intent.canonical_binding_digest
+         OR authority.project_id IS NULL
+         OR authority.revision!=intent.authority_revision
+         OR authority.binding_digest!=intent.canonical_binding_digest
+         OR authority.head_sequence!=intent.local_head_sequence
+         OR authority.head_operation_sha256 IS NOT intent.local_head_operation_sha256
+         OR authority.head_digest!=intent.local_head_digest
+       )
+     ) OR (
+       intent.state IN ('conflict','error')
+       AND (attachment.state!=intent.state OR attachment.diagnostic_code!=intent.diagnostic_code)
+     )
+     LIMIT 1`,
+  ).get() !== null) throw new Error("STATE_SCHEMA_V41_CANONICAL_MEMORY_SYNC_INVALID");
 };
 
 const assertSchemaVersion24Objects = (database: Database): void => {
@@ -7716,6 +10227,13 @@ const migrateWritableDatabase = (
 
     if (version < 31) {
       if (!hasTableColumn(database, "autorespond_evidence", "path")) {
+        // A pre-release/current-version object may already contain a trigger
+        // that references the additive message-source table while its schema
+        // stamp and autorespond table have been restored to v30. Recreate the
+        // additive v31 objects before SQLite reparses every trigger during the
+        // table rename; the surrounding migration transaction still rolls the
+        // repair back if the rebuild cannot complete.
+        database.exec(schemaVersion31Objects);
         applySchemaVersion31(database);
       }
       if (!hasTableColumn(database, "autorespond_evidence", "path")) {
@@ -7827,6 +10345,16 @@ const migrateWritableDatabase = (
       version = 40;
     }
 
+    if (version < 41) {
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      applySchemaVersion41CanonicalMemorySync(database);
+      database.query(
+        "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
+      ).run(41, migratedAt);
+      database.exec("PRAGMA user_version = 41");
+      version = 41;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     applySchemaVersion32(database);
@@ -7878,6 +10406,8 @@ const migrateWritableDatabase = (
     assertCompositeNotificationPolicy(database);
     applySchemaVersion40PeerSessions(database);
     assertSchemaVersion40Objects(database);
+    applySchemaVersion41CanonicalMemorySync(database);
+    assertSchemaVersion41Objects(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -8365,6 +10895,7 @@ export class StateStore {
       assertSessionTaskSchema(this.#database);
       assertCompositeNotificationPolicy(this.#database);
       assertSchemaVersion40Objects(this.#database);
+      assertSchemaVersion41Objects(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
       this.#database.close(false);
@@ -10991,13 +13522,21 @@ export class StateStore {
     if (input.preset !== undefined && current.state === "recovery_required") {
       throw new Error("SESSION_PRESET_RECOVERY_REQUIRED");
     }
+    const currentProjectId = current.projectId ?? null;
+    const requestedProjectId = input.projectId === undefined
+      ? currentProjectId
+      : input.projectId;
+    if (
+      requestedProjectId !== currentProjectId
+      && (current.state !== "idle" || current.activeTurnId !== undefined)
+    ) throw new Error("SESSION_PROJECT_REQUIRES_IDLE");
     const title = input.title === undefined ? current.title : titleSchema.parse(input.title);
     const note = input.note === undefined ? current.note : noteSchema.parse(input.note);
     const preset = input.preset === undefined ? current.preset : presetSchema.parse(input.preset);
     // A preset the session's provider cannot run is refused, never ignored.
     assertPresetSupportedByProvider(current.provider, preset);
     const fast = input.fastEnabled === undefined ? current.fastEnabled : input.fastEnabled;
-    const project = input.projectId === undefined ? current.projectId ?? null : input.projectId;
+    const project = requestedProjectId;
     // Naming the preset is an explicit opt-in to the current mapping, even
     // when the alias itself did not change. Unrelated metadata preserves the
     // durable interpretation admitted for this session.
@@ -11645,15 +14184,18 @@ export class StateStore {
     const anyUnknown = observations.sourceStateUnknown
       || observations.targetStateUnknown
       || observations.unaddressableTargetMayExist;
+    const unaddressableTargetEvidenceInvalid = observations.unaddressableTargetMayExist
+      && (observations.targetAddressable || !observations.targetStateUnknown);
+    const providerStateDeletionInvalid = observations.providerStateDeleted
+      && observations.providerStateUnknown;
     if (
       !anyUnknown
       || observations.providerStateUnknown !== anyUnknown
       || (observations.sourceStateUnknown
         && (observations.sourceObserved || observations.sourceReleased))
       || (observations.targetStateUnknown && observations.targetReleased)
-      || (observations.unaddressableTargetMayExist
-        && (observations.targetAddressable || !observations.targetStateUnknown))
-      || (observations.providerStateDeleted && observations.providerStateUnknown)
+      || unaddressableTargetEvidenceInvalid
+      || providerStateDeletionInvalid
     ) throw new Error("SESSION_PROVIDER_SWITCH_UNKNOWN_STATE_EVIDENCE_INVALID");
     const evidence = {
       kind: "session.switch.journal",
@@ -12655,41 +15197,81 @@ export class StateStore {
     return this.requireSessionHostCapabilityBinding(sessionId);
   }
 
-  initializeProjectMemoryAuthority(input: Readonly<{
+  reserveProjectMemoryAuthority(input: Readonly<{
     projectId: ProjectId;
-    authorityDigest: string;
-    bindingDigest: string;
+    identityContract: ProjectMemoryIdentityContract;
+    canonicalSpaceId: string;
     head: ProjectMemoryHeadRef;
   }>): ProjectMemoryAuthorityRecord {
     const projectId = projectIdSchema.parse(input.projectId);
-    const authorityDigest = sha256Schema.parse(input.authorityDigest);
-    const bindingDigest = sha256Schema.parse(input.bindingDigest);
-    const head = projectMemoryHeadRefSchema.parse(input.head);
-    const initialize = this.#database.transaction(() => {
+    let identity: ReturnType<typeof deriveProjectMemoryCanonicalIdentity>;
+    let head: ProjectMemoryHeadRef;
+    try {
+      identity = deriveProjectMemoryCanonicalIdentity({
+        canonicalSpaceId: input.canonicalSpaceId,
+        identityContract: input.identityContract,
+        projectId,
+      });
+      head = projectMemoryHeadRefSchema.parse(input.head);
+    } catch (cause: unknown) {
+      throw new TypeError("PROJECT_MEMORY_AUTHORITY_RESERVATION_INVALID", { cause });
+    }
+    if (identity.identityContract !== 2) {
+      throw new TypeError("PROJECT_MEMORY_AUTHORITY_RESERVATION_INVALID");
+    }
+    return this.#reserveProjectMemoryAuthority(projectId, identity, head);
+  }
+
+  reserveLegacyProjectMemoryAuthorityForRecovery(
+    projectIdValue: ProjectId,
+  ): ProjectMemoryAuthorityRecord {
+    const projectId = projectIdSchema.parse(projectIdValue);
+    const identity = deriveProjectMemoryCanonicalIdentity({
+      canonicalSpaceId: legacyProjectMemorySpaceId(projectId),
+      identityContract: 1,
+      projectId,
+    });
+    return this.#reserveProjectMemoryAuthority(
+      projectId,
+      identity,
+      PROJECT_MEMORY_EMPTY_HEAD,
+    );
+  }
+
+  #reserveProjectMemoryAuthority(
+    projectId: ProjectId,
+    identity: ReturnType<typeof deriveProjectMemoryCanonicalIdentity>,
+    head: ProjectMemoryHeadRef,
+  ): ProjectMemoryAuthorityRecord {
+    if (
+      head.sequence !== PROJECT_MEMORY_EMPTY_HEAD.sequence
+      || head.operationSha256 !== PROJECT_MEMORY_EMPTY_HEAD.operationSha256
+      || head.headDigest !== PROJECT_MEMORY_EMPTY_HEAD.headDigest
+    ) throw new TypeError("PROJECT_MEMORY_AUTHORITY_RESERVATION_INVALID");
+    const reserve = this.#database.transaction(() => {
       if (this.#database.query("SELECT 1 FROM projects WHERE id=?").get(projectId) === null) {
         throw new SelectionError("NOT_FOUND");
       }
       const existing = this.readProjectMemoryAuthority(projectId);
-      if (existing !== null) {
-        if (
-          existing.authorityDigest !== authorityDigest
-          || existing.bindingDigest !== bindingDigest
-          || JSON.stringify(existing.head) !== JSON.stringify(head)
-        ) throw new Error("PROJECT_MEMORY_AUTHORITY_CONFLICT");
-        return;
-      }
+      // Concurrent first-open callers may generate different portable ids.
+      // The immediate transaction elects one winner; every loser adopts the
+      // already durable identity before any physical Oh store is opened.
+      if (existing !== null) return;
       const now = unixMillisecondsSchema.parse(this.#now());
       this.#database.query(
         `INSERT INTO project_memory_authorities(
-           project_id,authority_digest,binding_digest,head_sequence,
+           project_id,identity_contract,canonical_space_id,physical_state,initialized_at,
+           authority_digest,binding_digest,head_sequence,
            head_operation_sha256,head_digest,revision,sync_state,
            last_exchange_at,last_exchange_sequence,last_exchange_operation_sha256,
            last_exchange_head_digest,diagnostic_code,created_at,updated_at
-         ) VALUES (?,?,?,?,?,?,1,'local_only',NULL,NULL,NULL,NULL,NULL,?,?)`,
+         ) VALUES (?,?,?,'reserved',NULL,?,?,?,?,?,1,'local_only',NULL,NULL,NULL,NULL,NULL,?,?)`,
       ).run(
         projectId,
-        authorityDigest,
-        bindingDigest,
+        identity.identityContract,
+        identity.canonicalSpaceId,
+        identity.authorityDigest,
+        identity.bindingDigest,
         head.sequence,
         head.operationSha256,
         head.headDigest,
@@ -12697,7 +15279,110 @@ export class StateStore {
         now,
       );
     });
+    reserve.immediate();
+    const authority = this.readProjectMemoryAuthority(projectId);
+    if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+    return authority;
+  }
+
+  markProjectMemoryAuthorityInitialized(input: Readonly<{
+    projectId: ProjectId;
+    expectedRevision: number;
+    expectedHead: ProjectMemoryHeadRef;
+  }>): ProjectMemoryAuthorityRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const expectedRevision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedRevision);
+    const expectedHead = projectMemoryHeadRefSchema.parse(input.expectedHead);
+    const initialize = this.#database.transaction(() => {
+      const current = this.readProjectMemoryAuthority(projectId);
+      if (current === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (current.physicalState === "initialized") {
+        if (JSON.stringify(current.head) !== JSON.stringify(expectedHead)) {
+          throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+        }
+        return;
+      }
+      if (current.revision !== expectedRevision) {
+        throw new Error("PROJECT_MEMORY_REVISION_CONFLICT");
+      }
+      if (JSON.stringify(current.head) !== JSON.stringify(expectedHead)) {
+        throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const initializedAt = Math.max(current.updatedAt, now);
+      const changed = this.#database.query(
+        `UPDATE project_memory_authorities
+         SET physical_state='initialized',initialized_at=?,revision=revision+1,
+             updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND revision=? AND physical_state='reserved'
+           AND head_sequence=? AND head_operation_sha256 IS ? AND head_digest=?`,
+      ).run(
+        initializedAt,
+        initializedAt,
+        projectId,
+        expectedRevision,
+        expectedHead.sequence,
+        expectedHead.operationSha256,
+        expectedHead.headDigest,
+      );
+      if (changed.changes !== 1) throw new Error("PROJECT_MEMORY_REVISION_CONFLICT");
+    });
     initialize.immediate();
+    const authority = this.readProjectMemoryAuthority(projectId);
+    if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+    return authority;
+  }
+
+  rejectReservedProjectMemoryAuthority(input: Readonly<{
+    diagnosticCode: string;
+    expectedHead: ProjectMemoryHeadRef;
+    expectedRevision: number;
+    projectId: ProjectId;
+  }>): ProjectMemoryAuthorityRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const expectedRevision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedRevision);
+    const expectedHead = projectMemoryHeadRefSchema.parse(input.expectedHead);
+    const diagnosticCode = memoryDiagnosticCodeSchema.parse(input.diagnosticCode);
+    const reject = this.#database.transaction(() => {
+      const current = this.readProjectMemoryAuthority(projectId);
+      if (current === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (current.physicalState === "rejected") {
+        if (
+          current.diagnosticCode !== diagnosticCode
+          || JSON.stringify(current.head) !== JSON.stringify(expectedHead)
+        ) throw new Error("PROJECT_MEMORY_AUTHORITY_REJECTION_CONFLICT");
+        return;
+      }
+      if (current.physicalState !== "reserved") {
+        throw new Error("PROJECT_MEMORY_AUTHORITY_ALREADY_INITIALIZED");
+      }
+      if (current.revision !== expectedRevision) {
+        throw new Error("PROJECT_MEMORY_REVISION_CONFLICT");
+      }
+      if (JSON.stringify(current.head) !== JSON.stringify(expectedHead)) {
+        throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+      }
+      const now = Math.max(current.updatedAt, unixMillisecondsSchema.parse(this.#now()));
+      const changed = this.#database.query(
+        `UPDATE project_memory_authorities
+         SET physical_state='rejected',sync_state='error',diagnostic_code=?,
+             revision=revision+1,updated_at=?
+         WHERE project_id=? AND revision=? AND physical_state='reserved'
+           AND head_sequence=? AND head_operation_sha256 IS ? AND head_digest=?`,
+      ).run(
+        diagnosticCode,
+        now,
+        projectId,
+        expectedRevision,
+        expectedHead.sequence,
+        expectedHead.operationSha256,
+        expectedHead.headDigest,
+      );
+      if (changed.changes !== 1) throw new Error("PROJECT_MEMORY_REVISION_CONFLICT");
+    });
+    reject.immediate();
     const authority = this.readProjectMemoryAuthority(projectId);
     if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
     return authority;
@@ -12708,6 +15393,50 @@ export class StateStore {
     const row = this.#database.query("SELECT * FROM project_memory_authorities WHERE project_id=?")
       .get(parsedProjectId);
     return row === null ? null : mapProjectMemoryAuthority(row);
+  }
+
+  readCanonicalMemoryPortableAdoptionProof(input: Readonly<{
+    operationSha256: string;
+    projectId: ProjectId;
+    sequence: number;
+  }>): CanonicalMemoryPortableAdoptionProofRecord | null {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const sequence = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.sequence);
+    const operationSha256 = canonicalMemoryDigestSchema.parse(input.operationSha256);
+    const row = this.#database.query(
+      `SELECT * FROM project_memory_portable_adoption_proofs
+       WHERE project_id=? AND sequence=? AND operation_sha256=?`,
+    ).get(projectId, sequence, operationSha256);
+    return row === null ? null : mapCanonicalMemoryPortableAdoptionProof(row);
+  }
+
+  isCanonicalMemoryPortableAdoptionProofReferenced(input: Readonly<{
+    bindingDigest: string;
+    contentDigest?: string;
+    keyDigest: string;
+    projectId: ProjectId;
+    recordSha256: string;
+  }>): boolean {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const bindingDigest = canonicalMemoryDigestSchema.parse(input.bindingDigest);
+    const recordSha256 = canonicalMemoryDigestSchema.parse(input.recordSha256);
+    const keyDigest = canonicalMemoryDigestSchema.parse(input.keyDigest);
+    const contentDigest = input.contentDigest === undefined
+      ? undefined
+      : canonicalMemoryDigestSchema.parse(input.contentDigest);
+    return this.#database.query(
+      `SELECT 1 FROM project_memory_portable_adoption_proofs
+       WHERE project_id=? AND canonical_binding_digest=? AND record_sha256=?
+         AND key_digest=? ${contentDigest === undefined ? "" : "AND content_digest=?"}
+       LIMIT 1`,
+    ).get(
+      projectId,
+      bindingDigest,
+      recordSha256,
+      keyDigest,
+      ...(contentDigest === undefined ? [] : [contentDigest]),
+    ) !== null;
   }
 
   compareAndSwapProjectMemoryHead(input: Readonly<{
@@ -12724,6 +15453,9 @@ export class StateStore {
     const advance = this.#database.transaction(() => {
       const current = this.readProjectMemoryAuthority(projectId);
       if (current === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (current.physicalState !== "initialized") {
+        throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+      }
       if (current.revision !== expectedRevision) {
         throw new Error("PROJECT_MEMORY_REVISION_CONFLICT");
       }
@@ -12797,6 +15529,9 @@ export class StateStore {
     const observe = this.#database.transaction(() => {
       const current = this.readProjectMemoryAuthority(projectId);
       if (current === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (current.physicalState !== "initialized") {
+        throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+      }
       if (current.revision !== expectedRevision) {
         throw new Error("PROJECT_MEMORY_REVISION_CONFLICT");
       }
@@ -12841,6 +15576,1615 @@ export class StateStore {
     return authority;
   }
 
+  readCanonicalMemoryHostedCreateIntent(
+    intentId: string,
+  ): CanonicalMemoryHostedCreateIntentRecord | null {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(intentId);
+    const row = this.#database.query(
+      "SELECT * FROM project_memory_hosted_create_intents WHERE id=?",
+    ).get(id);
+    return row === null ? null : mapCanonicalMemoryHostedCreateIntent(row);
+  }
+
+  readUnresolvedCanonicalMemoryHostedCreateIntent(
+    projectId: ProjectId,
+  ): CanonicalMemoryHostedCreateIntentRecord | null {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    const row = this.#database.query(
+      `SELECT id FROM project_memory_hosted_create_intents
+       WHERE project_id=? AND state IN (
+         'allocating','key_staged','prepared','effect_started','winner_observed'
+       )`,
+    ).get(parsedProjectId);
+    if (row === null) return null;
+    return this.readCanonicalMemoryHostedCreateIntent(
+      z.object({ id: canonicalMemoryHostedCreateIntentIdSchema }).strict().parse(row).id,
+    );
+  }
+
+  #assertCanonicalMemoryHostedCreatePinsCurrent(
+    intent: CanonicalMemoryHostedCreateIntentRecord,
+  ): void {
+    const authority = this.readProjectMemoryAuthority(intent.projectId);
+    if (
+      authority === null
+      || authority.identityContract !== 2
+      || authority.physicalState === "rejected"
+      || authority.syncState === "conflict"
+      || authority.syncState === "error"
+      || authority.revision !== intent.authorityRevision
+      || authority.bindingDigest !== intent.canonicalBindingDigest
+      || !sameProjectMemoryHead(authority.head, intent.authorityHead)
+    ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_AUTHORITY_CONFLICT");
+    if (this.readCanonicalMemoryHostedAttachment(intent.projectId) !== null) {
+      throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_ATTACHMENT_CONFLICT");
+    }
+    if (this.readUnresolvedCanonicalMemorySyncIntent(intent.projectId) !== null) {
+      throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+    }
+  }
+
+  allocateCanonicalMemoryHostedCreate(input: Readonly<{
+    accountBindingDigest: string;
+    idempotencyKey: string;
+    projectId: ProjectId;
+    remoteSpaceId: string;
+  }>): CanonicalMemoryHostedCreateAllocation {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const accountBindingDigest = canonicalMemoryDigestSchema.parse(input.accountBindingDigest);
+    const idempotencyKey = z.string().uuid().parse(input.idempotencyKey);
+    const remoteSpaceId = canonicalMemoryHostedSpaceIdSchema.parse(input.remoteSpaceId);
+    let id: string | undefined;
+    let replay = false;
+    const allocate = this.#database.transaction(() => {
+      const existingRow = this.#database.query(
+        "SELECT id FROM project_memory_hosted_create_intents WHERE idempotency_key=?",
+      ).get(idempotencyKey);
+      if (existingRow !== null) {
+        const existing = this.readCanonicalMemoryHostedCreateIntent(
+          z.object({ id: canonicalMemoryHostedCreateIntentIdSchema }).strict()
+            .parse(existingRow).id,
+        );
+        if (
+          existing === null
+          || existing.projectId !== projectId
+          || existing.accountBindingDigest !== accountBindingDigest
+          || existing.remoteSpaceId !== remoteSpaceId
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_IDEMPOTENCY_CONFLICT");
+        id = existing.id;
+        replay = true;
+        return;
+      }
+      if (this.#database.query("SELECT 1 FROM projects WHERE id=?").get(projectId) === null) {
+        throw new SelectionError("NOT_FOUND");
+      }
+      const authority = this.readProjectMemoryAuthority(projectId);
+      if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (authority.identityContract !== 2 || authority.physicalState === "rejected") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_IDENTITY_MISMATCH");
+      }
+      if (authority.syncState === "conflict" || authority.syncState === "error") {
+        throw new Error("PROJECT_MEMORY_SYNC_FROZEN");
+      }
+      if (this.readCanonicalMemoryHostedAttachment(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_ALREADY_EXISTS");
+      }
+      if (this.readUnresolvedCanonicalMemoryHostedCreateIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_RECOVERY_REQUIRED");
+      }
+      if (this.readUnresolvedCanonicalMemorySyncIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+      }
+      if (this.#database.query(
+        `SELECT 1 FROM memory_submissions
+         WHERE project_id=? AND kind='share'
+           AND state IN ('prepared','effect_started','ambiguous') LIMIT 1`,
+      ).get(projectId) !== null) throw new Error("MEMORY_RECOVERY_REQUIRED");
+      if (this.#database.query(
+        "SELECT 1 FROM project_memory_hosted_create_intents WHERE remote_space_id=?",
+      ).get(remoteSpaceId) !== null) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_ROUTE_CONFLICT");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      id = `cmcreate_${randomUUID().replaceAll("-", "")}`;
+      this.#database.query(
+        `INSERT INTO project_memory_hosted_create_intents(
+           id,idempotency_key,project_id,state,authority_revision,
+           canonical_binding_digest,authority_head_sequence,
+           authority_head_operation_sha256,authority_head_digest,
+           account_binding_digest,remote_space_id,space_key_version,
+           wrapped_key_algorithm,wrapped_key_ciphertext,wrapped_key_version,
+           wrapped_key_nonce,descriptor_algorithm,descriptor_ciphertext,
+           descriptor_key_version,descriptor_nonce,genesis_proof_algorithm,
+           genesis_proof_ciphertext,genesis_proof_key_version,genesis_proof_nonce,
+           genesis_token,request_digest,effect_started_at,winner_digest,
+           winner_revision,winner_replay,winner_observed_at,settled_at,
+           diagnostic_code,created_at,updated_at
+         ) VALUES (?,?,?,'allocating',?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,NULL,
+           NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+           NULL,NULL,NULL,?,?)`,
+      ).run(
+        id,
+        idempotencyKey,
+        projectId,
+        authority.revision,
+        authority.bindingDigest,
+        authority.head.sequence,
+        authority.head.operationSha256,
+        authority.head.headDigest,
+        accountBindingDigest,
+        remoteSpaceId,
+        now,
+        now,
+      );
+    });
+    allocate.immediate();
+    if (id === undefined) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_ALLOCATION_FAILED");
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    return { record, replay };
+  }
+
+  stageCanonicalMemoryHostedCreateKey(input: Readonly<{
+    intentId: string;
+    keyVersion: number;
+    wrappedSpaceKey: CanonicalMemoryEncryptedEnvelope;
+  }>): CanonicalMemoryHostedCreateIntentRecord {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(input.intentId);
+    const keyVersion = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.keyVersion);
+    const wrappedSpaceKey = parseCanonicalMemoryEncryptedEnvelope(
+      input.wrappedSpaceKey,
+      canonicalMemoryCiphertextLimits.terminalHeadProof,
+    );
+    const stage = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedCreateIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+      if (current.wrappedSpaceKey !== undefined || current.keyVersion !== undefined) {
+        if (
+          current.keyVersion !== keyVersion
+          || current.wrappedSpaceKey === undefined
+          || !sameCanonicalMemoryEncryptedEnvelope(current.wrappedSpaceKey, wrappedSpaceKey)
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_KEY_CONFLICT");
+        return;
+      }
+      if (current.state !== "allocating") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_FROZEN");
+      }
+      this.#assertCanonicalMemoryHostedCreatePinsCurrent(current);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_create_intents
+         SET state='key_staged',space_key_version=?,wrapped_key_algorithm=?,
+             wrapped_key_ciphertext=?,wrapped_key_version=?,wrapped_key_nonce=?,
+             updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='allocating'`,
+      ).run(
+        keyVersion,
+        wrappedSpaceKey.algorithm,
+        wrappedSpaceKey.ciphertext,
+        wrappedSpaceKey.keyVersion,
+        wrappedSpaceKey.nonce,
+        now,
+        id,
+      );
+      if (changed.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+    });
+    stage.immediate();
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    return record;
+  }
+
+  prepareCanonicalMemoryHostedCreate(input: Readonly<{
+    intentId: string;
+    request: CanonicalMemoryHostedCreateRequest;
+  }>): CanonicalMemoryHostedCreateIntentRecord {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(input.intentId);
+    const request = parseCanonicalMemoryHostedCreateRequest(input.request);
+    const requestDigest = canonicalMemoryHostedCreateRequestDigest(request);
+    const prepare = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedCreateIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+      if (current.request !== undefined) {
+        if (
+          current.requestDigest !== requestDigest
+          || JSON.stringify(current.request) !== JSON.stringify(request)
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_REQUEST_CONFLICT");
+        return;
+      }
+      if (
+        current.state !== "key_staged"
+        || current.keyVersion === undefined
+        || current.wrappedSpaceKey === undefined
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      this.#assertCanonicalMemoryHostedCreatePinsCurrent(current);
+      if (
+        request.spaceId !== current.remoteSpaceId
+        || request.keyVersion !== current.keyVersion
+        || !sameCanonicalMemoryEncryptedEnvelope(
+          request.wrappedSpaceKey,
+          current.wrappedSpaceKey,
+        )
+      ) throw new TypeError("CANONICAL_MEMORY_HOSTED_CREATE_REQUEST_INVALID");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_create_intents
+         SET state='prepared',descriptor_algorithm=?,descriptor_ciphertext=?,
+             descriptor_key_version=?,descriptor_nonce=?,genesis_proof_algorithm=?,
+             genesis_proof_ciphertext=?,genesis_proof_key_version=?,
+             genesis_proof_nonce=?,genesis_token=?,request_digest=?,
+             updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='key_staged'`,
+      ).run(
+        request.encryptedDescriptor.algorithm,
+        request.encryptedDescriptor.ciphertext,
+        request.encryptedDescriptor.keyVersion,
+        request.encryptedDescriptor.nonce,
+        request.genesisHeadProof.algorithm,
+        request.genesisHeadProof.ciphertext,
+        request.genesisHeadProof.keyVersion,
+        request.genesisHeadProof.nonce,
+        request.genesisToken,
+        requestDigest,
+        now,
+        id,
+      );
+      if (changed.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+    });
+    prepare.immediate();
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    return record;
+  }
+
+  markCanonicalMemoryHostedCreateEffectStarted(
+    intentId: string,
+  ): CanonicalMemoryHostedCreateIntentRecord {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(intentId);
+    const mark = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedCreateIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+      if (["effect_started", "winner_observed", "settled"].includes(current.state)) return;
+      if (current.state !== "prepared") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_FROZEN");
+      }
+      this.#assertCanonicalMemoryHostedCreatePinsCurrent(current);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_create_intents
+         SET state='effect_started',effect_started_at=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='prepared'`,
+      ).run(now, now, id);
+      if (changed.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+    });
+    mark.immediate();
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    return record;
+  }
+
+  recordCanonicalMemoryHostedCreateWinner(input: Readonly<{
+    intentId: string;
+    winner: CanonicalMemoryHostedCreateWinner;
+  }>): CanonicalMemoryHostedCreateIntentRecord {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(input.intentId);
+    const winner = parseCanonicalMemoryHostedCreateWinner(input.winner);
+    const winnerRequest = parseCanonicalMemoryHostedCreateRequest({
+      bindingPolicy: winner.bindingPolicy,
+      encryptedDescriptor: winner.encryptedDescriptor,
+      genesisHeadProof: winner.genesisHeadProof,
+      genesisToken: winner.genesisToken,
+      identityContract: winner.identityContract,
+      keyVersion: winner.keyVersion,
+      spaceId: winner.spaceId,
+      wrappedSpaceKey: winner.wrappedSpaceKey,
+    });
+    const winnerDigest = canonicalMemoryHostedCreateWinnerDigest(
+      winnerRequest,
+      winner.revision,
+      winner.replay,
+    );
+    const observe = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedCreateIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+      if (current.state === "winner_observed" || current.state === "settled") {
+        if (
+          current.winnerDigest !== winnerDigest
+          || current.winnerRevision !== winner.revision
+          || current.winnerReplay !== winner.replay
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_WINNER_CONFLICT");
+        return;
+      }
+      if (current.state !== "effect_started" || current.request === undefined) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+      this.#assertCanonicalMemoryHostedCreatePinsCurrent(current);
+      if (
+        current.requestDigest !== canonicalMemoryHostedCreateRequestDigest(winnerRequest)
+        || JSON.stringify(current.request) !== JSON.stringify(winnerRequest)
+      ) throw new TypeError("CANONICAL_MEMORY_HOSTED_CREATE_WINNER_INVALID");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_create_intents
+         SET state='winner_observed',winner_digest=?,winner_revision=?,
+             winner_replay=?,winner_observed_at=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='effect_started'`,
+      ).run(winnerDigest, winner.revision, winner.replay ? 1 : 0, now, now, id);
+      if (changed.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+    });
+    observe.immediate();
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    return record;
+  }
+
+  settleCanonicalMemoryHostedCreate(
+    intentId: string,
+  ): CanonicalMemoryHostedCreateIntentRecord {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(intentId);
+    const settle = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedCreateIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+      if (current.state === "settled") return;
+      if (
+        current.state !== "winner_observed"
+        || current.request === undefined
+        || current.winnerRevision === undefined
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      this.#assertCanonicalMemoryHostedCreatePinsCurrent(current);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const intentChanged = this.#database.query(
+        `UPDATE project_memory_hosted_create_intents
+         SET state='settled',settled_at=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='winner_observed'`,
+      ).run(now, now, id);
+      if (intentChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+      const attachmentChanged = this.#database.query(
+        `INSERT INTO project_memory_hosted_attachments(
+           project_id,remote_space_id,account_binding_digest,canonical_binding_digest,
+           generation,revision,state,genesis_token,remote_revision,remote_key_version,
+           remote_head_sequence,remote_head_operation_sha256,remote_head_digest,
+           remote_head_token,remote_head_proof_digest,diagnostic_code,created_at,updated_at
+         ) VALUES (?,?,?,?,1,1,'attached',?,?,?,0,NULL,?,?,?,NULL,?,?)`,
+      ).run(
+        current.projectId,
+        current.remoteSpaceId,
+        current.accountBindingDigest,
+        current.canonicalBindingDigest,
+        current.request.genesisToken,
+        current.winnerRevision,
+        current.request.keyVersion,
+        PROJECT_MEMORY_EMPTY_HEAD.headDigest,
+        current.request.genesisToken,
+        canonicalMemoryHostedHeadProofDigest(current.request.genesisHeadProof),
+        now,
+        now,
+      );
+      if (attachmentChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_ATTACHMENT_CONFLICT");
+      }
+    });
+    settle.immediate();
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    if (record.state !== "settled") {
+      throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_SETTLEMENT_FAILED");
+    }
+    return record;
+  }
+
+  failCanonicalMemoryHostedCreate(input: Readonly<{
+    diagnosticCode: string;
+    intentId: string;
+    state: "conflict" | "error";
+  }>): CanonicalMemoryHostedCreateIntentRecord {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(input.intentId);
+    const state = z.enum(["conflict", "error"]).parse(input.state);
+    const diagnosticCode = memoryDiagnosticCodeSchema.parse(input.diagnosticCode);
+    const fail = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedCreateIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+      if (current.state === "conflict" || current.state === "error") {
+        if (current.state !== state || current.diagnosticCode !== diagnosticCode) {
+          throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_FAILURE_CONFLICT");
+        }
+        return;
+      }
+      if (current.state === "settled") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_ALREADY_SETTLED");
+      }
+      this.#assertCanonicalMemoryHostedCreatePinsCurrent(current);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const intentChanged = this.#database.query(
+        `UPDATE project_memory_hosted_create_intents
+         SET state=?,settled_at=?,diagnostic_code=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state IN (
+           'allocating','key_staged','prepared','effect_started','winner_observed'
+         )`,
+      ).run(state, now, diagnosticCode, now, id);
+      if (intentChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+      const authorityChanged = this.#database.query(
+        `UPDATE project_memory_authorities
+         SET sync_state=?,diagnostic_code=?,revision=revision+1,
+             updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND revision=? AND binding_digest=?
+           AND head_sequence=? AND head_operation_sha256 IS ? AND head_digest=?`,
+      ).run(
+        state,
+        diagnosticCode,
+        now,
+        current.projectId,
+        current.authorityRevision,
+        current.canonicalBindingDigest,
+        current.authorityHead.sequence,
+        current.authorityHead.operationSha256,
+        current.authorityHead.headDigest,
+      );
+      if (authorityChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_AUTHORITY_CONFLICT");
+      }
+    });
+    fail.immediate();
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    return record;
+  }
+
+  readCanonicalMemoryHostedAttachment(
+    projectId: ProjectId,
+  ): CanonicalMemoryHostedAttachmentRecord | null {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    const row = this.#database.query(
+      "SELECT * FROM project_memory_hosted_attachments WHERE project_id=?",
+    ).get(parsedProjectId);
+    return row === null ? null : mapCanonicalMemoryHostedAttachment(row);
+  }
+
+  attachCanonicalMemoryHostedSpace(input: Readonly<{
+    accountBindingDigest: string;
+    canonicalSpaceId: string;
+    projectId: ProjectId;
+    remote: CanonicalMemoryHostedRemoteObservation;
+    remoteSpaceId: string;
+  }>): CanonicalMemoryHostedAttachmentRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const accountBindingDigest = canonicalMemoryDigestSchema.parse(input.accountBindingDigest);
+    const remoteSpaceId = canonicalMemoryHostedSpaceIdSchema.parse(input.remoteSpaceId);
+    const remote = parseCanonicalMemoryRemoteObservation(input.remote);
+    let identity: ReturnType<typeof deriveProjectMemoryCanonicalIdentity>;
+    try {
+      identity = deriveProjectMemoryCanonicalIdentity({
+        canonicalSpaceId: input.canonicalSpaceId,
+        identityContract: 2,
+        projectId,
+      });
+    } catch (cause: unknown) {
+      throw new TypeError("CANONICAL_MEMORY_HOSTED_ATTACHMENT_INVALID", { cause });
+    }
+    const attach = this.#database.transaction(() => {
+      if (this.#database.query("SELECT 1 FROM projects WHERE id=?").get(projectId) === null) {
+        throw new SelectionError("NOT_FOUND");
+      }
+      if (this.readUnresolvedCanonicalMemoryHostedCreateIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_RECOVERY_REQUIRED");
+      }
+      let authority = this.readProjectMemoryAuthority(projectId);
+      if (authority === null) {
+        const now = unixMillisecondsSchema.parse(this.#now());
+        this.#database.query(
+          `INSERT INTO project_memory_authorities(
+             project_id,identity_contract,canonical_space_id,physical_state,initialized_at,
+             authority_digest,binding_digest,head_sequence,head_operation_sha256,
+             head_digest,revision,sync_state,last_exchange_at,last_exchange_sequence,
+             last_exchange_operation_sha256,last_exchange_head_digest,diagnostic_code,
+             created_at,updated_at
+           ) VALUES (?,?,?,'reserved',NULL,?,?,?,?,?,1,'local_only',NULL,NULL,NULL,NULL,NULL,?,?)`,
+        ).run(
+          projectId,
+          identity.identityContract,
+          identity.canonicalSpaceId,
+          identity.authorityDigest,
+          identity.bindingDigest,
+          PROJECT_MEMORY_EMPTY_HEAD.sequence,
+          PROJECT_MEMORY_EMPTY_HEAD.operationSha256,
+          PROJECT_MEMORY_EMPTY_HEAD.headDigest,
+          now,
+          now,
+        );
+        authority = this.readProjectMemoryAuthority(projectId);
+      }
+      if (
+        authority === null
+        || authority.identityContract !== 2
+        || authority.canonicalSpaceId !== identity.canonicalSpaceId
+        || authority.bindingDigest !== identity.bindingDigest
+        || authority.physicalState === "rejected"
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_IDENTITY_MISMATCH");
+      if (authority.syncState === "conflict" || authority.syncState === "error") {
+        throw new Error("PROJECT_MEMORY_SYNC_FROZEN");
+      }
+      const existing = this.readCanonicalMemoryHostedAttachment(projectId);
+      if (existing === null) {
+        const now = unixMillisecondsSchema.parse(this.#now());
+        this.#database.query(
+          `INSERT INTO project_memory_hosted_attachments(
+             project_id,remote_space_id,account_binding_digest,canonical_binding_digest,
+             generation,revision,state,genesis_token,remote_revision,remote_key_version,
+             remote_head_sequence,remote_head_operation_sha256,remote_head_digest,
+             remote_head_token,remote_head_proof_digest,diagnostic_code,created_at,updated_at
+           ) VALUES (?,?,?,?,1,1,'attached',?,?,?,?,?,?,?,?,NULL,?,?)`,
+        ).run(
+          projectId,
+          remoteSpaceId,
+          accountBindingDigest,
+          identity.bindingDigest,
+          remote.genesisToken,
+          remote.revision,
+          remote.keyVersion,
+          remote.head.sequence,
+          remote.head.operationSha256,
+          remote.head.headDigest,
+          remote.headToken,
+          remote.headProofDigest,
+          now,
+          now,
+        );
+        return;
+      }
+      if (
+        existing.remoteSpaceId !== remoteSpaceId
+        || existing.accountBindingDigest !== accountBindingDigest
+        || existing.canonicalBindingDigest !== identity.bindingDigest
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_REBIND_REFUSED");
+      if (existing.state === "conflict" || existing.state === "error") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_FROZEN");
+      }
+      if (existing.state === "attached") {
+        if (!sameCanonicalMemoryRemoteObservation(existing.remote, remote)) {
+          throw new Error("CANONICAL_MEMORY_HOSTED_OBSERVATION_CONFLICT");
+        }
+        return;
+      }
+      if (
+        remote.genesisToken !== existing.remote.genesisToken
+        || remote.revision !== existing.remote.revision
+        || remote.keyVersion !== existing.remote.keyVersion
+        || remote.head.sequence < existing.remote.head.sequence
+        || (remote.head.sequence === existing.remote.head.sequence
+          && !sameCanonicalMemoryRemoteObservation(existing.remote, remote))
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_OBSERVATION_CONFLICT");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_attachments
+         SET state='attached',generation=generation+1,revision=revision+1,
+             remote_revision=?,remote_key_version=?,remote_head_sequence=?,
+             remote_head_operation_sha256=?,remote_head_digest=?,remote_head_token=?,
+             remote_head_proof_digest=?,updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND state='detached' AND generation=? AND revision=?`,
+      ).run(
+        remote.revision,
+        remote.keyVersion,
+        remote.head.sequence,
+        remote.head.operationSha256,
+        remote.head.headDigest,
+        remote.headToken,
+        remote.headProofDigest,
+        now,
+        projectId,
+        existing.generation,
+        existing.revision,
+      );
+      if (changed.changes !== 1) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_CONFLICT");
+    });
+    attach.immediate();
+    const attached = this.readCanonicalMemoryHostedAttachment(projectId);
+    if (attached === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+    return attached;
+  }
+
+  recordCanonicalMemoryHostedObservation(input: Readonly<{
+    expectedGeneration: number;
+    expectedRevision: number;
+    projectId: ProjectId;
+    remote: CanonicalMemoryHostedRemoteObservation;
+  }>): CanonicalMemoryHostedAttachmentRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const expectedGeneration = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedGeneration);
+    const expectedRevision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedRevision);
+    const remote = parseCanonicalMemoryRemoteObservation(input.remote);
+    let stickyRefusal: string | undefined;
+    const observe = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedAttachment(projectId);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+      if (current.state !== "attached") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_NOT_ACTIVE");
+      }
+      if (
+        current.generation !== expectedGeneration
+        || current.revision !== expectedRevision
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_OBSERVATION_CONFLICT");
+      const authority = this.readProjectMemoryAuthority(projectId);
+      if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (authority.physicalState !== "initialized") {
+        throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+      }
+      if (authority.syncState === "conflict" || authority.syncState === "error") {
+        throw new Error("PROJECT_MEMORY_SYNC_FROZEN");
+      }
+      if (this.readUnresolvedCanonicalMemorySyncIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+      }
+      if (sameCanonicalMemoryRemoteObservation(current.remote, remote)) return;
+      const configurationMismatch =
+        remote.genesisToken !== current.remote.genesisToken
+        || remote.revision !== current.remote.revision
+        || remote.keyVersion !== current.remote.keyVersion;
+      if (configurationMismatch || remote.head.sequence <= current.remote.head.sequence) {
+        stickyRefusal = "CANONICAL_MEMORY_HOSTED_OBSERVATION_CONFLICT";
+        this.#freezeCanonicalMemoryHostedState({
+          attachment: current,
+          authority,
+          diagnosticCode: configurationMismatch
+            ? "REMOTE_MEMORY_CONFIGURATION_CONFLICT"
+            : "REMOTE_MEMORY_HEAD_CONFLICT",
+          observedHead: remote.head,
+          now: unixMillisecondsSchema.parse(this.#now()),
+        });
+        return;
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_attachments
+         SET revision=revision+1,remote_revision=?,remote_key_version=?,
+             remote_head_sequence=?,remote_head_operation_sha256=?,remote_head_digest=?,
+             remote_head_token=?,remote_head_proof_digest=?,updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND state='attached' AND generation=? AND revision=?`,
+      ).run(
+        remote.revision,
+        remote.keyVersion,
+        remote.head.sequence,
+        remote.head.operationSha256,
+        remote.head.headDigest,
+        remote.headToken,
+        remote.headProofDigest,
+        now,
+        projectId,
+        expectedGeneration,
+        expectedRevision,
+      );
+      if (changed.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_OBSERVATION_CONFLICT");
+      }
+    });
+    observe.immediate();
+    if (stickyRefusal !== undefined) throw new Error(stickyRefusal);
+    const observed = this.readCanonicalMemoryHostedAttachment(projectId);
+    if (observed === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+    return observed;
+  }
+
+  /**
+   * Permanently freeze an attached hosted-memory binding when no sync intent
+   * exists to own the failure (for example, a deleted space or an invalid
+   * encrypted configuration discovered before an operation was prepared).
+   */
+  failCanonicalMemoryHostedAttachment(input: Readonly<{
+    diagnosticCode: string;
+    expectedGeneration: number;
+    expectedRevision: number;
+    observedHead?: ProjectMemoryHeadRef;
+    projectId: ProjectId;
+    state: "conflict" | "error";
+  }>): CanonicalMemoryHostedAttachmentRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const expectedGeneration = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedGeneration);
+    const expectedRevision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedRevision);
+    const state = z.enum(["conflict", "error"]).parse(input.state);
+    const diagnosticCode = memoryDiagnosticCodeSchema.parse(input.diagnosticCode);
+    const observedHead = input.observedHead === undefined
+      ? undefined
+      : projectMemoryHeadRefSchema.parse(input.observedHead);
+    const fail = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedAttachment(projectId);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+      if (current.state !== "attached") {
+        if (
+          current.state === state
+          && current.diagnosticCode === diagnosticCode
+          && current.generation === expectedGeneration
+          && current.revision === expectedRevision + 1
+        ) return;
+        throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_FROZEN");
+      }
+      if (
+        current.generation !== expectedGeneration
+        || current.revision !== expectedRevision
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_CONFLICT");
+      if (this.readUnresolvedCanonicalMemorySyncIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+      }
+      const authority = this.readProjectMemoryAuthority(projectId);
+      if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (authority.physicalState !== "initialized") {
+        throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+      }
+      if (authority.syncState === "conflict" || authority.syncState === "error") {
+        throw new Error("PROJECT_MEMORY_SYNC_FROZEN");
+      }
+      this.#freezeCanonicalMemoryHostedState({
+        attachment: current,
+        authority,
+        diagnosticCode,
+        observedHead: observedHead ?? current.remote.head,
+        now: unixMillisecondsSchema.parse(this.#now()),
+        state,
+      });
+    });
+    fail.immediate();
+    const failed = this.readCanonicalMemoryHostedAttachment(projectId);
+    if (failed === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+    return failed;
+  }
+
+  detachCanonicalMemoryHostedSpace(input: Readonly<{
+    expectedGeneration: number;
+    projectId: ProjectId;
+  }>): CanonicalMemoryHostedAttachmentRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const expectedGeneration = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedGeneration);
+    const detach = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedAttachment(projectId);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+      if (current.state === "conflict" || current.state === "error") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_FROZEN");
+      }
+      if (current.state === "detached") {
+        if (current.generation !== expectedGeneration) {
+          throw new Error("CANONICAL_MEMORY_HOSTED_GENERATION_CONFLICT");
+        }
+        return;
+      }
+      if (current.generation !== expectedGeneration) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_GENERATION_CONFLICT");
+      }
+      if (this.readUnresolvedCanonicalMemorySyncIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_attachments
+         SET state='detached',generation=generation+1,revision=revision+1,
+             updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND state='attached' AND generation=? AND revision=?`,
+      ).run(now, projectId, current.generation, current.revision);
+      if (changed.changes !== 1) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_CONFLICT");
+    });
+    detach.immediate();
+    const detached = this.readCanonicalMemoryHostedAttachment(projectId);
+    if (detached === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+    return detached;
+  }
+
+  readCanonicalMemorySyncIntent(intentId: string): CanonicalMemorySyncIntentRecord | null {
+    const id = canonicalMemorySyncIntentIdSchema.parse(intentId);
+    const row = this.#database.query(
+      "SELECT * FROM project_memory_sync_intents WHERE id=?",
+    ).get(id);
+    if (row === null) return null;
+    const projectId = canonicalMemorySyncIntentRowSchema.parse(row).project_id;
+    const attachment = z.object({
+      remote_space_id: canonicalMemoryHostedSpaceIdSchema,
+    }).strict().parse(this.#database.query(
+      "SELECT remote_space_id FROM project_memory_hosted_attachments WHERE project_id=?",
+    ).get(projectId));
+    return mapCanonicalMemorySyncIntent(row, this.#database.query(
+      "SELECT * FROM project_memory_sync_spool WHERE intent_id=? ORDER BY phase",
+    ).all(id), attachment.remote_space_id);
+  }
+
+  readUnresolvedCanonicalMemorySyncIntent(
+    projectId: ProjectId,
+  ): CanonicalMemorySyncIntentRecord | null {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    const row = this.#database.query(
+      `SELECT id FROM project_memory_sync_intents
+       WHERE project_id=? AND state IN ('prepared','effect_started','response_observed')`,
+    ).get(parsedProjectId);
+    if (row === null) return null;
+    return this.readCanonicalMemorySyncIntent(
+      z.object({ id: canonicalMemorySyncIntentIdSchema }).strict().parse(row).id,
+    );
+  }
+
+  isCanonicalMemoryMutationFenced(projectId: ProjectId): boolean {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    return this.#database.query(
+      `SELECT 1
+       WHERE EXISTS (
+         SELECT 1 FROM project_memory_authorities authority
+         WHERE authority.project_id=? AND authority.sync_state IN ('conflict','error')
+       ) OR EXISTS (
+         SELECT 1 FROM project_memory_hosted_create_intents create_intent
+         WHERE create_intent.project_id=?
+           AND create_intent.state IN (
+             'allocating','key_staged','prepared','effect_started','winner_observed'
+           )
+       ) OR EXISTS (
+         SELECT 1 FROM project_memory_hosted_attachments attachment
+         WHERE attachment.project_id=?
+           AND (
+             attachment.state IN ('conflict','error')
+             OR EXISTS (
+               SELECT 1 FROM project_memory_sync_intents intent
+               WHERE intent.project_id=attachment.project_id
+                 AND intent.state IN ('prepared','effect_started','response_observed')
+             )
+           )
+       )
+       LIMIT 1`,
+    ).get(parsedProjectId, parsedProjectId, parsedProjectId) !== null;
+  }
+
+  isCanonicalMemoryPhysicalHeadAuthorized(input: Readonly<{
+    canonicalBindingDigest: string;
+    controlHead: ProjectMemoryHeadRef;
+    observedHead: ProjectMemoryHeadRef;
+    projectId: ProjectId;
+  }>): boolean {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const canonicalBindingDigest = canonicalMemoryDigestSchema.parse(
+      input.canonicalBindingDigest,
+    );
+    const controlHead = projectMemoryHeadRefSchema.parse(input.controlHead);
+    const observedHead = projectMemoryHeadRefSchema.parse(input.observedHead);
+    let authorized = false;
+    const classify = this.#database.transaction(() => {
+      const authority = this.readProjectMemoryAuthority(projectId);
+      if (
+        authority === null
+        || authority.physicalState !== "initialized"
+        || authority.syncState === "conflict"
+        || authority.syncState === "error"
+        || authority.bindingDigest !== canonicalBindingDigest
+      ) return;
+      // If settlement committed before this snapshot began, the current
+      // control head is authoritative even when the caller captured an older
+      // control head before opening the physical Oh authority.
+      if (sameProjectMemoryHead(authority.head, observedHead)) {
+        authorized = true;
+        return;
+      }
+      if (!sameProjectMemoryHead(authority.head, controlHead)) return;
+      const attachment = this.readCanonicalMemoryHostedAttachment(projectId);
+      const intent = this.readUnresolvedCanonicalMemorySyncIntent(projectId);
+      if (
+        attachment === null
+        || attachment.state !== "attached"
+        || intent === null
+        || intent.state !== "response_observed"
+        || intent.direction !== "pull"
+        || intent.responseObservation === undefined
+        || intent.responseOperation === undefined
+        || intent.resultHead === undefined
+        || attachment.canonicalBindingDigest !== canonicalBindingDigest
+        || intent.canonicalBindingDigest !== canonicalBindingDigest
+        || intent.attachmentGeneration !== attachment.generation
+        || intent.attachmentRevision !== attachment.revision
+        || intent.authorityRevision !== authority.revision
+        || !sameProjectMemoryHead(intent.localHead, controlHead)
+        || !sameProjectMemoryHead(intent.resultHead, observedHead)
+        || !sameCanonicalMemoryRemoteObservation(
+          intent.remoteObservation,
+          attachment.remote,
+        )
+        || !sameCanonicalMemoryRemoteObservation(
+          intent.responseObservation,
+          attachment.remote,
+        )
+        || intent.responseOperation.genesisToken !== attachment.remote.genesisToken
+        || intent.responseOperation.priorToken !== intent.localHeadToken
+        || intent.responseOperation.operation.keyVersion !== attachment.remote.keyVersion
+        || intent.responseOperation.sequence !== controlHead.sequence + 1
+        || intent.resultHead.sequence !== intent.responseOperation.sequence
+        || intent.resultHead.sequence > attachment.remote.head.sequence
+        || (intent.resultHead.sequence === attachment.remote.head.sequence && (
+          intent.responseOperation.headToken !== attachment.remote.headToken
+          || !sameProjectMemoryHead(intent.resultHead, attachment.remote.head)
+        ))
+      ) return;
+      authorized = true;
+    });
+    classify.deferred();
+    return authorized;
+  }
+
+  #insertCanonicalMemorySyncSpoolOperation(
+    intentId: string,
+    phase: "request" | "response",
+    operation: CanonicalMemorySyncSpoolOperation,
+    createdAt: number,
+  ): void {
+    this.#database.query(
+      `INSERT INTO project_memory_sync_spool(
+         intent_id,phase,genesis_token,prior_token,head_token,sequence,
+         adoption_proof_algorithm,adoption_proof_ciphertext,
+         adoption_proof_key_version,adoption_proof_nonce,
+         operation_algorithm,operation_ciphertext,operation_key_version,
+         operation_nonce,proof_algorithm,proof_ciphertext,proof_key_version,
+         proof_nonce,operation_digest,created_at
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      intentId,
+      phase,
+      operation.genesisToken,
+      operation.priorToken,
+      operation.headToken,
+      operation.sequence,
+      operation.adoptionProof?.algorithm ?? null,
+      operation.adoptionProof?.ciphertext ?? null,
+      operation.adoptionProof?.keyVersion ?? null,
+      operation.adoptionProof?.nonce ?? null,
+      operation.operation.algorithm,
+      operation.operation.ciphertext,
+      operation.operation.keyVersion,
+      operation.operation.nonce,
+      operation.terminalHeadProof.algorithm,
+      operation.terminalHeadProof.ciphertext,
+      operation.terminalHeadProof.keyVersion,
+      operation.terminalHeadProof.nonce,
+      operation.operationDigest,
+      createdAt,
+    );
+  }
+
+  #assertCanonicalMemorySyncPinsCurrent(intent: CanonicalMemorySyncIntentRecord): void {
+    const attachment = this.readCanonicalMemoryHostedAttachment(intent.projectId);
+    if (
+      attachment === null
+      || attachment.state !== "attached"
+      || attachment.generation !== intent.attachmentGeneration
+      || attachment.revision !== intent.attachmentRevision
+      || attachment.canonicalBindingDigest !== intent.canonicalBindingDigest
+      || !sameCanonicalMemoryRemoteObservation(
+        attachment.remote,
+        intent.remoteObservation,
+      )
+    ) throw new Error("CANONICAL_MEMORY_SYNC_ATTACHMENT_CONFLICT");
+    const authority = this.readProjectMemoryAuthority(intent.projectId);
+    if (
+      authority === null
+      || authority.physicalState !== "initialized"
+      || authority.syncState === "conflict"
+      || authority.syncState === "error"
+      || authority.revision !== intent.authorityRevision
+      || authority.bindingDigest !== intent.canonicalBindingDigest
+      || !sameProjectMemoryHead(authority.head, intent.localHead)
+    ) throw new Error("CANONICAL_MEMORY_SYNC_AUTHORITY_CONFLICT");
+  }
+
+  #freezeCanonicalMemoryHostedState(input: Readonly<{
+    attachment: CanonicalMemoryHostedAttachmentRecord;
+    authority: ProjectMemoryAuthorityRecord;
+    diagnosticCode: string;
+    observedHead: ProjectMemoryHeadRef;
+    now: number;
+    state?: "conflict" | "error";
+  }>): void {
+    const diagnosticCode = memoryDiagnosticCodeSchema.parse(input.diagnosticCode);
+    const observedHead = projectMemoryHeadRefSchema.parse(input.observedHead);
+    const state = z.enum(["conflict", "error"]).parse(input.state ?? "conflict");
+    const attachmentChanged = this.#database.query(
+      `UPDATE project_memory_hosted_attachments
+       SET state=?,revision=revision+1,diagnostic_code=?,updated_at=MAX(updated_at,?)
+       WHERE project_id=? AND state='attached' AND generation=? AND revision=?`,
+    ).run(
+      state,
+      diagnosticCode,
+      input.now,
+      input.attachment.projectId,
+      input.attachment.generation,
+      input.attachment.revision,
+    );
+    if (attachmentChanged.changes !== 1) {
+      throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_CONFLICT");
+    }
+    const authorityChanged = this.#database.query(
+      `UPDATE project_memory_authorities
+       SET sync_state=?,last_exchange_at=?,last_exchange_sequence=?,
+           last_exchange_operation_sha256=?,last_exchange_head_digest=?,diagnostic_code=?,
+           revision=revision+1,updated_at=MAX(updated_at,?)
+       WHERE project_id=? AND physical_state='initialized' AND revision=?
+         AND head_sequence=? AND head_operation_sha256 IS ? AND head_digest=?`,
+    ).run(
+      state,
+      input.now,
+      observedHead.sequence,
+      observedHead.operationSha256,
+      observedHead.headDigest,
+      diagnosticCode,
+      input.now,
+      input.authority.projectId,
+      input.authority.revision,
+      input.authority.head.sequence,
+      input.authority.head.operationSha256,
+      input.authority.head.headDigest,
+    );
+    if (authorityChanged.changes !== 1) {
+      throw new Error("CANONICAL_MEMORY_SYNC_AUTHORITY_CONFLICT");
+    }
+  }
+
+  prepareCanonicalMemorySync(input: Readonly<{
+    direction: CanonicalMemorySyncDirection;
+    idempotencyKey: string;
+    localHeadToken: string;
+    projectId: ProjectId;
+    requestOperation?: CanonicalMemorySyncOperation;
+  }>): CanonicalMemorySyncPreparation {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const direction = canonicalMemorySyncDirectionSchema.parse(input.direction);
+    const idempotencyKey = z.string().uuid().parse(input.idempotencyKey);
+    const localHeadToken = canonicalMemoryHeadTokenSchema.parse(input.localHeadToken);
+    const requestOperation = input.requestOperation === undefined
+      ? undefined
+      : parseCanonicalMemorySyncSpoolOperation(input.requestOperation);
+    if ((direction === "push") !== (requestOperation !== undefined)) {
+      throw new TypeError("CANONICAL_MEMORY_SYNC_REQUEST_SPOOL_MISMATCH");
+    }
+    let id: string | undefined;
+    let replay = false;
+    let stickyRefusal: string | undefined;
+    const prepare = this.#database.transaction(() => {
+      const existingRow = this.#database.query(
+        "SELECT id FROM project_memory_sync_intents WHERE idempotency_key=?",
+      ).get(idempotencyKey);
+      if (existingRow !== null) {
+        const existing = this.readCanonicalMemorySyncIntent(
+          z.object({ id: canonicalMemorySyncIntentIdSchema }).strict().parse(existingRow).id,
+        );
+        if (
+          existing === null
+          || existing.projectId !== projectId
+          || existing.direction !== direction
+          || existing.localHeadToken !== localHeadToken
+          || !sameCanonicalMemorySyncOperation(existing.requestOperation, requestOperation)
+        ) throw new Error("CANONICAL_MEMORY_SYNC_IDEMPOTENCY_CONFLICT");
+        id = existing.id;
+        replay = true;
+        return;
+      }
+      const attachment = this.readCanonicalMemoryHostedAttachment(projectId);
+      if (attachment === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+      if (attachment.state !== "attached") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_NOT_ACTIVE");
+      }
+      const authority = this.readProjectMemoryAuthority(projectId);
+      if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (authority.physicalState !== "initialized") {
+        throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+      }
+      if (authority.syncState === "conflict" || authority.syncState === "error") {
+        throw new Error("PROJECT_MEMORY_SYNC_FROZEN");
+      }
+      if (this.readUnresolvedCanonicalMemorySyncIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+      }
+      if (this.#database.query(
+        `SELECT 1 FROM memory_submissions
+         WHERE project_id=? AND kind='share'
+           AND state IN ('prepared','effect_started','ambiguous') LIMIT 1`,
+      ).get(projectId) !== null) throw new Error("MEMORY_RECOVERY_REQUIRED");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      if (
+        direction === "pull"
+        && authority.head.sequence === attachment.remote.head.sequence
+        && (
+          !sameProjectMemoryHead(authority.head, attachment.remote.head)
+          || localHeadToken !== attachment.remote.headToken
+        )
+      ) {
+        stickyRefusal = "CANONICAL_MEMORY_SYNC_EQUAL_SEQUENCE_CONFLICT";
+        this.#freezeCanonicalMemoryHostedState({
+          attachment,
+          authority,
+          diagnosticCode: "REMOTE_MEMORY_EQUAL_SEQUENCE_CONFLICT",
+          observedHead: attachment.remote.head,
+          now,
+        });
+        return;
+      }
+      const requestDigest = canonicalMemorySyncRequestDigest({
+        direction,
+        localHead: authority.head,
+        localHeadToken,
+        remote: attachment.remote,
+        remoteSpaceId: attachment.remoteSpaceId,
+        ...(requestOperation === undefined ? {} : { requestOperation }),
+      });
+      if (now >= CANONICAL_MEMORY_SYNC_RETAIN_AGE_MS) {
+        this.#database.query(
+          `DELETE FROM project_memory_sync_intents
+           WHERE project_id=? AND state='settled' AND updated_at<=?`,
+        ).run(projectId, now - CANONICAL_MEMORY_SYNC_RETAIN_AGE_MS);
+      }
+      const retained = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+        this.#database.query(
+          "SELECT COUNT(*) AS count FROM project_memory_sync_intents WHERE project_id=?",
+        ).get(projectId),
+      );
+      if (retained.count >= CANONICAL_MEMORY_SYNC_RETAINED_PROJECT_LIMIT) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RETAINED_QUOTA_EXCEEDED");
+      }
+      id = `cmsync_${randomUUID().replaceAll("-", "")}`;
+      if (requestOperation !== undefined) {
+        this.#insertCanonicalMemorySyncSpoolOperation(id, "request", requestOperation, now);
+      }
+      this.#database.query(
+        `INSERT INTO project_memory_sync_intents(
+           id,idempotency_key,project_id,direction,state,attachment_generation,
+           attachment_revision,authority_revision,canonical_binding_digest,
+           local_head_sequence,local_head_operation_sha256,local_head_digest,
+           local_head_token,remote_genesis_token,remote_revision,remote_key_version,
+           remote_head_sequence,remote_head_operation_sha256,remote_head_digest,
+           remote_head_token,remote_head_proof_digest,request_digest,effect_started_at,
+           response_digest,response_genesis_token,response_revision,response_key_version,
+           response_head_sequence,response_head_operation_sha256,response_head_digest,
+           response_head_token,response_head_proof_digest,response_observed_at,
+           result_head_sequence,result_head_operation_sha256,result_head_digest,
+           settled_at,diagnostic_code,created_at,updated_at
+         ) VALUES (?,?,?,?,'prepared',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,
+           NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?,?)`,
+      ).run(
+        id,
+        idempotencyKey,
+        projectId,
+        direction,
+        attachment.generation,
+        attachment.revision,
+        authority.revision,
+        authority.bindingDigest,
+        authority.head.sequence,
+        authority.head.operationSha256,
+        authority.head.headDigest,
+        localHeadToken,
+        attachment.remote.genesisToken,
+        attachment.remote.revision,
+        attachment.remote.keyVersion,
+        attachment.remote.head.sequence,
+        attachment.remote.head.operationSha256,
+        attachment.remote.head.headDigest,
+        attachment.remote.headToken,
+        attachment.remote.headProofDigest,
+        requestDigest,
+        now,
+        now,
+      );
+    });
+    prepare.immediate();
+    if (stickyRefusal !== undefined) throw new Error(stickyRefusal);
+    if (id === undefined) throw new Error("CANONICAL_MEMORY_SYNC_PREPARATION_FAILED");
+    const record = this.readCanonicalMemorySyncIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+    return { record, replay };
+  }
+
+  markCanonicalMemorySyncEffectStarted(intentId: string): CanonicalMemorySyncIntentRecord {
+    const id = canonicalMemorySyncIntentIdSchema.parse(intentId);
+    const mark = this.#database.transaction(() => {
+      const current = this.readCanonicalMemorySyncIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+      if (current.state !== "prepared") {
+        if (["effect_started", "response_observed", "settled"].includes(current.state)) return;
+        throw new Error("CANONICAL_MEMORY_SYNC_INTENT_FROZEN");
+      }
+      this.#assertCanonicalMemorySyncPinsCurrent(current);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_sync_intents
+         SET state='effect_started',effect_started_at=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='prepared'`,
+      ).run(now, now, id);
+      if (changed.changes !== 1) throw new Error("CANONICAL_MEMORY_SYNC_STATE_CONFLICT");
+    });
+    mark.immediate();
+    const record = this.readCanonicalMemorySyncIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+    return record;
+  }
+
+  recordCanonicalMemorySyncResponse(input: Readonly<{
+    intentId: string;
+    operation?: CanonicalMemorySyncOperation;
+    remote: CanonicalMemoryHostedRemoteObservation;
+  }>): CanonicalMemorySyncIntentRecord {
+    const id = canonicalMemorySyncIntentIdSchema.parse(input.intentId);
+    const remote = parseCanonicalMemoryRemoteObservation(input.remote);
+    const operation = input.operation === undefined
+      ? undefined
+      : parseCanonicalMemorySyncSpoolOperation(input.operation);
+    const observe = this.#database.transaction(() => {
+      const current = this.readCanonicalMemorySyncIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+      const responseDigest = canonicalMemorySyncResponseDigest({
+        direction: current.direction,
+        remote,
+        ...(operation === undefined ? {} : { operation }),
+      });
+      if (current.state === "response_observed" || current.state === "settled") {
+        if (
+          current.responseDigest !== responseDigest
+          || current.responseObservation === undefined
+          || !sameCanonicalMemoryRemoteObservation(current.responseObservation, remote)
+          || !sameCanonicalMemorySyncOperation(current.responseOperation, operation)
+        ) throw new Error("CANONICAL_MEMORY_SYNC_RESPONSE_CONFLICT");
+        return;
+      }
+      if (current.state !== "effect_started") {
+        throw new Error("CANONICAL_MEMORY_SYNC_STATE_CONFLICT");
+      }
+      this.#assertCanonicalMemorySyncPinsCurrent(current);
+      if (current.direction === "push") {
+        if (
+          operation !== undefined
+          || current.requestOperation === undefined
+          || remote.genesisToken !== current.remoteObservation.genesisToken
+          || remote.revision !== current.remoteObservation.revision
+          || remote.keyVersion !== current.remoteObservation.keyVersion
+          || remote.head.sequence !== current.remoteObservation.head.sequence + 1
+          || remote.headToken !== current.requestOperation.headToken
+        ) throw new TypeError("CANONICAL_MEMORY_SYNC_RESPONSE_INVALID");
+      } else if (
+        !sameCanonicalMemoryRemoteObservation(remote, current.remoteObservation)
+        || ((remote.head.sequence === current.localHead.sequence) !== (operation === undefined))
+        || (operation !== undefined && (
+          operation.genesisToken !== remote.genesisToken
+          || operation.priorToken !== current.localHeadToken
+          || operation.sequence !== current.localHead.sequence + 1
+          || operation.sequence > remote.head.sequence
+          || operation.operation.keyVersion !== remote.keyVersion
+          || (operation.sequence === remote.head.sequence
+            && operation.headToken !== remote.headToken)
+        ))
+      ) throw new TypeError("CANONICAL_MEMORY_SYNC_RESPONSE_INVALID");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      if (operation !== undefined) {
+        this.#insertCanonicalMemorySyncSpoolOperation(id, "response", operation, now);
+      }
+      const changed = this.#database.query(
+        `UPDATE project_memory_sync_intents
+         SET state='response_observed',response_digest=?,response_genesis_token=?,
+             response_revision=?,response_key_version=?,response_head_sequence=?,
+             response_head_operation_sha256=?,response_head_digest=?,response_head_token=?,
+             response_head_proof_digest=?,response_observed_at=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='effect_started'`,
+      ).run(
+        responseDigest,
+        remote.genesisToken,
+        remote.revision,
+        remote.keyVersion,
+        remote.head.sequence,
+        remote.head.operationSha256,
+        remote.head.headDigest,
+        remote.headToken,
+        remote.headProofDigest,
+        now,
+        now,
+        id,
+      );
+      if (changed.changes !== 1) throw new Error("CANONICAL_MEMORY_SYNC_STATE_CONFLICT");
+    });
+    observe.immediate();
+    const record = this.readCanonicalMemorySyncIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+    return record;
+  }
+
+  authorizeCanonicalMemoryPullResult(input: Readonly<{
+    intentId: string;
+    resultHead: ProjectMemoryHeadRef;
+  }>): CanonicalMemorySyncIntentRecord {
+    const id = canonicalMemorySyncIntentIdSchema.parse(input.intentId);
+    const resultHead = projectMemoryHeadRefSchema.parse(input.resultHead);
+    const authorize = this.#database.transaction(() => {
+      const current = this.readCanonicalMemorySyncIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+      if (current.resultHead !== undefined) {
+        if (!sameProjectMemoryHead(current.resultHead, resultHead)) {
+          throw new Error("CANONICAL_MEMORY_SYNC_RESULT_AUTHORIZATION_CONFLICT");
+        }
+        return;
+      }
+      if (
+        current.state !== "response_observed"
+        || current.direction !== "pull"
+        || current.responseObservation === undefined
+        || current.responseOperation === undefined
+      ) throw new Error("CANONICAL_MEMORY_SYNC_RESULT_NOT_AUTHORIZABLE");
+      this.#assertCanonicalMemorySyncPinsCurrent(current);
+      if (
+        resultHead.sequence !== current.localHead.sequence + 1
+        || resultHead.sequence !== current.responseOperation.sequence
+        || resultHead.sequence > current.responseObservation.head.sequence
+        || (resultHead.sequence === current.responseObservation.head.sequence
+          && !sameProjectMemoryHead(resultHead, current.responseObservation.head))
+      ) throw new TypeError("CANONICAL_MEMORY_SYNC_RESULT_INVALID");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_sync_intents
+         SET result_head_sequence=?,result_head_operation_sha256=?,result_head_digest=?,
+             updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='response_observed' AND direction='pull'
+           AND result_head_sequence IS NULL AND result_head_operation_sha256 IS NULL
+           AND result_head_digest IS NULL`,
+      ).run(
+        resultHead.sequence,
+        resultHead.operationSha256,
+        resultHead.headDigest,
+        now,
+        id,
+      );
+      if (changed.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RESULT_AUTHORIZATION_CONFLICT");
+      }
+    });
+    authorize.immediate();
+    const record = this.readCanonicalMemorySyncIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+    return record;
+  }
+
+  settleCanonicalMemorySync(input: Readonly<{
+    intentId: string;
+    latestRemote?: CanonicalMemoryHostedRemoteObservation;
+    portableAdoptionProof?: CanonicalMemoryPortableAdoptionProof;
+    resultHead: ProjectMemoryHeadRef;
+  }>): CanonicalMemorySyncIntentRecord {
+    const id = canonicalMemorySyncIntentIdSchema.parse(input.intentId);
+    const resultHead = projectMemoryHeadRefSchema.parse(input.resultHead);
+    const latestRemote = input.latestRemote === undefined
+      ? undefined
+      : parseCanonicalMemoryRemoteObservation(input.latestRemote);
+    const portableAdoptionProof = input.portableAdoptionProof === undefined
+      ? undefined
+      : parseCanonicalMemoryPortableAdoptionProof(input.portableAdoptionProof);
+    const settle = this.#database.transaction(() => {
+      const current = this.readCanonicalMemorySyncIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+      if (current.state === "settled") {
+        if (current.resultHead === undefined || !sameProjectMemoryHead(current.resultHead, resultHead)) {
+          throw new Error("CANONICAL_MEMORY_SYNC_SETTLEMENT_CONFLICT");
+        }
+        if (latestRemote !== undefined) {
+          const attachment = this.readCanonicalMemoryHostedAttachment(current.projectId);
+          if (
+            attachment === null
+            || !sameCanonicalMemoryRemoteObservation(attachment.remote, latestRemote)
+          ) throw new Error("CANONICAL_MEMORY_SYNC_SETTLEMENT_CONFLICT");
+        }
+        if (portableAdoptionProof !== undefined) {
+          const admitted = this.readCanonicalMemoryPortableAdoptionProof({
+            operationSha256: portableAdoptionProof.operationSha256,
+            projectId: current.projectId,
+            sequence: portableAdoptionProof.sequence,
+          });
+          if (
+            admitted === null
+            || admitted.bindingDigest !== portableAdoptionProof.bindingDigest
+            || admitted.canonicalSpaceId !== portableAdoptionProof.canonicalSpaceId
+            || admitted.contentDigest !== portableAdoptionProof.contentDigest
+            || admitted.keyDigest !== portableAdoptionProof.keyDigest
+            || admitted.recordSha256 !== portableAdoptionProof.recordSha256
+            || admitted.sourceReceiptSha256 !== portableAdoptionProof.sourceReceiptSha256
+          ) throw new Error("CANONICAL_MEMORY_PORTABLE_ADOPTION_PROOF_CONFLICT");
+        }
+        return;
+      }
+      if (current.state !== "response_observed" || current.responseObservation === undefined) {
+        throw new Error("CANONICAL_MEMORY_SYNC_STATE_CONFLICT");
+      }
+      this.#assertCanonicalMemorySyncPinsCurrent(current);
+      const response = current.responseObservation;
+      const settlementRemote = latestRemote ?? response;
+      if (
+        settlementRemote.genesisToken !== response.genesisToken
+        || settlementRemote.revision !== response.revision
+        || settlementRemote.keyVersion !== response.keyVersion
+        || settlementRemote.head.sequence < response.head.sequence
+        || (settlementRemote.head.sequence === response.head.sequence
+          && !sameCanonicalMemoryRemoteObservation(settlementRemote, response))
+        || (settlementRemote.head.sequence > response.head.sequence
+          && current.direction !== "push")
+      ) throw new TypeError("CANONICAL_MEMORY_SYNC_SETTLEMENT_REMOTE_INVALID");
+      const exchangeHead = current.direction === "push"
+        ? settlementRemote.head
+        : resultHead;
+      if (
+        (current.direction === "push" && !sameProjectMemoryHead(resultHead, current.localHead))
+        || (current.direction === "pull" && current.responseOperation === undefined
+          && !sameProjectMemoryHead(resultHead, current.localHead))
+        || (current.direction === "pull" && current.responseOperation !== undefined
+          && (current.resultHead === undefined
+            || !sameProjectMemoryHead(resultHead, current.resultHead)))
+        || (resultHead.sequence === current.responseObservation.head.sequence
+          && !sameProjectMemoryHead(resultHead, current.responseObservation.head))
+      ) throw new TypeError("CANONICAL_MEMORY_SYNC_SETTLEMENT_INVALID");
+      if (
+        portableAdoptionProof !== undefined
+        && (
+          current.direction !== "pull"
+          || current.responseOperation === undefined
+          || portableAdoptionProof.bindingDigest !== current.canonicalBindingDigest
+          || portableAdoptionProof.sequence !== resultHead.sequence
+          || portableAdoptionProof.operationSha256 !== resultHead.operationSha256
+        )
+      ) throw new TypeError("CANONICAL_MEMORY_PORTABLE_ADOPTION_PROOF_INVALID");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const intentChanged = this.#database.query(
+        `UPDATE project_memory_sync_intents
+         SET state='settled',result_head_sequence=?,result_head_operation_sha256=?,
+             result_head_digest=?,settled_at=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='response_observed'`,
+      ).run(
+        resultHead.sequence,
+        resultHead.operationSha256,
+        resultHead.headDigest,
+        now,
+        now,
+        id,
+      );
+      if (intentChanged.changes !== 1) throw new Error("CANONICAL_MEMORY_SYNC_STATE_CONFLICT");
+      const attachmentChanged = this.#database.query(
+        `UPDATE project_memory_hosted_attachments
+         SET revision=revision+1,remote_revision=?,remote_key_version=?,
+             remote_head_sequence=?,remote_head_operation_sha256=?,remote_head_digest=?,
+             remote_head_token=?,remote_head_proof_digest=?,updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND state='attached' AND generation=? AND revision=?`,
+      ).run(
+        settlementRemote.revision,
+        settlementRemote.keyVersion,
+        settlementRemote.head.sequence,
+        settlementRemote.head.operationSha256,
+        settlementRemote.head.headDigest,
+        settlementRemote.headToken,
+        settlementRemote.headProofDigest,
+        now,
+        current.projectId,
+        current.attachmentGeneration,
+        current.attachmentRevision,
+      );
+      if (attachmentChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_SYNC_ATTACHMENT_CONFLICT");
+      }
+      const converged = sameProjectMemoryHead(resultHead, settlementRemote.head);
+      const authorityChanged = this.#database.query(
+        `UPDATE project_memory_authorities
+         SET head_sequence=?,head_operation_sha256=?,head_digest=?,revision=revision+1,
+             sync_state=?,last_exchange_at=?,last_exchange_sequence=?,
+             last_exchange_operation_sha256=?,last_exchange_head_digest=?,
+             diagnostic_code=NULL,updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND revision=? AND binding_digest=?
+           AND head_sequence=? AND head_operation_sha256 IS ? AND head_digest=?`,
+      ).run(
+        resultHead.sequence,
+        resultHead.operationSha256,
+        resultHead.headDigest,
+        converged ? "settled" : "local_only",
+        now,
+        exchangeHead.sequence,
+        exchangeHead.operationSha256,
+        exchangeHead.headDigest,
+        now,
+        current.projectId,
+        current.authorityRevision,
+        current.canonicalBindingDigest,
+        current.localHead.sequence,
+        current.localHead.operationSha256,
+        current.localHead.headDigest,
+      );
+      if (authorityChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_SYNC_AUTHORITY_CONFLICT");
+      }
+      if (portableAdoptionProof !== undefined) {
+        this.#insertCanonicalMemoryPortableAdoptionProof({
+          createdAt: now,
+          projectId: current.projectId,
+          proof: portableAdoptionProof,
+        });
+      }
+    });
+    settle.immediate();
+    const record = this.readCanonicalMemorySyncIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+    return record;
+  }
+
+  failCanonicalMemorySync(input: Readonly<{
+    diagnosticCode: string;
+    intentId: string;
+    state: "conflict" | "error";
+  }>): CanonicalMemorySyncIntentRecord {
+    const id = canonicalMemorySyncIntentIdSchema.parse(input.intentId);
+    const state = z.enum(["conflict", "error"]).parse(input.state);
+    const diagnosticCode = memoryDiagnosticCodeSchema.parse(input.diagnosticCode);
+    const fail = this.#database.transaction(() => {
+      const current = this.readCanonicalMemorySyncIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+      if (current.state === "conflict" || current.state === "error") {
+        if (current.state !== state || current.diagnosticCode !== diagnosticCode) {
+          throw new Error("CANONICAL_MEMORY_SYNC_FAILURE_CONFLICT");
+        }
+        return;
+      }
+      if (current.state === "settled") throw new Error("CANONICAL_MEMORY_SYNC_ALREADY_SETTLED");
+      this.#assertCanonicalMemorySyncPinsCurrent(current);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const effectStartedAt = current.effectStartedAt ?? now;
+      const intentChanged = this.#database.query(
+        `UPDATE project_memory_sync_intents
+         SET state=?,effect_started_at=?,settled_at=?,diagnostic_code=?,
+             updated_at=MAX(updated_at,?)
+         WHERE id=? AND state IN ('prepared','effect_started','response_observed')`,
+      ).run(state, effectStartedAt, now, diagnosticCode, now, id);
+      if (intentChanged.changes !== 1) throw new Error("CANONICAL_MEMORY_SYNC_STATE_CONFLICT");
+      const attachmentChanged = this.#database.query(
+        `UPDATE project_memory_hosted_attachments
+         SET state=?,revision=revision+1,diagnostic_code=?,updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND state='attached' AND generation=? AND revision=?`,
+      ).run(
+        state,
+        diagnosticCode,
+        now,
+        current.projectId,
+        current.attachmentGeneration,
+        current.attachmentRevision,
+      );
+      if (attachmentChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_SYNC_ATTACHMENT_CONFLICT");
+      }
+      const authorityChanged = this.#database.query(
+        `UPDATE project_memory_authorities
+         SET sync_state=?,diagnostic_code=?,revision=revision+1,updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND revision=? AND binding_digest=?
+           AND head_sequence=? AND head_operation_sha256 IS ? AND head_digest=?`,
+      ).run(
+        state,
+        diagnosticCode,
+        now,
+        current.projectId,
+        current.authorityRevision,
+        current.canonicalBindingDigest,
+        current.localHead.sequence,
+        current.localHead.operationSha256,
+        current.localHead.headDigest,
+      );
+      if (authorityChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_SYNC_AUTHORITY_CONFLICT");
+      }
+    });
+    fail.immediate();
+    const record = this.readCanonicalMemorySyncIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+    return record;
+  }
+
   prepareMemorySubmission(input: Readonly<{
     actorSessionId: SessionId;
     projectId: ProjectId;
@@ -12867,6 +17211,16 @@ export class StateStore {
     let submissionId: string | undefined;
     let replay = false;
     const prepare = this.#database.transaction(() => {
+      const actor = this.#requirePeerSession(actorSessionId);
+      if (actor.state === "terminal") {
+        throw new Error("MEMORY_SUBMISSION_ACTOR_TERMINAL");
+      }
+      if (actor.state === "recovery_required") {
+        throw new Error("MEMORY_SUBMISSION_ACTOR_RECOVERY_REQUIRED");
+      }
+      if (actor.projectId !== projectId) {
+        throw new Error("MEMORY_SUBMISSION_PROJECT_REFUSED");
+      }
       const existingRow = this.#database.query(
         "SELECT * FROM memory_submissions WHERE idempotency_key=?",
       ).get(idempotencyKey);
@@ -12884,13 +17238,12 @@ export class StateStore {
           || JSON.stringify(existing.expectedHead) !== JSON.stringify(expectedHead)
         ) throw new Error("MEMORY_SUBMISSION_IDEMPOTENCY_CONFLICT");
         if (["prepared", "effect_started", "ambiguous"].includes(existing.state)) {
-          const actor = this.#requirePeerSession(actorSessionId);
-          if (actor.projectId !== projectId) {
-            throw new Error("MEMORY_SUBMISSION_PROJECT_REFUSED");
-          }
           if (kind === "share") {
             const authority = this.readProjectMemoryAuthority(projectId);
             if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+            if (authority.physicalState !== "initialized") {
+              throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+            }
             if (JSON.stringify(authority.head) !== JSON.stringify(expectedHead)) {
               throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
             }
@@ -12900,11 +17253,15 @@ export class StateStore {
         replay = true;
         return;
       }
-      const actor = this.#requirePeerSession(actorSessionId);
-      if (actor.projectId !== projectId) throw new Error("MEMORY_SUBMISSION_PROJECT_REFUSED");
       if (kind === "share") {
+        if (this.isCanonicalMemoryMutationFenced(projectId)) {
+          throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+        }
         const authority = this.readProjectMemoryAuthority(projectId);
         if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+        if (authority.physicalState !== "initialized") {
+          throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+        }
         if (JSON.stringify(authority.head) !== JSON.stringify(expectedHead)) {
           throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
         }
@@ -13338,6 +17695,58 @@ export class StateStore {
     );
   }
 
+  #insertCanonicalMemoryPortableAdoptionProof(input: Readonly<{
+    createdAt: number;
+    projectId: ProjectId;
+    proof: CanonicalMemoryPortableAdoptionProof;
+  }>): void {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const createdAt = unixMillisecondsSchema.parse(input.createdAt);
+    const proof = parseCanonicalMemoryPortableAdoptionProof(input.proof);
+    const authority = this.readProjectMemoryAuthority(projectId);
+    if (
+      authority === null
+      || authority.identityContract !== 2
+      || authority.physicalState !== "initialized"
+      || authority.canonicalSpaceId !== proof.canonicalSpaceId
+      || authority.bindingDigest !== proof.bindingDigest
+      || authority.head.sequence !== proof.sequence
+      || authority.head.operationSha256 !== proof.operationSha256
+    ) throw new Error("CANONICAL_MEMORY_PORTABLE_ADOPTION_PROOF_AUTHORITY_INVALID");
+    this.#database.query(
+      `INSERT OR IGNORE INTO project_memory_portable_adoption_proofs(
+         project_id,canonical_space_id,canonical_binding_digest,sequence,
+         operation_sha256,record_sha256,key_digest,content_digest,
+         source_receipt_sha256,created_at
+       ) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      projectId,
+      proof.canonicalSpaceId,
+      proof.bindingDigest,
+      proof.sequence,
+      proof.operationSha256,
+      proof.recordSha256,
+      proof.keyDigest,
+      proof.contentDigest,
+      proof.sourceReceiptSha256,
+      createdAt,
+    );
+    const admitted = this.readCanonicalMemoryPortableAdoptionProof({
+      operationSha256: proof.operationSha256,
+      projectId,
+      sequence: proof.sequence,
+    });
+    if (
+      admitted === null
+      || admitted.bindingDigest !== proof.bindingDigest
+      || admitted.canonicalSpaceId !== proof.canonicalSpaceId
+      || admitted.contentDigest !== proof.contentDigest
+      || admitted.keyDigest !== proof.keyDigest
+      || admitted.recordSha256 !== proof.recordSha256
+      || admitted.sourceReceiptSha256 !== proof.sourceReceiptSha256
+    ) throw new Error("CANONICAL_MEMORY_PORTABLE_ADOPTION_PROOF_CONFLICT");
+  }
+
   #deleteOrphanedMemoryPageAttestations(projectId?: ProjectId): void {
     this.#database.query(
       `DELETE FROM memory_page_attestations
@@ -13412,6 +17821,12 @@ export class StateStore {
         || current.operationId === undefined
       ) throw new Error("MEMORY_SUBMISSION_EFFECT_UNBOUND");
       const actor = this.#requirePeerSession(current.actorSessionId);
+      if (actor.state === "terminal") {
+        throw new Error("MEMORY_SUBMISSION_ACTOR_TERMINAL");
+      }
+      if (actor.state === "recovery_required") {
+        throw new Error("MEMORY_SUBMISSION_ACTOR_RECOVERY_REQUIRED");
+      }
       if (actor.projectId !== current.projectId) {
         throw new Error("MEMORY_SUBMISSION_PROJECT_REFUSED");
       }
@@ -13660,6 +18075,27 @@ export class StateStore {
             now,
             projectId: current.projectId,
           });
+          if (outcomeCode === "share_adopted" && authority.identityContract === 2) {
+            if (
+              resultHead === undefined
+              || resultHead.operationSha256 === null
+              || receiptDigest === undefined
+            ) throw new Error("MEMORY_SUBMISSION_RESULT_MISMATCH");
+            this.#insertCanonicalMemoryPortableAdoptionProof({
+              createdAt: now,
+              projectId: current.projectId,
+              proof: {
+                bindingDigest: authority.bindingDigest,
+                canonicalSpaceId: authority.canonicalSpaceId,
+                contentDigest: source.contentDigest,
+                keyDigest: current.keyDigest,
+                operationSha256: resultHead.operationSha256,
+                recordSha256: current.effectRecordSha256,
+                sequence: resultHead.sequence,
+                sourceReceiptSha256: receiptDigest,
+              },
+            });
+          }
         }
         this.#deleteOrphanedMemoryPageAttestations();
       }
@@ -13675,6 +18111,28 @@ export class StateStore {
     ).get(parsedSessionId);
     if (row === null) throw new PeerSessionRefusalError("PEER_SESSION_NOT_FOUND");
     return mapPeerSessionPolicy(row);
+  }
+
+  listPeerSessionPolicies(limitValue = 200): readonly PeerSessionPolicyRecord[] {
+    const limit = z.number().int().min(1).max(200).parse(limitValue);
+    return this.#database.query(
+      `SELECT session_id,mode,revision,created_at,updated_at
+       FROM session_peer_policies ORDER BY updated_at DESC,session_id LIMIT ?`,
+    ).all(limit).map(mapPeerSessionPolicy);
+  }
+
+  countPeerSessionPolicies(): number {
+    const row = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+      this.#database.query("SELECT COUNT(*) AS count FROM session_peer_policies").get(),
+    );
+    return row.count;
+  }
+
+  listRecentPeerSessionActions(limitValue = 50): readonly PeerSessionActionRecord[] {
+    const limit = z.number().int().min(1).max(50).parse(limitValue);
+    return this.#database.query(
+      `SELECT * FROM peer_session_actions ORDER BY updated_at DESC,id LIMIT ?`,
+    ).all(limit).map((row) => this.#mapPeerSessionAction(row));
   }
 
   setPeerSessionPolicy(input: Readonly<{
@@ -13760,12 +18218,6 @@ export class StateStore {
       targetPolicy.mode !== "coordinate"
       || targetPolicy.revision !== action.targetPolicyRevision
     ) throw new PeerSessionRefusalError("PEER_SESSION_POLICY_REVISION_CONFLICT");
-    if (phase === "queued_begin") {
-      if (target.state !== "idle") {
-        throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
-      }
-      return;
-    }
     const actor = this.#requirePeerSession(action.actorSessionId);
     const actorPolicy = this.requirePeerSessionPolicy(action.actorSessionId);
     if (actor.projectId !== action.projectId) {
@@ -13775,6 +18227,12 @@ export class StateStore {
       actorPolicy.mode !== "coordinate"
       || actorPolicy.revision !== action.actorPolicyRevision
     ) throw new PeerSessionRefusalError("PEER_SESSION_POLICY_REVISION_CONFLICT");
+    if (phase === "queued_begin") {
+      if (target.state !== "idle") {
+        throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+      }
+      return;
+    }
     if (
       actor.state !== "active"
       || actor.activeTurnId === undefined
@@ -14110,17 +18568,31 @@ export class StateStore {
     ) throw new Error("PEER_SESSION_CAUSAL_AUTHORITY_INVALID");
     if (parentActionIds.length > 0) {
       const parentRows = this.#database.query(
-        `SELECT id,hop FROM peer_session_actions
+        `SELECT id,hop,project_id FROM peer_session_actions
          WHERE id IN (${parentActionIds.map(() => "?").join(",")}) ORDER BY id`,
       ).all(...parentActionIds).map((entry) => z.object({
         id: peerActionIdSchema,
         hop: z.number().int().min(1).max(PEER_SESSION_HOP_LIMIT),
+        project_id: projectIdSchema,
       }).strict().parse(entry));
       if (
         parentRows.length !== parentActionIds.length
+        || parentRows.some((parent) => parent.project_id !== row.project_id)
         || row.hop !== Math.max(...parentRows.map((parent) => parent.hop)) + 1
       ) throw new Error("PEER_SESSION_CAUSAL_AUTHORITY_INVALID");
     }
+    const rootRows = this.#database.query(
+      `SELECT id,hop,project_id FROM peer_session_actions
+       WHERE id IN (${rootActionIds.map(() => "?").join(",")}) ORDER BY id`,
+    ).all(...rootActionIds).map((entry) => z.object({
+      id: peerActionIdSchema,
+      hop: z.literal(1),
+      project_id: projectIdSchema,
+    }).strict().parse(entry));
+    if (
+      rootRows.length !== rootActionIds.length
+      || rootRows.some((root) => root.project_id !== row.project_id)
+    ) throw new Error("PEER_SESSION_CAUSAL_AUTHORITY_INVALID");
     return {
       id: row.id,
       idempotencyKey: row.idempotency_key,
@@ -14584,10 +19056,12 @@ export class StateStore {
       const parentRows = this.#database.query(
         `SELECT action.id,action.hop FROM peer_session_turn_origins origin
          JOIN peer_session_actions action ON action.id=origin.action_id
-         WHERE origin.session_id=? AND origin.turn_digest=? ORDER BY action.id LIMIT ?`,
+         WHERE origin.session_id=? AND origin.turn_digest=? AND action.project_id=?
+         ORDER BY action.id LIMIT ?`,
       ).all(
         actorSessionId,
         actorTurnDigest,
+        actor.projectId,
         PEER_SESSION_PARENT_FAN_IN_LIMIT + 1,
       ).map((row) => z.object({
         id: peerActionIdSchema,
@@ -15180,6 +19654,71 @@ export class StateStore {
     return changed !== null;
   }
 
+  /**
+   * Retire a queued peer message whose durable admission authority has been
+   * permanently revoked before any provider effect evidence was recorded.
+   *
+   * A peer queue is intentionally allowed to outlive the actor turn that
+   * admitted it, but not a policy revision, a project move, or a terminal
+   * target. Keeping such an entry pending would make it the permanent
+   * head-of-line item for the target session and would retain inbound quota
+   * forever. The queue transition trigger settles the linked peer action in
+   * the same transaction.
+   */
+  cancelRevokedPendingPeerQueue(queueId: QueueId): QueueRecord | null {
+    completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
+    const id = queueIdSchema.parse(queueId);
+    const cancel = this.#database.transaction((): boolean => {
+      const queue = this.requireQueue(id);
+      if (
+        queue.state !== "pending"
+        || queue.messageActor !== "peer_session"
+        || queue.peerActionId === undefined
+      ) return false;
+      const action = this.requirePeerSessionAction(queue.peerActionId);
+      if (
+        action.delivery !== "queue"
+        || action.targetSessionId !== queue.sessionId
+        || action.state !== "queued"
+      ) throw new Error("QUEUE_PEER_ACTION_AUTHORITY_CHANGED");
+      const actor = this.#requirePeerSession(action.actorSessionId);
+      const target = this.#requirePeerSession(action.targetSessionId);
+      const actorPolicy = this.requirePeerSessionPolicy(action.actorSessionId);
+      const targetPolicy = this.requirePeerSessionPolicy(action.targetSessionId);
+      const permanentlyRevoked = actor.projectId !== action.projectId
+        || target.projectId !== action.projectId
+        || actorPolicy.mode !== "coordinate"
+        || actorPolicy.revision !== action.actorPolicyRevision
+        || targetPolicy.mode !== "coordinate"
+        || targetPolicy.revision !== action.targetPolicyRevision
+        || target.state === "terminal";
+      if (!permanentlyRevoked) return false;
+      const changed = z.object({ id: queueIdSchema }).strict().nullable().parse(
+        this.#database.query(
+        `UPDATE queue_entries
+         SET state='cancelled',updated_at=?
+         WHERE id=? AND state='pending' AND peer_action_id=?
+           AND NOT EXISTS(
+             SELECT 1 FROM queue_effect_evidence evidence
+             WHERE evidence.queue_id=?
+           )
+         RETURNING id`,
+        ).get(this.#now(), id, action.id, id),
+      );
+      if (changed === null) {
+        throw new Error("QUEUE_PEER_CANCELLATION_CONFLICT");
+      }
+      if (this.requirePeerSessionAction(action.id).state !== "cancelled") {
+        throw new Error("QUEUE_PEER_CANCELLATION_CONFLICT");
+      }
+      return true;
+    });
+    const cancelled = cancel.immediate();
+    if (!cancelled) return null;
+    completePendingSecurityScrub(this.#database, true, this.#securityScrubCheckpoint);
+    return this.requireQueue(id);
+  }
+
   beginQueueEffect(input: {
     queueId: QueueId;
     sessionId: SessionId;
@@ -15324,11 +19863,12 @@ export class StateStore {
       for (const row of rows) {
         const parsed = z.object({ id: queueIdSchema, session_id: sessionIdSchema }).strict().parse(row);
         const record = this.readQueueEffect(parsed.id);
-        const binding = z.object({ provider_thread_id: providerThreadIdSchema.nullable(), process_generation: z.number().int().nonnegative() }).strict().parse(
-          this.#database.query(`SELECT s.provider_thread_id,p.process_generation FROM sessions s JOIN profiles p ON p.id=s.profile_id WHERE s.id=?`).get(parsed.session_id),
+        const binding = z.object({ profile_id: profileIdSchema, provider_thread_id: providerThreadIdSchema.nullable(), process_generation: z.number().int().nonnegative() }).strict().parse(
+          this.#database.query(`SELECT s.profile_id,s.provider_thread_id,p.process_generation FROM sessions s JOIN profiles p ON p.id=s.profile_id WHERE s.id=?`).get(parsed.session_id),
         );
         const authorityValid = record !== null
           && record.evidence.sessionId === parsed.session_id
+          && binding.profile_id === record.evidence.runtimeProfile.profileId
           && binding.provider_thread_id === record.evidence.providerThreadId
           && binding.process_generation === record.evidence.profileGeneration;
         const now = this.#now();
@@ -15397,6 +19937,7 @@ export class StateStore {
         row.evidence_digest !== evidenceDigest
         || digestJson(evidence) !== evidenceDigest
         || JSON.stringify(evidence.runtimeProfile) !== JSON.stringify(profile)
+        || evidence.runtimeProfile.profileId !== row.profile_id
         || row.profile_id !== accountId
         || row.process_generation !== providerGeneration
         || row.message !== message
@@ -15581,14 +20122,17 @@ export class StateStore {
                               WHERE q.id=? AND r.queue_id IS NULL`).get(queueId),
       );
       const evidence = queueEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      const session = mapSession(
+        this.#database.query("SELECT * FROM sessions WHERE id=?").get(row.session_id),
+      );
       if (
         row.evidence_digest !== expectedDigest
         || digestJson(evidence) !== expectedDigest
+        || session.profileId !== evidence.runtimeProfile.profileId
         || createHash("sha256").update(row.message, "utf8").digest("hex")
           !== evidence.messageDigest
       ) throw new Error("QUEUE_RECOVERY_EVIDENCE_MISMATCH");
       sessionId = row.session_id;
-      const session = mapSession(this.#database.query("SELECT * FROM sessions WHERE id=?").get(row.session_id));
       if (session.providerThreadId !== input.provider.providerThreadId || evidence.providerThreadId !== input.provider.providerThreadId) {
         throw new Error("QUEUE_RECOVERY_THREAD_MISMATCH");
       }
@@ -19843,7 +24387,7 @@ export class StateStore {
 
   readSessionMessageEventSource(
     sessionId: SessionId,
-    sourceId: AttemptId | QueueId,
+    sourceId: string,
   ): SessionMessageEventSourceRecord | null {
     const parsedSessionId = sessionIdSchema.parse(sessionId);
     const parsedSourceId = z.union([attemptIdSchema, queueIdSchema]).parse(sourceId);
@@ -19986,7 +24530,7 @@ export class StateStore {
   }
 
   #appendUserMessageEventSourceInTransaction(input: Readonly<{
-    sourceId: AttemptId | QueueId;
+    sourceId: string;
     sourceKind: "mutation" | "queue";
     sessionId: SessionId;
     accountId: ProfileId;

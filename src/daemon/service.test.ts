@@ -34,6 +34,7 @@ import {
   type NotificationEmailHostedAuthority,
 } from "../domain/contracts";
 import { HRA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES } from "../domain/host-tools";
+import { PROJECT_MEMORY_EMPTY_HEAD } from "../domain/project-memory";
 import {
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
   encodeProtectedInteractionDetailDocument,
@@ -771,6 +772,7 @@ class FakeMemory implements HraMemoryPort {
   readonly shares: Array<Parameters<HraMemoryPort["share"]>[0]> = [];
   readonly forgottenSessions: string[] = [];
   queryError: Error | undefined;
+  beforeRememberReturn: (() => Promise<void>) | undefined;
   closeCalls = 0;
   recoverCalls = 0;
 
@@ -781,6 +783,7 @@ class FakeMemory implements HraMemoryPort {
 
   async remember(input: Parameters<HraMemoryPort["remember"]>[0]) {
     this.remembers.push(input);
+    await this.beforeRememberReturn?.();
     return { version: 1, ok: true, kind: "remember" };
   }
 
@@ -870,6 +873,7 @@ async function fixture(
   now: () => number = Date.now,
   factsMemory?: HraFactsMemoryLifecyclePort,
   autorespond: Readonly<{
+    beforeMemoryClose?: () => Promise<void>;
     claude?: ClaudeRuntimePort;
     devin?: DevinRuntimePort;
     gatewayKeys?: GatewayKeyPort;
@@ -894,7 +898,7 @@ async function fixture(
   const daemonAuthority = new FakeDaemonAuthority();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
   const selectedClaude = claude ?? autorespond.claude;
-  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(selectedClaude === undefined ? {} : { claude: selectedClaude }), ...(autorespond.devin === undefined ? {} : { devin: autorespond.devin }), ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), ...(memory === undefined ? {} : { memory }), ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }), ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }), now, platform, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
+  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(selectedClaude === undefined ? {} : { claude: selectedClaude }), ...(autorespond.devin === undefined ? {} : { devin: autorespond.devin }), ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), ...(memory === undefined ? {} : { memory }), ...(autorespond.beforeMemoryClose === undefined ? {} : { beforeMemoryClose: autorespond.beforeMemoryClose }), ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }), ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }), now, platform, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
 }
 
 async function claudeAccountFixture(
@@ -1545,6 +1549,82 @@ describe("HraService", () => {
     }, { signal })).rejects.toMatchObject({ code: "NOT_FOUND" });
   });
 
+  test("cancels a revoked peer queue and dispatches the next human item", async () => {
+    const value = await fixture();
+    const { sessionId: targetSessionId } = await createIdleSession(
+      value,
+      "Revoked peer queue target",
+    );
+    const target = value.store.requireSession(targetSessionId);
+    if (target.projectId === undefined || target.providerThreadId === undefined) {
+      throw new Error("Expected a project-bound target session.");
+    }
+    const actorBase = value.store.createSession({
+      profileId: target.profileId,
+      projectId: target.projectId,
+      title: "Revoked peer queue actor",
+      provider: "codex",
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actorIdle = value.store.bindSession({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      providerThreadId: "provider-revoked-peer-actor",
+      state: "idle",
+    });
+    const actor = value.store.setSessionTurnState({
+      sessionId: actorIdle.id,
+      expectedRevision: actorIdle.revision,
+      state: "active",
+      activeTurnId: "turn-revoked-peer-actor",
+    });
+    const peerMessage = "This revoked peer message must never reach the provider.";
+    const admitted = value.store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "queue",
+      requestDigest: createHash("sha256").update("revoked peer request").digest("hex"),
+      messageDigest: createHash("sha256").update(peerMessage).digest("hex"),
+      reasonDigest: createHash("sha256").update("revoked peer reason").digest("hex"),
+      idempotencyKey: crypto.randomUUID(),
+      message: peerMessage,
+    });
+    const actorPolicy = value.store.requirePeerSessionPolicy(actor.id);
+    value.store.setPeerSessionPolicy({
+      sessionId: actor.id,
+      expectedRevision: actorPolicy.revision,
+      mode: "off",
+    });
+    value.codex.readProjection = {
+      providerThreadId: target.providerThreadId,
+      title: target.title,
+      status: "idle",
+      providerUpdatedAt: target.providerUpdatedAt ?? 10,
+    };
+    value.codex.turnStatus = "completed";
+    const writesBefore = providerMutationCalls(value.codex).length;
+    const humanMessage = "This human queue item must advance after revocation.";
+
+    const human = await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.queue",
+      message: humanMessage,
+      session: target.id,
+    }, { signal }) as { queued: { id: `queue_${string}` } };
+    await value.service.settled();
+
+    expect(value.store.requireQueue(admitted.queue!.id).state).toBe("cancelled");
+    expect(value.store.requirePeerSessionAction(admitted.action.id).state).toBe("cancelled");
+    expect(value.store.readQueueEffect(admitted.queue!.id)).toBeNull();
+    expect(value.store.requireQueue(human.queued.id).state).toBe("applied");
+    expect(providerMutationCalls(value.codex)).toHaveLength(writesBefore + 1);
+    expect(value.codex.calls.filter((call) => call === "review-turn")).toHaveLength(1);
+    expect(value.codex.readProjection.messages?.at(-1)?.text).toBe(humanMessage);
+  });
+
   test("cancels a crash-left direct peer admission with no nested mutation on restart", async () => {
     const value = await fixture();
     const { sessionId } = await createIdleSession(value, "Peer restart actor");
@@ -1618,6 +1698,482 @@ describe("HraService", () => {
       replay: true,
     });
     await restarted.close();
+  });
+
+  for (const peerEffectStarted of [false, true]) {
+    test(`cancels a crash-left ${peerEffectStarted ? "effect-started" : "prepared"} peer action with a prepared nested mutation on restart`, async () => {
+      const value = await fixture();
+      const { sessionId } = await createIdleSession(
+        value,
+        `Prepared peer restart ${peerEffectStarted ? "started" : "admitted"}`,
+      );
+      const idleActor = value.store.requireSession(sessionId);
+      const actorProjectId = idleActor.projectId;
+      if (actorProjectId === undefined) throw new Error("Expected a project-bound actor.");
+      const actor = value.store.setSessionTurnState({
+        sessionId: idleActor.id,
+        expectedRevision: idleActor.revision,
+        state: "active",
+        activeTurnId: `turn-peer-prepared-restart-${peerEffectStarted ? "started" : "admitted"}`,
+      });
+      const targetBase = value.store.createSession({
+        profileId: actor.profileId,
+        projectId: actorProjectId,
+        title: "Prepared peer restart target",
+        provider: "codex",
+        preset: "high",
+        fastEnabled: false,
+      });
+      const target = value.store.bindSession({
+        sessionId: targetBase.id,
+        expectedRevision: targetBase.revision,
+        providerThreadId: `provider-peer-prepared-restart-${peerEffectStarted ? "started" : "admitted"}`,
+        state: "idle",
+      });
+      const profile = value.store.requireProfileById(target.profileId);
+      const idempotencyKey = crypto.randomUUID();
+      const message = "prepared peer restart message";
+      const request = {
+        actorSessionId: actor.id,
+        actorTurnId: actor.activeTurnId!,
+        targetSessionId: target.id,
+        expectedTargetRevision: target.revision,
+        delivery: "send" as const,
+        requestDigest: createHash("sha256").update("prepared peer restart request").digest("hex"),
+        messageDigest: createHash("sha256").update(message).digest("hex"),
+        reasonDigest: createHash("sha256").update("prepared peer restart reason").digest("hex"),
+        idempotencyKey,
+      };
+      const admitted = value.store.admitPeerSessionAction(request);
+      value.store.prepareMutation({
+        kind: "session.send",
+        authorityId: target.id,
+        authorityGeneration: profile.processGeneration,
+        request: { message },
+        idempotencyKey,
+      });
+      if (peerEffectStarted) value.store.beginPeerSessionActionEffect(admitted.action.id);
+      expect(value.store.requirePeerSessionAction(admitted.action.id).state)
+        .toBe(peerEffectStarted ? "effect_started" : "prepared");
+      expect(value.store.readMutation(idempotencyKey)?.state).toBe("prepared");
+
+      await value.service.close();
+      const restartedCodex = new FakeCodex();
+      const restarted = new HraService({
+        store: value.store,
+        paths: value.paths,
+        codex: restartedCodex,
+        cloud: new FakeCloud(),
+        daemonAuthority: new FakeDaemonAuthority(),
+        eventCursors: value.eventCursors,
+        requestStop: () => undefined,
+      });
+      await restarted.recover();
+
+      expect(value.store.requirePeerSessionAction(admitted.action.id).state).toBe("cancelled");
+      expect(value.store.readMutation(idempotencyKey)).toMatchObject({
+        state: "cancelled",
+        result: {
+          code: "PEER_SESSION_PROVIDER_EFFECT_NOT_STARTED",
+          peerActionId: admitted.action.id,
+          providerEffectStarted: false,
+        },
+      });
+      expect(providerMutationCalls(restartedCodex)).toEqual([]);
+      await restarted.close();
+    });
+  }
+
+  test("resumes an exact live peer replay with a prepared nested mutation", async () => {
+    const value = await fixture();
+    const { sessionId: actorSessionId } = await createIdleSession(value, "Prepared live peer replay");
+    const idleActor = value.store.requireSession(actorSessionId);
+    if (idleActor.projectId === undefined || idleActor.providerThreadId === undefined) {
+      throw new Error("Expected a project-bound actor session.");
+    }
+    const targetBase = value.store.createSession({
+      profileId: idleActor.profileId,
+      projectId: idleActor.projectId,
+      title: "Prepared live peer replay target",
+      provider: "codex",
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = value.store.bindSession({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      providerThreadId: "provider-peer-prepared-live-replay",
+      state: "idle",
+      providerUpdatedAt: 11,
+    });
+    await value.service.execute({
+      kind: "session.send",
+      session: actorSessionId,
+      message: "Start the peer replay actor.",
+    }, { signal });
+    const actor = value.store.requireSession(actorSessionId);
+    const profile = value.store.requireProfileById(actor.profileId);
+    if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
+      throw new Error("Expected an active bound actor turn.");
+    }
+    value.codex.readProjection = {
+      providerThreadId: target.providerThreadId!,
+      title: target.title,
+      status: "idle",
+      providerUpdatedAt: 11,
+    };
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    const call = {
+      authority: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+      },
+      callId: "peer-prepared-live-replay",
+      connectionId: value.codex.observationConnectionId,
+      input: {
+        sessionId: target.id,
+        expectedRevision: target.revision,
+        delivery: "send" as const,
+        message: "Resume only this exact prepared message.",
+        reason: "Prove live replay remains resumable",
+      },
+      requestDigest: createHash("sha256").update("peer-prepared-live-replay").digest("hex"),
+      requestId: { type: "string" as const, value: "peer-prepared-live-replay" },
+      threadId: actor.providerThreadId,
+      tool: "session_message" as const,
+      turnId: actor.activeTurnId,
+    } satisfies HraHostToolCall;
+    const originalBegin = value.store.beginSessionMutationEffect.bind(value.store);
+    let injected = false;
+    (value.store as unknown as {
+      beginSessionMutationEffect: StateStore["beginSessionMutationEffect"];
+    }).beginSessionMutationEffect = (input) => {
+      if (!injected && input.sessionId === target.id) {
+        injected = true;
+        const action = value.store.listUnsettledPeerSessionActions(10)[0];
+        if (action === undefined) throw new Error("Expected a prepared peer action.");
+        value.store.beginPeerSessionActionEffect(action.id);
+        throw new Error("injected before nested mutation begin");
+      }
+      return originalBegin(input);
+    };
+    const providerWritesBefore = providerMutationCalls(value.codex);
+
+    await expect(value.service.handleHraHostToolCall(authority, call))
+      .rejects.toThrow("injected before nested mutation begin");
+    const unsettled = value.store.listUnsettledPeerSessionActions(10);
+    expect(unsettled).toHaveLength(1);
+    expect(unsettled[0]).toMatchObject({ state: "ambiguous", targetSessionId: target.id });
+    expect(value.store.readMutation(unsettled[0]!.idempotencyKey)?.state).toBe("prepared");
+    expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
+
+    (value.store as unknown as {
+      beginSessionMutationEffect: StateStore["beginSessionMutationEffect"];
+    }).beginSessionMutationEffect = originalBegin;
+    const replayed = await value.service.handleHraHostToolCall(authority, call);
+    expect(replayed).toMatchObject({
+      ok: true,
+      replay: true,
+      action: { state: "applied", targetSessionId: target.id },
+    });
+    expect(providerMutationCalls(value.codex)).toHaveLength(providerWritesBefore.length + 1);
+  });
+
+  test("fences established and peer Claude and Devin targets with universally unavailable profiles", async () => {
+    for (const provider of ["claude", "devin"] as const) {
+      for (const profileState of ["recovery_required", "removed"] as const) {
+        const value = provider === "claude"
+          ? await claudeAccountFixture(true)
+          : await devinAccountFixture(true);
+        const fence = profileState === "removed" ? "removed" : "recovery-fenced";
+        const { sessionId: actorSessionId } = await createIdleSession(
+          value,
+          `${provider} ${fence} peer actor`,
+        );
+        const idleActor = value.store.requireSession(actorSessionId);
+        if (idleActor.projectId === undefined) throw new Error("Expected a project-bound actor.");
+        const targetProfile = value.store.createProfile(`${provider} ${fence} target`);
+        const targetBase = value.store.createSession({
+          profileId: targetProfile.id,
+          projectId: idleActor.projectId,
+          title: `${provider} ${fence} target`,
+          provider,
+          preset: provider === "claude" ? "fable-max" : "astra",
+          fastEnabled: false,
+        });
+        const target = value.store.bindSession({
+          sessionId: targetBase.id,
+          expectedRevision: targetBase.revision,
+          providerThreadId: `provider-${provider}-${fence}-target`,
+          state: "idle",
+        });
+        expect(value.store.setProfileState(
+          targetProfile.id,
+          targetProfile.processGeneration,
+          profileState,
+        )).toBe(true);
+
+        const establishedCode = profileState === "removed" ? "NOT_FOUND" : "RECOVERY_REQUIRED";
+        await expect(value.service.execute({
+          kind: "session.send",
+          session: target.id,
+          message: `Do not dispatch while the profile is ${profileState}.`,
+        }, { signal })).rejects.toMatchObject({ code: establishedCode });
+        await expect(value.service.execute({
+          kind: "session.queue",
+          session: target.id,
+          message: `Do not enqueue while the profile is ${profileState}.`,
+        }, { signal })).rejects.toMatchObject({ code: establishedCode });
+        expect(value.store.listQueue(target.id)).toEqual([]);
+        expect(value.providerSessionCalls).toEqual([]);
+
+        await value.service.execute({
+          kind: "session.send",
+          session: actorSessionId,
+          message: "Start the peer actor.",
+        }, { signal });
+        const actor = value.store.requireSession(actorSessionId);
+        const actorProfile = value.store.requireProfileById(actor.profileId);
+        if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
+          throw new Error("Expected an active bound peer actor.");
+        }
+        const authority: ProfileAuthority = {
+          id: actorProfile.id,
+          generation: actorProfile.processGeneration,
+          codexHome: "unused",
+          desktopUserData: "unused",
+        };
+        const base = {
+          authority: {
+            profileId: actorProfile.id,
+            processGeneration: actorProfile.processGeneration,
+          },
+          connectionId: value.codex.observationConnectionId,
+          requestId: { type: "string" as const, value: `${provider}-${fence}-peer` },
+          threadId: actor.providerThreadId,
+          tool: "session_message" as const,
+          turnId: actor.activeTurnId,
+        } as const;
+        for (const delivery of ["send", "queue"] as const) {
+          const result = await value.service.handleHraHostToolCall(authority, {
+            ...base,
+            callId: `${provider}-${fence}-peer-${delivery}`,
+            input: {
+              sessionId: target.id,
+              expectedRevision: target.revision,
+              delivery,
+              message: `Do not ${delivery} into a ${fence} target.`,
+              reason: `Target profile is ${profileState}`,
+            },
+            requestDigest: createHash("sha256")
+              .update(`${provider}-${fence}-peer-${delivery}`).digest("hex"),
+          } satisfies HraHostToolCall);
+          expect(result).toEqual({
+            version: 1,
+            ok: false,
+            code: profileState === "removed" ? "CONFLICT" : "RECOVERY_REQUIRED",
+          });
+        }
+        expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
+        expect(value.store.listQueue(target.id)).toEqual([]);
+        expect(value.providerSessionCalls).toEqual([]);
+      }
+    }
+  });
+
+  test("revalidates peer actor account authority after its mutation locks are acquired", async () => {
+    const cloud = new FakeCloud();
+    const value = await fixture(undefined, cloud);
+    const { sessionId: actorSessionId } = await createIdleSession(
+      value,
+      "Peer actor authority race",
+    );
+    const idleActor = value.store.requireSession(actorSessionId);
+    if (idleActor.projectId === undefined) throw new Error("Expected a project-bound actor.");
+    const targetBase = value.store.createSession({
+      profileId: idleActor.profileId,
+      projectId: idleActor.projectId,
+      title: "Peer actor authority race target",
+      provider: "codex",
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = value.store.bindSession({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      providerThreadId: "provider-peer-actor-authority-race-target",
+      state: "idle",
+    });
+    await value.service.execute({
+      kind: "session.send",
+      session: actorSessionId,
+      message: "Start the peer actor authority race.",
+    }, { signal });
+    const actor = value.store.requireSession(actorSessionId);
+    const profile = value.store.requireProfileById(actor.profileId);
+    if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
+      throw new Error("Expected an active bound actor turn.");
+    }
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    const call = {
+      authority: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+      },
+      callId: "peer-actor-authority-race",
+      connectionId: value.codex.observationConnectionId,
+      input: {
+        sessionId: target.id,
+        expectedRevision: target.revision,
+        delivery: "send" as const,
+        message: "This stale actor must not dispatch.",
+        reason: "Prove post-lock actor revalidation",
+      },
+      requestDigest: createHash("sha256").update("peer-actor-authority-race").digest("hex"),
+      requestId: { type: "string" as const, value: "peer-actor-authority-race" },
+      threadId: actor.providerThreadId,
+      tool: "session_message" as const,
+      turnId: actor.activeTurnId,
+    } satisfies HraHostToolCall;
+    const originalAdmission = value.store.admitPeerSessionAction.bind(value.store);
+    let admissionCalls = 0;
+    (value.store as unknown as {
+      admitPeerSessionAction: StateStore["admitPeerSessionAction"];
+    }).admitPeerSessionAction = (input) => {
+      admissionCalls += 1;
+      return originalAdmission(input);
+    };
+    let authorityInvalidated = false;
+    cloud.beforeProjectionUnsettledSessionReturn = async (sessionPublicId) => {
+      if (authorityInvalidated || sessionPublicId !== actor.id) return;
+      authorityInvalidated = true;
+      expect(value.store.setProfileState(
+        profile.id,
+        profile.processGeneration,
+        "signed_out",
+      )).toBe(true);
+    };
+    const providerWritesBefore = providerMutationCalls(value.codex);
+
+    await expect(value.service.handleHraHostToolCall(authority, call))
+      .rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
+    expect(authorityInvalidated).toBe(true);
+    expect(admissionCalls).toBe(0);
+    expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
+    expect(value.store.listQueue(target.id)).toEqual([]);
+    expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
+  });
+
+  test("refuses a peer target that moved to an account whose lock was not acquired", async () => {
+    const cloud = new FakeCloud();
+    const value = await fixture(undefined, cloud);
+    const { sessionId: actorSessionId } = await createIdleSession(
+      value,
+      "Peer target lock freshness actor",
+    );
+    const idleActor = value.store.requireSession(actorSessionId);
+    if (idleActor.projectId === undefined) throw new Error("Expected a project-bound actor.");
+    const targetBase = value.store.createSession({
+      profileId: idleActor.profileId,
+      projectId: idleActor.projectId,
+      title: "Peer target lock freshness target",
+      provider: "codex",
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = value.store.bindSession({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      providerThreadId: "provider-peer-target-lock-freshness",
+      state: "idle",
+    });
+    const movedProfile = value.store.createProfile("Peer target moved account");
+    expect(value.store.setProfileState(
+      movedProfile.id,
+      movedProfile.processGeneration,
+      "signed_in",
+    )).toBe(true);
+    await value.service.execute({
+      kind: "session.send",
+      session: actorSessionId,
+      message: "Start the peer target lock freshness actor.",
+    }, { signal });
+    const actor = value.store.requireSession(actorSessionId);
+    const actorProfile = value.store.requireProfileById(actor.profileId);
+    if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
+      throw new Error("Expected an active bound actor turn.");
+    }
+    const authority: ProfileAuthority = {
+      id: actorProfile.id,
+      generation: actorProfile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    const call = {
+      authority: {
+        profileId: actorProfile.id,
+        processGeneration: actorProfile.processGeneration,
+      },
+      callId: "peer-target-lock-freshness",
+      connectionId: value.codex.observationConnectionId,
+      input: {
+        sessionId: target.id,
+        // A caller can predict the next session revision. That must not let a
+        // post-switch target pass while only its former account lock is held.
+        expectedRevision: target.revision + 1,
+        delivery: "send" as const,
+        message: "This target moved beyond the acquired account lock.",
+        reason: "Prove target account lock freshness",
+      },
+      requestDigest: createHash("sha256").update("peer-target-lock-freshness").digest("hex"),
+      requestId: { type: "string" as const, value: "peer-target-lock-freshness" },
+      threadId: actor.providerThreadId,
+      tool: "session_message" as const,
+      turnId: actor.activeTurnId,
+    } satisfies HraHostToolCall;
+    const originalRequireSession = value.store.requireSession.bind(value.store);
+    let targetMoved = false;
+    (value.store as unknown as {
+      requireSession: StateStore["requireSession"];
+    }).requireSession = (sessionId) => {
+      const current = originalRequireSession(sessionId);
+      return targetMoved && sessionId === target.id
+        ? { ...current, profileId: movedProfile.id, revision: target.revision + 1 }
+        : current;
+    };
+    const originalAdmission = value.store.admitPeerSessionAction.bind(value.store);
+    let admissionCalls = 0;
+    (value.store as unknown as {
+      admitPeerSessionAction: StateStore["admitPeerSessionAction"];
+    }).admitPeerSessionAction = (input) => {
+      admissionCalls += 1;
+      return originalAdmission(input);
+    };
+    cloud.beforeProjectionUnsettledSessionReturn = async (sessionPublicId) => {
+      if (sessionPublicId === target.id) targetMoved = true;
+    };
+    const providerWritesBefore = providerMutationCalls(value.codex);
+
+    await expect(value.service.handleHraHostToolCall(authority, call)).resolves.toEqual({
+      version: 1,
+      ok: false,
+      code: "PEER_SESSION_REVISION_CONFLICT",
+    });
+    expect(targetMoved).toBe(true);
+    expect(admissionCalls).toBe(0);
+    expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
+    expect(value.store.listQueue(target.id)).toEqual([]);
+    expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
   });
 
   test("lists, inspects, and messages a same-project peer through exact host authority", async () => {
@@ -1992,6 +2548,54 @@ describe("HraService", () => {
     await value.service.close();
     await value.service.close();
     expect(memory.closeCalls).toBe(1);
+  });
+
+  test("quiesces external memory observers before closing the memory coordinator", async () => {
+    const memory = new FakeMemory();
+    let releaseQuiescence!: () => void;
+    let markQuiescenceStarted!: () => void;
+    const quiescenceStarted = new Promise<void>((resolve) => { markQuiescenceStarted = resolve; });
+    const quiescence = new Promise<void>((resolve) => { releaseQuiescence = resolve; });
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      Date.now,
+      undefined,
+      {
+        beforeMemoryClose: async () => {
+          markQuiescenceStarted();
+          await quiescence;
+        },
+      },
+      memory,
+    );
+
+    const closing = value.service.close();
+    await quiescenceStarted;
+    expect(memory.closeCalls).toBe(0);
+    releaseQuiescence();
+    await closing;
+    expect(memory.closeCalls).toBe(1);
+  });
+
+  test("does not close memory when external observer quiescence fails", async () => {
+    const memory = new FakeMemory();
+    const quiescenceFailure = new Error("external memory observer remained live");
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      Date.now,
+      undefined,
+      {
+        beforeMemoryClose: async () => { throw quiescenceFailure; },
+      },
+      memory,
+    );
+
+    await expect(value.service.close()).rejects.toBe(quiescenceFailure);
+    expect(memory.closeCalls).toBe(0);
   });
 
   test("routes the owner memory CLI through the coordinator with exact session and replay authority", async () => {
@@ -4561,7 +5165,7 @@ describe("HraService", () => {
       expectedHead: {
         sequence: 0,
         operationSha256: null,
-        headDigest: "5".repeat(64),
+        headDigest: PROJECT_MEMORY_EMPTY_HEAD.headDigest,
       },
       idempotencyKey: crypto.randomUUID(),
     }).record;
@@ -4583,6 +5187,89 @@ describe("HraService", () => {
       sessionId,
     });
     expect(memory.forgottenSessions).toContain(sessionId);
+  });
+
+  test("terminalizes provider deletion immediately but orders purge after admitted memory", async () => {
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    const memory = new FakeMemory();
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      Date.now,
+      factsMemory,
+      {},
+      memory,
+    );
+    const { sessionId } = await createIdleSession(value, "Provider deletion memory race");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const authority: ProfileAuthority = {
+      codexHome: "unused",
+      desktopUserData: "unused",
+      generation: profile.processGeneration,
+      id: profile.id,
+    };
+    let entered!: () => void;
+    const memoryEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const memoryGate = new Promise<void>((resolve) => { release = resolve; });
+    memory.beforeRememberReturn = async () => {
+      entered();
+      await memoryGate;
+    };
+    const first = value.service.execute({
+      idempotencyKey: "00000000-0000-4000-8000-000000000611",
+      kind: "memory.remember",
+      session: sessionId,
+      value: {
+        body: "The admitted operation settles before provider deletion purges its authority.",
+        key: "authority.deletion-order",
+        summary: "Deletion waits for admitted memory",
+        title: "Provider deletion ordering",
+      },
+    }, { signal });
+    await memoryEntered;
+
+    // The provider callback persists terminal authority while memory is blocked,
+    // but it may not purge the directory underneath that admitted operation.
+    await value.service.observeCodexFact(authority, {
+      ...parseFact("thread/deleted", { threadId: session.providerThreadId }),
+      connectionId: "32000000-0000-4000-8000-000000000611",
+    });
+    expect(value.store.requireSession(sessionId).state).toBe("terminal");
+    expect(factsMemory.cleanups).toEqual([]);
+
+    const queued = value.service.execute({
+      kind: "memory.query",
+      session: sessionId,
+      value: { mode: "list" },
+    }, { signal });
+    const queuedOutcome = queued.then(
+      () => ({ error: null }),
+      (error: unknown) => ({ error }),
+    );
+    release();
+    await expect(first).resolves.toMatchObject({ ok: true });
+    await expect(queuedOutcome).resolves.toMatchObject({
+      error: {
+        code: "CONFLICT",
+        details: { reason: "MEMORY_SESSION_REFUSED" },
+      },
+    });
+    await value.service.settled();
+
+    expect(value.store.requireSession(sessionId).state).toBe("terminal");
+    expect(factsMemory.cleanups).toEqual([{
+      ownerId: profile.id,
+      reason: "archive",
+      sessionId,
+    }]);
+    expect(factsMemory.states.get(sessionId)).toBe("purged");
+    expect(memory.remembers).toHaveLength(1);
+    expect(memory.queries).toEqual([]);
+    await value.service.close();
   });
 
   test("retains terminal facts memory while a post-effect submission needs recovery", async () => {
@@ -4613,7 +5300,7 @@ describe("HraService", () => {
       expectedHead: {
         sequence: 0,
         operationSha256: null,
-        headDigest: "a".repeat(64),
+        headDigest: PROJECT_MEMORY_EMPTY_HEAD.headDigest,
       },
       idempotencyKey,
     }).record;
@@ -4685,7 +5372,7 @@ describe("HraService", () => {
       expectedHead: {
         sequence: 0,
         operationSha256: null,
-        headDigest: "2".repeat(64),
+        headDigest: PROJECT_MEMORY_EMPTY_HEAD.headDigest,
       },
       idempotencyKey,
     }).record;
@@ -4747,7 +5434,7 @@ describe("HraService", () => {
       expectedHead: {
         sequence: 0,
         operationSha256: null,
-        headDigest: "9".repeat(64),
+        headDigest: PROJECT_MEMORY_EMPTY_HEAD.headDigest,
       },
       idempotencyKey: crypto.randomUUID(),
     }).record;
@@ -4767,6 +5454,101 @@ describe("HraService", () => {
       session: sessionId,
     }, { signal })).resolves.toMatchObject({ session: { projectId: alternate.project.id } });
     expect(memory.forgottenSessions).toEqual([sessionId]);
+  });
+
+  test("moves provider, peer, and memory project authority only between turns", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Project turn boundary");
+    const original = value.store.requireSession(sessionId);
+    const alternateDirectory = join(value.documents, "project-turn-boundary-alternate");
+    await mkdir(alternateDirectory);
+    const alternate = await value.service.execute({
+      kind: "project.add",
+      label: "Project turn boundary alternate",
+      path: alternateDirectory,
+    }, { signal }) as { project: { id: string } };
+    await value.service.execute({
+      kind: "session.send",
+      message: "Keep this provider turn on its admitted project.",
+      session: sessionId,
+    }, { signal });
+    const active = value.store.requireSession(sessionId);
+    expect(active).toMatchObject({ projectId: original.projectId, state: "active" });
+
+    await expect(value.service.execute({
+      kind: "session.project",
+      project: alternate.project.id,
+      session: sessionId,
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      details: { sessionId, state: "active" },
+    });
+    expect(value.store.requireSession(sessionId)).toEqual(active);
+
+    await value.service.execute({ kind: "session.stop", session: sessionId }, { signal });
+    await expect(value.service.execute({
+      kind: "session.project",
+      project: alternate.project.id,
+      session: sessionId,
+    }, { signal })).resolves.toMatchObject({
+      session: { projectId: alternate.project.id, state: "idle" },
+    });
+  });
+
+  test("never moves Claude or Devin project authority away from the provider working directory", async () => {
+    const value = await fixture();
+    const original = await value.store.createProject(
+      "Provider-bound original",
+      value.documents,
+    );
+    const alternateDirectory = join(value.documents, "provider-bound-alternate");
+    await mkdir(alternateDirectory);
+    const alternate = await value.store.createProject(
+      "Provider-bound alternate",
+      alternateDirectory,
+    );
+    const profile = value.store.createProfile("Provider-bound account");
+
+    for (const provider of ["claude", "devin"] as const) {
+      const created = value.store.createSession({
+        fastEnabled: false,
+        preset: provider === "claude" ? "fable-max" : "astra",
+        profileId: profile.id,
+        projectId: original.id,
+        provider,
+      });
+      const session = value.store.bindSession({
+        expectedRevision: created.revision,
+        providerThreadId: `${provider}-provider-bound-thread`,
+        sessionId: created.id,
+        state: "idle",
+      });
+
+      await expect(value.service.execute({
+        kind: "session.project",
+        project: alternate.id,
+        session: session.id,
+      }, { signal })).rejects.toMatchObject({
+        code: "CONFLICT",
+        details: {
+          provider,
+          reason: "provider_project_rebind_unsupported",
+          sessionId: session.id,
+        },
+      });
+      expect(value.store.requireSession(session.id)).toMatchObject({
+        projectId: original.id,
+        revision: session.revision,
+      });
+
+      await expect(value.service.execute({
+        kind: "session.project",
+        project: original.id,
+        session: session.id,
+      }, { signal })).resolves.toMatchObject({
+        session: { projectId: original.id, revision: session.revision + 1 },
+      });
+    }
   });
 
   test("cleans list-driven terminalization and reconciles a crash-left terminal on restart", async () => {
@@ -5681,7 +6463,7 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
       ).all()).toEqual([
@@ -5701,6 +6483,7 @@ describe("HraService", () => {
         { version: 38 },
         { version: 39 },
         { version: 40 },
+        { version: 41 },
       ]);
     } finally {
       inspector.close(false);

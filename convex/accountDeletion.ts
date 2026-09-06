@@ -17,6 +17,7 @@ import {
   releaseCodexAccountQuotaForDelete,
   releaseCommandQuotaForDelete,
   releaseDeviceQuotaForDelete,
+  releaseMemorySpaceQuotaForDelete,
   releaseParentAttributedQuotaForDelete,
   releaseQuotaForDelete,
   releaseQuotaForStoredIdentity,
@@ -46,6 +47,7 @@ export const accountDeletionReceiptRetentionMs = 30 * 24 * 60 * 60 * 1_000;
 const deletionCategoryOrder = [
   "commands_and_leases",
   "chunks_and_epochs",
+  "memory_history",
   "session_heads",
   "usage_and_bindings",
   "codex_accounts",
@@ -104,6 +106,8 @@ export const ACCOUNT_DELETION_TABLE_STRATEGY = {
   recoveryEnvelopes: "user_index",
   devicePresence: "user_index",
   deviceRegistries: "user_index",
+  memorySpaces: "user_index",
+  memoryOperations: "user_index_immutable_erasure",
   sessionHeads: "user_index",
   sessionChunks: "user_index_immutable_erasure",
   sessionStreamEpochs: "user_index_immutable_erasure",
@@ -308,6 +312,36 @@ async function deleteChunksAndEpochs(
   }
   remaining -= epochs.length;
   return { deleted: limit - remaining, empty: chunks.length === 0 && epochs.length === 0 };
+}
+
+async function deleteMemoryHistory(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+  limit: number,
+): Promise<DeleteResult> {
+  // Immutable canonical history has no ordinary erasure path. Whole-account
+  // deletion removes operation children before their owning space rows.
+  const operations = await ctx.db.query("memoryOperations")
+    .withIndex("by_user", (builder) => builder.eq("userId", userId))
+    .take(limit);
+  for (const operation of operations) {
+    await releaseQuotaForDelete(ctx, userId, "memory", operation);
+    await ctx.db.delete(operation._id);
+  }
+  let remaining = limit - operations.length;
+  if (remaining === 0) return { deleted: limit, empty: false };
+  const spaces = await ctx.db.query("memorySpaces")
+    .withIndex("by_user_and_updated_at", (builder) => builder.eq("userId", userId))
+    .take(remaining);
+  for (const space of spaces) {
+    await releaseMemorySpaceQuotaForDelete(ctx, userId, space);
+    await ctx.db.delete(space._id);
+  }
+  remaining -= spaces.length;
+  return {
+    deleted: limit - remaining,
+    empty: operations.length === 0 && spaces.length === 0,
+  };
 }
 
 async function deleteSessionHeads(
@@ -677,6 +711,8 @@ async function deleteCategory(
       return await deleteCommandsAndLeases(ctx, input.userId, input.limit);
     case "chunks_and_epochs":
       return await deleteChunksAndEpochs(ctx, input.userId, input.limit);
+    case "memory_history":
+      return await deleteMemoryHistory(ctx, input.userId, input.limit);
     case "session_heads":
       return await deleteSessionHeads(ctx, input.userId, input.limit);
     case "usage_and_bindings":

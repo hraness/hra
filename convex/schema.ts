@@ -202,6 +202,9 @@ export default defineSchema({
     devicePublicId: v.string(),
     envelope: encryptedEnvelope,
     keyVersion: v.number(),
+    memorySummaryEnvelope: v.optional(encryptedEnvelope),
+    memorySummaryRevision: v.optional(v.number()),
+    memorySummaryUpdatedAt: v.optional(v.number()),
     notificationEmailEnvelope: v.optional(encryptedEnvelope),
     notificationHoursEnvelope: v.optional(encryptedEnvelope),
     notificationPolicyRevision: v.optional(v.number()),
@@ -211,6 +214,40 @@ export default defineSchema({
   })
     .index("by_device", ["deviceId"])
     .index("by_user_and_device_public_id", ["userId", "devicePublicId"])
+    .index("by_user", ["userId"]),
+  memorySpaces: defineTable({
+    bindingPolicy: v.literal("one_project_one_space"),
+    createdAt: v.number(),
+    encryptedDescriptor: encryptedEnvelope,
+    genesisToken: v.string(),
+    genesisHeadProof: encryptedEnvelope,
+    identityContract: v.literal(2),
+    keyVersion: v.number(),
+    publicId: v.string(),
+    revision: v.number(),
+    updatedAt: v.number(),
+    userId: v.id("users"),
+    wrappedSpaceKey: encryptedEnvelope,
+  })
+    .index("by_user_and_public_id", ["userId", "publicId"])
+    .index("by_user_and_updated_at", ["userId", "updatedAt"]),
+  memoryOperations: defineTable({
+    adoptionProof: v.union(v.null(), encryptedEnvelope),
+    baseRevision: v.number(),
+    createdAt: v.number(),
+    genesisToken: v.string(),
+    headToken: v.string(),
+    keyVersion: v.number(),
+    memorySpaceId: v.id("memorySpaces"),
+    operation: encryptedEnvelope,
+    priorToken: v.string(),
+    sequence: v.number(),
+    sourceDeviceId: v.id("devices"),
+    terminalHeadProof: encryptedEnvelope,
+    userId: v.id("users"),
+  })
+    .index("by_space_and_sequence", ["memorySpaceId", "sequence"])
+    .index("by_space_and_head_token", ["memorySpaceId", "headToken"])
     .index("by_user", ["userId"]),
   sessionHeads: defineTable({
     compactHasRecoveryGap: v.optional(v.boolean()),

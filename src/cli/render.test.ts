@@ -3059,6 +3059,8 @@ describe("CLI rendering", () => {
         projectId: `proj_${"2".repeat(32)}`,
         canonical: {
           initialized: true,
+          physicalState: "initialized",
+          identityContract: 2,
           authorityDigest: "c".repeat(64),
           bindingDigest: "d".repeat(64),
           expectedHead: { digest, operationSha256: operation, sequence: 4 },
@@ -3083,6 +3085,8 @@ describe("CLI rendering", () => {
     );
     const statusText = status.stdout.join("");
     expect(statusText).toContain("Canonical: error (frozen)");
+    expect(statusText).toContain("Canonical physical state: initialized");
+    expect(statusText).toContain("Canonical identity contract: 2");
     expect(statusText).toContain("Canonical expected head: sequence 4");
     expect(statusText).toContain("Working: active, epoch 2");
     expect(statusText).toContain("Unsettled submission: none");
@@ -3113,7 +3117,9 @@ describe("CLI rendering", () => {
           chunkCount: 1,
         }],
         continuation: null,
-        canonicalHead: { digest, operationSha256: null, sequence: 0 },
+        scope: "working",
+        canonical: { included: false, frozen: true },
+        canonicalHead: null,
         workingHead: { digest: "f".repeat(64), operationSha256: operation, sequence: 3 },
       },
       false,
@@ -3121,6 +3127,8 @@ describe("CLI rendering", () => {
     );
     const queryText = query.stdout.join("");
     expect(queryText).toContain("Body chunk 1 of 1:");
+    expect(queryText).toContain("Scope: working only");
+    expect(queryText).toContain("Canonical: excluded (frozen)");
     expect(queryText).toContain("  first line\n  second line\\u{001b}[31m");
     expect(queryText).not.toContain("\u001b[31m");
 
@@ -3148,5 +3156,26 @@ describe("CLI rendering", () => {
     }, false, mutation.output);
     expect(mutation.stdout.join("")).toContain("Remember: applied (replay)");
     expect(mutation.stdout.join("")).toContain(mutationCommand.idempotencyKey);
+  });
+
+  test("renders explicit hosted memory ownership without exposing cryptographic material", () => {
+    const command = {
+      idempotencyKey: "00000000-0000-4000-8000-000000000704",
+      kind: "memory.hosted.create" as const,
+      project: "jungle",
+    };
+    const target = capture();
+    renderSuccess(command, {
+      attachment: { generation: 1 },
+      canonicalSpaceId: `pmem_${"B".repeat(32)}`,
+      hostedSpaceId: `memory_${"A".repeat(32)}`,
+      projectId: `proj_${"1".repeat(32)}`,
+      replay: false,
+    }, false, target.output);
+    const rendered = target.stdout.join("");
+    expect(rendered).toContain(`Hosted memory created: memory_${"A".repeat(32)}`);
+    expect(rendered).toContain("Attachment generation: 1");
+    expect(rendered).not.toContain("wrappedSpaceKey");
+    expect(rendered).not.toContain("ciphertext");
   });
 });

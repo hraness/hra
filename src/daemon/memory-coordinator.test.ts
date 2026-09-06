@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { Database } from "bun:sqlite";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,15 +8,29 @@ import {
   canonicalSha256,
   createKnowledgeGraphRecordV1,
 } from "@hraness/oh";
-import { createOhSqliteStoreAuthorityV1 } from "@hraness/oh/sqlite";
-import { OH_CANONICAL_STORE_PROFILE_V1 } from "@hraness/oh/store";
+import {
+  OhSqliteStore,
+  applyOhSqliteMigrations,
+  createOhSqliteStoreAuthorityV1,
+} from "@hraness/oh/sqlite";
+import { OH_CANONICAL_STORE_PROFILE_V1, type OhHeadV1 } from "@hraness/oh/store";
 
 import type {
   HraMemoryRememberInput,
 } from "../domain/host-tools";
+import {
+  createPortableProjectMemoryCanonicalIdentity,
+  deriveProjectMemoryCanonicalIdentity,
+  HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
+  legacyProjectMemorySpaceId,
+  PROJECT_MEMORY_EMPTY_HEAD,
+} from "../domain/project-memory";
 import { FactsMemoryControlStore } from "../storage/facts-memory-control";
 import { LocalFactsMemoryBroker } from "../storage/local-facts-memory-broker";
-import { OhSqliteFactsMemoryEngine } from "../storage/oh-facts-memory-engine";
+import {
+  digestOhHead,
+  OhSqliteFactsMemoryEngine,
+} from "../storage/oh-facts-memory-engine";
 import {
   initializeStatePaths,
   resolveStatePaths,
@@ -30,6 +45,7 @@ import {
   HraMemoryRefusalError,
   HraOhMemoryCoordinator,
 } from "./memory-coordinator";
+import type { HraCanonicalMemorySyncPort } from "./canonical-memory-sync";
 
 type Clock = {
   monotonic: number;
@@ -123,9 +139,15 @@ class GateFirstEnsure implements HraFactsMemoryLifecyclePort {
   #enter!: () => void;
   #release!: () => void;
   readonly #released: Promise<void>;
+  #remaining: number;
   #waiting = true;
 
-  constructor(readonly delegate: HraFactsMemoryLifecyclePort) {
+  constructor(
+    readonly delegate: HraFactsMemoryLifecyclePort,
+    blockOnCall = 1,
+    readonly afterEnsure = false,
+  ) {
+    this.#remaining = blockOnCall;
     this.entered = new Promise((resolve) => { this.#enter = resolve; });
     this.#released = new Promise((resolve) => { this.#release = resolve; });
   }
@@ -143,10 +165,19 @@ class GateFirstEnsure implements HraFactsMemoryLifecyclePort {
   async ensureSession(
     input: Parameters<HraFactsMemoryLifecyclePort["ensureSession"]>[0],
   ) {
+    if (this.#remaining > 1) {
+      this.#remaining -= 1;
+      return await this.delegate.ensureSession(input);
+    }
     if (this.#waiting) {
       this.#waiting = false;
+      this.#remaining = 0;
+      const receipt = this.afterEnsure
+        ? await this.delegate.ensureSession(input)
+        : undefined;
       this.#enter();
       await this.#released;
+      if (receipt !== undefined) return receipt;
     }
     return await this.delegate.ensureSession(input);
   }
@@ -232,6 +263,7 @@ const makeRuntime = (
   wrapLifecycle?: (
     lifecycle: HraFactsMemoryLifecycle,
   ) => HraFactsMemoryLifecyclePort,
+  sync?: HraCanonicalMemorySyncPort,
 ): Runtime => {
   const now = () => clock.wall++;
   const store = new StateStore(paths, { now });
@@ -255,6 +287,7 @@ const makeRuntime = (
     now,
     paths,
     store,
+    ...(sync === undefined ? {} : { sync }),
   });
   const runtime = { control, coordinator, engine, lifecycle, store };
   runtimes.push(runtime);
@@ -284,7 +317,9 @@ const failNextAdoptedShareSettlement = (
   });
 };
 
-const createFixture = async () => {
+const createFixture = async (wrapLifecycle?: (
+  lifecycle: HraFactsMemoryLifecycle,
+) => HraFactsMemoryLifecyclePort, sync?: HraCanonicalMemorySyncPort) => {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-memory-coordinator-")));
   roots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
@@ -293,7 +328,7 @@ const createFixture = async () => {
     monotonic: 25_000,
     wall: Date.parse("2026-09-04T12:00:00.000Z"),
   };
-  const runtime = makeRuntime(paths, clock);
+  const runtime = makeRuntime(paths, clock, wrapLifecycle, sync);
   const profile = runtime.store.createProfile("Memory owner");
   const generation = runtime.store.nextProfileGeneration(profile.id);
   expect(runtime.store.setProfileState(
@@ -357,6 +392,47 @@ const expectRefusal = async (
 };
 
 describe("HRA Oh memory coordinator integration", () => {
+  test("keeps terminal sessions metadata-only instead of resurrecting working memory", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Terminal memory refusal");
+    value.runtime.store.setSessionTurnState({
+      sessionId: actor.id,
+      expectedRevision: actor.revision,
+      state: "terminal",
+    });
+
+    await expect(value.runtime.coordinator.status({ actorSessionId: actor.id }))
+      .resolves.toMatchObject({
+        canonical: { initialized: false },
+        projectId: value.firstProject.id,
+        sessionId: actor.id,
+        working: { state: "missing" },
+      });
+    await expectRefusal(value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(200, "terminal-remember-refusal"),
+      value: page({ key: "terminal/refused" }),
+    }), "MEMORY_SESSION_REFUSED");
+    await expectRefusal(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    }), "MEMORY_SESSION_REFUSED");
+    await expectRefusal(value.runtime.coordinator.explain({
+      actorSessionId: actor.id,
+      value: { queryId: `memq_${"1".repeat(32)}`, row: 0 },
+    }), "MEMORY_SESSION_REFUSED");
+    await expectRefusal(value.runtime.coordinator.share({
+      actorSessionId: actor.id,
+      ...operationInput(201, "terminal-share-refusal"),
+      value: { key: "terminal/refused", reason: "must remain retired" },
+    }), "MEMORY_SESSION_REFUSED");
+
+    expect(value.runtime.lifecycle.readSession(actor.id)).toBeNull();
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toBeNull();
+    expect(value.runtime.store.readUnsettledMemorySubmissionForProject(value.firstProject.id))
+      .toBeNull();
+  });
+
   test("remembers, queries, explains, shares by project, and never overwrites a conflict", async () => {
     const value = await createFixture();
     const author = value.session(value.firstProject, "Author");
@@ -482,6 +558,789 @@ describe("HRA Oh memory coordinator integration", () => {
         lane: "canonical",
         recordSha256: shared.share.recordSha256,
       })],
+    });
+  });
+
+  test("durably refuses an oversized canonical share before changing its head", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Bounded canonical share");
+    const memory = page({
+      body: "x".repeat(HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES + 1),
+      key: "architecture/oversized-canonical-share",
+      summary: "This working page cannot fit one hosted canonical operation.",
+      title: "Oversized canonical share",
+    });
+    await expect(value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(5, "remember-oversized-share"),
+      value: memory,
+    })).resolves.toMatchObject({ ok: true });
+    await expect(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    })).resolves.toMatchObject({ ok: true });
+    const before = await value.runtime.coordinator.status({ actorSessionId: actor.id });
+    const shareInput = {
+      actorSessionId: actor.id,
+      ...operationInput(6, "share-oversized-share"),
+      value: { key: memory.key, reason: "Exercise the hosted operation ceiling." },
+    } as const;
+
+    await expect(value.runtime.coordinator.share(shareInput)).resolves.toMatchObject({
+      code: "MEMORY_SHARE_TOO_LARGE",
+      ok: false,
+      replay: false,
+      submission: { kind: "share", state: "failed" },
+    });
+    await expect(value.runtime.coordinator.share(shareInput)).resolves.toMatchObject({
+      code: "MEMORY_SHARE_TOO_LARGE",
+      ok: false,
+      replay: true,
+      submission: { kind: "share", state: "failed" },
+    });
+    await expect(value.runtime.coordinator.status({ actorSessionId: actor.id }))
+      .resolves.toMatchObject({
+        canonical: {
+          expectedHead: (before as { canonical: { expectedHead: unknown } })
+            .canonical.expectedHead,
+        },
+      });
+  });
+
+  test("recognizes an exact portable canonical proof without source-device attestations", async () => {
+    const value = await createFixture();
+    const author = value.session(value.firstProject, "Portable proof author");
+    const receiver = value.session(value.firstProject, "Portable proof receiver");
+    const memory = page({ key: "architecture/portable-proof" });
+    await value.runtime.coordinator.remember({
+      actorSessionId: author.id,
+      ...operationInput(108, "remember-portable-proof"),
+      value: memory,
+    });
+    const shared = await value.runtime.coordinator.share({
+      actorSessionId: author.id,
+      ...operationInput(109, "share-portable-proof"),
+      value: { key: memory.key, reason: "Portable cross-device provenance" },
+    }) as { share: { recordSha256: string } };
+    const authority = value.runtime.store.readProjectMemoryAuthority(value.firstProject.id);
+    if (authority === null || authority.head.operationSha256 === null) {
+      throw new Error("Expected a nonempty canonical authority.");
+    }
+    expect(value.runtime.store.readCanonicalMemoryPortableAdoptionProof({
+      operationSha256: authority.head.operationSha256,
+      projectId: value.firstProject.id,
+      sequence: authority.head.sequence,
+    })).toMatchObject({ recordSha256: shared.share.recordSha256 });
+
+    // Model the receiving device: portable proof remains, while the source
+    // device's session-bound attestation rows do not cross the sync boundary.
+    const writer = new Database(value.paths.database, { create: false, strict: true });
+    try {
+      writer.exec("PRAGMA foreign_keys=ON");
+      writer.query("DELETE FROM memory_page_attestation_refs WHERE project_id=?")
+        .run(value.firstProject.id);
+      writer.query("DELETE FROM memory_page_attestations WHERE project_id=?")
+        .run(value.firstProject.id);
+    } finally {
+      writer.close(false);
+    }
+
+    await expect(value.runtime.coordinator.query({
+      actorSessionId: receiver.id,
+      value: { key: memory.key, mode: "get" },
+    })).resolves.toMatchObject({
+      rows: [expect.objectContaining({
+        key: memory.key,
+        lane: "canonical",
+        provenance: expect.objectContaining({ verification: "local-ledger-verified" }),
+        recordSha256: shared.share.recordSha256,
+      })],
+    });
+  });
+
+  test("fences canonical shares during hosted sync without blocking working memory", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Hosted sync fence");
+    const memory = page({ key: "architecture/hosted-sync-fence" });
+    await expect(value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(101, "remember-before-hosted-sync"),
+      value: memory,
+    })).resolves.toMatchObject({ ok: true });
+    await expect(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    })).resolves.toMatchObject({ ok: true });
+
+    const authority = value.runtime.store.readProjectMemoryAuthority(value.firstProject.id);
+    if (authority === null) throw new Error("Expected initialized canonical memory authority.");
+    expect(authority).toMatchObject({
+      head: PROJECT_MEMORY_EMPTY_HEAD,
+      identityContract: 2,
+      physicalState: "initialized",
+    });
+    const genesisToken = canonicalSha256({
+      projectId: value.firstProject.id,
+      purpose: "hosted-sync-fence-genesis",
+      v: 1,
+    });
+    value.runtime.store.attachCanonicalMemoryHostedSpace({
+      accountBindingDigest: canonicalSha256({ account: "memory-owner@example.com", v: 1 }),
+      canonicalSpaceId: authority.canonicalSpaceId,
+      projectId: value.firstProject.id,
+      remote: {
+        genesisToken,
+        head: PROJECT_MEMORY_EMPTY_HEAD,
+        headProofDigest: canonicalSha256({ genesisToken, purpose: "remote-head-proof", v: 1 }),
+        headToken: genesisToken,
+        keyVersion: 1,
+        revision: 1,
+      },
+      remoteSpaceId: `memory_${"f".repeat(32)}`,
+    });
+    value.runtime.store.prepareCanonicalMemorySync({
+      direction: "pull",
+      ...operationInput(102, "prepare-hosted-pull"),
+      localHeadToken: genesisToken,
+      projectId: value.firstProject.id,
+    });
+    expect(value.runtime.store.isCanonicalMemoryMutationFenced(value.firstProject.id)).toBe(true);
+
+    const shareOperation = operationInput(103, "share-during-hosted-sync");
+    await expectRefusal(value.runtime.coordinator.share({
+      actorSessionId: actor.id,
+      ...shareOperation,
+      value: { key: memory.key, reason: "Must wait for the hosted exchange to settle." },
+    }), "MEMORY_RECOVERY_REQUIRED");
+    expect(value.runtime.store.readMemorySubmissionByIdempotencyKey(
+      shareOperation.idempotencyKey,
+    )).toBeNull();
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toMatchObject({
+      head: PROJECT_MEMORY_EMPTY_HEAD,
+      syncState: "local_only",
+    });
+
+    await expect(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { key: memory.key, mode: "get" },
+    })).resolves.toMatchObject({
+      ok: true,
+      rows: [expect.objectContaining({ key: memory.key, lane: "working" })],
+    });
+    await expect(value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(104, "remember-during-hosted-sync"),
+      value: page({ key: "architecture/working-during-hosted-sync" }),
+    })).resolves.toMatchObject({ ok: true });
+    await expect(value.runtime.coordinator.status({ actorSessionId: actor.id }))
+      .resolves.toMatchObject({
+        canonical: {
+          expectedHead: {
+            digest: PROJECT_MEMORY_EMPTY_HEAD.headDigest,
+            operationSha256: null,
+            sequence: 0,
+          },
+        },
+      });
+  });
+
+  test("rechecks the hosted-sync fence before dispatching a crash-left prepared share", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Prepared share sync race");
+    const memory = page({ key: "architecture/prepared-share-sync-race" });
+    await value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(202, "remember-before-prepared-share-sync-race"),
+      value: memory,
+    });
+    await expect(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    })).resolves.toMatchObject({ ok: true });
+    const authority = value.runtime.store.readProjectMemoryAuthority(value.firstProject.id);
+    const lifecycle = value.runtime.lifecycle.readSession(actor.id);
+    if (
+      authority === null
+      || lifecycle === null
+      || lifecycle.head === null
+      || lifecycle.handleHash === null
+    ) {
+      throw new Error("Expected initialized memory authorities.");
+    }
+    const shareInput = {
+      actorSessionId: actor.id,
+      ...operationInput(203, "prepared-share-before-hosted-sync"),
+      value: { key: memory.key, reason: "Must remain prepared behind the sync fence." },
+    } as const;
+    const prepared = value.runtime.store.prepareMemorySubmission({
+      actorSessionId: actor.id,
+      contentDigest: canonicalSha256({ reason: shareInput.value.reason, v: 1 }),
+      expectedHead: authority.head,
+      idempotencyKey: shareInput.idempotencyKey,
+      keyDigest: canonicalSha256({ key: memory.key, v: 1 }),
+      kind: "share",
+      projectId: value.firstProject.id,
+      requestDigest: shareInput.requestDigest,
+      workingBindingDigest: lifecycle.bindingDigest,
+      workingEpoch: lifecycle.epoch,
+    }).record;
+    const originalFence = value.runtime.store.isCanonicalMemoryMutationFenced.bind(
+      value.runtime.store,
+    );
+    let lateFenceChecks = 0;
+    Object.defineProperty(value.runtime.store, "isCanonicalMemoryMutationFenced", {
+      configurable: true,
+      value: (projectId: Parameters<StateStore["isCanonicalMemoryMutationFenced"]>[0]) => {
+        lateFenceChecks += 1;
+        expect(projectId).toBe(value.firstProject.id);
+        return true;
+      },
+    });
+
+    try {
+      await expectRefusal(
+        value.runtime.coordinator.share(shareInput),
+        "MEMORY_RECOVERY_REQUIRED",
+      );
+    } finally {
+      Object.defineProperty(value.runtime.store, "isCanonicalMemoryMutationFenced", {
+        configurable: true,
+        value: originalFence,
+      });
+    }
+    expect(lateFenceChecks).toBe(1);
+    const refusedSubmission = value.runtime.store.requireMemorySubmission(prepared.id);
+    expect(refusedSubmission).toMatchObject({ state: "prepared" });
+    expect(refusedSubmission).not.toHaveProperty("effectRecordSha256");
+    expect(refusedSubmission).not.toHaveProperty("nominationSha256");
+    expect(refusedSubmission).not.toHaveProperty("operationId");
+
+    const identity = deriveProjectMemoryCanonicalIdentity({
+      canonicalSpaceId: authority.canonicalSpaceId,
+      identityContract: authority.identityContract,
+      projectId: authority.projectId,
+    });
+    const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
+    const canonical = createOhSqliteStoreAuthorityV1({
+      path: join(value.paths.projectMemory, projectDigest, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId: identity.canonicalRealmId,
+      spaceId: identity.canonicalSpaceId,
+    });
+    try {
+      expect(await canonical.store.head()).toMatchObject({
+        operationSha256: null,
+        sequence: 0,
+      });
+    } finally {
+      await canonical.store.close();
+    }
+  });
+
+  test("requires a fresh converged hosted head for each canonical share", async () => {
+    const sync: HraCanonicalMemorySyncPort = {
+      attachHostedSpace: async () => { throw new Error("UNUSED_ATTACH"); },
+      close: async () => undefined,
+      createHostedSpace: async () => { throw new Error("UNUSED_CREATE"); },
+      detachHostedSpace: async () => { throw new Error("UNUSED_DETACH"); },
+      listHostedSpaces: async () => [],
+      recover: async () => undefined,
+      scheduleProject: () => undefined,
+      synchronizeProject: async (input) => ({
+        attached: true,
+        complete: true,
+        localHead: null,
+        operations: 0,
+        projectId: input.projectId,
+        remoteHead: null,
+        state: "converged",
+      }),
+    };
+    const value = await createFixture(undefined, sync);
+    const actor = value.session(value.firstProject, "Hosted share convergence race");
+    const first = page({ key: "architecture/first-hosted-share" });
+    const second = page({ key: "architecture/second-hosted-share" });
+    await expect(value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(204, "remember-first-hosted-share"),
+      value: first,
+    })).resolves.toMatchObject({ ok: true });
+    await expect(value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(205, "remember-second-hosted-share"),
+      value: second,
+    })).resolves.toMatchObject({ ok: true });
+    await expect(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    })).resolves.toMatchObject({ ok: true });
+
+    const authority = value.runtime.store.readProjectMemoryAuthority(value.firstProject.id);
+    if (authority === null) throw new Error("Expected initialized canonical memory authority.");
+    const genesisToken = canonicalSha256({
+      projectId: value.firstProject.id,
+      purpose: "hosted-share-convergence-race-genesis",
+      v: 1,
+    });
+    value.runtime.store.attachCanonicalMemoryHostedSpace({
+      accountBindingDigest: canonicalSha256({ account: "memory-owner@example.com", v: 1 }),
+      canonicalSpaceId: authority.canonicalSpaceId,
+      projectId: value.firstProject.id,
+      remote: {
+        genesisToken,
+        head: PROJECT_MEMORY_EMPTY_HEAD,
+        headProofDigest: canonicalSha256({ genesisToken, purpose: "remote-head-proof", v: 1 }),
+        headToken: genesisToken,
+        keyVersion: 1,
+        revision: 1,
+      },
+      remoteSpaceId: `memory_${"d".repeat(32)}`,
+    });
+    value.runtime.store.recordProjectMemorySyncObservation({
+      exchangeHead: authority.head,
+      expectedHead: authority.head,
+      expectedRevision: authority.revision,
+      projectId: value.firstProject.id,
+      state: "settled",
+    });
+
+    await expect(value.runtime.coordinator.share({
+      actorSessionId: actor.id,
+      ...operationInput(206, "first-share-after-hosted-sync"),
+      value: { key: first.key, reason: "The first share owns the fresh hosted head." },
+    })).resolves.toMatchObject({ ok: true, share: { status: "adopted" } });
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toMatchObject({
+      syncState: "local_only",
+    });
+
+    const secondShare = operationInput(207, "second-share-after-stale-hosted-sync");
+    await expectRefusal(value.runtime.coordinator.share({
+      actorSessionId: actor.id,
+      ...secondShare,
+      value: { key: second.key, reason: "This share needs another hosted pre-sync." },
+    }), "MEMORY_RECOVERY_REQUIRED");
+    expect(value.runtime.store.readMemorySubmissionByIdempotencyKey(
+      secondShare.idempotencyKey,
+    )).toBeNull();
+  });
+
+  test("refuses an attached canonical mutation when hosted sync is unavailable", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Hosted sync unavailable");
+    const memory = page({ key: "architecture/hosted-sync-required" });
+    await value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(208, "remember-before-hosted-sync-unavailable"),
+      value: memory,
+    });
+    await value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    });
+    const authority = value.runtime.store.readProjectMemoryAuthority(value.firstProject.id);
+    if (authority === null) throw new Error("Expected initialized canonical memory authority.");
+    const genesisToken = canonicalSha256({
+      projectId: value.firstProject.id,
+      purpose: "hosted-sync-unavailable-genesis",
+      v: 1,
+    });
+    value.runtime.store.attachCanonicalMemoryHostedSpace({
+      accountBindingDigest: canonicalSha256({ account: "memory-owner@example.com", v: 2 }),
+      canonicalSpaceId: authority.canonicalSpaceId,
+      projectId: value.firstProject.id,
+      remote: {
+        genesisToken,
+        head: authority.head,
+        headProofDigest: canonicalSha256({ genesisToken, purpose: "remote-head-proof", v: 2 }),
+        headToken: genesisToken,
+        keyVersion: 1,
+        revision: 1,
+      },
+      remoteSpaceId: `memory_${"c".repeat(32)}`,
+    });
+    value.runtime.store.recordProjectMemorySyncObservation({
+      exchangeHead: authority.head,
+      expectedHead: authority.head,
+      expectedRevision: authority.revision,
+      projectId: value.firstProject.id,
+      state: "settled",
+    });
+
+    const share = operationInput(209, "share-without-hosted-sync-capability");
+    await expectRefusal(value.runtime.coordinator.share({
+      actorSessionId: actor.id,
+      ...share,
+      value: { key: memory.key, reason: "An attachment requires live sync authority." },
+    }), "MEMORY_RECOVERY_REQUIRED");
+    expect(value.runtime.store.readMemorySubmissionByIdempotencyKey(share.idempotencyKey))
+      .toBeNull();
+  });
+
+  test("preserves sticky hosted conflict diagnostics when sync is unavailable", async () => {
+    for (const [index, state] of (["conflict", "error"] as const).entries()) {
+      const value = await createFixture();
+      const actor = value.session(value.firstProject, `Hosted ${state} without sync`);
+      const memory = page({ key: `architecture/hosted-${state}-without-sync` });
+      await value.runtime.coordinator.remember({
+        actorSessionId: actor.id,
+        ...operationInput(210 + index * 3, `remember-before-hosted-${state}`),
+        value: memory,
+      });
+      await value.runtime.coordinator.query({
+        actorSessionId: actor.id,
+        value: { mode: "list" },
+      });
+      const authority = value.runtime.store.readProjectMemoryAuthority(value.firstProject.id);
+      if (authority === null) throw new Error("Expected initialized canonical memory authority.");
+      const genesisToken = canonicalSha256({
+        projectId: value.firstProject.id,
+        purpose: `hosted-${state}-without-sync-genesis`,
+        v: 1,
+      });
+      const attached = value.runtime.store.attachCanonicalMemoryHostedSpace({
+        accountBindingDigest: canonicalSha256({ account: "memory-owner@example.com", state, v: 1 }),
+        canonicalSpaceId: authority.canonicalSpaceId,
+        projectId: value.firstProject.id,
+        remote: {
+          genesisToken,
+          head: authority.head,
+          headProofDigest: canonicalSha256({ genesisToken, purpose: "remote-head-proof", v: 3 }),
+          headToken: genesisToken,
+          keyVersion: 1,
+          revision: 1,
+        },
+        remoteSpaceId: `memory_${state === "conflict" ? "a".repeat(32) : "b".repeat(32)}`,
+      });
+      value.runtime.store.failCanonicalMemoryHostedAttachment({
+        diagnosticCode: state === "conflict"
+          ? "REMOTE_MEMORY_ERASED"
+          : "REMOTE_MEMORY_CONFIGURATION_INVALID",
+        expectedGeneration: attached.generation,
+        expectedRevision: attached.revision,
+        projectId: value.firstProject.id,
+        state,
+      });
+
+      const share = operationInput(211 + index * 3, `share-after-hosted-${state}`);
+      await expectRefusal(value.runtime.coordinator.share({
+        actorSessionId: actor.id,
+        ...share,
+        value: { key: memory.key, reason: "Sticky hosted failure remains canonical freeze." },
+      }), "MEMORY_CANONICAL_FROZEN");
+      expect(value.runtime.store.readMemorySubmissionByIdempotencyKey(share.idempotencyKey))
+        .toBeNull();
+    }
+  });
+
+  test("replays a terminal share without sync or Oh access while hosted custody is frozen", async () => {
+    let syncCalls = 0;
+    let syncUnavailable = false;
+    const sync: HraCanonicalMemorySyncPort = {
+      attachHostedSpace: async () => { throw new Error("UNUSED_ATTACH"); },
+      close: async () => undefined,
+      createHostedSpace: async () => { throw new Error("UNUSED_CREATE"); },
+      detachHostedSpace: async () => { throw new Error("UNUSED_DETACH"); },
+      listHostedSpaces: async () => [],
+      recover: async () => undefined,
+      scheduleProject: () => undefined,
+      synchronizeProject: async (input) => {
+        syncCalls += 1;
+        if (syncUnavailable) throw new Error("HOSTED_SYNC_UNAVAILABLE");
+        return {
+          attached: false,
+          complete: true,
+          localHead: null,
+          operations: 0,
+          projectId: input.projectId,
+          remoteHead: null,
+          state: "detached",
+        };
+      },
+    };
+    const value = await createFixture(undefined, sync);
+    const actor = value.session(value.firstProject, "Terminal share replay");
+    const memory = page({ key: "architecture/terminal-hosted-share-replay" });
+    await value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(216, "remember-before-terminal-hosted-replay"),
+      value: memory,
+    });
+    await value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    });
+    const shareInput = {
+      actorSessionId: actor.id,
+      ...operationInput(217, "terminal-hosted-share-replay"),
+      value: { key: memory.key, reason: "Return the retained receipt without a new effect." },
+    } as const;
+    const original = await value.runtime.coordinator.share(shareInput);
+    expect(original).toMatchObject({ ok: true, replay: false });
+
+    const authority = value.runtime.store.readProjectMemoryAuthority(value.firstProject.id);
+    if (authority === null) throw new Error("Expected initialized canonical memory authority.");
+    const headToken = canonicalSha256({ head: authority.head, purpose: "terminal-replay", v: 1 });
+    const attached = value.runtime.store.attachCanonicalMemoryHostedSpace({
+      accountBindingDigest: canonicalSha256({ account: "terminal-replay@example.com", v: 1 }),
+      canonicalSpaceId: authority.canonicalSpaceId,
+      projectId: value.firstProject.id,
+      remote: {
+        genesisToken: canonicalSha256({ purpose: "terminal-replay-genesis", v: 1 }),
+        head: authority.head,
+        headProofDigest: canonicalSha256({ headToken, purpose: "terminal-replay-proof", v: 1 }),
+        headToken,
+        keyVersion: 1,
+        revision: 1,
+      },
+      remoteSpaceId: `memory_${"9".repeat(32)}`,
+    });
+    value.runtime.store.failCanonicalMemoryHostedAttachment({
+      diagnosticCode: "REMOTE_MEMORY_ERASED",
+      expectedGeneration: attached.generation,
+      expectedRevision: attached.revision,
+      projectId: value.firstProject.id,
+      state: "conflict",
+    });
+    syncCalls = 0;
+    syncUnavailable = true;
+    let ohCalls = 0;
+    const originalWithMemoryStores = value.runtime.engine.withMemoryStores
+      .bind(value.runtime.engine);
+    Object.defineProperty(value.runtime.engine, "withMemoryStores", {
+      configurable: true,
+      value: () => {
+        ohCalls += 1;
+        throw new Error("TERMINAL_REPLAY_MUST_NOT_OPEN_OH");
+      },
+    });
+
+    try {
+      await expect(value.runtime.coordinator.share(shareInput)).resolves.toEqual({
+        ...original,
+        replay: true,
+      });
+      await expect(value.runtime.coordinator.share({
+        ...shareInput,
+        value: { ...shareInput.value, reason: "Changed same-key request" },
+      })).rejects.toThrow("MEMORY_SUBMISSION_IDEMPOTENCY_CONFLICT");
+    } finally {
+      Object.defineProperty(value.runtime.engine, "withMemoryStores", {
+        configurable: true,
+        value: originalWithMemoryStores,
+      });
+    }
+    expect(syncCalls).toBe(0);
+    expect(ohCalls).toBe(0);
+  });
+
+  test("refuses a share when its session changes projects during hosted pre-sync", async () => {
+    let markSyncEntered!: () => void;
+    const syncEntered = new Promise<void>((resolve) => { markSyncEntered = resolve; });
+    let releaseSync!: () => void;
+    const syncGate = new Promise<void>((resolve) => { releaseSync = resolve; });
+    const synchronizedProjects: string[] = [];
+    const sync: HraCanonicalMemorySyncPort = {
+      attachHostedSpace: async () => { throw new Error("UNUSED_ATTACH"); },
+      close: async () => undefined,
+      createHostedSpace: async () => { throw new Error("UNUSED_CREATE"); },
+      detachHostedSpace: async () => { throw new Error("UNUSED_DETACH"); },
+      listHostedSpaces: async () => [],
+      recover: async () => undefined,
+      scheduleProject: () => undefined,
+      synchronizeProject: async (input) => {
+        synchronizedProjects.push(input.projectId);
+        markSyncEntered();
+        await syncGate;
+        return {
+          attached: false,
+          complete: true,
+          localHead: null,
+          operations: 0,
+          projectId: input.projectId,
+          remoteHead: null,
+          state: "detached",
+        };
+      },
+    };
+    const value = await createFixture(undefined, sync);
+    const actor = value.session(value.firstProject, "Hosted pre-sync project race");
+    value.runtime.store.setSessionTurnState({
+      expectedRevision: actor.revision,
+      sessionId: actor.id,
+      state: "idle",
+    });
+    const memory = page({ key: "architecture/hosted-presync-project-race" });
+    await value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(218, "remember-before-hosted-presync-project-race"),
+      value: memory,
+    });
+    const shareInput = operationInput(219, "share-during-hosted-presync-project-race");
+    const refused = expectRefusal(value.runtime.coordinator.share({
+      actorSessionId: actor.id,
+      ...shareInput,
+      value: { key: memory.key, reason: "The request remains bound to its pre-sync project." },
+    }), "MEMORY_RECOVERY_REQUIRED");
+    await syncEntered;
+    const current = value.runtime.store.requireSession(actor.id);
+    value.runtime.store.updateSessionMetadata({
+      expectedRevision: current.revision,
+      projectId: value.secondProject.id,
+      sessionId: current.id,
+    });
+    releaseSync();
+
+    await refused;
+    expect(synchronizedProjects).toEqual([value.firstProject.id]);
+    expect(value.runtime.store.readMemorySubmissionByIdempotencyKey(shareInput.idempotencyKey))
+      .toBeNull();
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toBeNull();
+    expect(value.runtime.store.readProjectMemoryAuthority(value.secondProject.id)).toBeNull();
+  });
+
+  test("keeps working memory available after an authorized pull import until settlement", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Authorized pull crash window");
+    const existing = page({ key: "recovery/working-through-authorized-pull" });
+    await expect(value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(105, "remember-before-authorized-pull"),
+      value: existing,
+    })).resolves.toMatchObject({ ok: true });
+    await expect(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    })).resolves.toMatchObject({ ok: true });
+
+    const authority = value.runtime.store.readProjectMemoryAuthority(value.firstProject.id);
+    if (authority === null) throw new Error("Expected initialized canonical memory authority.");
+    const identity = deriveProjectMemoryCanonicalIdentity({
+      canonicalSpaceId: authority.canonicalSpaceId,
+      identityContract: authority.identityContract,
+      projectId: authority.projectId,
+    });
+    const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
+    const canonical = createOhSqliteStoreAuthorityV1({
+      path: join(value.paths.projectMemory, projectDigest, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId: identity.canonicalRealmId,
+      spaceId: identity.canonicalSpaceId,
+    });
+    const importedHead: OhHeadV1 = await (async () => {
+      try {
+        await canonical.store.commit({
+          actorId: "hra.memory.host",
+          changes: [{
+            kind: "put",
+            record: createKnowledgeGraphRecordV1({
+              dependencies: [],
+              key: "entity:authorized-pull-crash-window",
+              kind: "entity",
+              v: 1,
+              value: { label: "Physically imported before control settlement" },
+            }),
+            v: 1,
+          }],
+          expectedHead: await canonical.store.head(),
+          operationId: "test.authorized-pull-crash-window",
+        });
+        return await canonical.store.head();
+      } finally {
+        await canonical.store.close();
+      }
+    })();
+    const resultHead = {
+      headDigest: digestOhHead(importedHead),
+      operationSha256: importedHead.operationSha256,
+      sequence: importedHead.sequence,
+    };
+    const genesisToken = canonicalSha256({
+      projectId: value.firstProject.id,
+      purpose: "authorized-pull-genesis",
+      v: 1,
+    });
+    const headToken = canonicalSha256({ resultHead, purpose: "authorized-pull-head", v: 1 });
+    const remote = {
+      genesisToken,
+      head: resultHead,
+      headProofDigest: canonicalSha256({ headToken, purpose: "authorized-pull-proof", v: 1 }),
+      headToken,
+      keyVersion: 1,
+      revision: 1,
+    } as const;
+    value.runtime.store.attachCanonicalMemoryHostedSpace({
+      accountBindingDigest: canonicalSha256({ account: "authorized-pull-owner", v: 1 }),
+      canonicalSpaceId: authority.canonicalSpaceId,
+      projectId: value.firstProject.id,
+      remote,
+      remoteSpaceId: `memory_${"e".repeat(32)}`,
+    });
+    const prepared = value.runtime.store.prepareCanonicalMemorySync({
+      direction: "pull",
+      ...operationInput(106, "prepare-authorized-pull"),
+      localHeadToken: genesisToken,
+      projectId: value.firstProject.id,
+    }).record;
+    value.runtime.store.markCanonicalMemorySyncEffectStarted(prepared.id);
+    const envelope = (ciphertext: string) => ({
+      algorithm: "A256GCM" as const,
+      ciphertext,
+      keyVersion: 1,
+      nonce: "N".repeat(16),
+    });
+    value.runtime.store.recordCanonicalMemorySyncResponse({
+      intentId: prepared.id,
+      operation: {
+        adoptionProof: null,
+        genesisToken,
+        headToken,
+        operation: envelope("o".repeat(22)),
+        priorToken: genesisToken,
+        sequence: resultHead.sequence,
+        terminalHeadProof: envelope("p".repeat(22)),
+      },
+      remote,
+    });
+    value.runtime.store.authorizeCanonicalMemoryPullResult({
+      intentId: prepared.id,
+      resultHead,
+    });
+
+    await expect(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { key: existing.key, mode: "get" },
+    })).resolves.toMatchObject({
+      ok: true,
+      rows: [expect.objectContaining({ key: existing.key, lane: "working" })],
+    });
+    await expect(value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(107, "remember-during-authorized-pull-window"),
+      value: page({ key: "recovery/working-after-authorized-import" }),
+    })).resolves.toMatchObject({ ok: true });
+    await expect(value.runtime.coordinator.status({ actorSessionId: actor.id }))
+      .resolves.toMatchObject({
+        canonical: {
+          expectedHead: {
+            digest: PROJECT_MEMORY_EMPTY_HEAD.headDigest,
+            operationSha256: null,
+            sequence: 0,
+          },
+          frozen: false,
+        },
+      });
+
+    value.runtime.store.settleCanonicalMemorySync({
+      intentId: prepared.id,
+      resultHead,
+    });
+    await expect(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    })).resolves.toMatchObject({ ok: true });
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toMatchObject({
+      head: resultHead,
+      syncState: "settled",
     });
   });
 
@@ -626,11 +1485,18 @@ describe("HRA Oh memory coordinator integration", () => {
       .rejects.toThrow("CONTROLLED_POST_ADOPTION_SETTLEMENT_FAILURE");
 
     const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
+    const control = failing.store.readProjectMemoryAuthority(value.firstProject.id);
+    if (control === null) throw new Error("Expected a reserved canonical authority.");
+    const identity = deriveProjectMemoryCanonicalIdentity({
+      canonicalSpaceId: control.canonicalSpaceId,
+      identityContract: control.identityContract,
+      projectId: control.projectId,
+    });
     const canonical = createOhSqliteStoreAuthorityV1({
       path: join(value.paths.projectMemory, projectDigest, "oh.sqlite"),
       profile: OH_CANONICAL_STORE_PROFILE_V1,
-      realmId: `hra:project-memory:${projectDigest}`,
-      spaceId: `hra:project:${projectDigest}`,
+      realmId: identity.canonicalRealmId,
+      spaceId: identity.canonicalSpaceId,
     });
     try {
       await canonical.store.commit({
@@ -714,11 +1580,18 @@ describe("HRA Oh memory coordinator integration", () => {
     });
 
     const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
+    const control = value.runtime.store.readProjectMemoryAuthority(value.firstProject.id);
+    if (control === null) throw new Error("Expected a reserved canonical authority.");
+    const identity = deriveProjectMemoryCanonicalIdentity({
+      canonicalSpaceId: control.canonicalSpaceId,
+      identityContract: control.identityContract,
+      projectId: control.projectId,
+    });
     const canonical = createOhSqliteStoreAuthorityV1({
       path: join(value.paths.projectMemory, projectDigest, "oh.sqlite"),
       profile: OH_CANONICAL_STORE_PROFILE_V1,
-      realmId: `hra:project-memory:${projectDigest}`,
-      spaceId: `hra:project:${projectDigest}`,
+      realmId: identity.canonicalRealmId,
+      spaceId: identity.canonicalSpaceId,
     });
     try {
       await canonical.store.commit({
@@ -755,9 +1628,555 @@ describe("HRA Oh memory coordinator integration", () => {
     }), "MEMORY_CANONICAL_FROZEN");
   });
 
-  test("refuses a queued operation when the session changes projects before its tail starts", async () => {
+  test("durably freezes a canonical database containing a second Oh space", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Canonical space custody");
+    await value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    });
+
+    const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
+    const alien = createOhSqliteStoreAuthorityV1({
+      path: join(value.paths.projectMemory, projectDigest, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId: "hra:project-memory:space-alien",
+      spaceId: "hra:project:space-alien",
+    });
+    await alien.store.close();
+
+    await expectRefusal(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    }), "MEMORY_CANONICAL_FROZEN");
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toMatchObject({
+      diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
+      syncState: "error",
+    });
+  });
+
+  test("adopts every exact empty crash-left legacy stage before creating a portable identity", async () => {
+    for (const stage of ["zero-byte", "migrated", "space-created", "bound"] as const) {
+      const value = await createFixture();
+      const actor = value.session(value.firstProject, `Legacy ${stage} recovery`);
+      const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
+      const canonicalDirectory = join(value.paths.projectMemory, projectDigest);
+      const databasePath = join(canonicalDirectory, "oh.sqlite");
+      await mkdir(canonicalDirectory, { mode: 0o700 });
+      const identity = deriveProjectMemoryCanonicalIdentity({
+        canonicalSpaceId: legacyProjectMemorySpaceId(value.firstProject.id),
+        identityContract: 1,
+        projectId: value.firstProject.id,
+      });
+      if (stage === "zero-byte") {
+        await writeFile(databasePath, new Uint8Array(), { mode: 0o600 });
+      } else if (stage === "migrated") {
+        const database = new Database(databasePath);
+        try {
+          applyOhSqliteMigrations(database);
+        } finally {
+          database.close(false);
+        }
+      } else if (stage === "space-created") {
+        const interrupted = new OhSqliteStore({
+          path: databasePath,
+          spaceId: identity.canonicalSpaceId,
+        });
+        interrupted.close();
+      } else {
+        const bound = createOhSqliteStoreAuthorityV1({
+          path: databasePath,
+          profile: OH_CANONICAL_STORE_PROFILE_V1,
+          realmId: identity.canonicalRealmId,
+          spaceId: identity.canonicalSpaceId,
+        });
+        await bound.store.close();
+      }
+
+      await expect(value.runtime.coordinator.query({
+        actorSessionId: actor.id,
+        value: { mode: "list" },
+      })).resolves.toMatchObject({ ok: true, rows: [] });
+
+      const authority = value.runtime.store.readProjectMemoryAuthority(value.firstProject.id);
+      expect(authority).toMatchObject({
+        canonicalSpaceId: identity.canonicalSpaceId,
+        head: PROJECT_MEMORY_EMPTY_HEAD,
+        identityContract: 1,
+        physicalState: "initialized",
+        revision: 2,
+      });
+      const status = await value.runtime.coordinator.status({ actorSessionId: actor.id });
+      expect(status).toMatchObject({
+        canonical: {
+          identityContract: 1,
+          initialized: true,
+        },
+      });
+      expect((status.canonical as Record<string, unknown>).spaceId).toBeUndefined();
+    }
+  });
+
+  test("resumes every exact empty stage after a portable authority reservation", async () => {
+    for (const stage of ["absent", "zero-byte", "migrated", "space-created", "bound"] as const) {
+      const value = await createFixture();
+      const actor = value.session(value.firstProject, `Portable ${stage} recovery`);
+      const identity = createPortableProjectMemoryCanonicalIdentity(value.firstProject.id);
+      const reserved = value.runtime.store.reserveProjectMemoryAuthority({
+        canonicalSpaceId: identity.canonicalSpaceId,
+        head: PROJECT_MEMORY_EMPTY_HEAD,
+        identityContract: identity.identityContract,
+        projectId: value.firstProject.id,
+      });
+      const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
+      const canonicalDirectory = join(value.paths.projectMemory, projectDigest);
+      const databasePath = join(canonicalDirectory, "oh.sqlite");
+      if (stage !== "absent") {
+        await mkdir(canonicalDirectory, { mode: 0o700 });
+        if (stage === "zero-byte") {
+          await writeFile(databasePath, new Uint8Array(), { mode: 0o600 });
+        } else if (stage === "migrated") {
+          const database = new Database(databasePath);
+          try {
+            applyOhSqliteMigrations(database);
+          } finally {
+            database.close(false);
+          }
+        } else if (stage === "space-created") {
+          const interrupted = new OhSqliteStore({
+            path: databasePath,
+            spaceId: identity.canonicalSpaceId,
+          });
+          interrupted.close();
+        } else {
+          const bound = createOhSqliteStoreAuthorityV1({
+            path: databasePath,
+            profile: OH_CANONICAL_STORE_PROFILE_V1,
+            realmId: identity.canonicalRealmId,
+            spaceId: identity.canonicalSpaceId,
+          });
+          await bound.store.close();
+        }
+      }
+
+      await expect(value.runtime.coordinator.query({
+        actorSessionId: actor.id,
+        value: { mode: "list" },
+      })).resolves.toMatchObject({ ok: true, rows: [] });
+      expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toMatchObject({
+        canonicalSpaceId: reserved.canonicalSpaceId,
+        identityContract: 2,
+        physicalState: "initialized",
+        revision: 2,
+      });
+    }
+  });
+
+  test("durably rejects a nonempty store left behind after portable reservation", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Portable nonempty refusal");
+    const identity = createPortableProjectMemoryCanonicalIdentity(value.firstProject.id);
+    value.runtime.store.reserveProjectMemoryAuthority({
+      canonicalSpaceId: identity.canonicalSpaceId,
+      head: PROJECT_MEMORY_EMPTY_HEAD,
+      identityContract: identity.identityContract,
+      projectId: value.firstProject.id,
+    });
+    const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
+    const canonicalDirectory = join(value.paths.projectMemory, projectDigest);
+    await mkdir(canonicalDirectory, { mode: 0o700 });
+    const canonical = createOhSqliteStoreAuthorityV1({
+      path: join(canonicalDirectory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId: identity.canonicalRealmId,
+      spaceId: identity.canonicalSpaceId,
+    });
+    await canonical.store.commit({
+      actorId: "test.portable-crash",
+      changes: [{
+        kind: "put",
+        record: createKnowledgeGraphRecordV1({
+          dependencies: [],
+          key: "entity:portable-nonempty",
+          kind: "entity",
+          v: 1,
+          value: { label: "Must not be adopted by an empty reservation" },
+        }),
+        v: 1,
+      }],
+      expectedHead: await canonical.store.head(),
+      operationId: "test.portable-crash-nonempty",
+    });
+    await canonical.store.close();
+
+    await expectRefusal(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    }), "MEMORY_CANONICAL_FROZEN");
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toMatchObject({
+      canonicalSpaceId: identity.canonicalSpaceId,
+      diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
+      head: PROJECT_MEMORY_EMPTY_HEAD,
+      identityContract: 2,
+      physicalState: "rejected",
+      syncState: "error",
+    });
+  });
+
+  test("keeps working memory usable while a nonempty crash-left legacy database freezes canonical", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Legacy nonempty refusal");
+    const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
+    const canonicalDirectory = join(value.paths.projectMemory, projectDigest);
+    await mkdir(canonicalDirectory, { mode: 0o700 });
+    const identity = deriveProjectMemoryCanonicalIdentity({
+      canonicalSpaceId: legacyProjectMemorySpaceId(value.firstProject.id),
+      identityContract: 1,
+      projectId: value.firstProject.id,
+    });
+    const canonical = createOhSqliteStoreAuthorityV1({
+      path: join(canonicalDirectory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId: identity.canonicalRealmId,
+      spaceId: identity.canonicalSpaceId,
+    });
+    await canonical.store.commit({
+      actorId: "test.legacy-crash",
+      changes: [{
+        kind: "put",
+        record: createKnowledgeGraphRecordV1({
+          dependencies: [],
+          key: "entity:legacy-nonempty",
+          kind: "entity",
+          v: 1,
+          value: { label: "Must not be adopted without control evidence" },
+        }),
+        v: 1,
+      }],
+      expectedHead: await canonical.store.head(),
+      operationId: "test.legacy-crash-nonempty",
+    });
+    await canonical.store.close();
+
+    await expect(value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(91, "legacy-nonempty-refusal"),
+      value: page({ key: "legacy/refused-working-effect" }),
+    })).resolves.toMatchObject({
+      ok: true,
+      workingHead: expect.objectContaining({ sequence: 1 }),
+    });
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toBeNull();
+    expect(value.runtime.lifecycle.readSession(actor.id)).toMatchObject({
+      head: expect.objectContaining({ sequence: 1 }),
+    });
+
+    await expectRefusal(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    }), "MEMORY_CANONICAL_FROZEN");
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toMatchObject({
+      diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
+      head: PROJECT_MEMORY_EMPTY_HEAD,
+      identityContract: 1,
+      physicalState: "rejected",
+      syncState: "error",
+    });
+    const working = await value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list", scope: "working" },
+    }) as {
+      canonical: { frozen: boolean; included: boolean };
+      canonicalHead: unknown;
+      queryId: string;
+      rows: readonly Readonly<Record<string, unknown>>[];
+      scope: string;
+    };
+    expect(working).toMatchObject({
+      canonical: { frozen: true, included: false },
+      canonicalHead: null,
+      rows: [expect.objectContaining({
+        key: "legacy/refused-working-effect",
+        lane: "working",
+      })],
+      scope: "working",
+    });
+    await expect(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: {
+        key: "legacy/refused-working-effect",
+        mode: "get",
+        scope: "working",
+      },
+    })).resolves.toMatchObject({
+      canonical: { frozen: true, included: false },
+      rows: [expect.objectContaining({
+        bodyChunk: expect.any(String),
+        key: "legacy/refused-working-effect",
+        lane: "working",
+      })],
+      scope: "working",
+    });
+    await expect(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "search", scope: "working", text: "durable canonical" },
+    })).resolves.toMatchObject({
+      canonical: { frozen: true, included: false },
+      matchedTokens: ["canonical", "durable"],
+      rows: [expect.objectContaining({
+        key: "legacy/refused-working-effect",
+        lane: "working",
+      })],
+      scope: "working",
+    });
+    await expect(value.runtime.coordinator.explain({
+      actorSessionId: actor.id,
+      value: { queryId: working.queryId, row: 0 },
+    })).resolves.toMatchObject({
+      canonical: { frozen: true, included: false },
+      scope: "working",
+    });
+
+    await value.runtime.coordinator.close();
+    value.runtime.control.close();
+    value.runtime.store.close();
+    const databasePath = join(canonicalDirectory, "oh.sqlite");
+    await rm(databasePath);
+    await rm(`${databasePath}-wal`, { force: true });
+    await rm(`${databasePath}-shm`, { force: true });
+    await writeFile(databasePath, new Uint8Array(), { mode: 0o600 });
+    const restarted = makeRuntime(value.paths, value.clock);
+    await expectRefusal(restarted.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    }), "MEMORY_CANONICAL_FROZEN");
+    await expect(restarted.coordinator.status({ actorSessionId: actor.id })).resolves.toMatchObject({
+      canonical: {
+        frozen: true,
+        initialized: false,
+        physicalState: "rejected",
+      },
+    });
+    await expect(restarted.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list", scope: "working" },
+    })).resolves.toMatchObject({
+      canonical: { frozen: true, included: false },
+      rows: [expect.objectContaining({ key: "legacy/refused-working-effect" })],
+      scope: "working",
+    });
+    expect((await Bun.file(databasePath).arrayBuffer()).byteLength).toBe(0);
+  });
+
+  test("continues a working-only query against one deterministic ephemeral canonical authority", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Working-only continuation");
+    for (let index = 0; index < 6; index += 1) {
+      await expect(value.runtime.coordinator.remember({
+        actorSessionId: actor.id,
+        ...operationInput(300 + index, `remember-working-continuation-${String(index)}`),
+        value: page({
+          key: `working/continuation-${String(index)}`,
+          title: `Working continuation ${String(index)}`,
+        }),
+      })).resolves.toMatchObject({ ok: true });
+    }
+
+    const first = await value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list", scope: "working" },
+    }) as { continuation: string | null; rows: readonly unknown[] };
+    expect(first.rows).toHaveLength(5);
+    if (first.continuation === null) throw new Error("Expected a working-only continuation.");
+    await expect(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { continuation: first.continuation, mode: "list", scope: "working" },
+    })).resolves.toMatchObject({
+      canonical: { included: false },
+      continuation: null,
+      rows: [expect.objectContaining({ lane: "working" })],
+      scope: "working",
+    });
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toBeNull();
+  });
+
+  test("durably rejects a head-empty legacy database with hidden same-space state", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Legacy hidden-state refusal");
+    const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
+    const canonicalDirectory = join(value.paths.projectMemory, projectDigest);
+    await mkdir(canonicalDirectory, { mode: 0o700 });
+    const identity = deriveProjectMemoryCanonicalIdentity({
+      canonicalSpaceId: legacyProjectMemorySpaceId(value.firstProject.id),
+      identityContract: 1,
+      projectId: value.firstProject.id,
+    });
+    const canonical = createOhSqliteStoreAuthorityV1({
+      path: join(canonicalDirectory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId: identity.canonicalRealmId,
+      spaceId: identity.canonicalSpaceId,
+    });
+    await canonical.store.close();
+    const database = new Database(join(canonicalDirectory, "oh.sqlite"));
+    try {
+      database.query(
+        `INSERT INTO oh_sync_state(
+           remote_id,space_id,pulled_sequence,pushed_sequence,remote_head_sha256,updated_at
+         ) VALUES ('hidden',?,0,0,NULL,'2026-09-06T00:00:00.000Z')`,
+      ).run(identity.canonicalSpaceId);
+    } finally {
+      database.close(false);
+    }
+
+    await expectRefusal(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    }), "MEMORY_CANONICAL_FROZEN");
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toMatchObject({
+      diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
+      head: PROJECT_MEMORY_EMPTY_HEAD,
+      identityContract: 1,
+      physicalState: "rejected",
+      syncState: "error",
+    });
+  });
+
+  test("durably rejects an unsafe sidecar-only legacy remnant", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Legacy sidecar refusal");
+    const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
+    const canonicalDirectory = join(value.paths.projectMemory, projectDigest);
+    await mkdir(canonicalDirectory, { mode: 0o700 });
+    await writeFile(join(canonicalDirectory, "oh.sqlite-wal"), new Uint8Array(), { mode: 0o600 });
+
+    await expectRefusal(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    }), "MEMORY_CANONICAL_FROZEN");
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toMatchObject({
+      diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
+      identityContract: 1,
+      physicalState: "rejected",
+      syncState: "error",
+    });
+  });
+
+  test("keeps an unavailable first inspection retryable without manufacturing an identity", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Retryable canonical inspection");
+    await value.runtime.coordinator.close();
+    value.runtime.control.close();
+    value.runtime.store.close();
+    const unavailablePaths: StatePaths = {
+      ...value.paths,
+      projectMemory: join(value.paths.root, "x".repeat(300)),
+    };
+    const unavailable = makeRuntime(unavailablePaths, value.clock);
+
+    await expectRefusal(unavailable.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    }), "MEMORY_RECOVERY_REQUIRED");
+    expect(unavailable.store.readProjectMemoryAuthority(value.firstProject.id)).toBeNull();
+  });
+
+  test("keeps a raw SQLite lock retryable without freezing canonical memory", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Retryable canonical lock");
+    await value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    });
+    const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
+    const databasePath = join(value.paths.projectMemory, projectDigest, "oh.sqlite");
+    const lock = new Database(databasePath, { create: false, strict: true });
+    try {
+      lock.exec("BEGIN IMMEDIATE");
+      await expectRefusal(value.runtime.coordinator.query({
+        actorSessionId: actor.id,
+        value: { mode: "list" },
+      }), "MEMORY_RECOVERY_REQUIRED");
+      expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toMatchObject({
+        physicalState: "initialized",
+        syncState: "local_only",
+      });
+    } finally {
+      if (lock.inTransaction) lock.exec("ROLLBACK");
+      lock.close(false);
+    }
+    await expect(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    })).resolves.toMatchObject({ ok: true, rows: [] });
+  }, 12_000);
+
+  test("never recreates a missing database after canonical initialization", async () => {
+    const value = await createFixture();
+    const actor = value.session(value.firstProject, "Initialized deletion fence");
+    await value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    });
+    const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
+    const canonicalDirectory = join(value.paths.projectMemory, projectDigest);
+    await rm(join(canonicalDirectory, "oh.sqlite"));
+    await rm(join(canonicalDirectory, "oh.sqlite-wal"), { force: true });
+    await rm(join(canonicalDirectory, "oh.sqlite-shm"), { force: true });
+
+    await expectRefusal(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    }), "MEMORY_CANONICAL_FROZEN");
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toMatchObject({
+      diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
+      physicalState: "initialized",
+      syncState: "error",
+    });
+    await expect(Bun.file(join(canonicalDirectory, "oh.sqlite")).exists()).resolves.toBe(false);
+  });
+
+  test("refuses a terminalized actor after lifecycle selection without reopening purged memory", async () => {
+    let gate: GateFirstEnsure | undefined;
+    const value = await createFixture((lifecycle) => {
+      gate = new GateFirstEnsure(lifecycle, 1, true);
+      return gate;
+    });
+    const actor = value.session(value.firstProject, "Terminal lifecycle race");
+    const refused = expectRefusal(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    }), "MEMORY_SESSION_REFUSED");
+    if (gate === undefined) throw new Error("Expected a lifecycle gate.");
+    await gate.entered;
+
+    const current = value.runtime.store.requireSession(actor.id);
+    value.runtime.store.setSessionTurnState({
+      expectedRevision: current.revision,
+      sessionId: current.id,
+      state: "terminal",
+    });
+    await value.runtime.lifecycle.cleanupSession({
+      ownerId: current.profileId,
+      reason: "archive",
+      sessionId: current.id,
+    });
+    gate.release();
+
+    await refused;
+    expect(value.runtime.lifecycle.readSession(actor.id)).toMatchObject({ state: "purged" });
+    expect(value.runtime.store.readProjectMemoryAuthority(value.firstProject.id)).toBeNull();
+    expect(value.runtime.store.readUnsettledMemorySubmissionForSession(actor.id)).toBeNull();
+  });
+
+  test("refuses in-flight and queued operations when the session changes projects before authority selection", async () => {
     const value = await createFixture();
     const actor = value.session(value.firstProject, "Queued project change");
+    value.runtime.store.setSessionTurnState({
+      sessionId: actor.id,
+      expectedRevision: actor.revision,
+      state: "idle",
+    });
 
     await value.runtime.coordinator.close();
     value.runtime.control.close();
@@ -768,10 +2187,10 @@ describe("HRA Oh memory coordinator integration", () => {
       return gate;
     });
 
-    const first = restarted.coordinator.query({
+    const firstRefusal = expectRefusal(restarted.coordinator.query({
       actorSessionId: actor.id,
       value: { mode: "list" },
-    });
+    }), "MEMORY_RECOVERY_REQUIRED");
     if (gate === undefined) throw new Error("Expected a lifecycle gate.");
     await gate.entered;
     const queuedRefusal = expectRefusal(restarted.coordinator.query({
@@ -787,8 +2206,51 @@ describe("HRA Oh memory coordinator integration", () => {
     });
     gate.release();
 
-    await expect(first).resolves.toMatchObject({ ok: true, mode: "list" });
+    await firstRefusal;
     await queuedRefusal;
     expect(restarted.store.readProjectMemoryAuthority(value.secondProject.id)).toBeNull();
+  });
+
+  test("never explains a cached row after a queued session project change", async () => {
+    let gate: GateFirstEnsure | undefined;
+    const value = await createFixture((lifecycle) => {
+      gate = new GateFirstEnsure(lifecycle, 3);
+      return gate;
+    });
+    const actor = value.session(value.firstProject, "Queued explanation scope");
+    value.runtime.store.setSessionTurnState({
+      sessionId: actor.id,
+      expectedRevision: actor.revision,
+      state: "idle",
+    });
+    await value.runtime.coordinator.remember({
+      actorSessionId: actor.id,
+      ...operationInput(101, "explain-project-race-remember"),
+      value: page({ key: "scope/explain-project-race" }),
+    });
+    const query = await value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    }) as { queryId: string };
+    const blockerRefusal = expectRefusal(value.runtime.coordinator.query({
+      actorSessionId: actor.id,
+      value: { mode: "list" },
+    }), "MEMORY_RECOVERY_REQUIRED");
+    if (gate === undefined) throw new Error("Expected a lifecycle gate.");
+    await gate.entered;
+    const explanation = expectRefusal(value.runtime.coordinator.explain({
+      actorSessionId: actor.id,
+      value: { queryId: query.queryId, row: 0 },
+    }), "MEMORY_RECOVERY_REQUIRED");
+    const current = value.runtime.store.requireSession(actor.id);
+    value.runtime.store.updateSessionMetadata({
+      sessionId: current.id,
+      expectedRevision: current.revision,
+      projectId: value.secondProject.id,
+    });
+    gate.release();
+
+    await blockerRefusal;
+    await explanation;
   });
 });

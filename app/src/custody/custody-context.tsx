@@ -52,12 +52,12 @@ import { newConnectionId, presenceArgs, type PresenceIdentity } from "./presence
 import {
   browserDeviceLabel,
   encryptDeviceLabel,
-  isDeviceClassValidatorRejection,
   randomBindNonce,
   randomOpaqueId,
   registrationIntent,
   registrationRequestDigest,
   selectKeyEnvelope,
+  submitBrowserDeviceRegistration,
 } from "./registration";
 
 export type EnrollmentStage =
@@ -261,19 +261,11 @@ export function CustodyProvider({ children }: Readonly<{ children: ReactNode }>)
         wrappingPublicKey: deviceKeys.wrappingPublicKey,
       });
       const requestDigest = await registrationRequestDigest(provisionalKey, intent);
-      try {
-        await convex.mutation(registerDevice, {
-          ...intent,
-          deviceClass: "browser",
-          requestDigest,
-        });
-      } catch (failure: unknown) {
-        // The additive `deviceClass` field may not be deployed yet. A validator
-        // rejection runs before the handler, so nothing was written and the
-        // identical idempotency key and digest replay cleanly without it.
-        if (!isDeviceClassValidatorRejection(failure)) throw failure;
-        await convex.mutation(registerDevice, { ...intent, requestDigest });
-      }
+      await submitBrowserDeviceRegistration({
+        intent,
+        mutate: async (request) => await convex.mutation(registerDevice, request),
+        requestDigest,
+      });
     } finally {
       wipeBytes(provisionalKey);
     }

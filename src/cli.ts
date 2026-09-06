@@ -91,6 +91,7 @@ import {
   type CloudDeploymentAuthority,
   type CloudProjectionRecoveryStatus,
   type CloudSecretCustodyPort,
+  type CanonicalMemoryCloudAuthoritySource,
 } from "./cloud/index";
 import { allowlistedEnvironment, resolvePinnedCodexRuntime } from "./codex/index";
 import {
@@ -3208,6 +3209,8 @@ export async function runDaemon(
   let server: LocalDaemonServer | undefined;
   let cloudAdapter: StateBackedCloudDaemonAdapter | undefined;
   let cloudLifecycle: CloudDaemonLifecycle | undefined;
+  let cloudLifecycleShutdown: Promise<void> | undefined;
+  let canonicalMemoryAuthoritySource: CanonicalMemoryCloudAuthoritySource | undefined;
   let usagePoller: AccountUsagePoller | undefined;
   let usagePollerShutdown: Promise<void> | undefined;
   let cloudRequestController: AbortController | undefined;
@@ -3218,10 +3221,16 @@ export async function runDaemon(
   let resolveStop!: () => void;
   const stopped = new Promise<void>((resolve) => { resolveStop = resolve; });
   let stopRequested = false;
+  const closeCloudLifecycle = (): Promise<void> => {
+    if (cloudLifecycle === undefined) return Promise.resolve();
+    cloudLifecycleShutdown ??= cloudLifecycle.close();
+    return cloudLifecycleShutdown;
+  };
   const requestStop = () => {
     if (stopRequested) return;
     stopRequested = true;
     if (usagePoller !== undefined) usagePollerShutdown ??= usagePoller.close();
+    void closeCloudLifecycle().catch(() => undefined);
     if (service !== undefined) serviceShutdown = service.close();
     else daemonAuthority?.close();
     claudeHostToolServer?.beginShutdown();
@@ -3564,6 +3573,7 @@ export async function runDaemon(
         cloudAdapter = candidateAdapter;
         cloud = candidateCloud;
         cloudLifecycle = candidateLifecycle;
+        canonicalMemoryAuthoritySource = localCloudControl;
         candidateAdapter = undefined;
         candidateBridge = undefined;
       } catch (error: unknown) {
@@ -3598,9 +3608,15 @@ export async function runDaemon(
     const [
       { OhSqliteFactsMemoryEngine },
       { HraOhMemoryCoordinator },
+      { HraCanonicalMemorySynchronizer },
+      { HraMemorySummarySource },
+      { ProjectMemorySerialExecutor },
     ] = await Promise.all([
       import("./storage/oh-facts-memory-engine"),
       import("./daemon/memory-coordinator"),
+      import("./cloud/canonical-memory-sync"),
+      import("./cloud/memory-summary-source"),
+      import("./daemon/project-memory-serial"),
     ]);
     const memoryEngine = new OhSqliteFactsMemoryEngine({
       forkAttestations: activeStore,
@@ -3613,12 +3629,39 @@ export async function runDaemon(
       }),
       control: factsMemoryControl,
     });
+    const projectMemorySerial = new ProjectMemorySerialExecutor();
+    const canonicalMemorySync = canonicalMemoryAuthoritySource === undefined
+      ? undefined
+      : new HraCanonicalMemorySynchronizer({
+          authoritySource: canonicalMemoryAuthoritySource,
+          engine: memoryEngine,
+          paths,
+          projectSerial: projectMemorySerial,
+          store: activeStore,
+        });
     const memory = new HraOhMemoryCoordinator({
       engine: memoryEngine,
       factsMemory,
       paths,
+      projectSerial: projectMemorySerial,
       store: activeStore,
+      ...(canonicalMemorySync === undefined ? {} : { sync: canonicalMemorySync }),
     });
+    // A configured daemon may legitimately start before its first cloud
+    // identity is selected. Authentication requires a restart into the newly
+    // bound identity, so keep this optional projection absent until that boot
+    // instead of making cloud enrollment or local HRA unavailable.
+    if (cloudAdapter !== undefined && cloudIdentityNamespace !== null) {
+      const memorySummary = new HraMemorySummarySource({
+        engine: memoryEngine,
+        identityNamespace: cloudIdentityNamespace,
+        paths,
+        projectSerial: projectMemorySerial,
+        store: activeStore,
+      });
+      cloudAdapter.bindMemorySummarySource(async ({ devicePublicId, signal }) =>
+        await memorySummary.read({ devicePublicId, signal }));
+    }
     const desktop = process.platform === "darwin" && installation.desktopSwitching
       ? (() => {
           const bundle = new ExactChatGptBundlePort("/Applications/ChatGPT.app");
@@ -3645,6 +3688,8 @@ export async function runDaemon(
       workCapabilities,
       factsMemory,
       memory,
+      beforeMemoryClose: closeCloudLifecycle,
+      ...(canonicalMemorySync === undefined ? {} : { canonicalMemorySync }),
       gatewayKeys,
       proseResponder: new AiGatewayProseResponder({
         readKey: async () => await gatewayKeys.read(),
@@ -3742,17 +3787,9 @@ export async function runDaemon(
       }
     }
     if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && cloudLifecycle !== undefined) {
-      try { await joinBeforeDeadline("Cloud daemon shutdown", cloudLifecycle.close()); } catch (error: unknown) {
+      try { await joinBeforeDeadline("Cloud daemon shutdown", closeCloudLifecycle()); } catch (error: unknown) {
         if (error instanceof DaemonJoinDeadlineError) runError = error;
         else cleanupErrors.push(error);
-      }
-    }
-    cloudRequestController?.abort(new Error("Cloud daemon transport is closing."));
-    if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && cloudAdapter !== undefined) {
-      try { await joinBeforeDeadline("Cloud account observation shutdown", cloudAdapter.close()); } catch (error: unknown) {
-        runError = error instanceof DaemonJoinDeadlineError
-          ? error
-          : new DaemonAccountObservationJoinError(error);
       }
     }
     if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError)) {
@@ -3793,6 +3830,18 @@ export async function runDaemon(
       } catch (error: unknown) {
         if (error instanceof DaemonJoinDeadlineError) runError = error;
         else cleanupErrors.push(error);
+      }
+    }
+    // The hosted-memory synchronizer is owned by the service/memory
+    // coordinator but uses the cloud authority snapshot. Join it before
+    // aborting or closing that transport so shutdown cannot strand an
+    // indeterminate write or reopen an Oh database after local custody closes.
+    cloudRequestController?.abort(new Error("Cloud daemon transport is closing."));
+    if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && cloudAdapter !== undefined) {
+      try { await joinBeforeDeadline("Cloud account observation shutdown", cloudAdapter.close()); } catch (error: unknown) {
+        runError = error instanceof DaemonJoinDeadlineError
+          ? error
+          : new DaemonAccountObservationJoinError(error);
       }
     }
     if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && claudeHostToolServer !== undefined) {

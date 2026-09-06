@@ -34,6 +34,18 @@ describe("hosted public authority policy", () => {
       .toBe("active_daemon_device");
     expect(HOSTED_PUBLIC_FUNCTION_AUTHORITY["attentionNotifications:reconcile"])
       .toBe("active_daemon_device");
+    expect(HOSTED_PUBLIC_FUNCTION_AUTHORITY["devices:updateMemorySummary"])
+      .toBe("active_daemon_device");
+    expect(Object.entries(HOSTED_PUBLIC_FUNCTION_AUTHORITY)
+      .filter(([name]) => name.startsWith("memorySync:")))
+      .toEqual([
+        ["memorySync:create", "active_daemon_device"],
+        ["memorySync:get", "active_daemon_device"],
+        ["memorySync:head", "active_daemon_device"],
+        ["memorySync:list", "active_daemon_device"],
+        ["memorySync:pull", "active_daemon_device"],
+        ["memorySync:push", "active_daemon_device"],
+      ]);
     expect(Object.values(HOSTED_PUBLIC_FUNCTION_AUTHORITY).every((policy) => [
       "active_device",
       "active_daemon_device",

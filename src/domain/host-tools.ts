@@ -88,9 +88,23 @@ export type HraMemoryRememberInput = Readonly<{
 }>;
 
 export type HraMemoryQueryInput =
-  | Readonly<{ continuation?: string | undefined; mode: "list" }>
-  | Readonly<{ continuation?: string | undefined; key: string; mode: "get" }>
-  | Readonly<{ continuation?: string | undefined; mode: "search"; text: string }>;
+  | Readonly<{
+      continuation?: string | undefined;
+      mode: "list";
+      scope?: "composite" | "working" | undefined;
+    }>
+  | Readonly<{
+      continuation?: string | undefined;
+      key: string;
+      mode: "get";
+      scope?: "composite" | "working" | undefined;
+    }>
+  | Readonly<{
+      continuation?: string | undefined;
+      mode: "search";
+      scope?: "composite" | "working" | undefined;
+      text: string;
+    }>;
 
 export type HraMemoryExplainInput = Readonly<{
   queryId: string;
@@ -276,7 +290,7 @@ const hostToolDefinitions = [
   },
   {
     name: "memory_query",
-    description: "List, get, or search this session's working memory together with current-project shared memory.",
+    description: "List, get, or search this session's memory. The default composite scope includes current-project shared memory and fails closed when canonical custody is unavailable; explicit working scope reads only the session lane.",
     inputSchema: {
       oneOf: [
         {
@@ -285,6 +299,7 @@ const hostToolDefinitions = [
           required: ["mode"],
           properties: {
             mode: { const: "list" },
+            scope: { enum: ["composite", "working"] },
             continuation: continuationJsonSchema,
           },
         },
@@ -295,6 +310,7 @@ const hostToolDefinitions = [
           properties: {
             mode: { const: "get" },
             key: memoryKeyJsonSchema,
+            scope: { enum: ["composite", "working"] },
             continuation: continuationJsonSchema,
           },
         },
@@ -305,6 +321,7 @@ const hostToolDefinitions = [
           properties: {
             mode: { const: "search" },
             text: { type: "string", minLength: 1, maxLength: 8_192 },
+            scope: { enum: ["composite", "working"] },
             continuation: continuationJsonSchema,
           },
         },
@@ -481,15 +498,21 @@ const inputSchemas = {
       .regex(/^(?:und|[a-z]{2,3}(?:-[a-z0-9]{2,8})*)$/u).optional(),
   }).strict(),
   memory_query: z.union([
-    z.object({ mode: z.literal("list"), continuation: memoryContinuationSchema.optional() }).strict(),
+    z.object({
+      mode: z.literal("list"),
+      scope: z.enum(["composite", "working"]).optional(),
+      continuation: memoryContinuationSchema.optional(),
+    }).strict(),
     z.object({
       mode: z.literal("get"),
       key: memoryKeySchema,
+      scope: z.enum(["composite", "working"]).optional(),
       continuation: memoryContinuationSchema.optional(),
     }).strict(),
     z.object({
       mode: z.literal("search"),
       text: modelText(8_192),
+      scope: z.enum(["composite", "working"]).optional(),
       continuation: memoryContinuationSchema.optional(),
     }).strict(),
   ]),

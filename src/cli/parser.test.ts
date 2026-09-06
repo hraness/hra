@@ -304,6 +304,15 @@ describe("CLI parser", () => {
           value: { key: "architecture.boundary", mode: "get" },
         },
       });
+    expect(parseCli([
+      "memory", "get", "release", "architecture.boundary", "--working-only",
+    ])).toMatchObject({
+      command: {
+        kind: "memory.query",
+        session: "release",
+        value: { key: "architecture.boundary", mode: "get", scope: "working" },
+      },
+    });
     expect(parseCli(["memory", "search", "release", "--", "--authority", "boundary"]))
       .toMatchObject({
         command: {
@@ -365,6 +374,7 @@ describe("CLI parser", () => {
   test("rejects widened or incoherent owner memory arguments before daemon admission", () => {
     for (const argv of [
       ["memory", "status", "release", "--continuation", "token"],
+      ["memory", "status", "release", "--working-only"],
       ["memory", "get", "release", "Not A Key"],
       ["memory", "search", "release"],
       ["memory", "explain", "release", "query", "0"],
@@ -372,8 +382,45 @@ describe("CLI parser", () => {
       ["memory", "remember", "release", "preferences.review", "--summary", "summary", "body"],
       ["memory", "remember", "release", "preferences.review", "--title", "title", "body"],
       ["memory", "share", "release", "preferences.review"],
+      ["memory", "share", "release", "preferences.review", "--working-only", "--reason", "x"],
       ["memory", "list", "release", "--idempotency-key", "00000000-0000-4000-8000-000000000502"],
       ["memory", "purge", "release"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+  });
+
+  test("parses the explicit owner-only hosted memory lifecycle", () => {
+    const key = "00000000-0000-4000-8000-000000000503";
+    const space = `memory_${"A".repeat(32)}`;
+    expect(parseCli(["memory", "hosted", "list", "--json"])).toEqual({
+      command: { kind: "memory.hosted.list" },
+      json: true,
+      kind: "command",
+    });
+    expect(parseCli([
+      "memory", "hosted", "create", "jungle", "--idempotency-key", key,
+    ])).toEqual({
+      command: { idempotencyKey: key, kind: "memory.hosted.create", project: "jungle" },
+      json: false,
+      kind: "command",
+    });
+    expect(parseCli(["memory", "hosted", "attach", "jungle", space]))
+      .toMatchObject({ command: { hostedSpaceId: space, kind: "memory.hosted.attach" } });
+    expect(parseCli(["memory", "hosted", "detach", "jungle", "--generation", "7"]))
+      .toMatchObject({
+        command: {
+          expectedGeneration: 7,
+          kind: "memory.hosted.detach",
+          project: "jungle",
+        },
+      });
+    expect(parseCli(["memory", "hosted", "sync", "jungle"]))
+      .toMatchObject({ command: { kind: "memory.hosted.sync", project: "jungle" } });
+    for (const argv of [
+      ["memory", "hosted", "attach", "jungle", "memory_invalid"],
+      ["memory", "hosted", "detach", "jungle"],
+      ["memory", "hosted", "detach", "jungle", "--generation", "0"],
+      ["memory", "hosted", "list", "--working-only"],
+      ["memory", "hosted", "purge", "jungle"],
     ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
   });
 

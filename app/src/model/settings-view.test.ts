@@ -8,6 +8,9 @@ import {
   archivedSessionRows,
   attentionEmailPresentation,
   commandTargetForMachine,
+  hostedMemorySpaces,
+  hostedPeerActions,
+  hostedPeerPolicies,
   isMachineOnline,
   machineLabelsByDevice,
   registryHeartbeatToleranceMs,
@@ -167,6 +170,8 @@ describe("toMachineView", () => {
     expect(view.attentionEmailEnabled).toBeNull();
     expect(view.notificationPolicyFreshness).toBe("unsupported");
     expect(view.notificationPolicyRevision).toBeNull();
+    expect(view.memorySummary).toBeNull();
+    expect(view.memorySummaryFreshness).toBe("unsupported");
   });
 
   test("labels every scheduled task by provider and carries its machine", () => {
@@ -188,6 +193,183 @@ describe("toMachineView", () => {
   test("names both scheduled task kinds", () => {
     expect(scheduledTaskKindLabel("codex_automation")).toBe("Codex");
     expect(scheduledTaskKindLabel("hra_conversation")).toBe("HRA");
+  });
+});
+
+describe("hosted memory supervision", () => {
+  const digest = (scalar: string) => scalar.repeat(64);
+  const canonicalSpaceId = `hra:project:space-${"d".repeat(32)}`;
+  const summary = (headScalar: string, observedAt = now) => ({
+    coverage: { peerActions: "complete" as const, peerPolicies: "complete" as const, spaces: "complete" as const },
+    observedAt,
+    peerActions: [{
+      actor: { label: "Planner", ref: digest("a") },
+      createdAt: now - 2_000,
+      delivery: "steer" as const,
+      state: "applied" as const,
+      target: { label: "Planner", ref: digest("b") },
+      updatedAt: now - 1_000,
+    }],
+    peerPolicies: [{
+      mode: "coordinate" as const,
+      projectLabel: "HRA",
+      session: { label: "Planner", ref: digest("a") },
+      updatedAt: now - 3_000,
+    }],
+    spaces: [{
+      bindingDigest: digest("c"),
+      canonicalSpaceId,
+      enrollment: "attached" as const,
+      head: { digest: digest(headScalar), operationSha256: digest(headScalar), sequence: 4 },
+      lastExchangeAt: now - 500,
+      projectLabel: "HRA",
+      recentRecords: [{ key: "release-policy", kind: "memory_page" as const, updatedAt: now - 4_000 }],
+      recordCount: 3,
+      remoteHead: { digest: digest(headScalar), operationSha256: digest(headScalar), sequence: 4 },
+      syncStatus: "settled" as const,
+    }],
+    version: 1 as const,
+  });
+  const machine = (devicePublicId: string, label: string, headScalar: string, observedAt = now) =>
+    toMachineView({
+      device: { online: true, status: "active" },
+      devicePublicId,
+      memorySummary: summary(headScalar, observedAt),
+      memorySummaryStatus: "available",
+      now,
+      payload: registry({ machineLabel: label }),
+      revision: 1,
+      updatedAt: now,
+    });
+
+  test("retains exact per-device heads and reports agreement without choosing a winner", () => {
+    const agreed = hostedMemorySpaces([
+      machine("device_one", "Studio", "e"),
+      machine("device_two", "Laptop", "e"),
+    ]);
+    expect(agreed).toHaveLength(1);
+    expect(agreed[0]?.agreement).toBe("agreed");
+    expect(agreed[0]?.observations.map((observation) => observation.space?.head.digest))
+      .toEqual([digest("e"), digest("e")]);
+
+    const disagreed = hostedMemorySpaces([
+      machine("device_one", "Studio", "e"),
+      machine("device_two", "Laptop", "f"),
+    ]);
+    expect(disagreed[0]?.agreement).toBe("disagreed");
+    expect(disagreed[0]?.observations.map((observation) => observation.space?.head.digest))
+      .toEqual([digest("e"), digest("f")]);
+  });
+
+  test("excludes stale evidence from agreement and shows a current device's enrollment gap", () => {
+    const stale = machine(
+      "device_one",
+      "Studio",
+      "e",
+      now - registryHeartbeatToleranceMs - 1,
+    );
+    const withoutSpace = toMachineView({
+      device: { online: true, status: "active" },
+      devicePublicId: "device_two",
+      memorySummary: { ...summary("e"), spaces: [] },
+      memorySummaryStatus: "available",
+      now,
+      payload: registry({ machineLabel: "Laptop" }),
+      revision: 1,
+      updatedAt: now,
+    });
+    const grouped = hostedMemorySpaces([stale, withoutSpace]);
+    expect(stale.memorySummaryFreshness).toBe("stale");
+    expect(grouped[0]?.agreement).toBe("insufficient");
+    expect(grouped[0]?.observations.map((observation) => observation.freshness))
+      .toEqual(["stale", "missing"]);
+  });
+
+  test("distinguishes a bounded space list from a complete enrollment gap", () => {
+    const bounded = toMachineView({
+      device: { online: true, status: "active" },
+      devicePublicId: "device_two",
+      memorySummary: {
+        ...summary("e"),
+        coverage: { ...summary("e").coverage, spaces: "bounded" },
+        spaces: [],
+      },
+      memorySummaryStatus: "available",
+      now,
+      payload: registry({ machineLabel: "Laptop" }),
+      revision: 1,
+      updatedAt: now,
+    });
+    const grouped = hostedMemorySpaces([
+      machine("device_one", "Studio", "e"),
+      bounded,
+    ]);
+    expect(grouped[0]?.agreement).toBe("insufficient");
+    expect(grouped[0]?.observations.map((observation) => observation.freshness))
+      .toEqual(["current", "bounded"]);
+  });
+
+  test("does not treat a head with an unavailable record count as convergence evidence", () => {
+    const unavailableSpace = summary("e").spaces[0];
+    if (unavailableSpace === undefined) throw new Error("Expected a memory summary space fixture.");
+    const unavailable = toMachineView({
+      device: { online: true, status: "active" },
+      devicePublicId: "device_two",
+      memorySummary: {
+        ...summary("e"),
+        spaces: [{ ...unavailableSpace, recordCount: null }],
+      },
+      memorySummaryStatus: "available",
+      now,
+      payload: registry({ machineLabel: "Laptop" }),
+      revision: 1,
+      updatedAt: now,
+    });
+    const grouped = hostedMemorySpaces([
+      machine("device_one", "Studio", "e"),
+      unavailable,
+    ]);
+    expect(grouped[0]?.agreement).toBe("insufficient");
+    expect(grouped[0]?.observations[1]?.space?.recordCount).toBeNull();
+  });
+
+  test("discards summaries from missing, pending, and revoked device authorities", () => {
+    for (const device of [
+      null,
+      { online: true, status: "pending" } as const,
+      { online: true, status: "revoked" } as const,
+    ]) {
+      const inactive = toMachineView({
+        device,
+        devicePublicId: "device_inactive",
+        memorySummary: summary("e"),
+        memorySummaryStatus: "available",
+        now,
+        payload: registry({ machineLabel: "Retired" }),
+        revision: 1,
+        updatedAt: now,
+      });
+      expect(inactive.memorySummaryFreshness).toBe("inactive");
+      expect(inactive.memorySummary).toBeNull();
+      expect(hostedMemorySpaces([inactive])).toEqual([]);
+      expect(hostedPeerPolicies([inactive])).toEqual([]);
+      expect(hostedPeerActions([inactive])).toEqual([]);
+    }
+  });
+
+  test("keeps actor and target roles distinct even when their labels are equal", () => {
+    const machines = [machine("device_one", "Studio", "e")];
+    const actions = hostedPeerActions(machines);
+    expect(actions[0]).toMatchObject({
+      actor: { label: "Planner", ref: digest("a") },
+      target: { label: "Planner", ref: digest("b") },
+    });
+    expect(actions[0]?.actor.ref).not.toBe(actions[0]?.target.ref);
+    expect(hostedPeerPolicies(machines)[0]).toMatchObject({
+      machineLabel: "Studio",
+      mode: "coordinate",
+      session: { ref: digest("a") },
+    });
   });
 });
 

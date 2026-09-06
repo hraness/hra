@@ -342,6 +342,8 @@ describe("status-first account deletion", () => {
         .withIndex("by_user", (builder) => builder.eq("userId", world.userId))
         .collect())).toHaveLength(0);
     expect(await world.testRuntime.mutation(drainDeletion, { limit: 200 }))
+      .toMatchObject({ category: "memory_history", kind: "advanced", processed: 0 });
+    expect(await world.testRuntime.mutation(drainDeletion, { limit: 200 }))
       .toMatchObject({ category: "session_heads", kind: "advanced", processed: 0 });
   });
 

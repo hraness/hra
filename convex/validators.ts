@@ -145,6 +145,7 @@ export const accountDeletionState = v.union(
 export const accountDeletionCategory = v.union(
   v.literal("commands_and_leases"),
   v.literal("chunks_and_epochs"),
+  v.literal("memory_history"),
   v.literal("session_heads"),
   v.literal("usage_and_bindings"),
   v.literal("codex_accounts"),
@@ -192,6 +193,7 @@ export const quotaCategory = v.union(
   v.literal("receipt"),
   v.literal("security"),
   v.literal("job"),
+  v.literal("memory"),
 );
 export const quotaEnforcement = v.union(v.literal("shadow"), v.literal("hard"));
 export const quotaUserResource = v.union(
@@ -201,6 +203,7 @@ export const quotaUserResource = v.union(
   v.literal("session_chunk"),
   v.literal("nonterminal_command"),
   v.literal("live_chunk"),
+  v.literal("memory_space"),
 );
 export const quotaAccountResource = v.literal("usage_snapshot");
 export const maintenanceCategory = v.union(

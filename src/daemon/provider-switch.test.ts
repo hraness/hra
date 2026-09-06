@@ -2408,6 +2408,56 @@ describe("provider portability", () => {
     expect(value.claude.endedThreads).toEqual(["claude-thread-1"]);
   });
 
+  test("refuses an owner send captured before a cross-account switch wins", async () => {
+    const value = await fixture();
+    const { sessionId } = await codexSession(value);
+    const target = await value.service.execute(
+      { kind: "account.add", label: "Owner-send target" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredRead = new Promise<void>((resolve) => { entered = resolve; });
+    const holdRead = new Promise<void>((resolve) => { release = resolve; });
+    value.claude.accountSignedInResults.push(true);
+    value.claude.beforeReadAccountReturn = async () => {
+      entered();
+      await holdRead;
+    };
+
+    const switching = value.service.execute({
+      account: target.account.id,
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.switch",
+      provider: "claude",
+      session: sessionId,
+    }, { signal });
+    await enteredRead;
+    let sendSettled = false;
+    const sending = value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "This stale account authority must not dispatch.",
+      session: sessionId,
+    }, { signal }).then(
+      (result) => ({ result, status: "fulfilled" as const }),
+      (error: unknown) => ({ error, status: "rejected" as const }),
+    ).finally(() => { sendSettled = true; });
+    for (let index = 0; index < 8; index += 1) await Promise.resolve();
+    expect(sendSettled).toBe(false);
+
+    release();
+    await expect(switching).resolves.toMatchObject({
+      session: { id: sessionId, profileId: target.account.id, provider: "claude" },
+    });
+    const sendOutcome = await sending;
+    expect(sendOutcome.status).toBe("rejected");
+    expect(sendOutcome.status === "rejected" ? sendOutcome.error : undefined)
+      .toMatchObject({ code: "CONFLICT", name: "CommandFailure" });
+    expect(value.codex.calls.filter((call) => call === "start-turn")).toEqual([]);
+    expect(value.claude.calls.filter((call) => call === "start-turn")).toHaveLength(1);
+  });
+
   test("serializes a remote cross-account switch before target Claude login admission", async () => {
     const value = await fixture();
     const { accountId, sessionId } = await codexSession(value);

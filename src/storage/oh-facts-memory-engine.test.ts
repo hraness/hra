@@ -25,10 +25,15 @@ import {
   OH_MEMORY_LIMITS_V1,
   OH_MEMORY_PAGE_FORMAT_V1,
 } from "@hraness/oh/memory";
-import { createOhSqliteStoreAuthorityV1 } from "@hraness/oh/sqlite";
+import {
+  OhSqliteStore,
+  applyOhSqliteMigrations,
+  createOhSqliteStoreAuthorityV1,
+} from "@hraness/oh/sqlite";
 import {
   OH_CANONICAL_STORE_PROFILE_V1,
   OH_WORKING_STORE_PROFILE_V1,
+  emptyOhHeadV1,
 } from "@hraness/oh/store";
 
 import {
@@ -41,8 +46,13 @@ import { FactsMemoryControlStore } from "./facts-memory-control";
 import { LocalFactsMemoryBroker } from "./local-facts-memory-broker";
 import {
   HRA_OH_FACTS_MEMORY_LIMITS_V1,
+  inspectOhCanonicalDatabaseForRecovery,
+  OhCanonicalDatabaseInspectionError,
   OhSqliteFactsMemoryEngine,
   projectOhHead,
+  type OhCanonicalReplicationInput,
+  type OpenOhCanonicalReplication,
+  type OpenOhWorkingMemoryStores,
 } from "./oh-facts-memory-engine";
 import { ensurePrivateDirectory } from "./paths";
 
@@ -247,15 +257,733 @@ const legacyMetadataFixture = (current: AdapterMetadataFixture): LegacyMetadataF
   });
 
 describe("released Oh SQLite facts-memory adapter", () => {
-  test("pins the immutable public v0.2.7 release without installing optional semantic peers", async () => {
+  test("opens a verified working store without touching durable canonical custody", async () => {
+    const { broker, engine, root } = await fixture();
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const receipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const expectedHead = await inspectionHead(broker, working);
+    const brokenCanonicalDirectory = await ensurePrivateDirectory(
+      join(root, "broken-durable-canonical"),
+    );
+    const brokenCanonicalDatabase = join(brokenCanonicalDirectory, "oh.sqlite");
+    await symlink(join(root, "missing-canonical-target"), brokenCanonicalDatabase);
+
+    let escaped: OpenOhWorkingMemoryStores | undefined;
+    const completed = await engine.withWorkingMemoryStore({
+      binding: working,
+      directory: join(root, working.sessionId),
+      expectedHandleHash: receipt.handleHash,
+      expectedHead,
+    }, async (stores) => {
+      escaped = stores;
+      expect(Object.keys(stores).sort()).toEqual(["ephemeralCanonical", "working"]);
+      expect(stores.ephemeralCanonical.expectedHead).toEqual(emptyOhHeadV1());
+      expect(stores.ephemeralCanonical.store.binding.profile.profileKind).toBe("canonical");
+      expect(stores.working.store.binding.profile.profileKind).toBe("working");
+      expect(await stores.ephemeralCanonical.store.verify()).toMatchObject({
+        head: emptyOhHeadV1(),
+        operations: 0,
+        records: 0,
+      });
+
+      const record = createKnowledgeGraphRecordV1({
+        dependencies: [],
+        key: "entity:working-only",
+        kind: "entity",
+        v: 1,
+        value: { name: "Working only" },
+      });
+      await expect(stores.ephemeralCanonical.store.commit({
+        actorId: "hra.memory.host",
+        changes: [{ kind: "put", record, v: 1 }],
+        expectedHead: stores.ephemeralCanonical.expectedHead,
+        operationId: "host.test.working-only-ephemeral-refusal",
+      })).rejects.toThrow("FACTS_MEMORY_OH_WORKING_ONLY_EPHEMERAL_READ_ONLY");
+      const committed = await stores.working.store.commit({
+        actorId: "hra.memory.host",
+        changes: [{ kind: "put", record, v: 1 }],
+        expectedHead: stores.working.expectedHead,
+        operationId: "host.test.working-only-commit",
+      });
+      return committed.operationSha256;
+    });
+
+    expect(completed.workingHead.operationSha256).toBe(completed.result);
+    expect(completed.workingHead.sequence).toBe(1);
+    expect(Object.keys(completed).sort()).toEqual(["result", "workingHead"]);
+    expect((await lstat(brokenCanonicalDatabase)).isSymbolicLink()).toBe(true);
+    expect(escaped).toBeDefined();
+    await expect(escaped!.working.store.head()).rejects.toThrow();
+    await expect(escaped!.ephemeralCanonical.store.head()).rejects.toThrow();
+  });
+
+  test("rechecks working custody and closes both capabilities after failure", async () => {
+    const { broker, engine, root } = await fixture();
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const receipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const expectedHead = await inspectionHead(broker, working);
+    const directory = join(root, working.sessionId);
+    const databasePath = join(directory, "oh.sqlite");
+    let escaped: OpenOhWorkingMemoryStores | undefined;
+
+    let callbackCalled = false;
+    await expect(engine.withWorkingMemoryStore({
+      binding: working,
+      directory,
+      expectedHandleHash: "f".repeat(64),
+      expectedHead,
+    }, async () => {
+      callbackCalled = true;
+    })).rejects.toThrow("FACTS_MEMORY_OH_HANDLE_MISMATCH");
+    await expect(engine.withWorkingMemoryStore({
+      binding: working,
+      directory,
+      expectedHandleHash: receipt.handleHash,
+      expectedHead: { ...expectedHead, digest: "f".repeat(64) },
+    }, async () => {
+      callbackCalled = true;
+    })).rejects.toThrow("FACTS_MEMORY_OH_WORKING_HEAD_CONFLICT");
+    expect(callbackCalled).toBe(false);
+
+    let failure: unknown;
+    try {
+      await engine.withWorkingMemoryStore({
+        binding: working,
+        directory,
+        expectedHandleHash: receipt.handleHash,
+        expectedHead,
+      }, async (stores) => {
+        escaped = stores;
+        await rename(databasePath, join(directory, "oh.sqlite.replaced"));
+        await writeFile(databasePath, new Uint8Array(), { mode: 0o600 });
+      });
+    } catch (error: unknown) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("FACTS_MEMORY_OH_WORKING_DATABASE_REPLACED");
+    expect((failure as Error).message).not.toContain("CANONICAL");
+    expect(escaped).toBeDefined();
+    await expect(escaped!.working.store.head()).rejects.toThrow();
+    await expect(escaped!.ephemeralCanonical.store.head()).rejects.toThrow();
+  });
+
+  test("exports and imports exact canonical operations through a callback-scoped host capability", async () => {
+    const { broker, engine, root } = await fixture();
+    const realmId = "hra:project-memory:replication-round-trip";
+    const spaceId = "hra:project:replication-round-trip";
+    const sourceDirectory = await ensurePrivateDirectory(join(root, "replication-source"));
+    const targetDirectory = await ensurePrivateDirectory(join(root, "replication-target"));
+    const sourceAuthority = createOhSqliteStoreAuthorityV1({
+      path: join(sourceDirectory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId,
+      spaceId,
+    });
+    await sourceAuthority.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{
+        kind: "put",
+        record: createKnowledgeGraphRecordV1({
+          dependencies: [],
+          key: "entity:replicated",
+          kind: "entity",
+          v: 1,
+          value: { name: "Replicated" },
+        }),
+        v: 1,
+      }],
+      expectedHead: await sourceAuthority.store.head(),
+      operationId: "host.test.replication-source",
+    });
+    const sourceHead = await sourceAuthority.store.head();
+    const sourceBindingSha256 = sourceAuthority.store.binding.bindingSha256;
+    await sourceAuthority.store.close();
+    const sourceInspection = inspectOhCanonicalDatabaseForRecovery(sourceDirectory);
+    if (sourceInspection.state !== "present") throw new Error("Expected source inode receipt.");
+
+    const exported = await engine.withCanonicalReplication({
+      directory: sourceDirectory,
+      expectedDatabaseFile: sourceInspection.file,
+      expectedHead: projectOhHead(sourceHead),
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async (opened) => {
+      expect(Object.keys(opened).sort()).toEqual([
+        "bindingSha256",
+        "expectedHead",
+        "replication",
+      ]);
+      expect(opened.bindingSha256).toBe(sourceBindingSha256);
+      expect(opened.expectedHead).toEqual(sourceHead);
+      expect(Object.keys(opened.replication).sort()).toEqual(["exportBundle", "importBundle"]);
+      const page = await opened.replication.exportBundle({
+        after: { operationSha256: null, sequence: 0 },
+      });
+      expect(page).toMatchObject({
+        from: { operationSha256: null, sequence: 0 },
+        hasMore: false,
+        through: sourceHead,
+        to: { operationSha256: sourceHead.operationSha256, sequence: 1 },
+        v: 1,
+      });
+      expect(page.bundle.operations).toHaveLength(1);
+      return { bundle: page.bundle, escaped: opened.replication };
+    });
+    expect(exported.canonicalHead).toEqual(sourceHead);
+    await expect(exported.result.escaped.exportBundle({
+      after: { operationSha256: null, sequence: 0 },
+    })).rejects.toThrow();
+
+    const imported = await engine.withCanonicalReplication({
+      directory: targetDirectory,
+      expectedHead: projectOhHead(emptyOhHeadV1()),
+      realmId,
+      requireVacant: true,
+      spaceId,
+    }, async (opened) => await opened.replication.importBundle({
+      bundle: exported.result.bundle,
+    }));
+    expect(imported.result).toMatchObject({ imported: 1, status: "imported", v: 1 });
+    expect(imported.canonicalHead).toEqual(sourceHead);
+
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const workingReceipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const workingHead = await inspectionHead(broker, working);
+    await engine.withMemoryStores({
+      canonical: {
+        directory: targetDirectory,
+        expectedHead: projectOhHead(imported.canonicalHead),
+        realmId,
+        requireExisting: true,
+        spaceId,
+      },
+      working: {
+        binding: working,
+        directory: join(root, working.sessionId),
+        expectedHandleHash: workingReceipt.handleHash,
+        expectedHead: workingHead,
+      },
+    }, async (opened) => {
+      expect(Object.hasOwn(opened.working, "replication")).toBe(false);
+      expect(opened.working.store.binding.profile.capabilities.operationReplication).toBe(false);
+    });
+  });
+
+  test("pins an exact canonical ancestor and rejects equivocation or regression", async () => {
+    const { engine, root } = await fixture();
+    const directory = await ensurePrivateDirectory(join(root, "replication-heads"));
+    const realmId = "hra:project-memory:replication-heads";
+    const spaceId = "hra:project:replication-heads";
+    const authority = createOhSqliteStoreAuthorityV1({
+      path: join(directory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId,
+      spaceId,
+    });
+    await authority.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: createKnowledgeGraphRecordV1({
+        dependencies: [],
+        key: "entity:replication-first",
+        kind: "entity",
+        v: 1,
+        value: { name: "First" },
+      }), v: 1 }],
+      expectedHead: await authority.store.head(),
+      operationId: "host.test.replication-first",
+    });
+    const firstHead = await authority.store.head();
+    await authority.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: createKnowledgeGraphRecordV1({
+        dependencies: [],
+        key: "entity:replication-second",
+        kind: "entity",
+        v: 1,
+        value: { name: "Second" },
+      }), v: 1 }],
+      expectedHead: firstHead,
+      operationId: "host.test.replication-second",
+    });
+    const currentHead = await authority.store.head();
+    await authority.store.close();
+
+    let omittedHeadCallbackCalled = false;
+    expect(() => engine.withCanonicalReplication({
+      directory,
+      realmId,
+      requireExisting: true,
+      spaceId,
+    } as unknown as OhCanonicalReplicationInput, async () => {
+      omittedHeadCallbackCalled = true;
+    })).toThrow();
+    expect(omittedHeadCallbackCalled).toBe(false);
+
+    const pinned = await engine.withCanonicalReplication({
+      directory,
+      expectedHead: projectOhHead(firstHead),
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async (opened) => {
+      expect(opened.expectedHead).toEqual(firstHead);
+      return await opened.replication.exportBundle({
+        after: { operationSha256: null, sequence: 0 },
+        // A caller cannot widen the authority even through an unchecked JS
+        // value: the wrapper reconstructs an exact request at the pin.
+        through: currentHead,
+      } as Parameters<typeof opened.replication.exportBundle>[0] & {
+        through: typeof currentHead;
+      });
+    });
+    expect(pinned.result.bundle.operations).toHaveLength(1);
+    expect(pinned.canonicalHead).toEqual(currentHead);
+
+    let called = false;
+    await expect(engine.withCanonicalReplication({
+      directory,
+      expectedHead: { ...projectOhHead(firstHead), digest: "f".repeat(64) },
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async () => {
+      called = true;
+    })).rejects.toThrow("FACTS_MEMORY_OH_CANONICAL_HEAD_EQUIVOCATION");
+    expect(called).toBe(false);
+
+    await expect(engine.withCanonicalReplication({
+      directory,
+      expectedHead: {
+        ...projectOhHead(firstHead),
+        digest: "e".repeat(64),
+        operationSha256: "e".repeat(64),
+      },
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async () => undefined)).rejects.toThrow(
+      "FACTS_MEMORY_OH_CANONICAL_HEAD_EQUIVOCATION",
+    );
+
+    await expect(engine.withCanonicalReplication({
+      directory,
+      expectedHead: { ...projectOhHead(currentHead), sequence: currentHead.sequence + 1 },
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async () => undefined)).rejects.toThrow(
+      "FACTS_MEMORY_OH_CANONICAL_HEAD_REGRESSION",
+    );
+  });
+
+  test("reads only an exact verified canonical snapshot and refuses physical head drift", async () => {
+    const { engine, root } = await fixture();
+    const directory = await ensurePrivateDirectory(join(root, "canonical-summary"));
+    const realmId = "hra:project-memory:canonical-summary";
+    const spaceId = "hra:project:canonical-summary";
+    const authority = createOhSqliteStoreAuthorityV1({
+      path: join(directory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId,
+      spaceId,
+    });
+    await authority.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: memoryPageRecord(1, "first"), v: 1 }],
+      expectedHead: await authority.store.head(),
+      operationId: "host.test.canonical-summary-first",
+    });
+    const firstHead = await authority.store.head();
+    await authority.store.close();
+
+    const snapshot = await engine.inspectCanonicalMemorySnapshot({
+      directory,
+      expectedHead: projectOhHead(firstHead),
+      realmId,
+      requireExisting: true,
+      spaceId,
+    });
+    expect(snapshot.bindingSha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(snapshot.head).toEqual(firstHead);
+    expect(snapshot.records).toEqual([memoryPageRecord(1, "first")]);
+    expect(Object.hasOwn(snapshot, "store")).toBe(false);
+
+    const advanced = createOhSqliteStoreAuthorityV1({
+      path: join(directory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId,
+      spaceId,
+    });
+    await advanced.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: memoryPageRecord(2, "second"), v: 1 }],
+      expectedHead: await advanced.store.head(),
+      operationId: "host.test.canonical-summary-second",
+    });
+    await advanced.store.close();
+
+    await expect(engine.inspectCanonicalMemorySnapshot({
+      directory,
+      expectedHead: projectOhHead(firstHead),
+      realmId,
+      requireExisting: true,
+      spaceId,
+    })).rejects.toThrow("FACTS_MEMORY_OH_CANONICAL_HEAD_NOT_SETTLED");
+  });
+
+  test("rechecks canonical inode custody after replication and rejects oversized storage", async () => {
+    const { engine, root } = await fixture();
+    const realmId = "hra:project-memory:replication-custody";
+    const spaceId = "hra:project:replication-custody";
+    const directory = await ensurePrivateDirectory(join(root, "replication-custody"));
+    const authority = createOhSqliteStoreAuthorityV1({
+      path: join(directory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId,
+      spaceId,
+    });
+    await authority.store.close();
+    const inspection = inspectOhCanonicalDatabaseForRecovery(directory);
+    if (inspection.state !== "present") throw new Error("Expected canonical inode receipt.");
+    const escaped: OpenOhCanonicalReplication["replication"][] = [];
+    await expect(engine.withCanonicalReplication({
+      directory,
+      expectedDatabaseFile: inspection.file,
+      expectedHead: projectOhHead(emptyOhHeadV1()),
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async (opened) => {
+      escaped.push(opened.replication);
+      await rename(join(directory, "oh.sqlite"), join(directory, "oh.sqlite.replaced"));
+      await writeFile(join(directory, "oh.sqlite"), new Uint8Array(), { mode: 0o600 });
+    })).rejects.toThrow("FACTS_MEMORY_OH_CANONICAL_DATABASE_REPLACED");
+    expect(escaped).toHaveLength(1);
+    await expect(escaped[0]!.exportBundle({
+      after: { operationSha256: null, sequence: 0 },
+    })).rejects.toThrow();
+    expect((await stat(join(directory, "oh.sqlite"))).size).toBe(0);
+
+    const oversizedDirectory = await ensurePrivateDirectory(join(root, "replication-oversized"));
+    const oversized = createOhSqliteStoreAuthorityV1({
+      path: join(oversizedDirectory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId,
+      spaceId,
+    });
+    await oversized.store.close();
+    await truncate(
+      join(oversizedDirectory, "oh.sqlite"),
+      HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes + 1,
+    );
+    let oversizedCallbackCalled = false;
+    await expect(engine.withCanonicalReplication({
+      directory: oversizedDirectory,
+      expectedHead: projectOhHead(emptyOhHeadV1()),
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async () => {
+      oversizedCallbackCalled = true;
+    })).rejects.toThrow("FACTS_MEMORY_OH_DATABASE_TOO_LARGE");
+    expect(oversizedCallbackCalled).toBe(false);
+  });
+
+  test("classifies legacy recovery without following sidecars or accepting a replaced main inode", async () => {
+    const { broker, engine, root } = await fixture();
+    const absentDirectory = join(root, "recovery-absent");
+    expect(inspectOhCanonicalDatabaseForRecovery(absentDirectory)).toEqual({ state: "absent" });
+
+    const sidecarOnly = await ensurePrivateDirectory(join(root, "recovery-sidecar-only"));
+    await writeFile(join(sidecarOnly, "oh.sqlite-wal"), new Uint8Array(), { mode: 0o600 });
+    expect(() => inspectOhCanonicalDatabaseForRecovery(sidecarOnly)).toThrow(
+      "FACTS_MEMORY_OH_CANONICAL_DATABASE_UNSAFE",
+    );
+    try {
+      inspectOhCanonicalDatabaseForRecovery(sidecarOnly);
+      throw new Error("Expected unsafe sidecar evidence to be rejected.");
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(OhCanonicalDatabaseInspectionError);
+      expect(error).toMatchObject({ failure: "unsafe" });
+    }
+
+    const unavailableDirectory = join(root, "x".repeat(300));
+    try {
+      inspectOhCanonicalDatabaseForRecovery(unavailableDirectory);
+      throw new Error("Expected an overlong lookup to be unavailable.");
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(OhCanonicalDatabaseInspectionError);
+      expect(error).toMatchObject({
+        failure: "unavailable",
+        message: "FACTS_MEMORY_OH_CANONICAL_DATABASE_INSPECTION_UNAVAILABLE",
+      });
+    }
+
+    const directory = await ensurePrivateDirectory(join(root, "recovery-replaced"));
+    const path = join(directory, "oh.sqlite");
+    await writeFile(path, new Uint8Array(), { mode: 0o600 });
+    const inspection = inspectOhCanonicalDatabaseForRecovery(directory);
+    if (inspection.state !== "present") throw new Error("Expected a database inode receipt.");
+    await rename(path, join(directory, "oh.sqlite.old"));
+    await writeFile(path, new Uint8Array(), { mode: 0o600 });
+
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const workingReceipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const workingHead = await inspectionHead(broker, working);
+    await expect(engine.withMemoryStores({
+      canonical: {
+        directory,
+        expectedDatabaseFile: inspection.file,
+        realmId: "hra:project-memory:replaced",
+        requireExisting: true,
+        spaceId: "hra:project:replaced",
+      },
+      working: {
+        binding: working,
+        directory: join(root, working.sessionId),
+        expectedHandleHash: workingReceipt.handleHash,
+        expectedHead: workingHead,
+      },
+    }, async () => undefined)).rejects.toThrow(
+      "FACTS_MEMORY_OH_CANONICAL_DATABASE_REPLACED",
+    );
+    expect((await stat(path)).size).toBe(0);
+  });
+
+  test("requires total non-anchor vacancy before a bound canonical database is initialized", async () => {
+    for (const hidden of ["sync", "fts", "operation-record"] as const) {
+      const { broker, engine, root } = await fixture();
+      const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+      const workingReceipt = await broker.create({
+        binding: working,
+        operationKey: `create:${working.sessionId}`,
+      });
+      const workingHead = await inspectionHead(broker, working);
+      const directory = await ensurePrivateDirectory(join(root, `vacancy-${hidden}`));
+      const spaceId = `hra:project:vacancy-${hidden}`;
+      const realmId = `hra:project-memory:vacancy-${hidden}`;
+      const authority = createOhSqliteStoreAuthorityV1({
+        path: join(directory, "oh.sqlite"),
+        profile: OH_CANONICAL_STORE_PROFILE_V1,
+        realmId,
+        spaceId,
+      });
+      await authority.store.close();
+      const database = new Database(join(directory, "oh.sqlite"));
+      try {
+        if (hidden === "sync") {
+          database.query(
+            `INSERT INTO oh_sync_state(
+               remote_id,space_id,pulled_sequence,pushed_sequence,remote_head_sha256,updated_at
+             ) VALUES ('hidden',?,0,0,NULL,'2026-09-06T00:00:00.000Z')`,
+          ).run(spaceId);
+        } else if (hidden === "fts") {
+          database.query(
+            "INSERT INTO oh_search_fts(space_id,record_key,text) VALUES (?,'ghost','hidden')",
+          ).run(spaceId);
+        } else {
+          database.exec("PRAGMA foreign_keys=OFF");
+          database.query(
+            `INSERT INTO oh_operation_records(
+               operation_sha256,ordinal,record_key,change_kind,record_sha256
+             ) VALUES (?,0,'ghost','tombstone',NULL)`,
+          ).run("a".repeat(64));
+          database.exec("PRAGMA foreign_keys=ON");
+        }
+      } finally {
+        database.close(false);
+      }
+
+      await expect(engine.withMemoryStores({
+        canonical: { directory, realmId, requireExisting: true, requireVacant: true, spaceId },
+        working: {
+          binding: working,
+          directory: join(root, working.sessionId),
+          expectedHandleHash: workingReceipt.handleHash,
+          expectedHead: workingHead,
+        },
+      }, async () => undefined)).rejects.toThrow(
+        "FACTS_MEMORY_OH_CANONICAL_MULTIPLE_SPACES_REFUSED",
+      );
+    }
+  });
+
+  test("refuses an alien canonical space without inserting the requested space", async () => {
+    const { broker, engine, root } = await fixture();
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const workingReceipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const workingHead = await inspectionHead(broker, working);
+    const canonicalDirectory = await ensurePrivateDirectory(join(root, "single-space-canonical"));
+    const alien = createOhSqliteStoreAuthorityV1({
+      path: join(canonicalDirectory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId: "hra:project-memory:space-alien",
+      spaceId: "hra:project:space-alien",
+    });
+    await alien.store.close();
+
+    await expect(engine.withMemoryStores({
+      canonical: {
+        directory: canonicalDirectory,
+        realmId: "hra:project-memory:space-primary",
+        spaceId: "hra:project:space-primary",
+      },
+      working: {
+        binding: working,
+        directory: join(root, working.sessionId),
+        expectedHandleHash: workingReceipt.handleHash,
+        expectedHead: workingHead,
+      },
+    }, async () => undefined)).rejects.toThrow(
+      "FACTS_MEMORY_OH_CANONICAL_MULTIPLE_SPACES_REFUSED",
+    );
+
+    const database = new Database(join(canonicalDirectory, "oh.sqlite"), { readonly: true });
+    try {
+      for (const table of ["oh_spaces", "oh_space_bindings"] as const) {
+        expect(database.query<{ space_id: string }, []>(
+          `SELECT space_id FROM ${table} ORDER BY space_id`,
+        ).all()).toEqual([{ space_id: "hra:project:space-alien" }]);
+      }
+    } finally {
+      database.close();
+    }
+  });
+
+  test("recovers exact empty SQLite bootstrap states before binding one space", async () => {
+    const { broker, engine, root } = await fixture();
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const workingReceipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const workingHead = await inspectionHead(broker, working);
+    const expectedSpaceId = "hra:project:bootstrap-recovery";
+    const expectedRealmId = "hra:project-memory:bootstrap-recovery";
+
+    for (const state of ["migrated", "space-created"] as const) {
+      const directory = await ensurePrivateDirectory(join(root, `bootstrap-${state}`));
+      const path = join(directory, "oh.sqlite");
+      if (state === "migrated") {
+        const database = new Database(path);
+        try {
+          applyOhSqliteMigrations(database);
+        } finally {
+          database.close(false);
+        }
+      } else {
+        const interrupted = new OhSqliteStore({ path, spaceId: expectedSpaceId });
+        interrupted.close();
+      }
+
+      await expect(engine.withMemoryStores({
+        canonical: {
+          directory,
+          realmId: expectedRealmId,
+          spaceId: expectedSpaceId,
+        },
+        working: {
+          binding: working,
+          directory: join(root, working.sessionId),
+          expectedHandleHash: workingReceipt.handleHash,
+          expectedHead: workingHead,
+        },
+      }, async () => undefined)).resolves.toMatchObject({
+        canonicalHead: { sequence: 0 },
+      });
+
+      const database = new Database(path, { readonly: true });
+      try {
+        expect(database.query<{ space_id: string }, []>(
+          "SELECT space_id FROM oh_spaces",
+        ).all()).toEqual([{ space_id: expectedSpaceId }]);
+        expect(database.query<{ space_id: string }, []>(
+          "SELECT space_id FROM oh_space_bindings",
+        ).all()).toEqual([{ space_id: expectedSpaceId }]);
+      } finally {
+        database.close();
+      }
+    }
+  });
+
+  test("rejects orphan foreign-key, search, and purge space rows", async () => {
+    const { broker, engine, root } = await fixture();
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const workingReceipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const workingHead = await inspectionHead(broker, working);
+    const canonicalDirectory = await ensurePrivateDirectory(join(root, "hidden-space-rows"));
+    const canonicalInput = {
+      directory: canonicalDirectory,
+      realmId: "hra:project-memory:hidden-space-rows",
+      spaceId: "hra:project:hidden-space-rows",
+    } as const;
+    const stores = {
+      canonical: canonicalInput,
+      working: {
+        binding: working,
+        directory: join(root, working.sessionId),
+        expectedHandleHash: workingReceipt.handleHash,
+        expectedHead: workingHead,
+      },
+    } as const;
+    await engine.withMemoryStores(stores, async () => undefined);
+
+    const database = new Database(join(canonicalDirectory, "oh.sqlite"));
+    try {
+      database.exec("PRAGMA foreign_keys=OFF");
+      database.query(
+        `INSERT INTO oh_sync_state(
+           remote_id,space_id,pulled_sequence,pushed_sequence,remote_head_sha256,updated_at
+         ) VALUES ('alien-remote','alien-space',0,0,NULL,'2026-09-06T00:00:00.000Z')`,
+      ).run();
+      database.query(
+        "INSERT INTO oh_search_fts(space_id,record_key,text) VALUES ('alien-space','alien:key','hidden')",
+      ).run();
+      database.query(
+        `INSERT INTO oh_space_purges(
+           space_id,binding_sha256,prior_operation_sha256,prior_sequence,
+           purged_at,receipt_sha256,receipt_json
+         ) VALUES ('alien-space',?,NULL,0,'2026-09-06T00:00:00.000Z',?,?)`,
+      ).run("a".repeat(64), "b".repeat(64), JSON.stringify({ alien: true }));
+      database.exec("PRAGMA foreign_keys=ON");
+    } finally {
+      database.close(false);
+    }
+
+    await expect(engine.withMemoryStores(stores, async () => undefined)).rejects.toThrow(
+      "FACTS_MEMORY_OH_CANONICAL_MULTIPLE_SPACES_REFUSED",
+    );
+  });
+
+  test("pins the immutable public v0.4.1 release without installing optional semantic peers", async () => {
     const packageDocument = JSON.parse(
       await readFile(join(import.meta.dir, "..", "..", "package.json"), "utf8"),
     ) as { dependencies?: Record<string, string> };
     expect(packageDocument.dependencies?.["@hraness/oh"])
-      .toBe("0.2.7");
+      .toBe("0.4.1");
     const lockfile = await readFile(join(import.meta.dir, "..", "..", "bun.lock"), "utf8");
-    expect(lockfile).toContain('"@hraness/oh": ["@hraness/oh@0.2.7"');
-    expect(lockfile).toContain("sha512-+9OIjJqEzriKdcV2dMze5y6Kl/DzjdbHwSghxVRkxHAhQIsdOoRujFynxgBQL2PXRqFJMRBmSQKnu8R5D/EXLg==");
+    expect(lockfile).toContain('"@hraness/oh": ["@hraness/oh@0.4.1"');
+    expect(lockfile).toContain("sha512-J4JMsGvd2wwacwLn2NT98ZmgBQ/8diaMkxSSBh3oUkOyeBa5V91BIbgfEev2jNDzw1DEAls330q1p1jEZQLrvQ==");
     expect(lockfile).not.toContain("@hraness/oh@github:");
     expect(OH_LIBSQL_STORE_LIMITS_V1.snapshotComponentBytes).toBe(6 * 1024 * 1024);
     expect(OH_LIBSQL_STORE_LIMITS_V1.providerResponseBytes).toBe(9_000_000);

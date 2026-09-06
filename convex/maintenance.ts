@@ -23,6 +23,7 @@ import { commandTerminalRetentionMs } from "./commands";
 import {
   ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS,
   CLOUD_USAGE_SNAPSHOT_RETENTION_MS,
+  type HOSTED_TABLE_LIFECYCLE,
 } from "./lifecyclePolicy";
 import {
   adjustCommandQuotaForPatch,
@@ -72,6 +73,65 @@ const maintenanceCategories = [
   "live_tail_chunks",
 ] as const;
 type MaintenanceCategory = typeof maintenanceCategories[number];
+
+// Every hosted table is explicitly classified for periodic retention. Empty
+// means the table is governed by another lifecycle (for example active state,
+// immutable encrypted history, account deletion, or permanent service state).
+export const MAINTENANCE_RETENTION_STRATEGY = {
+  users: ["abandoned_identities"],
+  authSessions: [],
+  authAccounts: ["abandoned_identities"],
+  authRefreshTokens: [],
+  authVerificationCodes: ["abandoned_identities"],
+  authVerifiers: [],
+  authRateLimits: [],
+  authSubjects: ["abandoned_identities"],
+  authEmailAttemptEvents: ["auth_attempts"],
+  authOtpChallenges: ["otp_challenges", "abandoned_identities"],
+  authInvites: ["auth_invites"],
+  devices: [],
+  deviceSessions: [],
+  deviceBindChallenges: ["bind_challenges"],
+  deviceKeyEnvelopes: [],
+  recoveryEnvelopes: [],
+  devicePresence: ["device_presence"],
+  deviceRegistries: [],
+  memorySpaces: [],
+  memoryOperations: [],
+  sessionHeads: ["live_tail_chunks"],
+  sessionChunks: ["live_tail_chunks"],
+  sessionStreamEpochs: ["live_tail_chunks"],
+  executionLeases: [],
+  sessionCommands: ["pending_commands", "terminal_commands"],
+  deviceCommands: [
+    "pending_device_commands",
+    "device_command_login_results",
+    "terminal_device_commands",
+  ],
+  attentionNotificationOutbox: [
+    "pending_attention_notifications",
+    "started_attention_notifications",
+    "terminal_attention_notifications",
+  ],
+  attentionNotificationSafetyFaults: ["attention_notification_faults"],
+  codexAccounts: [],
+  deviceAccountBindings: ["usage_snapshots"],
+  accountUsageSnapshots: ["usage_snapshots"],
+  idempotencyReceipts: ["idempotency_receipts"],
+  securityEvents: ["security_events"],
+  accountDeletionJobs: [],
+  accountDeletionReceipts: ["account_deletion_receipts"],
+  deviceRevocationJobs: ["device_revocation_jobs"],
+  storageUsageByUser: [],
+  storageUsageService: [],
+  serviceControl: [],
+  storageResourceUsageByUser: [],
+  storageResourceUsageByAccount: [],
+  maintenanceState: [],
+} as const satisfies Readonly<Record<
+  keyof typeof HOSTED_TABLE_LIFECYCLE,
+  readonly MaintenanceCategory[]
+>>;
 
 export const cloudRetentionMs = Object.freeze({
   abandonedIdentity: 24 * 60 * 60 * 1_000,

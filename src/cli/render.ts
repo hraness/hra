@@ -1285,6 +1285,8 @@ const renderMemoryStatus = (data: unknown): string => {
     `Session: ${line(root.sessionId)}`,
     `Project: ${line(root.projectId)}`,
     `Canonical: ${canonical.initialized === true ? line(canonical.syncState) : "not initialized"}${canonical.frozen === true ? " (frozen)" : ""}`,
+    `Canonical physical state: ${line(canonical.physicalState)}`,
+    `Canonical identity contract: ${line(canonical.identityContract)}`,
     `Canonical authority: ${line(canonical.authorityDigest)}`,
     `Canonical binding: ${line(canonical.bindingDigest)}`,
     `Canonical revision: ${line(canonical.revision)}`,
@@ -1322,6 +1324,7 @@ const renderMemoryQuery = (command: Extract<LocalCommand, { kind: "memory.query"
   const rows = memoryRows(root.rows);
   const output = [
     `Memory ${line(command.value.mode)}: ${String(rows.length)} row${rows.length === 1 ? "" : "s"}`,
+    `Scope: ${root.scope === "working" ? "working only" : "working + canonical"}`,
     `Query: ${line(root.queryId)}`,
   ];
   if (command.value.mode === "get") {
@@ -1352,7 +1355,9 @@ const renderMemoryQuery = (command: Extract<LocalCommand, { kind: "memory.query"
   }
   output.push(
     `Continuation: ${line(root.continuation)}`,
-    renderMemoryHead("Canonical head", root.canonicalHead),
+    root.scope === "working"
+      ? `Canonical: excluded${object(root.canonical)?.frozen === true ? " (frozen)" : ""}`
+      : renderMemoryHead("Canonical head", root.canonicalHead),
     renderMemoryHead("Working head", root.workingHead),
   );
   return output.join("\n");
@@ -1399,6 +1404,58 @@ const renderMemoryMutation = (
   }
   if (root.receiptSha256 !== undefined) rows.push(`Receipt: ${line(root.receiptSha256)}`);
   return rows.join("\n");
+};
+
+const renderHostedMemory = (
+  command: Extract<LocalCommand, { kind: `memory.hosted.${string}` }>,
+  data: unknown,
+): string => {
+  const root = object(data);
+  if (root === null) return "Hosted memory data is unavailable.";
+  if (command.kind === "memory.hosted.list") {
+    const spaces = memoryRows(root.spaces);
+    return [
+      `Hosted memory spaces: ${String(spaces.length)}`,
+      table(spaces, [
+        "hostedSpaceId",
+        "canonicalSpaceId",
+        "attachedProjectId",
+        "keyVersion",
+        "revision",
+      ]),
+    ].join("\n");
+  }
+  const attachment = object(root.attachment);
+  if (command.kind === "memory.hosted.create") {
+    return [
+      `Hosted memory created: ${line(root.hostedSpaceId)}`,
+      `Portable canonical space: ${line(root.canonicalSpaceId)}`,
+      `Project: ${line(root.projectId)}`,
+      `Attachment generation: ${line(attachment?.generation)}`,
+      `Idempotency key: ${line(command.idempotencyKey)}`,
+      `Replay: ${root.replay === true ? "yes" : "no"}`,
+    ].join("\n");
+  }
+  if (command.kind === "memory.hosted.attach") {
+    return [
+      `Hosted memory attached: ${line(attachment?.remoteSpaceId)}`,
+      `Project: ${line(attachment?.projectId ?? root.projectId)}`,
+      `Attachment generation: ${line(attachment?.generation)}`,
+    ].join("\n");
+  }
+  if (command.kind === "memory.hosted.detach") {
+    return [
+      `Hosted memory detached: ${line(attachment?.remoteSpaceId)}`,
+      `Project: ${line(attachment?.projectId ?? root.projectId)}`,
+      `Attachment generation: ${line(attachment?.generation)}`,
+    ].join("\n");
+  }
+  return [
+    `Hosted memory sync: ${line(root.state)}`,
+    `Project: ${line(root.projectId)}`,
+    `Operations: ${line(root.operations)}`,
+    `Complete: ${root.complete === true ? "yes" : "no"}`,
+  ].join("\n");
 };
 
 const renderSessionTask = (task: SessionTaskRecord): string => [
@@ -2634,6 +2691,11 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     output.writeStdout(`${table(value.projects as Record<string, unknown>[], ["label", "rootPath", "default", "id"])}\n`);
   } else if (command.kind === "memory.status") {
     output.writeStdout(`${renderMemoryStatus(data)}\n`);
+  } else if (command.kind.startsWith("memory.hosted.")) {
+    output.writeStdout(`${renderHostedMemory(
+      command as Extract<LocalCommand, { kind: `memory.hosted.${string}` }>,
+      data,
+    )}\n`);
   } else if (command.kind === "memory.query") {
     output.writeStdout(`${renderMemoryQuery(command, data)}\n`);
   } else if (command.kind === "memory.explain") {
