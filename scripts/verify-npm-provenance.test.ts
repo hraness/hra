@@ -208,9 +208,14 @@ describe("npm provenance attestation-set and signer admission", () => {
       .toThrow("bounded expected attestation set");
   });
 
-  test("binds the Fulcio certificate to the exact public workflow run", () => {
+  test("binds the Fulcio certificate to the exact npm-release environment and public workflow run", () => {
     const invocation = "https://github.com/hraness/hra/actions/runs/123/attempts/2";
     const repositorySubject = [
+      "repo:hraness",
+      "307125679/hra",
+      "1343008607:environment:npm-release",
+    ].join("@");
+    const retiredRefSubject = [
       "repo:hraness",
       "307125679/hra",
       "1343008607:ref:refs/tags/v0.6.0",
@@ -237,11 +242,35 @@ describe("npm provenance attestation-set and signer admission", () => {
       "1.3.6.1.4.1.57264.1.20": der("push"),
       "1.3.6.1.4.1.57264.1.21": der(invocation),
       "1.3.6.1.4.1.57264.1.22": der("public"),
+      "1.3.6.1.4.1.57264.1.23": der("npm-release"),
       "1.3.6.1.4.1.57264.1.24": der(
         repositorySubject,
       ),
     });
     expect(policy.certificateOIDs["1.3.6.1.4.1.57264.1.1"]).toBeUndefined();
+    expect(Buffer.from(policy.certificateOIDs["1.3.6.1.4.1.57264.1.23"] ?? ""))
+      .toEqual(Buffer.from([0x0c, 0x0b, ...Buffer.from("npm-release", "ascii")]));
+    expect(Object.values(policy.certificateOIDs)).not.toContain(der(retiredRefSubject));
+    const nextTagPolicy = npmProvenanceSignerPolicy("v0.6.1", sha, invocation);
+    expect(nextTagPolicy.certificateOIDs["1.3.6.1.4.1.57264.1.23"])
+      .toBe(policy.certificateOIDs["1.3.6.1.4.1.57264.1.23"]);
+    expect(nextTagPolicy.certificateOIDs["1.3.6.1.4.1.57264.1.24"])
+      .toBe(policy.certificateOIDs["1.3.6.1.4.1.57264.1.24"]);
+    expect(nextTagPolicy.certificateIdentityURI).toBe(
+      "^https://github\\.com/hraness/hra/\\.github/workflows/release\\.yml@refs/tags/v0\\.6\\.1$",
+    );
+    expect(nextTagPolicy.certificateOIDs["1.3.6.1.4.1.57264.1.6"])
+      .toBe("refs/tags/v0.6.1");
+    expect(nextTagPolicy.certificateOIDs["1.3.6.1.4.1.57264.1.14"])
+      .toBe(der("refs/tags/v0.6.1"));
+    expect(nextTagPolicy.certificateOIDs["1.3.6.1.4.1.57264.1.18"])
+      .toBe(der("https://github.com/hraness/hra/.github/workflows/release.yml@refs/tags/v0.6.1"));
+    for (const oid of [
+      "1.3.6.1.4.1.57264.1.6",
+      "1.3.6.1.4.1.57264.1.14",
+      "1.3.6.1.4.1.57264.1.18",
+    ]) expect(nextTagPolicy.certificateOIDs[oid]).not.toBe(policy.certificateOIDs[oid]);
+    expect(nextTagPolicy.certificateIdentityURI).not.toBe(policy.certificateIdentityURI);
     expect(npmProvenanceSignerPolicy(tag, sha,
       "https://github.com/hraness/hra/actions/runs/123/attempts/1").certificateOIDs["1.3.6.1.4.1.57264.1.21"])
       .not.toBe(der(invocation));

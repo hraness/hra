@@ -111,8 +111,15 @@ describe("release workflow", () => {
       expect(source).toContain("String.fromCharCode(0x0c, value.length)");
       expect(source).toContain('"1.3.6.1.4.1.57264.1.2": "push"');
       expect(source).toContain('"1.3.6.1.4.1.57264.1.11": der("github-hosted")');
+      expect(source).toContain('"1.3.6.1.4.1.57264.1.23": der("npm-release")');
+      for (const claim of [
+        '"1.3.6.1.4.1.57264.1.6": ref',
+        '"1.3.6.1.4.1.57264.1.14": der(ref)',
+        '"1.3.6.1.4.1.57264.1.18": der(identity)',
+        '"1.3.6.1.4.1.57264.1.19": der(sha)',
+      ]) expect(source).toContain(claim);
       expect(source).toContain(
-        "`repo:${GITHUB_REPOSITORY_OWNER}@${GITHUB_REPOSITORY_OWNER_ID}/${GITHUB_REPOSITORY_NAME}@${GITHUB_REPOSITORY_ID}:ref:${ref}`",
+        "`repo:${GITHUB_REPOSITORY_OWNER}@${GITHUB_REPOSITORY_OWNER_ID}/${GITHUB_REPOSITORY_NAME}@${GITHUB_REPOSITORY_ID}:environment:npm-release`",
       );
       expect(source).not.toContain("`repo:hraness/hra:ref:${ref}`");
     }
@@ -120,6 +127,8 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("repository path `hraness/hra`, numeric owner ID");
     expect(releaseRecord).toContain("`307125679`, numeric repository ID `1343008607`");
     expect(releaseRecord).toContain("ref `refs/tags/v0.7.0`");
+    expect(releaseRecord).toContain("environment `npm-release`");
+    expect(releaseRecord).toContain("`repo:hraness@307125679/hra@1343008607:environment:npm-release`");
   });
 
   test("gives GitHub publisher commands only their explicit non-OIDC environment", () => {
@@ -451,7 +460,7 @@ describe("release workflow", () => {
     expect(domainRecord).toContain("unresolved_prior_intent");
     expect(domainRecord).toContain("reasserts only the plan's exact source");
     expect(domainRecord).toContain("unresolved_current_intent");
-    expect(releaseRecord).toContain("Status: integrated memory candidate `v0.7.0`; validation and release admission are pending.");
+    expect(releaseRecord).toContain("Status: integrated memory and signer-policy forward-repair candidate `v0.7.0`; validation and release admission are pending.");
     expect(releaseRecord).toContain("At retirement, `hraness/hra` had no `v0.1.0` tag");
     expect(releaseRecord).toContain("## Immutable v0.1.0 failure record");
     expect(releaseRecord).toContain("Release workflow run `33363290345`, attempt 1");

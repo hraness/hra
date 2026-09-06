@@ -112,8 +112,9 @@ export function npmProvenanceSignerPolicy(tag: string, sha: string, invocation: 
       "1.3.6.1.4.1.57264.1.20": der("push"),
       "1.3.6.1.4.1.57264.1.21": der(invocation),
       "1.3.6.1.4.1.57264.1.22": der("public"),
+      "1.3.6.1.4.1.57264.1.23": der("npm-release"),
       "1.3.6.1.4.1.57264.1.24": der(
-        `repo:${GITHUB_REPOSITORY_OWNER}@${GITHUB_REPOSITORY_OWNER_ID}/${GITHUB_REPOSITORY_NAME}@${GITHUB_REPOSITORY_ID}:ref:${ref}`,
+        `repo:${GITHUB_REPOSITORY_OWNER}@${GITHUB_REPOSITORY_OWNER_ID}/${GITHUB_REPOSITORY_NAME}@${GITHUB_REPOSITORY_ID}:environment:npm-release`,
       ),
     }),
   });

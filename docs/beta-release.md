@@ -1,6 +1,6 @@
 # Public CLI release control
 
-Status: integrated memory candidate `v0.7.0`; validation and release admission are pending. The independent `v0.6.0` release is owned by the Codex runtime integration. Its release evidence must be read back before preparing the next tag; no candidate supersedes an admitted release until immutable artifact admission succeeds.
+Status: integrated memory and signer-policy forward-repair candidate `v0.7.0`; validation and release admission are pending. The independent `v0.6.0` runtime release published immutable GitHub and npm artifacts but failed final provenance admission. Preserve that release without retrying, retagging, replacing, or deleting it. The verified failure record below informs the next governed release; no candidate supersedes an admitted release until immutable artifact admission succeeds.
 
 The former `v0.1.0` beta process depended on the HRA v0 Vercel deployment, its public fallback, and its paired provider readbacks. That dependency became invalid when HRA v0's Vercel and Convex resources were permanently retired. At retirement, `hraness/hra` had no `v0.1.0` tag, no draft release for that tag, and no published `v0.1.0` release.
 
@@ -96,6 +96,14 @@ Annotated `v0.5.0` tag object `b91b0d30168cc684b762483ea2f652d2a576fe3a` peels t
 
 Retained Actions artifact `9954989662`, named `hra-release-3`, is 809,215 bytes with digest `sha256:b91cf8a66dd65db33db563c81c2fc214379aefb52e55116c64dce28084bfe37d` and expires at `2026-09-11T21:24:48Z`. GitHub asset `544705971` is the 808,632-byte `hraness-hra-0.5.0.tgz` with SHA-256 `d0d958a95b15989f639e60ba90a2abefa7d01a3c54af601c300657d365f39063`; asset `544705988` is the 88-byte `SHA256SUMS` file with SHA-256 `4ffe3a23d3ee7bd926c6a20df30e0f8b7378aaded6eb007a41e0d35d45c91a5b`. npm `latest` names `@hraness/hra@0.5.0` with integrity `sha512-lpiJw1nEDc1CKVpnbtvw4+3+3DZAAKDJ2rvP0VZCwfzatP3gEMh6iTQNQjvZn1z4kyKCQcwo//cRg3/HLyz27Q==` and SHA-1 `f48f878256a768e5b58ebf990b63b4a3e59e5b69`; `bootstrap` still names `0.1.0-bootstrap.0`. `v0.5.0` is the current supported public CLI beta.
 
+## Immutable v0.6.0 partial failure record
+
+The immutable `v0.6.0` release names reviewed commit `576ccd76a6742cd62759ab6176a6a41844846daa`, merged through PR 122. Release workflow run `34057589482`, attempt 1, created the GitHub Release and published npm `@hraness/hra@0.6.0`. Independent readback proved byte-identical GitHub and npm archives with SHA-256 `f9f1bfecddd867e4ca781a2a045dc9573bd91eb9810fef75b2d28e8af0c37813`. Attempt 2 re-proved the existing artifacts without another publication, but both attempts failed final provenance admission. Version existence and registry promotion do not establish successful release admission; `v0.5.0` remains the last fully admitted release.
+
+The actual npm trusted-publishing certificate binds OID `.23` to DER UTF8String `npm-release` and OID `.24` to DER UTF8String `repo:hraness@307125679/hra@1343008607:environment:npm-release`. The frozen verifier omitted the environment claim and instead required a ref-bound subject. Its separate SAN correctly names `https://github.com/hraness/hra/.github/workflows/release.yml@refs/tags/v0.6.0`, and its invocation names `https://github.com/hraness/hra/actions/runs/34057589482/attempts/1`. An independent cryptographic comparison of those published attestations failed under the frozen policy and passed with only those two claim corrections. Wrong-environment, wrong-subject, wrong-invocation, and wrong-commit controls each failed under the corrected policy.
+
+Do not rerun the frozen workflow, retag, replace or delete either artifact copy, or create a `v0.6.1` workaround. The integrated `v0.7.0` candidate applies the exact environment correction to both the TypeScript policy and the Node cryptographic verifier, retaining the independent repository, issuer, workflow, tag, event, run, and source-commit checks. It still requires its own exact-tree gate, reviewed merge, governed tag, public artifact admission, and live acceptance. This forward repair does not retroactively admit `v0.6.0`.
+
 ## Reserved version tag names
 
 GitHub immutable releases reserve a tag name forever once an immutable release used it, and that reservation survives deleting the release and even deleting and recreating a repository with the same name. The retired HRA v0 repository published immutable releases `v0.1.7`, `v0.1.8`, `v0.1.9`, and `v0.1.10` under the `hraness/hra` name, so those tags cannot be created in this repository even by an actor who bypasses repository rulesets. The first release after `v0.1.6` was therefore `v0.2.0`. Never probe availability by creating and deleting a throwaway tag. Choose a monotonically newer package version and let `bun run release:tag` verify local and remote absence read-only before its one governed annotated-tag push. If GitHub retains an otherwise invisible reservation, the push fails before publication.
@@ -171,7 +179,7 @@ repository-variable or conversational approval.
 After the coordinate existed, an operator using npm CLI 11.19.0 verified the sole
 trusted publisher as GitHub repository `hraness/hra`, workflow `release.yml`, publish-only,
 with no npm environment for the releases through `v0.5.0`. On 2026-09-06, the operator revoked binding `41124856-baa6-46ad-b242-6e3278c73ce8` and created replacement binding `28b1ff93-c1b0-42a7-bef6-41bffb992eb2` in one npm-authenticated maintenance session with the same repository and workflow, environment `npm-release`, and direct `--allow-publish`. The request omitted `--allow-stage-publish`, but npm automatically grants stage publishing to trusted-publisher configurations created after 2026-09-03. Authenticated readback showed exactly that one replacement binding with repository `hraness/hra`, workflow `release.yml`, environment `npm-release`, and permissions `publish, stage publish`. The registry-mandated stage permission is not an HRA release path: `.github/workflows/release.yml` invokes direct `npm publish` and never invokes `npm stage publish`. Stable `v0.1.5` is the first complete OIDC/provenance publication,
-stable `v0.1.6` was the second, stable `v0.2.0` the third, stable `v0.2.1` the fourth, stable `v0.3.0` the fifth, stable `v0.4.0` the sixth, stable `v0.4.1` the seventh, and stable `v0.5.0` is the current complete publication; `v0.6.0` is the independently owned runtime release and `v0.7.0` is the integrated memory candidate. The stable workflow never performs
+stable `v0.1.6` was the second, stable `v0.2.0` the third, stable `v0.2.1` the fourth, stable `v0.3.0` the fifth, stable `v0.4.0` the sixth, stable `v0.4.1` the seventh, and stable `v0.5.0` is the last fully admitted publication; `v0.6.0` is an immutable partial failure and `v0.7.0` is the integrated memory and signer-policy forward-repair candidate. The stable workflow never performs
 the bootstrap or grants a second publisher. Exact `0.1.6` publication moved `latest` from
 stable `0.1.5` to stable `0.1.6`, while the bootstrap
 seed remains available only as the explicitly named `bootstrap` version and dist-tag.
@@ -185,8 +193,12 @@ Fulcio signer admission preserves raw ASCII matching for legacy GitHub workflow 
 OIDs `.2` through `.6`. Current V2 claims from `.11` onward are matched as one canonical
 short-form DER UTF8String whose payload is bounded nonempty ASCII. The repository-subject
 claim remains mandatory and exact: repository path `hraness/hra`, numeric owner ID
-`307125679`, numeric repository ID `1343008607`, and ref `refs/tags/v0.7.0` for the current
-release candidate. The generated
+`307125679`, numeric repository ID `1343008607`, and environment `npm-release`. OID
+`.23` binds that exact environment; `.24` binds the exact ID-bearing subject
+`repo:hraness@307125679/hra@1343008607:environment:npm-release`. The independent
+certificate SAN and OIDs `.6`, `.14`, `.18`, and `.19` still bind the exact workflow,
+tag ref and commit, including ref `refs/tags/v0.7.0` for the current candidate.
+The generated
 SLSA internal parameters must separately preserve exact event `push`, repository
 ID `1343008607`, and owner ID `307125679`. The already-published v0.5.0
 historical provenance uses that same `push` event. The encoding repair does not
