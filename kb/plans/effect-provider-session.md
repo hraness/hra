@@ -2,7 +2,7 @@
 
 Design: [issue 118](https://github.com/hraness/hra/issues/118).
 
-Status: implemented; focused validation passed. Independent review passed; aggregate validation on the converged source is pending.
+Status: implemented and independently reviewed. Rebased onto the provider-retirement merge; final archive-inventory convergence is in progress.
 
 The Codex connection uses Effect 3.22.1 for request deadlines and cancellation,
 ordered fact delivery, background task ownership, and stdout/stderr consumption. The
@@ -46,3 +46,14 @@ The first aggregate attempt stopped on two strict checker lint incompatibilities
 Review hardened reservation-before-deadline activation and found a reproduced response/abort tie regression in the initial nested races. The repaired native listener now synchronously claims the exact pending reservation and settles the same Deferred as responses and timeouts. The callback's scoped finalizer removes the listener. A separate stderr scope stops diagnostic consumption after close without turning normal interruption into a failure diagnostic.
 
 Independent review of the runtime and subsequent reservation, abort, stderr and inventory repairs found no remaining concrete defect. A fresh aggregate gate on the converged source remains pending. This phase does not authorize substituting fake process tests for native custody proofs, or treating compiler checks as proof of durable authority correctness.
+
+The converged aggregate on the provider-retirement base passed 659 script, 108
+local-efficiency, 29 cloud-efficiency, 2,764 source, 285 Convex/site, 447 app and
+10 package-policy tests, plus lint, types and builds. It stopped at the exact
+archive inventory, which still described the pre-Effect source. The reviewed
+archive adds only the two Codex session modules; changed existing payloads are
+the client, package manifest and third-party notice. Its 159 path/type/mode/size
+entries occupy 7,376 canonical JSON bytes, with SHA-256
+`80ed18a28c652e17eba75f9d8beeb090531b0756c16a98acfd5df1da611aeee8`.
+The strict comparison remains mandatory. A final complete gate follows this
+inventory update; no package release or native activation is claimed here.
