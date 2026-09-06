@@ -792,6 +792,7 @@ export interface CodexThread {
   readonly modelProvider: string;
   readonly createdAt: number;
   readonly updatedAt: number;
+  readonly providerTimestampUnit?: "unix_milliseconds_v1";
   readonly status: CodexThreadStatus;
   readonly cwd: string;
   readonly name: string | null;
@@ -1675,6 +1676,7 @@ function parseThread(value: unknown, index: number): CodexThread {
     modelProvider: identifier(root.modelProvider, "thread.modelProvider"),
     createdAt: unixSecondsToMilliseconds(root.createdAt, "thread.createdAt"),
     updatedAt: unixSecondsToMilliseconds(root.updatedAt, "thread.updatedAt"),
+    providerTimestampUnit: "unix_milliseconds_v1",
     status: parseThreadStatus(root.status),
     cwd: string(root.cwd, "thread.cwd", { min: 1, max: 16_384 }),
     name: nullableString(root.name, "thread.name", 1_024),

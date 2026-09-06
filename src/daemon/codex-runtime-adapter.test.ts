@@ -183,6 +183,16 @@ function makeCapabilitySnapshot(): CodexCapabilitySnapshot {
 }
 
 describe("PinnedCodexRuntimeManager", () => {
+  test("propagates only explicitly validated provider timestamp units", () => {
+    expect(projectBoundedThread(makeThread([]), false)).not.toHaveProperty("providerTimestampUnit");
+    expect(projectBoundedThread({ ...makeThread([]), providerTimestampUnit: "unix_milliseconds_v1" }, false))
+      .toHaveProperty("providerTimestampUnit", "unix_milliseconds_v1");
+    for (const updatedAt of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN]) {
+      expect(projectBoundedThread({ ...makeThread([]), updatedAt, providerTimestampUnit: "unix_milliseconds_v1" }, false))
+        .not.toHaveProperty("providerTimestampUnit");
+    }
+  });
+
   test("single-flights an exact resumed thread observation by generation and connection", async () => {
     let resumeCalls = 0;
     let releaseResume!: () => void;

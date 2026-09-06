@@ -114,6 +114,7 @@ export type CodexSessionProjection = {
   status: "active" | "idle" | "terminal";
   projectRoot?: string;
   providerUpdatedAt?: number;
+  providerTimestampUnit?: "unix_milliseconds_v1";
   activeTurnId?: string;
   messages?: readonly CodexProjectedMessage[];
   turnSummaries?: readonly CodexTurnSummary[];

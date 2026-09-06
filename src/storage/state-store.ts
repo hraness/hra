@@ -988,8 +988,8 @@ export type SessionProviderBaseline = {
 export type MutationEffectEvidence =
   | { kind: "session.send"; providerThreadId: string; baseline: SessionProviderBaseline; clientMessageId: string; messageDigest: string; runtimeProfile?: ReviewedRuntimeProfile }
   | { kind: "session.steer"; providerThreadId: string; baseline: SessionProviderBaseline; activeTurnId: string | null; clientMessageId: string; messageDigest: string }
-  | { kind: "session.stop"; providerThreadId: string; baseline: SessionProviderBaseline; activeTurnId: string | null }
-  | { kind: "session.rename"; providerThreadId: string; baseline: SessionProviderBaseline; requestedName: string }
+  | { kind: "session.stop"; providerThreadId: string; providerTimestampUnit?: "unix_milliseconds_v1"; baseline: SessionProviderBaseline; activeTurnId: string | null }
+  | { kind: "session.rename"; providerThreadId: string; providerTimestampUnit?: "unix_milliseconds_v1"; baseline: SessionProviderBaseline; requestedName: string }
   | { kind: "session.start"; projectId: ProjectId; clientMessageId: string | null; messageDigest: string | null; runtimeProfile?: ReviewedRuntimeProfile; conversationAutomationCapability?: typeof SESSION_CONVERSATION_AUTOMATION_CAPABILITY }
   | { kind: "session.switch"; daemonGeneration?: number | undefined; requestedAccountId: ProfileId | null; requestedPreset: Preset | null; sourceProfileId: ProfileId; sourceProcessGeneration: number; sourceProvider: Provider; sourceProviderThreadId: string; sourcePreset: Preset; targetProfileId: ProfileId; targetProcessGeneration: number; targetProvider: Provider; targetProviderAccountKey?: string | undefined; targetPreset: Preset; transcriptDigest: string; seedDigest: string; seedIncludedRecords: number; seedOmittedRecords: number; runtimeProfile: ReviewedRuntimeProfile }
   | { kind: "account.login"; method: "browser" | "device_code" }
@@ -1082,8 +1082,8 @@ const providerBaselineSchema = z.object({
 const mutationEffectEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.send"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, clientMessageId: z.string().min(1).max(512), messageDigest: sha256Schema, runtimeProfile: reviewedRuntimeProfileSchema.optional() }).strict(),
   z.object({ kind: z.literal("session.steer"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable(), clientMessageId: z.string().min(1).max(512), messageDigest: sha256Schema }).strict(),
-  z.object({ kind: z.literal("session.stop"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable() }).strict(),
-  z.object({ kind: z.literal("session.rename"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, requestedName: titleSchema }).strict(),
+  z.object({ kind: z.literal("session.stop"), providerThreadId: providerThreadIdSchema, providerTimestampUnit: z.literal("unix_milliseconds_v1").optional(), baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable() }).strict(),
+  z.object({ kind: z.literal("session.rename"), providerThreadId: providerThreadIdSchema, providerTimestampUnit: z.literal("unix_milliseconds_v1").optional(), baseline: providerBaselineSchema, requestedName: titleSchema }).strict(),
   z.object({ kind: z.literal("session.start"), projectId: projectIdSchema, clientMessageId: z.string().min(1).max(512).nullable(), messageDigest: sha256Schema.nullable(), runtimeProfile: reviewedRuntimeProfileSchema.optional(), conversationAutomationCapability: z.literal(SESSION_CONVERSATION_AUTOMATION_CAPABILITY).optional() }).strict(),
   z.object({
     kind: z.literal("session.switch"),
@@ -1117,6 +1117,65 @@ const mutationEffectEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("account.logout"), baselineSignedIn: z.boolean() }).strict(),
   z.object({ kind: z.literal("account.login-cancel"), loginId: providerLoginIdSchema }).strict(),
 ]);
+const safeProviderTimestampSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const timestampResolutionEvidenceSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("session.stop"),
+    providerThreadId: providerThreadIdSchema,
+    providerTimestampUnit: z.literal("unix_milliseconds_v1"),
+    providerUpdatedAt: safeProviderTimestampSchema,
+    activeTurnId: z.string().min(1).max(200),
+    observedStatus: z.enum(["absent", "completed", "interrupted", "failed"]),
+  }).strict(),
+  z.object({
+    kind: z.literal("session.rename"),
+    providerThreadId: providerThreadIdSchema,
+    providerTimestampUnit: z.literal("unix_milliseconds_v1"),
+    providerUpdatedAt: safeProviderTimestampSchema,
+    requestedName: z.string().refine((value) => value === value.trim()).pipe(titleSchema),
+  }).strict(),
+]);
+
+const assertTimestampMutationResolution = (input: {
+  effect: Extract<MutationEffectEvidence, { kind: "session.stop" | "session.rename" }>;
+  resolution: MutationResolutionRecord["kind"];
+  evidence: unknown;
+  receipt: unknown;
+  provider: { providerThreadId: string; title: string; activeTurnId?: string; providerUpdatedAt?: number } | undefined;
+}): void => {
+  if (input.resolution !== "proven_applied") {
+    if (input.receipt !== undefined) throw new Error("MUTATION_RECOVERY_TIMESTAMP_RECEIPT_UNEXPECTED");
+    return;
+  }
+  const { effect, provider } = input;
+  const proof = timestampResolutionEvidenceSchema.safeParse(input.evidence);
+  const baseline = safeProviderTimestampSchema.safeParse(effect.baseline.providerUpdatedAt);
+  if (!proof.success || !baseline.success
+    || effect.providerTimestampUnit !== "unix_milliseconds_v1"
+    || proof.data.kind !== effect.kind
+    || proof.data.providerThreadId !== effect.providerThreadId
+    || proof.data.providerUpdatedAt <= baseline.data
+    || provider?.providerThreadId !== effect.providerThreadId
+    || provider.providerUpdatedAt !== proof.data.providerUpdatedAt) {
+    throw new Error("MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID");
+  }
+  if (effect.kind === "session.stop" && proof.data.kind === "session.stop") {
+    const receipt = z.object({ stopped: z.literal(true), activeTurnId: z.string().min(1).max(200) }).strict().safeParse(input.receipt);
+    if (!receipt.success || effect.activeTurnId === null
+      || effect.activeTurnId !== proof.data.activeTurnId
+      || receipt.data.activeTurnId !== effect.activeTurnId
+      || provider.activeTurnId === effect.activeTurnId) {
+      throw new Error("MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID");
+    }
+  } else if (effect.kind === "session.rename" && proof.data.kind === "session.rename") {
+    const receipt = z.object({ renamed: z.literal(true) }).strict().safeParse(input.receipt);
+    if (!receipt.success || proof.data.requestedName !== effect.requestedName
+      || provider.title !== effect.requestedName) {
+      throw new Error("MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID");
+    }
+  }
+};
+
 const queueEffectEvidenceSchema = z.object({
   kind: z.literal("queue.dispatch"),
   queueId: queueIdSchema,
@@ -1183,7 +1242,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 40;
+const currentSchemaVersion = 41;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -1325,6 +1384,77 @@ export const USAGE_LOCAL_RETAIN_SUCCESS_COUNT = 2_048;
 export const USAGE_LOCAL_RETAIN_FAILURE_COUNT = 2_048;
 export const USAGE_LOCAL_RETAIN_BYTES = 16 * 1_024 * 1_024;
 export const USAGE_LOCAL_SNAPSHOT_MAX_BYTES = 262_144;
+
+// Insert-only hardening leaves legacy evidence, digests, and resolutions intact.
+const timestampMutationResolutionGuard = `
+CREATE TRIGGER mutation_resolutions_timestamp_proof_insert
+BEFORE INSERT ON mutation_resolutions
+WHEN (SELECT kind FROM mutation_attempts WHERE id=NEW.attempt_id) IN ('session.stop','session.rename')
+BEGIN
+  SELECT CASE WHEN NEW.resolution_kind<>'proven_applied' AND NEW.receipt_json IS NOT NULL
+    THEN RAISE(ABORT,'MUTATION_RECOVERY_TIMESTAMP_RECEIPT_UNEXPECTED') END;
+  SELECT CASE WHEN NEW.resolution_kind='proven_applied' AND (
+    NOT json_valid(NEW.evidence_json) OR NEW.receipt_json IS NULL OR NOT json_valid(NEW.receipt_json)
+  ) THEN RAISE(ABORT,'MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID') END;
+  SELECT CASE WHEN NEW.resolution_kind='proven_applied' AND NOT EXISTS (
+    SELECT 1 FROM mutation_attempts m
+    JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+    JOIN sessions s ON s.id=m.authority_id
+    WHERE m.id=NEW.attempt_id AND e.kind=m.kind
+      AND json_extract(e.evidence_json,'$.kind')=m.kind
+      AND json_extract(NEW.evidence_json,'$.kind')=m.kind
+      AND json_extract(e.evidence_json,'$.providerThreadId')=s.provider_thread_id
+      AND json_extract(NEW.evidence_json,'$.providerThreadId')=s.provider_thread_id
+      AND json_extract(e.evidence_json,'$.providerTimestampUnit')='unix_milliseconds_v1'
+      AND json_extract(NEW.evidence_json,'$.providerTimestampUnit')='unix_milliseconds_v1'
+      AND json_type(e.evidence_json,'$.baseline.providerUpdatedAt')='integer'
+      AND json_extract(e.evidence_json,'$.baseline.providerUpdatedAt') BETWEEN 0 AND 9007199254740991
+      AND json_type(NEW.evidence_json,'$.providerUpdatedAt')='integer'
+      AND json_extract(NEW.evidence_json,'$.providerUpdatedAt') BETWEEN 0 AND 9007199254740991
+      AND json_extract(NEW.evidence_json,'$.providerUpdatedAt')>json_extract(e.evidence_json,'$.baseline.providerUpdatedAt')
+      AND s.provider_updated_at=json_extract(NEW.evidence_json,'$.providerUpdatedAt')
+      AND (
+        (m.kind='session.stop'
+          AND s.active_turn_id IS NOT json_extract(e.evidence_json,'$.activeTurnId')
+          AND (SELECT count(*) FROM json_each(NEW.evidence_json))=6
+          AND (SELECT count(*) FROM json_each(NEW.receipt_json))=2
+          AND json_type(e.evidence_json,'$.activeTurnId')='text'
+          AND json_extract(NEW.evidence_json,'$.activeTurnId')=json_extract(e.evidence_json,'$.activeTurnId')
+          AND json_extract(NEW.receipt_json,'$.activeTurnId')=json_extract(e.evidence_json,'$.activeTurnId')
+          AND json_extract(NEW.evidence_json,'$.observedStatus') IN ('absent','completed','interrupted','failed')
+          AND json_type(NEW.receipt_json,'$.stopped')='true')
+        OR (m.kind='session.rename'
+          AND s.title=json_extract(e.evidence_json,'$.requestedName')
+          AND (SELECT count(*) FROM json_each(NEW.evidence_json))=5
+          AND (SELECT count(*) FROM json_each(NEW.receipt_json))=1
+          AND json_extract(NEW.evidence_json,'$.requestedName')=json_extract(e.evidence_json,'$.requestedName')
+          AND json_type(NEW.receipt_json,'$.renamed')='true')
+      )
+  ) THEN RAISE(ABORT,'MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID') END;
+END;
+`;
+
+const assertSchemaVersion41TimestampProof = (database: Database): void => {
+  const observed = z.object({ type: z.literal("trigger"), tbl_name: z.literal("mutation_resolutions"), sql: z.string() }).strict().safeParse(
+    database.query("SELECT type,tbl_name,sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'").get(),
+  );
+  // SQLite stores our CREATE statement without its terminal semicolon. Compare
+  // the exact remaining text: normalizing whitespace can change SQL literals.
+  if (!observed.success || observed.data.sql !== timestampMutationResolutionGuard.trim().slice(0, -1)) {
+    throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID");
+  }
+};
+
+const assertSchemaVersion41Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  const ledger = z.object({
+    version: z.literal(41),
+    applied_at: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
+  }).strict().array().length(1).safeParse(database.query(
+    "SELECT version,applied_at FROM migrations WHERE version>=41 ORDER BY version LIMIT 2",
+  ).all());
+  if (!ledger.success) throw new Error("STATE_SCHEMA_V41_MIGRATION_LEDGER_INVALID");
+};
 
 const schemaVersion1 = `
 CREATE TABLE IF NOT EXISTS migrations (
@@ -6558,7 +6688,11 @@ const migrateWritableDatabase = (
   if (initialVersion > currentSchemaVersion) {
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
   }
-  if (initialVersion === currentSchemaVersion) {
+  if (initialVersion === 41) assertSchemaVersion41Authority(database);
+  else if (database.query("SELECT 1 FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'").get() !== null) {
+    throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
+  }
+  if (initialVersion >= 40) {
     // A current-version stamp is an assertion boundary, not permission to
     // reconstruct authority. Prove every provider/adoption execution guard
     // before the idempotent maintenance tail can touch any schema object.
@@ -6575,7 +6709,7 @@ const migrateWritableDatabase = (
     database,
     initialVersion,
   );
-  const legacySessionAdoption = initialVersion < currentSchemaVersion
+  const legacySessionAdoption = initialVersion < 40
     ? classifyLegacySessionAdoptionSchema(database, initialVersion)
     : "absent";
   if (initialVersion === 39 && legacySessionAdoption === "absent") {
@@ -7110,6 +7244,16 @@ const migrateWritableDatabase = (
       version = 40;
     }
 
+    if (version < 41) {
+      // v40 remains an immutable predecessor. This migration adds one guard;
+      // a colliding same-name object is not silently replaced or trusted.
+      database.exec(timestampMutationResolutionGuard);
+      assertSchemaVersion41TimestampProof(database);
+      database.query("INSERT INTO migrations(version, applied_at) VALUES (?, ?)").run(41, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version = 41");
+      version = 41;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     applySchemaVersion32(database);
@@ -7138,8 +7282,8 @@ const migrateWritableDatabase = (
     assertSchemaVersion24Objects(database);
     ensureSessionEventProjectionVersion(database);
     applySchemaVersion38PresetContracts(database);
-    if (initialVersion < currentSchemaVersion) applySchemaVersion39ProviderAuthority(database);
-    if (initialVersion < currentSchemaVersion) database.exec(WORK_SCHEMA_SQL);
+    if (initialVersion < 40) applySchemaVersion39ProviderAuthority(database);
+    if (initialVersion < 40) database.exec(WORK_SCHEMA_SQL);
     assertSchemaVersion38PresetContracts(database);
     assertSchemaVersion39ProviderAuthority(database);
     database.exec(schemaVersion27);
@@ -7158,6 +7302,7 @@ const migrateWritableDatabase = (
     database.exec(schemaVersion36NotificationHours);
     database.exec(schemaVersion37AttentionEmailPolicy);
     assertCompositeNotificationPolicy(database);
+    assertSchemaVersion41Authority(database);
     assertSchemaVersion40AdoptionObjects(database);
     assertExactSchemaVersion40AdoptionSurface(database);
     assertWorkSchema(database);
@@ -7837,6 +7982,7 @@ export class StateStore {
       assertSchemaVersion39ProviderAuthority(this.#database);
       assertSchemaVersion40AdoptionObjects(this.#database);
       assertExactSchemaVersion40AdoptionSurface(this.#database);
+      assertSchemaVersion41Authority(this.#database);
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);
@@ -15563,6 +15709,10 @@ export class StateStore {
     const parsedSessionId = sessionIdSchema.parse(input.sessionId);
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
+    if ((evidence.kind === "session.stop" || evidence.kind === "session.rename")
+      && evidence.providerTimestampUnit !== undefined) {
+      safeProviderTimestampSchema.parse(evidence.baseline.providerUpdatedAt);
+    }
     const canonical = JSON.stringify(evidence);
     const digest = createHash("sha256").update(canonical).digest("hex");
     const now = this.#now();
@@ -17277,6 +17427,15 @@ export class StateStore {
       const effectEvidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown) as MutationEffectEvidence;
       if (effectEvidence.kind !== row.kind || digestJson(effectEvidence) !== row.evidence_digest) {
         throw new Error("MUTATION_RECOVERY_EVIDENCE_MISMATCH");
+      }
+      if (effectEvidence.kind === "session.stop" || effectEvidence.kind === "session.rename") {
+        assertTimestampMutationResolution({
+          effect: effectEvidence,
+          resolution,
+          evidence: input.resolutionEvidence,
+          receipt: input.receipt,
+          provider: input.provider,
+        });
       }
       if (effectEvidence.kind === "session.switch") {
         if (resolution === "proven_applied" && input.receipt === undefined) {

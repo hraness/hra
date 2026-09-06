@@ -16,7 +16,8 @@ import {
   type CodexFact,
   type CodexPluginCatalog,
 } from "../codex";
-import { parseFact } from "../codex/protocol";
+import { parseFact, parseThreadMetadataRead } from "../codex/protocol";
+import { projectBoundedThread } from "./codex-runtime-adapter";
 import { CLAUDE_PIN, CLAUDE_PIN_MODEL } from "../claude/pin";
 import { CloudProjectionRecoveryAdmissionError } from "../cloud/contracts";
 import { AccountKeyLossPreconditionError } from "../cloud/local-control";
@@ -11819,7 +11820,7 @@ describe("HraService", () => {
       }
       legacy.exec(`
         DELETE FROM migrations WHERE version>=25;
-        PRAGMA user_version=24;
+        DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=24;
         PRAGMA foreign_keys=ON;
       `);
     } finally {
@@ -11835,7 +11836,7 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
       ).all()).toEqual([
@@ -11855,6 +11856,7 @@ describe("HraService", () => {
         { version: 38 },
         { version: 39 },
         { version: 40 },
+        { version: 41 },
       ]);
     } finally {
       inspector.close(false);
@@ -16322,6 +16324,79 @@ describe("HraService", () => {
     await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     await expect(service.execute({ ...command, idempotencyKey: "00000000-0000-4000-8000-000000000404" }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     expect(codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(1);
+  });
+
+  test("keeps legacy stop and rename timestamps unresolved after real provider seconds conversion", async () => {
+    for (const operation of ["stop", "rename"] as const) {
+      const value = await fixture();
+      const { service, codex, store } = value;
+      const { sessionId } = await createIdleSession(value, `Legacy ${operation}`);
+      if (operation === "stop") await service.execute({ kind: "session.send", session: sessionId, message: "activate" }, { signal });
+      codex.readProjection = { ...codex.readProjection, providerUpdatedAt: 1_900_000_000 };
+      const key = crypto.randomUUID();
+      if (operation === "stop") codex.interruptError = new IndeterminateCodexEffectError("turn/interrupt", 61);
+      else codex.renameError = new IndeterminateCodexEffectError("thread/name/set", 62);
+      const command = operation === "stop"
+        ? { kind: "session.stop" as const, session: sessionId, idempotencyKey: key }
+        : { kind: "session.rename" as const, session: sessionId, name: "Recovered", idempotencyKey: key };
+      await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      const original = store.readMutation(key)?.evidence;
+      expect(original?.evidence).not.toHaveProperty("providerTimestampUnit");
+      expect(original?.evidence).toMatchObject({ baseline: { providerUpdatedAt: 1_900_000_000 } });
+      codex.readProjection = projectBoundedThread(parseThreadMetadataRead({ thread: {
+        id: "provider-thread", preview: "Recovered", ephemeral: false, modelProvider: "openai",
+        createdAt: 1_900_000_000, updatedAt: 1_900_000_000, status: { type: "idle" },
+        cwd: value.documents, name: "Recovered", turns: [],
+      } }), false);
+      expect(codex.readProjection.providerUpdatedAt).toBe(1_900_000_000_000);
+      await expect(service.execute({ kind: "session.recover", session: sessionId }, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      expect(store.readMutation(key)?.evidence).toEqual(original);
+      expect(store.readMutation(key)?.state).toBe("ambiguous");
+      expect(store.requireSession(sessionId).state).toBe("recovery_required");
+      expect(codex.calls.filter((call) => call === operation)).toHaveLength(1);
+    }
+  });
+
+  test("requires marked safe advancement for stop and rename recovery and strips internal provenance", async () => {
+    for (const operation of ["stop", "rename"] as const) {
+      const value = await fixture();
+      const { service, codex, store } = value;
+      const { sessionId } = await createIdleSession(value, `Marked ${operation}`);
+      if (operation === "stop") await service.execute({ kind: "session.send", session: sessionId, message: "activate" }, { signal });
+      codex.readProjection = { ...codex.readProjection, providerUpdatedAt: 10_000, providerTimestampUnit: "unix_milliseconds_v1" };
+      const key = crypto.randomUUID();
+      if (operation === "stop") codex.interruptError = new IndeterminateCodexEffectError("turn/interrupt", 63);
+      else codex.renameError = new IndeterminateCodexEffectError("thread/name/set", 64);
+      const command = operation === "stop"
+        ? { kind: "session.stop" as const, session: sessionId, idempotencyKey: key }
+        : { kind: "session.rename" as const, session: sessionId, name: "Recovered", idempotencyKey: key };
+      await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      expect(store.readMutation(key)?.evidence?.evidence).toMatchObject({ providerTimestampUnit: "unix_milliseconds_v1" });
+      const observed = codex.readProjection;
+      for (const invalid of [
+        { providerUpdatedAt: 10_000 }, { providerUpdatedAt: 9_999 },
+        { providerUpdatedAt: -1 }, { providerUpdatedAt: 10_000.5 },
+        { providerUpdatedAt: Number.MAX_SAFE_INTEGER + 1 },
+        { providerUpdatedAt: null }, { providerUpdatedAt: undefined },
+        { providerTimestampUnit: undefined }, { providerTimestampUnit: "unix_seconds" },
+      ]) {
+        // Foreign adapters can return invalid runtime values despite their local type.
+        codex.readProjection = { ...observed, ...invalid } as CodexSessionProjection;
+        await expect(service.execute({ kind: "session.recover", session: sessionId }, { signal }))
+          .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+        expect(store.readMutation(key)?.state).toBe("ambiguous");
+      }
+      codex.readProjection = observed;
+      const recovered = await service.execute({ kind: "session.recover", session: sessionId }, { signal });
+      expect(recovered).toMatchObject({ recovery: { resolution: "proven_applied", providerEffectRetried: false } });
+      expect(recovered).not.toHaveProperty("projection.providerTimestampUnit");
+      expect(store.readMutation(key)?.resolution?.evidence).toMatchObject({ providerTimestampUnit: "unix_milliseconds_v1", providerUpdatedAt: 10_001 });
+      expect(codex.calls.filter((call) => call === operation)).toHaveLength(1);
+      expect(await service.execute({ kind: "session.show", session: sessionId, detail: false }, { signal }))
+        .not.toHaveProperty("projection.providerTimestampUnit");
+      expect(await service.readSessionProjectionForCloud(sessionId, signal)).not.toHaveProperty("providerTimestampUnit");
+    }
   });
 
   test("causally reconciles a lost send by exact client id within one provider timestamp tick", async () => {
