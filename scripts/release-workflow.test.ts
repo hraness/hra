@@ -567,7 +567,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("unshallows only that exact commit into `refs/remotes/ci/verified`");
     expect(releaseRecord).toContain("The package gate still scans `rev-list --all`");
     expect(releaseRecord).toContain("coordinate completed its non-executable bootstrap");
-    expect(releaseRecord).toContain("npm trusted publishing names repository `hraness/hra` and workflow `release.yml`");
+    expect(releaseRecord).toContain("npm trusted publishing has exactly one binding");
     expect(releaseRecord).toContain("Stable `@hraness/hra@0.5.0` is authoritative until the next release is admitted");
     expect(releaseRecord).toContain("The canonical README and website use a two-phase local-release surface");
     expect(releaseRecord).toContain("The website remains live and the `v0.6.0` local CLI tag stays release-ready until exact release admission");
@@ -601,7 +601,10 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("the owner-authorized exact annotated tag is the publication authorization");
     expect(releaseRecord).toContain("exact event `push`");
     expect(releaseRecord).not.toContain("must remove it before the next release");
-    expect(releaseRecord).toContain("Before `v0.6.0`, replace that sole binding");
+    expect(releaseRecord).toContain("binding `41124856-baa6-46ad-b242-6e3278c73ce8`");
+    expect(releaseRecord).toContain("binding `28b1ff93-c1b0-42a7-bef6-41bffb992eb2`");
+    expect(releaseRecord).toContain("environment `npm-release`");
+    expect(releaseRecord).toContain("permissions `publish, stage publish`");
     expect(releaseRecord).toContain("npm CLI 11.19.0");
     expect(releaseRecord).toContain("numeric owner ID\n`307125679`");
     expect(releaseRecord).toContain("owner ID `307125679`");
