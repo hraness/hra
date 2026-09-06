@@ -6419,77 +6419,9 @@ describe("StateStore", () => {
     })).toThrow("CLAUDE_LOGIN_NOT_UNSETTLED");
   });
 
-  test("retains cleanup-only terminalization of exact quiescent historical Devin authority", async () => {
-    const { store } = await fixture();
-    const profile = store.createProfile("Devin relink");
-    const created = seedLegacyDevinSession(store, {
-      fastEnabled: false,
-      preset: "astra",
-      profileId: profile.id,
-      provider: "devin",
-    });
-    let session = store.bindSession({
-      expectedRevision: created.revision,
-      providerThreadId: "devin-thread-relink",
-      sessionId: created.id,
-      state: "idle",
-    });
-    const input = {
-      accountId: profile.id,
-      providerConnectionId: null,
-      providerGeneration: profile.processGeneration,
-      sessionId: session.id,
-    } as const;
-
-    expect(store.canReleaseIdleDevinSessionForAccountLogin({
-      profileId: profile.id,
-      profileGeneration: profile.processGeneration,
-      sessionId: session.id,
-    })).toBe(true);
-    expect(store.canReleaseIdleClaudeSessionForAccountLogin({
-      profileId: profile.id,
-      profileGeneration: profile.processGeneration,
-      sessionId: session.id,
-    })).toBe(false);
-    session = store.setSessionTurnState({
-      activeTurnId: "devin-turn-relink",
-      expectedRevision: session.revision,
-      sessionId: session.id,
-      state: "active",
-    });
-    expect(store.canReleaseIdleDevinSessionForAccountLogin({
-      profileId: profile.id,
-      profileGeneration: profile.processGeneration,
-      sessionId: session.id,
-    })).toBe(false);
-    expect(() => store.terminalizeIdleDevinSessionForAccountLogin(input))
-      .toThrow("DEVIN_LOGIN_SESSION_NOT_QUIESCENT");
-    session = store.setSessionTurnState({
-      expectedRevision: session.revision,
-      sessionId: session.id,
-      state: "idle",
-    });
-    expect(() => store.enqueue(session.id, "new send is forbidden")).toThrow("PROVIDER_RETIRED:devin");
-    const queued = seedLegacyDevinQueue(store, session.id);
-    expect(store.canReleaseIdleDevinSessionForAccountLogin({
-      profileId: profile.id,
-      profileGeneration: profile.processGeneration,
-      sessionId: session.id,
-    })).toBe(false);
-    expect(() => store.terminalizeIdleDevinSessionForAccountLogin(input))
-      .toThrow("DEVIN_LOGIN_SESSION_NOT_QUIESCENT");
-    expect(store.requireSession(session.id)).toMatchObject({ state: "idle" });
-    expect(store.requireQueue(queued.id)).toMatchObject({ state: "pending" });
-
-    expect(store.transitionQueue(queued.id, "pending", "cancelled")).toBe(true);
-    expect(store.terminalizeIdleDevinSessionForAccountLogin(input)).toMatchObject({
-      changed: true,
-      event: {
-        body: { activeTurnId: null, status: "terminal", type: "session_status" },
-      },
-      interactions: [],
-      session: { provider: "devin", state: "terminal" },
-    });
+  test("does not expose retired Devin account-login execution APIs", () => {
+    expect("canReleaseIdleDevinSessionForAccountLogin" in StateStore.prototype).toBe(false);
+    expect("terminalizeIdleDevinSessionForAccountLogin" in StateStore.prototype).toBe(false);
   });
 
   test("retains exact legacy Devin login authority for acknowledged abandonment only", async () => {
@@ -9373,6 +9305,54 @@ describe("StateStore", () => {
       expectedRevision: recovery.revision, resolution: "abandoned" }))
       .toMatchObject({ provider: "devin", state: "terminal" });
     expect(store.requireQueue(queue.id).state).toBe("cancelled");
+  });
+
+  test("includes retired local history only through an explicit read-only authority-filter opt-in", async () => {
+    const { store } = await fixture();
+    const account = signInProfile(store, "Retired history", "retired-history@example.com");
+    const codex = store.upsertProviderSession({
+      profileId: account.id,
+      provider: "codex",
+      providerThreadId: "current-codex-history-thread",
+      providerAccountKey: providerAccountKeyForProfile(store, account.id, "codex"),
+      title: "Current supported history",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const unprovenCodex = store.createSession({
+      profileId: account.id, preset: "high", fastEnabled: false,
+    });
+    const unprovenClaude = store.createSession({
+      profileId: account.id, provider: "claude", preset: "fable-max", fastEnabled: false,
+    });
+    const devin = seedLegacyDevinSession(store, {
+      profileId: account.id, preset: "astra", fastEnabled: false,
+    });
+    const input = { profileId: account.id, after: null, limit: 10,
+      requireCurrentAccountAuthority: true } as const;
+    expect(store.listLocalSessionPage(input).sessions).toEqual([codex]);
+    expect(store.listLocalSessionPage({ ...input, includeRetiredHistory: false }).sessions)
+      .toEqual([codex]);
+    expect(new Set(store.listLocalSessionPage({ ...input, includeRetiredHistory: true })
+      .sessions.map((session) => session.id))).toEqual(new Set([codex.id, devin.id]));
+    expect(store.listLocalSessionPage({ ...input, includeRetiredHistory: true,
+      excludedProvider: "devin" }).sessions).toEqual([codex]);
+    expect(store.listLocalSessionPage(input).sessions).toEqual([codex]);
+    for (const session of [unprovenCodex, unprovenClaude, devin]) {
+      expect(store.sessionAccountAuthorityMatches(session.id, account.id)).toBe(false);
+      expect(store.requireSession(session.id)).toEqual(session);
+    }
+    expect(store.setProfileState(account.id, account.processGeneration, "signed_in", {
+      email: "replacement-history@example.com", plan: "Plus",
+    })).toBe(true);
+    expect(store.listLocalSessionPage(input).sessions).toEqual([]);
+    expect(store.listLocalSessionPage({ ...input, includeRetiredHistory: true }).sessions)
+      .toEqual([devin]);
+    expect(store.sessionAccountAuthorityMatches(codex.id, account.id)).toBe(false);
+    expect(store.sessionAccountAuthorityMatches(devin.id, account.id)).toBe(false);
+    expect(() => store.enqueue(devin.id, "history is not executable"))
+      .toThrow("PROVIDER_RETIRED:devin");
   });
 
   test("keeps mixed v39 history readable while rejecting new retired-provider effects", async () => {

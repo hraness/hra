@@ -33,6 +33,10 @@ Validated retired in-flight operations are quarantined locally on restart,
 without replay, resolution, or new retired authority successors. Invalid evidence
 still fails closed. This preserves uncertainty without blocking supported
 accounts from starting.
+The aggregate also exposed obsolete login-session cleanup methods, which are
+removed, and a signed-in history pagination omission. Local history listing now
+opts into retired rows explicitly; current account-authority queries remain
+strict by default.
 
 Focused evidence before final integration:
 
@@ -49,6 +53,7 @@ Focused evidence before final integration:
 - Independent release review found no blockers. The actual npm archive has
   157 reviewed entries and no Devin runtime files. Installer pins and security
   primitive counts match their reviewed tables.
+- The adoption-integrated Convex, site, and app suites pass together: 732 tests.
 - Deadline starvation and recovery side effects were reproduced before their
   guards. Delivery still requires the exact-tree repository aggregate and normal
   protected-main checks; their final evidence belongs on the removal PR.

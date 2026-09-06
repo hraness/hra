@@ -12527,6 +12527,7 @@ export class HraService {
         includeArchived,
         limit,
         requireCurrentAccountAuthority: true,
+        includeRetiredHistory: true,
       });
       for (const session of localPage.sessions) {
         traversal.state.emittedSessionIds.add(session.id);
@@ -12575,6 +12576,7 @@ export class HraService {
         includeArchived,
         limit,
         requireCurrentAccountAuthority: true,
+        includeRetiredHistory: true,
       });
       if (localPage.sessions.length > 0) {
         for (const session of localPage.sessions) {

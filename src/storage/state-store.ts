@@ -8363,60 +8363,6 @@ export class StateStore {
     return this.canReleaseIdleManagedClaudeSessionForAccountLogin(input);
   }
 
-  canReleaseIdleDevinSessionForAccountLogin(input: Readonly<{
-    profileId: ProfileId;
-    profileGeneration: number;
-    sessionId: SessionId;
-  }>): boolean {
-    const profileId = profileIdSchema.parse(input.profileId);
-    const profileGeneration = z.number().int().nonnegative()
-      .max(Number.MAX_SAFE_INTEGER).parse(input.profileGeneration);
-    const sessionId = sessionIdSchema.parse(input.sessionId);
-    return this.#database.query(
-      `SELECT 1 AS releasable
-       FROM sessions s
-       JOIN profiles p ON p.id=s.profile_id
-       WHERE s.id=? AND s.profile_id=? AND p.process_generation=?
-         AND p.state!='removed'
-         AND s.provider_v39='devin' AND s.provider_thread_id IS NOT NULL
-         AND s.state='idle' AND s.active_turn_id IS NULL
-         AND NOT EXISTS(
-           SELECT 1 FROM mutation_attempts m
-           LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
-           LEFT JOIN session_start_attempts a ON a.attempt_id=m.id
-           WHERE (m.authority_id=s.id OR a.session_id=s.id)
-             AND m.state IN ('prepared','effect_started','ambiguous')
-             AND r.attempt_id IS NULL
-         )
-         AND NOT EXISTS(
-           SELECT 1 FROM queue_entries q
-           LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
-           WHERE q.session_id=s.id
-             AND q.state IN ('pending','dispatching','ambiguous')
-             AND r.queue_id IS NULL
-         )
-         AND NOT EXISTS(
-           SELECT 1 FROM provider_interactions i
-           WHERE i.session_id=s.id
-             AND i.state IN ('pending','response_prepared','response_written')
-         )
-         AND NOT EXISTS(
-           SELECT 1 FROM work_attempts w
-           WHERE w.worker_session_id=s.id
-             AND w.state IN ('claimed','dispatching','running','recovery_required')
-         )
-         AND NOT EXISTS(
-           SELECT 1 FROM work_signals w
-           WHERE w.to_session_id=s.id
-             AND NOT EXISTS(
-               SELECT 1 FROM work_signal_receipts r
-               WHERE r.signal_id=w.id AND r.kind='ack'
-             )
-         )
-       LIMIT 1`,
-    ).get(sessionId, profileId, profileGeneration) !== null;
-  }
-
   canReleaseIdleManagedClaudeSessionForAccountLogin(input: Readonly<{
     profileId: ProfileId;
     profileGeneration: number;
@@ -9413,6 +9359,8 @@ export class StateStore {
     after: Readonly<{ createdAt: number; sessionId: SessionId }> | null;
     excludedProvider?: Provider;
     includeArchived?: boolean;
+    /** Include retired local history in this read projection, never current authority. */
+    includeRetiredHistory?: boolean;
     limit: number;
     requireCurrentAccountAuthority?: boolean;
   }>): Readonly<{
@@ -9432,7 +9380,7 @@ export class StateStore {
       : providerSchema.parse(input.excludedProvider);
     const archiveClause = input.includeArchived === true ? "" : " AND s.archived_at IS NULL";
     const accountAuthorityClause = input.requireCurrentAccountAuthority === true
-      ? ` AND s.provider_v39 IN ('codex','claude') AND EXISTS (
+      ? ` AND ((s.provider_v39 IN ('codex','claude') AND EXISTS (
            SELECT 1
            FROM profiles p
            LEFT JOIN session_provider_account_authorities pa
@@ -9475,7 +9423,7 @@ export class StateStore {
                  ))
                OR (s.provider_v39='devin' AND p.state IN ('signed_in','signed_out'))
              )
-         )`
+         ))${input.includeRetiredHistory === true ? " OR s.provider_v39='devin'" : ""})`
       : "";
     const rows = (after === null
       ? this.#database.query(
@@ -14587,29 +14535,12 @@ export class StateStore {
     });
   }
 
-  terminalizeIdleDevinSessionForAccountLogin(input: Readonly<{
-    accountId: ProfileId;
-    providerConnectionId: string | null;
-    providerGeneration: number;
-    sessionId: SessionId;
-  }>): Readonly<{
-    changed: boolean;
-    event?: SessionEvent;
-    interactions: readonly InteractionRecord[];
-    session: SessionRecord;
-  }> {
-    return this.#terminalizeProviderSession({
-      ...input,
-      source: "devin_account_login",
-    });
-  }
-
   #terminalizeProviderSession(input: Readonly<{
     accountId: ProfileId;
     providerConnectionId: string | null;
     providerGeneration: number;
     sessionId: SessionId;
-    source: "provider_thread_deleted" | "claude_account_login" | "devin_account_login";
+    source: "provider_thread_deleted" | "claude_account_login";
   }>): Readonly<{
     changed: boolean;
     event?: SessionEvent;

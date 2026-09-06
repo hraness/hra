@@ -5412,7 +5412,7 @@ describe("HraService personal-session adoption", () => {
     )).toBeNull();
   });
 
-  test("pages every authorized local session while provider listing is recovery-blocked", async () => {
+  test("pages every authorized local session and retired history while provider listing is recovery-blocked", async () => {
     const cloud = new FakeCloud();
     const value = await fixture(undefined, cloud);
     const added = await value.service.execute(
@@ -5437,6 +5437,8 @@ describe("HraService personal-session adoption", () => {
       });
       return session.id;
     }));
+    expectedIds.add(legacyDevinSession(value, added.account.id).id);
+    const callsBeforeListing = [...value.codex.calls];
     cloud.unsettledProjectionProfiles.add(added.account.id);
     value.codex.listedProjections = [{
       providerThreadId: "recovery-blocked-provider-thread",
@@ -5446,7 +5448,7 @@ describe("HraService personal-session adoption", () => {
 
     const listedIds: string[] = [];
     let cursor: string | undefined;
-    for (let pageIndex = 0; pageIndex < 3; pageIndex += 1) {
+    for (let pageIndex = 0; pageIndex < expectedIds.size; pageIndex += 1) {
       const page = await value.service.execute({
         kind: "session.list",
         archived: false,
@@ -5461,7 +5463,7 @@ describe("HraService personal-session adoption", () => {
       expect(page.sessions).toHaveLength(1);
       expect(page.recovery.required).toBe(true);
       listedIds.push(page.sessions[0]?.id ?? "missing-session");
-      if (pageIndex < 2) {
+      if (pageIndex < expectedIds.size - 1) {
         expect(page.nextCursor).not.toBeNull();
         cursor = page.nextCursor ?? undefined;
       } else {
@@ -5472,6 +5474,7 @@ describe("HraService personal-session adoption", () => {
     expect(new Set(listedIds)).toEqual(expectedIds);
     expect(listedIds).toHaveLength(expectedIds.size);
     expect(value.codex.sessionListRequests).toEqual([]);
+    expect(value.codex.calls).toEqual(callsBeforeListing);
     expect(value.store.findSessionByProviderThread(
       added.account.id,
       "recovery-blocked-provider-thread",
@@ -10422,6 +10425,7 @@ describe("HraService", () => {
       state: "idle",
       title: "Existing Codex cache",
     });
+    const callsBeforeLocalListing = [...value.codex.calls];
 
     const first = await value.service.execute({
       kind: "session.list",
@@ -10438,6 +10442,7 @@ describe("HraService", () => {
       existingCodex.id,
     ].includes(session.id))).toBe(true);
     expect(value.codex.sessionListRequests).toHaveLength(0);
+    expect(value.codex.calls).toEqual(callsBeforeLocalListing);
 
     value.codex.listedProjections = [{
       providerThreadId: "provider-existing-codex",
@@ -10457,6 +10462,7 @@ describe("HraService", () => {
     };
     expect(second.sessions).toHaveLength(2);
     expect(value.codex.sessionListRequests).toHaveLength(0);
+    expect(value.codex.calls).toEqual(callsBeforeLocalListing);
 
     const third = await value.service.execute({
       kind: "session.list",
