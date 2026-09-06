@@ -49,6 +49,7 @@ import type { PreparedAttachment } from "../domain/attachments";
 import { AttachmentBlobStore } from "../storage/attachment-store";
 import { ingestAttachments } from "./attachment-ingest";
 import { presetRequirements } from "../domain/presets";
+import { createQueueId } from "../domain/values";
 import type {
   EffectiveClaudeRuntimeProfile,
   EffectiveRuntimeProfile,
@@ -15483,6 +15484,59 @@ describe("HraService", () => {
     expect(memory.ensures).toEqual([]);
   });
 
+  test("keeps retired note changes from minting facts-memory authority", async () => {
+    const memory = new FakeFactsMemoryLifecycle();
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
+    const profile = value.store.createProfile("Retired note authority");
+    const session = legacyDevinSession(value, profile.id);
+    const beforeMutations = value.store.listUnsettledMutations({ sessionId: session.id });
+    try {
+      for (const command of [
+        { kind: "session.note.set", session: session.id, note: "Do not change history" },
+        { kind: "session.note.clear", session: session.id },
+      ] as const) {
+        await expect(value.service.execute(command, { signal })).rejects.toMatchObject({
+          code: "UNAVAILABLE", details: { reason: "provider_retired" },
+        });
+        expect(value.store.requireSession(session.id)).toEqual(session);
+        expect(value.store.listUnsettledMutations({ sessionId: session.id })).toEqual(beforeMutations);
+        expect(memory.ensures).toEqual([]);
+        expect(memory.cleanups).toEqual([]);
+        expect(value.codex.calls).toEqual([]);
+      }
+      await expect(value.service.execute({
+        kind: "session.note.get", session: session.id,
+      }, { signal })).resolves.toMatchObject({ note: session.note, revision: session.revision });
+    } finally {
+      await value.service.close();
+    }
+  });
+
+  test.each([
+    { kind: "session.archive", archived: true },
+    { kind: "session.archive", archived: false },
+    { kind: "autorespond.set", mode: "auto:all" },
+    { kind: "autorespond.set", mode: null },
+  ] as const)("rejects retired session policy writes %j without changing history", async (change) => {
+    const value = await fixture();
+    const profile = value.store.createProfile("Retired session policy");
+    const session = legacyDevinSession(value, profile.id);
+    const approval = value.store.readSessionApprovalMode(session.id);
+    try {
+      await expect(value.service.execute({ ...change, session: session.id }, { signal }))
+        .rejects.toMatchObject({ code: "UNAVAILABLE", details: { reason: "provider_retired" } });
+      expect(value.store.requireSession(session.id)).toEqual(session);
+      expect(value.store.readSessionApprovalMode(session.id)).toEqual(approval);
+      expect(value.codex.calls).toEqual([]);
+      await expect(value.service.execute({ kind: "autorespond.set", mode: "auto:workspace" }, { signal }))
+        .resolves.toMatchObject({ mode: "auto:workspace", source: "default" });
+      await expect(value.service.execute({ kind: "autorespond.status", session: session.id }, { signal }))
+        .resolves.toMatchObject({ mode: "auto:workspace", source: "default" });
+    } finally {
+      await value.service.close();
+    }
+  });
+
   test("rejects a stale retired cloud account callback before account inspection", async () => {
     const value = await claudeAccountFixture(true);
     const profile = value.store.createProfile("Stale retired cloud account");
@@ -15597,10 +15651,16 @@ describe("HraService", () => {
       } finally {
         legacy.close();
       }
-      value.store.quarantineSession(session.id);
-      const beforeSession = value.store.requireSession(session.id);
-      const beforeMutation = value.store.readMutation(key);
+      const immutableEvidence = value.store.readMutation(key)?.evidence;
       try {
+        await expect(value.service.recover()).resolves.toBeUndefined();
+        expect(value.store.requireSession(session.id).state).toBe("recovery_required");
+        expect(value.store.readMutation(key)).toMatchObject({ state: "ambiguous", evidence: immutableEvidence });
+        expect(value.codex.calls).toEqual([]);
+        expect(memory.ensures).toEqual([]);
+        expect(memory.cleanups).toEqual([]);
+        const beforeSession = value.store.requireSession(session.id);
+        const beforeMutation = value.store.readMutation(key);
         for (const kind of ["session.recover", "session.abandon"] as const) {
           await expect(value.service.execute({ kind, session: session.id }, { signal }))
             .rejects.toMatchObject({ code: "UNAVAILABLE", details: { reason: "provider_retired" } });
@@ -15610,11 +15670,126 @@ describe("HraService", () => {
           expect(memory.ensures).toEqual([]);
           expect(value.codex.calls).toEqual([]);
         }
+        const supported = await createIdleSession(value, `Supported after retired ${side}`);
+        expect(value.store.requireSession(supported.sessionId).provider).toBe("codex");
       } finally {
         await value.service.close();
       }
     },
   );
+
+  test("quarantines an exact retired in-flight start without blocking supported startup", async () => {
+    const memory = new FakeFactsMemoryLifecycle();
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
+    const profile = value.store.createProfile("Retired start recovery");
+    await value.service.execute({ kind: "project.add", label: "Historical start project", path: value.documents }, { signal });
+    const project = value.store.listProjects()[0];
+    if (project === undefined) throw new Error("Expected a registered project.");
+    const session = value.store.createSession({
+      profileId: profile.id, projectId: project.id,
+      provider: "codex", preset: "ultra", fastEnabled: false,
+    });
+    const key = crypto.randomUUID();
+    const attemptId = `attempt_${crypto.randomUUID().replaceAll("-", "")}`;
+    const evidence = JSON.stringify({
+      kind: "session.start", projectId: project.id,
+      clientMessageId: null, messageDigest: null,
+      runtimeProfile: {
+        profileId: profile.id, processGeneration: profile.processGeneration,
+        observedAt: 2_000, preset: "astra", model: "gpt-6-astra",
+        reasoningEffort: "provider-default", devinVersion: "3000.6.14",
+        protocolVersion: 1, isolatedHome: true,
+      },
+    });
+    const legacy = new Database(value.paths.database, { strict: true });
+    try {
+      legacy.query("UPDATE sessions SET provider_v39='devin' WHERE id=?").run(session.id);
+      legacy.query(
+        "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,'session.start',?,?,?,'effect_started',0,0)",
+      ).run(attemptId, key, profile.id, profile.processGeneration, "d".repeat(64));
+      legacy.query(
+        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,'session.start',?,?,0)",
+      ).run(attemptId, evidence, createHash("sha256").update(evidence).digest("hex"));
+      legacy.query("INSERT INTO session_start_attempts(attempt_id,session_id,created_at) VALUES (?,?,0)")
+        .run(attemptId, session.id);
+    } finally {
+      legacy.close();
+    }
+    const immutableEvidence = value.store.readMutation(key)?.evidence;
+    try {
+      await expect(value.service.recover()).resolves.toBeUndefined();
+      expect(value.store.requireSession(session.id)).toMatchObject({
+        provider: "devin", state: "recovery_required",
+      });
+      expect(value.store.readMutation(key)).toMatchObject({ state: "ambiguous", evidence: immutableEvidence });
+      expect(value.codex.calls).toEqual([]);
+      expect(memory.ensures).toEqual([]);
+      expect(memory.cleanups).toEqual([]);
+      const added = await value.service.execute({
+        kind: "account.add", label: "Supported after retired start",
+      }, { signal }) as { account: { id: string } };
+      await value.service.execute({
+        kind: "account.login", account: added.account.id, deviceCode: false,
+      }, { signal });
+      await expect(value.service.execute({
+        kind: "session.start", account: added.account.id, project: project.id,
+        preset: "high", fast: false,
+      }, { signal })).resolves.toMatchObject({ session: { provider: "codex" } });
+    } finally {
+      await value.service.close();
+    }
+  });
+
+  test("quarantines a retired queued send after restart without redispatching or blocking supported work", async () => {
+    const memory = new FakeFactsMemoryLifecycle();
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
+    const profile = value.store.createProfile("Retired queue restart");
+    const session = legacyDevinSession(value, profile.id);
+    const queueId = createQueueId();
+    const message = "Historical uncertain queued send";
+    const evidence = JSON.stringify({
+      kind: "queue.dispatch", queueId, sessionId: session.id,
+      providerThreadId: session.providerThreadId, profileGeneration: profile.processGeneration,
+      baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+      clientMessageId: queueId, messageDigest: createHash("sha256").update(message).digest("hex"),
+      runtimeProfile: {
+        profileId: profile.id, processGeneration: profile.processGeneration,
+        observedAt: 1_000, preset: "astra", model: "gpt-6-astra",
+        reasoningEffort: "provider-default", devinVersion: "3000.6.14",
+        protocolVersion: 1, isolatedHome: true,
+      },
+    });
+    const legacy = new Database(value.paths.database, { strict: true });
+    try {
+      legacy.transaction(() => {
+        legacy.query(
+          "INSERT INTO queue_entries(id,session_id,message,state,enqueue_sequence,created_at,updated_at) VALUES (?,?,?,'dispatching',(SELECT next_sequence FROM queue_sequence_authority WHERE singleton=1),1000,1000)",
+        ).run(queueId, session.id, message);
+        legacy.query("UPDATE queue_sequence_authority SET next_sequence=next_sequence+1 WHERE singleton=1").run();
+        legacy.query("INSERT INTO queue_effect_evidence(queue_id,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,1000)")
+          .run(queueId, evidence, createHash("sha256").update(evidence).digest("hex"));
+      }).immediate();
+    } finally {
+      legacy.close();
+    }
+    const immutableEvidence = value.store.readQueueEffect(queueId);
+    value.store.nextDaemonGeneration(`boot_${"c".repeat(32)}`);
+    try {
+      await expect(value.service.recover()).resolves.toBeUndefined();
+      await value.service.settled();
+      expect(value.store.requireQueue(queueId)).toMatchObject({ state: "ambiguous", message });
+      expect(value.store.requireSession(session.id)).toMatchObject({ provider: "devin", state: "recovery_required" });
+      expect(value.store.readQueueEffect(queueId)).toEqual(immutableEvidence);
+      expect(value.codex.calls).toEqual([]);
+      expect(memory.ensures).toEqual([]);
+      expect(memory.cleanups).toEqual([]);
+      const supported = await createIdleSession(value, "Supported after retired queue");
+      expect(value.store.requireSession(supported.sessionId).provider).toBe("codex");
+      expect(value.store.requireQueue(queueId)).toMatchObject({ state: "ambiguous", message });
+    } finally {
+      await value.service.close();
+    }
+  });
 
   test("atomically retires an old connection across Codex logout and fresh login", async () => {
     const value = await fixture();

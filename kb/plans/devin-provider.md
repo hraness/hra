@@ -17,7 +17,41 @@ separately owned model defaults remain unchanged.
 Acceptance requires parser rejection of new Devin operations, zero runtime
 dispatch for old rows or commands, preserved mixed-provider history and login
 cleanup, focused regressions, independent review, and the repository final gate.
-Implementation and validation are in progress.
+The removal is implemented on `codex/remove-devin-support-20260906`, integrated
+with personal-session adoption at `6f056dc`. Schema v40 and its immutable v39/v40
+DDL remain unchanged. Current runtime admission, Work authority, and all three
+scheduled-task eligibility checks reject retired providers outside those
+historical definitions.
+
+Review added local-only interaction expiry so old pending Devin approvals cannot
+starve supported deadlines. Prepared and uncertain replies remain evidence.
+Recovery rejects a retired current provider or either retired side of an old
+switch before provider reads, process release, or facts-memory cleanup. Browser
+session, grid, and archived-session controls retain the retired marker and refuse
+mutations without redirecting a message to another conversation.
+Validated retired in-flight operations are quarantined locally on restart,
+without replay, resolution, or new retired authority successors. Invalid evidence
+still fails closed. This preserves uncertainty without blocking supported
+accounts from starting.
+
+Focused evidence before final integration:
+
+- Pre-adoption CLI: 435 tests passed; cloud retirement checks passed after
+  preserving existing interaction failure codes; web suite: 442 tests passed.
+- Adoption-integrated public content: 60 tests passed. Archived-session model
+  and settings regressions: 26 tests passed, including supported controls.
+- Adoption-integrated CLI and installer: 303 tests passed. Cloud boundary:
+  150 tests passed. Storage authority and historical migration scope: 12 tests
+  passed, including two generation advances and malformed-evidence negatives.
+- Final queue and mixed-history storage scope: 13 tests passed after reproducing
+  the old-generation restart failure. Service policy scope: 47 tests passed;
+  corrected in-flight start and queued-send startup regressions each passed.
+- Independent release review found no blockers. The actual npm archive has
+  157 reviewed entries and no Devin runtime files. Installer pins and security
+  primitive counts match their reviewed tables.
+- Deadline starvation and recovery side effects were reproduced before their
+  guards. Delivery still requires the exact-tree repository aggregate and normal
+  protected-main checks; their final evidence belongs on the removal PR.
 
 The rest of this file records the superseded implementation evidence.
 

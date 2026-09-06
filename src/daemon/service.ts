@@ -1387,6 +1387,7 @@ export class HraService {
         case "project.use": return { project: this.#store.setDefaultProject(this.#store.requireProject(command.project).id) };
         case "session.archive": {
           const session = this.#store.requireSession(command.session);
+          if (session.provider === "devin") throw retiredProviderFailure();
           this.#assertSessionAccountAuthorityIfSignedIn(session);
           const archived = this.#store.setSessionArchived(session.id, command.archived);
           return {
@@ -1481,6 +1482,7 @@ export class HraService {
             return { version: 1, mode: command.mode, source: "default" };
           }
           const session = this.#store.requireSession(command.session);
+          if (session.provider === "devin") throw retiredProviderFailure();
           this.#assertSessionAccountAuthorityIfSignedIn(session);
           this.#store.setSessionApprovalMode(session.id, command.mode);
           const effective = this.#store.readSessionApprovalMode(session.id);
@@ -14043,9 +14045,7 @@ export class HraService {
               ? {}
               : { providerUpdatedAt: started.providerUpdatedAt }),
             runtimeProfile: started.effectiveRuntimeProfile,
-            ...(committedTargetAccountKey === undefined
-              ? {}
-              : { providerAccountKey: committedTargetAccountKey }),
+            providerAccountKey: committedTargetAccountKey,
             ...(targetClaudeProcessIdentity === undefined
               ? {}
               : { claudeProcessIdentity: targetClaudeProcessIdentity }),
@@ -16199,6 +16199,7 @@ export class HraService {
     const session = this.#store.requireSession(selector);
     return await this.#serializeSessionAuthority(session, async () => {
       const current = this.#store.requireSession(session.id);
+      if (current.provider === "devin") throw retiredProviderFailure();
       const updated = this.#store.updateSessionMetadata({ sessionId: current.id, ...fields(current) });
       if (updated.state !== "terminal" && updated.state !== "recovery_required") {
         await this.#ensureFactsMemory(updated);

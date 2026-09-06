@@ -8277,6 +8277,7 @@ export class StateStore {
     const provider = providerSchema.parse(input.provider);
     const originGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
       .parse(input.originGeneration);
+    if (provider === "devin") return false;
     const current = z.object({
       process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     }).strict().safeParse(this.#database.query(
@@ -8614,6 +8615,9 @@ export class StateStore {
   }>): void {
     const tuples = this.#sessionMutationAuthorityTuplesForProfile(input.profileId);
     for (const tuple of tuples) {
+      // Retained evidence is still parsed above, but a retired provider must
+      // neither acquire a successor nor prevent supported runtimes closing.
+      if (tuple.provider === "devin") continue;
       if (!this.isSessionMutationProviderAuthorityCurrent({
         attemptId: tuple.attemptId,
         profileId: input.profileId,
@@ -8633,10 +8637,8 @@ export class StateStore {
         input.now,
       );
       if (inserted.changes !== 1) throw new Error("SESSION_MUTATION_SUCCESSOR_CAS_CONFLICT");
-      // Keep the v35 compatibility ledger current for its two representable
-      // providers. Devin authority exists only in the widened v39 ledger.
-      if (tuple.provider !== "devin") {
-        const compatibility = this.#database.query(
+      // Supported successors remain identical in both historical ledgers.
+      const compatibility = this.#database.query(
           `INSERT INTO session_mutation_authority_rebinds(
              attempt_id,profile_id,provider,from_generation,to_generation,recorded_at
            ) VALUES (?,?,?,?,?,?)`,
@@ -8648,9 +8650,8 @@ export class StateStore {
           input.fromGeneration + 1,
           input.now,
         );
-        if (compatibility.changes !== 1) {
-          throw new Error("SESSION_MUTATION_SUCCESSOR_COMPATIBILITY_CAS_CONFLICT");
-        }
+      if (compatibility.changes !== 1) {
+        throw new Error("SESSION_MUTATION_SUCCESSOR_COMPATIBILITY_CAS_CONFLICT");
       }
     }
   }
@@ -14761,12 +14762,16 @@ export class StateStore {
       expectedRevision: number;
       resolution: "abandoned";
     }): SessionRecord {
-    completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const sessionId = sessionIdSchema.parse(input.sessionId);
+    if (input.resolution === "provider_state_reconciled") {
+      assertSupportedProvider(this.requireSession(sessionId).provider);
+    }
+    completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const expectedRevision = z.number().int().positive().parse(input.expectedRevision);
     const now = this.#now();
     const resolveRecovery = this.#database.transaction(() => {
       const session = mapSession(this.#database.query("SELECT * FROM sessions WHERE id=?").get(sessionId));
+      if (input.resolution === "provider_state_reconciled") assertSupportedProvider(session.provider);
       if (session.state !== "recovery_required" || session.revision !== expectedRevision) {
         throw new Error("SESSION_STATUS_RECOVERY_CAS_CONFLICT");
       }
@@ -15073,18 +15078,38 @@ export class StateStore {
     const recovered: QueueId[] = [];
     const unresolved: QueueId[] = [];
     const recover = this.#database.transaction(() => {
-      const rows = this.#database.query("SELECT id,session_id FROM queue_entries WHERE state='dispatching' ORDER BY enqueue_sequence").all();
+      const rows = this.#database.query("SELECT id,session_id,message FROM queue_entries WHERE state='dispatching' ORDER BY enqueue_sequence").all();
       for (const row of rows) {
-        const parsed = z.object({ id: queueIdSchema, session_id: sessionIdSchema }).strict().parse(row);
+        const parsed = z.object({ id: queueIdSchema, session_id: sessionIdSchema, message: z.string() }).strict().parse(row);
         const record = this.readQueueEffect(parsed.id);
         if (record === null || record.evidence.sessionId !== parsed.session_id) {
           unresolved.push(parsed.id);
           continue;
         }
-        const binding = z.object({ provider_thread_id: providerThreadIdSchema.nullable(), process_generation: z.number().int().nonnegative() }).strict().parse(
-          this.#database.query(`SELECT s.provider_thread_id,p.process_generation FROM sessions s JOIN profiles p ON p.id=s.profile_id WHERE s.id=?`).get(parsed.session_id),
+        const binding = z.object({
+          provider_thread_id: providerThreadIdSchema.nullable(),
+          provider: providerSchema,
+          profile_id: profileIdSchema,
+          profile_state: profileStateSchema,
+          process_generation: z.number().int().nonnegative(),
+        }).strict().parse(
+          this.#database.query(`SELECT s.provider_thread_id,s.provider_v39 AS provider,s.profile_id,
+                                       p.state AS profile_state,p.process_generation
+                                FROM sessions s JOIN profiles p ON p.id=s.profile_id WHERE s.id=?`).get(parsed.session_id),
         );
-        if (binding.provider_thread_id !== record.evidence.providerThreadId || binding.process_generation !== record.evidence.profileGeneration) {
+        // A retired in-flight send can become ambiguous after a boot fence,
+        // but never regain execution authority. Its original request/runtime
+        // must remain exact even when the profile generation has advanced.
+        const generationAllowsQuarantine = binding.provider === "devin"
+          ? binding.profile_state !== "removed"
+            && binding.process_generation >= record.evidence.profileGeneration
+            && record.resolution === undefined
+            && isDevinRuntimeProfile(record.evidence.runtimeProfile)
+            && record.evidence.runtimeProfile.profileId === binding.profile_id
+            && record.evidence.runtimeProfile.processGeneration === record.evidence.profileGeneration
+            && createHash("sha256").update(parsed.message).digest("hex") === record.evidence.messageDigest
+          : binding.process_generation === record.evidence.profileGeneration;
+        if (binding.provider_thread_id !== record.evidence.providerThreadId || !generationAllowsQuarantine) {
           unresolved.push(parsed.id);
           continue;
         }
@@ -15775,6 +15800,7 @@ export class StateStore {
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
     assertSupportedProvider(evidence.sourceProvider);
     assertSupportedProvider(evidence.targetProvider);
+    const targetProvider = evidence.targetProvider;
     if (
       evidence.targetProviderAccountKey === undefined
       || !providerAccountAuthorityKeyMatchesProvider(
@@ -15875,7 +15901,7 @@ export class StateStore {
       ) throw new Error("SESSION_PROVIDER_SWITCH_AUTHORITY_CHANGED");
       const targetRevocation = this.readProviderRuntimeAccountRevocation({
         profileId: evidence.targetProfileId,
-        provider: evidence.targetProvider,
+        provider: targetProvider,
         runtimeScope: "managed",
       });
       if (
@@ -17656,6 +17682,13 @@ export class StateStore {
     unresolved: readonly { id: AttemptId; kind: string; authorityId: string }[];
   } {
     const recover = this.#database.transaction(() => {
+      // This local predicate authorizes only quarantine of retired evidence.
+      // It is deliberately not a provider-current proof: no successor or
+      // executable authority is granted when a historical generation is old.
+      const canQuarantineRetiredAuthority = (profileId: ProfileId, generation: number): boolean =>
+        this.#database.query(
+          "SELECT 1 FROM profiles WHERE id=? AND state!='removed' AND process_generation>=?",
+        ).get(profileId, generation) !== null;
       const rows = this.#database
         .query(`SELECT m.id,m.kind,m.authority_id,m.authority_generation,e.kind AS evidence_kind,e.evidence_json,e.evidence_digest,s.session_id AS session_start_id
                 FROM mutation_attempts m
@@ -17740,14 +17773,23 @@ export class StateStore {
           const parsedSession = sessionIdSchema.safeParse(raw.session_start_id);
           if (parsedProfile.success && parsedSession.success) {
             const binding = this.#database.query("SELECT profile_id,state FROM sessions WHERE id=?").get(parsedSession.data) as { profile_id: string; state: string } | null;
+            const session = binding === null ? null : this.requireSession(parsedSession.data);
+            const retiredStartCanBeQuarantined = session?.provider === "devin"
+              && effectEvidence?.kind === "session.start"
+              && effectEvidence.runtimeProfile !== undefined
+              && isDevinRuntimeProfile(effectEvidence.runtimeProfile)
+              && effectEvidence.runtimeProfile.profileId === parsedProfile.data
+              && effectEvidence.runtimeProfile.processGeneration === authorityGeneration
+              && session.projectId === effectEvidence.projectId
+              && canQuarantineRetiredAuthority(parsedProfile.data, authorityGeneration);
             if (
               binding?.profile_id === parsedProfile.data
-              && this.isSessionMutationProviderAuthorityCurrent({
+              && (retiredStartCanBeQuarantined || this.isSessionMutationProviderAuthorityCurrent({
                 attemptId: id,
                 profileId: parsedProfile.data,
                 provider: this.requireSession(parsedSession.data).provider,
                 originGeneration: authorityGeneration,
-              })
+              }))
             ) {
               if (binding.state !== "terminal" && binding.state !== "recovery_required") {
                 this.#database.query("UPDATE sessions SET state='recovery_required',active_turn_id=NULL,revision=revision+1,updated_at=? WHERE id=?").run(this.#now(), parsedSession.data);
@@ -17776,23 +17818,36 @@ export class StateStore {
               && session.profileId === effectEvidence.targetProfileId
               && session.provider === effectEvidence.targetProvider
               && session.providerThreadId === target.provider_thread_id;
+            const hasRetiredProvider = effectEvidence.sourceProvider === "devin"
+              || effectEvidence.targetProvider === "devin";
+            const retiredRuntimeProfileMatches = !hasRetiredProvider || (
+              reviewedRuntimeProfileProvider(effectEvidence.runtimeProfile) === effectEvidence.targetProvider
+              && effectEvidence.runtimeProfile.profileId === effectEvidence.targetProfileId
+              && effectEvidence.runtimeProfile.processGeneration === effectEvidence.targetProcessGeneration
+              && effectEvidence.runtimeProfile.preset === effectEvidence.targetPreset
+            );
             if (
-              !(target !== null && sessionProviderSwitchTargetAliasesSource(
+              retiredRuntimeProfileMatches
+              && !(target !== null && sessionProviderSwitchTargetAliasesSource(
                 effectEvidence,
                 target.provider_thread_id,
               ))
-              && this.isSessionMutationProviderAuthorityCurrent({
+              && (effectEvidence.sourceProvider === "devin"
+                ? canQuarantineRetiredAuthority(effectEvidence.sourceProfileId, effectEvidence.sourceProcessGeneration)
+                : this.isSessionMutationProviderAuthorityCurrent({
                 attemptId: id,
                 profileId: effectEvidence.sourceProfileId,
                 provider: effectEvidence.sourceProvider,
                 originGeneration: effectEvidence.sourceProcessGeneration,
-              })
-              && this.isSessionMutationProviderAuthorityCurrent({
+              }))
+              && (effectEvidence.targetProvider === "devin"
+                ? canQuarantineRetiredAuthority(effectEvidence.targetProfileId, effectEvidence.targetProcessGeneration)
+                : this.isSessionMutationProviderAuthorityCurrent({
                 attemptId: id,
                 profileId: effectEvidence.targetProfileId,
                 provider: effectEvidence.targetProvider,
                 originGeneration: effectEvidence.targetProcessGeneration,
-              })
+              }))
               && authorityGeneration === effectEvidence.targetProcessGeneration
               && (sourceBinding || targetBinding)
             ) {

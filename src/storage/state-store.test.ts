@@ -9218,6 +9218,163 @@ describe("StateStore", () => {
       .toBe("gpt-5.6-sol");
   });
 
+  test.each([
+    ["source", "valid"], ["target", "valid"],
+    ["source", "digest"], ["target", "binding"],
+    ["source", "runtime_profile"], ["target", "runtime_profile"],
+  ] as const)(
+    "handles retired Devin %s switch shutdown with %s evidence without reviving authority",
+    async (side, variant) => {
+      const { store } = await fixture();
+      const profile = signInProfile(store, `Retired ${side} shutdown`, "retired-shutdown@example.com");
+      const created = side === "source"
+        ? seedLegacyDevinSession(store, { profileId: profile.id, preset: "astra", fastEnabled: false })
+        : store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+      const session = store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
+        providerThreadId: "legacy-shutdown-source", state: "idle" });
+      const attemptId = createAttemptId();
+      const key = "00000000-0000-4000-8000-0000000006c3";
+      const evidence = {
+        kind: "session.switch", requestedAccountId: null, requestedPreset: null,
+        sourceProfileId: profile.id, sourceProcessGeneration: profile.processGeneration,
+        sourceProvider: side === "source" ? "devin" : "codex",
+        sourceProviderThreadId: session.providerThreadId,
+        sourcePreset: side === "source" ? "astra" : "high",
+        targetProfileId: profile.id, targetProcessGeneration: profile.processGeneration,
+        targetProvider: side === "target" ? "devin" : "codex",
+        targetPreset: side === "target" ? "astra" : "high",
+        transcriptDigest: "b".repeat(64), seedDigest: "c".repeat(64),
+        seedIncludedRecords: 0, seedOmittedRecords: 0,
+        runtimeProfile: side === "target" ? {
+          profileId: profile.id, processGeneration: profile.processGeneration, observedAt: 1000,
+          preset: "astra", model: "gpt-6-astra", reasoningEffort: "provider-default",
+          devinVersion: "3000.6.14", protocolVersion: 1, isolatedHome: true,
+        } : effectiveRuntimeProfileSchema.parse(codexAdoptionRuntimeProfile(profile, "high", false)),
+      };
+      if (variant === "binding") evidence.sourceProviderThreadId = "unmatched-legacy-source";
+      if (variant === "runtime_profile") evidence.runtimeProfile.processGeneration += 1;
+      const evidenceJson = JSON.stringify(evidence);
+      const database = new Database(store.paths.database, { create: false, strict: true });
+      try {
+        database.query("INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,'session.switch',?,?,?,'effect_started',1000,1000)")
+          .run(attemptId, key, session.id, profile.processGeneration, "d".repeat(64));
+        database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,'session.switch',?,?,1000)")
+          .run(attemptId, evidenceJson, variant === "digest" ? "f".repeat(64)
+            : createHash("sha256").update(evidenceJson).digest("hex"));
+        const before = database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(attemptId);
+        if (variant !== "valid") {
+          expect(store.recoverEffectStartedMutations()).toEqual({ recovered: [],
+            unresolved: [{ id: attemptId, kind: "session.switch", authorityId: session.id }] });
+          expect(store.requireSession(session.id)).toEqual(session);
+          expect(database.query("SELECT state FROM mutation_attempts WHERE id=?").get(attemptId))
+            .toEqual({ state: "effect_started" });
+          expect(database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(attemptId)).toEqual(before);
+          return;
+        }
+        for (const boot of ["a", "b"] as const) {
+          expect(() => store.nextDaemonGeneration(`boot_${boot.repeat(32)}`)).not.toThrow();
+          expect(store.recoverEffectStartedMutations()).toEqual({
+            recovered: boot === "a" ? [attemptId] : [], unresolved: [],
+          });
+          expect(store.requireSession(session.id).state).toBe("recovery_required");
+          expect(store.readMutation(key)?.state).toBe("ambiguous");
+          expect(store.isSessionMutationProviderAuthorityCurrent({ attemptId,
+            profileId: profile.id, provider: "devin", originGeneration: profile.processGeneration })).toBe(false);
+          expect(store.isSessionMutationProviderAuthorityCurrent({ attemptId,
+            profileId: profile.id, provider: "codex", originGeneration: profile.processGeneration })).toBe(true);
+        }
+        expect(database.query("SELECT provider,from_generation,to_generation FROM session_mutation_authority_rebinds_v39 WHERE attempt_id=? ORDER BY from_generation").all(attemptId))
+          .toEqual([
+            { provider: "codex", from_generation: profile.processGeneration, to_generation: profile.processGeneration + 1 },
+            { provider: "codex", from_generation: profile.processGeneration + 1, to_generation: profile.processGeneration + 2 },
+          ]);
+        expect(database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(attemptId)).toEqual(before);
+        expect(store.readMutation(key)?.evidence?.evidence).toEqual(evidence);
+      } finally {
+        database.close(false);
+      }
+    },
+  );
+
+  test.each(["valid", "digest", "binding", "runtime_profile"] as const)(
+    "quarantines retired Devin dispatch after daemon generation advance only with %s evidence",
+    async (variant) => {
+      const { store } = await fixture();
+      const profile = store.createProfile("Retired queue restart");
+      const created = seedLegacyDevinSession(store, {
+        profileId: profile.id, preset: "astra", fastEnabled: false,
+      });
+      const session = store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
+        providerThreadId: "retired-queue-thread", state: "idle" });
+      const queue = seedLegacyDevinQueue(store, session.id);
+      const runtimeProfile = effectiveDevinRuntimeProfileSchema.parse({
+        profileId: profile.id, processGeneration: profile.processGeneration, observedAt: 1000,
+        preset: "astra", model: "gpt-6-astra", reasoningEffort: "provider-default",
+        devinVersion: "3000.6.14", protocolVersion: 1, isolatedHome: true,
+      });
+      if (variant === "runtime_profile") runtimeProfile.processGeneration += 1;
+      const evidence = { kind: "queue.dispatch", queueId: queue.id, sessionId: session.id,
+        providerThreadId: variant === "binding" ? "unmatched-thread" : "retired-queue-thread",
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: queue.id, messageDigest: createHash("sha256").update(queue.message).digest("hex"),
+        runtimeProfile,
+      };
+      const evidenceJson = JSON.stringify(evidence);
+      const database = new Database(store.paths.database, { create: false, strict: true });
+      try {
+        database.query("INSERT INTO queue_effect_evidence(queue_id,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,1000)")
+          .run(queue.id, evidenceJson, variant === "digest" ? "f".repeat(64)
+            : createHash("sha256").update(evidenceJson).digest("hex"));
+        database.query("UPDATE queue_entries SET state='dispatching' WHERE id=?").run(queue.id);
+        const before = database.query("SELECT * FROM queue_effect_evidence WHERE queue_id=?").get(queue.id);
+        store.nextDaemonGeneration(`boot_${"c".repeat(32)}`);
+        const beforeSession = store.requireSession(session.id);
+        if (variant === "digest") {
+          expect(() => store.recoverDispatchingQueueEffects()).toThrow("QUEUE_EFFECT_EVIDENCE_MISMATCH");
+        } else {
+          expect(store.recoverDispatchingQueueEffects()).toEqual(variant === "valid"
+            ? { recovered: [queue.id], unresolved: [] }
+            : { recovered: [], unresolved: [queue.id] });
+        }
+        expect(store.requireQueue(queue.id).state).toBe(variant === "valid" ? "ambiguous" : "dispatching");
+        expect(store.requireQueue(queue.id).message).toBe(queue.message);
+        if (variant === "valid") {
+          expect(store.requireSession(session.id).state).toBe("recovery_required");
+          expect(store.recoverDispatchingQueueEffects()).toEqual({ recovered: [], unresolved: [] });
+          expect(store.sessionAccountAuthorityMatches(session.id, profile.id)).toBe(false);
+        } else {
+          expect(store.requireSession(session.id)).toEqual(beforeSession);
+        }
+        expect(database.query("SELECT * FROM queue_effect_evidence WHERE queue_id=?").get(queue.id)).toEqual(before);
+      } finally {
+        database.close(false);
+      }
+    },
+  );
+
+  test("keeps legacy Devin status recovery inert except explicit local abandonment", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Retired recovery");
+    const created = seedLegacyDevinSession(store, {
+      profileId: profile.id, preset: "astra", fastEnabled: false,
+    });
+    const bound = store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
+      providerThreadId: "retired-recovery-thread", state: "idle" });
+    const queue = seedLegacyDevinQueue(store, bound.id);
+    const recovery = store.quarantineSession(bound.id);
+    expect(() => store.resolveSessionStatusRecovery({ sessionId: recovery.id,
+      expectedRevision: recovery.revision, resolution: "provider_state_reconciled",
+      provider: { providerThreadId: "retired-recovery-thread", title: "Must not restore", status: "idle" },
+    })).toThrow("PROVIDER_RETIRED:devin");
+    expect(store.requireSession(recovery.id)).toEqual(recovery);
+    expect(store.requireQueue(queue.id).state).toBe("pending");
+    expect(store.resolveSessionStatusRecovery({ sessionId: recovery.id,
+      expectedRevision: recovery.revision, resolution: "abandoned" }))
+      .toMatchObject({ provider: "devin", state: "terminal" });
+    expect(store.requireQueue(queue.id).state).toBe("cancelled");
+  });
+
   test("keeps mixed v39 history readable while rejecting new retired-provider effects", async () => {
     const { store } = await fixture();
     const account = signInProfile(store, "Mixed provider archive", "archive@example.com");
@@ -9250,6 +9407,9 @@ describe("StateStore", () => {
       kind: "session.send", authorityId: devin.id, authorityGeneration: account.processGeneration,
       request: { message: "rejected" }, idempotencyKey: "00000000-0000-4000-8000-0000000006b3",
     });
+    expect(store.isSessionMutationProviderAuthorityCurrent({ attemptId: mutation.id,
+      profileId: account.id, provider: "devin", originGeneration: account.processGeneration }))
+      .toBe(false);
     expect(() => store.createSession({ profileId: account.id, provider: "devin", preset: "astra", fastEnabled: false }))
       .toThrow("PROVIDER_RETIRED:devin");
     expect(() => store.upsertProviderSession({ profileId: account.id, provider: "devin",
