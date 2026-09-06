@@ -699,6 +699,9 @@ describe("release workflow", () => {
     expect(governedHistory).not.toContain("pull_request.head.sha");
     expect(asRecord(install, "CI install step").run).toBe("bun install --frozen-lockfile --ignore-scripts");
     expect(asRecord(gate, "CI gate step").run).toBe("bun run check");
+    expect(asRecord(asRecord(gate, "CI gate step").env, "CI gate environment")).toEqual({
+      NODE_OPTIONS: "--max-old-space-size=4096",
+    });
     // The gate already verifies generated public documents and runs the
     // Linux custody test through `bun test ./scripts`; CI does not repeat them.
     const packageScripts = asRecord(asRecord(

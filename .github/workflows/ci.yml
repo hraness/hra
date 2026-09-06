@@ -97,6 +97,10 @@ jobs:
           /usr/bin/unshare --user --map-root-user --fork /usr/bin/true
 
       - name: Run the repository gate
+        env:
+          # Typed ESLint loads the complete repository project graph and can
+          # exceed V8's default heap on the 7 GiB macOS runner.
+          NODE_OPTIONS: "--max-old-space-size=4096"
         run: bun run check
 
       - name: Restore Ubuntu user-namespace restriction
