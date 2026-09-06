@@ -237,6 +237,10 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
     reasoningOutputTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
     totalTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
     modelContextWindow: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+    providerCost: z.object({
+      amount: z.number().finite().nonnegative().max(1_000_000_000),
+      currency: z.string().regex(/^[A-Z]{3}$/u),
+    }).strict().optional(),
   }).strict(),
   z.object({
     type: z.literal("interaction_requested"),

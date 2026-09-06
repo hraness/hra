@@ -3,14 +3,27 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 
 import {
-  providerAccountAuthoritySchema,
-  type ProviderAccountAuthority,
+  claudeProviderAccountAuthoritySchema,
+  claudeProviderAccountIdSchema,
+  codexProviderAccountAuthoritySchema,
+  codexProviderAccountIdSchema,
 } from "./provider-accounts";
 import {
   storedAccountUsageSnapshotSchema,
   type StoredAccountUsageSnapshot,
 } from "./usage-metrics";
 import { sessionIdSchema, unixMillisecondsSchema } from "./values";
+
+/** Subscription quota and automatic usage management are not general provider capabilities. */
+export const usageProviderSchema = z.enum(["codex", "claude"]);
+export type UsageProvider = z.infer<typeof usageProviderSchema>;
+export const usageProviderAccountIdSchema = z.union([
+  codexProviderAccountIdSchema, claudeProviderAccountIdSchema,
+]);
+export const usageProviderAccountAuthoritySchema = z.discriminatedUnion("provider", [
+  codexProviderAccountAuthoritySchema, claudeProviderAccountAuthoritySchema,
+]);
+export type UsageProviderAccountAuthority = z.infer<typeof usageProviderAccountAuthoritySchema>;
 
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
 const safeNonnegativeIntegerSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
@@ -154,7 +167,7 @@ export type CodexAccountingUsage = z.infer<typeof codexAccountingUsageSchema>;
 
 const providerUsageComponentBase = {
   version: z.literal(2),
-  authority: providerAccountAuthoritySchema,
+  authority: usageProviderAccountAuthoritySchema,
   observationRevision: safeNonnegativeIntegerSchema,
   idempotencyKey: sha256Schema,
   sourceEventDigest: sha256Schema,
@@ -251,8 +264,8 @@ export const providerUsageComponentSchema = z.union([
 export type ProviderUsageComponent = z.infer<typeof providerUsageComponentSchema>;
 
 const sameAuthority = (
-  left: ProviderAccountAuthority,
-  right: ProviderAccountAuthority,
+  left: UsageProviderAccountAuthority,
+  right: UsageProviderAccountAuthority,
 ): boolean =>
   left.providerAccountId === right.providerAccountId
   && left.profileId === right.profileId
@@ -262,7 +275,7 @@ const sameAuthority = (
 
 export const providerUsageObservationV2Schema = z.object({
   version: z.literal(2),
-  authority: providerAccountAuthoritySchema,
+  authority: usageProviderAccountAuthoritySchema,
   authorityMode: providerUsageAuthorityModeSchema,
   quota: providerUsageQuotaComponentSchema.nullable(),
   accounting: providerUsageAccountingComponentSchema.nullable(),
@@ -314,7 +327,7 @@ export const providerUsageDigest = (value: unknown): string =>
   createHash("sha256").update(canonicalProviderUsageJson(value)).digest("hex");
 
 export function providerUsageIdempotencyKey(input: Readonly<{
-  authority: ProviderAccountAuthority;
+  authority: UsageProviderAccountAuthority;
   component: ProviderUsageComponentKind;
   sessionId: string;
   turnId: string;
@@ -322,7 +335,7 @@ export function providerUsageIdempotencyKey(input: Readonly<{
 }>): string {
   return providerUsageDigest({
     domain: "hra:provider-usage-component-idempotency:v2",
-    authority: providerAccountAuthoritySchema.parse(input.authority),
+    authority: usageProviderAccountAuthoritySchema.parse(input.authority),
     component: providerUsageComponentKindSchema.parse(input.component),
     sessionId: sessionIdSchema.parse(input.sessionId),
     turnId: z.string().min(1).max(200).parse(input.turnId),
@@ -381,7 +394,7 @@ export function canonicalProviderUsageComponent(
 }
 
 type ClaudeComponentInputBase = Readonly<{
-  authority: ProviderAccountAuthority;
+  authority: UsageProviderAccountAuthority;
   sessionId: string;
   turnId: string;
   sourceEventId: string;
@@ -400,7 +413,7 @@ export type CreateClaudeQuotaUsageComponentInput = ClaudeComponentInputBase & Re
 export function createClaudeQuotaUsageComponent(
   input: CreateClaudeQuotaUsageComponentInput,
 ): ClaudeProviderUsageQuotaComponent {
-  const authority = providerAccountAuthoritySchema.parse(input.authority);
+  const authority = usageProviderAccountAuthoritySchema.parse(input.authority);
   if (authority.provider !== "claude") throw new Error("Claude quota authority is not Claude.");
   const quota = claudeQuotaUsageSchema.parse({ ...input.quota, format: "claude_v1" });
   const sortedQuota: ClaudeQuotaUsage = {
@@ -448,7 +461,7 @@ export type CreateClaudeAccountingUsageComponentInput = ClaudeComponentInputBase
 export function createClaudeAccountingUsageComponent(
   input: CreateClaudeAccountingUsageComponentInput,
 ): ClaudeProviderUsageAccountingComponent {
-  const authority = providerAccountAuthoritySchema.parse(input.authority);
+  const authority = usageProviderAccountAuthoritySchema.parse(input.authority);
   if (authority.provider !== "claude") throw new Error("Claude accounting authority is not Claude.");
   const accounting = claudeAccountingUsageSchema.parse({
     ...input.accounting,
@@ -584,7 +597,7 @@ export function projectCodexV1Usage(input: Readonly<{
   sourceRevision: number;
   observedAt: number;
   storedDigest: string;
-  authority: ProviderAccountAuthority;
+  authority: UsageProviderAccountAuthority;
   authorityMode: ProviderUsageAuthorityMode;
 }>): CodexV1UsageProjection {
   const parsedSnapshot = storedAccountUsageSnapshotSchema.parse(input.snapshot);
@@ -594,7 +607,7 @@ export function projectCodexV1Usage(input: Readonly<{
   const sourceRevision = safeNonnegativeIntegerSchema.parse(input.sourceRevision);
   const observedAt = unixMillisecondsSchema.parse(input.observedAt);
   const storedDigest = sha256Schema.parse(input.storedDigest);
-  const authority = providerAccountAuthoritySchema.parse(input.authority);
+  const authority = usageProviderAccountAuthoritySchema.parse(input.authority);
   if (
     authority.provider !== "codex"
     || authority.processGeneration !== parsedSnapshot.observation.providerGeneration

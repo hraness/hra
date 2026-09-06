@@ -968,12 +968,16 @@ type CodexFactBody =
       readonly type: "tokenUsageUpdated";
       readonly threadId: string;
       readonly turnId: string;
-      readonly inputTokens: number;
-      readonly cachedInputTokens: number;
-      readonly outputTokens: number;
-      readonly reasoningOutputTokens: number;
+      readonly inputTokens: number | null;
+      readonly cachedInputTokens: number | null;
+      readonly outputTokens: number | null;
+      readonly reasoningOutputTokens: number | null;
       readonly totalTokens: number;
       readonly modelContextWindow: number | null;
+      readonly providerCost?: {
+        readonly amount: number;
+        readonly currency: string;
+      };
     }
   | {
       readonly type: "providerWarning";
@@ -3372,7 +3376,10 @@ export function resolvePreset(
   requirement: PresetRequirement,
   fast: boolean,
 ): ResolvedPreset {
-  if (!isAdmittedPresetRequirement(alias, requirement)) {
+  if (
+    requirement.effort === "provider-default"
+    || !isAdmittedPresetRequirement(alias, requirement)
+  ) {
     throw new CodexError(
       "UNSUPPORTED_CAPABILITY",
       `${alias} requested an unadmitted exact HRA model and reasoning tuple`,

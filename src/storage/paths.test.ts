@@ -1,9 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { initializeStatePaths, resolveStatePaths } from "./paths";
+import {
+  initializeProfilePaths,
+  initializeStatePaths,
+  profilePaths,
+  resolveStatePaths,
+} from "./paths";
 import { GenerationalSecretCustody } from "./secret-custody";
 
 describe("HRA v1 local namespace", () => {
@@ -34,5 +39,29 @@ describe("HRA v1 local namespace", () => {
   test("uses a versioned collision-proof Linux root", () => {
     const paths = resolveStatePaths({ homeDirectory: "/workspace/hra-user", platform: "linux" });
     expect(paths.root).toBe("/workspace/hra-user/.local/state/hra-control-plane-v1");
+  });
+
+  test("isolates Devin HOME and every XDG root inside one private profile", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-devin-profile-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const profileId = `acct_${"a".repeat(32)}`;
+    const expected = profilePaths(paths, profileId);
+    const initialized = await initializeProfilePaths(paths, profileId);
+
+    expect(initialized).toEqual(expected);
+    expect(initialized).toMatchObject({
+      devinHome: join(initialized.root, "devin-home"),
+      devinConfigDir: join(initialized.root, "devin-config"),
+      devinDataDir: join(initialized.root, "devin-data"),
+      devinCacheDir: join(initialized.root, "devin-cache"),
+      devinStateDir: join(initialized.root, "devin-state"),
+    });
+    for (const path of Object.values(initialized)) {
+      const metadata = await lstat(path);
+      expect(metadata.isDirectory()).toBe(true);
+      expect(metadata.isSymbolicLink()).toBe(false);
+      expect(metadata.mode & 0o077).toBe(0);
+    }
   });
 });

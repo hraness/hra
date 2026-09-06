@@ -4,7 +4,7 @@ This page summarizes the active HRA plans for readers who want the provider and 
 
 ## Direction
 
-HRA is a control plane for Codex and Claude Code. Codex runs through HRA's exact packaged pin. Claude runs through a realpath-resolved installed executable whose exact self-reported version must match HRA's compatibility pin; HRA does not authenticate those executable bytes against an upstream package digest. Both use user-selected isolated profiles. HRA owns the provider-neutral conversation and control record while each provider owns authentication, native sessions, execution, tools, approvals, and hidden state. Codex is supported on macOS and Linux; Claude Code is supported on Linux while authenticated isolated-Keychain and detached-read acceptance remains pending on macOS. Humans get a terminal shell and a keyboard-first web surface; agents get the same machine-readable CLI and work protocol.
+HRA is a control plane for Codex, Claude Code, and Devin. Codex runs through HRA's exact packaged pin. Claude and Devin run through separately installed, realpath-resolved executables whose exact self-reported versions must match HRA's compatibility pins; HRA does not authenticate those executable bytes against upstream package digests. All three use user-selected isolated profiles. HRA owns the provider-neutral conversation and control record while each provider owns authentication, native sessions, execution, tools, approvals, and hidden state. Codex and Devin are supported on macOS and Linux; Claude Code is supported on Linux while authenticated isolated-Keychain and detached-read acceptance remains pending on macOS. Humans get a terminal shell and a keyboard-first web surface; agents get the same machine-readable CLI and work protocol.
 
 ## Waves
 
@@ -15,11 +15,12 @@ HRA is a control plane for Codex and Claude Code. Codex runs through HRA's exact
 | 3 | Provider seam | Published in v0.5.0: reviewed Codex and Claude Code ports, a pinned Claude dialect, provider-tagged sessions, and provider-specific presets. Claude execution was still refused in that release. |
 | 4 | Claude Code execution | Implemented in the current unreleased source: start, turn, steer, stop, interaction, projection, queue dispatch, foreground Linux sign-in, and bounded sign-in status run through the selected provider. Claude Code native listing, rename, resume, usage, web sign-in, and protected turn inspection remain unavailable. |
 | 5 | Conversation portability | Implemented in the current unreleased source: HRA's neutral transcript, local and remote provider switching, and trajectory or JSON export. Switching preserves the HRA record, not provider-native hidden state or cached context. |
+| 6 | Devin execution | Implemented in current source: exact Devin CLI 3000.6.14 admission, foreground isolated sign-in, ACP v1 sessions, Astra selection, turns, stop, permission interactions, provider switching, restart loading when advertised, and provider-supplied context and cost facts. ACP v1 has no in-turn steer, and Devin exposes no machine-readable account allowance or reset operation. |
 
 ## What HRA will not do
 
 - Rotate, pool, or fail over between accounts or providers automatically.
 - Hold, read, or forward any provider credential.
 - Route through a learned model router or a cost cascade.
-- Pretend provider-specific features have parity: Codex account, usage, plugin, desktop, and native transcript operations remain Codex-specific until an independently reviewed Claude Code contract exists.
-- Offer Claude login from the web surface. Codex web linking uses its provider-owned device-code flow.
+- Pretend provider-specific features have parity: Codex account allowance, reset, plugin, desktop, and native transcript operations remain Codex-specific. Devin exposes session context and optional cost facts but no machine-readable account allowance or reset operation.
+- Offer Claude or Devin login from the web surface. Codex web linking uses its provider-owned device-code flow.

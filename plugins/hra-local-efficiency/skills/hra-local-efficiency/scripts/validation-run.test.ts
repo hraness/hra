@@ -266,6 +266,9 @@ describe("validation receipts", () => {
     });
   });
 
+  // Three real validation runs perform seven complete Git/toolchain fingerprints
+  // (63 subprocesses), plus fixture setup and owned command launches. Budget the
+  // combined integration workload explicitly; no individual runtime limit changes.
   test("rejects malformed and oversized reusable receipts without echoing them", async () => {
     const root = fixture();
     const options = parseValidationArguments([
@@ -303,7 +306,7 @@ describe("validation receipts", () => {
     } finally {
       log.mockRestore();
     }
-  });
+  }, 15_000);
 
   test("reuses a valid receipt once across a canonical cwd alias", async () => {
     const root = fixture();

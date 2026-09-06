@@ -163,6 +163,29 @@ describe("session events", () => {
     })).toThrow();
   });
 
+  test("preserves only bounded, provider-reported cost on token usage events", () => {
+    const usage = sessionEventBodySchema.parse({
+      type: "token_usage",
+      turnId: publicProviderId("turn-usage"),
+      inputTokens: null,
+      cachedInputTokens: null,
+      outputTokens: null,
+      reasoningOutputTokens: null,
+      totalTokens: 53_000,
+      modelContextWindow: 200_000,
+      providerCost: { amount: 0.01, currency: "USD" },
+    });
+    expect(usage).toMatchObject({ providerCost: { amount: 0.01, currency: "USD" } });
+    expect(() => sessionEventBodySchema.parse({
+      ...usage,
+      providerCost: { amount: 0.01, currency: "usd" },
+    })).toThrow();
+    expect(() => sessionEventBodySchema.parse({
+      ...usage,
+      providerCost: { amount: -0.01, currency: "USD" },
+    })).toThrow();
+  });
+
   test("accepts a revisioned session state and rejects an out-of-range or overlong reason", () => {
     const parsed = sessionEventBodySchema.parse({
       type: "session_state",

@@ -918,6 +918,27 @@ describe("cloud daemon journal", () => {
     expect(parseCloudDaemonJournal(jsonClone(migrated))).toEqual(migrated);
   });
 
+  test("round-trips exact Devin recovery authority and rejects borrowed provider ids", () => {
+    const base = recovery(64, "prepared");
+    if (!isProviderBoundCloudProjectionRecoveryLocalAuthority(base.localAuthority)) {
+      throw new Error("Expected exact recovery authority.");
+    }
+    const localAuthority = {
+      ...base.localAuthority,
+      provider: "devin" as const,
+      providerAccountId: `dact_${"4".repeat(32)}`,
+    };
+    const parsed = parseCloudProjectionRecoveryEntry({ ...base, localAuthority });
+    expect(parsed.localAuthority).toEqual(localAuthority);
+    expect(parseCloudDaemonJournal(stateWith([parsed])).projectionRecoveries).toEqual([parsed]);
+    for (const prefix of ["acct", "pact"]) {
+      expect(() => parseCloudProjectionRecoveryEntry({
+        ...base,
+        localAuthority: { ...localAuthority, providerAccountId: `${prefix}_${"4".repeat(32)}` },
+      })).toThrow();
+    }
+  });
+
   test("decodes legacy local authority but quarantines it instead of inferring a provider", () => {
     const current = recovery(64, "prepared");
     const legacy = withoutProviderAuthority(current);

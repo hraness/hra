@@ -110,25 +110,58 @@ export const effectiveClaudeRuntimeProfileSchema = z.object({
 export type EffectiveClaudeRuntimeProfile = z.infer<typeof effectiveClaudeRuntimeProfileSchema>;
 
 /**
+ * The exact local Devin ACP profile HRA admits. The pinned CLI owns its
+ * authentication and model defaults inside the isolated home; HRA records
+ * only the public runtime/protocol facts it proved before dispatch.
+ */
+export const effectiveDevinRuntimeProfileSchema = z.object({
+  profileId: profileIdSchema,
+  processGeneration: z.number().int().nonnegative(),
+  observedAt: unixMillisecondsSchema,
+  preset: z.literal("astra"),
+  model: z.string().trim().min(1).max(200),
+  reasoningEffort: z.literal("provider-default"),
+  devinVersion: z.literal("3000.6.14"),
+  protocolVersion: z.literal(1),
+  isolatedHome: z.literal(true),
+}).strict().superRefine((value, context) => {
+  if (!isAdmittedPresetRequirement(value.preset, {
+    effort: value.reasoningEffort,
+    model: value.model,
+  })) {
+    context.addIssue({
+      code: "custom",
+      message: "The effective model and reasoning effort must match Devin's exact current HRA preset.",
+    });
+  }
+});
+
+export type EffectiveDevinRuntimeProfile = z.infer<typeof effectiveDevinRuntimeProfileSchema>;
+
+/**
  * The reviewed runtime profile one session-start, turn-start, or queue-start
- * effect proved, for either provider.
+ * effect proved, for one provider.
  *
- * The two provider documents are stored exactly as their provider reviewed
- * them rather than inside a `{provider, profile}` wrapper: both are `.strict()`
- * objects with disjoint required keys (`approvalPolicy`/`permissionProfile`
- * against `claudeVersion`/`permissionMode`), so exactly one member can ever
- * match, and every Codex row and receipt written before Claude existed still
- * parses and re-serialises byte for byte. `session_runtime_profiles` and
- * `session_turn_runtime_profiles` already carry the three columns both
+ * Provider documents are stored exactly as their provider reviewed them
+ * rather than inside a `{provider, profile}` wrapper. Every member is a
+ * `.strict()` object with a provider-owned discriminator (`approvalPolicy`,
+ * `claudeVersion`, or `devinVersion`), so exactly one member can match and
+ * every pre-existing Codex or Claude row still parses and re-serialises byte
+ * for byte. `session_runtime_profiles` and
+ * `session_turn_runtime_profiles` already carry the three columns all
  * documents share (`profile_id`, `process_generation`, `observed_at`), so the
  * widening needs no new column and no schema version.
  */
 export const reviewedRuntimeProfileSchema = z.union([
   effectiveRuntimeProfileSchema,
   effectiveClaudeRuntimeProfileSchema,
+  effectiveDevinRuntimeProfileSchema,
 ]);
 
-export type ReviewedRuntimeProfile = EffectiveRuntimeProfile | EffectiveClaudeRuntimeProfile;
+export type ReviewedRuntimeProfile =
+  | EffectiveRuntimeProfile
+  | EffectiveClaudeRuntimeProfile
+  | EffectiveDevinRuntimeProfile;
 
 /** The provider a reviewed profile belongs to, read from its exact preset. */
 export const reviewedRuntimeProfileProvider = (
@@ -139,3 +172,8 @@ export const reviewedRuntimeProfileProvider = (
 export const isCodexRuntimeProfile = (
   profile: ReviewedRuntimeProfile,
 ): profile is EffectiveRuntimeProfile => reviewedRuntimeProfileProvider(profile) === "codex";
+
+/** True only for the Devin ACP document. */
+export const isDevinRuntimeProfile = (
+  profile: ReviewedRuntimeProfile,
+): profile is EffectiveDevinRuntimeProfile => reviewedRuntimeProfileProvider(profile) === "devin";

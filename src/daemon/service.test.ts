@@ -15,6 +15,7 @@ import {
 } from "../codex";
 import { parseFact } from "../codex/protocol";
 import { CLAUDE_PIN } from "../claude/pin";
+import { DEVIN_MODEL, DEVIN_PIN } from "../devin/pin";
 import { CloudProjectionRecoveryAdmissionError } from "../cloud/contracts";
 import { AccountKeyLossPreconditionError } from "../cloud/local-control";
 import {
@@ -44,7 +45,7 @@ import { sessionStatusSchema, type SessionStatus } from "../domain/observation";
 import type { PreparedAttachment } from "../domain/attachments";
 import { AttachmentBlobStore } from "../storage/attachment-store";
 import { ingestAttachments } from "./attachment-ingest";
-import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
+import { effectiveDevinRuntimeProfileSchema, type EffectiveDevinRuntimeProfile, type EffectiveRuntimeProfile } from "../domain/runtime-profile";
 import {
   SESSION_EVENT_RETAIN_AGE_MS,
   sessionEventPageSchema,
@@ -69,7 +70,7 @@ import type {
   HraFactsMemoryLifecyclePort,
   HraFactsMemoryLifecycleReceipt,
 } from "./facts-memory-lifecycle";
-import { CodexSessionObservationError, UnavailableCloudControl, type ClaudeRuntimePort, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
+import { CodexSessionObservationError, UnavailableClaudeRuntime, UnavailableCloudControl, type ClaudeRuntimePort, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type DevinRuntimeCloseWitness, type DevinRuntimePort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
 import { SessionEventCursorCodec } from "./session-event-cursor";
 import { CommandFailure, FACTS_MEMORY_SESSION_TTL_MS, HraService } from "./service";
 import { USAGE_HISTORY_CURSOR_TTL_MS } from "./usage-history-cursor";
@@ -252,6 +253,7 @@ class FakeCodex implements CodexRuntimePort {
   async reviewSessionStart(input: Parameters<CodexRuntimePort["reviewSessionStart"]>[0]): Promise<RuntimeStartReview> {
     this.calls.push("review-session");
     this.sessionReviewRequests.push(input);
+    if (input.requirement.effort === "provider-default") throw new Error("not a Codex requirement");
     const base = runtimeProfile(input.authority);
     const effectiveRuntimeProfile = this.runtimeProfileOverride ?? {
       ...base,
@@ -321,6 +323,7 @@ class FakeCodex implements CodexRuntimePort {
     const error = this.reviewTurnErrorOnce;
     delete this.reviewTurnErrorOnce;
     if (error !== undefined) throw error;
+    if (input.requirement.effort === "provider-default") throw new Error("not a Codex requirement");
     const base = runtimeProfile(input.authority);
     const effectiveRuntimeProfile = this.runtimeProfileOverride ?? {
       ...base,
@@ -778,6 +781,7 @@ async function fixture(
   factsMemory?: HraFactsMemoryLifecyclePort,
   autorespond: Readonly<{
     claude?: ClaudeRuntimePort;
+    devin?: DevinRuntimePort;
     gatewayKeys?: GatewayKeyPort;
     proseResponder?: ProseResponder;
   }> = {},
@@ -797,7 +801,7 @@ async function fixture(
   const codex = new FakeCodex();
   const daemonAuthority = new FakeDaemonAuthority();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
-  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), ...(autorespond.claude === undefined ? {} : { claude: autorespond.claude }), ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }), ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }), now, platform, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
+  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), ...(autorespond.claude === undefined ? {} : { claude: autorespond.claude }), ...(autorespond.devin === undefined ? {} : { devin: autorespond.devin }), ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }), ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }), now, platform, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
 }
 
 async function claudeAccountFixture(
@@ -807,14 +811,20 @@ async function claudeAccountFixture(
   let signedIn = initiallySignedIn;
   let readError: Error | undefined;
   let readCalls = 0;
+  let readHook: ((authority: ProfileAuthority) => void | Promise<void>) | undefined;
+  const readAuthorities: ProfileAuthority[] = [];
   const providerSessionCalls: string[] = [];
   const unexpectedInteraction = async (): Promise<never> => {
     throw new Error("No Claude session interaction expected.");
   };
   const claude: ClaudeRuntimePort = {
     provider: "claude" as const,
-    readAccount: async () => {
+    readAccount: async (input) => {
       readCalls += 1;
+      readAuthorities.push({ ...input.authority });
+      const hook = readHook;
+      readHook = undefined;
+      await hook?.(input.authority);
       if (readError !== undefined) throw readError;
       return { readiness: signedIn ? "signed_in" : "signed_out", observedAt: 2_000 };
     },
@@ -876,10 +886,299 @@ async function claudeAccountFixture(
   return {
     ...value,
     claudeReadCalls: () => readCalls,
+    providerReadCalls: () => readCalls,
+    readAuthorities,
+    setProviderReadHook: (hook: typeof readHook) => { readHook = hook; },
+    setProviderSignedIn: (value: boolean) => { signedIn = value; },
     providerSessionCalls,
     setClaudeReadError: (value: Error | undefined) => { readError = value; },
     setClaudeSignedIn: (value: boolean) => { signedIn = value; },
   };
+}
+
+async function devinAccountFixture(initiallySignedIn = false) {
+  let signedIn = initiallySignedIn;
+  let readError: Error | undefined;
+  let readCalls = 0;
+  let readHook: ((authority: ProfileAuthority) => void | Promise<void>) | undefined;
+  const readAuthorities: ProfileAuthority[] = [];
+  const providerSessionCalls: string[] = [];
+  const unexpectedInteraction = async (): Promise<never> => {
+    throw new Error("No Devin session interaction expected.");
+  };
+  const devin: DevinRuntimePort = {
+    provider: "devin" as const,
+    readAccount: async (input) => {
+      readCalls += 1;
+      readAuthorities.push({ ...input.authority });
+      const hook = readHook;
+      readHook = undefined;
+      await hook?.(input.authority);
+      if (readError !== undefined) throw readError;
+      return { signedIn };
+    },
+    observeSession: async () => {
+      providerSessionCalls.push("observe-session");
+      throw new Error("Devin session observation was not expected.");
+    },
+    readSession: async () => {
+      providerSessionCalls.push("read-session");
+      throw new Error("Devin session read was not expected.");
+    },
+    reviewSessionStart: async () => {
+      providerSessionCalls.push("review-session-start");
+      throw new Error("Devin session start review was not expected.");
+    },
+    reviewTurnStart: async () => {
+      providerSessionCalls.push("review-turn-start");
+      throw new Error("Devin turn review was not expected.");
+    },
+    startSession: async () => {
+      providerSessionCalls.push("start-session");
+      throw new Error("Devin session start was not expected.");
+    },
+    startTurn: async () => {
+      providerSessionCalls.push("start-turn");
+      throw new Error("Devin turn start was not expected.");
+    },
+    steer: async () => {
+      providerSessionCalls.push("steer");
+      throw new Error("Devin steer was not expected.");
+    },
+    interrupt: async () => {
+      providerSessionCalls.push("interrupt");
+      throw new Error("Devin interrupt was not expected.");
+    },
+    endSession: async () => {
+      providerSessionCalls.push("end-session");
+      throw new Error("Devin session end was not expected.");
+    },
+    interactionAuthority: () => { throw new Error("No Devin session interaction expected."); },
+    discardRuntimeReview: () => undefined,
+    inspectInteractionAuthority: unexpectedInteraction,
+    validateInteractionResolution: unexpectedInteraction,
+    resolveInteraction: unexpectedInteraction,
+    validateInteractionTimeout: unexpectedInteraction,
+    timeoutInteraction: unexpectedInteraction,
+    pinnedVersion: () => DEVIN_PIN,
+    close: async () => undefined,
+  };
+  const value = await fixture(
+    undefined,
+    new FakeCloud(),
+    () => undefined,
+    Date.now,
+    undefined,
+    { devin },
+  );
+  return {
+    ...value,
+    devinReadCalls: () => readCalls,
+    devin,
+    providerReadCalls: () => readCalls,
+    readAuthorities,
+    setProviderReadHook: (hook: typeof readHook) => { readHook = hook; },
+    setProviderSignedIn: (value: boolean) => { signedIn = value; },
+    providerSessionCalls,
+    setDevinReadError: (value: Error | undefined) => { readError = value; },
+    setDevinSignedIn: (value: boolean) => { signedIn = value; },
+  };
+}
+
+async function devinRestartContinuationFixture() {
+  const value = await devinAccountFixture(true);
+  // Start with a real daemon generation, before creating any provider account.
+  // The fixture's unused service owns no session or native writer.
+  await value.service.close();
+  const daemonBootId = `boot_${"1".repeat(32)}`;
+  const daemonGeneration = value.store.nextDaemonGeneration(daemonBootId);
+  const profile = value.store.createProfile("Devin restart continuation");
+  const project = await value.store.createProject("Devin restart project", value.documents, true);
+  const providerThreadId = "devin-restart-owned-thread";
+  const projection: CodexSessionProjection = {
+    providerThreadId, projectRoot: project.rootPath, title: "Retained Devin session", status: "idle",
+  };
+  const startedThreads: string[] = [];
+  const loadedThreads: Array<{ authority: ProfileAuthority; providerThreadId: string }> = [];
+  const observations: Array<{ authority: ProfileAuthority; connectionId: string }> = [];
+  const closes: string[] = [];
+  const joinedWitnesses: DevinRuntimeCloseWitness[] = [];
+  const custodySnapshots: Array<readonly DevinRuntimeCloseWitness[]> = [];
+  let closeError: Error | undefined;
+  let snapshotError: Error | undefined;
+  let claudeCloses = 0;
+  const claude = new UnavailableClaudeRuntime(CLAUDE_PIN);
+  claude.close = async () => { claudeCloses += 1; };
+  const makeRuntime = (name: "original" | "replacement"): DevinRuntimePort => {
+    let writer: DevinRuntimeCloseWitness | undefined;
+    let activated = false;
+    const connectionId = crypto.randomUUID();
+    const reviewedProfile = (authority: ProfileAuthority): EffectiveDevinRuntimeProfile => ({
+      devinVersion: DEVIN_PIN, isolatedHome: true, model: DEVIN_MODEL, observedAt: Date.now(),
+      preset: "astra", processGeneration: authority.generation, profileId: authority.id,
+      protocolVersion: 1, reasoningEffort: "provider-default",
+    });
+    const ownWriter = (authority: ProfileAuthority, effectiveRuntimeProfile: EffectiveDevinRuntimeProfile) => {
+      writer = Object.freeze({
+        authority: Object.freeze({ ...authority }), providerThreadId, connectionId,
+        projectRoot: project.rootPath, effectiveRuntimeProfile: Object.freeze({ ...effectiveRuntimeProfile }),
+      });
+    };
+    const close = async () => {
+      closes.push(name);
+      if (name === "original" && closeError !== undefined) throw closeError;
+      writer = undefined;
+      activated = false;
+    };
+    return {
+      ...value.devin,
+      reviewSessionStart: async (input) => ({
+        kind: "session_start", reviewId: crypto.randomUUID(), effectiveRuntimeProfile: reviewedProfile(input.authority),
+      }),
+      startSession: async (input) => {
+        startedThreads.push(providerThreadId);
+        ownWriter(input.authority, effectiveDevinRuntimeProfileSchema.parse(input.review.effectiveRuntimeProfile));
+        return { ...projection, effectiveRuntimeProfile: input.review.effectiveRuntimeProfile };
+      },
+      observeSession: async (input) => {
+        // This is the service/native-load boundary, not a weaker fake-current
+        // predicate: no generation-zero or stale captured binding is admitted.
+        const session = value.store.findSessionByProviderThread(profile.id, input.providerThreadId);
+        if (session === null) throw new Error("The native thread has no HRA session.");
+        const current = value.store.requireSessionProviderAuthority(session.id);
+        expect(input.authority).toMatchObject({
+          id: current.profileId, provider: current.provider, providerAccountId: current.providerAccountId,
+          bindingGeneration: current.bindingGeneration, generation: current.processGeneration,
+        });
+        expect(input.authority.generation).toBeGreaterThan(0);
+        expect(input.providerThreadId).toBe(providerThreadId);
+        expect(session.projectId).toBe(project.id);
+        const resumed = writer === undefined;
+        if (resumed) {
+          loadedThreads.push({ authority: { ...input.authority }, providerThreadId: input.providerThreadId });
+          ownWriter(input.authority, reviewedProfile(input.authority));
+        }
+        activated = true;
+        observations.push({ authority: { ...input.authority }, connectionId });
+        return { connectionId, projection, resumed };
+      },
+      readSession: async () => projection,
+      close,
+      closeCustody: {
+        snapshot: () => {
+          if (name === "original" && snapshotError !== undefined) throw snapshotError;
+          // Witnesses originate only in this fake manager's activated native
+          // writer, never from a durable-session listing or a guessed receipt.
+          const witnesses = Object.freeze(writer !== undefined && activated ? [writer] : []);
+          custodySnapshots.push(witnesses);
+          return witnesses;
+        },
+        close: async (selected) => {
+          const owned = selected.length <= 1
+            && selected.every((candidate) => candidate === writer && activated);
+          await close();
+          if (!owned) throw new Error("A selected close witness does not belong to the live fake writer.");
+          joinedWitnesses.push(...selected);
+          return selected;
+        },
+      },
+    };
+  };
+  const originalRuntime = makeRuntime("original");
+  const daemonAuthority = new FakeDaemonAuthority();
+  const service = new HraService({
+    store: value.store, paths: value.paths, codex: value.codex, claude, devin: originalRuntime,
+    cloud: value.cloud, daemonAuthority, daemonGeneration, daemonBootId, eventCursors: value.eventCursors,
+    platform: "linux", requestStop: () => undefined,
+  });
+  const startKey = crypto.randomUUID();
+  const started = await service.execute({
+    kind: "session.start", account: profile.id, provider: "devin", preset: "astra", fast: false,
+    idempotencyKey: startKey,
+  }, { signal }) as { session: { id: `sess_${string}` } };
+  const status = sessionStatusSchema.parse(await service.execute({
+    kind: "session.status", session: started.session.id,
+  }, { signal }));
+  expect(status.providerObservation.state).toBe("live");
+  const captured = value.store.requireSessionProviderAuthority(started.session.id);
+  expect(captured).toMatchObject({ provider: "devin", processGeneration: 1, routingProvenance: "explicit" });
+  const originalMutation = value.store.readMutation(startKey);
+  if (originalMutation === null) throw new Error("Expected the original Devin session-start mutation.");
+  expect(originalMutation.state).toBe("applied");
+  const originalAuthorities = value.store.readMutationProviderAuthorities(originalMutation.id);
+  const readEvidenceBytes = () => {
+    const database = new Database(value.paths.database, { readonly: true, strict: true });
+    try {
+      return {
+        effect: database.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?")
+          .get(originalMutation.id),
+        runtime: database.query("SELECT profile_json FROM session_runtime_profiles WHERE session_id=? ORDER BY revision")
+          .all(started.session.id),
+      };
+    } finally { database.close(false); }
+  };
+  const originalEvidenceBytes = readEvidenceBytes();
+  const restartedCodex = new FakeCodex();
+  let bootNumber = 1;
+  const restart = () => {
+    daemonAuthority.invalidate();
+    bootNumber += 1;
+    const nextBootId = `boot_${bootNumber.toString(16).padStart(32, "0")}`;
+    const generation = value.store.nextDaemonGeneration(nextBootId);
+    return new HraService({
+      store: value.store, paths: value.paths, codex: restartedCodex, devin: makeRuntime("replacement"),
+      cloud: new FakeCloud(), daemonAuthority: new FakeDaemonAuthority(), daemonGeneration: generation,
+      daemonBootId: nextBootId,
+      eventCursors: value.eventCursors, platform: "linux", requestStop: () => undefined,
+    });
+  };
+  return {
+    ...value, service, profile, project, providerThreadId, sessionId: started.session.id,
+    captured, startedThreads, loadedThreads, observations, closes, restart, restartedCodex,
+    custodySnapshots, joinedWitnesses,
+    originalMutation, originalAuthorities, originalEvidenceBytes, readEvidenceBytes,
+    claudeCloseCalls: () => claudeCloses,
+    setCloseError: (error: Error) => { closeError = error; },
+    setSnapshotError: (error: Error) => { snapshotError = error; },
+  };
+}
+
+async function isolatedLoginCompletionFixture(provider: "claude" | "devin") {
+  const value = provider === "claude" ? await claudeAccountFixture() : await devinAccountFixture();
+  const profile = value.store.createProfile(`${provider} completion authority`);
+  const key = crypto.randomUUID();
+  const prepared = await value.service.execute(provider === "claude" ? {
+    kind: "account.claude-login.prepare", account: profile.id, idempotencyKey: key,
+  } : {
+    kind: "account.devin-login.prepare", account: profile.id, idempotencyKey: key, manualTokenFlow: false,
+  }, { signal }) as { login: { attemptId: `attempt_${string}`; providerGeneration: number } };
+  const complete = {
+    kind: provider === "claude" ? "account.claude-login.complete" : "account.devin-login.complete",
+    account: profile.id,
+    attemptId: prepared.login.attemptId,
+    idempotencyKey: key,
+    providerGeneration: prepared.login.providerGeneration,
+    outcome: { state: "joined" as const, exitCode: 0, interruptedBy: null },
+  } satisfies LocalCommand;
+  value.setProviderSignedIn(true);
+  const corruptProviderProcess = () => {
+    const original = value.store.requireProviderAccountAuthority(profile.id, provider);
+    // The public retirement CAS refuses a live CLI-owned login grant. Model
+    // external corruption directly to prove the service also rejects it.
+    const database = new Database(value.paths.database, { create: false, strict: true });
+    try {
+      expect(database.query(`UPDATE provider_accounts
+        SET process_generation=process_generation+1
+        WHERE id=? AND profile_id=? AND provider=?
+          AND binding_generation=? AND process_generation=?`).run(
+        original.providerAccountId, original.profileId, original.provider,
+        original.bindingGeneration, original.processGeneration,
+      ).changes).toBe(1);
+    } finally {
+      database.close(false);
+    }
+  };
+  return { ...value, profile, key, prepared, complete, corruptProviderProcess };
 }
 
 async function createIdleSession(
@@ -1669,6 +1968,510 @@ describe("HraService", () => {
     expect(codex.calls).toEqual([]);
   });
 
+  describe.each(["claude", "devin"] as const)("exact %s login completion", (provider) => {
+    test.each(["missing", "provenance", "binding", "process"] as const)("refuses %s authority before any status read", async (corruption) => {
+      const value = await isolatedLoginCompletionFixture(provider);
+      const readAuthorities = value.store.readMutationProviderAuthorities.bind(value.store);
+      const captured = readAuthorities(value.prepared.login.attemptId);
+      const mutationBefore = value.store.readMutation(value.key);
+      const original = value.store.requireProviderAccountAuthority(value.profile.id, provider);
+      const readsBefore = value.providerReadCalls();
+      if (corruption === "binding") {
+        value.store.observeProviderAccountReadiness({
+          profileId: value.profile.id, provider,
+          expectedBindingGeneration: original.bindingGeneration, readiness: "signed_in",
+        });
+      } else if (corruption === "process") {
+        value.corruptProviderProcess();
+      } else {
+        Object.defineProperty(value.store, "readMutationProviderAuthorities", {
+          configurable: true,
+          value: (attemptId: Parameters<StateStore["readMutationProviderAuthorities"]>[0]) => {
+            const recorded = readAuthorities(attemptId);
+            if (attemptId !== value.prepared.login.attemptId) return recorded;
+            return corruption === "missing" ? [] : recorded.map((entry) => ({ ...entry, provenance: "unproved_login" }));
+          },
+        });
+      }
+      try {
+        await expect(value.service.execute(value.complete, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+        expect(value.providerReadCalls()).toBe(readsBefore);
+        expect(value.providerSessionCalls).toEqual([]);
+        expect(value.store.readMutation(value.key)).toEqual(mutationBefore);
+      } finally {
+        Object.defineProperty(value.store, "readMutationProviderAuthorities", { configurable: true, value: readAuthorities });
+      }
+      expect(readAuthorities(value.prepared.login.attemptId)).toEqual(captured);
+    });
+
+    test.each(["binding", "process"] as const)("refuses settlement when %s authority retires during status read", async (retirement) => {
+      const value = await isolatedLoginCompletionFixture(provider);
+      const original = value.store.requireProviderAccountAuthority(value.profile.id, provider);
+      const captured = value.store.readMutationProviderAuthorities(value.prepared.login.attemptId);
+      const mutationBefore = value.store.readMutation(value.key);
+      const readsBefore = value.providerReadCalls();
+      value.setProviderReadHook(() => {
+        if (retirement === "binding") value.store.observeProviderAccountReadiness({
+          profileId: value.profile.id, provider,
+          expectedBindingGeneration: original.bindingGeneration, readiness: "signed_in",
+        });
+        else value.corruptProviderProcess();
+      });
+      await expect(value.service.execute(value.complete, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(value.providerReadCalls()).toBe(readsBefore + 1);
+      expect(value.readAuthorities.at(-1)).toMatchObject({
+        id: original.profileId, provider, providerAccountId: original.providerAccountId,
+        bindingGeneration: original.bindingGeneration, generation: original.processGeneration,
+      });
+      expect(value.store.readMutation(value.key)).toEqual(mutationBefore);
+      expect(value.store.readMutationProviderAuthorities(value.prepared.login.attemptId)).toEqual(captured);
+      expect(value.providerSessionCalls).toEqual([]);
+    });
+
+    test("ignores sibling generation advances while settling the original provider authority", async () => {
+      const value = await isolatedLoginCompletionFixture(provider);
+      const original = value.store.requireProviderAccountAuthority(value.profile.id, provider);
+      const captured = value.store.readMutationProviderAuthorities(value.prepared.login.attemptId);
+      const sibling = provider === "claude" ? "devin" : "claude";
+      value.setProviderReadHook(() => {
+        for (const other of ["codex", sibling] as const) {
+          const authority = value.store.requireProviderAccountAuthority(value.profile.id, other);
+          value.store.advanceProviderAccountProcessGeneration({
+            profileId: value.profile.id, provider: other, expectedProcessGeneration: authority.processGeneration,
+          });
+        }
+      });
+      await expect(value.service.execute(value.complete, { signal })).resolves.toMatchObject({
+        authentication: { provider, signedIn: true }, login: { status: "signed_in" },
+      });
+      expect(value.store.readMutation(value.key)).toMatchObject({ state: "applied" });
+      expect(value.store.requireProviderAccountAuthority(value.profile.id, provider)).toEqual(original);
+      expect(value.store.readMutationProviderAuthorities(value.prepared.login.attemptId)).toEqual(captured);
+      expect(value.providerSessionCalls).toEqual([]);
+    });
+  });
+
+  test("observes an exact existing explicit Devin binding without inferring new-work readiness", async () => {
+    const value = await devinAccountFixture();
+    const profile = value.store.createProfile("Existing Devin authority");
+    const authority = value.store.advanceProviderAccountProcessGeneration({
+      profileId: profile.id, provider: "devin", expectedProcessGeneration: 0,
+    });
+    const created = value.store.createSession({
+      profileId: profile.id, provider: "devin", preset: "astra", fastEnabled: false,
+    });
+    const session = value.store.bindSession({
+      sessionId: created.id, expectedRevision: created.revision,
+      providerThreadId: "existing-devin-thread", state: "idle",
+    });
+    const captured = value.store.requireSessionProviderAuthority(session.id);
+    const projection: CodexSessionProjection = {
+      providerThreadId: "existing-devin-thread", status: "idle", title: "Existing Devin",
+    };
+    const seen: ProfileAuthority[] = [];
+    value.devin.observeSession = async (input) => {
+      seen.push(input.authority);
+      return { connectionId: crypto.randomUUID(), projection, resumed: true };
+    };
+    value.devin.readSession = async (input) => {
+      seen.push(input.authority);
+      return projection;
+    };
+    await expect(value.service.execute({
+      kind: "session.show", session: session.id, detail: false,
+    }, { signal })).resolves.toMatchObject({ session: { id: session.id, provider: "devin" } });
+    expect(seen).toHaveLength(2);
+    for (const observed of seen) expect(observed).toMatchObject({
+      provider: "devin", providerAccountId: authority.providerAccountId,
+      bindingGeneration: authority.bindingGeneration, generation: authority.processGeneration,
+    });
+    expect(value.devinReadCalls()).toBe(0);
+    expect(value.codex.calls).toEqual([]);
+    expect(value.store.requireProviderAccountForProfile(profile.id, "devin").readiness).toBe("unverified");
+    expect(value.store.requireSessionProviderAuthority(session.id)).toEqual(captured);
+
+    await expect(value.service.execute({
+      kind: "session.start", account: profile.id, provider: "devin", preset: "astra", fast: false,
+    }, { signal })).rejects.toMatchObject({ code: "INTERACTION_REQUIRED" });
+    expect(value.devinReadCalls()).toBe(1);
+    expect(value.providerSessionCalls).toEqual([]);
+  });
+
+  test("Devin restart continuation: resumes the exact joined-close writer without auth or effect replay", async () => {
+    const value = await devinRestartContinuationFixture();
+    const originalConnection = value.observations.at(-1)?.connectionId;
+    const originalSession = value.store.requireSession(value.sessionId);
+    const readCalls = value.devinReadCalls();
+    await value.service.close();
+    expect(value.closes).toEqual(["original"]);
+    expect(value.joinedWitnesses).toHaveLength(1);
+    expect(value.joinedWitnesses[0]).toBe(value.custodySnapshots[0]?.[0]);
+    expect(value.store.requireProviderAccountAuthority(value.profile.id, "devin").processGeneration)
+      .toBe(value.captured.processGeneration + 1);
+    const closedEvents = value.store.listSessionEvents({ sessionId: value.sessionId, afterSequence: null }).events;
+    expect(closedEvents.slice(-2)).toMatchObject([
+      { providerConnectionId: originalConnection, body: { type: "connection", state: "disconnected", reason: "closed" } },
+      { providerConnectionId: originalConnection, body: { type: "gap", reason: "provider_disconnect" } },
+    ]);
+
+    const restarted = value.restart();
+    try {
+      await restarted.recover();
+      const status = sessionStatusSchema.parse(await restarted.execute({
+        kind: "session.status", session: value.sessionId,
+      }, { signal }));
+      expect(status.providerObservation.state).toBe("live");
+      expect(status.session).toMatchObject({
+        id: value.sessionId, accountId: value.profile.id, projectId: value.project.id, execution: "idle",
+      });
+      expect(value.store.requireSession(value.sessionId)).toMatchObject({
+        id: value.sessionId, profileId: value.profile.id, provider: "devin",
+        providerThreadId: value.providerThreadId, projectId: value.project.id, state: "idle",
+        preset: originalSession.preset,
+      });
+      const current = value.store.requireSessionProviderAuthority(value.sessionId);
+      expect(current).toEqual({
+        ...value.captured,
+        processGeneration: value.captured.processGeneration + 2,
+        authorityRevision: value.captured.authorityRevision + 1,
+      });
+      expect(value.loadedThreads).toEqual([{
+        providerThreadId: value.providerThreadId,
+        authority: expect.objectContaining({
+          id: current.profileId, provider: "devin", providerAccountId: current.providerAccountId,
+          bindingGeneration: current.bindingGeneration, generation: current.processGeneration,
+        }),
+      }]);
+      expect(value.observations.at(-1)?.connectionId).not.toBe(originalConnection);
+      expect(value.devinReadCalls()).toBe(readCalls);
+      expect(value.startedThreads).toEqual([value.providerThreadId]);
+      expect(value.providerSessionCalls).toEqual([]);
+      expect(value.codex.calls).toEqual([]);
+      expect(value.restartedCodex.calls).toEqual([]);
+      expect(value.store.requireProfileById(value.profile.id)).toMatchObject({ state: "signed_out", processGeneration: 0 });
+      expect(value.store.readMutation(value.originalMutation.idempotencyKey)).toEqual(value.originalMutation);
+      expect(value.store.readMutationProviderAuthorities(value.originalMutation.id)).toEqual(value.originalAuthorities);
+      expect(value.readEvidenceBytes()).toEqual(value.originalEvidenceBytes);
+    } finally { await restarted.close(); }
+  });
+
+  test("Devin restart continuation: renews custody only after a real load joins on the next clean close", async () => {
+    const value = await devinRestartContinuationFixture();
+    const readCalls = value.devinReadCalls();
+    await value.service.close();
+    const firstRestart = value.restart();
+    try {
+      await firstRestart.recover();
+      const status = sessionStatusSchema.parse(await firstRestart.execute({
+        kind: "session.status", session: value.sessionId,
+      }, { signal }));
+      expect(status.providerObservation.state).toBe("live");
+      expect(value.loadedThreads).toHaveLength(1);
+    } finally { await firstRestart.close(); }
+    expect(value.joinedWitnesses).toHaveLength(2);
+    const reloadedWitness = value.joinedWitnesses[1];
+    expect(reloadedWitness).toMatchObject({
+      providerThreadId: value.providerThreadId,
+      effectiveRuntimeProfile: {
+        profileId: value.profile.id, processGeneration: value.captured.processGeneration + 2,
+        model: DEVIN_MODEL, devinVersion: DEVIN_PIN, protocolVersion: 1,
+      },
+    });
+    expect(reloadedWitness).not.toBe(value.joinedWitnesses[0]);
+    expect(reloadedWitness?.connectionId).not.toBe(value.joinedWitnesses[0]?.connectionId);
+
+    const secondRestart = value.restart();
+    try {
+      await secondRestart.recover();
+      const status = sessionStatusSchema.parse(await secondRestart.execute({
+        kind: "session.status", session: value.sessionId,
+      }, { signal }));
+      expect(status.providerObservation.state).toBe("live");
+      expect(status.session).toMatchObject({
+        id: value.sessionId, accountId: value.profile.id, projectId: value.project.id, execution: "idle",
+      });
+      expect(value.store.requireSessionProviderAuthority(value.sessionId)).toEqual({
+        ...value.captured,
+        processGeneration: value.captured.processGeneration + 4,
+        authorityRevision: value.captured.authorityRevision + 2,
+      });
+      expect(value.loadedThreads.map((loaded) => ({
+        providerThreadId: loaded.providerThreadId, generation: loaded.authority.generation,
+      }))).toEqual([
+        { providerThreadId: value.providerThreadId, generation: value.captured.processGeneration + 2 },
+        { providerThreadId: value.providerThreadId, generation: value.captured.processGeneration + 4 },
+      ]);
+      expect(value.devinReadCalls()).toBe(readCalls);
+      expect(value.startedThreads).toEqual([value.providerThreadId]);
+      expect(value.providerSessionCalls).toEqual([]);
+      expect(value.restartedCodex.calls).toEqual([]);
+      expect(value.store.requireProfileById(value.profile.id).processGeneration).toBe(0);
+      expect(value.store.readMutationProviderAuthorities(value.originalMutation.id)).toEqual(value.originalAuthorities);
+      expect(value.readEvidenceBytes()).toEqual(value.originalEvidenceBytes);
+    } finally { await secondRestart.close(); }
+  });
+
+  test("Devin restart continuation: cannot renew consumed close proof by restarting without loading", async () => {
+    const value = await devinRestartContinuationFixture();
+    const readCalls = value.devinReadCalls();
+    await value.service.close();
+    expect(value.joinedWitnesses).toHaveLength(1);
+    const firstRestart = value.restart();
+    let firstCaptured: typeof value.captured;
+    try {
+      await firstRestart.recover();
+      firstCaptured = value.store.requireSessionProviderAuthority(value.sessionId);
+      expect(firstCaptured).toEqual({
+        ...value.captured,
+        processGeneration: value.captured.processGeneration + 2,
+        authorityRevision: value.captured.authorityRevision + 1,
+      });
+      expect(value.loadedThreads).toEqual([]);
+      // Do not observe or load this session: a durable binding alone is not
+      // an owned writer and must not issue a new close witness.
+    } finally { await firstRestart.close(); }
+    expect(value.joinedWitnesses).toHaveLength(1);
+    expect(value.custodySnapshots.at(-1)).toEqual([]);
+
+    const secondRestart = value.restart();
+    try {
+      await secondRestart.recover();
+      const status = sessionStatusSchema.parse(await secondRestart.execute({
+        kind: "session.status", session: value.sessionId,
+      }, { signal }));
+      expect(status.providerObservation).toMatchObject({ basis: "local_state", state: "recovery_required" });
+      expect(status.session.execution).toBe("recovery_required");
+      expect(value.store.requireCapturedSessionProviderAuthority(value.sessionId)).toEqual(firstCaptured);
+      expect(value.loadedThreads).toEqual([]);
+      expect(value.devinReadCalls()).toBe(readCalls);
+      expect(value.startedThreads).toEqual([value.providerThreadId]);
+      expect(value.providerSessionCalls).toEqual([]);
+      expect(value.restartedCodex.calls).toEqual([]);
+      expect(value.store.requireProfileById(value.profile.id).processGeneration).toBe(0);
+      expect(value.store.readMutationProviderAuthorities(value.originalMutation.id)).toEqual(value.originalAuthorities);
+      expect(value.readEvidenceBytes()).toEqual(value.originalEvidenceBytes);
+    } finally { await secondRestart.close(); }
+  });
+
+  test.each(["unclean restart", "failed close"] as const)("Devin restart continuation: %s remains visibly recovery-required without loading", async (failure) => {
+    const value = await devinRestartContinuationFixture();
+    const readCalls = value.devinReadCalls();
+    if (failure === "failed close") {
+      value.setCloseError(new Error("The original Devin writer could not be joined."));
+      await expect(value.service.close()).rejects.toThrow("The original Devin writer could not be joined.");
+      expect(value.closes).toEqual(["original"]);
+      expect(value.store.requireProviderAccountAuthority(value.profile.id, "devin").processGeneration)
+        .toBe(value.captured.processGeneration);
+      expect(value.joinedWitnesses).toEqual([]);
+    }
+    const restarted = value.restart();
+    try {
+      await restarted.recover();
+      const status = sessionStatusSchema.parse(await restarted.execute({
+        kind: "session.status", session: value.sessionId,
+      }, { signal }));
+      expect(value.loadedThreads).toEqual([]);
+      expect(value.devinReadCalls()).toBe(readCalls);
+      expect(value.startedThreads).toEqual([value.providerThreadId]);
+      expect(value.providerSessionCalls).toEqual([]);
+      expect(value.restartedCodex.calls).toEqual([]);
+      expect(value.store.requireCapturedSessionProviderAuthority(value.sessionId)).toEqual(value.captured);
+      expect(value.store.readMutationProviderAuthorities(value.originalMutation.id)).toEqual(value.originalAuthorities);
+      expect(value.readEvidenceBytes()).toEqual(value.originalEvidenceBytes);
+      expect(status.providerObservation).toMatchObject({ basis: "local_state", state: "recovery_required" });
+      expect(status.session).toMatchObject({
+        id: value.sessionId, accountId: value.profile.id, projectId: value.project.id, execution: "recovery_required",
+      });
+      expect(value.store.requireSession(value.sessionId)).toMatchObject({
+        id: value.sessionId, provider: "devin", providerThreadId: value.providerThreadId,
+        projectId: value.project.id, state: "recovery_required",
+      });
+      await expect(restarted.execute({
+        kind: "session.send", session: value.sessionId, message: "do not replay after retirement",
+        idempotencyKey: crypto.randomUUID(),
+      }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      expect(value.loadedThreads).toEqual([]);
+      expect(value.providerSessionCalls).toEqual([]);
+    } finally { await restarted.close(); }
+  });
+
+  test.each(["snapshot", "prepare"] as const)("Devin restart continuation: %s failure still closes every runtime without granting restart proof", async (stage) => {
+    const value = await devinRestartContinuationFixture();
+    const originalPrepare = value.store.prepareDevinJoinedClose.bind(value.store);
+    const codexCloses = value.codex.closeCalls;
+    if (stage === "snapshot") value.setSnapshotError(new Error("Fake custody snapshot failed."));
+    else value.store.prepareDevinJoinedClose = () => { throw new Error("Fake durable close capture failed."); };
+    try {
+      await expect(value.service.close()).rejects.toThrow("without complete Devin restart custody evidence");
+    } finally { value.store.prepareDevinJoinedClose = originalPrepare; }
+    expect(value.codex.closeCalls).toBe(codexCloses + 1);
+    expect(value.claudeCloseCalls()).toBe(1);
+    expect(value.closes).toEqual(["original"]);
+    const restarted = value.restart();
+    try {
+      await restarted.recover();
+      const status = sessionStatusSchema.parse(await restarted.execute({
+        kind: "session.status", session: value.sessionId,
+      }, { signal }));
+      expect(status.providerObservation).toMatchObject({ basis: "local_state", state: "recovery_required" });
+      expect(status.session.execution).toBe("recovery_required");
+      expect(value.loadedThreads).toEqual([]);
+      expect(value.store.requireCapturedSessionProviderAuthority(value.sessionId)).toEqual(value.captured);
+      expect(value.store.readMutationProviderAuthorities(value.originalMutation.id)).toEqual(value.originalAuthorities);
+      expect(value.readEvidenceBytes()).toEqual(value.originalEvidenceBytes);
+    } finally { await restarted.close(); }
+  });
+
+  test("starts and sends through the authenticated Devin binding while sibling Codex remains signed out", async () => {
+    const value = await devinAccountFixture(true);
+    const profile = value.store.createProfile("Independent Devin session");
+    await value.service.execute({ kind: "project.add", label: "Devin project", path: value.documents }, { signal });
+    const authorities: ProfileAuthority[] = [];
+    let activeTurnId: string | undefined;
+    const projection = (): CodexSessionProjection => ({
+      providerThreadId: "devin-service-thread", projectRoot: value.documents,
+      title: "Independent Devin session",
+      status: activeTurnId === undefined ? "idle" : "active",
+      ...(activeTurnId === undefined ? {} : { activeTurnId }),
+    });
+    const reviewedProfile = (authority: ProfileAuthority): EffectiveDevinRuntimeProfile => ({
+      devinVersion: DEVIN_PIN, isolatedHome: true, model: DEVIN_MODEL, observedAt: Date.now(),
+      preset: "astra", processGeneration: authority.generation, profileId: authority.id,
+      protocolVersion: 1, reasoningEffort: "provider-default",
+    });
+    value.devin.reviewSessionStart = async (input) => {
+      authorities.push(input.authority);
+      expect(input.requirement).toEqual({ model: DEVIN_MODEL, effort: "provider-default" });
+      return { kind: "session_start", reviewId: crypto.randomUUID(), effectiveRuntimeProfile: reviewedProfile(input.authority) };
+    };
+    value.devin.reviewTurnStart = async (input) => {
+      authorities.push(input.authority);
+      expect(input.providerThreadId).toBe("devin-service-thread");
+      return { kind: "turn_start", reviewId: crypto.randomUUID(), effectiveRuntimeProfile: reviewedProfile(input.authority) };
+    };
+    value.devin.startSession = async (input) => {
+      authorities.push(input.authority);
+      return { ...projection(), effectiveRuntimeProfile: input.review.effectiveRuntimeProfile };
+    };
+    const connectionId = crypto.randomUUID();
+    value.devin.observeSession = async (input) => {
+      authorities.push(input.authority);
+      return { projection: projection(), connectionId, resumed: false };
+    };
+    value.devin.readSession = async (input) => { authorities.push(input.authority); return projection(); };
+    value.devin.startTurn = async (input) => {
+      authorities.push(input.authority);
+      expect(input.message).toBe("one Devin request");
+      activeTurnId = "devin-service-turn";
+      return { turnId: activeTurnId, status: "inProgress", effectiveRuntimeProfile: input.review.effectiveRuntimeProfile };
+    };
+    const started = await value.service.execute({
+      kind: "session.start", account: profile.id, provider: "devin", preset: "astra", fast: false,
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const captured = value.store.requireSessionProviderAuthority(started.session.id);
+    expect(captured).toMatchObject({ provider: "devin", processGeneration: 1 });
+    expect(captured.providerAccountId).toMatch(/^dact_[0-9a-f]{32}$/u);
+    const messageKey = crypto.randomUUID();
+    await expect(value.service.execute({
+      kind: "session.send", session: started.session.id, message: "one Devin request", idempotencyKey: messageKey,
+    }, { signal })).resolves.toMatchObject({ turnId: "devin-service-turn" });
+    const messageAttempt = value.store.readMutation(messageKey);
+    expect(messageAttempt).toMatchObject({ kind: "session.send", state: "applied" });
+    if (messageAttempt === null) throw new Error("missing Devin message attempt");
+    expect(value.store.readMutationProviderAuthorities(messageAttempt.id)).toMatchObject([{
+      role: "primary", provenance: "session_send", authority: {
+        profileId: captured.profileId, provider: "devin", providerAccountId: captured.providerAccountId,
+        bindingGeneration: captured.bindingGeneration, processGeneration: captured.processGeneration,
+      },
+    }]);
+    expect(authorities.length).toBeGreaterThan(0);
+    for (const authority of authorities) expect(authority).toMatchObject({
+      id: captured.profileId, provider: "devin", providerAccountId: captured.providerAccountId,
+      bindingGeneration: captured.bindingGeneration, generation: captured.processGeneration,
+    });
+    expect(value.store.requireProfileById(profile.id)).toMatchObject({ state: "signed_out", processGeneration: 0 });
+    expect(value.codex.calls).toEqual([]);
+    expect(value.store.latestUsage(profile.id)).toBeNull();
+    await value.service.close();
+  });
+
+  test("reports Devin auth separately, preserves unknown allowance, and settles one foreground login", async () => {
+    const value = await devinAccountFixture();
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Devin private" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+
+    await expect(value.service.execute({
+      kind: "account.show",
+      account: added.account.id,
+      provider: "devin",
+    }, { signal })).resolves.toMatchObject({
+      account: { id: added.account.id, label: "Devin private" },
+      authentication: { provider: "devin", signedIn: false },
+      nextCommand: `hra account login ${added.account.id} --provider devin`,
+      usage: {
+        allowance: "unknown",
+        source: "devin_acp",
+      },
+    });
+
+    const key = "00000000-0000-4000-8000-000000000711";
+    const prepared = await value.service.execute({
+      kind: "account.devin-login.prepare",
+      account: added.account.id,
+      idempotencyKey: key,
+      manualTokenFlow: true,
+    }, { signal }) as {
+      login: { attemptId: `attempt_${string}`; providerGeneration: number };
+    };
+    expect(prepared).toMatchObject({
+      authentication: { provider: "devin", signedIn: false },
+      login: { status: "launch_granted", idempotencyKey: key },
+    });
+    const readsBeforeRecovery = value.devinReadCalls();
+    await expect(value.service.execute({
+      kind: "account.show",
+      account: added.account.id,
+      provider: "devin",
+    }, { signal })).resolves.toMatchObject({
+      authentication: { provider: "devin", signedIn: null },
+      recovery: {
+        required: true,
+        attemptId: prepared.login.attemptId,
+        idempotencyKey: key,
+      },
+      usage: { allowance: "unknown", source: "devin_acp" },
+    });
+    expect(value.devinReadCalls()).toBe(readsBeforeRecovery);
+
+    value.setDevinSignedIn(true);
+    await expect(value.service.execute({
+      kind: "account.devin-login.complete",
+      account: added.account.id,
+      attemptId: prepared.login.attemptId,
+      idempotencyKey: key,
+      providerGeneration: prepared.login.providerGeneration,
+      outcome: { state: "joined", exitCode: 0, interruptedBy: null },
+    }, { signal })).resolves.toMatchObject({
+      authentication: { provider: "devin", signedIn: true },
+      login: { status: "signed_in" },
+    });
+    expect(value.store.readMutation(key)).toMatchObject({ state: "applied" });
+
+    value.setDevinReadError(new Error("terminal replay must not inspect Devin auth"));
+    await expect(value.service.execute({
+      kind: "account.devin-login.prepare",
+      account: added.account.id,
+      idempotencyKey: key,
+      manualTokenFlow: false,
+    }, { signal })).resolves.toMatchObject({
+      authentication: { provider: "devin", signedIn: true },
+      login: { status: "signed_in" },
+    });
+    expect(value.providerSessionCalls).toEqual([]);
+  });
+
   test("grants Claude foreground login once and accepts a status-versus-complete race", async () => {
     const value = await claudeAccountFixture();
     const added = await value.service.execute(
@@ -1800,7 +2603,7 @@ describe("HraService", () => {
     expect(value.store.readMutation(interruptedKey)).toMatchObject({ state: "failed" });
   });
 
-  test("accepts the original joined completion after restart made the Claude launch historical", async () => {
+  test("preserves the original foreground Claude authority across daemon restart and reconciles its joined completion", async () => {
     const value = await claudeAccountFixture();
     const added = await value.service.execute(
       { kind: "account.add", label: "Claude restart" },
@@ -1831,7 +2634,7 @@ describe("HraService", () => {
     }]);
     expect(value.store.nextDaemonGeneration(`boot_${"c".repeat(32)}`)).toBe(1);
     expect(value.store.requireProviderAccountAuthority(added.account.id, "claude").processGeneration)
-      .toBe(launchedAuthority.processGeneration + 1);
+      .toBe(launchedAuthority.processGeneration);
     expect(value.store.requireProviderAccountAuthority(added.account.id, "codex"))
       .toEqual(codexBefore);
     expect(value.store.readMutationProviderAuthorities(prepared.login.attemptId)).toEqual(captured);
@@ -2115,8 +2918,15 @@ describe("HraService", () => {
 
     const profile = value.store.requireProfileById(added.account.id);
     const claudeBefore = value.store.requireProviderAccountAuthority(profile.id, "claude");
-    const claudeAuthority = value.store.advanceProviderAccountProcessGeneration({
+    expect(claudeBefore.processGeneration).toBe(0);
+    const firstClaudeProcess = value.store.advanceProviderAccountProcessGeneration({
       expectedProcessGeneration: claudeBefore.processGeneration,
+      profileId: profile.id,
+      provider: "claude",
+    });
+    // Arrange historical recovery independently of the refused platform probes.
+    const claudeAuthority = value.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: firstClaudeProcess.processGeneration,
       profileId: profile.id,
       provider: "claude",
     });
@@ -2469,6 +3279,24 @@ describe("HraService", () => {
       fast: false,
     }, { signal })).rejects.toThrow(
       `This daemon has no Claude Code runtime. Install Claude Code ${CLAUDE_PIN} exactly`,
+    );
+
+    await expect(service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      provider: "devin",
+      preset: "ultra",
+      fast: false,
+    }, { signal })).rejects.toThrow("does not support the `ultra` model preset");
+
+    await expect(service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      provider: "devin",
+      preset: "astra",
+      fast: false,
+    }, { signal })).rejects.toThrow(
+      `This daemon has no Devin runtime. Install Devin CLI ${DEVIN_PIN} exactly`,
     );
 
     // Every existing Codex path is unchanged.
@@ -3079,6 +3907,117 @@ describe("HraService", () => {
       limit: 1,
     }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
     expect(value.codex.sessionListRequests).toHaveLength(callsBeforeInvalid);
+  });
+
+  test("pages durable non-Codex sessions before Codex without duplicates or private provider reads", async () => {
+    const value = await fixture();
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Mixed provider history" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+
+    const localSessions = [
+      value.store.createSession({
+        profileId: added.account.id,
+        provider: "claude",
+        preset: "fable-max",
+        fastEnabled: false,
+        title: "Durable Claude one",
+      }),
+      value.store.createSession({
+        profileId: added.account.id,
+        provider: "devin",
+        preset: "astra",
+        fastEnabled: false,
+        title: "Durable Devin",
+      }),
+      value.store.createSession({
+        profileId: added.account.id,
+        provider: "claude",
+        preset: "fable-max",
+        fastEnabled: false,
+        title: "Durable Claude two",
+      }),
+    ];
+    const existingCodex = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(added.account.id, "codex"),
+      providerThreadId: "provider-existing-codex",
+      state: "idle",
+      title: "Existing Codex cache",
+    });
+
+    const first = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      limit: 2,
+    }, { signal }) as {
+      sessions: readonly { id: string; provider: string }[];
+      nextCursor: string;
+    };
+    expect(first.sessions).toHaveLength(2);
+    expect(first.sessions.every((session) => session.provider !== "codex")).toBe(true);
+    expect(value.codex.sessionListRequests).toHaveLength(0);
+
+    value.codex.listedProjections = [{
+      providerThreadId: "provider-existing-codex",
+      status: "idle",
+      title: "Existing Codex refreshed",
+    }];
+    value.codex.listedNextCursor = "provider-page-two";
+    const second = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      cursor: first.nextCursor,
+      limit: 2,
+    }, { signal }) as {
+      sessions: readonly { id: string; provider: string }[];
+      nextCursor: string;
+    };
+    expect(second.sessions).toHaveLength(2);
+    expect(second.sessions.filter((session) => session.provider !== "codex")).toHaveLength(1);
+    expect(second.sessions.filter((session) => session.id === existingCodex.id)).toHaveLength(1);
+
+    value.codex.listedProjections = [{
+      providerThreadId: "provider-new-codex",
+      status: "idle",
+      title: "Next Codex page",
+    }];
+    value.codex.listedNextCursor = null;
+    const third = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      cursor: second.nextCursor,
+      limit: 2,
+    }, { signal }) as {
+      sessions: readonly { id: string; provider: string }[];
+      nextCursor: null;
+    };
+
+    const allReturned = [...first.sessions, ...second.sessions, ...third.sessions];
+    const nextCodex = third.sessions[0];
+    if (nextCodex === undefined) throw new Error("Expected the final Codex session page.");
+    expect(new Set(allReturned.map((session) => session.id)).size).toBe(allReturned.length);
+    expect(new Set(allReturned.map((session) => session.id))).toEqual(new Set([
+      ...localSessions.map((session) => session.id),
+      existingCodex.id,
+      nextCodex.id,
+    ]));
+    expect(third).toMatchObject({
+      sessions: [{ provider: "codex" }],
+      nextCursor: null,
+    });
+    expect(value.codex.sessionListRequests.map(({ cursor, limit }) => ({ cursor, limit }))).toEqual([
+      { cursor: undefined, limit: 1 },
+      { cursor: "provider-page-two", limit: 2 },
+    ]);
   });
 
   test("fails closed on a provider session-list cursor cycle before importing that page", async () => {
@@ -4408,6 +5347,10 @@ describe("HraService", () => {
     try {
       legacy.exec("PRAGMA foreign_keys=OFF");
       legacy.exec(`
+        DROP TRIGGER IF EXISTS session_mutation_provider_successor_insert_guard;
+        DROP TRIGGER IF EXISTS session_mutation_provider_successor_v39_insert_guard;
+        DROP TRIGGER IF EXISTS session_provider_compatibility_insert_guard;
+        DROP TRIGGER IF EXISTS session_provider_compatibility_update_guard;
         DROP TRIGGER IF EXISTS profiles_process_generation_provider_mirror;
         DROP TRIGGER IF EXISTS session_events_account_authority_guard;
         DROP TABLE IF EXISTS account_rate_limit_reset_provider_authorities;
@@ -4482,10 +5425,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual(Array.from({ length: 18 }, (_, index) => ({ version: index + 25 })));
+      ).all()).toEqual(Array.from({ length: 20 }, (_, index) => ({ version: index + 25 })));
     } finally {
       inspector.close(false);
     }
@@ -8044,6 +8987,108 @@ describe("HraService", () => {
     });
     expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
     expect(store.readPendingLoginAuthority(added.account.id, 2)).toBeNull();
+  });
+
+  test("scopes an isolated Devin disconnect to its provider session", async () => {
+    const value = await fixture();
+    const profile = value.store.createProfile("Provider-scoped disconnect");
+    const codexCreated = value.store.createSession({
+      fastEnabled: false,
+      preset: "high",
+      profileId: profile.id,
+      provider: "codex",
+    });
+    const codexSession = value.store.bindSession({
+      expectedRevision: codexCreated.revision,
+      providerThreadId: "codex-provider-scoped-thread",
+      sessionId: codexCreated.id,
+      state: "idle",
+    });
+    const devinCreated = value.store.createSession({
+      fastEnabled: false,
+      preset: "astra",
+      profileId: profile.id,
+      provider: "devin",
+    });
+    const devinSession = value.store.bindSession({
+      expectedRevision: devinCreated.revision,
+      providerThreadId: "devin-provider-scoped-thread",
+      sessionId: devinCreated.id,
+      state: "idle",
+    });
+    const codexProviderThreadId = "codex-provider-scoped-thread";
+    const devinProviderThreadId = "devin-provider-scoped-thread";
+    const codexAuthority: ProfileAuthority = {
+      codexHome: "unused",
+      desktopUserData: "unused",
+      generation: value.store.requireProviderAccountAuthority(profile.id, "codex").processGeneration,
+      id: profile.id,
+      provider: "codex",
+      providerAccountId: value.store.requireProviderAccountAuthority(profile.id, "codex").providerAccountId,
+      bindingGeneration: value.store.requireProviderAccountAuthority(profile.id, "codex").bindingGeneration,
+    };
+    const devinBinding = value.store.requireProviderAccountAuthority(profile.id, "devin");
+    const authority: ProfileAuthority = {
+      ...codexAuthority,
+      provider: "devin",
+      providerAccountId: devinBinding.providerAccountId,
+      bindingGeneration: devinBinding.bindingGeneration,
+      generation: devinBinding.processGeneration,
+    };
+    const codexConnection = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
+    const devinConnection = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3c";
+    await value.service.observeCodexFact(codexAuthority, {
+      connectionId: codexConnection,
+      status: { type: "idle" },
+      threadId: codexProviderThreadId,
+      type: "threadStatusChanged",
+    });
+    await value.service.observeDevinFact(authority, {
+      connectionId: devinConnection,
+      status: { type: "idle" },
+      threadId: devinProviderThreadId,
+      type: "threadStatusChanged",
+    });
+
+    // A provider-scoped observer may not mutate a sibling provider even when
+    // handed its exact thread id.
+    await value.service.observeDevinFact(authority, {
+      connectionId: devinConnection,
+      status: { type: "systemError" },
+      threadId: codexProviderThreadId,
+      type: "threadStatusChanged",
+    });
+    await value.service.observeDevinFact(authority, {
+      connectionId: devinConnection,
+      reason: "process_exit",
+      type: "providerDisconnected",
+    });
+
+    expect(value.store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration);
+    expect(value.store.listSessionEvents({
+      afterSequence: 0,
+      limit: 20,
+      sessionId: codexSession.id,
+    }).events.map((event) => event.body)).toEqual([
+      { state: "connected", type: "connection" },
+      { activeTurnId: null, status: "idle", type: "session_status" },
+    ]);
+    expect(value.store.listSessionEvents({
+      afterSequence: 0,
+      limit: 20,
+      sessionId: devinSession.id,
+    }).events.map((event) => event.body)).toEqual([
+      { state: "connected", type: "connection" },
+      { activeTurnId: null, status: "idle", type: "session_status" },
+      { reason: "process_exit", state: "disconnected", type: "connection" },
+      {
+        fromSequence: 4,
+        reason: "provider_disconnect",
+        throughSequence: 4,
+        type: "gap",
+      },
+    ]);
   });
 
   test("atomically retires an old connection while a fresh login advances the profile", async () => {

@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 
-import type { ProviderAccountAuthority } from "./provider-accounts";
 import {
   canonicalProviderUsageComponent,
   createClaudeAccountingUsageComponent,
@@ -9,10 +8,12 @@ import {
   projectCodexV1Usage,
   providerUsageComponentSchema,
   providerUsageDigest,
+  usageProviderAccountAuthoritySchema,
+  type UsageProviderAccountAuthority,
 } from "./provider-usage";
 import { createStoredAccountUsageSnapshot } from "./usage-metrics";
 
-const authority: ProviderAccountAuthority = {
+const authority: UsageProviderAccountAuthority = {
   provider: "claude",
   providerAccountId: "pact_11111111111111111111111111111111",
   profileId: "acct_22222222222222222222222222222222",
@@ -91,6 +92,14 @@ const accounting = (observedAt = 2_000) => createClaudeAccountingUsageComponent(
 });
 
 describe("provider usage v2", () => {
+  test("rejects Devin authority instead of treating ACP accounting as supported usage policy evidence", () => {
+    const devin = { ...authority, provider: "devin", providerAccountId: `dact_${"1".repeat(32)}` };
+    expect(usageProviderAccountAuthoritySchema.safeParse(devin).success).toBe(false);
+    for (const observed of [quota(), accounting()]) {
+      expect(providerUsageComponentSchema.safeParse({ ...observed, authority: devin }).success).toBe(false);
+    }
+  });
+
   test("canonicalizes component collections and binds idempotency to exact authority", () => {
     const observed = quota();
     expect(observed.quota.windows.map((window) => window.id)).toEqual([
@@ -245,7 +254,7 @@ describe("provider usage v2", () => {
       daemonGeneration: 1,
       previousPayload: null,
     });
-    const codexAuthority: ProviderAccountAuthority = {
+    const codexAuthority: UsageProviderAccountAuthority = {
       provider: "codex",
       providerAccountId: "acct_44444444444444444444444444444444",
       profileId: "acct_44444444444444444444444444444444",

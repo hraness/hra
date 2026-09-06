@@ -33,10 +33,13 @@ import {
 import { workReadSuccessWireBytes } from "../domain/terminal-json";
 import {
   WORK_SCHEMA_SQL,
+  WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL,
   WorkStore,
   WorkStoreError,
   assertReadonlyWorkSchema,
+  assertWorkSignalProviderAuthorities,
   assertWorkSchema,
+  backfillLegacyWorkSignalProviderAuthorities,
   workPreparedEffectMessage,
 } from "./work-store";
 
@@ -98,11 +101,59 @@ CREATE TABLE sessions(
   profile_id TEXT NOT NULL REFERENCES profiles(id),
   project_id TEXT NOT NULL REFERENCES projects(id),
   provider TEXT NOT NULL DEFAULT 'codex',
+  provider_v39 TEXT NOT NULL DEFAULT 'codex',
   preset TEXT NOT NULL,
   preset_contract INTEGER NOT NULL DEFAULT 2 CHECK(preset_contract IN (1,2)),
   fast_enabled INTEGER NOT NULL,
   state TEXT NOT NULL
 ) STRICT;
+CREATE TABLE provider_accounts(
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  provider TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL,
+  process_generation INTEGER NOT NULL,
+  readiness TEXT NOT NULL,
+  UNIQUE(profile_id,provider)
+) STRICT;
+CREATE TABLE session_provider_authorities(
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+  provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id),
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  provider TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL,
+  process_generation INTEGER NOT NULL,
+  authority_revision INTEGER NOT NULL
+) STRICT;
+CREATE TRIGGER fixture_session_authority_insert AFTER INSERT ON sessions BEGIN
+  INSERT OR IGNORE INTO provider_accounts
+    SELECT NEW.profile_id,NEW.profile_id,'codex',1,p.process_generation,'signed_in'
+    FROM profiles p WHERE p.id=NEW.profile_id;
+  INSERT OR IGNORE INTO provider_accounts
+    SELECT 'pact_'||substr(p.id,6),p.id,'claude',1,1,'signed_in'
+    FROM profiles p WHERE p.id=NEW.profile_id;
+  INSERT OR IGNORE INTO provider_accounts
+    SELECT 'dact_'||substr(p.id,6),p.id,'devin',1,1,'signed_in'
+    FROM profiles p WHERE p.id=NEW.profile_id;
+  INSERT INTO session_provider_authorities
+    SELECT NEW.id,a.id,a.profile_id,a.provider,a.binding_generation,a.process_generation,1
+    FROM provider_accounts a WHERE a.profile_id=NEW.profile_id AND a.provider=NEW.provider_v39;
+END;
+CREATE TRIGGER fixture_session_authority_update AFTER UPDATE OF provider_v39 ON sessions
+WHEN NEW.provider_v39!=OLD.provider_v39 BEGIN
+  UPDATE session_provider_authorities SET
+    provider_account_id=(SELECT id FROM provider_accounts WHERE profile_id=NEW.profile_id AND provider=NEW.provider_v39),
+    provider=NEW.provider_v39,
+    binding_generation=(SELECT binding_generation FROM provider_accounts WHERE profile_id=NEW.profile_id AND provider=NEW.provider_v39),
+    process_generation=(SELECT process_generation FROM provider_accounts WHERE profile_id=NEW.profile_id AND provider=NEW.provider_v39),
+    authority_revision=authority_revision+1
+  WHERE session_id=NEW.id;
+END;
+CREATE TRIGGER fixture_codex_process_mirror AFTER UPDATE OF process_generation ON profiles BEGIN
+  UPDATE provider_accounts SET process_generation=NEW.process_generation WHERE profile_id=NEW.id AND provider='codex';
+  UPDATE session_provider_authorities SET process_generation=NEW.process_generation,authority_revision=authority_revision+1
+    WHERE profile_id=NEW.id AND provider='codex';
+END;
 CREATE TABLE session_events(
   session_id TEXT NOT NULL,
   sequence INTEGER NOT NULL,
@@ -133,6 +184,16 @@ CREATE TABLE mutation_resolutions(
   resolution_kind TEXT,
   receipt_json TEXT
 ) STRICT;
+CREATE TABLE legacy_provider_authority_quarantines(
+  scope_kind TEXT NOT NULL,scope_id TEXT NOT NULL,reason TEXT NOT NULL,recorded_at INTEGER NOT NULL,
+  PRIMARY KEY(scope_kind,scope_id)
+) STRICT;
+CREATE TABLE mutation_provider_authorities(
+  attempt_id TEXT NOT NULL REFERENCES mutation_attempts(id),role TEXT NOT NULL,
+  provider_account_id TEXT NOT NULL,profile_id TEXT NOT NULL,provider TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL,process_generation INTEGER NOT NULL,provenance TEXT NOT NULL,
+  PRIMARY KEY(attempt_id,role)
+) STRICT;
 `;
 
 const encodeCursor = (payload: unknown): string =>
@@ -156,6 +217,7 @@ function fixture(): Fixture {
   database.exec("PRAGMA foreign_keys=ON;");
   database.exec(parentSchema);
   database.exec(WORK_SCHEMA_SQL);
+  database.exec(WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL);
   assertWorkSchema(database);
   const accountId = createProfileId();
   const projectId = createProjectId();
@@ -398,13 +460,14 @@ function insertAppliedNestedMutation(
   value: Fixture,
   effect: WorkPreparedEffect,
 ): void {
+  const generation = nestedMutationGeneration(value, effect);
   const kind = effect.kind === "dispatch"
     ? "session.send"
     : effect.mode === "queue" ? "session.queue" : "session.steer";
   const requestDigest = createHash("sha256").update(JSON.stringify({
     kind,
     authorityId: effect.targetSessionId,
-    authorityGeneration: effect.accountGeneration,
+    authorityGeneration: generation,
     request: { message: workPreparedEffectMessage(effect) },
   })).digest("hex");
   const result = effect.kind === "dispatch"
@@ -421,23 +484,45 @@ function insertAppliedNestedMutation(
     effect.nestedMutationKey,
     kind,
     effect.targetSessionId,
-    effect.accountGeneration,
+    generation,
     requestDigest,
     JSON.stringify(result),
   );
+  insertNestedSignalAuthority(value, effect);
+}
+
+function nestedMutationGeneration(value: Fixture, effect: WorkPreparedEffect): number {
+  if (effect.kind !== "signal") return effect.accountGeneration;
+  const authority = value.database.query(
+    "SELECT process_generation FROM work_signal_provider_authorities WHERE signal_id=?",
+  ).get(effect.signalId) as { process_generation: number } | null;
+  if (authority === null) throw new Error("signal authority missing");
+  return authority.process_generation;
+}
+
+function insertNestedSignalAuthority(value: Fixture, effect: WorkPreparedEffect): void {
+  if (effect.kind !== "signal") return;
+  value.database.query(`INSERT INTO mutation_provider_authorities
+    SELECT mutation.id,'primary',authority.provider_account_id,authority.profile_id,
+      authority.provider,authority.binding_generation,authority.process_generation,
+      CASE WHEN mutation.kind='session.queue' THEN 'session_queue' ELSE 'session_steer' END
+    FROM mutation_attempts mutation JOIN work_signal_provider_authorities authority
+      ON authority.signal_id=? WHERE mutation.idempotency_key=?`)
+    .run(effect.signalId, effect.nestedMutationKey);
 }
 
 function insertFailedNestedMutation(
   value: Fixture,
   effect: WorkPreparedEffect,
 ): void {
+  const generation = nestedMutationGeneration(value, effect);
   const kind = effect.kind === "dispatch"
     ? "session.send"
     : effect.mode === "queue" ? "session.queue" : "session.steer";
   const requestDigest = createHash("sha256").update(JSON.stringify({
     kind,
     authorityId: effect.targetSessionId,
-    authorityGeneration: effect.accountGeneration,
+    authorityGeneration: generation,
     request: { message: workPreparedEffectMessage(effect) },
   })).digest("hex");
   value.database.query(
@@ -449,12 +534,219 @@ function insertFailedNestedMutation(
     effect.nestedMutationKey,
     kind,
     effect.targetSessionId,
-    effect.accountGeneration,
+    generation,
     requestDigest,
   );
+  insertNestedSignalAuthority(value, effect);
+}
+
+function prepareSignal(value: Fixture, provider: "codex" | "claude" | "devin" = "codex") {
+  if (provider !== "codex") {
+    value.database.query("UPDATE sessions SET provider_v39=?,preset='ultra' WHERE id=?")
+      .run(provider, value.reviewerSessionId);
+  }
+  const created = createWork(value);
+  join(value, created.work.id, created.work.revision, value.reviewerSessionId);
+  const key = randomUUID();
+  value.store.apply({
+    kind: "signal.send", idempotencyKey: key, workId: created.work.id,
+    senderSessionId: value.actorSessionId, senderCapability: capability,
+    targetSessionId: value.reviewerSessionId, mode: "queue", body: "Keep this exact authority.",
+  });
+  const effect = value.store.preparedEffect(key)?.effect;
+  if (effect?.kind !== "signal") throw new Error("signal effect missing");
+  return { key, effect, workId: created.work.id };
 }
 
 describe("WorkStore schema and atomic plans", () => {
+  test("work signal authority survives a sibling process restart but rejects its own provider generation", () => {
+    for (const changedProvider of ["codex", "devin"] as const) {
+      const value = fixture();
+      value.database.query("UPDATE sessions SET provider_v39='devin',preset='ultra' WHERE id=?")
+        .run(value.reviewerSessionId);
+      const created = createWork(value);
+      join(value, created.work.id, created.work.revision, value.reviewerSessionId);
+      const key = randomUUID();
+      value.store.apply({
+        kind: "signal.send", idempotencyKey: key, workId: created.work.id,
+        senderSessionId: value.actorSessionId, senderCapability: capability,
+        targetSessionId: value.reviewerSessionId, mode: "queue", body: "Continue exactly here.",
+      });
+      if (changedProvider === "codex") {
+        value.database.query("UPDATE profiles SET process_generation=2 WHERE id=?").run(value.accountId);
+      } else {
+        value.database.query("UPDATE provider_accounts SET process_generation=2 WHERE profile_id=? AND provider='devin'").run(value.accountId);
+      }
+      expect(value.store.authorizePreparedEffect(key).executable).toBe(changedProvider === "codex");
+    }
+  });
+
+  test("work signal authority rejects a same-counter provider switch after preparation", () => {
+    const value = fixture();
+    const created = createWork(value);
+    join(value, created.work.id, created.work.revision, value.reviewerSessionId);
+    const key = randomUUID();
+    value.store.apply({
+      kind: "signal.send", idempotencyKey: key, workId: created.work.id,
+      senderSessionId: value.actorSessionId, senderCapability: capability,
+      targetSessionId: value.reviewerSessionId, mode: "queue", body: "Keep this provider binding.",
+    });
+    value.database.query("UPDATE sessions SET provider_v39='devin',preset='ultra' WHERE id=?")
+      .run(value.reviewerSessionId);
+    expect(value.store.authorizePreparedEffect(key).executable).toBe(false);
+  });
+
+  test("work signal authority rejects a replaced binding or session revision with unchanged process counters", () => {
+    for (const changed of ["binding", "revision", "account"] as const) {
+      const value = fixture();
+      const { key } = prepareSignal(value, "claude");
+      if (changed === "binding") {
+        value.database.query("UPDATE provider_accounts SET binding_generation=2 WHERE profile_id=? AND provider='claude'")
+          .run(value.accountId);
+        value.database.query("UPDATE session_provider_authorities SET binding_generation=2 WHERE session_id=?")
+          .run(value.reviewerSessionId);
+      } else if (changed === "revision") {
+        value.database.query("UPDATE session_provider_authorities SET authority_revision=authority_revision+1 WHERE session_id=?")
+          .run(value.reviewerSessionId);
+      } else {
+        value.database.query("UPDATE provider_accounts SET readiness='removed' WHERE profile_id=? AND provider='claude'")
+          .run(value.accountId);
+      }
+      expect(value.store.authorizePreparedEffect(key).executable).toBe(false);
+    }
+  });
+
+  test("work signal authority is immutable and current-format missing or altered rows fail closed", () => {
+    for (const corruption of ["missing", "generation", "digest"] as const) {
+      const value = fixture();
+      const { key, effect } = prepareSignal(value, "devin");
+      expect(() => value.database.query("UPDATE work_signal_provider_authorities SET process_generation=2 WHERE signal_id=?")
+        .run(effect.signalId)).toThrow("WORK_SIGNAL_PROVIDER_AUTHORITY_IMMUTABLE");
+      expect(() => value.database.query("DELETE FROM work_signal_provider_authorities WHERE signal_id=?")
+        .run(effect.signalId)).toThrow("WORK_SIGNAL_PROVIDER_AUTHORITY_IMMUTABLE");
+      value.database.exec("DROP TRIGGER work_signal_provider_authority_no_delete; DROP TRIGGER work_signal_provider_authority_no_update");
+      if (corruption === "missing") {
+        value.database.query("DELETE FROM work_signal_provider_authorities WHERE signal_id=?").run(effect.signalId);
+      } else if (corruption === "generation") {
+        value.database.query("UPDATE work_signal_provider_authorities SET process_generation=2 WHERE signal_id=?").run(effect.signalId);
+      } else {
+        value.database.query("UPDATE work_signal_provider_authorities SET authority_digest=? WHERE signal_id=?")
+          .run("0".repeat(64), effect.signalId);
+      }
+      value.database.exec(WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL);
+      expect(() => assertWorkSignalProviderAuthorities(value.database)).toThrow(
+        corruption === "missing" ? "WORK_SIGNAL_PROVIDER_AUTHORITY_MISSING" : "WORK_SIGNAL_PROVIDER_AUTHORITY_CORRUPT",
+      );
+      expect(value.store.authorizePreparedEffect(key).executable).toBe(false);
+    }
+  });
+
+  test("work signal authority audit refuses altered guard structure without repairing it", () => {
+    const value = fixture();
+    prepareSignal(value);
+    value.database.exec(`DROP TRIGGER work_signal_provider_authority_no_update;
+      CREATE TRIGGER work_signal_provider_authority_no_update
+      BEFORE UPDATE ON work_signal_provider_authorities BEGIN SELECT 1; END;`);
+    expect(() => assertWorkSignalProviderAuthorities(value.database)).toThrow("WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_INVALID");
+    expect(value.database.query("SELECT sql FROM sqlite_master WHERE name='work_signal_provider_authority_no_update'").get())
+      .toEqual({ sql: expect.stringContaining("SELECT 1") });
+  });
+
+  test("legacy work signals retain their instruction bytes and quarantine without inferring current authority", () => {
+    const value = fixture();
+    const { key, effect } = prepareSignal(value);
+    const instruction = value.database.query("SELECT instruction_json,instruction_digest FROM work_prepared_effects WHERE idempotency_key=?").get(key);
+    value.database.exec("DROP TRIGGER work_signal_provider_authority_no_delete");
+    value.database.query("DELETE FROM work_signal_provider_authorities WHERE signal_id=?").run(effect.signalId);
+    value.database.exec(WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL);
+    value.database.query("UPDATE sessions SET provider_v39='devin',preset='ultra' WHERE id=?").run(value.reviewerSessionId);
+    expect(() => assertWorkSignalProviderAuthorities(value.database)).toThrow("WORK_SIGNAL_PROVIDER_AUTHORITY_MISSING");
+    backfillLegacyWorkSignalProviderAuthorities(value.database, 12_000);
+    backfillLegacyWorkSignalProviderAuthorities(value.database, 13_000);
+    expect(() => assertWorkSignalProviderAuthorities(value.database)).not.toThrow();
+    expect(value.database.query("SELECT * FROM work_signal_provider_authorities WHERE signal_id=?").get(effect.signalId)).toBeNull();
+    expect(value.database.query("SELECT reason,recorded_at FROM legacy_provider_authority_quarantines WHERE scope_kind='work_signal' AND scope_id=?")
+      .get(effect.signalId)).toEqual({ reason: "missing_immutable_runtime_authority", recorded_at: 12_000 });
+    expect(value.database.query("SELECT instruction_json,instruction_digest FROM work_prepared_effects WHERE idempotency_key=?").get(key)).toEqual(instruction);
+    expect(value.store.authorizePreparedEffect(key).executable).toBe(false);
+  });
+
+  test("work signal preparation rolls back the entire operation if authority capture fails", () => {
+    const value = fixture();
+    const created = createWork(value);
+    join(value, created.work.id, created.work.revision, value.reviewerSessionId);
+    const before = value.database.query("SELECT revision,next_sequence,head_hash FROM works WHERE id=?").get(created.work.id);
+    value.database.exec(`CREATE TRIGGER test_refuse_signal_authority BEFORE INSERT ON work_signal_provider_authorities
+      BEGIN SELECT RAISE(ABORT,'TEST_AUTHORITY_CAPTURE_FAILURE'); END;`);
+    const key = randomUUID();
+    expect(() => value.store.apply({
+      kind: "signal.send", idempotencyKey: key, workId: created.work.id,
+      senderSessionId: value.actorSessionId, senderCapability: capability,
+      targetSessionId: value.reviewerSessionId, mode: "queue", body: "Do not leave an unbound signal.",
+    })).toThrow("TEST_AUTHORITY_CAPTURE_FAILURE");
+    expect(value.database.query("SELECT revision,next_sequence,head_hash FROM works WHERE id=?").get(created.work.id)).toEqual(before);
+    expect(value.database.query("SELECT * FROM work_signals WHERE work_id=?").all(created.work.id)).toEqual([]);
+    expect(value.store.preparedEffect(key)).toBeNull();
+  });
+
+  test("work signal receipts use frozen provider generation while released wire retains the Codex mirror", () => {
+    for (const useNestedReceipt of [false, true]) {
+      const value = fixture();
+      value.database.query("UPDATE provider_accounts SET process_generation=3 WHERE profile_id=? AND provider='devin'").run(value.accountId);
+      const { key, effect } = prepareSignal(value, "devin");
+      expect(effect.accountGeneration).toBe(1);
+      expect(value.database.query("SELECT process_generation FROM work_signal_provider_authorities WHERE signal_id=?").get(effect.signalId))
+        .toEqual({ process_generation: 3 });
+      if (useNestedReceipt) {
+        insertAppliedNestedMutation(value, effect);
+        expect(value.store.authorizePreparedEffect(key).status.state).toBe("accepted");
+      } else {
+        expect(value.store.authorizePreparedEffect(key).executable).toBe(true);
+        expect(() => value.store.finalizeSignal(key, { kind: "accepted", receipt: queueReceipt(1) })).toThrow("ROUTE_MISMATCH");
+        expect(value.store.finalizeSignal(key, { kind: "accepted", receipt: queueReceipt(3) }).deliveryState).toBe("accepted");
+      }
+    }
+  });
+
+  test("work signal reconciliation rejects a borrowed same-counter nested provider authority", () => {
+    for (const corruption of ["provider", "provenance", "missing"] as const) {
+      const value = fixture();
+      const { key, effect } = prepareSignal(value, "devin");
+      insertAppliedNestedMutation(value, effect);
+      if (corruption === "provider") {
+        value.database.query(`UPDATE mutation_provider_authorities SET provider='codex',provider_account_id=?
+          WHERE attempt_id=(SELECT id FROM mutation_attempts WHERE idempotency_key=?)`)
+          .run(value.accountId, effect.nestedMutationKey);
+      } else if (corruption === "provenance") {
+        value.database.query("UPDATE mutation_provider_authorities SET provenance='legacy_runtime' WHERE attempt_id=(SELECT id FROM mutation_attempts WHERE idempotency_key=?)")
+          .run(effect.nestedMutationKey);
+      } else {
+        value.database.query("DELETE FROM mutation_provider_authorities WHERE attempt_id=(SELECT id FROM mutation_attempts WHERE idempotency_key=?)")
+          .run(effect.nestedMutationKey);
+      }
+      const result = value.store.authorizePreparedEffect(key);
+      expect(result.executable).toBe(false);
+      expect(result.status.state).toBe("unknown");
+    }
+  });
+
+  test("legacy work signal settled receipt replay remains historical after execution quarantine", () => {
+    const value = fixture();
+    const { key, effect } = prepareSignal(value);
+    expect(value.store.authorizePreparedEffect(key).executable).toBe(true);
+    const outcome = { kind: "accepted" as const, receipt: queueReceipt() };
+    const accepted = value.store.finalizeSignal(key, outcome);
+    value.database.exec("DROP TRIGGER work_signal_provider_authority_no_delete");
+    value.database.query("DELETE FROM work_signal_provider_authorities WHERE signal_id=?").run(effect.signalId);
+    value.database.exec(WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL);
+    backfillLegacyWorkSignalProviderAuthorities(value.database, 12_000);
+    expect(() => assertWorkSignalProviderAuthorities(value.database)).not.toThrow();
+    expect(value.store.finalizeSignal(key, outcome)).toEqual(accepted);
+    expect(value.store.authorizePreparedEffect(key).executable).toBe(false);
+    expect(() => value.store.finalizeSignal(key, { kind: "accepted", receipt: queueReceipt(2) }))
+      .toThrow("IDEMPOTENCY_CONFLICT");
+  });
+
   test("creates strict append-only state with a verified event hash chain", () => {
     const value = fixture();
     const created = createWork(value);
@@ -517,7 +809,7 @@ describe("WorkStore schema and atomic plans", () => {
     databases.push(database);
     database.exec("PRAGMA foreign_keys=ON;");
     const legacyParentSchema = parentSchema.replace(
-      "  provider TEXT NOT NULL DEFAULT 'codex',\n",
+      "  provider_v39 TEXT NOT NULL DEFAULT 'codex',\n",
       "",
     );
     expect(legacyParentSchema).not.toBe(parentSchema);
@@ -525,10 +817,10 @@ describe("WorkStore schema and atomic plans", () => {
     database.exec(WORK_SCHEMA_SQL);
 
     expect(() => assertWorkSchema(database)).toThrow(
-      "WORK_SCHEMA_STALE:sessions.provider",
+      "WORK_SCHEMA_STALE:sessions.provider_v39",
     );
     expect(() => assertReadonlyWorkSchema(database)).toThrow(
-      "WORK_SCHEMA_STALE:sessions.provider",
+      "WORK_SCHEMA_STALE:sessions.provider_v39",
     );
   });
 
@@ -677,14 +969,14 @@ describe("WorkStore claims, fences, and prepared effects", () => {
       "UPDATE sessions SET preset='low',preset_contract=1 WHERE id=?",
     ).run(value.actorSessionId);
 
-    value.database.query("UPDATE sessions SET provider='claude' WHERE id=?")
+    value.database.query("UPDATE sessions SET provider_v39='claude' WHERE id=?")
       .run(value.actorSessionId);
     expect(() => claim(value, {
       workId: created.work.id,
       taskId: created.tasks[0]!.id,
       revision: created.tasks[0]!.revision,
     })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
-    value.database.query("UPDATE sessions SET provider='codex' WHERE id=?")
+    value.database.query("UPDATE sessions SET provider_v39='codex' WHERE id=?")
       .run(value.actorSessionId);
 
     const claimed = claim(value, {
@@ -718,7 +1010,7 @@ describe("WorkStore claims, fences, and prepared effects", () => {
     const value = fixture();
     value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
       .run(value.accountId);
-    value.database.query("UPDATE sessions SET provider='claude',preset='ultra' WHERE profile_id=?")
+    value.database.query("UPDATE sessions SET provider_v39='claude',preset='ultra' WHERE profile_id=?")
       .run(value.accountId);
 
     const created = createWork(value, [taskSpec(value, "claude-tier-collision", {
@@ -758,7 +1050,7 @@ describe("WorkStore claims, fences, and prepared effects", () => {
     });
 
     expect(() => value.database.query(
-      "UPDATE sessions SET provider='claude' WHERE id=?",
+      "UPDATE sessions SET provider_v39='claude' WHERE id=?",
     ).run(value.actorSessionId)).toThrow("WORK_SESSION_ATTEMPT_AUTHORITY");
 
     const dispatchKey = randomUUID();
@@ -775,13 +1067,93 @@ describe("WorkStore claims, fences, and prepared effects", () => {
       mode: "send",
     });
     value.database.exec("DROP TRIGGER work_session_attempt_authority_guard");
-    value.database.query("UPDATE sessions SET provider='claude' WHERE id=?")
+    value.database.query("UPDATE sessions SET provider_v39='claude' WHERE id=?")
       .run(value.actorSessionId);
     expect(value.store.authorizePreparedEffect(dispatchKey)).toMatchObject({
       disposition: "settled",
       executable: false,
       status: { state: "failed" },
     });
+  });
+
+  test("lets a Work claim win before a provider-switch effect starts", () => {
+    const value = fixture();
+    const created = createWork(value);
+    const switchAttemptId = createAttemptId();
+    value.database.query(
+      `INSERT INTO mutation_attempts(
+         id,idempotency_key,kind,authority_id,authority_generation,request_digest,state
+       ) VALUES (?,?,?,?,?,?,'prepared')`,
+    ).run(
+      switchAttemptId,
+      randomUUID(),
+      "session.switch",
+      value.actorSessionId,
+      1,
+      "a".repeat(64),
+    );
+
+    claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    });
+    expect(() => value.store.assertSessionCanChangeRoute(value.actorSessionId))
+      .toThrow(new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED"));
+    expect(() => value.database.query(
+      "UPDATE mutation_attempts SET state='effect_started' WHERE id=? AND state='prepared'",
+    ).run(switchAttemptId)).toThrow("WORK_SESSION_SWITCH_ATTEMPT_AUTHORITY");
+    expect(value.database.query(
+      "SELECT state FROM mutation_attempts WHERE id=?",
+    ).get(switchAttemptId)).toEqual({ state: "prepared" });
+  });
+
+  test("fences Work claims behind an unresolved provider-switch effect", () => {
+    const value = fixture();
+    const created = createWork(value);
+    const switchAttemptId = createAttemptId();
+    value.database.query(
+      `INSERT INTO mutation_attempts(
+         id,idempotency_key,kind,authority_id,authority_generation,request_digest,state
+       ) VALUES (?,?,?,?,?,?,'effect_started')`,
+    ).run(
+      switchAttemptId,
+      randomUUID(),
+      "session.switch",
+      value.actorSessionId,
+      1,
+      "b".repeat(64),
+    );
+    const claimTask = (): unknown => claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    });
+
+    const next = value.store.apply({
+      kind: "task.claimNext",
+      idempotencyKey: randomUUID(),
+      workId: created.work.id,
+      actorSessionId: value.actorSessionId,
+      actorCapability: capability,
+      route: { accountId: value.accountId, projectId: value.projectId },
+      leaseMs: 5_000,
+    });
+    expect(next).toMatchObject({ kind: "task.claimNext", task: null, attempt: null });
+    expect(claimTask).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    value.database.query(
+      "UPDATE mutation_attempts SET state='ambiguous' WHERE id=?",
+    ).run(switchAttemptId);
+    expect(claimTask).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(value.database.query(
+      "SELECT COUNT(*) AS count FROM work_attempts WHERE work_id=?",
+    ).get(created.work.id)).toEqual({ count: 0 });
+
+    value.database.query(
+      `INSERT INTO mutation_resolutions(attempt_id,resolution_kind,receipt_json)
+       VALUES (?,'abandoned',NULL)`,
+    ).run(switchAttemptId);
+    expect(claimTask()).toMatchObject({ kind: "task.claim" });
   });
 
   test("still refuses Codex work authority while the Codex profile is signed out", () => {
@@ -2790,6 +3162,8 @@ describe("WorkStore submissions, reviews, and signals", () => {
     expect(value.database.query("SELECT COUNT(*) AS count FROM work_task_history_versions").get())
       .toEqual({ count: 0 });
     expect(value.database.query("SELECT COUNT(*) AS count FROM work_events").get()).toEqual({ count: 0 });
+    expect(value.database.query("SELECT COUNT(*) AS count FROM work_signal_provider_authorities").get()).toEqual({ count: 0 });
+    expect(() => assertWorkSignalProviderAuthorities(value.database)).not.toThrow();
     expect(value.database.query("SELECT COUNT(*) AS count FROM work_idempotency_intents").get())
       .toEqual({ count: 0 });
     expect(value.database.query(

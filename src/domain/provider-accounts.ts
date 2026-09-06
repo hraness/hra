@@ -5,21 +5,26 @@ import { z } from "zod";
 import { profileIdSchema } from "./values";
 
 /**
- * Codex keeps the established public profile id. Claude receives a distinct,
- * HRA-owned opaque id because its auth-status probe exposes no stable account
- * identity that HRA can safely join across profiles or machines.
+ * Codex keeps the established public profile id. Isolated Claude and Devin
+ * accounts receive distinct HRA-owned opaque ids, never inferred subscription
+ * identities that could join profiles or machines.
  */
 export const codexProviderAccountIdSchema = z.string().regex(/^acct_[0-9a-f]{32}$/u);
 export const claudeProviderAccountIdSchema = z.string().regex(/^pact_[0-9a-f]{32}$/u);
+export const devinProviderAccountIdSchema = z.string().regex(/^dact_[0-9a-f]{32}$/u);
 export const providerAccountIdSchema = z.union([
   codexProviderAccountIdSchema,
   claudeProviderAccountIdSchema,
+  devinProviderAccountIdSchema,
 ]);
 
 export type ProviderAccountId = z.infer<typeof providerAccountIdSchema>;
 
 export const createClaudeProviderAccountId = (): ProviderAccountId =>
   providerAccountIdSchema.parse(`pact_${randomUUID().replaceAll("-", "")}`);
+
+export const createDevinProviderAccountId = (): ProviderAccountId =>
+  devinProviderAccountIdSchema.parse(`dact_${randomUUID().replaceAll("-", "")}`);
 
 export const providerAccountReadinessSchema = z.enum([
   "unverified",
@@ -53,17 +58,25 @@ const providerAuthorityFields = {
   processGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 } as const;
 
+export const codexProviderAccountAuthoritySchema = z.object({
+  ...providerAuthorityFields,
+  provider: z.literal("codex"),
+  providerAccountId: codexProviderAccountIdSchema,
+}).strict();
+export const claudeProviderAccountAuthoritySchema = z.object({
+  ...providerAuthorityFields,
+  provider: z.literal("claude"),
+  providerAccountId: claudeProviderAccountIdSchema,
+}).strict();
+export const devinProviderAccountAuthoritySchema = z.object({
+  ...providerAuthorityFields,
+  provider: z.literal("devin"),
+  providerAccountId: devinProviderAccountIdSchema,
+}).strict();
 export const providerAccountAuthoritySchema = z.discriminatedUnion("provider", [
-  z.object({
-    ...providerAuthorityFields,
-    provider: z.literal("codex"),
-    providerAccountId: codexProviderAccountIdSchema,
-  }).strict(),
-  z.object({
-    ...providerAuthorityFields,
-    provider: z.literal("claude"),
-    providerAccountId: claudeProviderAccountIdSchema,
-  }).strict(),
+  codexProviderAccountAuthoritySchema,
+  claudeProviderAccountAuthoritySchema,
+  devinProviderAccountAuthoritySchema,
 ]);
 
 export type ProviderAccountAuthority = z.infer<

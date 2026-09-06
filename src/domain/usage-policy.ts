@@ -1,19 +1,20 @@
 import { z } from "zod";
 
-import { providerSchema, type Provider } from "./presets";
 import {
-  providerAccountAuthoritySchema,
-  providerAccountIdSchema,
   providerAccountReadinessSchema,
   sessionRoutingProvenanceSchema,
-  type ProviderAccountAuthority,
 } from "./provider-accounts";
 import {
   canonicalProviderUsageComponent,
   providerUsageAuthorityModeSchema,
   providerUsageQuotaComponentSchema,
+  usageProviderAccountAuthoritySchema,
+  usageProviderAccountIdSchema,
+  usageProviderSchema,
   type CodexQuotaUsage,
   type ProviderUsageQuotaComponent,
+  type UsageProvider,
+  type UsageProviderAccountAuthority,
 } from "./provider-usage";
 import {
   accountRateLimitResetOutcomeSchema,
@@ -51,7 +52,7 @@ export const automaticUsagePolicyConfigurationUpdateSchema = z.object({
     z.object({ kind: z.literal("set_default"), enabled: z.boolean() }).strict(),
     z.object({
       kind: z.literal("set_override"),
-      provider: providerSchema,
+      provider: usageProviderSchema,
       override: automaticUsageOverrideSchema,
     }).strict(),
   ]),
@@ -71,15 +72,15 @@ export function initialAutomaticUsagePolicyConfiguration(): AutomaticUsagePolicy
 
 export function resolveAutomaticUsagePolicy(input: Readonly<{
   configuration: unknown;
-  provider: Provider;
+  provider: UsageProvider;
 }>): Readonly<{
-  provider: Provider;
+  provider: UsageProvider;
   enabled: boolean;
   source: "default" | "override";
   automaticPolicyRevision: number;
 }> {
   const configuration = automaticUsagePolicyConfigurationSchema.parse(input.configuration);
-  const provider = providerSchema.parse(input.provider);
+  const provider = usageProviderSchema.parse(input.provider);
   const override = configuration.overrides[provider];
   return {
     provider,
@@ -101,14 +102,14 @@ export function usageObservationFreshness(input: Readonly<{
   return now - receivedAt <= AUTOMATIC_USAGE_FRESHNESS_MS ? "fresh" : "stale";
 }
 
-const sameAuthority = (left: ProviderAccountAuthority, right: ProviderAccountAuthority): boolean =>
+const sameAuthority = (left: UsageProviderAccountAuthority, right: UsageProviderAccountAuthority): boolean =>
   left.provider === right.provider
   && left.profileId === right.profileId
   && left.providerAccountId === right.providerAccountId
   && left.bindingGeneration === right.bindingGeneration
   && left.processGeneration === right.processGeneration;
 
-const sameBinding = (left: ProviderAccountAuthority, right: ProviderAccountAuthority): boolean =>
+const sameBinding = (left: UsageProviderAccountAuthority, right: UsageProviderAccountAuthority): boolean =>
   left.provider === right.provider
   && left.profileId === right.profileId
   && left.providerAccountId === right.providerAccountId
@@ -116,7 +117,7 @@ const sameBinding = (left: ProviderAccountAuthority, right: ProviderAccountAutho
 
 /** Accounting deliberately has no place in the policy input. */
 export const usagePolicyAccountSchema = z.object({
-  authority: providerAccountAuthoritySchema,
+  authority: usageProviderAccountAuthoritySchema,
   readiness: providerAccountReadinessSchema,
   authorityMode: providerUsageAuthorityModeSchema,
   quota: z.unknown(),
@@ -124,7 +125,7 @@ export const usagePolicyAccountSchema = z.object({
 export type UsagePolicyAccount = z.infer<typeof usagePolicyAccountSchema>;
 
 export const automaticUsageQuotaEvidenceSchema = z.object({
-  authority: providerAccountAuthoritySchema,
+  authority: usageProviderAccountAuthoritySchema,
   quotaObservationRevision: observationRevisionSchema,
   quotaComponentDigest: digestSchema,
   receivedAt: unixMillisecondsSchema,
@@ -288,7 +289,7 @@ export function classifyProviderUsageAccount(input: Readonly<{
 }
 
 const resetGateBase = {
-  authority: providerAccountAuthoritySchema,
+  authority: usageProviderAccountAuthoritySchema,
   quotaObservationRevision: observationRevisionSchema,
   resetPolicyRevision: revisionSchema,
   resetBoundary: unixMillisecondsSchema.nullable(),
@@ -368,10 +369,10 @@ export type AutomaticUsageDecision =
 const automaticUsageDecisionInputBase = {
   now: unixMillisecondsSchema,
   configuration: automaticUsagePolicyConfigurationSchema,
-  observedSource: providerAccountAuthoritySchema,
-  order: z.array(providerAccountIdSchema).max(AUTOMATIC_USAGE_ACCOUNT_LIMIT),
+  observedSource: usageProviderAccountAuthoritySchema,
+  order: z.array(usageProviderAccountIdSchema).max(AUTOMATIC_USAGE_ACCOUNT_LIMIT),
   orderRevision: revisionSchema,
-  activeProviderAccountId: providerAccountIdSchema.nullable(),
+  activeProviderAccountId: usageProviderAccountIdSchema.nullable(),
   pointerRevision: revisionSchema,
   accounts: z.array(usagePolicyAccountSchema).max(AUTOMATIC_USAGE_ACCOUNT_LIMIT),
   nativeFallback: z.enum(["armed", "unavailable", "disabled"]),
@@ -399,7 +400,7 @@ export type AutomaticUsageDecisionInput = z.infer<typeof automaticUsageDecisionI
 
 /** Model ladders are provider data; no current quota input admits model scope. */
 export type ProviderUsageModelLadder = Readonly<{
-  provider: Provider;
+  provider: UsageProvider;
   entries: readonly Readonly<{ model: string; reasoningEffort: string }>[];
 }>;
 
@@ -527,7 +528,7 @@ export const automaticUsageManagedSessionSchema = z.object({
   sessionId: sessionIdSchema,
   sessionRevision: revisionSchema,
   sessionAuthorityRevision: revisionSchema,
-  authority: providerAccountAuthoritySchema,
+  authority: usageProviderAccountAuthoritySchema,
   routingProvenance: sessionRoutingProvenanceSchema,
   appliedPointerRevision: revisionSchema.nullable(),
   turnId: z.string().min(1).max(200).nullable(),
@@ -542,7 +543,7 @@ export type AutomaticUsageFollowDecision =
       action: "follow_pointer_moves" | "advance_pointer_revision";
       session: AutomaticUsageManagedSession;
       moveIds: readonly string[];
-      target: ProviderAccountAuthority;
+      target: UsageProviderAccountAuthority;
       toPointerRevision: number;
       automaticPolicyRevision: number;
     }>;
@@ -576,7 +577,7 @@ export function followSettledAutomaticPointerMoves(input: Readonly<{
     return { action: "reconciliation_required", reason: "invalid_lineage" };
   }
   let revision = applied;
-  let authority: ProviderAccountAuthority = session.authority;
+  let authority: UsageProviderAccountAuthority = session.authority;
   let lastSettledAt = 0;
   let lastOrderRevision = 0;
   let lastPolicyRevision = 0;

@@ -586,9 +586,9 @@ function AccountRow({
   const readStatusCommand = useRef<string | null>(null);
   const activeCommand = useRef<string | null>(null);
   const mounted = useRef(true);
-  const localLoginCommand = account.provider === "claude"
-    ? `hra account login ${account.publicId} --provider claude`
-    : `hra account login ${account.publicId}`;
+  const localLoginCommand = account.provider === "codex"
+    ? `hra account login ${account.publicId}`
+    : `hra account login ${account.publicId} --provider ${account.provider}`;
   const busy = loginAction.phase !== "idle";
 
   const updateLoginAction = useCallback((next: AccountLoginActionState) => {
@@ -810,6 +810,11 @@ function AccountRow({
               Run this on its Linux custodian. Claude linking is not available in the browser,
               and macOS refuses before provider launch.
             </p>
+          ) : account.provider === "devin" ? (
+            <p className="text-xs text-ink-muted">
+              Devin owns this foreground sign-in. Browser linking is not available; run the
+              command on the custodian machine, or add --manual-token-flow for a headless shell.
+            </p>
           ) : null}
         </>
       )}
@@ -1016,10 +1021,10 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
               <CommandHint>hra remote allow account-linking</CommandHint>
             </SettingsRow>
             <SettingsRow
-              description="Codex works on macOS or Linux. Claude login is foreground-only on its Linux custodian."
+              description="Codex, Claude, and Devin sign in on the machine that owns their isolated provider home."
               title="Link an account from the machine"
             >
-              <CommandHint>hra account login &lt;profile&gt; [--provider claude]</CommandHint>
+              <CommandHint>hra account login &lt;profile&gt; [--provider &lt;provider&gt;]</CommandHint>
             </SettingsRow>
           </SettingsCard>
         </SettingsSection>

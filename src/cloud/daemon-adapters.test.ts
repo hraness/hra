@@ -34,6 +34,7 @@ import type {
   CodexRuntimePort,
   CodexSessionProjection,
   CloudControlPort,
+  DevinRuntimePort,
   ProfileAuthority,
 } from "../daemon/ports";
 import { initializeStatePaths, resolveStatePaths, type StatePaths } from "../storage/paths";
@@ -48,7 +49,11 @@ import type {
   CloudDaemonCycleResult,
   CloudLocalCommandAuthority,
 } from "./daemon-bridge";
-import { BridgedCloudControl, StateBackedCloudDaemonAdapter } from "./daemon-adapters";
+import {
+  BridgedCloudControl,
+  deviceRegistryAccountAddress,
+  StateBackedCloudDaemonAdapter,
+} from "./daemon-adapters";
 import { parseDeviceRegistryPayload, type RemoteCommandPayload } from "./payloads";
 import type { CloudRemoteControlPort } from "./local-control";
 import type { CompactRemoteInteractionReasonCode } from "./projection";
@@ -437,6 +442,8 @@ class FakeClaude implements ClaudeRuntimePort {
   discardRuntimeReview(): void {}
   readSessionCalls = 0;
   readonly readSessionAuthorities: ProfileAuthority[] = [];
+  readAccountCalls = 0;
+  readonly accountProjection: ClaudeAccountReadinessProjection | Error;
   projection: CodexSessionProjection = {
     messages: [
       { role: "user", text: "Summarise the diff", turnId: "turn_claude_1" },
@@ -457,6 +464,13 @@ class FakeClaude implements ClaudeRuntimePort {
     }],
   };
 
+  constructor(accountProjection: ClaudeAccountReadinessProjection | Error = {
+    observedAt: 1_050,
+    readiness: "signed_in",
+  }) {
+    this.accountProjection = accountProjection;
+  }
+
   async readSession(
     input: Parameters<ClaudeRuntimePort["readSession"]>[0],
   ): Promise<CodexSessionProjection> {
@@ -470,7 +484,10 @@ class FakeClaude implements ClaudeRuntimePort {
   pinnedVersion(): string { return this.#unused(); }
   interactionAuthority(): never { return this.#unused(); }
   readAccount(): Promise<ClaudeAccountReadinessProjection> {
-    return Promise.resolve({ observedAt: 1_050, readiness: "signed_in" });
+    this.readAccountCalls += 1;
+    return this.accountProjection instanceof Error
+      ? Promise.reject(this.accountProjection)
+      : Promise.resolve(this.accountProjection);
   }
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unused()); }
   startSession(): Promise<never> { return Promise.reject(this.#unused()); }
@@ -480,6 +497,70 @@ class FakeClaude implements ClaudeRuntimePort {
   steer(): Promise<void> { return Promise.reject(this.#unused()); }
   interrupt(): Promise<void> { return Promise.reject(this.#unused()); }
   inspectInteractionAuthority(): ReturnType<ClaudeRuntimePort["inspectInteractionAuthority"]> { return Promise.reject(this.#unused()); }
+  validateInteractionResolution(): Promise<{ responseDigest: string }> { return Promise.reject(this.#unused()); }
+  resolveInteraction(): Promise<{ responseWritten: true }> { return Promise.reject(this.#unused()); }
+  validateInteractionTimeout(): Promise<{ responseDigest: string }> { return Promise.reject(this.#unused()); }
+  timeoutInteraction(): Promise<{ responseWritten: true }> { return Promise.reject(this.#unused()); }
+  async close(): Promise<void> {}
+}
+
+/** The same projection-only seam for a Devin ACP session. */
+class FakeDevin implements DevinRuntimePort {
+  readonly provider = "devin" as const;
+  discardRuntimeReview(): void {}
+  readSessionCalls = 0;
+  readonly readSessionAuthorities: ProfileAuthority[] = [];
+  readAccountCalls = 0;
+  readonly readAccountAuthorities: ProfileAuthority[] = [];
+  readonly accountProjection: CodexAccountProjection | Error;
+  projection: CodexSessionProjection = {
+    messages: [
+      { role: "user", text: "Implement the bounded change", turnId: "turn_devin_1" },
+      { role: "assistant", text: "The focused tests pass", turnId: "turn_devin_1" },
+    ],
+    providerThreadId: "thread_devin_0001",
+    providerUpdatedAt: 1_000,
+    status: "idle",
+    title: "Devin title",
+    turnSummaries: [{
+      actions: ["bun test"],
+      files: ["src/index.ts"],
+      id: "turn_devin_1",
+      omittedActions: 0,
+      omittedFiles: 0,
+      runtimeMs: 1_876,
+      status: "completed",
+    }],
+  };
+
+  constructor(accountProjection: CodexAccountProjection | Error = new Error("unused")) {
+    this.accountProjection = accountProjection;
+  }
+
+  async readSession(input: Parameters<DevinRuntimePort["readSession"]>[0]): Promise<CodexSessionProjection> {
+    this.readSessionCalls += 1;
+    this.readSessionAuthorities.push(input.authority);
+    return this.projection;
+  }
+  endSession(): Promise<void> { return Promise.resolve(); }
+  #unused(): never { throw new Error("unused"); }
+  pinnedVersion(): string { return this.#unused(); }
+  interactionAuthority(): never { return this.#unused(); }
+  readAccount(input: Parameters<DevinRuntimePort["readAccount"]>[0]): Promise<CodexAccountProjection> {
+    this.readAccountCalls += 1;
+    this.readAccountAuthorities.push(input.authority);
+    return this.accountProjection instanceof Error
+      ? Promise.reject(this.accountProjection)
+      : Promise.resolve(this.accountProjection);
+  }
+  reviewSessionStart(): Promise<never> { return Promise.reject(this.#unused()); }
+  startSession(): Promise<never> { return Promise.reject(this.#unused()); }
+  observeSession(): ReturnType<DevinRuntimePort["observeSession"]> { return Promise.reject(this.#unused()); }
+  reviewTurnStart(): Promise<never> { return Promise.reject(this.#unused()); }
+  startTurn(): Promise<never> { return Promise.reject(this.#unused()); }
+  steer(): Promise<void> { return Promise.reject(this.#unused()); }
+  interrupt(): Promise<void> { return Promise.reject(this.#unused()); }
+  inspectInteractionAuthority(): ReturnType<DevinRuntimePort["inspectInteractionAuthority"]> { return Promise.reject(this.#unused()); }
   validateInteractionResolution(): Promise<{ responseDigest: string }> { return Promise.reject(this.#unused()); }
   resolveInteraction(): Promise<{ responseWritten: true }> { return Promise.reject(this.#unused()); }
   validateInteractionTimeout(): Promise<{ responseDigest: string }> { return Promise.reject(this.#unused()); }
@@ -715,7 +796,7 @@ describe("state-backed cloud daemon adapter", () => {
         signal,
       })).rejects.toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -763,7 +844,183 @@ describe("state-backed cloud daemon adapter", () => {
       })).rejects.toThrow("local authority changed");
       expect(claude.readSessionCalls).toBe(0);
     } finally {
-      adapter.close();
+      await adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("projects an established Devin Astra session through the Devin port on Darwin", async () => {
+    const value = await fixture();
+    const profile = value.store.requireProfileById(
+      value.store.requireSession(value.sessionId).profileId,
+    );
+    const devinAccount = value.store.requireProviderAccountForProfile(profile.id, "devin");
+    value.store.observeProviderAccountReadiness({
+      expectedBindingGeneration: devinAccount.bindingGeneration,
+      profileId: profile.id,
+      provider: "devin",
+      readiness: "signed_in",
+    });
+    const firstDevinProcess = value.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: devinAccount.processGeneration,
+      profileId: profile.id,
+      provider: "devin",
+    });
+    const devinAuthority = value.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: firstDevinProcess.processGeneration,
+      profileId: profile.id,
+      provider: "devin",
+    });
+    expect(value.store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_out",
+    )).toBe(true);
+    const starting = value.store.createSession({
+      fastEnabled: false,
+      preset: "astra",
+      profileId: profile.id,
+      provider: "devin",
+      title: "Devin work",
+    });
+    const bound = value.store.bindSession({
+      expectedRevision: starting.revision,
+      providerThreadId: "thread_devin_0001",
+      sessionId: starting.id,
+      state: "idle",
+      providerUpdatedAt: 1_000,
+    });
+    const devinProfile = {
+      devinVersion: "3000.6.14" as const,
+      isolatedHome: true as const,
+      model: "gpt-6-astra",
+      observedAt: 2_100,
+      preset: "astra" as const,
+      processGeneration: devinAuthority.processGeneration,
+      profileId: profile.id,
+      protocolVersion: 1 as const,
+      reasoningEffort: "provider-default" as const,
+    };
+    const queued = value.store.enqueue(bound.id, "Implement the bounded change");
+    const evidence = value.store.beginQueueEffect({
+      evidence: {
+        baseline: { activeTurnId: null, providerUpdatedAt: 1_000, status: "idle" },
+        clientMessageId: queued.id,
+        kind: "queue.dispatch",
+        messageDigest: sha256("Implement the bounded change"),
+        profileGeneration: devinAuthority.processGeneration,
+        providerThreadId: "thread_devin_0001",
+        queueId: queued.id,
+        runtimeProfile: devinProfile,
+        sessionId: bound.id,
+      },
+      profileGeneration: devinAuthority.processGeneration,
+      providerAuthority: devinAuthority,
+      queueId: queued.id,
+      sessionId: bound.id,
+    });
+    value.store.completeQueueEffect({
+      applyResponseState: false,
+      expectedEvidenceDigest: evidence.digest,
+      expectedSessionRevision: bound.revision,
+      providerAuthority: devinAuthority,
+      queueId: queued.id,
+      receipt: { turnId: "turn_devin_1" },
+      runtimeProfile: devinProfile,
+      turnId: "turn_devin_1",
+      turnStatus: "completed",
+    });
+
+    const devin = new FakeDevin();
+    const remoteAuthorities: unknown[] = [];
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      devin,
+      executeRemote: (_command, authority) => {
+        remoteAuthorities.push(authority);
+        return Promise.resolve({});
+      },
+      paths: value.paths,
+      platform: "darwin",
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      const projected = await adapter.listSessions({ limit: 25, signal });
+      expect(projected.sessions.map((session) => session.publicId)).toContain(bound.id);
+      expect(devin.readSessionCalls).toBe(1);
+      expect(devinAuthority.processGeneration).toBe(2);
+      expect(profile.processGeneration).toBe(1);
+      expect(devin.readSessionAuthorities).toMatchObject([{
+        bindingGeneration: devinAuthority.bindingGeneration,
+        generation: devinAuthority.processGeneration,
+        id: profile.id,
+        provider: "devin",
+        providerAccountId: devinAuthority.providerAccountId,
+      }]);
+      expect(value.codex.readSessionCalls).toBe(0);
+      expect(await adapter.resolveCommandAuthority({
+        sessionPublicId: bound.id,
+        signal,
+      })).toMatchObject({
+        bindingGeneration: devinAuthority.bindingGeneration,
+        processGeneration: devinAuthority.processGeneration,
+        profileId: profile.id,
+        provider: "devin",
+        providerAccountId: devinAuthority.providerAccountId,
+        providerThreadId: "thread_devin_0001",
+      });
+      const events = await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: bound.id,
+        signal,
+      });
+      expect(events.events.map((event) => event.kind)).toEqual([
+        "user_message",
+        "assistant_message",
+        "turn_summary",
+      ]);
+      expect(events.events[2]).toMatchObject({
+        fast: false,
+        filesTouched: ["src/index.ts"],
+        kind: "turn_summary",
+        model: "astra",
+        runtimeMs: 1_876,
+      });
+      value.store.nextProfileGeneration(profile.id);
+      const commandAuthority = await adapter.resolveCommandAuthority({ sessionPublicId: bound.id, signal });
+      if (commandAuthority === null) throw new Error("Sibling Codex process cannot revoke Devin authority.");
+      expect(await adapter.execute({
+        authority: commandAuthority,
+        idempotencyKey: "00000000-0000-7000-8000-0000000000d1",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+        payload: { kind: "stop" },
+        sessionPublicId: bound.id,
+        signal,
+      })).toEqual({ code: "APPLIED", state: "applied" });
+      expect(remoteAuthorities).toMatchObject([{
+        bindingGeneration: devinAuthority.bindingGeneration,
+        processGeneration: devinAuthority.processGeneration,
+        provider: "devin",
+        providerAccountId: devinAuthority.providerAccountId,
+      }]);
+      value.store.advanceProviderAccountProcessGeneration({
+        expectedProcessGeneration: devinAuthority.processGeneration,
+        profileId: profile.id,
+        provider: "devin",
+      });
+      expect(await adapter.execute({
+        authority: commandAuthority,
+        idempotencyKey: "00000000-0000-7000-8000-0000000000d2",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+        payload: { kind: "stop" },
+        sessionPublicId: bound.id,
+        signal,
+      })).toEqual({ code: "LOCAL_AUTHORITY_CHANGED", state: "failed" });
+      expect(remoteAuthorities).toHaveLength(1);
+    } finally {
+      await adapter.close();
       value.store.close();
     }
   });
@@ -830,7 +1087,7 @@ describe("state-backed cloud daemon adapter", () => {
       expect(JSON.stringify(usage)).not.toContain("resetCreditsAvailable");
       expect(JSON.stringify(usage)).not.toContain("PRIVATE-RESET-CREDIT-SENTINEL");
 
-      adapter.close();
+      await adapter.close();
       adapter = new StateBackedCloudDaemonAdapter({
         codex: value.codex,
         executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
@@ -846,7 +1103,7 @@ describe("state-backed cloud daemon adapter", () => {
       });
       expect(replay.events).toEqual(first.events);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -917,7 +1174,7 @@ describe("state-backed cloud daemon adapter", () => {
         sourceRevision: snapshot.sourceRevision,
       }))).toEqual([{ matchReference: secondEmail, sourceRevision: 2 }]);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -1016,7 +1273,7 @@ describe("state-backed cloud daemon adapter", () => {
         .toMatchObject({ text: ordinaryPrompt });
       expect(JSON.stringify(projected.events)).not.toContain(privatePrompt);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -1064,7 +1321,7 @@ describe("state-backed cloud daemon adapter", () => {
       expect(new Set(observed).size).toBe(31);
       expect(afterPublicId).toBeNull();
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -1186,7 +1443,7 @@ describe("state-backed cloud daemon adapter", () => {
         signal,
       })).events).toEqual(terminal.events);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -1290,7 +1547,7 @@ describe("state-backed cloud daemon adapter", () => {
       expect((await adapter.listSessions({ limit: 25, signal })).sessions).toEqual([]);
       expect(value.codex.readSessionCalls).toBe(readSessionCalls);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -1381,7 +1638,7 @@ describe("state-backed cloud daemon adapter", () => {
       await adapter.acknowledgeCompactUpload(firstTerminalCheckpoint);
       expect((await adapter.listSessions({ limit: 25, signal })).sessions).toEqual([]);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -1451,7 +1708,7 @@ describe("state-backed cloud daemon adapter", () => {
       expect((await adapter.listSessions({ limit: 25, signal })).sessions.map(
         (session) => session.publicId,
       )).toEqual([value.sessionId]);
-      adapter.close();
+      await adapter.close();
       adapter = new StateBackedCloudDaemonAdapter({
         codex: value.codex,
         executeRemote: () => Promise.resolve({}),
@@ -1475,7 +1732,7 @@ describe("state-backed cloud daemon adapter", () => {
         state: "expired",
       })]);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -1512,7 +1769,7 @@ describe("state-backed cloud daemon adapter", () => {
       expect(first.events.filter((event) => event.kind === "interaction_state"))
         .toHaveLength(200);
 
-      adapter.close();
+      await adapter.close();
       const newestTerminalId = "11000000-0000-4000-8005-000000000001";
       admitCloudInteraction(
         value,
@@ -1545,7 +1802,7 @@ describe("state-backed cloud daemon adapter", () => {
         state: "expired",
       });
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -1622,7 +1879,7 @@ describe("state-backed cloud daemon adapter", () => {
         (session) => session.publicId,
       )).toEqual([value.sessionId]);
 
-      adapter.close();
+      await adapter.close();
       adapter = new StateBackedCloudDaemonAdapter({
         codex: value.codex,
         executeRemote: () => Promise.resolve({}),
@@ -1645,7 +1902,7 @@ describe("state-backed cloud daemon adapter", () => {
         state: "expired",
       })]);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -1686,7 +1943,7 @@ describe("state-backed cloud daemon adapter", () => {
         };
         await adapter.recordCompactUploadIntent(checkpoint);
         await adapter.acknowledgeCompactUpload(checkpoint);
-        adapter.close();
+        await adapter.close();
 
         const database = new Database(cachePath, { strict: true });
         if (variant === "epoch") {
@@ -1759,7 +2016,7 @@ describe("state-backed cloud daemon adapter", () => {
           signal,
         })).rejects.toThrow("explicit, potentially history-discarding reseed");
       } finally {
-        adapter.close();
+        await adapter.close();
         value.store.close();
       }
     }
@@ -1778,7 +2035,7 @@ describe("state-backed cloud daemon adapter", () => {
       try {
         const signal = new AbortController().signal;
         await adapter.listSessions({ limit: 25, signal });
-        adapter.close();
+        await adapter.close();
         const database = new Database(cachePath, { strict: true });
         if (variant === "body") {
           database.query(
@@ -1824,7 +2081,7 @@ describe("state-backed cloud daemon adapter", () => {
           state: "degraded",
         });
       } finally {
-        adapter.close();
+        await adapter.close();
         value.store.close();
       }
     }
@@ -1868,7 +2125,7 @@ describe("state-backed cloud daemon adapter", () => {
         state: "degraded",
       });
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -1909,7 +2166,7 @@ describe("state-backed cloud daemon adapter", () => {
         state: "degraded",
       });
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -1932,7 +2189,7 @@ describe("state-backed cloud daemon adapter", () => {
     try {
       const signal = new AbortController().signal;
       await adapter.listSessions({ limit: 25, signal });
-      adapter.close();
+      await adapter.close();
       const database = new Database(cachePath, { strict: true });
       database.query(
         `UPDATE projection_turns
@@ -1963,7 +2220,7 @@ describe("state-backed cloud daemon adapter", () => {
         state: "degraded",
       });
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2023,7 +2280,7 @@ describe("state-backed cloud daemon adapter", () => {
         sourceGeneration: profile.processGeneration + 1,
       })).toEqual([]);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2063,7 +2320,7 @@ describe("state-backed cloud daemon adapter", () => {
       await adapter.listSessions({ limit: 25, signal });
       expect(await adapter.readCompactEvents({ afterSequence: 0, limit: 128, sessionPublicId: value.sessionId, signal })).toEqual(first);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2107,7 +2364,7 @@ describe("state-backed cloud daemon adapter", () => {
       expect((await adapter.readCompactEvents({ afterSequence: 0, limit: 128, sessionPublicId: value.sessionId, signal })).events.at(-1))
         .toMatchObject({ fast: true, model: "ultra" });
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2152,7 +2409,7 @@ describe("state-backed cloud daemon adapter", () => {
       expect((await adapter.readCompactEvents({ afterSequence: 0, limit: 128, sessionPublicId: value.sessionId, signal })).events)
         .toHaveLength(3);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2166,7 +2423,7 @@ describe("state-backed cloud daemon adapter", () => {
       paths: value.paths,
       store: value.store,
     });
-    initial.close();
+    await initial.close();
     const database = new Database(cachePath, { strict: true });
     database.query("INSERT INTO projection_sessions(session_id,next_sequence) VALUES (?,?)")
       .run(value.sessionId, 41);
@@ -2237,7 +2494,7 @@ describe("state-backed cloud daemon adapter", () => {
         Array.from({ length: 40 }, (_, index) => index + 1),
       );
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2291,7 +2548,7 @@ describe("state-backed cloud daemon adapter", () => {
         signal,
       })).rejects.toThrow("explicit, potentially history-discarding reseed");
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2352,7 +2609,7 @@ describe("state-backed cloud daemon adapter", () => {
         signal,
       })).rejects.toThrow("awaiting exact local cache activation");
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2453,7 +2710,7 @@ describe("state-backed cloud daemon adapter", () => {
       expect(future.events[2]).toMatchObject({ kind: "turn_summary", runtimeMs: 25 });
       expect(JSON.stringify(future.events)).not.toContain(privatePrompt);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2549,7 +2806,7 @@ describe("state-backed cloud daemon adapter", () => {
       } as const;
       await adapter.stageCompactProjectionRecovery(installation);
 
-      adapter.close();
+      await adapter.close();
       adapter = new StateBackedCloudDaemonAdapter({
         codex: value.codex,
         executeRemote: () => Promise.resolve({}),
@@ -2582,7 +2839,7 @@ describe("state-backed cloud daemon adapter", () => {
         summary: "An MCP server requests protected form input",
       }]);
 
-      adapter.close();
+      await adapter.close();
       adapter = new StateBackedCloudDaemonAdapter({
         codex: value.codex,
         executeRemote: () => Promise.resolve({}),
@@ -2611,7 +2868,7 @@ describe("state-backed cloud daemon adapter", () => {
         "d".repeat(64),
       ]) expect(JSON.stringify(replay.events)).not.toContain(privateValue);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2672,7 +2929,7 @@ describe("state-backed cloud daemon adapter", () => {
         signal,
       })).events.map((event) => event.sequence)).toEqual([10, 11, 12]);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2724,7 +2981,7 @@ describe("state-backed cloud daemon adapter", () => {
       });
       expect(plan.baselineCompletedTurns).toEqual([]);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2777,7 +3034,7 @@ describe("state-backed cloud daemon adapter", () => {
         signal,
       })).cacheId).toBe(plan.replacementCacheId);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2824,7 +3081,7 @@ describe("state-backed cloud daemon adapter", () => {
       expect((await readdir(value.paths.root)).some((name) =>
         name.includes(`quarantine-${idempotencyKey}`))).toBe(false);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2878,7 +3135,7 @@ describe("state-backed cloud daemon adapter", () => {
         name.includes(`recovery-${idempotencyKey}`))).toBe(false);
       expect((await lstat(cachePath)).ino).toBe(replacementIdentity.ino);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2923,7 +3180,7 @@ describe("state-backed cloud daemon adapter", () => {
       expect((await readdir(value.paths.root)).some((name) =>
         name.includes(`quarantine-${idempotencyKey}`))).toBe(true);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -2963,7 +3220,7 @@ describe("state-backed cloud daemon adapter", () => {
       expect((await readdir(value.paths.root)).some((name) =>
         name.includes(`recovery-${idempotencyKey}`))).toBe(false);
 
-      adapter.close();
+      await adapter.close();
       await rm(cachePath);
       await rename(originalPath, cachePath);
       adapter = new StateBackedCloudDaemonAdapter({
@@ -2993,7 +3250,7 @@ describe("state-backed cloud daemon adapter", () => {
       rebuilt.close(false);
       await adapter.activateCompactProjectionRecovery(installation);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -3051,7 +3308,7 @@ describe("state-backed cloud daemon adapter", () => {
       const after = await snapshotFutureFiles();
       expect(after).toEqual(before);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -3092,7 +3349,7 @@ describe("state-backed cloud daemon adapter", () => {
         expect((await readdir(value.paths.root)).some((name) =>
           name.includes(`recovery-${idempotencyKey}`))).toBe(false);
       } finally {
-        adapter.close();
+        await adapter.close();
         value.store.close();
       }
     }
@@ -3197,7 +3454,7 @@ describe("state-backed cloud daemon adapter", () => {
         ? projection.events[0].remotePolicy
         : "wrong-kind").toBeUndefined();
     } finally {
-      adapter.close();
+      await adapter.close();
       const migrated = new Database(cachePath, { strict: true });
       expect((migrated.query("PRAGMA user_version").get() as { user_version: number })
         .user_version).toBe(5);
@@ -3276,7 +3533,7 @@ describe("state-backed cloud daemon adapter", () => {
     try {
       expect(adapter.projectionCacheStatus()).toEqual({ state: "ready" });
     } finally {
-      adapter.close();
+      await adapter.close();
       const migrated = new Database(cachePath, { readonly: true, strict: true });
       expect((migrated.query("PRAGMA user_version").get() as { user_version: number })
         .user_version).toBe(5);
@@ -3314,7 +3571,7 @@ describe("state-backed cloud daemon adapter", () => {
         limit: 25,
         signal: new AbortController().signal,
       });
-      adapter.close();
+      await adapter.close();
       const previous = new Database(cachePath, { strict: true });
       previous.exec(`
         DROP TABLE projection_interaction_index;
@@ -3331,7 +3588,7 @@ describe("state-backed cloud daemon adapter", () => {
       });
       expect(adapter.projectionCacheStatus()).toEqual({ state: "ready" });
     } finally {
-      adapter.close();
+      await adapter.close();
       const migrated = new Database(cachePath, { readonly: true, strict: true });
       expect((migrated.query("PRAGMA user_version").get() as { user_version: number })
         .user_version).toBe(5);
@@ -3363,7 +3620,7 @@ describe("state-backed cloud daemon adapter", () => {
         limit: 25,
         signal: new AbortController().signal,
       });
-      adapter.close();
+      await adapter.close();
       const previous = new Database(cachePath, { strict: true });
       previous.exec(`
         DROP TABLE projection_interaction_index;
@@ -3379,7 +3636,7 @@ describe("state-backed cloud daemon adapter", () => {
       });
       expect(adapter.projectionCacheStatus()).toEqual({ state: "ready" });
     } finally {
-      adapter.close();
+      await adapter.close();
       const migrated = new Database(cachePath, { readonly: true, strict: true });
       expect((migrated.query("PRAGMA user_version").get() as { user_version: number })
         .user_version).toBe(5);
@@ -3433,7 +3690,7 @@ describe("state-backed cloud daemon adapter", () => {
       await adapter.acknowledgeCompactUpload(checkpoint);
       expect(adapter.projectionCacheStatus()).toEqual({ state: "ready" });
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -3477,7 +3734,7 @@ describe("state-backed cloud daemon adapter", () => {
         await expect(adapter.readCompactEvents({ afterSequence: 0, limit: 128, sessionPublicId: value.sessionId, signal: new AbortController().signal }))
           .rejects.toThrow("cloud projection cache");
       } finally {
-        adapter.close();
+        await adapter.close();
         value.store.close();
       }
     }
@@ -3530,8 +3787,23 @@ describe("state-backed cloud daemon adapter", () => {
         provider: "codex",
         session: value.sessionId,
       });
+      expect(await adapter.execute({
+        authority: authority as CloudLocalCommandAuthority,
+        idempotencyKey: "00000000-0000-7000-8000-0000000000a3",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+        payload: { kind: "set_provider", preset: "astra", provider: "devin" },
+        sessionPublicId: value.sessionId,
+        signal,
+      })).toEqual({ code: "APPLIED", state: "applied" });
+      expect(commands[2]).toEqual({
+        idempotencyKey: "00000000-0000-7000-8000-0000000000a3",
+        kind: "session.switch",
+        preset: "astra",
+        provider: "devin",
+        session: value.sessionId,
+      });
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -3606,7 +3878,7 @@ describe("state-backed cloud daemon adapter", () => {
       })).toEqual({ code: "LOCAL_AUTHORITY_CHANGED", state: "failed" });
       expect(commands).toHaveLength(2);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -3647,7 +3919,7 @@ describe("state-backed cloud daemon adapter", () => {
       })).toEqual({ code: "LOCAL_AUTHORITY_CHANGED", state: "failed" });
       expect(commands).toEqual([]);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -3867,7 +4139,7 @@ describe("remote decisions at the custodian", () => {
       })).toEqual({ code: "INTERACTION_NOT_FOUND", state: "failed" });
       expect(commands.filter((command) => command.kind === "interaction.resolve")).toHaveLength(0);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -4023,7 +4295,7 @@ describe("remote interaction detail and the decisions it licenses", () => {
         resolution: { decision: "decline", kind: "approval_decision" },
       });
     } finally {
-      harnessed.adapter.close();
+      await harnessed.adapter.close();
       value.store.close();
     }
   });
@@ -4099,7 +4371,7 @@ describe("remote interaction detail and the decisions it licenses", () => {
         && command.resolution.kind === "approval_decision"
         && command.resolution.decision === "decline")).toBe(true);
     } finally {
-      harnessed.adapter.close();
+      await harnessed.adapter.close();
       value.store.close();
     }
   });
@@ -4204,7 +4476,7 @@ describe("remote interaction detail and the decisions it licenses", () => {
       });
 
     } finally {
-      harnessed.adapter.close();
+      await harnessed.adapter.close();
       value.store.close();
     }
   });
@@ -4522,7 +4794,7 @@ describe("remote interaction detail and the decisions it licenses", () => {
       })).toEqual({ code: "INTERACTION_ELICITATION_NOT_REMOTE", state: "failed" });
       expect(harnessed.commands).toHaveLength(0);
     } finally {
-      harnessed.adapter.close();
+      await harnessed.adapter.close();
       value.store.close();
     }
   });
@@ -4583,7 +4855,7 @@ describe("remote interaction detail and the decisions it licenses", () => {
         revision: 1,
       })).toEqual({ code: "INTERACTION_ALREADY_RESOLVED", state: "failed" });
     } finally {
-      harnessed.adapter.close();
+      await harnessed.adapter.close();
       value.store.close();
     }
   });
@@ -4613,7 +4885,7 @@ describe("remote interaction detail and the decisions it licenses", () => {
         revision: 1,
       })).toEqual({ code: "INTERACTION_DECISION_NOT_REMOTE", state: "failed" });
     } finally {
-      harnessed.adapter.close();
+      await harnessed.adapter.close();
       value.store.close();
     }
   });
@@ -4724,7 +4996,7 @@ describe("remote interaction detail and the decisions it licenses", () => {
         }
       }
     } finally {
-      harnessed.adapter.close();
+      await harnessed.adapter.close();
       value.store.close();
     }
   });
@@ -4792,7 +5064,7 @@ describe("remote interaction detail and the decisions it licenses", () => {
         revision: 2,
       })).toEqual({ code: "INTERACTION_ALREADY_RESOLVED", state: "failed" });
     } finally {
-      harnessed.adapter.close();
+      await harnessed.adapter.close();
       value.store.close();
     }
   });
@@ -4881,7 +5153,7 @@ describe("settings commands and the device registry", () => {
         .toEqual({ code: "APPLIED", state: "applied" });
       expect(commands.at(-1)).toMatchObject({ kind: "session.rename", name: "Untitled session" });
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -4918,7 +5190,7 @@ describe("settings commands and the device registry", () => {
         signal,
       })).includeThinking).toBe(true);
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -5044,7 +5316,7 @@ describe("settings commands and the device registry", () => {
         signal,
       })).rejects.toThrow("NOTIFICATION_POLICY_REVISION_DIVERGED");
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -5068,7 +5340,7 @@ describe("settings commands and the device registry", () => {
       const restored = await adapter.listSessions({ limit: 10, signal });
       expect(restored.sessions.at(0)?.metadata.archived).toBeUndefined();
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -5080,7 +5352,11 @@ describe("settings commands and the device registry", () => {
  * day bucket, and the account and project the registry projected. Each refusal
  * has its own closed code so the browser can name the operator switch.
  */
-async function deviceCommandFixture() {
+async function deviceCommandFixture(options: Readonly<{
+  claude?: ClaudeRuntimePort;
+  devin?: DevinRuntimePort;
+  now?: () => number;
+}> = {}) {
   const value = await fixture();
   const root = join(value.paths.root, "device-command-project");
   await mkdir(root, { recursive: true });
@@ -5091,7 +5367,9 @@ async function deviceCommandFixture() {
   const executed: LocalCommand[] = [];
   const notices: string[] = [];
   const adapter = new StateBackedCloudDaemonAdapter({
+    ...(options.claude === undefined ? {} : { claude: options.claude }),
     codex: value.codex,
+    ...(options.devin === undefined ? {} : { devin: options.devin }),
     executeLocal: (command) => {
       executed.push(command);
       if (command.kind === "session.start") {
@@ -5110,7 +5388,8 @@ async function deviceCommandFixture() {
     },
     executeRemote: () => Promise.resolve({}),
     notifyOperator: (input) => { notices.push(input.title); return Promise.resolve(); },
-    now: () => 1_760_000_000_000,
+    now: options.now ?? (() => 1_760_000_000_000),
+    readCodexAutomations: async () => [],
     paths: value.paths,
     store: value.store,
   });
@@ -5125,7 +5404,568 @@ async function deviceCommandFixture() {
   return { account, adapter, executed, loginAccount, notices, project, sessionStart, value };
 }
 
+async function observeFixtureRegistry(world: Awaited<ReturnType<typeof deviceCommandFixture>>) {
+  const signal = new AbortController().signal;
+  // These fake providers settle immediately. Each refresh advances the bounded
+  // background discovery cursor; the following read projects that observation.
+  const count = world.value.store.listProfiles().length;
+  for (let index = 0; index < count; index += 1) {
+    await world.adapter.readDeviceRegistry({ signal });
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+  }
+  return await world.adapter.readDeviceRegistry({ signal });
+}
+
 describe("device command execution", () => {
+  test("a login-pending profile cannot starve later provider account discovery", async () => {
+    const world = await deviceCommandFixture({ devin: new FakeDevin({ signedIn: true }) });
+    try {
+      const [first, second] = world.value.store.listProfiles();
+      if (first === undefined || second === undefined) throw new Error("Expected two isolated profiles.");
+      const account = world.value.store.requireProviderAccountForProfile(first.id, "devin");
+      world.value.store.observeProviderAccountReadiness({
+        expectedBindingGeneration: account.bindingGeneration,
+        profileId: first.id,
+        provider: "devin",
+        readiness: "login_pending",
+      });
+      const registry = await observeFixtureRegistry(world);
+      expect(registry.accounts.filter((entry) => entry.provider === "devin").map((entry) => entry.publicId))
+        .toEqual([`devin_${second.id}`]);
+    } finally {
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("backwards clock movement invalidates cached auth instead of extending its freshness", async () => {
+    let now = 1_760_000_000_000;
+    const devin = new FakeDevin({ signedIn: true });
+    const world = await deviceCommandFixture({ devin, now: () => now });
+    try {
+      expect((await observeFixtureRegistry(world)).accounts.some((account) => account.provider === "devin")).toBe(true);
+      now -= 1;
+      const backwards = await world.adapter.readDeviceRegistry({ signal: new AbortController().signal });
+      expect(backwards.accounts.some((account) => account.provider === "devin")).toBe(false);
+      expect((await observeFixtureRegistry(world)).accounts.some((account) => account.provider === "devin")).toBe(true);
+    } finally {
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("held auth results cannot survive their own binding or process change", async () => {
+    for (const change of ["binding", "process"] as const) {
+      const devin = new FakeDevin();
+      let release: (projection: CodexAccountProjection) => void = () => {};
+      let observedAuthority: ProfileAuthority | undefined;
+      Object.defineProperty(devin, "readAccount", {
+        value: (input: Parameters<DevinRuntimePort["readAccount"]>[0]) => {
+          observedAuthority = input.authority;
+          return new Promise<CodexAccountProjection>((resolve) => {
+            release = resolve;
+            input.signal.addEventListener("abort", () => resolve({ signedIn: false }), { once: true });
+          });
+        },
+      });
+      const world = await deviceCommandFixture({ devin });
+      try {
+        await world.adapter.readDeviceRegistry({ signal: new AbortController().signal });
+        const captured = observedAuthority;
+        if (captured === undefined) throw new Error("Expected an admitted auth probe.");
+        const account = world.value.store.requireProviderAccountForProfile(captured.id, "devin");
+        expect(captured).toMatchObject({
+          bindingGeneration: account.bindingGeneration,
+          generation: account.processGeneration,
+          provider: "devin",
+          providerAccountId: account.id,
+        });
+        if (change === "binding") {
+          world.value.store.observeProviderAccountReadiness({
+            expectedBindingGeneration: account.bindingGeneration,
+            profileId: captured.id,
+            provider: "devin",
+            readiness: "signed_out",
+          });
+        } else {
+          world.value.store.advanceProviderAccountProcessGeneration({
+            expectedProcessGeneration: account.processGeneration,
+            profileId: captured.id,
+            provider: "devin",
+          });
+        }
+        release({ signedIn: true });
+        await new Promise<void>((resolve) => { setImmediate(resolve); });
+        const registry = await world.adapter.readDeviceRegistry({ signal: new AbortController().signal });
+        expect(registry.accounts.some((entry) => entry.publicId === `devin_${captured.id}`)).toBe(false);
+      } finally {
+        release({ signedIn: false });
+        await world.adapter.close();
+        world.value.store.close();
+      }
+    }
+  });
+
+  test("Claude unverified readiness is omitted and foreground login states cannot inherit cached signed-in rows", async () => {
+    const claude = new FakeClaude({ observedAt: 1_050, readiness: "unverified" });
+    const devin = new FakeDevin({ signedIn: true });
+    const world = await deviceCommandFixture({ claude, devin });
+    try {
+      const registry = await observeFixtureRegistry(world);
+      expect(registry.accounts.some((account) => account.provider === "claude")).toBe(false);
+      expect(registry.accounts.some((account) => account.provider === "devin")).toBe(true);
+      const account = world.value.store.requireProviderAccountForProfile(world.account.id, "devin");
+      world.value.store.observeProviderAccountReadiness({
+        expectedBindingGeneration: account.bindingGeneration,
+        profileId: world.account.id,
+        provider: "devin",
+        readiness: "login_pending",
+      });
+      const pending = await observeFixtureRegistry(world);
+      expect(pending.accounts.some((entry) => entry.publicId === `devin_${world.account.id}`)).toBe(false);
+    } finally {
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("expires optional auth observations and invalidates their own authority without borrowing Codex generation", async () => {
+    let now = 1_760_000_000_000;
+    const devin = new FakeDevin({ signedIn: true });
+    const world = await deviceCommandFixture({ devin, now: () => now });
+    try {
+      expect((await observeFixtureRegistry(world)).accounts.filter((account) => account.provider === "devin"))
+        .toHaveLength(2);
+      world.value.store.removeProfile(world.loginAccount.id);
+      world.value.store.nextProfileGeneration(world.account.id);
+      const changed = await world.adapter.readDeviceRegistry({ signal: new AbortController().signal });
+      expect(changed.accounts.some((account) => account.publicId.endsWith(world.loginAccount.id)))
+        .toBe(false);
+      expect(changed.accounts.some((account) => account.provider === "devin")).toBe(true);
+      const devinAccount = world.value.store.requireProviderAccountForProfile(world.account.id, "devin");
+      world.value.store.advanceProviderAccountProcessGeneration({
+        expectedProcessGeneration: devinAccount.processGeneration,
+        profileId: world.account.id,
+        provider: "devin",
+      });
+      const ownChanged = await world.adapter.readDeviceRegistry({ signal: new AbortController().signal });
+      expect(ownChanged.accounts.some((account) => account.provider === "devin")).toBe(false);
+      expect((await observeFixtureRegistry(world)).accounts.some((account) => account.provider === "devin"))
+        .toBe(true);
+      now += 60_001;
+      const expired = await world.adapter.readDeviceRegistry({ signal: new AbortController().signal });
+      expect(expired.accounts.some((account) => account.provider === "devin")).toBe(false);
+    } finally {
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("provider discovery rotates through later profiles and backs off failed probes", async () => {
+    let now = 1_760_000_000_000;
+    const devin = new FakeDevin(new Error("runtime unavailable"));
+    const observedProfiles: string[] = [];
+    Object.defineProperty(devin, "readAccount", {
+      value: (input: Parameters<DevinRuntimePort["readAccount"]>[0]) => {
+        observedProfiles.push(input.authority.id);
+        return Promise.reject(new Error("runtime unavailable"));
+      },
+    });
+    const world = await deviceCommandFixture({ devin, now: () => now });
+    world.value.store.createProfile("Third provider profile");
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        await world.adapter.readDeviceRegistry({ signal: new AbortController().signal });
+        await new Promise<void>((resolve) => { setImmediate(resolve); });
+        now += 60_001;
+      }
+      expect(new Set(observedProfiles).size).toBe(3);
+      await observeFixtureRegistry(world);
+      const count = observedProfiles.length;
+      await observeFixtureRegistry(world);
+      expect(observedProfiles).toHaveLength(count);
+    } finally {
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("joins canceled background auth cleanup and shares the close outcome", async () => {
+    const devin = new FakeDevin();
+    let releaseJoin!: () => void;
+    const joined = new Promise<void>((resolve) => { releaseJoin = resolve; });
+    let probeSignal: AbortSignal | undefined;
+    Object.defineProperty(devin, "readAccount", {
+      value: async (input: Parameters<DevinRuntimePort["readAccount"]>[0]) => {
+        probeSignal = input.signal;
+        await new Promise<void>((resolve) => {
+          input.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        await joined;
+        throw new Error("Provider observation canceled after cleanup");
+      },
+    });
+    const world = await deviceCommandFixture({ devin });
+    try {
+      await world.adapter.readDeviceRegistry({ signal: new AbortController().signal });
+      const closing = world.adapter.close();
+      expect(probeSignal?.aborted).toBe(true);
+      expect(world.adapter.close()).toBe(closing);
+      let settled = false;
+      void closing.then(() => { settled = true; });
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+      expect(settled).toBe(false);
+      releaseJoin();
+      await closing;
+      expect(settled).toBe(true);
+    } finally {
+      releaseJoin();
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("fences future observations and fails close when provider child cleanup is unproven", async () => {
+    const cleanupFailure = new Error("Devin authentication output could not be drained");
+    const devin = new FakeDevin(new Error("runtime admission failed", { cause: cleanupFailure }));
+    const world = await deviceCommandFixture({ devin });
+    try {
+      await observeFixtureRegistry(world);
+      await observeFixtureRegistry(world);
+      expect(devin.readAccountCalls).toBe(1);
+      await expect(world.adapter.close()).rejects.toThrow("cleanup could not be proven");
+    } finally {
+      await world.adapter.close().catch(() => undefined);
+      world.value.store.close();
+    }
+  });
+
+  test("a held Devin auth probe cannot block registry, Codex, or settings commands", async () => {
+    const devin = new FakeDevin();
+    const probeSignals: AbortSignal[] = [];
+    Object.defineProperty(devin, "readAccount", {
+      value: (input: Parameters<DevinRuntimePort["readAccount"]>[0]) => {
+        devin.readAccountCalls += 1;
+        probeSignals.push(input.signal);
+        return new Promise<CodexAccountProjection>((_resolve, reject) => {
+          input.signal.addEventListener("abort", () => reject(input.signal.reason), { once: true });
+        });
+      },
+    });
+    const world = await deviceCommandFixture({ devin });
+    const controller = new AbortController();
+    const promptly = async <T>(promise: Promise<T>): Promise<T | "blocked"> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<"blocked">((resolve) => {
+            timer = setTimeout(() => resolve("blocked"), 100);
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    };
+    const registry = world.adapter.readDeviceRegistry({ signal: controller.signal });
+    try {
+      expect(await promptly(registry)).not.toBe("blocked");
+      for (let index = 0; index < 3; index += 1) {
+        const projection = await world.adapter.readDeviceRegistry({ signal: controller.signal });
+        expect(projection.accounts.some((account) => account.provider === "devin")).toBe(false);
+      }
+      expect(devin.readAccountCalls).toBe(1);
+      expect(await promptly(world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000111",
+        payload: world.sessionStart,
+        requestingDevicePublicId: "device_browser1",
+        signal: controller.signal,
+      }))).toMatchObject({ code: "APPLIED", state: "applied" });
+      expect(await promptly(world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000112",
+        payload: {
+          endMinute: 1_320,
+          expectedRevision: world.value.store.readNotificationHours().revision,
+          kind: "set_notification_hours",
+          startMinute: 600,
+          timeZone: "America/Puerto_Rico",
+          version: 1,
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal: controller.signal,
+      }))).toEqual({ code: "APPLIED", state: "applied" });
+      expect(devin.readAccountCalls).toBe(1);
+      controller.abort(new Error("registry caller canceled"));
+      expect(probeSignals.every((signal) => signal.aborted)).toBe(true);
+      await world.adapter.close();
+      expect(probeSignals.every((signal) => signal.aborted)).toBe(true);
+    } finally {
+      controller.abort(new Error("test cleanup"));
+      await registry.catch(() => undefined);
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("derives reversible provider-qualified account ids without cross-provider collisions", async () => {
+    const world = await deviceCommandFixture({
+      claude: new FakeClaude({ observedAt: 1_050, readiness: "signed_in" }),
+      devin: new FakeDevin({ signedIn: true }),
+    });
+    try {
+      const addresses = (["codex", "claude", "devin"] as const).map((provider) =>
+        deviceRegistryAccountAddress({
+          kind: "local",
+          profileId: world.account.id,
+          provider,
+        }));
+      expect(addresses.every((address) => address !== null)).toBe(true);
+      expect(new Set(addresses.map((address) => address?.publicId)).size).toBe(3);
+      expect(addresses.map((address) => address?.publicId)).toEqual([
+        world.account.id,
+        `claude_${world.account.id}`,
+        `devin_${world.account.id}`,
+      ]);
+      for (const address of addresses) {
+        if (address === null) throw new Error("expected account address");
+        expect(deviceRegistryAccountAddress({ kind: "public", publicId: address.publicId }))
+          .toEqual(address);
+      }
+      expect(deviceRegistryAccountAddress({
+        kind: "public",
+        publicId: `codex_${world.account.id}`,
+      })).toBeNull();
+      expect(deviceRegistryAccountAddress({
+        kind: "public",
+        publicId: "devin_".padEnd(97, "a"),
+      })).toBeNull();
+
+      const registry = await observeFixtureRegistry(world);
+      expect(new Set(registry.accounts.map((account) => account.publicId)).size)
+        .toBe(registry.accounts.length);
+      for (const provider of ["claude", "devin"] as const) {
+        const localId = world.value.store.requireProviderAccountForProfile(world.account.id, provider).id;
+        expect(JSON.stringify(registry)).not.toContain(localId);
+        expect(deviceRegistryAccountAddress({ kind: "public", publicId: localId })).toBeNull();
+      }
+      expect(registry.accounts
+        .filter((account) => account.publicId.endsWith(world.account.id))
+        .map((account) => [account.provider, account.status]))
+        .toEqual([
+          ["codex", "signed_in"],
+          ["claude", "signed_in"],
+          ["devin", "signed_in"],
+        ]);
+    } finally {
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("caps the registry only at complete provider-qualified profile groups", async () => {
+    const world = await deviceCommandFixture({
+      claude: new FakeClaude({ observedAt: 1_050, readiness: "signed_in" }),
+      devin: new FakeDevin({ signedIn: true }),
+    });
+    try {
+      for (let index = 0; index < 32; index += 1) {
+        world.value.store.createProfile(`Provider group ${index.toString().padStart(2, "0")}`);
+      }
+      const registry = await observeFixtureRegistry(world);
+      expect(registry.accounts).toHaveLength(99);
+      const providersByProfile = new Map<string, string[]>();
+      for (const account of registry.accounts) {
+        const address = deviceRegistryAccountAddress({
+          kind: "public",
+          publicId: account.publicId,
+        });
+        if (address === null) throw new Error("expected bounded registry account address");
+        const providers = providersByProfile.get(address.profileId) ?? [];
+        providers.push(address.provider);
+        providersByProfile.set(address.profileId, providers);
+      }
+      expect(providersByProfile.size).toBe(33);
+      for (const providers of providersByProfile.values()) {
+        expect(providers).toEqual(["codex", "claude", "devin"]);
+      }
+    } finally {
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("discovers a signed-in Devin account and translates its public id before local start", async () => {
+    const devin = new FakeDevin({ signedIn: true });
+    const world = await deviceCommandFixture({ devin });
+    try {
+      const signal = new AbortController().signal;
+      const registry = await observeFixtureRegistry(world);
+      const account = registry.accounts.find((entry) =>
+        entry.provider === "devin" && entry.publicId.endsWith(world.account.id));
+      expect(account).toEqual({
+        label: "Personal `[local-path]`",
+        provider: "devin",
+        publicId: `devin_${world.account.id}`,
+        status: "signed_in",
+      });
+      if (account === undefined) throw new Error("expected Devin registry account");
+
+      const outcome = await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000101",
+        payload: {
+          ...world.sessionStart,
+          accountPublicId: account.publicId,
+          preset: "astra",
+          provider: "devin",
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      });
+      expect(outcome).toMatchObject({ code: "APPLIED", state: "applied" });
+      expect(world.executed[0]).toMatchObject({
+        account: world.account.id,
+        kind: "session.start",
+        preset: "astra",
+        provider: "devin",
+      });
+      expect(devin.readAccountCalls).toBe(2);
+    } finally {
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("publishes known signed-out Devin state and refuses it before local execution", async () => {
+    const world = await deviceCommandFixture({ devin: new FakeDevin({ signedIn: false }) });
+    try {
+      const signal = new AbortController().signal;
+      const address = deviceRegistryAccountAddress({
+        kind: "local",
+        profileId: world.account.id,
+        provider: "devin",
+      });
+      if (address === null) throw new Error("expected Devin account address");
+      expect((await observeFixtureRegistry(world)).accounts.some((account) =>
+        account.provider === "devin"
+        && account.publicId === address.publicId
+        && account.status === "signed_out"))
+        .toBe(true);
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000102",
+        payload: {
+          ...world.sessionStart,
+          accountPublicId: address.publicId,
+          preset: "astra",
+          provider: "devin",
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toEqual({ code: "DEVICE_COMMAND_ACCOUNT_SIGNED_OUT", state: "failed" });
+      expect(world.executed).toEqual([]);
+    } finally {
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("refuses a provider mismatch against the provider-qualified account row", async () => {
+    const world = await deviceCommandFixture({ devin: new FakeDevin({ signedIn: true }) });
+    try {
+      const address = deviceRegistryAccountAddress({
+        kind: "local",
+        profileId: world.account.id,
+        provider: "devin",
+      });
+      if (address === null) throw new Error("expected Devin account address");
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000103",
+        payload: { ...world.sessionStart, accountPublicId: address.publicId },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      })).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", state: "failed" });
+      expect(world.executed).toEqual([]);
+    } finally {
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("omits a Devin row when its runtime cannot prove authentication", async () => {
+    const devin = new FakeDevin(new Error("runtime unavailable"));
+    const world = await deviceCommandFixture({ devin });
+    try {
+      const registry = await world.adapter.readDeviceRegistry({
+        signal: new AbortController().signal,
+      });
+      expect(registry.accounts.some((account) => account.provider === "devin")).toBe(false);
+      expect(registry.accounts.some((account) =>
+        account.provider === "codex"
+        && account.publicId === world.account.id
+        && account.status === "signed_in"))
+        .toBe(true);
+      expect(devin.readAccountCalls).toBe(1);
+    } finally {
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("keeps Codex login on raw profile ids and refuses provider-qualified ids", async () => {
+    const world = await deviceCommandFixture({ devin: new FakeDevin({ signedIn: true }) });
+    try {
+      world.value.store.setAccountLinkingAllowed(true);
+      const signal = new AbortController().signal;
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000104",
+        payload: {
+          accountPublicId: world.loginAccount.id,
+          kind: "account_login_status",
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toMatchObject({
+        code: "APPLIED",
+        result: { kind: "account_login_status", status: "idle" },
+        state: "applied",
+      });
+
+      const devinAddress = deviceRegistryAccountAddress({
+        kind: "local",
+        profileId: world.loginAccount.id,
+        provider: "devin",
+      });
+      if (devinAddress === null) throw new Error("expected Devin account address");
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000105",
+        payload: {
+          accountPublicId: devinAddress.publicId,
+          kind: "account_login_status",
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", state: "failed" });
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000106",
+        payload: {
+          accountPublicId: world.loginAccount.id,
+          handoffVersion: 2,
+          kind: "account_login_start",
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toEqual({ code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" });
+      expect(world.executed).toHaveLength(1);
+      expect(world.executed[0]).toMatchObject({
+        account: world.loginAccount.id,
+        deviceCode: true,
+        kind: "account.login",
+      });
+    } finally {
+      await world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
   test("starts a session then sends its prompt, inheriting the project approval mode", async () => {
     const world = await deviceCommandFixture();
     try {
@@ -5158,7 +5998,7 @@ describe("device command execution", () => {
       // The desktop notice fires on the first session start from this device.
       expect(world.notices).toEqual(["HRA: new device started a session"]);
     } finally {
-      world.adapter.close();
+      await world.adapter.close();
       world.value.store.close();
     }
   });
@@ -5199,13 +6039,14 @@ describe("device command execution", () => {
       expect(outcome).toEqual({ code: "LOCAL_SESSION_SEND_INDETERMINATE", state: "ambiguous" });
       expect(outcome.result).toBeUndefined();
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
 
-  test("the kill switch refuses every device command with its own code", async () => {
-    const world = await deviceCommandFixture();
+  test("the kill switch refuses every device command without probing provider authentication", async () => {
+    const devin = new FakeDevin({ signedIn: true });
+    const world = await deviceCommandFixture({ devin });
     try {
       world.value.store.setDeviceCommandsAllowed(false);
       const signal = new AbortController().signal;
@@ -5223,8 +6064,9 @@ describe("device command execution", () => {
       }
       expect(world.executed).toEqual([]);
       expect(world.notices).toEqual([]);
+      expect(devin.readAccountCalls).toBe(0);
     } finally {
-      world.adapter.close();
+      await world.adapter.close();
       world.value.store.close();
     }
   });
@@ -5287,7 +6129,7 @@ describe("device command execution", () => {
         signal: new AbortController().signal,
       })).toEqual({ code: "LOCAL_NOTIFICATION_HOURS_REVISION_EXHAUSTED", state: "failed" });
     } finally {
-      world.adapter.close();
+      await world.adapter.close();
       world.value.store.close();
     }
   });
@@ -5324,7 +6166,7 @@ describe("device command execution", () => {
         kind: "account.login",
       });
     } finally {
-      world.adapter.close();
+      await world.adapter.close();
       world.value.store.close();
     }
   });
@@ -5377,7 +6219,7 @@ describe("device command execution", () => {
         kind: "account.login",
       });
     } finally {
-      adapter.close();
+      await adapter.close();
       value.store.close();
     }
   });
@@ -5395,7 +6237,7 @@ describe("device command execution", () => {
       expect(outcome).toEqual({ code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" });
       expect(world.executed).toEqual([]);
     } finally {
-      world.adapter.close();
+      await world.adapter.close();
       world.value.store.close();
     }
   });
@@ -5416,7 +6258,7 @@ describe("device command execution", () => {
       })).toEqual({ code: "ACCOUNT_LOGIN_NOT_AVAILABLE", state: "failed" });
       expect(world.executed).toEqual([]);
     } finally {
-      world.adapter.close();
+      await world.adapter.close();
       world.value.store.close();
     }
   });
@@ -5472,7 +6314,7 @@ describe("device command execution", () => {
       });
       expect(world.executed).toEqual([]);
     } finally {
-      world.adapter.close();
+      await world.adapter.close();
       world.value.store.close();
     }
   });
@@ -5495,7 +6337,7 @@ describe("device command execution", () => {
       })).toEqual({ code: "DEVICE_COMMAND_PROJECT_UNKNOWN", state: "failed" });
       expect(world.executed).toEqual([]);
     } finally {
-      world.adapter.close();
+      await world.adapter.close();
       world.value.store.close();
     }
   });
@@ -5531,7 +6373,7 @@ describe("device command execution", () => {
         signal,
       })).toMatchObject({ state: "applied" });
     } finally {
-      world.adapter.close();
+      await world.adapter.close();
       world.value.store.close();
     }
   });
@@ -5552,7 +6394,7 @@ describe("device command execution", () => {
         deviceCommandsAllowed: false,
       });
     } finally {
-      world.adapter.close();
+      await world.adapter.close();
       world.value.store.close();
     }
   });

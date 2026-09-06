@@ -12,6 +12,10 @@ import {
 import { ClaudeError } from "../claude/errors";
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- `claude/pin.ts` is the zero-import pin module; the daemon names the exact release an operator must install.
 import { CLAUDE_PIN } from "../claude/pin";
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- the daemon maps this provider's closed failure codes onto command outcomes; no protocol payload crosses the adapter.
+import { DevinError } from "../devin/errors";
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- `devin/pin.ts` is the zero-import pin module; the daemon names the exact release an operator must install.
+import { DEVIN_PIN } from "../devin/pin";
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- D4 extracts the provider port; until then the daemon composes the pinned Codex runtime directly.
 import {
   CodexError,
@@ -171,6 +175,7 @@ import {
   StateSecurityScrubRequiredError,
   UnusableProjectRootError,
   USAGE_LOCAL_RETAIN_AGE_MS,
+  type DevinJoinedCloseCapture,
   type MutationAttemptRecord,
   type MutationEffectEvidence,
   type AccountRateLimitResetAttemptRecord,
@@ -201,6 +206,7 @@ import {
   CodexSessionObservationError,
   ProviderRuntimeUnavailableError,
   UnavailableClaudeRuntime,
+  UnavailableDevinRuntime,
   type ClaudeRuntimePort,
   type CloudControlPort,
   type CodexAccountProjection,
@@ -209,6 +215,8 @@ import {
   type CodexSessionObservation,
   type CodexSessionProjection,
   type DesktopSwitchPort,
+  type DevinRuntimePort,
+  type DevinRuntimeCloseWitness,
   type ProfileAuthority,
   type RuntimeStartReviewOf,
   type SessionRuntimePort,
@@ -357,8 +365,10 @@ const cloudProjectionRecoveryAction = (
  * interaction lane reasons about provider outcomes (invalid input, expired
  * deadline, unproven effect) rather than about which provider produced them.
  */
-const providerFailure = (error: unknown): CodexError | ClaudeError | null =>
-  error instanceof CodexError || error instanceof ClaudeError ? error : null;
+const providerFailure = (error: unknown): CodexError | ClaudeError | DevinError | null =>
+  error instanceof CodexError || error instanceof ClaudeError || error instanceof DevinError
+    ? error
+    : null;
 
 const providerFailureCode = (error: unknown): string | null => providerFailure(error)?.code ?? null;
 
@@ -401,6 +411,43 @@ const claudeCommandFailure = (error: ClaudeError): CommandFailure => {
         "UNAVAILABLE",
         `The pinned Claude Code ${CLAUDE_PIN} runtime connection ended before the operation finished. Start a fresh attempt.`,
         { reason: "claude_runtime_fault" },
+      );
+  }
+};
+
+const devinCommandFailure = (error: DevinError): CommandFailure => {
+  switch (error.code) {
+    case "AUTHORITY_STALE":
+      return new CommandFailure(
+        "UNAVAILABLE",
+        "The exact Devin process authority changed before the operation finished. Inspect daemon status before starting a fresh attempt.",
+        { reason: "devin_authority_stale", nextCommand: "hra daemon status --json" },
+      );
+    case "DEADLINE_EXPIRED":
+      return new CommandFailure(
+        "CONFLICT",
+        "The Devin interaction deadline expired before HRA could apply the response. Refresh pending interactions instead of replaying the expired response.",
+        { reason: "devin_interaction_deadline_expired", nextCommand: "hra interaction list --pending --json" },
+      );
+    case "INVALID_INPUT":
+    case "UNSUPPORTED_CAPABILITY":
+      return new CommandFailure("INVALID_INPUT", error.message, { reason: "devin_unsupported" });
+    case "NOT_AUTHENTICATED":
+      return new CommandFailure(
+        "INTERACTION_REQUIRED",
+        `Devin CLI ${DEVIN_PIN} is installed but this account's isolated Devin profile is not signed in. Sign in inside that profile, then retry.`,
+        { reason: "devin_not_authenticated" },
+      );
+    case "RUNTIME_MISMATCH":
+      return new CommandFailure("UNAVAILABLE", error.message, { reason: "devin_runtime_unavailable" });
+    case "PROCESS_EXITED":
+    case "PROTOCOL_ERROR":
+    case "PROTOCOL_LIMIT":
+    case "TIMEOUT":
+      return new CommandFailure(
+        "UNAVAILABLE",
+        `The pinned Devin CLI ${DEVIN_PIN} ACP connection ended before the operation finished. Start a fresh attempt.`,
+        { reason: "devin_runtime_fault" },
       );
   }
 };
@@ -790,6 +837,9 @@ const claudeLoginTerminalReceiptSchema = z.object({
     }).strict(),
   ]),
 }).strict();
+// Both foreground CLI providers settle the same provider-neutral child
+// outcome. Their mutation kind and authority remain distinct in storage.
+const devinLoginTerminalReceiptSchema = claudeLoginTerminalReceiptSchema;
 const sessionStartReceiptSchema = z.object({
   sessionId: sessionIdSchema,
   sourceId: z.string().min(1).max(200).optional(),
@@ -1004,7 +1054,7 @@ type ProviderUsagePersistenceJob = Readonly<{
 }>;
 
 type SessionSwitchDeferredFact =
-  | Readonly<{ provider: "codex"; authority: ProfileAuthority; fact: CodexFact }>
+  | Readonly<{ provider: "codex" | "devin"; authority: ProfileAuthority; fact: CodexFact }>
   | Readonly<{ provider: "claude"; authority: ProfileAuthority; fact: ClaudeSessionFact }>;
 
 type SessionSwitchDeferredFactOwner = {
@@ -1035,6 +1085,7 @@ export class HraService {
   #attachmentBlobs: AttachmentBlobStore | undefined;
   readonly #codex: CodexRuntimePort;
   readonly #claude: ClaudeRuntimePort;
+  readonly #devin: DevinRuntimePort;
   readonly #claudeFacts: ClaudeSessionFactTranslator;
   readonly #desktop: DesktopSwitchPort | undefined;
   readonly #cloud: CloudControlPort;
@@ -1054,6 +1105,7 @@ export class HraService {
   readonly #proseAutorespondedTurns = new Map<string, string>();
   readonly #factsMemory: HraFactsMemoryLifecyclePort | undefined;
   readonly #daemonGeneration: number;
+  readonly #daemonBootId: string | undefined;
   readonly #platform: NodeJS.Platform;
   readonly #now: () => number;
   readonly #mutationTails = new Map<string, Promise<unknown>>();
@@ -1102,6 +1154,8 @@ export class HraService {
     codex: CodexRuntimePort;
     /** Omitted on a machine with no admitted `claude` binary. */
     claude?: ClaudeRuntimePort;
+    /** Omitted on a machine with no admitted `devin` binary. */
+    devin?: DevinRuntimePort;
     cloud: CloudControlPort;
     daemonAuthority: Pick<DaemonAuthorityFence, "assertCurrent" | "close">;
     desktop?: DesktopSwitchPort;
@@ -1114,6 +1168,7 @@ export class HraService {
     workWaiters?: WorkEventWaiters;
     workCapabilities?: WorkCapabilityCodec;
     daemonGeneration?: number;
+    daemonBootId?: string;
     platform?: NodeJS.Platform;
     now?: () => number;
     requestStop: () => void;
@@ -1122,6 +1177,7 @@ export class HraService {
     this.#paths = input.paths;
     this.#codex = input.codex;
     this.#claude = input.claude ?? new UnavailableClaudeRuntime(CLAUDE_PIN);
+    this.#devin = input.devin ?? new UnavailableDevinRuntime(DEVIN_PIN);
     this.#claudeFacts = new ClaudeSessionFactTranslator({
       authorityFor: (providerAuthority, providerThreadId, requestId) =>
         this.#claude.interactionAuthority(
@@ -1155,6 +1211,8 @@ export class HraService {
     this.#factsMemory = input.factsMemory;
     this.#daemonGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
       .parse(input.daemonGeneration ?? 0);
+    this.#daemonBootId = z.string().regex(/^boot_[a-f0-9]{32}$/u).optional()
+      .parse(input.daemonBootId);
     this.#platform = input.platform ?? process.platform;
     const workCapabilities = input.workCapabilities
       ?? new WorkCapabilityCodec(WorkCapabilityCodec.generateKey());
@@ -1446,7 +1504,7 @@ export class HraService {
       || account.processGeneration !== authority.processGeneration
     ) throw new CommandFailure("CONFLICT", "Provider account authority changed before dispatch.");
     if (account.readiness === "signed_in") return;
-    if (provider === "claude" && account.readiness === "unverified") {
+    if ((provider === "claude" || provider === "devin") && account.readiness === "unverified") {
       if (options.session !== undefined) {
         const bound = this.#store.requireSessionProviderAuthority(options.session.id);
         if (
@@ -1460,7 +1518,7 @@ export class HraService {
       }
       throw new CommandFailure(
         "INTERACTION_REQUIRED",
-        "Claude readiness is unverified; only an existing explicitly bound session may continue. Verify Claude sign-in before starting or switching a session.",
+        `${provider === "claude" ? "Claude" : "Devin"} readiness is unverified; only an existing explicitly bound session may continue. Verify provider sign-in before starting or switching a session.`,
         { accountSelector: profile.id, provider, readiness: account.readiness },
       );
     }
@@ -1477,7 +1535,7 @@ export class HraService {
     const state: ProviderAccountReadiness = account.readiness;
     throw new CommandFailure(
       "INTERACTION_REQUIRED",
-      `Sign in to Claude inside ${profile.label}'s isolated Claude configuration before using this binding.`,
+      `Sign in to ${provider} inside ${profile.label}'s isolated provider configuration before using this binding.`,
       { accountSelector: profile.id, provider, readiness: state },
     );
   }
@@ -1489,6 +1547,20 @@ export class HraService {
   ): Promise<Readonly<{ profile: ProfileRecord; providerAuthority: ProviderAccountAuthority }>> {
     let profile = initialProfile;
     let providerAuthority = this.#providerAuthority(profile, provider);
+    // A CLI-owned foreground grant must be recognized before even the initial
+    // process counter can advance. Storage independently enforces that fence.
+    if (provider === "claude") {
+      this.#assertClaudeIsolationAccepted();
+      const unsettled = this.#unsettledClaudeLogin(profile);
+      if (unsettled !== undefined) {
+        throw new CommandFailure("RECOVERY_REQUIRED", "A foreground Claude login still owns this account.", this.#claudeLoginRecovery(unsettled));
+      }
+    } else if (provider === "devin") {
+      const unsettled = this.#unsettledDevinLogin(profile);
+      if (unsettled !== undefined) {
+        throw new CommandFailure("RECOVERY_REQUIRED", "A foreground Devin login still owns this account.", this.#devinLoginRecovery(unsettled));
+      }
+    }
     if (providerAuthority.processGeneration === 0) {
       providerAuthority = this.#store.advanceProviderAccountProcessGeneration({
         profileId: profile.id,
@@ -1498,17 +1570,15 @@ export class HraService {
       profile = this.#store.requireProfileById(profile.id);
     }
     if (provider === "claude") {
-      this.#assertClaudeIsolationAccepted();
-      const unsettled = this.#unsettledClaudeLogin(profile);
-      if (unsettled !== undefined) {
-        throw new CommandFailure("RECOVERY_REQUIRED", "A foreground Claude login still owns this account.", this.#claudeLoginRecovery(unsettled));
-      }
       const before = providerAuthority;
       const observed = await this.#fencedEffect(async () => await this.#claude.readAccount({
         authority: authorityFor(this.#paths, profile, before),
         signal,
       }));
       await this.#daemonAuthority.assertCurrent();
+      if (!this.#profileAuthorityIsCurrent(authorityFor(this.#paths, profile, before))) {
+        throw new CommandFailure("CONFLICT", "Claude account authority changed during authentication observation.");
+      }
       this.#store.observeProviderAccountReadiness({
         profileId: profile.id,
         provider,
@@ -1534,6 +1604,36 @@ export class HraService {
             ...(observed.readiness === "signed_out" ? { accountState: "signed_out", nextCommand } : {}),
           },
         );
+      }
+    }
+    if (provider === "devin") {
+      const before = providerAuthority;
+      const runtimeAuthority = authorityFor(this.#paths, profile, before);
+      const observed = await this.#fencedEffect(async () => await this.#devin.readAccount({
+        authority: runtimeAuthority,
+        signal,
+      }));
+      await this.#daemonAuthority.assertCurrent();
+      if (!this.#profileAuthorityIsCurrent(runtimeAuthority)) {
+        throw new CommandFailure("CONFLICT", "Devin account authority changed during authentication observation.");
+      }
+      this.#store.observeProviderAccountReadiness({
+        profileId: profile.id,
+        provider,
+        expectedBindingGeneration: before.bindingGeneration,
+        readiness: observed.signedIn ? "signed_in" : "signed_out",
+        observedAt: this.#now(),
+      });
+      profile = this.#store.requireProfileById(profile.id);
+      providerAuthority = this.#providerAuthority(profile, provider);
+      if (!observed.signedIn) {
+        const nextCommand = `hra account login ${profile.id} --provider devin`;
+        throw new CommandFailure("INTERACTION_REQUIRED", `Sign in with \`${nextCommand}\` before using this account's Devin runtime.`, {
+          accountSelector: profile.id,
+          accountState: "signed_out",
+          provider,
+          nextCommand,
+        });
       }
     }
     this.#assertProviderReady(profile, providerAuthority);
@@ -1590,11 +1690,23 @@ export class HraService {
         );
         case "account.list": return { accounts: this.#store.listProfiles().map((profile) => this.#publicProfile(profile)) };
         case "account.add": return await this.#addAccount(command.label);
-        case "account.show": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => command.provider === "claude" ? this.#showClaudeAccount(profile.id, context.signal) : this.#showAccount(profile.id, context.signal)); }
+        case "account.show": {
+          const profile = this.#store.requireProfile(command.account);
+          return await this.#serialize(`account:${profile.id}`, async () => {
+            switch (command.provider ?? "codex") {
+              case "codex": return await this.#showAccount(profile.id, context.signal);
+              case "claude": return await this.#showClaudeAccount(profile.id, context.signal);
+              case "devin": return await this.#showDevinAccount(profile.id, context.signal);
+            }
+          });
+        }
         case "account.login": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#login(profile.id, command.deviceCode, command.idempotencyKey, context.signal)); }
         case "account.claude-login.prepare": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#prepareClaudeLogin(profile.id, command.idempotencyKey, context.signal)); }
         case "account.claude-login.complete": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#completeClaudeLogin({ ...command, account: profile.id }, context.signal)); }
         case "account.claude-login.abandon": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#abandonClaudeLogin({ ...command, account: profile.id })); }
+        case "account.devin-login.prepare": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#prepareDevinLogin(profile.id, command.idempotencyKey, command.manualTokenFlow, context.signal)); }
+        case "account.devin-login.complete": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#completeDevinLogin({ ...command, account: profile.id }, context.signal)); }
+        case "account.devin-login.abandon": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#abandonDevinLogin({ ...command, account: profile.id })); }
         case "account.login-cancel": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#cancelLogin(profile.id, command.idempotencyKey, context.signal)); }
         case "account.logout": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#logout(profile.id, command.idempotencyKey, context.signal)); }
         case "account.usage": {
@@ -2217,6 +2329,7 @@ export class HraService {
       }
       if (error instanceof CodexError) throw codexCommandFailure(error);
       if (error instanceof ClaudeError) throw claudeCommandFailure(error);
+      if (error instanceof DevinError) throw devinCommandFailure(error);
       // A provider this machine cannot run at all is reported verbatim: the
       // message names the exact release the operator has to install.
       if (error instanceof ProviderRuntimeUnavailableError) {
@@ -2894,6 +3007,7 @@ export class HraService {
   }
 
   #deferSessionSwitchFact(value: SessionSwitchDeferredFact): boolean {
+    if (value.authority.provider !== value.provider) return true;
     const authority = this.#providerAccountAuthority(value.authority);
     const providerThreadId = value.provider === "claude"
       ? value.fact.providerThreadId
@@ -3095,10 +3209,10 @@ export class HraService {
         return false;
       }
       try {
-        if (value.provider === "codex") {
-          await this.#observeCodexFactAdmitted(value.authority, value.fact);
-        } else {
+        if (value.provider === "claude") {
           await this.#observeClaudeFactAdmitted(value.authority, value.fact);
+        } else {
+          await this.#observeProviderFactAdmitted(value.provider, value.authority, value.fact);
         }
       } catch (error: unknown) {
         if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
@@ -3138,11 +3252,24 @@ export class HraService {
   }
 
   async observeCodexFact(authority: ProfileAuthority, fact: CodexFact): Promise<void> {
+    await this.#observeProviderFact("codex", authority, fact);
+  }
+
+  /** Applies one neutral fact emitted by the isolated Devin ACP runtime. */
+  async observeDevinFact(authority: ProfileAuthority, fact: CodexFact): Promise<void> {
+    await this.#observeProviderFact("devin", authority, fact);
+  }
+
+  async #observeProviderFact(
+    provider: "codex" | "devin",
+    authority: ProfileAuthority,
+    fact: CodexFact,
+  ): Promise<void> {
     const finish = this.#beginFactOperation();
     if (finish === null) return;
     try {
-      if (this.#deferSessionSwitchFact({ provider: "codex", authority, fact })) return;
-      await this.#observeCodexFactAdmitted(authority, fact);
+      if (this.#deferSessionSwitchFact({ provider, authority, fact })) return;
+      await this.#observeProviderFactAdmitted(provider, authority, fact);
     } catch (error: unknown) {
       if (error instanceof InteractionPersistenceBoundaryError) this.#scheduleStop();
       if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
@@ -3232,7 +3359,7 @@ export class HraService {
       }
     }
     for (const neutral of translated.timelineFacts) {
-      await this.#observeCodexFactAdmitted(authority, neutral);
+      await this.#observeProviderFactAdmitted("claude", authority, neutral);
     }
     for (const component of usageComponents) {
       this.#enqueueProviderUsagePersistence(component);
@@ -3243,6 +3370,9 @@ export class HraService {
     sessionId: SessionRecord["id"],
     observation: ClaudeUsageObservation,
   ): ProviderUsageComponent {
+    if (observation.authority.provider !== "claude") {
+      throw new Error("CLAUDE_USAGE_AUTHORITY_MISMATCH");
+    }
     const base = {
       authority: observation.authority,
       observationRevision: observation.observationRevision,
@@ -3404,7 +3534,11 @@ export class HraService {
   /** The port that runs one provider's sessions, turns, and interactions. */
   #sessionRuntime(provider: Provider): SessionRuntimePort<ReviewedRuntimeProfile> {
     if (provider === "claude") this.#assertClaudeIsolationAccepted();
-    return provider === "claude" ? this.#claude : this.#codex;
+    switch (provider) {
+      case "codex": return this.#codex;
+      case "claude": return this.#claude;
+      case "devin": return this.#devin;
+    }
   }
 
   #runtimeForSession(
@@ -3414,9 +3548,9 @@ export class HraService {
   }
 
   /**
-   * The port that owns a brokered interaction. The session it belongs to is
-   * the authority; an interaction with no session (a provider-level request)
-   * is attributed by the durable method name its authority recorded.
+   * The captured provider tuple owns a brokered interaction, even after a
+   * session switches provider. Neither its current session nor a method prefix
+   * may redirect a pending response to a different runtime.
    */
   #runtimeForInteraction(
     record: Readonly<{
@@ -3426,6 +3560,12 @@ export class HraService {
   ): SessionRuntimePort<ReviewedRuntimeProfile> {
     if (record.authority.provider === "claude") this.#assertClaudeIsolationAccepted();
     return this.#sessionRuntime(record.authority.provider);
+  }
+
+  #providerForInteractionAuthority(
+    authority: Pick<ProviderInteractionAuthority, "provider">,
+  ): Provider {
+    return authority.provider;
   }
 
   /** Refuses a Codex-only capability on a session bound to another provider. */
@@ -3664,8 +3804,13 @@ export class HraService {
     }
   }
 
-  async #observeCodexFactAdmitted(authority: ProfileAuthority, fact: CodexFact): Promise<void> {
+  async #observeProviderFactAdmitted(
+    provider: Provider,
+    authority: ProfileAuthority,
+    fact: CodexFact,
+  ): Promise<void> {
     await this.#daemonAuthority.assertCurrent();
+    if (provider !== authority.provider) return;
     let profile: ProfileRecord;
     try {
       profile = this.#store.requireProfileById(authority.id);
@@ -3699,10 +3844,11 @@ export class HraService {
     if (fact.type === "providerConnected") return;
     if (fact.type === "notificationIgnored") return;
     if (fact.type === "rateLimitsUpdated") {
-      this.#scheduleUsageRefresh(authority);
+      if (provider === "codex") this.#scheduleUsageRefresh(authority);
       return;
     }
     if (fact.type === "loginCompleted") {
+      if (provider !== "codex") return;
       if (fact.success || fact.loginId === null) return;
       const loginId = fact.loginId;
       const settleFailedLogin = (): void => {
@@ -3742,6 +3888,7 @@ export class HraService {
         || fact.provider.bindingGeneration !== authority.bindingGeneration
         || fact.provider.connectionId !== fact.connectionId
       ) throw new Error("INTERACTION_FACT_AUTHORITY_MISMATCH");
+      if (this.#providerForInteractionAuthority(fact.provider) !== provider) return;
       if (
         fact.kind === "mcp_elicitation"
         && (
@@ -3789,8 +3936,13 @@ export class HraService {
       return;
     }
     if (fact.type === "interactionResolved") {
+      if (this.#providerForInteractionAuthority(fact.provider) !== provider) return;
       const observed = this.#store.findInteractionByAuthority(fact.provider);
       if (observed === null) return;
+      if (
+        observed.sessionId !== null
+        && this.#store.requireSession(observed.sessionId).provider !== provider
+      ) return;
       await this.#serialize(`interaction:${observed.publicId}`, async () => {
         const current = this.#store.findInteractionByAuthority(fact.provider);
         if (
@@ -3846,6 +3998,7 @@ export class HraService {
     const session = this.#store.findSessionByProviderThread(authority.id, fact.threadId);
     if (
       session === null
+      || session.provider !== provider
       || (session.state === "terminal" && fact.type !== "threadDeleted")
       || (session.state === "recovery_required" && fact.type !== "threadDeleted")
     ) return;
@@ -4482,7 +4635,7 @@ export class HraService {
     });
     for (const interaction of terminal) this.#appendInteractionState(interaction);
     // Codex shares one connection across its account runtime, while each
-    // Claude session owns a distinct subprocess/connection. In both cases the
+    // Claude or Devin session owns a distinct subprocess/connection. The
     // connection map is the exact loss boundary: account/daemon retirement is
     // handled separately by #retireClosedRuntimeAuthorities.
     const affectedSessions = [...this.#sessionProviderConnections]
@@ -4780,6 +4933,7 @@ export class HraService {
         reasoningOutputTokens: fact.reasoningOutputTokens,
         totalTokens: fact.totalTokens,
         modelContextWindow: fact.modelContextWindow,
+        ...(fact.providerCost === undefined ? {} : { providerCost: fact.providerCost }),
       };
       case "providerWarning": return {
         type: "warning",
@@ -4867,6 +5021,10 @@ export class HraService {
 
   async #closeAdmittedService(): Promise<void> {
     let runtimeError: unknown;
+    let captureError: unknown;
+    let devinClose = async () => await this.#devin.close();
+    let devinCaptures: readonly DevinJoinedCloseCapture[] = [];
+    let joinedDevinWriters: readonly DevinRuntimeCloseWitness[] = [];
     const failedProviders = new Set<Provider>();
     try {
       if (this.#interactionDeadlineTask !== undefined) {
@@ -4875,14 +5033,45 @@ export class HraService {
       if (this.#sessionTaskPumpTask !== undefined) {
         await this.#sessionTaskPumpTask.catch(() => undefined);
       }
-      const closed = await Promise.allSettled([
-        Promise.resolve().then(async () => await this.#codex.close()),
-        Promise.resolve().then(async () => await this.#claude.close()),
-      ]);
+      const custody = this.#devin.closeCustody;
+      if (custody !== undefined && this.#daemonBootId !== undefined && this.#daemonGeneration > 0) {
+        try {
+          const witnesses = custody.snapshot();
+          devinClose = async () => {
+            const joined = await custody.close(witnesses);
+            const issued = new Set(witnesses);
+            const seen = new Set<DevinRuntimeCloseWitness>();
+            for (const witness of joined) {
+              if (!issued.has(witness) || seen.has(witness)) {
+                throw new Error("DEVIN_JOINED_CLOSE_WITNESS_MISMATCH");
+              }
+              seen.add(witness);
+            }
+            joinedDevinWriters = joined;
+          };
+          devinCaptures = this.#prepareDevinJoinedClose(witnesses, this.#daemonBootId);
+        } catch (error: unknown) {
+          // An invalid capture grants no restart authority, but must never
+          // prevent the ordinary all-child cleanup below.
+          captureError = error;
+        }
+      }
+      const runtimes: readonly Readonly<{
+        close: () => Promise<void>;
+        provider: Provider;
+      }>[] = [
+        { close: async () => await this.#codex.close(), provider: "codex" },
+        { close: async () => await this.#claude.close(), provider: "claude" },
+        { close: devinClose, provider: "devin" },
+      ];
+      const closed = await Promise.allSettled(
+        runtimes.map(async (runtime) => await runtime.close()),
+      );
       for (const [index, outcome] of closed.entries()) {
         if (outcome.status === "rejected") {
           runtimeError ??= outcome.reason;
-          failedProviders.add(index === 0 ? "codex" : "claude");
+          const runtime = runtimes[index];
+          if (runtime !== undefined) failedProviders.add(runtime.provider);
         }
       }
     } catch (error: unknown) {
@@ -4920,19 +5109,69 @@ export class HraService {
     }
     let retirementError: unknown;
     try {
-      this.#retireClosedRuntimeAuthorities();
+      this.#retireClosedRuntimeAuthorities(devinCaptures, joinedDevinWriters);
     } catch (error: unknown) {
       retirementError = error;
     }
     this.#state = "closed";
+    if (captureError !== undefined) {
+      throw new AggregateError(
+        retirementError === undefined ? [captureError] : [captureError, retirementError],
+        "The provider runtimes closed without complete Devin restart custody evidence.",
+      );
+    }
     if (retirementError !== undefined) {
       throw retirementError instanceof Error
         ? retirementError
-        : new Error("The Codex runtime authority retirement failed with a non-Error failure.");
+        : new Error("The provider runtime authority retirement failed with a non-Error failure.");
     }
   }
 
-  #retireClosedRuntimeAuthorities(): void {
+  #prepareDevinJoinedClose(
+    witnesses: readonly DevinRuntimeCloseWitness[],
+    bootId: string,
+  ): readonly DevinJoinedCloseCapture[] {
+    const groups = new Map<ProviderAccountId, DevinRuntimeCloseWitness[]>();
+    for (const witness of witnesses) {
+      if (witness.authority.provider !== "devin") {
+        throw new Error("DEVIN_JOINED_CLOSE_WITNESS_MISMATCH");
+      }
+      const group = groups.get(witness.authority.providerAccountId) ?? [];
+      group.push(witness);
+      groups.set(witness.authority.providerAccountId, group);
+    }
+    const captures: DevinJoinedCloseCapture[] = [];
+    for (const group of groups.values()) {
+      const first = group[0];
+      if (first === undefined) continue;
+      const capture = this.#store.prepareDevinJoinedClose({
+        daemonGeneration: this.#daemonGeneration,
+        bootId,
+        providerAuthority: this.#providerAccountAuthority(first.authority),
+        writers: group.flatMap((witness) => {
+          const session = this.#store.findSessionByProviderThread(
+            witness.authority.id,
+            witness.providerThreadId,
+          );
+          if (session === null || !this.#authorityMatchesSession(witness.authority, session)) return [];
+          return [{
+            sessionId: session.id,
+            providerThreadId: witness.providerThreadId,
+            connectionId: witness.connectionId,
+            projectRoot: witness.projectRoot,
+            effectiveRuntimeProfile: witness.effectiveRuntimeProfile,
+          }];
+        }),
+      });
+      if (capture !== null) captures.push(capture);
+    }
+    return captures;
+  }
+
+  #retireClosedRuntimeAuthorities(
+    devinCaptures: readonly DevinJoinedCloseCapture[],
+    joinedDevinWriters: readonly DevinRuntimeCloseWitness[],
+  ): void {
     const projectionErrors: unknown[] = [];
     for (const account of this.#store.listProviderAccounts()) {
       if (account.processGeneration === 0) continue;
@@ -5028,9 +5267,9 @@ export class HraService {
         }
       }
       try {
-        if (account.provider === "claude" && this.#store
+        if (account.provider !== "codex" && this.#store
           .listUnsettledMutations({ authorityId: account.profileId })
-          .some((attempt) => attempt.kind === "account.claude-login")) continue;
+          .some((attempt) => attempt.kind === `account.${account.provider}-login`)) continue;
         if (account.provider === "codex") {
           const retirement = this.#store.advanceProfileGenerationWithWorkRetirement(
             account.profileId,
@@ -5039,6 +5278,27 @@ export class HraService {
             { preserveSessionMutationAuthorities: true },
           );
           this.#notifyAffectedWork(retirement.affectedWorkIds);
+        } else if (account.provider === "devin" && devinCaptures.some(
+          (capture) => capture.providerAuthority.providerAccountId === account.id,
+        )) {
+          const capture = devinCaptures.find(
+            (value) => value.providerAuthority.providerAccountId === account.id,
+          );
+          if (capture === undefined) throw new Error("DEVIN_JOINED_CLOSE_CAPTURE_MISSING");
+          this.#store.recordDevinJoinedClose({
+            capture,
+            joinedWriters: joinedDevinWriters.filter((witness) =>
+              witness.authority.providerAccountId === account.id
+              && capture.writers.some((writer) =>
+                writer.providerThreadId === witness.providerThreadId
+                && writer.connectionId === witness.connectionId,
+              ),
+            ).map((witness) => ({
+              providerAuthority: this.#providerAccountAuthority(witness.authority),
+              providerThreadId: witness.providerThreadId,
+              connectionId: witness.connectionId,
+            })),
+          });
         } else {
           this.#store.advanceProviderAccountProcessGeneration({
             profileId: account.profileId,
@@ -5371,7 +5631,21 @@ export class HraService {
     };
   }
 
-  #publicClaudeAccount(profile: ProfileRecord): Readonly<{ id: ProfileRecord["id"]; label: string }> {
+  #devinLoginRecovery(attempt: MutationAttemptRecord): Readonly<Record<string, unknown>> {
+    const accountId = profileIdSchema.parse(attempt.authorityId);
+    return {
+      required: true,
+      attemptId: attempt.id,
+      idempotencyKey: attempt.idempotencyKey,
+      providerGeneration: attempt.authorityGeneration,
+      statusCommand: `hra account show ${accountId} --provider devin`,
+      sameKeyReplayCommand: `hra account login ${accountId} --provider devin --idempotency-key ${attempt.idempotencyKey}`,
+      abandonCommand: `hra account login-cancel ${accountId} --provider devin --attempt-id ${attempt.id} --provider-generation ${String(attempt.authorityGeneration)} --idempotency-key ${attempt.idempotencyKey} --acknowledge-child-exited`,
+      diagnostic: "The foreground Devin login launch was granted once. Its exact completion can settle after a daemon restart. Status may report credential presence but never proves that the child exited or grants another launch. If the original HRA parent is gone, first confirm its Devin child exited, then run the exact acknowledged local abandon command; abandon does not stop Devin or change or delete credentials.",
+    };
+  }
+
+  #publicIsolatedProviderAccount(profile: ProfileRecord): Readonly<{ id: ProfileRecord["id"]; label: string }> {
     return { id: profile.id, label: profile.label };
   }
 
@@ -5413,9 +5687,78 @@ export class HraService {
     }));
   }
 
+  async #readDevinAccount(profile: ProfileRecord, signal: AbortSignal): Promise<CodexAccountProjection> {
+    await this.#daemonAuthority.assertCurrent();
+    return await this.#fencedEffect(async () => await this.#devin.readAccount({
+      authority: this.#profileAuthority(profile, "devin"),
+      signal,
+    }));
+  }
+
+  #foregroundLoginObservationAuthority(
+    profile: ProfileRecord,
+    attempt: MutationAttemptRecord,
+    provider: "claude" | "devin",
+  ): ProfileAuthority {
+    const records = this.#store.readMutationProviderAuthorities(attempt.id);
+    const captured = records[0];
+    if (
+      attempt.kind !== `account.${provider}-login`
+      || attempt.authorityId !== profile.id
+      || (attempt.state !== "effect_started" && attempt.state !== "ambiguous")
+      || records.length !== 1
+      || captured?.role !== "primary"
+      || captured.authority.profileId !== profile.id
+      || captured.authority.provider !== provider
+      || captured.authority.processGeneration !== attempt.authorityGeneration
+      || ![`account_${provider}_login`, `legacy_account_${provider}_login`].includes(captured.provenance)
+    ) {
+      throw new CommandFailure("CONFLICT", "The login observation has no exact original provider authority.");
+    }
+    const authority = authorityFor(this.#paths, profile, captured.authority);
+    if (!this.#profileAuthorityIsCurrent(authority)) {
+      throw new CommandFailure("CONFLICT", "The original login provider authority changed before authentication observation.");
+    }
+    return authority;
+  }
+
+  async #readForegroundLoginSignedIn(
+    profile: ProfileRecord,
+    attempt: MutationAttemptRecord,
+    provider: "claude" | "devin",
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const authority = this.#foregroundLoginObservationAuthority(profile, attempt, provider);
+    if (provider === "claude") this.#assertClaudeIsolationAccepted();
+    const signedIn = await this.#fencedEffect(async () => {
+      // The daemon fence awaited before entering this closure. Never substitute
+      // a replacement binding for the exact foreground child that was granted.
+      if (!this.#profileAuthorityIsCurrent(authority)) {
+        throw new CommandFailure("CONFLICT", "The original login provider authority changed before authentication observation.");
+      }
+      if (provider === "devin") {
+        return (await this.#devin.readAccount({ authority, signal })).signedIn;
+      }
+      const observed = await this.#claude.readAccount({ authority, signal });
+      if (observed.readiness === "unverified") {
+        throw new CommandFailure("UNAVAILABLE", "Claude authentication status could not be verified; the exact login remains unsettled.");
+      }
+      return observed.readiness === "signed_in";
+    });
+    if (!this.#profileAuthorityIsCurrent(authority)) {
+      throw new CommandFailure("CONFLICT", "The original login provider authority changed during authentication observation.");
+    }
+    return signedIn;
+  }
+
   #unsettledClaudeLogin(profile: ProfileRecord): MutationAttemptRecord | undefined {
     return this.#store.listUnsettledMutations({ authorityId: profile.id }).find((attempt) =>
       attempt.kind === "account.claude-login");
+  }
+
+  #unsettledDevinLogin(profile: ProfileRecord): MutationAttemptRecord | undefined {
+    return this.#store.listUnsettledMutations({ authorityId: profile.id }).find((attempt) =>
+      attempt.kind === "account.devin-login");
   }
 
   async #showClaudeAccount(selector: string, signal: AbortSignal): Promise<unknown> {
@@ -5426,7 +5769,7 @@ export class HraService {
       // binary is missing, drifts from the pin, or cannot answer. Do not hide
       // the only exact recovery command behind a best-effort status process.
       return {
-        account: this.#publicClaudeAccount(profile),
+        account: this.#publicIsolatedProviderAccount(profile),
         authentication: { provider: "claude", signedIn: null },
         providerGeneration: this.#providerAuthority(profile, "claude").processGeneration,
         recovery: this.#claudeLoginRecovery(unsettled),
@@ -5435,12 +5778,360 @@ export class HraService {
     this.#assertClaudeIsolationAccepted();
     const account = await this.#readClaudeAccount(profile, signal);
     return {
-      account: this.#publicClaudeAccount(profile),
+      account: this.#publicIsolatedProviderAccount(profile),
       authentication: { provider: "claude", signedIn: account.readiness === "unverified" ? null : account.readiness === "signed_in" },
       providerGeneration: this.#providerAuthority(profile, "claude").processGeneration,
       ...(account.readiness === "signed_in"
         ? {}
         : { nextCommand: `hra account login ${profile.id} --provider claude` }),
+    };
+  }
+
+  async #showDevinAccount(selector: string, signal: AbortSignal): Promise<unknown> {
+    const profile = this.#store.requireProfile(selector);
+    const unsettled = this.#unsettledDevinLogin(profile);
+    if (unsettled !== undefined) {
+      return {
+        account: this.#publicIsolatedProviderAccount(profile),
+        authentication: { provider: "devin", signedIn: null },
+        providerGeneration: this.#providerAuthority(profile, "devin").processGeneration,
+        recovery: this.#devinLoginRecovery(unsettled),
+        usage: {
+          allowance: "unknown",
+          reason: "Devin ACP reports context and optional cumulative session cost, but exposes no account allowance or reset window.",
+          source: "devin_acp",
+        },
+      };
+    }
+    const account = await this.#readDevinAccount(profile, signal);
+    return {
+      account: this.#publicIsolatedProviderAccount(profile),
+      authentication: { provider: "devin", signedIn: account.signedIn },
+      providerGeneration: this.#providerAuthority(profile, "devin").processGeneration,
+      usage: {
+        allowance: "unknown",
+        reason: "Devin ACP reports context and optional cumulative session cost, but exposes no account allowance or reset window.",
+        source: "devin_acp",
+      },
+      ...(account.signedIn
+        ? {}
+        : { nextCommand: `hra account login ${profile.id} --provider devin` }),
+    };
+  }
+
+  async #prepareDevinLogin(
+    selector: string,
+    idempotencyKey: string,
+    _manualTokenFlow: boolean,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    const profile = this.#store.requireProfile(selector);
+    if (profile.state === "removed") throw new CommandFailure("NOT_FOUND", "That account is removed.");
+    const providerAuthority = this.#providerAuthority(profile, "devin");
+    const prior = this.#store.readMutation(idempotencyKey);
+    if (prior !== null) {
+      // The manual-token choice is foreground presentation, not daemon
+      // authority. A same-key replay can only recover the already-granted
+      // child fence and can never relaunch with a different choice.
+      this.#store.prepareMutation({
+        kind: "account.devin-login",
+        authorityId: profile.id,
+        authorityGeneration: prior.authorityGeneration,
+        providerAuthorities: this.#store.readMutationProviderAuthorities(prior.id),
+        request: { provider: "devin" },
+        idempotencyKey,
+      });
+      if (prior.state === "effect_started" || prior.state === "ambiguous") {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "This Devin login launch was already granted and will not be granted again.",
+          this.#devinLoginRecovery(prior),
+        );
+      }
+      if (prior.state === "reconciled" && prior.resolution?.kind === "abandoned") {
+        throw new CommandFailure(
+          "CONFLICT",
+          "This Devin login fence was explicitly abandoned. Start a fresh login with a new idempotency key.",
+        );
+      }
+      if (prior.state === "applied" || prior.state === "reconciled") {
+        const receipt = devinLoginTerminalReceiptSchema.safeParse(prior.result);
+        if (
+          !receipt.success
+          || receipt.data.accountId !== profile.id
+          || receipt.data.attemptId !== prior.id
+          || receipt.data.idempotencyKey !== prior.idempotencyKey
+          || receipt.data.providerGeneration !== prior.authorityGeneration
+        ) throw new CommandFailure("INTERNAL", "The Devin login terminal receipt is invalid.");
+        if (!receipt.data.signedIn) {
+          throw new CommandFailure(
+            "INTERACTION_REQUIRED",
+            "This Devin login attempt settled signed out. Start a fresh login with a new idempotency key.",
+          );
+        }
+        return {
+          account: this.#publicIsolatedProviderAccount(profile),
+          authentication: { provider: "devin", signedIn: true },
+          login: { status: "signed_in" },
+        };
+      }
+      if (prior.state === "failed" || prior.state === "cancelled") {
+        throw new CommandFailure(
+          "INTERACTION_REQUIRED",
+          "This Devin login attempt is terminal without sign-in. Start a fresh login with a new idempotency key.",
+        );
+      }
+      if (prior.authorityGeneration !== providerAuthority.processGeneration) {
+        if (!this.#store.transitionMutation(prior.id, "prepared", "cancelled", {
+          provider: "devin",
+          signedIn: false,
+          status: "stale_no_effect",
+        })) throw new CommandFailure("CONFLICT", "The Devin login preparation changed concurrently.");
+        throw new CommandFailure(
+          "CONFLICT",
+          "This no-effect Devin login preparation belongs to an older provider generation. Start a fresh login with a new idempotency key.",
+        );
+      }
+    }
+    const unsettled = this.#unsettledDevinLogin(profile);
+    if (unsettled !== undefined) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "A Devin login already owns this account, including across provider generations.",
+        this.#devinLoginRecovery(unsettled),
+      );
+    }
+    const providerBlocker = this.#store.providerAuthorityAdvanceBlocker(profile.id, "devin");
+    if (providerBlocker !== null) {
+      throw new CommandFailure(
+        providerBlocker === "active_session" ? "CONFLICT" : "RECOVERY_REQUIRED",
+        `Devin login cannot replace the shared isolated home while Devin session authority is ${providerBlocker.replaceAll("_", " ")}. Inspect \`hra session list --account ${profile.id}\`, stop active turns, and resolve recovery before retrying.`,
+        { provider: "devin", reason: providerBlocker, retryable: true },
+      );
+    }
+    const releasableSessions = this.#store.listNonterminalProviderSessions(profile.id, "devin");
+    if (releasableSessions.some((session) =>
+      session.state !== "idle"
+      || session.activeTurnId !== undefined
+      || session.providerThreadId === undefined)) {
+      throw new CommandFailure(
+        "CONFLICT",
+        `Devin login can release only idle, fully bound Devin sessions. Inspect \`hra session list --account ${profile.id}\`, then finish or recover every other session before retrying.`,
+        { provider: "devin", reason: "session_not_idle", retryable: true },
+      );
+    }
+    const observed = await this.#readDevinAccount(profile, signal);
+    if (observed.signedIn) {
+      if (prior?.state === "prepared") {
+        if (!this.#store.transitionMutation(prior.id, "prepared", "cancelled", {
+          provider: "devin",
+          signedIn: true,
+          status: "no_effect",
+        })) throw new CommandFailure("CONFLICT", "The Devin login preparation changed concurrently.");
+      }
+      return {
+        account: this.#publicIsolatedProviderAccount(profile),
+        authentication: { provider: "devin", signedIn: true },
+        login: { status: "signed_in" },
+      };
+    }
+    if (releasableSessions.length > 0) {
+      await this.#assertNoCompactProjectionRecoveryForProfile(profile.id);
+      for (const candidate of releasableSessions) {
+        await this.#serialize(`session:${candidate.id}`, async () => {
+          const current = this.#store.requireSession(candidate.id);
+          const blocker = this.#store.providerAuthorityAdvanceBlocker(profile.id, "devin");
+          if (
+            blocker !== null
+            || current.profileId !== profile.id
+            || current.provider !== "devin"
+            || current.state !== "idle"
+            || current.activeTurnId !== undefined
+            || current.providerThreadId === undefined
+            || !this.#store.canReleaseIdleDevinSessionForAccountLogin({
+              profileId: profile.id,
+              profileGeneration: providerAuthority.processGeneration,
+              sessionId: current.id,
+            })
+          ) {
+            throw new CommandFailure(
+              blocker === "recovery_required" || blocker === "unsettled_authority"
+                ? "RECOVERY_REQUIRED"
+                : "CONFLICT",
+              "Devin session authority changed before the idle session could be released for login. Inspect the session and retry after it is quiescent.",
+              { provider: "devin", reason: blocker ?? "session_not_idle", retryable: true },
+            );
+          }
+          const providerConnectionId = this.#sessionProviderConnections.get(current.id) ?? null;
+          await this.#endProviderSession(
+            { ...current, providerThreadId: current.providerThreadId },
+            profile,
+            signal,
+            "Devin account login",
+          );
+          const terminal = this.#store.terminalizeIdleDevinSessionForAccountLogin({
+            accountId: profile.id,
+            providerAuthority,
+            providerConnectionId,
+            providerGeneration: providerAuthority.processGeneration,
+            sessionId: current.id,
+          });
+          if (terminal.event !== undefined) this.#eventWaiters.notify(current.id);
+          for (const interaction of terminal.interactions) this.#appendInteractionState(interaction);
+          await this.#cleanupTerminalFactsMemory(terminal.session);
+          await this.#cloud.supersedeCompactProjectionRecoveryForProviderDeletion(current.id);
+          await this.#daemonAuthority.assertCurrent();
+        });
+      }
+    }
+    let attempt: ReturnType<StateStore["prepareMutation"]>;
+    try {
+      attempt = this.#store.prepareMutation({
+        kind: "account.devin-login",
+        authorityId: profile.id,
+        authorityGeneration: providerAuthority.processGeneration,
+        providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "account_devin_login" }],
+        request: { provider: "devin" },
+        idempotencyKey,
+      });
+      this.#store.beginDevinLoginMutationEffect({
+        attemptId: attempt.id,
+        profileId: profile.id,
+        profileGeneration: providerAuthority.processGeneration,
+        evidence: { kind: "account.devin-login", provider: "devin", baselineSignedIn: false },
+      });
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message === "UNSETTLED_MUTATION_AUTHORITY") {
+        const blocking = this.#unsettledDevinLogin(profile);
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "Another mutation already owns this account generation.",
+          blocking === undefined ? undefined : this.#devinLoginRecovery(blocking),
+        );
+      }
+      throw error;
+    }
+    return {
+      account: this.#publicIsolatedProviderAccount(profile),
+      authentication: { provider: "devin", signedIn: false },
+      login: {
+        status: "launch_granted",
+        attemptId: attempt.id,
+        idempotencyKey,
+        providerGeneration: providerAuthority.processGeneration,
+      },
+    };
+  }
+
+  async #completeDevinLogin(
+    command: Extract<LocalCommand, { kind: "account.devin-login.complete" }>,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    const profile = this.#store.requireProfile(command.account);
+    const attempt = this.#store.readMutation(command.idempotencyKey);
+    if (
+      attempt === null
+      || attempt.id !== command.attemptId
+      || attempt.kind !== "account.devin-login"
+      || attempt.authorityId !== profile.id
+      || attempt.authorityGeneration !== command.providerGeneration
+    ) throw new CommandFailure("CONFLICT", "The Devin login completion does not match its exact launch authority.");
+    if (attempt.state === "reconciled" && attempt.resolution?.kind === "abandoned") {
+      throw new CommandFailure(
+        "CONFLICT",
+        "This Devin login fence was explicitly abandoned. Start a fresh login with a new idempotency key.",
+      );
+    }
+    const priorReceipt = attempt.state === "applied"
+      || attempt.state === "failed"
+      || attempt.state === "reconciled"
+      ? devinLoginTerminalReceiptSchema.safeParse(attempt.result)
+      : undefined;
+    if (priorReceipt !== undefined && !priorReceipt.success) {
+      throw new CommandFailure("INTERNAL", "The Devin login terminal receipt is invalid.");
+    }
+    let signedIn: boolean;
+    if (priorReceipt?.success === true) {
+      signedIn = priorReceipt.data.signedIn;
+    } else if (command.outcome.state === "not_started") {
+      signedIn = false;
+    } else {
+      signedIn = await this.#readForegroundLoginSignedIn(profile, attempt, "devin", signal);
+    }
+    try {
+      this.#store.settleDevinLoginMutation({
+        attemptId: command.attemptId,
+        idempotencyKey: command.idempotencyKey,
+        profileId: profile.id,
+        profileGeneration: command.providerGeneration,
+        signedIn,
+        outcome: command.outcome,
+      });
+    } catch (error: unknown) {
+      if (
+        error instanceof Error
+        && (
+          error.message === "DEVIN_LOGIN_AUTHORITY_MISMATCH"
+          || error.message === "DEVIN_LOGIN_TERMINAL_OUTCOME_CONFLICT"
+          || error.message === "MUTATION_RECOVERY_CAS_CONFLICT"
+        )
+      ) throw new CommandFailure("CONFLICT", "The Devin login completion conflicts with its durable terminal receipt.");
+      throw error;
+    }
+    return {
+      account: this.#publicIsolatedProviderAccount(profile),
+      authentication: { provider: "devin", signedIn },
+      login: {
+        status: signedIn ? "signed_in" : "signed_out",
+        attemptId: command.attemptId,
+        idempotencyKey: command.idempotencyKey,
+        providerGeneration: command.providerGeneration,
+      },
+    };
+  }
+
+  #abandonDevinLogin(
+    command: Extract<LocalCommand, { kind: "account.devin-login.abandon" }>,
+  ): unknown {
+    const profile = this.#store.requireProfile(command.account);
+    const attempt = this.#store.readMutation(command.idempotencyKey);
+    if (
+      attempt === null
+      || attempt.id !== command.attemptId
+      || attempt.kind !== "account.devin-login"
+      || attempt.authorityId !== profile.id
+      || attempt.authorityGeneration !== command.providerGeneration
+    ) throw new CommandFailure("CONFLICT", "The acknowledged Devin login abandon does not match its exact launch authority.");
+    try {
+      this.#store.abandonDevinLoginMutation({
+        attemptId: command.attemptId,
+        idempotencyKey: command.idempotencyKey,
+        profileId: profile.id,
+        profileGeneration: command.providerGeneration,
+        acknowledgeChildExited: command.acknowledgeChildExited,
+      });
+    } catch (error: unknown) {
+      if (
+        error instanceof Error
+        && (
+          error.message === "DEVIN_LOGIN_AUTHORITY_MISMATCH"
+          || error.message === "DEVIN_LOGIN_NOT_UNSETTLED"
+          || error.message === "DEVIN_LOGIN_TERMINAL_OUTCOME_CONFLICT"
+          || error.message === "MUTATION_RECOVERY_CAS_CONFLICT"
+        )
+      ) throw new CommandFailure("CONFLICT", "The acknowledged Devin login abandon does not match one live unsettled launch fence.");
+      throw error;
+    }
+    return {
+      account: this.#publicIsolatedProviderAccount(profile),
+      login: {
+        status: "abandoned",
+        attemptId: command.attemptId,
+        idempotencyKey: command.idempotencyKey,
+        providerGeneration: command.providerGeneration,
+        localOnly: true,
+        credentialAction: "none",
+      },
     };
   }
 
@@ -5493,7 +6184,7 @@ export class HraService {
           );
         }
         return {
-          account: this.#publicClaudeAccount(profile),
+          account: this.#publicIsolatedProviderAccount(profile),
           authentication: { provider: "claude", signedIn: true },
           login: { status: "signed_in" },
         };
@@ -5563,7 +6254,7 @@ export class HraService {
         })) throw new CommandFailure("CONFLICT", "The Claude login preparation changed concurrently.");
       }
       return {
-        account: this.#publicClaudeAccount(profile),
+        account: this.#publicIsolatedProviderAccount(profile),
         authentication: { provider: "claude", signedIn: true },
         login: { status: "signed_in" },
       };
@@ -5648,7 +6339,7 @@ export class HraService {
       throw error;
     }
     return {
-      account: this.#publicClaudeAccount(profile),
+      account: this.#publicIsolatedProviderAccount(profile),
       authentication: { provider: "claude", signedIn: false },
       login: {
         status: "launch_granted",
@@ -5683,6 +6374,9 @@ export class HraService {
       || attempt.state === "reconciled"
       ? claudeLoginTerminalReceiptSchema.safeParse(attempt.result)
       : undefined;
+    if (priorReceipt !== undefined && !priorReceipt.success) {
+      throw new CommandFailure("INTERNAL", "The Claude login terminal receipt is invalid.");
+    }
     let signedIn: boolean;
     if (priorReceipt?.success === true) {
       signedIn = priorReceipt.data.signedIn;
@@ -5692,12 +6386,7 @@ export class HraService {
       // depend on a fallible provider status probe.
       signedIn = false;
     } else {
-      this.#assertClaudeIsolationAccepted();
-      const observed = await this.#readClaudeAccount(profile, signal);
-      if (observed.readiness === "unverified") {
-        throw new CommandFailure("UNAVAILABLE", "Claude authentication status could not be verified; the exact login remains unsettled.");
-      }
-      signedIn = observed.readiness === "signed_in";
+      signedIn = await this.#readForegroundLoginSignedIn(profile, attempt, "claude", signal);
     }
     try {
       this.#store.settleClaudeLoginMutation({
@@ -5720,7 +6409,7 @@ export class HraService {
       throw error;
     }
     return {
-      account: this.#publicClaudeAccount(profile),
+      account: this.#publicIsolatedProviderAccount(profile),
       authentication: { provider: "claude", signedIn },
       login: {
         status: signedIn ? "signed_in" : "signed_out",
@@ -5764,7 +6453,7 @@ export class HraService {
       throw error;
     }
     return {
-      account: this.#publicClaudeAccount(profile),
+      account: this.#publicIsolatedProviderAccount(profile),
       login: {
         status: "abandoned",
         attemptId: command.attemptId,
@@ -7334,7 +8023,7 @@ export class HraService {
       const sessionAuthority = this.#store.requireSessionProviderAuthority(session.id);
       const dispatchable = binding.readiness === "signed_in"
         || (
-          binding.provider === "claude"
+          (binding.provider === "claude" || binding.provider === "devin")
           && binding.readiness === "unverified"
           && sessionAuthority.routingProvenance === "explicit"
         );
@@ -8140,8 +8829,10 @@ export class HraService {
     let quarantineFailed = false;
     try {
       const focalProvider = input.focalInteraction.authority.provider;
-      if (focalProvider === "claude") {
-        throw new Error("CLAUDE_INTERACTION_QUARANTINE_REQUIRES_DAEMON_RETIREMENT");
+      if (focalProvider !== "codex") {
+        throw new Error(
+          `${focalProvider.toUpperCase()}_INTERACTION_QUARANTINE_REQUIRES_DAEMON_RETIREMENT`,
+        );
       }
       const quarantined = this.#store.quarantineInteractionPersistenceBoundary({
         profileId: input.focalInteraction.authority.profileId,
@@ -8727,12 +9418,19 @@ export class HraService {
       providerGeneration: profile.processGeneration,
       limit,
     } as const;
-    const decodedCursor = cursor === undefined
-      ? undefined
-      : this.#eventCursors.decodeSessionList(cursor, cursorFilter);
+    let decodedComposite: ReturnType<SessionEventCursorCodec["decodeCompositeSessionList"]> | undefined;
+    let decodedLegacy: ReturnType<SessionEventCursorCodec["decodeSessionList"]> | undefined;
+    if (cursor !== undefined) {
+      try {
+        decodedComposite = this.#eventCursors.decodeCompositeSessionList(cursor, cursorFilter);
+      } catch (error: unknown) {
+        if (!(error instanceof SessionEventCursorError) || error.reason !== "type_mismatch") throw error;
+        decodedLegacy = this.#eventCursors.decodeSessionList(cursor, cursorFilter);
+      }
+    }
     if (await this.#cloud.isCompactProjectionRecoveryUnsettledForProfile(profile.id)) {
       await this.#daemonAuthority.assertCurrent();
-      if (decodedCursor !== undefined) {
+      if (decodedComposite !== undefined || decodedLegacy !== undefined) {
         throw new CommandFailure(
           "RECOVERY_REQUIRED",
           "Provider session-list continuation is paused while compact-projection recovery preserves exact local authority.",
@@ -8750,20 +9448,81 @@ export class HraService {
     }
     const providerAuthority = this.#providerAuthority(profile, "codex");
     const runtimeAuthority = authorityFor(this.#paths, profile, providerAuthority);
+
+    const sessions: SessionRecord[] = [];
+    const shouldPageLocalSessions = decodedLegacy === undefined
+      && (decodedComposite === undefined || decodedComposite.continuation.phase === "local");
+    if (shouldPageLocalSessions) {
+      const localPage = this.#store.listLocalSessionPage({
+        profileId: profile.id,
+        after: decodedComposite?.continuation.phase === "local"
+          ? {
+              createdAt: decodedComposite.continuation.afterCreatedAt,
+              sessionId: decodedComposite.continuation.afterSessionId,
+            }
+          : null,
+        excludedProvider: this.#codex.provider,
+        includeArchived,
+        limit,
+      });
+      sessions.push(...localPage.sessions);
+      if (localPage.nextPosition !== null) {
+        return {
+          accountId: profile.id,
+          sessions,
+          nextCursor: this.#eventCursors.encodeCompositeSessionList({
+            ...cursorFilter,
+            continuation: {
+              phase: "local",
+              afterCreatedAt: localPage.nextPosition.createdAt,
+              afterSessionId: localPage.nextPosition.sessionId,
+            },
+          }),
+        };
+      }
+      if (sessions.length === limit) {
+        return {
+          accountId: profile.id,
+          sessions,
+          nextCursor: this.#eventCursors.encodeCompositeSessionList({
+            ...cursorFilter,
+            continuation: { phase: "provider_start" },
+          }),
+        };
+      }
+    }
+
+    const providerCursor = decodedLegacy?.providerCursor
+      ?? (decodedComposite?.continuation.phase === "provider"
+        ? decodedComposite.continuation.state.providerCursor
+        : undefined);
+    const providerLimit = limit - sessions.length;
     const remote = await this.#fencedEffect(async () => await this.#codex.listSessions({
       authority: runtimeAuthority,
-      limit,
-      ...(decodedCursor === undefined ? {} : { cursor: decodedCursor.providerCursor }),
+      limit: providerLimit,
+      ...(providerCursor === undefined ? {} : { cursor: providerCursor }),
       signal,
     }));
+    if (remote.sessions.length > providerLimit) {
+      throw new CommandFailure(
+        "UNAVAILABLE",
+        "Codex returned more session-list rows than the requested page can safely retain.",
+      );
+    }
     let nextCursor: string | null = null;
     if (remote.nextCursor !== null) {
       try {
-        nextCursor = this.#eventCursors.advanceSessionList({
-          ...cursorFilter,
-          providerCursor: remote.nextCursor,
-          ...(decodedCursor === undefined ? {} : { prior: decodedCursor }),
-        });
+        nextCursor = decodedLegacy === undefined
+          ? this.#eventCursors.advanceCompositeSessionList({
+              ...cursorFilter,
+              providerCursor: remote.nextCursor,
+              ...(decodedComposite === undefined ? {} : { prior: decodedComposite }),
+            })
+          : this.#eventCursors.advanceSessionList({
+              ...cursorFilter,
+              providerCursor: remote.nextCursor,
+              prior: decodedLegacy,
+            });
       } catch (error: unknown) {
         if (error instanceof SessionEventCursorError) {
           throw new CommandFailure(
@@ -8775,7 +9534,6 @@ export class HraService {
       }
     }
     const projects = this.#store.listProjects();
-    const sessions: SessionRecord[] = [];
     for (const projection of remote.sessions) {
       const projectId = projection.projectRoot === undefined ? undefined : projects.find((project) => project.rootPath === projection.projectRoot)?.id;
       const session = this.#store.upsertProviderSession({
@@ -8787,14 +9545,14 @@ export class HraService {
         ...(projection.activeTurnId === undefined ? {} : { activeTurnId: projection.activeTurnId }),
         ...(projection.providerUpdatedAt === undefined ? {} : { providerUpdatedAt: projection.providerUpdatedAt }),
       });
-      sessions.push(session);
+      if (includeArchived || session.archivedAt === undefined) sessions.push(session);
       await this.#reconcileCommittedSessionFactsMemory(session);
     }
     return {
       accountId: profile.id,
       // Archive is a listing filter over locally known sessions: the
       // provider has no archive concept, so its page is filtered here.
-      sessions: includeArchived ? sessions : sessions.filter((session) => session.archivedAt === undefined),
+      sessions,
       nextCursor,
     };
   }
@@ -8908,7 +9666,7 @@ export class HraService {
     const project = command.project === undefined ? this.#store.listProjects().find((candidate) => candidate.default) : this.#store.requireProject(command.project);
     if (project === undefined) throw new CommandFailure("INTERACTION_REQUIRED", "Add or select a project directory before starting a session.");
     await this.#requireUsableProjectRoot(project.rootPath);
-    // The session binds this provider's port for its whole life: the durable
+    // This binding selects the provider port until a journaled switch: the durable
     // session-start evidence carries whichever provider's reviewed profile the
     // port proves, and every later turn, steer, stop, and interaction on this
     // session is routed back to the same port by its immutable provider-account
@@ -9599,6 +10357,7 @@ export class HraService {
     remoteExpected?: RemoteExpectedSessionAuthority,
   ): Promise<unknown> {
     const session = this.#requireBoundSession(selectedSession.id);
+    this.#work.assertSessionCanChangeRoute(session.id);
     if (session.provider === "claude") this.#assertClaudeIsolationAccepted();
     const currentProfile = this.#store.requireProfileById(session.profileId);
     const source = this.#store.requireSessionProviderAuthority(session.id);
@@ -9695,6 +10454,9 @@ export class HraService {
       command.provider,
       key,
     );
+    // Work claims do not share the session lock. A claim admitted while the
+    // runtime review awaited must win before a switch journal is created.
+    this.#work.assertSessionCanChangeRoute(session.id);
     const prepared = this.#store.prepareSessionSwitch({
       idempotencyKey: key,
       rawRequest,
@@ -9790,6 +10552,7 @@ export class HraService {
       const targetRuntime = this.#sessionRuntime(record.targetAuthority.provider);
       const targetProfileAuthority = authorityFor(this.#paths, targetProfile, record.targetAuthority);
       try {
+        this.#work.assertSessionCanChangeRoute(record.sessionId);
         record = this.#store.beginSessionSwitchTargetStart(cas);
       } catch (error: unknown) {
         this.#discardSessionSwitchFactDeferral(record.sessionId, sourceDeferral);
@@ -12429,9 +13192,11 @@ export class HraService {
     profile: ProfileRecord,
     session: Pick<SessionRecord, "provider">,
   ): boolean {
-    return session.provider === "claude"
-      ? this.#platform === "linux"
-      : profile.state === "signed_in";
+    switch (session.provider) {
+      case "codex": return profile.state === "signed_in";
+      case "claude": return this.#platform === "linux";
+      case "devin": return true;
+    }
   }
 
 
@@ -12699,7 +13464,7 @@ export class HraService {
   }
 
   #scheduleUsageRefresh(authority: ProfileAuthority): void {
-    if (this.#state !== "open" || authority.provider === "claude") return;
+    if (this.#state !== "open" || authority.provider !== "codex") return;
     if (this.#usageRefreshes.has(authority.id)) {
       this.#usageRefreshDirty.add(authority.id);
       return;

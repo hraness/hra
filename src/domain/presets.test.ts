@@ -19,20 +19,26 @@ import {
 } from "./presets";
 import {
   effectiveClaudeRuntimeProfileSchema,
+  effectiveDevinRuntimeProfileSchema,
   effectiveRuntimeProfileSchema,
+  isDevinRuntimeProfile,
+  reviewedRuntimeProfileProvider,
+  reviewedRuntimeProfileSchema,
 } from "./runtime-profile";
 
 describe("model presets and providers", () => {
-  test("names exactly the four presets and two providers", () => {
-    expect(presetSchema.options).toEqual(["low", "high", "ultra", "fable-max"]);
-    expect(providerSchema.options).toEqual(["codex", "claude"]);
+  test("names exactly the five presets and three providers", () => {
+    expect(presetSchema.options).toEqual(["low", "high", "ultra", "fable-max", "astra"]);
+    expect(providerSchema.options).toEqual(["codex", "claude", "devin"]);
     expect(presetsForProvider("codex")).toEqual(["low", "high", "ultra"]);
     expect(presetsForProvider("claude")).toEqual(["fable-max"]);
+    expect(presetsForProvider("devin")).toEqual(["astra"]);
   });
 
   test("gives every provider one supported default without changing preset meanings", () => {
     expect(defaultPresetForProvider("codex")).toBe("ultra");
     expect(defaultPresetForProvider("claude")).toBe("fable-max");
+    expect(defaultPresetForProvider("devin")).toBe("astra");
 
     for (const provider of providerSchema.options) {
       const preset = defaultPresetForProvider(provider);
@@ -54,6 +60,11 @@ describe("model presets and providers", () => {
       model: "gpt-6-astra",
       effort: "ultra",
     });
+    expect(() => presetRequirementForContract("astra", legacyPresetContract)).toThrow("No preset requirement exists for that contract.");
+    expect(presetRequirementForContract("astra", currentPresetContract)).toEqual({
+      model: "gpt-6-astra",
+      effort: "provider-default",
+    });
     expect(isAdmittedPresetRequirement("high", {
       model: "gpt-5.6-sol",
       effort: "max",
@@ -64,6 +75,15 @@ describe("model presets and providers", () => {
     })).toBe(false);
   });
 
+  test("refuses an unshipped legacy Devin contract before returning any runtime requirement", () => {
+    expect(() => presetRequirementForContract("astra", legacyPresetContract))
+      .toThrow("No preset requirement exists for that contract.");
+    expect(presetRequirementForContract("astra", currentPresetContract)).toEqual({
+      model: "gpt-6-astra",
+      effort: "provider-default",
+    });
+  });
+
   test("refuses a preset the session's provider cannot run", () => {
     expect(() => { assertPresetSupportedByProvider("claude", "ultra"); })
       .toThrow(PresetProviderMismatchError);
@@ -71,9 +91,13 @@ describe("model presets and providers", () => {
       .toThrow("The claude provider does not support the `ultra` model preset. Supported presets: fable-max.");
     expect(() => { assertPresetSupportedByProvider("codex", "fable-max"); })
       .toThrow("Supported presets: low, high, ultra.");
+    expect(() => { assertPresetSupportedByProvider("devin", "ultra"); })
+      .toThrow("The devin provider does not support the `ultra` model preset. Supported presets: astra.");
     expect(() => { assertPresetSupportedByProvider("codex", "ultra"); }).not.toThrow();
+    expect(() => { assertPresetSupportedByProvider("devin", "astra"); }).not.toThrow();
     expect(isPresetSupportedByProvider("claude", "fable-max")).toBe(true);
     expect(isPresetSupportedByProvider("codex", "fable-max")).toBe(false);
+    expect(isPresetSupportedByProvider("devin", "astra")).toBe(true);
   });
 
   test("round-trips every preset through its durable provider and tier", () => {
@@ -84,6 +108,7 @@ describe("model presets and providers", () => {
     // No Claude preset exists below the top tier, so a stored `low` tier can
     // never be reassembled as a Claude preset.
     expect(() => presetForProviderTier("claude", "low")).toThrow("No claude model preset exists");
+    expect(() => presetForProviderTier("devin", "high")).toThrow("No devin model preset exists");
   });
 
   test("keeps another provider's preset out of a Codex runtime profile", () => {
@@ -166,5 +191,31 @@ describe("model presets and providers", () => {
       ...profile,
       nativeFallback: undefined,
     }).success).toBe(true);
+  });
+
+  test("pins Devin to Astra through ACP without inventing an effort flag", () => {
+    const profile = {
+      devinVersion: "3000.6.14",
+      isolatedHome: true,
+      model: "gpt-6-astra",
+      observedAt: 1_700_000_000_000,
+      preset: "astra",
+      processGeneration: 1,
+      profileId: "acct_00000000000000000000000000000000",
+      protocolVersion: 1,
+      reasoningEffort: "provider-default",
+    };
+    const parsed = effectiveDevinRuntimeProfileSchema.parse(profile);
+    expect(reviewedRuntimeProfileSchema.parse(profile)).toEqual(parsed);
+    expect(reviewedRuntimeProfileProvider(parsed)).toBe("devin");
+    expect(isDevinRuntimeProfile(parsed)).toBe(true);
+    expect(effectiveDevinRuntimeProfileSchema.safeParse({
+      ...profile,
+      model: "gpt",
+    }).success).toBe(false);
+    expect(effectiveDevinRuntimeProfileSchema.safeParse({
+      ...profile,
+      reasoningEffort: "max",
+    }).success).toBe(false);
   });
 });

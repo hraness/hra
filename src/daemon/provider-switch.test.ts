@@ -51,7 +51,11 @@ const codexProfile = (
   authority: ProfileAuthority,
   preset: Preset,
   requirement?: PresetRequirement,
-): EffectiveRuntimeProfile => ({
+): EffectiveRuntimeProfile => {
+  if (requirement?.effort === "provider-default") {
+    throw new Error("A Codex fixture cannot use Devin's provider-default effort.");
+  }
+  return {
   profileId: authority.id,
   processGeneration: authority.generation,
   observedAt: 2_000,
@@ -66,7 +70,8 @@ const codexProfile = (
   computerUse: true,
   pluginCapability: true,
   enabledApps: [],
-});
+  };
+};
 
 const claudeProfile = (authority: ProfileAuthority): EffectiveClaudeRuntimeProfile => ({
   profileId: authority.id,
@@ -1691,24 +1696,28 @@ describe("provider portability", () => {
   test("keeps the settled receipt stable when a deferred target fact is lost", async () => {
     const value = await fixture();
     const { sessionId } = await codexSession(value);
-    const reconcile = value.store.reconcileSessionFromProvider.bind(value.store);
-    let rejectDeferredTitle = true;
-    Object.defineProperty(value.store, "reconcileSessionFromProvider", {
+    const appendEvent = value.store.appendPublicSessionEvent.bind(value.store);
+    let rejectDeferredFact = true;
+    Object.defineProperty(value.store, "appendPublicSessionEvent", {
       configurable: true,
-      value: (input: Parameters<StateStore["reconcileSessionFromProvider"]>[0]) => {
-        if (rejectDeferredTitle && input.title === "deferred target title") {
-          rejectDeferredTitle = false;
+      value: (input: Parameters<StateStore["appendPublicSessionEvent"]>[0]) => {
+        if (rejectDeferredFact && input.body.type === "error"
+          && input.body.code === "DEFERRED_TARGET_NOTICE") {
+          rejectDeferredFact = false;
           throw new Error("forced deferred-fact persistence loss");
         }
-        return reconcile(input);
+        return appendEvent(input);
       },
     });
     value.claude.beforeStartTurnReturn = async (input) => {
-      await value.service.observeCodexFact(input.authority, {
+      await value.service.observeClaudeFact(input.authority, {
         connectionId: "30000000-0000-4000-8000-000000000002",
-        name: "deferred target title",
-        threadId: input.providerThreadId,
-        type: "threadNameUpdated",
+        code: "DEFERRED_TARGET_NOTICE",
+        message: "deferred target notice",
+        providerThreadId: input.providerThreadId,
+        terminal: false,
+        turnId: null,
+        type: "providerError",
       });
     };
     const command = {
@@ -1720,6 +1729,7 @@ describe("provider portability", () => {
 
     const first = await value.service.execute(command, { signal });
     const calls = { claude: [...value.claude.calls], codex: [...value.codex.calls] };
+    expect(rejectDeferredFact).toBe(false);
     expect(value.store.readSessionSwitchByIdempotencyKey(command.idempotencyKey))
       .toMatchObject({ phase: "seed_settled" });
     expect(value.store.requireSession(sessionId)).toMatchObject({
@@ -1782,11 +1792,14 @@ describe("provider portability", () => {
       // Fill the exact target-thread buffer, then deliver one more fact while
       // reviewTurnStart still owns the provider-neutral pre-effect boundary.
       for (let index = 0; index <= 256; index += 1) {
-        await value.service.observeCodexFact(input.authority, {
+        await value.service.observeClaudeFact(input.authority, {
           connectionId: "30000000-0000-4000-8000-000000000002",
-          name: `deferred-overflow-${String(index)}`,
-          threadId: input.providerThreadId,
-          type: "threadNameUpdated",
+          code: `DEFERRED_OVERFLOW_${String(index)}`,
+          message: "bounded target callback",
+          providerThreadId: input.providerThreadId,
+          terminal: false,
+          turnId: null,
+          type: "providerError",
         });
       }
     };
@@ -1828,11 +1841,14 @@ describe("provider portability", () => {
         value.daemonAuthority.beforeAssertReturn = async () => {
           startPreFenceOverflowed = true;
           for (let index = 0; index <= 256; index += 1) {
-            await value.service.observeCodexFact(input.authority, {
+            await value.service.observeClaudeFact(input.authority, {
               connectionId: "30000000-0000-4000-8000-000000000002",
-              name: `fence-overflow-${String(index)}`,
-              threadId: input.providerThreadId,
-              type: "threadNameUpdated",
+              code: `FENCE_OVERFLOW_${String(index)}`,
+              message: "bounded target callback at the effect fence",
+              providerThreadId: input.providerThreadId,
+              terminal: false,
+              turnId: null,
+              type: "providerError",
             });
           }
         };

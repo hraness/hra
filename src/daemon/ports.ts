@@ -3,6 +3,7 @@ import type { Preset, PresetRequirement, Provider } from "../domain/presets";
 import type { ProviderAccountId } from "../domain/provider-accounts";
 import type {
   EffectiveClaudeRuntimeProfile,
+  EffectiveDevinRuntimeProfile,
   EffectiveRuntimeProfile,
 } from "../domain/runtime-profile";
 import type { AccountRateLimitResetOutcome } from "../domain/usage-metrics";
@@ -45,6 +46,29 @@ export type RuntimeStartReviewOf<Profile> = {
 export type RuntimeStartReview = RuntimeStartReviewOf<EffectiveRuntimeProfile>;
 
 export type ClaudeRuntimeStartReview = RuntimeStartReviewOf<EffectiveClaudeRuntimeProfile>;
+
+export type DevinRuntimeStartReview = RuntimeStartReviewOf<EffectiveDevinRuntimeProfile>;
+
+/** Private local custody, never a wire receipt or evidence of another provider. */
+export type DevinRuntimeCloseWitness = Readonly<{
+  authority: Readonly<ProfileAuthority>;
+  providerThreadId: string;
+  connectionId: string;
+  projectRoot: string;
+  effectiveRuntimeProfile: Readonly<EffectiveDevinRuntimeProfile>;
+}>;
+
+export type DevinRuntimeCloseCustody = Readonly<{
+  /** Synchronous, frozen and bounded; observes only this manager's live idle writers. */
+  snapshot(): readonly DevinRuntimeCloseWitness[];
+  /**
+   * Closes every owned child once, granting proof only for the supplied original
+   * witnesses after every close and join succeeds. Copies and old writers are
+   * invalid but still receive cleanup, never proof. Call this instead of close(),
+   * not in addition to it.
+   */
+  close(witnesses: readonly DevinRuntimeCloseWitness[]): Promise<readonly DevinRuntimeCloseWitness[]>;
+}>;
 
 export type CodexAccountProjection = {
   signedIn: boolean;
@@ -162,9 +186,8 @@ export type CodexSessionPage = {
  * listing) stays on that provider's own port. `Profile` is the reviewed
  * runtime-profile document the provider proves before it runs.
  *
- * D4/W3 seam: `CodexRuntimePort` and `ClaudeRuntimePort` are the two
- * implementations, and the daemon selects one per session by the session's
- * recorded provider.
+ * D4/W3 seam: Codex, Claude Code, and Devin each implement this interface,
+ * and the daemon selects one per session by the session's recorded provider.
  */
 export interface SessionRuntimePort<Profile> {
   readonly provider: Provider;
@@ -235,6 +258,24 @@ export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRun
    * Codex publishes its own request authority on the notification; Claude's
    * control request carries only an id, so the daemon asks the port for it.
    */
+  interactionAuthority(
+    authority: ProfileAuthority,
+    providerThreadId: string,
+    requestId: string,
+  ): ProviderInteractionAuthority;
+}
+
+/**
+ * The Devin implementation of the neutral seam. Devin owns authentication and
+ * native sessions inside its isolated XDG home; HRA observes only signed-in
+ * state and the bounded ACP facts required by the neutral session timeline.
+ */
+export interface DevinRuntimePort extends SessionRuntimePort<EffectiveDevinRuntimeProfile> {
+  readonly provider: "devin";
+  /** Absence grants no restart proof; ordinary close() still owns cleanup. */
+  readonly closeCustody?: DevinRuntimeCloseCustody;
+  readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
+  pinnedVersion(): string;
   interactionAuthority(
     authority: ProfileAuthority,
     providerThreadId: string,
@@ -409,6 +450,43 @@ export class UnavailableClaudeRuntime implements ClaudeRuntimePort {
       `This daemon has no Claude Code runtime. Install Claude Code ${this.#pinnedVersion} exactly, `
       + "put `claude` on this daemon's PATH, restart the daemon with `hra daemon restart`, then sign in "
       + "inside the account's isolated Claude profile.",
+    );
+  }
+  interactionAuthority(): ProviderInteractionAuthority { return this.#unavailable(); }
+  pinnedVersion(): string { return this.#unavailable(); }
+  readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  discardRuntimeReview(): void {}
+  startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  observeSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  readSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  endSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  reviewTurnStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  startTurn(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  steer(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  interrupt(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  inspectInteractionAuthority(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  validateInteractionResolution(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  resolveInteraction(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  validateInteractionTimeout(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  timeoutInteraction(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  async close(): Promise<void> {}
+}
+
+/** Fails closed when the exact pinned Devin CLI is absent or incompatible. */
+export class UnavailableDevinRuntime implements DevinRuntimePort {
+  readonly provider = "devin" as const;
+  readonly #pinnedVersion: string;
+
+  constructor(pinnedVersion: string) {
+    this.#pinnedVersion = pinnedVersion;
+  }
+
+  #unavailable(): never {
+    throw new ProviderRuntimeUnavailableError(
+      `This daemon has no Devin runtime. Install Devin CLI ${this.#pinnedVersion} exactly, `
+      + "put `devin` on this daemon's PATH, restart the daemon with `hra daemon restart`, then sign in "
+      + "inside the account's isolated Devin profile.",
     );
   }
   interactionAuthority(): ProviderInteractionAuthority { return this.#unavailable(); }

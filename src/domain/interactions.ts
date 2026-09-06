@@ -4,6 +4,7 @@ import { publicProviderIdentifierSchema } from "../public-provider-identifier";
 import {
   claudeProviderAccountIdSchema,
   codexProviderAccountIdSchema,
+  devinProviderAccountIdSchema,
   providerAccountIdSchema,
 } from "./provider-accounts";
 import { providerSchema } from "./presets";
@@ -143,6 +144,10 @@ export const legacyProviderInteractionAuthoritySchema = z.object({
       message: "Claude interaction authority requires a Claude provider-account id.",
     });
   }
+  if (authority.provider === "devin"
+    && !devinProviderAccountIdSchema.safeParse(authority.providerAccountId).success) {
+    context.addIssue({ code: "custom", message: "Devin interaction authority requires a Devin provider-account id." });
+  }
 });
 
 export type LegacyProviderInteractionAuthority = z.infer<
@@ -173,6 +178,10 @@ export const providerInteractionAuthoritySchema = z.object({
       code: "custom",
       message: "Claude interaction authority requires a Claude provider-account id.",
     });
+  }
+  if (authority.provider === "devin"
+    && !devinProviderAccountIdSchema.safeParse(authority.providerAccountId).success) {
+    context.addIssue({ code: "custom", message: "Devin interaction authority requires a Devin provider-account id." });
   }
 });
 

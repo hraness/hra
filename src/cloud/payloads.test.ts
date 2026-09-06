@@ -72,11 +72,13 @@ describe("closed encrypted payloads", () => {
     expect(await decryptUsageProjection(envelope, key, authority)).toEqual(projection);
   });
 
-  test("admits the fable-max preset in model and default-preset commands", () => {
-    expect(parseRemoteCommandPayload({ kind: "set_model", preset: "fable-max" }))
-      .toEqual({ kind: "set_model", preset: "fable-max" });
-    expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset: "fable-max" }))
-      .toEqual({ kind: "set_default_preset", preset: "fable-max" });
+  test("admits every provider-specific preset in model and default-preset commands", () => {
+    for (const preset of ["high", "fable-max", "astra"] as const) {
+      expect(parseRemoteCommandPayload({ kind: "set_model", preset }))
+        .toEqual({ kind: "set_model", preset });
+      expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset }))
+        .toEqual({ kind: "set_default_preset", preset });
+    }
     expect(parseRemoteCommandPayload({ kind: "set_model", preset: "fable" })).toBeNull();
   });
 
@@ -85,6 +87,15 @@ describe("closed encrypted payloads", () => {
       .toEqual({ kind: "set_provider", provider: "claude" });
     expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "fable-max", provider: "claude" }))
       .toEqual({ kind: "set_provider", preset: "fable-max", provider: "claude" });
+    expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "astra", provider: "devin" }))
+      .toEqual({ kind: "set_provider", preset: "astra", provider: "devin" });
+    expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "high", provider: "codex" }))
+      .toEqual({ kind: "set_provider", preset: "high", provider: "codex" });
+    for (const mismatch of [
+      { kind: "set_provider", preset: "astra", provider: "codex" },
+      { kind: "set_provider", preset: "fable-max", provider: "devin" },
+      { kind: "set_provider", preset: "ultra", provider: "claude" },
+    ]) expect(parseRemoteCommandPayload(mismatch)).toBeNull();
     expect(parseRemoteCommandPayload({ kind: "set_provider", provider: "gemini" })).toBeNull();
     expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "fable", provider: "claude" }))
       .toBeNull();
@@ -120,9 +131,12 @@ describe("closed encrypted payloads", () => {
       kind: "command",
       userPublicId: "user_12345678",
     } as const;
-    const envelope = await encryptRemoteCommand({ kind: "set_fast", enabled: true }, key, authority);
-    expect(await decryptRemoteCommand(envelope, key, authority))
-      .toEqual({ kind: "set_fast", enabled: true });
+    const existingPayload = { kind: "set_fast", enabled: true } as const;
+    const existingEnvelope = await encryptRemoteCommand(existingPayload, key, authority);
+    expect(await decryptRemoteCommand(existingEnvelope, key, authority)).toEqual(existingPayload);
+    const devinPayload = { kind: "set_provider", preset: "astra", provider: "devin" } as const;
+    const envelope = await encryptRemoteCommand(devinPayload, key, authority);
+    expect(await decryptRemoteCommand(envelope, key, authority)).toEqual(devinPayload);
     await expectPromiseToReject(decryptRemoteCommand(envelope, key, {
       ...authority,
       entityPublicId: "command_87654321",
@@ -446,6 +460,26 @@ describe("device registry payloads", () => {
     }));
   });
 
+  test("parses and encrypts a registry carrying a Devin account and Astra default", async () => {
+    const providerRegistry = {
+      ...registry,
+      accounts: [
+        ...registry.accounts,
+        {
+          label: "Build",
+          provider: "devin",
+          publicId: "acct_00000000000000000000000000000002",
+          status: "signed_in",
+        },
+      ],
+      defaultPreset: "astra",
+    } as const;
+    expect(parseDeviceRegistryPayload(providerRegistry)).toEqual(providerRegistry);
+    const key = randomKeyBytes();
+    const envelope = await encryptDeviceRegistry(providerRegistry, key, authority);
+    expect(await decryptDeviceRegistry(envelope, key, authority)).toEqual(providerRegistry);
+  });
+
   test("refuses a path-shaped label anywhere in the projection", async () => {
     const absolutePath = ["", "srv", "runner", "checkout"].join("/");
     const homePath = `~/${["projects", "control-plane"].join("/")}`;
@@ -534,6 +568,16 @@ describe("device command payloads", () => {
   test("accepts each kind in its exact shape", () => {
     expect(parseDeviceCommandPayload(sessionStart)).toEqual(sessionStart);
     expect(parseDeviceCommandPayload({
+      ...sessionStart,
+      preset: "fable-max",
+      provider: "claude",
+    })).toEqual({ ...sessionStart, preset: "fable-max", provider: "claude" });
+    expect(parseDeviceCommandPayload({
+      ...sessionStart,
+      preset: "astra",
+      provider: "devin",
+    })).toEqual({ ...sessionStart, preset: "astra", provider: "devin" });
+    expect(parseDeviceCommandPayload({
       accountPublicId: "account_primary",
       kind: "account_login_start",
     })).toEqual({ accountPublicId: "account_primary", kind: "account_login_start" });
@@ -567,6 +611,18 @@ describe("device command payloads", () => {
   test("refuses an extra key, a wrong scalar, and a session command kind", () => {
     expect(parseDeviceCommandPayload({ ...sessionStart, extra: 1 })).toBeNull();
     expect(parseDeviceCommandPayload({ ...sessionStart, preset: "fable-max" })).toBeNull();
+    expect(parseDeviceCommandPayload({ ...sessionStart, preset: "astra" })).toBeNull();
+    expect(parseDeviceCommandPayload({ ...sessionStart, provider: "devin" })).toBeNull();
+    expect(parseDeviceCommandPayload({
+      ...sessionStart,
+      preset: "fable-max",
+      provider: "devin",
+    })).toBeNull();
+    expect(parseDeviceCommandPayload({
+      ...sessionStart,
+      preset: "ultra",
+      provider: "claude",
+    })).toBeNull();
     expect(parseDeviceCommandPayload({ ...sessionStart, provider: "gemini" })).toBeNull();
     expect(parseDeviceCommandPayload({ kind: "send_or_steer", message: "hello" })).toBeNull();
     expect(parseDeviceCommandPayload({
@@ -743,8 +799,9 @@ describe("device command payloads", () => {
       userPublicId: "user_0000000000000001",
     } as const;
     const resultAuthority = { ...commandAuthority, kind: "device_command_result" } as const;
-    const envelope = await encryptDeviceCommand(sessionStart, key, commandAuthority);
-    expect(await decryptDeviceCommand(envelope, key, commandAuthority)).toEqual(sessionStart);
+    const devinSessionStart = { ...sessionStart, preset: "astra", provider: "devin" } as const;
+    const envelope = await encryptDeviceCommand(devinSessionStart, key, commandAuthority);
+    expect(await decryptDeviceCommand(envelope, key, commandAuthority)).toEqual(devinSessionStart);
     // The two authorities are separate: a command envelope never decrypts as a
     // result, so a relayed login handoff cannot be produced by replaying a request.
     await expectPromiseToReject(decryptDeviceCommandResult(envelope, key, resultAuthority));

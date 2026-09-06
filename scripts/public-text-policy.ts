@@ -7,6 +7,7 @@ import {
 } from "./authority-supervisor-artifact";
 
 const allowedPublicScopes = new Set([
+  "agentclientprotocol",
   "auth",
   "convex-dev",
   "eslint",

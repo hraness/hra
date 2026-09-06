@@ -457,7 +457,7 @@ const renderSingleEvent = (event: SessionEvent): string => {
       ...(body.explanation === undefined ? [] : [`  ${line(body.explanation)}`]),
     ].join("\n");
     case "diff_updated": return `Diff: ${String(body.changedFiles)} files, ${String(body.patchBytesObserved)} bytes observed`;
-    case "token_usage": return `Tokens: ${body.totalTokens === null ? "unknown" : String(body.totalTokens)} total${body.modelContextWindow === null ? "" : ` of ${String(body.modelContextWindow)}`}`;
+    case "token_usage": return `Tokens: ${body.totalTokens === null ? "unknown" : String(body.totalTokens)} total${body.modelContextWindow === null ? "" : ` of ${String(body.modelContextWindow)}`}${body.providerCost === undefined ? "" : `; provider cost ${String(body.providerCost.amount)} ${body.providerCost.currency}`}`;
     case "interaction_requested": return [
       `Interaction required: ${line(body.interactionKind)} ${line(body.interactionId)}`,
       `  revision ${String(body.revision)}${body.blocking ? ", blocking" : ""}`,
@@ -1972,11 +1972,12 @@ const renderAccountShow = (data: unknown): string => {
   if (account === null) return "Account data is unavailable.";
   const authentication = object(root?.authentication);
   if (
-    authentication?.provider === "claude"
+    (authentication?.provider === "claude" || authentication?.provider === "devin")
     && (typeof authentication.signedIn === "boolean" || authentication.signedIn === null)
   ) {
+    const providerName = authentication.provider === "claude" ? "Claude Code" : "Devin";
     const rows = [
-      `Claude Code: ${authentication.signedIn === null
+      `${providerName}: ${authentication.signedIn === null
         ? "status unknown"
         : authentication.signedIn ? "signed in" : "signed out"}`,
       `Label: ${line(account.label)}`,
@@ -1991,10 +1992,15 @@ const renderAccountShow = (data: unknown): string => {
       if (typeof recovery.diagnostic === "string") rows.push(`  ${safeDiagnostic(recovery.diagnostic)}`);
       if (typeof recovery.statusCommand === "string") rows.push(`Next: ${line(recovery.statusCommand)}`);
       if (typeof recovery.abandonCommand === "string") {
-        rows.push(`Only after confirming the original Claude child exited: ${line(recovery.abandonCommand)}`);
+        rows.push(`Only after confirming the original ${providerName} child exited: ${line(recovery.abandonCommand)}`);
       }
     } else if (authentication.signedIn === false && typeof root?.nextCommand === "string") {
       rows.push(`Next: ${line(root.nextCommand)}`);
+    }
+    const usage = object(root?.usage);
+    if (usage?.allowance === "unknown") {
+      rows.push("Account allowance: unknown");
+      if (typeof usage.reason === "string") rows.push(`  ${safeDiagnostic(usage.reason)}`);
     }
     return rows.join("\n");
   }

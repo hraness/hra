@@ -1,13 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
 
-import type { ProviderAccountAuthority } from "./provider-accounts";
 import {
   createClaudeQuotaUsageComponent,
   providerUsageDigest,
   providerUsageQuotaComponentSchema,
   type CodexQuotaUsage,
   type CreateClaudeQuotaUsageComponentInput,
+  type UsageProviderAccountAuthority,
 } from "./provider-usage";
 import {
   AUTO_RATE_LIMIT_RESET_USED_PERCENT,
@@ -18,6 +18,7 @@ import {
 import {
   automaticUsageDecision,
   automaticUsageDecisionInputSchema,
+  automaticUsageManagedSessionSchema,
   automaticUsagePolicyConfigurationSchema,
   automaticUsagePolicyConfigurationUpdateSchema,
   automaticUsageResetGateSchema,
@@ -39,7 +40,7 @@ const hour = 60 * 60_000;
 const week = CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES;
 const digest = "a".repeat(64);
 const accountId = (id: number): string => `acct_${id.toString(16).padStart(32, "0")}`;
-const authorityFor = (id: number): ProviderAccountAuthority => ({
+const authorityFor = (id: number): UsageProviderAccountAuthority => ({
   provider: "codex",
   providerAccountId: accountId(id),
   profileId: accountId(id),
@@ -95,7 +96,7 @@ function account(id: number, usedPercent: number, options: Readonly<{
 const classify = (value: unknown, evaluatedAt = now) => classifyProviderUsageAccount({ account: value, now: evaluatedAt });
 
 function claudeAccount(quota: CreateClaudeQuotaUsageComponentInput["quota"]): UsagePolicyAccount {
-  const authority: ProviderAccountAuthority = {
+  const authority: UsageProviderAccountAuthority = {
     ...authorityFor(1), provider: "claude", providerAccountId: `pact_${"1".repeat(32)}`,
   };
   return {
@@ -201,6 +202,24 @@ const follow = (moves: readonly SettledAutomaticPointerMove[], throughPointerRev
   });
 
 describe("automatic usage policy configuration", () => {
+  test("keeps Devin outside configuration, decision inputs, and managed following", () => {
+    const configuration = initialAutomaticUsagePolicyConfiguration();
+    expect(automaticUsagePolicyConfigurationSchema.safeParse({
+      ...configuration, overrides: { ...configuration.overrides, devin: "on" },
+    }).success).toBe(false);
+    expect(automaticUsagePolicyConfigurationUpdateSchema.safeParse({
+      idempotencyKey: "00000000-0000-4000-8000-000000000001",
+      expectedAutomaticPolicyRevision: 1,
+      change: { kind: "set_override", provider: "devin", override: "on" },
+    }).success).toBe(false);
+    expect(() => resolveAutomaticUsagePolicy({ configuration, provider: "devin" } as never)).toThrow();
+    expect(automaticUsageDecisionInputSchema.safeParse({ provider: "devin", resetPolicyRevision: null, resetGate: null }).success).toBe(false);
+    expect(automaticUsageManagedSessionSchema.safeParse({
+      ...managedSession(),
+      authority: { ...authorityFor(1), provider: "devin", providerAccountId: `dact_${"1".repeat(32)}` },
+    }).success).toBe(false);
+  });
+
   test("defaults to enabled with independently inherited provider overrides at revision one", () => {
     const initial = initialAutomaticUsagePolicyConfiguration();
     expect(initial).toEqual({ version: 1, defaultEnabled: true, overrides: { codex: "inherit", claude: "inherit" }, automaticPolicyRevision: 1 });
@@ -356,7 +375,7 @@ describe("provider usage classification", () => {
   });
 
   test("Claude blocked observations expire and never authorize account or model movement", () => {
-    const authority: ProviderAccountAuthority = { ...authorityFor(1), provider: "claude", providerAccountId: `pact_${"1".repeat(32)}` };
+    const authority: UsageProviderAccountAuthority = { ...authorityFor(1), provider: "claude", providerAccountId: `pact_${"1".repeat(32)}` };
     const quota = createClaudeQuotaUsageComponent({
       authority,
       sessionId: "sess_00000000000000000000000000000001",
@@ -441,7 +460,7 @@ describe("provider usage classification", () => {
 describe("automatic usage selector", () => {
   test("requires provider-owned reset fields without borrowing Codex authority for Claude", () => {
     const codex = decisionInput();
-    const authority: ProviderAccountAuthority = {
+    const authority: UsageProviderAccountAuthority = {
       ...authorityFor(1), provider: "claude", providerAccountId: `pact_${"1".repeat(32)}`,
     };
     const claude: Extract<AutomaticUsageDecisionInput, { provider: "claude" }> = {
@@ -678,7 +697,7 @@ describe("following settled automatic pointer moves", () => {
   test("explicit and Claude sessions stay pinned and current policy can disable following", () => {
     const input = { session: managedSession(), configuration: initialAutomaticUsagePolicyConfiguration(), throughPointerRevision: 7, moves: [move(1, 2, 5), move(2, 3, 6)] };
     expect(followSettledAutomaticPointerMoves({ ...input, session: { ...input.session, routingProvenance: "explicit", appliedPointerRevision: null } })).toEqual({ action: "stay", reason: "explicit_session" });
-    const claudeAuthority: ProviderAccountAuthority = {
+    const claudeAuthority: UsageProviderAccountAuthority = {
       ...input.session.authority, provider: "claude", providerAccountId: `pact_${"1".repeat(32)}`,
     };
     expect(followSettledAutomaticPointerMoves({ ...input, session: { ...input.session, authority: claudeAuthority } }))

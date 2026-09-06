@@ -22,6 +22,30 @@ const codexProviderAuthority = {
 };
 
 describe("provider interactions", () => {
+  test("Devin live and legacy interactions require their own exact opaque account identity", () => {
+    const authority = {
+      provider: "devin" as const,
+      providerAccountId: `dact_${"3".repeat(32)}`,
+      bindingGeneration: 2,
+      profileId: createProfileId(),
+      processGeneration: 4,
+      connectionId: crypto.randomUUID(),
+      requestId: { type: "string" as const, value: "devin-1" },
+      method: "session/request_permission",
+      requestDigest: "a".repeat(64),
+      threadId: "devin-thread-1",
+      turnId: null,
+      itemId: null,
+      approvalId: null,
+    };
+    for (const schema of [providerInteractionAuthoritySchema, legacyProviderInteractionAuthoritySchema]) {
+      expect(schema.parse(authority)).toEqual(authority);
+      for (const prefix of ["acct", "pact"]) {
+        expect(schema.safeParse({ ...authority, providerAccountId: `${prefix}_${"3".repeat(32)}` }).success).toBe(false);
+      }
+    }
+  });
+
   test("binds complete protected authority to one live public revision and kind", () => {
     const document = {
       type: "hra_protected_interaction_detail" as const,

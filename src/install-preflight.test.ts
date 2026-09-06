@@ -680,6 +680,7 @@ afterAll(async () => {
 describe("transactional HRA installer", () => {
   test("strips only dependency maps from the private installer fixture", () => {
     expect(sourcePackageManifest.dependencies).toEqual({
+      "@agentclientprotocol/sdk": "1.4.0",
       "@hraness/oh": "0.2.7",
       "@openai/codex": "0.153.2",
       convex: "1.45.0",

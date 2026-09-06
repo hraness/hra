@@ -28,9 +28,9 @@ import { decryptBytes, encryptBytes } from "./crypto";
  * rejects a chunk whose `turn_summary.model` names it. The parser tolerates
  * unknown *keys* (see `maximumUnknownKeySlack`), never unknown enum values.
  */
-export type ModelPreset = "low" | "high" | "ultra" | "fable-max";
+export type ModelPreset = "low" | "high" | "ultra" | "fable-max" | "astra";
 
-const modelPresets = new Set<ModelPreset>(["low", "high", "ultra", "fable-max"]);
+const modelPresets = new Set<ModelPreset>(["low", "high", "ultra", "fable-max", "astra"]);
 
 export const isModelPreset = (value: unknown): value is ModelPreset =>
   typeof value === "string" && modelPresets.has(value as ModelPreset);

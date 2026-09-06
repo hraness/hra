@@ -1,4 +1,5 @@
 import type { DeviceCommandPayload } from "./payloads";
+import type { Provider } from "../domain/presets";
 
 /*
  * The guards that stand between a browser and this machine. Every one of them
@@ -38,7 +39,7 @@ export function deviceCommandDayKey(now: number): number {
 }
 
 export type DeviceCommandRegistryAccount = Readonly<{
-  provider: "codex" | "claude";
+  provider: Provider;
   publicId: string;
   status: "login_pending" | "recovery_required" | "signed_in" | "signed_out";
 }>;

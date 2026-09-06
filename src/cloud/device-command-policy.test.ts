@@ -50,6 +50,22 @@ describe("device command guards", () => {
     });
   });
 
+  test("admits a Devin Astra start only for the matching signed-in Devin account", () => {
+    const devinStart = payload({
+      ...sessionStart,
+      preset: "astra",
+      provider: "devin",
+    });
+    expect(deviceCommandGuardDecision(input({
+      accounts: [{ provider: "devin", publicId: "account_primary", status: "signed_in" }],
+      payload: devinStart,
+    }))).toMatchObject({ kind: "admitted", notifyFirstSessionStart: true });
+    expect(deviceCommandGuardDecision(input({
+      accounts: [{ provider: "codex", publicId: "account_primary", status: "signed_in" }],
+      payload: devinStart,
+    }))).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", kind: "refused" });
+  });
+
   test("notifies exactly once per device", () => {
     const decision = deviceCommandGuardDecision(input({
       ledger: {
@@ -138,19 +154,21 @@ describe("device command guards", () => {
     expect(deviceCommandGuardDecision(input({
       accounts: [{ provider: "claude", publicId: "account_primary", status: "signed_in" }],
     }))).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", kind: "refused" });
-    expect(deviceCommandGuardDecision(input({
-      accountLinkingAllowed: true,
-      accounts: [{ provider: "claude", publicId: "account_primary", status: "signed_out" }],
-      payload: payload({ accountPublicId: "account_primary", kind: "account_login_start" }),
-    }))).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", kind: "refused" });
-    expect(deviceCommandGuardDecision(input({
-      accountLinkingAllowed: true,
-      accounts: [{ provider: "claude", publicId: "account_primary", status: "signed_out" }],
-      payload: payload({
-        accountPublicId: "account_primary",
-        kind: "account_login_status",
-      }),
-    }))).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", kind: "refused" });
+    for (const provider of ["claude", "devin"] as const) {
+      expect(deviceCommandGuardDecision(input({
+        accountLinkingAllowed: true,
+        accounts: [{ provider, publicId: "account_primary", status: "signed_out" }],
+        payload: payload({ accountPublicId: "account_primary", kind: "account_login_start" }),
+      }))).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", kind: "refused" });
+      expect(deviceCommandGuardDecision(input({
+        accountLinkingAllowed: true,
+        accounts: [{ provider, publicId: "account_primary", status: "signed_out" }],
+        payload: payload({
+          accountPublicId: "account_primary",
+          kind: "account_login_status",
+        }),
+      }))).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", kind: "refused" });
+    }
     expect(deviceCommandGuardDecision(input({
       accountLinkingAllowed: true,
       payload: payload({
