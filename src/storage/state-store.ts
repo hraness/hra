@@ -14700,6 +14700,12 @@ export class StateStore {
            AND m.state IN ('effect_started','ambiguous')
            AND r.attempt_id IS NULL`,
       ).run(providerDeletionEvidence, now, current.id, current.id);
+      this.#database.query(
+        `UPDATE session_tasks
+         SET status='paused',revision=revision+1,next_due_at=NULL,
+           updated_at=MAX(updated_at+1,?)
+         WHERE session_id=? AND deleted_at IS NULL AND status='active'`,
+      ).run(now, current.id);
       const rows = this.#database.query(
         `SELECT * FROM provider_interactions
          WHERE session_id=? AND state IN ('pending','response_prepared','response_written')

@@ -2659,12 +2659,15 @@ export class HraService {
   }
 
   #scheduleTerminalPersonalDetach(session: SessionRecord): void {
+    // The durable fence is already `detaching`, so it intentionally no longer
+    // satisfies the live-session account-authority predicate. Preserve the
+    // normal adoption/account/session lock order while releasing that fenced
+    // controller without trying to re-admit it as operational authority.
     const task = this.#serialize(`session-adoption:${session.provider}`, async () =>
-      await this.#serializeSessionAuthority(
-        session,
-        async () => { await this.#detachPersonalSession(session.id, this.#backgroundAbort.signal); },
-        { allowDuringProjectionRecovery: true },
-      ));
+      await this.#serializeProfileAuthorities([session.profileId], async () =>
+        await this.#serialize(`session:${session.id}`, async () => {
+          await this.#detachPersonalSession(session.id, this.#backgroundAbort.signal);
+        })));
     const tracked = task.catch((error: unknown) => {
       if (this.#backgroundAbort.signal.aborted) return;
       this.recordBackgroundDiagnostic("session_adoption_failed", error);

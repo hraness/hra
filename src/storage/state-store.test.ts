@@ -30,7 +30,7 @@ import {
   observedAccountTokenVelocity,
   type StoredAccountUsageSnapshot,
 } from "../domain/usage-metrics";
-import { utf8Bytes } from "../domain/values";
+import { createAttemptId, utf8Bytes } from "../domain/values";
 import { canTransitionQueue, queueStateSchema, type QueueState } from "../domain/transitions";
 import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 import { presetRequirements } from "../domain/presets";
@@ -7091,6 +7091,17 @@ describe("StateStore", () => {
         sessionId: session.id,
       },
     });
+    const taskStore = store.createSessionTaskStore();
+    const activeTask = taskStore.create({
+      sessionId: session.id,
+      name: "Provider-deleted task",
+      prompt: "Must not run after the provider deletes this session.",
+      minutes: 15,
+      status: "active",
+      idempotencyKey: "00000000-0000-4000-8000-000000000605",
+    });
+    const readTask = () => taskStore.list(session.id).find((task) =>
+      task.id === activeTask.id);
 
     expect(() => store.terminalizeSessionFromProviderDeletion({
       accountId: profile.id,
@@ -7104,6 +7115,12 @@ describe("StateStore", () => {
     expect(store.readMutation("00000000-0000-4000-8000-000000000604"))
       .toMatchObject({ state: "effect_started" });
     expect(store.requireQueue(queued.id)).toMatchObject({ state: "dispatching" });
+    expect(readTask()).toMatchObject({
+      status: "active",
+      revision: activeTask.revision,
+      nextDueAt: activeTask.nextDueAt,
+      updatedAt: activeTask.updatedAt,
+    });
 
     const terminal = store.terminalizeSessionFromProviderDeletion({
       accountId: profile.id,
@@ -7138,6 +7155,12 @@ describe("StateStore", () => {
     });
     expect(store.listUnsettledMutations({ sessionId: session.id })).toEqual([]);
     expect(store.listUnsettledQueueEffects(session.id)).toEqual([]);
+    const pausedTask = readTask();
+    expect(pausedTask).toMatchObject({
+      status: "paused",
+      revision: activeTask.revision + 1,
+      nextDueAt: null,
+    });
     expect(store.terminalizeSessionFromProviderDeletion({
       accountId: profile.id,
       providerConnectionId: null,
@@ -7148,12 +7171,232 @@ describe("StateStore", () => {
       interactions: [],
       session: { state: "terminal" },
     });
+    expect(readTask()).toEqual(pausedTask);
     expect(store.listSessionEvents({
       afterSequence: 0,
       sessionId: session.id,
     }).events.filter((event) =>
       event.body.type === "session_status" && event.body.status === "terminal"))
       .toHaveLength(1);
+  });
+
+  test("late accepted Work dispatch stays in recovery after provider deletion and restart", async () => {
+    const { store, home } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Provider-deleted Work authority",
+      "provider-deleted-work@example.com",
+    );
+    const projectRoot = join(home, "provider-deleted-work");
+    await mkdir(projectRoot);
+    const project = await store.createProject(
+      "Provider-deleted Work",
+      projectRoot,
+      true,
+    );
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: profile.id });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "provider-deleted-work-thread",
+      title: "Provider-deleted Work",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    const claiming = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+    const adopted = store.adoptSessionCandidate({
+      provider: "codex",
+      providerThreadId: claiming.providerThreadId,
+      expectedCandidateRevision: claiming.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "high",
+      requirement: presetRequirements.high,
+      fastEnabled: false,
+      runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    });
+    const session = store.updateSessionMetadata({
+      sessionId: adopted.session.id,
+      expectedRevision: adopted.session.revision,
+      projectId: project.id,
+    });
+    const workCapability = `hrac1_${"A".repeat(43)}`;
+    const encodeWorkCursor = (payload: unknown) =>
+      `hra1.${Buffer.from(JSON.stringify(payload), "utf8").toString("base64url")}.${"A".repeat(43)}`;
+    const createWorkStore = (generation: number) => store.createWorkStore(
+      generation,
+      encodeWorkCursor,
+      {
+        issue: () => workCapability,
+        verify: (candidateCapability) => candidateCapability === workCapability,
+      },
+    );
+    const workStore = createWorkStore(17);
+    const created = workStore.apply({
+      kind: "work.create",
+      idempotencyKey: "01890f31-a123-7000-8000-000000000951",
+      clientRef: "provider-deleted-work",
+      coordinatorSessionId: session.id,
+      objective: "Keep late provider receipts from resurrecting deleted session authority.",
+      routes: [{
+        accountId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fast: false,
+      }],
+      tasks: [{
+        clientRef: "provider-deleted-work-task",
+        dependsOnRefs: [],
+        dependsOnTaskIds: [],
+        objective: "Hold one dispatch across provider deletion.",
+        instructions: "Remain fail-closed when the accepted receipt arrives late.",
+        criteria: ["The attempt never returns to running."],
+        route: { accountId: profile.id, projectId: project.id },
+        preset: "high",
+        fast: false,
+        priority: 0,
+        maxAttempts: 3,
+        requiredReviews: 0,
+        resultKind: "text",
+        minEvidence: 0,
+      }],
+    });
+    if (created.kind !== "work.create") throw new Error("Expected a created work item.");
+    const task = created.tasks[0];
+    if (task === undefined) throw new Error("Expected one work task.");
+    const claimed = workStore.apply({
+      kind: "task.claim",
+      idempotencyKey: "01890f31-a123-7000-8000-000000000952",
+      workId: created.work.id,
+      taskId: task.id,
+      expectedTaskRevision: task.revision,
+      actorSessionId: session.id,
+      actorCapability: workCapability,
+      leaseMs: 50_000,
+    });
+    if (claimed.kind !== "task.claim") throw new Error("Expected a claimed work task.");
+    const dispatchKey = "01890f31-a123-7000-8000-000000000953";
+    const prepared = workStore.apply({
+      kind: "attempt.dispatch",
+      idempotencyKey: dispatchKey,
+      workId: created.work.id,
+      attemptId: claimed.attempt.id,
+      expectedAttemptRevision: claimed.attempt.revision,
+      fence: claimed.attempt.fence,
+      actorSessionId: session.id,
+      attemptCapability: workCapability,
+      targetSessionId: session.id,
+      mode: "send",
+    });
+    if (prepared.kind !== "attempt.dispatch") throw new Error("Expected a dispatch effect.");
+    expect(workStore.authorizePreparedEffect(dispatchKey)).toMatchObject({
+      executable: true,
+      status: { state: "effect_started" },
+    });
+
+    expect(store.terminalizeSessionFromProviderDeletion({
+      accountId: profile.id,
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration,
+      sessionId: session.id,
+    })).toMatchObject({
+      changed: true,
+      session: { state: "terminal" },
+    });
+    const acceptedReceipt = {
+      kind: "turn_started" as const,
+      turnId: `opaque_v2_${"d".repeat(64)}`,
+      runtimeProfileDigest: "e".repeat(64),
+      mutationAttemptId: createAttemptId(),
+      accountGeneration: profile.processGeneration,
+    };
+    const recovered = workStore.finalizeDispatch(dispatchKey, {
+      kind: "accepted",
+      receipt: acceptedReceipt,
+    });
+    expect(recovered).toMatchObject({
+      id: claimed.attempt.id,
+      status: "unknown",
+      dispatchReceipt: acceptedReceipt,
+    });
+    const rawAttempt = () => {
+      const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+      try {
+        return inspector.query(
+          "SELECT state,revision FROM work_attempts WHERE id=?",
+        ).get(claimed.attempt.id);
+      } finally {
+        inspector.close(false);
+      }
+    };
+    expect(rawAttempt()).toEqual({
+      state: "recovery_required",
+      revision: recovered.revision,
+    });
+    expect(workStore.task(task.id)).toMatchObject({
+      task: { status: "blocked" },
+      activeAttempt: { id: claimed.attempt.id, status: "unknown" },
+    });
+    const afterFinalization = workStore.events(created.work.id, 0, 50);
+    expect(afterFinalization.events.at(-1)?.body).toEqual({
+      type: "attempt.dispatch_finalized",
+      attemptId: claimed.attempt.id,
+      outcome: "accepted",
+    });
+
+    expect(workStore.finalizeDispatch(dispatchKey, {
+      kind: "accepted",
+      receipt: acceptedReceipt,
+    })).toEqual(recovered);
+    expect(workStore.snapshot(created.work.id).tasks[0]).toMatchObject({
+      id: task.id,
+      status: "blocked",
+    });
+    expect(workStore.events(created.work.id, 0, 50)).toEqual(afterFinalization);
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths);
+    stores.push(restarted);
+    const restartedWork = restarted.createWorkStore(
+      18,
+      encodeWorkCursor,
+      {
+        issue: () => workCapability,
+        verify: (candidateCapability) => candidateCapability === workCapability,
+      },
+    );
+    expect(restartedWork.authorizePreparedEffect(dispatchKey)).toMatchObject({
+      executable: false,
+      disposition: "settled",
+      status: { state: "accepted" },
+    });
+    expect(restartedWork.finalizeDispatch(dispatchKey, {
+      kind: "accepted",
+      receipt: acceptedReceipt,
+    })).toEqual(recovered);
+    expect(restartedWork.snapshot(created.work.id).tasks[0]).toMatchObject({
+      id: task.id,
+      status: "blocked",
+    });
+    expect(restartedWork.events(created.work.id, 0, 50)).toEqual(afterFinalization);
+    const restartedInspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(restartedInspector.query(
+        "SELECT state,revision FROM work_attempts WHERE id=?",
+      ).get(claimed.attempt.id)).toEqual({
+        state: "recovery_required",
+        revision: recovered.revision,
+      });
+    } finally {
+      restartedInspector.close(false);
+    }
   });
 
   test("atomically binds a session-start placeholder before its provider effect is admitted", async () => {
@@ -12573,10 +12816,12 @@ describe("StateStore", () => {
     const profile = signInProfile(store, "Active restart attention", "active-restart-attention@example.com");
     const threadId = "thread-active-restart-attention";
     const turnId = "turn-active-restart-attention";
-    const session = store.upsertProviderSession({
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       providerThreadId: threadId,
       title: "Active restart attention",
+      preset: "high",
+      fastEnabled: false,
       state: "active",
       activeTurnId: turnId,
     });
@@ -12649,10 +12894,12 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Idle restart attention", "idle-restart-attention@example.com");
     const threadId = "thread-idle-restart-attention";
-    const session = store.upsertProviderSession({
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       providerThreadId: threadId,
       title: "Idle restart attention",
+      preset: "high",
+      fastEnabled: false,
       state: "idle",
     });
     const interaction = admitRestartCommandInteraction(store, {
@@ -12733,10 +12980,12 @@ describe("StateStore", () => {
     for (const input of cases) {
       const threadId = `thread-non-interaction-attention-${String(input.index)}`;
       const turnId = `turn-non-interaction-attention-${String(input.index)}`;
-      const session = store.upsertProviderSession({
+      const session = createProvenTestSession(store, {
         profileId: profile.id,
         providerThreadId: threadId,
         title: `Non-interaction attention ${String(input.index)}`,
+        preset: "high",
+        fastEnabled: false,
         state: "active",
         activeTurnId: turnId,
       });
@@ -12780,10 +13029,12 @@ describe("StateStore", () => {
     const profile = signInProfile(store, "Multi restart attention", "multi-restart-attention@example.com");
     const threadId = "thread-multi-restart-attention";
     const turnId = "turn-multi-restart-attention";
-    const session = store.upsertProviderSession({
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       providerThreadId: threadId,
       title: "Multi restart attention",
+      preset: "high",
+      fastEnabled: false,
       state: "active",
       activeTurnId: turnId,
     });
@@ -12837,10 +13088,12 @@ describe("StateStore", () => {
     const profile = signInProfile(store, "Restart repair rollback", "restart-repair-rollback@example.com");
     const threadId = "thread-restart-repair-rollback";
     const turnId = "turn-restart-repair-rollback";
-    const session = store.upsertProviderSession({
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       providerThreadId: threadId,
       title: "Restart repair rollback",
+      preset: "high",
+      fastEnabled: false,
       state: "active",
       activeTurnId: turnId,
     });
@@ -12890,6 +13143,100 @@ describe("StateStore", () => {
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interaction.publicId)).toEqual([{ revision: 1, state: "pending" }]);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("repairs adopted Codex attention before advancing personal authority", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Adopted restart attention",
+      "adopted-restart-attention@example.com",
+    );
+    const threadId = "thread-adopted-restart-attention";
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: profile.id });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: threadId,
+      title: "Adopted restart attention",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    const claiming = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: threadId,
+      expectedRevision: candidate.revision,
+    });
+    const adopted = store.adoptSessionCandidate({
+      provider: "codex",
+      providerThreadId: threadId,
+      expectedCandidateRevision: claiming.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "high",
+      requirement: presetRequirements.high,
+      fastEnabled: false,
+      runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    });
+    const interaction = admitRestartCommandInteraction(store, {
+      index: 41,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      sessionId: adopted.session.id,
+      threadId,
+      turnId: null,
+    });
+    const beforeState = store.upsertSessionState({
+      sessionId: adopted.session.id,
+      state: "needs_approval",
+      attention: true,
+      reason: "autorespond_protected_authority_required",
+      verbatimRequired: false,
+      verbatimLiteral: undefined,
+      lastActivityAt: 941,
+      revision: 41,
+    });
+
+    expect(store.nextDaemonGeneration(`boot_${"6".repeat(32)}`)).toBe(1);
+
+    expect(store.requireInteraction(interaction.publicId)).toMatchObject({
+      state: "expired",
+      revision: interaction.revision + 1,
+    });
+    expect(store.readSessionState(adopted.session.id)).toMatchObject({
+      state: "aborted",
+      attention: false,
+      reason: "provider interaction ended during daemon restart",
+      revision: beforeState.revision + 1,
+    });
+    expect(store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 1);
+    expect(store.readSessionPersonalRuntimeBinding(adopted.session.id)).toMatchObject({
+      provider: "codex",
+      providerThreadId: threadId,
+      state: "active",
+    });
+    expect(store.sessionAccountAuthorityMatches(adopted.session.id, profile.id)).toBe(true);
+    expect(store.listSessionEvents({
+      sessionId: adopted.session.id,
+      afterSequence: 0,
+    }).events.map((event) => ({
+      type: event.body.type,
+      providerGeneration: event.providerGeneration,
+    }))).toEqual([
+      { type: "interaction_state", providerGeneration: profile.processGeneration },
+      { type: "session_state", providerGeneration: profile.processGeneration },
+      { type: "gap", providerGeneration: profile.processGeneration + 1 },
+    ]);
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT COUNT(*) AS count FROM session_adoption_profile_generation_permits",
+      ).get()).toEqual({ count: 0 });
     } finally {
       inspector.close(false);
     }

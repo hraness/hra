@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -31,6 +31,7 @@ import {
 import { renderSuccess } from "../cli/render";
 import {
   localCommandSchema,
+  publicSessionListPageSchema,
   type LocalCommand,
   type NotificationEmailHostedAuthority,
 } from "../domain/contracts";
@@ -1838,7 +1839,7 @@ function seedUnsettledInteractionStates(
 }
 
 async function seedResolvableInteraction(
-  value: Awaited<ReturnType<typeof fixture>>,
+  value: Awaited<ReturnType<typeof fixture>> & Readonly<{ personalCodex?: FakeCodex }>,
   sessionId: SessionRecord["id"],
   requestId: string,
   timing?: Readonly<{ requestedAt: number; deadlineAt: number }>,
@@ -1850,8 +1851,15 @@ async function seedResolvableInteraction(
   const session = value.store.requireSession(sessionId);
   const profile = value.store.requireProfileById(session.profileId);
   if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-  const connectionId = value.codex.observationConnectionId;
-  const authority: ProfileAuthority = {
+  const personalCodex = source === "personal" ? value.personalCodex : undefined;
+  const personalClaim = personalCodex?.claimRequests.findLast((request) =>
+    request.providerThreadId === session.providerThreadId);
+  if (source === "personal" && personalClaim === undefined) {
+    throw new Error("Expected exact personal Codex claim authority.");
+  }
+  const connectionId = personalCodex?.observationConnectionId
+    ?? value.codex.observationConnectionId;
+  const authority: ProfileAuthority = personalClaim?.authority ?? {
     id: profile.id,
     generation: profile.processGeneration,
     codexHome: "unused",
@@ -3242,6 +3250,211 @@ describe("HraService personal-session adoption", () => {
     }, { signal })).resolves.toMatchObject({
       providers: [{ provider: "codex", restartRequired: true }],
     });
+  });
+
+  test("adopts an old exact target from a real paused Desktop heartbeat without projecting task metadata", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-scheduled-adoption-chain-")));
+    serviceRoots.push(root);
+    const codexHome = join(root, "codex-home");
+    const automationsDirectory = join(codexHome, "automations");
+    const sourceDirectoryName = "desktop-paused-heartbeat-source";
+    const privateAutomationId = "desktop-private-task-identifier";
+    const privateName = "Desktop private task name";
+    const privatePrompt = "Desktop private task prompt";
+    const privateCwd = join(root, "desktop-private-task-cwd");
+    const privateRrule = "FREQ=DAILY;INTERVAL=17;BYHOUR=3";
+    const providerThreadId = "scheduled-real-paused-heartbeat-thread";
+    const automationPath = join(automationsDirectory, sourceDirectoryName, "automation.toml");
+    const automationDocument = [
+      `id = "${privateAutomationId}"`,
+      'kind = "heartbeat"',
+      `name = "${privateName}"`,
+      `prompt = "${privatePrompt}"`,
+      `cwds = ["${privateCwd}"]`,
+      `rrule = "${privateRrule}"`,
+      'status = "PAUSED"',
+      `target_thread_id = "${providerThreadId}"`,
+      "",
+    ].join("\n");
+    await mkdir(join(automationsDirectory, sourceDirectoryName), { recursive: true });
+    await writeFile(automationPath, automationDocument);
+
+    const personalCodex = new FakeCodex();
+    const context: { personalAuthority?: ProfileAuthority } = {};
+    const requirePersonalAuthority = (): ProfileAuthority => {
+      if (context.personalAuthority === undefined) {
+        throw new Error("Expected personal Codex discovery authority.");
+      }
+      return context.personalAuthority;
+    };
+    const discovery = new BoundedPersonalSessionDiscovery({
+      now: () => personalAdoptionNow,
+      codexListPage: ({ cursor, limit, signal: discoverySignal }) =>
+        personalCodex.listSessions({
+          authority: requirePersonalAuthority(),
+          ...(cursor === undefined ? {} : { cursor }),
+          limit,
+          signal: discoverySignal,
+        }),
+      codexReadSession: ({ providerThreadId: exactThreadId, signal: discoverySignal }) =>
+        personalCodex.readSessionMetadata(
+          requirePersonalAuthority(),
+          exactThreadId,
+          discoverySignal,
+        ),
+    });
+    const authorityRequests: CodexAutomationAuthorityRequest[] = [];
+    const authorityScans: CodexAutomationAuthorityScan[] = [];
+    const readPersonalCodexAutomations = async (
+      request: CodexAutomationAuthorityRequest,
+    ): Promise<CodexAutomationAuthorityScan> => {
+      authorityRequests.push(request);
+      const scan = await readCodexAutomationAuthority({
+        ...request,
+        automationsDirectory,
+      });
+      authorityScans.push(scan);
+      return scan;
+    };
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => personalAdoptionNow,
+      undefined,
+      {},
+      {
+        personalCodex,
+        personalCodexHome: codexHome,
+        personalDiscovery: discovery,
+        readPersonalCodexAutomations,
+      },
+    );
+    const projectRoot = value.documents;
+    const added = await value.service.execute({
+      kind: "account.add",
+      label: "Real paused Desktop heartbeat",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    await value.service.execute({
+      kind: "project.add",
+      label: "Real paused Desktop heartbeat project",
+      path: projectRoot,
+    }, { signal });
+    const profile = value.store.requireProfileById(added.account.id);
+    context.personalAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome,
+      desktopUserData: profilePaths(value.paths, profile.id).desktopUserData,
+    };
+    personalCodex.readProjection = {
+      providerThreadId,
+      title: "Old exact Desktop heartbeat target",
+      projectRoot,
+      status: "idle",
+      providerUpdatedAt: personalAdoptionNow - 24 * 60 * 60_000,
+    };
+
+    await expect(value.service.execute({
+      kind: "session.adoption.set",
+      provider: "codex",
+      enabled: true,
+      account: added.account.id,
+    }, { signal })).resolves.toMatchObject({
+      discovery: { provider: "codex", discovered: 1, adopted: 1, failed: 0 },
+    });
+
+    expect(personalCodex.sessionListRequests).toHaveLength(1);
+    expect(personalCodex.listedProjections).toEqual([]);
+    expect(personalCodex.metadataReadRequests).toEqual([{
+      authority: context.personalAuthority,
+      providerThreadId,
+    }]);
+    expect(authorityRequests.map((request) => request.kind)).toEqual([
+      "page",
+      "sources",
+      "sources",
+    ]);
+    expect(authorityRequests.slice(1).map((request) =>
+      request.kind === "sources" ? request.sourceDirectoryNames : [])).toEqual([
+      [sourceDirectoryName],
+      [sourceDirectoryName],
+    ]);
+    expect(authorityScans).toHaveLength(3);
+    for (const scan of authorityScans) {
+      expect(scan).toMatchObject({ complete: true, diagnostics: [], nextCursor: null });
+      expect(scan.entries).toEqual([{
+        automation: {
+          kind: "heartbeat",
+          status: "paused",
+          targetThreadId: providerThreadId,
+        },
+        sourceDirectoryName,
+      }]);
+      expect(Object.keys(scan.entries[0]?.automation ?? {})).toEqual([
+        "kind",
+        "status",
+        "targetThreadId",
+      ]);
+    }
+    expect(personalCodex.claimRequests).toHaveLength(1);
+    expect(personalCodex.claimRequests[0]).toMatchObject({
+      authority: { codexHome },
+      providerThreadId,
+      projectRoot,
+    });
+    const session = value.store.findSessionByProviderThread(
+      added.account.id,
+      providerThreadId,
+    );
+    if (session === null || session.projectId === undefined) {
+      throw new Error("Expected the real scheduled target to become a project-bound session.");
+    }
+    expect(value.store.isConversationAutomationEnabled(session.id, providerThreadId)).toBe(true);
+    expect(value.store.createSessionTaskStore().list(session.id)).toEqual([]);
+    expect(await readFile(automationPath, "utf8")).toBe(automationDocument);
+
+    const listCommand = localCommandSchema.parse({
+      kind: "session.list",
+      archived: false,
+      limit: 10,
+    });
+    const listed = await value.service.execute(listCommand, { signal });
+    const rendered = JSON.parse(renderJson(listCommand, listed)) as { data: unknown };
+    const publicPage = publicSessionListPageSchema.parse(rendered.data);
+    expect(publicPage.sessions).toEqual([{
+      id: session.id,
+      profileId: session.profileId,
+      projectId: session.projectId,
+      title: session.title,
+      state: session.state,
+      provider: session.provider,
+      preset: session.preset,
+      fastEnabled: session.fastEnabled,
+      revision: session.revision,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+    }]);
+    const publicJson = JSON.stringify(publicPage);
+    for (const privateValue of [
+      sourceDirectoryName,
+      privateAutomationId,
+      privateName,
+      privatePrompt,
+      privateCwd,
+      privateRrule,
+      providerThreadId,
+    ]) {
+      expect(publicJson).not.toContain(privateValue);
+    }
+    expect(publicJson).not.toContain("scheduledTaskTarget");
+    expect(publicJson).not.toContain("sourceDirectoryName");
+    expect(publicJson).not.toContain("automation");
   });
 
   test.each(["active", "paused"] as const)(
@@ -6909,6 +7122,61 @@ describe("HraService personal-session adoption", () => {
     });
   });
 
+  test("terminalizes an adopted Codex session task and releases personal custody on provider deletion", async () => {
+    const providerThreadId = "personal-thread-deleted-with-task";
+    const value = await adoptedCodexFixture(
+      "Adopted deletion with task",
+      providerThreadId,
+    );
+    const authority = value.personalCodex.claimRequests[0]?.authority;
+    if (authority === undefined) throw new Error("Expected personal claim authority.");
+    const taskStore = value.store.createSessionTaskStore();
+    const activeTask = taskStore.create({
+      sessionId: value.session.id,
+      name: "Adopted session task",
+      prompt: "Must not run after the personal provider deletes this session.",
+      minutes: 15,
+      status: "active",
+      idempotencyKey: "00000000-0000-4000-8000-00000000d001",
+    });
+    const personalEndsBefore = value.personalCodex.calls.filter((call) => call === "end").length;
+    const managedEndsBefore = value.codex.calls.filter((call) => call === "end").length;
+    const deletedFact = {
+      ...parseFact("thread/deleted", { threadId: providerThreadId }),
+      connectionId: value.personalCodex.observationConnectionId,
+    };
+
+    await value.service.observePersonalCodexFact(authority, deletedFact);
+    await value.service.settled();
+
+    const terminalSession = value.store.requireSession(value.session.id);
+    expect(terminalSession).toMatchObject({ state: "terminal" });
+    expect(terminalSession.activeTurnId).toBeUndefined();
+    const pausedTask = taskStore.list(value.session.id).find((task) =>
+      task.id === activeTask.id);
+    expect(pausedTask).toMatchObject({
+      status: "paused",
+      revision: activeTask.revision + 1,
+      nextDueAt: null,
+    });
+    expect(value.personalCodex.calls.filter((call) => call === "end"))
+      .toHaveLength(personalEndsBefore + 1);
+    expect(value.codex.calls.filter((call) => call === "end"))
+      .toHaveLength(managedEndsBefore);
+    expect(value.service.backgroundDiagnostics()).toEqual({ last: null, byCode: [] });
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id)).toBeNull();
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id, true))
+      .toMatchObject({ state: "detached" });
+    await value.service.observePersonalCodexFact(authority, deletedFact);
+    await value.service.settled();
+    expect(taskStore.list(value.session.id).find((task) => task.id === activeTask.id))
+      .toEqual(pausedTask);
+    expect(value.personalCodex.calls.filter((call) => call === "end"))
+      .toHaveLength(personalEndsBefore + 1);
+    expect(value.codex.calls.filter((call) => call === "end"))
+      .toHaveLength(managedEndsBefore);
+  });
+
   test("keeps committed adoption authority and retries failed memory initialization", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     factsMemory.ensureErrorOnce = new Error("lost adoption memory receipt");
@@ -7001,6 +7269,327 @@ describe("HraService personal-session adoption", () => {
         mode: "auto:all",
         outcome: "accepted",
       });
+  });
+
+  test("keeps adopted Codex protected approvals pending through personal custody", async () => {
+    const providerThreadId = "personal-thread-protected-approvals";
+    const value = await adoptedCodexFixture(
+      "Adopted protected approvals",
+      providerThreadId,
+    );
+    const authority = value.personalCodex.claimRequests[0]?.authority;
+    if (authority === undefined) throw new Error("Expected personal claim authority.");
+    const connectionId = value.personalCodex.observationConnectionId;
+    const providerAuthority = (
+      requestId: string,
+      method: string,
+    ): ProviderInteractionAuthority => ({
+      profileId: value.session.profileId,
+      processGeneration: authority.generation,
+      connectionId,
+      requestId: { type: "string", value: requestId },
+      method,
+      requestDigest: createHash("sha256").update(requestId).digest("hex"),
+      threadId: providerThreadId,
+      turnId: `turn-${requestId}`,
+      itemId: `item-${requestId}`,
+      approvalId: null,
+    });
+    const findInteraction = (requestId: string): InteractionRecord => {
+      const interaction = value.store.listInteractions({
+        sessionId: value.session.id,
+        limit: 10,
+      }).find((candidate) => candidate.authority.requestId.value === requestId);
+      if (interaction === undefined) throw new Error(`Expected interaction ${requestId}.`);
+      return interaction;
+    };
+
+    value.store.setSessionApprovalMode(value.session.id, "auto:workspace");
+    const commandRequestId = "adopted-workspace-command";
+    await value.service.observePersonalCodexFact(authority, {
+      type: "interactionRequested",
+      connectionId,
+      provider: providerAuthority(
+        commandRequestId,
+        "item/commandExecution/requestApproval",
+      ),
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Run the adopted workspace command",
+        reason: null,
+        commandClass: "bun test",
+        workingDirectory: null,
+        availableDecisions: ["once", "session", "decline", "cancel"],
+      },
+    });
+    const command = findInteraction(commandRequestId);
+    await waitFor(() => value.store.listAutorespondEvidence({
+      sessionId: value.session.id,
+    }).length === 1);
+
+    const permissionRequestId = "adopted-workspace-permission";
+    await value.service.observePersonalCodexFact(authority, {
+      type: "interactionRequested",
+      connectionId,
+      provider: providerAuthority(
+        permissionRequestId,
+        "item/permissions/requestApproval",
+      ),
+      kind: "permission_approval",
+      blocking: true,
+      display: {
+        kind: "permission_approval",
+        summary: "Allow the adopted workspace permission",
+        reason: null,
+        requested: [{ name: "workspace_write" }],
+        allowsSessionScope: true,
+      },
+    });
+    const permission = findInteraction(permissionRequestId);
+    await waitFor(() => value.store.listAutorespondEvidence({
+      sessionId: value.session.id,
+    }).length === 2);
+
+    value.store.setSessionApprovalMode(value.session.id, "auto:all");
+    const fileChangeRequestId = "adopted-all-file-change";
+    await value.service.observePersonalCodexFact(authority, {
+      type: "interactionRequested",
+      connectionId,
+      provider: providerAuthority(
+        fileChangeRequestId,
+        "item/fileChange/requestApproval",
+      ),
+      kind: "file_change_approval",
+      blocking: true,
+      display: {
+        kind: "file_change_approval",
+        summary: "Allow the adopted file changes",
+        reason: null,
+        grantRoot: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+    });
+    const fileChange = findInteraction(fileChangeRequestId);
+    await waitFor(() => value.store.listAutorespondEvidence({
+      sessionId: value.session.id,
+    }).length === 3);
+
+    for (const interaction of [command, permission, fileChange]) {
+      expect(value.store.requireInteraction(interaction.publicId)).toMatchObject({
+        resolvedBy: null,
+        state: "pending",
+      });
+    }
+    const evidence = value.store.listAutorespondEvidence({
+      sessionId: value.session.id,
+    });
+    for (const [interaction, mode] of [
+      [command, "auto:workspace"],
+      [permission, "auto:workspace"],
+      [fileChange, "auto:all"],
+    ] as const) {
+      expect(evidence.find((row) => row.interactionId === interaction.publicId))
+        .toMatchObject({
+          decision: "protected_authority_required",
+          interactionId: interaction.publicId,
+          mode,
+          outcome: "refused",
+        });
+    }
+    expect(value.store.readSessionState(value.session.id)).toMatchObject({
+      attention: true,
+      reason: "autorespond_protected_authority_required",
+      state: "needs_approval",
+    });
+    expect(value.personalCodex.validatedInteractions).toHaveLength(0);
+    expect(value.personalCodex.resolvedInteractions).toHaveLength(0);
+    expect(value.codex.validatedInteractions).toHaveLength(0);
+    expect(value.codex.resolvedInteractions).toHaveLength(0);
+  });
+
+  test("inspects and manually resolves an adopted Codex approval only through personal custody", async () => {
+    const value = await adoptedCodexFixture(
+      "Adopted manual approval",
+      "personal-thread-manual-approval",
+    );
+    value.store.setSessionApprovalMode(value.session.id, "manual");
+    const seeded = await seedResolvableInteraction(
+      value,
+      value.session.id,
+      "adopted-manual-approval",
+      undefined,
+      "personal",
+    );
+    await waitFor(() => value.store.listAutorespondEvidence({
+      sessionId: value.session.id,
+    }).length === 1);
+
+    await expect(value.service.execute({
+      kind: "interaction.inspect",
+      interaction: seeded.interaction.publicId,
+      expectedRevision: seeded.interaction.revision,
+    }, { signal })).resolves.toMatchObject({
+      binding: { interactionId: seeded.interaction.publicId },
+      authority: { kind: "command_approval", command: "git status --short" },
+    });
+    await expect(value.service.execute({
+      kind: "interaction.resolve",
+      interaction: seeded.interaction.publicId,
+      expectedRevision: seeded.interaction.revision,
+      resolution: { kind: "approval_decision", decision: "once" },
+    }, { signal })).resolves.toMatchObject({
+      responseWritten: true,
+      interaction: { state: "response_written" },
+    });
+
+    expect(value.personalCodex.inspectedInteractions).toHaveLength(1);
+    expect(value.personalCodex.inspectedInteractions[0]).toMatchObject({
+      authority: seeded.authority,
+      provider: seeded.interaction.authority,
+    });
+    expect(value.personalCodex.validatedInteractions).toHaveLength(1);
+    expect(value.personalCodex.resolvedInteractions).toHaveLength(1);
+    expect(value.personalCodex.resolvedInteractions[0]).toMatchObject({
+      authority: seeded.authority,
+      provider: seeded.interaction.authority,
+      resolution: { kind: "approval_decision", decision: "once" },
+    });
+    expect(value.codex.inspectedInteractions).toHaveLength(0);
+    expect(value.codex.validatedInteractions).toHaveLength(0);
+    expect(value.codex.resolvedInteractions).toHaveLength(0);
+    expect(value.store.requireInteraction(seeded.interaction.publicId)).toMatchObject({
+      resolvedBy: null,
+      state: "response_written",
+    });
+    expect(value.store.readAutorespondBudgets(value.session.id).consecutive).toBe(0);
+  });
+
+  test("does not credit autorespond when an adopted Codex account drifts after provider write", async () => {
+    const value = await adoptedCodexFixture(
+      "Adopted post-write account drift",
+      "personal-thread-post-write-account-drift",
+    );
+    const authority = value.personalCodex.claimRequests[0]?.authority;
+    if (authority === undefined) throw new Error("Expected personal claim authority.");
+    value.store.setSessionApprovalMode(value.session.id, "auto:all");
+    const managedRevocationBefore = value.store.readProviderRuntimeAccountRevocation({
+      profileId: value.accountId,
+      provider: "codex",
+      runtimeScope: "managed",
+    });
+    const managedValidatedBefore = value.codex.validatedInteractions.length;
+    const managedResolvedBefore = value.codex.resolvedInteractions.length;
+    const managedReleasesBefore = value.codex.releasedAuthorities.length;
+
+    let validationStarted!: () => void;
+    const validationAdmission = new Promise<void>((resolve) => {
+      validationStarted = resolve;
+    });
+    let finishValidation!: () => void;
+    const validationGate = new Promise<void>((resolve) => {
+      finishValidation = resolve;
+    });
+    value.personalCodex.beforeValidateInteractionResolutionReturn = async () => {
+      validationStarted();
+      await validationGate;
+    };
+    let releaseStarted!: () => void;
+    const releaseAdmission = new Promise<void>((resolve) => {
+      releaseStarted = resolve;
+    });
+    let finishRelease!: () => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      finishRelease = resolve;
+    });
+    value.personalCodex.beforeReleaseOwnedAuthorityReturn = async () => {
+      releaseStarted();
+      await releaseGate;
+    };
+    const replacementAccount: CodexAccountProjection = {
+      signedIn: true,
+      email: "replacement-after-adopted-response@example.com",
+      plan: "Plus",
+    };
+    value.personalCodex.beforeResolveInteractionReturn = async () => {
+      value.personalCodex.accountProjection = replacementAccount;
+      await expect(value.service.observePersonalCodexAccount(
+        authority,
+        replacementAccount,
+      )).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    };
+
+    const seeded = await seedResolvableInteraction(
+      value,
+      value.session.id,
+      "adopted-post-write-account-drift",
+      undefined,
+      "personal",
+    );
+    await validationAdmission;
+    finishValidation();
+    await waitFor(() => value.personalCodex.resolvedInteractions.length === 1);
+    await releaseAdmission;
+    await waitFor(() => value.store.listAutorespondEvidence({
+      sessionId: value.session.id,
+    }).length === 1);
+
+    expect(value.store.requireInteraction(seeded.interaction.publicId)).toMatchObject({
+      intendedTerminalState: "resolved",
+      resolvedBy: null,
+      state: "resolution_unknown",
+    });
+    expect(value.store.readAutorespondBudgets(value.session.id)).toMatchObject({
+      consecutive: 0,
+      lastDay: 0,
+      lastHour: 0,
+    });
+    expect(value.store.listAutorespondEvidence({ sessionId: value.session.id })[0])
+      .toMatchObject({
+        decision: "once",
+        interactionId: seeded.interaction.publicId,
+        mode: "auto:all",
+        outcome: "refused",
+      });
+    expect(value.store.readProviderRuntimeAccountRevocation({
+      profileId: value.accountId,
+      provider: "codex",
+      runtimeScope: "personal",
+    })).toMatchObject({
+      currentAccountKey: codexProviderAccountKey(
+        "replacement-after-adopted-response@example.com",
+      ),
+      profileGeneration: authority.generation,
+      state: "releasing",
+    });
+    expect(value.store.readProviderRuntimeAccountRevocation({
+      profileId: value.accountId,
+      provider: "codex",
+      runtimeScope: "managed",
+    })).toEqual(managedRevocationBefore);
+    expect(value.personalCodex.validatedInteractions).toHaveLength(1);
+    expect(value.personalCodex.resolvedInteractions).toHaveLength(1);
+    expect(value.codex.validatedInteractions).toHaveLength(managedValidatedBefore);
+    expect(value.codex.resolvedInteractions).toHaveLength(managedResolvedBefore);
+    expect(value.codex.releasedAuthorities).toHaveLength(managedReleasesBefore);
+
+    finishRelease();
+    await value.service.settled();
+    expect(value.personalCodex.releasedAuthorities).toEqual([authority]);
+    expect(value.store.readProviderRuntimeAccountRevocation({
+      profileId: value.accountId,
+      provider: "codex",
+      runtimeScope: "personal",
+    })).toMatchObject({ state: "completed" });
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id, true))
+      .toMatchObject({ state: "detached" });
+    expect(value.store.readProviderRuntimeAccountRevocation({
+      profileId: value.accountId,
+      provider: "codex",
+      runtimeScope: "managed",
+    })).toEqual(managedRevocationBefore);
+    expect(value.codex.releasedAuthorities).toHaveLength(managedReleasesBefore);
   });
 
   test("refuses protected approval inspection when the adopted Codex account changes in flight", async () => {
@@ -20084,7 +20673,7 @@ describe("HraService autorespond", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const connectionId = "46000000-0000-4000-8000-000000000002";
+    const connectionId = value.codex.observationConnectionId;
     await value.service.observeCodexFact({
       id: profile.id,
       generation: profile.processGeneration,
@@ -20129,7 +20718,7 @@ describe("HraService autorespond", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const connectionId = "46000000-0000-4000-8000-000000000003";
+    const connectionId = value.codex.observationConnectionId;
     await value.service.observeCodexFact({
       id: profile.id,
       generation: profile.processGeneration,

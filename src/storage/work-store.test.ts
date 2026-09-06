@@ -1295,6 +1295,89 @@ describe("WorkStore claims, fences, and prepared effects", () => {
     });
   });
 
+  test("retains a late accepted receipt without reviving swept provider authority", () => {
+    const value = fixture();
+    const created = createWork(value);
+    const claimed = claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    });
+    const dispatchKey = randomUUID();
+    value.store.apply({
+      kind: "attempt.dispatch",
+      idempotencyKey: dispatchKey,
+      workId: created.work.id,
+      attemptId: claimed.attempt.id,
+      expectedAttemptRevision: claimed.attempt.revision,
+      fence: claimed.attempt.fence,
+      actorSessionId: value.actorSessionId,
+      attemptCapability: capability,
+      targetSessionId: value.actorSessionId,
+      mode: "send",
+    });
+    expect(value.store.authorizePreparedEffect(dispatchKey).executable).toBe(true);
+
+    value.database.query("UPDATE sessions SET state='terminal' WHERE id=?")
+      .run(value.actorSessionId);
+    expect(value.store.snapshot(created.work.id).tasks[0]).toMatchObject({
+      status: "blocked",
+    });
+    expect(value.database.query(
+      "SELECT state FROM work_attempts WHERE id=?",
+    ).get(claimed.attempt.id)).toEqual({ state: "recovery_required" });
+    expect(value.store.events(created.work.id, 0, 50).events.at(-1)?.body).toEqual({
+      type: "attempt.recovery_required",
+      attemptId: claimed.attempt.id,
+      fence: claimed.attempt.fence,
+      reason: "custodian_restart",
+    });
+
+    const receipt = turnStartedReceipt();
+    const recovered = value.store.finalizeDispatch(dispatchKey, {
+      kind: "accepted",
+      receipt,
+    });
+    expect(recovered).toMatchObject({
+      status: "unknown",
+      dispatchReceipt: receipt,
+    });
+    const afterFinalization = value.store.events(created.work.id, 0, 50);
+    expect(afterFinalization.events.at(-1)?.body).toEqual({
+      type: "attempt.dispatch_finalized",
+      attemptId: claimed.attempt.id,
+      outcome: "accepted",
+    });
+
+    const restarted = new WorkStore(value.database, {
+      daemonGeneration: 8,
+      now: () => value.now.value,
+      encodeCursor,
+      issueCapability,
+      verifyCapability,
+      projectProviderIdentifier,
+    });
+    expect(restarted.authorizePreparedEffect(dispatchKey)).toMatchObject({
+      executable: false,
+      disposition: "settled",
+      status: { state: "accepted" },
+    });
+    expect(restarted.finalizeDispatch(dispatchKey, {
+      kind: "accepted",
+      receipt,
+    })).toEqual(recovered);
+    expect(restarted.snapshot(created.work.id).tasks[0]).toMatchObject({
+      status: "blocked",
+    });
+    expect(restarted.events(created.work.id, 0, 50)).toEqual(afterFinalization);
+    expect(value.database.query(
+      "SELECT state,revision FROM work_attempts WHERE id=?",
+    ).get(claimed.attempt.id)).toEqual({
+      state: "recovery_required",
+      revision: recovered.revision,
+    });
+  });
+
   test("lets a Work claim win before a provider-switch effect starts", () => {
     const value = fixture();
     const created = createWork(value);

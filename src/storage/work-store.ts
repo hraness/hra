@@ -6684,53 +6684,15 @@ export class WorkStore {
         this.#tryFinalizePendingWork(effect.work_id);
         return this.#attemptRecord(this.#requireAttempt(attempt.id, effect.work_id));
       }
-      if (attempt.state !== "dispatching") throw new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
-      const now = this.#tick();
-      const nextState = parsedOutcome.kind === "accepted"
-        ? "running"
-        : parsedOutcome.kind === "unknown"
-          ? "recovery_required"
-          : "failed";
-      this.#database.query(
-        `UPDATE work_attempts
-         SET state=?,revision=revision+1,updated_at=?,terminal_at=?
-         WHERE id=? AND state='dispatching'`,
-      ).run(nextState, now, nextState === "failed" ? now : null, attempt.id);
-      if (nextState === "failed") {
-        const task = this.#requireTask(attempt.task_id, effect.work_id);
-        this.#database.query(
-          `UPDATE work_task_states
-           SET state=?,revision=revision+1,updated_at=? WHERE task_id=?`,
-        ).run(
-          task.state.attempt_count < task.task.max_attempts ? "pending" : "failed",
-          now,
-          attempt.task_id,
-        );
-      } else {
-        this.#database.query(
-          `UPDATE work_task_states
-           SET state=?,revision=revision+1,updated_at=? WHERE task_id=?`,
-        ).run(nextState, now, attempt.task_id);
-      }
-      const settled = this.#database.query(
-        `UPDATE work_prepared_effects
-         SET state=?,outcome_digest=?,outcome_json=?,finalized_at=?
-         WHERE idempotency_key=? AND state='effect_started'`,
-      ).run(
-        parsedOutcome.kind,
-        outcomeDigest,
-        outcomeJson,
-        now,
-        idempotencyKey,
-      );
-      if (settled.changes !== 1) throw new WorkStoreError("IDEMPOTENCY_CONFLICT");
-      const body = {
-        type: "attempt.dispatch_finalized" as const,
-        attemptId: attempt.id,
-        outcome: parsedOutcome.kind,
-      };
-      this.#appendEvent(effect.work_id, body.type, attempt.worker_session_id, body);
-      this.#tryFinalizePendingWork(effect.work_id);
+      if (
+        attempt.state !== "dispatching"
+        && !(attempt.state === "recovery_required" && parsedOutcome.kind === "accepted")
+      ) throw new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
+      // Use the same full resume predicate as restart recovery: active Work,
+      // live lease, open task deadline, and exact current provider authority.
+      // A late accepted receipt is still retained after an intervening stale-
+      // authority sweep, but that receipt cannot reactivate a fenced attempt.
+      this.#settleAuthorizedDispatch(effect, parsedOutcome);
       return this.#attemptRecord(this.#requireAttempt(attempt.id, effect.work_id));
     });
     return finalize.immediate();
