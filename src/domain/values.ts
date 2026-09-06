@@ -29,6 +29,7 @@ export const sessionIdSchema = z.string().regex(/^sess_[0-9a-f]{32}$/u);
 export const sessionTaskIdSchema = z.string().regex(/^stask_[0-9a-f]{32}$/u);
 export const queueIdSchema = z.string().regex(/^queue_[0-9a-f]{32}$/u);
 export const attemptIdSchema = z.string().regex(/^attempt_[0-9a-f]{32}$/u);
+export const peerActionIdSchema = z.string().regex(/^peer_[0-9a-f]{32}$/u);
 
 export type ProfileId = z.infer<typeof profileIdSchema>;
 export type ProjectId = z.infer<typeof projectIdSchema>;
@@ -36,6 +37,7 @@ export type SessionId = z.infer<typeof sessionIdSchema>;
 export type SessionTaskId = z.infer<typeof sessionTaskIdSchema>;
 export type QueueId = z.infer<typeof queueIdSchema>;
 export type AttemptId = z.infer<typeof attemptIdSchema>;
+export type PeerActionId = z.infer<typeof peerActionIdSchema>;
 
 const createId = <Prefix extends string>(prefix: Prefix): `${Prefix}_${string}` =>
   `${prefix}_${randomUUID().replaceAll("-", "")}`;
@@ -46,6 +48,7 @@ export const createSessionId = (): SessionId => sessionIdSchema.parse(createId("
 export const createSessionTaskId = (): SessionTaskId => sessionTaskIdSchema.parse(createId("stask"));
 export const createQueueId = (): QueueId => queueIdSchema.parse(createId("queue"));
 export const createAttemptId = (): AttemptId => attemptIdSchema.parse(createId("attempt"));
+export const createPeerActionId = (): PeerActionId => peerActionIdSchema.parse(createId("peer"));
 
 /** Upper bound on an accepted AI Gateway key, in UTF-8 bytes. */
 export const GATEWAY_KEY_MAX_BYTES = 512;

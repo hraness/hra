@@ -533,6 +533,18 @@ export class SessionEventStreamRedactor {
     return this.#drainSession(write.sessionId);
   }
 
+  /**
+   * Finish buffered text before a locally-authored message is appended outside
+   * this reducer. Unlike an interruption boundary, this preserves active-item
+   * custody so later provider deltas for the same item remain admissible.
+   */
+  flushSession(write: Omit<SessionEventWrite, "body">): readonly SessionEventWrite[] {
+    this.#finish((stream) =>
+      stream.context.accountId === write.accountId
+      && stream.context.sessionId === write.sessionId, false);
+    return this.#drainSession(write.sessionId);
+  }
+
   get activeStreamCount(): number {
     return this.#streams.size;
   }

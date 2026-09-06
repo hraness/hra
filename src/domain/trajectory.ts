@@ -96,7 +96,9 @@ const recordToTrajectory = (record: TranscriptRecord): readonly TrajectoryRecord
         ? ""
         : record.actor === "autorespond"
           ? "[hra autorespond] "
-          : "[hra provider handoff] ";
+          : record.actor === "peer_session"
+            ? "[hra peer session] "
+            : "[hra provider handoff] ";
       return [{
         type: "user",
         content: `${prefix}${record.text}${

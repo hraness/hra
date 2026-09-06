@@ -1826,6 +1826,59 @@ describe("CLI rendering", () => {
     }
   });
 
+  test("renders bounded peer policy reports and binds CAS results to the command", () => {
+    const sessionId = `sess_${"7".repeat(32)}`;
+    const current = {
+      version: 1 as const,
+      sessionId,
+      mode: "coordinate" as const,
+      revision: 1,
+      updatedAt: 1_000,
+    };
+    const human = capture();
+    renderSuccess(
+      { kind: "session.peer-policy.get", session: sessionId },
+      current,
+      false,
+      human.output,
+    );
+    expect(human.stdout.join("")).toBe([
+      "Peer policy: coordinate",
+      `Session: ${sessionId}`,
+      "Revision: 1",
+      "Updated: 1970-01-01T00:00:01.000Z",
+      "",
+    ].join("\n"));
+
+    const command = {
+      expectedRevision: 1,
+      kind: "session.peer-policy.set",
+      mode: "inspect",
+      session: sessionId,
+    } as const;
+    const changed = { ...current, mode: "inspect" as const, revision: 2, updatedAt: 2_000 };
+    const json = capture();
+    renderSuccess(command, changed, true, json.output);
+    expect(JSON.parse(json.stdout.join(""))).toEqual({
+      command: "session.peer-policy.set",
+      data: changed,
+      ok: true,
+      version: 1,
+    });
+
+    for (const attacked of [
+      { ...changed, sessionId: `sess_${"8".repeat(32)}` },
+      { ...changed, mode: "off" },
+      { ...changed, revision: 3 },
+      { ...changed, providerThreadId: "private-thread" },
+    ]) {
+      const target = capture();
+      expect(() => renderSuccess(command, attacked, true, target.output))
+        .toThrow(InvalidCommandResponseError);
+      expect(target.stdout).toEqual([]);
+    }
+  });
+
   test("renders strict conversation-bound session task records without list prompt leakage", () => {
     const sessionId = `sess_${"1".repeat(32)}`;
     const taskId = `stask_${"2".repeat(32)}`;
@@ -3323,5 +3376,138 @@ describe("CLI rendering", () => {
     )).toThrow(InvalidCommandResponseError);
     expect(events.stdout).toEqual([]);
     expect(events.stdout.join("")).not.toContain(sentinel);
+  });
+
+  test("renders owner memory status, query rows, and replay authority without raw store locators", () => {
+    const digest = "a".repeat(64);
+    const operation = "b".repeat(64);
+    const status = capture();
+    renderSuccess(
+      { kind: "memory.status", session: "release" },
+      {
+        version: 1,
+        ok: true,
+        sessionId: `sess_${"1".repeat(32)}`,
+        projectId: `proj_${"2".repeat(32)}`,
+        canonical: {
+          initialized: true,
+          physicalState: "initialized",
+          identityContract: 2,
+          authorityDigest: "c".repeat(64),
+          bindingDigest: "d".repeat(64),
+          expectedHead: { digest, operationSha256: operation, sequence: 4 },
+          syncState: "error",
+          frozen: true,
+          diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
+          revision: 5,
+          lastExchangeAt: null,
+          lastExchangeHead: null,
+        },
+        working: {
+          state: "active",
+          ownerMatchesSession: true,
+          bindingDigest: "e".repeat(64),
+          epoch: 2,
+          head: { digest: "f".repeat(64), operationSha256: operation, sequence: 3 },
+        },
+        unsettledSubmission: null,
+      },
+      false,
+      status.output,
+    );
+    const statusText = status.stdout.join("");
+    expect(statusText).toContain("Canonical: error (frozen)");
+    expect(statusText).toContain("Canonical physical state: initialized");
+    expect(statusText).toContain("Canonical identity contract: 2");
+    expect(statusText).toContain("Canonical expected head: sequence 4");
+    expect(statusText).toContain("Working: active, epoch 2");
+    expect(statusText).toContain("Unsettled submission: none");
+    expect(statusText).not.toContain("/project-memory/");
+
+    const query = capture();
+    renderSuccess(
+      {
+        kind: "memory.query",
+        session: "release",
+        value: { key: "architecture.boundary", mode: "get" },
+      },
+      {
+        version: 1,
+        ok: true,
+        mode: "get",
+        queryId: `memq_${"3".repeat(32)}`,
+        rows: [{
+          row: 0,
+          lane: "working",
+          key: "architecture.boundary",
+          title: "Authority boundary",
+          summary: "Use the coordinator.",
+          recordSha256: "4".repeat(64),
+          provenance: { verification: "local-ledger-verified" },
+          bodyChunk: "first line\nsecond line\u001b[31m",
+          chunkIndex: 0,
+          chunkCount: 1,
+        }],
+        continuation: null,
+        scope: "working",
+        canonical: { included: false, frozen: true },
+        canonicalHead: null,
+        workingHead: { digest: "f".repeat(64), operationSha256: operation, sequence: 3 },
+      },
+      false,
+      query.output,
+    );
+    const queryText = query.stdout.join("");
+    expect(queryText).toContain("Body chunk 1 of 1:");
+    expect(queryText).toContain("Scope: working only");
+    expect(queryText).toContain("Canonical: excluded (frozen)");
+    expect(queryText).toContain("  first line\n  second line\\u{001b}[31m");
+    expect(queryText).not.toContain("\u001b[31m");
+
+    const mutation = capture();
+    const mutationCommand = {
+      kind: "memory.remember" as const,
+      session: "release",
+      idempotencyKey: "00000000-0000-4000-8000-000000000701",
+      value: {
+        key: "architecture.boundary",
+        title: "Authority boundary",
+        summary: "Use the coordinator.",
+        body: "No direct store access.",
+      },
+    };
+    renderSuccess(mutationCommand, {
+      version: 1,
+      ok: true,
+      replay: true,
+      idempotencyRetainedUntil: "2026-10-01T00:00:00.000Z",
+      submission: { id: `memsub_${"5".repeat(32)}`, kind: "remember", state: "applied" },
+      page: { key: "architecture.boundary", recordSha256: "6".repeat(64) },
+      workingHead: { digest, operationSha256: operation, sequence: 4 },
+      receiptSha256: "7".repeat(64),
+    }, false, mutation.output);
+    expect(mutation.stdout.join("")).toContain("Remember: applied (replay)");
+    expect(mutation.stdout.join("")).toContain(mutationCommand.idempotencyKey);
+  });
+
+  test("renders explicit hosted memory ownership without exposing cryptographic material", () => {
+    const command = {
+      idempotencyKey: "00000000-0000-4000-8000-000000000704",
+      kind: "memory.hosted.create" as const,
+      project: "jungle",
+    };
+    const target = capture();
+    renderSuccess(command, {
+      attachment: { generation: 1 },
+      canonicalSpaceId: `pmem_${"B".repeat(32)}`,
+      hostedSpaceId: `memory_${"A".repeat(32)}`,
+      projectId: `proj_${"1".repeat(32)}`,
+      replay: false,
+    }, false, target.output);
+    const rendered = target.stdout.join("");
+    expect(rendered).toContain(`Hosted memory created: memory_${"A".repeat(32)}`);
+    expect(rendered).toContain("Attachment generation: 1");
+    expect(rendered).not.toContain("wrappedSpaceKey");
+    expect(rendered).not.toContain("ciphertext");
   });
 });

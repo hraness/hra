@@ -5,6 +5,7 @@ import {
   ROOT_STATUS_MAXIMUM_BYTES,
   assertRootStatusBound,
   deriveSessionAttention,
+  providerObservationSchema,
   rootStatusAttentionRecordSchema,
   rootStatusSchema,
   sessionEventCutSchema,
@@ -17,6 +18,31 @@ const cursorWire = (label: string): string =>
   `hra1.${Buffer.from(`fixture:${label}`).toString("base64url")}.${cursorWireSignature}`;
 
 describe("observation contract", () => {
+  test("accepts exact Codex, Claude, and Devin runtime attribution", () => {
+    const observation = {
+      basis: "provider_read",
+      connectionId: "00000000-0000-4000-8000-000000000001",
+      coverage: "complete",
+      freshness: "fresh",
+      mode: "connected",
+      observedAt: 2,
+      profileGeneration: 1,
+      state: "live",
+    } as const;
+    expect(providerObservationSchema.parse({
+      ...observation,
+      source: "codex_app_server",
+    }).source).toBe("codex_app_server");
+    expect(providerObservationSchema.parse({
+      ...observation,
+      source: "claude_runtime",
+    }).source).toBe("claude_runtime");
+    expect(providerObservationSchema.parse({
+      ...observation,
+      source: "devin_acp",
+    }).source).toBe("devin_acp");
+  });
+
   test("rejects an impossible event retention cut", () => {
     expect(sessionEventCutSchema.safeParse({
       streamEpoch: "00000000-0000-4000-8000-000000000001",

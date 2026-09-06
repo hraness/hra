@@ -606,6 +606,7 @@ function beginNestedSend(
       messageDigest: createHash("sha256").update(nested.message).digest("hex"),
       runtimeProfile,
     },
+    message: nested.message,
   });
   return { runtimeProfile, session };
 }
@@ -937,9 +938,13 @@ describe("HraService work protocol", () => {
       .toMatchObject({ executable: true, status: { state: "effect_started" } });
     const begun = beginNestedSend(value, actor, prepared.effect, nested);
     value.store.completeSessionTurnEffect({
+      accountId: actor.accountId,
       attemptId: nested.attempt.id,
       sessionId: actor.sessionId,
       expectedSessionRevision: begun.session.revision,
+      message: nested.message,
+      providerConnectionId: null,
+      providerGeneration: prepared.effect.accountGeneration,
       applyResponseState: true,
       turnId: "provider-turn-before-restart",
       turnStatus: "inProgress",

@@ -20,7 +20,7 @@ export const LIVE_TAIL_ROW_CAP_TRIGGER = 20;
 
 export type HostedTableLifecycle = Readonly<{
   owner: "user" | "parent" | "email_digest" | "capability" | "service";
-  quota: "identity" | "device" | "account" | "session" | "chunk" | "usage" | "command" | "custody" | "receipt" | "security" | "job" | null;
+  quota: "identity" | "device" | "account" | "session" | "chunk" | "usage" | "command" | "custody" | "receipt" | "security" | "job" | "memory" | null;
   retention: "auth_library" | "challenge_expiry" | "invite_expiry" | "active" | "encrypted_history" | "live_tail" | "lease_expiry" | "command_recovery" | "attention_notification_7d" | "usage_90d_daily" | "receipt_expiry" | "security_90d" | "job_until_complete" | "service_permanent";
   deletionOrder: number | null;
   disposition: "erase" | "expire" | "complete_receipt" | "service_reset";
@@ -56,6 +56,8 @@ export const HOSTED_TABLE_LIFECYCLE = {
   recoveryEnvelopes: { owner: "user", quota: "custody", retention: "active", deletionOrder: 60, disposition: "erase" },
   devicePresence: { owner: "user", quota: "device", retention: "lease_expiry", deletionOrder: 60, disposition: "erase" },
   deviceRegistries: { owner: "user", quota: "custody", retention: "active", deletionOrder: 60, disposition: "erase" },
+  memorySpaces: { owner: "user", quota: "memory", retention: "active", deletionOrder: 30, disposition: "erase" },
+  memoryOperations: { owner: "user", quota: "memory", retention: "encrypted_history", deletionOrder: 20, disposition: "erase" },
   sessionHeads: { owner: "user", quota: "session", retention: "encrypted_history", deletionOrder: 30, disposition: "erase" },
   sessionChunks: { owner: "user", quota: "chunk", retention: "encrypted_history", deletionOrder: 20, disposition: "erase" },
   sessionStreamEpochs: { owner: "user", quota: "chunk", retention: "encrypted_history", deletionOrder: 20, disposition: "erase" },

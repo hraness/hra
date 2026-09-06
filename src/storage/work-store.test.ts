@@ -859,6 +859,52 @@ describe("WorkStore schema and atomic plans", () => {
       "SELECT COUNT(*) AS count FROM work_tasks WHERE work_id=?",
     ).get(created.work.id)).toEqual({ count: 1 });
   });
+
+  test("keeps coordination provider-neutral while attempts remain Codex-only", () => {
+    const value = fixture();
+    expect(() => value.store.assertSessionProviderSwitchAllowed(value.actorSessionId))
+      .not.toThrow();
+
+    value.database.query(
+      "UPDATE sessions SET provider_v39='claude',preset='ultra' WHERE id=?",
+    ).run(value.actorSessionId);
+    value.database.query(
+      `UPDATE session_provider_account_authorities
+       SET provider='claude',runtime_scope='managed',account_key=?
+       WHERE session_id=?`,
+    ).run(claudeAccountKey("managed-work-account"), value.actorSessionId);
+    value.database.query(
+      "UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=2 WHERE id=?",
+    ).run(value.reviewerSessionId);
+
+    const created = createWork(value, [
+      taskSpec(value, "claude-attempt", { preset: "ultra" }),
+      taskSpec(value, "devin-attempt", { preset: "ultra" }),
+    ]);
+    join(value, created.work.id, created.work.revision, value.reviewerSessionId);
+
+    // Membership and coordination are transport-neutral, but entering or
+    // leaving either provider is fenced while the session belongs to live Work.
+    expect(() => value.store.assertSessionProviderSwitchAllowed(value.actorSessionId))
+      .toThrow(new WorkStoreError("SESSION_PROVIDER_SWITCH_BLOCKED"));
+    expect(() => value.store.assertSessionProviderSwitchAllowed(value.reviewerSessionId))
+      .toThrow(new WorkStoreError("SESSION_PROVIDER_SWITCH_BLOCKED"));
+
+    expect(() => claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(() => claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[1]!.id,
+      revision: created.tasks[1]!.revision,
+      actorSessionId: value.reviewerSessionId,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(value.database.query("SELECT COUNT(*) AS count FROM work_attempts").get())
+      .toEqual({ count: 0 });
+    expect(() => assertWorkSchema(value.database)).not.toThrow();
+  });
 });
 
 describe("WorkStore claims, fences, and prepared effects", () => {
@@ -915,7 +961,6 @@ describe("WorkStore claims, fences, and prepared effects", () => {
     })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
     value.database.query("UPDATE sessions SET provider_v39='codex' WHERE id=?")
       .run(value.actorSessionId);
-
     const claimed = claim(value, {
       workId: created.work.id,
       taskId: created.tasks[0]!.id,

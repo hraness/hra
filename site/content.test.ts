@@ -165,6 +165,52 @@ describe("public content contract", () => {
     expect(llms.indexOf(publicContent.thesis)).toBeLessThan(llms.indexOf(publicContent.installCommand));
   });
 
+  test("publishes the stable memory, peer, and exact provider surfaces", () => {
+    const markdown = renderReadmeMarkdown();
+    const html = renderSiteHtml();
+    const visibleHtml = htmlVisibleText(html);
+    const claims = [
+      "Stable working and shared project memory",
+      "reads that lane together with durable project memory",
+      "shares one attested page only through conflict-checked adoption",
+      "hra memory status|list|get|search|explain|remember|share",
+      "Claude exposes no admitted provider-side session listing or resume",
+      "Provider-native rename remains Codex-only",
+      "Protected full-turn inspection remains Codex-only",
+      "For Claude, HRA admits only the pinned Fable profile and reviewed host-tool boundary",
+      "the Devin ACP adapter does not yet bind HRA's static preamble or host-tool server",
+      "Attributed peer coordination",
+      "list, inspect, and message only bounded same-project peers",
+      "Devin sessions remain valid peer targets, but Devin cannot originate these model tool calls",
+      "Peer coordination is separate from Work",
+      "Changing either policy revokes stale inspection and mutation authority",
+      "starts a new turn only for an idle target",
+      "records bounded untrusted input for later delivery",
+      "Devin ACP refuses it",
+      "Peer input cannot resolve approvals",
+      "causal cycles, and a ninth hop",
+      "120 new peer actions per actor and per project in a rolling hour",
+      "25,000-action project cap fails closed",
+      "hra session start <account> [--project <project>] [--provider <codex|claude|devin>] [--preset <low|high|ultra|fable-max|astra>] [--fast]",
+      "hra session peer-policy get <session> [--json]",
+      "hra session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]",
+      "hra session preset <session> <low|high|ultra|fable-max|astra>",
+      "hra session switch <session> --provider <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>] [--account <account>]",
+      "hra session export <session> [--format <trajectory|json>] [--out <path>]",
+    ];
+
+    for (const claim of claims) {
+      expect(markdown).toContain(claim);
+      expect(visibleHtml).toContain(claim);
+    }
+    for (const surface of [markdown, html, renderLlmsText()]) {
+      expect(surface).not.toContain("Codex is supported today; Claude is next.");
+      expect(surface).not.toContain("Codex today, Claude next.");
+      expect(surface).not.toContain("Claude authentication happens outside HRA");
+      expect(surface).not.toContain("HRA does not expose Claude login");
+    }
+  });
+
   test("names the product and its maintainer once, beside what HRA does", () => {
     const nameSentence = "HRA is short for harness: the control plane that keeps Codex, Claude Code, and Devin sessions working together, and ";
     const maintainerSentence = "The Hraness organization maintains HRA and publishes it under the MIT license.";

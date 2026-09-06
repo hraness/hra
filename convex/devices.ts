@@ -911,6 +911,9 @@ function publicRegistry(registry: Readonly<{
   devicePublicId: string;
   envelope: Parameters<typeof parseEncryptedEnvelope>[0];
   keyVersion: number;
+  memorySummaryEnvelope?: Parameters<typeof parseEncryptedEnvelope>[0];
+  memorySummaryRevision?: number;
+  memorySummaryUpdatedAt?: number;
   notificationEmailEnvelope?: Parameters<typeof parseEncryptedEnvelope>[0];
   notificationHoursEnvelope?: Parameters<typeof parseEncryptedEnvelope>[0];
   notificationPolicyRevision?: number;
@@ -921,6 +924,15 @@ function publicRegistry(registry: Readonly<{
     devicePublicId: registry.devicePublicId,
     envelope: registry.envelope,
     keyVersion: registry.keyVersion,
+    ...(registry.memorySummaryEnvelope === undefined
+      ? {}
+      : { memorySummaryEnvelope: registry.memorySummaryEnvelope }),
+    ...(registry.memorySummaryRevision === undefined
+      ? {}
+      : { memorySummaryRevision: registry.memorySummaryRevision }),
+    ...(registry.memorySummaryUpdatedAt === undefined
+      ? {}
+      : { memorySummaryUpdatedAt: registry.memorySummaryUpdatedAt }),
     ...(registry.notificationEmailEnvelope === undefined
       ? {}
       : { notificationEmailEnvelope: registry.notificationEmailEnvelope }),
@@ -1037,6 +1049,56 @@ export const updateRegistry = mutation({
       devicePublicId: existing.devicePublicId,
       revision: patch.revision,
       updatedAt: patch.updatedAt,
+    };
+  },
+});
+
+/**
+ * Publish the daemon-only memory supervision companion under its own revision
+ * chain. A registry heartbeat never rewrites or clears these fields, and a
+ * summary quota/conflict failure therefore cannot suppress the core machine
+ * projection.
+ */
+export const updateMemorySummary = mutation({
+  args: {
+    envelope: v.optional(encryptedEnvelope),
+    expectedRevision: v.number(),
+    keyVersion: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const authority = await requireDaemonDevice(ctx);
+    if (
+      !isSafeNonNegativeInteger(args.expectedRevision)
+      || !isSafePositiveInteger(args.keyVersion)
+      || (args.envelope !== undefined
+        && (parseEncryptedEnvelope(
+          args.envelope,
+          cloudLimits.memorySummaryCiphertextCharacters,
+        ) === null || args.envelope.keyVersion !== args.keyVersion))
+    ) rejectAuthority();
+    const matches = await ctx.db
+      .query("deviceRegistries")
+      .withIndex("by_device", (builder) => builder.eq("deviceId", authority.deviceId))
+      .take(2);
+    if (matches.length !== 1) rejectAuthority();
+    const existing = matches[0];
+    if (existing === undefined || existing.keyVersion !== args.keyVersion) rejectAuthority();
+    const currentRevision = existing.memorySummaryRevision ?? 0;
+    if (currentRevision !== args.expectedRevision) {
+      throw new Error("MEMORY_SUMMARY_REVISION_CONFLICT");
+    }
+    const now = Date.now();
+    const patch = {
+      memorySummaryEnvelope: args.envelope,
+      memorySummaryRevision: currentRevision + 1,
+      memorySummaryUpdatedAt: now,
+    } as const;
+    await adjustQuotaForPatch(ctx, authority.userId, "custody", existing, patch);
+    await ctx.db.patch(existing._id, patch);
+    return {
+      devicePublicId: existing.devicePublicId,
+      revision: patch.memorySummaryRevision,
+      updatedAt: patch.memorySummaryUpdatedAt,
     };
   },
 });

@@ -14,6 +14,10 @@ import type {
   DeviceRegistryProject,
   DeviceRegistryScheduledTask,
   DeviceRegistrySessionAdoption,
+  MemorySummaryPayload,
+  MemorySummaryPeerAction,
+  MemorySummaryPeerPolicy,
+  MemorySummarySpace,
   NotificationHoursPolicy,
 } from "../hra/cloud";
 import type { ApprovalMode, PresetChoice } from "./settings-commands";
@@ -108,6 +112,8 @@ export type MachineView = Readonly<{
   deviceStatus: MachineDeviceState["status"] | null;
   heartbeatAt: number;
   label: string;
+  memorySummary: MemorySummaryPayload | null;
+  memorySummaryFreshness: "current" | "inactive" | "stale" | "unreadable" | "unsupported";
   online: boolean;
   notificationHours: NotificationHoursPolicy | null;
   notificationHoursStatus: "available" | "unreadable" | "unsupported";
@@ -127,11 +133,14 @@ export type MachineViewInput = Readonly<{
   attentionEmailEnabled?: boolean | null;
   device: MachineDeviceState | null;
   devicePublicId: string;
+  memorySummaryReady?: boolean;
   now: number;
   notificationHours?: NotificationHoursPolicy | null;
   notificationHoursStatus?: MachineView["notificationHoursStatus"];
   notificationPolicyFreshness?: MachineView["notificationPolicyFreshness"];
   notificationPolicyRevision?: number | null;
+  memorySummary?: MemorySummaryPayload | null;
+  memorySummaryStatus?: "available" | "unreadable" | "unsupported";
   payload: DeviceRegistryPayload;
   revision: number;
   updatedAt: number;
@@ -139,6 +148,26 @@ export type MachineViewInput = Readonly<{
 
 export function toMachineView(input: MachineViewInput): MachineView {
   const { payload } = input;
+  const deviceActive = input.device?.status === "active";
+  // A caller that forgets the hosted-clock gate must not accidentally fold a
+  // cross-machine timestamp against a browser wall clock.
+  const memorySummaryReady = input.memorySummaryReady ?? false;
+  const memorySummary = deviceActive && memorySummaryReady ? input.memorySummary ?? null : null;
+  const memorySummaryStatus = memorySummaryReady
+    ? input.memorySummaryStatus ?? "unsupported"
+    : "unsupported";
+  const memorySummaryFreshness = !deviceActive
+    ? "inactive"
+    : !memorySummaryReady
+      ? "unsupported"
+    : memorySummaryStatus === "unreadable"
+      ? "unreadable"
+      : memorySummaryStatus === "unsupported" || memorySummary === null
+        ? "unsupported"
+        : memorySummary.observedAt > input.now + registryHeartbeatToleranceMs
+          || input.now - memorySummary.observedAt > registryHeartbeatToleranceMs
+          ? "stale"
+          : "current";
   return {
     accountLinkingAllowed: payload.accountLinkingAllowed ?? false,
     accounts: payload.accounts,
@@ -151,6 +180,8 @@ export function toMachineView(input: MachineViewInput): MachineView {
     deviceStatus: input.device?.status ?? null,
     heartbeatAt: payload.heartbeatAt,
     label: payload.machineLabel,
+    memorySummary,
+    memorySummaryFreshness,
     online: isMachineOnline({
       device: input.device,
       heartbeatAt: payload.heartbeatAt,
@@ -178,6 +209,107 @@ export function toMachineView(input: MachineViewInput): MachineView {
     notificationPolicyRevision: input.notificationPolicyRevision ?? null,
     updatedAt: input.updatedAt,
   };
+}
+
+export type HostedMemoryObservationView = Readonly<{
+  devicePublicId: string;
+  freshness: MachineView["memorySummaryFreshness"] | "bounded" | "missing";
+  machineLabel: string;
+  space: MemorySummarySpace | null;
+}>;
+
+export type HostedMemorySpaceView = Readonly<{
+  agreement: "agreed" | "disagreed" | "insufficient";
+  canonicalSpaceId: string;
+  observations: readonly HostedMemoryObservationView[];
+  projectLabels: readonly string[];
+}>;
+
+const memoryObservationFingerprint = (space: MemorySummarySpace): string => JSON.stringify({
+  bindingDigest: space.bindingDigest,
+  head: space.head,
+  recordCount: space.recordCount,
+});
+
+/**
+ * Groups by portable identity while retaining every device observation. Only
+ * current observations participate in agreement; stale and unreadable rows
+ * remain visible but can never make two devices look converged.
+ */
+export function hostedMemorySpaces(
+  machines: readonly MachineView[],
+): readonly HostedMemorySpaceView[] {
+  const ids = new Set<string>();
+  for (const machine of machines) {
+    for (const space of machine.memorySummary?.spaces ?? []) ids.add(space.canonicalSpaceId);
+  }
+  return [...ids].sort().map((canonicalSpaceId) => {
+    const observations = machines.map((machine): HostedMemoryObservationView => {
+      const space = machine.memorySummary?.spaces.find((entry) =>
+        entry.canonicalSpaceId === canonicalSpaceId) ?? null;
+      return {
+        devicePublicId: machine.devicePublicId,
+        freshness: space === null && machine.memorySummaryFreshness === "current"
+          ? machine.memorySummary?.coverage.spaces === "bounded" ? "bounded" : "missing"
+          : machine.memorySummaryFreshness,
+        machineLabel: machine.label,
+        space,
+      };
+    });
+    const current = observations.filter((observation): observation is HostedMemoryObservationView & {
+      space: MemorySummarySpace;
+    } => observation.freshness === "current"
+      && observation.space !== null
+      && observation.space.recordCount !== null);
+    const fingerprints = new Set(current.map((observation) =>
+      memoryObservationFingerprint(observation.space)));
+    return {
+      agreement: current.length < 2
+        ? "insufficient"
+        : fingerprints.size === 1
+          ? "agreed"
+          : "disagreed",
+      canonicalSpaceId,
+      observations,
+      projectLabels: [...new Set(current.map((observation) => observation.space.projectLabel))]
+        .sort((left, right) => left.localeCompare(right)),
+    };
+  });
+}
+
+export type HostedPeerPolicyView = MemorySummaryPeerPolicy & Readonly<{
+  devicePublicId: string;
+  machineLabel: string;
+}>;
+
+export type HostedPeerActionView = MemorySummaryPeerAction & Readonly<{
+  devicePublicId: string;
+  machineLabel: string;
+}>;
+
+export function hostedPeerPolicies(machines: readonly MachineView[]): readonly HostedPeerPolicyView[] {
+  return machines.flatMap((machine) => machine.memorySummaryFreshness === "current"
+    ? (machine.memorySummary?.peerPolicies ?? []).map((policy) => ({
+        ...policy,
+        devicePublicId: machine.devicePublicId,
+        machineLabel: machine.label,
+      }))
+    : []).sort((left, right) => right.updatedAt - left.updatedAt
+      || left.machineLabel.localeCompare(right.machineLabel)
+      || left.session.ref.localeCompare(right.session.ref));
+}
+
+export function hostedPeerActions(machines: readonly MachineView[]): readonly HostedPeerActionView[] {
+  return machines.flatMap((machine) => machine.memorySummaryFreshness === "current"
+    ? (machine.memorySummary?.peerActions ?? []).map((action) => ({
+        ...action,
+        devicePublicId: machine.devicePublicId,
+        machineLabel: machine.label,
+      }))
+    : []).sort((left, right) => right.updatedAt - left.updatedAt
+      || left.machineLabel.localeCompare(right.machineLabel)
+      || left.actor.ref.localeCompare(right.actor.ref)
+      || left.target.ref.localeCompare(right.target.ref));
 }
 
 export type AttentionEmailPresentation = Readonly<{

@@ -17,6 +17,7 @@ export const modules = {
   "./deviceRevocation.ts": async () => await import("./deviceRevocation"),
   "./leases.ts": async () => await import("./leases"),
   "./maintenance.ts": async () => await import("./maintenance"),
+  "./memorySync.ts": async () => await import("./memorySync"),
   "./presence.ts": async () => await import("./presence"),
   "./quota.ts": async () => await import("./quota"),
   "./releaseAttestation.ts": async () => await import("./releaseAttestation"),

@@ -161,6 +161,8 @@ hra session export <session-id> --format json
 
 ACP v1 has no in-turn steer method, so `hra session steer` refuses an active Devin turn. Use `hra session queue` to send the message after the current prompt completes, or stop the turn before sending another message. HRA never sends concurrent prompts to one Devin session.
 
+The initial Devin ACP adapter is text-only and does not bind HRA's static session preamble or closed host-tool server. A Devin session can receive ordinary owner or peer `send` and `queue` messages under the same authority checks, and an owner can use the separate HRA memory CLI for that session. The Devin model cannot originate HRA memory, peer-session, or conversation-automation tool calls in this release.
+
 ### Scheduled work in the same conversation
 
 Attach a recurring whole-minute interval to an existing session with `hra session task`. Each run returns to that exact HRA conversation. A task cannot independently retarget its account, provider, project, model, or execution environment; later explicit changes to the session apply to future runs. Missed intervals coalesce into one queued turn. Use the returned task ID and revision for later edits or deletion; HRA never creates a replacement provider conversation or writes a provider's private automation registry.
@@ -262,13 +264,23 @@ Cloud-account erasure is an explicit and irreversible fallback, not the default 
 ## Features
 
 - Isolated provider profiles: each named profile has its own user-only `CODEX_HOME` for Codex and `CLAUDE_CONFIG_DIR` for Claude Code, plus distinct private `HOME` and XDG roots for Devin. Each provider owns its authentication state; HRA never copies or parses provider credentials.
-- Usage with provenance: account identity, quota, rate-limit, and token snapshots include their provider source time and freshness. A bounded source-ordered 24-hour ledger supports safe human and JSON pagination without returning raw provider payloads.
-- Compact sessions: list sessions, read user and final assistant messages, inspect elapsed time plus bounded observed file and Git actions, then open one turn for full provider-visible detail.
+- Codex usage with provenance: account identity, quota, rate-limit, and token snapshots include their provider source time and freshness. A bounded source-ordered 24-hour ledger supports safe human and JSON pagination without returning raw provider payloads.
+- Compact sessions: list sessions, read provider-neutral user and final assistant messages, and inspect elapsed time plus bounded observed file and Git actions. Protected full-turn inspection remains Codex-only.
 - Personal-home adoption: opt in to discover recent Codex and Claude Code sessions, plus older Codex threads targeted by present Desktop heartbeat automations, then admit them after bounded account, project, liveness, and exact-resume checks. Active and paused automation records both count until deletion or retargeting. HRA locally parses a bounded automation record but ignores and retains no prompt or working-directory field, keeps later records reachable across daemon restarts, and replaces Desktop's exact fired heartbeat envelope with generic protected text before projection. Account-filtered session lists include admitted rows, which use the same provider-supported public commands, autorespond policy, and approval authority as every HRA session. Provider-specific limits are identical for native and adopted sessions, and provider APIs do not supply a global lease against every later external resume. Read [the session-adoption guide](https://github.com/hraness/hra/blob/main/docs/session-adoption.md).
-- Durable controls: send, queue, steer, and stop through either provider; rename Codex sessions; and keep one editable note per session. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing.
+- Durable controls: send, queue, stop, and keep one editable note per session. Codex and Claude Code can steer an active turn; Devin ACP cannot, so Devin steering refuses without an effect. Provider-native rename remains Codex-only. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing.
 - Named projects: a project is a canonical directory that may contain several repositories. Changing it affects future turns only.
+- Stable working and shared project memory: a project-bound session writes to its expiring working lane, reads that lane together with durable project memory, and shares one attested page only through conflict-checked adoption. Codex and Claude Code models use closed HRA tools in this release; the Devin ACP adapter does not yet bind HRA's static preamble or host-tool server. Owners use `hra memory status|list|get|search|explain|remember|share` and explicitly enroll canonical project memory through `hra memory hosted list|create|attach|detach|sync`. Hosted memory is opt-in and does not upload the working lane. See [working and project memory](https://github.com/hraness/hra/blob/main/docs/facts-memory.md) for the authority, quota, and recovery boundaries.
+- Attributed peer coordination: each session owns a revocable `off|inspect|coordinate` policy. Bound Codex and Claude Code tools can list, inspect, and message only bounded same-project peers; every action retains actor and lineage without granting session administration or approval authority. Devin sessions remain valid peer targets, but Devin cannot originate these model tool calls in this release.
 - Agent work coordination: the frozen beta contract specifies bounded local task graphs, fenced attempts, structured submissions, independent reviews, signals, and a resumable work event stream for exact existing sessions.
 - Optional encrypted sync: paired devices share a bounded session projection and submit commands to the one machine holding the execution lease.
+
+### Peer coordination boundary
+
+Peer coordination is separate from Work. It creates no Work, task, attempt, review, or signal membership. The actor and target must be distinct current sessions in the same project. Inspection requires neither policy to be `off`; messaging requires both exact current policy revisions to remain `coordinate`. Changing either policy revokes stale inspection and mutation authority.
+
+`send` starts a new turn only for an idle target. `queue` records bounded untrusted input for later delivery and works for an active target, including Devin. `steer` addresses one exact active turn and is supported by Codex and Claude Code; Devin ACP refuses it. Peer input cannot resolve approvals, answer protected questions, administer a session, or inherit an identity.
+
+HRA refuses self-addressing, stale target revisions, causal cycles, and a ninth hop. It admits at most 120 new peer actions per actor and per project in a rolling hour, at most 16 distinct targets per actor in that hour, and at most 64 unsettled inbound queue entries or 1 MiB of their text per target. Complete replay and causal evidence remains for at least seven days. Protected recovery ancestry is never pruned to make room, and the 25,000-action project cap fails closed when protected rows consume it.
 
 ## Terminal and agent interfaces
 
@@ -327,7 +339,7 @@ For non-streaming `--json` commands, stdout contains exactly one versioned succe
 
 ## Presets and permissions
 
-HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; `hra session show` displays it with the provider-neutral transcript. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof, and stream formats. Devin profiles include exact CLI 3000.6.14, ACP v1, model `gpt-6-astra`, provider-default reasoning, and isolated-home proof. Each provider remains authoritative for its native permissions, tools, and hidden runtime state.
+HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. For Codex, that refresh includes model, reasoning effort, Fast service tier, permission profile, computer-use capability, and accessible apps. For Claude, HRA admits only the pinned Fable profile and reviewed host-tool boundary. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; `hra session show` displays it with the provider-neutral transcript. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof, and stream formats. Devin profiles include exact CLI 3000.6.14, ACP v1, model `gpt-6-astra`, provider-default reasoning, and isolated-home proof. Each provider remains authoritative for its native permissions, tools, and hidden runtime state.
 
 - `low`: Codex Luna Max, currently `gpt-5.6-luna` with `max` reasoning.
 - `high`: Codex Astra Max, currently `gpt-6-astra` with `max` reasoning.
@@ -401,7 +413,7 @@ Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code 
 
 ### Encrypted before upload
 
-- User messages and final assistant display text.
+- User messages and final assistant display text. This includes peer-session messages and their supplied reasons when HRA records them as transcript messages.
 - Session names, notes, queued messages, and steering input.
 - Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not projected. For managed profiles, HRA validates one bounded Claude Code authentication-status response transiently, reduces it to signedIn, and never retains, returns, projects, or uploads the identity or usage fields. Personal-home Claude adoption transiently reads bounded account, email, and organization identity metadata and retains only a one-way local authority key. Raw Claude identity fields and that private authority key are never publicly returned, projected, or uploaded; HRA never opens or parses a Claude credential file. Devin account identity and allowance are not projected. HRA reports only local signed-in readiness and records provider-supplied session context and cost facts in the neutral session stream.
 - Codex and Claude Code personal-session adoption status: whether discovery is enabled and bounded pending, adopted, and fenced counts. Candidate identities and records are never included. Devin has no personal-home adoption surface.
@@ -409,6 +421,8 @@ Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code 
 - Bounded observed file and Git metadata, without unbounded filesystem paths.
 - Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.
 - Remote-command input and results that fit the closed command protocol.
+- Canonical Oh operations, including their page records and provenance, terminal-head proofs, portable adoption proofs, and hosted-space descriptors for projects the owner explicitly enrolls in hosted memory.
+- A bounded read-only memory summary containing portable space and project labels, exact head and sync metadata, record counts and recent record keys, effective peer policies, and content-free recent peer-action state. Authenticated coverage markers distinguish complete from bounded selections. This summary excludes page bodies, peer message text, action reasons, raw local project or session IDs, paths, and Oh operation bytes.
 - For an explicitly requested Codex web login, the provider HTTPS verification URL and separate one-time user code. HRA encrypts both to the account key before upload, lets only the requesting browser read them once, and deletes the hosted handoff on that read or after five minutes.
 
 ### Never uploaded
@@ -419,8 +433,9 @@ Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code 
 - Raw reasoning, hidden chain of thought, or approval secrets.
 - Provider-internal login and request IDs, permission values, MCP field contracts, protected answers, or response digests.
 - Environment variables, arbitrary command output, or unbounded filesystem paths.
+- Working-memory Oh records and database bytes; canonical operations or page bodies outside their encrypted operation envelopes; and local Oh database paths.
 
-The sync service necessarily sees the verified HRA email address, device identifiers, record types, revisions, ciphertext sizes, timestamps, and execution-lease or command lifecycle metadata. It cannot decrypt session content without a paired device key. Email access alone does not recover that key.
+The sync service necessarily sees the verified HRA email address, device identifiers, opaque hosted-space identifiers, record types, revisions and key versions, ciphertext sizes, timestamps, execution-lease or command lifecycle metadata, and canonical-memory sequences plus keyed head tokens. It cannot decrypt session or memory content without a paired device key. Email access alone does not recover that key.
 
 A browser device holds the account key and decrypted projection only in that tab's memory by default. HRA does not programmatically write decrypted provider or session text to the clipboard, but browser extensions, accessibility APIs, screenshots, and explicit user selection can observe rendered text.
 
@@ -483,6 +498,18 @@ hra session status <session> [--json]
 hra session watch <session> [--cursor <cursor>] [--jsonl]
 hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
 hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
+hra memory status <session> [--json]
+hra memory list <session> [--working-only] [--continuation <token>] [--json]
+hra memory get <session> <key> [--working-only] [--continuation <token>] [--json]
+hra memory search <session> [--working-only] [--continuation <token>] <text> [--json]
+hra memory explain <session> <query-id> <row> [--json]
+hra memory remember <session> <key> --title <title> --summary <summary> [--language <tag>] [--idempotency-key <uuid>] [--json] -- <body>
+hra memory share <session> <key> --reason <reason> [--idempotency-key <uuid>] [--json]
+hra memory hosted list [--json]
+hra memory hosted create <project> [--idempotency-key <uuid>] [--json]
+hra memory hosted attach <project> <hosted-space-id> [--json]
+hra memory hosted detach <project> --generation <n> [--json]
+hra memory hosted sync <project> [--json]
 hra session start <account> [--project <project>] [--provider <codex|claude|devin>] [--preset <low|high|ultra|fable-max|astra>] [--fast]
 hra session send|queue|steer <session> [--attach <path>]... <message>
 hra session stop|recover|abandon <session>
@@ -491,11 +518,13 @@ hra session archive|unarchive <session>
 hra session note get|edit|clear <session>
 hra session note set <session> <note>
 hra session state <session> [--json]
+hra session peer-policy get <session> [--json]
+hra session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]
 hra session preset <session> <low|high|ultra|fable-max|astra>
-hra session switch <session> --provider <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>] [--account <account>]
-hra session export <session> [--format <trajectory|json>] [--out <path>]
 hra session fast <session> <on|off>
 hra session project <session> <project>
+hra session switch <session> --provider <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>] [--account <account>]
+hra session export <session> [--format <trajectory|json>] [--out <path>]
 hra session task list <session>
 hra session task show <session> <task-id>
 hra session task create <session> --name <name> --every-minutes <15..10080> [--paused] [--idempotency-key <uuid>] -- <prompt>

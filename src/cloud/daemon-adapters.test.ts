@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import type { LocalCommand } from "../domain/contracts";
+import { HRA_SESSION_PREAMBLE } from "../domain/hra-preamble";
 import { presetRequirements } from "../domain/presets";
 import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
 import type { SessionId } from "../domain/values";
@@ -67,6 +68,12 @@ function sha256(value: string): string {
 }
 
 const codexProviderAccountKey = `v1:codex:${sha256("person@example.com")}`;
+const hostCapabilities = {
+  preambleVersion: HRA_SESSION_PREAMBLE.version,
+  preambleDigest: HRA_SESSION_PREAMBLE.digest,
+  manifestVersion: HRA_SESSION_PREAMBLE.manifestVersion,
+  manifestDigest: HRA_SESSION_PREAMBLE.manifestDigest,
+};
 
 class FakeCodex implements CodexRuntimePort {
   readonly provider = "codex" as const;
@@ -280,6 +287,7 @@ function adoptPersonalCodexSession(
     expectedRevision: candidate.revision,
   });
   return value.store.adoptSessionCandidate({
+    hostCapabilities,
     expectedCandidateRevision: claiming.revision,
     fastEnabled: false,
     preset: "high",
@@ -311,9 +319,14 @@ function adoptPersonalCodexSession(
 function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, input: Readonly<{
   fast: boolean;
   preset: "low" | "high" | "ultra";
-}>): Readonly<{ attemptId: `attempt_${string}`; profile: Parameters<StateStore["recordSessionRuntimeProfile"]>[0]["profile"] }> {
+}>): Readonly<{
+  attemptId: `attempt_${string}`;
+  message: string;
+  profile: Parameters<StateStore["recordSessionRuntimeProfile"]>[0]["profile"];
+}> {
   const session = value.store.requireSession(value.sessionId);
   const profile = value.store.requireProfileById(session.profileId);
+  const message = "fixture";
   const presetSelection = value.store.requireSessionPresetRequirement(session.id);
   if (presetSelection.preset !== input.preset) {
     throw new Error("Expected the fixture preset to match the session preset.");
@@ -338,7 +351,7 @@ function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, inp
     authorityGeneration: profile.processGeneration,
     authorityId: session.id,
     kind: "session.send",
-    request: { message: "fixture" },
+    request: { message },
   });
   value.store.beginSessionMutationEffect({
     attemptId: attempt.id,
@@ -346,14 +359,15 @@ function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, inp
       baseline: { activeTurnId: null, providerUpdatedAt: session.providerUpdatedAt ?? null, status: "idle" },
       clientMessageId: attempt.id,
       kind: "session.send",
-      messageDigest: "a".repeat(64),
+      messageDigest: sha256(message),
       providerThreadId: session.providerThreadId ?? "thread_0001",
       runtimeProfile: runtime,
     },
     profileGeneration: profile.processGeneration,
     sessionId: session.id,
+    message,
   });
-  return { attemptId: attempt.id as `attempt_${string}`, profile: runtime };
+  return { attemptId: attempt.id as `attempt_${string}`, message, profile: runtime };
 }
 
 async function materializeScheduledTaskQueue(
@@ -427,9 +441,13 @@ async function materializeScheduledTaskQueue(
     },
   });
   value.store.completeQueueEffect({
+    accountId: profile.id,
     queueId: occurrence.queue.id,
     expectedEvidenceDigest: evidence.digest,
     expectedSessionRevision: current.revision,
+    message: input.prompt,
+    providerConnectionId: null,
+    providerGeneration: profile.processGeneration,
     applyResponseState: false,
     turnId: input.turnId,
     turnStatus: "completed",
@@ -688,9 +706,13 @@ describe("state-backed cloud daemon adapter", () => {
       sessionId: bound.id,
     });
     value.store.completeQueueEffect({
+      accountId: profile.id,
       applyResponseState: false,
       expectedEvidenceDigest: evidence.digest,
       expectedSessionRevision: bound.revision,
+      message: "Summarise the diff",
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration,
       queueId: queued.id,
       receipt: { turnId: "turn_claude_1" },
       runtimeProfile: claudeProfile,
@@ -879,9 +901,13 @@ describe("state-backed cloud daemon adapter", () => {
       sessionId: bound.id,
     });
     value.store.completeQueueEffect({
+      accountId: profile.id,
       applyResponseState: false,
       expectedEvidenceDigest: evidence.digest,
       expectedSessionRevision: bound.revision,
+      message: "Implement the bounded change",
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration,
       queueId: queued.id,
       receipt: { turnId: "turn_devin_1" },
       runtimeProfile: devinProfile,
@@ -976,6 +1002,7 @@ describe("state-backed cloud daemon adapter", () => {
       .find((entry) => entry.providerThreadId === candidate.providerThreadId);
     if (claimed === undefined) throw new Error("Expected the claimed personal Claude candidate.");
     const adopted = value.store.adoptSessionCandidate({
+      hostCapabilities,
       provider: "claude",
       providerThreadId: candidate.providerThreadId,
       expectedCandidateRevision: claimed.revision,
@@ -1237,6 +1264,76 @@ describe("state-backed cloud daemon adapter", () => {
     } finally {
       await adapter.close();
       value.store.close();
+    }
+  });
+
+  test("keeps every non-owner message compatible with the released actor field", async () => {
+    const cases = [
+      { actorKind: undefined, messageActor: "autorespond" as const, text: "Continue after the recorded answer." },
+      { actorKind: "peer_session" as const, messageActor: "peer_session" as const, text: "Check the peer result." },
+      { actorKind: "provider_switch" as const, messageActor: "provider_switch" as const, text: "Continue from the provider-neutral handoff." },
+    ];
+    for (const actorCase of cases) {
+      const value = await fixture();
+      const sourceId = "attempt_00000000-0000-4000-8000-0000000000a1";
+      value.codex.projection = {
+        ...value.codex.projection,
+        messages: [{
+          clientId: sourceId,
+          role: "user",
+          text: actorCase.text,
+          turnId: "turn_handoff_0001",
+        }],
+        turnSummaries: [{
+          actions: [],
+          files: [],
+          id: "turn_handoff_0001",
+          omittedActions: 0,
+          omittedFiles: 0,
+          runtimeMs: 25,
+          status: "completed",
+        }],
+      };
+      const lookups: string[] = [];
+      const classify = value.store.sessionMessageActorForSource.bind(value.store);
+      Object.defineProperty(value.store, "sessionMessageActorForSource", {
+        configurable: true,
+        value: (sessionId: SessionId, candidateSourceId: string) => {
+          lookups.push(candidateSourceId);
+          return candidateSourceId === sourceId
+            ? actorCase.messageActor
+            : classify(sessionId, candidateSourceId);
+        },
+      });
+      const adapter = new StateBackedCloudDaemonAdapter({
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
+        executeRemote: () => Promise.resolve({}),
+        paths: value.paths,
+        store: value.store,
+      });
+      try {
+        const signal = new AbortController().signal;
+        await adapter.listSessions({ limit: 25, signal });
+        const projected = await adapter.readCompactEvents({
+          afterSequence: 0,
+          limit: 128,
+          sessionPublicId: value.sessionId,
+          signal,
+        });
+        expect(lookups).toContain(sourceId);
+        expect(projected.events[0]).toEqual({
+          actor: "autorespond",
+          ...(actorCase.actorKind === undefined ? {} : { actorKind: actorCase.actorKind }),
+          kind: "user_message",
+          sequence: 1,
+          text: actorCase.text,
+          turnId: "turn_handoff_0001",
+        });
+        expect(JSON.stringify(projected.events)).not.toContain("provider_switched");
+      } finally {
+        await adapter.close();
+        value.store.close();
+      }
     }
   });
 
@@ -2343,9 +2440,13 @@ describe("state-backed cloud daemon adapter", () => {
     const value = await fixture();
     const binding = beginTurnProfileBinding(value, { fast: false, preset: "high" });
     value.store.completeSessionTurnEffect({
+      accountId: binding.profile.profileId,
       applyResponseState: false,
       attemptId: binding.attemptId,
       expectedSessionRevision: value.store.requireSession(value.sessionId).revision,
+      message: binding.message,
+      providerConnectionId: null,
+      providerGeneration: binding.profile.processGeneration,
       receipt: { turnId: "turn_0001" },
       runtimeProfile: binding.profile,
       sessionId: value.sessionId as `sess_${string}`,
@@ -2403,9 +2504,13 @@ describe("state-backed cloud daemon adapter", () => {
       await adapter.listSessions({ limit: 25, signal });
       expect((await adapter.readCompactEvents({ afterSequence: 0, limit: 128, sessionPublicId: value.sessionId, signal })).events).toEqual([]);
       value.store.completeSessionTurnEffect({
+        accountId: binding.profile.profileId,
         applyResponseState: false,
         attemptId: binding.attemptId,
         expectedSessionRevision: value.store.requireSession(value.sessionId).revision,
+        message: binding.message,
+        providerConnectionId: null,
+        providerGeneration: binding.profile.processGeneration,
         receipt: { turnId: "turn_0001" },
         runtimeProfile: binding.profile,
         sessionId: value.sessionId as `sess_${string}`,
@@ -5227,6 +5332,7 @@ describe("settings commands and the device registry", () => {
       expectedRevision: adopted.revision,
     });
     const activeAdoption = value.store.adoptSessionCandidate({
+      hostCapabilities,
       expectedCandidateRevision: claimedAdopted.revision,
       fastEnabled: false,
       preset: "high",
@@ -5251,6 +5357,7 @@ describe("settings commands and the device registry", () => {
       expectedRevision: fenced.revision,
     });
     const fencedAdoption = value.store.adoptSessionCandidate({
+      hostCapabilities,
       expectedCandidateRevision: claimedFenced.revision,
       fastEnabled: false,
       preset: "high",

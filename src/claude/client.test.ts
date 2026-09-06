@@ -167,6 +167,107 @@ describe("Claude stream client", () => {
     await aborted.client.close();
   });
 
+  test("continues draining stderr after the bounded diagnostic count is reached", async () => {
+    const process = new FakeClaudeProcess();
+    const facts: ClaudeFact[] = [];
+    let yieldedChunks = 0;
+    const chunkCount = 32;
+    let releaseDrain: (() => void) | undefined;
+    const drainAllowed = new Promise<void>((resolve) => { releaseDrain = resolve; });
+    const stderr: AsyncIterable<Uint8Array> = {
+      async *[Symbol.asyncIterator]() {
+        await drainAllowed;
+        for (let index = 0; index < chunkCount; index += 1) {
+          yieldedChunks += 1;
+          yield new Uint8Array(4 * 1024);
+        }
+        process.emit({
+          duration_ms: 1,
+          is_error: false,
+          num_turns: 1,
+          result: "done after stderr",
+          session_id: "sess",
+          stop_reason: "end_turn",
+          terminal_reason: "completed",
+          type: "result",
+          usage: {},
+        });
+      },
+    };
+    const diagnostics: string[] = [];
+    const drainingProcess: ClaudeProcess = {
+      exited: process.exited,
+      forceTerminate: () => process.forceTerminate(),
+      identity: process.identity,
+      stderr,
+      stdout: process.stdout,
+      terminate: () => process.terminate(),
+      write: async (bytes) => await process.write(bytes),
+    };
+    const client = new ClaudeStreamClient({
+      configDir: CONFIG_DIR,
+      onFact: (fact) => { facts.push(fact); },
+      onSafeDiagnostic: (message) => diagnostics.push(message),
+      process: drainingProcess,
+    });
+
+    await client.startTurn({ message: "work", turnId: "turn-stderr" });
+    releaseDrain?.();
+    await settle();
+    expect(yieldedChunks).toBe(chunkCount);
+    expect(facts.some((fact) => fact.type === "turnCompleted")).toBe(true);
+    process.end();
+    await client.close();
+    expect(diagnostics).toEqual(["claude stderr bytes: 4096+"]);
+  });
+
+  test("bounds shutdown when TERM and inherited streams never settle", async () => {
+    const never = new Promise<never>(() => undefined);
+    const neverEnding: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]() {
+        return { next: async () => await never };
+      },
+    };
+    const signals: string[] = [];
+    const process: ClaudeProcess = {
+      exited: never,
+      forceTerminate: () => { signals.push("SIGKILL"); },
+      identity: Promise.resolve(Object.freeze({
+        pid: 8_124,
+        pidDomain: "darwin",
+        procStart: "Fri Sep  4 12:00:01 2026",
+      })),
+      stderr: neverEnding,
+      stdout: neverEnding,
+      terminate: () => { signals.push("SIGTERM"); },
+      write: async () => undefined,
+    };
+    const diagnostics: string[] = [];
+    const client = new ClaudeStreamClient({
+      configDir: CONFIG_DIR,
+      onFact: () => undefined,
+      onSafeDiagnostic: (message) => diagnostics.push(message),
+      process,
+      shutdownSettlementMs: 5,
+      shutdownTermGraceMs: 5,
+    });
+
+    const outcome = await Promise.race([
+      Promise.allSettled([client.close(), client.close()]).then((settlements) => ({
+        kind: "settled" as const,
+        settlements,
+      })),
+      new Promise<"timed-out">((resolve) => { setTimeout(() => resolve("timed-out"), 250); }),
+    ]);
+
+    expect(outcome).not.toBe("timed-out");
+    if (outcome === "timed-out") throw new Error("Claude close exceeded its bound");
+    expect(outcome.settlements).toHaveLength(2);
+    expect(outcome.settlements.every((settlement) => settlement.status === "rejected")).toBe(true);
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(diagnostics).toEqual([]);
+  });
+
   test("drives one full turn: user line in, deltas and a result out", async () => {
     const { client, facts, process } = open();
     await client.startTurn({ message: "say ok", turnId: "turn-1" });

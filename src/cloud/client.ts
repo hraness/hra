@@ -33,6 +33,10 @@ export const cloudQueries = [
   "usage:getAccountBinding",
   "usage:listAccounts",
   "usage:listSnapshots",
+  "memorySync:list",
+  "memorySync:get",
+  "memorySync:head",
+  "memorySync:pull",
 ] as const;
 
 export const cloudMutations = [
@@ -44,6 +48,7 @@ export const cloudMutations = [
   "devices:approve",
   "devices:beginBind",
   "devices:revoke",
+  "devices:updateMemorySummary",
   "devices:updateRegistry",
   "presence:connect",
   "presence:heartbeat",
@@ -74,6 +79,8 @@ export const cloudMutations = [
   "deviceCommands:cancelPending",
   "usage:upsertAccount",
   "usage:upsertSnapshot",
+  "memorySync:create",
+  "memorySync:push",
 ] as const;
 
 export const cloudActions = [

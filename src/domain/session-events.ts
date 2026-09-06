@@ -93,6 +93,7 @@ export const SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS = 16_384;
 export const sessionMessageActorSchema = z.enum([
   "human",
   "autorespond",
+  "peer_session",
   "provider_switch",
 ]);
 

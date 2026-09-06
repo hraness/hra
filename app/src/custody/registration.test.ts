@@ -17,12 +17,12 @@ import {
   encryptDeviceLabel,
   enqueueRequest,
   enqueueRequestDigest,
-  isDeviceClassValidatorRejection,
   randomBindNonce,
   randomOpaqueId,
   registrationIntent,
   registrationRequestDigest,
   selectKeyEnvelope,
+  submitBrowserDeviceRegistration,
 } from "./registration";
 
 const userPublicId = "user_0123456789abcdef";
@@ -235,15 +235,34 @@ describe("identifiers", () => {
   });
 });
 
-describe("isDeviceClassValidatorRejection", () => {
-  test("recognises an argument validator rejection naming the field", () => {
-    expect(isDeviceClassValidatorRejection(new Error(
+describe("browser registration submission", () => {
+  test("fails closed instead of retrying classless against an older validator", async () => {
+    const intent = registrationIntent({
+      encryptedLabel: envelope,
+      idempotencyKey: "01931f2a-7c00-7000-8000-000000000003",
+      keyVersion,
+      publicId: devicePublicId,
+      signingPublicKey: "signing",
+      wrappingPublicKey: "wrapping",
+    });
+    const requests: unknown[] = [];
+    const rejection = new Error(
       "ArgumentValidationError: Object contains extra field `deviceClass` that is not in the validator.",
-    ))).toBe(true);
-  });
+    );
 
-  test("does not swallow a handler failure", () => {
-    expect(isDeviceClassValidatorRejection(new Error("Cloud authority is not current."))).toBe(false);
-    expect(isDeviceClassValidatorRejection(new Error("deviceClass is revoked"))).toBe(false);
+    await expect(submitBrowserDeviceRegistration({
+      intent,
+      mutate: async (request) => {
+        requests.push(request);
+        throw rejection;
+      },
+      requestDigest: "a".repeat(64),
+    })).rejects.toBe(rejection);
+
+    expect(requests).toEqual([{
+      ...intent,
+      deviceClass: "browser",
+      requestDigest: "a".repeat(64),
+    }]);
   });
 });

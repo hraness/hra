@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, renameSync, symlinkSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, symlinkSync } from "node:fs";
 import { chmod, lstat, mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,12 +17,20 @@ import {
 } from "../domain/observation";
 import type { InteractionDisplay, InteractionKind } from "../domain/interactions";
 import {
+  currentPresetContract,
   legacyPresetContract,
 } from "../domain/presets";
+import {
+  createPortableProjectMemoryCanonicalIdentity,
+  deriveProjectMemoryCanonicalIdentity,
+  legacyProjectMemorySpaceId,
+  PROJECT_MEMORY_EMPTY_HEAD,
+} from "../domain/project-memory";
 import {
   SESSION_EVENT_MAX_BYTES,
   SESSION_EVENT_PUBLIC_MAX_BYTES,
   SESSION_EVENT_RETAIN_AGE_MS,
+  SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
 } from "../domain/session-events";
 import {
   accountUsageCounterSamples,
@@ -30,7 +38,7 @@ import {
   observedAccountTokenVelocity,
   type StoredAccountUsageSnapshot,
 } from "../domain/usage-metrics";
-import { createAttemptId, utf8Bytes } from "../domain/values";
+import { createAttemptId, utf8Bytes, type ProjectId } from "../domain/values";
 import { canTransitionQueue, queueStateSchema, type QueueState } from "../domain/transitions";
 import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 import { presetRequirements } from "../domain/presets";
@@ -41,6 +49,15 @@ import {
 import { initializeProfilePaths, initializeStatePaths, resolveStatePaths } from "./paths";
 import {
   ATTENTION_NOTIFICATION_SNAPSHOT_LIMIT,
+  CONTROL_PLANE_RECONCILIATION_BATCH_LIMIT,
+  MEMORY_SUBMISSION_RETAIN_AGE_MS,
+  PEER_SESSION_ACTION_RETAIN_AGE_MS,
+  PEER_SESSION_HOP_LIMIT,
+  PEER_SESSION_HOURLY_ACTION_LIMIT,
+  PEER_SESSION_HOURLY_DISTINCT_TARGET_LIMIT,
+  PEER_SESSION_PROJECT_HOURLY_ACTION_LIMIT,
+  PEER_SESSION_RATE_WINDOW_MS,
+  PEER_SESSION_RETAINED_ACTION_LIMIT,
   USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
   USAGE_CLOUD_UPLOAD_ANCHOR_COUNT,
   USAGE_LOCAL_RETAIN_AGE_MS,
@@ -50,7 +67,10 @@ import {
   StateSecurityScrubRequiredError,
   StateStore,
   type MachineTimeZoneResolver,
+  type ProjectRecord,
+  type ProjectMemoryHeadRef,
   type SecurityScrubCheckpointPolicy,
+  type SessionRecord,
 } from "./state-store";
 import { WORK_SCHEMA_SQL } from "./work-store";
 
@@ -118,6 +138,24 @@ const createProvenTestSession = (
   });
 };
 
+type CreateSessionInput = Parameters<StateStore["createSession"]>[0];
+const createAuthorizedStartingTestSession = (
+  store: StateStore,
+  input: CreateSessionInput,
+) => {
+  const session = store.createSession(input);
+  const provider = input.provider ?? "codex";
+  if (provider !== "devin") {
+    store.bindSessionProviderAccountAuthority({
+      sessionId: session.id,
+      provider,
+      runtimeScope: "managed",
+      accountKey: providerAccountKeyForProfile(store, input.profileId, provider),
+    });
+  }
+  return session;
+};
+
 const createRevocationWorkStore = (store: StateStore, generation = 1) =>
   store.createWorkStore(
     generation,
@@ -182,7 +220,7 @@ async function fixture(
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const store = new StateStore(paths, {
-    now: (() => { let value = 1_000; return () => value++; })(),
+    now: options.now ?? (() => { let value = 1_000; return () => value++; })(),
     resolveMachineTimeZone: () => "America/Puerto_Rico",
     ...options,
   });
@@ -302,7 +340,91 @@ const dropSessionAdoptionAndPresetContractSchema = (database: Database): void =>
   database.exec("ALTER TABLE works DROP COLUMN preset_contract");
 };
 
+const dropHostedMemorySchema = (database: Database): void => {
+  const hostedObjects = z.object({
+    name: z.string().regex(/^[a-z0-9_]+$/u),
+    type: z.enum(["index", "trigger"]),
+  }).strict().array().parse(database.query(`
+    SELECT name,type FROM sqlite_master
+    WHERE type IN ('index','trigger') AND (
+      name LIKE 'project_memory_hosted_%'
+      OR name LIKE 'project_memory_sync_%'
+      OR name LIKE 'project_memory_portable_adoption_%'
+      OR name='canonical_memory_sync_share_fence'
+    )
+    ORDER BY CASE type WHEN 'trigger' THEN 0 ELSE 1 END,name
+  `).all());
+  for (const object of hostedObjects) {
+    database.exec(`DROP ${object.type.toUpperCase()} IF EXISTS "${object.name}"`);
+  }
+  database.exec(`
+    DROP TABLE IF EXISTS project_memory_sync_spool;
+    DROP TABLE IF EXISTS project_memory_sync_intents;
+    DROP TABLE IF EXISTS project_memory_hosted_create_intents;
+    DROP TABLE IF EXISTS project_memory_portable_adoption_proofs;
+    DROP TABLE IF EXISTS project_memory_hosted_attachments;
+  `);
+};
+
+const dropPeerAndHostedMemorySchema = (database: Database): void => {
+  dropHostedMemorySchema(database);
+  const featureObjects = z.object({
+    name: z.string().regex(/^[a-z0-9_]+$/u),
+    type: z.enum(["index", "trigger"]),
+  }).strict().array().parse(database.query(`
+    SELECT name,type FROM sqlite_master
+    WHERE type IN ('index','trigger') AND (
+      name LIKE 'peer_session_%'
+      OR name LIKE 'session_peer_%'
+      OR name LIKE 'session_message_event_source%'
+      OR name LIKE 'session_host_capability%'
+      OR name LIKE 'project_memory_%'
+      OR name LIKE 'memory_%'
+      OR name LIKE 'queue_peer_%'
+      OR name IN (
+        'session_provider_switch_authority_immutable',
+        'session_provider_switch_transition_guard',
+        'session_provider_switch_seed_transition_guard',
+        'session_provider_switch_session_update_guard',
+        'session_provider_switch_session_delete_guard',
+        'session_provider_switch_delete_guard',
+        'session_provider_switch_v40_authority_guard',
+        'session_provider_switch_v40_authority_immutable'
+      )
+    )
+    ORDER BY CASE type WHEN 'trigger' THEN 0 ELSE 1 END,name
+  `).all());
+  for (const object of featureObjects) {
+    database.exec(`DROP ${object.type.toUpperCase()} IF EXISTS "${object.name}"`);
+  }
+  database.exec(`
+    DROP TABLE IF EXISTS memory_page_attestation_refs;
+    DROP TABLE IF EXISTS memory_working_attestation_forks;
+    DROP TABLE IF EXISTS memory_working_attestation_heads;
+    DROP TABLE IF EXISTS memory_page_attestations;
+    DROP TABLE IF EXISTS memory_submissions;
+    DROP TABLE IF EXISTS project_memory_authorities;
+    DROP TABLE IF EXISTS session_provider_switches;
+    DROP TABLE IF EXISTS peer_session_direct_message_sources;
+    DROP TABLE IF EXISTS peer_session_turn_origins;
+    DROP TABLE IF EXISTS peer_session_action_roots;
+    DROP TABLE IF EXISTS peer_session_action_visits;
+    DROP TABLE IF EXISTS peer_session_action_parents;
+    DROP TABLE IF EXISTS peer_session_actions;
+    DROP TABLE IF EXISTS session_peer_policies;
+    DROP TABLE IF EXISTS session_message_event_sources;
+    DROP TABLE IF EXISTS session_host_capability_bindings;
+  `);
+  if (database.query(
+    "SELECT 1 FROM pragma_table_info('queue_entries') WHERE name='peer_action_id'",
+  ).get() !== null) database.exec("ALTER TABLE queue_entries DROP COLUMN peer_action_id");
+  if (database.query(
+    "SELECT 1 FROM pragma_table_info('queue_entries') WHERE name='message_actor'",
+  ).get() !== null) database.exec("ALTER TABLE queue_entries DROP COLUMN message_actor");
+};
+
 const dropPostProviderSwitchSchema = (database: Database): void => {
+  dropPeerAndHostedMemorySchema(database);
   dropSessionAdoptionAndPresetContractSchema(database);
   database.exec(`
     DROP TABLE IF EXISTS attention_email_policy;
@@ -339,6 +461,32 @@ const downgradeToExactProviderVersion39 = (database: Database): void => {
     DELETE FROM migrations WHERE version>39;
     PRAGMA user_version=39;
   `);
+};
+
+const historicalFeatureProviderSwitchSchemaSha256 =
+  "5a5806b3b93b58915de2ab72ca63b58fa2def304c465ab6613c33a22f2ce328c";
+
+const installHistoricalFeatureProviderSwitchJournal = (database: Database): void => {
+  const source = readFileSync(join(import.meta.dir, "state-store.ts"), "utf8");
+  const embeddedSchema = (name: string): string => {
+    const marker = `const ${name} = \``;
+    const start = source.indexOf(marker);
+    const end = source.indexOf("`;", start + marker.length);
+    if (start < 0 || end < 0) throw new Error(`Historical schema ${name} is missing.`);
+    return source.slice(start + marker.length, end);
+  };
+  const schema = (
+    embeddedSchema("legacyFeatureProviderSwitchJournalSchema")
+    + embeddedSchema("legacyFeatureProviderSwitchAuthoritySchema")
+  )
+    .replaceAll("${legacyPresetContract}", String(legacyPresetContract))
+    .replaceAll("${currentPresetContract}", String(currentPresetContract))
+    .replaceAll("${\"0\".repeat(64)}", "0".repeat(64));
+  if (createHash("sha256").update(schema).digest("hex")
+    !== historicalFeatureProviderSwitchSchemaSha256) {
+    throw new Error("Historical feature provider-switch schema digest mismatch.");
+  }
+  database.exec(schema);
 };
 
 // Exact sqlite_master SQL emitted by StateStore at 42c4235e35daed1dec7eca4ff985bd9e8606b78a.
@@ -557,6 +705,13 @@ const managedClaudeRuntimeProfile = (
   configHome: "isolated" as const,
 });
 
+const testAdoptionHostCapabilities = {
+  preambleVersion: 1,
+  preambleDigest: "a".repeat(64),
+  manifestVersion: 1,
+  manifestDigest: "b".repeat(64),
+} as const;
+
 let personalClaudeSessionSequence = 0;
 const adoptPersonalClaudeTestSession = (
   store: StateStore,
@@ -605,18 +760,23 @@ const adoptPersonalClaudeTestSession = (
     runtimeProfile: claudeAdoptionRuntimeProfile(profile),
     providerAccountKey: testProviderAccountKey("claude"),
     claudeProcessIdentity: processIdentity,
+    hostCapabilities: testAdoptionHostCapabilities,
   }).session;
 };
 
 const dropProviderSwitchVersion35Objects = (database: Database): void => {
   database.exec(`
     PRAGMA foreign_keys=OFF;
-    DROP TABLE session_provider_switch_source_releases;
-    DROP TABLE session_provider_switch_seed_results;
-    DROP TABLE session_provider_switch_seed_intents;
-    DROP TABLE session_provider_switch_target_releases;
-    DROP TABLE session_provider_switch_targets;
-    DROP TABLE session_mutation_authority_rebinds;
+    DROP TRIGGER IF EXISTS session_provider_switch_session_update_guard;
+    DROP TRIGGER IF EXISTS session_provider_switch_session_delete_guard;
+    DROP TABLE IF EXISTS session_provider_switches;
+    DROP TABLE IF EXISTS session_mutation_authority_rebinds_v39;
+    DROP TABLE IF EXISTS session_provider_switch_source_releases;
+    DROP TABLE IF EXISTS session_provider_switch_seed_results;
+    DROP TABLE IF EXISTS session_provider_switch_seed_intents;
+    DROP TABLE IF EXISTS session_provider_switch_target_releases;
+    DROP TABLE IF EXISTS session_provider_switch_targets;
+    DROP TABLE IF EXISTS session_mutation_authority_rebinds;
     PRAGMA foreign_keys=ON;
   `);
 };
@@ -861,6 +1021,82 @@ async function prepareSignedOutSessionStart(
 const usageFingerprint = "a".repeat(64);
 const resetAccountFingerprint = (email: string): string =>
   createHash("sha256").update(email.trim().toLowerCase()).digest("hex");
+const testDigest = (value: string): string =>
+  createHash("sha256").update(value, "utf8").digest("hex");
+const testSwitchHostCapabilities = {
+  preambleVersion: 1,
+  preambleDigest: "a".repeat(64),
+  manifestVersion: 1,
+  manifestDigest: "b".repeat(64),
+} as const;
+const testCanonicalMemoryEnvelope = (value: string, keyVersion = 1) => ({
+  algorithm: "A256GCM" as const,
+  ciphertext: testDigest(`ciphertext:${value}`),
+  keyVersion,
+  nonce: testDigest(`nonce:${value}`).slice(0, 16),
+});
+const testCanonicalMemoryHostedCreateRequest = (
+  remoteSpaceId: string,
+  keyVersion = 7,
+  accountKeyVersion = 3,
+) => ({
+  bindingPolicy: "one_project_one_space" as const,
+  encryptedDescriptor: testCanonicalMemoryEnvelope(
+    "PRIVATE HOSTED CREATE DESCRIPTOR",
+    keyVersion,
+  ),
+  genesisHeadProof: testCanonicalMemoryEnvelope(
+    "PRIVATE HOSTED CREATE GENESIS PROOF",
+    keyVersion,
+  ),
+  genesisToken: testDigest("hosted create genesis token"),
+  identityContract: 2 as const,
+  keyVersion,
+  spaceId: remoteSpaceId,
+  wrappedSpaceKey: testCanonicalMemoryEnvelope(
+    "PRIVATE HOSTED CREATE WRAPPED KEY",
+    accountKeyVersion,
+  ),
+});
+const reserveTestProjectMemoryAuthority = (
+  store: StateStore,
+  projectId: ProjectId,
+  head: ProjectMemoryHeadRef,
+) => {
+  const identity = createPortableProjectMemoryCanonicalIdentity(projectId);
+  const reserved = store.reserveProjectMemoryAuthority({
+    canonicalSpaceId: identity.canonicalSpaceId,
+    head,
+    identityContract: identity.identityContract,
+    projectId,
+  });
+  return store.markProjectMemoryAuthorityInitialized({
+    expectedHead: reserved.head,
+    expectedRevision: reserved.revision,
+    projectId,
+  });
+};
+const peerIdempotencyKey = (index: number): string =>
+  `20000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+const codexRuntimeProfile = (
+  profile: Readonly<{ id: string; processGeneration: number }>,
+  observedAt = 2_000,
+) => ({
+  profileId: profile.id,
+  processGeneration: profile.processGeneration,
+  observedAt,
+  preset: "high" as const,
+  model: "gpt-6-astra",
+  reasoningEffort: "max" as const,
+  serviceTier: null,
+  fast: false,
+  approvalPolicy: "on-request" as const,
+  reviewMode: "auto_review" as const,
+  permissionProfile: ":workspace" as const,
+  computerUse: true as const,
+  pluginCapability: true as const,
+  enabledApps: [],
+});
 
 const prepareAuthorizedReset = (
   store: StateStore,
@@ -1514,6 +1750,7 @@ describe("StateStore", () => {
       attemptId: attempt.id,
       sessionId: session.id,
       profileGeneration: profile.processGeneration,
+      message: "legacy recovery",
       evidence: {
         baseline: { activeTurnId: null, providerUpdatedAt: 10, status: "idle" },
         clientMessageId: attempt.id,
@@ -1544,10 +1781,23 @@ describe("StateStore", () => {
         title: "Legacy recovery preset",
       },
       receipt: { turnId: "turn-legacy-recovery-preset" },
+      message: "legacy recovery",
       resolution: "proven_applied",
       resolutionEvidence: { providerUpdatedAt: 11, source: "thread/read" },
     });
     expect(recovered.state).toBe("idle");
+    expect(recovered.messageEvent).toMatchObject({
+      appended: true,
+      event: {
+        body: {
+          type: "user_message",
+          actor: "human",
+          text: "legacy recovery",
+        },
+      },
+    });
+    expect(store.readSessionMessageEventSource(session.id, attempt.id))
+      .toMatchObject({ actor: "human", sourceKind: "mutation" });
     expect(store.runtimeProfileForTurn(session.id, "turn-legacy-recovery-preset"))
       .toEqual(runtimeProfile);
     expect(store.requireSessionPresetRequirement(session.id).requirement)
@@ -1725,6 +1975,7 @@ describe("StateStore", () => {
       fastEnabled: true,
       runtimeProfile: codexAdoptionRuntimeProfile(profile, "ultra", true),
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+      hostCapabilities: testAdoptionHostCapabilities,
     })).toThrow("SESSION_ADOPTION_CANDIDATE_STALE");
     expect(() => store.adoptSessionCandidate({
       provider: "codex",
@@ -1737,6 +1988,7 @@ describe("StateStore", () => {
       fastEnabled: true,
       runtimeProfile: codexAdoptionRuntimeProfile(profile, "ultra", true),
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+      hostCapabilities: testAdoptionHostCapabilities,
     })).toThrow("SESSION_ADOPTION_CANDIDATE_NOT_CLAIMED");
     const firstPreflight = store.recordSessionAdoptionCandidatePreflightAttempt({
       provider: "codex",
@@ -1772,6 +2024,7 @@ describe("StateStore", () => {
       fastEnabled: true,
       runtimeProfile: codexAdoptionRuntimeProfile(profile, "ultra", true),
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+      hostCapabilities: testAdoptionHostCapabilities,
     });
     expect(adopted.session).toMatchObject({
       profileId: profile.id,
@@ -1785,6 +2038,10 @@ describe("StateStore", () => {
     expect(adopted.binding).toMatchObject({
       sessionId: adopted.session.id,
       state: "active",
+    });
+    expect(store.requireSessionHostCapabilityBinding(adopted.session.id)).toMatchObject({
+      sessionId: adopted.session.id,
+      ...testAdoptionHostCapabilities,
     });
     expect(store.latestSessionRuntimeProfile(adopted.session.id)).toMatchObject({
       sourceKind: "session_start",
@@ -1865,6 +2122,30 @@ describe("StateStore", () => {
       providerThreadId: pendingAgain.providerThreadId,
       expectedRevision: pendingAgain.revision,
     });
+    expect(() => store.adoptSessionCandidate({
+      provider: "codex",
+      providerThreadId: "personal-thread",
+      expectedCandidateRevision: claimedAgain.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "high",
+      requirement: presetRequirements.high,
+      fastEnabled: false,
+      runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+      hostCapabilities: {
+        ...testAdoptionHostCapabilities,
+        manifestDigest: "c".repeat(64),
+      },
+    })).toThrow("SESSION_ADOPTION_HOST_CAPABILITY_BINDING_CONFLICT");
+    expect(store.requireSession(adopted.session.id)).toMatchObject({
+      preset: "ultra",
+      fastEnabled: true,
+    });
+    expect(store.readSessionPersonalRuntimeBinding(adopted.session.id, true))
+      .toMatchObject({ state: "detached" });
+    expect(store.listSessionAdoptionCandidates({ provider: "codex" })[0])
+      .toMatchObject({ status: "claiming" });
     const readopted = store.adoptSessionCandidate({
       provider: "codex",
       providerThreadId: "personal-thread",
@@ -1876,6 +2157,7 @@ describe("StateStore", () => {
       fastEnabled: false,
       runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+      hostCapabilities: testAdoptionHostCapabilities,
     });
     expect(readopted.session).toMatchObject({
       id: adopted.session.id,
@@ -2000,6 +2282,7 @@ describe("StateStore", () => {
       fastEnabled: false,
       runtimeProfile: codexAdoptionRuntimeProfile(first, "high", false),
       providerAccountKey: providerAccountKeyForProfile(store, first.id, "codex"),
+      hostCapabilities: testAdoptionHostCapabilities,
     });
     expect(() => store.setSessionAdoptionPolicy({
       provider: "codex",
@@ -2029,6 +2312,7 @@ describe("StateStore", () => {
       fastEnabled: false,
       runtimeProfile: codexAdoptionRuntimeProfile(second, "high", false),
       providerAccountKey: providerAccountKeyForProfile(store, second.id, "codex"),
+      hostCapabilities: testAdoptionHostCapabilities,
     })).toThrow("SESSION_ADOPTION_BINDING_COLLISION");
     expect(store.requireSession(adopted.session.id).profileId).toBe(first.id);
   });
@@ -2092,6 +2376,7 @@ describe("StateStore", () => {
       fastEnabled: false,
       runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
       providerAccountKey: testProviderAccountKey("codex"),
+      hostCapabilities: testAdoptionHostCapabilities,
     })).toThrow("SESSION_ADOPTION_PROFILE_NOT_SIGNED_IN");
     expect(store.findSessionPersonalRuntimeBinding(
       "codex",
@@ -2263,6 +2548,7 @@ describe("StateStore", () => {
       runtimeProfile: claudeAdoptionRuntimeProfile(profile),
       providerAccountKey: testProviderAccountKey("claude"),
       claudeProcessIdentity: identity,
+      hostCapabilities: testAdoptionHostCapabilities,
     });
     expect(() => store.updateClaudeSessionAdoptionCandidateLivenessAfterExactProbe({
       providerThreadId: adopted.candidate.providerThreadId,
@@ -2763,6 +3049,7 @@ describe("StateStore", () => {
       runtimeProfile: claudeAdoptionRuntimeProfile(profile),
       providerAccountKey: testProviderAccountKey("claude"),
       claudeProcessIdentity: processIdentity,
+      hostCapabilities: testAdoptionHostCapabilities,
     })).toThrow("SESSION_ADOPTION_SOURCE_STILL_LIVE");
 
     const stopped = store.upsertSessionAdoptionCandidate({
@@ -2785,6 +3072,7 @@ describe("StateStore", () => {
       runtimeProfile: claudeAdoptionRuntimeProfile(profile),
       providerAccountKey: testProviderAccountKey("claude"),
       claudeProcessIdentity: processIdentity,
+      hostCapabilities: testAdoptionHostCapabilities,
     });
     expect(adopted.session.state).toBe("terminal");
     expect(() => store.removeProfile(profile.id))
@@ -2892,6 +3180,7 @@ describe("StateStore", () => {
       runtimeProfile: claudeAdoptionRuntimeProfile(profile),
       providerAccountKey: testProviderAccountKey("claude"),
       claudeProcessIdentity: processIdentity,
+      hostCapabilities: testAdoptionHostCapabilities,
     });
     expect(store.sessionAccountAuthorityMatches(adopted.session.id, profile.id)).toBe(true);
     expect(store.listLocalSessionPage({
@@ -3971,7 +4260,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=35 ORDER BY version",
       ).all()).toEqual([
@@ -3981,6 +4270,8 @@ describe("StateStore", () => {
         { version: 38 },
         { version: 39 },
         { version: 40 },
+        { version: 41 },
+        { version: 42 },
       ]);
       expect(inspector.query(
         "SELECT name FROM pragma_table_info('session_adoption_candidates') WHERE name='provider_project_root'",
@@ -4065,7 +4356,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_ADOPTION_WORK_INVALID");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         `SELECT revision,claim_status FROM session_adoption_candidates
          WHERE provider=? AND provider_thread_id=?`,
@@ -4110,6 +4401,7 @@ describe("StateStore", () => {
       fastEnabled: false,
       runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+      hostCapabilities: testAdoptionHostCapabilities,
     });
     const workStore = store.createWorkStore(
       11,
@@ -5024,6 +5316,7 @@ describe("StateStore", () => {
       fastEnabled: false,
       runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
       providerAccountKey: accountKey,
+      hostCapabilities: testAdoptionHostCapabilities,
     }).session;
     const queueIds = [native, adopted].map((session, index) =>
       store.enqueue(session.id, `parity queue ${index}`).id);
@@ -5171,6 +5464,7 @@ describe("StateStore", () => {
         targetProfileId: targetProfile.id,
         targetProvider: "claude",
         targetProviderAccountKey: testProviderAccountKey("claude"),
+        targetHostCapabilities: testSwitchHostCapabilities,
         transcriptDigest: "9".repeat(64),
       },
     });
@@ -6401,12 +6695,13 @@ describe("StateStore", () => {
       attemptId: send.id,
       sessionId: session.id,
       profileGeneration: profile.processGeneration,
+      message: "uncertain",
       evidence: {
         kind: "session.send",
         providerThreadId: "thread-restart",
         baseline: { providerUpdatedAt: 10, status: "idle", activeTurnId: null },
         clientMessageId: send.id,
-        messageDigest: "a".repeat(64),
+        messageDigest: createHash("sha256").update("uncertain").digest("hex"),
       },
     });
     expect(() => store.prepareMutation({
@@ -6699,6 +6994,7 @@ describe("StateStore", () => {
         targetProfileId: codexProfile.id,
         targetProvider: "codex",
         targetProviderAccountKey: providerAccountKeyForProfile(store, codexProfile.id, "codex"),
+        targetHostCapabilities: testSwitchHostCapabilities,
         transcriptDigest: personalSourceTranscript,
       },
     });
@@ -6968,6 +7264,7 @@ describe("StateStore", () => {
         targetProfileId: claudeProfile.id,
         targetProvider: "claude",
         targetProviderAccountKey: testProviderAccountKey("claude"),
+        targetHostCapabilities: testSwitchHostCapabilities,
         transcriptDigest: createHash("sha256")
           .update("managed Claude target transcript")
           .digest("hex"),
@@ -7219,6 +7516,7 @@ describe("StateStore", () => {
       fastEnabled: false,
       runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+      hostCapabilities: testAdoptionHostCapabilities,
     });
     const session = store.updateSessionMetadata({
       sessionId: adopted.session.id,
@@ -7421,6 +7719,18 @@ describe("StateStore", () => {
       fastEnabled: false,
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
       evidence: { kind: "session.start", projectId: project.id, clientMessageId: null, messageDigest: null },
+      hostCapabilities: {
+        preambleVersion: 1,
+        preambleDigest: "a".repeat(64),
+        manifestVersion: 1,
+        manifestDigest: "b".repeat(64),
+      },
+    });
+    expect(store.requireSessionHostCapabilityBinding(session.id)).toMatchObject({
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
     });
     expect(store.readMutation("00000000-0000-4000-8000-000000000610")).toMatchObject({
       state: "effect_started",
@@ -8117,6 +8427,7 @@ describe("StateStore", () => {
             targetProfile.id,
             "codex",
           ),
+          targetHostCapabilities: testSwitchHostCapabilities,
           transcriptDigest: createHash("sha256").update(seedName).digest("hex"),
         },
       });
@@ -8269,8 +8580,20 @@ describe("StateStore", () => {
       targetProfileId: claudeAccount.id,
       targetProvider: "claude" as const,
       targetProviderAccountKey: testProviderAccountKey("claude"),
+      targetHostCapabilities: testSwitchHostCapabilities,
       transcriptDigest,
     };
+    expect(() => store.beginSessionProviderSwitchEffect({
+      attemptId: switchAttempt.id,
+      sessionId: started.id,
+      providerAuthentication: {
+        profileId: claudeAccount.id,
+        processGeneration: claudeAccount.processGeneration,
+        provider: "claude",
+        signedIn: true,
+      },
+      evidence: { ...immutableSwitchEvidence, targetHostCapabilities: undefined },
+    })).toThrow("SESSION_PROVIDER_SWITCH_HOST_CAPABILITY_MISMATCH");
     expect(() => store.beginSessionProviderSwitchEffect({
       attemptId: switchAttempt.id,
       sessionId: started.id,
@@ -8371,6 +8694,12 @@ describe("StateStore", () => {
       transcriptDigest,
       turnId: "claude-turn",
     };
+    const targetHostCapabilities = {
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
+    };
     expect(() => store.completeSessionProviderSwitch({
       attemptId: switchAttempt.id,
       expectedSessionRevision: before.revision,
@@ -8381,6 +8710,7 @@ describe("StateStore", () => {
       providerThreadId: "claude-thread",
       providerAccountKey: testProviderAccountKey("claude"),
       claudeProcessIdentity,
+      hostCapabilities: targetHostCapabilities,
       receipt: { ...switchReceipt, turnId: "wrong-turn" },
       runtimeProfile: claudeProfile,
       seedTurnId: "claude-turn",
@@ -8398,12 +8728,33 @@ describe("StateStore", () => {
       providerThreadId: "claude-thread",
       providerAccountKey: testProviderAccountKey("claude"),
       claudeProcessIdentity,
+      hostCapabilities: targetHostCapabilities,
       receipt: switchReceipt,
       runtimeProfile: claudeProfile,
       seedTurnId: "claude-turn",
       sessionId: started.id,
       state: "idle",
     })).toThrow("SESSION_PROVIDER_SWITCH_CAS_CONFLICT");
+    expect(() => store.completeSessionProviderSwitch({
+      attemptId: switchAttempt.id,
+      expectedSessionRevision: before.revision,
+      expectedTargetProfileGeneration: claudeAccount.processGeneration,
+      preset: "fable-max",
+      profileId: claudeAccount.id,
+      provider: "claude",
+      providerThreadId: "claude-thread",
+      providerAccountKey: testProviderAccountKey("claude"),
+      claudeProcessIdentity,
+      hostCapabilities: {
+        ...targetHostCapabilities,
+        manifestDigest: "c".repeat(64),
+      },
+      receipt: switchReceipt,
+      runtimeProfile: claudeProfile,
+      seedTurnId: "claude-turn",
+      sessionId: started.id,
+      state: "idle",
+    })).toThrow("SESSION_PROVIDER_SWITCH_EFFECT_EVIDENCE_MISMATCH");
     const switched = store.completeSessionProviderSwitch({
       attemptId: switchAttempt.id,
       expectedSessionRevision: before.revision,
@@ -8412,6 +8763,7 @@ describe("StateStore", () => {
       profileId: claudeAccount.id,
       provider: "claude",
       providerThreadId: "claude-thread",
+      hostCapabilities: targetHostCapabilities,
       receipt: switchReceipt,
       runtimeProfile: claudeProfile,
       providerAccountKey: testProviderAccountKey("claude"),
@@ -8443,6 +8795,12 @@ describe("StateStore", () => {
         },
       },
       state: "applied",
+    });
+    expect(store.requireSessionHostCapabilityBinding(started.id)).toMatchObject({
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
     });
 
     // A stale revision never rebinds, and a preset the target cannot run is
@@ -8492,6 +8850,7 @@ describe("StateStore", () => {
       runtimeProfile: claudeProfile,
       providerAccountKey: testProviderAccountKey("claude"),
       claudeProcessIdentity: replacementProcessIdentity,
+      hostCapabilities: testSwitchHostCapabilities,
       seedTurnId: "claude-turn",
       sessionId: started.id,
       state: "idle",
@@ -8607,6 +8966,7 @@ describe("StateStore", () => {
         providerThreadId,
         receipt: { providerThreadId, sessionId: session.id, toProvider: "claude" },
         providerAccountKey: testProviderAccountKey("claude"),
+        hostCapabilities: testSwitchHostCapabilities,
         runtimeProfile: {
           claudeVersion: "2.1.260",
           inputFormat: "stream-json",
@@ -8661,6 +9021,7 @@ describe("StateStore", () => {
       fastEnabled: false,
       runtimeProfile: codexAdoptionRuntimeProfile(codexAccount, "high", false),
       providerAccountKey: providerAccountKeyForProfile(store, codexAccount.id, "codex"),
+      hostCapabilities: testAdoptionHostCapabilities,
     });
 
     const direct = new Database(store.paths.database, { create: false, strict: true });
@@ -8729,6 +9090,7 @@ describe("StateStore", () => {
         targetProfileId: claudeAccount.id,
         targetProvider: "claude",
         targetProviderAccountKey: testProviderAccountKey("claude"),
+        targetHostCapabilities: testSwitchHostCapabilities,
         transcriptDigest,
       },
     });
@@ -8800,6 +9162,7 @@ describe("StateStore", () => {
       runtimeProfile: claudeProfile,
       providerAccountKey: testProviderAccountKey("claude"),
       claudeProcessIdentity: targetProcessIdentity,
+      hostCapabilities: testSwitchHostCapabilities,
       seedTurnId: "claimed-claude-turn",
       sessionId: adopted.session.id,
       state: "active",
@@ -8885,6 +9248,7 @@ describe("StateStore", () => {
       fastEnabled: true,
       runtimeProfile: codexAdoptionRuntimeProfile(codexAccount, "ultra", true),
       providerAccountKey: providerAccountKeyForProfile(store, codexAccount.id, "codex"),
+      hostCapabilities: testAdoptionHostCapabilities,
     });
 
     expect(readopted.session).toMatchObject({
@@ -8980,6 +9344,7 @@ describe("StateStore", () => {
           targetProfile.id,
           "codex",
         ),
+        targetHostCapabilities: testSwitchHostCapabilities,
         targetProcessGeneration: targetProfile.processGeneration,
         targetProfileId: targetProfile.id,
         targetProvider: "codex" as const,
@@ -9064,6 +9429,315 @@ describe("StateStore", () => {
     })).not.toThrow();
     expect(store.readSessionProviderSwitchProgress(legacy.attempt.id).seed?.runtimeProfile.model)
       .toBe("gpt-5.6-sol");
+  });
+
+  test("releases a Devin source binding before completing its provider switch", async () => {
+    const { store, home } = await fixture();
+    const account = signInProfile(store, "Devin switch source", "devin-switch@example.com");
+    const projectRoot = join(home, "devin-switch-project");
+    await mkdir(projectRoot);
+    const project = await store.createProject("Devin switch project", projectRoot, true);
+    const devinProfile = {
+      devinVersion: "3000.6.14" as const,
+      isolatedHome: true as const,
+      model: "gpt-6-astra" as const,
+      observedAt: 2_000,
+      preset: "astra" as const,
+      processGeneration: account.processGeneration,
+      profileId: account.id,
+      protocolVersion: 1 as const,
+      reasoningEffort: "provider-default" as const,
+    };
+    const codexProfile = {
+      approvalPolicy: "on-request" as const,
+      computerUse: true as const,
+      enabledApps: [],
+      fast: false,
+      model: "gpt-6-astra",
+      observedAt: 2_100,
+      permissionProfile: ":workspace" as const,
+      pluginCapability: true as const,
+      preset: "high" as const,
+      processGeneration: account.processGeneration,
+      profileId: account.id,
+      reasoningEffort: "max" as const,
+      reviewMode: "auto_review" as const,
+      serviceTier: null,
+    };
+    const startAttempt = store.prepareMutation({
+      authorityGeneration: account.processGeneration,
+      authorityId: account.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006b2",
+      kind: "session.start",
+      request: { fast: false, preset: "astra", projectId: project.id },
+    });
+    const started = store.beginSessionStartEffect({
+      attemptId: startAttempt.id,
+      evidence: {
+        clientMessageId: null,
+        kind: "session.start",
+        messageDigest: null,
+        projectId: project.id,
+        runtimeProfile: devinProfile,
+      },
+      fastEnabled: false,
+      preset: "astra",
+      profileGeneration: account.processGeneration,
+      profileId: account.id,
+      projectId: project.id,
+      provider: "devin",
+      providerAuthentication: {
+        profileId: account.id,
+        processGeneration: account.processGeneration,
+        provider: "devin",
+        signedIn: true,
+      },
+    });
+    store.completeSessionStartEffect({
+      attemptId: startAttempt.id,
+      expectedSessionRevision: started.revision,
+      providerThreadId: "devin-source-thread",
+      receipt: { effectiveRuntimeProfile: devinProfile, sessionId: started.id },
+      runtimeProfile: devinProfile,
+      sessionId: started.id,
+      state: "idle",
+    });
+
+    expect(store.requireSession(started.id)).toMatchObject({
+      preset: "astra",
+      provider: "devin",
+      providerThreadId: "devin-source-thread",
+    });
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT provider,provider_v39 FROM sessions WHERE id=?",
+      ).get(started.id)).toEqual({ provider: "codex", provider_v39: "devin" });
+    } finally {
+      inspector.close(false);
+    }
+
+    const switchAttempt = store.prepareMutation({
+      authorityGeneration: account.processGeneration,
+      authorityId: started.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006b3",
+      kind: "session.switch",
+      request: { preset: "high", provider: "codex" },
+    });
+    const seedText = "Continue after switching away from Devin.";
+    const seedDigest = createHash("sha256")
+      .update("hra:session-transcript-seed:v1\0", "utf8")
+      .update(seedText, "utf8")
+      .digest("hex");
+    const transcriptDigest = createHash("sha256")
+      .update("devin source switch transcript")
+      .digest("hex");
+    const evidence = {
+      daemonGeneration: 0,
+      kind: "session.switch" as const,
+      requestedAccountId: null,
+      requestedPreset: "high" as const,
+      runtimeProfile: codexProfile,
+      seedDigest,
+      seedIncludedRecords: 1,
+      seedOmittedRecords: 0,
+      sourcePreset: "astra" as const,
+      sourceProcessGeneration: account.processGeneration,
+      sourceProfileId: account.id,
+      sourceProvider: "devin" as const,
+      sourceProviderThreadId: "devin-source-thread",
+      targetPreset: "high" as const,
+      targetProcessGeneration: account.processGeneration,
+      targetProfileId: account.id,
+      targetProvider: "codex" as const,
+      targetProviderAccountKey: providerAccountKeyForProfile(store, account.id, "codex"),
+      targetHostCapabilities: testSwitchHostCapabilities,
+      transcriptDigest,
+    };
+    store.beginSessionProviderSwitchEffect({
+      attemptId: switchAttempt.id,
+      evidence,
+      sessionId: started.id,
+    });
+    store.recordSessionProviderSwitchTarget({
+      attemptId: switchAttempt.id,
+      providerThreadId: "codex-target-thread",
+      sessionId: started.id,
+    });
+    store.recordSessionProviderSwitchSeedIntent({
+      attemptId: switchAttempt.id,
+      providerThreadId: "codex-target-thread",
+      runtimeProfile: codexProfile,
+      seedText,
+      sessionId: started.id,
+    });
+    store.recordSessionProviderSwitchSeedResult({
+      attemptId: switchAttempt.id,
+      providerThreadId: "codex-target-thread",
+      runtimeProfile: codexProfile,
+      sessionId: started.id,
+      turnId: "codex-seed-turn",
+      turnStatus: "completed",
+    });
+
+    expect(store.readSessionProviderSwitchProgress(switchAttempt.id).sourceReleased).toBe(false);
+    store.recordSessionProviderSwitchSourceReleased({
+      attemptId: switchAttempt.id,
+      sessionId: started.id,
+    });
+    expect(store.readSessionProviderSwitchProgress(switchAttempt.id).sourceReleased).toBe(true);
+
+    const before = store.requireSession(started.id);
+    const switched = store.completeSessionProviderSwitch({
+      attemptId: switchAttempt.id,
+      expectedSessionRevision: before.revision,
+      expectedTargetProfileGeneration: account.processGeneration,
+      preset: "high",
+      profileId: account.id,
+      provider: "codex",
+      providerThreadId: "codex-target-thread",
+      hostCapabilities: testSwitchHostCapabilities,
+      providerAccountKey: providerAccountKeyForProfile(store, account.id, "codex"),
+      receipt: {
+        from: { account: account.id, preset: "astra", provider: "devin" },
+        providerThreadId: "codex-target-thread",
+        request: { accountId: null, preset: "high", provider: "codex" },
+        seed: {
+          digest: seedDigest,
+          includedRecords: 1,
+          omittedRecords: 0,
+          status: "completed",
+        },
+        sessionId: started.id,
+        to: { account: account.id, preset: "high", provider: "codex" },
+        transcriptDigest,
+        turnId: "codex-seed-turn",
+      },
+      runtimeProfile: codexProfile,
+      seedTurnId: "codex-seed-turn",
+      sessionId: started.id,
+      state: "idle",
+    });
+    expect(switched).toMatchObject({
+      preset: "high",
+      profileId: account.id,
+      provider: "codex",
+      providerThreadId: "codex-target-thread",
+    });
+    expect(store.readMutation("00000000-0000-4000-8000-0000000006b3"))
+      .toMatchObject({
+        evidence: { evidence: { sourceProvider: "devin", targetProvider: "codex" } },
+        result: { from: { provider: "devin" }, session: { provider: "codex" } },
+        state: "applied",
+      });
+    expect(store.requireSessionHostCapabilityBinding(started.id)).toMatchObject({
+      preambleDigest: testSwitchHostCapabilities.preambleDigest,
+      manifestDigest: testSwitchHostCapabilities.manifestDigest,
+    });
+
+    const returnAttempt = store.prepareMutation({
+      authorityGeneration: account.processGeneration,
+      authorityId: started.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006b4",
+      kind: "session.switch",
+      request: { preset: "astra", provider: "devin" },
+    });
+    const returnSeedText = "Continue after switching back to Devin.";
+    const returnSeedDigest = createHash("sha256")
+      .update("hra:session-transcript-seed:v1\0", "utf8")
+      .update(returnSeedText, "utf8")
+      .digest("hex");
+    const returnTranscriptDigest = createHash("sha256")
+      .update("Codex source switch transcript")
+      .digest("hex");
+    store.beginSessionProviderSwitchEffect({
+      attemptId: returnAttempt.id,
+      evidence: {
+        daemonGeneration: 0,
+        kind: "session.switch",
+        requestedAccountId: null,
+        requestedPreset: "astra",
+        runtimeProfile: devinProfile,
+        seedDigest: returnSeedDigest,
+        seedIncludedRecords: 1,
+        seedOmittedRecords: 0,
+        sourcePreset: "high",
+        sourceProcessGeneration: account.processGeneration,
+        sourceProfileId: account.id,
+        sourceProvider: "codex",
+        sourceProviderThreadId: "codex-target-thread",
+        targetPreset: "astra",
+        targetProcessGeneration: account.processGeneration,
+        targetProfileId: account.id,
+        targetProvider: "devin",
+        transcriptDigest: returnTranscriptDigest,
+      },
+      providerAuthentication: {
+        profileId: account.id,
+        processGeneration: account.processGeneration,
+        provider: "devin",
+        signedIn: true,
+      },
+      sessionId: started.id,
+    });
+    store.recordSessionProviderSwitchTarget({
+      attemptId: returnAttempt.id,
+      providerThreadId: "devin-return-thread",
+      sessionId: started.id,
+    });
+    store.recordSessionProviderSwitchSeedIntent({
+      attemptId: returnAttempt.id,
+      providerThreadId: "devin-return-thread",
+      runtimeProfile: devinProfile,
+      seedText: returnSeedText,
+      sessionId: started.id,
+    });
+    store.recordSessionProviderSwitchSeedResult({
+      attemptId: returnAttempt.id,
+      providerThreadId: "devin-return-thread",
+      runtimeProfile: devinProfile,
+      sessionId: started.id,
+      turnId: "devin-return-seed-turn",
+      turnStatus: "completed",
+    });
+    store.recordSessionProviderSwitchSourceReleased({
+      attemptId: returnAttempt.id,
+      sessionId: started.id,
+    });
+    const beforeReturn = store.requireSession(started.id);
+    expect(store.completeSessionProviderSwitch({
+      attemptId: returnAttempt.id,
+      expectedSessionRevision: beforeReturn.revision,
+      expectedTargetProfileGeneration: account.processGeneration,
+      preset: "astra",
+      profileId: account.id,
+      provider: "devin",
+      providerThreadId: "devin-return-thread",
+      receipt: {
+        from: { account: account.id, preset: "high", provider: "codex" },
+        providerThreadId: "devin-return-thread",
+        request: { accountId: null, preset: "astra", provider: "devin" },
+        seed: {
+          digest: returnSeedDigest,
+          includedRecords: 1,
+          omittedRecords: 0,
+          status: "completed",
+        },
+        sessionId: started.id,
+        to: { account: account.id, preset: "astra", provider: "devin" },
+        transcriptDigest: returnTranscriptDigest,
+        turnId: "devin-return-seed-turn",
+      },
+      runtimeProfile: devinProfile,
+      seedTurnId: "devin-return-seed-turn",
+      sessionId: started.id,
+      state: "idle",
+    })).toMatchObject({
+      preset: "astra",
+      provider: "devin",
+      providerThreadId: "devin-return-thread",
+    });
+    expect(store.readSessionHostCapabilityBinding(started.id)).toBeNull();
   });
 
   test("refuses a session-start evidence row whose profile names another provider", async () => {
@@ -9548,12 +10222,16 @@ describe("StateStore", () => {
     }
     store.completeQueueEffect({
       queueId: applied.queued.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
       expectedEvidenceDigest: applied.evidence.digest,
       expectedSessionRevision: session.revision,
       applyResponseState: false,
       turnId: "turn-queue-body-custody",
       turnStatus: "completed",
       runtimeProfile: runtime,
+      message: "applied queue body sentinel",
       receipt: { turnId: "turn-queue-body-custody" },
     });
     expect(store.requireQueue(applied.queued.id)).toMatchObject({
@@ -9839,7 +10517,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -10607,12 +11285,13 @@ describe("StateStore", () => {
       attemptId: sendAttempt.id,
       sessionId: sendSession.id,
       profileGeneration: profile.processGeneration,
+      message: "send",
       evidence: {
         kind: "session.send",
         providerThreadId: "thread-send-cas",
         baseline: { providerUpdatedAt: 10, status: "idle", activeTurnId: null },
         clientMessageId: sendAttempt.id,
-        messageDigest: "a".repeat(64),
+        messageDigest: createHash("sha256").update("send").digest("hex"),
         runtimeProfile: runtime,
       },
     });
@@ -10620,11 +11299,15 @@ describe("StateStore", () => {
     expect(() => store.completeSessionTurnEffect({
       attemptId: sendAttempt.id,
       sessionId: sendSession.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
       expectedSessionRevision: sendSession.revision,
       applyResponseState: true,
       turnId: "turn-send-cas",
       turnStatus: "inProgress",
       runtimeProfile: runtime,
+      message: "send",
       receipt: { turnId: "turn-send-cas" },
     })).toThrow("SESSION_TURN_STATE_CAS_CONFLICT");
     expect(store.readMutation(sendKey)).toMatchObject({ state: "effect_started" });
@@ -10664,17 +11347,276 @@ describe("StateStore", () => {
     store.updateSessionMetadata({ sessionId: queueSession.id, expectedRevision: queueSession.revision, fastEnabled: true });
     expect(() => store.completeQueueEffect({
       queueId: queue.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
       expectedEvidenceDigest: queueEvidence.digest,
       expectedSessionRevision: queueSession.revision,
       applyResponseState: true,
       turnId: "turn-queue-cas",
       turnStatus: "inProgress",
       runtimeProfile: runtime,
+      message: "queued",
       receipt: { turnId: "turn-queue-cas" },
     })).toThrow("QUEUE_EFFECT_SESSION_CAS_CONFLICT");
     expect(store.requireQueue(queue.id)).toMatchObject({ state: "dispatching" });
     expect(store.latestSessionRuntimeProfile(queueSession.id)).toBeNull();
     expect(store.requireSession(queueSession.id)).toMatchObject({ state: "idle", fastEnabled: true });
+  });
+
+  test("commits sanitized send, steer, and queue message events with their effect receipts", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Atomic message events", "atomic-events@example.com");
+    const runtime = codexRuntimeProfile(profile);
+    const bind = (
+      thread: string,
+      state: "active" | "idle",
+      activeTurnId?: string,
+    ) => {
+      const created = createAuthorizedStartingTestSession(store, {
+        profileId: profile.id,
+        preset: "high",
+        fastEnabled: false,
+      });
+      return store.bindSession({
+        sessionId: created.id,
+        expectedRevision: created.revision,
+        providerThreadId: thread,
+        state,
+        ...(activeTurnId === undefined ? {} : { activeTurnId }),
+      });
+    };
+
+    const sendSession = bind("thread-atomic-send", "idle");
+    const sendMessage = `/Users/private/project/${"x".repeat(
+      SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
+    )}`;
+    const sendKey = peerIdempotencyKey(70_001);
+    const sendAttempt = store.prepareMutation({
+      kind: "session.send",
+      authorityId: sendSession.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: sendMessage },
+      idempotencyKey: sendKey,
+    });
+    store.beginSessionMutationEffect({
+      attemptId: sendAttempt.id,
+      sessionId: sendSession.id,
+      profileGeneration: profile.processGeneration,
+      message: sendMessage,
+      evidence: {
+        kind: "session.send",
+        providerThreadId: "thread-atomic-send",
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: sendAttempt.id,
+        messageDigest: testDigest(sendMessage),
+        runtimeProfile: runtime,
+      },
+    });
+    expect(store.bumpAutorespondCounter(sendSession.id)).toBe(1);
+    expect(store.bumpAutorespondCounter(sendSession.id)).toBe(2);
+    expect(() => store.completeSessionTurnEffect({
+      attemptId: sendAttempt.id,
+      sessionId: sendSession.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      expectedSessionRevision: sendSession.revision,
+      applyResponseState: false,
+      turnId: "turn-atomic-send",
+      turnStatus: "completed",
+      runtimeProfile: runtime,
+      message: `${sendMessage}changed`,
+      receipt: { turnId: "turn-atomic-send" },
+    })).toThrow("SESSION_MESSAGE_DIGEST_MISMATCH");
+    expect(store.readMutation(sendKey)?.state).toBe("effect_started");
+    expect(store.readSessionMessageEventSource(sendSession.id, sendAttempt.id)).toBeNull();
+    expect(store.listSessionEvents({ sessionId: sendSession.id, afterSequence: 0 }).events)
+      .toEqual([]);
+    expect(store.latestSessionRuntimeProfile(sendSession.id)).toBeNull();
+    expect(store.readAutorespondBudgets(sendSession.id).consecutive).toBe(2);
+
+    const sent = store.completeSessionTurnEffect({
+      attemptId: sendAttempt.id,
+      sessionId: sendSession.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      expectedSessionRevision: sendSession.revision,
+      applyResponseState: false,
+      turnId: "turn-atomic-send",
+      turnStatus: "completed",
+      runtimeProfile: runtime,
+      message: sendMessage,
+      receipt: { turnId: "turn-atomic-send" },
+    });
+    expect(sent).toMatchObject({
+      appended: true,
+      event: {
+        body: {
+          type: "user_message",
+          actor: "human",
+          text: "[local-path]",
+          omittedCharacters: sendMessage.length
+            - SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
+        },
+      },
+    });
+    expect(store.readAutorespondBudgets(sendSession.id).consecutive).toBe(0);
+    expect(store.bumpAutorespondCounter(sendSession.id)).toBe(1);
+    expect(store.appendSessionUserMessageEventOnce({
+      sourceId: sendAttempt.id,
+      sessionId: sendSession.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      turnId: "turn-atomic-send",
+      message: sendMessage,
+    })).toEqual({ ...sent, appended: false });
+    expect(store.readAutorespondBudgets(sendSession.id).consecutive).toBe(1);
+
+    const steerSession = bind("thread-atomic-steer", "active", "turn-atomic-steer");
+    const steerMessage = "sk_testabcdefgh";
+    const steerKey = peerIdempotencyKey(70_002);
+    const steerAttempt = store.prepareMutation({
+      kind: "session.steer",
+      authorityId: steerSession.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: steerMessage },
+      idempotencyKey: steerKey,
+    });
+    store.beginSessionMutationEffect({
+      attemptId: steerAttempt.id,
+      sessionId: steerSession.id,
+      profileGeneration: profile.processGeneration,
+      message: steerMessage,
+      evidence: {
+        kind: "session.steer",
+        providerThreadId: "thread-atomic-steer",
+        baseline: {
+          providerUpdatedAt: null,
+          status: "active",
+          activeTurnId: "turn-atomic-steer",
+        },
+        activeTurnId: "turn-atomic-steer",
+        clientMessageId: steerAttempt.id,
+        messageDigest: testDigest(steerMessage),
+      },
+    });
+    expect(store.completeSessionSteerEffect({
+      attemptId: steerAttempt.id,
+      sessionId: steerSession.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      turnId: "turn-atomic-steer",
+      message: steerMessage,
+      receipt: { steered: true, activeTurnId: "turn-atomic-steer" },
+    })).toMatchObject({
+      appended: true,
+      event: { body: { type: "user_message", actor: "human", text: "[protected]" } },
+    });
+
+    const queueSession = bind("thread-atomic-queue", "idle");
+    const queueMessage = "line one\nright\u202Eleft\u0000done";
+    const queue = store.enqueue(queueSession.id, queueMessage);
+    const queueEvidence = store.beginQueueEffect({
+      queueId: queue.id,
+      sessionId: queueSession.id,
+      profileGeneration: profile.processGeneration,
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: queue.id,
+        sessionId: queueSession.id,
+        providerThreadId: "thread-atomic-queue",
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: queue.id,
+        messageDigest: testDigest(queueMessage),
+        runtimeProfile: runtime,
+      },
+    });
+    expect(store.completeQueueEffect({
+      queueId: queue.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      expectedEvidenceDigest: queueEvidence.digest,
+      expectedSessionRevision: queueSession.revision,
+      applyResponseState: false,
+      turnId: "turn-atomic-queue",
+      turnStatus: "completed",
+      runtimeProfile: runtime,
+      message: queueMessage,
+      receipt: { turnId: "turn-atomic-queue" },
+    })).toMatchObject({
+      appended: true,
+      event: {
+        body: {
+          type: "user_message",
+          actor: "human",
+          text: "line one\nright�left�done",
+        },
+      },
+    });
+
+    const cutoffSecrets = [
+      ["aws", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"],
+      ["google", `AIza${"Sy".repeat(17)}A`],
+      ["npm", `npm_${"Ab9".repeat(12)}`],
+    ] as const;
+    for (const [index, [name, secret]] of cutoffSecrets.entries()) {
+      const cutoffMessage = `${" ".repeat(
+        SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS - secret.length + 1,
+      )}${secret} tail`;
+      expect(cutoffMessage.slice(0, SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS))
+        .toEndWith(secret.slice(0, -1));
+      const cutoffSession = bind(`thread-atomic-cutoff-${name}`, "idle");
+      const cutoffKey = peerIdempotencyKey(70_010 + index);
+      const cutoffAttempt = store.prepareMutation({
+        kind: "session.send",
+        authorityId: cutoffSession.id,
+        authorityGeneration: profile.processGeneration,
+        request: { message: cutoffMessage },
+        idempotencyKey: cutoffKey,
+      });
+      store.beginSessionMutationEffect({
+        attemptId: cutoffAttempt.id,
+        sessionId: cutoffSession.id,
+        profileGeneration: profile.processGeneration,
+        message: cutoffMessage,
+        evidence: {
+          kind: "session.send",
+          providerThreadId: `thread-atomic-cutoff-${name}`,
+          baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+          clientMessageId: cutoffAttempt.id,
+          messageDigest: testDigest(cutoffMessage),
+          runtimeProfile: runtime,
+        },
+      });
+      const cutoffResult = store.completeSessionTurnEffect({
+        attemptId: cutoffAttempt.id,
+        sessionId: cutoffSession.id,
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: null,
+        expectedSessionRevision: cutoffSession.revision,
+        applyResponseState: false,
+        turnId: `turn-atomic-cutoff-${name}`,
+        turnStatus: "completed",
+        runtimeProfile: runtime,
+        message: cutoffMessage,
+        receipt: { turnId: `turn-atomic-cutoff-${name}` },
+      });
+      if (cutoffResult.event.body.type !== "user_message") {
+        throw new Error("Expected a cutoff user-message event.");
+      }
+      expect(cutoffResult.event.body.text).toContain("[protected]");
+      expect(cutoffResult.event.body.text).not.toContain(secret.slice(0, -1));
+      expect(cutoffResult.event.body.omittedCharacters).toBe(
+        cutoffMessage.length - SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
+      );
+    }
   });
 
   test("reports whether any session is mid-turn as a cloud cadence hint", async () => {
@@ -13181,6 +14123,7 @@ describe("StateStore", () => {
       fastEnabled: false,
       runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+      hostCapabilities: testAdoptionHostCapabilities,
     });
     const interaction = admitRestartCommandInteraction(store, {
       index: 41,
@@ -13705,7 +14648,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts",
       ).get()).toEqual({ count: 1 });
@@ -15365,9 +16308,9 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query("SELECT version FROM migrations ORDER BY version").all())
-        .toEqual(Array.from({ length: 40 }, (_, index) => ({ version: index + 1 })));
+        .toEqual(Array.from({ length: 42 }, (_, index) => ({ version: index + 1 })));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
         .toContainEqual(expect.objectContaining({ name: "attempt_sequence", type: "INTEGER", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
@@ -15556,7 +16499,7 @@ describe("StateStore", () => {
       foreignKeyViolations: 0,
       profileColumns: ["codex_account_key"],
       sqliteVersion: expect.stringMatching(/^3\./u),
-      userVersion: 40,
+      userVersion: 42,
     });
   });
 
@@ -15589,6 +16532,14 @@ describe("StateStore", () => {
       pluginCapability: true,
       enabledApps: [],
     });
+    const legacyBinding = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      legacyBinding.query(
+        "UPDATE sessions SET preset_contract=? WHERE id=?",
+      ).run(legacyPresetContract, session.id);
+    } finally {
+      legacyBinding.close(false);
+    }
     store.recordSessionRuntimeProfile({
       sessionId: session.id,
       sourceKind: "turn_start",
@@ -15615,7 +16566,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:40");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:42");
     const migrated = new StateStore(paths, { now: () => 4_000 });
     stores.push(migrated);
     expect(migrated.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtimeProfile);
@@ -15625,7 +16576,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
         .toEqual([
           { version: 35 },
@@ -15634,6 +16585,8 @@ describe("StateStore", () => {
           { version: 38 },
           { version: 39 },
           { version: 40 },
+          { version: 41 },
+          { version: 42 },
         ]);
       expect(inspector.query(
         `SELECT type,COUNT(*) AS count FROM sqlite_master
@@ -15647,6 +16600,9 @@ describe("StateStore", () => {
       expect(inspector.query(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
       ).get()).toEqual({ name: "session_adoption_policies" });
+      expect(inspector.query(
+        "SELECT profile_json FROM session_runtime_profiles WHERE source_id='historical-sol-source'",
+      ).get()).toEqual({ profile_json: JSON.stringify(runtimeProfile) });
     } finally {
       inspector.close(false);
     }
@@ -15676,7 +16632,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
         .toEqual([
           { version: 35 },
@@ -15685,6 +16641,8 @@ describe("StateStore", () => {
           { version: 38 },
           { version: 39 },
           { version: 40 },
+          { version: 41 },
+          { version: 42 },
         ]);
       expect(inspector.query(
         `SELECT name FROM sqlite_master WHERE type='table'
@@ -15730,7 +16688,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:40");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:42");
     const migrated = new StateStore(paths, { now: () => 2_000 });
     stores.push(migrated);
     expect(migrated.requireSession(session.id)).toMatchObject({
@@ -15739,10 +16697,15 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=39 ORDER BY version",
-      ).all()).toEqual([{ version: 39 }, { version: 40 }]);
+      ).all()).toEqual([
+        { version: 39 },
+        { version: 40 },
+        { version: 41 },
+        { version: 42 },
+      ]);
       expect(inspector.query(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
       ).get()).toEqual({ name: "session_adoption_policies" });
@@ -15845,7 +16808,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT 1 FROM pragma_table_info('session_adoption_candidates') WHERE name='last_live_observed_at'",
       ).get()).toEqual({ 1: 1 });
@@ -16013,7 +16976,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_adoption_candidates");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT name FROM pragma_table_info('session_adoption_candidates') WHERE name=?",
       ).get(column)).toBeNull();
@@ -16040,7 +17003,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_mutation_authority_rebinds_v39");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT name FROM sqlite_master WHERE name='session_mutation_authority_rebinds_v39'",
       ).get()).toBeNull();
@@ -16079,7 +17042,7 @@ describe("StateStore", () => {
     }
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         `SELECT sql FROM sqlite_master
          WHERE type='trigger'
@@ -16111,7 +17074,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:sessions.provider_v39");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT name FROM pragma_table_info('sessions') WHERE name='provider_v39'",
       ).get()).toBeNull();
@@ -16169,7 +17132,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_claude_process_authorities_live_identity");
     const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT sql FROM sqlite_master WHERE name='session_adoption_candidate_revision_guard'",
       ).get()).toEqual(expect.objectContaining({ sql: expect.stringContaining("SELECT 1") }));
@@ -16222,7 +17185,7 @@ describe("StateStore", () => {
         .toContainEqual(expect.objectContaining({ name: "preset_contract", notnull: 1 }));
       expect(inspector.query("SELECT preset_contract FROM sessions WHERE id=?").get(session.id))
         .toEqual({ preset_contract: legacyPresetContract });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query("SELECT version FROM migrations WHERE version=38").get())
         .toEqual({ version: 38 });
     } finally {
@@ -16320,7 +17283,7 @@ describe("StateStore", () => {
     mainV35.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:40");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:42");
     const migrated = new StateStore(paths, {
       now: () => 8_000,
       resolveMachineTimeZone: () => "UTC",
@@ -16334,7 +17297,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT provider_thread_id,recorded_at FROM session_provider_switch_targets WHERE attempt_id=?",
       ).get(attempt.id)).toEqual({
@@ -16342,13 +17305,16 @@ describe("StateStore", () => {
         recorded_at: 7_350,
       });
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 35 AND 39 ORDER BY version",
+        "SELECT version FROM migrations WHERE version BETWEEN 35 AND 42 ORDER BY version",
       ).all()).toEqual([
         { version: 35 },
         { version: 36 },
         { version: 37 },
         { version: 38 },
         { version: 39 },
+        { version: 40 },
+        { version: 41 },
+        { version: 42 },
       ]);
     } finally {
       inspector.close(false);
@@ -16380,7 +17346,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:40");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:42");
     const migrated = new StateStore(paths, {
       now: () => 9_000,
       resolveMachineTimeZone: () => {
@@ -16402,7 +17368,7 @@ describe("StateStore", () => {
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
     } finally {
       inspector.close(false);
     }
@@ -16427,7 +17393,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:40");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:42");
 
     expect(() => new StateStore(paths))
       .toThrow("ATTENTION_EMAIL_POLICY_MIGRATION_OPT_IN_REFUSED");
@@ -16475,7 +17441,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:40");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:42");
     const migrated = new StateStore(paths, {
       now: () => 12_000,
       resolveMachineTimeZone: () => {
@@ -16503,7 +17469,7 @@ describe("StateStore", () => {
          FROM notification_hours h JOIN attention_email_policy e ON h.singleton=e.singleton`,
       ).get()).toEqual(before);
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
     } finally {
       inspector.close(false);
     }
@@ -16642,7 +17608,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:40");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:42");
     const unchanged = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
@@ -16700,7 +17666,7 @@ describe("StateStore", () => {
     const schemaInspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(schemaInspector)).toBe(21);
-      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
     } finally {
       schemaInspector.close(false);
     }
@@ -17042,13 +18008,13 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query("PRAGMA table_info(sessions)").all())
         .toContainEqual(expect.objectContaining({ name: "provider", dflt_value: "'codex'" }));
       expect(inspector.query("PRAGMA table_info(autorespond_evidence)").all())
         .toContainEqual(expect.objectContaining({ name: "path" }));
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 40 ORDER BY version",
+        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 42 ORDER BY version",
       ).all()).toEqual([
         { version: 30 },
         { version: 31 },
@@ -17061,6 +18027,8 @@ describe("StateStore", () => {
         { version: 38 },
         { version: 39 },
         { version: 40 },
+        { version: 41 },
+        { version: 42 },
       ]);
     } finally {
       inspector.close(false);
@@ -17357,7 +18325,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -17471,7 +18439,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -17593,7 +18561,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -17651,7 +18619,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -17741,7 +18709,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -17848,7 +18816,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -17940,7 +18908,7 @@ describe("StateStore", () => {
     expect(reopened.listAutorespondEvidence({ sessionId: session.id })).toEqual([expectedEvidence]);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query("SELECT id,path,rule,model FROM autorespond_evidence").get()).toEqual({
         id: 7,
         path: "protocol",
@@ -18050,7 +19018,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -18092,6 +19060,8 @@ describe("StateStore", () => {
         { version: 38, applied_at: 2000 },
         { version: 39, applied_at: 2000 },
         { version: 40, applied_at: 2000 },
+        { version: 41, applied_at: 2000 },
+        { version: 42, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
       expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
@@ -18139,7 +19109,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -18154,14 +19124,4509 @@ describe("StateStore", () => {
     }
   });
 
+  test("binds immutable host capabilities and keeps project memory authority content-free", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "memory-project");
+    await mkdir(root);
+    const project = await store.createProject("Memory project", root);
+    const profile = signInProfile(store, "Memory account", "memory@example.com");
+    const session = store.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+
+    expect(store.requirePeerSessionPolicy(session.id)).toMatchObject({
+      mode: "coordinate",
+      revision: 1,
+    });
+    expect(store.setPeerSessionPolicy({
+      sessionId: session.id,
+      expectedRevision: 1,
+      mode: "inspect",
+    })).toMatchObject({ mode: "inspect", revision: 2 });
+    expect(() => store.setPeerSessionPolicy({
+      sessionId: session.id,
+      expectedRevision: 1,
+      mode: "off",
+    })).toThrow("PEER_SESSION_POLICY_REVISION_CONFLICT");
+
+    expect(() => store.bindSessionHostCapabilities({
+      sessionId: session.id,
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
+    })).toThrow("SESSION_HOST_CAPABILITY_ADOPTION_MID_TURN");
+    const idleSession = store.bindSession({
+      sessionId: session.id,
+      expectedRevision: session.revision,
+      providerThreadId: "thread-capability-idle",
+      state: "idle",
+    });
+    const capability = store.bindSessionHostCapabilities({
+      sessionId: idleSession.id,
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
+    });
+    expect(store.bindSessionHostCapabilities({
+      sessionId: session.id,
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
+    })).toEqual(capability);
+    expect(() => store.bindSessionHostCapabilities({
+      sessionId: session.id,
+      preambleVersion: 2,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
+    })).toThrow("SESSION_HOST_CAPABILITY_BINDING_CONFLICT");
+    const active = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    store.setSessionTurnState({
+      sessionId: active.id,
+      expectedRevision: active.revision,
+      state: "active",
+      activeTurnId: "turn-mid-adoption",
+    });
+    expect(() => store.bindSessionHostCapabilities({
+      sessionId: active.id,
+      preambleVersion: 1,
+      preambleDigest: "a".repeat(64),
+      manifestVersion: 1,
+      manifestDigest: "b".repeat(64),
+    })).toThrow("SESSION_HOST_CAPABILITY_ADOPTION_MID_TURN");
+
+    const emptyHead = PROJECT_MEMORY_EMPTY_HEAD;
+    const invalidIdentity = createPortableProjectMemoryCanonicalIdentity(project.id);
+    expect(() => store.reserveProjectMemoryAuthority({
+      canonicalSpaceId: invalidIdentity.canonicalSpaceId,
+      head: { ...emptyHead, headDigest: "c".repeat(64) },
+      identityContract: invalidIdentity.identityContract,
+      projectId: project.id,
+    })).toThrow("PROJECT_MEMORY_AUTHORITY_RESERVATION_INVALID");
+    expect(store.readProjectMemoryAuthority(project.id)).toBeNull();
+    const identity = createPortableProjectMemoryCanonicalIdentity(project.id);
+    const reserved = store.reserveProjectMemoryAuthority({
+      canonicalSpaceId: identity.canonicalSpaceId,
+      head: emptyHead,
+      identityContract: identity.identityContract,
+      projectId: project.id,
+    });
+    expect(reserved).toMatchObject({
+      physicalState: "reserved",
+      revision: 1,
+    });
+    expect(reserved.initializedAt).toBeUndefined();
+    expect(() => store.compareAndSwapProjectMemoryHead({
+      projectId: project.id,
+      expectedRevision: reserved.revision,
+      expectedHead: emptyHead,
+      nextHead: {
+        sequence: 1,
+        operationSha256: "e".repeat(64),
+        headDigest: "2".repeat(64),
+      },
+    })).toThrow("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+    const initialized = store.markProjectMemoryAuthorityInitialized({
+      expectedHead: reserved.head,
+      expectedRevision: reserved.revision,
+      projectId: project.id,
+    });
+    expect(initialized).toMatchObject({
+      initializedAt: expect.any(Number),
+      physicalState: "initialized",
+      revision: 2,
+    });
+    expect(store.markProjectMemoryAuthorityInitialized({
+      expectedHead: reserved.head,
+      expectedRevision: reserved.revision,
+      projectId: project.id,
+    })).toEqual(initialized);
+    const losingIdentity = createPortableProjectMemoryCanonicalIdentity(project.id);
+    expect(store.reserveProjectMemoryAuthority({
+      canonicalSpaceId: losingIdentity.canonicalSpaceId,
+      head: emptyHead,
+      identityContract: losingIdentity.identityContract,
+      projectId: project.id,
+    })).toEqual(initialized);
+    const nextHead = {
+      sequence: 1,
+      operationSha256: "f".repeat(64),
+      headDigest: "1".repeat(64),
+    } as const;
+    const advanced = store.compareAndSwapProjectMemoryHead({
+      projectId: project.id,
+      expectedRevision: initialized.revision,
+      expectedHead: emptyHead,
+      nextHead,
+    });
+    expect(advanced).toMatchObject({ head: nextHead, revision: 3, syncState: "local_only" });
+    const settled = store.recordProjectMemorySyncObservation({
+      projectId: project.id,
+      expectedRevision: advanced.revision,
+      expectedHead: nextHead,
+      state: "settled",
+      exchangeHead: nextHead,
+    });
+    expect(settled).toMatchObject({
+      revision: 4,
+      syncState: "settled",
+      lastExchangeHead: nextHead,
+    });
+
+    const memoryRequestDigest = testDigest("memory request");
+    const memoryContentDigest = testDigest("PRIVATE MEMORY CONTENT");
+    const memoryKeyDigest = testDigest("private:key");
+    const memoryWorkingBindingDigest = testDigest("private working binding");
+    const memoryRecordDigest = testDigest("private memory record");
+    const memoryAttestationDigest = testDigest("private memory attestation");
+    const workingRemember = store.prepareMemorySubmission({
+      actorSessionId: session.id,
+      projectId: project.id,
+      kind: "remember",
+      requestDigest: memoryRequestDigest,
+      contentDigest: memoryContentDigest,
+      keyDigest: memoryKeyDigest,
+      workingBindingDigest: memoryWorkingBindingDigest,
+      workingEpoch: 1,
+      expectedHead: emptyHead,
+      idempotencyKey: peerIdempotencyKey(7_999),
+    }).record;
+    store.bindMemorySubmissionEffect({
+      submissionId: workingRemember.id,
+      effectRecordSha256: memoryRecordDigest,
+      attestationSha256: memoryAttestationDigest,
+      operationId: "memory_remember_private",
+    });
+    store.beginMemorySubmission(workingRemember.id);
+    store.settleMemorySubmission({
+      submissionId: workingRemember.id,
+      expectedState: "effect_started",
+      state: "applied",
+      outcomeCode: "remember_committed",
+      resultHead: nextHead,
+      receiptDigest: testDigest("private remember receipt"),
+    });
+
+    const prepared = store.prepareMemorySubmission({
+      actorSessionId: session.id,
+      projectId: project.id,
+      kind: "share",
+      requestDigest: memoryRequestDigest,
+      contentDigest: memoryContentDigest,
+      keyDigest: memoryKeyDigest,
+      workingBindingDigest: memoryWorkingBindingDigest,
+      workingEpoch: 1,
+      expectedHead: nextHead,
+      idempotencyKey: peerIdempotencyKey(8_000),
+    });
+    expect(store.prepareMemorySubmission({
+      actorSessionId: session.id,
+      projectId: project.id,
+      kind: "share",
+      requestDigest: memoryRequestDigest,
+      contentDigest: memoryContentDigest,
+      keyDigest: memoryKeyDigest,
+      workingBindingDigest: memoryWorkingBindingDigest,
+      workingEpoch: 1,
+      expectedHead: nextHead,
+      idempotencyKey: peerIdempotencyKey(8_000),
+    })).toMatchObject({ replay: true, record: { id: prepared.record.id } });
+    const invariantWriter = new Database(store.paths.database, { create: false, strict: true });
+    invariantWriter.exec("PRAGMA foreign_keys=ON");
+    expect(() => invariantWriter.query(
+      `UPDATE memory_submissions
+       SET result_head_operation_sha256=? WHERE id=?`,
+    ).run("9".repeat(64), prepared.record.id)).toThrow();
+    expect(() => invariantWriter.query(
+      `UPDATE project_memory_authorities
+       SET head_sequence=0,head_operation_sha256=NULL,head_digest=?,revision=revision+1
+       WHERE project_id=?`,
+    ).run(emptyHead.headDigest, project.id)).toThrow();
+    expect(() => invariantWriter.query(
+      "DELETE FROM session_host_capability_bindings WHERE session_id=?",
+    ).run(idleSession.id)).toThrow();
+    invariantWriter.close(false);
+    store.bindMemorySubmissionEffect({
+      submissionId: prepared.record.id,
+      effectRecordSha256: memoryRecordDigest,
+      attestationSha256: memoryAttestationDigest,
+      operationId: "memory_adopt_private",
+      sourceHead: nextHead,
+      nominationSha256: testDigest("private memory nomination"),
+    });
+    store.beginMemorySubmission(prepared.record.id);
+    const resultHead = {
+      sequence: 2,
+      operationSha256: "2".repeat(64),
+      headDigest: "3".repeat(64),
+    } as const;
+    expect(store.settleMemorySubmission({
+      submissionId: prepared.record.id,
+      expectedState: "effect_started",
+      state: "applied",
+      outcomeCode: "share_adopted",
+      resultHead,
+      receiptDigest: "4".repeat(64),
+    })).toMatchObject({ state: "applied", resultHead });
+    expect(store.readProjectMemoryAuthority(project.id)).toMatchObject({
+      head: resultHead,
+      lastExchangeHead: nextHead,
+      syncState: "local_only",
+    });
+
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      const retained = JSON.stringify({
+        authority: inspector.query("SELECT * FROM project_memory_authorities").get(),
+        capability: inspector.query("SELECT * FROM session_host_capability_bindings").get(),
+        submission: inspector.query("SELECT * FROM memory_submissions").get(),
+      });
+      expect(retained).not.toContain("PRIVATE MEMORY CONTENT");
+      expect(retained).not.toContain("private:key");
+      expect(retained).not.toContain(root);
+    } finally {
+      inspector.close(false);
+    }
+
+    const currentAuthority = store.readProjectMemoryAuthority(project.id);
+    if (currentAuthority === null) throw new Error("Expected project memory authority.");
+    const frozen = store.recordProjectMemorySyncObservation({
+      projectId: project.id,
+      expectedRevision: currentAuthority.revision,
+      expectedHead: currentAuthority.head,
+      state: "error",
+      diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
+    });
+    expect(() => store.recordProjectMemorySyncObservation({
+      projectId: project.id,
+      expectedRevision: frozen.revision,
+      expectedHead: frozen.head,
+      state: "local_only",
+    })).toThrow("PROJECT_MEMORY_SYNC_FROZEN");
+    const thawWriter = new Database(store.paths.database, { create: false, strict: true });
+    thawWriter.exec("PRAGMA foreign_keys=ON");
+    expect(() => thawWriter.query(
+      `UPDATE project_memory_authorities
+       SET sync_state='local_only',diagnostic_code=NULL,revision=revision+1
+       WHERE project_id=?`,
+    ).run(project.id)).toThrow();
+    thawWriter.close(false);
+  });
+
+  test("journals hosted canonical create through crash recovery and exact replay", async () => {
+    let now = 20_000;
+    const { store, home } = await fixture({ now: () => now++ });
+    const root = join(home, "hosted-memory-create-journal");
+    await mkdir(root);
+    const project = await store.createProject("Hosted memory create journal", root);
+    const authority = reserveTestProjectMemoryAuthority(
+      store,
+      project.id,
+      PROJECT_MEMORY_EMPTY_HEAD,
+    );
+    const accountBindingDigest = testDigest("hosted create account binding");
+    const remoteSpaceId = `memory_${"c".repeat(32)}`;
+    const idempotencyKey = peerIdempotencyKey(87_501);
+    const allocated = store.allocateCanonicalMemoryHostedCreate({
+      accountBindingDigest,
+      idempotencyKey,
+      projectId: project.id,
+      remoteSpaceId,
+    });
+    expect(allocated).toMatchObject({
+      replay: false,
+      record: {
+        accountBindingDigest,
+        authorityHead: authority.head,
+        authorityRevision: authority.revision,
+        canonicalBindingDigest: authority.bindingDigest,
+        projectId: project.id,
+        remoteSpaceId,
+        state: "allocating",
+      },
+    });
+    expect(store.isCanonicalMemoryMutationFenced(project.id)).toBe(true);
+    expect(store.allocateCanonicalMemoryHostedCreate({
+      accountBindingDigest,
+      idempotencyKey,
+      projectId: project.id,
+      remoteSpaceId,
+    })).toMatchObject({ replay: true, record: { id: allocated.record.id } });
+    expect(() => store.allocateCanonicalMemoryHostedCreate({
+      accountBindingDigest: testDigest("different hosted create account"),
+      idempotencyKey,
+      projectId: project.id,
+      remoteSpaceId,
+    })).toThrow("CANONICAL_MEMORY_HOSTED_CREATE_IDEMPOTENCY_CONFLICT");
+    expect(() => store.allocateCanonicalMemoryHostedCreate({
+      accountBindingDigest,
+      idempotencyKey: peerIdempotencyKey(87_502),
+      projectId: project.id,
+      remoteSpaceId,
+    })).toThrow("CANONICAL_MEMORY_HOSTED_CREATE_RECOVERY_REQUIRED");
+    const unreconciledGenesisToken = testDigest("unjournaled create genesis");
+    expect(() => store.attachCanonicalMemoryHostedSpace({
+      accountBindingDigest,
+      canonicalSpaceId: authority.canonicalSpaceId,
+      projectId: project.id,
+      remote: {
+        genesisToken: unreconciledGenesisToken,
+        head: PROJECT_MEMORY_EMPTY_HEAD,
+        headProofDigest: testDigest("unreconciled create proof"),
+        headToken: unreconciledGenesisToken,
+        keyVersion: 7,
+        revision: 1,
+      },
+      remoteSpaceId,
+    })).toThrow("CANONICAL_MEMORY_HOSTED_CREATE_RECOVERY_REQUIRED");
+    expect(() => store.compareAndSwapProjectMemoryHead({
+      expectedHead: authority.head,
+      expectedRevision: authority.revision,
+      nextHead: {
+        sequence: 1,
+        operationSha256: testDigest("create fenced operation"),
+        headDigest: testDigest("create fenced head"),
+      },
+      projectId: project.id,
+    })).toThrow("canonical memory mutation fenced by hosted create");
+
+    const request = testCanonicalMemoryHostedCreateRequest(remoteSpaceId);
+    expect(store.stageCanonicalMemoryHostedCreateKey({
+      intentId: allocated.record.id,
+      keyVersion: request.keyVersion,
+      wrappedSpaceKey: request.wrappedSpaceKey,
+    })).toMatchObject({
+      keyVersion: request.keyVersion,
+      state: "key_staged",
+      wrappedSpaceKey: request.wrappedSpaceKey,
+    });
+    expect(store.stageCanonicalMemoryHostedCreateKey({
+      intentId: allocated.record.id,
+      keyVersion: request.keyVersion,
+      wrappedSpaceKey: request.wrappedSpaceKey,
+    })).toMatchObject({ state: "key_staged" });
+    expect(() => store.stageCanonicalMemoryHostedCreateKey({
+      intentId: allocated.record.id,
+      keyVersion: request.keyVersion,
+      wrappedSpaceKey: testCanonicalMemoryEnvelope("different wrapped key", 3),
+    })).toThrow("CANONICAL_MEMORY_HOSTED_CREATE_KEY_CONFLICT");
+    expect(store.prepareCanonicalMemoryHostedCreate({
+      intentId: allocated.record.id,
+      request,
+    })).toMatchObject({ request, requestDigest: expect.any(String), state: "prepared" });
+    expect(store.prepareCanonicalMemoryHostedCreate({
+      intentId: allocated.record.id,
+      request,
+    })).toMatchObject({ state: "prepared" });
+    expect(() => store.prepareCanonicalMemoryHostedCreate({
+      intentId: allocated.record.id,
+      request: {
+        ...request,
+        encryptedDescriptor: testCanonicalMemoryEnvelope("different descriptor", 7),
+      },
+    })).toThrow("CANONICAL_MEMORY_HOSTED_CREATE_REQUEST_CONFLICT");
+    expect(store.markCanonicalMemoryHostedCreateEffectStarted(allocated.record.id))
+      .toMatchObject({ effectStartedAt: expect.any(Number), state: "effect_started" });
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    now += 1_000;
+    const recovered = new StateStore(paths, { now: () => now++ });
+    stores.push(recovered);
+    expect(recovered.readUnresolvedCanonicalMemoryHostedCreateIntent(project.id))
+      .toMatchObject({
+        id: allocated.record.id,
+        request,
+        state: "effect_started",
+      });
+    const winner = { ...request, replay: false, revision: 1 } as const;
+    expect(recovered.recordCanonicalMemoryHostedCreateWinner({
+      intentId: allocated.record.id,
+      winner,
+    })).toMatchObject({
+      state: "winner_observed",
+      winnerReplay: false,
+      winnerRevision: 1,
+    });
+    expect(recovered.recordCanonicalMemoryHostedCreateWinner({
+      intentId: allocated.record.id,
+      winner,
+    })).toMatchObject({ state: "winner_observed" });
+    expect(recovered.settleCanonicalMemoryHostedCreate(allocated.record.id))
+      .toMatchObject({ state: "settled" });
+    expect(recovered.settleCanonicalMemoryHostedCreate(allocated.record.id))
+      .toMatchObject({ state: "settled" });
+    expect(recovered.readCanonicalMemoryHostedAttachment(project.id)).toMatchObject({
+      accountBindingDigest,
+      canonicalBindingDigest: authority.bindingDigest,
+      generation: 1,
+      remote: {
+        genesisToken: request.genesisToken,
+        head: PROJECT_MEMORY_EMPTY_HEAD,
+        headProofDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        headToken: request.genesisToken,
+        keyVersion: request.keyVersion,
+        revision: 1,
+      },
+      remoteSpaceId,
+      revision: 1,
+      state: "attached",
+    });
+    expect(recovered.readUnresolvedCanonicalMemoryHostedCreateIntent(project.id)).toBeNull();
+    expect(recovered.isCanonicalMemoryMutationFenced(project.id)).toBe(false);
+    expect(recovered.allocateCanonicalMemoryHostedCreate({
+      accountBindingDigest,
+      idempotencyKey,
+      projectId: project.id,
+      remoteSpaceId,
+    })).toMatchObject({ replay: true, record: { state: "settled" } });
+    expect(recovered.stageCanonicalMemoryHostedCreateKey({
+      intentId: allocated.record.id,
+      keyVersion: request.keyVersion,
+      wrappedSpaceKey: request.wrappedSpaceKey,
+    })).toMatchObject({ state: "settled" });
+    expect(recovered.prepareCanonicalMemoryHostedCreate({
+      intentId: allocated.record.id,
+      request,
+    })).toMatchObject({ state: "settled" });
+    expect(recovered.markCanonicalMemoryHostedCreateEffectStarted(allocated.record.id))
+      .toMatchObject({ state: "settled" });
+    const settledAuthority = recovered.readProjectMemoryAuthority(project.id);
+    if (settledAuthority === null) throw new Error("Expected settled create authority.");
+    const laterLocalHead = {
+      sequence: 1,
+      operationSha256: testDigest("post-create local operation"),
+      headDigest: testDigest("post-create local head"),
+    } as const;
+    recovered.compareAndSwapProjectMemoryHead({
+      expectedHead: settledAuthority.head,
+      expectedRevision: settledAuthority.revision,
+      nextHead: laterLocalHead,
+      projectId: project.id,
+    });
+    expect(recovered.detachCanonicalMemoryHostedSpace({
+      expectedGeneration: 1,
+      projectId: project.id,
+    })).toMatchObject({ generation: 2, state: "detached" });
+    recovered.close();
+    stores.splice(stores.indexOf(recovered), 1);
+    const afterLifecycleAdvance = new StateStore(paths, { now: () => now++ });
+    stores.push(afterLifecycleAdvance);
+    expect(afterLifecycleAdvance.readCanonicalMemoryHostedCreateIntent(allocated.record.id))
+      .toMatchObject({ state: "settled" });
+    expect(afterLifecycleAdvance.readCanonicalMemoryHostedAttachment(project.id))
+      .toMatchObject({ generation: 2, state: "detached" });
+    expect(afterLifecycleAdvance.settleCanonicalMemoryHostedCreate(allocated.record.id))
+      .toMatchObject({ state: "settled" });
+
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      const persisted = inspector.query(
+        "SELECT * FROM project_memory_hosted_create_intents WHERE id=?",
+      ).get(allocated.record.id);
+      expect(persisted).toMatchObject({
+        descriptor_ciphertext: request.encryptedDescriptor.ciphertext,
+        genesis_proof_ciphertext: request.genesisHeadProof.ciphertext,
+        wrapped_key_ciphertext: request.wrappedSpaceKey.ciphertext,
+      });
+      const retained = JSON.stringify(persisted);
+      expect(retained).not.toContain("PRIVATE HOSTED CREATE DESCRIPTOR");
+      expect(retained).not.toContain("PRIVATE HOSTED CREATE GENESIS PROOF");
+      expect(retained).not.toContain("PRIVATE HOSTED CREATE WRAPPED KEY");
+      expect(retained).not.toContain(root);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("keeps an uncertain hosted create fenced and freezes a proven failure", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "hosted-memory-create-uncertain");
+    await mkdir(root);
+    const project = await store.createProject("Hosted memory create uncertain", root);
+    reserveTestProjectMemoryAuthority(store, project.id, PROJECT_MEMORY_EMPTY_HEAD);
+    const accountBindingDigest = testDigest("uncertain hosted create account");
+    const remoteSpaceId = `memory_${"d".repeat(32)}`;
+    const allocated = store.allocateCanonicalMemoryHostedCreate({
+      accountBindingDigest,
+      idempotencyKey: peerIdempotencyKey(87_503),
+      projectId: project.id,
+      remoteSpaceId,
+    }).record;
+    const request = testCanonicalMemoryHostedCreateRequest(remoteSpaceId, 11, 5);
+    store.stageCanonicalMemoryHostedCreateKey({
+      intentId: allocated.id,
+      keyVersion: request.keyVersion,
+      wrappedSpaceKey: request.wrappedSpaceKey,
+    });
+    store.prepareCanonicalMemoryHostedCreate({ intentId: allocated.id, request });
+    store.markCanonicalMemoryHostedCreateEffectStarted(allocated.id);
+    expect(() => store.recordCanonicalMemoryHostedCreateWinner({
+      intentId: allocated.id,
+      winner: {
+        ...request,
+        encryptedDescriptor: testCanonicalMemoryEnvelope("hostile descriptor", 11),
+        replay: true,
+        revision: 1,
+      },
+    })).toThrow("CANONICAL_MEMORY_HOSTED_CREATE_WINNER_INVALID");
+    expect(store.readUnresolvedCanonicalMemoryHostedCreateIntent(project.id))
+      .toMatchObject({ id: allocated.id, state: "effect_started" });
+
+    const guarded = new Database(store.paths.database, { create: false, strict: true });
+    guarded.exec("PRAGMA foreign_keys=ON");
+    try {
+      expect(() => guarded.query(
+        `UPDATE project_memory_authorities
+         SET revision=revision+1 WHERE project_id=?`,
+      ).run(project.id)).toThrow("canonical memory mutation fenced by hosted create");
+      expect(() => guarded.query(
+        "DELETE FROM project_memory_hosted_create_intents WHERE id=?",
+      ).run(allocated.id)).toThrow("canonical memory hosted create intent is immutable");
+    } finally {
+      guarded.close(false);
+    }
+
+    expect(store.failCanonicalMemoryHostedCreate({
+      diagnosticCode: "REMOTE_MEMORY_CREATE_CONFLICT",
+      intentId: allocated.id,
+      state: "conflict",
+    })).toMatchObject({
+      diagnosticCode: "REMOTE_MEMORY_CREATE_CONFLICT",
+      state: "conflict",
+    });
+    expect(store.failCanonicalMemoryHostedCreate({
+      diagnosticCode: "REMOTE_MEMORY_CREATE_CONFLICT",
+      intentId: allocated.id,
+      state: "conflict",
+    })).toMatchObject({ state: "conflict" });
+    expect(() => store.failCanonicalMemoryHostedCreate({
+      diagnosticCode: "REMOTE_MEMORY_CREATE_ERROR",
+      intentId: allocated.id,
+      state: "error",
+    })).toThrow("CANONICAL_MEMORY_HOSTED_CREATE_FAILURE_CONFLICT");
+    expect(store.readUnresolvedCanonicalMemoryHostedCreateIntent(project.id)).toBeNull();
+    expect(store.isCanonicalMemoryMutationFenced(project.id)).toBe(true);
+    expect(store.readProjectMemoryAuthority(project.id)).toMatchObject({
+      diagnosticCode: "REMOTE_MEMORY_CREATE_CONFLICT",
+      syncState: "conflict",
+    });
+    expect(() => store.recordCanonicalMemoryHostedCreateWinner({
+      intentId: allocated.id,
+      winner: { ...request, replay: false, revision: 1 },
+    })).toThrow("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+  });
+
+  test("journals hosted canonical push before effect and preserves exact replay", async () => {
+    let now = 10_000;
+    const { store, home } = await fixture({ now: () => now });
+    const root = join(home, "hosted-memory-journal");
+    await mkdir(root);
+    const project = await store.createProject("Hosted memory journal", root);
+    const profile = signInProfile(
+      store,
+      "Hosted memory journal",
+      "hosted-memory-journal@example.com",
+    );
+    const actor = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const identity = createPortableProjectMemoryCanonicalIdentity(project.id);
+    const genesisToken = testDigest("hosted genesis token");
+    const initialRemote = {
+      genesisToken,
+      head: PROJECT_MEMORY_EMPTY_HEAD,
+      headProofDigest: testDigest("hosted genesis proof"),
+      headToken: genesisToken,
+      keyVersion: 1,
+      revision: 1,
+    } as const;
+    const attached = store.attachCanonicalMemoryHostedSpace({
+      accountBindingDigest: testDigest("hosted owner account"),
+      canonicalSpaceId: identity.canonicalSpaceId,
+      projectId: project.id,
+      remote: initialRemote,
+      remoteSpaceId: `memory_${"a".repeat(32)}`,
+    });
+    expect(attached).toMatchObject({ generation: 1, revision: 1, state: "attached" });
+    const reserved = store.readProjectMemoryAuthority(project.id);
+    if (reserved === null) throw new Error("Expected hosted attach to reserve memory authority.");
+    expect(reserved).toMatchObject({
+      canonicalSpaceId: identity.canonicalSpaceId,
+      physicalState: "reserved",
+    });
+    const initialized = store.markProjectMemoryAuthorityInitialized({
+      expectedHead: reserved.head,
+      expectedRevision: reserved.revision,
+      projectId: project.id,
+    });
+    const localHead = {
+      sequence: 1,
+      operationSha256: testDigest("hosted local operation"),
+      headDigest: testDigest("hosted local head"),
+    } as const;
+    const advanced = store.compareAndSwapProjectMemoryHead({
+      expectedHead: initialized.head,
+      expectedRevision: initialized.revision,
+      nextHead: localHead,
+      projectId: project.id,
+    });
+    const terminalShareInput = {
+      actorSessionId: actor.id,
+      projectId: project.id,
+      kind: "share" as const,
+      requestDigest: testDigest("terminal hosted share request"),
+      contentDigest: testDigest("terminal hosted share content"),
+      keyDigest: testDigest("terminal hosted share key"),
+      workingBindingDigest: testDigest("terminal hosted share working binding"),
+      workingEpoch: 1,
+      expectedHead: localHead,
+      idempotencyKey: peerIdempotencyKey(87_999),
+    };
+    const cancelledShare = store.cancelPreparedMemorySubmission(
+      store.prepareMemorySubmission(terminalShareInput).record.id,
+    );
+    expect(cancelledShare.state).toBe("cancelled");
+    const localHeadToken = testDigest("hosted local head token");
+    const requestOperation = {
+      adoptionProof: testCanonicalMemoryEnvelope("PRIVATE HOSTED ADOPTION PROOF"),
+      genesisToken,
+      headToken: localHeadToken,
+      operation: testCanonicalMemoryEnvelope("PRIVATE HOSTED OPERATION"),
+      priorToken: genesisToken,
+      sequence: 1,
+      terminalHeadProof: testCanonicalMemoryEnvelope("PRIVATE HOSTED HEAD PROOF"),
+    } as const;
+    const idempotencyKey = peerIdempotencyKey(88_001);
+    const prepared = store.prepareCanonicalMemorySync({
+      direction: "push",
+      idempotencyKey,
+      localHeadToken,
+      projectId: project.id,
+      requestOperation,
+    });
+    expect(prepared).toMatchObject({
+      replay: false,
+      record: {
+        attachmentGeneration: attached.generation,
+        attachmentRevision: attached.revision,
+        authorityRevision: advanced.revision,
+        requestOperation,
+        state: "prepared",
+      },
+    });
+    expect(store.isCanonicalMemoryMutationFenced(project.id)).toBe(true);
+    expect(store.prepareMemorySubmission(terminalShareInput)).toMatchObject({
+      record: { id: cancelledShare.id, state: "cancelled" },
+      replay: true,
+    });
+    expect(() => store.prepareMemorySubmission({
+      ...terminalShareInput,
+      idempotencyKey: peerIdempotencyKey(88_099),
+      requestDigest: testDigest("new fenced hosted share request"),
+    })).toThrow("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+    const fencedWriter = new Database(store.paths.database, { create: false, strict: true });
+    fencedWriter.exec("PRAGMA foreign_keys=ON");
+    try {
+      expect(() => fencedWriter.query(
+        `INSERT INTO memory_submissions
+         SELECT ?,?,kind,actor_session_id,project_id,request_digest,content_digest,
+           key_digest,working_binding_digest,working_epoch,effect_record_sha256,
+           attestation_sha256,operation_id,source_head_sequence,
+           source_head_operation_sha256,source_head_digest,nomination_sha256,
+           expected_head_sequence,expected_head_operation_sha256,expected_head_digest,
+           result_head_sequence,result_head_operation_sha256,result_head_digest,
+           receipt_digest,outcome_code,conflict_actual_head_sequence,
+           conflict_actual_head_operation_sha256,conflict_actual_head_digest,
+           conflict_canonical_record_sha256,conflict_nominated_record_sha256,
+           'prepared',created_at,updated_at
+         FROM memory_submissions WHERE id=?`,
+      ).run(
+        `memsub_${"f".repeat(32)}`,
+        peerIdempotencyKey(88_100),
+        cancelledShare.id,
+      )).toThrow("canonical memory mutation fenced by hosted sync");
+    } finally {
+      fencedWriter.close(false);
+    }
+    expect(() => store.detachCanonicalMemoryHostedSpace({
+      expectedGeneration: attached.generation,
+      projectId: project.id,
+    })).toThrow("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+    expect(() => store.compareAndSwapProjectMemoryHead({
+      expectedHead: localHead,
+      expectedRevision: advanced.revision,
+      nextHead: {
+        sequence: 2,
+        operationSha256: testDigest("fenced operation"),
+        headDigest: testDigest("fenced head"),
+      },
+      projectId: project.id,
+    })).toThrow("canonical memory mutation fenced by hosted sync");
+
+    const begun = store.markCanonicalMemorySyncEffectStarted(prepared.record.id);
+    expect(begun).toMatchObject({ effectStartedAt: expect.any(Number), state: "effect_started" });
+    const responseRemote = {
+      genesisToken,
+      head: localHead,
+      headProofDigest: testDigest("hosted accepted proof"),
+      headToken: localHeadToken,
+      keyVersion: 1,
+      revision: 1,
+    } as const;
+    const observed = store.recordCanonicalMemorySyncResponse({
+      intentId: prepared.record.id,
+      remote: responseRemote,
+    });
+    expect(observed).toMatchObject({
+      responseObservation: responseRemote,
+      state: "response_observed",
+    });
+    const settled = store.settleCanonicalMemorySync({
+      intentId: prepared.record.id,
+      resultHead: localHead,
+    });
+    expect(settled).toMatchObject({ resultHead: localHead, state: "settled" });
+    expect(store.isCanonicalMemoryMutationFenced(project.id)).toBe(false);
+    expect(store.readProjectMemoryAuthority(project.id)).toMatchObject({
+      head: localHead,
+      lastExchangeHead: localHead,
+      syncState: "settled",
+    });
+    expect(store.prepareCanonicalMemorySync({
+      direction: "push",
+      idempotencyKey,
+      localHeadToken,
+      projectId: project.id,
+      requestOperation,
+    })).toMatchObject({ replay: true, record: { id: prepared.record.id } });
+    expect(() => store.prepareCanonicalMemorySync({
+      direction: "push",
+      idempotencyKey,
+      localHeadToken,
+      projectId: project.id,
+      requestOperation: {
+        ...requestOperation,
+        adoptionProof: testCanonicalMemoryEnvelope("DIFFERENT HOSTED ADOPTION PROOF"),
+      },
+    })).toThrow("CANONICAL_MEMORY_SYNC_IDEMPOTENCY_CONFLICT");
+
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      const retained = JSON.stringify({
+        attachment: inspector.query("SELECT * FROM project_memory_hosted_attachments").get(),
+        intent: inspector.query("SELECT * FROM project_memory_sync_intents").get(),
+        spool: inspector.query("SELECT * FROM project_memory_sync_spool").get(),
+      });
+      expect(retained).not.toContain(root);
+      expect(retained).not.toContain("PRIVATE HOSTED OPERATION");
+      expect(retained).not.toContain("PRIVATE HOSTED HEAD PROOF");
+      expect(retained).not.toContain("PRIVATE HOSTED ADOPTION PROOF");
+    } finally {
+      inspector.close(false);
+    }
+    const settledAuthority = store.readProjectMemoryAuthority(project.id);
+    if (settledAuthority === null) throw new Error("Expected settled hosted authority.");
+    const secondLocalHead = {
+      sequence: 2,
+      operationSha256: testDigest("second hosted local operation"),
+      headDigest: testDigest("second hosted local head"),
+    } as const;
+    store.compareAndSwapProjectMemoryHead({
+      expectedHead: settledAuthority.head,
+      expectedRevision: settledAuthority.revision,
+      nextHead: secondLocalHead,
+      projectId: project.id,
+    });
+    now += 30 * 24 * 60 * 60_000 + 1;
+    const retainedPreparation = store.prepareCanonicalMemorySync({
+      direction: "push",
+      idempotencyKey: peerIdempotencyKey(88_101),
+      localHeadToken: testDigest("second hosted local head token"),
+      projectId: project.id,
+      requestOperation: {
+        adoptionProof: null,
+        genesisToken,
+        headToken: testDigest("second hosted local head token"),
+        operation: testCanonicalMemoryEnvelope("SECOND PRIVATE HOSTED OPERATION"),
+        priorToken: localHeadToken,
+        sequence: 2,
+        terminalHeadProof: testCanonicalMemoryEnvelope("SECOND PRIVATE HOSTED HEAD PROOF"),
+      },
+    });
+    expect(store.readCanonicalMemorySyncIntent(prepared.record.id)).toBeNull();
+    const retentionInspector = new Database(
+      store.paths.database,
+      { readonly: true, strict: true },
+    );
+    try {
+      expect(retentionInspector.query(
+        "SELECT COUNT(*) AS count FROM project_memory_sync_spool WHERE intent_id=?",
+      ).get(prepared.record.id)).toEqual({ count: 0 });
+    } finally {
+      retentionInspector.close(false);
+    }
+    const tamperWriter = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      const guard = z.object({ sql: z.string() }).strict().parse(tamperWriter.query(
+        `SELECT sql FROM sqlite_master
+         WHERE type='trigger' AND name='project_memory_sync_spool_update_guard'`,
+      ).get());
+      tamperWriter.exec("DROP TRIGGER project_memory_sync_spool_update_guard");
+      expect(() => tamperWriter.query(
+        `UPDATE project_memory_sync_spool SET adoption_proof_algorithm='A256GCM'
+         WHERE intent_id=? AND phase='request'`,
+      ).run(retainedPreparation.record.id)).toThrow();
+      tamperWriter.query(
+        `UPDATE project_memory_sync_spool SET operation_digest=?
+         WHERE intent_id=? AND phase='request'`,
+      ).run("f".repeat(64), retainedPreparation.record.id);
+      tamperWriter.exec(guard.sql);
+    } finally {
+      tamperWriter.close(false);
+    }
+    expect(() => store.readCanonicalMemorySyncIntent(retainedPreparation.record.id))
+      .toThrow("CANONICAL_MEMORY_SYNC_SPOOL_INVALID");
+  });
+
+  test("structurally identifies upstream adoption v40 before adding peer and hosted memory", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Upstream adoption v40", "upstream-v40@example.com");
+    const session = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      providerThreadId: "upstream-adoption-v40-thread",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const upstream = new Database(paths.database, { create: false, strict: true });
+    try {
+      dropPeerAndHostedMemorySchema(upstream);
+      upstream.exec("DELETE FROM migrations WHERE version>40; PRAGMA user_version=40;");
+      expect(upstream.query(
+        "SELECT name FROM sqlite_master WHERE name='session_adoption_policies'",
+      ).get()).toEqual({ name: "session_adoption_policies" });
+      expect(upstream.query(
+        "SELECT name FROM sqlite_master WHERE name='session_peer_policies'",
+      ).get()).toBeNull();
+    } finally {
+      upstream.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:42");
+    const migrated = new StateStore(paths, { now: () => 5_050 });
+    stores.push(migrated);
+    expect(migrated.requireSession(session.id)).toMatchObject({
+      providerThreadId: session.providerThreadId,
+      state: "idle",
+    });
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+      expect(inspector.query(
+        "SELECT version,applied_at FROM migrations WHERE version IN (41,42) ORDER BY version",
+      ).all()).toEqual([
+        { applied_at: 5_050, version: 41 },
+        { applied_at: 5_050, version: 42 },
+      ]);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("structurally identifies exact feature-era v40 before adopting v41 and v42", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Feature v40 peer state");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    try {
+      installHistoricalFeatureProviderSwitchJournal(legacy);
+      downgradeToExactProviderVersion39(legacy);
+      dropHostedMemorySchema(legacy);
+      legacy.exec(`
+        INSERT INTO migrations(version,applied_at) VALUES (40,4000);
+        PRAGMA user_version=40;
+      `);
+      expect(legacy.query(
+        "SELECT name FROM sqlite_master WHERE name='session_peer_policies'",
+      ).get()).toEqual({ name: "session_peer_policies" });
+      expect(legacy.query(
+        "SELECT name FROM sqlite_master WHERE name='session_adoption_policies'",
+      ).get()).toBeNull();
+      expect(legacy.query(
+        "SELECT name FROM sqlite_master WHERE name='project_memory_sync_intents'",
+      ).get()).toBeNull();
+    } finally {
+      legacy.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:42");
+    const migrated = new StateStore(paths, { now: () => 5_100 });
+    stores.push(migrated);
+    expect(migrated.requireSession(session.id).id).toBe(session.id);
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+      expect(inspector.query(
+        "SELECT version,applied_at FROM migrations WHERE version>=40 ORDER BY version",
+      ).all()).toEqual([
+        { applied_at: 4_000, version: 40 },
+        { applied_at: 5_100, version: 41 },
+        { applied_at: 5_100, version: 42 },
+      ]);
+      expect(inspector.query(
+        `SELECT name FROM sqlite_master
+         WHERE name IN ('session_adoption_policies','session_peer_policies',
+           'project_memory_sync_intents','session_provider_switches') ORDER BY name`,
+      ).all()).toEqual([
+        { name: "project_memory_sync_intents" },
+        { name: "session_adoption_policies" },
+        { name: "session_peer_policies" },
+      ]);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("migrates exact feature-era v41 to the hosted-memory v42 journal", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "hosted-memory-v40-migration");
+    await mkdir(root);
+    const project = await store.createProject("Hosted memory v40 migration", root);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    installHistoricalFeatureProviderSwitchJournal(legacy);
+    downgradeToExactProviderVersion39(legacy);
+    legacy.exec(`
+      INSERT INTO migrations(version,applied_at) VALUES (40,4000),(41,4001);
+      PRAGMA user_version=41;
+    `);
+    legacy.close(false);
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:41:42");
+    const migrated = new StateStore(paths, { now: () => 5_000 });
+    stores.push(migrated);
+    expect(migrated.requireProject(project.id).label).toBe(project.label);
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+      expect(inspector.query(
+        "SELECT applied_at FROM migrations WHERE version=42",
+      ).get()).toEqual({ applied_at: 5_000 });
+      expect(inspector.query(
+        `SELECT name FROM sqlite_master
+         WHERE name IN ('project_memory_hosted_attachments',
+           'project_memory_hosted_create_intents','project_memory_sync_intents',
+           'project_memory_sync_spool','canonical_memory_sync_share_fence',
+           'session_provider_switches')
+         ORDER BY name`,
+      ).all()).toEqual([
+        { name: "canonical_memory_sync_share_fence" },
+        { name: "project_memory_hosted_attachments" },
+        { name: "project_memory_hosted_create_intents" },
+        { name: "project_memory_sync_intents" },
+        { name: "project_memory_sync_spool" },
+      ]);
+      expect(inspector.query("PRAGMA table_info(project_memory_sync_spool)").all()
+        .filter((column) => z.object({ name: z.string() }).passthrough().parse(column)
+          .name.startsWith("adoption_proof_"))
+        .map((column) => {
+          const parsed = z.object({ name: z.string(), notnull: z.number().int() })
+            .passthrough().parse(column);
+          return { name: parsed.name, notnull: parsed.notnull };
+        })).toEqual([
+        { name: "adoption_proof_algorithm", notnull: 0 },
+        { name: "adoption_proof_ciphertext", notnull: 0 },
+        { name: "adoption_proof_key_version", notnull: 0 },
+        { name: "adoption_proof_nonce", notnull: 0 },
+      ]);
+    } finally {
+      inspector.close(false);
+    }
+    migrated.close();
+    stores.splice(stores.indexOf(migrated), 1);
+
+    const weakened = new Database(paths.database, { create: false, strict: true });
+    weakened.exec(`
+      DROP TRIGGER canonical_memory_sync_share_fence;
+      CREATE TRIGGER canonical_memory_sync_share_fence
+      BEFORE INSERT ON memory_submissions BEGIN SELECT 1; END;
+    `);
+    weakened.close(false);
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V41_STRUCTURE_INVALID");
+    expect(() => new StateStore(paths, { now: () => 6_000 }))
+      .toThrow("STATE_SCHEMA_V41_STRUCTURE_INVALID");
+    const inspectorAfterFailure = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspectorAfterFailure.query(
+        "SELECT sql FROM sqlite_master WHERE name='canonical_memory_sync_share_fence'",
+      ).get()).toEqual(expect.objectContaining({ sql: expect.stringContaining("SELECT 1") }));
+      expect(inspectorAfterFailure.query("PRAGMA user_version").get())
+        .toEqual({ user_version: 42 });
+    } finally {
+      inspectorAfterFailure.close(false);
+    }
+  });
+
+  test("refuses an exact feature-era journal with recovery evidence without mutating it", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Feature journal recovery refusal");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    installHistoricalFeatureProviderSwitchJournal(legacy);
+    downgradeToExactProviderVersion39(legacy);
+    dropHostedMemorySchema(legacy);
+    legacy.exec("PRAGMA foreign_keys=OFF");
+    legacy.query(`
+      INSERT INTO session_provider_switches(
+        attempt_id,session_id,phase,source_profile_id,source_generation,
+        source_provider,source_preset,source_preset_contract,source_thread_id,
+        source_session_revision,target_profile_id,target_generation,target_provider,
+        target_preset,target_preset_contract,target_review_json,fast_enabled,
+        preamble_version,preamble_digest,manifest_version,manifest_digest,
+        transcript_digest,seed_text,seed_digest,seed_included_records,
+        seed_omitted_records,seed_idempotency_key,seed_state,journal_digest,
+        created_at,updated_at,source_provider_v40,source_preset_v40,
+        target_provider_v40,target_preset_v40,target_preamble_version_v40,
+        target_preamble_digest_v40,target_manifest_version_v40,
+        target_manifest_digest_v40,authority_contract_v40
+      ) VALUES (
+        ?,?,'target_start_started',?,0,'codex','high',2,'legacy-source',1,
+        ?,0,'codex','high',2,'{}',0,1,?,1,?,?,
+        'legacy seed',?,0,0,?,'pending',?,1000,1000,
+        'codex','high','codex','high',1,?,1,?,1
+      )
+    `).run(
+      createAttemptId(),
+      session.id,
+      profile.id,
+      profile.id,
+      testDigest("legacy feature preamble"),
+      testDigest("legacy feature manifest"),
+      testDigest("legacy feature transcript"),
+      testDigest("legacy feature seed"),
+      peerIdempotencyKey(90_001),
+      testDigest("legacy feature journal"),
+      testDigest("legacy feature preamble"),
+      testDigest("legacy feature manifest"),
+    );
+    legacy.exec(`
+      INSERT INTO migrations(version,applied_at) VALUES (40,1000);
+      PRAGMA user_version=40;
+    `);
+    legacy.close(false);
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:42");
+    expect(() => new StateStore(paths, { now: () => 2_000 }))
+      .toThrow("STATE_SCHEMA_LEGACY_PROVIDER_SWITCH_RECOVERY_REFUSED");
+    const unchanged = new Database(paths.database, { create: false, readonly: true, strict: true });
+    try {
+      expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(unchanged.query("SELECT COUNT(*) AS count FROM session_provider_switches").get())
+        .toEqual({ count: 1 });
+      expect(unchanged.query(
+        "SELECT name FROM sqlite_master WHERE name='session_adoption_policies'",
+      ).get()).toBeNull();
+    } finally {
+      unchanged.close(false);
+    }
+  });
+
+  test("imports one encrypted pull operation and settles only after pinned revalidation", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "hosted-memory-pull");
+    await mkdir(root);
+    const project = await store.createProject("Hosted memory pull", root);
+    const identity = createPortableProjectMemoryCanonicalIdentity(project.id);
+    const genesisToken = testDigest("pull genesis");
+    const remoteHead = {
+      sequence: 1,
+      operationSha256: testDigest("pull operation sha"),
+      headDigest: testDigest("pull raw head"),
+    } as const;
+    const initialRemote = {
+      genesisToken,
+      head: PROJECT_MEMORY_EMPTY_HEAD,
+      headProofDigest: testDigest("pull genesis proof"),
+      headToken: genesisToken,
+      keyVersion: 3,
+      revision: 7,
+    } as const;
+    const remote = {
+      genesisToken,
+      head: remoteHead,
+      headProofDigest: testDigest("pull terminal proof"),
+      headToken: testDigest("pull terminal token"),
+      keyVersion: 3,
+      revision: 7,
+    } as const;
+    const attached = store.attachCanonicalMemoryHostedSpace({
+      accountBindingDigest: testDigest("pull account"),
+      canonicalSpaceId: identity.canonicalSpaceId,
+      projectId: project.id,
+      remote: initialRemote,
+      remoteSpaceId: `memory_${"b".repeat(32)}`,
+    });
+    const reserved = store.readProjectMemoryAuthority(project.id);
+    if (reserved === null) throw new Error("Expected pull authority reservation.");
+    store.markProjectMemoryAuthorityInitialized({
+      expectedHead: reserved.head,
+      expectedRevision: reserved.revision,
+      projectId: project.id,
+    });
+    const observedRemoteAdvance = store.recordCanonicalMemoryHostedObservation({
+      expectedGeneration: attached.generation,
+      expectedRevision: attached.revision,
+      projectId: project.id,
+      remote,
+    });
+    expect(observedRemoteAdvance).toMatchObject({
+      generation: attached.generation,
+      remote,
+      revision: attached.revision + 1,
+      state: "attached",
+    });
+    expect(() => store.recordCanonicalMemoryHostedObservation({
+      expectedGeneration: attached.generation,
+      expectedRevision: attached.revision,
+      projectId: project.id,
+      remote,
+    })).toThrow("CANONICAL_MEMORY_HOSTED_OBSERVATION_CONFLICT");
+    const prepared = store.prepareCanonicalMemorySync({
+      direction: "pull",
+      idempotencyKey: peerIdempotencyKey(88_002),
+      localHeadToken: genesisToken,
+      projectId: project.id,
+    }).record;
+    expect(() => store.recordCanonicalMemoryHostedObservation({
+      expectedGeneration: observedRemoteAdvance.generation,
+      expectedRevision: observedRemoteAdvance.revision,
+      projectId: project.id,
+      remote: {
+        ...remote,
+        head: {
+          sequence: 2,
+          operationSha256: testDigest("later pull operation sha"),
+          headDigest: testDigest("later pull raw head"),
+        },
+        headProofDigest: testDigest("later pull terminal proof"),
+        headToken: testDigest("later pull terminal token"),
+      },
+    })).toThrow("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+    store.markCanonicalMemorySyncEffectStarted(prepared.id);
+    const operation = {
+      adoptionProof: testCanonicalMemoryEnvelope("PULL ADOPTION PROOF CIPHERTEXT", 3),
+      genesisToken,
+      headToken: remote.headToken,
+      operation: testCanonicalMemoryEnvelope("PULL OPERATION CIPHERTEXT", 3),
+      priorToken: genesisToken,
+      sequence: 1,
+      terminalHeadProof: testCanonicalMemoryEnvelope("PULL HEAD CIPHERTEXT", 3),
+    } as const;
+    expect(store.recordCanonicalMemorySyncResponse({
+      intentId: prepared.id,
+      operation,
+      remote,
+    })).toMatchObject({ responseOperation: operation, state: "response_observed" });
+    expect(store.recordCanonicalMemorySyncResponse({
+      intentId: prepared.id,
+      operation,
+      remote,
+    })).toMatchObject({ responseOperation: operation, state: "response_observed" });
+    expect(() => store.recordCanonicalMemorySyncResponse({
+      intentId: prepared.id,
+      operation: {
+        ...operation,
+        adoptionProof: testCanonicalMemoryEnvelope("DIFFERENT PULL ADOPTION PROOF", 3),
+      },
+      remote,
+    })).toThrow("CANONICAL_MEMORY_SYNC_RESPONSE_CONFLICT");
+    expect(store.isCanonicalMemoryPhysicalHeadAuthorized({
+      canonicalBindingDigest: identity.bindingDigest,
+      controlHead: PROJECT_MEMORY_EMPTY_HEAD,
+      observedHead: remoteHead,
+      projectId: project.id,
+    })).toBe(false);
+    expect(() => store.settleCanonicalMemorySync({
+      intentId: prepared.id,
+      resultHead: remoteHead,
+    })).toThrow("CANONICAL_MEMORY_SYNC_SETTLEMENT_INVALID");
+    const authorized = store.authorizeCanonicalMemoryPullResult({
+      intentId: prepared.id,
+      resultHead: remoteHead,
+    });
+    expect(authorized).toMatchObject({
+      resultHead: remoteHead,
+      state: "response_observed",
+    });
+    expect(store.isCanonicalMemoryPhysicalHeadAuthorized({
+      canonicalBindingDigest: identity.bindingDigest,
+      controlHead: PROJECT_MEMORY_EMPTY_HEAD,
+      observedHead: remoteHead,
+      projectId: project.id,
+    })).toBe(true);
+    expect(store.isCanonicalMemoryPhysicalHeadAuthorized({
+      canonicalBindingDigest: testDigest("hostile pull binding"),
+      controlHead: PROJECT_MEMORY_EMPTY_HEAD,
+      observedHead: remoteHead,
+      projectId: project.id,
+    })).toBe(false);
+    expect(store.isCanonicalMemoryPhysicalHeadAuthorized({
+      canonicalBindingDigest: identity.bindingDigest,
+      controlHead: {
+        sequence: 1,
+        operationSha256: testDigest("hostile stale control operation"),
+        headDigest: testDigest("hostile stale control head"),
+      },
+      observedHead: remoteHead,
+      projectId: project.id,
+    })).toBe(false);
+    expect(store.isCanonicalMemoryPhysicalHeadAuthorized({
+      canonicalBindingDigest: identity.bindingDigest,
+      controlHead: PROJECT_MEMORY_EMPTY_HEAD,
+      observedHead: {
+        ...remoteHead,
+        headDigest: testDigest("hostile observed pull head"),
+      },
+      projectId: project.id,
+    })).toBe(false);
+    expect(store.authorizeCanonicalMemoryPullResult({
+      intentId: prepared.id,
+      resultHead: remoteHead,
+    })).toEqual(authorized);
+    expect(() => store.authorizeCanonicalMemoryPullResult({
+      intentId: prepared.id,
+      resultHead: {
+        ...remoteHead,
+        headDigest: testDigest("different authorized pull result"),
+      },
+    })).toThrow("CANONICAL_MEMORY_SYNC_RESULT_AUTHORIZATION_CONFLICT");
+    expect(store.settleCanonicalMemorySync({
+      intentId: prepared.id,
+      resultHead: remoteHead,
+    })).toMatchObject({ resultHead: remoteHead, state: "settled" });
+    expect(store.readProjectMemoryAuthority(project.id)).toMatchObject({
+      head: remoteHead,
+      lastExchangeHead: remoteHead,
+      syncState: "settled",
+    });
+    expect(store.isCanonicalMemoryPhysicalHeadAuthorized({
+      canonicalBindingDigest: identity.bindingDigest,
+      controlHead: PROJECT_MEMORY_EMPTY_HEAD,
+      observedHead: remoteHead,
+      projectId: project.id,
+    })).toBe(true);
+  });
+
+  test("freezes equal-sequence pull disagreement before preparing an effect", async () => {
+    const { store, home } = await fixture();
+    for (const [index, disagreement] of ["token", "raw-head"].entries()) {
+      const root = join(home, `hosted-memory-equal-${disagreement}`);
+      await mkdir(root);
+      const project = await store.createProject(`Hosted equal ${disagreement}`, root);
+      const identity = createPortableProjectMemoryCanonicalIdentity(project.id);
+      const genesisToken = testDigest(`equal ${disagreement} genesis`);
+      const remoteHead = {
+        sequence: 1,
+        operationSha256: testDigest(`equal ${disagreement} remote operation`),
+        headDigest: testDigest(`equal ${disagreement} remote head`),
+      } as const;
+      const remote = {
+        genesisToken,
+        head: remoteHead,
+        headProofDigest: testDigest(`equal ${disagreement} proof`),
+        headToken: testDigest(`equal ${disagreement} remote token`),
+        keyVersion: 1,
+        revision: 1,
+      } as const;
+      store.attachCanonicalMemoryHostedSpace({
+        accountBindingDigest: testDigest(`equal ${disagreement} account`),
+        canonicalSpaceId: identity.canonicalSpaceId,
+        projectId: project.id,
+        remote,
+        remoteSpaceId: `memory_${String(index + 4).repeat(32)}`,
+      });
+      const reserved = store.readProjectMemoryAuthority(project.id);
+      if (reserved === null) throw new Error("Expected equal-sequence authority reservation.");
+      const initialized = store.markProjectMemoryAuthorityInitialized({
+        expectedHead: reserved.head,
+        expectedRevision: reserved.revision,
+        projectId: project.id,
+      });
+      const localHead = disagreement === "raw-head"
+        ? {
+            sequence: 1,
+            operationSha256: testDigest("different equal-sequence local operation"),
+            headDigest: testDigest("different equal-sequence local head"),
+          }
+        : remoteHead;
+      store.compareAndSwapProjectMemoryHead({
+        expectedHead: initialized.head,
+        expectedRevision: initialized.revision,
+        nextHead: localHead,
+        projectId: project.id,
+      });
+      expect(() => store.prepareCanonicalMemorySync({
+        direction: "pull",
+        idempotencyKey: peerIdempotencyKey(88_020 + index),
+        localHeadToken: disagreement === "token"
+          ? testDigest("different equal-sequence local token")
+          : remote.headToken,
+        projectId: project.id,
+      })).toThrow("CANONICAL_MEMORY_SYNC_EQUAL_SEQUENCE_CONFLICT");
+      expect(store.readUnresolvedCanonicalMemorySyncIntent(project.id)).toBeNull();
+      expect(store.readCanonicalMemoryHostedAttachment(project.id)).toMatchObject({
+        diagnosticCode: "REMOTE_MEMORY_EQUAL_SEQUENCE_CONFLICT",
+        state: "conflict",
+      });
+      expect(store.readProjectMemoryAuthority(project.id)).toMatchObject({
+        diagnosticCode: "REMOTE_MEMORY_EQUAL_SEQUENCE_CONFLICT",
+        lastExchangeHead: remoteHead,
+        syncState: "conflict",
+      });
+      expect(store.isCanonicalMemoryMutationFenced(project.id)).toBe(true);
+    }
+  });
+
+  test("freezes hosted configuration drift and same-sequence observation divergence", async () => {
+    const { store, home } = await fixture();
+    const variants = ["genesis", "revision", "key", "same-sequence"] as const;
+    for (const [index, variant] of variants.entries()) {
+      const root = join(home, `hosted-memory-observation-${variant}`);
+      await mkdir(root);
+      const project = await store.createProject(`Hosted observation ${variant}`, root);
+      const identity = createPortableProjectMemoryCanonicalIdentity(project.id);
+      const genesisToken = testDigest(`observation ${variant} genesis`);
+      const remote = {
+        genesisToken,
+        head: PROJECT_MEMORY_EMPTY_HEAD,
+        headProofDigest: testDigest(`observation ${variant} proof`),
+        headToken: genesisToken,
+        keyVersion: 1,
+        revision: 1,
+      } as const;
+      const attached = store.attachCanonicalMemoryHostedSpace({
+        accountBindingDigest: testDigest(`observation ${variant} account`),
+        canonicalSpaceId: identity.canonicalSpaceId,
+        projectId: project.id,
+        remote,
+        remoteSpaceId: `memory_${String(index + 6).repeat(32)}`,
+      });
+      const reserved = store.readProjectMemoryAuthority(project.id);
+      if (reserved === null) throw new Error("Expected observation authority reservation.");
+      store.markProjectMemoryAuthorityInitialized({
+        expectedHead: reserved.head,
+        expectedRevision: reserved.revision,
+        projectId: project.id,
+      });
+      const differentGenesis = testDigest(`different observation ${variant} genesis`);
+      const changedRemote = variant === "genesis"
+        ? { ...remote, genesisToken: differentGenesis, headToken: differentGenesis }
+        : variant === "revision"
+          ? { ...remote, revision: 2 }
+          : variant === "key"
+            ? { ...remote, keyVersion: 2 }
+            : {
+                ...remote,
+                headProofDigest: testDigest("divergent same-sequence observation proof"),
+              };
+      expect(() => store.recordCanonicalMemoryHostedObservation({
+        expectedGeneration: attached.generation,
+        expectedRevision: attached.revision,
+        projectId: project.id,
+        remote: changedRemote,
+      })).toThrow("CANONICAL_MEMORY_HOSTED_OBSERVATION_CONFLICT");
+      const diagnosticCode = variant === "same-sequence"
+        ? "REMOTE_MEMORY_HEAD_CONFLICT"
+        : "REMOTE_MEMORY_CONFIGURATION_CONFLICT";
+      expect(store.readCanonicalMemoryHostedAttachment(project.id)).toMatchObject({
+        diagnosticCode,
+        state: "conflict",
+      });
+      expect(store.readProjectMemoryAuthority(project.id)).toMatchObject({
+        diagnosticCode,
+        syncState: "conflict",
+      });
+      expect(store.isCanonicalMemoryMutationFenced(project.id)).toBe(true);
+    }
+  });
+
+  test("preserves permanent hosted identity across detach and freezes sticky failure", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "hosted-memory-detach");
+    await mkdir(root);
+    const project = await store.createProject("Hosted memory detach", root);
+    const identity = createPortableProjectMemoryCanonicalIdentity(project.id);
+    const genesisToken = testDigest("detach genesis");
+    const remote = {
+      genesisToken,
+      head: PROJECT_MEMORY_EMPTY_HEAD,
+      headProofDigest: testDigest("detach proof"),
+      headToken: genesisToken,
+      keyVersion: 1,
+      revision: 1,
+    } as const;
+    expect(() => store.attachCanonicalMemoryHostedSpace({
+      accountBindingDigest: testDigest("detach account"),
+      canonicalSpaceId: identity.canonicalSpaceId,
+      projectId: project.id,
+      remote,
+      remoteSpaceId: "memory_short",
+    })).toThrow();
+    const attached = store.attachCanonicalMemoryHostedSpace({
+      accountBindingDigest: testDigest("detach account"),
+      canonicalSpaceId: identity.canonicalSpaceId,
+      projectId: project.id,
+      remote,
+      remoteSpaceId: `memory_${"c".repeat(32)}`,
+    });
+    const detached = store.detachCanonicalMemoryHostedSpace({
+      expectedGeneration: attached.generation,
+      projectId: project.id,
+    });
+    expect(detached).toMatchObject({ generation: 2, state: "detached" });
+    expect(() => store.attachCanonicalMemoryHostedSpace({
+      accountBindingDigest: testDigest("detach account"),
+      canonicalSpaceId: identity.canonicalSpaceId,
+      projectId: project.id,
+      remote,
+      remoteSpaceId: `memory_${"d".repeat(32)}`,
+    })).toThrow("CANONICAL_MEMORY_HOSTED_REBIND_REFUSED");
+    const reattached = store.attachCanonicalMemoryHostedSpace({
+      accountBindingDigest: testDigest("detach account"),
+      canonicalSpaceId: identity.canonicalSpaceId,
+      projectId: project.id,
+      remote,
+      remoteSpaceId: `memory_${"c".repeat(32)}`,
+    });
+    expect(reattached).toMatchObject({ generation: 3, state: "attached" });
+    const reserved = store.readProjectMemoryAuthority(project.id);
+    if (reserved === null) throw new Error("Expected detached identity authority.");
+    store.markProjectMemoryAuthorityInitialized({
+      expectedHead: reserved.head,
+      expectedRevision: reserved.revision,
+      projectId: project.id,
+    });
+    const intent = store.prepareCanonicalMemorySync({
+      direction: "pull",
+      idempotencyKey: peerIdempotencyKey(88_003),
+      localHeadToken: genesisToken,
+      projectId: project.id,
+    }).record;
+    const failed = store.failCanonicalMemorySync({
+      diagnosticCode: "REMOTE_MEMORY_ERASED",
+      intentId: intent.id,
+      state: "error",
+    });
+    expect(failed).toMatchObject({
+      diagnosticCode: "REMOTE_MEMORY_ERASED",
+      state: "error",
+    });
+    expect(store.failCanonicalMemorySync({
+      diagnosticCode: "REMOTE_MEMORY_ERASED",
+      intentId: intent.id,
+      state: "error",
+    })).toEqual(failed);
+    expect(store.isCanonicalMemoryMutationFenced(project.id)).toBe(true);
+    expect(store.readCanonicalMemoryHostedAttachment(project.id)).toMatchObject({
+      diagnosticCode: "REMOTE_MEMORY_ERASED",
+      remoteSpaceId: `memory_${"c".repeat(32)}`,
+      state: "error",
+    });
+    expect(() => store.detachCanonicalMemoryHostedSpace({
+      expectedGeneration: reattached.generation,
+      projectId: project.id,
+    })).toThrow("CANONICAL_MEMORY_HOSTED_ATTACHMENT_FROZEN");
+    expect(() => store.prepareCanonicalMemorySync({
+      direction: "pull",
+      idempotencyKey: peerIdempotencyKey(88_004),
+      localHeadToken: genesisToken,
+      projectId: project.id,
+    })).toThrow("CANONICAL_MEMORY_HOSTED_ATTACHMENT_NOT_ACTIVE");
+
+    const writer = new Database(store.paths.database, { create: false, strict: true });
+    writer.exec("PRAGMA foreign_keys=ON");
+    expect(() => writer.query(
+      "DELETE FROM project_memory_hosted_attachments WHERE project_id=?",
+    ).run(project.id)).toThrow();
+    expect(() => writer.query(
+      `UPDATE project_memory_hosted_attachments
+       SET state='attached',diagnostic_code=NULL,revision=revision+1 WHERE project_id=?`,
+    ).run(project.id)).toThrow();
+    writer.close(false);
+  });
+
+  test("freezes a missing hosted attachment before any sync intent exists", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "hosted-memory-pre-intent-failure");
+    await mkdir(root);
+    const project = await store.createProject("Hosted memory pre-intent failure", root);
+    const identity = createPortableProjectMemoryCanonicalIdentity(project.id);
+    const genesisToken = testDigest("pre-intent failure genesis");
+    const remote = {
+      genesisToken,
+      head: PROJECT_MEMORY_EMPTY_HEAD,
+      headProofDigest: testDigest("pre-intent failure proof"),
+      headToken: genesisToken,
+      keyVersion: 1,
+      revision: 1,
+    } as const;
+    const attached = store.attachCanonicalMemoryHostedSpace({
+      accountBindingDigest: testDigest("pre-intent failure account"),
+      canonicalSpaceId: identity.canonicalSpaceId,
+      projectId: project.id,
+      remote,
+      remoteSpaceId: `memory_${"e".repeat(32)}`,
+    });
+    const reserved = store.readProjectMemoryAuthority(project.id);
+    if (reserved === null) throw new Error("Expected a reserved project authority.");
+    store.markProjectMemoryAuthorityInitialized({
+      expectedHead: reserved.head,
+      expectedRevision: reserved.revision,
+      projectId: project.id,
+    });
+
+    const failed = store.failCanonicalMemoryHostedAttachment({
+      diagnosticCode: "REMOTE_MEMORY_ERASED",
+      expectedGeneration: attached.generation,
+      expectedRevision: attached.revision,
+      projectId: project.id,
+      state: "error",
+    });
+    expect(failed).toMatchObject({
+      diagnosticCode: "REMOTE_MEMORY_ERASED",
+      revision: attached.revision + 1,
+      state: "error",
+    });
+    expect(store.failCanonicalMemoryHostedAttachment({
+      diagnosticCode: "REMOTE_MEMORY_ERASED",
+      expectedGeneration: attached.generation,
+      expectedRevision: attached.revision,
+      projectId: project.id,
+      state: "error",
+    })).toEqual(failed);
+    expect(store.readProjectMemoryAuthority(project.id)).toMatchObject({
+      diagnosticCode: "REMOTE_MEMORY_ERASED",
+      syncState: "error",
+    });
+    expect(store.isCanonicalMemoryMutationFenced(project.id)).toBe(true);
+  });
+
+  test("keeps compact page attestations across journal GC and releases them with exact lane refs", async () => {
+    let now = 10_000;
+    const { store, home } = await fixture({ now: () => now });
+    const root = join(home, "memory-attestation-retention");
+    await mkdir(root);
+    const project = await store.createProject("Memory attestation retention", root);
+    const profile = signInProfile(store, "Memory attestation retention", "attest@example.com");
+    const actor = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const emptyHead = PROJECT_MEMORY_EMPTY_HEAD;
+    const authorityDigest = reserveTestProjectMemoryAuthority(
+      store,
+      project.id,
+      emptyHead,
+    ).authorityDigest;
+    const workingBindingDigest = testDigest("attestation working binding");
+    const remember = (
+      index: number,
+      expectedHead: typeof emptyHead | Readonly<{
+        sequence: number;
+        operationSha256: string;
+        headDigest: string;
+      }>,
+    ) => {
+      const keyDigest = testDigest(`attestation key ${String(index)}`);
+      const contentDigest = testDigest(`attestation content ${String(index)}`);
+      const effectRecordSha256 = testDigest(`attestation record ${String(index)}`);
+      const attestationSha256 = testDigest(`attestation evidence ${String(index)}`);
+      const record = store.prepareMemorySubmission({
+        actorSessionId: actor.id,
+        projectId: project.id,
+        kind: "remember",
+        requestDigest: testDigest(`attestation request ${String(index)}`),
+        contentDigest,
+        keyDigest,
+        workingBindingDigest,
+        workingEpoch: 1,
+        expectedHead,
+        idempotencyKey: peerIdempotencyKey(60_000 + index),
+      }).record;
+      store.bindMemorySubmissionEffect({
+        submissionId: record.id,
+        effectRecordSha256,
+        attestationSha256,
+        operationId: `memory_attestation_${String(index)}`,
+      });
+      store.beginMemorySubmission(record.id);
+      const resultHead = {
+        sequence: expectedHead.sequence + 1,
+        operationSha256: testDigest(`attestation operation ${String(index)}`),
+        headDigest: testDigest(`attestation head ${String(index)}`),
+      };
+      store.settleMemorySubmission({
+        submissionId: record.id,
+        expectedState: "effect_started",
+        state: "applied",
+        outcomeCode: "remember_committed",
+        resultHead,
+        receiptDigest: testDigest(`attestation receipt ${String(index)}`),
+      });
+      return {
+        attestationSha256,
+        contentDigest,
+        effectRecordSha256,
+        idempotencyKey: record.idempotencyKey,
+        keyDigest,
+        resultHead,
+      };
+    };
+    const first = remember(0, emptyHead);
+    const second = remember(1, first.resultHead);
+    expect(store.findMemoryPageAttestation(first.attestationSha256)).toMatchObject({
+      actorSessionId: actor.id,
+      projectId: project.id,
+      keyDigest: first.keyDigest,
+    });
+    expect(store.isMemoryPageAttestationReferenced({
+      attestationSha256: first.attestationSha256,
+      authorityDigest: workingBindingDigest,
+      keyDigest: first.keyDigest,
+      lane: "working",
+      projectId: project.id,
+    })).toBe(true);
+
+    const share = store.prepareMemorySubmission({
+      actorSessionId: actor.id,
+      projectId: project.id,
+      kind: "share",
+      requestDigest: testDigest("attestation share request"),
+      contentDigest: first.contentDigest,
+      keyDigest: first.keyDigest,
+      workingBindingDigest,
+      workingEpoch: 1,
+      expectedHead: emptyHead,
+      idempotencyKey: peerIdempotencyKey(60_100),
+    }).record;
+    store.bindMemorySubmissionEffect({
+      submissionId: share.id,
+      effectRecordSha256: first.effectRecordSha256,
+      attestationSha256: first.attestationSha256,
+      operationId: "memory_adopt_attestation",
+      sourceHead: second.resultHead,
+      nominationSha256: testDigest("attestation nomination"),
+    });
+    store.beginMemorySubmission(share.id);
+    const canonicalHead = {
+      sequence: 1,
+      operationSha256: testDigest("attestation canonical operation"),
+      headDigest: testDigest("attestation canonical head"),
+    } as const;
+    store.settleMemorySubmission({
+      submissionId: share.id,
+      expectedState: "effect_started",
+      state: "applied",
+      outcomeCode: "share_adopted",
+      resultHead: canonicalHead,
+      receiptDigest: testDigest("attestation share receipt"),
+    });
+    expect(store.isMemoryPageAttestationReferenced({
+      attestationSha256: first.attestationSha256,
+      authorityDigest,
+      keyDigest: first.keyDigest,
+      lane: "canonical",
+      projectId: project.id,
+    })).toBe(true);
+    const portableProof = store.readCanonicalMemoryPortableAdoptionProof({
+      operationSha256: canonicalHead.operationSha256,
+      projectId: project.id,
+      sequence: canonicalHead.sequence,
+    });
+    expect(portableProof).toMatchObject({
+      bindingDigest: store.readProjectMemoryAuthority(project.id)?.bindingDigest,
+      canonicalSpaceId: store.readProjectMemoryAuthority(project.id)?.canonicalSpaceId,
+      contentDigest: first.contentDigest,
+      keyDigest: first.keyDigest,
+      operationSha256: canonicalHead.operationSha256,
+      projectId: project.id,
+      recordSha256: first.effectRecordSha256,
+      sequence: canonicalHead.sequence,
+      sourceReceiptSha256: testDigest("attestation share receipt"),
+    });
+    expect(store.isCanonicalMemoryPortableAdoptionProofReferenced({
+      bindingDigest: portableProof?.bindingDigest ?? "",
+      contentDigest: first.contentDigest,
+      keyDigest: first.keyDigest,
+      projectId: project.id,
+      recordSha256: first.effectRecordSha256,
+    })).toBe(true);
+    const proofWriter = new Database(store.paths.database, { create: false, strict: true });
+    proofWriter.exec("PRAGMA foreign_keys=ON");
+    expect(() => proofWriter.query(
+      `UPDATE project_memory_portable_adoption_proofs
+       SET source_receipt_sha256=? WHERE project_id=? AND sequence=?`,
+    ).run(testDigest("forged receipt"), project.id, canonicalHead.sequence)).toThrow();
+    expect(() => proofWriter.query(
+      `DELETE FROM project_memory_portable_adoption_proofs
+       WHERE project_id=? AND sequence=?`,
+    ).run(project.id, canonicalHead.sequence)).toThrow();
+    proofWriter.close(false);
+
+    const childBindingDigest = testDigest("attestation child binding");
+    const childSessionId = `sess_${"f".repeat(32)}`;
+    const childHead = {
+      sequence: 1,
+      operationSha256: testDigest("attestation child fork operation"),
+      digest: testDigest("attestation child fork head"),
+    } as const;
+    const parentHead = {
+      sequence: second.resultHead.sequence,
+      operationSha256: second.resultHead.operationSha256,
+      digest: second.resultHead.headDigest,
+    } as const;
+    expect(store.reserveMemoryWorkingPageAttestationFork({
+      childBindingDigest,
+      childSessionId,
+      parentBindingDigest: workingBindingDigest,
+      parentHead,
+    })).toEqual({ references: 2, state: "reserved" });
+    expect(store.hasMemoryWorkingAttestationForkFromParent(workingBindingDigest)).toBe(true);
+    const third = remember(2, second.resultHead);
+    expect(store.reserveMemoryWorkingPageAttestationFork({
+      childBindingDigest,
+      childSessionId,
+      parentBindingDigest: workingBindingDigest,
+      parentHead,
+    })).toEqual({ references: 0, state: "reserved" });
+    expect(store.finalizeMemoryWorkingPageAttestationFork({
+      childBindingDigest,
+      childHead,
+      parentBindingDigest: workingBindingDigest,
+      parentHead,
+    })).toBe(0);
+    expect(store.hasMemoryWorkingAttestationForkFromParent(workingBindingDigest)).toBe(false);
+    expect(store.reserveMemoryWorkingPageAttestationFork({
+      childBindingDigest,
+      childSessionId,
+      parentBindingDigest: workingBindingDigest,
+      parentHead,
+    })).toEqual({ references: 0, state: "finalized" });
+    expect(store.finalizeMemoryWorkingPageAttestationFork({
+      childBindingDigest,
+      childHead,
+      parentBindingDigest: workingBindingDigest,
+      parentHead,
+    })).toBe(0);
+    expect(store.readMemoryWorkingAttestationHead(childBindingDigest)).toMatchObject({
+      authorityDigest: childBindingDigest,
+      forkParentAuthorityDigest: workingBindingDigest,
+      forkParentHead: second.resultHead,
+      head: {
+        sequence: childHead.sequence,
+        operationSha256: childHead.operationSha256,
+        headDigest: childHead.digest,
+      },
+      origin: "fork",
+    });
+    now += MEMORY_SUBMISSION_RETAIN_AGE_MS + 1;
+    const pruningAdmission = store.prepareMemorySubmission({
+      actorSessionId: actor.id,
+      projectId: project.id,
+      kind: "remember",
+      requestDigest: testDigest("attestation pruning request"),
+      contentDigest: testDigest("attestation pruning content"),
+      keyDigest: testDigest("attestation pruning key"),
+      workingBindingDigest,
+      workingEpoch: 1,
+      expectedHead: third.resultHead,
+      idempotencyKey: peerIdempotencyKey(60_200),
+    }).record;
+    store.cancelPreparedMemorySubmission(pruningAdmission.id);
+    expect(store.readMemorySubmissionByIdempotencyKey(first.idempotencyKey)).toBeNull();
+    expect(store.findMemoryPageAttestation(first.attestationSha256)).not.toBeNull();
+    expect(store.findMemoryPageAttestation(second.attestationSha256)).not.toBeNull();
+    expect(store.findMemoryPageAttestation(third.attestationSha256)).not.toBeNull();
+
+    expect(store.purgeMemoryWorkingPageAttestations({
+      bindingDigest: workingBindingDigest,
+    })).toBe(3);
+    expect(store.findMemoryPageAttestation(second.attestationSha256)).not.toBeNull();
+    expect(store.findMemoryPageAttestation(third.attestationSha256)).toBeNull();
+    expect(store.purgeMemoryWorkingPageAttestations({
+      bindingDigest: childBindingDigest,
+    })).toBe(2);
+    expect(store.findMemoryPageAttestation(second.attestationSha256)).toBeNull();
+    expect(store.findMemoryPageAttestation(first.attestationSha256)).not.toBeNull();
+  });
+
+  test("pages only actor-authorized visible same-project peers in stable creation order", async () => {
+    const { store, home } = await fixture({ now: () => 4_000 });
+    const firstRoot = join(home, "peer-directory-a");
+    const secondRoot = join(home, "peer-directory-b");
+    await mkdir(firstRoot);
+    await mkdir(secondRoot);
+    const firstProject = await store.createProject("Peer directory A", firstRoot);
+    const secondProject = await store.createProject("Peer directory B", secondRoot);
+    const profile = signInProfile(store, "Peer directory account", "directory@example.com");
+    const create = (projectId: typeof firstProject.id, title: string) =>
+      createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId,
+      title,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actorBase = create(firstProject.id, "Actor private note never projected");
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "peer-directory-turn",
+    });
+    const visible = [
+      create(firstProject.id, "Visible one"),
+      create(firstProject.id, "Visible two"),
+    ];
+    const off = create(firstProject.id, "Hidden by policy");
+    store.setPeerSessionPolicy({
+      sessionId: off.id,
+      expectedRevision: 1,
+      mode: "off",
+    });
+    const archived = create(firstProject.id, "Hidden by archive");
+    store.setSessionArchived(archived.id, true);
+    create(secondProject.id, "Hidden by project");
+
+    expect(() => store.listPeerProjectSessionPage({
+      actorSessionId: actor.id,
+      actorTurnId: "wrong-turn",
+      after: null,
+      limit: 1,
+    })).toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+
+    const expected = visible.map((session) => session.id).sort();
+    const first = store.listPeerProjectSessionPage({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      after: null,
+      limit: 1,
+    });
+    expect(first.sessions.map((session) => session.id)).toEqual(expected.slice(0, 1));
+    expect(first.nextPosition).not.toBeNull();
+    expect(Object.keys(first.sessions[0] ?? {}).sort()).toEqual([
+      "active",
+      "createdAt",
+      "id",
+      "policy",
+      "policyRevision",
+      "preset",
+      "provider",
+      "revision",
+      "state",
+      "title",
+      "updatedAt",
+    ]);
+    const second = store.listPeerProjectSessionPage({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      after: first.nextPosition,
+      limit: 1,
+    });
+    expect(second.sessions.map((session) => session.id)).toEqual(expected.slice(1));
+    expect(second.nextPosition).toBeNull();
+
+    const policy = store.requirePeerSessionPolicy(actor.id);
+    store.setPeerSessionPolicy({
+      sessionId: actor.id,
+      expectedRevision: policy.revision,
+      mode: "off",
+    });
+    expect(() => store.listPeerProjectSessionPage({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      after: null,
+      limit: 50,
+    })).toThrow("PEER_SESSION_POLICY_REFUSED");
+    expect(() => store.listPeerProjectSessionPage({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      after: null,
+      limit: 51,
+    })).toThrow();
+  });
+
+  test("admits peer queues idempotently and preserves attributed provenance across restart", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "peer-project");
+    await mkdir(root);
+    const project = await store.createProject("Peer project", root);
+    const profile = signInProfile(store, "Peer account", "peer@example.com");
+    const actor = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const activeActor = store.setSessionTurnState({
+      sessionId: actor.id,
+      expectedRevision: actor.revision,
+      state: "active",
+      activeTurnId: "actor-turn-without-sensitive-bytes",
+    });
+    const targetBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.bindSession({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      providerThreadId: "thread-peer-begin-authority",
+      state: "idle",
+    });
+    const message = "PRIVATE PEER MESSAGE BODY";
+    const request = {
+      actorSessionId: activeActor.id,
+      actorTurnId: activeActor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "queue" as const,
+      requestDigest: testDigest("PRIVATE PEER REQUEST AND REASON"),
+      messageDigest: testDigest(message),
+      reasonDigest: testDigest("PRIVATE PEER REASON"),
+      idempotencyKey: peerIdempotencyKey(9_000),
+      message,
+    };
+    const admitted = store.admitPeerSessionAction(request);
+    expect(admitted).toMatchObject({
+      replay: false,
+      action: {
+        actorPolicyRevision: 1,
+        delivery: "queue",
+        hop: 1,
+        projectId: project.id,
+        state: "queued",
+        targetPolicyRevision: 1,
+      },
+      queue: {
+        messageActor: "peer_session",
+        peerActionId: admitted.action.id,
+        state: "pending",
+      },
+    });
+    expect(store.admitPeerSessionAction(request)).toMatchObject({
+      replay: true,
+      action: { id: admitted.action.id },
+      queue: { id: admitted.queue?.id },
+    });
+    expect(() => store.admitPeerSessionAction({
+      ...request,
+      reasonDigest: testDigest("changed reason"),
+    })).toThrow("PEER_SESSION_IDEMPOTENCY_CONFLICT");
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      const peerLedger = JSON.stringify(
+        inspector.query("SELECT * FROM peer_session_actions WHERE id=?").get(admitted.action.id),
+      );
+      expect(peerLedger).not.toContain(message);
+      expect(peerLedger).not.toContain("PRIVATE PEER REASON");
+      expect(peerLedger).not.toContain("actor-turn-without-sensitive-bytes");
+      expect(peerLedger).not.toContain(root);
+    } finally {
+      inspector.close(false);
+    }
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths);
+    stores.push(restarted);
+    expect(restarted.requireQueue(admitted.queue!.id)).toMatchObject({
+      message,
+      messageActor: "peer_session",
+      peerActionId: admitted.action.id,
+      state: "pending",
+    });
+    expect(restarted.transitionQueue(admitted.queue!.id, "pending", "cancelled")).toBe(true);
+    expect(restarted.requirePeerSessionAction(admitted.action.id)).toMatchObject({
+      state: "cancelled",
+    });
+  });
+
+  test("revokes a queued peer dispatch when its actor policy or project changes", async () => {
+    const { store, home } = await fixture();
+    const firstRoot = join(home, "peer-queue-actor-authority-a");
+    const secondRoot = join(home, "peer-queue-actor-authority-b");
+    await mkdir(firstRoot);
+    await mkdir(secondRoot);
+    const firstProject = await store.createProject("Peer queue actor authority A", firstRoot);
+    const secondProject = await store.createProject("Peer queue actor authority B", secondRoot);
+    const profile = signInProfile(
+      store,
+      "Peer queue actor authority",
+      "peer-queue-actor@example.com",
+    );
+    const admitQueue = (index: number) => {
+      const actorBase = createAuthorizedStartingTestSession(store, {
+        profileId: profile.id,
+        projectId: firstProject.id,
+        preset: "high",
+        fastEnabled: false,
+      });
+      const actor = store.setSessionTurnState({
+        sessionId: actorBase.id,
+        expectedRevision: actorBase.revision,
+        state: "active",
+        activeTurnId: `turn-peer-queue-actor-${String(index)}`,
+      });
+      const targetBase = createAuthorizedStartingTestSession(store, {
+        profileId: profile.id,
+        projectId: firstProject.id,
+        preset: "high",
+        fastEnabled: false,
+      });
+      const providerThreadId = `thread-peer-queue-actor-${String(index)}`;
+      const target = store.bindSession({
+        sessionId: targetBase.id,
+        expectedRevision: targetBase.revision,
+        providerThreadId,
+        state: "idle",
+      });
+      const message = `queued actor authority ${String(index)}`;
+      const admitted = store.admitPeerSessionAction({
+        actorSessionId: actor.id,
+        actorTurnId: actor.activeTurnId!,
+        targetSessionId: target.id,
+        expectedTargetRevision: target.revision,
+        delivery: "queue",
+        requestDigest: testDigest(`queued actor request ${String(index)}`),
+        messageDigest: testDigest(message),
+        reasonDigest: testDigest(`queued actor reason ${String(index)}`),
+        idempotencyKey: peerIdempotencyKey(9_050 + index),
+        message,
+      });
+      const begin = () => store.beginQueueEffect({
+        queueId: admitted.queue!.id,
+        sessionId: target.id,
+        profileGeneration: profile.processGeneration,
+        evidence: {
+          kind: "queue.dispatch" as const,
+          queueId: admitted.queue!.id,
+          sessionId: target.id,
+          providerThreadId,
+          profileGeneration: profile.processGeneration,
+          baseline: { providerUpdatedAt: null, status: "idle" as const, activeTurnId: null },
+          clientMessageId: admitted.queue!.id,
+          messageDigest: testDigest(message),
+          runtimeProfile: codexRuntimeProfile(profile),
+        },
+      });
+      return { actor, admitted, begin, target };
+    };
+
+    const policyRevoked = admitQueue(0);
+    const actorPolicy = store.requirePeerSessionPolicy(policyRevoked.actor.id);
+    store.setPeerSessionPolicy({
+      sessionId: policyRevoked.actor.id,
+      expectedRevision: actorPolicy.revision,
+      mode: "off",
+    });
+    const laterHuman = store.enqueue(
+      policyRevoked.target.id,
+      "human work after revoked peer queue",
+    );
+    expect(policyRevoked.begin).toThrow("PEER_SESSION_POLICY_REVISION_CONFLICT");
+    expect(store.nextPendingQueue(policyRevoked.target.id)?.id)
+      .toBe(policyRevoked.admitted.queue!.id);
+    expect(store.readQueueEffect(policyRevoked.admitted.queue!.id)).toBeNull();
+    expect(store.cancelRevokedPendingPeerQueue(policyRevoked.admitted.queue!.id))
+      .toMatchObject({ state: "cancelled" });
+    expect(store.requirePeerSessionAction(policyRevoked.admitted.action.id).state)
+      .toBe("cancelled");
+    expect(store.nextPendingQueue(policyRevoked.target.id)?.id).toBe(laterHuman.id);
+    expect(store.cancelRevokedPendingPeerQueue(policyRevoked.admitted.queue!.id)).toBeNull();
+
+    const projectRevoked = admitQueue(1);
+    const idleActor = store.setSessionTurnState({
+      sessionId: projectRevoked.actor.id,
+      expectedRevision: projectRevoked.actor.revision,
+      state: "idle",
+    });
+    const movedActor = store.updateSessionMetadata({
+      sessionId: idleActor.id,
+      expectedRevision: idleActor.revision,
+      projectId: secondProject.id,
+    });
+    store.setSessionTurnState({
+      sessionId: movedActor.id,
+      expectedRevision: movedActor.revision,
+      state: "active",
+      activeTurnId: projectRevoked.actor.activeTurnId!,
+    });
+    expect(projectRevoked.begin).toThrow("PEER_SESSION_PROJECT_REFUSED");
+    expect(store.readQueueEffect(projectRevoked.admitted.queue!.id)).toBeNull();
+    expect(store.cancelRevokedPendingPeerQueue(projectRevoked.admitted.queue!.id))
+      .toMatchObject({ state: "cancelled" });
+    expect(store.requirePeerSessionAction(projectRevoked.admitted.action.id).state)
+      .toBe("cancelled");
+  });
+
+  test("attaches a queued peer action to the accepted target turn transactionally", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "peer-queue-effect");
+    await mkdir(root);
+    const project = await store.createProject("Peer queue effect", root);
+    const profile = signInProfile(store, "Peer queue effect", "peer-queue@example.com");
+    const actorBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-source",
+    });
+    const targetBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.bindSession({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      providerThreadId: "thread-peer-target",
+      state: "idle",
+    });
+    const message = "queued attributed coordination";
+    const admitted = store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "queue",
+      requestDigest: testDigest("queue effect request"),
+      messageDigest: testDigest(message),
+      reasonDigest: testDigest("queue effect reason"),
+      idempotencyKey: peerIdempotencyKey(9_100),
+      message,
+    });
+    const runtime = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      observedAt: 2_000,
+      preset: "high" as const,
+      model: "gpt-6-astra",
+      reasoningEffort: "max" as const,
+      serviceTier: null,
+      fast: false,
+      approvalPolicy: "on-request" as const,
+      reviewMode: "auto_review" as const,
+      permissionProfile: ":workspace" as const,
+      computerUse: true as const,
+      pluginCapability: true as const,
+      enabledApps: [],
+    };
+    const evidence = store.beginQueueEffect({
+      queueId: admitted.queue!.id,
+      sessionId: target.id,
+      profileGeneration: profile.processGeneration,
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: admitted.queue!.id,
+        sessionId: target.id,
+        providerThreadId: "thread-peer-target",
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: admitted.queue!.id,
+        messageDigest: testDigest(message),
+        runtimeProfile: runtime,
+      },
+    });
+    expect(store.requirePeerSessionAction(admitted.action.id).state).toBe("effect_started");
+    store.completeQueueEffect({
+      queueId: admitted.queue!.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      expectedEvidenceDigest: evidence.digest,
+      expectedSessionRevision: target.revision,
+      applyResponseState: true,
+      turnId: "turn-peer-target",
+      turnStatus: "inProgress",
+      runtimeProfile: runtime,
+      message,
+      receipt: { turnId: "turn-peer-target" },
+    });
+    expect(store.requirePeerSessionAction(admitted.action.id)).toMatchObject({
+      state: "applied",
+      targetTurnDigest: testDigest("turn-peer-target"),
+      resultDigest: testDigest(JSON.stringify({ turnId: "turn-peer-target" })),
+    });
+    expect(store.readPeerSessionTurnOrigins({
+      sessionId: target.id,
+      turnId: "turn-peer-target",
+    }).map((action) => action.id)).toEqual([admitted.action.id]);
+  });
+
+  test("reconciles ambiguous peer queues as proven applied or abandoned across restart", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "peer-queue-recovery");
+    await mkdir(root);
+    const project = await store.createProject("Peer queue recovery", root);
+    const profile = signInProfile(store, "Peer queue recovery", "peer-recovery@example.com");
+    const actorBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-recovery-source",
+    });
+    const runtime = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      observedAt: 2_000,
+      preset: "high" as const,
+      model: "gpt-6-astra",
+      reasoningEffort: "max" as const,
+      serviceTier: null,
+      fast: false,
+      approvalPolicy: "on-request" as const,
+      reviewMode: "auto_review" as const,
+      permissionProfile: ":workspace" as const,
+      computerUse: true as const,
+      pluginCapability: true as const,
+      enabledApps: [],
+    };
+    const prepare = (index: number) => {
+      const providerThreadId = `thread-peer-recovery-${String(index)}`;
+      const targetBase = createAuthorizedStartingTestSession(store, {
+        profileId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fastEnabled: false,
+      });
+      const target = store.bindSession({
+        sessionId: targetBase.id,
+        expectedRevision: targetBase.revision,
+        providerThreadId,
+        state: "idle",
+      });
+      const message = `peer recovery message ${String(index)}`;
+      const admitted = store.admitPeerSessionAction({
+        actorSessionId: actor.id,
+        actorTurnId: actor.activeTurnId!,
+        targetSessionId: target.id,
+        expectedTargetRevision: target.revision,
+        delivery: "queue",
+        requestDigest: testDigest(`peer recovery request ${String(index)}`),
+        messageDigest: testDigest(message),
+        reasonDigest: testDigest(`peer recovery reason ${String(index)}`),
+        idempotencyKey: peerIdempotencyKey(45_000 + index),
+        message,
+      });
+      const evidence = store.beginQueueEffect({
+        queueId: admitted.queue!.id,
+        sessionId: target.id,
+        profileGeneration: profile.processGeneration,
+        evidence: {
+          kind: "queue.dispatch",
+          queueId: admitted.queue!.id,
+          sessionId: target.id,
+          providerThreadId,
+          profileGeneration: profile.processGeneration,
+          baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+          clientMessageId: admitted.queue!.id,
+          messageDigest: testDigest(message),
+          runtimeProfile: runtime,
+        },
+      });
+      expect(store.requirePeerSessionAction(admitted.action.id).state).toBe("effect_started");
+      return { action: admitted.action, evidence, providerThreadId, queue: admitted.queue!, target };
+    };
+
+    const proven = prepare(0);
+    store.markQueueEffectAmbiguous(proven.queue.id, proven.evidence.digest);
+    expect(store.requirePeerSessionAction(proven.action.id).state).toBe("ambiguous");
+    const recovered = store.resolveQueueEffect({
+      queueId: proven.queue.id,
+      expectedEvidenceDigest: proven.evidence.digest,
+      resolution: "proven_applied",
+      resolutionEvidence: { source: "exact_provider_turn" },
+      receipt: { turnId: "turn-peer-recovered" },
+      provider: {
+        providerThreadId: proven.providerThreadId,
+        title: "Recovered applied peer queue",
+        status: "idle",
+      },
+    });
+    expect(recovered.messageEvent).toMatchObject({
+      appended: true,
+      event: {
+        body: {
+          type: "user_message",
+          actor: "peer_session",
+          text: "peer recovery message 0",
+        },
+      },
+    });
+    expect(store.requirePeerSessionAction(proven.action.id)).toMatchObject({
+      state: "applied",
+      targetTurnDigest: testDigest("turn-peer-recovered"),
+      resultDigest: testDigest(JSON.stringify({ turnId: "turn-peer-recovered" })),
+    });
+    expect(store.readPeerSessionTurnOrigins({
+      sessionId: proven.target.id,
+      turnId: "turn-peer-recovered",
+    }).map((action) => action.id)).toEqual([proven.action.id]);
+
+    const abandoned = prepare(1);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths);
+    stores.push(restarted);
+    expect(restarted.recoverDispatchingQueueEffects()).toEqual({
+      recovered: [abandoned.queue.id],
+      unresolved: [],
+    });
+    expect(restarted.requirePeerSessionAction(abandoned.action.id).state).toBe("ambiguous");
+    restarted.resolveQueueEffect({
+      queueId: abandoned.queue.id,
+      expectedEvidenceDigest: abandoned.evidence.digest,
+      resolution: "abandoned",
+      resolutionEvidence: { source: "exact_provider_absence" },
+      provider: {
+        providerThreadId: abandoned.providerThreadId,
+        title: "Recovered abandoned peer queue",
+        status: "idle",
+      },
+    });
+    expect(restarted.requirePeerSessionAction(abandoned.action.id)).toMatchObject({
+      state: "failed",
+      resultDigest: testDigest(JSON.stringify({ source: "exact_provider_absence" })),
+    });
+  });
+
+  test("refuses peer self, scope, policy, stale revision, and target-state violations distinctly", async () => {
+    const { store, home } = await fixture();
+    const firstRoot = join(home, "peer-refusal-a");
+    const secondRoot = join(home, "peer-refusal-b");
+    await mkdir(firstRoot);
+    await mkdir(secondRoot);
+    const firstProject = await store.createProject("Peer refusal A", firstRoot);
+    const secondProject = await store.createProject("Peer refusal B", secondRoot);
+    const profile = signInProfile(store, "Peer refusal", "peer-refusal@example.com");
+    const create = (projectId: typeof firstProject.id) =>
+      createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actorBase = create(firstProject.id);
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-refusal-actor",
+    });
+    const target = create(firstProject.id);
+    const otherProject = create(secondProject.id);
+    let key = 10_000;
+    const attempt = (overrides: Partial<Parameters<StateStore["admitPeerSessionAction"]>[0]> = {}) =>
+      store.admitPeerSessionAction({
+        actorSessionId: actor.id,
+        actorTurnId: actor.activeTurnId!,
+        targetSessionId: target.id,
+        expectedTargetRevision: target.revision,
+        delivery: "queue",
+        requestDigest: testDigest(`refusal request ${String(key)}`),
+        messageDigest: testDigest("refusal message"),
+        reasonDigest: testDigest("refusal reason"),
+        idempotencyKey: peerIdempotencyKey(key++),
+        message: "refusal message",
+        ...overrides,
+      });
+    expect(() => attempt({ targetSessionId: actor.id, expectedTargetRevision: actor.revision }))
+      .toThrow("PEER_SESSION_SELF_REFUSED");
+    expect(() => attempt({
+      targetSessionId: otherProject.id,
+      expectedTargetRevision: otherProject.revision,
+    })).toThrow("PEER_SESSION_PROJECT_REFUSED");
+    store.setPeerSessionPolicy({ sessionId: target.id, expectedRevision: 1, mode: "off" });
+    expect(() => attempt()).toThrow("PEER_SESSION_POLICY_REFUSED");
+    store.setPeerSessionPolicy({ sessionId: target.id, expectedRevision: 2, mode: "coordinate" });
+    expect(() => attempt({ expectedTargetRevision: target.revision + 1 }))
+      .toThrow("PEER_SESSION_REVISION_CONFLICT");
+    expect(() => attempt({ actorTurnId: "not-the-active-turn" }))
+      .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+    const activeTarget = store.setSessionTurnState({
+      sessionId: target.id,
+      expectedRevision: target.revision,
+      state: "active",
+      activeTurnId: "turn-refusal-target",
+    });
+    expect(() => store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: activeTarget.id,
+      expectedTargetRevision: activeTarget.revision,
+      delivery: "send",
+      requestDigest: testDigest("active target request"),
+      messageDigest: testDigest("active target message"),
+      reasonDigest: testDigest("active target reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+    })).toThrow("PEER_SESSION_TARGET_STATE_REFUSED");
+  });
+
+  test("unions every turn origin and refuses cycles and the ninth peer hop", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "peer-causal");
+    await mkdir(root);
+    const project = await store.createProject("Peer causal", root);
+    const profile = signInProfile(store, "Peer causal", "peer-causal@example.com");
+    const sessions = Array.from({ length: 11 }, (_, index) => {
+      const created = createAuthorizedStartingTestSession(store, {
+        profileId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fastEnabled: false,
+      });
+      return store.setSessionTurnState({
+        sessionId: created.id,
+        expectedRevision: created.revision,
+        state: "active",
+        activeTurnId: `turn-causal-${String(index)}`,
+      });
+    });
+    let key = 20_000;
+    const steer = (from: number, to: number) => {
+      const actor = sessions[from]!;
+      const target = sessions[to]!;
+      const action = store.admitPeerSessionAction({
+        actorSessionId: actor.id,
+        actorTurnId: actor.activeTurnId!,
+        targetSessionId: target.id,
+        expectedTargetRevision: target.revision,
+        delivery: "steer",
+        requestDigest: testDigest(`causal request ${String(key)}`),
+        messageDigest: testDigest(`causal message ${String(key)}`),
+        reasonDigest: testDigest(`causal reason ${String(key)}`),
+        idempotencyKey: peerIdempotencyKey(key++),
+      }).action;
+      store.beginPeerSessionActionEffect(action.id);
+      return store.settlePeerSessionAction({
+        actionId: action.id,
+        expectedState: "effect_started",
+        state: "applied",
+        targetTurnId: target.activeTurnId!,
+        resultDigest: testDigest(`causal receipt ${String(key)}`),
+      });
+    };
+    const chain = [];
+    for (let index = 0; index < PEER_SESSION_HOP_LIMIT; index += 1) {
+      chain.push(steer(index, index + 1));
+    }
+    expect(chain.map((action) => action.hop)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(() => steer(8, 9)).toThrow("PEER_SESSION_HOP_LIMIT_REFUSED");
+    expect(() => steer(1, 0)).toThrow("PEER_SESSION_CYCLE_REFUSED");
+
+    const independent = steer(9, 2);
+    expect(store.readPeerSessionTurnOrigins({
+      sessionId: sessions[2]!.id,
+      turnId: sessions[2]!.activeTurnId!,
+    })).toHaveLength(2);
+    expect(() => steer(2, 9)).toThrow("PEER_SESSION_CYCLE_REFUSED");
+    const unioned = steer(2, 10);
+    expect(unioned).toMatchObject({
+      hop: 3,
+      parentActionIds: expect.arrayContaining([chain[1]!.id, independent.id]),
+      rootActionIds: expect.arrayContaining([chain[0]!.id, independent.id]),
+    });
+  });
+
+  test("enforces atomic hourly peer action and distinct-target boundaries without charging replay", async () => {
+    let now = 1_000;
+    const { store, home } = await fixture({ now: () => now });
+    const root = join(home, "peer-budgets");
+    await mkdir(root);
+    const project = await store.createProject("Peer budgets", root);
+    const profile = signInProfile(store, "Peer budgets", "peer-budgets@example.com");
+    const actorBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-budget-actor",
+    });
+    const targetBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.setSessionTurnState({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      state: "idle",
+    });
+    const send = (index: number, targetSession = target) => store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: targetSession.id,
+      expectedTargetRevision: targetSession.revision,
+      delivery: "send",
+      requestDigest: testDigest(`rate request ${String(index)}`),
+      messageDigest: testDigest(`rate message ${String(index)}`),
+      reasonDigest: testDigest("rate reason"),
+      idempotencyKey: peerIdempotencyKey(30_000 + index),
+    });
+    const first = send(0);
+    expect(send(0)).toMatchObject({ replay: true, action: { id: first.action.id } });
+    for (let index = 1; index < PEER_SESSION_HOURLY_ACTION_LIMIT; index += 1) send(index);
+    expect(() => send(PEER_SESSION_HOURLY_ACTION_LIMIT))
+      .toThrow("PEER_SESSION_RATE_LIMIT_REFUSED");
+
+    const fanoutActorBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const fanoutActor = store.setSessionTurnState({
+      sessionId: fanoutActorBase.id,
+      expectedRevision: fanoutActorBase.revision,
+      state: "active",
+      activeTurnId: "turn-fanout-actor",
+    });
+    expect(() => store.admitPeerSessionAction({
+      actorSessionId: fanoutActor.id,
+      actorTurnId: fanoutActor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "send",
+      requestDigest: testDigest("aggregate project rate request"),
+      messageDigest: testDigest("aggregate project rate message"),
+      reasonDigest: testDigest("aggregate project rate reason"),
+      idempotencyKey: peerIdempotencyKey(39_999),
+    })).toThrow("PEER_SESSION_RATE_LIMIT_REFUSED");
+    expect(PEER_SESSION_PROJECT_HOURLY_ACTION_LIMIT).toBe(PEER_SESSION_HOURLY_ACTION_LIMIT);
+    const isolatedRoot = join(home, "peer-budgets-isolated");
+    await mkdir(isolatedRoot);
+    const isolatedProject = await store.createProject("Peer budgets isolated", isolatedRoot);
+    const isolatedActorBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: isolatedProject.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const isolatedActor = store.setSessionTurnState({
+      sessionId: isolatedActorBase.id,
+      expectedRevision: isolatedActorBase.revision,
+      state: "active",
+      activeTurnId: "turn-isolated-budget-actor",
+    });
+    const isolatedTarget = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: isolatedProject.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    expect(store.admitPeerSessionAction({
+      actorSessionId: isolatedActor.id,
+      actorTurnId: isolatedActor.activeTurnId!,
+      targetSessionId: isolatedTarget.id,
+      expectedTargetRevision: isolatedTarget.revision,
+      delivery: "queue",
+      requestDigest: testDigest("isolated aggregate rate request"),
+      messageDigest: testDigest("isolated aggregate rate message"),
+      reasonDigest: testDigest("isolated aggregate rate reason"),
+      idempotencyKey: peerIdempotencyKey(39_998),
+      message: "isolated aggregate rate message",
+    })).toMatchObject({ replay: false });
+    now += PEER_SESSION_RATE_WINDOW_MS + 1;
+    const targets = Array.from(
+      { length: PEER_SESSION_HOURLY_DISTINCT_TARGET_LIMIT + 1 },
+      () => createAuthorizedStartingTestSession(store, {
+        profileId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fastEnabled: false,
+      }),
+    );
+    const queue = (index: number) => {
+      const message = `fanout message ${String(index)}`;
+      return store.admitPeerSessionAction({
+        actorSessionId: fanoutActor.id,
+        actorTurnId: fanoutActor.activeTurnId!,
+        targetSessionId: targets[index]!.id,
+        expectedTargetRevision: targets[index]!.revision,
+        delivery: "queue",
+        requestDigest: testDigest(`fanout request ${String(index)}`),
+        messageDigest: testDigest(message),
+        reasonDigest: testDigest("fanout reason"),
+        idempotencyKey: peerIdempotencyKey(40_000 + index),
+        message,
+      });
+    };
+    for (let index = 0; index < PEER_SESSION_HOURLY_DISTINCT_TARGET_LIMIT; index += 1) {
+      queue(index);
+    }
+    expect(() => queue(PEER_SESSION_HOURLY_DISTINCT_TARGET_LIMIT))
+      .toThrow("PEER_SESSION_FANOUT_LIMIT_REFUSED");
+  });
+
+  test("retains exact peer replay for seven days then atomically compacts terminal queue provenance", async () => {
+    let now = 10_000;
+    const { store, home } = await fixture({ now: () => now });
+    const root = join(home, "peer-retention-terminal");
+    await mkdir(root);
+    const project = await store.createProject("Peer retention terminal", root);
+    const profile = signInProfile(store, "Peer retention terminal", "peer-retention@example.com");
+    const actorBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-retention-old",
+    });
+    const targetBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.setSessionTurnState({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      state: "idle",
+    });
+    const message = "terminal peer retention message";
+    const oldRequest = {
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "queue" as const,
+      requestDigest: testDigest("terminal peer retention request"),
+      messageDigest: testDigest(message),
+      reasonDigest: testDigest("terminal peer retention reason"),
+      idempotencyKey: peerIdempotencyKey(54_000),
+      message,
+    };
+    const old = store.admitPeerSessionAction(oldRequest);
+    expect(store.transitionQueue(old.queue!.id, "pending", "cancelled")).toBe(true);
+    const idleActor = store.setSessionTurnState({
+      sessionId: actor.id,
+      expectedRevision: actor.revision,
+      state: "idle",
+    });
+
+    now += PEER_SESSION_ACTION_RETAIN_AGE_MS;
+    const currentActor = store.setSessionTurnState({
+      sessionId: idleActor.id,
+      expectedRevision: idleActor.revision,
+      state: "active",
+      activeTurnId: "turn-peer-retention-current",
+    });
+    expect(store.admitPeerSessionAction(oldRequest)).toMatchObject({
+      replay: true,
+      action: { id: old.action.id },
+      queue: { id: old.queue!.id },
+    });
+    const admitFresh = (index: number) => store.admitPeerSessionAction({
+      actorSessionId: currentActor.id,
+      actorTurnId: currentActor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "send",
+      requestDigest: testDigest(`terminal retention fresh request ${String(index)}`),
+      messageDigest: testDigest(`terminal retention fresh message ${String(index)}`),
+      reasonDigest: testDigest("terminal retention fresh reason"),
+      idempotencyKey: peerIdempotencyKey(54_001 + index),
+    });
+    admitFresh(0);
+    expect(store.requirePeerSessionAction(old.action.id).state).toBe("cancelled");
+
+    now += 1;
+    const injector = new Database(store.paths.database, { create: false, strict: true });
+    injector.exec(`
+      CREATE TRIGGER peer_retention_test_abort
+      BEFORE DELETE ON peer_session_actions
+      BEGIN SELECT RAISE(ABORT, 'test peer retention abort'); END;
+    `);
+    injector.close(false);
+    expect(() => admitFresh(1)).toThrow("test peer retention abort");
+    expect(store.requireQueue(old.queue!.id)).toMatchObject({
+      messageActor: "peer_session",
+      peerActionId: old.action.id,
+      state: "cancelled",
+    });
+    expect(store.readPeerSessionActionByIdempotencyKey(peerIdempotencyKey(54_002))).toBeNull();
+    const repair = new Database(store.paths.database, { create: false, strict: true });
+    repair.exec("DROP TRIGGER peer_retention_test_abort;");
+    repair.close(false);
+
+    expect(admitFresh(1)).toMatchObject({ replay: false });
+    expect(() => store.requirePeerSessionAction(old.action.id)).toThrow("PEER_SESSION_NOT_FOUND");
+    expect(store.requireQueue(old.queue!.id)).toMatchObject({
+      messageActor: "peer_session",
+      state: "cancelled",
+    });
+    expect(store.requireQueue(old.queue!.id)).not.toHaveProperty("peerActionId");
+    expect(store.isPeerSessionMessageSource(target.id, old.queue!.id)).toBe(true);
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      inspector.close(false);
+    }
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths, { now: () => now });
+    stores.push(restarted);
+    expect(restarted.requireQueue(old.queue!.id)).toMatchObject({
+      messageActor: "peer_session",
+      state: "cancelled",
+    });
+    expect(restarted.requireQueue(old.queue!.id)).not.toHaveProperty("peerActionId");
+    expect(restarted.isPeerSessionMessageSource(target.id, old.queue!.id)).toBe(true);
+  });
+
+  test("pins unsettled actions and recursively required causal roots beyond the retention window", async () => {
+    let now = 20_000;
+    const { store, home } = await fixture({ now: () => now });
+    const root = join(home, "peer-retention-pins");
+    await mkdir(root);
+    const project = await store.createProject("Peer retention pins", root);
+    const profile = signInProfile(store, "Peer retention pins", "peer-retention-pins@example.com");
+    const createActive = (turnId: string) => {
+      const created = createAuthorizedStartingTestSession(store, {
+        profileId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fastEnabled: false,
+      });
+      return store.setSessionTurnState({
+        sessionId: created.id,
+        expectedRevision: created.revision,
+        state: "active",
+        activeTurnId: turnId,
+      });
+    };
+    const first = createActive("turn-peer-retention-first");
+    const second = createActive("turn-peer-retention-second");
+    const third = createActive("turn-peer-retention-third");
+    const maintainer = createActive("turn-peer-retention-maintainer");
+    const pendingTargetBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const pendingTarget = store.setSessionTurnState({
+      sessionId: pendingTargetBase.id,
+      expectedRevision: pendingTargetBase.revision,
+      state: "idle",
+    });
+    let key = 55_000;
+    const steer = (actor: typeof first, target: typeof first) => {
+      const action = store.admitPeerSessionAction({
+        actorSessionId: actor.id,
+        actorTurnId: actor.activeTurnId!,
+        targetSessionId: target.id,
+        expectedTargetRevision: target.revision,
+        delivery: "steer",
+        requestDigest: testDigest(`retention causal request ${String(key)}`),
+        messageDigest: testDigest(`retention causal message ${String(key)}`),
+        reasonDigest: testDigest("retention causal reason"),
+        idempotencyKey: peerIdempotencyKey(key++),
+      }).action;
+      store.beginPeerSessionActionEffect(action.id);
+      return store.settlePeerSessionAction({
+        actionId: action.id,
+        expectedState: "effect_started",
+        state: "applied",
+        targetTurnId: target.activeTurnId!,
+        resultDigest: testDigest(`retention causal result ${action.id}`),
+      });
+    };
+    const rootAction = steer(first, second);
+    const descendant = steer(second, third);
+    expect(descendant.parentActionIds).toContain(rootAction.id);
+    const actorPinned = store.admitPeerSessionAction({
+      actorSessionId: maintainer.id,
+      actorTurnId: maintainer.activeTurnId!,
+      targetSessionId: pendingTarget.id,
+      expectedTargetRevision: pendingTarget.revision,
+      delivery: "send",
+      requestDigest: testDigest("active actor retention request"),
+      messageDigest: testDigest("active actor retention message"),
+      reasonDigest: testDigest("active actor retention reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+    }).action;
+    store.beginPeerSessionActionEffect(actorPinned.id);
+    store.settlePeerSessionAction({
+      actionId: actorPinned.id,
+      expectedState: "effect_started",
+      state: "failed",
+      resultDigest: testDigest("active actor retention failed result"),
+    });
+    const unresolvedKey = peerIdempotencyKey(key++);
+    const unresolvedMessage = "unresolved evidence retention message";
+    const unresolvedPinned = store.admitPeerSessionAction({
+      actorSessionId: first.id,
+      actorTurnId: first.activeTurnId!,
+      targetSessionId: pendingTarget.id,
+      expectedTargetRevision: pendingTarget.revision,
+      delivery: "send",
+      requestDigest: testDigest("unresolved evidence retention request"),
+      messageDigest: testDigest(unresolvedMessage),
+      reasonDigest: testDigest("unresolved evidence retention reason"),
+      idempotencyKey: unresolvedKey,
+    }).action;
+    store.prepareMutation({
+      kind: "session.send",
+      authorityId: pendingTarget.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: unresolvedMessage },
+      idempotencyKey: unresolvedKey,
+    });
+    store.beginPeerSessionActionEffect(unresolvedPinned.id);
+    store.settlePeerSessionAction({
+      actionId: unresolvedPinned.id,
+      expectedState: "effect_started",
+      state: "failed",
+      resultDigest: testDigest("unresolved evidence outer result"),
+    });
+    const pendingMessage = "unsettled retention queue";
+    const pending = store.admitPeerSessionAction({
+      actorSessionId: first.id,
+      actorTurnId: first.activeTurnId!,
+      targetSessionId: pendingTarget.id,
+      expectedTargetRevision: pendingTarget.revision,
+      delivery: "queue",
+      requestDigest: testDigest("unsettled retention request"),
+      messageDigest: testDigest(pendingMessage),
+      reasonDigest: testDigest("unsettled retention reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+      message: pendingMessage,
+    });
+    const idleFirst = store.setSessionTurnState({
+      sessionId: first.id,
+      expectedRevision: first.revision,
+      state: "idle",
+    });
+    store.setSessionTurnState({
+      sessionId: second.id,
+      expectedRevision: second.revision,
+      state: "idle",
+    });
+
+    now += PEER_SESSION_ACTION_RETAIN_AGE_MS + 1;
+    store.admitPeerSessionAction({
+      actorSessionId: maintainer.id,
+      actorTurnId: maintainer.activeTurnId!,
+      targetSessionId: idleFirst.id,
+      expectedTargetRevision: idleFirst.revision,
+      delivery: "send",
+      requestDigest: testDigest("retention maintenance request"),
+      messageDigest: testDigest("retention maintenance message"),
+      reasonDigest: testDigest("retention maintenance reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+    });
+    expect(store.requirePeerSessionAction(rootAction.id).state).toBe("applied");
+    expect(store.requirePeerSessionAction(descendant.id)).toMatchObject({
+      state: "applied",
+      parentActionIds: [rootAction.id],
+      rootActionIds: [rootAction.id],
+    });
+    expect(store.requirePeerSessionAction(pending.action.id).state).toBe("queued");
+    expect(store.requirePeerSessionAction(actorPinned.id).state).toBe("failed");
+    expect(store.requirePeerSessionAction(unresolvedPinned.id).state).toBe("failed");
+    expect(store.readMutation(unresolvedKey)).toMatchObject({ state: "prepared" });
+    expect(() => store.admitPeerSessionAction({
+      actorSessionId: third.id,
+      actorTurnId: third.activeTurnId!,
+      targetSessionId: idleFirst.id,
+      expectedTargetRevision: idleFirst.revision,
+      delivery: "send",
+      requestDigest: testDigest("retention cycle request"),
+      messageDigest: testDigest("retention cycle message"),
+      reasonDigest: testDigest("retention cycle reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+    })).toThrow("PEER_SESSION_CYCLE_REFUSED");
+
+    const idleThird = store.setSessionTurnState({
+      sessionId: third.id,
+      expectedRevision: third.revision,
+      state: "idle",
+    });
+    store.admitPeerSessionAction({
+      actorSessionId: maintainer.id,
+      actorTurnId: maintainer.activeTurnId!,
+      targetSessionId: idleThird.id,
+      expectedTargetRevision: idleThird.revision,
+      delivery: "send",
+      requestDigest: testDigest("retention closed-subgraph maintenance request"),
+      messageDigest: testDigest("retention closed-subgraph maintenance message"),
+      reasonDigest: testDigest("retention closed-subgraph maintenance reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+    });
+    expect(() => store.requirePeerSessionAction(rootAction.id)).toThrow("PEER_SESSION_NOT_FOUND");
+    expect(() => store.requirePeerSessionAction(descendant.id)).toThrow("PEER_SESSION_NOT_FOUND");
+
+    const reactivatedThird = store.setSessionTurnState({
+      sessionId: idleThird.id,
+      expectedRevision: idleThird.revision,
+      state: "active",
+      activeTurnId: third.activeTurnId!,
+    });
+    const postCompaction = store.admitPeerSessionAction({
+      actorSessionId: reactivatedThird.id,
+      actorTurnId: reactivatedThird.activeTurnId!,
+      targetSessionId: idleFirst.id,
+      expectedTargetRevision: idleFirst.revision,
+      delivery: "send",
+      requestDigest: testDigest("retention post-compaction request"),
+      messageDigest: testDigest("retention post-compaction message"),
+      reasonDigest: testDigest("retention post-compaction reason"),
+      idempotencyKey: peerIdempotencyKey(key++),
+    }).action;
+    expect(postCompaction).toMatchObject({
+      hop: 1,
+      parentActionIds: [],
+      rootActionIds: [postCompaction.id],
+    });
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths, { now: () => now });
+    stores.push(restarted);
+    expect(restarted.listUnsettledPeerSessionActions(10).map((action) => action.id))
+      .toContain(pending.action.id);
+    expect(restarted.requireQueue(pending.queue!.id)).toMatchObject({
+      messageActor: "peer_session",
+      peerActionId: pending.action.id,
+      state: "pending",
+    });
+    expect(restarted.requirePeerSessionAction(unresolvedPinned.id).state).toBe("failed");
+    expect(restarted.readMutation(unresolvedKey)).toMatchObject({ state: "prepared" });
+  });
+
+  test("never carries peer causal parents across a project boundary", async () => {
+    let now = 40_000;
+    const { store, home } = await fixture({ now: () => now });
+    const firstRoot = join(home, "peer-causal-project-a");
+    const secondRoot = join(home, "peer-causal-project-b");
+    await mkdir(firstRoot);
+    await mkdir(secondRoot);
+    const firstProject = await store.createProject("Peer causal project A", firstRoot);
+    const secondProject = await store.createProject("Peer causal project B", secondRoot);
+    const profile = signInProfile(store, "Peer causal account", "peer-causal@example.com");
+    const createSession = (
+      projectId: ProjectId,
+      state: "active" | "idle",
+      activeTurnId?: string,
+    ) => {
+      const created = createAuthorizedStartingTestSession(store, {
+        profileId: profile.id,
+        projectId,
+        preset: "high",
+        fastEnabled: false,
+      });
+      return store.setSessionTurnState({
+        sessionId: created.id,
+        expectedRevision: created.revision,
+        state,
+        ...(activeTurnId === undefined ? {} : { activeTurnId }),
+      });
+    };
+    const source = createSession(firstProject.id, "active", "turn-peer-project-source");
+    const movingBase = createSession(firstProject.id, "idle");
+    const firstAction = store.admitPeerSessionAction({
+      actorSessionId: source.id,
+      actorTurnId: source.activeTurnId!,
+      targetSessionId: movingBase.id,
+      expectedTargetRevision: movingBase.revision,
+      delivery: "send",
+      requestDigest: testDigest("first project causal request"),
+      messageDigest: testDigest("first project causal message"),
+      reasonDigest: testDigest("first project causal reason"),
+      idempotencyKey: peerIdempotencyKey(56_000),
+    }).action;
+    store.beginPeerSessionActionEffect(firstAction.id);
+    store.settlePeerSessionAction({
+      actionId: firstAction.id,
+      expectedState: "effect_started",
+      state: "applied",
+      targetTurnId: "turn-peer-project-moving",
+      resultDigest: testDigest("first project causal result"),
+    });
+    const movingActive = store.setSessionTurnState({
+      sessionId: movingBase.id,
+      expectedRevision: movingBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-project-moving",
+    });
+    expect(() => store.updateSessionMetadata({
+      sessionId: movingActive.id,
+      expectedRevision: movingActive.revision,
+      projectId: secondProject.id,
+    })).toThrow("SESSION_PROJECT_REQUIRES_IDLE");
+    const movingIdle = store.setSessionTurnState({
+      sessionId: movingActive.id,
+      expectedRevision: movingActive.revision,
+      state: "idle",
+    });
+    const moved = store.updateSessionMetadata({
+      sessionId: movingIdle.id,
+      expectedRevision: movingIdle.revision,
+      projectId: secondProject.id,
+    });
+    const reactivated = store.setSessionTurnState({
+      sessionId: moved.id,
+      expectedRevision: moved.revision,
+      state: "active",
+      activeTurnId: "turn-peer-project-moving",
+    });
+    const secondTarget = createSession(secondProject.id, "idle");
+    const secondAction = store.admitPeerSessionAction({
+      actorSessionId: reactivated.id,
+      actorTurnId: reactivated.activeTurnId!,
+      targetSessionId: secondTarget.id,
+      expectedTargetRevision: secondTarget.revision,
+      delivery: "send",
+      requestDigest: testDigest("second project causal request"),
+      messageDigest: testDigest("second project causal message"),
+      reasonDigest: testDigest("second project causal reason"),
+      idempotencyKey: peerIdempotencyKey(56_001),
+    }).action;
+    expect(secondAction).toMatchObject({
+      hop: 1,
+      parentActionIds: [],
+      projectId: secondProject.id,
+      rootActionIds: [secondAction.id],
+    });
+    store.beginPeerSessionActionEffect(secondAction.id);
+    store.settlePeerSessionAction({
+      actionId: secondAction.id,
+      expectedState: "effect_started",
+      state: "failed",
+      resultDigest: testDigest("second project causal result"),
+    });
+    store.setSessionTurnState({
+      sessionId: source.id,
+      expectedRevision: source.revision,
+      state: "idle",
+    });
+    store.setSessionTurnState({
+      sessionId: reactivated.id,
+      expectedRevision: reactivated.revision,
+      state: "idle",
+    });
+
+    now += PEER_SESSION_ACTION_RETAIN_AGE_MS + 1;
+    const maintainer = createSession(firstProject.id, "active", "turn-peer-project-maintainer");
+    const maintenanceTarget = createSession(firstProject.id, "idle");
+    store.admitPeerSessionAction({
+      actorSessionId: maintainer.id,
+      actorTurnId: maintainer.activeTurnId!,
+      targetSessionId: maintenanceTarget.id,
+      expectedTargetRevision: maintenanceTarget.revision,
+      delivery: "send",
+      requestDigest: testDigest("first project maintenance request"),
+      messageDigest: testDigest("first project maintenance message"),
+      reasonDigest: testDigest("first project maintenance reason"),
+      idempotencyKey: peerIdempotencyKey(56_002),
+    });
+    expect(() => store.requirePeerSessionAction(firstAction.id))
+      .toThrow("PEER_SESSION_NOT_FOUND");
+    expect(store.requirePeerSessionAction(secondAction.id)).toMatchObject({
+      parentActionIds: [],
+      projectId: secondProject.id,
+      rootActionIds: [secondAction.id],
+      state: "failed",
+    });
+  });
+
+  test("keeps protected peer capacity fail-closed with a seven-day aggregate-rate envelope", async () => {
+    expect(PEER_SESSION_PROJECT_HOURLY_ACTION_LIMIT * 24 * 7).toBe(20_160);
+    expect(
+      PEER_SESSION_RETAINED_ACTION_LIMIT
+        - PEER_SESSION_PROJECT_HOURLY_ACTION_LIMIT * 24 * 7,
+    ).toBe(4_840);
+
+    const { store, home } = await fixture({ now: () => 30_000 });
+    const root = join(home, "peer-retention-capacity");
+    await mkdir(root);
+    const project = await store.createProject("Peer retention capacity", root);
+    const profile = signInProfile(store, "Peer retention capacity", "peer-retention-capacity@example.com");
+    const actorBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-retention-capacity",
+    });
+    const targetBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.setSessionTurnState({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      state: "idle",
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const seed = new Database(paths.database, { create: false, strict: true });
+    const retainedQuotaSql = seed.query(
+      "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='peer_session_action_retained_quota'",
+    ).get() as { sql: string } | null;
+    expect(retainedQuotaSql?.sql).toBeString();
+    seed.exec(`
+      PRAGMA foreign_keys=ON;
+      DROP TRIGGER peer_session_action_retained_quota;
+      WITH RECURSIVE counter(value) AS (
+        SELECT 1
+        UNION ALL
+        SELECT value+1 FROM counter WHERE value<${String(PEER_SESSION_RETAINED_ACTION_LIMIT)}
+      )
+      INSERT INTO peer_session_actions(
+        id,idempotency_key,actor_session_id,actor_turn_digest,project_id,
+        actor_policy_revision,target_session_id,target_expected_revision,
+        target_policy_revision,delivery,request_digest,message_digest,reason_digest,
+        state,hop,target_turn_digest,result_digest,created_at,updated_at
+      )
+      SELECT
+        'peer_' || printf('%032x',value),
+        '30000000-0000-4000-8000-' || printf('%012x',value),
+        '${actor.id}','${testDigest(actor.activeTurnId!)}','${project.id}',
+        1,'${target.id}',${String(target.revision)},1,'send',
+        '${testDigest("capacity request")}',
+        '${testDigest("capacity message")}',
+        '${testDigest("capacity reason")}',
+        'prepared',1,NULL,NULL,1,1
+      FROM counter;
+    `);
+    seed.exec(retainedQuotaSql!.sql);
+    seed.close(false);
+    const filled = new StateStore(paths, { now: () => 30_000 });
+    stores.push(filled);
+    expect(() => filled.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "send",
+      requestDigest: testDigest("capacity refused request"),
+      messageDigest: testDigest("capacity refused message"),
+      reasonDigest: testDigest("capacity refused reason"),
+      idempotencyKey: peerIdempotencyKey(56_000),
+    })).toThrow("PEER_SESSION_RETENTION_LIMIT_REFUSED");
+  });
+
+  test("lists bounded unsettled peer and memory effects across restart for reconciliation", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "control-plane-reconciliation");
+    await mkdir(root);
+    const project = await store.createProject("Control plane reconciliation", root);
+    const profile = signInProfile(store, "Control plane reconciliation", "reconcile@example.com");
+    const actorBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-reconciliation-actor",
+    });
+    const secondRoot = join(home, "control-plane-reconciliation-second");
+    await mkdir(secondRoot);
+    const secondProject = await store.createProject(
+      "Control plane reconciliation second",
+      secondRoot,
+    );
+    const secondActor = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: secondProject.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const targetBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.setSessionTurnState({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      state: "idle",
+    });
+    const admit = (index: number, delivery: "send" | "queue") => {
+      const message = `reconciliation message ${String(index)}`;
+      return store.admitPeerSessionAction({
+        actorSessionId: actor.id,
+        actorTurnId: actor.activeTurnId!,
+        targetSessionId: target.id,
+        expectedTargetRevision: target.revision,
+        delivery,
+        requestDigest: testDigest(`reconciliation request ${String(index)}`),
+        messageDigest: testDigest(message),
+        reasonDigest: testDigest(`reconciliation reason ${String(index)}`),
+        idempotencyKey: peerIdempotencyKey(50_000 + index),
+        ...(delivery === "queue" ? { message } : {}),
+      });
+    };
+    const ambiguousPeer = admit(0, "send").action;
+    store.beginPeerSessionActionEffect(ambiguousPeer.id);
+    store.settlePeerSessionAction({
+      actionId: ambiguousPeer.id,
+      expectedState: "effect_started",
+      state: "ambiguous",
+      resultDigest: testDigest("crash observation peer"),
+    });
+    const preparedPeer = admit(1, "send").action;
+    const queuedPeer = admit(2, "queue").action;
+    const appliedPeer = admit(3, "send").action;
+    store.beginPeerSessionActionEffect(appliedPeer.id);
+    store.settlePeerSessionAction({
+      actionId: appliedPeer.id,
+      expectedState: "effect_started",
+      state: "applied",
+      targetTurnId: "turn-reconciliation-applied",
+      resultDigest: testDigest("applied peer receipt"),
+    });
+
+    const emptyHead = PROJECT_MEMORY_EMPTY_HEAD;
+    reserveTestProjectMemoryAuthority(store, project.id, emptyHead);
+    reserveTestProjectMemoryAuthority(store, secondProject.id, emptyHead);
+    const prepareMemory = (
+      index: number,
+      memoryActor = actor,
+      memoryProject = project,
+    ) => {
+      const record = store.prepareMemorySubmission({
+        actorSessionId: memoryActor.id,
+        projectId: memoryProject.id,
+        kind: "remember",
+        requestDigest: testDigest(`memory reconciliation request ${String(index)}`),
+        contentDigest: testDigest(`memory reconciliation content ${String(index)}`),
+        keyDigest: testDigest(`memory reconciliation key ${String(index)}`),
+        workingBindingDigest: testDigest("memory reconciliation working binding"),
+        workingEpoch: 1,
+        expectedHead: emptyHead,
+        idempotencyKey: peerIdempotencyKey(51_000 + index),
+      }).record;
+      return store.bindMemorySubmissionEffect({
+        submissionId: record.id,
+        effectRecordSha256: testDigest(`memory reconciliation record ${String(index)}`),
+        attestationSha256: testDigest(`memory reconciliation attestation ${String(index)}`),
+        operationId: `memory_reconciliation_${String(index)}`,
+      });
+    };
+    const ambiguousMemory = prepareMemory(0);
+    store.beginMemorySubmission(ambiguousMemory.id);
+    store.settleMemorySubmission({
+      submissionId: ambiguousMemory.id,
+      expectedState: "effect_started",
+      state: "ambiguous",
+    });
+    expect(() => prepareMemory(1)).toThrow("MEMORY_RECOVERY_REQUIRED");
+    const preparedMemory = prepareMemory(1, secondActor, secondProject);
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths);
+    stores.push(restarted);
+    expect(restarted.listUnsettledPeerSessionActions(1).map((action) => action.id))
+      .toEqual([ambiguousPeer.id]);
+    expect(restarted.listUnsettledPeerSessionActions(3).map((action) => action.id))
+      .toEqual([ambiguousPeer.id, preparedPeer.id, queuedPeer.id]);
+    expect(restarted.listUnsettledMemorySubmissions(1).map((submission) => submission.id))
+      .toEqual([ambiguousMemory.id]);
+    expect(restarted.listUnsettledMemorySubmissions(2).map((submission) => submission.id))
+      .toEqual([ambiguousMemory.id, preparedMemory.id]);
+    expect(restarted.settlePeerSessionAction({
+      actionId: ambiguousPeer.id,
+      expectedState: "ambiguous",
+      state: "failed",
+    }).state).toBe("failed");
+    expect(restarted.settleMemorySubmission({
+      submissionId: ambiguousMemory.id,
+      expectedState: "ambiguous",
+      state: "failed",
+      outcomeCode: "remember_not_applied",
+    }).state).toBe("failed");
+    expect(() => restarted.listUnsettledPeerSessionActions(0)).toThrow();
+    expect(() => restarted.listUnsettledMemorySubmissions(
+      CONTROL_PLANE_RECONCILIATION_BATCH_LIMIT + 1,
+    )).toThrow();
+  });
+
+  test("revalidates direct peer authority at replay and begin and joins its nested mutation exactly", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "peer-begin-authority");
+    await mkdir(root);
+    const project = await store.createProject("Peer begin authority", root);
+    const profile = signInProfile(store, "Peer begin authority", "peer-begin@example.com");
+    const actorBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-begin",
+    });
+    const targetBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.setSessionTurnState({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      state: "idle",
+    });
+    const key = peerIdempotencyKey(52_000);
+    const request = {
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "send" as const,
+      requestDigest: testDigest("peer begin request"),
+      messageDigest: testDigest("peer begin message"),
+      reasonDigest: testDigest("peer begin reason"),
+      idempotencyKey: key,
+    };
+    const action = store.admitPeerSessionAction(request).action;
+    expect(() => store.prepareMutation({
+      kind: "session.send",
+      authorityId: target.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: "different peer begin message" },
+      idempotencyKey: key,
+    })).toThrow("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
+    expect(store.readMutation(key)).toBeNull();
+    expect(store.requirePeerSessionAction(action.id).state).toBe("prepared");
+    const attempt = store.prepareMutation({
+      kind: "session.send",
+      authorityId: target.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: "peer begin message" },
+      idempotencyKey: key,
+    });
+    expect(() => store.beginSessionMutationEffect({
+      attemptId: attempt.id,
+      sessionId: target.id,
+      profileGeneration: profile.processGeneration,
+      message: "different peer begin message",
+      evidence: {
+        kind: "session.send",
+        providerThreadId: "thread-peer-begin-authority",
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: attempt.id,
+        messageDigest: testDigest("different peer begin message"),
+        runtimeProfile: codexRuntimeProfile(profile),
+        messageActor: "peer_session",
+      },
+    })).toThrow("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
+    expect(store.readMutation(key)?.state).toBe("prepared");
+    expect(store.readMutation(key)?.evidence).toBeUndefined();
+    expect(store.requirePeerSessionAction(action.id).state).toBe("prepared");
+    expect(store.readPeerSessionDirectMessageSource(key)).not.toBeNull();
+    expect(store.readPeerSessionMutationJoin(key)).toMatchObject({
+      action: { id: action.id },
+      attempt: { id: attempt.id },
+    });
+
+    const steerTargetBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const steerTarget = store.bindSession({
+      sessionId: steerTargetBase.id,
+      expectedRevision: steerTargetBase.revision,
+      providerThreadId: "thread-peer-begin-steer",
+      state: "active",
+      activeTurnId: "turn-peer-begin-steer",
+    });
+    const steerMessage = "peer steer message";
+    const steerMismatch = "different peer steer message";
+    const steerKey = peerIdempotencyKey(52_002);
+    const steerAction = store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: steerTarget.id,
+      expectedTargetRevision: steerTarget.revision,
+      delivery: "steer",
+      requestDigest: testDigest("peer steer request"),
+      messageDigest: testDigest(steerMessage),
+      reasonDigest: testDigest("peer steer reason"),
+      idempotencyKey: steerKey,
+    }).action;
+    expect(() => store.prepareMutation({
+      kind: "session.steer",
+      authorityId: steerTarget.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: steerMismatch },
+      idempotencyKey: steerKey,
+    })).toThrow("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
+    const steerAttempt = store.prepareMutation({
+      kind: "session.steer",
+      authorityId: steerTarget.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: steerMessage },
+      idempotencyKey: steerKey,
+    });
+    expect(() => store.beginSessionMutationEffect({
+      attemptId: steerAttempt.id,
+      sessionId: steerTarget.id,
+      profileGeneration: profile.processGeneration,
+      message: steerMismatch,
+      evidence: {
+        kind: "session.steer",
+        providerThreadId: "thread-peer-begin-steer",
+        baseline: {
+          providerUpdatedAt: null,
+          status: "active",
+          activeTurnId: "turn-peer-begin-steer",
+        },
+        activeTurnId: "turn-peer-begin-steer",
+        clientMessageId: steerAttempt.id,
+        messageDigest: testDigest(steerMismatch),
+        messageActor: "peer_session",
+      },
+    })).toThrow("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
+    expect(store.readMutation(steerKey)?.state).toBe("prepared");
+    expect(store.readMutation(steerKey)?.evidence).toBeUndefined();
+    expect(store.requirePeerSessionAction(steerAction.id).state).toBe("prepared");
+
+    const queueTargetBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const queueTarget = store.bindSession({
+      sessionId: queueTargetBase.id,
+      expectedRevision: queueTargetBase.revision,
+      providerThreadId: "thread-peer-begin-queue",
+      state: "idle",
+    });
+    const queueMessage = "peer queue message";
+    const queueMismatch = "different peer queue message";
+    const queued = store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: queueTarget.id,
+      expectedTargetRevision: queueTarget.revision,
+      delivery: "queue",
+      requestDigest: testDigest("peer queue request"),
+      messageDigest: testDigest(queueMessage),
+      reasonDigest: testDigest("peer queue reason"),
+      idempotencyKey: peerIdempotencyKey(52_003),
+      message: queueMessage,
+    });
+    expect(() => store.beginQueueEffect({
+      queueId: queued.queue!.id,
+      sessionId: queueTarget.id,
+      profileGeneration: profile.processGeneration,
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: queued.queue!.id,
+        sessionId: queueTarget.id,
+        providerThreadId: "thread-peer-begin-queue",
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: queued.queue!.id,
+        messageDigest: testDigest(queueMismatch),
+        runtimeProfile: codexRuntimeProfile(profile),
+      },
+    })).toThrow("QUEUE_EFFECT_AUTHORITY_CHANGED");
+    expect(store.requireQueue(queued.queue!.id).state).toBe("pending");
+    expect(store.readQueueEffect(queued.queue!.id)).toBeNull();
+    expect(store.requirePeerSessionAction(queued.action.id).state).toBe("queued");
+
+    // Model a pre-fix/corrupt join whose queue still holds A but whose action
+    // digest claims B. The action/evidence comparison must fail independently
+    // of the queue/body comparison and roll the evidence insert back.
+    const queueCorruptor = new Database(store.paths.database, { create: false, strict: true });
+    const transitionTrigger = z.object({ sql: z.string() }).strict().parse(
+      queueCorruptor.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='peer_session_action_transition_guard'",
+      ).get(),
+    );
+    queueCorruptor.exec("DROP TRIGGER peer_session_action_transition_guard");
+    queueCorruptor.query(
+      "UPDATE peer_session_actions SET message_digest=? WHERE id=?",
+    ).run(testDigest(queueMismatch), queued.action.id);
+    queueCorruptor.exec(transitionTrigger.sql);
+    queueCorruptor.close(false);
+    expect(() => store.beginQueueEffect({
+      queueId: queued.queue!.id,
+      sessionId: queueTarget.id,
+      profileGeneration: profile.processGeneration,
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: queued.queue!.id,
+        sessionId: queueTarget.id,
+        providerThreadId: "thread-peer-begin-queue",
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: queued.queue!.id,
+        messageDigest: testDigest(queueMessage),
+        runtimeProfile: codexRuntimeProfile(profile),
+      },
+    })).toThrow("QUEUE_PEER_ACTION_AUTHORITY_CHANGED");
+    expect(store.requireQueue(queued.queue!.id).state).toBe("pending");
+    expect(store.readQueueEffect(queued.queue!.id)).toBeNull();
+    expect(store.requirePeerSessionAction(queued.action.id).state).toBe("queued");
+
+    const mismatchedSteerEvidence = {
+      kind: "session.steer" as const,
+      providerThreadId: "thread-peer-begin-steer",
+      baseline: {
+        providerUpdatedAt: null,
+        status: "active" as const,
+        activeTurnId: "turn-peer-begin-steer",
+      },
+      activeTurnId: "turn-peer-begin-steer",
+      clientMessageId: steerAttempt.id,
+      messageDigest: testDigest(steerMismatch),
+      messageActor: "peer_session" as const,
+    };
+    const mismatchedCanonical = JSON.stringify(mismatchedSteerEvidence);
+    const joinInjector = new Database(store.paths.database, { create: false, strict: true });
+    joinInjector.query(
+      `INSERT INTO mutation_effect_evidence(
+         attempt_id,kind,evidence_json,evidence_digest,recorded_at
+       ) VALUES (?,?,?,?,?)`,
+    ).run(
+      steerAttempt.id,
+      "session.steer",
+      mismatchedCanonical,
+      testDigest(mismatchedCanonical),
+      2_000,
+    );
+    joinInjector.query(
+      "UPDATE mutation_attempts SET state='effect_started' WHERE id=? AND state='prepared'",
+    ).run(steerAttempt.id);
+    joinInjector.close(false);
+    expect(() => store.readPeerSessionMutationJoin(steerKey))
+      .toThrow("PEER_SESSION_MUTATION_JOIN_INVALID");
+    expect(store.requirePeerSessionAction(steerAction.id).state).toBe("prepared");
+
+    expect(store.beginPeerSessionActionEffect(action.id).state).toBe("effect_started");
+    // A crash after the outer begin but before the exact same-key nested begin
+    // is resumable without rewriting either ledger.
+    expect(store.beginPeerSessionActionEffect(action.id).state).toBe("effect_started");
+    store.settlePeerSessionAction({
+      actionId: action.id,
+      expectedState: "effect_started",
+      state: "ambiguous",
+    });
+    expect(store.beginPeerSessionActionEffect(action.id).state).toBe("ambiguous");
+    const crashInjector = new Database(store.paths.database, { create: false, strict: true });
+    crashInjector.query(
+      "UPDATE mutation_attempts SET state='effect_started' WHERE id=? AND state='prepared'",
+    ).run(attempt.id);
+    crashInjector.close(false);
+    expect(() => store.beginPeerSessionActionEffect(action.id))
+      .toThrow("PEER_SESSION_NESTED_MUTATION_NOT_RESUMABLE");
+    store.setPeerSessionPolicy({
+      sessionId: target.id,
+      expectedRevision: 1,
+      mode: "inspect",
+    });
+    expect(() => store.admitPeerSessionAction(request))
+      .toThrow("PEER_SESSION_POLICY_REVISION_CONFLICT");
+    expect(() => store.beginPeerSessionActionEffect(action.id))
+      .toThrow("PEER_SESSION_POLICY_REVISION_CONFLICT");
+    expect(store.requirePeerSessionAction(action.id).state).toBe("ambiguous");
+  });
+
+  test("retains direct peer attribution through compaction and cancels provably unstarted joins", async () => {
+    let now = 40_000;
+    const { store, home } = await fixture({ now: () => now++ });
+    const root = join(home, "peer-direct-retention");
+    await mkdir(root);
+    const project = await store.createProject("Peer direct retention", root);
+    const profile = signInProfile(store, "Peer direct retention", "peer-direct@example.com");
+    const actorBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    let actor: SessionRecord = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-direct-origin",
+    });
+    const createTarget = (thread: string) => {
+      const created = createAuthorizedStartingTestSession(store, {
+        profileId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fastEnabled: false,
+      });
+      return store.bindSession({
+        sessionId: created.id,
+        expectedRevision: created.revision,
+        providerThreadId: thread,
+        state: "idle",
+      });
+    };
+    const target = createTarget("thread-peer-direct-retained");
+    const message = "retained peer message";
+    const key = peerIdempotencyKey(72_000);
+    const request = {
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "send" as const,
+      requestDigest: testDigest("retained peer request"),
+      messageDigest: testDigest(message),
+      reasonDigest: testDigest("retained peer reason"),
+      idempotencyKey: key,
+    };
+    const action = store.admitPeerSessionAction(request).action;
+    const attempt = store.prepareMutation({
+      kind: "session.send",
+      authorityId: target.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message },
+      idempotencyKey: key,
+    });
+    const runtime = codexRuntimeProfile(profile);
+    const evidence = store.beginSessionMutationEffect({
+      attemptId: attempt.id,
+      sessionId: target.id,
+      profileGeneration: profile.processGeneration,
+      message,
+      evidence: {
+        kind: "session.send",
+        providerThreadId: "thread-peer-direct-retained",
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: attempt.id,
+        messageDigest: testDigest(message),
+        runtimeProfile: runtime,
+      },
+    });
+    expect(evidence.evidence).toMatchObject({ messageActor: "peer_session" });
+    expect(store.requirePeerSessionAction(action.id).state).toBe("effect_started");
+    expect(store.readPeerSessionDirectMessageSource(key)).toBeNull();
+    const appended = store.completeSessionTurnEffect({
+      attemptId: attempt.id,
+      sessionId: target.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      expectedSessionRevision: target.revision,
+      applyResponseState: false,
+      turnId: "turn-peer-direct-target",
+      turnStatus: "completed",
+      runtimeProfile: runtime,
+      message,
+      receipt: { turnId: "turn-peer-direct-target" },
+    });
+    expect(appended.event.body).toMatchObject({
+      type: "user_message",
+      actor: "peer_session",
+      text: message,
+    });
+    store.settlePeerSessionAction({
+      actionId: action.id,
+      expectedState: "effect_started",
+      state: "applied",
+      targetTurnId: "turn-peer-direct-target",
+      resultDigest: testDigest("retained peer result"),
+    });
+
+    actor = store.setSessionTurnState({
+      sessionId: actor.id,
+      expectedRevision: actor.revision,
+      state: "idle",
+    });
+    actor = store.setSessionTurnState({
+      sessionId: actor.id,
+      expectedRevision: actor.revision,
+      state: "active",
+      activeTurnId: "turn-peer-direct-next",
+    });
+    now += PEER_SESSION_ACTION_RETAIN_AGE_MS + 1;
+    const cleanupMessage = "new peer message";
+    store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "send",
+      requestDigest: testDigest("new peer request"),
+      messageDigest: testDigest(cleanupMessage),
+      reasonDigest: testDigest("new peer reason"),
+      idempotencyKey: peerIdempotencyKey(72_001),
+    });
+    expect(() => store.requirePeerSessionAction(action.id)).toThrow("PEER_SESSION_NOT_FOUND");
+    expect(store.sessionMessageActorForSource(target.id, attempt.id)).toBe("peer_session");
+    expect(store.readPeerSessionMutationJoin(key)).toMatchObject({
+      action: null,
+      attempt: { id: attempt.id, state: "applied" },
+    });
+    expect(() => store.admitPeerSessionAction(request))
+      .toThrow("PEER_SESSION_IDEMPOTENCY_CONFLICT");
+
+    const crashTarget = createTarget("thread-peer-direct-crash");
+    const crashKey = peerIdempotencyKey(72_002);
+    const crashAction = store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: crashTarget.id,
+      expectedTargetRevision: crashTarget.revision,
+      delivery: "send",
+      requestDigest: testDigest("crash peer request"),
+      messageDigest: testDigest("crash peer message"),
+      reasonDigest: testDigest("crash peer reason"),
+      idempotencyKey: crashKey,
+    }).action;
+    store.beginPeerSessionActionEffect(crashAction.id);
+    store.settlePeerSessionAction({
+      actionId: crashAction.id,
+      expectedState: "effect_started",
+      state: "ambiguous",
+    });
+    store.updateSessionMetadata({
+      sessionId: crashTarget.id,
+      expectedRevision: crashTarget.revision,
+      note: "revision moved before provider dispatch",
+    });
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths, { now: () => now++ });
+    stores.push(restarted);
+    const cancelled = restarted.cancelUnstartedPeerSessionDirectAction({
+      actionId: crashAction.id,
+      diagnosticCode: "PEER_SESSION_PROVIDER_EFFECT_NOT_STARTED",
+    });
+    expect(cancelled.state).toBe("cancelled");
+    expect(restarted.readMutation(crashKey)).toMatchObject({
+      state: "cancelled",
+      result: { providerEffectStarted: false },
+    });
+    expect(restarted.readPeerSessionDirectMessageSource(crashKey)).toBeNull();
+    expect(restarted.cancelUnstartedPeerSessionDirectAction({
+      actionId: crashAction.id,
+      diagnosticCode: "PEER_SESSION_PROVIDER_EFFECT_NOT_STARTED",
+    })).toEqual(cancelled);
+
+    const preparedBase = restarted.createSession({
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const preparedTarget = restarted.bindSession({
+      sessionId: preparedBase.id,
+      expectedRevision: preparedBase.revision,
+      providerThreadId: "thread-peer-direct-prepared",
+      state: "idle",
+    });
+    const preparedKey = peerIdempotencyKey(72_003);
+    const preparedAction = restarted.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: preparedTarget.id,
+      expectedTargetRevision: preparedTarget.revision,
+      delivery: "send",
+      requestDigest: testDigest("prepared peer envelope"),
+      messageDigest: testDigest("prepared peer message"),
+      reasonDigest: testDigest("prepared peer reason"),
+      idempotencyKey: preparedKey,
+    }).action;
+    restarted.prepareMutation({
+      kind: "session.send",
+      authorityId: preparedTarget.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: "prepared peer message" },
+      idempotencyKey: preparedKey,
+    });
+    restarted.beginPeerSessionActionEffect(preparedAction.id);
+    expect(restarted.cancelUnstartedPeerSessionDirectAction({
+      actionId: preparedAction.id,
+      diagnosticCode: "PEER_SESSION_PROVIDER_EFFECT_NOT_STARTED",
+    }).state).toBe("cancelled");
+    expect(restarted.readMutation(preparedKey)?.state).toBe("cancelled");
+  });
+
+  test("requires peer queue effect evidence and quarantines missing-evidence restart state", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "peer-queue-evidence");
+    await mkdir(root);
+    const project = await store.createProject("Peer queue evidence", root);
+    const profile = signInProfile(store, "Peer queue evidence", "peer-queue-evidence@example.com");
+    const actorBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-peer-queue-evidence",
+    });
+    const targetBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = store.bindSession({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      providerThreadId: "thread-peer-queue-evidence",
+      state: "idle",
+    });
+    const message = "evidence must precede dispatch";
+    const admitted = store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: target.id,
+      expectedTargetRevision: target.revision,
+      delivery: "queue",
+      requestDigest: testDigest("peer queue evidence request"),
+      messageDigest: testDigest(message),
+      reasonDigest: testDigest("peer queue evidence reason"),
+      idempotencyKey: peerIdempotencyKey(52_001),
+      message,
+    });
+    expect(() => store.transitionQueue(admitted.queue!.id, "pending", "dispatching"))
+      .toThrow("PEER_QUEUE_EFFECT_EVIDENCE_REQUIRED");
+    const injector = new Database(store.paths.database, { create: false, strict: true });
+    const evidenceGuardSql = injector.query(
+      "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='queue_peer_effect_evidence_guard'",
+    ).get() as { sql: string } | null;
+    expect(evidenceGuardSql?.sql).toBeString();
+    injector.exec("PRAGMA foreign_keys=ON; DROP TRIGGER queue_peer_effect_evidence_guard;");
+    injector.query("UPDATE queue_entries SET state='dispatching' WHERE id=?")
+      .run(admitted.queue!.id);
+    injector.exec(evidenceGuardSql!.sql);
+    injector.close(false);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths);
+    stores.push(restarted);
+    expect(restarted.recoverDispatchingQueueEffects()).toEqual({
+      recovered: [],
+      unresolved: [admitted.queue!.id],
+    });
+    expect(restarted.requireQueue(admitted.queue!.id).state).toBe("ambiguous");
+    expect(restarted.requirePeerSessionAction(admitted.action.id).state).toBe("ambiguous");
+    expect(restarted.requireSession(target.id).state).toBe("recovery_required");
+  });
+
+  test("atomically advances only share memory heads and recovers started control effects with cursors", async () => {
+    const { store, home } = await fixture({ now: () => 7_000 });
+    const root = join(home, "memory-control-cas");
+    await mkdir(root);
+    const project = await store.createProject("Memory control CAS", root);
+    const profile = signInProfile(store, "Memory control CAS", "memory-control@example.com");
+    const actorBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const actor = store.setSessionTurnState({
+      sessionId: actorBase.id,
+      expectedRevision: actorBase.revision,
+      state: "active",
+      activeTurnId: "turn-memory-control",
+    });
+    const head = PROJECT_MEMORY_EMPTY_HEAD;
+    reserveTestProjectMemoryAuthority(store, project.id, head);
+    const remember = store.prepareMemorySubmission({
+      actorSessionId: actor.id,
+      projectId: project.id,
+      kind: "remember",
+      requestDigest: testDigest("remember request"),
+      contentDigest: testDigest("remember content"),
+      keyDigest: testDigest("remember key"),
+      workingBindingDigest: testDigest("memory control working binding"),
+      workingEpoch: 1,
+      expectedHead: head,
+      idempotencyKey: peerIdempotencyKey(52_002),
+    }).record;
+    store.bindMemorySubmissionEffect({
+      submissionId: remember.id,
+      effectRecordSha256: testDigest("memory control remember record"),
+      attestationSha256: testDigest("memory control remember attestation"),
+      operationId: "memory_control_remember",
+    });
+    store.beginMemorySubmission(remember.id);
+    const advancedHead = {
+      sequence: 1,
+      operationSha256: testDigest("share operation"),
+      headDigest: testDigest("share head"),
+    } as const;
+    const skippedHead = {
+      sequence: 2,
+      operationSha256: testDigest("skipped remember operation"),
+      headDigest: testDigest("skipped remember head"),
+    } as const;
+    expect(() => store.settleMemorySubmission({
+      submissionId: remember.id,
+      expectedState: "effect_started",
+      state: "applied",
+      outcomeCode: "remember_committed",
+      resultHead: skippedHead,
+      receiptDigest: testDigest("remember receipt"),
+    })).toThrow("MEMORY_SUBMISSION_OUTCOME_STATE_MISMATCH");
+    expect(store.readProjectMemoryAuthority(project.id)?.head).toEqual(head);
+    expect(store.settleMemorySubmission({
+      submissionId: remember.id,
+      expectedState: "effect_started",
+      state: "applied",
+      outcomeCode: "remember_committed",
+      resultHead: advancedHead,
+      receiptDigest: testDigest("remember receipt"),
+    })).toMatchObject({ state: "applied", resultHead: advancedHead });
+    expect(store.readProjectMemoryAuthority(project.id)?.head).toEqual(head);
+    const share = store.prepareMemorySubmission({
+      actorSessionId: actor.id,
+      projectId: project.id,
+      kind: "share",
+      requestDigest: testDigest("share request"),
+      contentDigest: remember.contentDigest,
+      keyDigest: remember.keyDigest,
+      workingBindingDigest: testDigest("memory control working binding"),
+      workingEpoch: 1,
+      expectedHead: head,
+      idempotencyKey: peerIdempotencyKey(52_003),
+    }).record;
+    store.bindMemorySubmissionEffect({
+      submissionId: share.id,
+      effectRecordSha256: testDigest("memory control remember record"),
+      attestationSha256: testDigest("memory control remember attestation"),
+      operationId: "memory_adopt_control_share",
+      sourceHead: advancedHead,
+      nominationSha256: testDigest("memory control nomination"),
+    });
+    store.beginMemorySubmission(share.id);
+    expect(store.recoverStartedControlPlaneEffects()).toEqual({
+      peerActionIds: [],
+      memorySubmissionIds: [share.id],
+    });
+    expect(() => store.beginMemorySubmission(
+      share.id,
+      peerIdempotencyKey(99_999),
+    )).toThrow("MEMORY_SUBMISSION_IDEMPOTENCY_CONFLICT");
+    expect(store.beginMemorySubmission(share.id, share.idempotencyKey).state)
+      .toBe("ambiguous");
+    expect(store.listUnsettledMemorySubmissionsPage({ limit: 1 }).records).toHaveLength(1);
+    store.settleMemorySubmission({
+      submissionId: share.id,
+      expectedState: "ambiguous",
+      state: "applied",
+      outcomeCode: "share_adopted",
+      resultHead: advancedHead,
+      receiptDigest: testDigest("share receipt"),
+    });
+    expect(store.readProjectMemoryAuthority(project.id)).toMatchObject({
+      head: advancedHead,
+      syncState: "local_only",
+    });
+  });
+
+  test("transactionally fences memory preparation and effect start by actor lifecycle", async () => {
+    const { store, home } = await fixture({ now: () => 7_100 });
+    const profile = signInProfile(store, "Memory actor lifecycle", "memory-lifecycle@example.com");
+    let key = 53_000;
+    const actorFor = async (
+      label: string,
+      state: "idle" | "recovery_required" | "terminal",
+    ) => {
+      const root = join(home, `memory-actor-${label}`);
+      await mkdir(root);
+      const project = await store.createProject(`Memory actor ${label}`, root);
+      const created = createAuthorizedStartingTestSession(store, {
+        fastEnabled: false,
+        preset: "high",
+        profileId: profile.id,
+        projectId: project.id,
+      });
+      const actor = state === "recovery_required"
+        ? store.quarantineSession(created.id)
+        : store.setSessionTurnState({
+            expectedRevision: created.revision,
+            sessionId: created.id,
+            state,
+          });
+      return { actor, project };
+    };
+    const submissionInput = (
+      actor: SessionRecord,
+      project: ProjectRecord,
+      label: string,
+    ) => ({
+      actorSessionId: actor.id,
+      contentDigest: testDigest(`${label} content`),
+      expectedHead: PROJECT_MEMORY_EMPTY_HEAD,
+      idempotencyKey: peerIdempotencyKey(key++),
+      keyDigest: testDigest(`${label} key`),
+      kind: "remember" as const,
+      projectId: project.id,
+      requestDigest: testDigest(`${label} request`),
+      workingBindingDigest: testDigest(`${label} working binding`),
+      workingEpoch: 1,
+    });
+
+    const terminalPrepare = await actorFor("terminal-prepare", "terminal");
+    expect(() => store.prepareMemorySubmission(submissionInput(
+      terminalPrepare.actor,
+      terminalPrepare.project,
+      "terminal prepare",
+    ))).toThrow("MEMORY_SUBMISSION_ACTOR_TERMINAL");
+
+    const recoveryPrepare = await actorFor("recovery-prepare", "recovery_required");
+    expect(() => store.prepareMemorySubmission(submissionInput(
+      recoveryPrepare.actor,
+      recoveryPrepare.project,
+      "recovery prepare",
+    ))).toThrow("MEMORY_SUBMISSION_ACTOR_RECOVERY_REQUIRED");
+
+    for (const terminalState of ["terminal", "recovery_required"] as const) {
+      const selected = await actorFor(`${terminalState}-begin`, "idle");
+      const prepared = store.prepareMemorySubmission(submissionInput(
+        selected.actor,
+        selected.project,
+        `${terminalState} begin`,
+      )).record;
+      store.bindMemorySubmissionEffect({
+        attestationSha256: testDigest(`${terminalState} begin attestation`),
+        effectRecordSha256: testDigest(`${terminalState} begin record`),
+        operationId: `${terminalState}_begin_operation`,
+        submissionId: prepared.id,
+      });
+      const current = store.requireSession(selected.actor.id);
+      if (terminalState === "terminal") {
+        store.setSessionTurnState({
+          expectedRevision: current.revision,
+          sessionId: current.id,
+          state: "terminal",
+        });
+      } else {
+        store.quarantineSession(current.id);
+      }
+      expect(() => store.beginMemorySubmission(prepared.id, prepared.idempotencyKey))
+        .toThrow(terminalState === "terminal"
+          ? "MEMORY_SUBMISSION_ACTOR_TERMINAL"
+          : "MEMORY_SUBMISSION_ACTOR_RECOVERY_REQUIRED");
+      expect(store.requireMemorySubmission(prepared.id).state).toBe("prepared");
+    }
+  });
+
+  test("makes a rejected project-memory reservation durable and terminal", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "rejected-project-memory");
+    await mkdir(root);
+    const project = await store.createProject("Rejected memory", root);
+    const identity = createPortableProjectMemoryCanonicalIdentity(project.id);
+    const reserved = store.reserveProjectMemoryAuthority({
+      canonicalSpaceId: identity.canonicalSpaceId,
+      head: PROJECT_MEMORY_EMPTY_HEAD,
+      identityContract: identity.identityContract,
+      projectId: project.id,
+    });
+    const rejected = store.rejectReservedProjectMemoryAuthority({
+      diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
+      expectedHead: reserved.head,
+      expectedRevision: reserved.revision,
+      projectId: project.id,
+    });
+    expect(rejected).toMatchObject({
+      diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
+      physicalState: "rejected",
+      revision: 2,
+      syncState: "error",
+    });
+    expect(store.rejectReservedProjectMemoryAuthority({
+      diagnosticCode: "MEMORY_CANONICAL_DIVERGED",
+      expectedHead: reserved.head,
+      expectedRevision: reserved.revision,
+      projectId: project.id,
+    })).toEqual(rejected);
+    expect(() => store.markProjectMemoryAuthorityInitialized({
+      expectedHead: reserved.head,
+      expectedRevision: rejected.revision,
+      projectId: project.id,
+    })).toThrow("PROJECT_MEMORY_REVISION_CONFLICT");
+
+    const writer = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(() => writer.query(
+        `UPDATE project_memory_authorities
+         SET physical_state='initialized',initialized_at=updated_at,
+             sync_state='local_only',diagnostic_code=NULL,revision=revision+1
+         WHERE project_id=?`,
+      ).run(project.id)).toThrow();
+    } finally {
+      writer.close(false);
+    }
+    expect(store.readProjectMemoryAuthority(project.id)).toEqual(rejected);
+  });
+
+  test("rejects a pre-portable memory lookalike stamped as current without repairing it", async () => {
+    const { store, home } = await fixture();
+    const root = join(home, "legacy-project-memory-identity");
+    await mkdir(root);
+    const project = await store.createProject("Legacy memory identity", root);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacyIdentity = deriveProjectMemoryCanonicalIdentity({
+      canonicalSpaceId: legacyProjectMemorySpaceId(project.id),
+      identityContract: 1,
+      projectId: project.id,
+    });
+    const emptyHead = PROJECT_MEMORY_EMPTY_HEAD;
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    const currentSql = z.object({ sql: z.string() }).strict().parse(legacy.query(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='project_memory_authorities'",
+    ).get()).sql;
+    const identityStart = currentSql.indexOf(",\n  identity_contract");
+    const authorityStart = currentSql.indexOf(",\n  authority_digest", identityStart);
+    if (identityStart < 0 || authorityStart < 0) {
+      throw new Error("Expected the portable identity columns in the current fixture.");
+    }
+    const legacySql = (currentSql.slice(0, identityStart) + currentSql.slice(authorityStart))
+      .replace(
+        ",\n  CHECK((physical_state='initialized') = (initialized_at IS NOT NULL))",
+        "",
+      )
+      .replace(
+        ",\n  CHECK(initialized_at IS NULL OR (initialized_at >= created_at AND initialized_at <= updated_at))",
+        "",
+      )
+      .replace(
+        `,\n  CHECK(head_sequence != 0 OR head_digest = '${PROJECT_MEMORY_EMPTY_HEAD.headDigest}')`,
+        "",
+      )
+      .replace(
+        `,\n  CHECK(\n    last_exchange_sequence IS NULL\n    OR last_exchange_sequence != 0\n    OR last_exchange_head_digest = '${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'\n  )`,
+        "",
+      )
+      .replace(
+        `,\n  CHECK(\n    physical_state!='reserved'\n    OR (\n      head_sequence=0\n      AND head_operation_sha256 IS NULL\n      AND head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'\n      AND sync_state='local_only'\n      AND last_exchange_at IS NULL\n      AND last_exchange_sequence IS NULL\n      AND last_exchange_operation_sha256 IS NULL\n      AND last_exchange_head_digest IS NULL\n      AND diagnostic_code IS NULL\n    )\n  )`,
+        "",
+      )
+      .replace(
+        `,\n  CHECK(\n    physical_state!='rejected'\n    OR (\n      initialized_at IS NULL\n      AND head_sequence=0\n      AND head_operation_sha256 IS NULL\n      AND head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'\n      AND sync_state='error'\n      AND last_exchange_at IS NULL\n      AND last_exchange_sequence IS NULL\n      AND last_exchange_operation_sha256 IS NULL\n      AND last_exchange_head_digest IS NULL\n      AND diagnostic_code IS NOT NULL\n    )\n  )`,
+        "",
+      );
+    legacy.exec(`
+      PRAGMA foreign_keys=OFF;
+      DROP TRIGGER IF EXISTS memory_page_attestation_ref_insert_guard;
+      DROP TRIGGER IF EXISTS memory_page_attestation_ref_update_guard;
+      DROP TRIGGER IF EXISTS project_memory_authority_delete_guard;
+      DROP TRIGGER IF EXISTS project_memory_authority_insert_guard;
+      DROP TRIGGER IF EXISTS project_memory_authority_transition_guard;
+      DROP INDEX IF EXISTS project_memory_authorities_space_unique;
+      DROP TABLE project_memory_authorities;
+    `);
+    legacy.exec(legacySql);
+    legacy.query(
+      `INSERT INTO project_memory_authorities(
+         project_id,authority_digest,binding_digest,head_sequence,
+         head_operation_sha256,head_digest,revision,sync_state,
+         last_exchange_at,last_exchange_sequence,last_exchange_operation_sha256,
+         last_exchange_head_digest,diagnostic_code,created_at,updated_at
+       ) VALUES (?,?,?,?,?,?,1,'local_only',NULL,NULL,NULL,NULL,NULL,?,?)`,
+    ).run(
+      project.id,
+      legacyIdentity.authorityDigest,
+      legacyIdentity.bindingDigest,
+      emptyHead.sequence,
+      emptyHead.operationSha256,
+      emptyHead.headDigest,
+      4_000,
+      4_000,
+    );
+    legacy.exec("PRAGMA foreign_keys=ON");
+    legacy.close(false);
+
+    const corrupted = new Database(paths.database, { create: false, strict: true });
+    corrupted.query(
+      "UPDATE project_memory_authorities SET head_digest=? WHERE project_id=?",
+    ).run("c".repeat(64), project.id);
+    corrupted.close(false);
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+    expect(() => new StateStore(paths, { now: () => 8_000 }))
+      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+    const unchanged = new Database(paths.database, { create: false, readonly: true, strict: true });
+    expect(unchanged.query<{ name: string }, []>(
+      "SELECT name FROM pragma_table_info('project_memory_authorities') WHERE name='identity_contract'",
+    ).get()).toBeNull();
+    expect(unchanged.query(
+      "SELECT head_digest FROM project_memory_authorities WHERE project_id=?",
+    ).get(project.id)).toEqual({ head_digest: "c".repeat(64) });
+    unchanged.close(false);
+  });
+
+  test("upgrades an exact upstream v39 schema through adoption, peer, and hosted state", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Upstream v39 peer migration",
+      "upstream-v39@example.com",
+    );
+    const session = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const queue = store.enqueue(session.id, "legacy human queue");
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    downgradeToExactProviderVersion39(legacy);
+    dropPeerAndHostedMemorySchema(legacy);
+    legacy.close(false);
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:42");
+    const migrated = new StateStore(paths, { now: () => 9_000 });
+    stores.push(migrated);
+    expect(migrated.requireQueue(queue.id)).toMatchObject({
+      message: "[queue message removed after settlement]",
+      messageActor: "human",
+      state: "cancelled",
+    });
+    expect(migrated.requireQueue(queue.id)).not.toHaveProperty("peerActionId");
+    expect(migrated.requirePeerSessionPolicy(session.id)).toMatchObject({
+      mode: "coordinate",
+      revision: 1,
+    });
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+      expect(inspector.query("SELECT applied_at FROM migrations WHERE version=40").get())
+        .toEqual({ applied_at: 9_000 });
+      expect(inspector.query(
+        "SELECT version,applied_at FROM migrations WHERE version IN (41,42) ORDER BY version",
+      ).all()).toEqual([
+        { applied_at: 9_000, version: 41 },
+        { applied_at: 9_000, version: 42 },
+      ]);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("current v42 opens require the exact peer and local-memory guards", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const weakened = new Database(paths.database, { create: false, strict: true });
+    weakened.exec(`
+      DROP TRIGGER queue_peer_effect_evidence_guard;
+      CREATE TRIGGER queue_peer_effect_evidence_guard
+      BEFORE UPDATE OF state ON queue_entries
+      BEGIN SELECT 1; END;
+    `);
+    weakened.close(false);
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+    expect(() => new StateStore(paths))
+      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT sql FROM sqlite_master WHERE name='queue_peer_effect_evidence_guard'",
+      ).get()).toEqual(expect.objectContaining({ sql: expect.stringContaining("SELECT 1") }));
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("current v42 opens never recreate a missing peer authority trigger or index", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const weakened = new Database(paths.database, { create: false, strict: true });
+    weakened.exec(`
+      DROP TRIGGER session_host_capability_binding_immutable;
+      DROP INDEX memory_submissions_project_recent;
+    `);
+    weakened.close(false);
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+    expect(() => new StateStore(paths))
+      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        `SELECT name FROM sqlite_master
+         WHERE name IN ('session_host_capability_binding_immutable',
+           'memory_submissions_project_recent')`,
+      ).all()).toEqual([]);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("current v42 opens reject a reintroduced legacy provider-switch journal", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const damaged = new Database(paths.database, { create: false, strict: true });
+    installHistoricalFeatureProviderSwitchJournal(damaged);
+    damaged.close(false);
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+    expect(() => new StateStore(paths))
+      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+    const unchanged = new Database(paths.database, { create: false, readonly: true, strict: true });
+    try {
+      expect(unchanged.query(
+        "SELECT name FROM sqlite_master WHERE name='session_provider_switches'",
+      ).get()).toEqual({ name: "session_provider_switches" });
+      expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+    } finally {
+      unchanged.close(false);
+    }
+  });
+
+  test("readonly open rejects a weakened previously unaudited v40 guard", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const weakened = new Database(paths.database, { create: false, strict: true });
+    weakened.exec(`
+      DROP TRIGGER session_peer_policy_transition_guard;
+      CREATE TRIGGER session_peer_policy_transition_guard
+      BEFORE UPDATE ON session_peer_policies
+      BEGIN SELECT 1; END;
+    `);
+    weakened.close(false);
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+  });
+
   test("rejects databases written by a newer schema version", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-newer-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 41");
+    newer.exec("PRAGMA user_version = 43");
     newer.close(false);
     await chmod(paths.database, 0o600);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:41:40");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:43:42");
   });
 });

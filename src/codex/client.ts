@@ -23,6 +23,7 @@ import { record, safeInteger, string } from "./parse.ts";
 import type { CodexProcess } from "./process.ts";
 import {
   HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
+  HRA_HOST_DYNAMIC_TOOLS,
   OPERATIONS,
   PINNED_CODEX_VERSION,
   assertPinnedCodexNotificationMatrix,
@@ -37,7 +38,7 @@ import {
   parseAccountUsage,
   parseAppPage,
   parseBrokeredCodexServerRequest,
-  parseConversationAutomationToolCall,
+  parseHraHostToolCall,
   parseCredentialStores,
   parseFact,
   parseFeaturePage,
@@ -72,6 +73,7 @@ import {
   type CodexAuthority,
   type CodexCapabilitySnapshot,
   type ConversationAutomationToolCall,
+  type HraHostToolCall,
   type CodexFact,
   type CodexFeature,
   type CodexMethod,
@@ -115,6 +117,23 @@ const PRE_READY_FACT_BYTES = 1 * 1024 * 1024;
 const INBOUND_DYNAMIC_REQUEST_LIMIT = 128;
 const DYNAMIC_REQUEST_LEDGER_LIMIT = 4_096;
 const CAPABILITY_DISCOVERY_MAX_DEADLINE_MS = 40_000;
+const DEVELOPER_INSTRUCTIONS_MAX_BYTES = 64 * 1_024;
+const developerInstructionsEncoder = new TextEncoder();
+
+const exactDeveloperInstructions = (value: string): string => {
+  const parsed = boundedText(
+    value,
+    "developer instructions",
+    DEVELOPER_INSTRUCTIONS_MAX_BYTES,
+  );
+  if (developerInstructionsEncoder.encode(parsed).byteLength > DEVELOPER_INSTRUCTIONS_MAX_BYTES) {
+    throw new CodexError(
+      "INVALID_INPUT",
+      "developer instructions exceed their UTF-8 byte limit",
+    );
+  }
+  return parsed;
+};
 
 interface PendingRequest {
   readonly id: number;
@@ -184,6 +203,14 @@ export interface CodexAppServerClientOptions {
     authority: CodexAuthority,
   ) => void | Promise<void>;
   readonly onFact?: (fact: FencedCodexValue<CodexFact>) => void | Promise<void>;
+  /** Local-only host service for the complete versioned HRA tool manifest. */
+  readonly onHraHostToolCall?: (
+    call: HraHostToolCall,
+  ) => DynamicToolPublicResult | Promise<DynamicToolPublicResult>;
+  /** Invoked only after the corresponding generic host-tool success response is fully written. */
+  readonly onHraHostToolResponseWritten?: (
+    call: HraHostToolCall,
+  ) => void | Promise<void>;
   /** Local-only host service for the one conversation-bound dynamic tool. */
   readonly onConversationAutomationToolCall?: (
     call: ConversationAutomationToolCall,
@@ -242,6 +269,7 @@ export interface ThreadPolicy {
 
 export interface StartThreadInput {
   readonly cwd: string;
+  readonly developerInstructions: string;
   readonly preset: ResolvedPreset;
   readonly policy: ThreadPolicy;
 }
@@ -294,6 +322,12 @@ export class CodexAppServerClient {
     | CodexAppServerClientOptions["onAccountAuthoritySignal"]
     | undefined;
   readonly #onFact: NonNullable<CodexAppServerClientOptions["onFact"]>;
+  readonly #onHraHostToolCall:
+    | CodexAppServerClientOptions["onHraHostToolCall"]
+    | undefined;
+  readonly #onHraHostToolResponseWritten:
+    | CodexAppServerClientOptions["onHraHostToolResponseWritten"]
+    | undefined;
   readonly #onConversationAutomationToolCall:
     | CodexAppServerClientOptions["onConversationAutomationToolCall"]
     | undefined;
@@ -352,6 +386,15 @@ export class CodexAppServerClient {
     this.#onAccountAuthoritySignal = options.onAccountAuthoritySignal;
     this.#onFact = options.onFact ?? (() => undefined);
     if (
+      (options.onHraHostToolCall === undefined)
+      !== (options.onHraHostToolResponseWritten === undefined)
+    ) {
+      throw new CodexError(
+        "INVALID_INPUT",
+        "HRA host tools require paired call and response-written callbacks",
+      );
+    }
+    if (
       (options.onConversationAutomationToolCall === undefined)
       !== (options.onConversationAutomationToolResponseWritten === undefined)
     ) {
@@ -360,6 +403,17 @@ export class CodexAppServerClient {
         "conversation automation requires paired call and response-written callbacks",
       );
     }
+    if (
+      options.onHraHostToolCall !== undefined
+      && options.onConversationAutomationToolCall !== undefined
+    ) {
+      throw new CodexError(
+        "INVALID_INPUT",
+        "generic HRA host tools and legacy conversation automation cannot both be configured",
+      );
+    }
+    this.#onHraHostToolCall = options.onHraHostToolCall;
+    this.#onHraHostToolResponseWritten = options.onHraHostToolResponseWritten;
     this.#onConversationAutomationToolCall = options.onConversationAutomationToolCall;
     this.#onConversationAutomationToolResponseWritten =
       options.onConversationAutomationToolResponseWritten;
@@ -750,18 +804,22 @@ export class CodexAppServerClient {
   }
 
   async startThread(input: StartThreadInput): Promise<FencedCodexValue<ThreadStartResult>> {
+    const hasGenericHostTools = this.#onHraHostToolCall !== undefined
+      && this.#onHraHostToolResponseWritten !== undefined;
+    const hasLegacyAutomation = this.#onConversationAutomationToolCall !== undefined
+      && this.#onConversationAutomationToolResponseWritten !== undefined;
     if (
       !this.#experimentalApi
-      || this.#onConversationAutomationToolCall === undefined
-      || this.#onConversationAutomationToolResponseWritten === undefined
+      || (!hasGenericHostTools && !hasLegacyAutomation)
     ) {
       throw new CodexError(
         "UNSUPPORTED_CAPABILITY",
-        "Conversation-bound scheduled tasks require the reviewed dynamic-tool host service",
+        "HRA host tools require the reviewed dynamic-tool host service",
       );
     }
     const cwd = canonicalAbsolute(input.cwd, "cwd");
     const policy = compileThreadPolicy(input.policy);
+    const developerInstructions = exactDeveloperInstructions(input.developerInstructions);
     return this.#closedRequest(
       "thread/start",
       {
@@ -773,18 +831,29 @@ export class CodexAppServerClient {
         approvalPolicy: "on-request",
         approvalsReviewer: input.policy.review,
         config: { model_reasoning_effort: input.preset.effort },
+        developerInstructions,
         ephemeral: false,
         historyMode: "paginated",
-        dynamicTools: HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
+        dynamicTools: hasGenericHostTools
+          ? HRA_HOST_DYNAMIC_TOOLS
+          : HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
       },
       (value) => validateThreadStartResult(parseThreadStart(value), input, policy.runtimeWorkspaceRoots, cwd),
     );
   }
 
-  async resumeThread(threadId: string): Promise<FencedCodexValue<CodexThread>> {
+  async resumeThread(
+    threadId: string,
+    developerInstructions?: string,
+  ): Promise<FencedCodexValue<CodexThread>> {
     return this.#closedRequest(
       "thread/resume",
-      { threadId: boundedIdentifier(threadId, "thread id") },
+      {
+        threadId: boundedIdentifier(threadId, "thread id"),
+        ...(developerInstructions === undefined
+          ? {}
+          : { developerInstructions: exactDeveloperInstructions(developerInstructions) }),
+      },
       parseThreadMutation,
     );
   }
@@ -1536,7 +1605,7 @@ export class CodexAppServerClient {
           return;
         }
         this.#trackInboundDynamicRequest(
-          this.#handleConversationAutomationToolCall(
+          this.#handleHraHostToolCall(
             message.id,
             message.params ?? {},
           ),
@@ -1707,7 +1776,7 @@ export class CodexAppServerClient {
     });
   }
 
-  async #handleConversationAutomationToolCall(
+  async #handleHraHostToolCall(
     idValue: unknown,
     params: unknown,
   ): Promise<void> {
@@ -1717,15 +1786,19 @@ export class CodexAppServerClient {
       this.#quarantineConnection("Codex reused a brokered request id for a dynamic tool");
       return;
     }
-    const handler = this.#onConversationAutomationToolCall;
-    const afterWrite = this.#onConversationAutomationToolResponseWritten;
+    const genericHandler = this.#onHraHostToolCall;
+    const genericAfterWrite = this.#onHraHostToolResponseWritten;
+    const automationHandler = this.#onConversationAutomationToolCall;
+    const automationAfterWrite = this.#onConversationAutomationToolResponseWritten;
     if (
       !this.#experimentalApi
-      || handler === undefined
-      || afterWrite === undefined
+      || (
+        (genericHandler === undefined || genericAfterWrite === undefined)
+        && (automationHandler === undefined || automationAfterWrite === undefined)
+      )
     ) {
-      if (!(await this.#conversationAutomationAuthorityIsCurrent())) return;
-      await this.#writeConversationAutomationFrame({
+      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
+      await this.#writeHraHostToolFrame({
         id: rawProviderRequestId(requestId),
         error: { code: -32_601, message: "HRA did not advertise this host service" },
       });
@@ -1737,9 +1810,9 @@ export class CodexAppServerClient {
       return;
     }
 
-    let call: ConversationAutomationToolCall;
+    let call: HraHostToolCall;
     try {
-      call = parseConversationAutomationToolCall({
+      call = parseHraHostToolCall({
         authority: this.#authority,
         connectionId: this.#connectionId,
         requestId,
@@ -1748,8 +1821,8 @@ export class CodexAppServerClient {
     } catch (error: unknown) {
       const unsupported = error instanceof CodexError
         && error.code === "UNSUPPORTED_CAPABILITY";
-      if (!(await this.#conversationAutomationAuthorityIsCurrent())) return;
-      await this.#writeConversationAutomationFrame({
+      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
+      await this.#writeHraHostToolFrame({
         id: rawProviderRequestId(requestId),
         error: unsupported
           ? { code: -32_601, message: "HRA did not advertise this dynamic tool" }
@@ -1758,6 +1831,31 @@ export class CodexAppServerClient {
       this.#onSafeDiagnostic(unsupported
         ? "Codex requested an unadvertised dynamic tool"
         : "Codex sent invalid params for item/tool/call");
+      void this.#enqueueFact({
+        type: "protocolNotice",
+        method: "item/tool/call",
+        connectionId: this.#connectionId,
+      });
+      return;
+    }
+
+    const invokeHostTool = genericHandler !== undefined
+      ? async () => await genericHandler(call)
+      : call.tool === "automation_update" && automationHandler !== undefined
+      ? async () => await automationHandler(call)
+      : undefined;
+    const notifyResponseWritten = genericAfterWrite !== undefined
+      ? async () => await genericAfterWrite(call)
+      : call.tool === "automation_update" && automationAfterWrite !== undefined
+      ? async () => await automationAfterWrite(call)
+      : undefined;
+    if (invokeHostTool === undefined || notifyResponseWritten === undefined) {
+      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
+      await this.#writeHraHostToolFrame({
+        id: rawProviderRequestId(requestId),
+        error: { code: -32_601, message: "HRA did not advertise this dynamic tool" },
+      });
+      this.#onSafeDiagnostic("Codex requested a host tool without an admitted handler");
       void this.#enqueueFact({
         type: "protocolNotice",
         method: "item/tool/call",
@@ -1781,19 +1879,21 @@ export class CodexAppServerClient {
 
     let text: string;
     try {
-      if (!(await this.#conversationAutomationAuthorityIsCurrent())) return;
-      const publicResult = await handler(call);
-      if (!(await this.#conversationAutomationAuthorityIsCurrent())) return;
+      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
+      const publicResult = await invokeHostTool();
+      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
       text = serializeDynamicToolPublicResult(publicResult);
     } catch {
-      if (!(await this.#conversationAutomationAuthorityIsCurrent())) return;
-      this.#onSafeDiagnostic("HRA conversation automation host handler failed");
-      await this.#writeConversationAutomationFrame({
+      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
+      this.#onSafeDiagnostic("HRA host-tool handler failed");
+      await this.#writeHraHostToolFrame({
         id: rawProviderRequestId(requestId),
         result: {
           contentItems: [{
             type: "inputText",
-            text: "HRA could not complete this conversation-bound scheduled task request.",
+            text: call.tool === "automation_update"
+              ? "HRA could not complete this conversation-bound scheduled task request."
+              : "HRA could not complete this host-tool request.",
           }],
           success: false,
         },
@@ -1801,18 +1901,18 @@ export class CodexAppServerClient {
       return;
     }
 
-    await this.#writeConversationAutomationFrame({
+    await this.#writeHraHostToolFrame({
       id: rawProviderRequestId(requestId),
       result: {
         contentItems: [{ type: "inputText", text }],
         success: true,
       },
     });
-    if (!(await this.#conversationAutomationAuthorityIsCurrent())) return;
+    if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
     try {
-      await afterWrite(call);
+      await notifyResponseWritten();
     } catch {
-      this.#onSafeDiagnostic("HRA conversation automation post-response hook failed");
+      this.#onSafeDiagnostic("HRA host-tool post-response hook failed");
     }
   }
 
@@ -1852,7 +1952,7 @@ export class CodexAppServerClient {
     });
   }
 
-  async #conversationAutomationAuthorityIsCurrent(): Promise<boolean> {
+  async #hraHostToolAuthorityIsCurrent(): Promise<boolean> {
     let current = false;
     try {
       current = await this.#authorityIsCurrent();
@@ -1866,10 +1966,10 @@ export class CodexAppServerClient {
     return false;
   }
 
-  async #writeConversationAutomationFrame(value: unknown): Promise<void> {
+  async #writeHraHostToolFrame(value: unknown): Promise<void> {
     await this.#writeFrame(value, {
       beforeWriteAsync: async () => {
-        if (!(await this.#conversationAutomationAuthorityIsCurrent())) {
+        if (!(await this.#hraHostToolAuthorityIsCurrent())) {
           throw new CodexError("AUTHORITY_STALE", "Codex process generation is stale");
         }
       },

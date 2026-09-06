@@ -47,7 +47,7 @@ export type WirePresenceArgs = Readonly<{
 }>;
 
 export type WireRegisterArgs = Readonly<{
-  deviceClass?: "browser";
+  deviceClass: "browser";
   encryptedLabel: WireEncryptedEnvelope;
   idempotencyKey: string;
   keyVersion: number;

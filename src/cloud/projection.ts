@@ -145,7 +145,14 @@ export type CompactInteractionEvent = Readonly<{
   summary: string;
 }>;
 
+/** Legacy compact actor values understood by every supported reader. */
 export type CompactMessageActor = "human" | "autorespond";
+
+/**
+ * Additive detail for a non-owner host-authored message. Unknown bounded
+ * values remain non-owner and render neutrally instead of losing the chunk.
+ */
+export type CompactMessageActorKind = "peer_session" | "provider_switch" | "unknown";
 
 /**
  * One attachment as the compact stream carries it: what it was called, what
@@ -216,6 +223,7 @@ export function parseCompactAttachments(value: unknown): readonly CompactAttachm
 export type CompactSessionEvent =
   | Readonly<{
       actor?: CompactMessageActor;
+      actorKind?: CompactMessageActorKind;
       attachments?: readonly CompactAttachment[];
       kind: "user_message";
       sequence: number;
@@ -249,6 +257,7 @@ export type SessionChunkAuthority = Readonly<{
 }>;
 
 const commitPattern = /^[0-9a-f]{7,64}$/u;
+const compactMessageActorKindPattern = /^[a-z][a-z0-9_]{0,63}$/u;
 const interactionIdPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const compactInteractionKinds = new Set<CompactInteractionKind>([
@@ -325,6 +334,16 @@ function isBoundedSafeText(
     && !containsAbsolutePath(value)
     && !containsUnsafeTerminalScalar(value, allowLineFeeds)
     && !containsSecretShapedText(value);
+}
+
+function parseCompactMessageActorKind(value: unknown): CompactMessageActorKind | null {
+  if (
+    !isBoundedSafeText(value, 64)
+    || value.length < 1
+    || !compactMessageActorKindPattern.test(value)
+  ) return null;
+  if (value === "peer_session" || value === "provider_switch") return value;
+  return "unknown";
 }
 
 function parseCompactInteractionQuestions(
@@ -813,7 +832,7 @@ function parseCompactSessionEventUnchecked(value: unknown): CompactSessionEvent 
   if (!isRecord(value)) return null;
   if (
     (value.kind === "user_message" || value.kind === "assistant_message")
-    && hasRequiredKeys(value, ["kind", "sequence", "text", "turnId"], 2)
+    && hasRequiredKeys(value, ["kind", "sequence", "text", "turnId"], 3)
     && isSafePositiveInteger(value.sequence)
     && typeof value.text === "string"
     && value.text.length <= 64_000
@@ -836,14 +855,17 @@ function parseCompactSessionEventUnchecked(value: unknown): CompactSessionEvent 
     }
     const actor: CompactMessageActor | undefined =
       value.actor === "human" || value.actor === "autorespond" ? value.actor : undefined;
-    // Absent stays absent: an event with no attachment is byte-identical to
-    // what an older writer produced, and an older reader ignores the key.
+    const actorKind = Object.hasOwn(value, "actorKind")
+      ? parseCompactMessageActorKind(value.actorKind)
+      : undefined;
+    if (actorKind === null || (actorKind !== undefined && actor !== "autorespond")) return null;
     const attachments = value.attachments === undefined
       ? undefined
       : parseCompactAttachments(value.attachments);
     if (attachments === null) return null;
     return {
       ...(actor === undefined ? {} : { actor }),
+      ...(actorKind === undefined ? {} : { actorKind }),
       ...(attachments === undefined ? {} : { attachments }),
       kind: value.kind,
       sequence: value.sequence,

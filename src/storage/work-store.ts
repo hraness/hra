@@ -1255,6 +1255,12 @@ const assertWorkSchemaShape = (database: Database): void => {
     if (!tables.has(name)) throw new Error(`WORK_SCHEMA_MISSING:${name}`);
     if (tables.get(name) !== 1) throw new Error(`WORK_SCHEMA_NOT_STRICT:${name}`);
   }
+  const sessionColumns = new Set((database.query("PRAGMA table_info(sessions)").all() as Array<{
+    name?: unknown;
+  }>).flatMap((row) => typeof row.name === "string" ? [row.name] : []));
+  for (const column of ["provider", "preset_contract"] as const) {
+    if (!sessionColumns.has(column)) throw new Error(`WORK_SCHEMA_STALE:sessions.${column}`);
+  }
   const triggerRows = database.query(
     "SELECT name FROM sqlite_master WHERE type='trigger'",
   ).all() as Array<{ name?: unknown }>;
@@ -1453,6 +1459,7 @@ export type WorkStoreErrorCode =
   | "NOT_REVIEWABLE"
   | "REVISION_CONFLICT"
   | "ROUTE_MISMATCH"
+  | "SESSION_PROVIDER_SWITCH_BLOCKED"
   | "SELF_REVIEW"
   | "SIGNAL_NOT_FOUND"
   | "TASK_DEPTH_EXCEEDED"
@@ -4159,6 +4166,28 @@ export class WorkStore {
        LIMIT 1`,
     ).get(sessionId) as { present: number } | null;
     if (live !== null) throw new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
+  }
+
+  assertSessionProviderSwitchAllowed(sessionId: string): void {
+    const blocked = this.#database.query(
+      `SELECT 1 AS present
+       FROM works AS w
+       WHERE w.state IN ('active','cancel_pending','fail_pending')
+         AND (
+           w.coordinator_session_id=?
+           OR EXISTS (
+             SELECT 1 FROM work_members AS m
+             WHERE m.work_id=w.id AND m.session_id=?
+           )
+         )
+       UNION ALL
+       SELECT 1 AS present
+       FROM work_attempts AS a
+       WHERE a.worker_session_id=?
+         AND a.state IN ('claimed','dispatching','running','recovery_required')
+       LIMIT 1`,
+    ).get(sessionId, sessionId, sessionId) as { present: number } | null;
+    if (blocked !== null) throw new WorkStoreError("SESSION_PROVIDER_SWITCH_BLOCKED");
   }
 
   #sweepStaleAttemptAuthority(workId: string, now: number): void {

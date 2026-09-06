@@ -18,6 +18,7 @@ import { CODEX_PIN, PINNED_CODEX_MATRIX_DIGESTS, PINNED_CODEX_SCHEMA_DIGESTS } f
 import { resolvePinnedCodexRuntime } from "./runtime.ts";
 import {
   HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
+  HRA_HOST_DYNAMIC_TOOLS,
   OPERATIONS,
   PINNED_CODEX_NOTIFICATION_MATRIX,
   PINNED_CODEX_NOTIFICATION_SCHEMA_DIGEST,
@@ -32,6 +33,7 @@ import {
   parseAccountUsage,
   parseBrokeredCodexServerRequest,
   parseConversationAutomationToolCall,
+  parseHraHostToolCall,
   parseFact,
   parseModelPage,
   parseManagedLoginCancel,
@@ -574,6 +576,65 @@ describe("pinned server requests and safe notifications", () => {
     expect(schedules.every((schedule) => schedule.additionalProperties === false)).toBe(true);
   });
 
+  test("projects the complete domain host-tool manifest into Codex", () => {
+    expect(HRA_HOST_DYNAMIC_TOOLS).toHaveLength(1);
+    expect(HRA_HOST_DYNAMIC_TOOLS[0]).toMatchObject({
+      type: "namespace",
+      name: "hra",
+    });
+    expect(HRA_HOST_DYNAMIC_TOOLS[0].tools.map((tool) => tool.name)).toEqual([
+      "automation_update",
+      "sessions_list",
+      "session_inspect",
+      "session_message",
+      "memory_remember",
+      "memory_query",
+      "memory_explain",
+      "memory_share",
+    ]);
+    const parsed = parseHraHostToolCall({
+      authority: { profileId: "profile-a", processGeneration: 9 },
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      requestId: { type: "number", value: 72 },
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-2",
+        namespace: "hra",
+        tool: "session_message",
+        arguments: {
+          sessionId: `sess_${"a".repeat(32)}`,
+          expectedRevision: 3,
+          delivery: "steer",
+          message: "Please check the failed boundary.",
+          reason: "Independent review",
+        },
+      },
+    });
+    expect(parsed).toMatchObject({
+      tool: "session_message",
+      input: {
+        expectedRevision: 3,
+        delivery: "steer",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    expect(() => parseConversationAutomationToolCall({
+      authority: { profileId: "profile-a", processGeneration: 9 },
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      requestId: { type: "number", value: 72 },
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-2",
+        namespace: "hra",
+        tool: "sessions_list",
+        arguments: {},
+      },
+    })).toThrow(CodexError);
+  });
+
   test("parses exact dynamic-tool authority and rejects standalone-field smuggling", () => {
     const common = {
       authority: { profileId: "profile-a", processGeneration: 9 },
@@ -716,6 +777,11 @@ describe("pinned server requests and safe notifications", () => {
     expect(serializeDynamicToolPublicResult({ z: 1, a: { d: 2, b: true } })).toBe(
       "{\"a\":{\"b\":true,\"d\":2},\"z\":1}",
     );
+    const exactFourByteResult = "😀".repeat((64 * 1_024) / 4);
+    expect(new TextEncoder().encode(serializeDynamicToolPublicResult(exactFourByteResult)))
+      .toHaveLength(64 * 1_024);
+    expect(() => serializeDynamicToolPublicResult(`${exactFourByteResult}x`))
+      .toThrow(CodexError);
     expect(() => serializeDynamicToolPublicResult("")).toThrow(CodexError);
     expect(() => serializeDynamicToolPublicResult("é".repeat(32_769))).toThrow(CodexError);
     expect(() => serializeDynamicToolPublicResult([] as never)).toThrow(CodexError);

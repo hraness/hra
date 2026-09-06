@@ -82,14 +82,15 @@ describe("cloud cryptography", () => {
     }, signature)).toBe(false);
   });
 
-  test("refuses further AES-GCM messages once a key version reaches its budget", async () => {
+  test("refuses further AES-GCM messages once a raw key reaches its budget", async () => {
     const key = randomKeyBytes();
     const plaintext = new TextEncoder().encode("chunk");
     const aad = new TextEncoder().encode("authority-a");
     const budget = new GcmMessageBudget();
     const budgetKey = await gcmMessageBudgetKey(key, 1);
     expect(budgetKey.fingerprint).toMatch(/^[0-9a-f]{32}$/u);
-    expect((await gcmMessageBudgetKey(key, 2)).fingerprint).not.toBe(budgetKey.fingerprint);
+    const relabeledBudgetKey = await gcmMessageBudgetKey(key, 2);
+    expect(relabeledBudgetKey.fingerprint).toBe(budgetKey.fingerprint);
     expect((await gcmMessageBudgetKey(randomKeyBytes(), 1)).fingerprint)
       .not.toBe(budgetKey.fingerprint);
 
@@ -107,10 +108,12 @@ describe("cloud cryptography", () => {
     expect(refused).toMatchObject({ code: "KEY_ROTATION_REQUIRED", keyVersion: 1 });
     expect(budget.observe(budgetKey)).toBe(gcmMessageBudgetPerKey);
 
-    // A rotated key version starts its own count under the same budget.
-    const rotated = await encryptBytes(plaintext, key, 2, aad, budget);
-    expect(rotated.keyVersion).toBe(2);
-    expect(budget.observe(await gcmMessageBudgetKey(key, 2))).toBe(1);
+    // Relabeling the same raw key cannot reset its cryptographic budget.
+    const relabeled = await encryptBytes(plaintext, key, 2, aad, budget)
+      .catch((error: unknown) => error);
+    expect(relabeled).toBeInstanceOf(KeyRotationRequiredError);
+    expect(relabeled).toMatchObject({ code: "KEY_ROTATION_REQUIRED", keyVersion: 2 });
+    expect(budget.observe(relabeledBudgetKey)).toBe(gcmMessageBudgetPerKey);
   });
 
   test("renders one stable device key fingerprint from both public keys", async () => {

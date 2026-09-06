@@ -5,7 +5,7 @@ import fc from "fast-check";
 
 import { sessionEventCursorWireSchema } from "../domain/session-events";
 import { createWorkId, createWorkTaskId, workEventCursorWireSchema } from "../domain/work";
-import { createSessionId } from "../domain/values";
+import { createProjectId, createSessionId } from "../domain/values";
 import {
   HRA_CURSOR_MAX_BYTES,
   SessionEventCursorCodec,
@@ -470,7 +470,7 @@ describe("SessionEventCursorCodec", () => {
     );
   });
 
-  test("binds session-list cursors to the immutable account generation and exact limit", () => {
+  test("binds provider session-list cursors to generation, archive filter, and limit", () => {
     const codec = new SessionEventCursorCodec(FIXED_KEY);
     const filter = {
       accountId: "acct_00000000000000000000000000000000" as const,
@@ -599,6 +599,48 @@ describe("SessionEventCursorCodec", () => {
     }));
     expectCursorRejection(
       () => codec.decodeAccountSessionLocal(legacyAdopted, filter),
+      "type_mismatch",
+    );
+  });
+
+  test("binds peer directory pages to the exact actor, project, policy revision, and limit", () => {
+    const codec = new SessionEventCursorCodec(FIXED_KEY);
+    const filter = {
+      actorSessionId: createSessionId(),
+      projectId: createProjectId(),
+      actorPolicyRevision: 3,
+      limit: 20,
+    };
+    const cursor = codec.encodePeerSessionList({
+      ...filter,
+      afterCreatedAt: 12_345,
+      afterSessionId: createSessionId(),
+    });
+    expect(codec.decodePeerSessionList(cursor, filter)).toMatchObject({
+      version: 1,
+      type: "peer_session_list",
+      ...filter,
+      afterCreatedAt: 12_345,
+    });
+    for (const mismatch of [
+      { ...filter, actorSessionId: createSessionId() },
+      { ...filter, projectId: createProjectId() },
+      { ...filter, actorPolicyRevision: 4 },
+      { ...filter, limit: 19 },
+    ]) {
+      expectCursorRejection(
+        () => codec.decodePeerSessionList(cursor, mismatch),
+        "filter_mismatch",
+      );
+    }
+    const eventCursor = codec.encode({
+      version: 1,
+      sessionId: filter.actorSessionId,
+      streamEpoch: crypto.randomUUID(),
+      sequence: 1,
+    });
+    expectCursorRejection(
+      () => codec.decodePeerSessionList(eventCursor, filter),
       "type_mismatch",
     );
   });
@@ -858,9 +900,18 @@ describe("SessionEventCursorCodec", () => {
       () => codec.decodeInteraction(cursor, { scope: { type: "global" }, pending: false }),
       "type_mismatch",
     );
-    const replacement = cursor.at(-1) === "A" ? "B" : "A";
+    const parts = cursor.split(".");
+    const encodedPayload = parts[1];
+    const signature = parts[2];
+    if (encodedPayload === undefined || signature === undefined) {
+      throw new Error("Expected a signed provider session-list cursor.");
+    }
+    const replacement = signature[0] === "A" ? "B" : "A";
     expectCursorRejection(
-      () => codec.decodeSessionList(`${cursor.slice(0, -1)}${replacement}`, filter),
+      () => codec.decodeSessionList(
+        `hra1.${encodedPayload}.${replacement}${signature.slice(1)}`,
+        filter,
+      ),
       "invalid_signature",
     );
 
