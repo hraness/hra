@@ -272,7 +272,8 @@ SQLite guard, `mutation_resolutions_timestamp_proof_insert`, and its migration
 ledger entry. The guard refuses invalid new stop/rename resolutions, requires
 the proof to agree with the resulting session snapshot, and requires SQL NULL
 receipts for non-proven resolutions. Current schema 41 opens require the exact
-stored guard definition before maintenance; missing or altered guards are
+stored guard definition and one migration-41 ledger row with a nonnegative safe
+integer application time before maintenance; missing or altered guards are
 refused without repair. Schema 40 remains an immutable predecessor, and readonly
 older databases retain the migration-required policy. Public and cloud projections
 omit the private unit marker.

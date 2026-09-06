@@ -1445,6 +1445,17 @@ const assertSchemaVersion41TimestampProof = (database: Database): void => {
   }
 };
 
+const assertSchemaVersion41Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  const ledger = z.object({
+    version: z.literal(41),
+    applied_at: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
+  }).strict().array().length(1).safeParse(database.query(
+    "SELECT version,applied_at FROM migrations WHERE version>=41 ORDER BY version LIMIT 2",
+  ).all());
+  if (!ledger.success) throw new Error("STATE_SCHEMA_V41_MIGRATION_LEDGER_INVALID");
+};
+
 const schemaVersion1 = `
 CREATE TABLE IF NOT EXISTS migrations (
   version INTEGER PRIMARY KEY,
@@ -6677,7 +6688,7 @@ const migrateWritableDatabase = (
   if (initialVersion > currentSchemaVersion) {
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
   }
-  if (initialVersion === 41) assertSchemaVersion41TimestampProof(database);
+  if (initialVersion === 41) assertSchemaVersion41Authority(database);
   else if (database.query("SELECT 1 FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'").get() !== null) {
     throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
   }
@@ -7291,7 +7302,7 @@ const migrateWritableDatabase = (
     database.exec(schemaVersion36NotificationHours);
     database.exec(schemaVersion37AttentionEmailPolicy);
     assertCompositeNotificationPolicy(database);
-    assertSchemaVersion41TimestampProof(database);
+    assertSchemaVersion41Authority(database);
     assertSchemaVersion40AdoptionObjects(database);
     assertExactSchemaVersion40AdoptionSurface(database);
     assertWorkSchema(database);
@@ -7971,7 +7982,7 @@ export class StateStore {
       assertSchemaVersion39ProviderAuthority(this.#database);
       assertSchemaVersion40AdoptionObjects(this.#database);
       assertExactSchemaVersion40AdoptionSurface(this.#database);
-      assertSchemaVersion41TimestampProof(this.#database);
+      assertSchemaVersion41Authority(this.#database);
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);

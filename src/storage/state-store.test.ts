@@ -9730,6 +9730,40 @@ describe("StateStore", () => {
     }
   });
 
+  test("refuses an invalid schema 41 migration ledger without changing retained rows or schema", async () => {
+    for (const damage of ["missing", "negative_time", "unsafe_time", "later_version"] as const) {
+      const { store } = await fixture();
+      const profile = signInProfile(store, "Ledger identity", "ledger@example.com");
+      const session = upsertProvenTestSession(store, {
+        profileId: profile.id, preset: "high", fastEnabled: false,
+        providerThreadId: "ledger-thread", state: "idle", providerUpdatedAt: 10,
+      });
+      const inspector = new Database(store.paths.database, { create: false, strict: true });
+      try {
+        if (damage === "missing") inspector.exec("DELETE FROM migrations WHERE version=41");
+        else if (damage === "negative_time") {
+          // Model an already malformed database; restore constraint enforcement
+          // before asking either admission path to inspect it.
+          inspector.exec("PRAGMA ignore_check_constraints=ON; UPDATE migrations SET applied_at=-1 WHERE version=41; PRAGMA ignore_check_constraints=OFF;");
+        } else if (damage === "unsafe_time") {
+          inspector.query("UPDATE migrations SET applied_at=? WHERE version=41").run(Number.MAX_SAFE_INTEGER + 1);
+        } else inspector.exec("INSERT INTO migrations(version,applied_at) VALUES (42,1000)");
+        const schemaBefore = inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all();
+        const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
+        const sessionBefore = inspector.query("SELECT * FROM sessions WHERE id=?").get(session.id);
+        const profileBefore = inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id);
+        for (const readonly of [false, true]) {
+          expect(() => new StateStore(store.paths, { readonly })).toThrow("STATE_SCHEMA_V41_MIGRATION_LEDGER_INVALID");
+          expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
+          expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledgerBefore);
+          expect(inspector.query("SELECT * FROM sessions WHERE id=?").get(session.id)).toEqual(sessionBefore);
+          expect(inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id)).toEqual(profileBefore);
+          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+        }
+      } finally { inspector.close(false); }
+    }
+  });
+
   test("rejects an unbound legacy effect-started session creation at daemon admission", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Legacy start", "legacy-start@example.com");
