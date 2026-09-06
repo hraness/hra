@@ -784,6 +784,86 @@ describe("WorkStore claims, fences, and prepared effects", () => {
     });
   });
 
+  test("lets a Work claim win before a provider-switch effect starts", () => {
+    const value = fixture();
+    const created = createWork(value);
+    const switchAttemptId = createAttemptId();
+    value.database.query(
+      `INSERT INTO mutation_attempts(
+         id,idempotency_key,kind,authority_id,authority_generation,request_digest,state
+       ) VALUES (?,?,?,?,?,?,'prepared')`,
+    ).run(
+      switchAttemptId,
+      randomUUID(),
+      "session.switch",
+      value.actorSessionId,
+      1,
+      "a".repeat(64),
+    );
+
+    claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    });
+    expect(() => value.store.assertSessionCanChangeRoute(value.actorSessionId))
+      .toThrow(new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED"));
+    expect(() => value.database.query(
+      "UPDATE mutation_attempts SET state='effect_started' WHERE id=? AND state='prepared'",
+    ).run(switchAttemptId)).toThrow("WORK_SESSION_SWITCH_ATTEMPT_AUTHORITY");
+    expect(value.database.query(
+      "SELECT state FROM mutation_attempts WHERE id=?",
+    ).get(switchAttemptId)).toEqual({ state: "prepared" });
+  });
+
+  test("fences Work claims behind an unresolved provider-switch effect", () => {
+    const value = fixture();
+    const created = createWork(value);
+    const switchAttemptId = createAttemptId();
+    value.database.query(
+      `INSERT INTO mutation_attempts(
+         id,idempotency_key,kind,authority_id,authority_generation,request_digest,state
+       ) VALUES (?,?,?,?,?,?,'effect_started')`,
+    ).run(
+      switchAttemptId,
+      randomUUID(),
+      "session.switch",
+      value.actorSessionId,
+      1,
+      "b".repeat(64),
+    );
+    const claimTask = (): unknown => claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    });
+
+    const next = value.store.apply({
+      kind: "task.claimNext",
+      idempotencyKey: randomUUID(),
+      workId: created.work.id,
+      actorSessionId: value.actorSessionId,
+      actorCapability: capability,
+      route: { accountId: value.accountId, projectId: value.projectId },
+      leaseMs: 5_000,
+    });
+    expect(next).toMatchObject({ kind: "task.claimNext", task: null, attempt: null });
+    expect(claimTask).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    value.database.query(
+      "UPDATE mutation_attempts SET state='ambiguous' WHERE id=?",
+    ).run(switchAttemptId);
+    expect(claimTask).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(value.database.query(
+      "SELECT COUNT(*) AS count FROM work_attempts WHERE work_id=?",
+    ).get(created.work.id)).toEqual({ count: 0 });
+
+    value.database.query(
+      `INSERT INTO mutation_resolutions(attempt_id,resolution_kind,receipt_json)
+       VALUES (?,'abandoned',NULL)`,
+    ).run(switchAttemptId);
+    expect(claimTask()).toMatchObject({ kind: "task.claim" });
+  });
+
   test("still refuses Codex work authority while the Codex profile is signed out", () => {
     const value = fixture();
     value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")

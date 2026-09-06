@@ -68,6 +68,9 @@ const effectiveRuntimeProfile = (
 class WorkRuntime implements CodexRuntimePort {
   readonly provider = "codex" as const;
   discardRuntimeReview(): void {}
+  beforeStartSessionReturn?: () => Promise<void>;
+  startSessionCount = 0;
+  endSessionCount = 0;
   logoutCalls = 0;
   readonly startTurnCalls: Array<Readonly<{
     clientMessageId: string;
@@ -114,6 +117,8 @@ class WorkRuntime implements CodexRuntimePort {
   async startSession(
     input: Parameters<CodexRuntimePort["startSession"]>[0],
   ): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveRuntimeProfile }> {
+    this.startSessionCount += 1;
+    await this.beforeStartSessionReturn?.();
     this.#threadSequence += 1;
     const projection: CodexSessionProjection = {
       providerThreadId: `provider-thread-${String(this.#threadSequence)}`,
@@ -146,7 +151,7 @@ class WorkRuntime implements CodexRuntimePort {
     return this.#requireProjection(input.providerThreadId);
   }
 
-  async endSession(): Promise<void> {}
+  async endSession(): Promise<void> { this.endSessionCount += 1; }
 
   async reviewTurnStart(
     input: Parameters<CodexRuntimePort["reviewTurnStart"]>[0],
@@ -318,6 +323,9 @@ async function fixture(): Promise<Fixture> {
   await initializeStatePaths(paths);
   let observedAt = 10_000;
   const store = new StateStore(paths, { now: () => observedAt++ });
+  const daemonGeneration = store.nextDaemonGeneration(
+    `boot_${crypto.randomUUID().replaceAll("-", "")}`,
+  );
   const runtime = new WorkRuntime();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
   const workCapabilities = new WorkCapabilityCodec(WorkCapabilityCodec.generateKey());
@@ -329,13 +337,13 @@ async function fixture(): Promise<Fixture> {
       daemonAuthority: new CurrentDaemonAuthority(),
       eventCursors,
       workCapabilities,
-      daemonGeneration: 9,
+      daemonGeneration,
       now: () => observedAt++,
       requestStop: () => undefined,
     });
   const service = createService();
   const workStore = store.createWorkStore(
-    9,
+    daemonGeneration,
     (payload) => payload.type === "work"
       ? eventCursors.encodeWorkEvent(payload)
       : payload.type === "work_actions"
@@ -446,7 +454,7 @@ const nextKey = (): string => {
   return `018f1f64-6c17-7000-8000-${String(keySequence).padStart(12, "0")}`;
 };
 
-async function createJoinClaim(value: Fixture, actor: Actor) {
+async function createAndJoin(value: Fixture, actor: Actor) {
   const created = workOperationResultSchema.parse(await value.service.execute({
     kind: "work.apply",
     requestId: crypto.randomUUID(),
@@ -479,6 +487,11 @@ async function createJoinClaim(value: Fixture, actor: Actor) {
     },
   }, { signal }));
   if (joined.kind !== "work.join") throw new Error("Expected work join.");
+  return { created, joined };
+}
+
+async function createJoinClaim(value: Fixture, actor: Actor) {
+  const { created, joined } = await createAndJoin(value, actor);
   const claimed = workOperationResultSchema.parse(await value.service.execute({
     kind: "work.apply",
     requestId: crypto.randomUUID(),
@@ -1124,6 +1137,109 @@ describe("HraService work protocol", () => {
     expect(logoutFailure).toBeInstanceOf(CommandFailure);
     expect((logoutFailure as CommandFailure).code).toBe("RECOVERY_REQUIRED");
     expect(value.runtime.logoutCalls).toBe(0);
+  });
+
+  test("refuses a provider switch before effects while the session owns a Work attempt", async () => {
+    const value = await fixture();
+    const actor = await createActor(value);
+    await createJoinClaim(value, actor);
+    const target = await value.service.execute(
+      { kind: "account.add", label: "Switch target" },
+      { signal },
+    ) as { account: { id: ProfileId } };
+    await value.service.execute(
+      { kind: "account.login", account: target.account.id, deviceCode: false },
+      { signal },
+    );
+    const switchKey = nextKey();
+    const startsBefore = value.runtime.startSessionCount;
+
+    await expect(value.service.execute({
+      kind: "session.switch",
+      account: target.account.id,
+      idempotencyKey: switchKey,
+      provider: "codex",
+      session: actor.sessionId,
+    }, { signal })).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+      details: { reason: "ATTEMPT_RECOVERY_REQUIRED" },
+    });
+
+    expect(value.runtime.startSessionCount).toBe(startsBefore);
+    expect(value.runtime.startTurnCalls).toHaveLength(0);
+    expect(value.runtime.endSessionCount).toBe(0);
+    expect(value.store.readMutation(switchKey)).toBeNull();
+    expect(value.store.requireSession(actor.sessionId)).toMatchObject({
+      profileId: actor.accountId,
+      provider: "codex",
+      state: "idle",
+    });
+  });
+
+  test("lets an effect-started provider switch fence a competing Work claim", async () => {
+    const value = await fixture();
+    const actor = await createActor(value);
+    const { created, joined } = await createAndJoin(value, actor);
+    const target = await value.service.execute(
+      { kind: "account.add", label: "Concurrent switch target" },
+      { signal },
+    ) as { account: { id: ProfileId } };
+    await value.service.execute(
+      { kind: "account.login", account: target.account.id, deviceCode: false },
+      { signal },
+    );
+    let enterTargetStart = (): void => {};
+    const targetStartEntered = new Promise<void>((resolve) => { enterTargetStart = resolve; });
+    let releaseTargetStart = (): void => {};
+    const targetStartGate = new Promise<void>((resolve) => { releaseTargetStart = resolve; });
+    value.runtime.beforeStartSessionReturn = async () => {
+      delete value.runtime.beforeStartSessionReturn;
+      enterTargetStart();
+      await targetStartGate;
+    };
+    const switchKey = nextKey();
+    const switchPromise = value.service.execute({
+      kind: "session.switch",
+      account: target.account.id,
+      idempotencyKey: switchKey,
+      provider: "codex",
+      session: actor.sessionId,
+    }, { signal });
+    await targetStartEntered;
+
+    let claimFailure: unknown;
+    try {
+      await value.service.execute({
+        kind: "work.apply",
+        requestId: crypto.randomUUID(),
+        operation: {
+          kind: "task.claim",
+          idempotencyKey: nextKey(),
+          workId: created.work.id,
+          taskId: created.tasks[0]!.id,
+          expectedTaskRevision: created.tasks[0]!.revision,
+          actorSessionId: actor.sessionId,
+          actorCapability: joined.memberCapability,
+          leaseMs: 5_000,
+        },
+      }, { signal });
+    } catch (error: unknown) {
+      claimFailure = error;
+    }
+    releaseTargetStart();
+    const switched = await switchPromise as { session: { profileId: ProfileId } };
+
+    expect(claimFailure).toBeInstanceOf(CommandFailure);
+    expect(claimFailure).toMatchObject({
+      code: "CONFLICT",
+      details: { reason: "ROUTE_MISMATCH" },
+    });
+    expect(value.workStore.snapshot(created.work.id).tasks[0]?.status).toBe("ready");
+    expect(value.store.readMutation(switchKey)).toMatchObject({ state: "applied" });
+    expect(switched.session.profileId).toBe(target.account.id);
+    expect(value.runtime.startSessionCount).toBe(2);
+    expect(value.runtime.startTurnCalls).toHaveLength(1);
+    expect(value.runtime.endSessionCount).toBe(1);
   });
 
   test("provider disconnect and service close atomically retire claimed, running, and recovery work", async () => {
