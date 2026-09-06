@@ -442,7 +442,8 @@ export const TRANSCRIPT_SEED_HEADER = "[HRA provider handoff]";
 const actorLabel = (actor: SessionMessageActor): string =>
   actor === "human" ? "User" : actor === "autorespond" ? "User (autorespond)" : "User (handoff)";
 
-const seedLine = (record: TranscriptRecord): string => {
+/** Render one already-validated neutral record; manual v1 bytes stay unchanged. */
+export const renderTranscriptRecord = (record: TranscriptRecord): string => {
   switch (record.kind) {
     case "user": return `${actorLabel(record.actor)}: ${record.text}${
       record.omittedCharacters > 0 ? ` [+${String(record.omittedCharacters)} characters omitted]` : ""}`;
@@ -494,7 +495,7 @@ export const renderTranscriptSeed = (input: Readonly<{
   for (let index = input.transcript.records.length - 1; index >= 0; index -= 1) {
     const record = input.transcript.records[index];
     if (record === undefined) continue;
-    const line = seedLine(record);
+    const line = renderTranscriptRecord(record);
     if (used + line.length + 1 > maxCharacters) break;
     lines.push(line);
     used += line.length + 1;
