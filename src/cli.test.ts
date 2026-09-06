@@ -130,13 +130,14 @@ const sessionAdoptionTableNames = [
 // An install written by the released provider-switch build: notification,
 // preset-contract, Devin-provider, and personal-session-adoption migrations are
 // absent and `user_version` still names schema v35. A writable open must carry
-// that authority through both later feature families to v40 without pretending
+// that authority through the later feature families, timestamp guard, peer/memory,
+// and hosted-memory migrations to v43 without pretending
 // either newer private authority surface already existed. Released v0.5 stores
 // use schema v33 and are covered by storage migration tests.
 const downgradeStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("PRAGMA foreign_keys=OFF");
+    database.exec("PRAGMA foreign_keys=OFF; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert;");
     const laterSchemaObjects = database.query(`
       SELECT name,type FROM sqlite_master
       WHERE name NOT LIKE 'sqlite_%' AND (
@@ -194,7 +195,7 @@ const downgradeStateSchema = (databasePath: string): void => {
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("PRAGMA user_version=41");
+    database.exec("PRAGMA user_version=44");
   } finally {
     database.close(false);
   }
@@ -6195,7 +6196,7 @@ describe("CLI entry point", () => {
       });
       expect(started.read().stderr).toBe("");
       expect(daemonStarts).toBe(1);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(40);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(43);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6219,7 +6220,7 @@ describe("CLI entry point", () => {
         error: {
           code: "RECOVERY_REQUIRED",
           details: { nextCommand: "hra daemon start" },
-          message: "The local state schema needs a migration (35 to 40); start the daemon to migrate it.",
+          message: "The local state schema needs a migration (35 to 43); start the daemon to migrate it.",
         },
         ok: false,
         version: 1,
@@ -6251,14 +6252,14 @@ describe("CLI entry point", () => {
       expect(JSON.parse(captured.read().stdout)).toEqual({
         error: {
           code: "RECOVERY_REQUIRED",
-          message: "This HRA build is older than the local state schema (41 vs 40); install the newer HRA.",
+          message: "This HRA build is older than the local state schema (44 vs 43); install the newer HRA.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
       expect(daemonStarts).toBe(0);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(41);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(44);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6280,7 +6281,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["The local state schema needs a migration (35 to 40). Run `hra daemon start` to migrate it."],
+          problems: ["The local state schema needs a migration (35 to 43). Run `hra daemon start` to migrate it."],
           state: { database: "invalid", initialized: false },
         },
       });
@@ -6307,7 +6308,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["This HRA build is older than the local state schema (41 vs 40). Install the newer HRA."],
+          problems: ["This HRA build is older than the local state schema (44 vs 43). Install the newer HRA."],
           state: { database: "invalid", initialized: false },
         },
       });

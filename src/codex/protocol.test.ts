@@ -1849,8 +1849,15 @@ describe("runtime capability resolution", () => {
     expect(page.data[0]).toMatchObject({
       createdAt: createdAtSeconds * 1_000,
       updatedAt: updatedAtSeconds * 1_000,
+      providerTimestampUnit: "unix_milliseconds_v1",
     });
-    for (const invalidCreatedAt of [1.5, Math.floor(Number.MAX_SAFE_INTEGER / 1_000) + 1]) {
+    fc.assert(fc.property(fc.integer({ min: 0, max: Math.floor(Number.MAX_SAFE_INTEGER / 1_000) }), (seconds) => {
+      const parsed = parseThreadMetadataRead({ thread: { ...providerThread, updatedAt: seconds } });
+      expect(parsed.providerTimestampUnit).toBe("unix_milliseconds_v1");
+      expect(parsed.updatedAt).toBe(seconds * 1_000);
+      expect(Number.isSafeInteger(parsed.updatedAt)).toBe(true);
+    }));
+    for (const invalidCreatedAt of [-1, 1.5, Math.floor(Number.MAX_SAFE_INTEGER / 1_000) + 1]) {
       expect(() => parseThreadPage({
         data: [{ ...providerThread, createdAt: invalidCreatedAt }],
         nextCursor: null,

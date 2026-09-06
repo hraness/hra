@@ -2926,8 +2926,8 @@ export type SessionProviderBaseline = {
 export type MutationEffectEvidence =
   | { kind: "session.send"; providerThreadId: string; baseline: SessionProviderBaseline; clientMessageId: string; messageDigest: string; runtimeProfile?: ReviewedRuntimeProfile; messageActor?: SessionMessageActor }
   | { kind: "session.steer"; providerThreadId: string; baseline: SessionProviderBaseline; activeTurnId: string | null; clientMessageId: string; messageDigest: string; messageActor?: SessionMessageActor }
-  | { kind: "session.stop"; providerThreadId: string; baseline: SessionProviderBaseline; activeTurnId: string | null }
-  | { kind: "session.rename"; providerThreadId: string; baseline: SessionProviderBaseline; requestedName: string }
+  | { kind: "session.stop"; providerThreadId: string; providerTimestampUnit?: "unix_milliseconds_v1"; baseline: SessionProviderBaseline; activeTurnId: string | null }
+  | { kind: "session.rename"; providerThreadId: string; providerTimestampUnit?: "unix_milliseconds_v1"; baseline: SessionProviderBaseline; requestedName: string }
   | { kind: "session.start"; projectId: ProjectId; clientMessageId: string | null; messageDigest: string | null; runtimeProfile?: ReviewedRuntimeProfile; conversationAutomationCapability?: typeof SESSION_CONVERSATION_AUTOMATION_CAPABILITY }
   | { kind: "session.switch"; daemonGeneration?: number | undefined; requestedAccountId: ProfileId | null; requestedPreset: Preset | null; sourceProfileId: ProfileId; sourceProcessGeneration: number; sourceProvider: Provider; sourceProviderThreadId: string; sourcePreset: Preset; targetProfileId: ProfileId; targetProcessGeneration: number; targetProvider: Provider; targetProviderAccountKey?: string | undefined; targetHostCapabilities?: SessionProviderSwitchHostCapabilities | undefined; targetPreset: Preset; transcriptDigest: string; seedDigest: string; seedIncludedRecords: number; seedOmittedRecords: number; runtimeProfile: ReviewedRuntimeProfile }
   | { kind: "account.login"; method: "browser" | "device_code" }
@@ -3034,8 +3034,8 @@ const sessionProviderSwitchHostCapabilitiesSchema = z.object({
 const mutationEffectEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.send"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, clientMessageId: z.string().min(1).max(512), messageDigest: sha256Schema, runtimeProfile: reviewedRuntimeProfileSchema.optional(), messageActor: sessionMessageActorSchema.optional() }).strict(),
   z.object({ kind: z.literal("session.steer"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable(), clientMessageId: z.string().min(1).max(512), messageDigest: sha256Schema, messageActor: sessionMessageActorSchema.optional() }).strict(),
-  z.object({ kind: z.literal("session.stop"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable() }).strict(),
-  z.object({ kind: z.literal("session.rename"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, requestedName: titleSchema }).strict(),
+  z.object({ kind: z.literal("session.stop"), providerThreadId: providerThreadIdSchema, providerTimestampUnit: z.literal("unix_milliseconds_v1").optional(), baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable() }).strict(),
+  z.object({ kind: z.literal("session.rename"), providerThreadId: providerThreadIdSchema, providerTimestampUnit: z.literal("unix_milliseconds_v1").optional(), baseline: providerBaselineSchema, requestedName: titleSchema }).strict(),
   z.object({ kind: z.literal("session.start"), projectId: projectIdSchema, clientMessageId: z.string().min(1).max(512).nullable(), messageDigest: sha256Schema.nullable(), runtimeProfile: reviewedRuntimeProfileSchema.optional(), conversationAutomationCapability: z.literal(SESSION_CONVERSATION_AUTOMATION_CAPABILITY).optional() }).strict(),
   z.object({
     kind: z.literal("session.switch"),
@@ -3073,6 +3073,65 @@ const mutationEffectEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("account.logout"), baselineSignedIn: z.boolean() }).strict(),
   z.object({ kind: z.literal("account.login-cancel"), loginId: providerLoginIdSchema }).strict(),
 ]);
+const safeProviderTimestampSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const timestampResolutionEvidenceSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("session.stop"),
+    providerThreadId: providerThreadIdSchema,
+    providerTimestampUnit: z.literal("unix_milliseconds_v1"),
+    providerUpdatedAt: safeProviderTimestampSchema,
+    activeTurnId: z.string().min(1).max(200),
+    observedStatus: z.enum(["absent", "completed", "interrupted", "failed"]),
+  }).strict(),
+  z.object({
+    kind: z.literal("session.rename"),
+    providerThreadId: providerThreadIdSchema,
+    providerTimestampUnit: z.literal("unix_milliseconds_v1"),
+    providerUpdatedAt: safeProviderTimestampSchema,
+    requestedName: z.string().refine((value) => value === value.trim()).pipe(titleSchema),
+  }).strict(),
+]);
+
+const assertTimestampMutationResolution = (input: {
+  effect: Extract<MutationEffectEvidence, { kind: "session.stop" | "session.rename" }>;
+  resolution: MutationResolutionRecord["kind"];
+  evidence: unknown;
+  receipt: unknown;
+  provider: { providerThreadId: string; title: string; activeTurnId?: string; providerUpdatedAt?: number } | undefined;
+}): void => {
+  if (input.resolution !== "proven_applied") {
+    if (input.receipt !== undefined) throw new Error("MUTATION_RECOVERY_TIMESTAMP_RECEIPT_UNEXPECTED");
+    return;
+  }
+  const { effect, provider } = input;
+  const proof = timestampResolutionEvidenceSchema.safeParse(input.evidence);
+  const baseline = safeProviderTimestampSchema.safeParse(effect.baseline.providerUpdatedAt);
+  if (!proof.success || !baseline.success
+    || effect.providerTimestampUnit !== "unix_milliseconds_v1"
+    || proof.data.kind !== effect.kind
+    || proof.data.providerThreadId !== effect.providerThreadId
+    || proof.data.providerUpdatedAt <= baseline.data
+    || provider?.providerThreadId !== effect.providerThreadId
+    || provider.providerUpdatedAt !== proof.data.providerUpdatedAt) {
+    throw new Error("MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID");
+  }
+  if (effect.kind === "session.stop" && proof.data.kind === "session.stop") {
+    const receipt = z.object({ stopped: z.literal(true), activeTurnId: z.string().min(1).max(200) }).strict().safeParse(input.receipt);
+    if (!receipt.success || effect.activeTurnId === null
+      || effect.activeTurnId !== proof.data.activeTurnId
+      || receipt.data.activeTurnId !== effect.activeTurnId
+      || provider.activeTurnId === effect.activeTurnId) {
+      throw new Error("MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID");
+    }
+  } else if (effect.kind === "session.rename" && proof.data.kind === "session.rename") {
+    const receipt = z.object({ renamed: z.literal(true) }).strict().safeParse(input.receipt);
+    if (!receipt.success || proof.data.requestedName !== effect.requestedName
+      || provider.title !== effect.requestedName) {
+      throw new Error("MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID");
+    }
+  }
+};
+
 const queueEffectEvidenceSchema = z.object({
   kind: z.literal("queue.dispatch"),
   queueId: queueIdSchema,
@@ -3139,11 +3198,11 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-// v40 is the released personal-session adoption schema. The feature branch
-// temporarily used v40 for peer/local memory and v41 for hosted memory; those
-// exact legacy surfaces are structurally recognized below and advance to the
-// canonical v41/v42 ordering without trusting their numeric stamp alone.
-const currentSchemaVersion = 42;
+// v40 is the released personal-session adoption schema. The timestamp-proof
+// guard is canonical v41, peer/local memory is v42, and hosted canonical memory
+// is v43. Exact private feature cohorts that used v40-v42 differently are
+// structurally recognized below; their numeric stamp alone is never trusted.
+const currentSchemaVersion = 43;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -3312,6 +3371,113 @@ export const USAGE_LOCAL_RETAIN_SUCCESS_COUNT = 2_048;
 export const USAGE_LOCAL_RETAIN_FAILURE_COUNT = 2_048;
 export const USAGE_LOCAL_RETAIN_BYTES = 16 * 1_024 * 1_024;
 export const USAGE_LOCAL_SNAPSHOT_MAX_BYTES = 262_144;
+
+// Insert-only hardening leaves legacy evidence, digests, and resolutions intact.
+const timestampMutationResolutionGuard = `
+CREATE TRIGGER mutation_resolutions_timestamp_proof_insert
+BEFORE INSERT ON mutation_resolutions
+WHEN (SELECT kind FROM mutation_attempts WHERE id=NEW.attempt_id) IN ('session.stop','session.rename')
+BEGIN
+  SELECT CASE WHEN NEW.resolution_kind<>'proven_applied' AND NEW.receipt_json IS NOT NULL
+    THEN RAISE(ABORT,'MUTATION_RECOVERY_TIMESTAMP_RECEIPT_UNEXPECTED') END;
+  SELECT CASE WHEN NEW.resolution_kind='proven_applied' AND (
+    NOT json_valid(NEW.evidence_json) OR NEW.receipt_json IS NULL OR NOT json_valid(NEW.receipt_json)
+  ) THEN RAISE(ABORT,'MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID') END;
+  SELECT CASE WHEN NEW.resolution_kind='proven_applied' AND NOT EXISTS (
+    SELECT 1 FROM mutation_attempts m
+    JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+    JOIN sessions s ON s.id=m.authority_id
+    WHERE m.id=NEW.attempt_id AND e.kind=m.kind
+      AND json_extract(e.evidence_json,'$.kind')=m.kind
+      AND json_extract(NEW.evidence_json,'$.kind')=m.kind
+      AND json_extract(e.evidence_json,'$.providerThreadId')=s.provider_thread_id
+      AND json_extract(NEW.evidence_json,'$.providerThreadId')=s.provider_thread_id
+      AND json_extract(e.evidence_json,'$.providerTimestampUnit')='unix_milliseconds_v1'
+      AND json_extract(NEW.evidence_json,'$.providerTimestampUnit')='unix_milliseconds_v1'
+      AND json_type(e.evidence_json,'$.baseline.providerUpdatedAt')='integer'
+      AND json_extract(e.evidence_json,'$.baseline.providerUpdatedAt') BETWEEN 0 AND 9007199254740991
+      AND json_type(NEW.evidence_json,'$.providerUpdatedAt')='integer'
+      AND json_extract(NEW.evidence_json,'$.providerUpdatedAt') BETWEEN 0 AND 9007199254740991
+      AND json_extract(NEW.evidence_json,'$.providerUpdatedAt')>json_extract(e.evidence_json,'$.baseline.providerUpdatedAt')
+      AND s.provider_updated_at=json_extract(NEW.evidence_json,'$.providerUpdatedAt')
+      AND (
+        (m.kind='session.stop'
+          AND s.active_turn_id IS NOT json_extract(e.evidence_json,'$.activeTurnId')
+          AND (SELECT count(*) FROM json_each(NEW.evidence_json))=6
+          AND (SELECT count(*) FROM json_each(NEW.receipt_json))=2
+          AND json_type(e.evidence_json,'$.activeTurnId')='text'
+          AND json_extract(NEW.evidence_json,'$.activeTurnId')=json_extract(e.evidence_json,'$.activeTurnId')
+          AND json_extract(NEW.receipt_json,'$.activeTurnId')=json_extract(e.evidence_json,'$.activeTurnId')
+          AND json_extract(NEW.evidence_json,'$.observedStatus') IN ('absent','completed','interrupted','failed')
+          AND json_type(NEW.receipt_json,'$.stopped')='true')
+        OR (m.kind='session.rename'
+          AND s.title=json_extract(e.evidence_json,'$.requestedName')
+          AND (SELECT count(*) FROM json_each(NEW.evidence_json))=5
+          AND (SELECT count(*) FROM json_each(NEW.receipt_json))=1
+          AND json_extract(NEW.evidence_json,'$.requestedName')=json_extract(e.evidence_json,'$.requestedName')
+          AND json_type(NEW.receipt_json,'$.renamed')='true')
+      )
+  ) THEN RAISE(ABORT,'MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID') END;
+END;
+`;
+
+const assertSchemaVersion41TimestampProof = (database: Database): void => {
+  const observed = z.object({ type: z.literal("trigger"), tbl_name: z.literal("mutation_resolutions"), sql: z.string() }).strict().safeParse(
+    database.query("SELECT type,tbl_name,sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'").get(),
+  );
+  // SQLite stores our CREATE statement without its terminal semicolon. Compare
+  // the exact remaining text: normalizing whitespace can change SQL literals.
+  if (!observed.success || observed.data.sql !== timestampMutationResolutionGuard.trim().slice(0, -1)) {
+    throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID");
+  }
+};
+
+const assertExactMigrationLedgerTail = (
+  database: Database,
+  expectedVersions: readonly number[],
+  code: string,
+): void => {
+  const firstVersion = expectedVersions[0];
+  if (firstVersion === undefined) throw new Error(code);
+  const ledger = z.object({
+    version: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    applied_at: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
+  }).strict().array().safeParse(database.query(
+    "SELECT version,applied_at FROM migrations WHERE version>=? ORDER BY version LIMIT ?",
+  ).all(firstVersion, expectedVersions.length + 1));
+  if (
+    !ledger.success
+    || ledger.data.length !== expectedVersions.length
+    || ledger.data.some((row, index) => row.version !== expectedVersions[index])
+  ) throw new Error(code);
+};
+
+const assertSchemaVersion41Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertExactMigrationLedgerTail(
+    database,
+    [41],
+    "STATE_SCHEMA_V41_MIGRATION_LEDGER_INVALID",
+  );
+};
+
+const assertSchemaVersion42Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertExactMigrationLedgerTail(
+    database,
+    [41, 42],
+    "STATE_SCHEMA_V42_MIGRATION_LEDGER_INVALID",
+  );
+};
+
+const assertSchemaVersion43Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertExactMigrationLedgerTail(
+    database,
+    [41, 42, 43],
+    "STATE_SCHEMA_V43_MIGRATION_LEDGER_INVALID",
+  );
+};
 
 const schemaVersion1 = `
 CREATE TABLE IF NOT EXISTS migrations (
@@ -10876,13 +11042,14 @@ const assertSchemaVersion41Objects = (database: Database): void => {
   ).get() !== null) throw new Error("STATE_SCHEMA_V41_CANONICAL_MEMORY_SYNC_INVALID");
 };
 
-// The memory branch used these numeric names before the released adoption
-// migration claimed v40. Keep its physical SQL and object names stable for
-// compatibility, but expose the canonical ordering explicitly at the
-// migration boundary: peer/local memory is v41 and hosted memory is v42.
-const applySchemaVersion41PeerSessions = applySchemaVersion40PeerSessions;
-const applySchemaVersion42CanonicalMemorySync = applySchemaVersion41CanonicalMemorySync;
-const assertSchemaVersion42CanonicalMemoryObjects = assertSchemaVersion41Objects;
+// The memory branch used these numeric names before the released adoption and
+// timestamp-proof migrations claimed v40/v41. Keep its physical SQL and object
+// names stable for exact predecessor recognition, while exposing the canonical
+// ordering at the migration boundary: peer/local memory is v42 and hosted
+// canonical memory is v43.
+const applySchemaVersion42PeerSessions = applySchemaVersion40PeerSessions;
+const applySchemaVersion43CanonicalMemorySync = applySchemaVersion41CanonicalMemorySync;
+const assertSchemaVersion43CanonicalMemoryObjects = assertSchemaVersion41Objects;
 
 const legacyFeaturePeerObjects: readonly EmbeddedSchemaObject[] = [
   ...schemaVersion40Objects.map((object) => object.name === "session_host_capability_binding_delete_guard"
@@ -10893,7 +11060,7 @@ const legacyFeaturePeerObjects: readonly EmbeddedSchemaObject[] = [
 const legacyFeatureProviderSwitchObjectNames = legacyFeatureProviderSwitchObjects
   .map((object) => object.name);
 
-const assertSchemaVersion41PeerObjects = (database: Database): void => {
+const assertSchemaVersion42PeerObjects = (database: Database): void => {
   assertSchemaVersion40Objects(database);
   assertNoSchemaObjects(
     database,
@@ -10928,7 +11095,15 @@ const dropEmptyLegacyFeatureProviderSwitchJournal = (database: Database): void =
   `);
 };
 
-type CollidingFeatureSchema = "none" | "upstream-v40" | "feature-v40" | "feature-v41";
+type CollidingFeatureSchema =
+  | "none"
+  | "upstream-v40"
+  | "upstream-v41"
+  | "canonical-v42"
+  | "feature-v40"
+  | "feature-v41"
+  | "private-v41"
+  | "private-v42";
 
 const hasAnySchemaObject = (
   database: Database,
@@ -10950,16 +11125,11 @@ const assertNoSchemaObjects = (
 
 const assertFeatureEraMigrationTail = (
   database: Database,
-  version: 40 | 41,
+  version: 40 | 41 | 42,
+  code = `STATE_SCHEMA_FEATURE_V${String(version)}_LEDGER_INVALID`,
 ): void => {
-  const rows = z.object({ version: z.number().int() }).strict().array().parse(
-    database.query("SELECT version FROM migrations WHERE version>=40 ORDER BY version").all(),
-  );
-  const expected = version === 40 ? [40] : [40, 41];
-  if (
-    rows.length !== expected.length
-    || rows.some((row, index) => row.version !== expected[index])
-  ) throw new Error(`STATE_SCHEMA_FEATURE_V${String(version)}_LEDGER_INVALID`);
+  const expected = version === 40 ? [40] : version === 41 ? [40, 41] : [40, 41, 42];
+  assertExactMigrationLedgerTail(database, expected, code);
 };
 
 /**
@@ -10971,32 +11141,108 @@ const classifyCollidingFeatureSchema = (
   database: Database,
   initialVersion: number,
 ): CollidingFeatureSchema => {
-  if (initialVersion !== 40 && initialVersion !== 41) return "none";
+  if (initialVersion !== 40 && initialVersion !== 41 && initialVersion !== 42) {
+    return "none";
+  }
   const adoptionNames = schemaVersion40AdoptionObjects.map((object) => object.name);
   const peerNames = schemaVersion40Objects.map((object) => object.name);
   const canonicalMemoryNames = schemaVersion41Objects.map((object) => object.name);
   const legacyProviderSwitchNames = legacyFeatureProviderSwitchObjectNames;
+  const timestampProofNames = ["mutation_resolutions_timestamp_proof_insert"];
   const hasAdoptionIdentity = hasTableColumn(database, "profiles", "codex_account_key")
     || hasAnySchemaObject(database, adoptionNames);
+  const hasPeerIdentity = hasTableColumn(database, "queue_entries", "message_actor")
+    || hasTableColumn(database, "queue_entries", "peer_action_id")
+    || hasAnySchemaObject(database, [...peerNames, ...legacyProviderSwitchNames]);
+  const hasCanonicalMemoryIdentity = hasAnySchemaObject(database, canonicalMemoryNames);
+  const hasTimestampProofIdentity = hasAnySchemaObject(database, timestampProofNames);
 
-  if (initialVersion === 40 && hasAdoptionIdentity) {
+  const assertAdoptionPredecessor = (): void => {
+    assertCanonicalLabelKeys(database);
+    assertSchemaVersion35Objects(database);
+    assertSchemaVersion38PresetContracts(database);
     assertSchemaVersion39ProviderAuthority(database);
     assertSchemaVersion40AdoptionObjects(database);
     assertExactSchemaVersion40AdoptionSurface(database);
     assertWorkSchema(database);
     assertSessionTaskSchema(database);
+    assertCompositeNotificationPolicy(database);
+  };
+
+  // A same-name timestamp object can never enter an unguarded compatibility
+  // cohort. Only an exact authoritative v41/v42 surface may prove it.
+  if (hasTimestampProofIdentity) {
+    if (
+      initialVersion === 41
+      && hasAdoptionIdentity
+      && !hasPeerIdentity
+      && !hasCanonicalMemoryIdentity
+    ) {
+      assertAdoptionPredecessor();
+      assertNoSchemaObjects(database, legacyProviderSwitchNames, "STATE_SCHEMA_V41_FEATURE_COLLISION");
+      assertSchemaVersion41Authority(database);
+      return "upstream-v41";
+    }
+    if (
+      initialVersion === 42
+      && hasAdoptionIdentity
+      && hasPeerIdentity
+      && !hasCanonicalMemoryIdentity
+    ) {
+      assertAdoptionPredecessor();
+      assertSchemaVersion42PeerObjects(database);
+      assertSchemaVersion42Authority(database);
+      return "canonical-v42";
+    }
+    throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
+  }
+
+  if (initialVersion === 40 && hasAdoptionIdentity) {
+    assertAdoptionPredecessor();
     assertNoSchemaObjects(
       database,
       [...peerNames, ...legacyProviderSwitchNames],
       "STATE_SCHEMA_V40_FEATURE_COLLISION",
     );
     assertNoSchemaObjects(database, canonicalMemoryNames, "STATE_SCHEMA_V40_FEATURE_COLLISION");
+    assertFeatureEraMigrationTail(
+      database,
+      40,
+      "STATE_SCHEMA_UPSTREAM_V40_LEDGER_INVALID",
+    );
     return "upstream-v40";
   }
 
   if (hasAdoptionIdentity) {
+    assertAdoptionPredecessor();
+    if (initialVersion === 41 && hasPeerIdentity && !hasCanonicalMemoryIdentity) {
+      assertSchemaVersion42PeerObjects(database);
+      assertFeatureEraMigrationTail(
+        database,
+        41,
+        "STATE_SCHEMA_PRIVATE_V41_LEDGER_INVALID",
+      );
+      return "private-v41";
+    }
+    if (initialVersion === 42 && hasPeerIdentity && hasCanonicalMemoryIdentity) {
+      assertSchemaVersion42PeerObjects(database);
+      assertSchemaVersion43CanonicalMemoryObjects(database);
+      assertFeatureEraMigrationTail(
+        database,
+        42,
+        "STATE_SCHEMA_PRIVATE_V42_LEDGER_INVALID",
+      );
+      return "private-v42";
+    }
+    // An authoritative timestamp predecessor with its guard removed must fail
+    // as guard damage rather than being laundered into a private cohort.
+    if (
+      (initialVersion === 41 && !hasPeerIdentity && !hasCanonicalMemoryIdentity)
+      || (initialVersion === 42 && hasPeerIdentity && !hasCanonicalMemoryIdentity)
+    ) assertSchemaVersion41TimestampProof(database);
     throw new Error(`STATE_SCHEMA_FEATURE_V${String(initialVersion)}_ADOPTION_COLLISION`);
   }
+  if (initialVersion === 42) throw new Error("STATE_SCHEMA_FEATURE_V42_ADOPTION_COLLISION");
   assertCanonicalLabelKeys(database);
   assertSchemaVersion35Objects(database);
   assertSchemaVersion38PresetContracts(database);
@@ -11007,7 +11253,7 @@ const classifyCollidingFeatureSchema = (
   if (hasAnySchemaObject(database, legacyProviderSwitchNames)) {
     assertLegacyFeaturePeerObjects(database);
   } else {
-    assertSchemaVersion41PeerObjects(database);
+    assertSchemaVersion42PeerObjects(database);
   }
   if (initialVersion === 40) {
     assertNoSchemaObjects(
@@ -11016,7 +11262,7 @@ const classifyCollidingFeatureSchema = (
       "STATE_SCHEMA_FEATURE_V40_HOSTED_MEMORY_COLLISION",
     );
   } else {
-    assertSchemaVersion42CanonicalMemoryObjects(database);
+    assertSchemaVersion43CanonicalMemoryObjects(database);
   }
   assertFeatureEraMigrationTail(database, initialVersion);
   return initialVersion === 40 ? "feature-v40" : "feature-v41";
@@ -11854,20 +12100,31 @@ const migrateWritableDatabase = (
   const collidingFeatureSchema = classifyCollidingFeatureSchema(database, initialVersion);
   const featureEraSchema = collidingFeatureSchema === "feature-v40"
     || collidingFeatureSchema === "feature-v41";
+  const unguardedHistoricalTimestampSchema = collidingFeatureSchema === "feature-v41"
+    || collidingFeatureSchema === "private-v41"
+    || collidingFeatureSchema === "private-v42";
   const hasLegacyFeatureProviderSwitchJournal = featureEraSchema
     && hasAnySchemaObject(database, legacyFeatureProviderSwitchObjectNames);
+  if (
+    initialVersion < 40
+    && hasAnySchemaObject(database, ["mutation_resolutions_timestamp_proof_insert"])
+  ) throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
   if (initialVersion === currentSchemaVersion) {
     // A current-version stamp is an assertion boundary, not permission to
     // reconstruct authority. Prove every provider/adoption execution guard
     // before the idempotent maintenance tail can touch any schema object.
     assertCanonicalLabelKeys(database);
+    assertSchemaVersion35Objects(database);
+    assertSchemaVersion38PresetContracts(database);
     assertSchemaVersion39ProviderAuthority(database);
     assertSchemaVersion40AdoptionObjects(database);
     assertExactSchemaVersion40AdoptionSurface(database);
     assertWorkSchema(database);
     assertSessionTaskSchema(database);
-    assertSchemaVersion41PeerObjects(database);
-    assertSchemaVersion42CanonicalMemoryObjects(database);
+    assertCompositeNotificationPolicy(database);
+    assertSchemaVersion42PeerObjects(database);
+    assertSchemaVersion43CanonicalMemoryObjects(database);
+    assertSchemaVersion43Authority(database);
   }
   // Both pre-release adoption and notification builds used version 36. Freeze
   // their identity before any additive pre-application can blur the evidence.
@@ -11875,7 +12132,7 @@ const migrateWritableDatabase = (
     database,
     initialVersion,
   );
-  const legacySessionAdoption = initialVersion < currentSchemaVersion
+  const legacySessionAdoption = initialVersion < 40
     && collidingFeatureSchema === "none"
     ? classifyLegacySessionAdoptionSchema(database, initialVersion)
     : "absent";
@@ -12425,31 +12682,45 @@ const migrateWritableDatabase = (
       }
     }
 
-    // origin/main v39 owns the Devin authority columns. Reapply and assert it before
-    // touching feature-era v39 databases: those builds used the same version
-    // number for peer/memory objects and therefore need the canonical v39
-    // authority materialized before they can advance to v40.
+    // Released v39 owns the provider-authority columns. Reapply and assert that
+    // immutable predecessor after the bounded legacy-adoption bridge and before
+    // advancing into the canonical v40+ sequence.
     applySchemaVersion39ProviderAuthority(database);
     assertSchemaVersion39ProviderAuthority(database);
 
-    if (version < 41) {
-      const migratedAt = unixMillisecondsSchema.parse(now());
-      applySchemaVersion41PeerSessions(database);
-      database.query(
-        "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
-      ).run(41, migratedAt);
-      database.exec("PRAGMA user_version = 41");
-      version = 41;
+    if (version < 41 || unguardedHistoricalTimestampSchema) {
+      // v40 remains an immutable predecessor. Canonical v41 adds one exact
+      // insert-only proof guard. An admitted unguarded private v41/v42 cohort
+      // receives that guard without rewriting its already-recorded ledger rows.
+      database.exec(timestampMutationResolutionGuard);
+      assertSchemaVersion41TimestampProof(database);
+      if (version < 41) {
+        database.query(
+          "INSERT INTO migrations(version, applied_at) VALUES (?, ?)",
+        ).run(41, unixMillisecondsSchema.parse(now()));
+        database.exec("PRAGMA user_version = 41");
+        version = 41;
+      }
     }
 
     if (version < 42) {
       const migratedAt = unixMillisecondsSchema.parse(now());
-      applySchemaVersion42CanonicalMemorySync(database);
+      applySchemaVersion42PeerSessions(database);
       database.query(
         "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
       ).run(42, migratedAt);
       database.exec("PRAGMA user_version = 42");
       version = 42;
+    }
+
+    if (version < 43) {
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      applySchemaVersion43CanonicalMemorySync(database);
+      database.query(
+        "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
+      ).run(43, migratedAt);
+      database.exec("PRAGMA user_version = 43");
+      version = 43;
     }
 
     // Reapplying additive objects and idempotent authority backfills makes a
@@ -12480,8 +12751,8 @@ const migrateWritableDatabase = (
     assertSchemaVersion24Objects(database);
     ensureSessionEventProjectionVersion(database);
     applySchemaVersion38PresetContracts(database);
-    if (initialVersion < currentSchemaVersion) applySchemaVersion39ProviderAuthority(database);
-    if (initialVersion < currentSchemaVersion) database.exec(WORK_SCHEMA_SQL);
+    if (initialVersion < 40) applySchemaVersion39ProviderAuthority(database);
+    if (initialVersion < 40) database.exec(WORK_SCHEMA_SQL);
     assertSchemaVersion38PresetContracts(database);
     assertSchemaVersion39ProviderAuthority(database);
     database.exec(schemaVersion27);
@@ -12503,10 +12774,11 @@ const migrateWritableDatabase = (
     assertSchemaVersion40AdoptionObjects(database);
     assertExactSchemaVersion40AdoptionSurface(database);
     assertWorkSchema(database);
-    applySchemaVersion41PeerSessions(database);
-    assertSchemaVersion41PeerObjects(database);
-    applySchemaVersion42CanonicalMemorySync(database);
-    assertSchemaVersion42CanonicalMemoryObjects(database);
+    applySchemaVersion42PeerSessions(database);
+    assertSchemaVersion42PeerObjects(database);
+    applySchemaVersion43CanonicalMemorySync(database);
+    assertSchemaVersion43CanonicalMemoryObjects(database);
+    assertSchemaVersion43Authority(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -13206,7 +13478,17 @@ export class StateStore {
       } else {
         const version = readUserVersion(this.#database);
         if (version > currentSchemaVersion) throw new Error(`STATE_SCHEMA_NEWER:${version}:${currentSchemaVersion}`);
-        if (version < currentSchemaVersion) throw new Error(`STATE_SCHEMA_MIGRATION_REQUIRED:${version}:${currentSchemaVersion}`);
+        if (version < currentSchemaVersion) {
+          // Validate colliding v40-v42 identities before returning the normal
+          // readonly migration diagnostic. This is structural proof only: it
+          // never repairs a missing/altered v41 guard or malformed ledger.
+          classifyCollidingFeatureSchema(this.#database, version);
+          if (
+            version < 40
+            && hasAnySchemaObject(this.#database, ["mutation_resolutions_timestamp_proof_insert"])
+          ) throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
+          throw new Error(`STATE_SCHEMA_MIGRATION_REQUIRED:${version}:${currentSchemaVersion}`);
+        }
         if (hasPendingSecurityScrub(this.#database)) throw new Error("STATE_SECURITY_SCRUB_REQUIRED");
       }
       assertSchemaVersion24Objects(this.#database);
@@ -13215,6 +13497,7 @@ export class StateStore {
       assertSchemaVersion39ProviderAuthority(this.#database);
       assertSchemaVersion40AdoptionObjects(this.#database);
       assertExactSchemaVersion40AdoptionSurface(this.#database);
+      assertSchemaVersion43Authority(this.#database);
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);
@@ -13223,8 +13506,8 @@ export class StateStore {
       assertAccountRateLimitResetPolicies(this.#database);
       assertSessionTaskSchema(this.#database);
       assertCompositeNotificationPolicy(this.#database);
-      assertSchemaVersion41PeerObjects(this.#database);
-      assertSchemaVersion42CanonicalMemoryObjects(this.#database);
+      assertSchemaVersion42PeerObjects(this.#database);
+      assertSchemaVersion43CanonicalMemoryObjects(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
       this.#database.close(false);
@@ -26149,6 +26432,10 @@ export class StateStore {
         messageActor,
       };
     }
+    if ((evidence.kind === "session.stop" || evidence.kind === "session.rename")
+      && evidence.providerTimestampUnit !== undefined) {
+      safeProviderTimestampSchema.parse(evidence.baseline.providerUpdatedAt);
+    }
     const canonical = JSON.stringify(evidence);
     const digest = createHash("sha256").update(canonical).digest("hex");
     const now = this.#now();
@@ -27940,6 +28227,15 @@ export class StateStore {
       if (effectEvidence.kind !== row.kind || digestJson(effectEvidence) !== row.evidence_digest) {
         throw new Error("MUTATION_RECOVERY_EVIDENCE_MISMATCH");
       }
+      if (effectEvidence.kind === "session.stop" || effectEvidence.kind === "session.rename") {
+        assertTimestampMutationResolution({
+          effect: effectEvidence,
+          resolution,
+          evidence: input.resolutionEvidence,
+          receipt: input.receipt,
+          provider: input.provider,
+        });
+      }
       if (effectEvidence.kind === "session.switch") {
         if (resolution === "proven_applied" && input.receipt === undefined) {
           throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_RECEIPT_REQUIRED");
@@ -28497,14 +28793,18 @@ export class StateStore {
           unresolved.push({ id, kind, authorityId });
           continue;
         }
+        const retiredSessionSwitchRecovered = kind === "session.switch"
+          && effectEvidence?.kind === "session.switch"
+          && (effectEvidence.sourceProvider === "devin"
+            || effectEvidence.targetProvider === "devin");
         if (
           kind !== "desktop.switch"
-          && kind !== "session.switch"
+          && (kind !== "session.switch" || retiredSessionSwitchRecovered)
           && !this.transitionMutation(id, "effect_started", "ambiguous", { code: "DAEMON_RESTART" })
         ) {
           throw new Error("Mutation changed during restart recovery.");
         }
-        if (kind !== "session.switch") recovered.push(id);
+        if (kind !== "session.switch" || retiredSessionSwitchRecovered) recovered.push(id);
       }
       return { recovered, unresolved };
     });

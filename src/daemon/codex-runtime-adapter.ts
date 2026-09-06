@@ -736,6 +736,9 @@ export const projectBoundedThread = (
     status: threadStatus(thread),
     projectRoot: thread.cwd,
     providerUpdatedAt: thread.updatedAt,
+    ...(thread.providerTimestampUnit === "unix_milliseconds_v1"
+      && Number.isSafeInteger(thread.updatedAt) && thread.updatedAt >= 0
+      ? { providerTimestampUnit: thread.providerTimestampUnit } : {}),
     ...(turnId === undefined ? {} : { activeTurnId: turnId }),
     messages,
     turnSummaries: turns.map((turn) => {
