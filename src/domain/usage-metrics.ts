@@ -11,6 +11,8 @@ const CODEX_WEEKLY_RATE_LIMIT_WINDOW_MS =
 export const AUTO_RATE_LIMIT_RESET_REMAINING_PERCENT = 1;
 export const AUTO_RATE_LIMIT_RESET_USED_PERCENT =
   100 - AUTO_RATE_LIMIT_RESET_REMAINING_PERCENT;
+// Exhaustion and the established weekly-credit policy share one threshold.
+export const USAGE_EXHAUSTION_USED_PERCENT = AUTO_RATE_LIMIT_RESET_USED_PERCENT;
 
 export const accountRateLimitResetOutcomeSchema = z.enum([
   "reset",
