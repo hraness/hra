@@ -142,7 +142,7 @@ export interface PublicContent {
     readonly url: string;
   };
   readonly productName: string;
-  /** Provider order stated the same way everywhere. */
+  /** Provider availability and its main capability limit, stated the same way everywhere. */
   readonly providerRoadmap: string;
   /** The exact CLI release named by the command; availability is stated separately. */
   readonly releaseVersion: string;
@@ -216,7 +216,7 @@ const privacyBlocks: readonly ContentBlock[] = [
   ),
   { kind: "subheading", text: "Encrypted before upload" },
   list(
-    [text("User messages and final assistant display text.")],
+    [text("User messages and final assistant display text. This includes peer-session messages and their supplied reasons when HRA records them as transcript messages.")],
     [text("Session names, notes, queued messages, and steering input.")],
     [text("Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not projected. For managed profiles, HRA validates one bounded Claude Code authentication-status response transiently, reduces it to signedIn, and never retains, returns, projects, or uploads the identity or usage fields. Personal-home Claude adoption transiently reads bounded account, email, and organization identity metadata and retains only a one-way local authority key. Raw Claude identity fields and that private authority key are never publicly returned, projected, or uploaded; HRA never opens or parses a Claude credential file.")],
     [text("Codex and Claude Code personal-session adoption status: whether discovery is enabled and bounded pending, adopted, and fenced counts. Candidate identities and records are never included.")],
@@ -224,6 +224,8 @@ const privacyBlocks: readonly ContentBlock[] = [
     [text("Bounded observed file and Git metadata, without unbounded filesystem paths.")],
     [text("Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.")],
     [text("Remote-command input and results that fit the closed command protocol.")],
+    [text("Canonical Oh operations, including their page records and provenance, terminal-head proofs, portable adoption proofs, and hosted-space descriptors for projects the owner explicitly enrolls in hosted memory.")],
+    [text("A bounded read-only memory summary containing portable space and project labels, exact head and sync metadata, record counts and recent record keys, effective peer policies, and content-free recent peer-action state. Authenticated coverage markers distinguish complete from bounded selections. This summary excludes page bodies, peer message text, action reasons, raw local project or session IDs, paths, and Oh operation bytes.")],
     [text("For an explicitly requested Codex web login, the provider HTTPS verification URL and separate one-time user code. HRA encrypts both to the account key before upload, lets only the requesting browser read them once, and deletes the hosted handoff on that read or after five minutes.")],
   ),
   { kind: "subheading", text: "Never uploaded" },
@@ -234,9 +236,10 @@ const privacyBlocks: readonly ContentBlock[] = [
     [text("Raw reasoning, hidden chain of thought, or approval secrets.")],
     [text("Provider-internal login and request IDs, permission values, MCP field contracts, protected answers, or response digests.")],
     [text("Environment variables, arbitrary command output, or unbounded filesystem paths.")],
+    [text("Working-memory Oh records and database bytes; canonical operations or page bodies outside their encrypted operation envelopes; and local Oh database paths.")],
   ),
   paragraph(
-    text("The sync service necessarily sees the verified HRA email address, device identifiers, record types, revisions, ciphertext sizes, timestamps, and execution-lease or command lifecycle metadata. It cannot decrypt session content without a paired device key. Email access alone does not recover that key."),
+    text("The sync service necessarily sees the verified HRA email address, device identifiers, opaque hosted-space identifiers, record types, revisions and key versions, ciphertext sizes, timestamps, execution-lease or command lifecycle metadata, and canonical-memory sequences plus keyed head tokens. It cannot decrypt session or memory content without a paired device key. Email access alone does not recover that key."),
   ),
   paragraph(
     text("A browser device holds the account key and decrypted projection only in that tab's memory by default. HRA does not programmatically write decrypted provider or session text to the clipboard, but browser extensions, accessibility APIs, screenshots, and explicit user selection can observe rendered text."),
@@ -273,17 +276,18 @@ export const siteDocumentPaths: readonly string[] = [
   "/privacy/",
 ];
 
-export const publicReleaseState: "live" | "release-ready" | "staged" = "live";
+export const publicReleaseState: "live" | "release-ready" | "staged" = "release-ready";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
-  "https://github.com/hraness/hra/releases/download/v0.6.3/hraness-hra-0.6.3.tgz",
+  "https://github.com/hraness/hra/releases/download/v0.7.0/hraness-hra-0.7.0.tgz",
 );
 
 const productName = "HRA";
 const tagline = "Control plane for Codex and Claude Code";
 const providerRoadmap = "Codex and Claude Code, side by side.";
-const releaseVersion = "0.6.3";
-const daemonRolloutNotice = `Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the v${releaseVersion} daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.`;
+const releaseVersion = "0.7.0";
+const admittedReleaseVersion = "0.6.3";
+const daemonRolloutNotice = `Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the admitted v${admittedReleaseVersion} daemon or candidate v${releaseVersion} daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability, candidate readiness, and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.`;
 
 /** Public runtime pins come from their authoritative source modules. */
 export const publicPins = {
@@ -341,16 +345,16 @@ export const publicContent: PublicContent = {
   providerRoadmap,
   releaseVersion,
   thesis: `${productName} runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.`,
-  description: `${tagline}. Local CLI v${releaseVersion} artifacts are live; daemon and hosted command-writer rollout remains blocked on capacity.`,
+  description: `${tagline}. Local CLI v${releaseVersion} is a release candidate; v${admittedReleaseVersion} is the admitted artifact, while daemon and hosted command-writer rollout remains blocked on capacity.`,
   daemonRolloutNotice,
-  statusLine: `Status: public beta. Local CLI v${releaseVersion} artifacts are live and passed immutable GitHub and npm release admission. Installing and checking the binary does not start the daemon. Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}. Current daemon and hosted command-writer rollout remains blocked on capacity.`,
+  statusLine: `Status: public beta. Local CLI v${releaseVersion} is a release candidate, while v${admittedReleaseVersion} is the fully admitted public artifact. Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}. Current daemon and hosted command-writer rollout remains blocked on capacity.`,
   badges,
   maintainer: {
     name: "Hraness",
     url: links.hraness,
   },
   socialCard: {
-    alt: `${productName} · local CLI beta v${releaseVersion} live · daemon rollout blocked on capacity · conditional session commands · hra.sh`,
+    alt: `${productName} · v${releaseVersion} release candidate · v${admittedReleaseVersion} admitted · daemon rollout blocked on capacity · hra.sh`,
     height: 630,
     path: "/social-card.png",
     width: 1200,
@@ -360,7 +364,7 @@ export const publicContent: PublicContent = {
   initCommand: "hra init --yes",
   doctorCommand: "hra doctor --offline",
   endpoints: {
-    betaTag: "live",
+    betaTag: "release-ready",
     githubRepository: "live",
     hostedSync: "live",
     website: "live",
@@ -372,7 +376,7 @@ export const publicContent: PublicContent = {
     heading: "One terminal for every Codex and Claude Code session",
     summary: "HRA keeps sessions alive behind a local daemon, isolates each account, and lets you or your agent direct any of them from a shell or JSON. Sync between machines is optional and encrypted.",
     example: "After the rollout prerequisite below is satisfied, ask your agent to start a Codex session on your work account, then hand the next turn to Claude Code without losing the conversation.",
-    boundary: `Local v${releaseVersion} artifacts live · current daemon and hosted command-writer rollout blocked on capacity · Codex on macOS and Linux · Claude Code on Linux · hosted sync live (${hostedBetaLabel})`,
+    boundary: `Local v${releaseVersion} release candidate · v${admittedReleaseVersion} artifacts admitted · current daemon and hosted command-writer rollout blocked on capacity · Codex on macOS and Linux · Claude Code on Linux · hosted sync live (${hostedBetaLabel})`,
     primaryAction: {
       href: "#install-command",
       label: "View release prerequisites",
@@ -426,8 +430,8 @@ export const publicContent: PublicContent = {
       },
       {
         label: "Sessions",
-        value: "Live and durable",
-        detail: "The local daemon keeps running after a terminal exits.",
+        value: "Live, locally recorded",
+        detail: "The daemon keeps sessions alive after a terminal exits and stores their provider-neutral transcript.",
       },
       {
         label: "Interfaces",
@@ -466,7 +470,7 @@ export const publicContent: PublicContent = {
     },
     {
       question: "What is live, and what is still blocked?",
-      answer: [text(`The v${releaseVersion} local CLI artifacts are live and passed immutable GitHub and npm release admission. Codex runs on macOS and Linux and Claude Code on Linux. Hosted sync is live as an ${hostedBetaLabel}, but current daemon and hosted command-writer rollout remains blocked on capacity. Artifact admission does not authorize initialization or daemon startup.`)],
+      answer: [text(`The v${admittedReleaseVersion} local CLI artifacts passed immutable GitHub and npm release admission. The v${releaseVersion} candidate does not become public until its own exact admission. Both support Codex on macOS and Linux and Claude Code on Linux. Hosted sync is live as an ${hostedBetaLabel}, but current daemon and hosted command-writer rollout remains blocked on capacity. The candidate install command becomes usable only after immutable GitHub and npm release admission; wait for the documented rollout prerequisite before initialization or daemon startup.`)],
     },
     {
       question: "Does HRA use my API keys or provider subscription?",
@@ -499,13 +503,13 @@ export const publicContent: PublicContent = {
   introduction: [
     {
       kind: "notice",
-      label: `Local CLI artifacts live; hosted sync live as an ${hostedBetaLabel}`,
+      label: `Local v${releaseVersion} candidate; v${admittedReleaseVersion} artifacts admitted; hosted sync live as an ${hostedBetaLabel}`,
       content: [
-        text("The "),
+        text("Use the exact install command below only after immutable GitHub and npm release admission for "),
         code(`v${releaseVersion}`),
-        text(" artifacts passed immutable GitHub and npm release admission. The exact install command below names this release. Its admitted predecessor is "),
-        link("v0.6.2", "https://github.com/hraness/hra/releases/tag/v0.6.2"),
-        text(". The website and optional hosted sync are live. Artifact admission does not authorize daemon startup or hosted command writers."),
+        text(". The "),
+        link(`v${admittedReleaseVersion} artifacts`, `https://github.com/hraness/hra/releases/tag/v${admittedReleaseVersion}`),
+        text(" passed immutable GitHub and npm release admission. The website and optional hosted sync are live; candidate readiness and prior artifact admission do not authorize current-daemon startup or hosted command writers."),
       ],
     },
     { kind: "notice", label: "Current daemon rollout blocked", content: [text(daemonRolloutNotice)] },
@@ -533,7 +537,7 @@ export const publicContent: PublicContent = {
       heading: "Install and update",
       blocks: [
         paragraph(
-          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install one reviewed immutable tag, then verify the binary before initialization:"),
+          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. After this candidate passes immutable release admission, install its reviewed tag, then verify the binary before initialization:"),
         ),
         {
           kind: "commands",
@@ -545,7 +549,7 @@ export const publicContent: PublicContent = {
           ],
         },
         paragraph(
-          text("The single install command removes ambient Bun, Node, and native-library injection variables before either download or Bun startup, disables Bun dotenv loading, and selects /dev/null as the only Bun configuration. Curl and the loader independently cap the streamed preflight at 512 KiB, and the loader refuses an overrun before transpilation or installation. It then verifies and executes the exact v0.6.3 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.6.3 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The detached staging worker and its Bun package-install child repeat the runtime neutralization while retaining the configured registry, proxy, and certificate trust inputs needed for dependency resolution. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation of that exact release's installer recovers or removes only the proven private stage; another release's installer refuses the durable intent. The invoking shell, PATH-selected pinned Bun binary, configured package registry and transport trust, operating system, and same-UID account remain trust boundaries. Existing trustedDependencies remain unchanged."),
+          text("After artifact admission, the single install command removes ambient Bun, Node, and native-library injection variables before either download or Bun startup, disables Bun dotenv loading, and selects /dev/null as the only Bun configuration. Curl and the loader independently cap the streamed preflight at 512 KiB, and the loader refuses an overrun before transpilation or installation. It then verifies and executes the exact v0.7.0 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.7.0 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The detached staging worker and its Bun package-install child repeat the runtime neutralization while retaining the configured registry, proxy, and certificate trust inputs needed for dependency resolution. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation of that exact release's installer recovers or removes only the proven private stage; another release's installer refuses the durable intent. The invoking shell, PATH-selected pinned Bun binary, configured package registry and transport trust, operating system, and same-UID account remain trust boundaries. Existing trustedDependencies remain unchanged."),
         ),
         { kind: "subheading", text: "Update runbook" },
         paragraph(
@@ -603,7 +607,7 @@ export const publicContent: PublicContent = {
           },
           {
             content: [
-              text("Install the admitted v0.6.3 release, then verify the installed version and offline health:"),
+              text("Only after v0.7.0 completes immutable GitHub and npm release admission, install that exact release, then verify the installed version and offline health:"),
             ],
             commands: [
               betaInstallCommand,
@@ -899,7 +903,7 @@ export const publicContent: PublicContent = {
           content: [
             text("These source commands are part of the "),
             code(`v${releaseVersion}`),
-            text(" local CLI release, whose exact artifacts passed immutable GitHub and npm release admission. Hosted sync is not required for this local protocol; the current-daemon rollout prerequisite still applies before startup."),
+            text(" local CLI candidate. Its install command becomes usable only after immutable GitHub and npm release admission. Hosted sync is not required for this local protocol; the current-daemon rollout prerequisite still applies before startup."),
           ],
         },
         paragraph(
@@ -1115,10 +1119,10 @@ export const publicContent: PublicContent = {
             text(" for Claude Code. Each provider owns its authentication state; HRA never copies or parses provider credentials."),
           ],
           [
-            text("Usage with provenance: account identity, quota, rate-limit, and token snapshots include their provider source time and freshness. A bounded source-ordered 24-hour ledger supports safe human and JSON pagination without returning raw provider payloads."),
+            text("Codex usage with provenance: account identity, quota, rate-limit, and token snapshots include their provider source time and freshness. A bounded source-ordered 24-hour ledger supports safe human and JSON pagination without returning raw provider payloads."),
           ],
           [
-            text("Compact sessions: list sessions, read user and final assistant messages, inspect elapsed time plus bounded observed file and Git actions, then open one turn for full provider-visible detail."),
+            text("Compact sessions: list sessions, read provider-neutral user and final assistant messages, and inspect elapsed time plus bounded observed file and Git actions. Protected full-turn inspection remains Codex-only."),
           ],
           [
             text("Personal-home adoption: opt in to discover recent Codex and Claude Code sessions, plus older Codex threads targeted by present Desktop heartbeat automations, then admit them after bounded account, project, liveness, and exact-resume checks. Active and paused automation records both count until deletion or retargeting. HRA locally parses a bounded automation record but ignores and retains no prompt or working-directory field, keeps later records reachable across daemon restarts, and replaces Desktop's exact fired heartbeat envelope with generic protected text before projection. Account-filtered session lists include admitted rows, which use the same provider-supported public commands, autorespond policy, and approval authority as every HRA session. Provider-specific limits are identical for native and adopted sessions, and provider APIs do not supply a global lease against every later external resume. Read "),
@@ -1126,10 +1130,24 @@ export const publicContent: PublicContent = {
             text("."),
           ],
           [
-            text("Durable controls: send, queue, steer, and stop through either provider; rename Codex sessions; and keep one editable note per session. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing."),
+            text("Durable controls: send, queue, stop, and keep one editable note per session. Codex and Claude Code can steer an active turn. Provider-native rename remains Codex-only. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing."),
           ],
           [
             text("Named projects: a project is a canonical directory that may contain several repositories. Changing it affects future turns only."),
+          ],
+          [
+            text("Stable working and shared project memory: a project-bound session writes to its expiring working lane, reads that lane together with durable project memory, and shares one attested page only through conflict-checked adoption. Bound Codex and Claude Code models use closed HRA tools. Owners use "),
+            code("hra memory status|list|get|search|explain|remember|share"),
+            text(" and explicitly enroll canonical project memory through "),
+            code("hra memory hosted list|create|attach|detach|sync"),
+            text(". Existing personal adoptions and legacy sessions without a proved HRA tool binding use the owner memory CLI; adoption does not silently install model tools or replace their conversation. Hosted memory is opt-in and does not upload the working lane. See "),
+            link("working and project memory", "https://github.com/hraness/hra/blob/main/docs/facts-memory.md"),
+            text(" for the authority, quota, and recovery boundaries."),
+          ],
+          [
+            text("Attributed peer coordination: each session owns a revocable "),
+            code("off|inspect|coordinate"),
+            text(" policy. Bound Codex and Claude Code tools can list, inspect, and message only bounded same-project peers; every action retains actor and lineage without granting session administration or approval authority. Retired sessions cannot participate."),
           ],
           [
             text("Agent work coordination: the frozen beta contract specifies bounded local task graphs, fenced attempts, structured submissions, independent reviews, signals, and a resumable work event stream for exact existing sessions."),
@@ -1137,6 +1155,25 @@ export const publicContent: PublicContent = {
           [
             text("Optional encrypted sync: paired devices share a bounded session projection and submit commands to the one machine holding the execution lease."),
           ],
+        ),
+        { kind: "subheading", text: "Peer coordination boundary" },
+        paragraph(
+          text("Peer coordination is separate from Work. It creates no Work, task, attempt, review, or signal membership. The actor and target must be distinct current sessions in the same project. Inspection requires neither policy to be "),
+          code("off"),
+          text("; messaging requires both exact current policy revisions to remain "),
+          code("coordinate"),
+          text(". Changing either policy revokes stale inspection and mutation authority."),
+        ),
+        paragraph(
+          code("send"),
+          text(" starts a new turn only for an idle target. "),
+          code("queue"),
+          text(" records bounded untrusted input for later delivery and works for an active target. "),
+          code("steer"),
+          text(" addresses one exact active turn and is supported by Codex and Claude Code. Peer input cannot resolve approvals, answer protected questions, administer a session, or inherit an identity."),
+        ),
+        paragraph(
+          text("HRA refuses self-addressing, stale target revisions, causal cycles, and a ninth hop. It admits at most 120 new peer actions per actor and per project in a rolling hour, at most 16 distinct targets per actor in that hour, and at most 64 unsettled inbound queue entries or 1 MiB of their text per target. Complete replay and causal evidence remains for at least seven days. Protected recovery ancestry is never pruned to make room, and the 25,000-action project cap fails closed when protected rows consume it."),
         ),
       ],
     },
@@ -1194,10 +1231,10 @@ export const publicContent: PublicContent = {
           code("default"),
           text(" to clear the override. Questions and MCP forms are never answered automatically. The baseline limits are three consecutive answers without a human message, ten in an hour, and forty in a day. "),
           code("hra autorespond status --session <session>"),
-          text(" shows the shared counters and the last twenty evidence rows. Only an actual human-authored message resets the consecutive counter; Work and scheduled automation, autorespond, and provider-switch handoff messages do not. Notification consent never enables automatic approvals."),
+          text(" shows the shared counters and the last twenty evidence rows. Only an actual human-authored message resets the consecutive counter; peer messages, Work and scheduled automation, autorespond, and provider-switch handoff messages do not. Notification consent never enables automatic approvals."),
         ),
         paragraph(
-          text("The v0.6.3 release includes after-hours protocol budgets; they are not part of the admitted v0.6.2 predecessor. They use a separate local opt-in, disabled on new and upgraded installations. After the daemon rollout gates are satisfied, "),
+          text("After-hours protocol budgets were admitted in v0.6.3. They use a separate local opt-in, disabled on new and upgraded installations. The v0.7.0 candidate retains this policy without enabling it. After the applicable artifact admission and daemon rollout gates are satisfied, "),
           code("hra autorespond-after-hours status"),
           text(" reports that policy and its revision. To opt in explicitly, use "),
           code("hra autorespond-after-hours enable --revision <revision>"),
@@ -1296,7 +1333,7 @@ export const publicContent: PublicContent = {
       blocks: [
         { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         paragraph(
-          text("HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; "),
+          text("HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. For Codex, that refresh includes model, reasoning effort, Fast service tier, permission profile, computer-use capability, and accessible apps. For Claude, HRA admits only the pinned Fable profile and reviewed host-tool boundary. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; "),
           code("hra session show"),
           text(" displays the bound provider's history and recorded public profile. Read the provider-neutral HRA record with "),
           code("hra session export"),
@@ -1509,6 +1546,18 @@ export const publicContent: PublicContent = {
             "hra session watch <session> [--cursor <cursor>] [--jsonl]",
             "hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
             "hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]",
+            "hra memory status <session> [--json]",
+            "hra memory list <session> [--working-only] [--continuation <token>] [--json]",
+            "hra memory get <session> <key> [--working-only] [--continuation <token>] [--json]",
+            "hra memory search <session> [--working-only] [--continuation <token>] <text> [--json]",
+            "hra memory explain <session> <query-id> <row> [--json]",
+            "hra memory remember <session> <key> --title <title> --summary <summary> [--language <tag>] [--idempotency-key <uuid>] [--json] -- <body>",
+            "hra memory share <session> <key> --reason <reason> [--idempotency-key <uuid>] [--json]",
+            "hra memory hosted list [--json]",
+            "hra memory hosted create <project> [--idempotency-key <uuid>] [--json]",
+            "hra memory hosted attach <project> <hosted-space-id> [--json]",
+            "hra memory hosted detach <project> --generation <n> [--json]",
+            "hra memory hosted sync <project> [--json]",
             "hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast] [--idempotency-key <uuid> [--preset-contract <1|2>]]",
             "hra session send|queue|steer <session> [--attach <path>]... <message>",
             "hra session stop|recover|abandon <session>",
@@ -1517,11 +1566,15 @@ export const publicContent: PublicContent = {
             "hra session note get|edit|clear <session>",
             "hra session note set <session> <note>",
             "hra session state <session> [--json]",
+            "hra session peer-policy get <session> [--json]",
+            "hra session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]",
             "hra session preset <session> <low|high|ultra|fable-max>",
             "hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>] [--idempotency-key <uuid> [--preset-contract <1|2>]]",
             "hra session export <session> [--format <trajectory|json>] [--out <path>]",
             "hra session fast <session> <on|off>",
             "hra session project <session> <project>",
+            "hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]",
+            "hra session export <session> [--format <trajectory|json>] [--out <path>]",
             "hra session task list <session>",
             "hra session task show <session> <task-id>",
             "hra session task create <session> --name <name> --every-minutes <15..10080> [--paused] [--idempotency-key <uuid>] -- <prompt>",
@@ -1757,7 +1810,7 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     content.thesis,
     content.statusLine,
     "",
-    `Install the live v${content.releaseVersion} local CLI artifact: ${content.installCommand}`,
+    `Only after immutable GitHub and npm release admission, install v${content.releaseVersion}: ${content.installCommand}`,
     `Verify local prerequisites without cloud access: ${content.doctorCommand}`,
     content.daemonRolloutNotice,
     `Initialize only after the rollout prerequisite is satisfied: ${content.initCommand}`,

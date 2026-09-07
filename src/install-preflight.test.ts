@@ -156,7 +156,7 @@ const officialReleaseRecord = (
   draft: false,
   id: 9_715_113,
   immutable: true,
-  tag_name: "v0.6.3",
+  tag_name: "v0.7.0",
   ...overrides,
 });
 
@@ -656,7 +656,7 @@ beforeAll(async () => {
     root,
   ], { cwd: repositoryRoot });
   if (packed.exitCode !== 0) throw new Error(`Could not build installer fixture: ${packed.stderr}${packed.stdout}`);
-  const productionArchivePath = join(root, "hraness-hra-0.6.3.tgz");
+  const productionArchivePath = join(root, "hraness-hra-0.7.0.tgz");
   const extractedRoot = join(root, "extracted");
   await mkdir(extractedRoot, { mode: 0o700 });
   const extracted = await run(["tar", "-xzf", productionArchivePath, "-C", extractedRoot], { cwd: root });
@@ -705,7 +705,7 @@ afterAll(async () => {
 describe("transactional HRA installer", () => {
   test("strips only dependency maps from the private installer fixture", () => {
     expect(sourcePackageManifest.dependencies).toEqual({
-      "@hraness/oh": "0.2.7",
+      "@hraness/oh": "0.4.1",
       "@openai/codex": "0.153.2",
       convex: "1.45.0",
       effect: "3.22.1",
@@ -719,10 +719,10 @@ describe("transactional HRA installer", () => {
 
   test("binds the public command to one tagged preflight and one exact tagged archive", async () => {
     expect(HRA_INSTALL_PREFLIGHT_SOURCE_URL).toBe(
-      "https://raw.githubusercontent.com/hraness/hra/v0.6.3/src/install-preflight-runtime.ts",
+      "https://raw.githubusercontent.com/hraness/hra/v0.7.0/src/install-preflight-runtime.ts",
     );
     expect(HRA_INSTALL_ARCHIVE_URL).toBe(
-      "https://github.com/hraness/hra/releases/download/v0.6.3/hraness-hra-0.6.3.tgz",
+      "https://github.com/hraness/hra/releases/download/v0.7.0/hraness-hra-0.7.0.tgz",
     );
     const runtimeBytes = await readFile(resolve(import.meta.dir, "install-preflight-runtime.ts"));
     // The public digest names the runtime at the released tag; the working
@@ -866,7 +866,7 @@ describe("transactional HRA installer", () => {
       archiveAssetId: 8_675_309,
       archiveBytes: 123,
       archiveReleaseId: 9_715_113,
-      archiveReleaseTag: "v0.6.3",
+      archiveReleaseTag: "v0.7.0",
       archiveRepositoryId: HRA_INSTALL_REPOSITORY_ID,
       archiveSha256,
       archiveSource: "official",
@@ -907,7 +907,7 @@ describe("transactional HRA installer", () => {
         message: "one exact archive asset",
         record: officialReleaseRecord({
           assets: [officialArchiveAsset({
-            browser_download_url: "https://example.com/hra-v0.6.3.tgz",
+            browser_download_url: "https://example.com/hra-v0.7.0.tgz",
             name: "other.tgz",
           })],
         }),
@@ -964,7 +964,7 @@ describe("transactional HRA installer", () => {
       expect(call.init.signal).toBeInstanceOf(AbortSignal);
       expect(headers.get("accept")).toBe("application/vnd.github+json");
       expect(headers.get("accept-encoding")).toBe("identity");
-      expect(headers.get("user-agent")).toBe("hra-installer/0.6.3");
+      expect(headers.get("user-agent")).toBe("hra-installer/0.7.0");
       expect(headers.get("x-github-api-version")).toBe("2022-11-28");
       expect(headers.get("authorization")).toBeNull();
     }
@@ -1066,7 +1066,7 @@ describe("transactional HRA installer", () => {
       "install",
       "global",
       "package.json",
-    ))).toEqual({ dependencies: { "@hraness/hra": "0.6.3" } });
+    ))).toEqual({ dependencies: { "@hraness/hra": "0.7.0" } });
 
     const second = await runInstaller(root);
     expect(second).toEqual({
@@ -1077,6 +1077,44 @@ describe("transactional HRA installer", () => {
     expect(await realpath(activePath)).toBe(activeTarget);
     expect(await readdir(join(bunRoot, "install", "hra", "versions"))).toEqual(versions);
   }, SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS);
+
+  test("rejects a staged loopback archive URL with a malformed route UUID or archive filename", async () => {
+    for (const mutation of ["route-uuid", "archive-name"] as const) {
+      const root = await makeRoot(`hra-install-loopback-${mutation}-`);
+      await mkdir(join(root, "home"), { mode: 0o700 });
+      const authorityRoot = join(root, "bun root", "install", "hra");
+      const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+      const program = [
+        `const module = await import(${JSON.stringify(runtimePath)});`,
+        `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+        `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
+        "  afterStageWorkerExit: async () => {",
+        '    const fs = await import("node:fs/promises");',
+        '    const path = await import("node:path");',
+        `    const authorityRoot = ${JSON.stringify(authorityRoot)};`,
+        '    const stageName = (await fs.readdir(authorityRoot)).find((entry) => entry.startsWith(".staging-"));',
+        '    if (!stageName) throw new Error("staging root is missing");',
+        '    const manifestPath = path.join(authorityRoot, stageName, "install", "global", "package.json");',
+        "    const manifest = JSON.parse(await fs.readFile(manifestPath, \"utf8\"));",
+        "    const archiveUrl = new URL(manifest.dependencies[module.HRA_INSTALL_PACKAGE_NAME]);",
+        mutation === "route-uuid"
+          ? '    archiveUrl.pathname = "/not-a-v4-uuid/" + module.HRA_INSTALL_ARCHIVE_NAME;'
+          : '    archiveUrl.pathname = archiveUrl.pathname.replace(/[^/]+$/u, "unexpected.tgz");',
+        "    manifest.dependencies[module.HRA_INSTALL_PACKAGE_NAME] = archiveUrl.toString();",
+        '    await fs.writeFile(manifestPath, JSON.stringify(manifest) + "\\n", { mode: 0o600 });',
+        "  },",
+        "});",
+      ].join("\n");
+      const result = await run([process.execPath, "-e", program], {
+        cwd: root,
+        environment: installEnvironment(root),
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("descriptor-bound loopback archive authority");
+      expect(result.stdout).toBe("");
+      expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    }
+  }, 60_000);
 
   test("scrubs ambient runtime preloads from the detached worker and Bun add", async () => {
     const root = await makeRoot("hra-install-runtime-preload-");

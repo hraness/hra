@@ -91,7 +91,9 @@ import {
   type CloudDeploymentAuthority,
   type CloudProjectionRecoveryStatus,
   type CloudSecretCustodyPort,
+  type CanonicalMemoryCloudAuthoritySource,
 } from "./cloud/index";
+import type { CanonicalMemoryTransport } from "./cloud/canonical-memory-transport";
 import {
   allowlistedEnvironment,
   readCodexAutomationAuthority,
@@ -99,15 +101,19 @@ import {
   type CodexAutomationAuthorityRequest,
 } from "./codex/index";
 import {
+  ClaudeHostToolBindingAuthority,
   createClaudeLoginSignalCustody,
   resolvePinnedClaudeRuntime,
   runClaudeForegroundLogin,
+  type ClaudeHostToolPublicResult,
+  type ClaudeHostToolResponseWritten,
   type ClaudeForegroundLoginResult,
   type ClaudeLoginSignalCustody,
   type ClaudeLoginSignalSource,
   type PinnedClaudeRuntime,
   type ResolvePinnedClaudeRuntimeOptions,
 } from "./claude/index";
+import type { HraHostToolCall } from "./codex/protocol";
 import { localCommandSchema, type CommandResponse, type LocalCommand } from "./domain/contracts";
 import { adoptableProviderSchema } from "./domain/presets";
 import {
@@ -167,6 +173,10 @@ import {
   waitForDaemonReady,
   type DaemonIdentity,
 } from "./daemon/daemon-startup";
+import {
+  ClaudeHostToolCallbackServer,
+  claudeHostToolCallbackSocketPath,
+} from "./daemon/claude-host-tool-transport";
 import { PinnedClaudeRuntimeManager } from "./daemon/claude-runtime-adapter";
 import { PinnedCodexRuntimeManager } from "./daemon/codex-runtime-adapter";
 import {
@@ -176,7 +186,12 @@ import {
   type ClaudeProcessLivenessProbe,
 } from "./daemon/personal-session-discovery";
 import { HraFactsMemoryLifecycle } from "./daemon/facts-memory-lifecycle";
-import { UnavailableCloudControl, type CloudControlPort, type CompactProjectionRecoveryBlocker } from "./daemon/ports";
+import {
+  UnavailableCloudControl,
+  type CloudControlPort,
+  type CompactProjectionRecoveryBlocker,
+  type ProfileAuthority,
+} from "./daemon/ports";
 import { SessionEventCursorCodec } from "./daemon/session-event-cursor";
 import { CommandFailure, HraService } from "./daemon/service";
 import { AccountUsagePoller } from "./daemon/usage-poller";
@@ -3230,12 +3245,37 @@ type DaemonStopLatch = {
 };
 
 export type RunDaemonOptions = Readonly<{
+  liveAcceptanceCanonicalMemoryTransportDecorator?: (
+    transport: CanonicalMemoryTransport,
+  ) => CanonicalMemoryTransport;
+  liveAcceptanceClaudeProof?: LiveAcceptanceClaudeProofPort;
   stopSignal?: AbortSignal;
+}>;
+
+/**
+ * Acceptance-only custody for one managed-Claude host-tool proof. The concrete
+ * collector lives under `scripts/`; production exposes no observer, flag, or
+ * environment switch that can enable this seam.
+ */
+export type LiveAcceptanceClaudeProofPort = Readonly<{
+  beginDaemonGeneration(generation: number): void;
+  handleManagedHostToolCall(input: Readonly<{
+    authority: ProfileAuthority;
+    call: HraHostToolCall;
+    dispatch: () => Promise<ClaudeHostToolPublicResult>;
+  }>): Promise<ClaudeHostToolPublicResult>;
+  handleManagedHostToolResponseWritten(receipt: ClaudeHostToolResponseWritten): void;
+  /** Invalidates this in-process hook; it is not provider or filesystem cleanup proof. */
+  closeDaemonGeneration(generation: number | null): void;
 }>;
 
 async function runDaemonLifecycle(
   installation: HraInstallation,
   stopLatch: DaemonStopLatch,
+  liveAcceptanceCanonicalMemoryTransportDecorator?: (
+    transport: CanonicalMemoryTransport,
+  ) => CanonicalMemoryTransport,
+  liveAcceptanceClaudeProof?: LiveAcceptanceClaudeProofPort,
 ): Promise<number> {
   assertInstallationHome(installation);
   const paths = installation.paths;
@@ -3249,10 +3289,14 @@ async function runDaemonLifecycle(
   let claude: PinnedClaudeRuntimeManager | undefined;
   let personalCodex: PinnedCodexRuntimeManager | undefined;
   let personalClaude: PinnedClaudeRuntimeManager | undefined;
+  let claudeHostToolAuthority: ClaudeHostToolBindingAuthority | undefined;
+  let claudeHostToolServer: ClaudeHostToolCallbackServer | undefined;
   let service: HraService | undefined;
   let server: LocalDaemonServer | undefined;
   let cloudAdapter: StateBackedCloudDaemonAdapter | undefined;
   let cloudLifecycle: CloudDaemonLifecycle | undefined;
+  let cloudLifecycleShutdown: Promise<void> | undefined;
+  let canonicalMemoryAuthoritySource: CanonicalMemoryCloudAuthoritySource | undefined;
   let usagePoller: AccountUsagePoller | undefined;
   let usagePollerShutdown: Promise<void> | undefined;
   let adoptionPoller: AccountUsagePoller | undefined;
@@ -3265,13 +3309,20 @@ async function runDaemonLifecycle(
   let resolveStop!: () => void;
   const stopped = new Promise<void>((resolve) => { resolveStop = resolve; });
   let stopRequested = false;
+  const closeCloudLifecycle = (): Promise<void> => {
+    if (cloudLifecycle === undefined) return Promise.resolve();
+    cloudLifecycleShutdown ??= cloudLifecycle.close();
+    return cloudLifecycleShutdown;
+  };
   const requestStop = () => {
     if (stopRequested) return;
     stopRequested = true;
     if (usagePoller !== undefined) usagePollerShutdown ??= usagePoller.close();
     if (adoptionPoller !== undefined) adoptionPollerShutdown ??= adoptionPoller.close();
+    void closeCloudLifecycle().catch(() => undefined);
     if (service !== undefined) serviceShutdown = service.close();
     else daemonAuthority?.close();
+    claudeHostToolServer?.beginShutdown();
     server?.beginShutdown(new Error("Daemon shutdown was requested."));
     resolveStop();
   };
@@ -3284,6 +3335,7 @@ async function runDaemonLifecycle(
   // shutdown path and publish a closed failure receipt instead of letting the
   // runtime print the raw error and exit without one.
   let unhandledRejectionError: Error | undefined;
+  let claudeHostToolTransportError: Error | undefined;
   const onUnhandledRejection = () => {
     unhandledRejectionError ??= new Error("The daemon stopped after an unhandled promise rejection in an owned background task.");
     requestStop();
@@ -3320,11 +3372,52 @@ async function runDaemonLifecycle(
     await releaseProvenDeadClaudeAuthoritiesBeforeDaemonGeneration(activeStore);
     bootId = `boot_${randomUUID().replaceAll("-", "")}`;
     generation = activeStore.nextDaemonGeneration(bootId);
+    liveAcceptanceClaudeProof?.beginDaemonGeneration(generation);
     await daemonLock.publish({ state: "booting", generation, bootId });
     daemonAuthority = new DaemonAuthorityFence(daemonLock, { generation, bootId });
     const activeDaemonAuthority = daemonAuthority;
     checkpointBoot();
     const serviceReference: { current?: HraService } = {};
+    claudeHostToolAuthority = new ClaudeHostToolBindingAuthority();
+    const activeClaudeHostToolAuthority = claudeHostToolAuthority;
+    claudeHostToolServer = await ClaudeHostToolCallbackServer.start({
+      paths,
+      authority: activeClaudeHostToolAuthority,
+      onFatalError: () => {
+        claudeHostToolTransportError ??= new Error(
+          "The daemon stopped after the Claude host-tool callback transport failed.",
+        );
+        requestStop();
+      },
+      handler: {
+        call: async (call) => {
+          const owners = [claude, personalClaude].filter(
+            (runtime): runtime is PinnedClaudeRuntimeManager =>
+              runtime?.ownsSessionHostToolBinding(call) === true,
+          );
+          const owner = owners[0];
+          if (owner === undefined || owners.length !== 1) {
+            throw new Error("The Claude host-tool call has no unique runtime owner.");
+          }
+          return await owner.handleSessionHostToolCall(call);
+        },
+        responseWritten: async (receipt) => {
+          const owners = [claude, personalClaude].filter(
+            (runtime): runtime is PinnedClaudeRuntimeManager =>
+              runtime?.ownsSessionHostToolBinding(receipt) === true,
+          );
+          const owner = owners[0];
+          if (owner === undefined || owners.length !== 1) {
+            throw new Error("The Claude host-tool receipt has no unique runtime owner.");
+          }
+          await owner.handleSessionHostToolResponseWritten(receipt);
+          if (owner === claude) {
+            liveAcceptanceClaudeProof?.handleManagedHostToolResponseWritten(receipt);
+          }
+        },
+      },
+    });
+    const activeClaudeHostToolServer = claudeHostToolServer;
     codex = new PinnedCodexRuntimeManager({
       allowSameGenerationRelaunchAfterProviderDisconnect: true,
       ...(installation.kind === "live_acceptance"
@@ -3346,17 +3439,21 @@ async function runDaemonLifecycle(
         account: async (authority, account) => {
           await serviceReference.current?.observeCodexAccount(authority, account);
         },
-        conversationAutomation: async (authority, call) => {
+        hraHostTool: async (authority, call) => {
           const current = serviceReference.current;
           if (current === undefined) {
-            throw new Error("The HRA service is unavailable during conversation automation.");
+            throw new Error("The HRA service is unavailable during host-tool execution.");
           }
-          return await current.handleConversationAutomationToolCall(authority, call);
+          return await current.handleHraHostToolCall(authority, call, {
+            provider: "codex",
+            source: "managed",
+          });
         },
-        conversationAutomationResponseWritten: (authority, call) => {
-          serviceReference.current?.notifyConversationAutomationToolResponseWritten(
+        hraHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyHraHostToolResponseWritten(
             authority,
             call,
+            { provider: "codex", source: "managed" },
           );
         },
         fact: async (authority, fact) => { await serviceReference.current?.observeCodexFact(authority, fact); },
@@ -3380,9 +3477,42 @@ async function runDaemonLifecycle(
         }
       },
       observer: {
+        hraHostTool: async (authority, call) => {
+          const current = serviceReference.current;
+          if (current === undefined) {
+            throw new Error("The HRA service is unavailable during host-tool execution.");
+          }
+          if (liveAcceptanceClaudeProof === undefined) {
+            return await current.handleHraHostToolCall(authority, call, {
+              provider: "claude",
+              source: "managed",
+            });
+          }
+          return await liveAcceptanceClaudeProof.handleManagedHostToolCall({
+            authority,
+            call,
+            dispatch: async () => await current.handleHraHostToolCall(
+              authority,
+              call,
+              { provider: "claude", source: "managed" },
+            ),
+          });
+        },
+        hraHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyHraHostToolResponseWritten(
+            authority,
+            call,
+            { provider: "claude", source: "managed" },
+          );
+        },
         fact: async (authority, fact) => {
           await serviceReference.current?.observeClaudeFact(authority, fact);
         },
+      },
+      hostTools: {
+        bindingAuthority: activeClaudeHostToolAuthority,
+        callbackSocketPath: claudeHostToolCallbackSocketPath(paths),
+        privateRoot: paths.runtime,
       },
     });
     const personalHomes = installation.personalProviderHomes;
@@ -3411,18 +3541,21 @@ async function runDaemonLifecycle(
         account: async (authority, account) => {
           await serviceReference.current?.observePersonalCodexAccount(authority, account);
         },
-        conversationAutomation: async (authority, call) => {
+        hraHostTool: async (authority, call) => {
           const current = serviceReference.current;
           if (current === undefined) {
-            throw new Error("The HRA service is unavailable during conversation automation.");
+            throw new Error("The HRA service is unavailable during host-tool execution.");
           }
-          return await current.handleConversationAutomationToolCall(authority, call, "personal");
+          return await current.handleHraHostToolCall(authority, call, {
+            provider: "codex",
+            source: "personal",
+          });
         },
-        conversationAutomationResponseWritten: (authority, call) => {
-          serviceReference.current?.notifyConversationAutomationToolResponseWritten(
+        hraHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyHraHostToolResponseWritten(
             authority,
             call,
-            "personal",
+            { provider: "codex", source: "personal" },
           );
         },
         fact: async (authority, fact) => {
@@ -3442,9 +3575,31 @@ async function runDaemonLifecycle(
         }
       },
       observer: {
+        hraHostTool: async (authority, call) => {
+          const current = serviceReference.current;
+          if (current === undefined) {
+            throw new Error("The HRA service is unavailable during host-tool execution.");
+          }
+          return await current.handleHraHostToolCall(authority, call, {
+            provider: "claude",
+            source: "personal",
+          });
+        },
+        hraHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyHraHostToolResponseWritten(
+            authority,
+            call,
+            { provider: "claude", source: "personal" },
+          );
+        },
         fact: async (authority, fact) => {
           await serviceReference.current?.observePersonalClaudeFact(authority, fact);
         },
+      },
+      hostTools: {
+        bindingAuthority: activeClaudeHostToolAuthority,
+        callbackSocketPath: claudeHostToolCallbackSocketPath(paths),
+        privateRoot: paths.runtime,
       },
     });
     const activePersonalCodex = personalCodex;
@@ -3500,6 +3655,9 @@ async function runDaemonLifecycle(
       },
       ...personalClaudeDiscovery,
     });
+    if (activeClaudeHostToolServer.path !== claudeHostToolCallbackSocketPath(paths)) {
+      throw new Error("Claude host-tool callback transport path changed during daemon startup.");
+    }
     const cloudEnvironment = installation.cloudEnvironment;
     const cloudStartup = await resolveDaemonCloudStartup({
       environment: cloudEnvironment,
@@ -3616,6 +3774,24 @@ async function runDaemonLifecycle(
         cloudAdapter = candidateAdapter;
         cloud = candidateCloud;
         cloudLifecycle = candidateLifecycle;
+        canonicalMemoryAuthoritySource = liveAcceptanceCanonicalMemoryTransportDecorator === undefined
+          ? localCloudControl
+          : {
+              snapshotCanonicalMemoryAuthority: async (signal) => {
+                const authority = await localCloudControl.snapshotCanonicalMemoryAuthority(signal);
+                try {
+                  return Object.freeze({
+                    ...authority,
+                    transport: liveAcceptanceCanonicalMemoryTransportDecorator(
+                      authority.transport,
+                    ),
+                  });
+                } catch (error: unknown) {
+                  authority.dispose();
+                  throw error;
+                }
+              },
+            };
         candidateAdapter = undefined;
         candidateBridge = undefined;
       } catch (error: unknown) {
@@ -3647,14 +3823,66 @@ async function runDaemonLifecycle(
     }
     checkpointBoot();
     factsMemoryControl = new FactsMemoryControlStore(paths.factsMemoryControl);
-    const { OhSqliteFactsMemoryEngine } = await import("./storage/oh-facts-memory-engine");
+    const [
+      { OhSqliteFactsMemoryEngine },
+      { HraOhMemoryCoordinator },
+      { HraCanonicalMemorySynchronizer },
+      { HraMemorySummarySource },
+      { ProjectMemorySerialExecutor },
+    ] = await Promise.all([
+      import("./storage/oh-facts-memory-engine"),
+      import("./daemon/memory-coordinator"),
+      import("./cloud/canonical-memory-sync"),
+      import("./cloud/memory-summary-source"),
+      import("./daemon/project-memory-serial"),
+    ]);
+    const memoryEngine = new OhSqliteFactsMemoryEngine({
+      forkAttestations: activeStore,
+    });
     const factsMemory = new HraFactsMemoryLifecycle({
+      attestations: activeStore,
       broker: new LocalFactsMemoryBroker({
-        engine: new OhSqliteFactsMemoryEngine(),
+        engine: memoryEngine,
         root: paths.factsMemorySessions,
       }),
       control: factsMemoryControl,
     });
+    const projectMemorySerial = new ProjectMemorySerialExecutor();
+    const canonicalMemorySync = canonicalMemoryAuthoritySource === undefined
+      ? undefined
+      : new HraCanonicalMemorySynchronizer({
+          authoritySource: canonicalMemoryAuthoritySource,
+          engine: memoryEngine,
+          onBackgroundFailure: () => {
+            serviceReference.current?.recordBackgroundDiagnostic("canonical_memory_sync_failed");
+          },
+          paths,
+          projectSerial: projectMemorySerial,
+          store: activeStore,
+        });
+    const memory = new HraOhMemoryCoordinator({
+      engine: memoryEngine,
+      factsMemory,
+      paths,
+      projectSerial: projectMemorySerial,
+      store: activeStore,
+      ...(canonicalMemorySync === undefined ? {} : { sync: canonicalMemorySync }),
+    });
+    // A configured daemon may legitimately start before its first cloud
+    // identity is selected. Authentication requires a restart into the newly
+    // bound identity, so keep this optional projection absent until that boot
+    // instead of making cloud enrollment or local HRA unavailable.
+    if (cloudAdapter !== undefined && cloudIdentityNamespace !== null) {
+      const memorySummary = new HraMemorySummarySource({
+        engine: memoryEngine,
+        identityNamespace: cloudIdentityNamespace,
+        paths,
+        projectSerial: projectMemorySerial,
+        store: activeStore,
+      });
+      cloudAdapter.bindMemorySummarySource(async ({ devicePublicId, signal }) =>
+        await memorySummary.read({ devicePublicId, signal }));
+    }
     const desktop = process.platform === "darwin" && installation.desktopSwitching
       ? (() => {
           const bundle = new ExactChatGptBundlePort("/Applications/ChatGPT.app");
@@ -3685,6 +3913,9 @@ async function runDaemonLifecycle(
       usageHistoryCursors,
       workCapabilities,
       factsMemory,
+      memory,
+      beforeMemoryClose: closeCloudLifecycle,
+      ...(canonicalMemorySync === undefined ? {} : { canonicalMemorySync }),
       gatewayKeys,
       proseResponder: new AiGatewayProseResponder({
         readKey: async () => await gatewayKeys.read(),
@@ -3764,6 +3995,9 @@ async function runDaemonLifecycle(
     checkpointBoot();
     await daemonLock.publish({ state: "ready", generation, bootId });
     await stopped;
+    if (claudeHostToolTransportError !== undefined) {
+      throw claudeHostToolTransportError;
+    }
     await daemonLock.publish({ state: "stopping", generation, bootId });
   } catch (error: unknown) {
     if (!(error instanceof DaemonBootInterruptedError)) runError = error;
@@ -3774,6 +4008,7 @@ async function runDaemonLifecycle(
     if (adoptionPoller !== undefined) adoptionPollerShutdown ??= adoptionPoller.close();
     if (service !== undefined) serviceShutdown ??= service.close();
     else daemonAuthority?.close();
+    claudeHostToolServer?.beginShutdown();
     server?.beginShutdown(new Error("Daemon lifetime ended."));
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
@@ -3801,17 +4036,9 @@ async function runDaemonLifecycle(
       }
     }
     if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && cloudLifecycle !== undefined) {
-      try { await joinBeforeDeadline("Cloud daemon shutdown", cloudLifecycle.close()); } catch (error: unknown) {
+      try { await joinBeforeDeadline("Cloud daemon shutdown", closeCloudLifecycle()); } catch (error: unknown) {
         if (error instanceof DaemonJoinDeadlineError) runError = error;
         else cleanupErrors.push(error);
-      }
-    }
-    cloudRequestController?.abort(new Error("Cloud daemon transport is closing."));
-    if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && cloudAdapter !== undefined) {
-      try { await joinBeforeDeadline("Cloud account observation shutdown", cloudAdapter.close()); } catch (error: unknown) {
-        runError = error instanceof DaemonJoinDeadlineError
-          ? error
-          : new DaemonAccountObservationJoinError(error);
       }
     }
     if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError)) {
@@ -3858,6 +4085,31 @@ async function runDaemonLifecycle(
         else cleanupErrors.push(error);
       }
     }
+    // The hosted-memory synchronizer is owned by the service/memory
+    // coordinator but uses the cloud authority snapshot. Join it before
+    // aborting or closing that transport so shutdown cannot strand an
+    // indeterminate write or reopen an Oh database after local custody closes.
+    cloudRequestController?.abort(new Error("Cloud daemon transport is closing."));
+    if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && cloudAdapter !== undefined) {
+      try { await joinBeforeDeadline("Cloud account observation shutdown", cloudAdapter.close()); } catch (error: unknown) {
+        runError = error instanceof DaemonJoinDeadlineError
+          ? error
+          : new DaemonAccountObservationJoinError(error);
+      }
+    }
+    if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && claudeHostToolServer !== undefined) {
+      try { await claudeHostToolServer.close(); } catch (error: unknown) { cleanupErrors.push(error); }
+    }
+    if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && claudeHostToolAuthority !== undefined) {
+      try { await claudeHostToolAuthority.close(); } catch (error: unknown) { cleanupErrors.push(error); }
+    }
+    if (liveAcceptanceClaudeProof !== undefined) {
+      try {
+        liveAcceptanceClaudeProof.closeDaemonGeneration(generation ?? null);
+      } catch (error: unknown) {
+        cleanupErrors.push(error);
+      }
+    }
 
     if (runError instanceof DaemonJoinDeadlineError || runError instanceof LocalDaemonShutdownTimeoutError) {
       const diagnostic = safeDaemonFailure(runError);
@@ -3900,6 +4152,17 @@ export async function runDaemon(
   installation: HraInstallation = createProductionInstallation(),
   options: RunDaemonOptions = {},
 ): Promise<number> {
+  if (
+    (
+      options.liveAcceptanceCanonicalMemoryTransportDecorator !== undefined
+      || options.liveAcceptanceClaudeProof !== undefined
+    )
+    && installation.kind !== "live_acceptance"
+  ) {
+    throw new Error(
+      "Daemon acceptance hooks are restricted to live acceptance.",
+    );
+  }
   const stopLatch: DaemonStopLatch = { deliver: undefined, requested: false };
   const requestLatchedStop = () => {
     if (stopLatch.requested) return;
@@ -3912,7 +4175,12 @@ export async function runDaemon(
   // event. Check after registration so no stop can be lost around this edge.
   if (stopSignal?.aborted === true) requestLatchedStop();
   try {
-    return await runDaemonLifecycle(installation, stopLatch);
+    return await runDaemonLifecycle(
+      installation,
+      stopLatch,
+      options.liveAcceptanceCanonicalMemoryTransportDecorator,
+      options.liveAcceptanceClaudeProof,
+    );
   } finally {
     stopLatch.deliver = undefined;
     stopSignal?.removeEventListener("abort", requestLatchedStop);
@@ -6187,6 +6455,9 @@ export async function main(
         || invocation.command.kind === "session.task.create"
         || invocation.command.kind === "session.task.edit"
         || invocation.command.kind === "session.task.delete"
+        || invocation.command.kind === "memory.remember"
+        || invocation.command.kind === "memory.share"
+        || invocation.command.kind === "memory.hosted.create"
       )
       && typeof invocation.command.idempotencyKey === "string"
       ? invocation.command

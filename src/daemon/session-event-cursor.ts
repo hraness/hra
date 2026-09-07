@@ -19,7 +19,12 @@ import {
   type WorkTaskHistoryCursorPayload,
   type WorkTaskId,
 } from "../domain/work";
-import { profileIdSchema, sessionIdSchema, unixMillisecondsSchema } from "../domain/values";
+import {
+  profileIdSchema,
+  projectIdSchema,
+  sessionIdSchema,
+  unixMillisecondsSchema,
+} from "../domain/values";
 import {
   projectPublicProviderIdentifier,
   type PublicProviderIdentifier,
@@ -230,6 +235,28 @@ export const localSessionListCursorPayloadSchema = z.object({
 
 export type LocalSessionListCursorPayload = z.infer<typeof localSessionListCursorPayloadSchema>;
 
+export const peerSessionListCursorFilterSchema = z.object({
+  actorSessionId: sessionIdSchema,
+  projectId: projectIdSchema,
+  actorPolicyRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  limit: z.number().int().min(1).max(50),
+}).strict();
+
+export type PeerSessionListCursorFilter = z.infer<typeof peerSessionListCursorFilterSchema>;
+
+export const peerSessionListCursorPayloadSchema = z.object({
+  version: z.literal(1),
+  type: z.literal("peer_session_list"),
+  actorSessionId: sessionIdSchema,
+  projectId: projectIdSchema,
+  actorPolicyRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  limit: z.number().int().min(1).max(50),
+  afterCreatedAt: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
+  afterSessionId: sessionIdSchema,
+}).strict();
+
+export type PeerSessionListCursorPayload = z.infer<typeof peerSessionListCursorPayloadSchema>;
+
 const canonicalPayload = (payload: SessionEventCursorPayload): string => JSON.stringify({
   version: payload.version,
   sessionId: payload.sessionId,
@@ -304,6 +331,19 @@ const canonicalLocalSessionListPayload = (
   accountGeneration: payload.accountGeneration,
   limit: payload.limit,
   includeArchived: payload.includeArchived,
+  afterCreatedAt: payload.afterCreatedAt,
+  afterSessionId: payload.afterSessionId,
+});
+
+const canonicalPeerSessionListPayload = (
+  payload: PeerSessionListCursorPayload,
+): string => JSON.stringify({
+  version: payload.version,
+  type: payload.type,
+  actorSessionId: payload.actorSessionId,
+  projectId: payload.projectId,
+  actorPolicyRevision: payload.actorPolicyRevision,
+  limit: payload.limit,
   afterCreatedAt: payload.afterCreatedAt,
   afterSessionId: payload.afterSessionId,
 });
@@ -386,6 +426,14 @@ const sameLocalSessionListFilter = (
   && actual.accountGeneration === expected.accountGeneration
   && actual.limit === expected.limit
   && actual.includeArchived === expected.includeArchived;
+
+const samePeerSessionListFilter = (
+  actual: PeerSessionListCursorFilter,
+  expected: PeerSessionListCursorFilter,
+): boolean => actual.actorSessionId === expected.actorSessionId
+  && actual.projectId === expected.projectId
+  && actual.actorPolicyRevision === expected.actorPolicyRevision
+  && actual.limit === expected.limit;
 
 const sessionListProviderCursorDigest = (providerCursor: string): string =>
   createHash("sha256")
@@ -730,6 +778,64 @@ export class SessionEventCursorCodec {
     if (!sameSessionListFilter(parsed.data, expected)) {
       throw new SessionEventCursorError(
         "Composite session-list cursor filters do not match the requested account listing.",
+        "filter_mismatch",
+      );
+    }
+    return parsed.data;
+  }
+
+  encodePeerSessionList(
+    input: PeerSessionListCursorFilter & Readonly<{
+      afterCreatedAt: number;
+      afterSessionId: string;
+    }>,
+  ): string {
+    const payload = peerSessionListCursorPayloadSchema.parse({
+      version: 1,
+      type: "peer_session_list",
+      actorSessionId: input.actorSessionId,
+      projectId: input.projectId,
+      actorPolicyRevision: input.actorPolicyRevision,
+      limit: input.limit,
+      afterCreatedAt: input.afterCreatedAt,
+      afterSessionId: input.afterSessionId,
+    });
+    return this.#encodeCanonical(
+      canonicalPeerSessionListPayload(payload),
+      "Peer session-list cursor",
+    );
+  }
+
+  decodePeerSessionList(
+    cursor: string,
+    expectedFilter: PeerSessionListCursorFilter,
+  ): PeerSessionListCursorPayload {
+    const expected = peerSessionListCursorFilterSchema.parse(expectedFilter);
+    const envelope = this.#decodeEnvelope(cursor, "Peer session-list cursor");
+    if (
+      typeof envelope.value !== "object"
+      || envelope.value === null
+      || !("type" in envelope.value)
+      || envelope.value.type !== "peer_session_list"
+    ) {
+      throw new SessionEventCursorError(
+        "Another HRA cursor type cannot be used as a peer session-list cursor.",
+        "type_mismatch",
+      );
+    }
+    const parsed = peerSessionListCursorPayloadSchema.safeParse(envelope.value);
+    if (
+      !parsed.success
+      || canonicalPeerSessionListPayload(parsed.data) !== envelope.payloadJson
+    ) {
+      throw new SessionEventCursorError(
+        "Peer session-list cursor payload is not canonical.",
+        "noncanonical",
+      );
+    }
+    if (!samePeerSessionListFilter(parsed.data, expected)) {
+      throw new SessionEventCursorError(
+        "Peer session-list cursor filters do not match this actor and project.",
         "filter_mismatch",
       );
     }

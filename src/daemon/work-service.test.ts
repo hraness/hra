@@ -49,15 +49,15 @@ const signal = new AbortController().signal;
 
 const effectiveRuntimeProfile = (
   authority: ProfileAuthority,
-  preset: "high" = "high",
+  preset: "low" | "high" | "ultra" = "high",
   fast = false,
 ): EffectiveRuntimeProfile => ({
   profileId: authority.id,
   processGeneration: authority.generation,
   observedAt: 10_000,
   preset,
-  model: "gpt-5.6-sol",
-  reasoningEffort: "max",
+  model: preset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
+  reasoningEffort: preset === "ultra" ? "ultra" : "max",
   serviceTier: fast ? "priority" : null,
   fast,
   approvalPolicy: "on-request",
@@ -113,7 +113,7 @@ class WorkRuntime implements CodexRuntimePort {
       kind: "session_start",
       effectiveRuntimeProfile: effectiveRuntimeProfile(
         input.authority,
-        input.preset === "high" ? "high" : "high",
+        input.preset === "low" || input.preset === "ultra" ? input.preset : "high",
         input.fast,
       ),
     };
@@ -169,7 +169,7 @@ class WorkRuntime implements CodexRuntimePort {
       kind: "turn_start",
       effectiveRuntimeProfile: effectiveRuntimeProfile(
         input.authority,
-        input.preset === "high" ? "high" : "high",
+        input.preset === "low" || input.preset === "ultra" ? input.preset : "high",
         input.fast,
       ),
     };
@@ -621,6 +621,7 @@ function beginNestedSend(
       messageDigest: createHash("sha256").update(nested.message).digest("hex"),
       runtimeProfile,
     },
+    message: nested.message,
   });
   return { runtimeProfile, session };
 }
@@ -1024,9 +1025,13 @@ describe("HraService work protocol", () => {
       .toMatchObject({ executable: true, status: { state: "effect_started" } });
     const begun = beginNestedSend(value, actor, prepared.effect, nested);
     value.store.completeSessionTurnEffect({
+      accountId: actor.accountId,
       attemptId: nested.attempt.id,
       sessionId: actor.sessionId,
       expectedSessionRevision: begun.session.revision,
+      message: nested.message,
+      providerConnectionId: null,
+      providerGeneration: prepared.effect.accountGeneration,
       applyResponseState: true,
       turnId: "provider-turn-before-restart",
       turnStatus: "inProgress",
@@ -1230,7 +1235,36 @@ describe("HraService work protocol", () => {
     expect(value.runtime.logoutCalls).toBe(0);
   });
 
-  test("refuses a provider switch before effects while the session owns a Work attempt", async () => {
+  test("refuses a meaningful same-account provider switch while the session belongs to live Work", async () => {
+    const value = await fixture();
+    const actor = await createActor(value);
+    await createJoinClaim(value, actor);
+    const switchKey = nextKey();
+    const startsBefore = value.runtime.startSessionCount;
+
+    await expect(value.service.execute({
+      kind: "session.switch",
+      idempotencyKey: switchKey,
+      preset: "low",
+      provider: "codex",
+      session: actor.sessionId,
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      details: { reason: "SESSION_PROVIDER_SWITCH_BLOCKED" },
+    });
+
+    expect(value.runtime.startSessionCount).toBe(startsBefore);
+    expect(value.runtime.startTurnCalls).toHaveLength(0);
+    expect(value.runtime.endSessionCount).toBe(0);
+    expect(value.store.readMutation(switchKey)).toBeNull();
+    expect(value.store.requireSession(actor.sessionId)).toMatchObject({
+      profileId: actor.accountId,
+      provider: "codex",
+      state: "idle",
+    });
+  });
+
+  test("refuses a cross-account provider switch before effects while the session belongs to live Work", async () => {
     const value = await fixture();
     const actor = await createActor(value);
     await createJoinClaim(value, actor);
@@ -1253,8 +1287,8 @@ describe("HraService work protocol", () => {
       provider: "codex",
       session: actor.sessionId,
     }, { signal })).rejects.toMatchObject({
-      code: "RECOVERY_REQUIRED",
-      details: { reason: "ATTEMPT_RECOVERY_REQUIRED" },
+      code: "CONFLICT",
+      details: { reason: "SESSION_PROVIDER_SWITCH_BLOCKED" },
     });
 
     expect(value.runtime.startSessionCount).toBe(startsBefore);
@@ -1268,10 +1302,86 @@ describe("HraService work protocol", () => {
     });
   });
 
-  test("lets an effect-started provider switch fence a competing Work claim", async () => {
+  test("lets an effect-started same-account provider switch fence a competing Work claim", async () => {
     const value = await fixture();
     const actor = await createActor(value);
-    const { created, joined } = await createAndJoin(value, actor);
+    const coordinator = await createSiblingActor(value, actor);
+    const { created } = await createAndJoin(value, coordinator);
+    let enterTargetStart = (): void => {};
+    const targetStartEntered = new Promise<void>((resolve) => { enterTargetStart = resolve; });
+    let releaseTargetStart = (): void => {};
+    const targetStartGate = new Promise<void>((resolve) => { releaseTargetStart = resolve; });
+    value.runtime.beforeStartSessionReturn = async () => {
+      delete value.runtime.beforeStartSessionReturn;
+      enterTargetStart();
+      await targetStartGate;
+    };
+    const switchKey = nextKey();
+    const startsBefore = value.runtime.startSessionCount;
+    const switchPromise = value.service.execute({
+      kind: "session.switch",
+      idempotencyKey: switchKey,
+      preset: "low",
+      provider: "codex",
+      session: actor.sessionId,
+    }, { signal });
+    await targetStartEntered;
+
+    const joined = workOperationResultSchema.parse(await value.service.execute({
+      kind: "work.apply",
+      requestId: crypto.randomUUID(),
+      operation: {
+        kind: "work.join",
+        idempotencyKey: nextKey(),
+        workId: created.work.id,
+        coordinatorSessionId: coordinator.sessionId,
+        coordinatorCapability: created.coordinatorCapability,
+        actorSessionId: actor.sessionId,
+      },
+    }, { signal }));
+    if (joined.kind !== "work.join") throw new Error("Expected the switching actor to join.");
+
+    let claimFailure: unknown;
+    try {
+      await value.service.execute({
+        kind: "work.apply",
+        requestId: crypto.randomUUID(),
+        operation: {
+          kind: "task.claim",
+          idempotencyKey: nextKey(),
+          workId: created.work.id,
+          taskId: created.tasks[0]!.id,
+          expectedTaskRevision: created.tasks[0]!.revision,
+          actorSessionId: actor.sessionId,
+          actorCapability: joined.memberCapability,
+          leaseMs: 5_000,
+        },
+      }, { signal });
+    } catch (error: unknown) {
+      claimFailure = error;
+    }
+    releaseTargetStart();
+    const switched = await switchPromise as { session: { profileId: ProfileId } };
+
+    expect(claimFailure).toBeInstanceOf(CommandFailure);
+    expect(claimFailure).toMatchObject({
+      code: "CONFLICT",
+      details: { reason: "ROUTE_MISMATCH" },
+    });
+    expect(value.workStore.snapshot(created.work.id).tasks[0]?.status).toBe("ready");
+    expect(value.store.readMutation(switchKey)).toMatchObject({ state: "applied" });
+    expect(switched.session.profileId).toBe(actor.accountId);
+    expect(value.store.requireSession(actor.sessionId).preset).toBe("low");
+    expect(value.runtime.startSessionCount).toBe(startsBefore + 1);
+    expect(value.runtime.startTurnCalls).toHaveLength(1);
+    expect(value.runtime.endSessionCount).toBe(1);
+  });
+
+  test("lets an effect-started cross-account provider switch fence a competing Work claim", async () => {
+    const value = await fixture();
+    const actor = await createActor(value);
+    const coordinator = await createSiblingActor(value, actor);
+    const { created } = await createAndJoin(value, coordinator);
     const target = await value.service.execute(
       { kind: "account.add", label: "Concurrent switch target" },
       { signal },
@@ -1289,6 +1399,7 @@ describe("HraService work protocol", () => {
       enterTargetStart();
       await targetStartGate;
     };
+    const startsBefore = value.runtime.startSessionCount;
     const switchKey = nextKey();
     const switchPromise = value.service.execute({
       kind: "session.switch",
@@ -1299,6 +1410,20 @@ describe("HraService work protocol", () => {
       session: actor.sessionId,
     }, { signal });
     await targetStartEntered;
+
+    const joined = workOperationResultSchema.parse(await value.service.execute({
+      kind: "work.apply",
+      requestId: crypto.randomUUID(),
+      operation: {
+        kind: "work.join",
+        idempotencyKey: nextKey(),
+        workId: created.work.id,
+        coordinatorSessionId: coordinator.sessionId,
+        coordinatorCapability: created.coordinatorCapability,
+        actorSessionId: actor.sessionId,
+      },
+    }, { signal }));
+    if (joined.kind !== "work.join") throw new Error("Expected the switching actor to join.");
 
     let claimFailure: unknown;
     try {
@@ -1330,7 +1455,7 @@ describe("HraService work protocol", () => {
     expect(value.workStore.snapshot(created.work.id).tasks[0]?.status).toBe("ready");
     expect(value.store.readMutation(switchKey)).toMatchObject({ state: "applied" });
     expect(switched.session.profileId).toBe(target.account.id);
-    expect(value.runtime.startSessionCount).toBe(2);
+    expect(value.runtime.startSessionCount).toBe(startsBefore + 1);
     expect(value.runtime.startTurnCalls).toHaveLength(1);
     expect(value.runtime.endSessionCount).toBe(1);
   });
@@ -1589,6 +1714,8 @@ describe("HraService work protocol", () => {
     ) throw new Error("Expected one exact ambiguous session.send mutation.");
     const session = value.store.requireSession(actor.sessionId);
     if (session.providerThreadId === undefined) throw new Error("Expected a provider thread.");
+    const prepared = value.workStore.preparedEffect(dispatchKey)?.effect;
+    if (prepared?.kind !== "dispatch") throw new Error("Expected the exact dispatch effect.");
     const recoveredTurnId = "provider-turn-recovered";
     value.store.resolveSessionMutation({
       attemptId: nestedMutation.id,
@@ -1606,6 +1733,7 @@ describe("HraService work protocol", () => {
         sourceId: nestedMutation.id,
         effectiveRuntimeProfile: nestedMutation.evidence.evidence.runtimeProfile,
       },
+      message: workPreparedEffectMessage(prepared),
       provider: {
         providerThreadId: session.providerThreadId,
         title: session.title,
