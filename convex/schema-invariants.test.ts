@@ -12,6 +12,7 @@ import { QUOTA_GENESIS_CHARGED_TABLES, USER_QUOTA_RESOURCES, USER_RESOURCE_QUOTA
 describe("hosted schema invariants", () => {
   test("every hosted table and index name satisfies the provider identifier contract", () => {
     const providerIdentifier = /^[A-Za-z][A-Za-z0-9_]*$/u;
+    const providerReservedIndexNames = new Set(["by_creation_time", "by_id"]);
     const tables = (schema as unknown as {
       readonly tables: Readonly<Record<string, unknown>>;
     }).tables;
@@ -41,6 +42,7 @@ describe("hosted schema invariants", () => {
       for (const indexName of indexNames) {
         expect(indexName).toMatch(providerIdentifier);
         expect(indexName.length).toBeLessThanOrEqual(64);
+        expect(providerReservedIndexNames.has(indexName)).toBeFalse();
       }
     }
   });
