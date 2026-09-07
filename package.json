@@ -31,6 +31,7 @@
     "local-efficiency:apply": "bun run ./plugins/hra-local-efficiency/skills/hra-local-efficiency/scripts/bootstrap.ts --apply",
     "local-efficiency:check": "bun run ./plugins/hra-local-efficiency/skills/hra-local-efficiency/scripts/bootstrap.ts --check",
     "acceptance:live": "bun ./scripts/live-acceptance.ts",
+    "acceptance:live:claude": "bun ./scripts/claude-live-acceptance.ts",
     "hosted:bootstrap": "bun ./scripts/bootstrap-hosted-sync.ts",
     "hosted:admission": "bun ./scripts/manage-hosted-admission.ts",
     "hosted:configure": "bun ./scripts/configure-hosted-sync.ts",

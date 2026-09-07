@@ -4,6 +4,7 @@ import { z } from "zod";
 import { InvalidCommandResponseError, renderFailure, renderProtectedInteractionDetail, renderRootStatus, renderSuccess, safeDiagnostic, type Output } from "./render";
 import type { ProtectedInteractionDetailDocument, PublicInteraction } from "../domain/interactions";
 import type { SessionEventPage } from "../domain/session-events";
+import { effectiveClaudeRuntimeProfileSchema, projectPublicReviewedRuntimeProfile } from "../domain/runtime-profile";
 import { WORK_STREAM_FAILURE_MAX_BYTES } from "../domain/work";
 import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 
@@ -436,6 +437,53 @@ describe("CLI rendering", () => {
     expect(document.data.effectiveRuntimeProfile).not.toHaveProperty("configHome");
     expect(document.data.effectiveRuntimeProfile).not.toHaveProperty("isolatedConfigDir");
   });
+
+  test.each(["session.start", "session.send", "session.show"] as const)(
+    "renders already-public Claude runtime evidence from the service: %s", (kind) => {
+      const profile = projectPublicReviewedRuntimeProfile(effectiveClaudeRuntimeProfileSchema.parse({
+        claudeVersion: "2.1.260", configHome: "isolated", inputFormat: "stream-json",
+        model: "claude-fable-5-1", observedAt: 2_000, outputFormat: "stream-json",
+        permissionMode: "default", preset: "fable-max", processGeneration: 3,
+        profileId: primaryProfileId, reasoningEffort: "max",
+      }));
+      const idempotencyKey = "00000000-0000-4000-8000-000000000811";
+      const sessionCommand = kind === "session.show"
+        ? { kind, session: primarySessionId, detail: false } as const
+        : kind === "session.send"
+          ? { kind, session: primarySessionId, message: "hello", idempotencyKey } as const
+          : { kind, account: primaryProfileId, provider: "claude", preset: "fable-max",
+              project: primaryProjectId, fast: false, idempotencyKey } as const;
+      const response = {
+        session: { ...data.session, provider: "claude", preset: "fable-max" },
+        effectiveRuntimeProfile: profile,
+        ...(kind === "session.show" ? {} : { idempotencyKey }),
+        ...(kind === "session.send" ? { turnId: "private-claude-turn" } : {}),
+      };
+      for (const json of [false, true]) {
+        const target = capture();
+        renderSuccess(sessionCommand, response, json, target.output);
+        expect(target.stderr).toEqual([]);
+        const rendered = target.stdout.join("");
+        expect(rendered.length).toBeGreaterThan(0);
+        expect(rendered).not.toContain("configHome");
+        expect(rendered).not.toContain("isolatedConfigDir");
+        expect(rendered).not.toContain("private-claude-turn");
+        if (json) expect(JSON.parse(rendered)).toMatchObject({
+          ok: true, data: { effectiveRuntimeProfile: profile },
+        });
+        for (const invalid of [
+          { ...profile, unexpectedPrivateField: "do-not-render" },
+          { ...profile, model: "unreviewed-model" },
+        ]) {
+          const rejected = capture();
+          expect(() => renderSuccess(sessionCommand, {
+            ...response, effectiveRuntimeProfile: invalid,
+          }, json, rejected.output)).toThrow(InvalidCommandResponseError);
+          expect(rejected.stdout).toEqual([]);
+        }
+      }
+    },
+  );
 
   test("renders bounded local root status with closed recovery commands", () => {
     const status = {

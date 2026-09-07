@@ -12,9 +12,9 @@ import {
 import { isAuthorityContainmentUnavailable } from "./authority-containment";
 import {
   buildConvexChildEnvironment,
-  runCommand,
   type CommandRunner,
 } from "./configure-hosted-sync";
+import { runLiveAcceptanceAuthorityCommand } from "./live-acceptance-authority-process";
 import {
   parseConvexTarget,
   verifyConvexDefaultTarget,
@@ -98,7 +98,7 @@ export function createLiveAcceptanceMemoryReadback(options: ReadbackOptions): Li
   if (candidate.cloudTargetDigest !== createHash("sha256").update(target.deploymentUrl).digest("hex")) {
     return refused();
   }
-  const runner = options.runner ?? runCommand;
+  const runner = options.runner ?? runLiveAcceptanceAuthorityCommand;
   const verifyTarget = options.verifyTarget ?? verifyConvexDefaultTarget;
   const guard = new BoundedProcessInvocationGuard();
   let userId: string | undefined;

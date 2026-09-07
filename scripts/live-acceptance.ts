@@ -2,22 +2,17 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { constants, readSync, type Stats } from "node:fs";
+import { readSync } from "node:fs";
 import {
-  chmod,
-  lstat,
-  mkdtemp,
-  open,
   readdir,
   realpath,
   rename,
   rm,
   rmdir,
   stat,
-  unlink,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { isatty } from "node:tty";
 
@@ -74,6 +69,30 @@ import {
   type RuntimeReleaseAttestation,
 } from "./release-evidence";
 import type { LiveAcceptanceEvidenceV2 } from "./live-acceptance-scenario";
+import {
+  assertPrivateDirectoryIdentity,
+  AtomicPrivateJsonReceipt,
+  createPrivateTemporaryDirectory as createPrivateTemporaryDirectoryWithCustody,
+  isPrivateDirectChild,
+  observePrivateDirectory as observePrivateDirectoryWithCustody,
+  privatePathExists,
+  privatePathsOverlap,
+  syncPrivateDirectory,
+} from "./live-acceptance-private-custody";
+import {
+  ClaudeLiveAcceptanceProofError,
+  parseClaudeLiveAcceptancePrivateReceipt,
+  parseClaudeLiveAcceptanceProvisionalPrivateReceipt,
+  type ClaudeLiveAcceptancePrivateReceipt,
+  type ClaudeLiveAcceptanceProvisionalPrivateReceipt,
+} from "./claude-live-acceptance-proof";
+import { parseHraHostToolRequest, type HraMemoryRememberInput } from "../src/domain/host-tools";
+import {
+  profileIdSchema,
+  sessionIdSchema,
+  type ProfileId,
+  type SessionId,
+} from "../src/domain/values";
 
 export const LIVE_ACCEPTANCE_CONTROL_FD = 0;
 export const LIVE_ACCEPTANCE_STATUS_FD = 1;
@@ -95,6 +114,56 @@ export type LiveAcceptanceDeviceName = z.infer<typeof deviceSchema>;
 const requestIdSchema = z.string().uuid();
 
 const cliArgumentSchema = z.string().min(1).max(16 * 1024);
+
+const parsedUnknown = <T>(
+  parser: (value: unknown) => T,
+  message: string,
+): z.ZodType<T> => z.unknown().transform((value, context): T | typeof z.NEVER => {
+  try {
+    return parser(value);
+  } catch {
+    context.addIssue({ code: "custom", message });
+    return z.NEVER;
+  }
+});
+
+const claudeWorkerArmSchema = z.object({
+  daemonGeneration: z.number().int().positive().safe(),
+  memory: z.unknown(),
+  profileGeneration: z.number().int().positive().safe(),
+  profileId: profileIdSchema,
+  sendIdempotencyKey: z.string().uuid(),
+  sessionId: sessionIdSchema,
+}).strict().transform((value, context): ClaudeLiveAcceptanceWorkerArm | typeof z.NEVER => {
+  try {
+    const request = parseHraHostToolRequest("memory_remember", value.memory);
+    if (request.tool !== "memory_remember") throw new Error("unreachable");
+    return Object.freeze({
+      ...value,
+      memory: Object.freeze({ ...request.input }),
+    });
+  } catch {
+    context.addIssue({ code: "custom", message: "Claude proof memory input is invalid." });
+    return z.NEVER;
+  }
+});
+
+export type ClaudeLiveAcceptanceWorkerArm = Readonly<{
+  daemonGeneration: number;
+  memory: HraMemoryRememberInput;
+  profileGeneration: number;
+  profileId: ProfileId;
+  sendIdempotencyKey: string;
+  sessionId: SessionId;
+}>;
+const claudeProvisionalPrivateReceiptSchema = parsedUnknown(
+  parseClaudeLiveAcceptanceProvisionalPrivateReceipt,
+  "Claude provisional proof receipt is invalid.",
+);
+const claudePrivateReceiptSchema = parsedUnknown(
+  parseClaudeLiveAcceptancePrivateReceipt,
+  "Claude final proof receipt is invalid.",
+);
 
 export const liveAcceptanceCliResultSchema = z.object({
   exitCode: z.number().int().min(0).max(255),
@@ -150,6 +219,22 @@ export const liveAcceptanceWorkerControlSchema = z.discriminatedUnion("type", [
     type: z.literal("stop"),
     version: z.literal(1),
   }).strict(),
+  z.object({
+    input: claudeWorkerArmSchema,
+    requestId: requestIdSchema,
+    type: z.literal("claude_proof_arm"),
+    version: z.literal(1),
+  }).strict(),
+  z.object({
+    requestId: requestIdSchema,
+    type: z.literal("claude_proof_read_provisional"),
+    version: z.literal(1),
+  }).strict(),
+  z.object({
+    requestId: requestIdSchema,
+    type: z.literal("claude_proof_stop"),
+    version: z.literal(1),
+  }).strict(),
 ]).superRefine((value, context) => {
   if (value.type !== "cli") return;
   const serializedBytes = value.argv.reduce(
@@ -183,6 +268,7 @@ export type LiveAcceptanceWorkerControl = z.infer<
 export const liveAcceptanceWorkerStatusSchema = z.discriminatedUnion("type", [
   z.object({
     device: deviceSchema,
+    daemonGeneration: z.number().int().positive().safe().optional(),
     pid: z.number().int().positive(),
     runId: z.string().uuid(),
     type: z.literal("ready"),
@@ -192,6 +278,68 @@ export const liveAcceptanceWorkerStatusSchema = z.discriminatedUnion("type", [
     requestId: requestIdSchema,
     result: liveAcceptanceCliResultSchema,
     type: z.literal("cli_result"),
+    version: z.literal(1),
+  }).strict(),
+  z.object({
+    action: z.literal("arm"),
+    requestId: requestIdSchema,
+    type: z.literal("claude_proof_ack"),
+    version: z.literal(1),
+  }).strict(),
+  z.object({
+    outcome: z.discriminatedUnion("status", [
+      z.object({
+        receipt: claudeProvisionalPrivateReceiptSchema,
+        status: z.literal("ready"),
+      }).strict(),
+      z.object({ status: z.literal("pending") }).strict(),
+      z.object({
+        code: z.enum([
+          "call_extra",
+          "call_mismatch",
+          "candidate_invalid",
+          "dispatch_failed",
+          "generation_invalid",
+          "lifecycle_closed",
+          "response_invalid",
+          "response_written_extra",
+          "response_written_mismatch",
+          "session_scope_invalid",
+          "turn_corroboration_invalid",
+        ]),
+        status: z.literal("refused"),
+      }).strict(),
+    ]),
+    requestId: requestIdSchema,
+    type: z.literal("claude_proof_provisional_result"),
+    version: z.literal(1),
+  }).strict(),
+  z.object({
+    outcome: z.discriminatedUnion("status", [
+      z.object({
+        receipt: claudePrivateReceiptSchema,
+        status: z.literal("proved"),
+      }).strict(),
+      z.object({
+        code: z.enum([
+          "call_extra",
+          "call_mismatch",
+          "candidate_invalid",
+          "dispatch_failed",
+          "generation_invalid",
+          "lifecycle_closed",
+          "proof_incomplete",
+          "response_invalid",
+          "response_written_extra",
+          "response_written_mismatch",
+          "session_scope_invalid",
+          "turn_corroboration_invalid",
+        ]),
+        status: z.literal("refused"),
+      }).strict(),
+    ]),
+    requestId: requestIdSchema,
+    type: z.literal("claude_proof_final_result"),
     version: z.literal(1),
   }).strict(),
   z.object({
@@ -392,6 +540,13 @@ export interface LiveAcceptanceWorker {
   suspend(): Promise<void>;
 }
 
+export interface ClaudeLiveAcceptanceWorker extends LiveAcceptanceWorker {
+  armClaudeProof(input: ClaudeLiveAcceptanceWorkerArm): Promise<void>;
+  currentDaemonGeneration(): Promise<number>;
+  readClaudeProvisionalProof(): Promise<ClaudeLiveAcceptanceProvisionalPrivateReceipt | null>;
+  stopWithClaudeProof(): Promise<ClaudeLiveAcceptancePrivateReceipt>;
+}
+
 export type LiveAcceptanceDevice = Readonly<{
   armCanonicalMemoryResponseDrop(
     input: LiveAcceptanceMemoryFaultArm,
@@ -497,12 +652,6 @@ const processIsAlive = (pid: number): boolean => {
   }
 };
 
-const currentOwner = (): number => {
-  const owner = typeof process.getuid === "function" ? process.getuid() : undefined;
-  if (owner === undefined) throw new LiveAcceptanceError("layout_changed");
-  return owner;
-};
-
 const assertNormalizedAbsolute = (value: string): string => {
   if (!isAbsolute(value) || resolve(value) !== value) {
     throw new LiveAcceptanceError("layout_changed");
@@ -511,22 +660,11 @@ const assertNormalizedAbsolute = (value: string): string => {
 };
 
 const isContainedDirectChild = (parent: string, child: string): boolean => {
-  const relation = relative(parent, child);
-  return relation !== ""
-    && !relation.startsWith("..")
-    && !isAbsolute(relation)
-    && !relation.includes("/")
-    && !relation.includes("\\");
+  return isPrivateDirectChild(parent, child);
 };
 
 const pathsOverlap = (leftInput: string, rightInput: string): boolean => {
-  const left = resolve(leftInput);
-  const right = resolve(rightInput);
-  const leftToRight = relative(left, right);
-  const rightToLeft = relative(right, left);
-  return left === right
-    || (!leftToRight.startsWith("..") && !isAbsolute(leftToRight))
-    || (!rightToLeft.startsWith("..") && !isAbsolute(rightToLeft));
+  return privatePathsOverlap(leftInput, rightInput);
 };
 
 function assertSafeAcceptanceLocation(
@@ -630,200 +768,80 @@ async function assertReceiptLayoutRuntime(receipt: LiveAcceptanceRecoveryReceipt
 }
 
 async function observePrivateDirectory(path: string): Promise<DirectoryIdentity> {
-  const normalized = assertNormalizedAbsolute(path);
-  const metadata = await lstat(normalized);
-  if (
-    !metadata.isDirectory()
-    || metadata.isSymbolicLink()
-    || metadata.uid !== currentOwner()
-    || (metadata.mode & 0o777) !== 0o700
-  ) throw new LiveAcceptanceError("layout_changed");
-  const canonical = await realpath(normalized);
-  if (canonical !== normalized) throw new LiveAcceptanceError("layout_changed");
-  return directoryIdentitySchema.parse({
-    device: metadata.dev,
-    inode: metadata.ino,
-    mode: 0o700,
-    owner: metadata.uid,
-    path: normalized,
-  });
+  return directoryIdentitySchema.parse(await observePrivateDirectoryWithCustody(
+    path,
+    () => new LiveAcceptanceError("layout_changed"),
+  ));
 }
 
 async function assertDirectoryIdentity(identity: DirectoryIdentity): Promise<void> {
-  const current = await observePrivateDirectory(identity.path);
-  if (
-    current.device !== identity.device
-    || current.inode !== identity.inode
-    || current.owner !== identity.owner
-  ) throw new LiveAcceptanceError("layout_changed");
+  await assertPrivateDirectoryIdentity(
+    identity,
+    () => new LiveAcceptanceError("layout_changed"),
+  );
 }
 
 async function createPrivateTemporaryDirectory(prefix: string): Promise<DirectoryIdentity> {
-  const path = await mkdtemp(prefix);
-  await chmod(path, 0o700);
-  return await observePrivateDirectory(path);
+  return directoryIdentitySchema.parse(await createPrivateTemporaryDirectoryWithCustody(
+    prefix,
+    () => new LiveAcceptanceError("layout_changed"),
+  ));
 }
 
 async function syncDirectory(path: string): Promise<void> {
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
+  await syncPrivateDirectory(path);
 }
 
 async function pathExists(path: string): Promise<boolean> {
-  try {
-    await lstat(path);
-    return true;
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
-  }
+  return await privatePathExists(path);
 }
 
-class AtomicRecoveryReceipt {
-  #identity: Readonly<{ device: number; inode: number }>;
-  #value: MutableReceipt;
+const recoveryReceiptPolicy = {
+  assertRuntime: async (value: MutableReceipt) => {
+    await assertReceiptLayoutRuntime(value);
+  },
+  createdIdentityMatches: (current: MutableReceipt, next: MutableReceipt) =>
+    current.receiptPath === next.receiptPath
+    && current.runId === next.runId
+    && current.createdAt === next.createdAt,
+  invalid: () => new LiveAcceptanceError("layout_changed"),
+  maximumBytes: 32 * 1024,
+  parse: (value: unknown) => liveAcceptanceRecoveryReceiptSchema.parse(value),
+  path: (value: MutableReceipt) => value.receiptPath,
+} as const;
 
-  private constructor(
-    value: MutableReceipt,
-    identity: Readonly<{ device: number; inode: number }>,
-  ) {
-    this.#value = value;
-    this.#identity = identity;
+class AtomicRecoveryReceipt {
+  readonly #receipt: AtomicPrivateJsonReceipt<MutableReceipt>;
+
+  private constructor(receipt: AtomicPrivateJsonReceipt<MutableReceipt>) {
+    this.#receipt = receipt;
   }
 
   static async create(value: MutableReceipt): Promise<AtomicRecoveryReceipt> {
-    const parsed = liveAcceptanceRecoveryReceiptSchema.parse(value);
-    await assertReceiptLayoutRuntime(parsed);
-    const parent = dirname(parsed.receiptPath);
-    await observePrivateDirectory(parsed.runRoot.path);
-    const handle = await open(
-      parsed.receiptPath,
-      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
-      0o600,
+    return new AtomicRecoveryReceipt(
+      await AtomicPrivateJsonReceipt.create(value, recoveryReceiptPolicy),
     );
-    try {
-      await handle.writeFile(JSON.stringify(parsed), "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await chmod(parsed.receiptPath, 0o600);
-    await syncDirectory(parent);
-    const metadata = await AtomicRecoveryReceipt.#observeFile(parsed.receiptPath);
-    return new AtomicRecoveryReceipt(parsed, metadata);
   }
 
   static async open(value: unknown): Promise<AtomicRecoveryReceipt> {
     const locator = liveAcceptanceRecoveryReceiptSchema.parse(value);
-    assertReceiptLayoutShape(locator);
-    const handle = await open(locator.receiptPath, constants.O_RDONLY | constants.O_NOFOLLOW);
-    let parsed: LiveAcceptanceRecoveryReceipt;
-    let identity: Readonly<{ device: number; inode: number }>;
-    try {
-      const before = await handle.stat();
-      AtomicRecoveryReceipt.#assertSafeFileMetadata(before);
-      if (before.size > 32 * 1024) throw new LiveAcceptanceError("layout_changed");
-      const bytes = await handle.readFile();
-      try {
-        parsed = liveAcceptanceRecoveryReceiptSchema.parse(
-          JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown,
-        );
-      } finally {
-        bytes.fill(0);
-      }
-      const after = await handle.stat();
-      AtomicRecoveryReceipt.#assertSafeFileMetadata(after);
-      if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size) {
-        throw new LiveAcceptanceError("layout_changed");
-      }
-      identity = { device: after.dev, inode: after.ino };
-    } finally {
-      await handle.close();
-    }
-    if (
-      parsed.receiptPath !== locator.receiptPath
-      || parsed.runId !== locator.runId
-    ) throw new LiveAcceptanceError("layout_changed");
-    await assertReceiptLayoutRuntime(parsed);
-    return new AtomicRecoveryReceipt(parsed, identity);
+    return new AtomicRecoveryReceipt(
+      await AtomicPrivateJsonReceipt.open(locator, recoveryReceiptPolicy),
+    );
   }
 
   get value(): MutableReceipt {
-    return this.#value;
+    return this.#receipt.value;
   }
 
   async update(
     transform: (current: MutableReceipt) => MutableReceipt,
   ): Promise<MutableReceipt> {
-    const next = liveAcceptanceRecoveryReceiptSchema.parse(transform(this.#value));
-    assertReceiptLayoutShape(next);
-    if (
-      next.receiptPath !== this.#value.receiptPath
-      || next.runId !== this.#value.runId
-      || next.createdAt !== this.#value.createdAt
-    ) throw new LiveAcceptanceError("layout_changed");
-    await this.#assertCurrent();
-    const parent = dirname(next.receiptPath);
-    const temporary = join(parent, `.${basename(next.receiptPath)}.${randomUUID()}.tmp`);
-    const handle = await open(
-      temporary,
-      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
-      0o600,
-    );
-    try {
-      await handle.writeFile(JSON.stringify(next), "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    try {
-      await chmod(temporary, 0o600);
-      await this.#assertCurrent();
-      await rename(temporary, next.receiptPath);
-      await syncDirectory(parent);
-    } catch (error: unknown) {
-      await unlink(temporary).catch(() => undefined);
-      throw error;
-    }
-    this.#identity = await AtomicRecoveryReceipt.#observeFile(next.receiptPath);
-    this.#value = next;
-    return next;
+    return await this.#receipt.update(transform);
   }
 
   async remove(): Promise<void> {
-    await this.#assertCurrent();
-    await unlink(this.#value.receiptPath);
-    await syncDirectory(dirname(this.#value.receiptPath));
-  }
-
-  async #assertCurrent(): Promise<void> {
-    const current = await AtomicRecoveryReceipt.#observeFile(this.#value.receiptPath);
-    if (
-      current.device !== this.#identity.device
-      || current.inode !== this.#identity.inode
-    ) throw new LiveAcceptanceError("layout_changed");
-  }
-
-  static async #observeFile(path: string): Promise<Readonly<{ device: number; inode: number }>> {
-    const metadata = await lstat(assertNormalizedAbsolute(path));
-    AtomicRecoveryReceipt.#assertSafeFileMetadata(metadata);
-    if (metadata.isSymbolicLink() || metadata.size > 32 * 1024) {
-      throw new LiveAcceptanceError("layout_changed");
-    }
-    return { device: metadata.dev, inode: metadata.ino };
-  }
-
-  static #assertSafeFileMetadata(metadata: Stats): void {
-    if (
-      !metadata.isFile()
-      || metadata.nlink !== 1
-      || metadata.uid !== currentOwner()
-      || (metadata.mode & 0o777) !== 0o600
-    ) throw new LiveAcceptanceError("layout_changed");
+    await this.#receipt.remove();
   }
 }
 
@@ -1024,9 +1042,22 @@ type WorkerPending =
   | Readonly<{
       kind: "memory_fault";
       result: ReturnType<typeof deferred<LiveAcceptanceMemoryFaultStatus>>;
+    }>
+  | Readonly<{
+      action: "arm";
+      kind: "claude_proof_ack";
+      result: ReturnType<typeof deferredSignal>;
+    }>
+  | Readonly<{
+      kind: "claude_proof_provisional";
+      result: ReturnType<typeof deferred<ClaudeLiveAcceptanceProvisionalPrivateReceipt | null>>;
+    }>
+  | Readonly<{
+      kind: "claude_proof_final";
+      result: ReturnType<typeof deferred<ClaudeLiveAcceptancePrivateReceipt>>;
     }>;
 
-class ProcessWorker implements LiveAcceptanceWorker {
+class ProcessWorker implements ClaudeLiveAcceptanceWorker {
   readonly device: LiveAcceptanceDeviceName;
   readonly pid: number;
   readonly projectDirectory: string;
@@ -1045,12 +1076,16 @@ class ProcessWorker implements LiveAcceptanceWorker {
   #statusEnded = false;
   #terminalError: Error | undefined;
   #stopOperation: Promise<void> | undefined;
+  #claudeProofStopOperation: Promise<ClaudeLiveAcceptancePrivateReceipt> | undefined;
+  #daemonGeneration: number | undefined;
+  readonly #claudeProofMode: boolean;
 
   private constructor(
     descriptor: AcceptanceInstallationDescriptor,
     child: ChildProcess,
     control: Writable,
     status: Readable,
+    claudeProofMode: boolean,
   ) {
     if (child.pid === undefined) throw new LiveAcceptanceError("worker_failed");
     this.device = descriptor.device;
@@ -1059,6 +1094,7 @@ class ProcessWorker implements LiveAcceptanceWorker {
     this.#descriptor = descriptor;
     this.#child = child;
     this.#control = control;
+    this.#claudeProofMode = claudeProofMode;
     void this.#closed.promise.catch(() => undefined);
     void this.#lifetime.promise.catch(() => undefined);
     void this.#ready.promise.catch(() => undefined);
@@ -1094,11 +1130,21 @@ class ProcessWorker implements LiveAcceptanceWorker {
   static async start(
     descriptorInput: AcceptanceInstallationDescriptor,
     launchInput?: ProcessWorkerLaunch,
+    options: Readonly<{
+      beforeDescriptorWrite?: (workerPid: number) => Promise<void>;
+      separateSignalDomain?: boolean;
+    }> = {},
   ): Promise<ProcessWorker> {
     const descriptor = acceptanceInstallationDescriptorSchema.parse(descriptorInput);
     const launch = launchInput ?? liveAcceptanceWorkerLaunch(descriptor);
     const child = spawn(launch.executable, [...launch.arguments], {
       cwd: launch.cwd,
+      // Only the dedicated Claude foreground gate requests a separate signal
+      // domain. Its controller and Claude's native login child share the
+      // invoking terminal's process group, while the daemon must remain alive
+      // until foreground custody joins and completes the exact RPC. The child
+      // stays referenced and pipe-owned; it is deliberately never `unref()`ed.
+      detached: options.separateSignalDomain === true,
       env: launch.environment,
       stdio: [...LIVE_ACCEPTANCE_WORKER_STDIO],
     });
@@ -1108,11 +1154,22 @@ class ProcessWorker implements LiveAcceptanceWorker {
     try {
       const control = asWritable(child.stdin);
       const status = asReadable(child.stdout);
-      const worker = new ProcessWorker(descriptor, child, control, status);
+      const worker = new ProcessWorker(
+        descriptor,
+        child,
+        control,
+        status,
+        options.separateSignalDomain === true,
+      );
       const serialized = `${JSON.stringify(descriptor)}\n`;
       if (Buffer.byteLength(serialized, "utf8") > LIVE_ACCEPTANCE_DESCRIPTOR_MAXIMUM_BYTES) {
         throw new LiveAcceptanceError("input_invalid");
       }
+      // The dedicated Claude gate durably records the exact inert child PID
+      // before giving that child any installation descriptor or authority to
+      // initialize the daemon. Ordinary live-acceptance workers omit this
+      // callback and retain their existing launch behavior.
+      await options.beforeDescriptorWrite?.(worker.pid);
       await writeStreamDocument(control, serialized);
       return worker;
     } catch (error: unknown) {
@@ -1196,6 +1253,87 @@ class ProcessWorker implements LiveAcceptanceWorker {
     }
   }
 
+  async currentDaemonGeneration(): Promise<number> {
+    await this.ready();
+    if (!this.#claudeProofMode || this.#daemonGeneration === undefined) {
+      throw new LiveAcceptanceError("worker_protocol_invalid");
+    }
+    return this.#daemonGeneration;
+  }
+
+  async armClaudeProof(input: ClaudeLiveAcceptanceWorkerArm): Promise<void> {
+    const parsed = claudeWorkerArmSchema.parse(input);
+    await this.#claudeProofAck({
+      input: parsed,
+      type: "claude_proof_arm",
+    });
+  }
+
+  async readClaudeProvisionalProof(): Promise<ClaudeLiveAcceptanceProvisionalPrivateReceipt | null> {
+    await this.ready();
+    this.#assertClaudeProofAvailable();
+    const requestId = randomUUID();
+    const result = deferred<ClaudeLiveAcceptanceProvisionalPrivateReceipt | null>();
+    this.#pending.set(requestId, { kind: "claude_proof_provisional", result });
+    const frame = `${JSON.stringify({
+      requestId,
+      type: "claude_proof_read_provisional",
+      version: 1,
+    })}\n`;
+    try {
+      await this.#writeControl(frame, requestId);
+      return await boundedDeadline(result.promise, workerCommandDeadlineMs, "worker_failed");
+    } finally {
+      this.#pending.delete(requestId);
+    }
+  }
+
+  async stopWithClaudeProof(): Promise<ClaudeLiveAcceptancePrivateReceipt> {
+    if (this.#claudeProofStopOperation !== undefined) {
+      return await this.#claudeProofStopOperation;
+    }
+    this.#assertClaudeProofAvailable();
+    this.#shutdownRequested = true;
+    this.#claudeProofStopOperation = (async () => {
+      this.#assertHealthy();
+      const requestId = randomUUID();
+      const result = deferred<ClaudeLiveAcceptancePrivateReceipt>();
+      this.#pending.set(requestId, { kind: "claude_proof_final", result });
+      const frame = `${JSON.stringify({
+        requestId,
+        type: "claude_proof_stop",
+        version: 1,
+      })}\n`;
+      try {
+        await this.#writeControl(frame, requestId);
+        const proof = await boundedDeadline(
+          result.promise.then(
+            (receipt) => ({ receipt, status: "proved" as const }),
+            (error: unknown) => ({ error, status: "refused" as const }),
+          ),
+          workerShutdownDeadlineMs,
+          "daemon_shutdown_unproven",
+        );
+        await boundedDeadline(
+          this.#stopped.promise,
+          workerShutdownDeadlineMs,
+          "daemon_shutdown_unproven",
+        );
+        await boundedDeadline(
+          this.#lifetime.promise,
+          workerShutdownDeadlineMs,
+          "daemon_shutdown_unproven",
+        );
+        if (this.#terminalError !== undefined) throw this.#terminalError;
+        if (proof.status === "refused") throw proof.error;
+        return proof.receipt;
+      } finally {
+        this.#pending.delete(requestId);
+      }
+    })();
+    return await this.#claudeProofStopOperation;
+  }
+
   async armCanonicalMemoryResponseDrop(
     input: LiveAcceptanceMemoryFaultArm,
   ): Promise<LiveAcceptanceMemoryFaultStatus> {
@@ -1274,6 +1412,28 @@ class ProcessWorker implements LiveAcceptanceWorker {
     this.#assertHealthy();
   }
 
+  async #claudeProofAck(input: Readonly<{
+    input: ClaudeLiveAcceptanceWorkerArm;
+    type: "claude_proof_arm";
+  }>): Promise<void> {
+    await this.ready();
+    this.#assertClaudeProofAvailable();
+    const requestId = randomUUID();
+    const result = deferredSignal();
+    this.#pending.set(requestId, { action: "arm", kind: "claude_proof_ack", result });
+    const control = liveAcceptanceWorkerControlSchema.parse({
+      ...input,
+      requestId,
+      version: 1,
+    });
+    try {
+      await this.#writeControl(`${JSON.stringify(control)}\n`, requestId);
+      await boundedDeadline(result.promise, workerCommandDeadlineMs, "worker_failed");
+    } finally {
+      this.#pending.delete(requestId);
+    }
+  }
+
   async #memoryFaultControl(input:
     | Readonly<{ input: LiveAcceptanceMemoryFaultArm; type: "memory_fault_arm" }>
     | Readonly<{ input: LiveAcceptanceMemoryFaultFinalize; type: "memory_fault_finalize" }>
@@ -1345,7 +1505,9 @@ class ProcessWorker implements LiveAcceptanceWorker {
         || frame.device !== this.device
         || frame.runId !== this.#descriptor.runId
         || frame.pid !== this.pid
+        || (this.#claudeProofMode !== (frame.daemonGeneration !== undefined))
       ) throw new LiveAcceptanceError("worker_protocol_invalid");
+      this.#daemonGeneration = frame.daemonGeneration;
       this.#receivedReady = true;
       this.#ready.resolve();
       return;
@@ -1387,6 +1549,43 @@ class ProcessWorker implements LiveAcceptanceWorker {
       }
       this.#pending.delete(frame.requestId);
       pending.result.resolve(frame.status);
+      return;
+    }
+    if (frame.type === "claude_proof_ack") {
+      const pending = this.#pending.get(frame.requestId);
+      if (pending?.kind !== "claude_proof_ack") {
+        throw new LiveAcceptanceError("worker_protocol_invalid");
+      }
+      this.#pending.delete(frame.requestId);
+      pending.result.resolve();
+      return;
+    }
+    if (frame.type === "claude_proof_provisional_result") {
+      const pending = this.#pending.get(frame.requestId);
+      if (pending?.kind !== "claude_proof_provisional") {
+        throw new LiveAcceptanceError("worker_protocol_invalid");
+      }
+      this.#pending.delete(frame.requestId);
+      if (frame.outcome.status === "ready") {
+        pending.result.resolve(frame.outcome.receipt);
+      } else if (frame.outcome.status === "pending") {
+        pending.result.resolve(null);
+      } else {
+        pending.result.reject(new ClaudeLiveAcceptanceProofError(frame.outcome.code));
+      }
+      return;
+    }
+    if (frame.type === "claude_proof_final_result") {
+      const pending = this.#pending.get(frame.requestId);
+      if (pending?.kind !== "claude_proof_final") {
+        throw new LiveAcceptanceError("worker_protocol_invalid");
+      }
+      this.#pending.delete(frame.requestId);
+      if (frame.outcome.status === "proved") {
+        pending.result.resolve(frame.outcome.receipt);
+      } else {
+        pending.result.reject(new ClaudeLiveAcceptanceProofError(frame.outcome.code));
+      }
       return;
     }
     if (frame.type === "ack") {
@@ -1432,12 +1631,51 @@ class ProcessWorker implements LiveAcceptanceWorker {
       throw new LiveAcceptanceError("worker_failed");
     }
   }
+
+  #assertClaudeProofAvailable(): void {
+    this.#assertControlAvailable();
+    if (!this.#claudeProofMode || this.#daemonGeneration === undefined) {
+      throw new LiveAcceptanceError("worker_protocol_invalid");
+    }
+  }
 }
 
 export const startLiveAcceptanceProcessWorkerForTesting = async (
   descriptor: AcceptanceInstallationDescriptor,
   launch: ProcessWorkerLaunch,
 ): Promise<LiveAcceptanceWorker> => await ProcessWorker.start(descriptor, launch);
+
+export const startLiveAcceptanceProcessWorker = async (
+  descriptor: AcceptanceInstallationDescriptor,
+): Promise<LiveAcceptanceWorker> => await ProcessWorker.start(descriptor);
+
+export const startClaudeLiveAcceptanceProcessWorker = async (
+  descriptor: AcceptanceInstallationDescriptor,
+  beforeDescriptorWrite?: (workerPid: number) => Promise<void>,
+): Promise<ClaudeLiveAcceptanceWorker> => {
+  const launch = liveAcceptanceWorkerLaunch(descriptor);
+  return await ProcessWorker.start(
+    descriptor,
+    { ...launch, arguments: [...launch.arguments, "--claude-proof"] },
+    {
+      ...(beforeDescriptorWrite === undefined ? {} : { beforeDescriptorWrite }),
+      separateSignalDomain: true,
+    },
+  );
+};
+
+export const startClaudeLiveAcceptanceProcessWorkerForTesting = async (
+  descriptor: AcceptanceInstallationDescriptor,
+  launch: ProcessWorkerLaunch,
+  beforeDescriptorWrite?: (workerPid: number) => Promise<void>,
+): Promise<ClaudeLiveAcceptanceWorker> => await ProcessWorker.start(
+  descriptor,
+  launch,
+  {
+    ...(beforeDescriptorWrite === undefined ? {} : { beforeDescriptorWrite }),
+    separateSignalDomain: true,
+  },
+);
 
 const initialReceipt = (
   layout: LiveAcceptanceLayout,
@@ -1802,17 +2040,31 @@ async function assertAbsent(path: string): Promise<void> {
   if (await pathExists(path)) throw new LiveAcceptanceError("daemon_shutdown_unproven");
 }
 
-async function proveWorkerShutdown(
+export async function proveLiveAcceptanceWorkerShutdown(
   worker: LiveAcceptanceWorker,
   descriptor: AcceptanceInstallationDescriptor,
 ): Promise<void> {
-  if (processIsAlive(worker.pid)) throw new LiveAcceptanceError("daemon_shutdown_unproven");
+  await proveLiveAcceptanceStoppedInstallation(worker.pid, descriptor);
+}
+
+/**
+ * Replays the exact stopped-worker custody check without constructing a new
+ * worker. Dedicated cleanup-only acceptance recovery uses this after pipe EOF;
+ * it never kills, restarts, or infers descendant exit from the parent PID.
+ */
+export async function proveLiveAcceptanceStoppedInstallation(
+  workerPid: number,
+  descriptor: AcceptanceInstallationDescriptor,
+): Promise<void> {
+  if (!Number.isSafeInteger(workerPid) || workerPid < 1 || processIsAlive(workerPid)) {
+    throw new LiveAcceptanceError("daemon_shutdown_unproven");
+  }
   const paths = resolveStatePaths({ rootDirectory: descriptor.rootDirectory });
   if (await DaemonLock.isAuthorityHeld(paths)) {
     throw new LiveAcceptanceError("daemon_shutdown_unproven");
   }
   const receipt = await readDaemonAuthorityReceipt(paths);
-  if (receipt?.state !== "stopped" || receipt.pid !== worker.pid) {
+  if (receipt?.state !== "stopped" || receipt.pid !== workerPid) {
     throw new LiveAcceptanceError("daemon_shutdown_unproven");
   }
   await Promise.all([assertAbsent(paths.socket), assertAbsent(paths.capability)]);
@@ -2046,7 +2298,7 @@ export class LiveAcceptanceRun {
     if (process.env.HOME !== originalHome) throw new LiveAcceptanceError("home_changed");
     const receipt = await AtomicRecoveryReceipt.create(initialReceipt(layout));
     const factory = options.workerFactory
-      ?? (async (descriptor) => await ProcessWorker.start(descriptor));
+      ?? startLiveAcceptanceProcessWorker;
     const started: LiveAcceptanceWorker[] = [];
     try {
       const results = await Promise.allSettled([
@@ -2087,7 +2339,7 @@ export class LiveAcceptanceRun {
         layout,
         receipt,
         { a: workerA, b: workerB },
-        options.shutdownVerifier ?? proveWorkerShutdown,
+        options.shutdownVerifier ?? proveLiveAcceptanceWorkerShutdown,
       );
     } catch (error: unknown) {
       await Promise.allSettled(started.map(async (worker) => await worker.preserve()));
@@ -2109,7 +2361,7 @@ export class LiveAcceptanceRun {
       throw new LiveAcceptanceError("layout_changed");
     }
     const factory = options.workerFactory
-      ?? (async (descriptor) => await ProcessWorker.start(descriptor));
+      ?? startLiveAcceptanceProcessWorker;
     const started: LiveAcceptanceWorker[] = [];
     try {
       const results = await Promise.allSettled([
@@ -2152,7 +2404,7 @@ export class LiveAcceptanceRun {
         layout,
         receipt,
         { a: workerA, b: workerB },
-        options.shutdownVerifier ?? proveWorkerShutdown,
+        options.shutdownVerifier ?? proveLiveAcceptanceWorkerShutdown,
       );
     } catch (error: unknown) {
       await Promise.allSettled(started.map(async (worker) => await worker.preserve()));

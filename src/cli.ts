@@ -103,12 +103,15 @@ import {
   createClaudeLoginSignalCustody,
   resolvePinnedClaudeRuntime,
   runClaudeForegroundLogin,
+  type ClaudeHostToolPublicResult,
+  type ClaudeHostToolResponseWritten,
   type ClaudeForegroundLoginResult,
   type ClaudeLoginSignalCustody,
   type ClaudeLoginSignalSource,
   type PinnedClaudeRuntime,
   type ResolvePinnedClaudeRuntimeOptions,
 } from "./claude/index";
+import type { HraHostToolCall } from "./codex/protocol";
 import { localCommandSchema, type CommandResponse, type LocalCommand } from "./domain/contracts";
 import { adoptableProviderSchema, providerSchema, type Provider } from "./domain/presets";
 import {
@@ -182,7 +185,12 @@ import {
   type ClaudeProcessLivenessProbe,
 } from "./daemon/personal-session-discovery";
 import { HraFactsMemoryLifecycle } from "./daemon/facts-memory-lifecycle";
-import { UnavailableCloudControl, type CloudControlPort, type CompactProjectionRecoveryBlocker } from "./daemon/ports";
+import {
+  UnavailableCloudControl,
+  type CloudControlPort,
+  type CompactProjectionRecoveryBlocker,
+  type ProfileAuthority,
+} from "./daemon/ports";
 import { SessionEventCursorCodec } from "./daemon/session-event-cursor";
 import { CommandFailure, HraService } from "./daemon/service";
 import { AccountUsagePoller } from "./daemon/usage-poller";
@@ -3267,7 +3275,25 @@ export type RunDaemonOptions = Readonly<{
   liveAcceptanceCanonicalMemoryTransportDecorator?: (
     transport: CanonicalMemoryTransport,
   ) => CanonicalMemoryTransport;
+  liveAcceptanceClaudeProof?: LiveAcceptanceClaudeProofPort;
   stopSignal?: AbortSignal;
+}>;
+
+/**
+ * Acceptance-only custody for one managed-Claude host-tool proof. The concrete
+ * collector lives under `scripts/`; production exposes no observer, flag, or
+ * environment switch that can enable this seam.
+ */
+export type LiveAcceptanceClaudeProofPort = Readonly<{
+  beginDaemonGeneration(generation: number): void;
+  handleManagedHostToolCall(input: Readonly<{
+    authority: ProfileAuthority;
+    call: HraHostToolCall;
+    dispatch: () => Promise<ClaudeHostToolPublicResult>;
+  }>): Promise<ClaudeHostToolPublicResult>;
+  handleManagedHostToolResponseWritten(receipt: ClaudeHostToolResponseWritten): void;
+  /** Invalidates this in-process hook; it is not provider or filesystem cleanup proof. */
+  closeDaemonGeneration(generation: number | null): void;
 }>;
 
 async function runDaemonLifecycle(
@@ -3276,6 +3302,7 @@ async function runDaemonLifecycle(
   liveAcceptanceCanonicalMemoryTransportDecorator?: (
     transport: CanonicalMemoryTransport,
   ) => CanonicalMemoryTransport,
+  liveAcceptanceClaudeProof?: LiveAcceptanceClaudeProofPort,
 ): Promise<number> {
   assertInstallationHome(installation);
   const paths = installation.paths;
@@ -3372,6 +3399,7 @@ async function runDaemonLifecycle(
     await releaseProvenDeadClaudeAuthoritiesBeforeDaemonGeneration(activeStore);
     bootId = `boot_${randomUUID().replaceAll("-", "")}`;
     generation = activeStore.nextDaemonGeneration(bootId);
+    liveAcceptanceClaudeProof?.beginDaemonGeneration(generation);
     await daemonLock.publish({ state: "booting", generation, bootId });
     daemonAuthority = new DaemonAuthorityFence(daemonLock, { generation, bootId });
     const activeDaemonAuthority = daemonAuthority;
@@ -3410,6 +3438,9 @@ async function runDaemonLifecycle(
             throw new Error("The Claude host-tool receipt has no unique runtime owner.");
           }
           await owner.handleSessionHostToolResponseWritten(receipt);
+          if (owner === claude) {
+            liveAcceptanceClaudeProof?.handleManagedHostToolResponseWritten(receipt);
+          }
         },
       },
     });
@@ -3478,9 +3509,20 @@ async function runDaemonLifecycle(
           if (current === undefined) {
             throw new Error("The HRA service is unavailable during host-tool execution.");
           }
-          return await current.handleHraHostToolCall(authority, call, {
-            provider: "claude",
-            source: "managed",
+          if (liveAcceptanceClaudeProof === undefined) {
+            return await current.handleHraHostToolCall(authority, call, {
+              provider: "claude",
+              source: "managed",
+            });
+          }
+          return await liveAcceptanceClaudeProof.handleManagedHostToolCall({
+            authority,
+            call,
+            dispatch: async () => await current.handleHraHostToolCall(
+              authority,
+              call,
+              { provider: "claude", source: "managed" },
+            ),
           });
         },
         hraHostToolResponseWritten: (authority, call) => {
@@ -4088,6 +4130,13 @@ async function runDaemonLifecycle(
     if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && claudeHostToolAuthority !== undefined) {
       try { await claudeHostToolAuthority.close(); } catch (error: unknown) { cleanupErrors.push(error); }
     }
+    if (liveAcceptanceClaudeProof !== undefined) {
+      try {
+        liveAcceptanceClaudeProof.closeDaemonGeneration(generation ?? null);
+      } catch (error: unknown) {
+        cleanupErrors.push(error);
+      }
+    }
 
     if (runError instanceof DaemonJoinDeadlineError || runError instanceof LocalDaemonShutdownTimeoutError) {
       const diagnostic = safeDaemonFailure(runError);
@@ -4131,11 +4180,14 @@ export async function runDaemon(
   options: RunDaemonOptions = {},
 ): Promise<number> {
   if (
-    options.liveAcceptanceCanonicalMemoryTransportDecorator !== undefined
+    (
+      options.liveAcceptanceCanonicalMemoryTransportDecorator !== undefined
+      || options.liveAcceptanceClaudeProof !== undefined
+    )
     && installation.kind !== "live_acceptance"
   ) {
     throw new Error(
-      "The canonical-memory transport decorator is restricted to live acceptance.",
+      "Daemon acceptance hooks are restricted to live acceptance.",
     );
   }
   const stopLatch: DaemonStopLatch = { deliver: undefined, requested: false };
@@ -4154,6 +4206,7 @@ export async function runDaemon(
       installation,
       stopLatch,
       options.liveAcceptanceCanonicalMemoryTransportDecorator,
+      options.liveAcceptanceClaudeProof,
     );
   } finally {
     stopLatch.deliver = undefined;

@@ -21321,6 +21321,85 @@ describe("StateStore", () => {
     expect(store.isCanonicalMemoryMutationFenced(project.id)).toBe(true);
   });
 
+  test("proves the sole retained memory submission without ignoring other states or actors", async () => {
+    const { store, home } = await fixture({ now: () => 10_000 });
+    const root = join(home, "memory-submission-cardinality");
+    await mkdir(root);
+    const project = await store.createProject("Memory submission cardinality", root);
+    const profile = signInProfile(store, "Memory cardinality", "cardinality@example.com");
+    const actor = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const other = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const absentId = `memsub_${"0".repeat(32)}`;
+    expect(store.isSoleMemorySubmissionForSession(actor.id, absentId)).toBe(false);
+    const prepare = (sessionId: typeof actor.id, index: number) => store.prepareMemorySubmission({
+      actorSessionId: sessionId,
+      projectId: project.id,
+      kind: "remember",
+      requestDigest: testDigest(`cardinality request ${String(index)}`),
+      contentDigest: testDigest(`cardinality content ${String(index)}`),
+      keyDigest: testDigest(`cardinality key ${String(index)}`),
+      workingBindingDigest: testDigest(`cardinality binding ${sessionId}`),
+      workingEpoch: 1,
+      expectedHead: PROJECT_MEMORY_EMPTY_HEAD,
+      idempotencyKey: peerIdempotencyKey(61_000 + index),
+    }).record;
+    const first = prepare(actor.id, 0);
+    expect(store.isSoleMemorySubmissionForSession(actor.id, first.id)).toBe(true);
+    expect(store.isSoleMemorySubmissionForSession(actor.id, absentId)).toBe(false);
+    expect(store.isSoleMemorySubmissionForSession(other.id, first.id)).toBe(false);
+    store.cancelPreparedMemorySubmission(first.id);
+    expect(store.isSoleMemorySubmissionForSession(actor.id, first.id)).toBe(true);
+    const otherSubmission = prepare(other.id, 1);
+    expect(store.isSoleMemorySubmissionForSession(other.id, otherSubmission.id)).toBe(true);
+    expect(store.isSoleMemorySubmissionForSession(actor.id, first.id)).toBe(true);
+    store.bindMemorySubmissionEffect({
+      submissionId: otherSubmission.id,
+      effectRecordSha256: testDigest("cardinality applied record"),
+      attestationSha256: testDigest("cardinality applied attestation"),
+      operationId: "memory_cardinality_applied",
+    });
+    store.beginMemorySubmission(otherSubmission.id);
+    store.settleMemorySubmission({
+      submissionId: otherSubmission.id,
+      expectedState: "effect_started",
+      state: "applied",
+      outcomeCode: "remember_committed",
+      resultHead: {
+        sequence: 1,
+        operationSha256: testDigest("cardinality applied operation"),
+        headDigest: testDigest("cardinality applied head"),
+      },
+      receiptDigest: testDigest("cardinality applied receipt"),
+    });
+    expect(store.isSoleMemorySubmissionForSession(other.id, otherSubmission.id)).toBe(true);
+    const second = prepare(actor.id, 2);
+    expect(store.isSoleMemorySubmissionForSession(actor.id, first.id)).toBe(false);
+    expect(store.isSoleMemorySubmissionForSession(actor.id, second.id)).toBe(false);
+    expect(() => store.isSoleMemorySubmissionForSession("invalid" as typeof actor.id, first.id))
+      .toThrow();
+    expect(() => store.isSoleMemorySubmissionForSession(actor.id, "invalid")).toThrow();
+    const reader = new StateStore(store.paths, { readonly: true });
+    try {
+      expect(reader.isSoleMemorySubmissionForSession(actor.id, first.id)).toBe(false);
+      expect(reader.isSoleMemorySubmissionForSession(other.id, otherSubmission.id)).toBe(true);
+      expect(reader.requireMemorySubmission(first.id).state).toBe("cancelled");
+      expect(reader.requireMemorySubmission(second.id).state).toBe("prepared");
+      expect(reader.requireMemorySubmission(otherSubmission.id).state).toBe("applied");
+    } finally {
+      reader.close();
+    }
+  });
+
   test("keeps compact page attestations across journal GC and releases them with exact lane refs", async () => {
     let now = 10_000;
     const { store, home } = await fixture({ now: () => now });

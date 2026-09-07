@@ -23035,6 +23035,18 @@ export class StateStore {
     return row === null ? null : mapMemorySubmission(row);
   }
 
+  /** Checks retained rows only; it does not establish unpruned historical uniqueness. */
+  isSoleMemorySubmissionForSession(sessionId: SessionId, submissionId: string): boolean {
+    const actorId = sessionIdSchema.parse(sessionId);
+    const expectedId = memorySubmissionIdSchema.parse(submissionId);
+    const rows = z.array(z.object({ id: memorySubmissionIdSchema }).strict()).max(2).parse(
+      this.#database.query(
+        "SELECT id FROM memory_submissions WHERE actor_session_id=? LIMIT 2",
+      ).all(actorId),
+    );
+    return rows.length === 1 && rows[0]?.id === expectedId;
+  }
+
   bindMemorySubmissionEffect(input: Readonly<{
     submissionId: string;
     effectRecordSha256: string;

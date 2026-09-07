@@ -23,6 +23,7 @@ import {
   FileSecretBackend,
   GenerationalSecretCustody,
 } from "../src/storage/secret-custody";
+import { privatePathsOverlap } from "./live-acceptance-private-custody";
 
 const normalizedAbsolutePathSchema = z.string()
   .min(1)
@@ -193,16 +194,6 @@ function assertDirectChild(parent: string, child: string, label: string): void {
   ) throw new Error(`${label} must be one direct child of the acceptance run root.`);
 }
 
-function pathsOverlap(leftInput: string, rightInput: string): boolean {
-  const left = resolve(leftInput);
-  const right = resolve(rightInput);
-  const leftToRight = relative(left, right);
-  const rightToLeft = relative(right, left);
-  return left === right
-    || (!leftToRight.startsWith("..") && !isAbsolute(leftToRight))
-    || (!rightToLeft.startsWith("..") && !isAbsolute(rightToLeft));
-}
-
 export function createAcceptanceInstallation(
   descriptorInput: AcceptanceInstallationDescriptor,
 ): HraInstallation {
@@ -220,8 +211,8 @@ export function createAcceptanceInstallation(
   ) throw new Error("Acceptance installation paths do not match their run identity.");
   const productionRoot = resolveStatePaths().root;
   if (
-    pathsOverlap(runRoot, productionRoot)
-    || pathsOverlap(runRoot, descriptor.expectedHomeDirectory)
+    privatePathsOverlap(runRoot, productionRoot)
+    || privatePathsOverlap(runRoot, descriptor.expectedHomeDirectory)
   ) throw new Error("Acceptance state must not overlap production HRA state or the invoking home.");
 
   const cloudDeploymentUrl = descriptor.cloudDeploymentUrl === undefined

@@ -18,6 +18,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 
+import {
+  CLAUDE_PIN,
+  CLAUDE_PIN_MODEL,
+  digestClaudeHostToolInvocation,
+} from "../src/claude/index";
 import type { CommandResponse, LocalCommand } from "../src/domain/contracts";
 import { readDaemonAuthorityReceipt } from "../src/daemon/daemon-lock";
 import { DEFAULT_CLOUD_DEPLOYMENT_URL } from "../src/cloud/identity-custody";
@@ -48,8 +53,10 @@ import {
   readLiveRuntimeAttestation,
   resumeLiveAcceptanceCleanup,
   sourceGitOutput,
+  startClaudeLiveAcceptanceProcessWorkerForTesting,
   startLiveAcceptanceProcessWorkerForTesting,
   startLiveAcceptanceRun,
+  type ClaudeLiveAcceptanceWorker,
   type LiveAcceptanceDeviceName,
   type LiveAcceptanceWorker,
 } from "./live-acceptance";
@@ -144,6 +151,277 @@ const startSyntheticProcessWorker = async (
     ...defaultLaunch,
     arguments: ["--no-env-file", "-e", harness],
   });
+};
+
+const startInjectedSupervisorProcessWorker = async (
+  descriptor: AcceptanceInstallationDescriptor,
+  source: readonly string[],
+  mode: "standard" | "claude_proof",
+  beforeDescriptorWrite?: (workerPid: number) => Promise<void>,
+): Promise<LiveAcceptanceWorker | ClaudeLiveAcceptanceWorker> => {
+  const launch = liveAcceptanceWorkerLaunch(descriptor);
+  const workerModule = new URL("./live-acceptance-worker.ts", import.meta.url).href;
+  const harness = [
+    `import { runLiveAcceptanceWorkerSupervisorForTest } from ${JSON.stringify(workerModule)};`,
+    ...source,
+  ].join("\n");
+  const injectedLaunch = {
+    ...launch,
+    arguments: ["--no-env-file", "-e", harness],
+  };
+  return mode === "claude_proof"
+    ? await startClaudeLiveAcceptanceProcessWorkerForTesting(
+        descriptor,
+        injectedLaunch,
+        beforeDescriptorWrite,
+      )
+    : await startLiveAcceptanceProcessWorkerForTesting(descriptor, injectedLaunch);
+};
+
+const processExists = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const processGroupExists = (pid: number): boolean => {
+  if (process.platform === "win32") return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const workerProofProfileId = `acct_${"1".repeat(32)}` as const;
+const workerProofProjectId = `proj_${"2".repeat(32)}` as const;
+const workerProofSessionId = `sess_${"3".repeat(32)}` as const;
+const workerProofStartKey = "00000000-0000-4000-8000-000000000421";
+const workerProofSendKey = "00000000-0000-4000-8000-000000000422";
+const workerProofThreadId = "worker-proof-thread";
+const workerProofTurnId = "worker-proof-turn";
+const workerProofCallId = "worker-proof-call";
+const workerProofConnectionId = "worker-proof-connection";
+const workerProofMemory = {
+  body: "Retain the one-shot worker proof nonce.",
+  key: "acceptance.worker.one_shot",
+  summary: "One worker callback reached durable memory.",
+  title: "Worker callback proof",
+} as const;
+const workerProofRequestDigest = digestClaudeHostToolInvocation(workerProofCallId, {
+  input: workerProofMemory,
+  tool: "memory_remember",
+});
+
+const standardInjectedWorkerSource = (): readonly string[] => [
+  'import { randomUUID } from "node:crypto";',
+  "let generation = 0;",
+  "let finishGeneration;",
+  "const success = (data) => ({ data, ok: true, requestId: randomUUID(), version: 1 });",
+  "const exitCode = await runLiveAcceptanceWorkerSupervisorForTest({",
+  '  kind: "worker_main",',
+  "  initializeWorkerInstallation: async () => undefined,",
+  "  runDaemon: async (_installation, options) => {",
+  "    generation += 1;",
+  "    const signal = options.stopSignal;",
+  '    if (signal === undefined) throw new Error("missing stop signal");',
+  "    let onAbort;",
+  "    await new Promise((resolve) => {",
+  "      finishGeneration = resolve;",
+  "      onAbort = resolve;",
+  "      if (signal.aborted) resolve();",
+  '      else signal.addEventListener("abort", onAbort, { once: true });',
+  "    });",
+  '    signal.removeEventListener("abort", onAbort);',
+  "    finishGeneration = undefined;",
+  "    return 0;",
+  "  },",
+  "  waitForDaemonReady: async () => ({",
+  '    bootId: "boot_00000000000000000000000000000001",',
+  "    generation,",
+  '    nonce: "00000000-0000-4000-8000-000000000423",',
+  "    pid: process.pid,",
+  '    protocol: "hra-control-plane-local-v2",',
+  "  }),",
+  "  callLocalDaemon: async ({ command }) => {",
+  '    if (command.kind === "auth.delete") {',
+  "      const finish = finishGeneration;",
+  "      setTimeout(() => finish?.(), 0);",
+  "      return success({",
+  "        daemonRestartRequired: true,",
+  '        deletion: { effectsDisabled: true, state: "pending" },',
+  "      });",
+  "    }",
+  '    if (command.kind === "daemon.stop") { finishGeneration?.(); return success({ stopped: true }); }',
+  '    if (command.kind === "daemon.status") return success({ generation, running: true });',
+  '    throw new Error("unexpected command");',
+  "  },",
+  "});",
+  "process.exitCode = exitCode;",
+];
+
+const claudeInjectedWorkerSource = (
+  descriptor: AcceptanceInstallationDescriptor,
+  inconsistentIdle = false,
+): readonly string[] => {
+  const profile = {
+    claudeVersion: CLAUDE_PIN,
+    inputFormat: "stream-json",
+    model: CLAUDE_PIN_MODEL,
+    observedAt: 2_000,
+    outputFormat: "stream-json",
+    permissionMode: "default",
+    preset: "fable-max",
+    processGeneration: 7,
+    profileId: workerProofProfileId,
+    reasoningEffort: "max",
+  } as const;
+  const idleSession = {
+    ...(inconsistentIdle ? { activeTurnId: workerProofTurnId } : {}),
+    createdAt: 1_000,
+    fastEnabled: false,
+    id: workerProofSessionId,
+    note: "",
+    preset: "fable-max",
+    profileId: workerProofProfileId,
+    projectId: workerProofProjectId,
+    provider: "claude",
+    providerThreadId: workerProofThreadId,
+    revision: 1,
+    state: "idle",
+    title: "Worker proof",
+    updatedAt: 1_000,
+  } as const;
+  const activeSession = {
+    ...idleSession,
+    activeTurnId: workerProofTurnId,
+    revision: 2,
+    state: "active",
+    updatedAt: 2_000,
+  } as const;
+  const rememberResult = {
+    idempotencyRetainedUntil: "2026-09-07T00:00:00.000Z",
+    ok: true,
+    page: {
+      key: workerProofMemory.key,
+      operationSha256: "4".repeat(64),
+      recordSha256: "5".repeat(64),
+    },
+    receiptSha256: "6".repeat(64),
+    replay: false,
+    submission: {
+      id: `memsub_${"7".repeat(32)}`,
+      kind: "remember",
+      state: "applied",
+    },
+    version: 1,
+    workingHead: {
+      digest: "8".repeat(64),
+      operationSha256: "4".repeat(64),
+      sequence: 1,
+    },
+  } as const;
+  const values = {
+    activeSession,
+    candidate: descriptor.candidate,
+    call: {
+      authority: { processGeneration: 7, profileId: workerProofProfileId },
+      callId: workerProofCallId,
+      connectionId: workerProofConnectionId,
+      input: workerProofMemory,
+      requestDigest: workerProofRequestDigest,
+      requestId: { type: "string", value: workerProofCallId },
+      threadId: workerProofThreadId,
+      tool: "memory_remember",
+      turnId: workerProofTurnId,
+    },
+    idleSession,
+    memory: workerProofMemory,
+    profile,
+    profileId: workerProofProfileId,
+    projectId: workerProofProjectId,
+    rememberResult,
+    runId: descriptor.runId,
+    sendKey: workerProofSendKey,
+    sessionId: workerProofSessionId,
+    startKey: workerProofStartKey,
+    turnId: workerProofTurnId,
+    written: {
+      bindingId: "worker-proof-binding",
+      callId: workerProofCallId,
+      processGeneration: 7,
+      profileId: workerProofProfileId,
+      provider: "claude",
+      providerThreadId: workerProofThreadId,
+      request: { input: workerProofMemory, tool: "memory_remember" },
+      requestDigest: workerProofRequestDigest,
+    },
+  };
+  return [
+    'import { randomUUID } from "node:crypto";',
+    `const values = ${JSON.stringify(values)};`,
+    "let finishGeneration;",
+    "let proof;",
+    "const success = (data) => ({ data, ok: true, requestId: randomUUID(), version: 1 });",
+    "const exitCode = await runLiveAcceptanceWorkerSupervisorForTest({",
+    '  kind: "worker_main",',
+    "  claudeProof: true,",
+    "  initializeWorkerInstallation: async () => undefined,",
+    "  runDaemon: async (_installation, options) => {",
+    "    proof = options.liveAcceptanceClaudeProof;",
+    '    if (proof === undefined) throw new Error("missing proof port");',
+    "    proof.beginDaemonGeneration(1);",
+    "    const signal = options.stopSignal;",
+    '    if (signal === undefined) throw new Error("missing stop signal");',
+    "    let onAbort;",
+    "    await new Promise((resolve) => {",
+    "      finishGeneration = resolve;",
+    "      onAbort = resolve;",
+    "      if (signal.aborted) resolve();",
+    '      else signal.addEventListener("abort", onAbort, { once: true });',
+    "    });",
+    '    signal.removeEventListener("abort", onAbort);',
+    "    proof.closeDaemonGeneration(1);",
+    "    return 0;",
+    "  },",
+    "  waitForDaemonReady: async () => ({",
+    '    bootId: "boot_00000000000000000000000000000002",',
+    "    generation: 1,",
+    '    nonce: "00000000-0000-4000-8000-000000000424",',
+    "    pid: process.pid,",
+    '    protocol: "hra-control-plane-local-v2",',
+    "  }),",
+    "  callLocalDaemon: async ({ command }) => {",
+    '    if (command.kind === "session.start") return success({',
+    "      effectiveRuntimeProfile: values.profile,",
+    "      idempotencyKey: command.idempotencyKey,",
+    "      session: values.idleSession,",
+    "    });",
+    '    if (command.kind === "session.send") {',
+    "      const result = await proof.handleManagedHostToolCall({",
+    "        authority: { generation: 7, id: values.profileId },",
+    "        call: values.call,",
+    "        dispatch: async () => values.rememberResult,",
+    "      });",
+    '      if (result !== values.rememberResult) throw new Error("result identity changed");',
+    "      proof.handleManagedHostToolResponseWritten(values.written);",
+    "      return success({",
+    "        effectiveRuntimeProfile: values.profile,",
+    "        idempotencyKey: command.idempotencyKey,",
+    "        session: values.activeSession,",
+    "        turnId: values.turnId,",
+    "      });",
+    "    }",
+    '    if (command.kind === "daemon.stop") { finishGeneration?.(); return success({ stopped: true }); }',
+    '    throw new Error("unexpected command");',
+    "  },",
+    "});",
+    "process.exitCode = exitCode;",
+  ];
 };
 
 const response = (data: unknown): CommandResponse => ({
@@ -848,6 +1126,331 @@ describe("source-only live acceptance isolation", () => {
         await childClosed?.catch(() => undefined);
       }
       if (runRoot !== undefined) await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test("keeps the standard worker attached and renders a restart-required response", async () => {
+    const base = await privateTestBase();
+    let runRoot: string | undefined;
+    let worker: LiveAcceptanceWorker | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      runRoot = layout.runRoot.path;
+      worker = await startInjectedSupervisorProcessWorker(
+        layout.descriptors.a,
+        standardInjectedWorkerSource(),
+        "standard",
+      );
+      await worker.ready();
+      if (process.platform !== "win32") expect(processGroupExists(worker.pid)).toBeFalse();
+
+      const result = await worker.execute([
+        "auth",
+        "delete",
+        "--acknowledge-erasure",
+        "--json",
+      ]);
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        data: {
+          daemonRestartRequired: true,
+          deletion: { effectsDisabled: true, state: "pending" },
+        },
+        ok: true,
+      });
+      await expect(worker.command({ kind: "daemon.status" })).resolves.toMatchObject({
+        data: { generation: 2, running: true },
+        ok: true,
+      });
+      await worker.stop();
+      await expect(worker.lifetime()).resolves.toBeUndefined();
+      expect(processExists(worker.pid)).toBeFalse();
+    } finally {
+      await worker?.preserve();
+      if (runRoot !== undefined) {
+        await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      }
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test("keeps a Claude worker inert until its exact PID is durably admitted", async () => {
+    const base = await privateTestBase();
+    const runRoots: string[] = [];
+    let worker: ClaudeLiveAcceptanceWorker | undefined;
+    let releaseAdmission = (): void => undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({
+        candidate: releaseCandidate,
+        temporaryBaseDirectory: base,
+      });
+      runRoots.push(layout.runRoot.path);
+      let admittedPid: number | undefined;
+      let markAdmissionStarted = (): void => undefined;
+      const admissionStarted = new Promise<void>((resolvePromise) => {
+        markAdmissionStarted = resolvePromise;
+      });
+      const admissionGate = new Promise<void>((resolvePromise) => {
+        releaseAdmission = resolvePromise;
+      });
+      let startSettled = false;
+      const startOperation = startInjectedSupervisorProcessWorker(
+        layout.descriptors.a,
+        claudeInjectedWorkerSource(layout.descriptors.a),
+        "claude_proof",
+        async (workerPid) => {
+          admittedPid = workerPid;
+          markAdmissionStarted();
+          await admissionGate;
+        },
+      ).finally(() => {
+        startSettled = true;
+      });
+      await admissionStarted;
+      await Bun.sleep(10);
+      if (admittedPid === undefined) throw new Error("missing admitted worker PID");
+      expect(startSettled).toBeFalse();
+      expect(processExists(admittedPid)).toBeTrue();
+      if (process.platform !== "win32") expect(processGroupExists(admittedPid)).toBeTrue();
+      expect(await readDaemonAuthorityReceipt(
+        resolveStatePaths({ rootDirectory: layout.descriptors.a.rootDirectory }),
+      )).toBeNull();
+
+      releaseAdmission();
+      worker = await startOperation as ClaudeLiveAcceptanceWorker;
+      await worker.ready();
+      await worker.preserve();
+      await expect(worker.lifetime()).resolves.toBeUndefined();
+      expect(processExists(admittedPid)).toBeFalse();
+      if (process.platform !== "win32") expect(processGroupExists(admittedPid)).toBeFalse();
+      worker = undefined;
+
+      const rejectedLayout = await createLiveAcceptanceLayout({
+        candidate: releaseCandidate,
+        temporaryBaseDirectory: base,
+      });
+      runRoots.push(rejectedLayout.runRoot.path);
+      let rejectedPid: number | undefined;
+      await expect(startInjectedSupervisorProcessWorker(
+        rejectedLayout.descriptors.a,
+        claudeInjectedWorkerSource(rejectedLayout.descriptors.a),
+        "claude_proof",
+        async (workerPid) => {
+          rejectedPid = workerPid;
+          throw new Error("synthetic PID persistence refusal");
+        },
+      )).rejects.toThrow("synthetic PID persistence refusal");
+      if (rejectedPid === undefined) throw new Error("missing rejected worker PID");
+      expect(processExists(rejectedPid)).toBeFalse();
+      if (process.platform !== "win32") expect(processGroupExists(rejectedPid)).toBeFalse();
+      expect(await readDaemonAuthorityReceipt(
+        resolveStatePaths({ rootDirectory: rejectedLayout.descriptors.a.rootDirectory }),
+      )).toBeNull();
+    } finally {
+      releaseAdmission();
+      await worker?.preserve();
+      for (const runRoot of runRoots) {
+        await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      }
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test("captures raw Claude start and send receipts before public projection", async () => {
+    const base = await privateTestBase();
+    let runRoot: string | undefined;
+    let worker: ClaudeLiveAcceptanceWorker | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({
+        candidate: releaseCandidate,
+        temporaryBaseDirectory: base,
+      });
+      runRoot = layout.runRoot.path;
+      worker = await startInjectedSupervisorProcessWorker(
+        layout.descriptors.a,
+        claudeInjectedWorkerSource(layout.descriptors.a),
+        "claude_proof",
+      ) as ClaudeLiveAcceptanceWorker;
+      await worker.ready();
+      if (process.platform !== "win32") expect(processGroupExists(worker.pid)).toBeTrue();
+      expect(await worker.currentDaemonGeneration()).toBe(1);
+
+      const started = await worker.execute([
+        "session",
+        "start",
+        workerProofProfileId,
+        "--project",
+        workerProofProjectId,
+        "--provider",
+        "claude",
+        "--preset",
+        "fable-max",
+        "--idempotency-key",
+        workerProofStartKey,
+        "--json",
+      ]);
+      expect(started.exitCode).toBe(0);
+      expect(started.stderr).toBe("");
+      expect(started.stdout).not.toContain("configHome");
+      expect(started.stdout).not.toContain(workerProofThreadId);
+      expect(started.stdout).not.toContain(workerProofConnectionId);
+      expect(started.stdout).not.toContain(workerProofCallId);
+
+      await worker.armClaudeProof({
+        daemonGeneration: 1,
+        memory: workerProofMemory,
+        profileGeneration: 7,
+        profileId: workerProofProfileId,
+        sendIdempotencyKey: workerProofSendKey,
+        sessionId: workerProofSessionId,
+      });
+      const sent = await worker.execute([
+        "session",
+        "send",
+        workerProofSessionId,
+        "Use the reviewed memory tool exactly once.",
+        "--idempotency-key",
+        workerProofSendKey,
+        "--json",
+      ]);
+      expect(sent.exitCode).toBe(0);
+      expect(sent.stderr).toBe("");
+      expect(sent.stdout).not.toContain("configHome");
+      expect(sent.stdout).not.toContain(workerProofThreadId);
+      expect(sent.stdout).not.toContain(workerProofConnectionId);
+      expect(sent.stdout).not.toContain(workerProofCallId);
+
+      const provisional = await worker.readClaudeProvisionalProof();
+      expect(provisional).toMatchObject({
+        callId: workerProofCallId,
+        connectionId: workerProofConnectionId,
+        lifecycleInvalidated: false,
+        providerThreadId: workerProofThreadId,
+        requestDigest: workerProofRequestDigest,
+        sendIdempotencyKey: workerProofSendKey,
+        sessionId: workerProofSessionId,
+        turnId: workerProofTurnId,
+      });
+      const final = await worker.stopWithClaudeProof();
+      expect(final).toMatchObject({
+        candidate: releaseCandidate,
+        lifecycleInvalidated: true,
+        requestDigest: workerProofRequestDigest,
+      });
+      await expect(worker.lifetime()).resolves.toBeUndefined();
+      expect(processExists(worker.pid)).toBeFalse();
+      if (process.platform !== "win32") expect(processGroupExists(worker.pid)).toBeFalse();
+    } finally {
+      await worker?.preserve();
+      if (runRoot !== undefined) {
+        await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      }
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test("joins an unarmed Claude proof worker before returning proof_incomplete", async () => {
+    const base = await privateTestBase();
+    let runRoot: string | undefined;
+    let worker: ClaudeLiveAcceptanceWorker | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({
+        candidate: releaseCandidate,
+        temporaryBaseDirectory: base,
+      });
+      runRoot = layout.runRoot.path;
+      worker = await startInjectedSupervisorProcessWorker(
+        layout.descriptors.a,
+        claudeInjectedWorkerSource(layout.descriptors.a),
+        "claude_proof",
+      ) as ClaudeLiveAcceptanceWorker;
+      await worker.ready();
+      await expect(worker.stopWithClaudeProof()).rejects.toMatchObject({
+        code: "proof_incomplete",
+      });
+      await expect(worker.lifetime()).resolves.toBeUndefined();
+      expect(processExists(worker.pid)).toBeFalse();
+    } finally {
+      await worker?.preserve();
+      if (runRoot !== undefined) {
+        await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      }
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test("joins the Claude signal-domain worker when its control pipe reaches EOF", async () => {
+    const base = await privateTestBase();
+    let runRoot: string | undefined;
+    let worker: ClaudeLiveAcceptanceWorker | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({
+        candidate: releaseCandidate,
+        temporaryBaseDirectory: base,
+      });
+      runRoot = layout.runRoot.path;
+      worker = await startInjectedSupervisorProcessWorker(
+        layout.descriptors.a,
+        claudeInjectedWorkerSource(layout.descriptors.a),
+        "claude_proof",
+      ) as ClaudeLiveAcceptanceWorker;
+      await worker.ready();
+      if (process.platform !== "win32") expect(processGroupExists(worker.pid)).toBeTrue();
+      await worker.preserve();
+      await expect(worker.lifetime()).resolves.toBeUndefined();
+      expect(processExists(worker.pid)).toBeFalse();
+      if (process.platform !== "win32") expect(processGroupExists(worker.pid)).toBeFalse();
+    } finally {
+      await worker?.preserve();
+      if (runRoot !== undefined) {
+        await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      }
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test("refuses an idle Claude start that still carries an active turn", async () => {
+    const base = await privateTestBase();
+    let runRoot: string | undefined;
+    let worker: ClaudeLiveAcceptanceWorker | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({
+        candidate: releaseCandidate,
+        temporaryBaseDirectory: base,
+      });
+      runRoot = layout.runRoot.path;
+      worker = await startInjectedSupervisorProcessWorker(
+        layout.descriptors.a,
+        claudeInjectedWorkerSource(layout.descriptors.a, true),
+        "claude_proof",
+      ) as ClaudeLiveAcceptanceWorker;
+      await worker.ready();
+      const started = await worker.execute([
+        "session",
+        "start",
+        workerProofProfileId,
+        "--project",
+        workerProofProjectId,
+        "--provider",
+        "claude",
+        "--preset",
+        "fable-max",
+        "--idempotency-key",
+        workerProofStartKey,
+        "--json",
+      ]);
+      expect(started.exitCode).toBe(0);
+      await expect(worker.stopWithClaudeProof()).rejects.toMatchObject({
+        code: "session_scope_invalid",
+      });
+      await expect(worker.lifetime()).resolves.toBeUndefined();
+    } finally {
+      await worker?.preserve();
+      if (runRoot !== undefined) {
+        await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      }
       await removeOwnedTestBase(base);
     }
   }, 60_000);

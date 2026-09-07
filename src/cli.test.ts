@@ -6114,6 +6114,23 @@ describe("CLI entry point", () => {
     expect(decorated).toBeFalse();
   });
 
+  test("rejects the Claude proof collector outside live acceptance before effects", async () => {
+    const installation = createProductionInstallation();
+    let invoked = false;
+    await expect(runDaemon(installation, {
+      liveAcceptanceClaudeProof: {
+        beginDaemonGeneration: () => { invoked = true; },
+        closeDaemonGeneration: () => { invoked = true; },
+        handleManagedHostToolCall: async () => {
+          invoked = true;
+          return {};
+        },
+        handleManagedHostToolResponseWritten: () => { invoked = true; },
+      },
+    })).rejects.toThrow("Daemon acceptance hooks are restricted to live acceptance.");
+    expect(invoked).toBeFalse();
+  });
+
   test("delivers an abort during early daemon boot before transport exists", async () => {
     const { installation: baseInstallation, runRoot } = await upgradeFixture("daemon-stop-during-early-boot");
     try {

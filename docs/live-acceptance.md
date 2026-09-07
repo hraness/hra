@@ -135,7 +135,7 @@ Version-two memory evidence contains only bounded digests, generation and sequen
 
 ### Separate Claude proof
 
-This runner's provider scenario is Codex-specific. It does not establish Claude parity. The memory release also requires a fresh HRA-created session on an authorized Linux host running exact Claude 2.1.260. Require one bounded nonsecret memory remember, the provider's consumption of the actual unpredictable receipt digest, owner-side working-memory and attribution readback, and shutdown proof that the exact process, bridge binding, configuration, capability, and socket are gone. Existing adopted Claude conversations are not eligible for this new-tool proof. Local revocation does not claim remote provider credential erasure.
+This runner's provider scenario is Codex-specific. It does not establish Claude parity. The separate [Claude live acceptance gate](claude-live-acceptance.md) requires a fresh HRA-created session on an authorized Linux host running exact Claude 2.1.260, one bounded memory remember, consumption of its actual unpredictable receipt, independent owner and private readback, exact child and bridge teardown, and isolated native logout. Existing adopted Claude conversations are not eligible. Local revocation does not claim remote provider credential erasure.
 
 ## Cleanup
 
@@ -162,7 +162,7 @@ bun scripts/live-acceptance.ts --resume-fd 3 3< /protected/path/to/recovery-rece
 
 The only argument is the descriptor number. The state root, socket, capability, and receipt contents do not enter argv or the environment.
 
-Recovery treats the mode-`0600` file on disk as authoritative. The caller-provided document is only a protected locator. Recovery opens the exact file without following links, verifies its owner, link count, mode, size, device, and inode before and after the bounded read, and parses the on-disk document. It rejects substituted caller fields.
+Recovery treats the mode-`0600` file on disk as authoritative. The caller-provided document is only a protected locator. Recovery uses a nonblocking, no-follow, size-bounded descriptor read and verifies the named file against that descriptor. Owner, link count, mode, size, device, inode, timestamps, and parent identity must remain consistent. Subsequent updates and removal also verify the admitted content digest, so an in-place edit cannot redirect cleanup or be overwritten silently. Inspection returns a copy, and concurrent mutations through the same receipt controller refuse. The exclusive-operator requirement still applies across processes; atomic rename is not a cross-process compare-and-swap. These checks do not claim hostile same-user isolation.
 
 It then revalidates the run-ID filename, receipt location, run-root prefix, all four distinct role paths and prefixes, directory identities, canonical temporary parent, and non-overlap with production HRA state and the invoking home. A live PID, stale socket, changed inode, symlink, unknown direct child, incomplete cloud erasure, incomplete Codex logout, or failed shutdown proof leaves the receipt and roots intact.
 

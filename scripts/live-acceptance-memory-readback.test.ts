@@ -4,7 +4,10 @@ import { resolve } from "node:path";
 import { describe, expect, test } from "bun:test";
 
 import { HRA_VERSION } from "../src/version";
-import { BoundedProcessCleanupUnprovenError } from "./bounded-process";
+import {
+  BoundedProcessCleanupUnprovenError,
+  BoundedProcessContainmentUnavailableError,
+} from "./bounded-process";
 import type { CommandRequest, CommandResult } from "./configure-hosted-sync";
 import { HRA_CONVEX_PROJECT_ID, HRA_CONVEX_TEAM_ID, type ConvexTarget } from "./convex-target";
 import {
@@ -268,6 +271,23 @@ describe("live memory quota and erasure readback", () => {
       await expect(f.port.bindDevices(devices, signal())).rejects.toThrow();
       expect(f.requests).toHaveLength(change.failTargetAt === 1 || change.failRuntimeAt === 1 ? 0 : 1);
       await expect(f.port.observePopulated(3, signal())).rejects.toThrow("live_memory_readback_refused");
+    }
+  });
+
+  test.skipIf(process.platform === "linux")("the default readback runner requires real authority containment", async () => {
+    const ordering: string[] = [];
+    const port = createLiveAcceptanceMemoryReadback({
+      candidate,
+      target,
+      verifyTarget: async () => { ordering.push("target"); },
+      verifyRuntime: async () => { ordering.push("runtime"); },
+    });
+    try {
+      await expect(port.bindDevices(devices, signal()))
+        .rejects.toBeInstanceOf(BoundedProcessContainmentUnavailableError);
+      expect(ordering).toEqual(["target", "runtime"]);
+    } finally {
+      port.close();
     }
   });
 

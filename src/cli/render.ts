@@ -840,6 +840,10 @@ const projectPublicRuntimeProfile = (
   value: unknown,
 ): z.infer<typeof publicReviewedRuntimeProfileSchema> | null | undefined => {
   if (value === null) return null;
+  // Service responses already omit private runtime custody. Accept that exact
+  // public contract without requiring callers to restore the omitted fields.
+  const publicProfile = publicReviewedRuntimeProfileSchema.safeParse(value);
+  if (publicProfile.success) return publicProfile.data;
   const reviewed = reviewedRuntimeProfileSchema.safeParse(value);
   if (!reviewed.success) return undefined;
   const projected = publicReviewedRuntimeProfileSchema.safeParse(
