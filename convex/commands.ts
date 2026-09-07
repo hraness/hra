@@ -490,7 +490,7 @@ export const listUnacknowledgedForRequester = query({
     const legacy = legacyRemaining === 0 ? [] : await ctx.db
       .query("sessionCommands")
       .withIndex(
-        "by_requesting_device_acknowledgement_cleanup_capacity_and_created_at",
+        "by_requesting_device_ack_cleanup_capacity_and_created_at",
         (builder) => builder
           .eq("requestingDeviceId", authority.deviceId)
           .eq("requesterAcknowledgedAt", undefined)

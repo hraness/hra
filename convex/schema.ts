@@ -458,7 +458,7 @@ export default defineSchema({
       "terminalCleanupAfter",
       "createdAt",
     ])
-    .index("by_requesting_device_acknowledgement_cleanup_capacity_and_created_at", [
+    .index("by_requesting_device_ack_cleanup_capacity_and_created_at", [
       "requestingDeviceId",
       "requesterAcknowledgedAt",
       "terminalCleanupAfter",
@@ -593,7 +593,7 @@ export default defineSchema({
       "terminalCleanupAfter",
       "createdAt",
     ])
-    .index("by_requesting_device_acknowledgement_cleanup_capacity_and_created_at", [
+    .index("by_requesting_device_ack_cleanup_capacity_and_created_at", [
       "requestingDeviceId",
       "requesterAcknowledgedAt",
       "terminalCleanupAfter",
