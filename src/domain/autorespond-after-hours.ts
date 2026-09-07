@@ -13,20 +13,20 @@ import {
 } from "./notification-hours";
 
 /** Separate consent, not a notification-email policy or a schedule update. */
-const policySchema = z.object({
+export const autorespondAfterHoursPolicySchema = z.object({
   kind: z.literal("autorespond_after_hours"),
   version: z.literal(1),
   revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   enabled: z.boolean(),
 }).strict().readonly();
 
-export type AutorespondAfterHoursPolicy = z.infer<typeof policySchema>;
+export type AutorespondAfterHoursPolicy = z.infer<typeof autorespondAfterHoursPolicySchema>;
 
 /** Missing or malformed consent has no enabled default. Never invoke accessors. */
 export function parseAutorespondAfterHoursPolicy(value: unknown): AutorespondAfterHoursPolicy | null {
   const snapshot = snapshotForeignJson(value);
   if (!snapshot.ok) return null;
-  const result = policySchema.safeParse(snapshot.value);
+  const result = autorespondAfterHoursPolicySchema.safeParse(snapshot.value);
   return result.success ? result.data : null;
 }
 
@@ -106,10 +106,10 @@ function baseline(
 }
 
 /**
- * Inactive policy foundation: select provisional limits, never admit an effect.
+ * Select provisional limits, never admit an effect.
  *
  * No clock, storage, provider, counters, or notification consent is read here.
- * Future final transactional admission must independently establish eligibility,
+ * Final transactional admission must independently establish eligibility,
  * complete history, a coherent current policy/schedule, and valid accounting
  * time before charging the shared ledger. Baseline selection after a bad clock
  * is not permission to admit against corrupt or unavailable accounting time.

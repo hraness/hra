@@ -14,9 +14,14 @@ import { isAbsolute, resolve } from "node:path";
 import { Database, constants as sqliteConstants } from "bun:sqlite";
 import { z } from "zod";
 import {
+  autorespondAfterHoursPolicySchema,
+  selectAutorespondAfterHoursTier,
+  type AutorespondAfterHoursPolicy,
+  type AutorespondAfterHoursSelection,
+} from "../domain/autorespond-after-hours";
+import { decideProtocolAutorespondAuthority } from "../domain/autorespond-protocol-policy";
+import {
   AUTORESPOND_CONSECUTIVE_LIMIT,
-  AUTORESPOND_HOURLY_BUDGET,
-  AUTORESPOND_DAILY_BUDGET,
   AUTORESPOND_HOUR_MS,
   AUTORESPOND_DAY_MS,
   AUTORESPOND_RESERVATIONS_PER_SESSION_CAP,
@@ -3406,8 +3411,9 @@ type DesktopSwitchPlan =
     };
 
 // Preserve main's v40 adoption, v41 timestamp, v42 Work, and v43 transcript
-// contracts, v44 approval budgets, and v45 auth authority. Memory follows at v46/v47.
-const currentSchemaVersion = 47;
+// contracts, v44 approval budgets, v45 auth authority, and v46 after-hours
+// policy. Memory follows in the previously unshipped v47/v48 slots.
+const currentSchemaVersion = 48;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -4266,6 +4272,159 @@ const assertSchemaVersion45Authority = (database: Database): void => {
   assertSchemaVersion44AutorespondObjects(database);
   assertSchemaVersion44AutorespondEvidence(database);
   assertSchemaVersion45AccountMutationAuthority(database);
+};
+
+// Higher protocol limits have independent, default-off consent. A legacy
+// floor of three cannot prove exact consecutive history, even after the v44
+// rolling-window hold expires. Only a newly finalized human source clears it.
+const schemaVersion46AutorespondAfterHours = `
+CREATE TABLE autorespond_after_hours_policy (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  kind TEXT NOT NULL CHECK(kind='autorespond_after_hours'),
+  version INTEGER NOT NULL CHECK(version=1),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+  created_at INTEGER NOT NULL CHECK(created_at BETWEEN 0 AND 9007199254740991),
+  updated_at INTEGER NOT NULL CHECK(updated_at BETWEEN created_at AND 9007199254740991)
+) STRICT;
+CREATE TRIGGER autorespond_after_hours_policy_insert_guard
+BEFORE INSERT ON autorespond_after_hours_policy
+WHEN EXISTS (SELECT 1 FROM autorespond_after_hours_policy)
+  OR NEW.revision!=1 OR NEW.enabled!=0
+BEGIN SELECT RAISE(ABORT, 'autorespond after-hours policy must start disabled'); END;
+CREATE TRIGGER autorespond_after_hours_policy_update_guard
+BEFORE UPDATE ON autorespond_after_hours_policy
+WHEN NEW.singleton!=OLD.singleton OR NEW.kind!=OLD.kind OR NEW.version!=OLD.version
+  OR NEW.created_at!=OLD.created_at OR NEW.revision!=OLD.revision+1
+  OR NEW.updated_at<OLD.updated_at
+BEGIN SELECT RAISE(ABORT, 'autorespond after-hours policy transition is invalid'); END;
+CREATE TRIGGER autorespond_after_hours_policy_delete_guard
+BEFORE DELETE ON autorespond_after_hours_policy
+BEGIN SELECT RAISE(ABORT, 'autorespond after-hours policy cannot be deleted'); END;
+CREATE TABLE autorespond_after_hours_history (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  human_reset_required INTEGER NOT NULL CHECK(human_reset_required IN (0,1)),
+  reset_source_kind TEXT CHECK(reset_source_kind IN ('mutation','queue')),
+  reset_source_id TEXT CHECK(length(reset_source_id) BETWEEN 1 AND 200),
+  CHECK((reset_source_kind IS NULL)=(reset_source_id IS NULL)),
+  CHECK(human_reset_required=0 OR reset_source_kind IS NULL)
+) STRICT;
+CREATE TRIGGER autorespond_after_hours_history_insert_guard
+BEFORE INSERT ON autorespond_after_hours_history
+WHEN EXISTS (SELECT 1 FROM autorespond_after_hours_history WHERE session_id=NEW.session_id)
+  OR NEW.reset_source_kind IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'autorespond after-hours history cannot be replaced'); END;
+CREATE TRIGGER autorespond_after_hours_history_delete_guard
+BEFORE DELETE ON autorespond_after_hours_history
+WHEN EXISTS (SELECT 1 FROM sessions WHERE id=OLD.session_id)
+BEGIN SELECT RAISE(ABORT, 'autorespond after-hours history cannot be deleted'); END;
+CREATE TRIGGER sessions_autorespond_after_hours_history
+AFTER INSERT ON sessions
+BEGIN
+  INSERT INTO autorespond_after_hours_history(session_id,human_reset_required)
+  VALUES (NEW.id,0);
+END;
+CREATE TRIGGER autorespond_after_hours_history_update_guard
+BEFORE UPDATE ON autorespond_after_hours_history
+WHEN NEW.session_id!=OLD.session_id OR OLD.human_reset_required!=1
+  OR NEW.human_reset_required!=0 OR NEW.reset_source_kind IS NULL
+  OR NOT EXISTS (
+    SELECT 1 FROM session_events e JOIN session_event_streams s
+      ON s.session_id=e.session_id AND s.stream_epoch=e.stream_epoch
+    WHERE e.session_id=NEW.session_id AND e.sequence=s.next_sequence
+      AND json_extract(e.event_json,'$.body.type')='user_message'
+      AND json_extract(e.event_json,'$.body.actor')='human'
+      AND json_extract(e.event_json,'$.body.sourceId')=NEW.reset_source_id
+  )
+  OR NOT (
+    (NEW.reset_source_kind='mutation' AND EXISTS (
+      SELECT 1 FROM mutation_attempts m
+      WHERE m.authority_id=NEW.session_id AND m.idempotency_key=NEW.reset_source_id
+        AND m.kind IN ('session.send','session.steer')
+        AND m.transcript_status='finalized'
+        AND json_extract(m.transcript_intent_json,'$.actor')='human'
+    )) OR (NEW.reset_source_kind='queue' AND EXISTS (
+      SELECT 1 FROM queue_entries q
+      WHERE q.session_id=NEW.session_id AND q.id=NEW.reset_source_id
+        AND q.transcript_status='finalized'
+        AND json_extract(q.transcript_intent_json,'$.actor')='human'
+    ))
+  )
+BEGIN SELECT RAISE(ABORT, 'autorespond after-hours history requires exact human finalization'); END;
+`;
+
+const schemaVersion46AutorespondAfterHoursObjects = (() => {
+  const expected = new Database(":memory:");
+  try {
+    expected.exec("CREATE TABLE sessions(id TEXT PRIMARY KEY) STRICT");
+    expected.exec(schemaVersion46AutorespondAfterHours);
+    return expected.query(
+      "SELECT name,sql,type FROM sqlite_master WHERE (tbl_name IN ('autorespond_after_hours_policy','autorespond_after_hours_history') OR name LIKE '%autorespond_after_hours%') AND sql IS NOT NULL ORDER BY name",
+    ).all();
+  } finally { expected.close(false); }
+})();
+
+const assertSchemaVersion46AutorespondAfterHours = (database: Database): void => {
+  const observed = database.query(
+    "SELECT name,sql,type FROM sqlite_master WHERE (tbl_name IN ('autorespond_after_hours_policy','autorespond_after_hours_history') OR name LIKE '%autorespond_after_hours%') AND sql IS NOT NULL ORDER BY name",
+  ).all();
+  if (JSON.stringify(observed) !== JSON.stringify(schemaVersion46AutorespondAfterHoursObjects)) {
+    throw new Error("STATE_SCHEMA_V46_AUTORESPOND_AFTER_HOURS_AUTHORITY_INVALID");
+  }
+  const policies = database.query("SELECT * FROM autorespond_after_hours_policy").all();
+  if (policies.length !== 1) throw new Error("STATE_SCHEMA_V46_AUTORESPOND_AFTER_HOURS_POLICY_INVALID");
+  mapAutorespondAfterHoursPolicy(policies[0]);
+  assertAutorespondBudgetHistoryCoverage(database);
+  if (database.query(`SELECT 1 FROM sessions s
+    LEFT JOIN autorespond_after_hours_history a ON a.session_id=s.id
+    JOIN autorespond_budget_history h ON h.session_id=s.id
+    WHERE a.session_id IS NULL
+      OR typeof(a.human_reset_required)!='integer' OR a.human_reset_required NOT IN (0,1)
+      OR (h.available_at=0 AND (a.human_reset_required!=0 OR a.reset_source_kind IS NOT NULL))
+      OR (h.available_at>0 AND a.human_reset_required=0 AND a.reset_source_kind IS NULL)
+      OR ((a.reset_source_kind IS NULL)!=(a.reset_source_id IS NULL))
+      OR (a.human_reset_required=1 AND a.reset_source_kind IS NOT NULL)
+      OR (a.reset_source_kind IS NOT NULL AND a.reset_source_kind NOT IN ('mutation','queue'))
+      OR (a.reset_source_id IS NOT NULL AND (typeof(a.reset_source_id)!='text' OR length(a.reset_source_id) NOT BETWEEN 1 AND 200))
+    LIMIT 1`).get() !== null
+    || database.query(`SELECT 1 FROM autorespond_after_hours_history a
+      WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id=a.session_id) LIMIT 1`).get() !== null) {
+    throw new Error("STATE_SCHEMA_V46_AUTORESPOND_AFTER_HOURS_HISTORY_INVALID");
+  }
+};
+
+const assertAutorespondBudgetHistoryCoverage = (database: Database): void => {
+  if (database.query(`SELECT 1 FROM sessions s
+    LEFT JOIN autorespond_budget_history h ON h.session_id=s.id
+    WHERE h.session_id IS NULL OR typeof(h.available_at)!='integer'
+      OR h.available_at<0 OR h.available_at>9007199254740991 LIMIT 1`).get() !== null
+    || database.query(`SELECT 1 FROM autorespond_budget_history h
+      WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id=h.session_id) LIMIT 1`).get() !== null) {
+    throw new Error("STATE_SCHEMA_V46_AUTORESPOND_BUDGET_HISTORY_INVALID");
+  }
+};
+
+const assertSchemaVersion46Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSchemaMigrationLedgerTail(database, [40, 41, 42, 43, 44, 45, 46], "STATE_SCHEMA_V46_MIGRATION_LEDGER_INVALID");
+  assertSchemaVersion43SessionUserMessageFinalizations(database);
+  assertSchemaVersion43QueueCancellationSettlement(database);
+  assertSchemaVersion44AutorespondObjects(database);
+  assertSchemaVersion44AutorespondEvidence(database);
+  assertSchemaVersion45AccountMutationAuthority(database);
+  assertSchemaVersion46AutorespondAfterHours(database);
+};
+
+const mapAutorespondAfterHoursPolicy = (row: unknown): AutorespondAfterHoursPolicy => {
+  const parsed = z.object({
+    singleton: z.literal(1), kind: z.literal("autorespond_after_hours"), version: z.literal(1),
+    revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), enabled: z.union([z.literal(0), z.literal(1)]),
+    created_at: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER), updated_at: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
+  }).strict().parse(row);
+  if (parsed.updated_at < parsed.created_at) throw new Error("AUTORESPOND_AFTER_HOURS_POLICY_INVALID");
+  return autorespondAfterHoursPolicySchema.parse({
+    kind: parsed.kind, version: parsed.version, revision: parsed.revision, enabled: parsed.enabled === 1,
+  });
 };
 
 // Display evidence has count retention and cannot prove a rolling budget.
@@ -9592,7 +9751,7 @@ const applySchemaVersion40PeerSessions = (database: Database): void => {
 };
 
 /*
- * Hosted canonical memory is an additive v47 control-plane journal. It stores
+ * Hosted canonical memory is an additive control-plane journal. It stores
  * only opaque routing identifiers, public heads/digests, and already-encrypted
  * operation envelopes. Portable descriptor/proof plaintext, data keys,
  * credentials, and project paths never cross this boundary.
@@ -11865,24 +12024,27 @@ const assertSchemaVersion41Objects = (database: Database): void => {
   ).get() !== null) throw new Error("STATE_SCHEMA_V41_CANONICAL_MEMORY_SYNC_INVALID");
 };
 
-// Unreleased memory migrations follow main's immutable v40-v45 sequence.
+// Unreleased memory migrations follow main's immutable v40-v46 sequence.
 // The embedded SQL identifiers remain stable; only forward ledger slots move.
-const applySchemaVersion46PeerSessions = applySchemaVersion40PeerSessions;
-const applySchemaVersion47CanonicalMemorySync = applySchemaVersion41CanonicalMemorySync;
-const assertSchemaVersion46PeerObjects = assertSchemaVersion40Objects;
-const assertSchemaVersion47CanonicalMemoryObjects = assertSchemaVersion41Objects;
+const applySchemaVersion47PeerSessions = applySchemaVersion40PeerSessions;
+const applySchemaVersion48CanonicalMemorySync = applySchemaVersion41CanonicalMemorySync;
+const assertSchemaVersion47PeerObjects = assertSchemaVersion40Objects;
+const assertSchemaVersion48CanonicalMemoryObjects = assertSchemaVersion41Objects;
 
-const assertSchemaVersionMemoryAuthority = (database: Database, version: 46 | 47): void => {
+const assertSchemaVersionMemoryAuthority = (database: Database, version: 47 | 48): void => {
   assertSchemaVersion41TimestampProof(database);
-  assertSchemaMigrationLedgerTail(database, version === 46 ? [40, 41, 42, 43, 44, 45, 46] : [40, 41, 42, 43, 44, 45, 46, 47],
+  assertSchemaMigrationLedgerTail(database, version === 47
+    ? [40, 41, 42, 43, 44, 45, 46, 47]
+    : [40, 41, 42, 43, 44, 45, 46, 47, 48],
     `STATE_SCHEMA_V${String(version)}_MIGRATION_LEDGER_INVALID`);
   assertSchemaVersion43SessionUserMessageFinalizations(database);
   assertSchemaVersion43QueueCancellationSettlement(database);
   assertSchemaVersion44AutorespondObjects(database);
   assertSchemaVersion44AutorespondEvidence(database);
   assertSchemaVersion45AccountMutationAuthority(database);
-  assertSchemaVersion46PeerObjects(database);
-  if (version === 47) assertSchemaVersion47CanonicalMemoryObjects(database);
+  assertSchemaVersion46AutorespondAfterHours(database);
+  assertSchemaVersion47PeerObjects(database);
+  if (version === 48) assertSchemaVersion48CanonicalMemoryObjects(database);
 };
 
 const assertSchemaVersion24Objects = (database: Database): void => {
@@ -12719,8 +12881,16 @@ const migrateWritableDatabase = (
   ).get() !== null) {
     throw new Error("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_PREDECESSOR_COLLISION");
   }
-  if (initialVersion === 46 || initialVersion === 47) assertSchemaVersionMemoryAuthority(database, initialVersion);
-  else if (initialVersion === 45) {
+  if (initialVersion < 46 && database.query(
+    "SELECT 1 FROM sqlite_master WHERE name LIKE '%autorespond_after_hours%' LIMIT 1",
+  ).get() !== null) {
+    throw new Error("STATE_SCHEMA_V46_AUTORESPOND_AFTER_HOURS_PREDECESSOR_COLLISION");
+  }
+  if (initialVersion === 47 || initialVersion === 48) {
+    assertSchemaVersionMemoryAuthority(database, initialVersion);
+  } else if (initialVersion === 46) {
+    assertSchemaVersion46Authority(database);
+  } else if (initialVersion === 45) {
     assertSchemaVersion45Authority(database);
   } else if (initialVersion === 44) {
     assertSchemaVersion43Authority(database);
@@ -13411,17 +13581,33 @@ const migrateWritableDatabase = (
     }
 
     if (version < 46) {
-      applySchemaVersion46PeerSessions(database);
-      database.query("INSERT INTO migrations(version, applied_at) VALUES (?, ?)").run(46, unixMillisecondsSchema.parse(now()));
+      assertAutorespondBudgetHistoryCoverage(database);
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      database.exec(schemaVersion46AutorespondAfterHours);
+      database.query(`INSERT INTO autorespond_after_hours_policy(
+        singleton,kind,version,revision,enabled,created_at,updated_at
+      ) VALUES (1,'autorespond_after_hours',1,1,0,?,?)`).run(migratedAt, migratedAt);
+      database.query(`INSERT INTO autorespond_after_hours_history(session_id,human_reset_required)
+        SELECT session_id,CASE WHEN available_at>0 THEN 1 ELSE 0 END
+        FROM autorespond_budget_history`).run();
+      assertSchemaVersion46AutorespondAfterHours(database);
+      database.query("INSERT INTO migrations(version,applied_at) VALUES (?,?)").run(46, migratedAt);
       database.exec("PRAGMA user_version = 46");
       version = 46;
     }
 
     if (version < 47) {
-      applySchemaVersion47CanonicalMemorySync(database);
+      applySchemaVersion47PeerSessions(database);
       database.query("INSERT INTO migrations(version, applied_at) VALUES (?, ?)").run(47, unixMillisecondsSchema.parse(now()));
       database.exec("PRAGMA user_version = 47");
       version = 47;
+    }
+
+    if (version < 48) {
+      applySchemaVersion48CanonicalMemorySync(database);
+      database.query("INSERT INTO migrations(version, applied_at) VALUES (?, ?)").run(48, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version = 48");
+      version = 48;
     }
 
     // Reapplying additive objects and idempotent authority backfills makes a
@@ -13479,12 +13665,15 @@ const migrateWritableDatabase = (
     database.exec(schemaVersion36NotificationHours);
     database.exec(schemaVersion37AttentionEmailPolicy);
     assertCompositeNotificationPolicy(database);
+    // The v46 object authority is part of the v48 composite check below. Do
+    // not use the exact-v46 ledger assertion after forward migrations exist.
+    assertSchemaVersion46AutorespondAfterHours(database);
     assertSchemaVersion40AdoptionObjects(database);
     assertExactSchemaVersion40AdoptionSurface(database);
     assertWorkSchema(database);
-    applySchemaVersion46PeerSessions(database);
-    applySchemaVersion47CanonicalMemorySync(database);
-    assertSchemaVersionMemoryAuthority(database, 47);
+    applySchemaVersion47PeerSessions(database);
+    applySchemaVersion48CanonicalMemorySync(database);
+    assertSchemaVersionMemoryAuthority(database, 48);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -14213,7 +14402,7 @@ export class StateStore {
       assertSchemaVersion39ProviderAuthority(this.#database);
       assertSchemaVersion40AdoptionObjects(this.#database);
       assertExactSchemaVersion40AdoptionSurface(this.#database);
-      assertSchemaVersionMemoryAuthority(this.#database, 47);
+      assertSchemaVersionMemoryAuthority(this.#database, 48);
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);
@@ -20510,6 +20699,92 @@ export class StateStore {
     return row.available_at > unixMillisecondsSchema.parse(now) ? row.available_at : null;
   }
 
+  readAutorespondAfterHoursPolicy(): AutorespondAfterHoursPolicy {
+    const row = this.#database.query("SELECT * FROM autorespond_after_hours_policy WHERE singleton=1").get();
+    if (row === null) throw new Error("AUTORESPOND_AFTER_HOURS_POLICY_MISSING");
+    return mapAutorespondAfterHoursPolicy(row);
+  }
+
+  updateAutorespondAfterHoursPolicy(
+    input: Readonly<{ enabled: boolean; expectedRevision: number }>,
+  ): AutorespondAfterHoursPolicy {
+    const parsed = z.object({
+      enabled: z.boolean(),
+      expectedRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    }).strict().parse(input);
+    const write = this.#database.transaction(() => {
+      const current = this.readAutorespondAfterHoursPolicy();
+      if (current.revision !== parsed.expectedRevision) throw new Error("AUTORESPOND_AFTER_HOURS_POLICY_CONFLICT");
+      if (current.revision >= Number.MAX_SAFE_INTEGER) throw new Error("AUTORESPOND_AFTER_HOURS_REVISION_EXHAUSTED");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const updated = this.#database.query(`UPDATE autorespond_after_hours_policy
+        SET enabled=?,revision=revision+1,updated_at=MAX(updated_at,?)
+        WHERE singleton=1 AND revision=?`).run(parsed.enabled ? 1 : 0, now, parsed.expectedRevision);
+      if (updated.changes !== 1) throw new Error("AUTORESPOND_AFTER_HOURS_POLICY_CONFLICT");
+      return this.readAutorespondAfterHoursPolicy();
+    });
+    return write.immediate();
+  }
+
+  /** Provisional observation only; reservation recomputes authority in its write transaction. */
+  readAutorespondAfterHoursSelection(
+    sessionId: SessionId,
+    sourceKind: "protocol" | "prose",
+    approvalEligibility: "eligible" | "ineligible" | "unknown",
+    now?: number,
+  ): AutorespondAfterHoursSelection {
+    const read = this.#database.transaction(() => {
+      let observedAt: unknown = now;
+      if (observedAt === undefined) {
+        try { observedAt = this.#now(); } catch { observedAt = null; }
+      }
+      return this.#readAutorespondAfterHoursSelectionInTransaction(
+        sessionIdSchema.parse(sessionId), sourceKind, approvalEligibility, observedAt,
+      );
+    });
+    return read.deferred();
+  }
+
+  #readAutorespondAfterHoursSelectionInTransaction(
+    sessionId: SessionId,
+    sourceKind: "protocol" | "prose",
+    approvalEligibility: "eligible" | "ineligible" | "unknown",
+    observedAt: unknown,
+  ): AutorespondAfterHoursSelection {
+    this.requireSession(sessionId);
+    const policy = this.readAutorespondAfterHoursPolicy();
+    const history = z.object({
+      available_at: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
+      human_reset_required: z.union([z.literal(0), z.literal(1)]),
+      reset_source_kind: z.enum(["mutation", "queue"]).nullable(),
+      reset_source_id: z.string().min(1).max(200).nullable(),
+    }).strict().parse(this.#database.query(`SELECT h.available_at,a.human_reset_required,a.reset_source_kind,a.reset_source_id
+      FROM autorespond_budget_history h JOIN autorespond_after_hours_history a ON a.session_id=h.session_id
+      WHERE h.session_id=?`).get(sessionId));
+    if ((history.reset_source_kind === null) !== (history.reset_source_id === null)
+      || (history.human_reset_required === 1 && history.reset_source_kind !== null)
+      || (history.available_at === 0 && (history.human_reset_required !== 0 || history.reset_source_kind !== null))
+      || (history.available_at > 0 && history.human_reset_required === 0 && history.reset_source_kind === null)) {
+      throw new Error("AUTORESPOND_AFTER_HOURS_HISTORY_INVALID");
+    }
+    const validTime = unixMillisecondsSchema.safeParse(observedAt);
+    const historyEligibility = history.human_reset_required === 1 ? "human_reset_required"
+      : (history.available_at === 0 || (validTime.success && history.available_at <= validTime.data))
+        && (!validTime.success || this.#database.query(
+          "SELECT 1 FROM autorespond_budget_reservations WHERE session_id=? AND reserved_at>? LIMIT 1",
+        ).get(sessionId, validTime.data) === null) ? "proven" : "unknown";
+    const input = { sourceKind, approvalEligibility, historyEligibility, policy, observedAt };
+    if (sourceKind === "prose" || !policy.enabled || approvalEligibility !== "eligible" || historyEligibility !== "proven") {
+      return selectAutorespondAfterHoursTier(input);
+    }
+    // A notification schedule is not approval authority. An unavailable or
+    // invalid schedule only prevents elevation; core consent/history errors
+    // above still fail closed, and reservation separately proves its clock.
+    let schedule: NotificationHoursPolicy | null = null;
+    try { schedule = this.readNotificationHours(); } catch { /* baseline only */ }
+    return selectAutorespondAfterHoursTier({ ...input, schedule });
+  }
+
   reserveAutorespondBudget(input: AutorespondBudgetReservationInput): AutorespondBudgetReservationResult {
     const sessionId = sessionIdSchema.parse(input.sessionId);
     const sourceKind = z.enum(["protocol", "prose"]).parse(input.sourceKind);
@@ -20518,7 +20793,7 @@ export class StateStore {
     const expectedMode = approvalModeSchema.parse(input.expectedMode);
     const reserve = this.#database.transaction((): AutorespondBudgetReservationResult => {
       this.requireSession(sessionId);
-      const now = unixMillisecondsSchema.parse(this.#now());
+      const now = unixMillisecondsSchema.max(8_640_000_000_000_000).parse(this.#now());
       const mode = this.readSessionApprovalMode(sessionId).mode;
       if (mode === "manual") return { state: "refused", code: "manual_mode" };
       if (mode !== expectedMode) return { state: "refused", code: "policy_changed" };
@@ -20532,8 +20807,7 @@ export class StateStore {
       }
       const source = sourceKind === "protocol"
         ? this.#database.query(
-            `SELECT 1 FROM provider_interactions WHERE public_id=? AND session_id=?
-             AND state='pending' AND kind IN ('command_approval','file_change_approval','permission_approval')`,
+            `SELECT * FROM provider_interactions WHERE public_id=? AND session_id=? AND state='pending'`,
           ).get(sourceId, sessionId)
         : this.#database.query(
             `SELECT 1 FROM mutation_attempts WHERE idempotency_key=? AND authority_id=?
@@ -20541,6 +20815,11 @@ export class StateStore {
              AND json_extract(transcript_intent_json,'$.actor')='autorespond'`,
           ).get(sourceId, sessionId);
       if (source === null) throw new Error("AUTORESPOND_BUDGET_SOURCE_AUTHORITY_INVALID");
+      if (sourceKind === "protocol") {
+        const interaction = mapInteraction(source);
+        const authority = decideProtocolAutorespondAuthority({ display: interaction.display, kind: interaction.kind, mode });
+        if (authority.action !== "accept") return { state: "refused", code: authority.code };
+      }
       if (this.readAutorespondBudgetHistoryAvailableAt(sessionId, now) !== null) {
         return { state: "refused", code: "history_unavailable" };
       }
@@ -20561,9 +20840,10 @@ export class StateStore {
         return { state: "refused", code: "history_unavailable" };
       }
       const budgets = this.readAutorespondBudgets(sessionId, now);
-      if (budgets.consecutive >= AUTORESPOND_CONSECUTIVE_LIMIT) return { state: "refused", code: "consecutive_limit" };
-      if (budgets.lastHour >= AUTORESPOND_HOURLY_BUDGET) return { state: "refused", code: "hourly_budget" };
-      if (budgets.lastDay >= AUTORESPOND_DAILY_BUDGET) return { state: "refused", code: "daily_budget" };
+      const selection = this.#readAutorespondAfterHoursSelectionInTransaction(sessionId, sourceKind, "eligible", now);
+      if (budgets.consecutive >= selection.limits.consecutive) return { state: "refused", code: "consecutive_limit" };
+      if (budgets.lastHour >= selection.limits.lastHour) return { state: "refused", code: "hourly_budget" };
+      if (budgets.lastDay >= selection.limits.lastDay) return { state: "refused", code: "daily_budget" };
       this.#database.query(
         `DELETE FROM autorespond_budget_reservations
          WHERE session_id=? AND reserved_at<? AND NOT (
@@ -32128,6 +32408,11 @@ export class StateStore {
       // sources spend on their first finalization. The event/source transaction
       // keeps exact replay neutral and failed finalization fully retryable.
       if (input.body.actor === "human") {
+        this.#database.query(`UPDATE autorespond_after_hours_history
+          SET human_reset_required=0,reset_source_kind=?,reset_source_id=?
+          WHERE session_id=? AND human_reset_required=1`).run(
+          input.userMessageSourceKind, input.body.sourceId, input.sessionId,
+        );
         this.#database.query(
           `UPDATE session_autorespond_counters
            SET consecutive_count=0,updated_at=? WHERE session_id=?`,

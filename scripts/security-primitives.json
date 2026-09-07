@@ -161,7 +161,7 @@
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
-    "immediateTransaction": 162,
+    "immediateTransaction": 163,
     "secureDelete": 2,
     "synchronousFull": 1,
     "redactCompleteSensitiveText": 3

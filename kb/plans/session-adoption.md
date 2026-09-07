@@ -318,5 +318,5 @@ tests and exposed two fixture errors; both were corrected and the focused
 rerun passed seven tests with 370 assertions. The merged PR and successful
 checks above close the repair's integration and delivery. Later schema 44
 approval budgets and schema 45 authentication recovery retain these historical
-proof rules; memory appends schemas 46 and 47 without renumbering them. No live
+proof rules; later after-hours and memory migrations retain those predecessors. No live
 provider or native authentication claim is needed for these local proof rules.
