@@ -10,9 +10,13 @@ import {
   adoptableProviderSchema,
   DEFAULT_PROVIDER,
   defaultPresetForProvider,
+  isReboundCodexPreset,
+  providerSwitchRequiresPresetContract,
+  sharedActiveCodexPresetContract,
   type AdoptableProvider,
   supportedPresetSchema,
   supportedProviderSchema,
+  type PresetContract,
   type SupportedPreset,
   type SupportedProvider,
 } from "../domain/presets";
@@ -92,6 +96,7 @@ export type SessionAttachmentCliInvocation = Readonly<{
   }>;
   json: boolean;
   kind: "session.attach";
+  legacyAttachmentReplay: boolean;
 }>;
 
 export type SessionEventFollowCliInvocation = Readonly<{
@@ -107,10 +112,9 @@ export type SessionEventWatchCliInvocation = Readonly<{
 }>;
 
 /**
- * `hra session export` reads the provider-neutral transcript in bounded pages
- * and writes one document. It is a client-side flow over the paged
- * `session.transcript` command rather than one round trip, so the whole
- * conversation never has to fit in a single local response.
+ * `hra session export` reads the provider-neutral transcript's latest bounded
+ * retained tail in one local command and writes one document. Older retained
+ * records omitted by that tail remain represented by its exact omission count.
  */
 export type SessionExportCliInvocation = Readonly<{
   format: "trajectory" | "json";
@@ -263,6 +267,7 @@ Interactive:
 
 Mutation safety:
   --idempotency-key <uuid>  Reuse after a lost response; changed reuse fails closed.
+  --preset-contract <1|2>   Replay a source-sensitive Codex session start or provider switch.
 
 Platform:
   Codex provider commands run on macOS and Linux. Claude login, status,
@@ -270,8 +275,8 @@ Platform:
 
 Recommended profiles:
   low         Luna Max        (codex)
-  high        Astra Max       (codex)
-  ultra       Astra Ultra     (codex)
+  high        Sol Max         (codex)
+  ultra       Sol Ultra       (codex)
   fable-max   Claude Fable    (claude)
 
 Run \`hra <group> --help\` or \`hra help <group> [<command>]\` for command examples.`;
@@ -438,7 +443,7 @@ Usage:
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
-  hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]
+  hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast] [--idempotency-key <uuid> [--preset-contract <1|2>]]
   hra session send|queue|steer <session> [--attach <path>]... <message>
   hra session stop|recover|abandon <session>
   hra session archive|unarchive <session>
@@ -450,7 +455,7 @@ Usage:
   hra session note get|edit|clear <session>
   hra session note set <session> <note>
   hra session preset <session> <low|high|ultra|fable-max>
-  hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]
+  hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>] [--idempotency-key <uuid> [--preset-contract <1|2>]]
   hra session export <session> [--format <trajectory|json>] [--out <path>]
   hra session fast <session> <on|off>
   hra session project <session> <project>
@@ -637,7 +642,7 @@ const outputModeCommandArguments = (argv: readonly string[]): readonly string[] 
   for (let index = 0; index < regular.length; index += 1) {
     const value = regular[index];
     if (value === undefined) continue;
-    if (value === "--idempotency-key") {
+    if (value === "--idempotency-key" || value === "--preset-contract") {
       index += 1;
       continue;
     }
@@ -691,6 +696,7 @@ const idempotentCommandKinds = new Set<LocalCommand["kind"]>([
   "session.steer",
   "session.stop",
   "session.rename",
+  "session.switch",
   "session.task.create",
   "session.task.edit",
   "session.task.delete",
@@ -800,6 +806,14 @@ const selectedPreset = (value: string): SupportedPreset => {
     throw new CliUsageError(`Preset must be one of: ${supportedPresetSchema.options.map((entry) => `\`${entry}\``).join(", ")}.`);
   }
   return parsed.data;
+};
+
+const selectedPresetContract = (value: string | undefined): PresetContract | undefined => {
+  if (value === undefined) return undefined;
+  if (value !== "1" && value !== "2") {
+    throw new CliUsageError("--preset-contract must be exactly `1` or `2`.");
+  }
+  return Number(value) as PresetContract;
 };
 
 const boundedDecimal = (
@@ -1587,6 +1601,7 @@ const parseSession = (
   cursor: Cursor,
   jsonl: boolean,
   idempotencyKey: string | undefined,
+  presetContract: PresetContract | undefined,
   jsonRequested: boolean,
 ):
   | LocalCommand
@@ -1662,11 +1677,36 @@ const parseSession = (
     case "start": {
       const project = option(cursor, "--project");
       const provider = selectedProvider(option(cursor, "--provider") ?? DEFAULT_PROVIDER);
-      const preset = selectedPreset(option(cursor, "--preset") ?? defaultPresetForProvider(provider));
+      const presetOption = option(cursor, "--preset");
+      const preset = presetOption === undefined
+        ? defaultPresetForProvider(provider)
+        : selectedPreset(presetOption);
       const fast = flag(cursor, "--fast");
       const account = take(cursor, "account");
       finish(cursor);
-      return command({ kind: "session.start", account, project, provider, preset, fast });
+      if (!isReboundCodexPreset(preset)) {
+        if (presetContract !== undefined) {
+          throw new CliUsageError("--preset-contract is supported only for Codex High or Ultra session starts.");
+        }
+        return command({ kind: "session.start", account, project, provider, preset, fast });
+      }
+      if (idempotencyKey !== undefined && presetContract === undefined) {
+        throw new CliUsageError(
+          "Replaying a Codex High or Ultra session start with --idempotency-key also requires --preset-contract.",
+        );
+      }
+      if (idempotencyKey === undefined && presetContract !== undefined) {
+        throw new CliUsageError("--preset-contract requires an explicit --idempotency-key.");
+      }
+      return command({
+        kind: "session.start",
+        account,
+        project,
+        provider,
+        preset,
+        fast,
+        presetContract: presetContract ?? sharedActiveCodexPresetContract(),
+      });
     }
     case "send":
     case "queue":
@@ -1686,7 +1726,12 @@ const parseSession = (
         && parsed.kind !== "session.queue"
         && parsed.kind !== "session.steer"
       ) throw new CliUsageError("Session message command is invalid.");
-      return { attach, command: parsed, kind: "session.attach" };
+      return {
+        attach,
+        command: parsed,
+        kind: "session.attach",
+        legacyAttachmentReplay: idempotencyKey !== undefined && action !== "queue",
+      };
     }
     case "stop": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.stop", session }; }
     case "rename": { const session = take(cursor, "session"); return command({ kind: "session.rename", session, name: remainder(cursor, "name") }); }
@@ -1757,11 +1802,35 @@ const parseSession = (
       const session = take(cursor, "session");
       finish(cursor);
       const selected = selectedProvider(provider);
+      const selectedModelPreset = preset === undefined ? undefined : selectedPreset(preset);
+      if (!providerSwitchRequiresPresetContract(selected, selectedModelPreset)) {
+        if (presetContract !== undefined) {
+          throw new CliUsageError(
+            "--preset-contract is supported only for a source-sensitive Codex provider switch.",
+          );
+        }
+        return command({
+          kind: "session.switch",
+          session,
+          provider: selected,
+          ...(selectedModelPreset === undefined ? {} : { preset: selectedModelPreset }),
+          ...(account === undefined ? {} : { account }),
+        });
+      }
+      if (idempotencyKey !== undefined && presetContract === undefined) {
+        throw new CliUsageError(
+          "Replaying a source-sensitive Codex provider switch with --idempotency-key also requires --preset-contract.",
+        );
+      }
+      if (idempotencyKey === undefined && presetContract !== undefined) {
+        throw new CliUsageError("--preset-contract requires an explicit --idempotency-key.");
+      }
       return command({
         kind: "session.switch",
         session,
         provider: selected,
-        ...(preset === undefined ? {} : { preset: selectedPreset(preset) }),
+        ...(selectedModelPreset === undefined ? {} : { preset: selectedModelPreset }),
+        presetContract: presetContract ?? sharedActiveCodexPresetContract(),
         ...(account === undefined ? {} : { account }),
       });
     }
@@ -2174,6 +2243,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     throw new CliUsageError("--json and --jsonl are mutually exclusive output modes.");
   }
   const idempotencyKey = option(cursor, "--idempotency-key");
+  const presetContract = selectedPresetContract(option(cursor, "--preset-contract"));
   const helpFlag = flag(cursor, "--help") || flag(cursor, "-h");
   const helpAlias = !helpFlag && cursor.values[0] === "help";
   if (helpFlag || helpAlias || (cursor.values.length === 0 && literalTail.length === 0)) {
@@ -2188,6 +2258,15 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   if (flag(cursor, "--version") || flag(cursor, "-v")) { finish(cursor); return { json, kind: "version" }; }
   cursor.values.push(...literalTail);
   const group = take(cursor, "command");
+  if (
+    presetContract !== undefined
+    && (
+      group !== "session"
+      || (cursor.values[0] !== "start" && cursor.values[0] !== "switch")
+    )
+  ) {
+    throw new CliUsageError("--preset-contract is supported only by session start or switch.");
+  }
   if (jsonl && group !== "session" && group !== "work") {
     throw new CliUsageError(
       "--jsonl is supported only by `hra session events` and `hra session watch`, or by `hra work events` and `hra work watch`.",
@@ -2370,6 +2449,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   }
   let parsed: LocalCommand;
   let sessionAttach: readonly string[] = [];
+  let legacyAttachmentReplay = false;
   if (group === "account") {
     const account = parseAccount(cursor, idempotencyKey, json);
     if (
@@ -2382,7 +2462,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   else if (group === "project") parsed = parseProject(cursor, cwd);
   else if (group === "memory") parsed = parseMemory(cursor, idempotencyKey);
   else if (group === "session") {
-    const sessionCommand = parseSession(cursor, jsonl, idempotencyKey, json);
+    const sessionCommand = parseSession(cursor, jsonl, idempotencyKey, presetContract, json);
     if (sessionCommand.kind === "session.export") {
       if (idempotencyKey !== undefined) {
         throw new CliUsageError("--idempotency-key is not supported by session.export.");
@@ -2415,6 +2495,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     }
     if (sessionCommand.kind === "session.attach") {
       sessionAttach = sessionCommand.attach;
+      legacyAttachmentReplay = sessionCommand.legacyAttachmentReplay;
       parsed = sessionCommand.command;
     } else {
       parsed = sessionCommand;
@@ -2579,10 +2660,11 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     }
   }
   else throw new CliUsageError("Unknown command. Run `hra --help` for supported commands.");
-  if (idempotencyKey !== undefined && !idempotentCommandKinds.has(parsed.kind)) {
+  const supportsIdempotency = idempotentCommandKinds.has(parsed.kind);
+  if (idempotencyKey !== undefined && !supportsIdempotency) {
     throw new CliUsageError(`--idempotency-key is not supported by ${parsed.kind}.`);
   }
-  if (idempotentCommandKinds.has(parsed.kind)) {
+  if (supportsIdempotency) {
     const generated = "idempotencyKey" in parsed && typeof parsed.idempotencyKey === "string"
       ? parsed.idempotencyKey
       : randomUUID();
@@ -2594,7 +2676,13 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       && parsed.kind !== "session.queue"
       && parsed.kind !== "session.steer"
     ) throw new CliUsageError("Only session send, queue, and steer accept --attach.");
-    return { attach: sessionAttach, command: parsed, json, kind: "session.attach" };
+    return {
+      attach: sessionAttach,
+      command: parsed,
+      json,
+      kind: "session.attach",
+      legacyAttachmentReplay,
+    };
   }
   return { kind: "command", command: parsed, json };
 }

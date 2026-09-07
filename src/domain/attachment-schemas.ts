@@ -8,6 +8,7 @@ import {
   ATTACHMENT_NAME_MAX_BYTES,
   isAttachmentDigest,
   isAttachmentName,
+  isLegacyAttachmentName,
   type AttachmentReference,
 } from "./attachments";
 
@@ -28,7 +29,13 @@ export const attachmentDigestSchema = z.string().refine(
 
 export const attachmentNameSchema = z.string().refine(
   isAttachmentName,
-  `An attachment name must be a single file name of at most ${String(ATTACHMENT_NAME_MAX_BYTES)} UTF-8 bytes, with no path separator or control character.`,
+  `An attachment name must be a single-line file name of at most ${String(ATTACHMENT_NAME_MAX_BYTES)} UTF-8 bytes, with no path separator, control, format, surrogate, or line-separator character.`,
+);
+
+/** Predecessor wire shape, accepted only behind an exact replay gate. */
+export const legacyAttachmentNameSchema = z.string().refine(
+  isLegacyAttachmentName,
+  `A legacy attachment name must satisfy the predecessor ${String(ATTACHMENT_NAME_MAX_BYTES)}-byte file-name rule.`,
 );
 
 export const attachmentByteLengthSchema = z.number()
@@ -43,7 +50,14 @@ export const attachmentReferenceSchema = z.object({
   name: attachmentNameSchema,
 }).strict() satisfies z.ZodType<AttachmentReference>;
 
-export const attachmentReferenceListSchema = z.array(attachmentReferenceSchema)
+export const legacyAttachmentReferenceSchema = z.object({
+  byteLength: attachmentByteLengthSchema,
+  digest: attachmentDigestSchema,
+  mediaType: attachmentMediaTypeSchema,
+  name: legacyAttachmentNameSchema,
+}).strict() satisfies z.ZodType<AttachmentReference>;
+
+const boundedAttachmentReferenceList = <T extends z.ZodType<AttachmentReference>>(schema: T) => z.array(schema)
   .min(1)
   .max(ATTACHMENT_MAX_COUNT, `A message carries at most ${String(ATTACHMENT_MAX_COUNT)} attachments.`)
   .superRefine((values, context) => {
@@ -68,5 +82,13 @@ export const attachmentReferenceListSchema = z.array(attachmentReferenceSchema)
       seen.add(key);
     }
   });
+
+export const attachmentReferenceListSchema = boundedAttachmentReferenceList(
+  attachmentReferenceSchema,
+);
+
+export const legacyAttachmentReferenceListSchema = boundedAttachmentReferenceList(
+  legacyAttachmentReferenceSchema,
+);
 
 export const attachmentManifestEntrySchema = attachmentReferenceSchema;

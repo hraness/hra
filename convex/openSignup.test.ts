@@ -1,8 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { convexTest } from "convex-test";
 import { makeFunctionReference } from "convex/server";
 import type { GenericId as Id, Value } from "convex/values";
 
+import { parseAuthCredentials } from "../src/cloud/authCredentials";
+import { digestAuthEmail } from "./authEmail";
 import {
   authAttemptPolicies,
   newIdentityAdmissionWindowLimit,
@@ -73,6 +75,23 @@ const emailB = "b".repeat(64);
 const codeA = "c".repeat(64);
 const codeB = "d".repeat(64);
 const hourMs = 60 * 60 * 1_000;
+const hmacEnvironmentName = "HRA_AUTH_HMAC_SECRET";
+const priorHmacSecret = process.env[hmacEnvironmentName];
+
+beforeAll(() => {
+  process.env[hmacEnvironmentName] = "open-signup-test-secret-at-least-thirty-two-characters";
+});
+
+afterAll(() => {
+  if (priorHmacSecret === undefined) delete process.env.HRA_AUTH_HMAC_SECRET;
+  else process.env[hmacEnvironmentName] = priorHmacSecret;
+});
+
+async function digestForEmail(email: string): Promise<string> {
+  const parsed = parseAuthCredentials({ email });
+  if (parsed.kind !== "request_code") throw new Error("email fixture is invalid");
+  return await digestAuthEmail(parsed.email);
+}
 
 async function inviteOnlyRuntime() {
   const runtime = convexTest(schema, authModules);
@@ -116,10 +135,11 @@ async function createAccount(runtime: Runtime, email: string): Promise<CreatedAc
 
 async function signUpWithoutInvite(
   runtime: Runtime,
-  input: Readonly<{ codeDigest: string; email: string; emailDigest: string }>,
+  input: Readonly<{ codeDigest: string; email: string }>,
 ) {
+  const emailDigest = await digestForEmail(input.email);
   const reservation = await runtime.mutation(reserve, {
-    emailDigest: input.emailDigest,
+    emailDigest,
     kind: "send",
   });
   const created = await createAccount(runtime, input.email);
@@ -127,16 +147,16 @@ async function signUpWithoutInvite(
     accountId: created.account._id,
     authEpoch: reservation.authEpoch,
     codeDigest: input.codeDigest,
-    emailDigest: input.emailDigest,
+    emailDigest,
     expiresAt: Date.now() + 60_000,
     userId: created.user._id,
   });
   const userId = await runtime.mutation(consume, {
     authEpoch: reservation.authEpoch,
     codeDigest: input.codeDigest,
-    emailDigest: input.emailDigest,
+    emailDigest,
   });
-  return { created, reservation, userId };
+  return { created, emailDigest, reservation, userId };
 }
 
 async function subjects(runtime: Runtime) {
@@ -196,15 +216,14 @@ describe("open sign-up admission", () => {
 
   test("open admission creates the subject without an invite and verifies it", async () => {
     const runtime = await openRuntime();
-    const { created, reservation, userId } = await signUpWithoutInvite(runtime, {
+    const { created, emailDigest, reservation, userId } = await signUpWithoutInvite(runtime, {
       codeDigest: codeA,
       email: "open@example.com",
-      emailDigest: emailA,
     });
     expect(reservation).toEqual({ authEpoch: 1, inviteBinding: "not_required" });
     expect(userId).toBe(created.user._id);
 
-    const subject = await subjectFor(runtime, emailA);
+    const subject = await subjectFor(runtime, emailDigest);
     expect(subject).toMatchObject({
       admittedBy: "open",
       authEpoch: 1,
@@ -245,13 +264,14 @@ describe("open sign-up admission", () => {
       publicId: authority.publicId,
       purpose: "identity",
     });
+    const invitedEmailDigest = await digestForEmail("invited@example.com");
     const reservation = await runtime.mutation(reserve, {
-      emailDigest: emailB,
+      emailDigest: invitedEmailDigest,
       inviteCapabilityDigest: capabilityDigest,
       kind: "send",
     });
     expect(reservation).toEqual({ authEpoch: 1, inviteBinding: "bound" });
-    const invited = await subjectFor(runtime, emailB);
+    const invited = await subjectFor(runtime, invitedEmailDigest);
     expect(invited?.admissionInviteId).toBeDefined();
     expect(invited?.admittedBy).toBeUndefined();
 
@@ -260,14 +280,14 @@ describe("open sign-up admission", () => {
       accountId: created.account._id,
       authEpoch: 1,
       codeDigest: codeB,
-      emailDigest: emailB,
+      emailDigest: invitedEmailDigest,
       expiresAt: Date.now() + 60_000,
       userId: created.user._id,
     });
     expect(await runtime.mutation(consume, {
       authEpoch: 1,
       codeDigest: codeB,
-      emailDigest: emailB,
+      emailDigest: invitedEmailDigest,
     })).toBe(created.user._id);
     expect(await runtime.query(inviteStatus, { publicId: authority.publicId }))
       .toMatchObject({ state: "consumed" });
@@ -275,9 +295,10 @@ describe("open sign-up admission", () => {
 
   test("only an open-admitted subject may proceed without an invitation", async () => {
     const runtime = await openRuntime();
-    await runtime.mutation(reserve, { emailDigest: emailA, kind: "send" });
+    const legacyEmailDigest = await digestForEmail("legacy@example.com");
+    await runtime.mutation(reserve, { emailDigest: legacyEmailDigest, kind: "send" });
     const created = await createAccount(runtime, "legacy@example.com");
-    const subject = await subjectFor(runtime, emailA);
+    const subject = await subjectFor(runtime, legacyEmailDigest);
     if (subject === null) throw new Error("missing fixture subject");
     await runtime.run(async (ctx) => {
       await ctx.db.patch(subject._id, { admittedBy: undefined });
@@ -286,7 +307,7 @@ describe("open sign-up admission", () => {
       accountId: created.account._id,
       authEpoch: 1,
       codeDigest: codeA,
-      emailDigest: emailA,
+      emailDigest: legacyEmailDigest,
       expiresAt: Date.now() + 60_000,
       userId: created.user._id,
     })).rejects.toThrow(rejected);
@@ -294,11 +315,15 @@ describe("open sign-up admission", () => {
 
   test("closing sign-up refuses new sends but honours an outstanding open admission", async () => {
     const runtime = await openRuntime();
-    await runtime.mutation(reserve, { emailDigest: emailA, kind: "send" });
+    const outstandingEmailDigest = await digestForEmail("outstanding@example.com");
+    await runtime.mutation(reserve, { emailDigest: outstandingEmailDigest, kind: "send" });
     await closeSignup(runtime);
     expect(await runtime.query(status, {}))
       .toMatchObject({ generation: 2, newIdentityAdmissions: "invite_only" });
-    await expect(runtime.mutation(reserve, { emailDigest: emailA, kind: "send" }))
+    await expect(runtime.mutation(reserve, {
+      emailDigest: outstandingEmailDigest,
+      kind: "send",
+    }))
       .rejects.toThrow(rejected);
     await expect(runtime.mutation(reserve, { emailDigest: emailB, kind: "send" }))
       .rejects.toThrow(rejected);
@@ -309,7 +334,7 @@ describe("open sign-up admission", () => {
       accountId: created.account._id,
       authEpoch: 1,
       codeDigest: codeA,
-      emailDigest: emailA,
+      emailDigest: outstandingEmailDigest,
       expiresAt: Date.now() + 60_000,
       userId: created.user._id,
     })).toBeString();
@@ -320,7 +345,6 @@ describe("open sign-up admission", () => {
     const { created } = await signUpWithoutInvite(runtime, {
       codeDigest: codeA,
       email: "single@example.com",
-      emailDigest: emailA,
     });
     await runtime.mutation(reserve, { emailDigest: emailB, kind: "send" });
     await expect(runtime.mutation(storeChallenge, {
@@ -367,30 +391,30 @@ describe("open sign-up abuse controls", () => {
 
   test("a verified address is not charged against the unverified lifetime ceiling", async () => {
     const runtime = await openRuntime();
-    await signUpWithoutInvite(runtime, {
+    const verified = await signUpWithoutInvite(runtime, {
       codeDigest: codeA,
       email: "verified@example.com",
-      emailDigest: emailA,
     });
     await runtime.run(async (ctx) => {
       for (const attempt of await ctx.db.query("authEmailAttemptEvents").collect()) {
         await ctx.db.delete(attempt._id);
       }
     });
-    await runtime.mutation(reserve, { emailDigest: emailA, kind: "send" });
-    expect(await subjectFor(runtime, emailA))
+    await runtime.mutation(reserve, { emailDigest: verified.emailDigest, kind: "send" });
+    expect(await subjectFor(runtime, verified.emailDigest))
       .toMatchObject({ unverifiedSendCount: 1 });
   });
 
   test("a backfilled verification releases the unverified lifetime ceiling", async () => {
     const runtime = await openRuntime();
-    await runtime.mutation(reserve, { emailDigest: emailA, kind: "send" });
+    const backfillEmailDigest = await digestForEmail("backfill@example.com");
+    await runtime.mutation(reserve, { emailDigest: backfillEmailDigest, kind: "send" });
     const created = await createAccount(runtime, "backfill@example.com");
     await runtime.mutation(storeChallenge, {
       accountId: created.account._id,
       authEpoch: 1,
       codeDigest: codeA,
-      emailDigest: emailA,
+      emailDigest: backfillEmailDigest,
       expiresAt: Date.now() + 60_000,
       userId: created.user._id,
     });
@@ -417,9 +441,12 @@ describe("open sign-up abuse controls", () => {
         await ctx.db.delete(attempt._id);
       }
     });
-    expect(await runtime.mutation(reserve, { emailDigest: emailA, kind: "send" }))
+    expect(await runtime.mutation(reserve, {
+      emailDigest: backfillEmailDigest,
+      kind: "send",
+    }))
       .toEqual({ authEpoch: 1, inviteBinding: "not_required" });
-    expect(await subjectFor(runtime, emailA)).toMatchObject({
+    expect(await subjectFor(runtime, backfillEmailDigest)).toMatchObject({
       unverifiedSendCount: unverifiedLifetimeSendLimit,
       verifiedAt: expect.any(Number) as unknown as number,
     });

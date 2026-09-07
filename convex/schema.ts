@@ -6,6 +6,8 @@ import {
   accountBindingState,
   accountDeletionCategory,
   accountDeletionState,
+  authorityReductionCapacityReservation,
+  authorityReductionCapacityVersion,
   attentionNotificationInteractionKind,
   attentionNotificationOutcomeCode,
   attentionNotificationRemoteAction,
@@ -18,7 +20,11 @@ import {
   authSubjectStatus,
   challengeDeliveryState,
   commandKind,
+  commandCapacityReadinessState,
+  commandLifecycleCapacityVersion,
+  commandReceiptCapacityReservation,
   commandState,
+  commandType,
   deviceClass,
   deviceCommandKind,
   deviceRevocationCategory,
@@ -140,6 +146,60 @@ export default defineSchema({
     .index("by_public_id", ["publicId"])
     .index("by_user_and_public_id", ["userId", "publicId"])
     .index("by_user_and_status", ["userId", "status"]),
+  accountDeletionIdentityReservations: defineTable({
+    capacityReservation: v.literal(authorityReductionCapacityReservation),
+    capacityVersion: v.literal(authorityReductionCapacityVersion),
+    category: v.literal("identity"),
+    createdAt: v.number(),
+    userId: v.id("users"),
+  }).index("by_user", ["userId"]),
+  accountDeletionJobReservations: defineTable({
+    capacityReservation: v.literal(authorityReductionCapacityReservation),
+    capacityVersion: v.literal(authorityReductionCapacityVersion),
+    category: v.literal("job"),
+    createdAt: v.number(),
+    userId: v.id("users"),
+  }).index("by_user", ["userId"]),
+  deviceRevocationDeviceReservations: defineTable({
+    capacityReservation: v.literal(authorityReductionCapacityReservation),
+    capacityVersion: v.literal(authorityReductionCapacityVersion),
+    category: v.literal("device"),
+    createdAt: v.number(),
+    deviceId: v.id("devices"),
+    userId: v.id("users"),
+  })
+    .index("by_device", ["deviceId"])
+    .index("by_user", ["userId"]),
+  deviceRevocationJobReservations: defineTable({
+    capacityReservation: v.literal(authorityReductionCapacityReservation),
+    capacityVersion: v.literal(authorityReductionCapacityVersion),
+    category: v.literal("job"),
+    createdAt: v.number(),
+    deviceId: v.id("devices"),
+    userId: v.id("users"),
+  })
+    .index("by_device", ["deviceId"])
+    .index("by_user", ["userId"]),
+  deviceRevocationSecurityReservations: defineTable({
+    capacityReservation: v.literal(authorityReductionCapacityReservation),
+    capacityVersion: v.literal(authorityReductionCapacityVersion),
+    category: v.literal("security"),
+    createdAt: v.number(),
+    deviceId: v.id("devices"),
+    userId: v.id("users"),
+  })
+    .index("by_device", ["deviceId"])
+    .index("by_user", ["userId"]),
+  deviceRevocationReceiptReservations: defineTable({
+    capacityReservation: v.literal(authorityReductionCapacityReservation),
+    capacityVersion: v.literal(authorityReductionCapacityVersion),
+    category: v.literal("receipt"),
+    createdAt: v.number(),
+    deviceId: v.id("devices"),
+    userId: v.id("users"),
+  })
+    .index("by_device", ["deviceId"])
+    .index("by_user", ["userId"]),
   deviceSessions: defineTable({
     authEpoch: v.number(),
     authSessionId: v.id("authSessions"),
@@ -197,6 +257,7 @@ export default defineSchema({
     .index("by_presence_until", ["presenceUntil"])
     .index("by_user", ["userId"]),
   deviceRegistries: defineTable({
+    commandRequestVersion: v.optional(v.literal(2)),
     createdAt: v.number(),
     deviceId: v.id("devices"),
     devicePublicId: v.string(),
@@ -365,12 +426,17 @@ export default defineSchema({
     deadline: v.number(),
     idempotencyKey: v.string(),
     kind: commandKind,
+    lifecycleCapacityVersion: v.optional(v.literal(commandLifecycleCapacityVersion)),
     nonterminal: v.boolean(),
+    operatorAbandonedAt: v.optional(v.number()),
     payload: encryptedEnvelope,
     publicId: v.string(),
+    requestCommitmentVersion: v.optional(v.literal(2)),
     requestDigest: v.string(),
     requestingDeviceId: v.id("devices"),
     requesterAcknowledgedAt: v.optional(v.number()),
+    requesterReceiptAbandonedAt: v.optional(v.number()),
+    receiptCapacityReservation: v.optional(v.literal(commandReceiptCapacityReservation)),
     result: v.optional(encryptedEnvelope),
     resultCode: v.optional(v.string()),
     resultDigest: v.optional(v.string()),
@@ -384,12 +450,94 @@ export default defineSchema({
     .index("by_public_id", ["publicId"])
     .index("by_session_and_created_at", ["sessionId", "createdAt"])
     .index("by_session_and_state", ["sessionId", "state"])
+    .index("by_session_nonterminal_capacity_and_created_at", [
+      "sessionId",
+      "nonterminal",
+      "lifecycleCapacityVersion",
+      "createdAt",
+    ])
     .index("by_target_state_and_created_at", ["targetDeviceId", "state", "createdAt"])
+    .index("by_target_state_capacity_and_created_at", [
+      "targetDeviceId",
+      "state",
+      "lifecycleCapacityVersion",
+      "createdAt",
+    ])
     .index("by_target_nonterminal_and_created_at", ["targetDeviceId", "nonterminal", "createdAt"])
+    .index("by_target_nonterminal_capacity_and_created_at", [
+      "targetDeviceId",
+      "nonterminal",
+      "lifecycleCapacityVersion",
+      "createdAt",
+    ])
     .index("by_requesting_device_and_nonterminal", ["requestingDeviceId", "nonterminal", "createdAt"])
+    .index("by_requesting_device_nonterminal_capacity_and_created_at", [
+      "requestingDeviceId",
+      "nonterminal",
+      "lifecycleCapacityVersion",
+      "createdAt",
+    ])
+    .index("by_requesting_device_nonterminal_capacity_ack_and_created_at", [
+      "requestingDeviceId",
+      "nonterminal",
+      "lifecycleCapacityVersion",
+      "requesterAcknowledgedAt",
+      "createdAt",
+    ])
+    .index("by_requesting_device_and_acknowledgement", [
+      "requestingDeviceId",
+      "requesterAcknowledgedAt",
+      "createdAt",
+    ])
+    .index("by_requesting_device_acknowledgement_and_cleanup", [
+      "requestingDeviceId",
+      "requesterAcknowledgedAt",
+      "terminalCleanupAfter",
+      "createdAt",
+    ])
+    .index("by_requesting_device_ack_cleanup_capacity_and_created_at", [
+      "requestingDeviceId",
+      "requesterAcknowledgedAt",
+      "terminalCleanupAfter",
+      "lifecycleCapacityVersion",
+      "receiptCapacityReservation",
+      "createdAt",
+    ])
+    .index("by_requesting_device_nonterminal_acknowledgement_and_cleanup", [
+      "requestingDeviceId",
+      "nonterminal",
+      "requesterAcknowledgedAt",
+      "terminalCleanupAfter",
+      "receiptCapacityReservation",
+      "createdAt",
+    ])
     .index("by_state_and_deadline", ["state", "deadline"])
+    .index("by_state_capacity_and_deadline", [
+      "state",
+      "lifecycleCapacityVersion",
+      "deadline",
+    ])
     .index("by_state_and_updated_at", ["state", "updatedAt"])
+    .index("by_acknowledged_no_effect_cleanup", [
+      "state",
+      "lifecycleCapacityVersion",
+      "nonterminal",
+      "terminalCleanupAfter",
+      "receiptCapacityReservation",
+      "requesterReceiptAbandonedAt",
+      "operatorAbandonedAt",
+      "resultCode",
+      "resultDigest",
+      "requesterAcknowledgedAt",
+    ])
     .index("by_state_and_cleanup_after", ["state", "terminalCleanupAfter"])
+    .index("by_state_unreserved_receipt_and_updated_at", [
+      "state",
+      "receiptCapacityReservation",
+      "requesterAcknowledgedAt",
+      "requesterReceiptAbandonedAt",
+      "updatedAt",
+    ])
     .index("by_idempotency", [
       "userId",
       "sessionId",
@@ -412,12 +560,17 @@ export default defineSchema({
     deadline: v.number(),
     idempotencyKey: v.string(),
     kind: deviceCommandKind,
+    lifecycleCapacityVersion: v.optional(v.literal(commandLifecycleCapacityVersion)),
     nonterminal: v.boolean(),
+    operatorAbandonedAt: v.optional(v.number()),
     payload: encryptedEnvelope,
     publicId: v.string(),
+    requestCommitmentVersion: v.optional(v.literal(2)),
     requestDigest: v.string(),
     requestingDeviceId: v.id("devices"),
     requesterAcknowledgedAt: v.optional(v.number()),
+    requesterReceiptAbandonedAt: v.optional(v.number()),
+    receiptCapacityReservation: v.optional(v.literal(commandReceiptCapacityReservation)),
     // Set when a settled result is a single-use account-linking handoff.
     // `deviceCommands:consumeResult` clears `result` on the first read and
     // stamps this, so a second read can prove the result is spent rather than
@@ -439,11 +592,87 @@ export default defineSchema({
     .index("by_public_id", ["publicId"])
     .index("by_target_and_created_at", ["targetDeviceId", "createdAt"])
     .index("by_target_state_and_created_at", ["targetDeviceId", "state", "createdAt"])
+    .index("by_target_state_capacity_and_created_at", [
+      "targetDeviceId",
+      "state",
+      "lifecycleCapacityVersion",
+      "createdAt",
+    ])
     .index("by_target_nonterminal_and_created_at", ["targetDeviceId", "nonterminal", "createdAt"])
+    .index("by_target_nonterminal_capacity_and_created_at", [
+      "targetDeviceId",
+      "nonterminal",
+      "lifecycleCapacityVersion",
+      "createdAt",
+    ])
     .index("by_requesting_device_and_nonterminal", ["requestingDeviceId", "nonterminal", "createdAt"])
+    .index("by_requesting_device_nonterminal_capacity_and_created_at", [
+      "requestingDeviceId",
+      "nonterminal",
+      "lifecycleCapacityVersion",
+      "createdAt",
+    ])
+    .index("by_requesting_device_nonterminal_capacity_ack_and_created_at", [
+      "requestingDeviceId",
+      "nonterminal",
+      "lifecycleCapacityVersion",
+      "requesterAcknowledgedAt",
+      "createdAt",
+    ])
+    .index("by_requesting_device_and_acknowledgement", [
+      "requestingDeviceId",
+      "requesterAcknowledgedAt",
+      "createdAt",
+    ])
+    .index("by_requesting_device_acknowledgement_and_cleanup", [
+      "requestingDeviceId",
+      "requesterAcknowledgedAt",
+      "terminalCleanupAfter",
+      "createdAt",
+    ])
+    .index("by_requesting_device_ack_cleanup_capacity_and_created_at", [
+      "requestingDeviceId",
+      "requesterAcknowledgedAt",
+      "terminalCleanupAfter",
+      "lifecycleCapacityVersion",
+      "receiptCapacityReservation",
+      "createdAt",
+    ])
+    .index("by_requesting_device_nonterminal_acknowledgement_and_cleanup", [
+      "requestingDeviceId",
+      "nonterminal",
+      "requesterAcknowledgedAt",
+      "terminalCleanupAfter",
+      "receiptCapacityReservation",
+      "createdAt",
+    ])
     .index("by_state_and_deadline", ["state", "deadline"])
+    .index("by_state_capacity_and_deadline", [
+      "state",
+      "lifecycleCapacityVersion",
+      "deadline",
+    ])
+    .index("by_state_and_updated_at", ["state", "updatedAt"])
+    .index("by_acknowledged_no_effect_cleanup", [
+      "state",
+      "lifecycleCapacityVersion",
+      "nonterminal",
+      "terminalCleanupAfter",
+      "receiptCapacityReservation",
+      "requesterReceiptAbandonedAt",
+      "operatorAbandonedAt",
+      "resultCode",
+      "resultDigest",
+      "requesterAcknowledgedAt",
+    ])
     .index("by_state_and_cleanup_after", ["state", "terminalCleanupAfter"])
-    .index("by_state_cleanup_after_updated_at", ["state", "terminalCleanupAfter", "updatedAt"])
+    .index("by_state_unreserved_receipt_and_updated_at", [
+      "state",
+      "receiptCapacityReservation",
+      "requesterAcknowledgedAt",
+      "requesterReceiptAbandonedAt",
+      "updatedAt",
+    ])
     .index("by_single_use_result_expiry", [
       "resultSingleUse",
       "resultConsumedAt",
@@ -456,6 +685,29 @@ export default defineSchema({
       "kind",
       "idempotencyKey",
     ])
+    .index("by_user", ["userId"]),
+  // Server-only physical capacity rows. Every admitted nonterminal command
+  // owns one command-category reservation and one terminal security-event
+  // reservation. Lifecycle mutations shrink or consume them before growing
+  // the command or inserting its terminal event.
+  commandLifecycleReservations: defineTable({
+    capacityReservation: v.string(),
+    commandPublicId: v.string(),
+    commandType,
+    createdAt: v.number(),
+    userId: v.id("users"),
+  })
+    .index("by_command", ["commandType", "commandPublicId"])
+    .index("by_user", ["userId"]),
+  commandTerminalSecurityReservations: defineTable({
+    actorDeviceId: v.id("devices"),
+    commandType,
+    createdAt: v.number(),
+    entityId: v.string(),
+    event: v.literal("command_terminal"),
+    userId: v.id("users"),
+  })
+    .index("by_command", ["commandType", "entityId"])
     .index("by_user", ["userId"]),
   attentionNotificationOutbox: defineTable({
     allowedWindowEnd: v.number(),
@@ -692,8 +944,10 @@ export default defineSchema({
     userId: v.id("users"),
   })
     .index("by_created_at", ["createdAt"])
+    .index("by_user_entity_and_event", ["userId", "entityId", "event"])
     .index("by_user_and_created_at", ["userId", "createdAt"]),
   accountDeletionJobs: defineTable({
+    capacityReservation: v.optional(v.string()),
     category: accountDeletionCategory,
     createdAt: v.number(),
     publicId: v.string(),
@@ -715,6 +969,7 @@ export default defineSchema({
     .index("by_expiry", ["expiresAt"])
     .index("by_public_id", ["publicId"]),
   deviceRevocationJobs: defineTable({
+    capacityReservation: v.optional(v.string()),
     category: deviceRevocationCategory,
     createdAt: v.number(),
     deviceId: v.id("devices"),
@@ -757,6 +1012,7 @@ export default defineSchema({
     bootstrapInviteCapabilityDigest: v.optional(v.string()),
     bootstrapInviteLifetimeMs: v.optional(v.number()),
     bootstrapInvitePublicId: v.optional(v.string()),
+    commandCapacityReadiness: v.optional(commandCapacityReadinessState),
     key: v.literal("global"),
     lastMutationId: v.optional(v.string()),
     // Absent means invite_only. The rolling window counts identities admitted
@@ -782,8 +1038,11 @@ export default defineSchema({
     .index("by_account_and_resource", ["accountId", "resource"])
     .index("by_user", ["userId"]),
   maintenanceState: defineTable({
+    deviceNoEffectCleanupCursor: v.optional(v.string()),
     key: v.literal("retention"),
     nextCategory: maintenanceCategory,
+    orphanedAuthUserCursor: v.optional(v.string()),
+    sessionNoEffectCleanupCursor: v.optional(v.string()),
     updatedAt: v.number(),
   }).index("by_key", ["key"]),
 });

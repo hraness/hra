@@ -6,13 +6,12 @@ import { convexTest } from "convex-test";
 import { expectPromiseToReject } from "../src/cloud/testAssertions";
 import { deviceCommandLoginResultLifetimeMs } from "../src/cloud/payloads";
 import {
-  adjustCommandQuotaForPatch,
   initializeUserQuotaAuthority,
   logicalDocumentBytes,
   reserveQuotaForStoredIdentity,
 } from "./quota";
 import schema from "./schema";
-import { modules } from "./test.setup";
+import { modules, trackedCommandCapacityReadiness } from "./test.setup";
 
 type Args = Readonly<Record<string, Value>>;
 type Authority = Readonly<{ bootGeneration: number; bootId: string; fence: number }>;
@@ -20,11 +19,15 @@ type Authority = Readonly<{ bootGeneration: number; bootId: string; fence: numbe
 const register = makeFunctionReference<"mutation", Args, unknown>("devices:register");
 const approve = makeFunctionReference<"mutation", Args, unknown>("devices:approve");
 const revoke = makeFunctionReference<"mutation", Args, unknown>("devices:revoke");
+const updateRegistry = makeFunctionReference<"mutation", Args, unknown>("devices:updateRegistry");
 const enqueue = makeFunctionReference<"mutation", Args, unknown>("deviceCommands:enqueue");
 const acknowledge = makeFunctionReference<"mutation", Args, unknown>(
   "deviceCommands:acknowledgeReceipt",
 );
 const prepare = makeFunctionReference<"mutation", Args, unknown>("deviceCommands:prepare");
+const failPrepared = makeFunctionReference<"mutation", Args, unknown>(
+  "deviceCommands:failPrepared",
+);
 const markEffectStarted = makeFunctionReference<"mutation", Args, unknown>(
   "deviceCommands:markEffectStarted",
 );
@@ -48,6 +51,9 @@ const expireLoginResult = makeFunctionReference<"mutation", Args, unknown>(
   "maintenance:expireDeviceCommandLoginResult",
 );
 const getCommand = makeFunctionReference<"query", Args, unknown>("deviceCommands:get");
+const listUnacknowledged = makeFunctionReference<"query", Args, unknown>(
+  "deviceCommands:listUnacknowledgedForRequester",
+);
 const listPending = makeFunctionReference<"query", Args, unknown>(
   "deviceCommands:listPendingForTarget",
 );
@@ -86,6 +92,11 @@ async function deviceCommandWorld() {
   await testRuntime.mutation(genesisQuota, {});
   const now = Date.now();
   const ids = await testRuntime.run(async (ctx) => {
+    const control = await ctx.db.query("serviceControl").unique();
+    if (control === null) throw new Error("missing service control fixture");
+    await ctx.db.patch(control._id, {
+      commandCapacityReadiness: trackedCommandCapacityReadiness,
+    });
     const userId = await ctx.db.insert("users", {
       email: "device-commands@example.com",
       emailVerificationTime: now,
@@ -154,7 +165,7 @@ async function deviceCommandWorld() {
     ordinal += 1;
     const suffix = ordinal.toString(16).padStart(2, "0");
     const publicId = uuidV7(now, `a${suffix}`);
-    const response = await runtime.mutation(enqueue, {
+    const request = {
       deadline: Date.now() + 60_000,
       expectedTargetDevicePublicId: "device_daemon01",
       idempotencyKey: uuidV7(now, `b${suffix}`),
@@ -163,10 +174,40 @@ async function deviceCommandWorld() {
       publicId,
       requestDigest: suffix.padEnd(64, "d"),
       ...overrides,
-    }) as Readonly<{ publicId: string }>;
+    };
+    const response = await runtime.mutation(enqueue, request) as Readonly<{ publicId: string }>;
+    // Most lifecycle tests model a client that observed its receipt. Tests for
+    // the lost-response gap enqueue directly and intentionally omit this ack.
+    await runtime.mutation(acknowledge, {
+      commandPublicId: response.publicId,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: request.requestDigest,
+    });
     return response;
   };
   return { browser, daemon, enqueueFrom, ids, now, testRuntime, uuid: (s: string) => uuidV7(now, s) };
+}
+
+async function deviceCommandWriteState(world: Awaited<ReturnType<typeof deviceCommandWorld>>) {
+  return await world.testRuntime.run(async (ctx) => ({
+    commands: await ctx.db.query("deviceCommands").collect(),
+    securityEvents: await ctx.db.query("securityEvents").collect(),
+    storage: await ctx.db.query("storageUsageByUser").collect(),
+    userResources: await ctx.db.query("storageResourceUsageByUser").collect(),
+  }));
+}
+
+async function setTrackedCommandCapacityReady(
+  world: Awaited<ReturnType<typeof deviceCommandWorld>>,
+  ready: boolean,
+): Promise<void> {
+  await world.testRuntime.run(async (ctx) => {
+    const control = await ctx.db.query("serviceControl").unique();
+    if (control === null) throw new Error("missing service control fixture");
+    await ctx.db.patch(control._id, {
+      commandCapacityReadiness: ready ? trackedCommandCapacityReadiness : undefined,
+    });
+  });
 }
 
 async function expectTerminalCleanup(
@@ -194,6 +235,255 @@ async function expectTerminalCleanup(
 }
 
 describe("device commands", () => {
+  test("rejects malformed public execution authorities before any lifecycle transition", async () => {
+    const world = await deviceCommandWorld();
+    const command = await world.enqueueFrom(world.browser);
+    const malformed = {
+      bootGeneration: 1,
+      bootId: "x".repeat(97),
+      fence: 1,
+    } as const;
+    const before = await deviceCommandWriteState(world);
+    const calls = [
+      () => world.daemon.mutation(prepare, {
+        authority: malformed,
+        commandPublicId: command.publicId,
+        localPhase: "prepared_no_effect",
+      }),
+      () => world.daemon.mutation(markEffectStarted, {
+        authority: malformed,
+        commandPublicId: command.publicId,
+      }),
+      () => world.daemon.mutation(failPrepared, {
+        authority: malformed,
+        commandPublicId: command.publicId,
+        resultCode: "INVALID",
+        resultDigest: "a".repeat(64),
+      }),
+      () => world.daemon.mutation(settle, {
+        authority: malformed,
+        commandPublicId: command.publicId,
+        resultCode: "INVALID",
+        resultDigest: "a".repeat(64),
+        state: "failed",
+      }),
+      () => world.daemon.mutation(confirmRevokedTerminal, {
+        authority: malformed,
+        commandPublicId: command.publicId,
+      }),
+      () => world.daemon.mutation(confirmTerminalRecovery, {
+        commandPublicId: command.publicId,
+        localPhase: "effect_started",
+        staleAuthority: malformed,
+      }),
+      () => world.daemon.mutation(recoverEffectStarted, {
+        commandPublicId: command.publicId,
+        recoveryAuthority: malformed,
+        resultCode: "INVALID",
+        resultDigest: "a".repeat(64),
+        staleAuthority: daemonAuthority,
+        state: "ambiguous",
+      }),
+      () => world.daemon.mutation(recoverEffectStarted, {
+        commandPublicId: command.publicId,
+        recoveryAuthority: laterAuthority,
+        resultCode: "INVALID",
+        resultDigest: "a".repeat(64),
+        staleAuthority: { ...daemonAuthority, bootGeneration: 0 },
+        state: "ambiguous",
+      }),
+    ];
+    for (const call of calls) {
+      await expectPromiseToReject(call(), "Cloud authority is not current.");
+    }
+    expect(await deviceCommandWriteState(world)).toEqual(before);
+  });
+
+  test("admits device command versions per target and binds executable transitions", async () => {
+    const world = await deviceCommandWorld();
+    const legacy = {
+      deadline: Date.now() + 60_000,
+      expectedTargetDevicePublicId: "device_daemon01",
+      idempotencyKey: world.uuid("c101"),
+      kind: "usage_refresh",
+      payload: envelope,
+      publicId: world.uuid("c102"),
+      requestDigest: "1".repeat(64),
+    } as const;
+    expect(await world.browser.mutation(enqueue, legacy)).toEqual({
+      publicId: legacy.publicId,
+      replay: false,
+      state: "pending",
+      targetDevicePublicId: legacy.expectedTargetDevicePublicId,
+    });
+    expect(await world.testRuntime.run(async (ctx) => {
+      const row = (await ctx.db.query("deviceCommands").collect())
+        .find((entry) => entry.publicId === legacy.publicId);
+      return row?.requesterAcknowledgedAt;
+    })).toBeNumber();
+
+    const currentWhileAbsent = {
+      ...legacy,
+      expectedRequestingDevicePublicId: "device_browser1",
+      idempotencyKey: world.uuid("c103"),
+      publicId: world.uuid("c104"),
+      requestCommitmentVersion: 2,
+      requestDigest: "2".repeat(64),
+    } as const;
+    const beforeAbsentMismatch = await deviceCommandWriteState(world);
+    await expectPromiseToReject(
+      world.browser.mutation(enqueue, currentWhileAbsent),
+      "COMMAND_REQUEST_VERSION_UNSUPPORTED",
+    );
+    expect(await deviceCommandWriteState(world)).toEqual(beforeAbsentMismatch);
+
+    await world.daemon.mutation(updateRegistry, {
+      commandRequestVersion: 2,
+      envelope,
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
+    await setTrackedCommandCapacityReady(world, false);
+    const beforeCapacityGate = await deviceCommandWriteState(world);
+    await expectPromiseToReject(
+      world.browser.mutation(enqueue, currentWhileAbsent),
+      "COMMAND_CAPACITY_NOT_READY",
+    );
+    expect(await deviceCommandWriteState(world)).toEqual(beforeCapacityGate);
+    await setTrackedCommandCapacityReady(world, true);
+    expect(await world.browser.mutation(enqueue, legacy)).toEqual({
+      publicId: legacy.publicId,
+      replay: true,
+      state: "pending",
+      targetDevicePublicId: legacy.expectedTargetDevicePublicId,
+    });
+    await expectPromiseToReject(world.browser.mutation(enqueue, {
+      ...legacy,
+      expectedRequestingDevicePublicId: "device_browser1",
+      requestCommitmentVersion: 2,
+    }), "IDEMPOTENCY_CONFLICT");
+
+    const current = {
+      ...currentWhileAbsent,
+      idempotencyKey: world.uuid("c105"),
+      publicId: world.uuid("c106"),
+      requestDigest: "3".repeat(64),
+    } as const;
+    expect(await world.browser.mutation(enqueue, current)).toEqual({
+      publicId: current.publicId,
+      replay: false,
+      requestCommitmentVersion: 2,
+      requestingDevicePublicId: "device_browser1",
+      state: "pending",
+      targetDevicePublicId: current.expectedTargetDevicePublicId,
+    });
+    expect(await world.testRuntime.run(async (ctx) => {
+      const row = (await ctx.db.query("deviceCommands").collect())
+        .find((entry) => entry.publicId === current.publicId);
+      return { requesterAcknowledgedAt: row?.requesterAcknowledgedAt };
+    })).toEqual({ requesterAcknowledgedAt: undefined });
+    const legacyWhileCurrent = {
+      ...legacy,
+      idempotencyKey: world.uuid("c107"),
+      publicId: world.uuid("c108"),
+      requestDigest: "4".repeat(64),
+    } as const;
+    const beforeCurrentMismatch = await deviceCommandWriteState(world);
+    await expectPromiseToReject(
+      world.browser.mutation(enqueue, legacyWhileCurrent),
+      "COMMAND_REQUEST_VERSION_UNSUPPORTED",
+    );
+    expect(await deviceCommandWriteState(world)).toEqual(beforeCurrentMismatch);
+
+    const beforeOldExecutor = await deviceCommandWriteState(world);
+    await expectPromiseToReject(world.daemon.mutation(prepare, {
+      authority: daemonAuthority,
+      commandPublicId: current.publicId,
+      localPhase: "prepared_no_effect",
+    }), "COMMAND_EXECUTOR_VERSION_UNSUPPORTED");
+    expect(await deviceCommandWriteState(world)).toEqual(beforeOldExecutor);
+    await setTrackedCommandCapacityReady(world, false);
+    await expectPromiseToReject(world.daemon.mutation(prepare, {
+      authority: daemonAuthority,
+      commandPublicId: current.publicId,
+      executorRequestVersion: 2,
+      localPhase: "prepared_no_effect",
+    }), "COMMAND_CAPACITY_NOT_READY");
+    await setTrackedCommandCapacityReady(world, true);
+    await world.daemon.mutation(prepare, {
+      authority: daemonAuthority,
+      commandPublicId: current.publicId,
+      executorRequestVersion: 2,
+      localPhase: "prepared_no_effect",
+    });
+    const beforeOldEffect = await deviceCommandWriteState(world);
+    await expectPromiseToReject(world.daemon.mutation(markEffectStarted, {
+      authority: daemonAuthority,
+      commandPublicId: current.publicId,
+    }), "COMMAND_EXECUTOR_VERSION_UNSUPPORTED");
+    expect(await deviceCommandWriteState(world)).toEqual(beforeOldEffect);
+    await setTrackedCommandCapacityReady(world, false);
+    await expectPromiseToReject(world.daemon.mutation(markEffectStarted, {
+      authority: daemonAuthority,
+      commandPublicId: current.publicId,
+      executorRequestVersion: 2,
+    }), "COMMAND_CAPACITY_NOT_READY");
+    await setTrackedCommandCapacityReady(world, true);
+    await world.daemon.mutation(markEffectStarted, {
+      authority: daemonAuthority,
+      commandPublicId: current.publicId,
+      executorRequestVersion: 2,
+    });
+    await setTrackedCommandCapacityReady(world, false);
+    expect(await world.daemon.mutation(markEffectStarted, {
+      authority: daemonAuthority,
+      commandPublicId: current.publicId,
+      executorRequestVersion: 2,
+    })).toMatchObject({ replay: true, state: "effect_started" });
+
+    await world.daemon.mutation(updateRegistry, {
+      envelope,
+      expectedRevision: 1,
+      keyVersion: 1,
+    });
+    expect(await world.browser.mutation(enqueue, current)).toEqual({
+      publicId: current.publicId,
+      replay: true,
+      requestCommitmentVersion: 2,
+      requestingDevicePublicId: "device_browser1",
+      state: "effect_started",
+      targetDevicePublicId: current.expectedTargetDevicePublicId,
+    });
+    const legacyShape: Record<string, Value> = { ...current };
+    delete legacyShape.expectedRequestingDevicePublicId;
+    delete legacyShape.requestCommitmentVersion;
+    await expectPromiseToReject(
+      world.browser.mutation(enqueue, legacyShape),
+      "IDEMPOTENCY_CONFLICT",
+    );
+
+    await expectPromiseToReject(world.daemon.mutation(prepare, {
+      authority: daemonAuthority,
+      commandPublicId: legacy.publicId,
+      executorRequestVersion: 2,
+      localPhase: "prepared_no_effect",
+    }), "COMMAND_EXECUTOR_VERSION_UNSUPPORTED");
+    await world.daemon.mutation(prepare, {
+      authority: daemonAuthority,
+      commandPublicId: legacy.publicId,
+      localPhase: "prepared_no_effect",
+    });
+    await expectPromiseToReject(world.daemon.mutation(markEffectStarted, {
+      authority: daemonAuthority,
+      commandPublicId: legacy.publicId,
+      executorRequestVersion: 2,
+    }), "COMMAND_EXECUTOR_VERSION_UNSUPPORTED");
+    await world.daemon.mutation(markEffectStarted, {
+      authority: daemonAuthority,
+      commandPublicId: legacy.publicId,
+    });
+  });
+
   test("runs the full lifecycle from a browser device to a daemon target", async () => {
     const world = await deviceCommandWorld();
     const enqueued = await world.browser.mutation(enqueue, {
@@ -277,6 +567,40 @@ describe("device commands", () => {
     );
   });
 
+  test("only the bound daemon fails a prepared invalid payload with an exact receipt", async () => {
+    const world = await deviceCommandWorld();
+    const commandPublicId = world.uuid("2f");
+    await world.enqueueFrom(world.browser, { publicId: commandPublicId });
+    await world.daemon.mutation(prepare, {
+      authority: daemonAuthority,
+      commandPublicId,
+      localPhase: "prepared_no_effect",
+    });
+    const failure = {
+      authority: daemonAuthority,
+      commandPublicId,
+      resultCode: "INVALID_COMMAND_PAYLOAD_BEFORE_EFFECT",
+      resultDigest: "f".repeat(64),
+    };
+    await expectPromiseToReject(
+      world.browser.mutation(failPrepared, failure),
+      "BROWSER_DEVICE_CANNOT_EXECUTE",
+    );
+    expect(await world.daemon.mutation(failPrepared, failure))
+      .toMatchObject({ replay: false, state: "failed" });
+    expect(await world.daemon.mutation(failPrepared, failure))
+      .toMatchObject({ replay: true, state: "failed" });
+    await expectPromiseToReject(world.daemon.mutation(failPrepared, {
+      ...failure,
+      resultDigest: "e".repeat(64),
+    }), "DEVICE_COMMAND_RESULT_CONFLICT");
+    await expectPromiseToReject(world.daemon.mutation(markEffectStarted, {
+      authority: daemonAuthority,
+      commandPublicId,
+    }), "DEVICE_COMMAND_TRANSITION_CONFLICT");
+    await expectTerminalCleanup(world, commandPublicId, "failed");
+  });
+
   test("replays an identical enqueue and refuses a conflicting digest", async () => {
     const world = await deviceCommandWorld();
     const request = {
@@ -296,62 +620,154 @@ describe("device commands", () => {
     );
   });
 
-  test("atomically acknowledges a new enqueue while every replay stays byte-stable", async () => {
+  test("binds marker-2 admission to the authenticated requester and projects it", async () => {
     const world = await deviceCommandWorld();
+    await world.daemon.mutation(updateRegistry, {
+      commandRequestVersion: 2,
+      envelope,
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
     const request = {
       deadline: Date.now() + 60_000,
+      expectedRequestingDevicePublicId: "device_browser1",
+      expectedTargetDevicePublicId: "device_daemon01",
+      idempotencyKey: world.uuid("d1"),
+      kind: "usage_refresh",
+      payload: envelope,
+      publicId: world.uuid("d2"),
+      requestCommitmentVersion: 2,
+      requestDigest: "7".repeat(64),
+    } as const;
+    expect(await world.browser.mutation(enqueue, request)).toEqual({
+      publicId: request.publicId,
+      requestCommitmentVersion: 2,
+      requestingDevicePublicId: "device_browser1",
+      replay: false,
+      state: "pending",
+      targetDevicePublicId: request.expectedTargetDevicePublicId,
+    });
+    expect(await world.daemon.query(listPending, { limit: 10 })).toMatchObject([{
+      publicId: request.publicId,
+      requestCommitmentVersion: 2,
+    }]);
+    expect(await world.daemon.query(getCommand, { commandPublicId: request.publicId }))
+      .toMatchObject({
+        publicId: request.publicId,
+        requestCommitmentVersion: 2,
+        requestingDevicePublicId: "device_browser1",
+      });
+    await expectPromiseToReject(world.browser.mutation(enqueue, {
+      ...request,
+      expectedRequestingDevicePublicId: "device_daemon01",
+      publicId: world.uuid("d3"),
+    }), "Cloud authority is not current");
+    const legacyReplay: Record<string, Value> = { ...request };
+    delete legacyReplay.expectedRequestingDevicePublicId;
+    delete legacyReplay.requestCommitmentVersion;
+    await expectPromiseToReject(
+      world.browser.mutation(enqueue, legacyReplay),
+      "IDEMPOTENCY_CONFLICT",
+    );
+  });
+
+  test("lists an exact lost-response proof until the requester explicitly acknowledges it", async () => {
+    const world = await deviceCommandWorld();
+    await world.daemon.mutation(updateRegistry, {
+      commandRequestVersion: 2,
+      envelope,
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
+    const request = {
+      deadline: Date.now() + 60_000,
+      expectedRequestingDevicePublicId: "device_browser1",
       expectedTargetDevicePublicId: "device_daemon01",
       idempotencyKey: world.uuid("1a"),
       kind: "usage_refresh",
       payload: envelope,
       publicId: world.uuid("4a"),
+      requestCommitmentVersion: 2,
       requestDigest: "a".repeat(64),
-    };
-    expect(await world.browser.mutation(enqueue, request)).toMatchObject({ replay: false });
+    } as const;
+    expect(await world.browser.mutation(enqueue, request)).toEqual({
+      publicId: request.publicId,
+      replay: false,
+      requestCommitmentVersion: 2,
+      requestingDevicePublicId: request.expectedRequestingDevicePublicId,
+      state: "pending",
+      targetDevicePublicId: request.expectedTargetDevicePublicId,
+    });
     const inserted = await world.testRuntime.run(async (ctx) => {
       const rows = await ctx.db.query("deviceCommands").collect();
       return rows.find((entry) => entry.publicId === request.publicId) ?? null;
     });
-    expect(typeof inserted?.requesterAcknowledgedAt).toBe("number");
+    expect(inserted?.requesterAcknowledgedAt).toBeUndefined();
     expect(inserted?.terminalCleanupAfter).toBeUndefined();
+    expect(await world.browser.query(listUnacknowledged, { limit: 10 })).toEqual([{
+      idempotencyKey: request.idempotencyKey,
+      publicId: request.publicId,
+      requestDigest: request.requestDigest,
+    }]);
+    expect(await world.daemon.query(listUnacknowledged, { limit: 10 })).toEqual([]);
 
-    expect(await world.browser.mutation(enqueue, request)).toMatchObject({ replay: true });
-    expect(await world.testRuntime.run(async (ctx) => {
-      const rows = await ctx.db.query("deviceCommands").collect();
-      const row = rows.find((entry) => entry.publicId === request.publicId);
-      return {
-        acknowledgedAt: row?.requesterAcknowledgedAt,
-        matchingRows: rows.filter((entry) => entry.publicId === request.publicId).length,
-      };
-    })).toEqual({
-      acknowledgedAt: inserted?.requesterAcknowledgedAt,
-      matchingRows: 1,
-    });
-
-    // A pre-upgrade row may lack acknowledgement. Replaying it must remain a
-    // read-only response: adding metadata here could fail at the hard byte
-    // ceiling and misreport a known committed row as an enqueue abort.
-    await world.testRuntime.run(async (ctx) => {
-      const rows = await ctx.db.query("deviceCommands").collect();
-      const row = rows.find((entry) => entry.publicId === request.publicId);
-      if (row === undefined) throw new Error("missing command fixture");
-      const patch = { requesterAcknowledgedAt: undefined };
-      await adjustCommandQuotaForPatch(ctx, row.userId, row, patch);
-      await ctx.db.patch(row._id, patch);
-    });
-    const legacyBeforeReplay = await world.testRuntime.run(async (ctx) => {
-      const row = (await ctx.db.query("deviceCommands").collect())
-        .find((entry) => entry.publicId === request.publicId);
-      if (row === undefined) throw new Error("missing legacy command fixture");
-      return row;
-    });
-    expect(await world.browser.mutation(enqueue, request)).toMatchObject({ replay: true });
-    const legacyAfterReplay = await world.testRuntime.run(async (ctx) => {
+    const beforeReplay = await world.testRuntime.run(async (ctx) => {
       const rows = await ctx.db.query("deviceCommands").collect();
       return rows.find((entry) => entry.publicId === request.publicId) ?? null;
     });
-    expect(legacyAfterReplay).toEqual(legacyBeforeReplay);
-    expect(legacyAfterReplay?.requesterAcknowledgedAt).toBeUndefined();
+    expect(await world.browser.mutation(enqueue, request)).toEqual({
+      publicId: request.publicId,
+      replay: true,
+      requestCommitmentVersion: 2,
+      requestingDevicePublicId: request.expectedRequestingDevicePublicId,
+      state: "pending",
+      targetDevicePublicId: request.expectedTargetDevicePublicId,
+    });
+    expect(await world.testRuntime.run(async (ctx) => {
+      const row = (await ctx.db.query("deviceCommands").collect())
+        .find((entry) => entry.publicId === request.publicId);
+      return row ?? null;
+    })).toEqual(beforeReplay);
+
+    expect(await world.browser.mutation(cancelPending, {
+      commandPublicId: request.publicId,
+    })).toMatchObject({ state: "cancelled" });
+    expect(await world.testRuntime.run(async (ctx) => {
+      const row = (await ctx.db.query("deviceCommands").collect())
+        .find((entry) => entry.publicId === request.publicId);
+      return row === undefined ? null : {
+        requesterAcknowledgedAt: row.requesterAcknowledgedAt,
+        state: row.state,
+        terminalCleanupAfter: row.terminalCleanupAfter,
+      };
+    })).toEqual({
+      requesterAcknowledgedAt: undefined,
+      state: "cancelled",
+      terminalCleanupAfter: undefined,
+    });
+    expect(await world.browser.query(listUnacknowledged, { limit: 10 })).toEqual([{
+      idempotencyKey: request.idempotencyKey,
+      publicId: request.publicId,
+      requestDigest: request.requestDigest,
+    }]);
+
+    expect(await world.browser.mutation(acknowledge, {
+      commandPublicId: request.publicId,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: request.requestDigest,
+    })).toMatchObject({ publicId: request.publicId, replay: false });
+    expect(await world.browser.query(listUnacknowledged, { limit: 10 })).toEqual([]);
+    expect(await world.testRuntime.run(async (ctx) => {
+      const row = (await ctx.db.query("deviceCommands").collect())
+        .find((entry) => entry.publicId === request.publicId);
+      return row === undefined ? null : {
+        requesterAcknowledgedAt: row.requesterAcknowledgedAt,
+        terminalCleanupAfter: row.terminalCleanupAfter,
+      };
+    })).toEqual({
+      requesterAcknowledgedAt: expect.any(Number),
+      terminalCleanupAfter: expect.any(Number),
+    });
   });
 
   test("quarantines an effect that may have begun as ambiguous under a later boot", async () => {

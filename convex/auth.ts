@@ -5,6 +5,7 @@ import { v, type GenericId as Id, type Value } from "convex/values";
 
 import {
   generateEightDigitOtp,
+  isCanonicalAuthEmail,
   parseAuthCredentials,
 } from "../src/cloud/authCredentials";
 import { digestAuthEmail, digestAuthOtp } from "./authEmail";
@@ -24,10 +25,15 @@ import {
   reserveQuotaForInsert,
   reserveQuotaForStoredIdentity,
   reserveServiceQuotaForInsert,
+  transferServiceQuotaToUserForPatch,
 } from "./quota";
 import { internalMutation, type DataModel, type MutationCtx } from "./server";
 import { requireActiveAuthSubject } from "./authDelivery";
 import { requireAuthAdmissionsOpen } from "./admissionControl";
+import {
+  createAccountDeletionCapacityForNewUser,
+  loadAccountDeletionCapacity,
+} from "./authorityReductionCapacity";
 
 export const hraOtpProviderId = "hra-control-plane-otp-v1";
 
@@ -116,6 +122,7 @@ type QuotaOwner =
   | Readonly<{ kind: "direct_user"; userId: Id<"users"> }>
   | Readonly<{ kind: "parent_user"; userId: Id<"users"> }>
   | Readonly<{ kind: "service" }>;
+type NewIdentityBinding = Readonly<{ email: string; emailDigest: string }>;
 
 const authStoreRejectedMessage = "Authentication storage could not be completed.";
 
@@ -237,11 +244,49 @@ async function reserveAuthDocument(
   ctx: MutationCtx,
   owner: QuotaOwner,
   document: StoredDocument,
+  newIdentityBinding?: NewIdentityBinding,
 ): Promise<void> {
   switch (owner.kind) {
     case "stored_identity":
+      if (
+        newIdentityBinding !== undefined
+        && (
+          document.email !== newIdentityBinding.email
+          || document.emailVerificationTime !== undefined
+        )
+      ) return rejectAuthStore();
       await initializeUserQuotaAuthority(ctx, owner.userId);
       await reserveQuotaForStoredIdentity(ctx, owner.userId, document);
+      await createAccountDeletionCapacityForNewUser(ctx, owner.userId);
+      if (newIdentityBinding !== undefined) {
+        const [subjectsByDigest, subjectsByUser] = await Promise.all([
+          ctx.db.query("authSubjects")
+            .withIndex("by_email_digest", (query) =>
+              query.eq("emailDigest", newIdentityBinding.emailDigest))
+            .take(2),
+          ctx.db.query("authSubjects")
+            .withIndex("by_user", (query) => query.eq("userId", owner.userId))
+            .take(2),
+        ]);
+        const subject = subjectsByDigest[0];
+        if (
+          subjectsByDigest.length !== 1
+          || subject === undefined
+          || subjectsByUser.length !== 0
+          || subject.status !== "active"
+          || subject.userId !== undefined
+          || subject.verifiedAt !== undefined
+        ) return rejectAuthStore();
+        const patch = { updatedAt: Date.now(), userId: owner.userId };
+        await transferServiceQuotaToUserForPatch(
+          ctx,
+          owner.userId,
+          "identity",
+          subject,
+          patch,
+        );
+        await ctx.db.patch(subject._id, patch);
+      }
       return;
     case "direct_user":
       await reserveQuotaForInsert(ctx, owner.userId, "identity", document);
@@ -291,6 +336,20 @@ async function releaseAuthDocument(
 ): Promise<void> {
   switch (owner.kind) {
     case "stored_identity":
+      {
+        const capacity = await loadAccountDeletionCapacity(ctx, owner.userId);
+        if (capacity.kind === "reserved") {
+          await releaseQuotaForDelete(
+            ctx,
+            owner.userId,
+            "identity",
+            capacity.identity,
+          );
+          await releaseQuotaForDelete(ctx, owner.userId, "job", capacity.job);
+          await ctx.db.delete(capacity.identity._id);
+          await ctx.db.delete(capacity.job._id);
+        }
+      }
       await releaseQuotaForStoredIdentity(ctx, owner.userId, document);
       return;
     case "direct_user":
@@ -327,7 +386,10 @@ type LooseWriter = Readonly<{
   replace(id: Id<string>, value: Record<string, Value | undefined>): Promise<void>;
 }>;
 
-function quotaAwareDatabase(ctx: MutationCtx): MutationCtx["db"] {
+function quotaAwareDatabase(
+  ctx: MutationCtx,
+  newIdentityBinding?: NewIdentityBinding,
+): MutationCtx["db"] {
   const writer = ctx.db as unknown as LooseWriter;
   const deleted: DeletedParents = {
     accounts: new Map(),
@@ -342,7 +404,7 @@ function quotaAwareDatabase(ctx: MutationCtx): MutationCtx["db"] {
           const id = await writer.insert(table, value);
           const stored = await requireDocument(ctx, id);
           const owner = await quotaOwner(ctx, table as AuthQuotaTable, stored, deleted);
-          await reserveAuthDocument(ctx, owner, stored);
+          await reserveAuthDocument(ctx, owner, stored, newIdentityBinding);
           return id;
         };
       }
@@ -391,6 +453,7 @@ export async function runQuotaAwareAuthStoreForTest<T>(
   ctx: MutationCtx,
   operation: AuthStoreOperation,
   handler: (ctx: MutationCtx) => Promise<T>,
+  newIdentityBinding?: NewIdentityBinding,
 ): Promise<T> {
   requireAuthStoreOperation(operation);
   if (operation === "refreshSession") {
@@ -401,7 +464,7 @@ export async function runQuotaAwareAuthStoreForTest<T>(
     { kind: "convex_auth_store_authority_probe", version: 1 },
     {},
   );
-  return await handler({ ...ctx, db: quotaAwareDatabase(ctx) });
+  return await handler({ ...ctx, db: quotaAwareDatabase(ctx, newIdentityBinding) });
 }
 
 const hraOtp = ConvexCredentials<DataModel>({
@@ -565,10 +628,31 @@ export const store = internalMutation({
   handler: async (ctx, args) => {
     const root = args.args as Record<string, unknown>;
     const operation = requireAuthStoreOperation(root.type);
+    let newIdentityBinding: NewIdentityBinding | undefined;
+    if (operation === "createAccountFromCredentials") {
+      const account = root.account;
+      const profile = root.profile;
+      const email = profile !== null && typeof profile === "object"
+        ? (profile as Record<string, unknown>).email
+        : undefined;
+      const accountId = account !== null && typeof account === "object"
+        ? (account as Record<string, unknown>).id
+        : undefined;
+      if (
+        root.provider !== hraOtpProviderId
+        || !isCanonicalAuthEmail(email)
+        || accountId !== email
+      ) return rejectAuthStore();
+      newIdentityBinding = {
+        email,
+        emailDigest: await digestAuthEmail(email),
+      };
+    }
     return await runQuotaAwareAuthStoreForTest(
       ctx,
       operation,
       async (quotaCtx) => await upstreamStoreHandler(quotaCtx, args),
+      newIdentityBinding,
     );
   },
 });

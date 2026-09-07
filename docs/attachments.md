@@ -32,7 +32,11 @@ Two media types exist for every attachment, and they are deliberately different 
 | `ATTACHMENT_NAME_MAX_BYTES` | 255 UTF-8 bytes per name |
 | `ATTACHMENT_INLINE_TEXT_MAX_BYTES` | 64 KiB of one text file inlined into a prompt |
 
-A name is one file name: no `/`, no `\`, no control scalar, and never `.` or `..`. A message may not repeat the same name and digest twice.
+A name is one single-line file name: no `/`, no `\`, no Unicode control, format, surrogate, line-separator, or paragraph-separator scalar, and never `.` or `..`. Ordinary right-to-left letters, combining marks, and spaces remain valid. A message may not repeat the same name and digest twice.
+
+The v43 upgrade preserves names admitted by the earlier policy. It replaces only newly disallowed Unicode scalars with the visible replacement character in retained manifests and pending transcript intents; at the exact 255-byte ceiling it uses `_` when the three-byte replacement would exceed the bound. If two names for the same digest would collapse onto one presentation key, the historical names receive deterministic position suffixes with UTF-8-safe trimming while an already-current name stays unchanged. Pending and already-dispatched messages keep their order, text, state, and blob custody. Immutable historical events are not rewritten: every public read applies the same list-level projection. A name that cannot become valid through only this historical-policy projection fails migration closed instead of being guessed, dropped, or sent.
+
+A v42 `session send` or `session steer` can also have stopped after its mutation attempt was prepared but before its attachment manifest or transcript intent was recorded. Exact replay remains possible with the same message, the same original attachment path and name, and the same explicit idempotency key. The CLI accepts an earlier-policy-only basename solely on an explicitly keyed local send or steer replay. Before resolving a blob or contacting a provider, the daemon requires an existing attempt for the same session and kind whose original request digest matches exactly; it then projects the name only on provider, manifest, transcript, and response surfaces. A missing or different key, message, name, digest, or command kind fails without creating a mutation. Fresh commands, queued messages, and hosted payloads always use the current strict name rule.
 
 `ATTACHMENT_INLINE_TEXT_MAX_BYTES` bounds only how much of a text file is folded into the prompt. A larger text file is still stored, still named in every manifest, and still reported at its true size; the folded block says how many further bytes were not inlined.
 
@@ -68,7 +72,7 @@ message_attachments(session_id, source_id, position PK, digest, name, media_type
 
 `attachments.media_type` is the **canonical** type, so one digest has exactly one row even when two messages declare the same bytes as `text/markdown` and `text/csv`. `message_attachments.media_type` is the **declared** type. `source_id` is the client message id the turn was dispatched under: an `attempt_…` id for a send or a steer, a `queue_…` id for a queued message. Two triggers keep `reference_count` exact, and link rows are immutable.
 
-Per session, `MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP` (200) manifest sources are retained, oldest pruned first. A message that has been sent stores only its `messageDigest`, exactly as before; the manifest is the only durable record of what was attached, and it holds no bytes.
+Per session, the newest `MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP` (200) settled manifest sources are retained, oldest pruned first. A provider-bound source whose neutral transcript is still pending finalization is never pruned; the table may therefore exceed 200 sources temporarily until those effects settle. A settled attachment-bearing queue replay compares the request with this manifest. If its manifest has aged out, HRA fails the replay closed instead of guessing that the attachments still match. The manifest holds no bytes.
 
 Custody maintenance runs after any message that actually carried attachments. It drops accounting rows nothing references any more and removes their blobs, then removes blob files local custody does not account for at all. Blobs younger than `ATTACHMENT_BLOB_SWEEP_GRACE_MS` (one hour) are never touched, so a command still in flight is safe.
 

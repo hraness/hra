@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, renameSync, symlinkSync } from "node:fs";
+import { existsSync, renameSync, symlinkSync } from "node:fs";
 import { chmod, lstat, mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,7 +18,9 @@ import {
 import type { InteractionDisplay, InteractionKind } from "../domain/interactions";
 import {
   currentPresetContract,
+  devinPresetContract,
   legacyPresetContract,
+  solCodexPresetContract,
 } from "../domain/presets";
 import {
   createPortableProjectMemoryCanonicalIdentity,
@@ -71,6 +73,8 @@ import {
   USAGE_LOCAL_RETAIN_BYTES,
   USAGE_LOCAL_RETAIN_SUCCESS_COUNT,
   SelectionError,
+  sessionProviderSwitchMutationRequest,
+  sessionStartMutationRequest,
   StateSecurityScrubRequiredError,
   StateStore,
   type MachineTimeZoneResolver,
@@ -243,7 +247,9 @@ const seedLegacyDevinSession = (
   const session = store.createSession({ ...input, provider: "codex", preset: "ultra" });
   const database = new Database(store.paths.database, { create: false, strict: true });
   try {
-    database.query("UPDATE sessions SET provider_v39='devin' WHERE id=?").run(session.id);
+    database.query(
+      "UPDATE sessions SET provider_v39='devin',preset_contract=2 WHERE id=?",
+    ).run(session.id);
   } finally {
     database.close(false);
   }
@@ -472,7 +478,32 @@ const dropPostProviderSwitchSchema = (database: Database): void => {
   `);
 };
 
+const dropTranscriptFinalizationSchema = (database: Database): void => {
+  database.exec(`
+    DROP TRIGGER IF EXISTS queue_transcript_cancellation_settlement;
+    DROP TRIGGER IF EXISTS mutation_transcript_finalization_guard;
+    DROP TRIGGER IF EXISTS queue_transcript_finalization_guard;
+    DROP TRIGGER IF EXISTS session_events_account_authority_guard;
+    CREATE TRIGGER session_events_account_authority_guard
+    BEFORE INSERT ON session_events
+    WHEN NOT EXISTS(
+      SELECT 1 FROM sessions s JOIN profiles p ON p.id=s.profile_id
+      WHERE s.id=NEW.session_id
+        AND s.profile_id=NEW.account_id
+        AND p.process_generation=NEW.provider_generation
+    )
+    BEGIN SELECT RAISE(ABORT, 'session event account authority mismatch'); END;
+    ALTER TABLE mutation_attempts DROP COLUMN transcript_intent_json;
+    ALTER TABLE mutation_attempts DROP COLUMN transcript_status;
+    ALTER TABLE mutation_attempts DROP COLUMN transcript_finalized;
+    ALTER TABLE queue_entries DROP COLUMN transcript_intent_json;
+    ALTER TABLE queue_entries DROP COLUMN transcript_status;
+    ALTER TABLE queue_entries DROP COLUMN transcript_finalized;
+  `);
+};
+
 const dropSchemaAfterVersion34 = (database: Database): void => {
+  dropTranscriptFinalizationSchema(database);
   dropPostProviderSwitchSchema(database);
   dropProviderSwitchProgressSchema(database);
 };
@@ -492,41 +523,80 @@ BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_MEMBER_INVALID'); END;
 `;
 
 const downgradeToExactProviderVersion39 = (database: Database): void => {
+  dropPeerAndHostedMemorySchema(database);
   dropSessionAdoptionSchema(database);
   database.exec(`
     DROP TRIGGER IF EXISTS work_profile_attempt_identity_guard;
     DROP TRIGGER IF EXISTS work_signal_member_guard;
     ${providerVersion39WorkSignalMemberGuardSql}
+    ${providerVersion40WorkPresetContractGuardsSql}
     ALTER TABLE profiles DROP COLUMN codex_account_key;
     DELETE FROM migrations WHERE version>39;
     DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=39;
   `);
 };
 
-const historicalFeatureProviderSwitchSchemaSha256 =
-  "5a5806b3b93b58915de2ab72ca63b58fa2def304c465ab6613c33a22f2ce328c";
-
-const installHistoricalFeatureProviderSwitchJournal = (database: Database): void => {
-  const source = readFileSync(join(import.meta.dir, "state-store.ts"), "utf8");
-  const embeddedSchema = (name: string): string => {
-    const marker = `const ${name} = \``;
-    const start = source.indexOf(marker);
-    const end = source.indexOf("`;", start + marker.length);
-    if (start < 0 || end < 0) throw new Error(`Historical schema ${name} is missing.`);
-    return source.slice(start + marker.length, end);
-  };
-  const schema = (
-    embeddedSchema("legacyFeatureProviderSwitchJournalSchema")
-    + embeddedSchema("legacyFeatureProviderSwitchAuthoritySchema")
+const providerVersion40WorkPresetContractGuardsSql = `
+DROP TRIGGER IF EXISTS work_devin_preset_contract_guard;
+CREATE TRIGGER work_devin_preset_contract_guard
+BEFORE INSERT ON works
+WHEN NEW.preset_contract!=2 AND EXISTS (
+  SELECT 1 FROM sessions AS s
+  WHERE s.id=NEW.coordinator_session_id AND s.provider_v39='devin'
+)
+BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END;
+DROP TRIGGER IF EXISTS work_session_devin_contract_guard;
+CREATE TRIGGER work_session_devin_contract_guard
+BEFORE UPDATE OF provider_v39,preset_contract ON sessions
+WHEN NEW.provider_v39='devin' AND (
+  NEW.preset_contract!=2
+  OR EXISTS (
+    SELECT 1 FROM works AS w
+    WHERE w.coordinator_session_id=OLD.id
+      AND w.preset_contract!=2
   )
-    .replaceAll("${legacyPresetContract}", String(legacyPresetContract))
-    .replaceAll("${currentPresetContract}", String(currentPresetContract))
-    .replaceAll("${\"0\".repeat(64)}", "0".repeat(64));
-  if (createHash("sha256").update(schema).digest("hex")
-    !== historicalFeatureProviderSwitchSchemaSha256) {
-    throw new Error("Historical feature provider-switch schema digest mismatch.");
-  }
-  database.exec(schema);
+)
+BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END;
+`;
+
+/** Exact released adoption-v40 Work surface, prior to active Sol rebinding. */
+const downgradeToExactProviderVersion40 = (database: Database): void => {
+  dropPeerAndHostedMemorySchema(database);
+  database.exec(`
+    ${providerVersion40WorkPresetContractGuardsSql}
+    DELETE FROM migrations WHERE version>40;
+    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert;
+    PRAGMA user_version=40;
+  `);
+};
+
+/** Exact released timestamp-v41 surface, prior to active Sol rebinding. */
+const downgradeToExactProviderVersion41 = (database: Database): void => {
+  dropPeerAndHostedMemorySchema(database);
+  database.exec(`
+    ${providerVersion40WorkPresetContractGuardsSql}
+    DELETE FROM migrations WHERE version>41;
+    PRAGMA user_version=41;
+  `);
+};
+
+/** Exact active-Sol v42 surface, before durable transcript finalization. */
+const downgradeToExactProviderVersion42 = (database: Database): void => {
+  dropPeerAndHostedMemorySchema(database);
+  dropTranscriptFinalizationSchema(database);
+  database.exec(`
+    DELETE FROM migrations WHERE version>42;
+    PRAGMA user_version=42;
+  `);
+};
+
+/** Exact main v43 surface, before the unreleased peer and memory additions. */
+const downgradeToExactProviderVersion43 = (database: Database): void => {
+  dropPeerAndHostedMemorySchema(database);
+  database.exec(`
+    DELETE FROM migrations WHERE version>43;
+    PRAGMA user_version=43;
+  `);
 };
 
 // Exact sqlite_master SQL emitted by StateStore at 42c4235e35daed1dec7eca4ff985bd9e8606b78a.
@@ -1047,12 +1117,13 @@ async function prepareSignedOutSessionStart(
     authorityId: profile.id,
     idempotencyKey: input.idempotencyKey,
     kind: "session.start",
-    request: {
-      fast: false,
-      preset: input.preset,
+    request: sessionStartMutationRequest({
       projectId: project.id,
       provider: input.provider,
-    },
+      preset: input.preset,
+      ...(input.preset === "high" ? { presetContract: legacyPresetContract } : {}),
+      fast: false,
+    }),
   });
   return { attempt, profile, project };
 }
@@ -1125,7 +1196,7 @@ const codexRuntimeProfile = (
   processGeneration: profile.processGeneration,
   observedAt,
   preset: "high" as const,
-  model: "gpt-6-astra",
+  model: "gpt-5.6-sol",
   reasoningEffort: "max" as const,
   serviceTier: null,
   fast: false,
@@ -1704,7 +1775,7 @@ describe("StateStore", () => {
     expect(updated.fastEnabled).toBe(true);
   });
 
-  test("keeps imported sessions legacy until an explicit preset selection", async () => {
+  test("uses active Sol bindings while preserving established contract 2", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Preset contracts", "preset-contracts@example.com");
     const created = store.createSession({
@@ -1714,7 +1785,7 @@ describe("StateStore", () => {
     });
     expect(store.requireSessionPresetRequirement(created.id)).toEqual({
       preset: "high",
-      requirement: { model: "gpt-6-astra", effort: "max" },
+      requirement: { model: "gpt-5.6-sol", effort: "max" },
     });
 
     const imported = store.upsertProviderSession({
@@ -1731,23 +1802,31 @@ describe("StateStore", () => {
       preset: "high",
       requirement: { model: "gpt-5.6-sol", effort: "max" },
     });
-    const renamed = store.updateSessionMetadata({
-      sessionId: imported.id,
-      expectedRevision: imported.revision,
-      title: "Still legacy",
+    const database = new Database(store.paths.database, { strict: true });
+    database.query("UPDATE sessions SET preset_contract=? WHERE id=?")
+      .run(currentPresetContract, created.id);
+    database.close(false);
+    expect(store.requireSessionPresetRequirement(created.id)).toEqual({
+      preset: "high",
+      requirement: { model: "gpt-6-astra", effort: "max" },
     });
-    expect(store.requireSessionPresetRequirement(imported.id).requirement.model)
-      .toBe("gpt-5.6-sol");
+    const renamed = store.updateSessionMetadata({
+      sessionId: created.id,
+      expectedRevision: created.revision,
+      title: "Established Astra",
+    });
+    expect(store.requireSessionPresetRequirement(created.id).requirement.model)
+      .toBe("gpt-6-astra");
     store.updateSessionMetadata({
-      sessionId: imported.id,
+      sessionId: created.id,
       expectedRevision: renamed.revision,
       preset: "high",
     });
-    expect(store.requireSessionPresetRequirement(imported.id).requirement.model)
-      .toBe("gpt-6-astra");
+    expect(store.requireSessionPresetRequirement(created.id).requirement.model)
+      .toBe("gpt-5.6-sol");
   });
 
-  test("settles immutable legacy evidence before permitting a preset-contract upgrade", async () => {
+  test("settles immutable Astra evidence before permitting a Sol reselection", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Legacy recovery preset", "legacy-recovery@example.com");
     const session = store.upsertProviderSession({
@@ -1761,12 +1840,16 @@ describe("StateStore", () => {
       providerUpdatedAt: 10,
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
     });
+    const database = new Database(store.paths.database, { strict: true });
+    database.query("UPDATE sessions SET preset_contract=? WHERE id=?")
+      .run(currentPresetContract, session.id);
+    database.close(false);
     const runtimeProfile = {
       approvalPolicy: "on-request" as const,
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -1790,6 +1873,13 @@ describe("StateStore", () => {
       sessionId: session.id,
       profileGeneration: profile.processGeneration,
       message: "legacy recovery",
+      transcript: {
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-00000000000b",
+        actor: "human",
+        message: "legacy recovery",
+      },
       evidence: {
         baseline: { activeTurnId: null, providerUpdatedAt: 10, status: "idle" },
         clientMessageId: attempt.id,
@@ -1840,7 +1930,7 @@ describe("StateStore", () => {
     expect(store.runtimeProfileForTurn(session.id, "turn-legacy-recovery-preset"))
       .toEqual(runtimeProfile);
     expect(store.requireSessionPresetRequirement(session.id).requirement)
-      .toEqual({ model: "gpt-5.6-sol", effort: "max" });
+      .toEqual({ model: "gpt-6-astra", effort: "max" });
 
     store.updateSessionMetadata({
       expectedRevision: recovered.revision,
@@ -1848,7 +1938,7 @@ describe("StateStore", () => {
       sessionId: session.id,
     });
     expect(store.requireSessionPresetRequirement(session.id).requirement)
-      .toEqual({ model: "gpt-6-astra", effort: "max" });
+      .toEqual({ model: "gpt-5.6-sol", effort: "max" });
   });
 
   test("records the session provider and refuses another provider's preset", async () => {
@@ -4313,7 +4403,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=35 ORDER BY version",
       ).all()).toEqual([
@@ -4326,6 +4416,8 @@ describe("StateStore", () => {
         { version: 41 },
         { version: 42 },
         { version: 43 },
+        { version: 44 },
+        { version: 45 },
       ]);
       expect(inspector.query(
         "SELECT name FROM pragma_table_info('session_adoption_candidates') WHERE name='provider_project_root'",
@@ -4410,7 +4502,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_ADOPTION_WORK_INVALID");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         `SELECT revision,claim_status FROM session_adoption_candidates
          WHERE provider=? AND provider_thread_id=?`,
@@ -5485,7 +5577,12 @@ describe("StateStore", () => {
       authorityId: source.id,
       idempotencyKey: "00000000-0000-4000-8000-000000000879",
       kind: "session.switch",
-      request: { preset: "fable-max", provider: "claude" },
+      request: sessionProviderSwitchMutationRequest({
+        provider: "claude",
+        preset: "fable-max",
+        targetProfileId: targetProfile.id,
+        seedDigest: "8".repeat(64),
+      }),
     });
     const targetRuntimeProfile = claudeAdoptionRuntimeProfile(targetProfile);
     store.beginSessionProviderSwitchEffect({
@@ -6403,6 +6500,56 @@ describe("StateStore", () => {
     expect(store.requireSession(quarantined.id)).toEqual(quarantined);
   });
 
+  test("explicit session abandonment settles pending queue transcript and attachment custody", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Recovery abandonment", "recovery-abandon@example.com");
+    const session = createProvenTestSession(store, {
+      fastEnabled: false,
+      preset: "high",
+      profileId: profile.id,
+      state: "idle",
+    });
+    const attachment = {
+      byteLength: 4,
+      canonicalMediaType: "text/plain" as const,
+      digest: "b".repeat(64),
+      mediaType: "text/plain" as const,
+      name: "recovery-abandon.txt",
+    };
+    const queued = store.enqueueIdempotent({
+      attachments: [{
+        byteLength: attachment.byteLength,
+        digest: attachment.digest,
+        mediaType: attachment.mediaType,
+        name: attachment.name,
+      }],
+      idempotencyKey: "00000000-0000-4000-8000-00000000060a",
+      message: "do not dispatch after explicit abandonment",
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+      storedAttachments: [attachment],
+    });
+    const quarantined = store.quarantineSession(session.id);
+    expect(store.hasPendingSessionUserMessageFinalization(session.id)).toBe(false);
+    expect(store.readSessionUserMessageSource(session.id, "queue", queued.id))
+      .toMatchObject({ status: "pending" });
+
+    expect(store.resolveSessionStatusRecovery({
+      expectedRevision: quarantined.revision,
+      resolution: "abandoned",
+      sessionId: session.id,
+    })).toMatchObject({ state: "terminal" });
+
+    expect(store.requireQueue(queued.id)).toMatchObject({ state: "cancelled" });
+    expect(store.readSessionUserMessageSource(session.id, "queue", queued.id)).toEqual({
+      status: "abandoned",
+      intent: { version: 1, actor: "human", hadAttachments: true },
+    });
+    expect(store.hasPendingSessionUserMessageFinalization(session.id)).toBe(false);
+    expect(store.messageAttachmentManifest(session.id, queued.id)).toEqual([]);
+    expect(store.attachmentCustody(attachment.digest)).toMatchObject({ referenceCount: 0 });
+  });
+
   test("deletes only exact unbound and evidence-free starting sessions", async () => {
     const { store, home } = await fixture();
     const profile = signInProfile(store, "Cleanup", "cleanup@example.com");
@@ -6431,7 +6578,13 @@ describe("StateStore", () => {
       kind: "session.start",
       authorityId: profile.id,
       authorityGeneration: profile.processGeneration,
-      request: { projectId: project.id, preset: "high", fast: false },
+      request: sessionStartMutationRequest({
+        projectId: project.id,
+        provider: "codex",
+        preset: "high",
+        presetContract: legacyPresetContract,
+        fast: false,
+      }),
       idempotencyKey: "00000000-0000-4000-8000-0000000006c0",
     });
     const queued = store.beginSessionStartEffect({
@@ -6447,6 +6600,7 @@ describe("StateStore", () => {
         projectId: project.id,
         clientMessageId: null,
         messageDigest: null,
+        presetContract: legacyPresetContract,
       },
     });
     store.enqueue(queued.id, "retained queue evidence");
@@ -6798,6 +6952,13 @@ describe("StateStore", () => {
       sessionId: session.id,
       profileGeneration: profile.processGeneration,
       message: "uncertain",
+      transcript: {
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-00000000000c",
+        actor: "human",
+        message: "uncertain",
+      },
       evidence: {
         kind: "session.send",
         providerThreadId: "thread-restart",
@@ -7059,18 +7220,24 @@ describe("StateStore", () => {
     if (personalSource.providerThreadId === undefined) {
       throw new Error("Expected the personal Claude source provider thread.");
     }
-    const sourceSwitch = store.prepareMutation({
-      authorityGeneration: codexProfile.processGeneration,
-      authorityId: personalSource.id,
-      idempotencyKey: "00000000-0000-4000-8000-000000000619",
-      kind: "session.switch",
-      request: { preset: "high", provider: "codex" },
-    });
     const personalSourceSeedText = "personal Claude source seed";
     const personalSourceSeed = createHash("sha256")
       .update("hra:session-transcript-seed:v1\0", "utf8")
       .update(personalSourceSeedText, "utf8")
       .digest("hex");
+    const sourceSwitch = store.prepareMutation({
+      authorityGeneration: codexProfile.processGeneration,
+      authorityId: personalSource.id,
+      idempotencyKey: "00000000-0000-4000-8000-000000000619",
+      kind: "session.switch",
+      request: sessionProviderSwitchMutationRequest({
+        provider: "codex",
+        preset: "high",
+        presetContract: legacyPresetContract,
+        targetProfileId: codexProfile.id,
+        seedDigest: personalSourceSeed,
+      }),
+    });
     const personalSourceTranscript = createHash("sha256")
       .update("personal Claude source transcript")
       .digest("hex");
@@ -7097,6 +7264,7 @@ describe("StateStore", () => {
         targetProvider: "codex",
         targetProviderAccountKey: providerAccountKeyForProfile(store, codexProfile.id, "codex"),
         targetHostCapabilities: testSwitchHostCapabilities,
+        presetContract: legacyPresetContract,
         transcriptDigest: personalSourceTranscript,
       },
     });
@@ -7281,7 +7449,12 @@ describe("StateStore", () => {
         provider: "claude" as const,
       },
       providerThreadId: recoveredTargetThreadId,
-      request: { accountId: null, preset: "high" as const, provider: "codex" as const },
+      request: {
+        accountId: null,
+        preset: "high" as const,
+        presetContract: legacyPresetContract,
+        provider: "codex" as const,
+      },
       seed: {
         digest: personalSourceSeed,
         includedRecords: 1,
@@ -7326,12 +7499,20 @@ describe("StateStore", () => {
       providerThreadId: "managed-codex-source-for-claude",
       state: "idle",
     });
+    const managedClaudeSeedDigest = createHash("sha256")
+      .update("managed Claude target seed")
+      .digest("hex");
     const targetSwitch = store.prepareMutation({
       authorityGeneration: claudeProfile.processGeneration,
       authorityId: managedCodexSource.id,
       idempotencyKey: "00000000-0000-4000-8000-000000000620",
       kind: "session.switch",
-      request: { preset: "fable-max", provider: "claude" },
+      request: sessionProviderSwitchMutationRequest({
+        provider: "claude",
+        preset: "fable-max",
+        targetProfileId: claudeProfile.id,
+        seedDigest: managedClaudeSeedDigest,
+      }),
     });
     store.beginSessionProviderSwitchEffect({
       attemptId: targetSwitch.id,
@@ -7351,9 +7532,7 @@ describe("StateStore", () => {
           ...claudeAdoptionRuntimeProfile(claudeProfile),
           configHome: "isolated",
         },
-        seedDigest: createHash("sha256")
-          .update("managed Claude target seed")
-          .digest("hex"),
+        seedDigest: managedClaudeSeedDigest,
         seedIncludedRecords: 1,
         seedOmittedRecords: 0,
         sourcePreset: "high",
@@ -7460,7 +7639,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
       preset: "high" as const,
@@ -7471,11 +7650,24 @@ describe("StateStore", () => {
       serviceTier: null,
       observedAt: 2_000,
     };
+    const storedAttachment = {
+      byteLength: 4,
+      canonicalMediaType: "text/plain" as const,
+      digest: "6".repeat(64),
+      mediaType: "text/plain" as const,
+      name: "terminalized.txt",
+    };
     const queued = store.enqueue(session.id, "possibly dispatched queue");
+    store.recordMessageAttachments({
+      attachments: [storedAttachment],
+      sessionId: session.id,
+      sourceId: queued.id,
+    });
     store.beginQueueEffect({
       queueId: queued.id,
       sessionId: session.id,
       profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000004",
       evidence: {
         baseline: { activeTurnId: null, providerUpdatedAt: 10, status: "idle" },
         clientMessageId: queued.id,
@@ -7514,6 +7706,10 @@ describe("StateStore", () => {
     expect(store.readMutation("00000000-0000-4000-8000-000000000604"))
       .toMatchObject({ state: "effect_started" });
     expect(store.requireQueue(queued.id)).toMatchObject({ state: "dispatching" });
+    expect(store.readSessionUserMessageSource(session.id, "queue", queued.id))
+      .toMatchObject({ status: "pending" });
+    expect(store.attachmentCustody(storedAttachment.digest))
+      .toMatchObject({ referenceCount: 1 });
     expect(readTask()).toMatchObject({
       status: "active",
       revision: activeTask.revision,
@@ -7552,6 +7748,18 @@ describe("StateStore", () => {
         kind: "abandoned",
       },
     });
+    expect(store.readSessionUserMessageSource(session.id, "queue", queued.id))
+      .toEqual({
+        status: "abandoned",
+        intent: { version: 1, actor: "human", hadAttachments: true },
+      });
+    expect(store.hasPendingSessionUserMessageFinalization(session.id)).toBe(false);
+    expect(store.messageAttachmentManifest(session.id, queued.id)).toEqual([]);
+    expect(store.attachmentCustody(storedAttachment.digest))
+      .toMatchObject({ referenceCount: 0 });
+    expect(store.listUnreferencedAttachments().some((candidate) =>
+      candidate.digest === storedAttachment.digest && candidate.referenceCount === 0))
+      .toBe(true);
     expect(store.listUnsettledMutations({ sessionId: session.id })).toEqual([]);
     expect(store.listUnsettledQueueEffects(session.id)).toEqual([]);
     const pausedTask = readTask();
@@ -7577,6 +7785,103 @@ describe("StateStore", () => {
     }).events.filter((event) =>
       event.body.type === "session_status" && event.body.status === "terminal"))
       .toHaveLength(1);
+  });
+
+  test("provider deletion abandons pending direct-message transcript and releases attachment custody", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Provider deletion send", "deleted-send@example.com");
+    const session = createProvenTestSession(store, {
+      fastEnabled: false,
+      preset: "high",
+      profileId: profile.id,
+      providerThreadId: "thread-provider-deleted-send",
+      state: "idle",
+    });
+    const runtime = {
+      approvalPolicy: "on-request" as const,
+      computerUse: true as const,
+      enabledApps: [],
+      fast: false,
+      model: "gpt-5.6-sol",
+      permissionProfile: ":workspace" as const,
+      pluginCapability: true as const,
+      preset: "high" as const,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      reasoningEffort: "max" as const,
+      reviewMode: "auto_review" as const,
+      serviceTier: null,
+      observedAt: 2_000,
+    };
+    const attachment = {
+      byteLength: 4,
+      canonicalMediaType: "text/plain" as const,
+      digest: "7".repeat(64),
+      mediaType: "text/plain" as const,
+      name: "terminalized-send.txt",
+    };
+    const reference = {
+      byteLength: attachment.byteLength,
+      digest: attachment.digest,
+      mediaType: attachment.mediaType,
+      name: attachment.name,
+    };
+    const message = "possibly dispatched direct message";
+    const key = "00000000-0000-4000-8000-000000000607";
+    const attempt = store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: session.id,
+      idempotencyKey: key,
+      kind: "session.send",
+      request: { message },
+    });
+    store.beginSessionMutationEffect({
+      message,
+      attemptId: attempt.id,
+      evidence: {
+        baseline: { activeTurnId: null, providerUpdatedAt: null, status: "idle" },
+        clientMessageId: attempt.id,
+        kind: "session.send",
+        messageDigest: createHash("sha256").update(message).digest("hex"),
+        providerThreadId: session.providerThreadId ?? "",
+        runtimeProfile: runtime,
+      },
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+      transcript: {
+        accountId: profile.id,
+        actor: "human",
+        attachments: [reference],
+        message,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-00000000000d",
+        storedAttachments: [attachment],
+      },
+    });
+    expect(store.hasPendingSessionUserMessageFinalization(session.id)).toBe(true);
+    expect(store.attachmentCustody(attachment.digest)).toMatchObject({ referenceCount: 1 });
+
+    store.terminalizeSessionFromProviderDeletion({
+      accountId: profile.id,
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration,
+      sessionId: session.id,
+    });
+
+    expect(store.readMutation(key)).toMatchObject({
+      resolution: { kind: "abandoned" },
+      state: "reconciled",
+    });
+    expect(store.readSessionUserMessageSource(session.id, "mutation", key)).toEqual({
+      status: "abandoned",
+      intent: { version: 1, actor: "human", hadAttachments: true },
+    });
+    expect(store.hasPendingSessionUserMessageFinalization(session.id)).toBe(false);
+    expect(store.messageAttachmentManifest(session.id, attempt.id)).toEqual([]);
+    expect(store.attachmentCustody(attachment.digest)).toMatchObject({ referenceCount: 0 });
+    expect(store.listUnreferencedAttachments().some((candidate) =>
+      candidate.digest === attachment.digest && candidate.referenceCount === 0))
+      .toBe(true);
   });
 
   test("late accepted Work dispatch stays in recovery after provider deletion and restart", async () => {
@@ -7808,7 +8113,13 @@ describe("StateStore", () => {
       kind: "session.start",
       authorityId: profile.id,
       authorityGeneration: profile.processGeneration,
-      request: { projectId: project.id, preset: "high", fast: false, message: null },
+      request: sessionStartMutationRequest({
+        projectId: project.id,
+        provider: "codex",
+        preset: "high",
+        presetContract: legacyPresetContract,
+        fast: false,
+      }),
       idempotencyKey: "00000000-0000-4000-8000-000000000610",
     });
     const session = store.beginSessionStartEffect({
@@ -7819,7 +8130,7 @@ describe("StateStore", () => {
       preset: "high",
       fastEnabled: false,
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
-      evidence: { kind: "session.start", projectId: project.id, clientMessageId: null, messageDigest: null },
+      evidence: { kind: "session.start", projectId: project.id, clientMessageId: null, messageDigest: null, presetContract: legacyPresetContract },
       hostCapabilities: {
         preambleVersion: 1,
         preambleDigest: "a".repeat(64),
@@ -7836,16 +8147,131 @@ describe("StateStore", () => {
     expect(store.readMutation("00000000-0000-4000-8000-000000000610")).toMatchObject({
       state: "effect_started",
       sessionStartId: session.id,
-      evidence: { evidence: { kind: "session.start", projectId: project.id } },
+      evidence: {
+        evidence: {
+          kind: "session.start",
+          presetContract: legacyPresetContract,
+          projectId: project.id,
+        },
+      },
     });
-    expect(store.recoverEffectStartedMutations()).toEqual({ recovered: [attempt.id], unresolved: [] });
-    expect(store.requireSession(session.id)).toMatchObject({ state: "recovery_required" });
-    expect(store.requireSession(session.id).providerThreadId).toBeUndefined();
-    expect(store.sessionAccountAuthorityMatches(session.id, profile.id)).toBe(true);
-    expect(store.readSessionProviderAccountAuthority(session.id)).toMatchObject({
-      accountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+
+    // Older effect-started evidence has no additive contract field. It must
+    // remain readable and recoverable after restart; only fresh prepared
+    // replay is fenced by the request digest below.
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      const stored = inspector.query(
+        "SELECT evidence_json FROM mutation_effect_evidence WHERE attempt_id=?",
+      ).get(attempt.id) as { evidence_json: string };
+      const legacyEvidence = JSON.parse(stored.evidence_json) as Record<string, unknown>;
+      delete legacyEvidence.presetContract;
+      const evidenceJson = JSON.stringify(legacyEvidence);
+      inspector.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
+      inspector.query(
+        "UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?",
+      ).run(evidenceJson, createHash("sha256").update(evidenceJson).digest("hex"), attempt.id);
+      inspector.exec(`
+        CREATE TRIGGER mutation_effect_evidence_immutable_update
+        BEFORE UPDATE ON mutation_effect_evidence
+        BEGIN SELECT RAISE(ABORT, 'mutation effect evidence is immutable'); END;
+      `);
+    } finally {
+      inspector.close(false);
+    }
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const reopened = new StateStore(paths);
+    stores.push(reopened);
+    expect(reopened.readMutation("00000000-0000-4000-8000-000000000610")).toMatchObject({
+      evidence: { evidence: { kind: "session.start", projectId: project.id } },
+      state: "effect_started",
+    });
+    expect(reopened.readMutation("00000000-0000-4000-8000-000000000610")?.evidence?.evidence)
+      .not.toHaveProperty("presetContract");
+    expect(reopened.recoverEffectStartedMutations())
+      .toEqual({ recovered: [attempt.id], unresolved: [] });
+    expect(reopened.requireSession(session.id)).toMatchObject({ state: "recovery_required" });
+    expect(reopened.requireSession(session.id).providerThreadId).toBeUndefined();
+  });
+
+  test("rejects a legacy rebound session-start digest before writing any effect state", async () => {
+    const { store, home } = await fixture();
+    const profile = signInProfile(store, "Legacy rebound start", "legacy-start@example.com");
+    const projectRoot = join(home, "legacy-rebound-start-project");
+    await mkdir(projectRoot);
+    const project = await store.createProject("Legacy rebound start", projectRoot, true);
+    const key = "00000000-0000-4000-8000-000000000611";
+    const attempt = store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: profile.id,
+      idempotencyKey: key,
+      kind: "session.start",
+      // Exact request shape from the preceding build, before the rebound
+      // contract became part of the durable mutation identity.
+      request: {
+        projectId: project.id,
+        provider: "codex",
+        preset: "high",
+        fast: false,
+      },
+    });
+
+    expect(() => store.beginSessionStartEffect({
+      attemptId: attempt.id,
+      evidence: {
+        clientMessageId: null,
+        kind: "session.start",
+        messageDigest: null,
+        presetContract: legacyPresetContract,
+        projectId: project.id,
+      },
+      fastEnabled: false,
+      preset: "high",
+      profileGeneration: profile.processGeneration,
+      profileId: profile.id,
+      projectId: project.id,
       provider: "codex",
-      runtimeScope: "managed",
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    })).toThrow("MUTATION_EFFECT_AUTHORITY_CHANGED");
+    expect(store.readMutation(key)).toMatchObject({ state: "prepared" });
+    expect(store.listSessions()).toEqual([]);
+    expect(store.readMutation(key)?.evidence).toBeUndefined();
+
+    const stableKey = "00000000-0000-4000-8000-000000000612";
+    const stableAttempt = store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: profile.id,
+      idempotencyKey: stableKey,
+      kind: "session.start",
+      request: {
+        projectId: project.id,
+        provider: "codex",
+        preset: "low",
+        fast: false,
+      },
+    });
+    const stableSession = store.beginSessionStartEffect({
+      attemptId: stableAttempt.id,
+      evidence: {
+        clientMessageId: null,
+        kind: "session.start",
+        messageDigest: null,
+        projectId: project.id,
+      },
+      fastEnabled: false,
+      preset: "low",
+      profileGeneration: profile.processGeneration,
+      profileId: profile.id,
+      projectId: project.id,
+      provider: "codex",
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    });
+    expect(store.readMutation(stableKey)).toMatchObject({ state: "effect_started" });
+    expect(store.requireSessionPresetRequirement(stableSession.id)).toEqual({
+      preset: "low",
+      requirement: { model: "gpt-5.6-luna", effort: "max" },
     });
   });
 
@@ -7869,7 +8295,13 @@ describe("StateStore", () => {
       authorityId: profile.id,
       idempotencyKey: "00000000-0000-4000-8000-0000000006c9",
       kind: "session.start",
-      request: { fast: false, preset: "high", projectId: project.id },
+      request: sessionStartMutationRequest({
+        projectId: project.id,
+        provider: "codex",
+        preset: "high",
+        presetContract: legacyPresetContract,
+        fast: false,
+      }),
     });
     const starting = store.beginSessionStartEffect({
       attemptId: attempt.id,
@@ -7877,6 +8309,7 @@ describe("StateStore", () => {
         clientMessageId: null,
         kind: "session.start",
         messageDigest: null,
+        presetContract: legacyPresetContract,
         projectId: project.id,
         runtimeProfile,
       },
@@ -7920,7 +8353,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -7937,7 +8370,13 @@ describe("StateStore", () => {
       authorityId: profile.id,
       idempotencyKey: key,
       kind: "session.start",
-      request: { fast: false, preset: "high", projectId: project.id },
+      request: sessionStartMutationRequest({
+        projectId: project.id,
+        provider: "codex",
+        preset: "high",
+        presetContract: legacyPresetContract,
+        fast: false,
+      }),
     });
     const starting = store.beginSessionStartEffect({
       attemptId: attempt.id,
@@ -7945,6 +8384,7 @@ describe("StateStore", () => {
         clientMessageId: null,
         kind: "session.start",
         messageDigest: null,
+        presetContract: legacyPresetContract,
         projectId: project.id,
         runtimeProfile,
       },
@@ -8014,7 +8454,12 @@ describe("StateStore", () => {
       authorityId: profile.id,
       idempotencyKey: key,
       kind: "session.start",
-      request: { fast: false, preset: "fable-max", projectId: project.id, provider: "claude" },
+      request: sessionStartMutationRequest({
+        projectId: project.id,
+        provider: "claude",
+        preset: "fable-max",
+        fast: false,
+      }),
     });
     const starting = store.beginSessionStartEffect({
       attemptId: attempt.id,
@@ -8111,7 +8556,13 @@ describe("StateStore", () => {
       authorityId: logoutProfile.id,
       idempotencyKey: "00000000-0000-4000-8000-0000000006c4",
       kind: "session.start",
-      request: { fast: false, preset: "high", projectId: logoutProject.id },
+      request: sessionStartMutationRequest({
+        projectId: logoutProject.id,
+        provider: "codex",
+        preset: "high",
+        presetContract: legacyPresetContract,
+        fast: false,
+      }),
     });
     const logoutKey = "00000000-0000-4000-8000-0000000006c5";
     const logoutAttempt = logoutFixture.store.prepareMutation({
@@ -8127,6 +8578,7 @@ describe("StateStore", () => {
         clientMessageId: null,
         kind: "session.start",
         messageDigest: null,
+        presetContract: legacyPresetContract,
         projectId: logoutProject.id,
       },
       fastEnabled: false,
@@ -8269,6 +8721,13 @@ describe("StateStore", () => {
         provider: "codex",
       },
     );
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_out",
+      { email: "codex-proof-refusal@example.com", plan: "Plus" },
+    )).toBe(true);
+    const identifiableAccountKey = providerAccountKeyForProfile(store, profile.id, "codex");
 
     expect(() => store.beginSessionStartEffect({
       attemptId: attempt.id,
@@ -8276,6 +8735,7 @@ describe("StateStore", () => {
         clientMessageId: null,
         kind: "session.start",
         messageDigest: null,
+        presetContract: legacyPresetContract,
         projectId: project.id,
       },
       fastEnabled: false,
@@ -8284,7 +8744,7 @@ describe("StateStore", () => {
       profileId: profile.id,
       projectId: project.id,
       provider: "codex",
-      providerAccountKey: testProviderAccountKey("codex"),
+      providerAccountKey: identifiableAccountKey,
       providerAuthentication: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
@@ -8304,6 +8764,7 @@ describe("StateStore", () => {
         clientMessageId: null,
         kind: "session.start",
         messageDigest: null,
+        presetContract: legacyPresetContract,
         projectId: project.id,
       },
       fastEnabled: false,
@@ -8312,7 +8773,7 @@ describe("StateStore", () => {
       profileId: profile.id,
       projectId: project.id,
       provider: "codex",
-      providerAccountKey: testProviderAccountKey("codex"),
+      providerAccountKey: identifiableAccountKey,
     })).toThrow("MUTATION_EFFECT_AUTHORITY_CHANGED");
     expect(store.readMutation("00000000-0000-4000-8000-0000000006a5"))
       .toMatchObject({ state: "prepared" });
@@ -8329,7 +8790,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -8375,7 +8836,13 @@ describe("StateStore", () => {
         authorityId: profile.id,
         idempotencyKey,
         kind: "session.start",
-        request: { fast: false, preset, projectId: project.id },
+        request: sessionStartMutationRequest({
+          projectId: project.id,
+          provider,
+          preset,
+          ...(preset === "high" ? { presetContract: legacyPresetContract } : {}),
+          fast: false,
+        }),
       });
       const session = store.beginSessionStartEffect({
         attemptId: attempt.id,
@@ -8383,6 +8850,7 @@ describe("StateStore", () => {
           clientMessageId: null,
           kind: "session.start",
           messageDigest: null,
+          ...(preset === "high" ? { presetContract: legacyPresetContract } : {}),
           projectId: project.id,
           runtimeProfile,
         },
@@ -8491,17 +8959,23 @@ describe("StateStore", () => {
       if (session.providerThreadId === undefined) {
         throw new Error("Expected a provider thread for switch alias testing.");
       }
+      const seedDigest = createHash("sha256")
+        .update("hra:session-transcript-seed:v1\0", "utf8")
+        .update(seedName, "utf8")
+        .digest("hex");
       const mutation = store.prepareMutation({
         authorityGeneration: targetProfile.processGeneration,
         authorityId: session.id,
         idempotencyKey,
         kind: "session.switch",
-        request: { preset: "high", provider: "codex" },
+        request: sessionProviderSwitchMutationRequest({
+          provider: "codex",
+          preset: "high",
+          presetContract: legacyPresetContract,
+          targetProfileId: targetProfile.id,
+          seedDigest,
+        }),
       });
-      const seedDigest = createHash("sha256")
-        .update("hra:session-transcript-seed:v1\0", "utf8")
-        .update(seedName, "utf8")
-        .digest("hex");
       return store.beginSessionProviderSwitchEffect({
         attemptId: mutation.id,
         sessionId: session.id,
@@ -8529,6 +9003,7 @@ describe("StateStore", () => {
             "codex",
           ),
           targetHostCapabilities: testSwitchHostCapabilities,
+          presetContract: legacyPresetContract,
           transcriptDigest: createHash("sha256").update(seedName).digest("hex"),
         },
       });
@@ -8591,7 +9066,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -8620,7 +9095,13 @@ describe("StateStore", () => {
       authorityId: codexAccount.id,
       idempotencyKey: "00000000-0000-4000-8000-0000000006b0",
       kind: "session.start",
-      request: { fast: false, preset: "high", projectId: project.id },
+      request: sessionStartMutationRequest({
+        projectId: project.id,
+        provider: "codex",
+        preset: "high",
+        presetContract: legacyPresetContract,
+        fast: false,
+      }),
     });
     const started = store.beginSessionStartEffect({
       attemptId: startAttempt.id,
@@ -8629,6 +9110,7 @@ describe("StateStore", () => {
         conversationAutomationCapability: SESSION_CONVERSATION_AUTOMATION_CAPABILITY,
         kind: "session.start",
         messageDigest: null,
+        presetContract: legacyPresetContract,
         projectId: project.id,
         runtimeProfile: codexProfile,
       },
@@ -8654,18 +9136,23 @@ describe("StateStore", () => {
       "codex-thread",
     )).toBe(true);
 
-    const switchAttempt = store.prepareMutation({
-      authorityGeneration: claudeAccount.processGeneration,
-      authorityId: started.id,
-      idempotencyKey: "00000000-0000-4000-8000-0000000006b1",
-      kind: "session.switch",
-      request: { preset: "fable-max", provider: "claude" },
-    });
     const seedText = "Continue this session after switching providers.";
     const seedDigest = createHash("sha256")
       .update("hra:session-transcript-seed:v1\0", "utf8")
       .update(seedText, "utf8")
       .digest("hex");
+    const switchAttempt = store.prepareMutation({
+      authorityGeneration: claudeAccount.processGeneration,
+      authorityId: started.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006b1",
+      kind: "session.switch",
+      request: sessionProviderSwitchMutationRequest({
+        provider: "claude",
+        preset: "fable-max",
+        targetProfileId: claudeAccount.id,
+        seedDigest,
+      }),
+    });
     const transcriptDigest = createHash("sha256").update("switch transcript").digest("hex");
     const immutableSwitchEvidence = {
       kind: "session.switch" as const,
@@ -9140,6 +9627,14 @@ describe("StateStore", () => {
       runtimeProfile: codexAdoptionRuntimeProfile(codexAccount, "high", false),
       providerAccountKey: providerAccountKeyForProfile(store, codexAccount.id, "codex"),
     });
+    const oldConnectionId = "10000000-0000-4000-8000-000000000201";
+    const queuedAcrossSwitch = store.enqueueIdempotent({
+      idempotencyKey: "00000000-0000-4000-8000-0000000006b1",
+      message: "preserve this message across the provider switch",
+      profileGeneration: codexAccount.processGeneration,
+      providerConnectionId: oldConnectionId,
+      sessionId: adopted.session.id,
+    });
 
     const direct = new Database(store.paths.database, { create: false, strict: true });
     try {
@@ -9151,13 +9646,6 @@ describe("StateStore", () => {
       direct.close(false);
     }
 
-    const switchAttempt = store.prepareMutation({
-      authorityGeneration: claudeAccount.processGeneration,
-      authorityId: adopted.session.id,
-      idempotencyKey: "00000000-0000-4000-8000-0000000006b2",
-      kind: "session.switch",
-      request: { preset: "fable-max", provider: "claude" },
-    });
     const claudeProfile = {
       claudeVersion: "2.1.260",
       inputFormat: "stream-json" as const,
@@ -9179,6 +9667,18 @@ describe("StateStore", () => {
     const transcriptDigest = createHash("sha256")
       .update("adopted provider-switch transcript")
       .digest("hex");
+    const switchAttempt = store.prepareMutation({
+      authorityGeneration: claudeAccount.processGeneration,
+      authorityId: adopted.session.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006b2",
+      kind: "session.switch",
+      request: sessionProviderSwitchMutationRequest({
+        provider: "claude",
+        preset: "fable-max",
+        targetProfileId: claudeAccount.id,
+        seedDigest,
+      }),
+    });
     store.beginSessionProviderSwitchEffect({
       attemptId: switchAttempt.id,
       sessionId: adopted.session.id,
@@ -9308,7 +9808,7 @@ describe("StateStore", () => {
       profileId: claudeAccount.id,
       profileGeneration: claudeAccount.processGeneration,
       sessionId: switched.id,
-    })).toBe(true);
+    })).toBe(false);
     expect(store.listNonterminalManagedClaudeSessions(claudeAccount.id))
       .toEqual([switched]);
     expect(store.listLocalSessionPage({
@@ -9341,6 +9841,50 @@ describe("StateStore", () => {
         }),
       }),
     ]);
+
+    const newConnectionId = "10000000-0000-4000-8000-000000000202";
+    const queueEffect = store.beginQueueEffect({
+      evidence: {
+        baseline: { activeTurnId: null, providerUpdatedAt: null, status: "idle" },
+        clientMessageId: queuedAcrossSwitch.id,
+        kind: "queue.dispatch",
+        messageDigest: createHash("sha256")
+          .update("preserve this message across the provider switch")
+          .digest("hex"),
+        profileGeneration: claudeAccount.processGeneration,
+        providerThreadId: "claimed-claude-thread",
+        queueId: queuedAcrossSwitch.id,
+        runtimeProfile: claudeProfile,
+        sessionId: switched.id,
+      },
+      profileGeneration: claudeAccount.processGeneration,
+      providerConnectionId: newConnectionId,
+      queueId: queuedAcrossSwitch.id,
+      sessionId: switched.id,
+    });
+    expect(queueEffect.evidence.profileGeneration).toBe(claudeAccount.processGeneration);
+    expect(store.transitionQueue(queuedAcrossSwitch.id, "dispatching", "applied")).toBe(true);
+    const queuedEvent = store.finalizeSessionUserMessageSource({
+      sessionId: switched.id,
+      sourceId: queuedAcrossSwitch.id,
+      sourceKind: "queue",
+      turnId: "claimed-claude-queued-turn",
+    });
+    if (queuedEvent === null) throw new Error("Expected the switched queue transcript event.");
+    expect(queuedEvent).toMatchObject({
+      accountId: claudeAccount.id,
+      body: {
+        text: "preserve this message across the provider switch",
+        type: "user_message",
+      },
+      providerConnectionId: newConnectionId,
+      providerGeneration: claudeAccount.processGeneration,
+    });
+    expect(store.canReleaseIdleManagedClaudeSessionForAccountLogin({
+      profileId: claudeAccount.id,
+      profileGeneration: claudeAccount.processGeneration,
+      sessionId: switched.id,
+    })).toBe(true);
 
     store.setSessionAdoptionPolicy({ provider: "codex", profileId: null });
     store.setSessionAdoptionPolicy({ provider: "codex", profileId: codexAccount.id });
@@ -9396,19 +9940,99 @@ describe("StateStore", () => {
     expect(store.listSessionEvents({
       sessionId: switched.id,
       afterSequence: 0,
-    }).events).toEqual(switchEvents);
+    }).events).toEqual([...switchEvents, queuedEvent]);
+  });
+
+  test("rejects a legacy rebound provider-switch digest before writing effect evidence", async () => {
+    const { store } = await fixture();
+    const sourceProfile = signInProfile(store, "Legacy switch source", "legacy-source@example.com");
+    const targetProfile = signInProfile(store, "Legacy switch target", "legacy-target@example.com");
+    const session = upsertProvenTestSession(store, {
+      fastEnabled: false,
+      preset: "fable-max",
+      profileId: sourceProfile.id,
+      provider: "claude",
+      providerThreadId: "legacy-switch-source-thread",
+      state: "idle",
+    });
+    expect(store.sessionAccountAuthorityMatches(session.id, sourceProfile.id)).toBe(true);
+    const seedDigest = createHash("sha256").update("legacy switch seed").digest("hex");
+    const key = "00000000-0000-4000-8000-0000000006b4";
+    const attempt = store.prepareMutation({
+      authorityGeneration: targetProfile.processGeneration,
+      authorityId: session.id,
+      idempotencyKey: key,
+      kind: "session.switch",
+      request: {
+        provider: "codex",
+        preset: "high",
+        targetProfileId: targetProfile.id,
+        seedDigest,
+      },
+    });
+    const runtimeProfile = {
+      approvalPolicy: "on-request" as const,
+      computerUse: true as const,
+      enabledApps: [],
+      fast: false,
+      model: "gpt-5.6-sol",
+      observedAt: 2_000,
+      permissionProfile: ":workspace" as const,
+      pluginCapability: true as const,
+      preset: "high" as const,
+      processGeneration: targetProfile.processGeneration,
+      profileId: targetProfile.id,
+      reasoningEffort: "max" as const,
+      reviewMode: "auto_review" as const,
+      serviceTier: null,
+    };
+
+    expect(() => store.beginSessionProviderSwitchEffect({
+      attemptId: attempt.id,
+      evidence: {
+        daemonGeneration: 0,
+        kind: "session.switch",
+        requestedAccountId: targetProfile.id,
+        requestedPreset: "high",
+        runtimeProfile,
+        seedDigest,
+        seedIncludedRecords: 0,
+        seedOmittedRecords: 0,
+        sourcePreset: "fable-max",
+        sourceProcessGeneration: sourceProfile.processGeneration,
+        sourceProfileId: sourceProfile.id,
+        sourceProvider: "claude",
+        sourceProviderThreadId: "legacy-switch-source-thread",
+        targetHostCapabilities: testSwitchHostCapabilities,
+        targetPreset: "high",
+        targetProcessGeneration: targetProfile.processGeneration,
+        targetProfileId: targetProfile.id,
+        targetProvider: "codex",
+        targetProviderAccountKey: providerAccountKeyForProfile(
+          store,
+          targetProfile.id,
+          "codex",
+        ),
+        presetContract: solCodexPresetContract,
+        transcriptDigest: createHash("sha256").update("legacy switch transcript").digest("hex"),
+      },
+      sessionId: session.id,
+    })).toThrow("SESSION_PROVIDER_SWITCH_AUTHORITY_CHANGED");
+    expect(store.readMutation(key)).toMatchObject({ state: "prepared" });
+    expect(store.readMutation(key)?.evidence).toBeUndefined();
+    expect(store.requireSession(session.id)).toEqual(session);
   });
 
   test("fences provider-switch seed reviews to the exact historical preset contract", async () => {
     const { store } = await fixture();
     const sourceProfile = signInProfile(store, "Seed source", "seed-source@example.com");
     const targetProfile = signInProfile(store, "Seed target", "seed-target@example.com");
-    const astraProfile = {
+    const solProfile = {
       approvalPolicy: "on-request" as const,
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       observedAt: 2_200,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -9419,7 +10043,7 @@ describe("StateStore", () => {
       reviewMode: "auto_review" as const,
       serviceTier: null,
     };
-    const solProfile = { ...astraProfile, model: "gpt-5.6-sol" };
+    const astraProfile = { ...solProfile, model: "gpt-6-astra" };
     const stageSwitch = (suffix: string, seedText: string) => {
       const session = upsertProvenTestSession(store, {
         fastEnabled: false,
@@ -9429,23 +10053,29 @@ describe("StateStore", () => {
         providerThreadId: `source-${suffix}`,
         state: "idle",
       });
+      const seedDigest = createHash("sha256")
+        .update("hra:session-transcript-seed:v1\0", "utf8")
+        .update(seedText, "utf8")
+        .digest("hex");
       const attempt = store.prepareMutation({
         authorityGeneration: targetProfile.processGeneration,
         authorityId: session.id,
         idempotencyKey: `00000000-0000-4000-8000-000000000${suffix}`,
         kind: "session.switch",
-        request: { preset: "high", provider: "codex" },
+        request: sessionProviderSwitchMutationRequest({
+          provider: "codex",
+          preset: "high",
+          presetContract: legacyPresetContract,
+          targetProfileId: targetProfile.id,
+          seedDigest,
+        }),
       });
-      const seedDigest = createHash("sha256")
-        .update("hra:session-transcript-seed:v1\0", "utf8")
-        .update(seedText, "utf8")
-        .digest("hex");
       const evidence = {
         kind: "session.switch" as const,
         daemonGeneration: 0,
         requestedAccountId: targetProfile.id,
         requestedPreset: "high" as const,
-        runtimeProfile: astraProfile,
+        runtimeProfile: solProfile,
         seedDigest,
         seedIncludedRecords: 1,
         seedOmittedRecords: 0,
@@ -9464,6 +10094,7 @@ describe("StateStore", () => {
         targetProcessGeneration: targetProfile.processGeneration,
         targetProfileId: targetProfile.id,
         targetProvider: "codex" as const,
+        presetContract: legacyPresetContract,
         transcriptDigest: createHash("sha256").update(`transcript-${suffix}`).digest("hex"),
       };
       store.beginSessionProviderSwitchEffect({
@@ -9479,11 +10110,11 @@ describe("StateStore", () => {
       return { attempt, seedText, session };
     };
 
-    const current = stageSwitch("6b2", "Seed the current Astra target.");
+    const current = stageSwitch("6b2", "Seed the active Sol target.");
     expect(() => store.recordSessionProviderSwitchSeedIntent({
       attemptId: current.attempt.id,
       providerThreadId: "target-6b2",
-      runtimeProfile: solProfile,
+      runtimeProfile: astraProfile,
       seedText: current.seedText,
       sessionId: current.session.id,
     })).toThrow("SESSION_PROVIDER_SWITCH_SEED_INTENT_AUTHORITY_MISMATCH");
@@ -9491,25 +10122,25 @@ describe("StateStore", () => {
     store.recordSessionProviderSwitchSeedIntent({
       attemptId: current.attempt.id,
       providerThreadId: "target-6b2",
-      runtimeProfile: astraProfile,
+      runtimeProfile: solProfile,
       seedText: current.seedText,
       sessionId: current.session.id,
     });
     expect(store.readSessionProviderSwitchProgress(current.attempt.id).seed?.runtimeProfile.model)
-      .toBe("gpt-6-astra");
+      .toBe("gpt-5.6-sol");
 
-    const legacy = stageSwitch("6b3", "Resume the historical Sol target.");
+    const legacy = stageSwitch("6b3", "Resume the established Astra target.");
     const inspector = new Database(store.paths.database, { create: false, strict: true });
     try {
-      // Simulate the immutable switch evidence a pre-v38 daemon could have
-      // left after the provider target was created but before its seed began.
+      // Simulate immutable contract-2 switch evidence left after the provider
+      // target was created but before its seed began.
       const stored = inspector.query(
         "SELECT evidence_json FROM mutation_effect_evidence WHERE attempt_id=?",
       ).get(legacy.attempt.id) as { evidence_json: string };
       const legacyEvidence = JSON.parse(stored.evidence_json) as {
         runtimeProfile: { model: string };
       };
-      legacyEvidence.runtimeProfile.model = "gpt-5.6-sol";
+      legacyEvidence.runtimeProfile.model = "gpt-6-astra";
       const legacyEvidenceJson = JSON.stringify(legacyEvidence);
       inspector.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
       inspector.query(
@@ -9529,7 +10160,7 @@ describe("StateStore", () => {
       inspector.close(false);
     }
     expect(store.readMutation("00000000-0000-4000-8000-0000000006b3"))
-      .toMatchObject({ evidence: { evidence: { runtimeProfile: { model: "gpt-5.6-sol" } } } });
+      .toMatchObject({ evidence: { evidence: { runtimeProfile: { model: "gpt-6-astra" } } } });
     expect(store.isSessionMutationProviderAuthorityCurrent({
       attemptId: legacy.attempt.id,
       originGeneration: targetProfile.processGeneration,
@@ -9539,12 +10170,115 @@ describe("StateStore", () => {
     expect(() => store.recordSessionProviderSwitchSeedIntent({
       attemptId: legacy.attempt.id,
       providerThreadId: "target-6b3",
-      runtimeProfile: solProfile,
+      runtimeProfile: astraProfile,
       seedText: legacy.seedText,
       sessionId: legacy.session.id,
     })).not.toThrow();
     expect(store.readSessionProviderSwitchProgress(legacy.attempt.id).seed?.runtimeProfile.model)
-      .toBe("gpt-5.6-sol");
+      .toBe("gpt-6-astra");
+  });
+
+  test("refuses to switch a historical Devin source without mutating its readable history", async () => {
+    const { store } = await fixture();
+    const account = signInProfile(store, "Devin switch source", "devin-switch@example.com");
+    const codexProfile = {
+      approvalPolicy: "on-request" as const,
+      computerUse: true as const,
+      enabledApps: [],
+      fast: false,
+      model: "gpt-5.6-sol",
+      observedAt: 2_100,
+      permissionProfile: ":workspace" as const,
+      pluginCapability: true as const,
+      preset: "high" as const,
+      processGeneration: account.processGeneration,
+      profileId: account.id,
+      reasoningEffort: "max" as const,
+      reviewMode: "auto_review" as const,
+      serviceTier: null,
+    };
+    const historical = seedLegacyDevinSession(store, {
+      profileId: account.id,
+      preset: "astra",
+      fastEnabled: false,
+    });
+    const started = store.bindSession({
+      expectedRevision: historical.revision,
+      providerThreadId: "devin-source-thread",
+      sessionId: historical.id,
+      state: "idle",
+    });
+
+    expect(store.requireSession(started.id)).toMatchObject({
+      preset: "astra",
+      provider: "devin",
+      providerThreadId: "devin-source-thread",
+    });
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT provider,provider_v39 FROM sessions WHERE id=?",
+      ).get(started.id)).toEqual({ provider: "codex", provider_v39: "devin" });
+    } finally {
+      inspector.close(false);
+    }
+
+    const seedText = "Continue after switching away from Devin.";
+    const seedDigest = createHash("sha256")
+      .update("hra:session-transcript-seed:v1\0", "utf8")
+      .update(seedText, "utf8")
+      .digest("hex");
+    const switchAttempt = store.prepareMutation({
+      authorityGeneration: account.processGeneration,
+      authorityId: started.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006b3",
+      kind: "session.switch",
+      request: sessionProviderSwitchMutationRequest({
+        provider: "codex",
+        preset: "high",
+        presetContract: legacyPresetContract,
+        targetProfileId: account.id,
+        seedDigest,
+      }),
+    });
+    const transcriptDigest = createHash("sha256")
+      .update("devin source switch transcript")
+      .digest("hex");
+    const evidence = {
+      daemonGeneration: 0,
+      kind: "session.switch" as const,
+      requestedAccountId: null,
+      requestedPreset: "high" as const,
+      runtimeProfile: codexProfile,
+      seedDigest,
+      seedIncludedRecords: 1,
+      seedOmittedRecords: 0,
+      sourcePreset: "astra" as const,
+      sourceProcessGeneration: account.processGeneration,
+      sourceProfileId: account.id,
+      sourceProvider: "devin" as const,
+      sourceProviderThreadId: "devin-source-thread",
+      targetPreset: "high" as const,
+      targetProcessGeneration: account.processGeneration,
+      targetProfileId: account.id,
+      targetProvider: "codex" as const,
+      targetProviderAccountKey: providerAccountKeyForProfile(store, account.id, "codex"),
+      presetContract: legacyPresetContract,
+      transcriptDigest,
+    };
+    const before = store.requireSession(started.id);
+    expect(() => store.beginSessionProviderSwitchEffect({
+      attemptId: switchAttempt.id,
+      evidence,
+      sessionId: started.id,
+    })).toThrow("PROVIDER_RETIRED:devin");
+    expect(store.readMutation("00000000-0000-4000-8000-0000000006b3"))
+      .toMatchObject({
+        state: "prepared",
+      });
+    expect(store.readMutation("00000000-0000-4000-8000-0000000006b3")?.evidence)
+      .toBeUndefined();
+    expect(store.requireSession(started.id)).toEqual(before);
   });
 
   test.each([
@@ -9797,6 +10531,13 @@ describe("StateStore", () => {
     expect(() => store.updateSessionMetadata({ sessionId: devin.id, expectedRevision: devin.revision, preset: "astra" }))
       .toThrow("PROVIDER_RETIRED:devin");
     expect(() => store.beginSessionMutationEffect({
+      transcript: {
+        accountId: store.requireSession(devin.id).profileId,
+        providerGeneration: account.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000099",
+        actor: store.sessionMessageActorForSource(devin.id, mutation.id) ?? "human",
+        message: "rejected",
+      },
       attemptId: mutation.id, sessionId: devin.id, profileGeneration: account.processGeneration,
       message: "rejected",
       evidence: { kind: "session.send", providerThreadId: "legacy-devin-thread",
@@ -9805,6 +10546,7 @@ describe("StateStore", () => {
     })).toThrow("PROVIDER_RETIRED:devin");
     expect(() => store.beginQueueEffect({
       queueId: queue.id, sessionId: devin.id, profileGeneration: account.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000005",
       evidence: { kind: "queue.dispatch", queueId: queue.id, sessionId: devin.id,
         providerThreadId: "legacy-devin-thread", profileGeneration: account.processGeneration,
         baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
@@ -10069,7 +10811,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("migrates upstream schema 40 through timestamp, peer, and hosted schema 43 while preserving legacy bytes", async () => {
+  test("migrates schema 40 through timestamp v41, Work v42, and transcript provenance v43 while preserving legacy bytes and digests", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Historical proof", "historical-proof@example.com");
     const local = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
@@ -10082,25 +10824,41 @@ describe("StateStore", () => {
     const inspector = new Database(store.paths.database, { create: false, strict: true });
     const resolutionBytes = '{"source":"thread/read","providerUpdatedAt":10000}';
     try {
-      // Emulate the released adoption-v40 surface before the three additive
-      // canonical migrations, including a resolution committed before the
-      // timestamp-proof insert guard existed.
-      dropPeerAndHostedMemorySchema(inspector);
-      inspector.exec("DROP TRIGGER mutation_resolutions_timestamp_proof_insert; DELETE FROM migrations WHERE version>40; PRAGMA user_version=40;");
-      expect(() => new StateStore(store.paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:43");
+      // Emulate a resolution committed before the timestamp and active-Work
+      // migrations existed, using the exact released v40 authority surface.
+      downgradeToExactProviderVersion40(inspector);
+      expect(() => new StateStore(store.paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:45");
       inspector.query("INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,'proven_applied',?,?,1000)").run(attempt.id, resolutionBytes, JSON.stringify({ renamed: true }));
       const before = inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id);
+      const stableSchemaBefore = inspector.query(
+        `SELECT type,name,tbl_name,sql FROM sqlite_master
+         WHERE name NOT IN (
+           'mutation_resolutions_timestamp_proof_insert',
+           'work_devin_preset_contract_guard',
+           'work_session_devin_contract_guard',
+           'queue_entries'
+         )
+         ORDER BY type,name`,
+      ).all();
       const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
       const reopened = new StateStore(store.paths);
       stores.push(reopened);
+      const stableSchemaAfter = inspector.query(
+        `SELECT type,name,tbl_name,sql FROM sqlite_master
+        WHERE name NOT IN (
+           'mutation_resolutions_timestamp_proof_insert',
+           'work_devin_preset_contract_guard',
+           'work_session_devin_contract_guard',
+           'queue_entries'
+         )
+         ORDER BY type,name`,
+      ).all();
+      for (const row of z.array(z.unknown()).parse(stableSchemaBefore)) {
+        expect(stableSchemaAfter).toContainEqual(row);
+      }
       expect(inspector.query("SELECT * FROM migrations WHERE version<41 ORDER BY version").all()).toEqual(ledgerBefore);
-      expect(inspector.query("SELECT version FROM migrations WHERE version>=40 ORDER BY version").all()).toEqual([
-        { version: 40 },
-        { version: 41 },
-        { version: 42 },
-        { version: 43 },
-      ]);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("SELECT version FROM migrations WHERE version>=40 ORDER BY version").all()).toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }, { version: 45 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(reopened.readMutation(key)?.evidence).toEqual(original);
       expect(reopened.readMutation(key)?.resolution?.evidence).toEqual(JSON.parse(resolutionBytes));
       expect(inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id)).toEqual(before);
@@ -10131,14 +10889,90 @@ describe("StateStore", () => {
           expect(() => new StateStore(store.paths, { readonly })).toThrow("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID");
           expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
           expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledgerBefore);
-          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
         }
+      } finally { inspector.close(false); }
+    }
+  });
+
+  test("refuses a damaged timestamp guard on exact schema 41 before Work v42 migration", async () => {
+    for (const definition of ["missing", "weaker", "changed_literal"] as const) {
+      const { store } = await fixture();
+      const inspector = new Database(store.paths.database, { create: false, strict: true });
+      try {
+        downgradeToExactProviderVersion41(inspector);
+        const original = z.object({ sql: z.string() }).parse(inspector.query(
+          "SELECT sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'",
+        ).get()).sql;
+        inspector.exec("DROP TRIGGER mutation_resolutions_timestamp_proof_insert");
+        if (definition === "weaker") {
+          inspector.exec("CREATE TRIGGER mutation_resolutions_timestamp_proof_insert BEFORE INSERT ON mutation_resolutions BEGIN SELECT 1; END");
+        } else if (definition === "changed_literal") {
+          inspector.exec(original.replace("'unix_milliseconds_v1'", "'unix_milliseconds_v1  '"));
+        }
+        const schemaBefore = inspector.query(
+          "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+        ).all();
+        const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
+
+        expect(() => new StateStore(store.paths)).toThrow(
+          "STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID",
+        );
+        expect(() => new StateStore(store.paths, { readonly: true })).toThrow(
+          "STATE_SCHEMA_MIGRATION_REQUIRED:41:45",
+        );
+        expect(inspector.query(
+          "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+        ).all()).toEqual(schemaBefore);
+        expect(inspector.query("SELECT * FROM migrations ORDER BY version").all())
+          .toEqual(ledgerBefore);
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
       } finally { inspector.close(false); }
     }
   });
 
   test("refuses an invalid current migration ledger without changing retained rows or schema", async () => {
     for (const damage of ["missing", "negative_time", "unsafe_time", "later_version"] as const) {
+      const { store } = await fixture();
+      const inspector = new Database(store.paths.database, { create: false, strict: true });
+      try {
+        downgradeToExactProviderVersion40(inspector);
+        if (damage === "missing") inspector.exec("DELETE FROM migrations WHERE version=40");
+        else if (damage === "negative_time") {
+          inspector.exec("PRAGMA ignore_check_constraints=ON; UPDATE migrations SET applied_at=-1 WHERE version=40; PRAGMA ignore_check_constraints=OFF;");
+        } else if (damage === "unsafe_time") {
+          inspector.query("UPDATE migrations SET applied_at=? WHERE version=40")
+            .run(Number.MAX_SAFE_INTEGER + 1);
+        } else inspector.exec("INSERT INTO migrations(version,applied_at) VALUES (41,1000)");
+        const schemaBefore = inspector.query(
+          "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+        ).all();
+        const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
+
+        expect(() => new StateStore(store.paths)).toThrow(
+          "STATE_SCHEMA_V40_MIGRATION_LEDGER_INVALID",
+        );
+        expect(() => new StateStore(store.paths, { readonly: true })).toThrow(
+          "STATE_SCHEMA_MIGRATION_REQUIRED:40:45",
+        );
+        expect(inspector.query(
+          "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+        ).all()).toEqual(schemaBefore);
+        expect(inspector.query("SELECT * FROM migrations ORDER BY version").all())
+          .toEqual(ledgerBefore);
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      } finally { inspector.close(false); }
+    }
+  });
+
+  test("refuses an invalid schema 41 migration ledger without changing retained rows or schema", async () => {
+    for (const damage of [
+      "missing_40",
+      "missing_41",
+      "negative_time",
+      "unsafe_time",
+      "later_version",
+    ] as const) {
       const { store } = await fixture();
       const profile = signInProfile(store, "Ledger identity", "ledger@example.com");
       const session = upsertProvenTestSession(store, {
@@ -10147,7 +10981,9 @@ describe("StateStore", () => {
       });
       const inspector = new Database(store.paths.database, { create: false, strict: true });
       try {
-        if (damage === "missing") inspector.exec("DELETE FROM migrations WHERE version=41");
+        downgradeToExactProviderVersion41(inspector);
+        if (damage === "missing_40") inspector.exec("DELETE FROM migrations WHERE version=40");
+        else if (damage === "missing_41") inspector.exec("DELETE FROM migrations WHERE version=41");
         else if (damage === "negative_time") {
           // Model an already malformed database; restore constraint enforcement
           // before asking either admission path to inspect it.
@@ -10159,13 +10995,71 @@ describe("StateStore", () => {
         const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
         const sessionBefore = inspector.query("SELECT * FROM sessions WHERE id=?").get(session.id);
         const profileBefore = inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id);
+        expect(() => new StateStore(store.paths)).toThrow(
+          "STATE_SCHEMA_V41_MIGRATION_LEDGER_INVALID",
+        );
+        expect(() => new StateStore(store.paths, { readonly: true })).toThrow(
+          "STATE_SCHEMA_MIGRATION_REQUIRED:41:45",
+        );
+        expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
+        expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledgerBefore);
+        expect(inspector.query("SELECT * FROM sessions WHERE id=?").get(session.id)).toEqual(sessionBefore);
+        expect(inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id)).toEqual(profileBefore);
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      } finally { inspector.close(false); }
+    }
+  });
+
+  test("refuses an invalid current schema 45 migration ledger without writes", async () => {
+    for (const damage of [
+      "missing_40",
+      "missing_41",
+      "missing_42",
+      "missing_43",
+      "missing_44",
+      "missing_45",
+      "negative_time",
+      "unsafe_time",
+      "later_version",
+    ] as const) {
+      const { store } = await fixture();
+      const profile = signInProfile(store, "Current ledger", "current-ledger@example.com");
+      const session = upsertProvenTestSession(store, {
+        profileId: profile.id,
+        preset: "high",
+        fastEnabled: false,
+        providerThreadId: "current-ledger-thread",
+        state: "idle",
+        providerUpdatedAt: 10,
+      });
+      const inspector = new Database(store.paths.database, { create: false, strict: true });
+      try {
+        if (damage === "missing_40") inspector.exec("DELETE FROM migrations WHERE version=40");
+        else if (damage === "missing_41") inspector.exec("DELETE FROM migrations WHERE version=41");
+        else if (damage === "missing_42") inspector.exec("DELETE FROM migrations WHERE version=42");
+        else if (damage === "missing_43") inspector.exec("DELETE FROM migrations WHERE version=43");
+        else if (damage === "missing_44") inspector.exec("DELETE FROM migrations WHERE version=44");
+        else if (damage === "missing_45") inspector.exec("DELETE FROM migrations WHERE version=45");
+        else if (damage === "negative_time") {
+          inspector.exec("PRAGMA ignore_check_constraints=ON; UPDATE migrations SET applied_at=-1 WHERE version=43; PRAGMA ignore_check_constraints=OFF;");
+        } else if (damage === "unsafe_time") {
+          inspector.query("UPDATE migrations SET applied_at=? WHERE version=43")
+            .run(Number.MAX_SAFE_INTEGER + 1);
+        } else inspector.exec("INSERT INTO migrations(version,applied_at) VALUES (46,1000)");
+        const schemaBefore = inspector.query(
+          "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+        ).all();
+        const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
+        const sessionBefore = inspector.query("SELECT * FROM sessions WHERE id=?").get(session.id);
+        const profileBefore = inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id);
+
         for (const readonly of [false, true]) {
-          expect(() => new StateStore(store.paths, { readonly })).toThrow("STATE_SCHEMA_V43_MIGRATION_LEDGER_INVALID");
+          expect(() => new StateStore(store.paths, { readonly })).toThrow("STATE_SCHEMA_V45_MIGRATION_LEDGER_INVALID");
           expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
           expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledgerBefore);
           expect(inspector.query("SELECT * FROM sessions WHERE id=?").get(session.id)).toEqual(sessionBefore);
           expect(inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id)).toEqual(profileBefore);
-          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
         }
       } finally { inspector.close(false); }
     }
@@ -10466,7 +11360,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -10516,6 +11410,7 @@ describe("StateStore", () => {
         queueId: queued.id,
         sessionId: session.id,
         profileGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000006",
         evidence: {
           kind: "queue.dispatch",
           queueId: queued.id,
@@ -10758,7 +11653,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -10773,6 +11668,7 @@ describe("StateStore", () => {
       queueId: ambiguous.id,
       sessionId: session.id,
       profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000007",
       evidence: {
         kind: "queue.dispatch",
         queueId: ambiguous.id,
@@ -10851,7 +11747,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -11550,7 +12446,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -11588,7 +12484,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -11620,6 +12516,13 @@ describe("StateStore", () => {
       sessionId: sendSession.id,
       profileGeneration: profile.processGeneration,
       message: "send",
+      transcript: {
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-00000000000e",
+        actor: "human",
+        message: "send",
+      },
       evidence: {
         kind: "session.send",
         providerThreadId: "thread-send-cas",
@@ -11666,6 +12569,7 @@ describe("StateStore", () => {
       queueId: queue.id,
       sessionId: queueSession.id,
       profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000008",
       evidence: {
         kind: "queue.dispatch",
         queueId: queue.id,
@@ -11699,7 +12603,8 @@ describe("StateStore", () => {
   });
 
   test("commits sanitized send, steer, and queue message events with their effect receipts", async () => {
-    const { store } = await fixture();
+    let currentTime = 1_000;
+    const { store } = await fixture({ now: () => currentTime });
     const profile = signInProfile(store, "Atomic message events", "atomic-events@example.com");
     const runtime = codexRuntimeProfile(profile);
     const bind = (
@@ -11735,6 +12640,13 @@ describe("StateStore", () => {
       idempotencyKey: sendKey,
     });
     store.beginSessionMutationEffect({
+      transcript: {
+        accountId: store.requireSession(sendSession.id).profileId,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000099",
+        actor: store.sessionMessageActorForSource(sendSession.id, sendAttempt.id) ?? "human",
+        message: sendMessage,
+      },
       attemptId: sendAttempt.id,
       sessionId: sendSession.id,
       profileGeneration: profile.processGeneration,
@@ -11809,6 +12721,18 @@ describe("StateStore", () => {
       message: sendMessage,
     })).toEqual({ ...sent, appended: false });
     expect(store.readAutorespondBudgets(sendSession.id).consecutive).toBe(1);
+    expect(() => store.appendSessionUserMessageEventOnce({
+      sourceId: sendAttempt.id,
+      sessionId: sendSession.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      turnId: "different-atomic-send-turn",
+      message: sendMessage,
+    })).toThrow("SESSION_MESSAGE_EVENT_SOURCE_CONFLICT");
+    expect(store.listSessionEvents({ sessionId: sendSession.id, afterSequence: 0 }).events)
+      .toEqual([sent.event]);
+    expect(store.readAutorespondBudgets(sendSession.id).consecutive).toBe(1);
 
     const steerSession = bind("thread-atomic-steer", "active", "turn-atomic-steer");
     const steerMessage = "sk_testabcdefgh";
@@ -11821,6 +12745,13 @@ describe("StateStore", () => {
       idempotencyKey: steerKey,
     });
     store.beginSessionMutationEffect({
+      transcript: {
+        accountId: store.requireSession(steerSession.id).profileId,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000099",
+        actor: store.sessionMessageActorForSource(steerSession.id, steerAttempt.id) ?? "human",
+        message: steerMessage,
+      },
       attemptId: steerAttempt.id,
       sessionId: steerSession.id,
       profileGeneration: profile.processGeneration,
@@ -11859,6 +12790,7 @@ describe("StateStore", () => {
       queueId: queue.id,
       sessionId: queueSession.id,
       profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000099",
       evidence: {
         kind: "queue.dispatch",
         queueId: queue.id,
@@ -11916,6 +12848,13 @@ describe("StateStore", () => {
         idempotencyKey: cutoffKey,
       });
       store.beginSessionMutationEffect({
+        transcript: {
+          accountId: store.requireSession(cutoffSession.id).profileId,
+          providerGeneration: profile.processGeneration,
+          providerConnectionId: "10000000-0000-4000-8000-000000000099",
+          actor: store.sessionMessageActorForSource(cutoffSession.id, cutoffAttempt.id) ?? "human",
+          message: cutoffMessage,
+        },
         attemptId: cutoffAttempt.id,
         sessionId: cutoffSession.id,
         profileGeneration: profile.processGeneration,
@@ -11929,6 +12868,16 @@ describe("StateStore", () => {
           runtimeProfile: runtime,
         },
       });
+      // Recovery consumes this durable intent without the original message.
+      // Its pre-effect bytes must already protect a credential crossing the cap.
+      const pendingCutoff = store.readSessionUserMessageSource(
+        cutoffSession.id, "mutation", cutoffKey,
+      );
+      expect(pendingCutoff).toMatchObject({ status: "pending" });
+      expect(pendingCutoff.intent).toMatchObject({
+        text: expect.stringContaining("[protected]"),
+      });
+      expect(JSON.stringify(pendingCutoff)).not.toContain(secret.slice(0, -1));
       const cutoffResult = store.completeSessionTurnEffect({
         attemptId: cutoffAttempt.id,
         sessionId: cutoffSession.id,
@@ -11952,6 +12901,33 @@ describe("StateStore", () => {
         cutoffMessage.length - SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
       );
     }
+
+    currentTime += SESSION_EVENT_RETAIN_AGE_MS + 1;
+    expect(store.listSessionEvents({ sessionId: sendSession.id, afterSequence: 0 }).events)
+      .toEqual([]);
+    expect(store.readSessionMessageEventSource(sendSession.id, sendAttempt.id)).toBeNull();
+    const replay = {
+      sourceId: sendAttempt.id,
+      sessionId: sendSession.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      turnId: "turn-atomic-send",
+      message: sendMessage,
+    };
+    expect(() => store.appendSessionUserMessageEventOnce(replay))
+      .toThrow("SESSION_USER_MESSAGE_SOURCE_FINALIZED");
+    expect(() => store.appendSessionUserMessageEventOnce({ ...replay, message: `${sendMessage}changed` }))
+      .toThrow("SESSION_MESSAGE_DIGEST_MISMATCH");
+    expect(store.finalizeSessionUserMessageSource({
+      sessionId: sendSession.id,
+      sourceKind: "mutation",
+      sourceId: sendKey,
+      turnId: "turn-atomic-send",
+    })).toBeNull();
+    expect(store.listSessionEvents({ sessionId: sendSession.id, afterSequence: 0 }).events)
+      .toEqual([]);
+    expect(store.readAutorespondBudgets(sendSession.id).consecutive).toBe(1);
   });
 
   test("reports whether any session is mid-turn as a cloud cadence hint", async () => {
@@ -12024,6 +13000,7 @@ describe("StateStore", () => {
       floorSequence: 1,
       observedThroughSequence: 2,
       gapReason: null,
+      retentionGapReason: null,
       events: [{ sequence: 1 }],
     });
     expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 1 })).toMatchObject({
@@ -12184,6 +13161,78 @@ describe("StateStore", () => {
       },
     });
     expect(JSON.stringify({ snapshot, publicEvents })).not.toContain("LEGACY-");
+  });
+
+  test("projects newly unsafe attachment scalars from immutable v1 and v2 event history", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Legacy attachment events", "legacy-attachment-events@example.com");
+    const session = createProvenTestSession(store, {
+      fastEnabled: false,
+      preset: "high",
+      profileId: profile.id,
+      state: "idle",
+    });
+    const append = (digest: string) => store.appendSessionEvent({
+      accountId: profile.id,
+      body: {
+        actor: "human" as const,
+        attachments: ["same€name.txt", "same₹name.txt", "same�name.txt"].map((name) => ({
+          byteLength: 4,
+          digest,
+          mediaType: "text/plain" as const,
+          name,
+        })),
+        omittedCharacters: 0,
+        text: "historical attachment",
+        turnId: null,
+        type: "user_message" as const,
+      },
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration,
+      sessionId: session.id,
+    });
+    const v1 = append("a".repeat(64));
+    const v2 = append("b".repeat(64));
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      inspector.exec("DROP TRIGGER session_events_immutable_update");
+      for (const [event, projectionVersion] of [[v1, 1], [v2, 2]] as const) {
+        const stored = z.object({
+          event_bytes: z.number().int(),
+          event_json: z.string(),
+        }).strict().parse(inspector.query(
+          `SELECT event_json,event_bytes FROM session_events
+           WHERE session_id=? AND sequence=?`,
+        ).get(session.id, event.sequence));
+        const legacyJson = stored.event_json
+          .replace("€", String.fromCodePoint(0x2028))
+          .replace("₹", String.fromCodePoint(0x2029));
+        expect(utf8Bytes(legacyJson)).toBe(stored.event_bytes);
+        inspector.query(
+          `UPDATE session_events SET event_json=?,projection_version=?
+           WHERE session_id=? AND sequence=?`,
+        ).run(legacyJson, projectionVersion, session.id, event.sequence);
+      }
+    } finally {
+      inspector.exec(`CREATE TRIGGER session_events_immutable_update
+        BEFORE UPDATE ON session_events
+        BEGIN SELECT RAISE(ABORT, 'session event is immutable'); END`);
+      inspector.close(false);
+    }
+
+    const projected = store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: session.id,
+    }).events;
+    expect(projected.map((event) =>
+      event.body.type === "user_message"
+        ? event.body.attachments?.map(({ name }) => name)
+        : null))
+      .toEqual([
+        ["same�name~1.txt", "same�name~2.txt", "same�name.txt"],
+        ["same�name~1.txt", "same�name~2.txt", "same�name.txt"],
+      ]);
+    expect(JSON.stringify(projected)).not.toContain(String.fromCodePoint(0x2028));
   });
 
   test("stores an exact 64 KiB public event and reads a maximally expanded legacy row", async () => {
@@ -13339,12 +14388,14 @@ describe("StateStore", () => {
     });
     expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 })).toMatchObject({
       gapReason: "retention_age",
+      retentionGapReason: "retention_age",
       floorSequence: 3,
       observedThroughSequence: 3,
       events: [{ sequence: 3 }],
     });
     expect(store.listSessionEvents({ sessionId: session.id, afterSequence: null })).toMatchObject({
       gapReason: null,
+      retentionGapReason: "retention_age",
       events: [{ sequence: 3 }],
     });
   });
@@ -14982,7 +16033,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts",
       ).get()).toEqual({ count: 1 });
@@ -16642,9 +17693,9 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query("SELECT version FROM migrations ORDER BY version").all())
-        .toEqual(Array.from({ length: 43 }, (_, index) => ({ version: index + 1 })));
+        .toEqual(Array.from({ length: 45 }, (_, index) => ({ version: index + 1 })));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
         .toContainEqual(expect.objectContaining({ name: "attempt_sequence", type: "INTEGER", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
@@ -16833,7 +17884,7 @@ describe("StateStore", () => {
       foreignKeyViolations: 0,
       profileColumns: ["codex_account_key"],
       sqliteVersion: expect.stringMatching(/^3\./u),
-      userVersion: 43,
+      userVersion: 45,
     });
   });
 
@@ -16900,7 +17951,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:45");
     const migrated = new StateStore(paths, { now: () => 4_000 });
     stores.push(migrated);
     expect(migrated.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtimeProfile);
@@ -16910,7 +17961,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
         .toEqual([
           { version: 35 },
@@ -16922,6 +17973,8 @@ describe("StateStore", () => {
           { version: 41 },
           { version: 42 },
           { version: 43 },
+          { version: 44 },
+          { version: 45 },
         ]);
       expect(inspector.query(
         `SELECT type,COUNT(*) AS count FROM sqlite_master
@@ -16967,7 +18020,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
         .toEqual([
           { version: 35 },
@@ -16979,6 +18032,8 @@ describe("StateStore", () => {
           { version: 41 },
           { version: 42 },
           { version: 43 },
+          { version: 44 },
+          { version: 45 },
         ]);
       expect(inspector.query(
         `SELECT name FROM sqlite_master WHERE type='table'
@@ -16993,7 +18048,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("migrates the exact protected-main provider-v39 predecessor through adoption v40 and timestamp v41", async () => {
+  test("migrates the exact provider-v39 predecessor through transcript finalization v43", async () => {
     const { store } = await fixture();
     const profile = store.createProfile("Provider v39 Devin");
     const session = seedLegacyDevinSession(store, {
@@ -17024,7 +18079,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:45");
     const migrated = new StateStore(paths, { now: () => 2_000 });
     stores.push(migrated);
     expect(migrated.requireSession(session.id)).toMatchObject({
@@ -17033,7 +18088,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=39 ORDER BY version",
       ).all()).toEqual([
@@ -17042,6 +18097,8 @@ describe("StateStore", () => {
         { version: 41 },
         { version: 42 },
         { version: 43 },
+        { version: 44 },
+        { version: 45 },
       ]);
       expect(inspector.query(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
@@ -17050,6 +18107,1719 @@ describe("StateStore", () => {
       inspector.close(false);
     }
   });
+
+  test("migrates exact timestamp-v41 Work guards to active Sol v42 without rewriting retired history", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Adoption v40 Devin history");
+    const session = seedLegacyDevinSession(store, {
+      profileId: profile.id,
+      provider: "devin",
+      preset: "astra",
+      fastEnabled: false,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const predecessor = new Database(paths.database, { create: false, strict: true });
+    let timestampGuardBefore: unknown;
+    let sessionBefore: unknown;
+    try {
+      downgradeToExactProviderVersion41(predecessor);
+      expect(predecessor.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      expect(predecessor.query(
+        "SELECT version FROM migrations WHERE version>=40 ORDER BY version",
+      ).all()).toEqual([{ version: 40 }, { version: 41 }]);
+      timestampGuardBefore = predecessor.query(
+        "SELECT type,tbl_name,sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'",
+      ).get();
+      sessionBefore = predecessor.query("SELECT * FROM sessions WHERE id=?").get(session.id);
+      expect(predecessor.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='work_devin_preset_contract_guard'",
+      ).get()).toEqual(expect.objectContaining({
+        sql: expect.stringContaining("s.provider_v39='devin'"),
+      }));
+      expect(predecessor.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='work_session_devin_contract_guard'",
+      ).get()).toEqual(expect.objectContaining({
+        sql: expect.stringContaining("FROM works AS w"),
+      }));
+    } finally {
+      predecessor.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:41:45");
+    const migrated = new StateStore(paths, { now: () => 2_000 });
+    stores.push(migrated);
+    expect(migrated.requireSession(session.id)).toMatchObject({
+      provider: "devin",
+      preset: "astra",
+    });
+
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
+      expect(inspector.query(
+        "SELECT version FROM migrations WHERE version>=40 ORDER BY version",
+      ).all()).toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }, { version: 45 }]);
+      expect(inspector.query(
+        "SELECT type,tbl_name,sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'",
+      ).get()).toEqual(timestampGuardBefore);
+      expect(inspector.query("SELECT * FROM sessions WHERE id=?").get(session.id))
+        .toEqual(sessionBefore);
+      const workGuard = z.object({ sql: z.string() }).parse(inspector.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='work_devin_preset_contract_guard'",
+      ).get()).sql;
+      expect(workGuard).toContain("NEW.preset_contract!=1");
+      expect(workGuard).not.toContain("provider_v39='devin'");
+      const sessionGuard = z.object({ sql: z.string() }).parse(inspector.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='work_session_devin_contract_guard'",
+      ).get()).sql;
+      expect(sessionGuard).toContain("NEW.preset_contract!=2");
+      expect(sessionGuard).toContain("w.coordinator_session_id=NEW.id");
+      expect(sessionGuard).not.toContain("w.coordinator_session_id=OLD.id");
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("migrates exact v42 sources without claiming unavailable transcript events", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Transcript v43", "transcript-v43@example.com");
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const appliedMutationKey = "43000000-0000-4000-8000-000000000001";
+    const preparedMutationKey = "43000000-0000-4000-8000-000000000002";
+    const legacyUnsafeName = `legacy${String.fromCodePoint(0x2028)}name.txt`;
+    const appliedMutation = store.prepareMutation({
+      kind: "session.send",
+      authorityId: session.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: "already dispatched" },
+      idempotencyKey: appliedMutationKey,
+    });
+    expect(store.transitionMutation(appliedMutation.id, "prepared", "effect_started")).toBe(true);
+    expect(store.transitionMutation(appliedMutation.id, "effect_started", "applied", { turnId: "old-turn" })).toBe(true);
+    store.prepareMutation({
+      kind: "session.send",
+      authorityId: session.id,
+      authorityGeneration: profile.processGeneration,
+      request: {
+        message: "not dispatched",
+        attachments: [{
+          byteLength: 4,
+          digest: "9".repeat(64),
+          mediaType: "text/plain",
+          name: legacyUnsafeName,
+        }],
+      },
+      idempotencyKey: preparedMutationKey,
+    });
+    const preparedDigest = store.readMutation(preparedMutationKey)?.requestDigest;
+    const dispatchingQueue = store.enqueue(session.id, "already dispatching");
+    expect(store.transitionQueue(dispatchingQueue.id, "pending", "dispatching")).toBe(true);
+    const pendingQueue = store.enqueue(session.id, "still pending");
+    const legacyAttachment = {
+      byteLength: 4,
+      canonicalMediaType: "text/plain" as const,
+      digest: "8".repeat(64),
+      mediaType: "text/plain" as const,
+      name: "legacy-safe-name.txt",
+    };
+    store.recordMessageAttachments({
+      attachments: [legacyAttachment],
+      sessionId: session.id,
+      sourceId: pendingQueue.id,
+    });
+    const laterPendingQueue = store.enqueue(session.id, "must not be blocked after upgrade");
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const predecessor = new Database(paths.database, { create: false, strict: true });
+    try {
+      downgradeToExactProviderVersion42(predecessor);
+      predecessor.exec("DROP TRIGGER message_attachments_immutable_update");
+      predecessor.query(
+        "UPDATE message_attachments SET name=? WHERE session_id=? AND source_id=?",
+      ).run(legacyUnsafeName, session.id, pendingQueue.id);
+      predecessor.exec(`
+        CREATE TRIGGER message_attachments_immutable_update
+        BEFORE UPDATE ON message_attachments
+        BEGIN SELECT RAISE(ABORT, 'message attachments are immutable'); END;
+      `);
+      expect(predecessor.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+      expect(predecessor.query(
+        "SELECT name FROM pragma_table_info('mutation_attempts') WHERE name='transcript_finalized'",
+      ).get()).toBeNull();
+      expect(predecessor.query(
+        "SELECT name FROM pragma_table_info('queue_entries') WHERE name='transcript_finalized'",
+      ).get()).toBeNull();
+    } finally {
+      predecessor.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:42:45");
+    const migrated = new StateStore(paths, { now: () => 4_300 });
+    stores.push(migrated);
+    expect(migrated.hasSessionUserMessageSource(session.id, "mutation", appliedMutationKey)).toBe(false);
+    expect(migrated.readSessionUserMessageSource(session.id, "mutation", appliedMutationKey))
+      .toEqual({ status: "unavailable" });
+    expect(migrated.hasSessionUserMessageSource(session.id, "mutation", preparedMutationKey)).toBe(false);
+    expect(migrated.readMutation(preparedMutationKey)).toMatchObject({
+      requestDigest: preparedDigest,
+      state: "prepared",
+    });
+    expect(migrated.hasSessionUserMessageSource(session.id, "queue", dispatchingQueue.id)).toBe(false);
+    expect(migrated.readSessionUserMessageSource(session.id, "queue", dispatchingQueue.id))
+      .toEqual({ status: "unavailable" });
+    expect(migrated.hasSessionUserMessageSource(session.id, "queue", pendingQueue.id)).toBe(false);
+    expect(migrated.requireQueue(pendingQueue.id)).toMatchObject({ state: "pending" });
+    expect(migrated.requireQueue(laterPendingQueue.id)).toMatchObject({ state: "pending" });
+    expect(migrated.messageAttachmentManifest(session.id, pendingQueue.id)).toEqual([{
+      byteLength: legacyAttachment.byteLength,
+      digest: legacyAttachment.digest,
+      mediaType: legacyAttachment.mediaType,
+      name: "legacy�name.txt",
+    }]);
+    expect(migrated.attachmentCustody(legacyAttachment.digest))
+      .toMatchObject({ referenceCount: 1 });
+    expect(migrated.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events
+      .filter((event) => event.body.type === "warning"))
+      .toEqual([]);
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
+      expect(inspector.query("SELECT version FROM migrations WHERE version>=40 ORDER BY version").all())
+        .toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }, { version: 45 }]);
+      expect(inspector.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_user_message_finalizations'",
+      ).get()).toBeNull();
+      expect(inspector.query(
+        `SELECT sql FROM sqlite_master WHERE type='trigger'
+         AND name='session_events_account_authority_guard'`,
+      ).get()).toEqual(expect.objectContaining({
+        sql: expect.stringContaining("p.process_generation>NEW.provider_generation"),
+      }));
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("upgrades exact main v43 through peer v44 and canonical memory v45 without changing released authority", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Main v43 upgrade", "main-v43@example.com");
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const queued = store.enqueueIdempotent({
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      message: "retain this v43 pending transcript",
+      idempotencyKey: "43000000-0000-4000-8000-000000000045",
+    });
+    const intent = store.readSessionUserMessageSource(session.id, "queue", queued.id);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const predecessor = new Database(paths.database, { create: false, strict: true });
+    try {
+      downgradeToExactProviderVersion43(predecessor);
+      const schemaBefore = predecessor.query(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name!='queue_entries' ORDER BY type,name",
+      ).all();
+      const ledgerBefore = predecessor.query("SELECT * FROM migrations ORDER BY version").all();
+      const sessionBefore = predecessor.query("SELECT * FROM sessions WHERE id=?").get(session.id);
+      const profileBefore = predecessor.query("SELECT * FROM profiles WHERE id=?").get(profile.id);
+      const queueBefore = predecessor.query(
+        "SELECT id,message,state,transcript_status,transcript_intent_json,transcript_finalized FROM queue_entries WHERE id=?",
+      ).get(queued.id);
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:45");
+      const upgraded = new StateStore(paths, { now: () => 4_500 });
+      stores.push(upgraded);
+      expect(predecessor.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
+      expect(predecessor.query("SELECT * FROM migrations WHERE version<=43 ORDER BY version").all())
+        .toEqual(ledgerBefore);
+      expect(predecessor.query("SELECT * FROM migrations WHERE version>43 ORDER BY version").all())
+        .toEqual([{ version: 44, applied_at: 4_500 }, { version: 45, applied_at: 4_500 }]);
+      const schemaAfter = predecessor.query(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name!='queue_entries' ORDER BY type,name",
+      ).all();
+      for (const row of z.array(z.unknown()).parse(schemaBefore)) {
+        expect(schemaAfter).toContainEqual(row);
+      }
+      expect(predecessor.query("SELECT * FROM sessions WHERE id=?").get(session.id)).toEqual(sessionBefore);
+      expect(predecessor.query("SELECT * FROM profiles WHERE id=?").get(profile.id)).toEqual(profileBefore);
+      expect(predecessor.query(
+        "SELECT id,message,state,transcript_status,transcript_intent_json,transcript_finalized FROM queue_entries WHERE id=?",
+      ).get(queued.id)).toEqual(queueBefore);
+      expect(predecessor.query("SELECT message_actor,peer_action_id FROM queue_entries WHERE id=?").get(queued.id))
+        .toEqual({ message_actor: "human", peer_action_id: null });
+      expect(upgraded.readSessionUserMessageSource(session.id, "queue", queued.id)).toEqual(intent);
+      expect(predecessor.query(
+        "SELECT name FROM sqlite_master WHERE name IN ('session_peer_policies','memory_submissions','project_memory_sync_intents') ORDER BY name",
+      ).all()).toEqual([
+        { name: "memory_submissions" },
+        { name: "project_memory_sync_intents" },
+        { name: "session_peer_policies" },
+      ]);
+      const readonly = new StateStore(paths, { readonly: true });
+      stores.push(readonly);
+      expect(readonly.requireSession(session.id)).toEqual(upgraded.requireSession(session.id));
+    } finally {
+      predecessor.close(false);
+    }
+  });
+
+  test("normalizes pre-release v43 attachment names without losing pending or effect-crossed messages", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Transcript v43 repair", "transcript-v43-repair@example.com");
+    const session = createProvenTestSession(store, {
+      fastEnabled: false,
+      preset: "high",
+      profileId: profile.id,
+      state: "idle",
+    });
+    const attachment = {
+      byteLength: 4,
+      canonicalMediaType: "text/plain" as const,
+      digest: "c".repeat(64),
+      mediaType: "text/plain" as const,
+      name: "pre-release-safe.txt",
+    };
+    const queued = store.enqueueIdempotent({
+      attachments: [{
+        byteLength: attachment.byteLength,
+        digest: attachment.digest,
+        mediaType: attachment.mediaType,
+        name: attachment.name,
+      }],
+      idempotencyKey: "43000000-0000-4000-8000-000000000003",
+      message: "pre-release pending queue",
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+      storedAttachments: [attachment],
+    });
+    const dispatchedAttachment = {
+      ...attachment,
+      digest: "d".repeat(64),
+      name: "pre-release-dispatched.txt",
+    };
+    const dispatched = store.enqueueIdempotent({
+      attachments: [{
+        byteLength: dispatchedAttachment.byteLength,
+        digest: dispatchedAttachment.digest,
+        mediaType: dispatchedAttachment.mediaType,
+        name: dispatchedAttachment.name,
+      }],
+      idempotencyKey: "43000000-0000-4000-8000-000000000004",
+      message: "pre-release effect-crossed queue",
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+      storedAttachments: [dispatchedAttachment],
+    });
+    expect(store.transitionQueue(dispatched.id, "pending", "dispatching")).toBe(true);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const unsafeName = `pre-release${String.fromCodePoint(0x2029)}name.txt`;
+    const predecessor = new Database(paths.database, { create: false, strict: true });
+    try {
+      downgradeToExactProviderVersion43(predecessor);
+      const triggers = z.array(z.object({ name: z.string(), sql: z.string() }).strict()).parse(
+        predecessor.query(
+          `SELECT name,sql FROM sqlite_master WHERE type='trigger'
+           AND name IN ('message_attachments_immutable_update','queue_transcript_finalization_guard')
+           ORDER BY name`,
+        ).all(),
+      );
+      expect(triggers).toHaveLength(2);
+      for (const trigger of triggers) predecessor.exec(`DROP TRIGGER ${trigger.name}`);
+      for (const sourceId of [queued.id, dispatched.id]) {
+        predecessor.query(
+          "UPDATE message_attachments SET name=? WHERE session_id=? AND source_id=?",
+        ).run(unsafeName, session.id, sourceId);
+        predecessor.query(
+          `UPDATE queue_entries
+           SET transcript_intent_json=json_set(
+             transcript_intent_json,'$.attachments[0].name',?
+           ) WHERE id=?`,
+        ).run(unsafeName, sourceId);
+      }
+      for (const trigger of triggers) predecessor.exec(trigger.sql);
+    } finally {
+      predecessor.close(false);
+    }
+
+    const repaired = new StateStore(paths, { now: () => 4_301 });
+    stores.push(repaired);
+    expect(repaired.requireQueue(queued.id)).toMatchObject({
+      message: "pre-release pending queue",
+      state: "pending",
+    });
+    expect(repaired.readSessionUserMessageSource(session.id, "queue", queued.id)).toEqual({
+      status: "pending",
+      intent: expect.objectContaining({
+        actor: "human",
+        attachments: [expect.objectContaining({ name: "pre-release�name.txt" })],
+        text: "pre-release pending queue",
+        version: 1,
+      }),
+    });
+    expect(repaired.messageAttachmentManifest(session.id, queued.id)).toEqual([{
+      byteLength: attachment.byteLength,
+      digest: attachment.digest,
+      mediaType: attachment.mediaType,
+      name: "pre-release�name.txt",
+    }]);
+    expect(repaired.attachmentCustody(attachment.digest)).toMatchObject({ referenceCount: 1 });
+    expect(repaired.requireQueue(dispatched.id)).toMatchObject({
+      message: "pre-release effect-crossed queue",
+      state: "dispatching",
+    });
+    expect(repaired.readSessionUserMessageSource(session.id, "queue", dispatched.id))
+      .toMatchObject({
+        intent: expect.objectContaining({
+          attachments: [expect.objectContaining({ name: "pre-release�name.txt" })],
+          text: "pre-release effect-crossed queue",
+        }),
+        status: "pending",
+      });
+    expect(repaired.messageAttachmentManifest(session.id, dispatched.id)[0]?.name)
+      .toBe("pre-release�name.txt");
+    expect(repaired.attachmentCustody(dispatchedAttachment.digest))
+      .toMatchObject({ referenceCount: 1 });
+
+    repaired.close();
+    stores.splice(stores.indexOf(repaired), 1);
+    const reopened = new StateStore(paths, { now: () => 4_302 });
+    stores.push(reopened);
+    expect(reopened.readSessionUserMessageSource(session.id, "queue", queued.id))
+      .toMatchObject({ status: "pending" });
+    expect(reopened.messageAttachmentManifest(session.id, queued.id)[0]?.name)
+      .toBe("pre-release�name.txt");
+  });
+
+  test("normalizes colliding v43 manifest and pending-intent names without collapsing positions", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Transcript v43 collisions", "transcript-v43-collisions@example.com");
+    const session = createProvenTestSession(store, {
+      fastEnabled: false,
+      preset: "high",
+      profileId: profile.id,
+      state: "idle",
+    });
+    const digest = "f".repeat(64);
+    const storedAttachments = ["collision-one.txt", "collision-two.txt", "same�name.txt"]
+      .map((name) => ({
+        byteLength: 4,
+        canonicalMediaType: "text/plain" as const,
+        digest,
+        mediaType: "text/plain" as const,
+        name,
+      }));
+    const queued = store.enqueueIdempotent({
+      attachments: storedAttachments.map((value) => ({
+        byteLength: value.byteLength,
+        digest: value.digest,
+        mediaType: value.mediaType,
+        name: value.name,
+      })),
+      idempotencyKey: "43000000-0000-4000-8000-00000000000d",
+      message: "preserve every colliding position",
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+      storedAttachments,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const predecessorNames = [
+      `same${String.fromCodePoint(0x2028)}name.txt`,
+      `same${String.fromCodePoint(0x2029)}name.txt`,
+      "same�name.txt",
+    ];
+    const damaged = new Database(paths.database, { create: false, strict: true });
+    try {
+      downgradeToExactProviderVersion43(damaged);
+      const triggers = z.array(z.object({ name: z.string(), sql: z.string() }).strict()).parse(
+        damaged.query(
+          `SELECT name,sql FROM sqlite_master WHERE type='trigger'
+           AND name IN ('message_attachments_immutable_update','queue_transcript_finalization_guard')
+           ORDER BY name`,
+        ).all(),
+      );
+      for (const trigger of triggers) damaged.exec(`DROP TRIGGER ${trigger.name}`);
+      for (const [position, name] of predecessorNames.entries()) {
+        damaged.query(
+          `UPDATE message_attachments SET name=?
+           WHERE session_id=? AND source_id=? AND position=?`,
+        ).run(name, session.id, queued.id, position);
+        damaged.query(
+          `UPDATE queue_entries SET transcript_intent_json=json_set(
+             transcript_intent_json,?,?
+           ) WHERE id=?`,
+        ).run(`$.attachments[${String(position)}].name`, name, queued.id);
+      }
+      for (const trigger of triggers) damaged.exec(trigger.sql);
+    } finally {
+      damaged.close(false);
+    }
+
+    const repaired = new StateStore(paths, { now: () => 4_302 });
+    stores.push(repaired);
+    const expectedNames = [
+      "same�name~1.txt",
+      "same�name~2.txt",
+      "same�name.txt",
+    ];
+    expect(repaired.messageAttachmentManifest(session.id, queued.id)
+      .map(({ name }) => name)).toEqual(expectedNames);
+    const source = repaired.readSessionUserMessageSource(session.id, "queue", queued.id);
+    expect(source).toMatchObject({ status: "pending" });
+    if (
+      source.status !== "pending"
+      || source.intent === undefined
+      || !("text" in source.intent)
+    ) throw new Error("Expected a pending transcript intent.");
+    expect(source.intent.attachments?.map(({ name }) => name)).toEqual(expectedNames);
+    expect(repaired.attachmentCustody(digest)).toMatchObject({ referenceCount: 3 });
+  });
+
+  test("rejects a missing v43 queue-cancellation guard on readonly open and repairs it on writable open", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const damaged = new Database(paths.database, { create: false, strict: true });
+    try {
+      downgradeToExactProviderVersion43(damaged);
+      damaged.exec("DROP TRIGGER queue_transcript_cancellation_settlement");
+    } finally {
+      damaged.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:45");
+    const repaired = new StateStore(paths);
+    stores.push(repaired);
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        `SELECT type FROM sqlite_master
+         WHERE name='queue_transcript_cancellation_settlement'`,
+      ).get()).toEqual({ type: "trigger" });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("upgrades the exact pre-rebind v43 queue transcript guard on writable open only", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const predecessor = new Database(paths.database, { create: false, strict: true });
+    try {
+      downgradeToExactProviderVersion43(predecessor);
+      const trigger = z.object({ sql: z.string() }).strict().parse(predecessor.query(
+        `SELECT sql FROM sqlite_master
+         WHERE type='trigger' AND name='queue_transcript_finalization_guard'`,
+      ).get());
+      const start = trigger.sql.indexOf("  OR (OLD.state='pending' AND NEW.state='pending'");
+      const end = trigger.sql.indexOf(
+        "\n  OR (OLD.transcript_status='pending' AND OLD.transcript_finalized=0\n"
+          + "    AND NEW.transcript_status='finalized'",
+        start,
+      );
+      expect(start).toBeGreaterThan(0);
+      expect(end).toBeGreaterThan(start);
+      const legacySql = trigger.sql.slice(0, start) + trigger.sql.slice(end);
+      predecessor.exec("DROP TRIGGER queue_transcript_finalization_guard");
+      predecessor.exec(legacySql);
+    } finally {
+      predecessor.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:45");
+    const upgraded = new StateStore(paths);
+    stores.push(upgraded);
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(z.object({ sql: z.string() }).strict().parse(inspector.query(
+        `SELECT sql FROM sqlite_master
+         WHERE type='trigger' AND name='queue_transcript_finalization_guard'`,
+      ).get()).sql).toContain("OLD.state='pending' AND NEW.state='pending'");
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("retroactively settles a cancelled v43 queue before accepting its authority surface", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Cancelled v43 repair", "cancelled-v43@example.com");
+    const session = createProvenTestSession(store, {
+      fastEnabled: false,
+      preset: "high",
+      profileId: profile.id,
+      state: "idle",
+    });
+    const attachment = {
+      byteLength: 4,
+      canonicalMediaType: "text/plain" as const,
+      digest: "e".repeat(64),
+      mediaType: "text/plain" as const,
+      name: "cancelled-v43.txt",
+    };
+    const queued = store.enqueueIdempotent({
+      attachments: [{
+        byteLength: attachment.byteLength,
+        digest: attachment.digest,
+        mediaType: attachment.mediaType,
+        name: attachment.name,
+      }],
+      idempotencyKey: "43000000-0000-4000-8000-000000000005",
+      message: "must be scrubbed after cancellation repair",
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+      storedAttachments: [attachment],
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const damaged = new Database(paths.database, { create: false, strict: true });
+    try {
+      downgradeToExactProviderVersion43(damaged);
+      const triggers = z.array(z.object({
+        name: z.string(),
+        sql: z.string(),
+      }).strict()).parse(damaged.query(
+        `SELECT name,sql FROM sqlite_master WHERE type='trigger'
+         AND name IN (
+           'message_attachments_immutable_update',
+           'queue_transcript_cancellation_settlement',
+           'queue_transcript_finalization_guard'
+         ) ORDER BY name`,
+      ).all());
+      expect(triggers).toHaveLength(3);
+      for (const trigger of triggers) damaged.exec(`DROP TRIGGER ${trigger.name}`);
+      const unsafeName = `cancelled${String.fromCodePoint(0x2028)}v43.txt`;
+      damaged.query(
+        "UPDATE message_attachments SET name=? WHERE session_id=? AND source_id=?",
+      ).run(unsafeName, session.id, queued.id);
+      damaged.query(
+        `UPDATE queue_entries SET transcript_intent_json=json_set(
+           transcript_intent_json,'$.attachments[0].name',?
+         ) WHERE id=?`,
+      ).run(unsafeName, queued.id);
+      damaged.query(
+        "UPDATE queue_entries SET state='cancelled' WHERE id=? AND state='pending'",
+      ).run(queued.id);
+      damaged.query("DELETE FROM queue_message_scrub_authority WHERE singleton=1").run();
+      // Model the earlier pre-release repair: it could install the trigger but
+      // did not settle rows cancelled before installation, even after an old
+      // message-only scrub checkpoint completed.
+      for (const trigger of triggers) damaged.exec(trigger.sql);
+    } finally {
+      damaged.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:45");
+    const repaired = new StateStore(paths, { now: () => 4_303 });
+    stores.push(repaired);
+    expect(repaired.requireQueue(queued.id)).toMatchObject({ state: "cancelled" });
+    expect(repaired.readSessionUserMessageSource(session.id, "queue", queued.id)).toEqual({
+      status: "abandoned",
+      intent: { actor: "human", hadAttachments: true, version: 1 },
+    });
+    expect(repaired.messageAttachmentManifest(session.id, queued.id)).toEqual([]);
+    expect(repaired.attachmentCustody(attachment.digest)).toMatchObject({ referenceCount: 0 });
+  });
+
+  test("refuses a colliding session-event authority guard during v43 migration", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const predecessor = new Database(paths.database, { create: false, strict: true });
+    let schemaBefore: unknown[] = [];
+    try {
+      downgradeToExactProviderVersion42(predecessor);
+      predecessor.exec(`
+        DROP TRIGGER session_events_account_authority_guard;
+        CREATE TRIGGER session_events_account_authority_guard
+        BEFORE INSERT ON session_events BEGIN SELECT 1; END;
+      `);
+      schemaBefore = predecessor.query(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+      ).all();
+    } finally {
+      predecessor.close(false);
+    }
+
+    expect(() => new StateStore(paths))
+      .toThrow("STATE_SCHEMA_V43_SESSION_EVENT_AUTHORITY_GUARD_COLLISION");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+      expect(inspector.query(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+      ).all()).toEqual(schemaBefore);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("rolls back the whole v43 migration when its ledger stamp is refused", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const predecessor = new Database(paths.database, { create: false, strict: true });
+    let accountAuthorityGuardBefore: unknown;
+    try {
+      downgradeToExactProviderVersion42(predecessor);
+      accountAuthorityGuardBefore = predecessor.query(
+        `SELECT type,name,tbl_name,sql FROM sqlite_master
+         WHERE type='trigger' AND name='session_events_account_authority_guard'`,
+      ).get();
+      predecessor.exec(`
+        CREATE TRIGGER reject_v43_migration_stamp
+        BEFORE INSERT ON migrations WHEN NEW.version=43
+        BEGIN SELECT RAISE(ABORT,'reject v43 migration stamp'); END;
+      `);
+    } finally {
+      predecessor.close(false);
+    }
+
+    expect(() => new StateStore(paths)).toThrow("reject v43 migration stamp");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+      expect(inspector.query("SELECT 1 FROM migrations WHERE version=43").get()).toBeNull();
+      expect(inspector.query(
+        `SELECT name FROM pragma_table_info('mutation_attempts')
+         WHERE name='transcript_finalized'`,
+      ).get()).toBeNull();
+      expect(inspector.query(
+        `SELECT name FROM pragma_table_info('mutation_attempts')
+         WHERE name IN ('transcript_status','transcript_intent_json')`,
+      ).all()).toEqual([]);
+      expect(inspector.query(
+        `SELECT name FROM pragma_table_info('queue_entries')
+         WHERE name='transcript_finalized'`,
+      ).get()).toBeNull();
+      expect(inspector.query(
+        `SELECT name FROM pragma_table_info('queue_entries')
+         WHERE name IN ('transcript_status','transcript_intent_json')`,
+      ).all()).toEqual([]);
+      expect(inspector.query(
+        `SELECT name FROM sqlite_master WHERE type='trigger'
+         AND name IN ('mutation_transcript_finalization_guard','queue_transcript_finalization_guard')`,
+      ).all()).toEqual([]);
+      expect(inspector.query(
+        `SELECT type,name,tbl_name,sql FROM sqlite_master
+         WHERE type='trigger' AND name='session_events_account_authority_guard'`,
+      ).get()).toEqual(accountAuthorityGuardBefore);
+    } finally {
+      inspector.close(false);
+    }
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:42:45");
+  });
+
+  test("refuses a missing or weakened v43 transcript authority guard without repair", async () => {
+    for (const damage of ["missing", "weakened"] as const) {
+      const { store } = await fixture();
+      const paths = store.paths;
+      store.close();
+      stores.splice(stores.indexOf(store), 1);
+      const malformed = new Database(paths.database, { create: false, strict: true });
+      try {
+        malformed.exec("DROP TRIGGER session_events_account_authority_guard");
+        if (damage === "weakened") {
+          malformed.exec(`
+            CREATE TRIGGER session_events_account_authority_guard
+            BEFORE INSERT ON session_events BEGIN SELECT 1; END;
+          `);
+        }
+        const schemaBefore = malformed.query(
+          "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+        ).all();
+        const ledgerBefore = malformed.query(
+          "SELECT * FROM migrations ORDER BY version",
+        ).all();
+        for (const readonly of [true, false]) {
+          expect(() => new StateStore(paths, readonly ? { readonly: true } : {}))
+            .toThrow("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+          expect(malformed.query(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+          ).all()).toEqual(schemaBefore);
+          expect(malformed.query("SELECT * FROM migrations ORDER BY version").all())
+            .toEqual(ledgerBefore);
+        }
+      } finally {
+        malformed.close(false);
+      }
+    }
+  });
+
+  test("refuses to begin a direct user-message effect without exact connection provenance", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Transcript connection authority",
+      "transcript-connection@example.com",
+    );
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      state: "active",
+      activeTurnId: "turn-transcript-connection",
+    });
+    const key = "43000000-0000-4000-8000-000000000014";
+    const attempt = store.prepareMutation({
+      kind: "session.steer",
+      authorityId: session.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: "must retain exact connection provenance" },
+      idempotencyKey: key,
+    });
+
+    expect(() => store.beginSessionMutationEffect({
+      message: "must retain exact connection provenance",
+      attemptId: attempt.id,
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      transcript: {
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: null as unknown as string,
+        actor: "human",
+        message: "must retain exact connection provenance",
+      },
+      evidence: {
+        kind: "session.steer",
+        providerThreadId: session.providerThreadId ?? "",
+        baseline: {
+          providerUpdatedAt: null,
+          status: "active",
+          activeTurnId: "turn-transcript-connection",
+        },
+        activeTurnId: "turn-transcript-connection",
+        clientMessageId: attempt.id,
+        messageDigest: createHash("sha256")
+          .update("must retain exact connection provenance")
+          .digest("hex"),
+      },
+    })).toThrow();
+
+    expect(store.readMutation(key)).toMatchObject({ state: "prepared" });
+    expect(store.readMutation(key)?.evidence).toBeUndefined();
+    expect(store.readSessionUserMessageSource(session.id, "mutation", key))
+      .toEqual({ status: "none" });
+  });
+
+  test("finalizes historical colliding mutation and queue source strings independently", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Transcript collision", "transcript-collision@example.com");
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const queued = store.enqueueIdempotent({
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      message: "queued collision source",
+    });
+    const attempt = store.prepareMutation({
+      kind: "session.steer",
+      authorityId: session.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: "mutation collision source" },
+      idempotencyKey: queued.id,
+    });
+    store.beginSessionMutationEffect({
+      message: "mutation collision source",
+      attemptId: attempt.id,
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      transcript: {
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-00000000000f",
+        actor: "human",
+        message: "mutation collision source",
+      },
+      evidence: {
+        kind: "session.steer",
+        providerThreadId: session.providerThreadId ?? "",
+        baseline: { providerUpdatedAt: null, status: "active", activeTurnId: "turn-collision" },
+        activeTurnId: "turn-collision",
+        clientMessageId: attempt.id,
+        messageDigest: createHash("sha256").update("mutation collision source").digest("hex"),
+      },
+    });
+    expect(store.transitionMutation(attempt.id, "effect_started", "applied", {
+      steered: true,
+      activeTurnId: "turn-collision",
+    })).toBe(true);
+    store.nextProfileGeneration(profile.id);
+
+    store.finalizeSessionUserMessageSource({
+      sessionId: session.id,
+      sourceKind: "mutation",
+      sourceId: queued.id,
+      turnId: "turn-collision",
+    });
+    expect(store.hasSessionUserMessageSource(session.id, "mutation", queued.id)).toBe(true);
+    expect(store.hasSessionUserMessageSource(session.id, "queue", queued.id)).toBe(false);
+    expect(store.transitionQueue(queued.id, "pending", "dispatching")).toBe(true);
+    expect(store.transitionQueue(queued.id, "dispatching", "applied")).toBe(true);
+    store.finalizeSessionUserMessageSource({
+      sessionId: session.id,
+      sourceKind: "queue",
+      sourceId: queued.id,
+      turnId: "turn-collision",
+    });
+    expect(store.hasSessionUserMessageSource(session.id, "mutation", queued.id)).toBe(true);
+    expect(store.hasSessionUserMessageSource(session.id, "queue", queued.id)).toBe(true);
+    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events
+      .filter((event) => event.body.type === "user_message")).toHaveLength(2);
+  });
+
+  test("rolls a settled-source transcript append and source finalization back together", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Transcript retry", "transcript-retry@example.com");
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      state: "active",
+      activeTurnId: "turn-transcript-retry",
+    });
+    const key = "43000000-0000-4000-8000-000000000009";
+    const attempt = store.prepareMutation({
+      kind: "session.steer",
+      authorityId: session.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: "retry this transcript append" },
+      idempotencyKey: key,
+    });
+    store.beginSessionMutationEffect({
+      message: "retry this transcript append",
+      attemptId: attempt.id,
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      transcript: {
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000010",
+        actor: "human",
+        message: "retry this transcript append",
+      },
+      evidence: {
+        kind: "session.steer",
+        providerThreadId: session.providerThreadId ?? "",
+        baseline: {
+          providerUpdatedAt: null,
+          status: "active",
+          activeTurnId: "turn-transcript-retry",
+        },
+        activeTurnId: "turn-transcript-retry",
+        clientMessageId: attempt.id,
+        messageDigest: createHash("sha256")
+          .update("retry this transcript append")
+          .digest("hex"),
+      },
+    });
+    expect(store.transitionMutation(attempt.id, "effect_started", "applied", {
+      steered: true,
+      activeTurnId: "turn-transcript-retry",
+    })).toBe(true);
+
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    inspector.exec(`CREATE TRIGGER reject_transcript_append
+      BEFORE INSERT ON session_events
+      BEGIN SELECT RAISE(ABORT,'reject transcript append'); END;`);
+    expect(() => store.finalizeSessionUserMessageSource({
+      sessionId: session.id,
+      sourceKind: "mutation",
+      sourceId: key,
+      turnId: "turn-transcript-retry",
+    })).toThrow("reject transcript append");
+    expect(store.readSessionUserMessageSource(session.id, "mutation", key))
+      .toMatchObject({ status: "pending", intent: { text: "retry this transcript append" } });
+    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events)
+      .toHaveLength(0);
+
+    inspector.exec("DROP TRIGGER reject_transcript_append");
+    const finalized = store.finalizeSessionUserMessageSource({
+      sessionId: session.id,
+      sourceKind: "mutation",
+      sourceId: key,
+      turnId: "turn-transcript-retry",
+    });
+    expect(finalized?.body).toMatchObject({
+      type: "user_message",
+      sourceId: key,
+      text: "retry this transcript append",
+    });
+    expect(store.readSessionUserMessageSource(session.id, "mutation", key)).toEqual({
+      status: "finalized",
+      intent: { version: 1, actor: "human", hadAttachments: false },
+    });
+    expect(store.finalizeSessionUserMessageSource({
+      sessionId: session.id,
+      sourceKind: "mutation",
+      sourceId: key,
+      turnId: "turn-transcript-retry",
+    })).toBeNull();
+    inspector.close(false);
+  });
+
+  test("rolls proven-applied mutation recovery back when transcript finalization fails", async () => {
+    let currentTime = 1_000;
+    const { store } = await fixture({ now: () => currentTime });
+    const profile = signInProfile(
+      store,
+      "Transcript mutation recovery",
+      "transcript-mutation-recovery@example.com",
+    );
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerUpdatedAt: 10,
+      state: "idle",
+    });
+    const runtime = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      observedAt: 2_000,
+      preset: "high" as const,
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max" as const,
+      serviceTier: null,
+      fast: false,
+      approvalPolicy: "on-request" as const,
+      reviewMode: "auto_review" as const,
+      permissionProfile: ":workspace" as const,
+      computerUse: true as const,
+      pluginCapability: true as const,
+      enabledApps: [],
+    };
+    const key = "43000000-0000-4000-8000-00000000000a";
+    const message = "recover this accepted send";
+    const attempt = store.prepareMutation({
+      kind: "session.send",
+      authorityId: session.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message },
+      idempotencyKey: key,
+    });
+    const effect = store.beginSessionMutationEffect({
+      message,
+      attemptId: attempt.id,
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      transcript: {
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000011",
+        actor: "human",
+        message,
+      },
+      evidence: {
+        kind: "session.send",
+        providerThreadId: session.providerThreadId ?? "",
+        baseline: { providerUpdatedAt: 10, status: "idle", activeTurnId: null },
+        clientMessageId: attempt.id,
+        messageDigest: createHash("sha256").update(message).digest("hex"),
+        runtimeProfile: runtime,
+      },
+    });
+    expect(store.transitionMutation(attempt.id, "effect_started", "ambiguous", {
+      code: "commit_error",
+    })).toBe(true);
+    const quarantined = store.quarantineSession(session.id);
+    const recovery = {
+      attemptId: attempt.id,
+      expectedOriginalState: "ambiguous" as const,
+      expectedEvidenceDigest: effect.digest,
+      resolution: "proven_applied" as const,
+      resolutionEvidence: { source: "exact_provider_projection" },
+      receipt: { turnId: "turn-transcript-mutation-recovery" },
+      provider: {
+        providerThreadId: session.providerThreadId ?? "",
+        title: "Recovered mutation transcript",
+        status: "active" as const,
+        activeTurnId: "turn-transcript-mutation-recovery",
+        providerUpdatedAt: 20,
+      },
+    };
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    inspector.exec(`CREATE TRIGGER reject_recovered_mutation_transcript
+      BEFORE INSERT ON session_events
+      BEGIN SELECT RAISE(ABORT,'reject recovered mutation transcript'); END;`);
+
+    expect(() => store.resolveSessionMutation(recovery))
+      .toThrow("reject recovered mutation transcript");
+    expect(store.requireSession(session.id)).toEqual(quarantined);
+    expect(store.readMutation(key)).toMatchObject({ state: "ambiguous" });
+    expect(store.readMutation(key)?.resolution).toBeUndefined();
+    expect(store.readSessionUserMessageSource(session.id, "mutation", key))
+      .toMatchObject({ status: "pending", intent: { text: message } });
+    expect(store.latestSessionRuntimeProfile(session.id)).toBeNull();
+    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events)
+      .toHaveLength(0);
+
+    inspector.exec("DROP TRIGGER reject_recovered_mutation_transcript");
+    expect(() => store.resolveSessionMutation({ ...recovery, message: `${message} changed` }))
+      .toThrow("SESSION_MESSAGE_DIGEST_MISMATCH");
+    expect(store.requireSession(session.id)).toEqual(quarantined);
+    expect(store.readMutation(key)?.resolution).toBeUndefined();
+    expect(store.resolveSessionMutation(recovery)).toMatchObject({
+      state: "active",
+      activeTurnId: "turn-transcript-mutation-recovery",
+    });
+    expect(store.readMutation(key)).toMatchObject({
+      state: "reconciled",
+      resolution: { kind: "proven_applied" },
+      result: { turnId: "turn-transcript-mutation-recovery" },
+    });
+    expect(store.readSessionUserMessageSource(session.id, "mutation", key))
+      .toMatchObject({ status: "finalized", intent: { hadAttachments: false } });
+    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events
+      .filter((event) => event.body.type === "user_message")).toHaveLength(1);
+    expect(store.readSessionMessageEventSource(session.id, attempt.id)).toMatchObject({
+      actor: "human",
+      sourceKind: "mutation",
+    });
+    const settled = store.readMutation(key);
+    currentTime += SESSION_EVENT_RETAIN_AGE_MS + 1;
+    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events)
+      .toEqual([]);
+    expect(store.readSessionMessageEventSource(session.id, attempt.id)).toBeNull();
+    for (const replayMessage of [message, `${message} changed`]) {
+      expect(() => store.resolveSessionMutation({ ...recovery, message: replayMessage })).toThrow();
+    }
+    expect(store.readMutation(key)).toEqual(settled);
+    expect(store.finalizeSessionUserMessageSource({
+      sessionId: session.id,
+      sourceKind: "mutation",
+      sourceId: key,
+      turnId: "turn-transcript-mutation-recovery",
+    })).toBeNull();
+    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events)
+      .toEqual([]);
+    inspector.close(false);
+  });
+
+  test("rolls proven-applied queue recovery back when transcript finalization fails", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Transcript queue recovery",
+      "transcript-queue-recovery@example.com",
+    );
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerUpdatedAt: 10,
+      state: "idle",
+    });
+    const runtime = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      observedAt: 2_000,
+      preset: "high" as const,
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max" as const,
+      serviceTier: null,
+      fast: false,
+      approvalPolicy: "on-request" as const,
+      reviewMode: "auto_review" as const,
+      permissionProfile: ":workspace" as const,
+      computerUse: true as const,
+      pluginCapability: true as const,
+      enabledApps: [],
+    };
+    const queued = store.enqueueIdempotent({
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      message: "recover this accepted queue dispatch",
+      idempotencyKey: "43000000-0000-4000-8000-00000000000b",
+    });
+    const effect = store.beginQueueEffect({
+      queueId: queued.id,
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000009",
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: queued.id,
+        sessionId: session.id,
+        providerThreadId: session.providerThreadId ?? "",
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: 10, status: "idle", activeTurnId: null },
+        clientMessageId: queued.id,
+        messageDigest: createHash("sha256")
+          .update("recover this accepted queue dispatch")
+          .digest("hex"),
+        runtimeProfile: runtime,
+      },
+    });
+    const quarantined = store.markQueueEffectAmbiguous(queued.id, effect.digest);
+    const recovery = {
+      queueId: queued.id,
+      expectedEvidenceDigest: effect.digest,
+      resolution: "proven_applied" as const,
+      resolutionEvidence: { source: "exact_provider_projection" },
+      receipt: { turnId: "turn-transcript-queue-recovery" },
+      provider: {
+        providerThreadId: session.providerThreadId ?? "",
+        title: "Recovered queue transcript",
+        status: "idle" as const,
+        providerUpdatedAt: 20,
+      },
+    };
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    inspector.exec(`CREATE TRIGGER reject_recovered_queue_transcript
+      BEFORE INSERT ON session_events
+      BEGIN SELECT RAISE(ABORT,'reject recovered queue transcript'); END;`);
+
+    expect(() => store.resolveQueueEffect(recovery))
+      .toThrow("reject recovered queue transcript");
+    expect(store.requireSession(session.id)).toEqual(quarantined);
+    expect(store.readQueueEffect(queued.id)?.resolution).toBeUndefined();
+    expect(store.listUnsettledQueueEffects(session.id)).toHaveLength(1);
+    expect(store.readSessionUserMessageSource(session.id, "queue", queued.id))
+      .toMatchObject({ status: "pending", intent: { text: "recover this accepted queue dispatch" } });
+    expect(store.latestSessionRuntimeProfile(session.id)).toBeNull();
+    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events)
+      .toHaveLength(0);
+
+    inspector.exec("DROP TRIGGER reject_recovered_queue_transcript");
+    expect(store.resolveQueueEffect(recovery)).toMatchObject({
+      state: "idle",
+      title: "Recovered queue transcript",
+    });
+    expect(store.readQueueEffect(queued.id)).toMatchObject({
+      resolution: { kind: "proven_applied" },
+    });
+    expect(store.listUnsettledQueueEffects(session.id)).toEqual([]);
+    expect(store.readSessionUserMessageSource(session.id, "queue", queued.id))
+      .toMatchObject({ status: "finalized", intent: { hadAttachments: false } });
+    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events
+      .filter((event) => event.body.type === "user_message")).toHaveLength(1);
+    inspector.close(false);
+  });
+
+  test("rebinds queued transcript provenance to the generation and connection that dispatch it", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Queue provenance", "queue-provenance@example.com");
+    const session = createProvenTestSession(store, {
+      fastEnabled: false,
+      preset: "high",
+      profileId: profile.id,
+      providerUpdatedAt: 10,
+      state: "idle",
+    });
+    const queued = store.enqueueIdempotent({
+      idempotencyKey: "43000000-0000-4000-8000-00000000000c",
+      message: "dispatch after reconnect",
+      profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000211",
+      sessionId: session.id,
+    });
+    const restarted = store.nextProfileGeneration(profile.id);
+    const connectionId = "10000000-0000-4000-8000-000000000212";
+    const runtime = {
+      approvalPolicy: "on-request" as const,
+      computerUse: true as const,
+      enabledApps: [],
+      fast: false,
+      model: "gpt-5.6-sol",
+      observedAt: 2_100,
+      permissionProfile: ":workspace" as const,
+      pluginCapability: true as const,
+      preset: "high" as const,
+      processGeneration: restarted.processGeneration,
+      profileId: restarted.id,
+      reasoningEffort: "max" as const,
+      reviewMode: "auto_review" as const,
+      serviceTier: null,
+    };
+    const queueEffectInput = {
+      evidence: {
+        baseline: { activeTurnId: null, providerUpdatedAt: 10, status: "idle" },
+        clientMessageId: queued.id,
+        kind: "queue.dispatch",
+        messageDigest: createHash("sha256").update("dispatch after reconnect").digest("hex"),
+        profileGeneration: restarted.processGeneration,
+        providerThreadId: session.providerThreadId ?? "",
+        queueId: queued.id,
+        runtimeProfile: runtime,
+        sessionId: session.id,
+      },
+      profileGeneration: restarted.processGeneration,
+      queueId: queued.id,
+      sessionId: session.id,
+    } satisfies Omit<
+      Parameters<StateStore["beginQueueEffect"]>[0],
+      "providerConnectionId"
+    >;
+    expect(() => store.beginQueueEffect({
+      ...queueEffectInput,
+      providerConnectionId: null as unknown as string,
+    })).toThrow();
+    expect(store.requireQueue(queued.id)).toMatchObject({ state: "pending" });
+    expect(store.readQueueEffect(queued.id)).toBeNull();
+    store.beginQueueEffect({
+      ...queueEffectInput,
+      providerConnectionId: connectionId,
+    });
+    expect(store.readSessionUserMessageSource(session.id, "queue", queued.id))
+      .toMatchObject({
+        intent: {
+          accountId: restarted.id,
+          providerConnectionId: connectionId,
+          providerGeneration: restarted.processGeneration,
+          text: "dispatch after reconnect",
+        },
+        status: "pending",
+      });
+    expect(store.transitionQueue(queued.id, "dispatching", "applied")).toBe(true);
+    const event = store.finalizeSessionUserMessageSource({
+      sessionId: session.id,
+      sourceId: queued.id,
+      sourceKind: "queue",
+      turnId: "turn-after-reconnect",
+    });
+    expect(event).toMatchObject({
+      accountId: restarted.id,
+      providerConnectionId: connectionId,
+      providerGeneration: restarted.processGeneration,
+    });
+  });
+
+  test("rolls attachment custody back with direct message intent and effect evidence", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Transcript attachment", "transcript-attachment@example.com");
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const key = "43000000-0000-4000-8000-000000000010";
+    const attempt = store.prepareMutation({
+      kind: "session.steer",
+      authorityId: session.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: "attached" },
+      idempotencyKey: key,
+    });
+    const stored = {
+      byteLength: 4,
+      canonicalMediaType: "text/plain" as const,
+      digest: "d".repeat(64),
+      mediaType: "text/plain" as const,
+      name: "proof.txt",
+    };
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    inspector.exec(`CREATE TRIGGER reject_atomic_message_attachment
+      BEFORE INSERT ON message_attachments
+      BEGIN SELECT RAISE(ABORT,'reject atomic attachment'); END;`);
+    expect(() => store.beginSessionMutationEffect({
+      message: "attached",
+      attemptId: attempt.id,
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      transcript: {
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000012",
+        actor: "human",
+        message: "attached",
+        attachments: [{
+          byteLength: stored.byteLength,
+          digest: stored.digest,
+          mediaType: stored.mediaType,
+          name: stored.name,
+        }],
+        storedAttachments: [stored],
+      },
+      evidence: {
+        kind: "session.steer",
+        providerThreadId: session.providerThreadId ?? "",
+        baseline: { providerUpdatedAt: null, status: "active", activeTurnId: "turn-atomic" },
+        activeTurnId: "turn-atomic",
+        clientMessageId: attempt.id,
+        messageDigest: createHash("sha256").update("attached").digest("hex"),
+      },
+    })).toThrow("reject atomic attachment");
+    expect(store.readMutation(key)).toMatchObject({ state: "prepared" });
+    expect(store.readMutation(key)?.evidence).toBeUndefined();
+    expect(store.readSessionUserMessageSource(session.id, "mutation", key))
+      .toEqual({ status: "none" });
+    expect(store.messageAttachmentManifest(session.id, attempt.id)).toEqual([]);
+    expect(store.attachmentCustody(stored.digest)).toBeNull();
+    inspector.exec("DROP TRIGGER reject_atomic_message_attachment");
+    inspector.close(false);
+  });
+
+  test("refuses a deceptive attachment name before durable message effect authority", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Transcript attachment control",
+      "transcript-attachment-control@example.com",
+    );
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const key = "43000000-0000-4000-8000-00000000001f";
+    const attempt = store.prepareMutation({
+      kind: "session.steer",
+      authorityId: session.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message: "attached" },
+      idempotencyKey: key,
+    });
+    const name = `report${String.fromCodePoint(0x202e)}fdp.exe`;
+    const attachment = {
+      byteLength: 4,
+      canonicalMediaType: "text/plain" as const,
+      digest: "9".repeat(64),
+      mediaType: "text/plain" as const,
+      name,
+    };
+
+    expect(() => store.beginSessionMutationEffect({
+      message: "attached",
+      attemptId: attempt.id,
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      transcript: {
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000013",
+        actor: "human",
+        message: "attached",
+        attachments: [{
+          byteLength: attachment.byteLength,
+          digest: attachment.digest,
+          mediaType: attachment.mediaType,
+          name,
+        }],
+        storedAttachments: [attachment],
+      },
+      evidence: {
+        kind: "session.steer",
+        providerThreadId: session.providerThreadId ?? "",
+        baseline: {
+          providerUpdatedAt: null,
+          status: "active",
+          activeTurnId: "turn-control-name",
+        },
+        activeTurnId: "turn-control-name",
+        clientMessageId: attempt.id,
+        messageDigest: createHash("sha256").update("attached").digest("hex"),
+      },
+    })).toThrow();
+    expect(store.readMutation(key)).toMatchObject({ state: "prepared" });
+    expect(store.readMutation(key)?.evidence).toBeUndefined();
+    expect(store.readSessionUserMessageSource(session.id, "mutation", key))
+      .toEqual({ status: "none" });
+    expect(store.messageAttachmentManifest(session.id, attempt.id)).toEqual([]);
+    expect(store.attachmentCustody(attachment.digest)).toBeNull();
+    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events)
+      .toHaveLength(0);
+  });
+
+  test("rolls queue source, mutation receipt, intent, and attachments back together", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Queue attachment", "queue-attachment@example.com");
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const key = "43000000-0000-4000-8000-000000000011";
+    const stored = {
+      byteLength: 4,
+      canonicalMediaType: "text/plain" as const,
+      digest: "e".repeat(64),
+      mediaType: "text/plain" as const,
+      name: "queued.txt",
+    };
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    inspector.exec(`CREATE TRIGGER reject_atomic_queue_attachment
+      BEFORE INSERT ON message_attachments
+      BEGIN SELECT RAISE(ABORT,'reject queue attachment'); END;`);
+    expect(() => store.enqueueIdempotent({
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      message: "queued attached",
+      actor: "automation",
+      attachments: [{
+        byteLength: stored.byteLength,
+        digest: stored.digest,
+        mediaType: stored.mediaType,
+        name: stored.name,
+      }],
+      storedAttachments: [stored],
+      idempotencyKey: key,
+    })).toThrow("reject queue attachment");
+    expect(store.readMutation(key)).toBeNull();
+    expect(store.listQueue(session.id)).toEqual([]);
+    expect(store.attachmentCustody(stored.digest)).toBeNull();
+    inspector.exec("DROP TRIGGER reject_atomic_queue_attachment");
+    inspector.close(false);
+  });
+
+  test("replays a finalized attachment queue only from its retained exact manifest", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Queue attachment replay",
+      "queue-attachment-replay@example.com",
+    );
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const key = "43000000-0000-4000-8000-000000000012";
+    const stored = {
+      byteLength: 4,
+      canonicalMediaType: "text/plain" as const,
+      digest: "f".repeat(64),
+      mediaType: "text/plain" as const,
+      name: "queued-replay.txt",
+    };
+    const attachments = [{
+      byteLength: stored.byteLength,
+      digest: stored.digest,
+      mediaType: stored.mediaType,
+      name: stored.name,
+    }];
+    const runtime = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      observedAt: 2_000,
+      preset: "high" as const,
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max" as const,
+      serviceTier: null,
+      fast: false,
+      approvalPolicy: "on-request" as const,
+      reviewMode: "auto_review" as const,
+      permissionProfile: ":workspace" as const,
+      computerUse: true as const,
+      pluginCapability: true as const,
+      enabledApps: [],
+    };
+    const queued = store.enqueueIdempotent({
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      message: "queued attached replay",
+      actor: "automation",
+      attachments,
+      storedAttachments: [stored],
+      idempotencyKey: key,
+    });
+    const guardInspector = new Database(store.paths.database, {
+      create: false,
+      strict: true,
+    });
+    try {
+      expect(() => guardInspector.query(
+        `UPDATE queue_entries
+         SET transcript_finalized=1,transcript_status='finalized',
+             transcript_intent_json=? WHERE id=?`,
+      ).run(
+        JSON.stringify({ version: 1, actor: "automation", hadAttachments: false }),
+        queued.id,
+      )).toThrow("queue transcript intent/status transition invalid");
+    } finally {
+      guardInspector.close(false);
+    }
+    for (let index = 0; index < 200; index += 1) {
+      store.recordMessageAttachments({
+        sessionId: session.id,
+        sourceId: `newer-settled-source-${String(index).padStart(3, "0")}`,
+        attachments: [stored],
+      });
+    }
+    const laterPending = store.enqueueIdempotent({
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      message: "later pending attached queue",
+      actor: "automation",
+      attachments,
+      storedAttachments: [stored],
+      idempotencyKey: "43000000-0000-4000-8000-000000000013",
+    });
+    // Pending provider work is custody, not retention history: it may take the
+    // bounded settled projection temporarily over its cap, but may not lose
+    // the only manifest that the eventual dispatch consumes.
+    expect(store.messageAttachmentManifest(session.id, queued.id)).toEqual(attachments);
+    expect(store.messageAttachmentManifest(
+      session.id,
+      "newer-settled-source-000",
+    )).toEqual(attachments);
+    expect(store.messageAttachmentManifest(session.id, laterPending.id)).toEqual(attachments);
+    const effect = store.beginQueueEffect({
+      queueId: queued.id,
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-00000000000a",
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: queued.id,
+        sessionId: session.id,
+        providerThreadId: session.providerThreadId ?? "",
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: queued.id,
+        messageDigest: createHash("sha256").update("queued attached replay").digest("hex"),
+        runtimeProfile: runtime,
+      },
+    });
+    store.completeQueueEffect({
+      queueId: queued.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-00000000000a",
+      message: "queued attached replay",
+      expectedEvidenceDigest: effect.digest,
+      expectedSessionRevision: session.revision,
+      applyResponseState: false,
+      turnId: "turn-queue-attachment-replay",
+      turnStatus: "completed",
+      runtimeProfile: runtime,
+      receipt: { turnId: "turn-queue-attachment-replay" },
+    });
+
+    expect(store.readSessionUserMessageSource(session.id, "queue", queued.id))
+      .toEqual({
+        status: "finalized",
+        intent: { version: 1, actor: "automation", hadAttachments: true },
+      });
+    expect(store.enqueueIdempotent({
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      message: "queued attached replay",
+      actor: "automation",
+      attachments,
+      idempotencyKey: key,
+    })).toEqual(store.requireQueue(queued.id));
+    expect(() => store.enqueueIdempotent({
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      message: "queued attached replay",
+      actor: "automation",
+      attachments: [{ ...attachments[0]!, digest: "a".repeat(64) }],
+      idempotencyKey: key,
+    })).toThrow("IDEMPOTENCY_CONFLICT");
+
+    store.recordMessageAttachments({
+      sessionId: session.id,
+      sourceId: "newest-settled-source",
+      attachments: [stored],
+    });
+    expect(store.messageAttachmentManifest(session.id, queued.id)).toEqual([]);
+    expect(() => store.enqueueIdempotent({
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      message: "queued attached replay",
+      actor: "automation",
+      attachments,
+      idempotencyKey: key,
+    })).toThrow("QUEUE_ATTACHMENT_REPLAY_EVIDENCE_PRUNED");
+  });
+
+  for (const drift of [
+    {
+      name: "work_devin_preset_contract_guard",
+      sql: `CREATE TRIGGER work_devin_preset_contract_guard
+        BEFORE INSERT ON works
+        WHEN NEW.preset_contract NOT IN (1,2)
+        BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END`,
+    },
+    {
+      name: "work_session_devin_contract_guard",
+      sql: `CREATE TRIGGER work_session_devin_contract_guard
+        BEFORE UPDATE OF provider_v39,preset_contract ON sessions
+        WHEN NEW.provider_v39='devin' AND NEW.preset_contract NOT IN (1,2)
+        BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END`,
+    },
+  ] as const) {
+    for (const predecessorVersion of [40, 41] as const) test(
+      `rejects drifted schema-v${predecessorVersion} Work guard before migration: ${drift.name}`,
+      async () => {
+      const { store } = await fixture();
+      const paths = store.paths;
+      store.close();
+      stores.splice(stores.indexOf(store), 1);
+
+      const predecessor = new Database(paths.database, { create: false, strict: true });
+      try {
+        if (predecessorVersion === 40) downgradeToExactProviderVersion40(predecessor);
+        else downgradeToExactProviderVersion41(predecessor);
+        predecessor.exec(`DROP TRIGGER ${drift.name}; ${drift.sql};`);
+      } finally {
+        predecessor.close(false);
+      }
+
+      expect(() => new StateStore(paths, { now: () => 2_000 }))
+        .toThrow(`WORK_SCHEMA_STALE_TRIGGER:${drift.name}`);
+      const inspector = new Database(paths.database, { readonly: true, strict: true });
+      try {
+        expect(inspector.query("PRAGMA user_version").get())
+          .toEqual({ user_version: predecessorVersion });
+        expect(inspector.query(
+          "SELECT version FROM migrations WHERE version>=40 ORDER BY version",
+        ).all()).toEqual(predecessorVersion === 40
+          ? [{ version: 40 }]
+          : [{ version: 40 }, { version: 41 }]);
+        expect(inspector.query(
+          "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+        ).get(drift.name)).toEqual(expect.objectContaining({
+          sql: expect.stringContaining("NOT IN (1,2)"),
+        }));
+      } finally {
+        inspector.close(false);
+      }
+    });
+  }
 
   test("rejects a drifted provider-v39 predecessor before adding adoption authority", async () => {
     const { store } = await fixture();
@@ -17145,7 +19915,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT 1 FROM pragma_table_info('session_adoption_candidates') WHERE name='last_live_observed_at'",
       ).get()).toEqual({ 1: 1 });
@@ -17313,7 +20083,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_adoption_candidates");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT name FROM pragma_table_info('session_adoption_candidates') WHERE name=?",
       ).get(column)).toBeNull();
@@ -17322,7 +20092,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v41 writable open never recreates missing provider-v39 authority", async () => {
+  test("current v45 writable open never recreates missing provider-v39 authority", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -17340,7 +20110,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_mutation_authority_rebinds_v39");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT name FROM sqlite_master WHERE name='session_mutation_authority_rebinds_v39'",
       ).get()).toBeNull();
@@ -17353,7 +20123,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v41 rejects a weakened same-name provider-v39 authority trigger without repair", async () => {
+  test("current v45 rejects a weakened same-name provider-v39 authority trigger without repair", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -17379,7 +20149,7 @@ describe("StateStore", () => {
     }
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         `SELECT sql FROM sqlite_master
          WHERE type='trigger'
@@ -17392,7 +20162,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v41 writable open never backfills a missing provider-v39 column", async () => {
+  test("current v45 writable open never backfills a missing provider-v39 column", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -17411,7 +20181,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:sessions.provider_v39");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT name FROM pragma_table_info('sessions') WHERE name='provider_v39'",
       ).get()).toBeNull();
@@ -17469,7 +20239,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_claude_process_authorities_live_identity");
     const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT sql FROM sqlite_master WHERE name='session_adoption_candidate_revision_guard'",
       ).get()).toEqual(expect.objectContaining({ sql: expect.stringContaining("SELECT 1") }));
@@ -17522,7 +20292,7 @@ describe("StateStore", () => {
         .toContainEqual(expect.objectContaining({ name: "preset_contract", notnull: 1 }));
       expect(inspector.query("SELECT preset_contract FROM sessions WHERE id=?").get(session.id))
         .toEqual({ preset_contract: legacyPresetContract });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query("SELECT version FROM migrations WHERE version=38").get())
         .toEqual({ version: 38 });
     } finally {
@@ -17620,7 +20390,7 @@ describe("StateStore", () => {
     mainV35.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:45");
     const migrated = new StateStore(paths, {
       now: () => 8_000,
       resolveMachineTimeZone: () => "UTC",
@@ -17634,7 +20404,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT provider_thread_id,recorded_at FROM session_provider_switch_targets WHERE attempt_id=?",
       ).get(attempt.id)).toEqual({
@@ -17642,7 +20412,7 @@ describe("StateStore", () => {
         recorded_at: 7_350,
       });
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 35 AND 43 ORDER BY version",
+        "SELECT version FROM migrations WHERE version BETWEEN 35 AND 45 ORDER BY version",
       ).all()).toEqual([
         { version: 35 },
         { version: 36 },
@@ -17653,6 +20423,8 @@ describe("StateStore", () => {
         { version: 41 },
         { version: 42 },
         { version: 43 },
+        { version: 44 },
+        { version: 45 },
       ]);
     } finally {
       inspector.close(false);
@@ -17684,7 +20456,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:45");
     const migrated = new StateStore(paths, {
       now: () => 9_000,
       resolveMachineTimeZone: () => {
@@ -17706,7 +20478,7 @@ describe("StateStore", () => {
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
     } finally {
       inspector.close(false);
     }
@@ -17731,7 +20503,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:45");
 
     expect(() => new StateStore(paths))
       .toThrow("ATTENTION_EMAIL_POLICY_MIGRATION_OPT_IN_REFUSED");
@@ -17779,7 +20551,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:45");
     const migrated = new StateStore(paths, {
       now: () => 12_000,
       resolveMachineTimeZone: () => {
@@ -17807,7 +20579,7 @@ describe("StateStore", () => {
          FROM notification_hours h JOIN attention_email_policy e ON h.singleton=e.singleton`,
       ).get()).toEqual(before);
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
     } finally {
       inspector.close(false);
     }
@@ -17946,7 +20718,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:45");
     const unchanged = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
@@ -18004,7 +20776,7 @@ describe("StateStore", () => {
     const schemaInspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(schemaInspector)).toBe(21);
-      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
     } finally {
       schemaInspector.close(false);
     }
@@ -18352,13 +21124,13 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query("PRAGMA table_info(sessions)").all())
         .toContainEqual(expect.objectContaining({ name: "provider", dflt_value: "'codex'" }));
       expect(inspector.query("PRAGMA table_info(autorespond_evidence)").all())
         .toContainEqual(expect.objectContaining({ name: "path" }));
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 43 ORDER BY version",
+        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 45 ORDER BY version",
       ).all()).toEqual([
         { version: 30 },
         { version: 31 },
@@ -18374,13 +21146,15 @@ describe("StateStore", () => {
         { version: 41 },
         { version: 42 },
         { version: 43 },
+        { version: 44 },
+        { version: 45 },
       ]);
     } finally {
       inspector.close(false);
     }
   });
 
-  test("current v43 opens reject a missing v35 authority object without repairing it", async () => {
+  test("current v45 opens reject a missing v35 authority object without repairing it", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -18401,13 +21175,13 @@ describe("StateStore", () => {
       expect(unchanged.query(
         "SELECT name FROM sqlite_master WHERE name='session_provider_switch_targets_immutable_delete'",
       ).get()).toBeNull();
-      expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
     } finally {
       unchanged.close(false);
     }
   });
 
-  test("current v43 writable open refuses a missing additive v35 table", async () => {
+  test("current v45 writable open refuses a missing additive v35 table", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -18665,7 +21439,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -18779,7 +21553,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -18901,7 +21675,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -18959,7 +21733,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -19049,7 +21823,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -19156,7 +21930,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -19248,7 +22022,7 @@ describe("StateStore", () => {
     expect(reopened.listAutorespondEvidence({ sessionId: session.id })).toEqual([expectedEvidence]);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query("SELECT id,path,rule,model FROM autorespond_evidence").get()).toEqual({
         id: 7,
         path: "protocol",
@@ -19358,7 +22132,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -19403,6 +22177,8 @@ describe("StateStore", () => {
         { version: 41, applied_at: 2000 },
         { version: 42, applied_at: 2000 },
         { version: 43, applied_at: 2000 },
+        { version: 44, applied_at: 2000 },
+        { version: 45, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
       expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
@@ -19450,7 +22226,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -20361,8 +23137,7 @@ describe("StateStore", () => {
 
     const upstream = new Database(paths.database, { create: false, strict: true });
     try {
-      dropPeerAndHostedMemorySchema(upstream);
-      upstream.exec("DROP TRIGGER mutation_resolutions_timestamp_proof_insert; DELETE FROM migrations WHERE version>40; PRAGMA user_version=40;");
+      downgradeToExactProviderVersion40(upstream);
       expect(upstream.query(
         "SELECT name FROM sqlite_master WHERE name='session_adoption_policies'",
       ).get()).toEqual({ name: "session_adoption_policies" });
@@ -20374,7 +23149,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:45");
     const migrated = new StateStore(paths, { now: () => 5_050 });
     stores.push(migrated);
     expect(migrated.requireSession(session.id)).toMatchObject({
@@ -20383,97 +23158,21 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT version,applied_at FROM migrations WHERE version>=41 ORDER BY version",
       ).all()).toEqual([
         { applied_at: 5_050, version: 41 },
         { applied_at: 5_050, version: 42 },
         { applied_at: 5_050, version: 43 },
+        { applied_at: 5_050, version: 44 },
+        { applied_at: 5_050, version: 45 },
       ]);
     } finally {
       inspector.close(false);
     }
   });
 
-  test("structurally distinguishes canonical and private v41/v42 cohorts while preserving their ledgers", async () => {
-    const scenarios = [
-      { cohort: "canonical-v41", version: 41, private: false },
-      { cohort: "private-v41", version: 41, private: true },
-      { cohort: "canonical-v42", version: 42, private: false },
-      { cohort: "private-v42", version: 42, private: true },
-    ] as const;
-    for (const [index, scenario] of scenarios.entries()) {
-      const { store } = await fixture();
-      const paths = store.paths;
-      const guardInspector = new Database(paths.database, { create: false, strict: true });
-      const originalGuard = z.object({ sql: z.string() }).strict().parse(
-        guardInspector.query(
-          "SELECT sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'",
-        ).get(),
-      ).sql;
-      guardInspector.close(false);
-      store.close();
-      stores.splice(stores.indexOf(store), 1);
-
-      const predecessor = new Database(paths.database, { create: false, strict: true });
-      try {
-        if (scenario.version === 41) {
-          if (scenario.private) dropHostedMemorySchema(predecessor);
-          else dropPeerAndHostedMemorySchema(predecessor);
-        } else if (!scenario.private) {
-          dropHostedMemorySchema(predecessor);
-        }
-        if (scenario.private) {
-          predecessor.exec("DROP TRIGGER mutation_resolutions_timestamp_proof_insert");
-        }
-        predecessor.query("DELETE FROM migrations WHERE version>?").run(scenario.version);
-        predecessor.query("UPDATE migrations SET applied_at=4000 WHERE version=40").run();
-        predecessor.query("UPDATE migrations SET applied_at=4100 WHERE version=41").run();
-        if (scenario.version === 42) {
-          predecessor.query("UPDATE migrations SET applied_at=4200 WHERE version=42").run();
-        }
-        predecessor.exec(`PRAGMA user_version=${String(scenario.version)}`);
-      } finally {
-        predecessor.close(false);
-      }
-
-      expect(() => new StateStore(paths, { readonly: true }))
-        .toThrow(`STATE_SCHEMA_MIGRATION_REQUIRED:${String(scenario.version)}:43`);
-      const migratedAt = 9_100 + index;
-      const migrated = new StateStore(paths, { now: () => migratedAt });
-      stores.push(migrated);
-      const inspector = new Database(paths.database, { readonly: true, strict: true });
-      try {
-        const expected = [
-          { applied_at: 4_000, version: 40 },
-          { applied_at: 4_100, version: 41 },
-          ...(scenario.version === 42
-            ? [{ applied_at: 4_200, version: 42 }]
-            : [{ applied_at: migratedAt, version: 42 }]),
-          { applied_at: migratedAt, version: 43 },
-        ];
-        expect(inspector.query(
-          "SELECT version,applied_at FROM migrations WHERE version>=40 ORDER BY version",
-        ).all()).toEqual(expected);
-        expect(inspector.query("PRAGMA user_version").get())
-          .toEqual({ user_version: 43 });
-        expect(inspector.query(
-          "SELECT sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'",
-        ).get()).toEqual({ sql: originalGuard });
-        expect(inspector.query(
-          `SELECT name FROM sqlite_master
-           WHERE name IN ('session_peer_policies','project_memory_sync_intents')
-           ORDER BY name`,
-        ).all()).toEqual([
-          { name: "project_memory_sync_intents" },
-          { name: "session_peer_policies" },
-        ]);
-      } finally {
-        inspector.close(false);
-      }
-    }
-  });
 
   test("refuses a missing guard on an authoritative v41 predecessor without writes", async () => {
     const { store } = await fixture();
@@ -20482,7 +23181,7 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
     const damaged = new Database(paths.database, { create: false, strict: true });
     try {
-      dropPeerAndHostedMemorySchema(damaged);
+      downgradeToExactProviderVersion41(damaged);
       damaged.exec(`
         DROP TRIGGER mutation_resolutions_timestamp_proof_insert;
         DELETE FROM migrations WHERE version>41;
@@ -20500,7 +23199,7 @@ describe("StateStore", () => {
 
     for (const readonly of [true, false]) {
       expect(() => new StateStore(paths, readonly ? { readonly: true } : {}))
-        .toThrow("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID");
+        .toThrow(readonly ? "STATE_SCHEMA_MIGRATION_REQUIRED:41:45" : "STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID");
     }
     const unchanged = new Database(paths.database, { create: false, readonly: true, strict: true });
     try {
@@ -20515,331 +23214,10 @@ describe("StateStore", () => {
     }
   });
 
-  test("refuses a same-name timestamp guard on an unguarded private v41 cohort", async () => {
-    const { store } = await fixture();
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-    const damaged = new Database(paths.database, { create: false, strict: true });
-    try {
-      dropHostedMemorySchema(damaged);
-      damaged.exec(`
-        DROP TRIGGER mutation_resolutions_timestamp_proof_insert;
-        CREATE TRIGGER mutation_resolutions_timestamp_proof_insert
-        BEFORE INSERT ON mutation_resolutions BEGIN SELECT 1; END;
-        DELETE FROM migrations WHERE version>41;
-        PRAGMA user_version=41;
-      `);
-    } finally {
-      damaged.close(false);
-    }
-    for (const readonly of [true, false]) {
-      expect(() => new StateStore(paths, readonly ? { readonly: true } : {}))
-        .toThrow("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
-    }
-    const unchanged = new Database(paths.database, { create: false, readonly: true, strict: true });
-    try {
-      expect(unchanged.query(
-        "SELECT sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'",
-      ).get()).toEqual(expect.objectContaining({ sql: expect.stringContaining("SELECT 1") }));
-      expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
-      expect(unchanged.query(
-        "SELECT name FROM sqlite_master WHERE name='project_memory_sync_intents'",
-      ).get()).toBeNull();
-    } finally {
-      unchanged.close(false);
-    }
-  });
 
-  test("refuses malformed or extra private v41/v42 ledger tails without writes", async () => {
-    const scenarios = [
-      { damage: "malformed", version: 41 },
-      { damage: "extra", version: 41 },
-      { damage: "malformed", version: 42 },
-      { damage: "extra", version: 42 },
-    ] as const;
-    for (const scenario of scenarios) {
-      const { store } = await fixture();
-      const paths = store.paths;
-      store.close();
-      stores.splice(stores.indexOf(store), 1);
-      const damaged = new Database(paths.database, { create: false, strict: true });
-      try {
-        if (scenario.version === 41) dropHostedMemorySchema(damaged);
-        damaged.exec("DROP TRIGGER mutation_resolutions_timestamp_proof_insert");
-        damaged.query("DELETE FROM migrations WHERE version>?").run(scenario.version);
-        damaged.query("UPDATE migrations SET applied_at=4000 WHERE version=40").run();
-        damaged.query("UPDATE migrations SET applied_at=4100 WHERE version=41").run();
-        if (scenario.version === 42) {
-          damaged.query("UPDATE migrations SET applied_at=4200 WHERE version=42").run();
-        }
-        if (scenario.damage === "malformed") {
-          damaged.exec(`
-            PRAGMA ignore_check_constraints=ON;
-            UPDATE migrations SET applied_at=-1 WHERE version=41;
-            PRAGMA ignore_check_constraints=OFF;
-          `);
-        } else {
-          damaged.query(
-            "INSERT INTO migrations(version,applied_at) VALUES (?,4300)",
-          ).run(scenario.version + 1);
-        }
-        damaged.exec(`PRAGMA user_version=${String(scenario.version)}`);
-      } finally {
-        damaged.close(false);
-      }
-      const before = new Database(paths.database, { create: false, readonly: true, strict: true });
-      const schemaBefore = before.query(
-        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
-      ).all();
-      const ledgerBefore = before.query("SELECT * FROM migrations ORDER BY version").all();
-      before.close(false);
 
-      for (const readonly of [true, false]) {
-        expect(() => new StateStore(paths, readonly ? { readonly: true } : {}))
-          .toThrow(`STATE_SCHEMA_PRIVATE_V${String(scenario.version)}_LEDGER_INVALID`);
-      }
-      const unchanged = new Database(paths.database, { create: false, readonly: true, strict: true });
-      try {
-        expect(unchanged.query(
-          "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
-        ).all()).toEqual(schemaBefore);
-        expect(unchanged.query("SELECT * FROM migrations ORDER BY version").all())
-          .toEqual(ledgerBefore);
-        expect(unchanged.query("PRAGMA user_version").get())
-          .toEqual({ user_version: scenario.version });
-      } finally {
-        unchanged.close(false);
-      }
-    }
-  });
 
-  test("structurally identifies exact feature-era v40 before adopting canonical v40-v43", async () => {
-    const { store } = await fixture();
-    const profile = store.createProfile("Feature v40 peer state");
-    const session = store.createSession({
-      profileId: profile.id,
-      preset: "high",
-      fastEnabled: false,
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
 
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    try {
-      installHistoricalFeatureProviderSwitchJournal(legacy);
-      downgradeToExactProviderVersion39(legacy);
-      dropHostedMemorySchema(legacy);
-      legacy.exec(`
-        INSERT INTO migrations(version,applied_at) VALUES (40,4000);
-        PRAGMA user_version=40;
-      `);
-      expect(legacy.query(
-        "SELECT name FROM sqlite_master WHERE name='session_peer_policies'",
-      ).get()).toEqual({ name: "session_peer_policies" });
-      expect(legacy.query(
-        "SELECT name FROM sqlite_master WHERE name='session_adoption_policies'",
-      ).get()).toBeNull();
-      expect(legacy.query(
-        "SELECT name FROM sqlite_master WHERE name='project_memory_sync_intents'",
-      ).get()).toBeNull();
-    } finally {
-      legacy.close(false);
-    }
-
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:43");
-    const migrated = new StateStore(paths, { now: () => 5_100 });
-    stores.push(migrated);
-    expect(migrated.requireSession(session.id).id).toBe(session.id);
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
-      expect(inspector.query(
-        "SELECT version,applied_at FROM migrations WHERE version>=40 ORDER BY version",
-      ).all()).toEqual([
-        { applied_at: 4_000, version: 40 },
-        { applied_at: 5_100, version: 41 },
-        { applied_at: 5_100, version: 42 },
-        { applied_at: 5_100, version: 43 },
-      ]);
-      expect(inspector.query(
-        `SELECT name FROM sqlite_master
-         WHERE name IN ('session_adoption_policies','session_peer_policies',
-           'project_memory_sync_intents','session_provider_switches') ORDER BY name`,
-      ).all()).toEqual([
-        { name: "project_memory_sync_intents" },
-        { name: "session_adoption_policies" },
-        { name: "session_peer_policies" },
-      ]);
-    } finally {
-      inspector.close(false);
-    }
-  });
-
-  test("migrates exact feature-era v41 through canonical timestamp, peer, and hosted authority", async () => {
-    const { store, home } = await fixture();
-    const root = join(home, "hosted-memory-v40-migration");
-    await mkdir(root);
-    const project = await store.createProject("Hosted memory v40 migration", root);
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    installHistoricalFeatureProviderSwitchJournal(legacy);
-    downgradeToExactProviderVersion39(legacy);
-    legacy.exec(`
-      INSERT INTO migrations(version,applied_at) VALUES (40,4000),(41,4001);
-      PRAGMA user_version=41;
-    `);
-    legacy.close(false);
-
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:41:43");
-    const migrated = new StateStore(paths, { now: () => 5_000 });
-    stores.push(migrated);
-    expect(migrated.requireProject(project.id).label).toBe(project.label);
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
-      expect(inspector.query(
-        "SELECT version,applied_at FROM migrations WHERE version>=40 ORDER BY version",
-      ).all()).toEqual([
-        { applied_at: 4_000, version: 40 },
-        { applied_at: 4_001, version: 41 },
-        { applied_at: 5_000, version: 42 },
-        { applied_at: 5_000, version: 43 },
-      ]);
-      expect(inspector.query(
-        `SELECT name FROM sqlite_master
-         WHERE name IN ('project_memory_hosted_attachments',
-           'project_memory_hosted_create_intents','project_memory_sync_intents',
-           'project_memory_sync_spool','canonical_memory_sync_share_fence',
-           'session_provider_switches')
-         ORDER BY name`,
-      ).all()).toEqual([
-        { name: "canonical_memory_sync_share_fence" },
-        { name: "project_memory_hosted_attachments" },
-        { name: "project_memory_hosted_create_intents" },
-        { name: "project_memory_sync_intents" },
-        { name: "project_memory_sync_spool" },
-      ]);
-      expect(inspector.query("PRAGMA table_info(project_memory_sync_spool)").all()
-        .filter((column) => z.object({ name: z.string() }).passthrough().parse(column)
-          .name.startsWith("adoption_proof_"))
-        .map((column) => {
-          const parsed = z.object({ name: z.string(), notnull: z.number().int() })
-            .passthrough().parse(column);
-          return { name: parsed.name, notnull: parsed.notnull };
-        })).toEqual([
-        { name: "adoption_proof_algorithm", notnull: 0 },
-        { name: "adoption_proof_ciphertext", notnull: 0 },
-        { name: "adoption_proof_key_version", notnull: 0 },
-        { name: "adoption_proof_nonce", notnull: 0 },
-      ]);
-    } finally {
-      inspector.close(false);
-    }
-    migrated.close();
-    stores.splice(stores.indexOf(migrated), 1);
-
-    const weakened = new Database(paths.database, { create: false, strict: true });
-    weakened.exec(`
-      DROP TRIGGER canonical_memory_sync_share_fence;
-      CREATE TRIGGER canonical_memory_sync_share_fence
-      BEFORE INSERT ON memory_submissions BEGIN SELECT 1; END;
-    `);
-    weakened.close(false);
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_V41_STRUCTURE_INVALID");
-    expect(() => new StateStore(paths, { now: () => 6_000 }))
-      .toThrow("STATE_SCHEMA_V41_STRUCTURE_INVALID");
-    const inspectorAfterFailure = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(inspectorAfterFailure.query(
-        "SELECT sql FROM sqlite_master WHERE name='canonical_memory_sync_share_fence'",
-      ).get()).toEqual(expect.objectContaining({ sql: expect.stringContaining("SELECT 1") }));
-      expect(inspectorAfterFailure.query("PRAGMA user_version").get())
-        .toEqual({ user_version: 43 });
-    } finally {
-      inspectorAfterFailure.close(false);
-    }
-  });
-
-  test("refuses an exact feature-era journal with recovery evidence without mutating it", async () => {
-    const { store } = await fixture();
-    const profile = store.createProfile("Feature journal recovery refusal");
-    const session = store.createSession({
-      profileId: profile.id,
-      preset: "high",
-      fastEnabled: false,
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    installHistoricalFeatureProviderSwitchJournal(legacy);
-    downgradeToExactProviderVersion39(legacy);
-    dropHostedMemorySchema(legacy);
-    legacy.exec("PRAGMA foreign_keys=OFF");
-    legacy.query(`
-      INSERT INTO session_provider_switches(
-        attempt_id,session_id,phase,source_profile_id,source_generation,
-        source_provider,source_preset,source_preset_contract,source_thread_id,
-        source_session_revision,target_profile_id,target_generation,target_provider,
-        target_preset,target_preset_contract,target_review_json,fast_enabled,
-        preamble_version,preamble_digest,manifest_version,manifest_digest,
-        transcript_digest,seed_text,seed_digest,seed_included_records,
-        seed_omitted_records,seed_idempotency_key,seed_state,journal_digest,
-        created_at,updated_at,source_provider_v40,source_preset_v40,
-        target_provider_v40,target_preset_v40,target_preamble_version_v40,
-        target_preamble_digest_v40,target_manifest_version_v40,
-        target_manifest_digest_v40,authority_contract_v40
-      ) VALUES (
-        ?,?,'target_start_started',?,0,'codex','high',2,'legacy-source',1,
-        ?,0,'codex','high',2,'{}',0,1,?,1,?,?,
-        'legacy seed',?,0,0,?,'pending',?,1000,1000,
-        'codex','high','codex','high',1,?,1,?,1
-      )
-    `).run(
-      createAttemptId(),
-      session.id,
-      profile.id,
-      profile.id,
-      testDigest("legacy feature preamble"),
-      testDigest("legacy feature manifest"),
-      testDigest("legacy feature transcript"),
-      testDigest("legacy feature seed"),
-      peerIdempotencyKey(90_001),
-      testDigest("legacy feature journal"),
-      testDigest("legacy feature preamble"),
-      testDigest("legacy feature manifest"),
-    );
-    legacy.exec(`
-      INSERT INTO migrations(version,applied_at) VALUES (40,1000);
-      PRAGMA user_version=40;
-    `);
-    legacy.close(false);
-
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:43");
-    expect(() => new StateStore(paths, { now: () => 2_000 }))
-      .toThrow("STATE_SCHEMA_LEGACY_PROVIDER_SWITCH_RECOVERY_REFUSED");
-    const unchanged = new Database(paths.database, { create: false, readonly: true, strict: true });
-    try {
-      expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
-      expect(unchanged.query("SELECT COUNT(*) AS count FROM session_provider_switches").get())
-        .toEqual({ count: 1 });
-      expect(unchanged.query(
-        "SELECT name FROM sqlite_master WHERE name='session_adoption_policies'",
-      ).get()).toBeNull();
-    } finally {
-      unchanged.close(false);
-    }
-  });
 
   test("imports one encrypted pull operation and settles only after pinned revalidation", async () => {
     const { store, home } = await fixture();
@@ -21690,8 +24068,8 @@ describe("StateStore", () => {
     const retired = create(firstProject.id, "Hidden retired provider history");
     const retire = new Database(store.paths.database, { create: false, strict: true });
     try {
-      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra' WHERE id=?")
-        .run(retired.id);
+      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=? WHERE id=?")
+        .run(devinPresetContract, retired.id);
     } finally {
       retire.close(false);
     }
@@ -21761,8 +24139,8 @@ describe("StateStore", () => {
     })).toThrow();
     const retireActor = new Database(store.paths.database, { create: false, strict: true });
     try {
-      retireActor.query("UPDATE sessions SET provider_v39='devin',preset='ultra' WHERE id=?")
-        .run(actor.id);
+      retireActor.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=? WHERE id=?")
+        .run(devinPresetContract, actor.id);
     } finally {
       retireActor.close(false);
     }
@@ -21836,8 +24214,8 @@ describe("StateStore", () => {
 
     const retire = new Database(store.paths.database, { create: false, strict: true });
     try {
-      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra' WHERE id=?")
-        .run(target.id);
+      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=? WHERE id=?")
+        .run(devinPresetContract, target.id);
     } finally {
       retire.close(false);
     }
@@ -21871,6 +24249,7 @@ describe("StateStore", () => {
       queueId: queued.queue!.id,
       sessionId: target.id,
       profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000099",
       evidence: {
         kind: "queue.dispatch",
         queueId: queued.queue!.id,
@@ -22044,6 +24423,7 @@ describe("StateStore", () => {
         queueId: admitted.queue!.id,
         sessionId: target.id,
         profileGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000099",
         evidence: {
           kind: "queue.dispatch" as const,
           queueId: admitted.queue!.id,
@@ -22149,26 +24529,12 @@ describe("StateStore", () => {
       idempotencyKey: peerIdempotencyKey(9_100),
       message,
     });
-    const runtime = {
-      profileId: profile.id,
-      processGeneration: profile.processGeneration,
-      observedAt: 2_000,
-      preset: "high" as const,
-      model: "gpt-6-astra",
-      reasoningEffort: "max" as const,
-      serviceTier: null,
-      fast: false,
-      approvalPolicy: "on-request" as const,
-      reviewMode: "auto_review" as const,
-      permissionProfile: ":workspace" as const,
-      computerUse: true as const,
-      pluginCapability: true as const,
-      enabledApps: [],
-    };
+    const runtime = codexRuntimeProfile(profile);
     const evidence = store.beginQueueEffect({
       queueId: admitted.queue!.id,
       sessionId: target.id,
       profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000099",
       evidence: {
         kind: "queue.dispatch",
         queueId: admitted.queue!.id,
@@ -22225,22 +24591,7 @@ describe("StateStore", () => {
       state: "active",
       activeTurnId: "turn-peer-recovery-source",
     });
-    const runtime = {
-      profileId: profile.id,
-      processGeneration: profile.processGeneration,
-      observedAt: 2_000,
-      preset: "high" as const,
-      model: "gpt-6-astra",
-      reasoningEffort: "max" as const,
-      serviceTier: null,
-      fast: false,
-      approvalPolicy: "on-request" as const,
-      reviewMode: "auto_review" as const,
-      permissionProfile: ":workspace" as const,
-      computerUse: true as const,
-      pluginCapability: true as const,
-      enabledApps: [],
-    };
+    const runtime = codexRuntimeProfile(profile);
     const prepare = (index: number) => {
       const providerThreadId = `thread-peer-recovery-${String(index)}`;
       const targetBase = createAuthorizedStartingTestSession(store, {
@@ -22272,6 +24623,7 @@ describe("StateStore", () => {
         queueId: admitted.queue!.id,
         sessionId: target.id,
         profileGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000099",
         evidence: {
           kind: "queue.dispatch",
           queueId: admitted.queue!.id,
@@ -23394,6 +25746,13 @@ describe("StateStore", () => {
       idempotencyKey: key,
     });
     expect(() => store.beginSessionMutationEffect({
+      transcript: {
+        accountId: store.requireSession(target.id).profileId,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000099",
+        actor: "peer_session",
+        message: "different peer begin message",
+      },
       attemptId: attempt.id,
       sessionId: target.id,
       profileGeneration: profile.processGeneration,
@@ -23459,6 +25818,13 @@ describe("StateStore", () => {
       idempotencyKey: steerKey,
     });
     expect(() => store.beginSessionMutationEffect({
+      transcript: {
+        accountId: store.requireSession(steerTarget.id).profileId,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000099",
+        actor: "peer_session",
+        message: steerMismatch,
+      },
       attemptId: steerAttempt.id,
       sessionId: steerTarget.id,
       profileGeneration: profile.processGeneration,
@@ -23511,6 +25877,7 @@ describe("StateStore", () => {
       queueId: queued.queue!.id,
       sessionId: queueTarget.id,
       profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000099",
       evidence: {
         kind: "queue.dispatch",
         queueId: queued.queue!.id,
@@ -23546,6 +25913,7 @@ describe("StateStore", () => {
       queueId: queued.queue!.id,
       sessionId: queueTarget.id,
       profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000099",
       evidence: {
         kind: "queue.dispatch",
         queueId: queued.queue!.id,
@@ -23682,6 +26050,13 @@ describe("StateStore", () => {
     });
     const runtime = codexRuntimeProfile(profile);
     const evidence = store.beginSessionMutationEffect({
+      transcript: {
+        accountId: store.requireSession(target.id).profileId,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000099",
+        actor: store.sessionMessageActorForSource(target.id, attempt.id) ?? "human",
+        message: message,
+      },
       attemptId: attempt.id,
       sessionId: target.id,
       profileGeneration: profile.processGeneration,
@@ -24282,7 +26657,7 @@ describe("StateStore", () => {
     dropPeerAndHostedMemorySchema(legacy);
     legacy.close(false);
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:45");
     const migrated = new StateStore(paths, { now: () => 9_000 });
     stores.push(migrated);
     expect(migrated.requireQueue(queue.id)).toMatchObject({
@@ -24297,7 +26672,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=40").get())
         .toEqual({ applied_at: 9_000 });
       expect(inspector.query(
@@ -24306,13 +26681,15 @@ describe("StateStore", () => {
         { applied_at: 9_000, version: 41 },
         { applied_at: 9_000, version: 42 },
         { applied_at: 9_000, version: 43 },
+        { applied_at: 9_000, version: 44 },
+        { applied_at: 9_000, version: 45 },
       ]);
     } finally {
       inspector.close(false);
     }
   });
 
-  test("current v43 refuses missing or changed hosted-memory triggers without repair", async () => {
+  test("current v45 refuses missing or changed hosted-memory triggers without repair", async () => {
     for (const damage of ["missing", "changed"] as const) {
       const { store } = await fixture();
       const paths = store.paths;
@@ -24349,14 +26726,14 @@ describe("StateStore", () => {
         ).all()).toEqual(schemaBefore);
         expect(unchanged.query("SELECT * FROM migrations ORDER BY version").all())
           .toEqual(ledgerBefore);
-        expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+        expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       } finally {
         unchanged.close(false);
       }
     }
   });
 
-  test("current v43 opens require the exact peer and local-memory guards", async () => {
+  test("current v45 opens require the exact peer and local-memory guards", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -24383,7 +26760,72 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v43 opens never recreate a missing peer authority trigger or index", async () => {
+  test("current v45 rejects widened peer queue columns and non-peer actor vocabulary without writes", async () => {
+    for (const damage of ["widened_column", "invalid_row"] as const) {
+      const { store } = await fixture();
+      const profile = signInProfile(store, "Queue provenance column", "queue-column@example.com");
+      const session = createProvenTestSession(store, {
+        profileId: profile.id,
+        preset: "high",
+        fastEnabled: false,
+        state: "idle",
+      });
+      const queued = store.enqueue(session.id, "closed peer queue metadata");
+      const paths = store.paths;
+      store.close();
+      stores.splice(stores.indexOf(store), 1);
+      const damaged = new Database(paths.database, { create: false, strict: true });
+      try {
+        if (damage === "widened_column") {
+          const table = z.object({ sql: z.string() }).strict().parse(damaged.query(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='queue_entries'",
+          ).get());
+          const widened = table.sql.replace(
+            "CHECK(message_actor IN ('human','peer_session'))",
+            "CHECK(message_actor IN ('human','peer_session','automation'))",
+          );
+          expect(widened).not.toBe(table.sql);
+          // Use supported DDL: the platform SQLite may prohibit writable_schema.
+          // Restore every trigger byte-for-byte after replacing only this column.
+          const triggers = damaged.query(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' ORDER BY name",
+          ).all().map((row) => z.object({ name: z.string(), sql: z.string() }).strict().parse(row));
+          for (const trigger of triggers) {
+            damaged.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+          }
+          damaged.exec("ALTER TABLE queue_entries DROP COLUMN message_actor");
+          damaged.exec(`ALTER TABLE queue_entries ADD COLUMN message_actor TEXT NOT NULL
+            DEFAULT 'human' CHECK(message_actor IN ('human','peer_session','automation'))`);
+          for (const trigger of triggers) damaged.exec(trigger.sql);
+        } else {
+          const guard = z.object({ sql: z.string() }).strict().parse(damaged.query(
+            "SELECT sql FROM sqlite_master WHERE name='queue_peer_provenance_immutable'",
+          ).get());
+          damaged.exec("DROP TRIGGER queue_peer_provenance_immutable; PRAGMA ignore_check_constraints=ON");
+          damaged.query("UPDATE queue_entries SET message_actor='automation' WHERE id=?").run(queued.id);
+          damaged.exec("PRAGMA ignore_check_constraints=OFF");
+          damaged.exec(guard.sql);
+        }
+      } finally {
+        damaged.close(false);
+      }
+      const inspector = new Database(paths.database, { readonly: true, strict: true });
+      try {
+        const schemaBefore = inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all();
+        const queueBefore = inspector.query("SELECT * FROM queue_entries WHERE id=?").get(queued.id);
+        for (const readonly of [true, false]) {
+          expect(() => new StateStore(paths, { readonly })).toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+        }
+        expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
+        expect(inspector.query("SELECT * FROM queue_entries WHERE id=?").get(queued.id)).toEqual(queueBefore);
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
+      } finally {
+        inspector.close(false);
+      }
+    }
+  });
+
+  test("current v45 opens never recreate a missing peer authority trigger or index", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -24410,29 +26852,6 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v43 opens reject a reintroduced legacy provider-switch journal", async () => {
-    const { store } = await fixture();
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-    const damaged = new Database(paths.database, { create: false, strict: true });
-    installHistoricalFeatureProviderSwitchJournal(damaged);
-    damaged.close(false);
-
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
-    expect(() => new StateStore(paths))
-      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
-    const unchanged = new Database(paths.database, { create: false, readonly: true, strict: true });
-    try {
-      expect(unchanged.query(
-        "SELECT name FROM sqlite_master WHERE name='session_provider_switches'",
-      ).get()).toEqual({ name: "session_provider_switches" });
-      expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
-    } finally {
-      unchanged.close(false);
-    }
-  });
 
   test("readonly open rejects a weakened previously unaudited v40 guard", async () => {
     const { store } = await fixture();
@@ -24456,9 +26875,9 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 44");
+    newer.exec("PRAGMA user_version = 46");
     newer.close(false);
     await chmod(paths.database, 0o600);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:44:43");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:46:45");
   });
 });

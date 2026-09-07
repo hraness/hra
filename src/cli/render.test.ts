@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 
-import { InvalidCommandResponseError, renderFailure, renderProtectedInteractionDetail, renderRootStatus, renderSuccess, safeDiagnostic, type Output } from "./render";
+import { InvalidCommandResponseError, renderFailure, renderProtectedInteractionDetail, renderRootStatus, renderSuccess, safeDiagnostic, terminalSafe, type Output } from "./render";
 import type { ProtectedInteractionDetailDocument, PublicInteraction } from "../domain/interactions";
 import type { SessionEventPage } from "../domain/session-events";
 import { effectiveClaudeRuntimeProfileSchema, projectPublicReviewedRuntimeProfile } from "../domain/runtime-profile";
@@ -83,6 +83,15 @@ const data = {
 };
 
 describe("CLI rendering", () => {
+  test("escapes line separators while preserving intentional join controls", () => {
+    const source =
+      `a${String.fromCodePoint(0x2028)}b${String.fromCodePoint(0x2029)}c`;
+    const joiners = `x${String.fromCodePoint(0x200c)}y${String.fromCodePoint(0x200d)}z`;
+
+    expect(terminalSafe(source)).toBe("a\\u{2028}b\\u{2029}c");
+    expect(terminalSafe(joiners)).toBe(joiners);
+  });
+
   test("renders notification hours without implying approval or autonomy behavior", () => {
     const notificationData = {
       policy: {

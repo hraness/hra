@@ -36,11 +36,14 @@ import {
 } from "../domain/notification-hours-contract";
 import { isModelPreset, type ModelPreset } from "./projection";
 import {
+  activePresetBinding,
   presetProviders,
   providerSchema,
+  sharedActiveCodexPresetContract,
   supportedPresetSchema,
   supportedProviderSchema,
   type AdoptableProvider,
+  type PresetContract,
   type Provider,
   type SupportedPreset,
   type SupportedProvider,
@@ -228,18 +231,68 @@ function parseRemoteAttachments(value: unknown): readonly RemoteAttachment[] | n
   return parsed;
 }
 
+/**
+ * Exact active interpretation of a preset alias at a remote write boundary.
+ *
+ * Browser, CLI, and daemon deployments do not roll atomically. Requiring this
+ * frozen token for the rebound Codex aliases means an old client cannot
+ * silently select their new meaning, while an old daemon rejects the additive
+ * key before effects. Stable aliases retain their existing token-free shape.
+ */
+export type ActiveRemotePresetSelection = Readonly<{
+  preset: "high" | "ultra";
+  presetContract: PresetContract;
+}> | Readonly<{
+  preset: Exclude<SupportedPreset, "high" | "ultra">;
+}>;
+
+export function activeRemotePresetSelection(
+  preset: SupportedPreset,
+): ActiveRemotePresetSelection {
+  return preset === "high" || preset === "ultra"
+    ? { preset, presetContract: activePresetBinding(preset).contract }
+    : { preset };
+}
+
+/**
+ * Contract fence for a provider switch that lets the daemon derive a Codex
+ * preset from the source tier. The client does not know whether that tier is
+ * High or Ultra, so those mutable aliases must share one active contract.
+ */
+export type ActiveRemoteDerivedCodexSelection = Readonly<{
+  presetContract: PresetContract;
+  provider: "codex";
+}>;
+
+export function activeRemoteDerivedCodexSelection(): ActiveRemoteDerivedCodexSelection {
+  return { presetContract: sharedActiveCodexPresetContract(), provider: "codex" };
+}
+
+function parseActiveRemotePresetSelection(
+  value: Readonly<Record<string, unknown>>,
+): ActiveRemotePresetSelection | null {
+  if (!isSupportedPreset(value.preset)) return null;
+  const selection = activeRemotePresetSelection(value.preset);
+  return "presetContract" in selection
+    && value.presetContract !== selection.presetContract
+    ? null
+    : selection;
+}
+
 export type RemoteCommandPayload =
   | Readonly<{ kind: "send" | "queue" | "steer" | "send_or_steer"; message: string }>
   | RemoteMessagePayload
   | Readonly<{ kind: "stop" }>
-  | Readonly<{ kind: "set_model"; preset: SupportedPreset }>
+  | (Readonly<{ kind: "set_model" }> & ActiveRemotePresetSelection)
   /**
    * Move one session to another provider. The preset is optional: omitted, the
    * custodian keeps the session's tier when the target provider has one. The
    * account is deliberately absent — choosing an account is user-directed and
    * stays on the machine that holds the credentials.
    */
-  | Readonly<{ kind: "set_provider"; preset?: SupportedPreset; provider: SupportedProvider }>
+  | Readonly<{ kind: "set_provider"; provider: Exclude<SupportedProvider, "codex"> }>
+  | (Readonly<{ kind: "set_provider" }> & ActiveRemoteDerivedCodexSelection)
+  | (Readonly<{ kind: "set_provider"; provider: SupportedProvider }> & ActiveRemotePresetSelection)
   | Readonly<{ enabled: boolean; kind: "set_fast" }>
   | ResolveInteractionDecisionPayload
   | ResolveInteractionAnswersPayload
@@ -249,7 +302,7 @@ export type RemoteCommandPayload =
       scope: "session" | "default";
     }>
   | Readonly<{ enabled: boolean; kind: "set_show_thinking"; scope: "session" | "default" }>
-  | Readonly<{ kind: "set_default_preset"; preset: SupportedPreset }>
+  | (Readonly<{ kind: "set_default_preset" }> & ActiveRemotePresetSelection)
   | Readonly<{ archived: boolean; kind: "archive_session" }>
   | Readonly<{ kind: "rename_session"; name: string | null }>
   | Readonly<{ key: string; kind: "set_gateway_key" }>;
@@ -265,14 +318,13 @@ export type RemoteCommandPayload =
  * question without widening the current UI's authority.
  */
 export type DeviceCommandPayload =
-  | Readonly<{
+  | (Readonly<{
       accountPublicId: string;
       kind: "session_start";
-      preset: SupportedPreset;
       projectPublicId: string;
       prompt: string;
       provider: SupportedProvider;
-    }>
+    }> & ActiveRemotePresetSelection)
   | Readonly<{
       accountPublicId: string;
       /** Absent identifies a legacy requester that the current daemon refuses. */
@@ -352,21 +404,22 @@ export function isRelayedLoginUserCode(value: unknown): value is string {
 
 export function parseDeviceCommandPayload(value: unknown): DeviceCommandPayload | null {
   if (!isRecord(value)) return null;
+  const presetSelection = parseActiveRemotePresetSelection(value);
   if (
     value.kind === "session_start"
+    && presetSelection !== null
     && hasExactKeys(value, [
       "accountPublicId",
       "kind",
-      "preset",
+      ...Object.keys(presetSelection),
       "projectPublicId",
       "prompt",
       "provider",
     ])
     && isOpaqueIdentifier(value.accountPublicId)
     && isOpaqueIdentifier(value.projectPublicId)
-    && isSupportedPreset(value.preset)
     && isSupportedProvider(value.provider)
-    && presetProviders[value.preset] === value.provider
+    && presetProviders[presetSelection.preset] === value.provider
     && typeof value.prompt === "string"
     && value.prompt.length >= 1
     && value.prompt.length <= deviceCommandLimits.promptCharacters
@@ -376,7 +429,7 @@ export function parseDeviceCommandPayload(value: unknown): DeviceCommandPayload 
     return {
       accountPublicId: value.accountPublicId,
       kind: value.kind,
-      preset: value.preset,
+      ...presetSelection,
       projectPublicId: value.projectPublicId,
       prompt: value.prompt,
       provider: value.provider,
@@ -683,6 +736,7 @@ export type CloudPayloadAuthority = Readonly<{
 
 function parseRemoteCommandPayloadUnchecked(value: unknown): RemoteCommandPayload | null {
   if (!isRecord(value)) return null;
+  const presetSelection = parseActiveRemotePresetSelection(value);
   if (
     (value.kind === "send" || value.kind === "queue" || value.kind === "steer"
       || value.kind === "send_or_steer")
@@ -707,23 +761,35 @@ function parseRemoteCommandPayloadUnchecked(value: unknown): RemoteCommandPayloa
   if (value.kind === "stop" && hasExactKeys(value, ["kind"])) return { kind: value.kind };
   if (
     value.kind === "set_model"
-    && hasExactKeys(value, ["kind", "preset"])
-    && isSupportedPreset(value.preset)
-  ) return { kind: value.kind, preset: value.preset };
+    && presetSelection !== null
+    && hasExactKeys(value, ["kind", ...Object.keys(presetSelection)])
+  ) return { kind: value.kind, ...presetSelection };
   if (
     value.kind === "set_provider"
     && isSupportedProvider(value.provider)
-    && (
-      (hasExactKeys(value, ["kind", "provider"]) && value.preset === undefined)
-      || (hasExactKeys(value, ["kind", "preset", "provider"]) && isSupportedPreset(value.preset))
-    )
   ) {
-    if (isSupportedPreset(value.preset)) {
-      return presetProviders[value.preset] === value.provider
-        ? { kind: value.kind, preset: value.preset, provider: value.provider }
+    if (
+      presetSelection !== null
+      && hasExactKeys(value, ["kind", ...Object.keys(presetSelection), "provider"])
+    ) {
+      return presetProviders[presetSelection.preset] === value.provider
+        ? {
+            kind: value.kind,
+            ...presetSelection,
+             provider: value.provider,
+           }
         : null;
     }
-    return { kind: value.kind, provider: value.provider };
+    if (value.provider === "codex") {
+      const derivedSelection = activeRemoteDerivedCodexSelection();
+      return hasExactKeys(value, ["kind", "presetContract", "provider"])
+        && value.presetContract === derivedSelection.presetContract
+        ? { kind: value.kind, ...derivedSelection }
+        : null;
+    }
+    return hasExactKeys(value, ["kind", "provider"])
+      ? { kind: value.kind, provider: value.provider }
+      : null;
   }
   if (
     value.kind === "set_fast"
@@ -776,9 +842,9 @@ function parseRemoteCommandPayloadUnchecked(value: unknown): RemoteCommandPayloa
   ) return { enabled: value.enabled, kind: value.kind, scope: value.scope };
   if (
     value.kind === "set_default_preset"
-    && hasExactKeys(value, ["kind", "preset"])
-    && isSupportedPreset(value.preset)
-  ) return { kind: value.kind, preset: value.preset };
+    && presetSelection !== null
+    && hasExactKeys(value, ["kind", ...Object.keys(presetSelection)])
+  ) return { kind: value.kind, ...presetSelection };
   if (
     value.kind === "archive_session"
     && hasExactKeys(value, ["archived", "kind"])
@@ -1365,6 +1431,30 @@ async function decryptJson(
   return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext)) as unknown;
 }
 
+export type AuthenticatedPayloadInspection<T> =
+  | Readonly<{ kind: "invalid" }>
+  | Readonly<{ kind: "valid"; payload: T }>;
+
+async function inspectAuthenticatedJson<T>(
+  envelope: EncryptedEnvelope,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+  parse: (value: unknown) => T | null,
+): Promise<AuthenticatedPayloadInspection<T>> {
+  if (envelope.keyVersion !== authority.keyVersion) throw new Error("Cloud payload key mismatch.");
+  // Authentication failures intentionally escape. Only bytes authenticated by
+  // the account key may be classified as a deterministic semantic rejection.
+  const plaintext = await decryptBytes(envelope, key, cloudPayloadAad(authority));
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext)) as unknown;
+  } catch {
+    return { kind: "invalid" };
+  }
+  const parsed = parse(value);
+  return parsed === null ? { kind: "invalid" } : { kind: "valid", payload: parsed };
+}
+
 export async function encryptRemoteCommand(
   payload: RemoteCommandPayload,
   key: Uint8Array,
@@ -1382,10 +1472,18 @@ export async function decryptRemoteCommand(
   key: Uint8Array,
   authority: CloudPayloadAuthority,
 ): Promise<RemoteCommandPayload> {
+  const inspected = await inspectRemoteCommand(envelope, key, authority);
+  if (inspected.kind === "invalid") throw new Error("Invalid remote command payload.");
+  return inspected.payload;
+}
+
+export async function inspectRemoteCommand(
+  envelope: EncryptedEnvelope,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<AuthenticatedPayloadInspection<RemoteCommandPayload>> {
   if (authority.kind !== "command") throw new Error("Invalid remote command authority.");
-  const parsed = parseRemoteCommandPayload(await decryptJson(envelope, key, authority));
-  if (parsed === null) throw new Error("Invalid remote command payload.");
-  return parsed;
+  return await inspectAuthenticatedJson(envelope, key, authority, parseRemoteCommandPayload);
 }
 
 export async function encryptDeviceCommand(
@@ -1404,10 +1502,18 @@ export async function decryptDeviceCommand(
   key: Uint8Array,
   authority: CloudPayloadAuthority,
 ): Promise<DeviceCommandPayload> {
+  const inspected = await inspectDeviceCommand(envelope, key, authority);
+  if (inspected.kind === "invalid") throw new Error("Invalid device command payload.");
+  return inspected.payload;
+}
+
+export async function inspectDeviceCommand(
+  envelope: EncryptedEnvelope,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<AuthenticatedPayloadInspection<DeviceCommandPayload>> {
   if (authority.kind !== "device_command") throw new Error("Invalid device command authority.");
-  const parsed = parseDeviceCommandPayload(await decryptJson(envelope, key, authority));
-  if (parsed === null) throw new Error("Invalid device command payload.");
-  return parsed;
+  return await inspectAuthenticatedJson(envelope, key, authority, parseDeviceCommandPayload);
 }
 
 export async function encryptDeviceCommandResult(

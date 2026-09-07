@@ -2,10 +2,14 @@ import { createHash } from "node:crypto";
 
 import { z } from "zod";
 
-import { presetSchema, providerSchema } from "./presets";
+import { attachmentReferenceListSchema } from "./attachment-schemas";
+import type { AttachmentReference } from "./attachments";
+import { presetContractSchema, presetSchema, providerSchema } from "./presets";
 import {
   sessionMessageActorSchema,
+  sessionEventGapReasonSchema,
   type SessionEvent,
+  type SessionEventGapReason,
   type SessionMessageActor,
   type SessionEventBody,
 } from "./session-events";
@@ -16,6 +20,7 @@ import {
   sessionIdSchema,
   titleSchema,
   unixMillisecondsSchema,
+  utf8Bytes,
 } from "./values";
 
 /**
@@ -49,6 +54,7 @@ const NON_TOOL_ITEM_KINDS: ReadonlySet<string> = new Set([
 const transcriptTextSchema = z.string().max(TRANSCRIPT_TEXT_MAX_CHARACTERS);
 const omittedCountSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const sequenceSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const cursorSequenceSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 
 export const sessionProviderSwitchReceiptSchema = z.object({
@@ -61,12 +67,15 @@ export const sessionProviderSwitchReceiptSchema = z.object({
   request: z.object({
     accountId: profileIdSchema.nullable(),
     preset: presetSchema.nullable(),
+    presetContract: presetContractSchema.optional(),
     provider: providerSchema,
   }).strict(),
   seed: z.object({
     digest: digestSchema,
     includedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     omittedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    /** Earlier ledger history is unavailable and its size cannot be counted. */
+    retentionGapReason: sessionEventGapReasonSchema.optional(),
     status: z.enum(["completed", "interrupted", "failed", "inProgress"]),
   }).strict(),
   sessionId: sessionIdSchema,
@@ -122,6 +131,7 @@ export const transcriptRecordSchema = z.discriminatedUnion("kind", [
     turnId: opaqueIdSchema.nullable(),
     text: transcriptTextSchema,
     omittedCharacters: omittedCountSchema,
+    attachments: attachmentReferenceListSchema.optional(),
   }).strict(),
   z.object({
     ...baseRecord,
@@ -177,12 +187,16 @@ export type TranscriptRecord = z.infer<typeof transcriptRecordSchema>;
 export const sessionTranscriptSchema = z.object({
   version: z.literal(1),
   sessionId: sessionIdSchema,
+  /** Current provider from local session authority; absent in pure builders. */
+  provider: providerSchema.optional(),
+  /** Prior ledger history was pruned for this reason; its record count is unknowable. */
+  retentionGapReason: sessionEventGapReasonSchema.nullable().optional(),
   records: z.array(transcriptRecordSchema).max(TRANSCRIPT_PAGE_LIMIT),
   /** The last event sequence this page consumed; null for an empty page. */
   throughSequence: sequenceSchema.nullable(),
-  /** The cursor for the next page, or null when the stream is exhausted. */
-  nextSequence: sequenceSchema.nullable(),
-  /** Records dropped because the page limit was reached. */
+  /** The last consumed sequence to pass as `after` for the next page. */
+  nextSequence: cursorSequenceSchema.nullable(),
+  /** Records dropped because a page or serialized-response bound was reached. */
   omittedRecords: omittedCountSchema,
   /** Characters dropped from record text because a record hit its bound. */
   omittedCharacters: omittedCountSchema,
@@ -264,24 +278,36 @@ export const buildSessionTranscript = (input: Readonly<{
   events: readonly SessionEvent[];
   limit?: number;
   textLimit?: number;
+  retain?: "head" | "tail";
 }>): SessionTranscript => {
   const sessionId = sessionIdSchema.parse(input.sessionId);
   const limit = z.number().int().min(1).max(TRANSCRIPT_PAGE_LIMIT)
     .parse(input.limit ?? TRANSCRIPT_PAGE_LIMIT);
   const textLimit = z.number().int().min(64).max(TRANSCRIPT_TEXT_MAX_CHARACTERS)
     .parse(input.textLimit ?? TRANSCRIPT_TEXT_MAX_CHARACTERS);
+  const retain = input.retain ?? "head";
 
   const records: TranscriptRecord[] = [];
   let open: OpenText | null = null;
   let omittedRecords = 0;
   let omittedCharacters = 0;
   let throughSequence: number | null = null;
-  let nextSequence: number | null = null;
+  const cursor: { nextSequence: number | null } = { nextSequence: null };
 
   const push = (record: TranscriptRecord): void => {
+    if (retain === "tail") {
+      records.push(record);
+      if (records.length > limit) {
+        records.shift();
+        omittedRecords += 1;
+      }
+      return;
+    }
     if (records.length >= limit) {
       omittedRecords += 1;
-      nextSequence ??= record.sequence;
+      // `after` is exclusive. Point to the event immediately before the
+      // first omitted record so a caller cannot skip that record on resume.
+      cursor.nextSequence ??= record.sequence - 1;
       return;
     }
     records.push(record);
@@ -332,7 +358,7 @@ export const buildSessionTranscript = (input: Readonly<{
       case "user_message": {
         flush();
         const admitted = body.text.slice(0, textLimit);
-        omittedCharacters += body.text.length - admitted.length;
+        omittedCharacters += body.omittedCharacters + (body.text.length - admitted.length);
         push({
           kind: "user",
           sequence: event.sequence,
@@ -342,6 +368,7 @@ export const buildSessionTranscript = (input: Readonly<{
           turnId: body.turnId,
           text: admitted,
           omittedCharacters: body.omittedCharacters + (body.text.length - admitted.length),
+          ...(body.attachments === undefined ? {} : { attachments: body.attachments }),
         });
         break;
       }
@@ -423,17 +450,88 @@ export const buildSessionTranscript = (input: Readonly<{
     throughSequence = event.sequence;
   }
   flush();
+  const nextSequence = cursor.nextSequence;
 
   return sessionTranscriptSchema.parse({
     version: 1,
     sessionId,
     records,
-    throughSequence,
+    throughSequence: nextSequence === null
+      ? throughSequence
+      : nextSequence === 0 ? null : nextSequence,
     nextSequence,
     omittedRecords,
     omittedCharacters,
     digest: digestTranscriptRecords(records),
   });
+};
+
+/**
+ * Fit a complete transcript result beneath an exact serialized UTF-8 bound.
+ *
+ * Page reads keep the oldest records and return an exclusive `after` cursor
+ * immediately before the first byte-omitted record. Tail/export reads keep
+ * the newest records. The digest is always recomputed over exactly what the
+ * caller receives.
+ */
+export const boundSessionTranscriptSerializedBytes = (input: Readonly<{
+  transcript: SessionTranscript;
+  maximumBytes: number;
+  retain: "head" | "tail";
+}>): SessionTranscript => {
+  const transcript = sessionTranscriptSchema.parse(input.transcript);
+  const maximumBytes = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER)
+    .parse(input.maximumBytes);
+  if (utf8Bytes(JSON.stringify(transcript)) <= maximumBytes) return transcript;
+  if (transcript.records.length === 0) {
+    throw new Error("TRANSCRIPT_SERIALIZED_BYTE_LIMIT_TOO_SMALL");
+  }
+
+  const candidate = (removed: number): SessionTranscript => {
+    const records = input.retain === "tail"
+      ? transcript.records.slice(removed)
+      : transcript.records.slice(0, transcript.records.length - removed);
+    let throughSequence = transcript.throughSequence;
+    let nextSequence = transcript.nextSequence;
+    if (input.retain === "head") {
+      const firstDropped = transcript.records[records.length];
+      if (firstDropped === undefined) throw new Error("TRANSCRIPT_BYTE_BOUND_CURSOR_MISSING");
+      const byteCursor = firstDropped.sequence - 1;
+      nextSequence = nextSequence === null
+        ? byteCursor
+        : Math.min(nextSequence, byteCursor);
+      throughSequence = nextSequence === 0 ? null : nextSequence;
+    } else {
+      nextSequence = null;
+    }
+    return sessionTranscriptSchema.parse({
+      ...transcript,
+      records,
+      throughSequence,
+      nextSequence,
+      omittedRecords: transcript.omittedRecords + removed,
+      digest: digestTranscriptRecords(records),
+    });
+  };
+
+  // Serialized size is monotone as records are removed. Binary search keeps
+  // the largest record set that fits without repeatedly serializing 500 full
+  // pages.
+  let lower = 1;
+  let upper = transcript.records.length;
+  let bounded: SessionTranscript | null = null;
+  while (lower <= upper) {
+    const removed = Math.floor((lower + upper) / 2);
+    const next = candidate(removed);
+    if (utf8Bytes(JSON.stringify(next)) <= maximumBytes) {
+      bounded = next;
+      upper = removed - 1;
+    } else {
+      lower = removed + 1;
+    }
+  }
+  if (bounded === null) throw new Error("TRANSCRIPT_SERIALIZED_BYTE_LIMIT_TOO_SMALL");
+  return bounded;
 };
 
 /** The first line of every rendered handoff seed. */
@@ -442,16 +540,34 @@ export const TRANSCRIPT_SEED_HEADER = "[HRA provider handoff]";
 const actorLabel = (actor: SessionMessageActor): string =>
   actor === "human"
     ? "User"
-    : actor === "autorespond"
-      ? "User (autorespond)"
-      : actor === "peer_session"
-        ? "User (peer session)"
-        : "User (handoff)";
+    : actor === "automation"
+      ? "User (automation)"
+      : actor === "autorespond"
+        ? "User (autorespond)"
+        : actor === "peer_session"
+          ? "User (peer session)"
+          : "User (handoff)";
+
+const attachmentManifestSuffix = (
+  attachments: readonly AttachmentReference[] | undefined,
+): string => attachments === undefined
+  ? ""
+  : ` [attachments: ${attachments.map((attachment) =>
+    `${attachment.name} (${attachment.mediaType}, ${String(attachment.byteLength)} bytes, sha256:${attachment.digest})`)
+    .join("; ")}; contents not embedded]`;
 
 const seedLine = (record: TranscriptRecord): string => {
   switch (record.kind) {
-    case "user": return `${actorLabel(record.actor)}: ${record.text}${
-      record.omittedCharacters > 0 ? ` [+${String(record.omittedCharacters)} characters omitted]` : ""}`;
+    // A provider-switch message is itself a generated transcript seed. Carrying
+    // that seed into the next seed recursively consumes the bounded handoff
+    // budget with an older serialization of the same history. The durable
+    // provider_switched record retains the boundary; this marker retains the
+    // fact that a seed was sent without nesting its generated body.
+    case "user": return record.actor === "provider_switch"
+      ? "User (handoff): [prior HRA handoff seed omitted]"
+      : `${actorLabel(record.actor)}: ${record.text}${
+      record.omittedCharacters > 0 ? ` [+${String(record.omittedCharacters)} characters omitted]` : ""}${
+      attachmentManifestSuffix(record.attachments)}`;
     case "assistant": return `Assistant: ${record.text}${
       record.omittedCharacters > 0 ? ` [+${String(record.omittedCharacters)} characters omitted]` : ""}`;
     case "reasoning": return `Assistant (reasoning summary): ${record.text}${
@@ -470,6 +586,7 @@ export type TranscriptSeed = Readonly<{
   digest: string;
   omittedRecords: number;
   includedRecords: number;
+  retentionGapReason?: SessionEventGapReason;
 }>;
 
 export const digestTranscriptSeed = (text: string): string => createHash("sha256")
@@ -492,40 +609,79 @@ export const renderTranscriptSeed = (input: Readonly<{
   toProvider: string;
   maxCharacters?: number;
 }>): TranscriptSeed => {
-  const maxCharacters = z.number().int().min(256).max(TRANSCRIPT_SEED_MAX_CHARACTERS)
+  const maxCharacters = z.number().int().min(512).max(TRANSCRIPT_SEED_MAX_CHARACTERS)
     .parse(input.maxCharacters ?? TRANSCRIPT_SEED_MAX_CHARACTERS);
+  const transcript = sessionTranscriptSchema.parse(input.transcript);
+  const fromProvider = providerSchema.parse(input.fromProvider);
+  const toProvider = providerSchema.parse(input.toProvider);
   const lines: string[] = [];
-  let used = 0;
   let included = 0;
-  for (let index = input.transcript.records.length - 1; index >= 0; index -= 1) {
-    const record = input.transcript.records[index];
-    if (record === undefined) continue;
-    const line = seedLine(record);
-    if (used + line.length + 1 > maxCharacters) break;
-    lines.push(line);
-    used += line.length + 1;
-    included += 1;
-  }
-  lines.reverse();
-  const omittedRecords = input.transcript.records.length - included
-    + input.transcript.omittedRecords;
-  const header = [
+  const retentionGapReason = transcript.retentionGapReason ?? undefined;
+  const verboseHeaderFor = (omittedRecords: number): string => [
     TRANSCRIPT_SEED_HEADER,
-    `This conversation ran on ${input.fromProvider} and now runs on ${input.toProvider}.`,
+    `This conversation ran on ${fromProvider} and now runs on ${toProvider}.`,
     "What follows is HRA's own record of it, not the previous provider's transcript:"
-    + " secrets, absolute paths, raw tool arguments, and raw tool output were never stored"
-    + " and are not here.",
-    omittedRecords > 0
-      ? `${String(omittedRecords)} earlier records were omitted to fit this summary.`
-      : "No records were omitted.",
+    + " secrets, absolute paths, raw tool arguments, raw tool output, and attachment contents"
+    + " were never embedded and are not here.",
+    ...(retentionGapReason === undefined
+      ? [omittedRecords > 0
+          ? `${String(omittedRecords)} earlier records were omitted to fit this summary.`
+          : "No retained records were omitted."]
+      : [
+          `WARNING: HRA pruned earlier ledger history (${retentionGapReason});`
+          + " the number of unavailable records is unknown.",
+          omittedRecords > 0
+            ? `${String(omittedRecords)} additional retained records were omitted to fit this summary.`
+            : "No additional retained records were omitted from this summary.",
+        ]),
     "Continue the work from here. Ask before assuming anything the summary does not state.",
     "",
   ].join("\n");
-  const text = `${header}${lines.join("\n")}`;
+  const compactHeaderFor = (omittedRecords: number): string => [
+    TRANSCRIPT_SEED_HEADER,
+    `${fromProvider} to ${toProvider}; HRA's retained record, not the provider transcript.`,
+    "Secrets, absolute paths, raw tool data, and attachment contents are excluded.",
+    ...(retentionGapReason === undefined
+      ? [omittedRecords > 0
+          ? `${String(omittedRecords)} retained records omitted.`
+          : "No retained records omitted."]
+      : [
+          `WARNING: earlier ledger history was pruned (${retentionGapReason}); its size is unknown.`,
+          omittedRecords > 0
+            ? `${String(omittedRecords)} additional retained records omitted.`
+            : "No additional retained records omitted.",
+        ]),
+    "Continue from here. Ask before assuming omitted facts.",
+    "",
+  ].join("\n");
+  const headerFor = (omittedRecords: number): string => {
+    const verbose = verboseHeaderFor(omittedRecords);
+    if (verbose.length <= maxCharacters) return verbose;
+    const compact = compactHeaderFor(omittedRecords);
+    if (compact.length <= maxCharacters) return compact;
+    throw new Error("TRANSCRIPT_SEED_HEADER_EXCEEDS_LIMIT");
+  };
+  for (let index = transcript.records.length - 1; index >= 0; index -= 1) {
+    const record = transcript.records[index];
+    if (record === undefined) continue;
+    const line = seedLine(record);
+    const nextIncluded = included + 1;
+    const nextOmitted = transcript.records.length - nextIncluded
+      + transcript.omittedRecords;
+    const candidateLines = [line, ...lines];
+    const candidate = `${headerFor(nextOmitted)}${candidateLines.join("\n")}`;
+    if (candidate.length > maxCharacters) break;
+    lines.unshift(line);
+    included = nextIncluded;
+  }
+  const omittedRecords = transcript.records.length - included
+    + transcript.omittedRecords;
+  const text = `${headerFor(omittedRecords)}${lines.join("\n")}`;
   return {
     text,
     digest: digestTranscriptSeed(text),
     omittedRecords,
     includedRecords: included,
+    ...(retentionGapReason === undefined ? {} : { retentionGapReason }),
   };
 };

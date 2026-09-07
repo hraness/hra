@@ -4,7 +4,12 @@ import { z } from "zod";
 
 import { isUuidV7 } from "./uuid-v7";
 import { publicProviderIdentifierSchema } from "../public-provider-identifier";
-import { presetSchema } from "./presets";
+import {
+  isReboundCodexPreset,
+  presetContractSchema,
+  sharedActiveCodexPresetContract,
+  type PresetContract,
+} from "./presets";
 import { workReadSuccessWireBytes } from "./terminal-json";
 import {
   attemptIdSchema,
@@ -19,7 +24,11 @@ import {
 } from "./values";
 
 export const WORK_PROTOCOL = "hra-work-local-v1" as const;
+/** Read/event envelope version. Apply requests version independently. */
 export const WORK_PROTOCOL_VERSION = 1 as const;
+export const WORK_APPLY_REQUEST_LEGACY_VERSION = 1 as const;
+export const WORK_APPLY_REQUEST_VERSION = 2 as const;
+export const WORK_PROTOCOL_DESCRIPTION_VERSION = 2 as const;
 
 export const WORK_PLAN_TASK_LIMIT = 256;
 export const WORK_ACTIVE_LIMIT = 1_024;
@@ -162,10 +171,14 @@ export const workRouteSchema = z.object({
 }).strict();
 export type WorkRoute = z.infer<typeof workRouteSchema>;
 
+/** Presets admitted by the Work protocol and its durable SQLite schema. */
+export const workPresetSchema = z.enum(["low", "high", "ultra"]);
+export type WorkPreset = z.infer<typeof workPresetSchema>;
+
 export const workExecutionRouteSchema = z.object({
   accountId: profileIdSchema,
   projectId: projectIdSchema,
-  preset: presetSchema,
+  preset: workPresetSchema,
   fast: z.boolean(),
 }).strict();
 export type WorkExecutionRoute = z.infer<typeof workExecutionRouteSchema>;
@@ -365,7 +378,7 @@ export const workTaskSpecSchema = z.object({
   instructions: instructionsSchema,
   criteria: z.array(criterionSchema).max(WORK_CRITERIA_LIMIT),
   route: workRouteSchema,
-  preset: presetSchema,
+  preset: workPresetSchema,
   fast: z.boolean(),
   priority: z.number().int().min(-100).max(100),
   notBefore: unixMillisecondsSchema.optional(),
@@ -895,6 +908,31 @@ export const workOperationSchema = z.discriminatedUnion("kind", [
 });
 export type WorkOperation = z.infer<typeof workOperationSchema>;
 
+export const workOperationRequiresPresetContract = (operation: WorkOperation): boolean => (
+  operation.kind === "work.create"
+  && operation.routes.some((route) => isReboundCodexPreset(route.preset))
+) || (
+  operation.kind === "task.addBatch"
+  && operation.tasks.some((task) => isReboundCodexPreset(task.preset))
+);
+
+export type WorkApplyRequestSource = Readonly<
+  | { version: typeof WORK_APPLY_REQUEST_LEGACY_VERSION }
+  | {
+      version: typeof WORK_APPLY_REQUEST_VERSION;
+      presetContract?: PresetContract;
+    }
+>;
+
+export const currentWorkApplyRequestSource = (
+  operation: WorkOperation,
+): WorkApplyRequestSource => ({
+  version: WORK_APPLY_REQUEST_VERSION,
+  ...(workOperationRequiresPresetContract(operation)
+    ? { presetContract: sharedActiveCodexPresetContract() }
+    : {}),
+});
+
 export const workStatusSchema = z.enum([
   "open",
   "cancel_pending",
@@ -1024,7 +1062,7 @@ export const workTaskSummarySchema = z.object({
   status: workTaskStatusSchema,
   revision: revisionSchema,
   route: workRouteSchema,
-  preset: presetSchema,
+  preset: workPresetSchema,
   fast: z.boolean(),
   priority: z.number().int().min(-100).max(100),
   depth: z.number().int().min(1).max(WORK_TASK_DEPTH_LIMIT),
@@ -2527,12 +2565,41 @@ export type WorkOperationResult = z.infer<typeof workOperationResultSchema>;
 export const workApplyResultSchema = workOperationResultSchema;
 export type WorkApplyResult = WorkOperationResult;
 
-export const workProtocolRequestSchema = z.object({
+const workProtocolRequestV1Schema = z.object({
   protocol: z.literal(WORK_PROTOCOL),
-  version: z.literal(WORK_PROTOCOL_VERSION),
+  version: z.literal(WORK_APPLY_REQUEST_LEGACY_VERSION),
   requestId: z.string().uuid(),
   operation: workOperationSchema,
-}).strict().superRefine((request, context) => {
+}).strict();
+
+const workProtocolRequestV2Schema = z.object({
+  protocol: z.literal(WORK_PROTOCOL),
+  version: z.literal(WORK_APPLY_REQUEST_VERSION),
+  requestId: z.string().uuid(),
+  presetContract: presetContractSchema.optional(),
+  operation: workOperationSchema,
+}).strict();
+
+export const workProtocolRequestSchema = z.discriminatedUnion("version", [
+  workProtocolRequestV1Schema,
+  workProtocolRequestV2Schema,
+]).superRefine((request, context) => {
+  if (request.version === WORK_APPLY_REQUEST_VERSION) {
+    const required = workOperationRequiresPresetContract(request.operation);
+    if (required && request.presetContract === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["presetContract"],
+        message: "A v2 High/Ultra work request requires its authored preset contract.",
+      });
+    } else if (!required && request.presetContract !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["presetContract"],
+        message: "A v2 work request may carry a preset contract only when it selects High or Ultra.",
+      });
+    }
+  }
   if (utf8Bytes(JSON.stringify(request)) > WORK_PROTOCOL_REQUEST_MAX_BYTES) {
     context.addIssue({
       code: "custom",
@@ -2597,14 +2664,20 @@ export type WorkProtocolError = z.infer<typeof workProtocolErrorSchema>;
 export const workProtocolResponseSchema = z.discriminatedUnion("ok", [
   z.object({
     protocol: z.literal(WORK_PROTOCOL),
-    version: z.literal(WORK_PROTOCOL_VERSION),
+    version: z.union([
+      z.literal(WORK_APPLY_REQUEST_LEGACY_VERSION),
+      z.literal(WORK_APPLY_REQUEST_VERSION),
+    ]),
     requestId: z.string().uuid(),
     ok: z.literal(true),
     result: workOperationResultSchema,
   }).strict(),
   z.object({
     protocol: z.literal(WORK_PROTOCOL),
-    version: z.literal(WORK_PROTOCOL_VERSION),
+    version: z.union([
+      z.literal(WORK_APPLY_REQUEST_LEGACY_VERSION),
+      z.literal(WORK_APPLY_REQUEST_VERSION),
+    ]),
     requestId: z.string().uuid(),
     ok: z.literal(false),
     error: workProtocolErrorSchema,
@@ -2694,9 +2767,13 @@ export const WORK_OPERATION_CONTRACTS = workOperationContractsSchema.parse([
 ]);
 
 const WORK_PROTOCOL_SHAPES = {
-  request: {
+  requestV1: {
     required: ["protocol", "version", "requestId", "operation"],
     optional: [],
+  },
+  requestV2: {
+    required: ["protocol", "version", "requestId", "operation"],
+    optional: ["presetContract"],
   },
   executionRoute: {
     required: ["accountId", "projectId", "preset", "fast"],
@@ -2736,7 +2813,7 @@ const WORK_PROTOCOL_SHAPES = {
 
 export const workProtocolDescriptionSchema = z.object({
   protocol: z.literal(WORK_PROTOCOL),
-  version: z.literal(WORK_PROTOCOL_VERSION),
+  version: z.literal(WORK_PROTOCOL_DESCRIPTION_VERSION),
   wire: z.object({
     applyArgv: z.tuple([
       z.literal("hra"),
@@ -2747,6 +2824,15 @@ export const workProtocolDescriptionSchema = z.object({
     input: z.literal("versioned_json_request"),
     output: z.literal("versioned_json_response"),
     streaming: z.literal("jsonl"),
+    acceptedApplyRequestVersions: z.tuple([
+      z.literal(WORK_APPLY_REQUEST_LEGACY_VERSION),
+      z.literal(WORK_APPLY_REQUEST_VERSION),
+    ]),
+    applyRequestCompatibility: z.object({
+      v1: z.literal("exact_historical_replay_or_fresh_stable_operation"),
+      v2: z.literal("exact_historical_replay_or_fresh_active_source"),
+      presetContract: z.literal("required_iff_create_routes_or_added_tasks_select_high_or_ultra"),
+    }).strict(),
   }).strict(),
   valueSyntax: z.object({
     idempotencyKey: z.literal("canonical_uuidv7"),
@@ -2758,7 +2844,8 @@ export const workProtocolDescriptionSchema = z.object({
     digest: z.literal("lower_hex_sha256"),
   }).strict(),
   shapes: z.object({
-    request: workProtocolShapeVariantSchema.omit({ kind: true }),
+    requestV1: workProtocolShapeVariantSchema.omit({ kind: true }),
+    requestV2: workProtocolShapeVariantSchema.omit({ kind: true }),
     executionRoute: workProtocolShapeVariantSchema.omit({ kind: true }),
     task: workProtocolShapeVariantSchema.omit({ kind: true }),
     claim: workProtocolShapeVariantSchema.omit({ kind: true }),
@@ -2876,12 +2963,21 @@ export type WorkProtocolDescription = z.infer<typeof workProtocolDescriptionSche
 
 export const WORK_PROTOCOL_DESCRIPTION: WorkProtocolDescription = {
   protocol: WORK_PROTOCOL,
-  version: WORK_PROTOCOL_VERSION,
+  version: WORK_PROTOCOL_DESCRIPTION_VERSION,
   wire: {
     applyArgv: ["hra", "work", "apply", "--input-stdin"],
     input: "versioned_json_request",
     output: "versioned_json_response",
     streaming: "jsonl",
+    acceptedApplyRequestVersions: [
+      WORK_APPLY_REQUEST_LEGACY_VERSION,
+      WORK_APPLY_REQUEST_VERSION,
+    ],
+    applyRequestCompatibility: {
+      v1: "exact_historical_replay_or_fresh_stable_operation",
+      v2: "exact_historical_replay_or_fresh_active_source",
+      presetContract: "required_iff_create_routes_or_added_tasks_select_high_or_ultra",
+    },
   },
   valueSyntax: {
     idempotencyKey: "canonical_uuidv7",

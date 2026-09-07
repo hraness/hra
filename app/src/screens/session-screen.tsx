@@ -35,6 +35,7 @@ import {
 import {
   sessionFastCommand,
   sessionFastCommandNotice,
+  sessionPresetCommand,
 } from "../model/settings-commands";
 import { deriveTranscript } from "../model/transcript";
 import {
@@ -371,7 +372,7 @@ export function SessionScreen({
               label={label}
               onSelect={() => {
                 setMenuOpen(false);
-                void run({ kind: "set_model", preset: value });
+                void run(sessionPresetCommand(value));
               }}
               selected={false}
             />

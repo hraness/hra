@@ -30,6 +30,7 @@ import {
   parseCloudProjectionRecoveryTerminalReceipt,
   providerDeletionProjectionRecoveryCode,
   pruneExpiredCloudProjectionRecoveryReceipts,
+  rebindPreparedCloudCommandJournalEntry,
   replaceCloudAttentionNotificationReconciliationDevice,
   sameCloudProjectionRecoveryEntry,
   sameCloudProjectionRecoveryTerminalReceipt,
@@ -163,7 +164,9 @@ function stateWith(
   };
 }
 
-function command(index: number): CloudCommandJournalEntry {
+function command(
+  index: number,
+): Extract<CloudCommandJournalEntry, { phase: "prepared" }> {
   return {
     authority: {
       bootGeneration: index + 1,
@@ -532,6 +535,64 @@ describe("cloud daemon journal", () => {
     expect(() => parseCloudDaemonJournal({ ...legacy, version: 5 })).toThrow(
       "Cloud daemon journal is corrupt.",
     );
+  });
+
+  test("round-trips legacy and requester-bound request commitment markers", () => {
+    const authority = { bootGeneration: 2, bootId: "boot_12345678", fence: 1 };
+    const state: CloudDaemonJournalState = {
+      commands: [
+        command(200),
+        {
+          ...command(201),
+          requestCommitmentVersion: 1,
+          requestingDevicePublicId: "device_legacy01",
+        },
+        {
+          ...command(202),
+          requestCommitmentVersion: 2,
+          requestingDevicePublicId: "device_current1",
+        },
+      ],
+      deviceCommands: [
+        {
+          authority,
+          commandPublicId: uuidV7(204),
+          kind: "usage_refresh",
+          payloadDigest: digest("3"),
+          phase: "prepared",
+          requestingDevicePublicId: "device_legacy02",
+        },
+        {
+          authority,
+          commandPublicId: uuidV7(205),
+          kind: "usage_refresh",
+          payloadDigest: digest("4"),
+          phase: "prepared",
+          requestCommitmentVersion: 1,
+          requestingDevicePublicId: "device_legacy03",
+        },
+        {
+          authority,
+          commandPublicId: uuidV7(206),
+          kind: "usage_refresh",
+          payloadDigest: digest("5"),
+          phase: "prepared",
+          requestCommitmentVersion: 2,
+          requestingDevicePublicId: "device_current2",
+        },
+      ],
+      pendingUsageAccount: null,
+      projectionRecoveries: [],
+      projectionRecoveryReceipts: [],
+      usageAccounts: [],
+      version: 5,
+    };
+
+    expect(parseCloudDaemonJournal(jsonClone(state))).toEqual(state);
+    expect(() => parseCloudDaemonJournal({
+      ...state,
+      commands: [{ ...command(207), requestCommitmentVersion: 2 }],
+    })).toThrow("Cloud daemon journal is corrupt.");
   });
 
   test("round-trips every active recovery phase and bounded baseline length", () => {
@@ -1457,6 +1518,34 @@ describe("cloud daemon journal", () => {
       "Cloud daemon journal is corrupt.",
     );
     expect(overLimit).toEqual(snapshot);
+  });
+
+  test("rebinds only the authority of an exact prepared command before phase advancement", () => {
+    const prepared = command(501);
+    const admitted = addCloudCommandJournalEntry(emptyCloudDaemonJournal(), prepared);
+    const reboundEntry = {
+      ...prepared,
+      authority: { ...prepared.authority, fence: prepared.authority.fence + 1 },
+    };
+    const rebound = rebindPreparedCloudCommandJournalEntry(admitted, reboundEntry);
+
+    expect(rebound.commands).toEqual([reboundEntry]);
+    expect(rebindPreparedCloudCommandJournalEntry(rebound, reboundEntry)).toEqual(rebound);
+    expect(() => transitionCloudCommandJournalEntry(admitted, {
+      ...reboundEntry,
+      phase: "effect_started",
+    })).toThrow("Cloud command journal transition is invalid.");
+    expect(() => rebindPreparedCloudCommandJournalEntry(admitted, {
+      ...reboundEntry,
+      payloadDigest: digest("9"),
+    })).toThrow("Cloud command journal authority rebind is invalid.");
+    const started = transitionCloudCommandJournalEntry(admitted, {
+      ...prepared,
+      phase: "effect_started",
+    });
+    expect(() => rebindPreparedCloudCommandJournalEntry(started, reboundEntry)).toThrow(
+      "Cloud command journal authority rebind is invalid.",
+    );
   });
 
   test("incrementally settles dense legacy commands without admitting a new effect", () => {

@@ -10,6 +10,7 @@ import type { TranscriptEntry } from "../model/transcript";
 type UserMessageActor = Extract<TranscriptEntry, { kind: "user" }>["actor"];
 
 const userMessageActorLabel: Readonly<Record<UserMessageActor, string>> = {
+  automation: "automation",
   autorespond: "autorespond",
   human: "you",
   peer_session: "peer session",

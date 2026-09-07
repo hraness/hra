@@ -76,6 +76,7 @@ const fixture = async () => {
   });
   const threadId = randomUUID();
   const turnId = randomUUID();
+  const connectionId = randomUUID();
   const identity = { pid: 40001, pidDomain: "linux" as const, procStart: "readback-test-child" };
   store.recordClaimedClaudeProcessAuthority({ providerThreadId: threadId, profileId: profile.id,
     profileGeneration: profile.processGeneration, runtimeScope: "managed", sessionId: session.id, identity });
@@ -87,11 +88,13 @@ const fixture = async () => {
   const send = store.prepareMutation({ kind: "session.send", authorityId: session.id,
     authorityGeneration: profile.processGeneration, idempotencyKey: sendIdempotencyKey, request: { message: sendText } });
   store.beginSessionMutationEffect({ attemptId: send.id, sessionId: session.id, profileGeneration: profile.processGeneration,
+    transcript: { accountId: profile.id, providerGeneration: profile.processGeneration,
+      providerConnectionId: connectionId, actor: "human", message: sendText },
     message: sendText, evidence: { kind: "session.send", providerThreadId: threadId,
       baseline: { status: "idle", activeTurnId: null, providerUpdatedAt: null },
       clientMessageId: send.id, messageDigest: sha(sendText), runtimeProfile: runtime, messageActor: "human" } });
   store.completeSessionTurnEffect({ attemptId: send.id, sessionId: session.id, accountId: profile.id,
-    providerGeneration: profile.processGeneration, providerConnectionId: null,
+    providerGeneration: profile.processGeneration, providerConnectionId: connectionId,
     expectedSessionRevision: store.requireSession(session.id).revision, applyResponseState: true,
     turnId, turnStatus: "completed", runtimeProfile: runtime, message: sendText,
     receipt: { turnId, status: "completed", effectiveRuntimeProfile: runtime } });
@@ -100,7 +103,6 @@ const fixture = async () => {
     summary: "Synthetic acceptance memory.", title: "Acceptance memory" };
   const bindingId = `clhb_${randomUUID().replaceAll("-", "")}`;
   const callId = randomUUID();
-  const connectionId = randomUUID();
   const request = { tool: "memory_remember", input: memory } as const;
   const requestDigest = digestClaudeHostToolInvocation(callId, request);
   const keyBytes = createHash("sha256").update([

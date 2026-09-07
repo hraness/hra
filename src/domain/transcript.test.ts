@@ -6,11 +6,14 @@ import {
   type SessionEventBody,
 } from "./session-events";
 import {
+  boundSessionTranscriptSerializedBytes,
   buildSessionTranscript,
   digestTranscriptRecords,
   renderTranscriptSeed,
+  sessionTranscriptSchema,
   TRANSCRIPT_SEED_HEADER,
 } from "./transcript";
+import { hraTrajectoryExportContextSchema, transcriptToTrajectory } from "./trajectory";
 
 const sessionId = `sess_${"a".repeat(32)}` as const;
 const accountId = `acct_${"b".repeat(32)}` as const;
@@ -104,14 +107,53 @@ describe("session transcript", () => {
     const first = buildSessionTranscript({ sessionId, events, limit: 2 });
     expect(first.records).toHaveLength(2);
     expect(first.omittedRecords).toBe(1);
-    expect(first.nextSequence).toBe(3);
+    expect(first.nextSequence).toBe(2);
+    expect(first.throughSequence).toBe(2);
     const second = buildSessionTranscript({
       sessionId,
-      events: events.filter((value) => value.sequence >= 3),
+      events: events.filter((value) => value.sequence > (first.nextSequence ?? 0)),
       limit: 2,
     });
     expect(second.records).toHaveLength(1);
+    expect(second.records[0]).toMatchObject({ kind: "user", text: "three" });
     expect(second.nextSequence).toBeNull();
+  });
+
+  test("bounds escaped JSON bytes without losing the resumable head or newest tail", () => {
+    reset();
+    const events = Array.from({ length: 10 }, (_unused, index) => event({
+      type: "user_message",
+      turnId: null,
+      actor: "human",
+      text: `${String(index)}:${'\\"\n\t'.repeat(4_000)}`,
+      omittedCharacters: 0,
+    }));
+    const full = buildSessionTranscript({ sessionId, events });
+    const maximumBytes = 80_000;
+    const head = boundSessionTranscriptSerializedBytes({
+      transcript: full,
+      maximumBytes,
+      retain: "head",
+    });
+    expect(new TextEncoder().encode(JSON.stringify(head)).byteLength).toBeLessThanOrEqual(maximumBytes);
+    expect(head.records[0]?.kind).toBe("user");
+    expect(head.records[0]?.kind === "user" && head.records[0].text.startsWith("0:")).toBe(true);
+    expect(head.records.length).toBeLessThan(full.records.length);
+    expect(head.nextSequence).toBe(head.records.at(-1)?.throughSequence ?? null);
+    expect(head.digest).toBe(digestTranscriptRecords(head.records));
+
+    const tail = boundSessionTranscriptSerializedBytes({
+      transcript: full,
+      maximumBytes,
+      retain: "tail",
+    });
+    expect(new TextEncoder().encode(JSON.stringify(tail)).byteLength).toBeLessThanOrEqual(maximumBytes);
+    const lastTailRecord = tail.records.at(-1);
+    expect(lastTailRecord?.kind).toBe("user");
+    expect(lastTailRecord?.kind === "user" && lastTailRecord.text.startsWith("9:")).toBe(true);
+    expect(tail.records.length).toBeLessThan(full.records.length);
+    expect(tail.nextSequence).toBeNull();
+    expect(tail.digest).toBe(digestTranscriptRecords(tail.records));
   });
 
   test("bounds record text and reports the exact omitted character count", () => {
@@ -144,6 +186,7 @@ describe("session transcript", () => {
       omittedCharacters: 7,
       turnId: turn,
     });
+    expect(transcript.omittedCharacters).toBe(7);
   });
 
   test("preserves peer-session authorship in transcripts and rendered seeds", () => {
@@ -192,7 +235,65 @@ describe("session transcript", () => {
     // early one does not.
     expect(seed.text).toContain("message 39");
     expect(seed.text).not.toContain("message 0 ");
+    expect(seed.text.length).toBeLessThanOrEqual(600);
     expect(seed.digest).toMatch(/^[a-f0-9]{64}$/u);
+  });
+
+  test("does not recursively embed an earlier generated handoff seed", () => {
+    reset();
+    const priorSeed = `${TRANSCRIPT_SEED_HEADER}\n${"old generated context ".repeat(700)}`;
+    const transcript = buildSessionTranscript({
+      sessionId,
+      events: [
+        event({
+          type: "user_message",
+          turnId: turn,
+          actor: "provider_switch",
+          text: priorSeed.slice(0, 16_384),
+          omittedCharacters: Math.max(0, priorSeed.length - 16_384),
+        }),
+        event({
+          type: "user_message",
+          turnId: turn,
+          actor: "human",
+          text: `latest real dialogue ${"z".repeat(400)}`,
+          omittedCharacters: 0,
+        }),
+      ],
+    });
+    const seed = renderTranscriptSeed({
+      transcript,
+      fromProvider: "claude",
+      toProvider: "codex",
+      maxCharacters: 1_024,
+    });
+    expect(seed.text.match(/\[HRA provider handoff\]/gu)).toHaveLength(1);
+    expect(seed.text).toContain("User (handoff): [prior HRA handoff seed omitted]");
+    expect(seed.text).toContain("latest real dialogue");
+    expect(seed.text).not.toContain("old generated context");
+    expect(seed.includedRecords).toBe(2);
+  });
+
+  test("retains the latest bounded records with an exact retained-history omission count", () => {
+    reset();
+    const events = Array.from({ length: 600 }, (_unused, index) => event({
+      type: "user_message",
+      turnId: null,
+      actor: "human",
+      text: `message ${String(index)}`,
+      omittedCharacters: 0,
+    }));
+    const transcript = buildSessionTranscript({
+      sessionId,
+      events,
+      limit: 500,
+      retain: "tail",
+    });
+    expect(transcript.records).toHaveLength(500);
+    expect(transcript.records[0]).toMatchObject({ kind: "user", text: "message 100" });
+    expect(transcript.records.at(-1)).toMatchObject({ kind: "user", text: "message 599" });
+    expect(transcript.omittedRecords).toBe(100);
+    expect(transcript.nextSequence).toBeNull();
   });
 
   test("says plainly when nothing was omitted", () => {
@@ -202,9 +303,64 @@ describe("session transcript", () => {
       events: [event({ type: "user_message", turnId: null, actor: "human", text: "hello", omittedCharacters: 0 })],
     });
     const seed = renderTranscriptSeed({ transcript, fromProvider: "claude", toProvider: "codex" });
-    expect(seed.text).toContain("No records were omitted.");
+    expect(seed.text).toContain("No retained records were omitted.");
     expect(seed.omittedRecords).toBe(0);
     expect(seed.includedRecords).toBe(1);
+  });
+
+  test("labels an unknown retention gap instead of claiming complete history", () => {
+    const transcript = sessionTranscriptSchema.parse({
+      version: 1,
+      sessionId,
+      records: [],
+      throughSequence: null,
+      nextSequence: null,
+      omittedRecords: 0,
+      omittedCharacters: 0,
+      retentionGapReason: "retention_age",
+      digest: digestTranscriptRecords([]),
+    });
+    const seed = renderTranscriptSeed({ transcript, fromProvider: "claude", toProvider: "codex" });
+    expect(seed.retentionGapReason).toBe("retention_age");
+    expect(seed.text).toContain("WARNING: HRA pruned earlier ledger history (retention_age)");
+    expect(seed.text).toContain("number of unavailable records is unknown");
+    expect(seed.text).toContain("No additional retained records were omitted");
+    expect(seed.text).not.toContain("No records were omitted");
+    const trajectory = transcriptToTrajectory({
+      transcript,
+      provider: "codex",
+      createdAt: 1_700_000_000_000,
+    });
+    expect(trajectory[0]).toEqual({ role: "meta", source: "hra" });
+    const context = trajectory[1];
+    if (context?.role !== "observation") throw new Error("Expected the HRA export context observation.");
+    expect(hraTrajectoryExportContextSchema.parse(JSON.parse(context.content))).toMatchObject({
+      omitted_records: 0,
+      retention_gap_reason: "retention_age",
+    });
+  });
+
+  test("keeps even the worst-case retention header inside the requested seed bound", () => {
+    const transcript = sessionTranscriptSchema.parse({
+      version: 1,
+      sessionId,
+      records: [],
+      throughSequence: null,
+      nextSequence: null,
+      omittedRecords: Number.MAX_SAFE_INTEGER,
+      omittedCharacters: Number.MAX_SAFE_INTEGER,
+      retentionGapReason: "retention_count",
+      digest: digestTranscriptRecords([]),
+    });
+    const seed = renderTranscriptSeed({
+      transcript,
+      fromProvider: "claude",
+      toProvider: "codex",
+      maxCharacters: 512,
+    });
+    expect(seed.text.length).toBeLessThanOrEqual(512);
+    expect(seed.text).toContain("WARNING: earlier ledger history was pruned (retention_count)");
+    expect(seed.text).toContain(`${String(Number.MAX_SAFE_INTEGER)} additional retained records omitted.`);
   });
 
   test("digests the same records identically and different records differently", () => {

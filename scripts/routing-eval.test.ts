@@ -38,15 +38,15 @@ function outcome(
   };
 }
 
-type RoutingEvaluationInputV2 = Extract<
+type RoutingEvaluationInputV3 = Extract<
   RoutingEvaluationInput,
-  { schemaVersion: 2 }
+  { schemaVersion: 3 }
 >;
 
 function evaluation(
   pairCount: number,
-  overrides: Partial<RoutingEvaluationInputV2> = {},
-): RoutingEvaluationInputV2 {
+  overrides: Partial<RoutingEvaluationInputV3> = {},
+): RoutingEvaluationInputV3 {
   const pairs = Array.from({ length: pairCount }, (_, index) => ({
     pairId: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
     environmentBinding: `hmac-sha256:${(index + 1)
@@ -57,11 +57,11 @@ function evaluation(
     candidate: outcome(),
   })) as RoutingEvaluationInput["pairs"];
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     study: "holdout",
     comparison: {
-      kind: "terra_vs_astra",
-      baseline: "codex_astra_ultra",
+      kind: "terra_vs_sol",
+      baseline: "codex_sol_ultra",
       candidate: "codex_terra_ultra",
     },
     taskShape: "well_defined",
@@ -93,8 +93,8 @@ describe("routing evaluation input", () => {
   test("accepts only the three closed comparison families", () => {
     for (const comparison of [
       {
-        kind: "terra_vs_astra",
-        baseline: "codex_astra_ultra",
+        kind: "terra_vs_sol",
+        baseline: "codex_sol_ultra",
         candidate: "codex_terra_ultra",
       },
       {
@@ -120,15 +120,15 @@ describe("routing evaluation input", () => {
 
   test.each([
     { privateTaskText: "must never enter an export" },
-    { schemaVersion: 3 },
+    { schemaVersion: 4 },
     { taskShape: "mechanical" },
     { design: { ...evaluation(2).design, paired: false } },
     { caseSetDigest: "not-a-digest" },
     {
       comparison: {
-        kind: "terra_vs_astra",
+        kind: "terra_vs_sol",
         baseline: "codex_terra_ultra",
-        candidate: "codex_astra_ultra",
+        candidate: "codex_sol_ultra",
       },
     },
     {
@@ -148,7 +148,7 @@ describe("routing evaluation input", () => {
     ).toBe(false);
   });
 
-  test("preserves schema v1 as an exact historical Sol comparison", () => {
+  test("preserves historical v1 Sol and v2 Astra while v3 starts current Sol studies", () => {
     const historical = {
       ...evaluation(2),
       schemaVersion: 1 as const,
@@ -159,6 +159,7 @@ describe("routing evaluation input", () => {
       },
     };
     const parsedHistorical = routingEvaluationInputSchema.parse(historical);
+    expect(JSON.stringify(parsedHistorical)).toBe(JSON.stringify(historical));
     expect(Object.keys(parsedHistorical).slice(0, 4)).toEqual([
       "schemaVersion",
       "study",
@@ -175,13 +176,31 @@ describe("routing evaluation input", () => {
       "taskShape",
     ]);
 
+    const astraHistorical = {
+      ...evaluation(2),
+      schemaVersion: 2 as const,
+      comparison: {
+        kind: "terra_vs_astra" as const,
+        baseline: "codex_astra_ultra" as const,
+        candidate: "codex_terra_ultra" as const,
+      },
+    };
+    expect(JSON.stringify(routingEvaluationInputSchema.parse(astraHistorical)))
+      .toBe(JSON.stringify(astraHistorical));
+    expect(analyzeRoutingEvaluation(astraHistorical).schemaVersion).toBe(2);
+    expect(analyzeRoutingEvaluation(evaluation(2)).schemaVersion).toBe(3);
+
     expect(routingEvaluationInputSchema.safeParse({
       ...historical,
-      comparison: evaluation(2).comparison,
+      comparison: astraHistorical.comparison,
+    }).success).toBe(false);
+    expect(routingEvaluationInputSchema.safeParse({
+      ...astraHistorical,
+      comparison: historical.comparison,
     }).success).toBe(false);
     expect(routingEvaluationInputSchema.safeParse({
       ...evaluation(2),
-      comparison: historical.comparison,
+      comparison: astraHistorical.comparison,
     }).success).toBe(false);
   });
 

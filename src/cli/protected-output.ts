@@ -436,7 +436,9 @@ export const parseAccountLoginAuthorityList = (value: unknown): readonly Account
 };
 
 const pendingLoginBase = {
-  loginId: z.string().min(1).max(512).refine((value) => !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)),
+  loginId: z.string().min(1).max(512).refine(
+    (value) => !/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(value),
+  ),
   next: z.string().min(1).max(1_024),
   status: z.literal("pending"),
 } as const;

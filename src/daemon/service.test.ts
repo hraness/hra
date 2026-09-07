@@ -52,7 +52,12 @@ import { sessionStatusSchema, type SessionStatus } from "../domain/observation";
 import type { PreparedAttachment } from "../domain/attachments";
 import { AttachmentBlobStore } from "../storage/attachment-store";
 import { ingestAttachments } from "./attachment-ingest";
-import { presetRequirements } from "../domain/presets";
+import {
+  currentPresetContract,
+  devinPresetContract,
+  legacyPresetContract,
+  presetRequirements,
+} from "../domain/presets";
 import { createQueueId } from "../domain/values";
 import type {
   EffectiveClaudeRuntimeProfile,
@@ -71,7 +76,12 @@ import {
   InMemoryGatewayKeyStore,
   type GatewayKeyPort,
 } from "../storage/gateway-key-custody";
-import { StateStore, type SessionRecord } from "../storage/state-store";
+import {
+  mutationRequestDigest,
+  sessionStartMutationRequest,
+  StateStore,
+  type SessionRecord,
+} from "../storage/state-store";
 import {
   DeterministicProseResponder,
   PROSE_APPROVAL_REPLY,
@@ -116,7 +126,7 @@ const runtimeProfile = (authority: ProfileAuthority): EffectiveRuntimeProfile =>
   processGeneration: authority.generation,
   observedAt: 2_000,
   preset: "high",
-  model: "gpt-6-astra",
+  model: "gpt-5.6-sol",
   reasoningEffort: "max",
   serviceTier: null,
   fast: false,
@@ -141,6 +151,10 @@ class FakeCodex implements CodexRuntimePort {
     attachments?: readonly PreparedAttachment[];
     clientMessageId: string;
   }[] = [];
+  readonly steerAttachments: {
+    attachments?: readonly PreparedAttachment[];
+    clientMessageId: string;
+  }[] = [];
   beforeObserveReturn?: () => Promise<void>;
   observeError?: Error;
   observeErrorOnce?: Error;
@@ -155,6 +169,7 @@ class FakeCodex implements CodexRuntimePort {
   beforeStartTurnEffect?: () => Promise<void>;
   beforeStartTurnReturn?: () => Promise<void>;
   beforeReadSessionReturn?: () => Promise<void>;
+  beforeReviewTurnStartReturn?: () => Promise<void>;
   readSessionErrorOnce?: Error;
   reviewTurnErrorOnce?: Error;
   beforeLogoutReturn?: () => Promise<void>;
@@ -496,6 +511,7 @@ class FakeCodex implements CodexRuntimePort {
       model: input.requirement.model,
       reasoningEffort: input.requirement.effort,
     };
+    await this.beforeReviewTurnStartReturn?.();
     return { reviewId: crypto.randomUUID(), kind: "turn_start", effectiveRuntimeProfile };
   }
   async startTurn(input: { review: RuntimeStartReview; message: string; attachments?: readonly PreparedAttachment[]; clientMessageId: string }): Promise<{ turnId: string; status: "completed" | "interrupted" | "failed" | "inProgress"; effectiveRuntimeProfile: EffectiveRuntimeProfile }> {
@@ -527,8 +543,12 @@ class FakeCodex implements CodexRuntimePort {
       this.activeStartTurns -= 1;
     }
   }
-  async steer(input: { activeTurnId: string; message: string; clientMessageId: string }): Promise<void> {
+  async steer(input: Parameters<CodexRuntimePort["steer"]>[0]): Promise<void> {
     this.calls.push("steer");
+    this.steerAttachments.push({
+      ...(input.attachments === undefined ? {} : { attachments: input.attachments }),
+      clientMessageId: input.clientMessageId,
+    });
     this.readProjection = { ...this.readProjection, status: "active", activeTurnId: input.activeTurnId, providerUpdatedAt: (this.readProjection.providerUpdatedAt ?? 10) + 1, messages: [...(this.readProjection.messages ?? []), { role: "user", text: input.message, turnId: input.activeTurnId, clientId: input.clientMessageId }] };
     if (this.steerError !== undefined) throw this.steerError;
   }
@@ -1854,6 +1874,70 @@ async function nativeClaudeFixture(
   };
 }
 
+/**
+ * Reconstructs the immutable request and evidence shape emitted by a historical
+ * binary. The current writer correctly cannot create or rewrite this shape, so
+ * the test fixture temporarily removes and then restores the evidence-update
+ * guard around one exact compatibility-row rewrite.
+ */
+function rewriteSessionStartAttemptAsHistoricalFixture(input: Readonly<{
+  idempotencyKey: string;
+  request: unknown;
+  store: StateStore;
+}>): Readonly<{ evidence: Readonly<Record<string, unknown>>; requestDigest: string }> {
+  const attempt = input.store.readMutation(input.idempotencyKey);
+  if (attempt === null) throw new Error("The session-start compatibility fixture is missing its mutation attempt.");
+  const inspector = new Database(input.store.paths.database, { create: false, strict: true });
+  let evidenceUpdateGuardDropped = false;
+  try {
+    const evidenceRow = inspector.query(
+      `SELECT e.evidence_json FROM mutation_effect_evidence e
+       JOIN mutation_attempts m ON m.id=e.attempt_id
+       WHERE m.idempotency_key=?`,
+    ).get(input.idempotencyKey) as { evidence_json: string } | null;
+    if (evidenceRow === null) {
+      throw new Error("The session-start compatibility fixture is missing its effect evidence.");
+    }
+    const parsedEvidence = JSON.parse(evidenceRow.evidence_json) as unknown;
+    if (typeof parsedEvidence !== "object" || parsedEvidence === null || Array.isArray(parsedEvidence)) {
+      throw new Error("The session-start compatibility fixture has invalid effect evidence.");
+    }
+    const contractlessEvidence = { ...(parsedEvidence as Record<string, unknown>) };
+    delete contractlessEvidence.presetContract;
+    const evidence = contractlessEvidence;
+    const evidenceJson = JSON.stringify(evidence);
+    const requestDigest = mutationRequestDigest({
+      authorityGeneration: attempt.authorityGeneration,
+      authorityId: attempt.authorityId,
+      kind: attempt.kind,
+      request: input.request,
+    });
+    inspector.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
+    evidenceUpdateGuardDropped = true;
+    inspector.query(
+      "UPDATE mutation_attempts SET request_digest=? WHERE idempotency_key=?",
+    ).run(requestDigest, input.idempotencyKey);
+    inspector.query(
+      "UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?",
+    ).run(
+      evidenceJson,
+      createHash("sha256").update(evidenceJson).digest("hex"),
+      attempt.id,
+    );
+    return { evidence, requestDigest };
+  } finally {
+    try {
+      if (evidenceUpdateGuardDropped) {
+        inspector.exec(`CREATE TRIGGER IF NOT EXISTS mutation_effect_evidence_immutable_update
+BEFORE UPDATE ON mutation_effect_evidence
+BEGIN SELECT RAISE(ABORT, 'mutation effect evidence is immutable'); END;`);
+      }
+    } finally {
+      inspector.close(false);
+    }
+  }
+}
+
 async function claudeAccountFixture(
   initiallySignedIn = false,
   platform: NodeJS.Platform = "linux",
@@ -1946,7 +2030,9 @@ function legacyDevinSession(
   const legacy = new Database(value.paths.database, { strict: true });
   try {
     legacy.query("DELETE FROM session_provider_account_authorities WHERE session_id=?").run(created.id);
-    legacy.query("UPDATE sessions SET provider_v39='devin' WHERE id=?").run(created.id);
+    legacy.query(
+      "UPDATE sessions SET provider_v39='devin',preset_contract=? WHERE id=?",
+    ).run(devinPresetContract, created.id);
   } finally {
     legacy.close();
   }
@@ -1960,7 +2046,7 @@ async function createIdleSession(
   const added = await value.service.execute({ kind: "account.add", label }, { signal }) as { account: { id: string } };
   await value.service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
   await value.service.execute({ kind: "project.add", label: `${label} docs`, path: value.documents }, { signal });
-  const started = await value.service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+  const started = await value.service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
   return { sessionId: started.session.id };
 }
 
@@ -2123,6 +2209,403 @@ describe("HraService personal-session adoption", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
   };
+
+  test.each([
+    ["high", { model: "gpt-5.6-sol", effort: "max" }],
+    ["ultra", { model: "gpt-5.6-sol", effort: "ultra" }],
+  ] as const)(
+    "binds a fresh adopted Codex %s session to Sol contract 1",
+    async (preset, requirement) => {
+      const providerThreadId = `personal-codex-fresh-${preset}-contract`;
+      const value = await preparedPersonalCodexCandidate({
+        label: `Fresh ${preset} contract`,
+        providerThreadId,
+        updatedAt: personalAdoptionNow - 11 * 60_000,
+        liveness: "not_live",
+      });
+      value.store.setDefaultPreset(preset);
+
+      await expect(value.enable()).resolves.toMatchObject({
+        discovery: { provider: "codex", adopted: 1, failed: 0 },
+      });
+
+      expect(value.personalCodex.claimRequests).toHaveLength(1);
+      expect(value.personalCodex.claimRequests[0]).toMatchObject({
+        preset,
+        requirement,
+      });
+      const session = value.store.findSessionByProviderThread(
+        value.accountId,
+        providerThreadId,
+      );
+      if (session === null) throw new Error("Expected the fresh Codex adoption.");
+      expect(value.store.requireSessionPresetRequirement(session.id)).toEqual({
+        preset,
+        requirement,
+      });
+      expect(value.store.latestSessionRuntimeProfile(session.id)).toMatchObject({
+        sourceKind: "session_start",
+        profile: { preset, model: requirement.model, reasoningEffort: requirement.effort },
+      });
+      const inspector = new Database(value.paths.database, { readonly: true, strict: true });
+      try {
+        expect(inspector.query(
+          "SELECT preset_contract FROM sessions WHERE id=?",
+        ).get(session.id)).toEqual({ preset_contract: legacyPresetContract });
+      } finally {
+        inspector.close(false);
+      }
+    },
+  );
+
+  test("keeps an adopted queue pending when its personal provider disconnects after review", async () => {
+    const value = await adoptedCodexFixture(
+      "Adopted queue disconnect fence",
+      "personal-codex-queue-disconnect-fence",
+    );
+    const authority = value.personalCodex.claimRequests[0]?.authority;
+    if (authority === undefined) throw new Error("Expected personal claim authority.");
+    const providerCallsBefore = value.personalCodex.calls.filter(
+      (call) => call === "send",
+    ).length;
+    value.personalCodex.beforeReviewTurnStartReturn = async () => {
+      delete value.personalCodex.beforeReviewTurnStartReturn;
+      value.personalCodex.observeError = new CodexSessionObservationError(
+        "resume_unavailable",
+      );
+      await value.service.observePersonalCodexFact(authority, {
+        type: "providerDisconnected",
+        connectionId: value.personalCodex.observationConnectionId,
+        reason: "process_exit",
+      });
+    };
+
+    const result = await value.service.execute({
+      kind: "session.queue",
+      session: value.session.id,
+      message: "remain pending across the exact disconnect race",
+      idempotencyKey: "00000000-0000-4000-8000-00000000c004",
+    }, { signal }) as { queued: { id: `queue_${string}` } };
+    await value.service.settled();
+
+    expect(value.personalCodex.turnReviewRequests).toHaveLength(1);
+    expect(value.personalCodex.calls.filter((call) => call === "send"))
+      .toHaveLength(providerCallsBefore);
+    expect(value.store.requireQueue(result.queued.id)).toMatchObject({ state: "pending" });
+    expect(value.store.readQueueEffect(result.queued.id)).toBeNull();
+  });
+
+  test("keeps an adopted direct send prepared when its personal provider disconnects after review, then retries on the replacement connection", async () => {
+    const value = await adoptedCodexFixture(
+      "Adopted send disconnect fence",
+      "personal-codex-send-disconnect-fence",
+    );
+    const authority = value.personalCodex.claimRequests[0]?.authority;
+    if (authority === undefined) throw new Error("Expected personal claim authority.");
+    const key = "00000000-0000-4000-8000-00000000c005";
+    const providerCallsBefore = value.personalCodex.calls.filter(
+      (call) => call === "send",
+    ).length;
+    value.personalCodex.beforeReviewTurnStartReturn = async () => {
+      delete value.personalCodex.beforeReviewTurnStartReturn;
+      value.personalCodex.observeError = new CodexSessionObservationError(
+        "resume_unavailable",
+      );
+      await value.service.observePersonalCodexFact(authority, {
+        type: "providerDisconnected",
+        connectionId: value.personalCodex.observationConnectionId,
+        reason: "process_exit",
+      });
+    };
+
+    const command = {
+      kind: "session.send" as const,
+      session: value.session.id,
+      message: "dispatch only on the replacement connection",
+      idempotencyKey: key,
+    };
+    await expect(value.service.execute(command, { signal })).rejects.toMatchObject({
+      code: "UNAVAILABLE",
+      details: { reason: "provider_connection_changed_before_effect" },
+    });
+
+    expect(value.personalCodex.calls.filter((call) => call === "send"))
+      .toHaveLength(providerCallsBefore);
+    const prepared = value.store.readMutation(key);
+    expect(prepared).toMatchObject({ state: "prepared" });
+    expect(prepared?.evidence).toBeUndefined();
+    expect(value.store.readSessionUserMessageSource(value.session.id, "mutation", key))
+      .toEqual({ status: "none" });
+
+    const replacementConnectionId = "30000000-0000-4000-8000-0000000000d5";
+    value.personalCodex.observationConnectionId = replacementConnectionId;
+    delete value.personalCodex.observeError;
+    await expect(value.service.execute(command, { signal })).resolves.toMatchObject({
+      idempotencyKey: key,
+    });
+
+    expect(value.personalCodex.calls.filter((call) => call === "send"))
+      .toHaveLength(providerCallsBefore + 1);
+    expect(value.store.readMutation(key)).toMatchObject({ state: "applied" });
+    const event = value.store.listSessionEvents({
+      sessionId: value.session.id,
+      afterSequence: 0,
+    }).events.find((candidate) =>
+      candidate.body.type === "user_message" && candidate.body.sourceId === key);
+    expect(event).toMatchObject({ providerConnectionId: replacementConnectionId });
+  });
+
+  test("keeps an adopted steer prepared when its personal provider disconnects after the exact read, then retries on the replacement connection", async () => {
+    const value = await adoptedCodexFixture(
+      "Adopted steer disconnect fence",
+      "personal-codex-steer-disconnect-fence",
+    );
+    const authority = value.personalCodex.claimRequests[0]?.authority;
+    if (authority === undefined) throw new Error("Expected personal claim authority.");
+    const activeTurnId = "turn-steer-disconnect-fence";
+    value.personalCodex.readProjection = {
+      ...value.personalCodex.readProjection,
+      status: "active",
+      activeTurnId,
+    };
+    value.store.reconcileSessionFromProvider({
+      sessionId: value.session.id,
+      state: "active",
+      activeTurnId,
+    });
+    const key = "00000000-0000-4000-8000-00000000c006";
+    const providerCallsBefore = value.personalCodex.calls.filter(
+      (call) => call === "steer",
+    ).length;
+    value.personalCodex.beforeReadSessionReturn = async () => {
+      delete value.personalCodex.beforeReadSessionReturn;
+      value.personalCodex.observeError = new CodexSessionObservationError(
+        "resume_unavailable",
+      );
+      await value.service.observePersonalCodexFact(authority, {
+        type: "providerDisconnected",
+        connectionId: value.personalCodex.observationConnectionId,
+        reason: "process_exit",
+      });
+    };
+
+    const command = {
+      kind: "session.steer" as const,
+      session: value.session.id,
+      message: "steer only on the replacement connection",
+      idempotencyKey: key,
+    };
+    await expect(value.service.execute(command, { signal })).rejects.toMatchObject({
+      code: "UNAVAILABLE",
+      details: { reason: "provider_connection_changed_before_effect" },
+    });
+
+    expect(value.personalCodex.calls.filter((call) => call === "steer"))
+      .toHaveLength(providerCallsBefore);
+    const prepared = value.store.readMutation(key);
+    expect(prepared).toMatchObject({ state: "prepared" });
+    expect(prepared?.evidence).toBeUndefined();
+    expect(value.store.readSessionUserMessageSource(value.session.id, "mutation", key))
+      .toEqual({ status: "none" });
+
+    const replacementConnectionId = "30000000-0000-4000-8000-0000000000d6";
+    value.personalCodex.observationConnectionId = replacementConnectionId;
+    delete value.personalCodex.observeError;
+    await expect(value.service.execute(command, { signal })).resolves.toMatchObject({
+      idempotencyKey: key,
+      steered: true,
+      turnId: activeTurnId,
+    });
+
+    expect(value.personalCodex.calls.filter((call) => call === "steer"))
+      .toHaveLength(providerCallsBefore + 1);
+    expect(value.store.readMutation(key)).toMatchObject({ state: "applied" });
+    const event = value.store.listSessionEvents({
+      sessionId: value.session.id,
+      afterSequence: 0,
+    }).events.find((candidate) =>
+      candidate.body.type === "user_message" && candidate.body.sourceId === key);
+    expect(event).toMatchObject({ providerConnectionId: replacementConnectionId });
+  });
+
+  test.each([
+    ["stop", "stop", "00000000-0000-4000-8000-00000000c007"],
+    ["rename", "rename", "00000000-0000-4000-8000-00000000c008"],
+  ] as const)(
+    "keeps an adopted %s prepared when its personal provider disconnects after the exact read",
+    async (operation, providerCall, key) => {
+      const value = await adoptedCodexFixture(
+        `Adopted ${operation} disconnect fence`,
+        `personal-codex-${operation}-disconnect-fence`,
+      );
+      const authority = value.personalCodex.claimRequests[0]?.authority;
+      if (authority === undefined) throw new Error("Expected personal claim authority.");
+      if (operation === "stop") {
+        const activeTurnId = "turn-stop-disconnect-fence";
+        value.personalCodex.readProjection = {
+          ...value.personalCodex.readProjection,
+          status: "active",
+          activeTurnId,
+        };
+        value.store.reconcileSessionFromProvider({
+          sessionId: value.session.id,
+          state: "active",
+          activeTurnId,
+        });
+      }
+      const providerCallsBefore = value.personalCodex.calls.filter(
+        (call) => call === providerCall,
+      ).length;
+      value.personalCodex.beforeReadSessionReturn = async () => {
+        delete value.personalCodex.beforeReadSessionReturn;
+        value.personalCodex.observeError = new CodexSessionObservationError(
+          "resume_unavailable",
+        );
+        await value.service.observePersonalCodexFact(authority, {
+          type: "providerDisconnected",
+          connectionId: value.personalCodex.observationConnectionId,
+          reason: "process_exit",
+        });
+      };
+      const command = operation === "stop"
+        ? {
+            kind: "session.stop" as const,
+            session: value.session.id,
+            idempotencyKey: key,
+          }
+        : {
+            kind: "session.rename" as const,
+            session: value.session.id,
+            name: "Renamed only on a live connection",
+            idempotencyKey: key,
+          };
+
+      await expect(value.service.execute(command, { signal })).rejects.toMatchObject({
+        code: "UNAVAILABLE",
+        details: { reason: "provider_connection_changed_before_effect" },
+      });
+      expect(value.personalCodex.calls.filter((call) => call === providerCall))
+        .toHaveLength(providerCallsBefore);
+      const prepared = value.store.readMutation(key);
+      expect(prepared).toMatchObject({ state: "prepared" });
+      expect(prepared?.evidence).toBeUndefined();
+    },
+  );
+
+  test("preserves an active adopted Astra contract across rediscovery and restart, then rebinds Sol after detach", async () => {
+    const providerThreadId = "personal-codex-historical-astra-contract";
+    const value = await adoptedCodexFixture(
+      "Historical adopted Astra contract",
+      providerThreadId,
+    );
+    const initialAuthority = value.personalCodex.claimRequests[0]?.authority;
+    if (initialAuthority === undefined) throw new Error("Expected initial adoption authority.");
+    const historicalAstraProfile: EffectiveRuntimeProfile = {
+      ...runtimeProfile(initialAuthority),
+      preset: "ultra",
+      model: "gpt-6-astra",
+      reasoningEffort: "ultra",
+    };
+    const writer = new Database(value.paths.database, { strict: true });
+    try {
+      expect(writer.query(
+        "UPDATE sessions SET preset_contract=? WHERE id=?",
+      ).run(currentPresetContract, value.session.id).changes).toBe(1);
+    } finally {
+      writer.close(false);
+    }
+    value.store.recordSessionRuntimeProfile({
+      sessionId: value.session.id,
+      sourceKind: "turn_start",
+      sourceId: "historical-adopted-astra-contract",
+      profile: historicalAstraProfile,
+    });
+    const establishedSession = value.store.requireSession(value.session.id);
+    const establishedProfile = value.store.latestSessionRuntimeProfile(value.session.id);
+    expect(value.store.requireSessionPresetRequirement(value.session.id)).toEqual({
+      preset: "ultra",
+      requirement: { model: "gpt-6-astra", effort: "ultra" },
+    });
+
+    await expect(value.service.execute({
+      kind: "session.adoption.discover",
+      provider: "codex",
+    }, { signal })).resolves.toMatchObject({
+      providers: [{ provider: "codex", adopted: 0 }],
+    });
+    expect(value.personalCodex.claimRequests).toHaveLength(1);
+    expect(value.store.requireSession(value.session.id)).toEqual(establishedSession);
+    expect(value.store.latestSessionRuntimeProfile(value.session.id)).toEqual(establishedProfile);
+
+    await value.service.close();
+    const restartedPersonalCodex = new FakeCodex();
+    restartedPersonalCodex.readProjection = {
+      ...value.personalCodex.readProjection,
+      providerThreadId,
+      status: "idle",
+    };
+    const restarted = new HraService({
+      store: value.store,
+      paths: value.paths,
+      codex: new FakeCodex(),
+      personalCodex: restartedPersonalCodex,
+      personalCodexHome,
+      personalDiscovery: value.discovery,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      eventCursors: value.eventCursors,
+      now: () => personalAdoptionNow,
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    await restarted.settled();
+    expect(restartedPersonalCodex.claimRequests).toHaveLength(0);
+    expect(restartedPersonalCodex.observedThreads).toContain(providerThreadId);
+    expect(value.store.requireSessionPresetRequirement(value.session.id)).toEqual({
+      preset: "ultra",
+      requirement: { model: "gpt-6-astra", effort: "ultra" },
+    });
+    expect(value.store.latestSessionRuntimeProfile(value.session.id)).toEqual(establishedProfile);
+
+    await expect(restarted.execute({
+      kind: "session.adoption.discover",
+      provider: "codex",
+    }, { signal })).resolves.toMatchObject({
+      providers: [{ provider: "codex", adopted: 0 }],
+    });
+    expect(restartedPersonalCodex.claimRequests).toHaveLength(0);
+    expect(value.store.requireSessionPresetRequirement(value.session.id).requirement)
+      .toEqual({ model: "gpt-6-astra", effort: "ultra" });
+
+    value.store.detachPersonalSession({ sessionId: value.session.id, archive: false });
+    value.store.setSessionAdoptionPolicy({ provider: "codex", profileId: null });
+    value.store.setSessionAdoptionPolicy({ provider: "codex", profileId: value.accountId });
+    value.store.setDefaultPreset("high");
+    await expect(restarted.execute({
+      kind: "session.adoption.discover",
+      provider: "codex",
+    }, { signal })).resolves.toMatchObject({
+      providers: [{ provider: "codex", adopted: 1, failed: 0 }],
+    });
+    expect(restartedPersonalCodex.claimRequests).toHaveLength(1);
+    expect(restartedPersonalCodex.claimRequests[0]).toMatchObject({
+      preset: "high",
+      requirement: { model: "gpt-5.6-sol", effort: "max" },
+    });
+    expect(value.store.requireSessionPresetRequirement(value.session.id)).toEqual({
+      preset: "high",
+      requirement: { model: "gpt-5.6-sol", effort: "max" },
+    });
+    const inspector = new Database(value.paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT preset_contract FROM sessions WHERE id=?",
+      ).get(value.session.id)).toEqual({ preset_contract: legacyPresetContract });
+    } finally {
+      inspector.close(false);
+    }
+    await restarted.close();
+  });
 
   test.each([
     ["a deterministically released claim failure", new Error("claim rejected after exact release"), "pending"],
@@ -6391,10 +6874,10 @@ describe("HraService personal-session adoption", () => {
     expect(value.store.requireSession(value.session.id).title).toBe(durableTitle);
   });
 
-  test("refuses a fresh Codex adoption whose claimed runtime profile uses a legacy preset contract", async () => {
-    const providerThreadId = "personal-thread-legacy-runtime-profile";
+  test("refuses a fresh Codex adoption whose claimed runtime profile uses the inactive Astra contract", async () => {
+    const providerThreadId = "personal-thread-inactive-astra-runtime-profile";
     const value = await preparedPersonalCodexCandidate({
-      label: "Legacy runtime profile",
+      label: "Inactive Astra runtime profile",
       providerThreadId,
       updatedAt: personalAdoptionNow - 11 * 60_000,
       liveness: "not_live",
@@ -6409,7 +6892,7 @@ describe("HraService personal-session adoption", () => {
         desktopUserData: join(privatePathRoot, "personal-codex-desktop"),
       }),
       preset,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: preset === "ultra" ? "ultra" : "max",
     };
 
@@ -7020,6 +7503,7 @@ describe("HraService personal-session adoption", () => {
       await expect(value.service.execute({
         idempotencyKey,
         kind: "session.switch",
+        presetContract: legacyPresetContract,
         provider: "codex",
         session: value.session.id,
       }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -7088,6 +7572,7 @@ describe("HraService personal-session adoption", () => {
       const outcome = await value.service.execute({
         idempotencyKey,
         kind: "session.switch",
+        presetContract: legacyPresetContract,
         provider: "codex",
         session: value.session.id,
       }, { signal }).catch((error: unknown) => ({
@@ -8651,6 +9136,7 @@ describe("HraService personal-session adoption", () => {
       kind: "session.start",
       account: existingOwner.account.id,
       preset: "high",
+      presetContract: legacyPresetContract,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const adoptingOwner = await value.service.execute(
@@ -11962,6 +12448,7 @@ describe("HraService", () => {
       fast: false,
       kind: "session.start",
       preset: "high",
+      presetContract: 1,
     }, { signal }) as { session: { id: `sess_${string}` } };
     const loginKey = "00000000-0000-4000-8000-000000000712";
     const expectedPlatformRefusal = {
@@ -12158,6 +12645,16 @@ describe("HraService", () => {
       records: [{ actor: "human", kind: "user", text: "durable local message" }],
       sessionId: idle.id,
     });
+    await expect(value.service.execute({
+      kind: "session.transcript",
+      limit: 20,
+      session: idle.id,
+      tail: true,
+    }, { signal })).resolves.toMatchObject({
+      provider: "claude",
+      records: [{ actor: "human", kind: "user", text: "durable local message" }],
+      sessionId: idle.id,
+    });
 
     const refusal = {
       code: "UNAVAILABLE",
@@ -12341,6 +12838,7 @@ describe("HraService", () => {
       account: added.account.id,
       provider: "claude",
       preset: "ultra",
+      presetContract: 1,
       fast: false,
     }, { signal })).rejects.toThrow("does not support the `ultra` model preset");
 
@@ -12368,6 +12866,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
+      presetContract: 1,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
     expect(started.session.id).toMatch(/^sess_/u);
@@ -12501,6 +13000,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
+      presetContract: 1,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
 
@@ -12557,6 +13057,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
+      presetContract: 1,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
     await service.execute({
@@ -12840,6 +13341,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
+      presetContract: 1,
       fast: false,
     }, { signal })).rejects.toMatchObject({
       code: "UNAVAILABLE",
@@ -13449,7 +13951,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Work" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: true }, { signal }) as { session: { id: `sess_${string}` }; effectiveRuntimeProfile: EffectiveRuntimeProfile };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: true }, { signal }) as { session: { id: `sess_${string}` }; effectiveRuntimeProfile: EffectiveRuntimeProfile };
     expect(started.effectiveRuntimeProfile).toMatchObject({ reviewMode: "auto_review", computerUse: true, enabledApps: [{ id: "app.files" }] });
     expect(store.latestSessionRuntimeProfile(started.session.id)).toMatchObject({ revision: 1, sourceKind: "session_start", profile: started.effectiveRuntimeProfile });
     await service.execute({ kind: "session.send", session: started.session.id, message: "hello" }, { signal });
@@ -13467,7 +13969,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Work" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
 
     // The image bytes are assembled here; the repository commits no binary.
     const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
@@ -13508,7 +14010,136 @@ describe("HraService", () => {
       session: started.session.id,
     }, { signal }) as { projection: { messages: readonly { attachments?: readonly unknown[] }[] } };
     expect(shown.projection.messages.at(-1)?.attachments).toEqual(manifest);
+    const transcript = await service.execute({
+      after: undefined,
+      kind: "session.transcript",
+      limit: 50,
+      session: started.session.id,
+    }, { signal }) as { records: readonly { attachments?: readonly unknown[]; kind: string; text?: string }[] };
+    expect(transcript.records.find((record) =>
+      record.kind === "user" && record.text === "what changed?")?.attachments).toEqual(manifest);
     expect(JSON.stringify(shown)).not.toContain(Buffer.from(png).toString("base64"));
+    expect(JSON.stringify(transcript)).not.toContain(Buffer.from(png).toString("base64"));
+  });
+
+  test("projects predecessor attachment names only for an exact durable send or steer replay", async () => {
+    const value = await fixture();
+    const { service, codex, documents, paths, store } = value;
+    const added = await service.execute(
+      { kind: "account.add", label: "Legacy attachment replay" },
+      { signal },
+    ) as { account: { id: string } };
+    await service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    await service.execute(
+      { kind: "project.add", label: "Legacy attachment docs", path: documents },
+      { signal },
+    );
+    const started = await service.execute({
+      account: added.account.id,
+      fast: false,
+      kind: "session.start",
+      preset: "high",
+      presetContract: 1,
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const session = store.requireSession(started.session.id);
+    const profile = store.requireProfileById(session.profileId);
+    const unsafeNames = [
+      `legacy${String.fromCodePoint(0x2028)}notes.txt`,
+      `legacy${String.fromCodePoint(0x2029)}notes.txt`,
+      "legacy�notes.txt",
+    ];
+    const projectedNames = [
+      "legacy�notes~1.txt",
+      "legacy�notes~2.txt",
+      "legacy�notes.txt",
+    ];
+    for (const name of unsafeNames) await writeFile(join(documents, name), "legacy body");
+    const blobs = AttachmentBlobStore.forStatePaths(paths);
+    const legacyAttachments = await ingestAttachments(
+      blobs,
+      unsafeNames,
+      documents,
+      { allowLegacyReplayName: true },
+    );
+    const sendKey = "00000000-0000-4000-8000-00000000020a";
+    const sendMessage = "finish the prepared send";
+    const preparedSend = store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: session.id,
+      idempotencyKey: sendKey,
+      kind: "session.send",
+      request: { message: sendMessage, attachments: legacyAttachments },
+    });
+
+    const sent = await service.execute({
+      attachments: [...legacyAttachments],
+      idempotencyKey: sendKey,
+      kind: "session.send",
+      message: sendMessage,
+      session: session.id,
+    }, { signal }) as { attachments: readonly { name: string }[] };
+    expect(sent.attachments.map(({ name }) => name)).toEqual(projectedNames);
+    expect(codex.startTurnAttachments.at(-1)?.attachments?.map(({ name }) => name))
+      .toEqual(projectedNames);
+    expect(store.messageAttachmentManifest(session.id, preparedSend.id)
+      .map(({ name }) => name)).toEqual(projectedNames);
+
+    const providerCallsAfterSend = [...codex.calls];
+    const replayedSend = await service.execute({
+      attachments: [...legacyAttachments],
+      idempotencyKey: sendKey,
+      kind: "session.send",
+      message: sendMessage,
+      session: session.id,
+    }, { signal }) as { attachments: readonly { name: string }[] };
+    expect(replayedSend.attachments.map(({ name }) => name)).toEqual(projectedNames);
+    expect(codex.calls).toEqual(providerCallsAfterSend);
+
+    const absentKey = "00000000-0000-4000-8000-00000000020b";
+    await expect(service.execute({
+      attachments: [...legacyAttachments],
+      idempotencyKey: absentKey,
+      kind: "session.send",
+      message: sendMessage,
+      session: session.id,
+    }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(store.readMutation(absentKey)).toBeNull();
+    expect(codex.calls).toEqual(providerCallsAfterSend);
+
+    const steerKey = "00000000-0000-4000-8000-00000000020c";
+    const steerMessage = "finish the prepared steer";
+    const preparedSteer = store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: session.id,
+      idempotencyKey: steerKey,
+      kind: "session.steer",
+      request: { message: steerMessage, attachments: legacyAttachments },
+    });
+    const steered = await service.execute({
+      attachments: [...legacyAttachments],
+      idempotencyKey: steerKey,
+      kind: "session.steer",
+      message: steerMessage,
+      session: session.id,
+    }, { signal }) as { attachments: readonly { name: string }[]; steered: boolean };
+    expect(steered.steered).toBe(true);
+    expect(steered.attachments.map(({ name }) => name)).toEqual(projectedNames);
+    expect(codex.steerAttachments.at(-1)?.attachments?.map(({ name }) => name))
+      .toEqual(projectedNames);
+    expect(store.messageAttachmentManifest(session.id, preparedSteer.id)
+      .map(({ name }) => name)).toEqual(projectedNames);
+    const providerCallsAfterSteer = [...codex.calls];
+    await expect(service.execute({
+      attachments: [...legacyAttachments],
+      idempotencyKey: steerKey,
+      kind: "session.steer",
+      message: `${steerMessage} changed`,
+      session: session.id,
+    }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(codex.calls).toEqual(providerCallsAfterSteer);
   });
 
   test("refuses a message whose attachment is not in local custody", async () => {
@@ -13517,7 +14148,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Work" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     await expect(service.execute({
       attachments: [{
         byteLength: 7,
@@ -13529,6 +14160,72 @@ describe("HraService", () => {
       message: "look",
       session: started.session.id,
     }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+  });
+
+  test("pages neutral transcript records without skipping and reports retained-history loss", async () => {
+    let currentTime = 1_000;
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => currentTime,
+    );
+    const { sessionId } = await createIdleSession(value, "Transcript paging");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    const append = (text: string): void => {
+      currentTime += 1;
+      value.store.appendSessionEvent({
+        accountId: profile.id,
+        body: {
+          actor: "human",
+          omittedCharacters: 0,
+          text,
+          turnId: null,
+          type: "user_message",
+        },
+        providerConnectionId: null,
+        providerGeneration: profile.processGeneration,
+        sessionId,
+      });
+    };
+    append("one");
+    append("two");
+    append("three");
+
+    type TranscriptResult = {
+      nextSequence: number | null;
+      records: readonly { kind: string; text?: string }[];
+      retentionGapReason?: string | null;
+    };
+    const first = await value.service.execute({
+      kind: "session.transcript",
+      limit: 2,
+      session: sessionId,
+    }, { signal }) as TranscriptResult;
+    expect(first.records.map((record) => record.text)).toEqual(["one", "two"]);
+    expect(first.nextSequence).not.toBeNull();
+    const second = await value.service.execute({
+      after: first.nextSequence ?? undefined,
+      kind: "session.transcript",
+      limit: 2,
+      session: sessionId,
+    }, { signal }) as TranscriptResult;
+    expect(second.records.map((record) => record.text)).toEqual(["three"]);
+    expect(second.nextSequence).toBeNull();
+
+    currentTime += SESSION_EVENT_RETAIN_AGE_MS + 1;
+    append("after retention");
+    for (const after of [undefined, 0] as const) {
+      const retained = await value.service.execute({
+        ...(after === undefined ? {} : { after }),
+        kind: "session.transcript",
+        limit: 10,
+        session: sessionId,
+      }, { signal }) as TranscriptResult;
+      expect(retained.records.map((record) => record.text)).toEqual(["after retention"]);
+      expect(retained.retentionGapReason).toBe("retention_age");
+    }
   });
 
   test("hooks host-owned facts memory into start, resume, terminal archive, and expiry without a model command", async () => {
@@ -13548,6 +14245,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
+      presetContract: 1,
       fast: false,
     }, { signal }) as { session: { id: string } };
     expect(factsMemory.ensures.length).toBeGreaterThanOrEqual(2);
@@ -13598,6 +14296,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: source.account.id,
       preset: "high",
+      presetContract: legacyPresetContract,
       fast: false,
     }, { signal }) as { session: { id: string } };
     const target = await value.service.execute(
@@ -13614,6 +14313,7 @@ describe("HraService", () => {
       account: target.account.id,
       idempotencyKey: crypto.randomUUID(),
       kind: "session.switch",
+      presetContract: legacyPresetContract,
       provider: "codex",
       session: started.session.id,
     }, { signal }).catch((error: unknown) => error);
@@ -14159,7 +14859,6 @@ describe("HraService", () => {
       session: sessionId,
     }, { signal })).rejects.toMatchObject(refusal);
     await expect(value.service.executeRemote({
-      idempotencyKey: "00000000-0000-4000-8000-0000000006c1",
       kind: "session.preset",
       preset: "high",
       session: sessionId,
@@ -14412,6 +15111,7 @@ describe("HraService", () => {
         kind: "session.start",
         account: added.account.id,
         preset: "high",
+        presetContract: 1,
         fast: false,
       }, { signal });
     } catch (error: unknown) {
@@ -14429,6 +15129,121 @@ describe("HraService", () => {
     expect(factsMemory.ensures.filter(({ sessionId }) => sessionId === details.sessionId).length)
       .toBeGreaterThanOrEqual(2);
     expect(value.codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(1);
+  });
+
+  test("same-key settled start replay reconciles missing facts memory without another provider start", async () => {
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    factsMemory.ensureErrorOnce = new Error("lost memory receipt");
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      Date.now,
+      factsMemory,
+    );
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Same-key memory retry" },
+      { signal },
+    ) as { account: { id: string } };
+    await value.service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    await value.service.execute(
+      { kind: "project.add", label: "Same-key memory retry docs", path: value.documents },
+      { signal },
+    );
+    const command = {
+      account: "Same-key memory retry",
+      fast: false,
+      idempotencyKey: "00000000-0000-4000-8000-00000000041e",
+      kind: "session.start" as const,
+      preset: "high" as const,
+      presetContract: 1 as const,
+    };
+
+    await expect(value.service.execute(command, { signal }))
+      .rejects.toMatchObject({
+        code: "RECOVERY_REQUIRED",
+        details: { idempotencyKey: command.idempotencyKey },
+      });
+    const providerStarts = value.codex.calls.filter((call) => call.startsWith("start:"));
+    expect(providerStarts).toHaveLength(1);
+
+    const replayed = await value.service.execute(command, { signal }) as {
+      session: { id: string };
+    };
+    expect(factsMemory.ensures.filter(({ sessionId }) => sessionId === replayed.session.id))
+      .toHaveLength(2);
+    expect(value.codex.calls.filter((call) => call.startsWith("start:")))
+      .toEqual(providerStarts);
+  });
+
+  test("same-key settled start replay keeps terminal facts memory purged without live dependencies", async () => {
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      Date.now,
+      factsMemory,
+    );
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Terminal start replay" },
+      { signal },
+    ) as { account: { id: string } };
+    await value.service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    await value.service.execute(
+      { kind: "project.add", label: "Terminal start replay docs", path: value.documents },
+      { signal },
+    );
+    const command = {
+      account: added.account.id,
+      fast: false,
+      idempotencyKey: "00000000-0000-4000-8000-00000000041f",
+      kind: "session.start" as const,
+      preset: "high" as const,
+      presetContract: 1 as const,
+    };
+    const first = await value.service.execute(command, { signal }) as {
+      session: { id: `sess_${string}`; profileId: `acct_${string}`; providerThreadId?: string };
+    };
+    if (first.session.providerThreadId === undefined) {
+      throw new Error("Expected a provider-bound started session.");
+    }
+    const profile = value.store.requireProfileById(first.session.profileId);
+    await value.service.observeCodexFact({
+      codexHome: "unused",
+      desktopUserData: "unused",
+      generation: profile.processGeneration,
+      id: profile.id,
+    }, {
+      ...parseFact("thread/deleted", { threadId: first.session.providerThreadId }),
+      connectionId: value.codex.observationConnectionId,
+    });
+    await value.service.settled();
+    expect(value.store.requireSession(first.session.id).state).toBe("terminal");
+    expect(factsMemory.states.get(first.session.id)).toBe("purged");
+
+    await rename(value.documents, `${value.documents}-missing`);
+    value.cloud.beforeProjectionUnsettledProfileReturn = () => {
+      throw new Error("A terminal settled start replay must not query current cloud recovery state.");
+    };
+    const providerCalls = [...value.codex.calls];
+    const ensureCount = factsMemory.ensures.length;
+    const cleanupCount = factsMemory.cleanups.length;
+
+    await expect(value.service.execute(command, { signal })).resolves.toMatchObject({
+      idempotencyKey: command.idempotencyKey,
+      session: { id: first.session.id, state: "terminal" },
+    });
+    expect(factsMemory.ensures).toHaveLength(ensureCount);
+    expect(factsMemory.cleanups.length).toBeGreaterThan(cleanupCount);
+    expect(factsMemory.states.get(first.session.id)).toBe("purged");
+    expect(value.codex.calls).toEqual(providerCalls);
   });
 
   test("refreshes usage without treating missing data as zero", async () => {
@@ -15064,7 +15879,7 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
       ).all()).toEqual([
@@ -15087,6 +15902,8 @@ describe("HraService", () => {
         { version: 41 },
         { version: 42 },
         { version: 43 },
+        { version: 44 },
+        { version: 45 },
       ]);
     } finally {
       inspector.close(false);
@@ -16573,7 +17390,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Race" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
     const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
     codex.beforeStartTurnReturn = async () => service.observeCodexFact(authority, { type: "turnStarted", threadId: started.session.providerThreadId, turn: { id: "turn-next", items: [], status: "inProgress", startedAt: 1, completedAt: null, durationMs: null } });
     expect(await service.execute({ kind: "session.send", session: started.session.id, message: "race" }, { signal })).toMatchObject({ session: { state: "active", activeTurnId: "turn-next" } });
@@ -16589,7 +17406,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Review order" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
 
     codex.turnEffectTrace.length = 0;
     await service.execute({ kind: "session.send", session: started.session.id, message: "active" }, { signal });
@@ -16612,7 +17429,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Metadata race" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     let note: Promise<unknown> | undefined;
     let fast: Promise<unknown> | undefined;
     codex.beforeStartTurnReturn = async () => {
@@ -16639,6 +17456,11 @@ describe("HraService", () => {
     const recoverySession = value.store.requireSession(sessionId);
     const recoveryProfile = value.store.requireProfileById(recoverySession.profileId);
     if (recoverySession.providerThreadId === undefined) throw new Error("Expected a bound recovery session.");
+    const recoveryProviderThreadId = recoverySession.providerThreadId;
+    const recoveryRuntime = value.store.latestSessionRuntimeProfile(sessionId)?.profile;
+    if (recoveryRuntime === undefined) throw new Error("Expected a recovery runtime profile.");
+    const pendingReplayKey = "00000000-0000-4000-8000-000000000807";
+    const pendingReplayMessage = "settled before compact recovery";
     const peerCreated = value.store.createSession({
       profileId: recoveryProfile.id,
       title: "Same-account recovery peer",
@@ -16680,6 +17502,44 @@ describe("HraService", () => {
         threadId: recoverySession.providerThreadId as string,
         type: "threadNameUpdated",
       });
+      const pendingReplay = value.store.prepareMutation({
+        authorityGeneration: recoveryProfile.processGeneration,
+        authorityId: sessionId,
+        idempotencyKey: pendingReplayKey,
+        kind: "session.send",
+        request: { message: pendingReplayMessage },
+      });
+      value.store.beginSessionMutationEffect({
+        attemptId: pendingReplay.id,
+        evidence: {
+          baseline: {
+            activeTurnId: null,
+            providerUpdatedAt: recoverySession.providerUpdatedAt ?? null,
+            status: "idle",
+          },
+          clientMessageId: pendingReplay.id,
+          kind: "session.send",
+          messageDigest: createHash("sha256").update(pendingReplayMessage).digest("hex"),
+          providerThreadId: recoveryProviderThreadId,
+          runtimeProfile: recoveryRuntime,
+        },
+        message: pendingReplayMessage,
+        profileGeneration: recoveryProfile.processGeneration,
+        sessionId,
+        transcript: {
+          accountId: recoveryProfile.id,
+          actor: "human",
+          message: pendingReplayMessage,
+          providerConnectionId: "30000000-0000-4000-8000-00000000000d",
+          providerGeneration: recoveryProfile.processGeneration,
+        },
+      });
+      expect(value.store.transitionMutation(pendingReplay.id, "effect_started", "applied", {
+        effectiveRuntimeProfile: recoveryRuntime,
+        sourceId: pendingReplay.id,
+        status: "inProgress",
+        turnId: "turn-pending-compact-recovery",
+      })).toBe(true);
       entered();
       await recoveryGate;
     };
@@ -16710,6 +17570,14 @@ describe("HraService", () => {
       session: sessionId,
     }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     await expect(value.service.execute({
+      idempotencyKey: pendingReplayKey,
+      kind: "session.send",
+      message: pendingReplayMessage,
+      session: sessionId,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(value.store.readSessionUserMessageSource(sessionId, "mutation", pendingReplayKey))
+      .toMatchObject({ status: "pending" });
+    await expect(value.service.execute({
       idempotencyKey: "00000000-0000-4000-8000-000000000803",
       kind: "session.note.set",
       note: "after recovery",
@@ -16731,6 +17599,12 @@ describe("HraService", () => {
 
     release();
     await expect(recovery).resolves.toBe(cloud.projectionRecoveryResult);
+    await expect(value.service.execute({
+      idempotencyKey: pendingReplayKey,
+      kind: "session.send",
+      message: pendingReplayMessage,
+      session: sessionId,
+    }, { signal })).resolves.toMatchObject({ turnId: "turn-pending-compact-recovery" });
     await expect(value.service.execute({
       idempotencyKey: "00000000-0000-4000-8000-000000000802",
       kind: "session.send",
@@ -16844,6 +17718,111 @@ describe("HraService", () => {
 
     release();
     await expect(recovery).resolves.toBe(cloud.projectionRecoveryResult);
+  });
+
+  test("fences every interaction effect behind a pending accepted-message transcript", async () => {
+    let now = 126_000;
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => now,
+    );
+    const { sessionId } = await createIdleSession(value, "Transcript interaction fence");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    const runtime = value.store.latestSessionRuntimeProfile(session.id)?.profile;
+    if (runtime === undefined || session.providerThreadId === undefined) {
+      throw new Error("Expected a bound session with a runtime profile.");
+    }
+    const message = "accepted before transcript commit";
+    const attempt = value.store.prepareMutation({
+      kind: "session.send",
+      authorityId: session.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message },
+      idempotencyKey: "00000000-0000-4000-8000-000000000806",
+    });
+    value.store.beginSessionMutationEffect({
+      attemptId: attempt.id,
+      message,
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      transcript: {
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "30000000-0000-4000-8000-00000000000b",
+        actor: "human",
+        message,
+      },
+      evidence: {
+        kind: "session.send",
+        providerThreadId: session.providerThreadId,
+        baseline: {
+          providerUpdatedAt: session.providerUpdatedAt ?? null,
+          status: "idle",
+          activeTurnId: null,
+        },
+        clientMessageId: attempt.id,
+        messageDigest: createHash("sha256").update(message).digest("hex"),
+        runtimeProfile: runtime,
+      },
+    });
+    expect(value.store.transitionMutation(attempt.id, "effect_started", "applied", {
+      turnId: "turn-pending-transcript-fence",
+      status: "inProgress",
+      sourceId: attempt.id,
+      effectiveRuntimeProfile: runtime,
+    })).toBe(true);
+
+    const manual = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "transcript-manual-fence",
+      { requestedAt: now, deadlineAt: now + 10_000 },
+    );
+    await expect(value.service.execute({
+      kind: "interaction.resolve",
+      interaction: manual.interaction.publicId,
+      expectedRevision: manual.interaction.revision,
+      resolution: { kind: "approval_decision", decision: "once" },
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+
+    const deadline = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "transcript-deadline-fence",
+      { requestedAt: now, deadlineAt: now + 1 },
+    );
+    now += 1;
+    await expect(value.service.maintainInteractionDeadlines()).resolves.toEqual({
+      examined: 1,
+      failed: 1,
+    });
+
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    const automatic = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "transcript-autorespond-fence",
+      { requestedAt: now, deadlineAt: now + 10_000 },
+    );
+    const evidenceDeadline = Date.now() + 2_000;
+    while (!value.store.listAutorespondEvidence({ sessionId }).some((row) =>
+      row.interactionId === automatic.interaction.publicId)) {
+      if (Date.now() >= evidenceDeadline) {
+        throw new Error("Timed out waiting for transcript-fenced autorespond evidence.");
+      }
+      await Bun.sleep(5);
+    }
+
+    expect(value.codex.validatedInteractions).toEqual([]);
+    expect(value.codex.resolvedInteractions).toEqual([]);
+    expect(value.codex.validatedInteractionTimeouts).toEqual([]);
+    expect(value.codex.timedOutInteractions).toEqual([]);
+    expect(value.store.requireInteraction(manual.interaction.publicId).state).toBe("pending");
+    expect(value.store.requireInteraction(deadline.interaction.publicId).state).toBe("pending");
+    expect(value.store.requireInteraction(automatic.interaction.publicId).state).toBe("pending");
   });
 
   test("routes same-key projection recovery replay through the same closed cloud seam", async () => {
@@ -17332,6 +18311,7 @@ describe("HraService", () => {
       fast: false,
       kind: "session.start",
       preset: "high",
+      presetContract: 1,
     }, { signal }) as { session: { id: `sess_${string}` } };
     const unrelatedSessionId = unrelatedStarted.session.id;
     const affectedSession = value.store.requireSession(affectedSessionId);
@@ -17565,7 +18545,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Completion race" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const queued = store.enqueue(started.session.id, "after completion");
     const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
     codex.beforeStartTurnReturn = async () => {
@@ -17586,7 +18566,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Terminal response" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const queued = store.enqueue(started.session.id, "next");
     codex.turnStatus = "completed";
     codex.beforeStartTurnReturn = async () => { delete codex.beforeStartTurnReturn; codex.turnStatus = "inProgress"; };
@@ -17602,7 +18582,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queued completion race" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const first = store.enqueue(started.session.id, "first queued");
     const second = store.enqueue(started.session.id, "second queued");
     const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
@@ -17625,7 +18605,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Coherent show" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     let releaseRead!: () => void;
     let markReadStarted!: () => void;
     const readStarted = new Promise<void>((resolve) => { markReadStarted = resolve; });
@@ -17649,7 +18629,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
     await service.execute({ kind: "session.send", session: started.session.id, message: "first" }, { signal });
     await service.execute({ kind: "session.queue", session: started.session.id, message: "second" }, { signal });
     codex.readProjection = { ...codex.readProjection, status: "idle", providerUpdatedAt: (codex.readProjection.providerUpdatedAt ?? 10) + 1 };
@@ -17667,7 +18647,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue liveness" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     await service.execute({ kind: "session.send", session: started.session.id, message: "active" }, { signal });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "active" });
     const first = await service.execute({ kind: "session.queue", session: started.session.id, message: "fails" }, { signal }) as { queued: { id: `queue_${string}` } };
@@ -17778,7 +18758,7 @@ describe("HraService", () => {
       const added = await service.execute({ kind: "account.add", label: `Transient ${failure}` }, { signal }) as { account: { id: string } };
       await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
       await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
       if (failure === "baseline") codex.readSessionErrorOnce = new Error("transient baseline read");
       else codex.reviewTurnErrorOnce = new Error("transient capability read");
 
@@ -17840,7 +18820,7 @@ describe("HraService", () => {
       const added = await service.execute({ kind: "account.add", label: `Unavailable ${failure.code}` }, { signal }) as { account: { id: string } };
       await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
       await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
       const idempotencyKey = `00000000-0000-4000-8000-${String(730 + index).padStart(12, "0")}`;
       codex.reviewTurnErrorOnce = new CodexError(failure.code, "private provider capability diagnostic");
 
@@ -17866,7 +18846,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Remote rejection" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const idempotencyKey = "00000000-0000-4000-8000-000000000799";
     codex.startTurnErrorOnce = new CodexRemoteError(-32_600, "private provider rejection diagnostic");
 
@@ -17892,7 +18872,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Bounded retry" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     const project = await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal }) as { project: { id: string } };
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     codex.beforeReadSessionReturn = async () => { throw new Error("persistent baseline failure"); };
 
     const queued = await service.execute({ kind: "session.queue", session: started.session.id, message: "bounded retry" }, { signal }) as { queued: { id: `queue_${string}` } };
@@ -17913,7 +18893,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Canonical" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string; title: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string; title: string } };
     const results = await Promise.allSettled([
       service.execute({ kind: "session.send", session: started.session.id, message: "one" }, { signal }),
       service.execute({ kind: "session.send", session: started.session.title, message: "two" }, { signal }),
@@ -17928,7 +18908,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Remote authority" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const session = store.requireSession(started.session.id);
     const profile = store.requireProfile(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("The provider binding is missing.");
@@ -17958,7 +18938,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Remote metadata" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const session = store.requireSession(started.session.id);
     const profile = store.requireProfile(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("The provider binding is missing.");
@@ -18001,7 +18981,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Remote fence" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const session = store.requireSession(started.session.id);
     const profile = store.requireProfile(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("The provider binding is missing.");
@@ -18014,7 +18994,6 @@ describe("HraService", () => {
       .then(() => null, (error: unknown) => error);
     await providerVisible;
     const remote = service.executeRemote({
-      idempotencyKey: "00000000-0000-4000-8000-000000000714",
       kind: "session.preset",
       preset: "ultra",
       session: session.id,
@@ -18999,7 +19978,9 @@ describe("HraService", () => {
     });
     const legacy = new Database(value.paths.database, { strict: true });
     try {
-      legacy.query("UPDATE sessions SET provider_v39='devin' WHERE id=?").run(session.id);
+      legacy.query(
+        "UPDATE sessions SET provider_v39='devin',preset_contract=? WHERE id=?",
+      ).run(devinPresetContract, session.id);
       legacy.query(
         "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,'session.start',?,?,?,'effect_started',0,0)",
       ).run(attemptId, key, profile.id, profile.processGeneration, "d".repeat(64));
@@ -19029,7 +20010,7 @@ describe("HraService", () => {
       }, { signal });
       await expect(value.service.execute({
         kind: "session.start", account: added.account.id, project: project.id,
-        preset: "high", fast: false,
+        preset: "high", presetContract: legacyPresetContract, fast: false,
       }, { signal })).resolves.toMatchObject({ session: { provider: "codex" } });
     } finally {
       await value.service.close();
@@ -19123,6 +20104,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
+      presetContract: legacyPresetContract,
       fast: false,
     }, { signal });
 
@@ -19176,6 +20158,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
+      presetContract: legacyPresetContract,
       fast: false,
     }, { signal });
     const before = store.requireProfileById(added.account.id);
@@ -19710,7 +20693,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue replay" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const command = { kind: "session.queue" as const, session: started.session.id, message: "only once", idempotencyKey: "00000000-0000-4000-8000-000000000103" };
     const first = await service.execute(command, { signal }) as { queued: { id: string } };
     const replay = await service.execute(command, { signal }) as { queued: { id: string } };
@@ -19719,19 +20702,275 @@ describe("HraService", () => {
   });
 
   test("replays applied send and stop receipts after their local session state has advanced", async () => {
-    const { service, codex, documents } = await fixture();
+    const { service, codex, documents, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Effect replay" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
     const send = { kind: "session.send" as const, session: started.session.id, message: "once", idempotencyKey: "00000000-0000-4000-8000-000000000105" };
     const firstSend = await service.execute(send, { signal });
     expect(await service.execute(send, { signal })).toEqual(firstSend);
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
+    expect(store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: started.session.id as `sess_${string}`,
+    }).events.filter((event) =>
+      event.body.type === "user_message" && event.body.text === send.message))
+      .toHaveLength(1);
     const stop = { kind: "session.stop" as const, session: started.session.id, idempotencyKey: "00000000-0000-4000-8000-000000000106" };
     const firstStop = await service.execute(stop, { signal });
     expect(await service.execute(stop, { signal })).toEqual(firstStop);
     expect(codex.calls.filter((call) => call === "stop")).toHaveLength(1);
+  });
+
+  test("fences pending transcript replay behind projection recovery but keeps settled replay authority-independent", async () => {
+    const { service, codex, cloud, documents, store } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "Transcript-first replay" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    await service.execute(
+      { kind: "project.add", label: "Docs", path: documents },
+      { signal },
+    );
+    const started = await service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      preset: "high",
+      presetContract: 1,
+      fast: false,
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const session = store.requireSession(started.session.id);
+    const profile = store.requireProfileById(session.profileId);
+    const runtime = store.latestSessionRuntimeProfile(session.id)?.profile;
+    if (runtime === undefined) throw new Error("Expected the session-start runtime profile.");
+    const key = "00000000-0000-4000-8000-00000000010a";
+    const message = "finish only the durable transcript";
+    const attempt = store.prepareMutation({
+      kind: "session.send",
+      authorityId: session.id,
+      authorityGeneration: profile.processGeneration,
+      request: { message },
+      idempotencyKey: key,
+    });
+    store.beginSessionMutationEffect({
+      attemptId: attempt.id,
+      message,
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      transcript: {
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "30000000-0000-4000-8000-00000000000c",
+        actor: "human",
+        message,
+      },
+      evidence: {
+        kind: "session.send",
+        providerThreadId: session.providerThreadId ?? "",
+        baseline: {
+          providerUpdatedAt: session.providerUpdatedAt ?? null,
+          status: "idle",
+          activeTurnId: null,
+        },
+        clientMessageId: attempt.id,
+        messageDigest: createHash("sha256").update(message).digest("hex"),
+        runtimeProfile: runtime,
+      },
+    });
+    expect(store.transitionMutation(attempt.id, "effect_started", "applied", {
+      turnId: "turn-transcript-first-replay",
+      status: "inProgress",
+      sourceId: attempt.id,
+      effectiveRuntimeProfile: runtime,
+    })).toBe(true);
+    store.updateSessionMetadata({
+      sessionId: session.id,
+      expectedRevision: session.revision,
+      preset: "ultra",
+    });
+    store.nextProfileGeneration(profile.id);
+    cloud.beforeProjectionUnsettledSessionReturn = () => {
+      throw new Error("A digest conflict must not observe current cloud recovery state.");
+    };
+    cloud.beforeProjectionUnsettledProfileReturn = () => {
+      throw new Error("A digest conflict must not observe current account recovery state.");
+    };
+    const providerCalls = [...codex.calls];
+
+    await expect(service.execute({
+      kind: "session.send",
+      session: session.id,
+      message: `${message} changed`,
+      idempotencyKey: key,
+    }, { signal })).rejects.toThrow("IDEMPOTENCY_CONFLICT");
+    delete cloud.beforeProjectionUnsettledSessionReturn;
+    delete cloud.beforeProjectionUnsettledProfileReturn;
+    cloud.unsettledProjectionSessions.add(session.id);
+    cloud.unsettledProjectionProfiles.add(profile.id);
+    await expect(service.execute({
+      kind: "session.send",
+      session: session.id,
+      message,
+      idempotencyKey: key,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(store.readSessionUserMessageSource(session.id, "mutation", key))
+      .toMatchObject({ status: "pending" });
+    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events
+      .filter((event) => event.body.type === "user_message"
+        && event.body.sourceId === key)).toHaveLength(0);
+    cloud.unsettledProjectionSessions.clear();
+    cloud.unsettledProjectionProfiles.clear();
+
+    const replayed = await service.execute({
+      kind: "session.send",
+      session: session.id,
+      message,
+      idempotencyKey: key,
+    }, { signal });
+    expect(replayed).toMatchObject({
+      idempotencyKey: key,
+      turnId: "turn-transcript-first-replay",
+    });
+    expect(codex.calls).toEqual(providerCalls);
+    expect(store.readSessionUserMessageSource(session.id, "mutation", key))
+      .toMatchObject({ status: "finalized", intent: { actor: "human" } });
+    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events
+      .filter((event) => event.body.type === "user_message"
+        && event.body.sourceId === key)).toHaveLength(1);
+    cloud.beforeProjectionUnsettledSessionReturn = () => {
+      throw new Error("A settled replay must not observe current cloud recovery state.");
+    };
+    cloud.beforeProjectionUnsettledProfileReturn = () => {
+      throw new Error("A settled replay must not observe current account recovery state.");
+    };
+    await expect(service.execute({
+      kind: "session.send",
+      session: session.id,
+      message,
+      idempotencyKey: key,
+    }, { signal })).resolves.toMatchObject({
+      idempotencyKey: key,
+      turnId: "turn-transcript-first-replay",
+    });
+  });
+
+  test("does not resurrect a retained-out send transcript record on exact replay", async () => {
+    let currentTime = 1_000;
+    const { service, codex, documents, store } = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => currentTime,
+    );
+    const added = await service.execute({ kind: "account.add", label: "Send retention replay" }, { signal }) as { account: { id: string } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const command = {
+      kind: "session.send" as const,
+      session: started.session.id,
+      message: "expire this send",
+      idempotencyKey: "00000000-0000-4000-8000-000000000107",
+    };
+
+    await service.execute(command, { signal });
+    currentTime += SESSION_EVENT_RETAIN_AGE_MS + 1;
+    store.maintainSessionEventRetention(started.session.id, currentTime);
+    expect(store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: started.session.id,
+    }).events.some((event) =>
+      event.body.type === "user_message"
+      && event.body.sourceId === command.idempotencyKey)).toBe(false);
+
+    await service.execute(command, { signal });
+
+    expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
+    expect(store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: started.session.id,
+    }).events.some((event) =>
+      event.body.type === "user_message"
+      && event.body.sourceId === command.idempotencyKey)).toBe(false);
+  });
+
+  test("does not reopen the human autorespond budget on retained-out exact replay", async () => {
+    let currentTime = 1_000;
+    const { service, codex, documents, store } = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => currentTime,
+    );
+    const added = await service.execute({ kind: "account.add", label: "Human replay budget" }, { signal }) as { account: { id: string } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const command = {
+      kind: "session.send" as const,
+      session: started.session.id,
+      message: "old human authority",
+      idempotencyKey: "00000000-0000-4000-8000-000000000109",
+    };
+
+    await service.execute(command, { signal });
+    currentTime += SESSION_EVENT_RETAIN_AGE_MS + 1;
+    store.maintainSessionEventRetention(started.session.id, currentTime);
+    store.bumpAutorespondCounter(started.session.id);
+    store.bumpAutorespondCounter(started.session.id);
+    store.bumpAutorespondCounter(started.session.id);
+    expect(store.readAutorespondBudgets(started.session.id).consecutive).toBe(3);
+
+    await service.execute(command, { signal });
+
+    expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
+    expect(store.readAutorespondBudgets(started.session.id).consecutive).toBe(3);
+  });
+
+  test("does not resurrect a retained-out steer transcript record on exact replay", async () => {
+    let currentTime = 1_000;
+    const { service, codex, documents, store } = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => currentTime,
+    );
+    const added = await service.execute({ kind: "account.add", label: "Steer retention replay" }, { signal }) as { account: { id: string } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    await service.execute({ kind: "session.send", session: started.session.id, message: "activate" }, { signal });
+    const command = {
+      kind: "session.steer" as const,
+      session: started.session.id,
+      message: "expire this steer",
+      idempotencyKey: "00000000-0000-4000-8000-000000000108",
+    };
+
+    await service.execute(command, { signal });
+    currentTime += SESSION_EVENT_RETAIN_AGE_MS + 1;
+    store.maintainSessionEventRetention(started.session.id, currentTime);
+    expect(store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: started.session.id,
+    }).events.some((event) =>
+      event.body.type === "user_message"
+      && event.body.sourceId === command.idempotencyKey)).toBe(false);
+
+    await service.execute(command, { signal });
+
+    expect(codex.calls.filter((call) => call === "steer")).toHaveLength(1);
+    expect(store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: started.session.id,
+    }).events.some((event) =>
+      event.body.type === "user_message"
+      && event.body.sourceId === command.idempotencyKey)).toBe(false);
   });
 
   test("keeps a receipt-commit ambiguity quarantined across passive and exact provider reads", async () => {
@@ -19739,7 +20978,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Receipt failure" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
     codex.turnId = "";
     const idempotencyKey = "00000000-0000-4000-8000-000000000107";
     const command = { kind: "session.send" as const, session: started.session.id, message: "ambiguous", idempotencyKey };
@@ -19771,7 +21010,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Runtime receipt" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const originalComplete = store.completeSessionTurnEffect.bind(store);
     store.completeSessionTurnEffect = (() => { throw new Error("simulated receipt storage failure"); }) as StateStore["completeSessionTurnEffect"];
     const key = "00000000-0000-4000-8000-000000000111";
@@ -19789,7 +21028,7 @@ describe("HraService", () => {
       const added = await service.execute({ kind: "account.add", label: `Lost ${operation}` }, { signal }) as { account: { id: string } };
       await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
       await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
+      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
       if (operation === "steer" || operation === "stop") {
         await service.execute({ kind: "session.send", session: started.session.id, message: "activate" }, { signal });
       }
@@ -19830,7 +21069,7 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const originalComplete = store.completeSessionStartEffect.bind(store);
     store.completeSessionStartEffect = (() => { throw new Error("simulated atomic start receipt failure"); }) as StateStore["completeSessionStartEffect"];
-    const command = { kind: "session.start" as const, account: added.account.id, preset: "high" as const, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000401" };
+    const command = { kind: "session.start" as const, account: added.account.id, preset: "high" as const, presetContract: 1 as const, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000401" };
     await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     store.completeSessionStartEffect = originalComplete;
 
@@ -19844,13 +21083,609 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(0);
   });
 
+  test("replays an applied v0.5 Codex high default across restart only under its matching source contract", async () => {
+    const { service, codex, documents, paths, store } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "v0.5 applied start" },
+      { signal },
+    ) as { account: { id: string } };
+    await service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    const project = await service.execute(
+      { kind: "project.add", label: "v0.5 start docs", path: documents },
+      { signal },
+    ) as { project: { id: string } };
+    const key = "00000000-0000-4000-8000-000000000409";
+    const command = {
+      account: added.account.id,
+      fast: false,
+      idempotencyKey: key,
+      kind: "session.start" as const,
+      preset: "high" as const,
+      presetContract: 1 as const,
+    };
+    const first = await service.execute(command, { signal }) as {
+      effectiveRuntimeProfile: EffectiveRuntimeProfile;
+      session: { id: `sess_${string}`; state: string };
+    };
+
+    const profile = store.requireProfileById(added.account.id);
+    // v0.5 resolved an omitted CLI preset to High before dispatch, while its
+    // stored request digest still omitted the then-implicit Codex provider.
+    const releasedRequest = {
+      projectId: project.project.id,
+      preset: "high" as const,
+      fast: false,
+    };
+    const historical = rewriteSessionStartAttemptAsHistoricalFixture({
+      idempotencyKey: key,
+      request: releasedRequest,
+      store,
+    });
+    expect(store.readMutation(key)).toMatchObject({
+      authorityGeneration: profile.processGeneration,
+      requestDigest: historical.requestDigest,
+      evidence: { evidence: historical.evidence },
+      state: "applied",
+    });
+    expect(store.readMutation(key)?.evidence?.evidence).not.toHaveProperty("presetContract");
+    expect(codex.calls.filter((call) => call === "review-session")).toHaveLength(1);
+    expect(codex.calls.filter((call) => call === "start:high")).toHaveLength(1);
+
+    await service.close();
+    expect(store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 1);
+    expect(store.nextDaemonGeneration(`boot_${"b".repeat(32)}`)).toBe(1);
+    expect(store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 2);
+    const restartedCodex = new FakeCodex();
+    const restarted = new HraService({
+      store,
+      paths,
+      codex: restartedCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+
+    const replayCommand = {
+      account: added.account.id,
+      fast: false,
+      idempotencyKey: key,
+      kind: "session.start" as const,
+      preset: "high" as const,
+      presetContract: 1 as const,
+    };
+    const providerCallsBeforeReplay = restartedCodex.calls.length;
+    await expect(restarted.execute({
+      account: replayCommand.account,
+      fast: replayCommand.fast,
+      idempotencyKey: replayCommand.idempotencyKey,
+      kind: replayCommand.kind,
+      preset: replayCommand.preset,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(restartedCodex.calls).toHaveLength(providerCallsBeforeReplay);
+    await expect(restarted.execute({ ...replayCommand, presetContract: 2 }, { signal }))
+      .rejects.toMatchObject({ code: "CONFLICT" });
+    expect(restartedCodex.calls).toHaveLength(providerCallsBeforeReplay);
+    await expect(restarted.execute(replayCommand, { signal })).resolves.toMatchObject({
+      effectiveRuntimeProfile: first.effectiveRuntimeProfile,
+      idempotencyKey: key,
+      session: { id: first.session.id },
+    });
+    expect(restartedCodex.calls.filter((call) => call === "review-session")).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "start:high")).toHaveLength(0);
+    await restarted.close();
+  });
+
+  test("replays a settled source-bound start against its original project after the default changes", async () => {
+    const { service, codex, cloud, documents } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "Settled start default project" },
+      { signal },
+    ) as { account: { id: string } };
+    await service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    const original = await service.execute(
+      { kind: "project.add", label: "Original start project", path: documents },
+      { signal },
+    ) as { project: { id: string } };
+    const command = {
+      account: added.account.id,
+      fast: false,
+      idempotencyKey: "00000000-0000-4000-8000-00000000041c",
+      kind: "session.start" as const,
+      preset: "high" as const,
+      presetContract: 1 as const,
+    };
+    const first = await service.execute(command, { signal }) as {
+      idempotencyKey: string;
+      session: { id: string; projectId?: string };
+    };
+    expect(first.session.projectId).toBe(original.project.id);
+
+    const alternateRoot = join(documents, "..", "Alternate");
+    await mkdir(alternateRoot, { recursive: true });
+    const alternate = await service.execute(
+      { kind: "project.add", label: "Alternate start project", path: alternateRoot },
+      { signal },
+    ) as { project: { id: string } };
+    await service.execute(
+      { kind: "project.use", project: alternate.project.id },
+      { signal },
+    );
+    cloud.beforeProjectionUnsettledProfileReturn = () => {
+      throw new Error("A settled start replay must not query current cloud recovery state.");
+    };
+    const providerCalls = [...codex.calls];
+
+    await expect(service.execute(command, { signal })).resolves.toMatchObject({
+      idempotencyKey: command.idempotencyKey,
+      session: { id: first.session.id, projectId: original.project.id },
+    });
+    await expect(service.execute({
+      ...command,
+      project: alternate.project.id,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(service.execute({
+      ...command,
+      presetContract: 2,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(codex.calls).toEqual(providerCalls);
+  });
+
+  test("replays a settled source-bound start after its project root disappears", async () => {
+    const { service, codex, cloud, documents } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "Settled start missing project" },
+      { signal },
+    ) as { account: { id: string } };
+    await service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    const project = await service.execute(
+      { kind: "project.add", label: "Missing start project", path: documents },
+      { signal },
+    ) as { project: { id: string } };
+    const command = {
+      account: added.account.id,
+      fast: false,
+      idempotencyKey: "00000000-0000-4000-8000-00000000041d",
+      kind: "session.start" as const,
+      preset: "ultra" as const,
+      presetContract: 1 as const,
+      project: project.project.id,
+    };
+    const first = await service.execute(command, { signal }) as {
+      idempotencyKey: string;
+      session: { id: string };
+    };
+    await rename(documents, `${documents}-missing`);
+    cloud.beforeProjectionUnsettledProfileReturn = () => {
+      throw new Error("A settled start replay must not query current cloud recovery state.");
+    };
+    const providerCalls = [...codex.calls];
+
+    await expect(service.execute(command, { signal })).resolves.toMatchObject({
+      idempotencyKey: command.idempotencyKey,
+      session: { id: first.session.id },
+    });
+    expect(codex.calls).toEqual(providerCalls);
+  });
+
+  test("keeps an effect-started v0.5 Codex high start recoverable across authority rebinding", async () => {
+    const { service, documents, paths, store } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "v0.5 unsettled start" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    const project = await service.execute(
+      { kind: "project.add", label: "v0.5 unsettled docs", path: documents },
+      { signal },
+    ) as { project: { id: `proj_${string}` } };
+    const profile = store.requireProfileById(added.account.id);
+    const key = "00000000-0000-4000-8000-000000000415";
+    const attempt = store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: profile.id,
+      idempotencyKey: key,
+      kind: "session.start",
+      request: sessionStartMutationRequest({
+        fast: false,
+        preset: "high",
+        presetContract: 1,
+        projectId: project.project.id,
+        provider: "codex",
+      }),
+    });
+    const effectiveRuntimeProfile = runtimeProfile({
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    });
+    const starting = store.beginSessionStartEffect({
+      attemptId: attempt.id,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      projectId: project.project.id,
+      provider: "codex",
+      providerAccountKey: codexProviderAccountKey(),
+      providerAuthentication: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        provider: "codex",
+        signedIn: true,
+      },
+      preset: "high",
+      fastEnabled: false,
+      evidence: {
+        kind: "session.start",
+        projectId: project.project.id,
+        clientMessageId: null,
+        messageDigest: null,
+        presetContract: 1,
+        runtimeProfile: effectiveRuntimeProfile,
+      },
+    });
+    const releasedRequest = {
+      projectId: project.project.id,
+      preset: "high" as const,
+      fast: false,
+    };
+    const historical = rewriteSessionStartAttemptAsHistoricalFixture({
+      idempotencyKey: key,
+      request: releasedRequest,
+      store,
+    });
+    expect(store.readMutation(key)).toMatchObject({
+      authorityGeneration: profile.processGeneration,
+      evidence: { evidence: historical.evidence },
+      requestDigest: historical.requestDigest,
+      sessionStartId: starting.id,
+      state: "effect_started",
+    });
+    expect(store.readMutation(key)?.evidence?.evidence).not.toHaveProperty("presetContract");
+
+    await service.close();
+    expect(store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 1);
+    expect(store.isSessionMutationProviderAuthorityCurrent({
+      attemptId: attempt.id,
+      profileId: profile.id,
+      provider: "codex",
+      originGeneration: profile.processGeneration,
+    })).toBe(true);
+    expect(store.nextDaemonGeneration(`boot_${"c".repeat(32)}`)).toBe(1);
+    expect(store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 2);
+    expect(store.isSessionMutationProviderAuthorityCurrent({
+      attemptId: attempt.id,
+      profileId: profile.id,
+      provider: "codex",
+      originGeneration: profile.processGeneration,
+    })).toBe(true);
+    const restartedCodex = new FakeCodex();
+    const restarted = new HraService({
+      store,
+      paths,
+      codex: restartedCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    expect(store.readMutation(key)).toMatchObject({
+      authorityGeneration: profile.processGeneration,
+      authorityId: profile.id,
+      evidence: {
+        evidence: {
+          kind: "session.start",
+          runtimeProfile: {
+            model: "gpt-5.6-sol",
+            reasoningEffort: "max",
+          },
+        },
+      },
+      requestDigest: historical.requestDigest,
+      state: "ambiguous",
+    });
+    expect(store.requireSession(starting.id)).toMatchObject({ state: "recovery_required" });
+
+    const replayCommand = {
+      account: profile.id,
+      fast: false,
+      idempotencyKey: key,
+      kind: "session.start" as const,
+      preset: "high" as const,
+      presetContract: 1 as const,
+    };
+    const providerCallsBeforeReplay = restartedCodex.calls.length;
+    await expect(restarted.execute({ ...replayCommand, presetContract: 2 }, { signal }))
+      .rejects.toMatchObject({ code: "CONFLICT" });
+    expect(restartedCodex.calls).toHaveLength(providerCallsBeforeReplay);
+    await expect(restarted.execute(replayCommand, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(restartedCodex.calls.filter((call) => call === "review-session")).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "start:high")).toHaveLength(0);
+    await restarted.close();
+  });
+
+  test("refuses fresh absent or stale rebound sources before provider contact or mutation preparation", async () => {
+    const { service, codex, documents, store } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "Fresh source admission" },
+      { signal },
+    ) as { account: { id: string } };
+    await service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    const project = await service.execute(
+      { kind: "project.add", label: "Fresh source docs", path: documents },
+      { signal },
+    ) as { project: { id: `proj_${string}` } };
+    const providerCallsBefore = codex.calls.length;
+    const base = {
+      account: added.account.id,
+      fast: false,
+      kind: "session.start" as const,
+      preset: "high" as const,
+    };
+    for (const [idempotencyKey, presetContract] of [
+      ["00000000-0000-4000-8000-00000000040a", undefined],
+      ["00000000-0000-4000-8000-00000000040b", 2],
+    ] as const) {
+      await expect(service.execute({
+        ...base,
+        idempotencyKey,
+        ...(presetContract === undefined ? {} : { presetContract }),
+      }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(store.readMutation(idempotencyKey)).toBeNull();
+      expect(codex.calls).toHaveLength(providerCallsBefore);
+    }
+
+    const currentKey = "00000000-0000-4000-8000-00000000040c";
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: currentKey,
+      presetContract: 1,
+    }, { signal })).resolves.toMatchObject({ session: { state: "idle" } });
+    expect(store.readMutation(currentKey)).toMatchObject({
+      evidence: { evidence: { presetContract: 1 } },
+      requestDigest: mutationRequestDigest({
+        authorityGeneration: store.requireProfileById(added.account.id).processGeneration,
+        authorityId: added.account.id,
+        kind: "session.start",
+        request: sessionStartMutationRequest({
+          fast: false,
+          preset: "high",
+          presetContract: 1,
+          projectId: project.project.id,
+          provider: "codex",
+        }),
+      }),
+      state: "applied",
+    });
+    const providerCallsAfterCurrent = codex.calls.length;
+    await expect(service.execute({
+      ...base,
+      fast: true,
+      idempotencyKey: currentKey,
+      presetContract: 1,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: currentKey,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(codex.calls).toHaveLength(providerCallsAfterCurrent);
+  });
+
+  test("resumes only current prepared rebound starts while preserving historical recovery lookups", async () => {
+    const { service, codex, documents, store } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "Prepared source admission" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    const project = await service.execute(
+      { kind: "project.add", label: "Prepared source docs", path: documents },
+      { signal },
+    ) as { project: { id: `proj_${string}` } };
+    const profile = store.requireProfileById(added.account.id);
+    const prepare = (idempotencyKey: string, presetContract?: 1 | 2) => store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: profile.id,
+      idempotencyKey,
+      kind: "session.start",
+      request: sessionStartMutationRequest({
+        fast: false,
+        preset: "high",
+        ...(presetContract === undefined ? {} : { presetContract }),
+        projectId: project.project.id,
+        provider: "codex",
+      }),
+    });
+    const prepareReleasedV05 = (idempotencyKey: string) => store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: profile.id,
+      idempotencyKey,
+      kind: "session.start",
+      request: {
+        projectId: project.project.id,
+        preset: "high",
+        fast: false,
+      },
+    });
+    const recordHistoricalStartEvidence = (
+      attemptId: string,
+      runtime: EffectiveRuntimeProfile,
+      presetContract?: 1 | 2,
+    ): void => {
+      const evidence = {
+        kind: "session.start",
+        projectId: project.project.id,
+        clientMessageId: null,
+        messageDigest: null,
+        ...(presetContract === undefined ? {} : { presetContract }),
+        runtimeProfile: runtime,
+      };
+      const evidenceJson = JSON.stringify(evidence);
+      const inspector = new Database(store.paths.database, { create: false, strict: true });
+      try {
+        inspector.query(
+          "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)",
+        ).run(
+          attemptId,
+          evidence.kind,
+          evidenceJson,
+          createHash("sha256").update(evidenceJson).digest("hex"),
+          2_000,
+        );
+      } finally {
+        inspector.close(false);
+      }
+    };
+    const base = {
+      account: profile.id,
+      fast: false,
+      kind: "session.start" as const,
+      preset: "high" as const,
+    };
+
+    const legacyPreparedKey = "00000000-0000-4000-8000-00000000040e";
+    prepareReleasedV05(legacyPreparedKey);
+    const stalePreparedKey = "00000000-0000-4000-8000-00000000040f";
+    prepare(stalePreparedKey, 2);
+    const providerCallsBefore = codex.calls.length;
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: legacyPreparedKey,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: legacyPreparedKey,
+      presetContract: 1,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: legacyPreparedKey,
+      presetContract: 2,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: stalePreparedKey,
+      presetContract: 2,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(codex.calls).toHaveLength(providerCallsBefore);
+    expect(store.readMutation(legacyPreparedKey)).toMatchObject({ state: "prepared" });
+    expect(store.readMutation(stalePreparedKey)).toMatchObject({ state: "prepared" });
+
+    const legacyStartedKey = "00000000-0000-4000-8000-000000000410";
+    const legacyStarted = prepare(legacyStartedKey);
+    const historicalAstraProfile = {
+      ...runtimeProfile({
+        id: profile.id,
+        generation: profile.processGeneration,
+        codexHome: "unused",
+        desktopUserData: "unused",
+      }),
+      model: "gpt-6-astra",
+      reasoningEffort: "max" as const,
+    };
+    recordHistoricalStartEvidence(legacyStarted.id, historicalAstraProfile);
+    expect(store.transitionMutation(legacyStarted.id, "prepared", "effect_started")).toBe(true);
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: legacyStartedKey,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(codex.calls).toHaveLength(providerCallsBefore);
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: legacyStartedKey,
+      presetContract: 2,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: legacyStartedKey,
+      presetContract: 1,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store.transitionMutation(
+      legacyStarted.id,
+      "effect_started",
+      "failed",
+      { code: "test_settled" },
+    )).toBe(true);
+
+    const staleStartedKey = "00000000-0000-4000-8000-000000000411";
+    const staleStarted = prepare(staleStartedKey, 2);
+    recordHistoricalStartEvidence(staleStarted.id, historicalAstraProfile, 2);
+    expect(store.transitionMutation(staleStarted.id, "prepared", "effect_started")).toBe(true);
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: staleStartedKey,
+      presetContract: 2,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(store.transitionMutation(
+      staleStarted.id,
+      "effect_started",
+      "failed",
+      { code: "test_settled" },
+    )).toBe(true);
+    expect(codex.calls).toHaveLength(providerCallsBefore);
+
+    const currentPreparedKey = "00000000-0000-4000-8000-000000000412";
+    prepare(currentPreparedKey, 1);
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: currentPreparedKey,
+      presetContract: 1,
+    }, { signal })).resolves.toMatchObject({ session: { preset: "high", state: "idle" } });
+    expect(store.readMutation(currentPreparedKey)).toMatchObject({ state: "applied" });
+    expect(codex.calls.filter((call) => call === "review-session")).toHaveLength(1);
+    expect(codex.calls.filter((call) => call === "start:high")).toHaveLength(1);
+
+    const currentReceipt = store.readMutation(currentPreparedKey)?.result;
+    if (currentReceipt === undefined) throw new Error("Expected the current start receipt.");
+    const staleAppliedKey = "00000000-0000-4000-8000-000000000413";
+    const staleApplied = prepare(staleAppliedKey, 2);
+    expect(store.transitionMutation(staleApplied.id, "prepared", "effect_started")).toBe(true);
+    expect(store.transitionMutation(staleApplied.id, "effect_started", "applied", currentReceipt))
+      .toBe(true);
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: staleAppliedKey,
+      presetContract: 2,
+    }, { signal })).resolves.toMatchObject({ session: { preset: "high", state: "idle" } });
+    const providerCallsAfterStaleReplay = codex.calls.length;
+    await expect(service.execute({
+      ...base,
+      idempotencyKey: staleAppliedKey,
+      presetContract: 1,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(codex.calls).toHaveLength(providerCallsAfterStaleReplay);
+  });
+
   test("quarantines an unbound session-start lost response without blind replay", async () => {
     const { service, codex, documents, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Lost start" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     codex.startSessionError = new IndeterminateCodexEffectError("thread/start", 42);
-    const command = { kind: "session.start" as const, account: added.account.id, preset: "high" as const, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000403" };
+    const command = { kind: "session.start" as const, account: added.account.id, preset: "high" as const, presetContract: 1 as const, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000403" };
     await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     expect(store.listSessions()).toHaveLength(1);
     expect(store.listSessions()[0]).toMatchObject({ state: "recovery_required" });
@@ -19937,7 +21772,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Causal send" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const key = "00000000-0000-4000-8000-000000000405";
     codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 44);
     await expect(service.execute({ kind: "session.send", session: started.session.id, message: "causal", idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED", details: { idempotencyKey: key } });
@@ -19965,7 +21800,7 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     codex.startSessionError = new IndeterminateCodexEffectError("thread/start", 45);
     const key = "00000000-0000-4000-8000-000000000407";
-    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false, idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED", details: { idempotencyKey: key } });
+    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false, idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED", details: { idempotencyKey: key } });
     const [session] = store.listSessions();
     if (session === undefined) throw new Error("Expected a bound start placeholder.");
     expect(await service.execute({ kind: "session.recover", session: session.id }, { signal }).catch((error: unknown) => error)).toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -19975,9 +21810,9 @@ describe("HraService", () => {
       recovery: { resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false },
     });
     expect(store.readMutation(key)).toMatchObject({ state: "reconciled", originalState: "ambiguous", resolution: { kind: "abandoned" } });
-    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false, idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false, idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
     delete codex.startSessionError;
-    expect(await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000408" }, { signal })).toMatchObject({ session: { state: "idle" } });
+    expect(await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000408" }, { signal })).toMatchObject({ session: { state: "idle" } });
     expect(codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(2);
   });
 
@@ -19986,7 +21821,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Status recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
@@ -20007,7 +21842,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Recovery queue" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const pending = store.enqueue(started.session.id, "continue after recovery");
     const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
@@ -20027,7 +21862,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Status abandon" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const pending = store.enqueue(started.session.id, "never dispatched");
     const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
@@ -20085,7 +21920,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Tamper proof" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 46);
     const key = "00000000-0000-4000-8000-000000000409";
     await expect(service.execute({ kind: "session.send", session: started.session.id, message: "tamper", idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -20142,6 +21977,7 @@ describe("HraService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
+      presetContract: legacyPresetContract,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
     await service.execute({
@@ -20188,7 +22024,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue readiness" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     store.enqueue(started.session.id, "resume in background");
     let releaseDispatch!: () => void;
     const dispatchGate = new Promise<void>((resolve) => { releaseDispatch = resolve; });
@@ -20256,12 +22092,18 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Idle queue" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     await service.execute({ kind: "session.queue", session: started.session.id, message: "dispatch now" }, { signal });
     await service.settled();
     expect(store.listQueue(started.session.id)[0]).toMatchObject({ state: "applied" });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "active", activeTurnId: "turn-next" });
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
+    expect(store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: started.session.id,
+    }).events.some((event) => event.body.type === "user_message"
+      && event.body.actor === "human"
+      && event.body.text === "dispatch now")).toBe(true);
   });
 
   test("stops after a committed queued turn scrub failure without inventing ambiguity", async () => {
@@ -20358,12 +22200,13 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const queued = store.enqueue(started.session.id, "uncertain");
     store.beginQueueEffect({
       queueId: queued.id,
       sessionId: started.session.id,
       profileGeneration: 1,
+      providerConnectionId: "10000000-0000-4000-8000-000000000003",
       evidence: {
         kind: "queue.dispatch",
         queueId: queued.id,
@@ -20387,7 +22230,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue causal recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 47);
     const queued = await service.execute({ kind: "session.queue", session: started.session.id, message: "uncertain queue" }, { signal }) as { queued: { id: `queue_${string}` } };
     await service.settled();
@@ -20426,6 +22269,18 @@ describe("HraService", () => {
     expect(store.readQueueEffect(queued.queued.id)).toMatchObject({ resolution: { kind: "proven_applied" } });
     expect(store.latestSessionRuntimeProfile(started.session.id)).toMatchObject({ revision: 2, sourceKind: "queue_start", sourceId: queued.queued.id });
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
+    const recoveredMessages = store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: started.session.id,
+    }).events.filter((event) => event.body.type === "user_message"
+      && event.body.sourceId === queued.queued.id);
+    expect(recoveredMessages).toHaveLength(1);
+    expect(recoveredMessages[0]?.body).toMatchObject({
+      actor: "human",
+      sourceId: queued.queued.id,
+      text: "uncertain queue",
+      type: "user_message",
+    });
     const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
     expect(await service.execute({ kind: "session.recover", session: started.session.id }, { signal })).toMatchObject({
@@ -20437,7 +22292,7 @@ describe("HraService", () => {
     const { service, documents, store, codex } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Signed out" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal })).rejects.toMatchObject({ code: "INTERACTION_REQUIRED" });
+    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal })).rejects.toMatchObject({ code: "INTERACTION_REQUIRED" });
     await expect(service.execute({ kind: "account.usage", account: added.account.id, refresh: true }, { signal })).rejects.toMatchObject({ code: "INTERACTION_REQUIRED" });
     expect(store.listSessions()).toHaveLength(0);
     expect(codex.calls).toHaveLength(0);
@@ -20450,7 +22305,7 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     codex.startSessionError = new Error("provider rejected before creating a thread");
 
-    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal })).rejects.toThrow("provider rejected");
+    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal })).rejects.toThrow("provider rejected");
 
     expect(store.listSessions()).toHaveLength(0);
     expect(codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(1);
@@ -20461,7 +22316,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Idle steer" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
     const idempotencyKey = "00000000-0000-4000-8000-000000000108";
     const steer = { kind: "session.steer" as const, session: started.session.id, message: "future", idempotencyKey };
     await expect(service.execute(steer, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
@@ -20476,7 +22331,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue failure" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     codex.startTurnError = new Error("provider rejected before effect");
     await service.execute({ kind: "session.queue", session: started.session.id, message: "will fail" }, { signal });
     await service.settled();
@@ -20499,7 +22354,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Logout recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
     const releasesBeforeLogout = codex.releasedAuthorities.length;
     codex.logoutError = new IndeterminateCodexEffectError("account/logout", 43);
     codex.beforeLogoutReturn = async () => {
@@ -20693,7 +22548,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Stale authority" }, { signal }) as { account: { id: `acct_${string}` } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     let releaseProvider!: () => void;
     let signalProviderApplied!: () => void;
     const providerGate = new Promise<void>((resolve) => { releaseProvider = resolve; });
@@ -24285,6 +26140,7 @@ describe("HraService", () => {
         kind: "session.start",
         account: value.accountId,
         preset: "high",
+        presetContract: legacyPresetContract,
         fast: false,
       }, { signal }) as { session: { id: `sess_${string}` } };
       const nativeSessionId = started.session.id;
@@ -24406,7 +26262,7 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Shutdown authority" }, { signal }) as { account: { id: `acct_${string}`; processGeneration: number } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     await service.execute({ kind: "session.send", session: started.session.id, message: "active" }, { signal });
     const queued = await service.execute({ kind: "session.queue", session: started.session.id, message: "must remain queued" }, { signal }) as { queued: { id: string } };
     let releaseFact!: () => void;
@@ -24891,14 +26747,23 @@ describe("HraService prose autorespond", () => {
 
   const proseFixture = async (options: Readonly<{
     gatewayKeys?: GatewayKeyPort;
+    now?: () => number;
+    onStopRequested?: () => void;
     responder?: ProseResponder;
   }> = {}) => {
     const responder = options.responder ?? new DeterministicProseResponder();
     const gatewayKeys = options.gatewayKeys ?? new InMemoryGatewayKeyStore(testGatewayKey);
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, undefined, {
-      gatewayKeys,
-      proseResponder: responder,
-    });
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      options.onStopRequested ?? (() => undefined),
+      options.now ?? Date.now,
+      undefined,
+      {
+        gatewayKeys,
+        proseResponder: responder,
+      },
+    );
     return { ...value, gatewayKeys, responder };
   };
 
@@ -25001,6 +26866,90 @@ describe("HraService prose autorespond", () => {
     // The autoresponse spends budget and never resets the consecutive counter.
     expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(1);
     expect(value.store.readAutorespondBudgets(sessionId).lastHour).toBe(1);
+  });
+
+  test("commits an accepted autoresponse receipt, transcript, and budget together", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Prose transcript replay");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    const sends = value.codex.calls.filter((call) => call === "send").length;
+    const complete = value.store.completeSessionTurnEffect.bind(value.store);
+    let completedAtomically = false;
+    Object.defineProperty(value.store, "completeSessionTurnEffect", {
+      configurable: true,
+      value: (write: Parameters<typeof complete>[0]): ReturnType<typeof complete> => {
+        expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+        const result = complete(write);
+        expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(1);
+        completedAtomically = true;
+        return result;
+      },
+    });
+
+    await completeTurn(
+      value,
+      sessionId,
+      "turn-prose-transcript-replay",
+      "The exact patch is staged. Should I proceed?",
+    );
+
+    await waitFor(() => proseEvidence(value, sessionId).length === 1);
+    expect(completedAtomically).toBe(true);
+    expect(proseEvidence(value, sessionId)[0]).toMatchObject({
+      decision: "send",
+      outcome: "sent",
+    });
+    expect(value.codex.calls.filter((call) => call === "send").length).toBe(sends + 1);
+    const messages = value.store
+      .listSessionEvents({ sessionId, afterSequence: null, limit: 200 })
+      .events
+      .map((event) => event.body)
+      .filter((body) => body.type === "user_message" && body.actor === "autorespond");
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ text: PROSE_APPROVAL_REPLY });
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(1);
+  });
+
+  test("fences the session when the atomic autoresponse receipt cannot commit", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Prose transcript quarantine");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    const sends = value.codex.calls.filter((call) => call === "send").length;
+    Object.defineProperty(value.store, "completeSessionTurnEffect", {
+      configurable: true,
+      value: () => { throw new Error("persistent atomic receipt failure"); },
+    });
+
+    await completeTurn(
+      value,
+      sessionId,
+      "turn-prose-transcript-quarantine",
+      "The exact patch is staged. Should I proceed?",
+    );
+
+    await waitFor(() => proseEvidence(value, sessionId).length === 1);
+    expect(proseEvidence(value, sessionId)[0]).toMatchObject({
+      decision: "send",
+      outcome: "sent",
+    });
+    expect(value.codex.calls.filter((call) => call === "send").length).toBe(sends + 1);
+    expect(value.store.readAutorespondBudgets(sessionId)).toMatchObject({
+      consecutive: 0,
+      lastHour: 1,
+    });
+    const [attempt] = value.store.listUnsettledMutations({ sessionId })
+      .filter((candidate) => candidate.kind === "session.send");
+    expect(attempt).toMatchObject({ state: "ambiguous" });
+    if (attempt === undefined) throw new Error("Expected the accepted autoresponse ambiguity.");
+    expect(value.store.readSessionUserMessageSource(
+      sessionId,
+      "mutation",
+      attempt.idempotencyKey,
+    )).toMatchObject({
+      status: "pending",
+      intent: { actor: "autorespond" },
+    });
+    expect(value.store.requireSession(sessionId).state).toBe("recovery_required");
   });
 
   test("marks the dispatched autoresponse as an autorespond message source", async () => {
@@ -25200,6 +27149,121 @@ describe("HraService prose autorespond", () => {
       { signal },
     );
     expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+  });
+
+  test("does not reset the consecutive budget for a rejected human send", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Rejected human send budget");
+    value.store.bumpAutorespondCounter(sessionId);
+    value.store.bumpAutorespondCounter(sessionId);
+    value.store.bumpAutorespondCounter(sessionId);
+    value.codex.startTurnErrorOnce = new Error("determinate provider refusal");
+
+    await expect(value.service.execute(
+      { kind: "session.send", session: sessionId, message: "human attempt" },
+      { signal },
+    )).rejects.toThrow("determinate provider refusal");
+
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(3);
+  });
+
+  test("resets the consecutive budget only when human steer and queue messages reach the provider", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Human message budget reset");
+    await value.service.execute(
+      { kind: "session.send", session: sessionId, message: "begin" },
+      { signal },
+    );
+    for (let count = 0; count < 3; count += 1) {
+      value.store.bumpAutorespondCounter(sessionId);
+    }
+
+    await value.service.execute(
+      { kind: "session.steer", session: sessionId, message: "human steering" },
+      { signal },
+    );
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+
+    for (let count = 0; count < 3; count += 1) {
+      value.store.bumpAutorespondCounter(sessionId);
+    }
+    await value.service.execute(
+      { kind: "session.queue", session: sessionId, message: "human queued follow-up" },
+      { signal },
+    );
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(3);
+
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    value.codex.readProjection = {
+      ...value.codex.readProjection,
+      status: "idle",
+      providerUpdatedAt: (value.codex.readProjection.providerUpdatedAt ?? 10) + 1,
+    };
+    delete (value.codex.readProjection as { activeTurnId?: string }).activeTurnId;
+    await value.service.observeCodexFact({
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    }, {
+      type: "turnCompleted",
+      threadId: session.providerThreadId as string,
+      turn: {
+        id: "human-message-budget-active",
+        items: [],
+        status: "completed",
+        startedAt: 1,
+        completedAt: 2,
+        durationMs: 1,
+      },
+    });
+    await value.service.settled();
+
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+  });
+
+  test("does not reset the consecutive budget when a scheduled automation reaches the provider", async () => {
+    let now = 1_900_000_000_000;
+    const value = await proseFixture({ now: () => now });
+    const { sessionId } = await createIdleSession(value, "Scheduled automation budget");
+    const prompt = "scheduled automation follow-up";
+    for (let count = 0; count < 3; count += 1) {
+      value.store.bumpAutorespondCounter(sessionId);
+    }
+    value.codex.turnStatus = "completed";
+    value.store.createSessionTaskStore().create({
+      sessionId,
+      name: "Scheduled automation budget",
+      prompt,
+      minutes: 15,
+      status: "active",
+      idempotencyKey: crypto.randomUUID(),
+    });
+
+    now += 15 * 60_000;
+    await expect(value.service.maintainSessionTasks()).resolves.toEqual({ materialized: 1 });
+    await value.service.settled();
+
+    const [queued] = value.store.listQueue(sessionId);
+    expect(queued).toMatchObject({ state: "applied" });
+    if (queued === undefined) throw new Error("Expected one scheduled queue entry.");
+    expect(value.store.queueMessageActor(queued.id)).toBe("automation");
+    expect(lastUserMessage(value)).toMatchObject({ clientId: queued.id, text: prompt });
+    expect(value.store.readSessionUserMessageSource(sessionId, "queue", queued.id))
+      .toMatchObject({ status: "finalized", intent: { actor: "automation" } });
+    const queuedTranscriptEvents = value.store.listSessionEvents({
+      sessionId,
+      afterSequence: null,
+      limit: 200,
+    }).events.map((event) => event.body).filter((body) =>
+      body.type === "user_message" && body.sourceId === queued.id);
+    expect(queuedTranscriptEvents).toHaveLength(1);
+    expect(queuedTranscriptEvents[0]).toMatchObject({
+      actor: "automation",
+      text: prompt,
+    });
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(3);
   });
 
   test("answers at most one prose approval per turn", async () => {

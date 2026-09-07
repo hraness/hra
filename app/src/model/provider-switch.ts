@@ -11,7 +11,14 @@
  * structurally over the three fields a command record carries, the same way
  * `deviceCommandNotice` is, so the settling line is provable without a client.
  */
-import { isCommandKind, parseRemoteCommandPayload, type SupportedPreset, type RemoteCommandPayload } from "../hra/cloud";
+import {
+  activeRemoteDerivedCodexSelection,
+  activeRemotePresetSelection,
+  isCommandKind,
+  parseRemoteCommandPayload,
+  type RemoteCommandPayload,
+  type SupportedPreset,
+} from "../hra/cloud";
 
 export type SessionProvider = "codex" | "claude";
 
@@ -22,8 +29,10 @@ export type SessionPresetOption = Readonly<{
 
 const codexPresetOptions: readonly SessionPresetOption[] = Object.freeze([
   { label: "Luna Max", value: "low" },
-  { label: "Astra Max", value: "high" },
-  { label: "Astra Ultra", value: "ultra" },
+  // These are remote aliases, not proof of the target daemon's active
+  // contract. Registry v1 cannot distinguish a rolling Sol/Astra binding.
+  { label: "Codex High", value: "high" },
+  { label: "Codex Ultra", value: "ultra" },
 ]);
 
 const claudePresetOptions: readonly SessionPresetOption[] = Object.freeze([
@@ -83,21 +92,25 @@ export const setProviderCommandKind = "set_provider";
  *
  * `preset` is optional: with it, the switch and the model choice are one
  * command, so a session cannot land on the new provider under a preset that
- * provider does not have. The cast is the seam: `set_provider` is not in the
- * repository's `CommandKind` union yet, and this assertion is the only place
- * the two shapes meet.
+ * provider does not have. A rebound Codex High or Ultra selection also carries
+ * this build's immutable contract. A preset-omitted Codex switch carries the
+ * shared High/Ultra contract because the daemon derives its target alias. That
+ * makes rolling mismatches fail before switching without changing stable
+ * explicit preset shapes.
  */
 export function buildSetProviderPayload(input: Readonly<{
   preset?: SupportedPreset;
   provider: SessionProvider;
 }>): RemoteCommandPayload {
-  const payload: Readonly<{
-    kind: string;
-    preset?: SupportedPreset;
-    provider: SessionProvider;
-  }> = input.preset === undefined
-    ? { kind: setProviderCommandKind, provider: input.provider }
-    : { kind: setProviderCommandKind, preset: input.preset, provider: input.provider };
+  const payload = input.preset === undefined
+    ? input.provider === "codex"
+      ? { kind: setProviderCommandKind, ...activeRemoteDerivedCodexSelection() }
+      : { kind: setProviderCommandKind, provider: input.provider }
+    : {
+        kind: setProviderCommandKind,
+        ...activeRemotePresetSelection(input.preset),
+        provider: input.provider,
+      };
   const parsed = parseRemoteCommandPayload(payload);
   if (parsed === null) throw new Error("The provider switch payload is not valid.");
   return parsed;

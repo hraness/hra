@@ -46,6 +46,16 @@ describe("hosted public authority policy", () => {
         ["memorySync:pull", "active_daemon_device"],
         ["memorySync:push", "active_daemon_device"],
       ]);
+    expect(HOSTED_PUBLIC_FUNCTION_AUTHORITY["commands:failPrepared"])
+      .toBe("active_device");
+    expect(HOSTED_PUBLIC_FUNCTION_AUTHORITY["commands:confirmTerminalRecovery"])
+      .toBe("active_daemon_device");
+    expect(HOSTED_PUBLIC_FUNCTION_AUTHORITY["commands:listUnacknowledgedForRequester"])
+      .toBe("active_device");
+    expect(HOSTED_PUBLIC_FUNCTION_AUTHORITY["deviceCommands:failPrepared"])
+      .toBe("active_device");
+    expect(HOSTED_PUBLIC_FUNCTION_AUTHORITY["deviceCommands:listUnacknowledgedForRequester"])
+      .toBe("active_device");
     expect(Object.values(HOSTED_PUBLIC_FUNCTION_AUTHORITY).every((policy) => [
       "active_device",
       "active_daemon_device",

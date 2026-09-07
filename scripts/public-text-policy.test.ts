@@ -125,7 +125,30 @@ describe("public text policy", () => {
       `${subject}π`,
       `${subject}\u0301`,
       `${subject}\u200b`,
+      `${subject}.\u200b`,
+      `${subject}.π`,
+      `${subject}..`,
+      `π${subject}.`,
     ]) expect(() => assertPublicText(value, "unreviewed identity")).toThrow(PublicTextPolicyError);
+  });
+
+  test("admits only the exact reviewed Fulcio repository subject", () => {
+    const subject = "repo:hraness@307125679/hra@1343008607:environment:npm-release";
+    const numericPackageShape = ["@307125679", "hra"].join("/");
+    expect(() => assertPublicText(`OID .24 contains ${subject}.`, "provenance record"))
+      .not.toThrow();
+    for (const value of [
+      numericPackageShape,
+      subject.replace(":environment:npm-release", ":environment:other"),
+      subject.replace("@307125679", "@1"),
+      subject.replace("@1343008607", "@1"),
+      `${subject}/private`,
+      `${subject}.private`,
+      `x${subject}`,
+    ]) {
+      expect(() => assertPublicText(value, "unreviewed provenance subject"))
+        .toThrow(PublicTextPolicyError);
+    }
   });
 
   test("scans SVG and TOML text and rejects unreviewed file types", async () => {

@@ -1758,7 +1758,7 @@ export function parseThreadStatus(value: unknown): CodexThreadStatus {
 }
 
 const canonicalTextEncoder = new TextEncoder();
-const unsafeDisplayScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const unsafeDisplayScalar = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
 
 const safeDisplayTextResult = (
   value: unknown,
@@ -1896,6 +1896,160 @@ const assertHraHostToolExactKeys = (
   ) throw protocol(`${label} does not match the closed tool contract`);
 };
 
+const assertConversationAutomationExactKeys = assertHraHostToolExactKeys;
+
+const parseConversationAutomationName = (value: unknown): string => {
+  const parsed = string(value, "conversation automation name", { min: 1, max: 160 });
+  if (canonicalTextEncoder.encode(parsed).byteLength > 160) {
+    throw protocol("conversation automation name exceeds its UTF-8 byte limit");
+  }
+  if (/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(parsed)) {
+    throw protocol("conversation automation name contains unsupported characters");
+  }
+  return parsed;
+};
+
+const parseConversationAutomationPrompt = (value: unknown): string => {
+  const parsed = string(value, "conversation automation prompt", {
+    min: 1,
+    max: 262_144,
+  });
+  if (canonicalTextEncoder.encode(parsed).byteLength > 262_144) {
+    throw protocol("conversation automation prompt exceeds its UTF-8 byte limit");
+  }
+  return parsed;
+};
+
+const parseConversationAutomationSchedule = (
+  value: unknown,
+): ConversationAutomationSchedule => {
+  const schedule = record(value, "conversation automation schedule");
+  assertConversationAutomationExactKeys(
+    schedule,
+    new Set(["kind", "minutes"]),
+    ["kind", "minutes"],
+    "conversation automation schedule",
+  );
+  const kind = oneOf(
+    schedule.kind,
+    "conversation automation schedule kind",
+    ["interval_minutes"] as const,
+  );
+  const minutes = safeInteger(schedule.minutes, "conversation automation interval");
+  if (minutes < 15 || minutes > 10_080) {
+    throw protocol("conversation automation interval is outside the supported range");
+  }
+  return { kind, minutes };
+};
+
+const parsePositiveRevision = (value: unknown): number => {
+  const revision = safeInteger(value, "conversation automation revision");
+  if (revision < 1) throw protocol("conversation automation revision must be positive");
+  return revision;
+};
+
+const parseConversationAutomationId = (value: unknown): string => {
+  const id = identifier(value, "conversation automation id");
+  if (!/^stask_[0-9a-f]{32}$/u.test(id)) {
+    throw protocol("conversation automation id does not match the public task identity");
+  }
+  return id;
+};
+
+const parseConversationAutomationOperation = (
+  value: unknown,
+): ConversationAutomationOperation => {
+  const operation = record(value, "conversation automation arguments");
+  const mode = oneOf(
+    operation.mode,
+    "conversation automation mode",
+    ["create", "update", "view", "list", "delete"] as const,
+  );
+  if (mode === "create") {
+    assertConversationAutomationExactKeys(
+      operation,
+      new Set(["mode", "name", "prompt", "schedule", "paused"]),
+      ["mode", "name", "prompt", "schedule"],
+      "conversation automation create",
+    );
+    return {
+      mode,
+      name: parseConversationAutomationName(operation.name),
+      prompt: parseConversationAutomationPrompt(operation.prompt),
+      schedule: parseConversationAutomationSchedule(operation.schedule),
+      ...(operation.paused === undefined
+        ? {}
+        : { paused: boolean(operation.paused, "conversation automation paused state") }),
+    };
+  }
+  if (mode === "update") {
+    const patchKeys = ["name", "prompt", "schedule", "status"] as const;
+    assertConversationAutomationExactKeys(
+      operation,
+      new Set(["mode", "id", "revision", ...patchKeys]),
+      ["mode", "id", "revision"],
+      "conversation automation update",
+    );
+    if (!patchKeys.some((key) => Object.hasOwn(operation, key))) {
+      throw protocol("conversation automation update requires a patch");
+    }
+    return {
+      mode,
+      id: parseConversationAutomationId(operation.id),
+      revision: parsePositiveRevision(operation.revision),
+      ...(operation.name === undefined
+        ? {}
+        : { name: parseConversationAutomationName(operation.name) }),
+      ...(operation.prompt === undefined
+        ? {}
+        : {
+            prompt: parseConversationAutomationPrompt(operation.prompt),
+          }),
+      ...(operation.schedule === undefined
+        ? {}
+        : { schedule: parseConversationAutomationSchedule(operation.schedule) }),
+      ...(operation.status === undefined
+        ? {}
+        : {
+            status: oneOf(
+              operation.status,
+              "conversation automation status",
+              ["active", "paused"] as const,
+            ),
+          }),
+    };
+  }
+  if (mode === "view") {
+    assertConversationAutomationExactKeys(
+      operation,
+      new Set(["mode", "id"]),
+      ["mode", "id"],
+      "conversation automation view",
+    );
+    return { mode, id: parseConversationAutomationId(operation.id) };
+  }
+  if (mode === "list") {
+    assertConversationAutomationExactKeys(
+      operation,
+      new Set(["mode"]),
+      ["mode"],
+      "conversation automation list",
+    );
+    return { mode };
+  }
+  assertConversationAutomationExactKeys(
+    operation,
+    new Set(["mode", "id", "revision"]),
+    ["mode", "id", "revision"],
+    "conversation automation delete",
+  );
+  return {
+    mode,
+    id: parseConversationAutomationId(operation.id),
+    revision: parsePositiveRevision(operation.revision),
+  };
+};
+
 export function parseHraHostToolCall(input: {
   readonly authority: CodexAuthority;
   readonly connectionId: string;
@@ -1922,7 +2076,9 @@ export function parseHraHostToolCall(input: {
   }
   let request: HraHostToolRequest;
   try {
-    request = parseHraHostToolRequest(tool, privateParams.arguments);
+    request = tool === HRA_CONVERSATION_AUTOMATION_TOOL
+      ? { tool, input: parseConversationAutomationOperation(privateParams.arguments) }
+      : parseHraHostToolRequest(tool, privateParams.arguments);
   } catch {
     throw protocol("dynamic tool arguments do not match the closed HRA host-tool contract");
   }

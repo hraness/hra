@@ -56,6 +56,19 @@ describe("bounded Convex transport", () => {
     expect(cloudMutations).toContain("devices:updateMemorySummary");
   });
 
+  test("admits the proof-bound session-command outbox recovery query", () => {
+    expect(cloudQueries).toContain("commands:getForOutboxRecovery");
+    expect(cloudQueries).toContain("commands:listUnacknowledgedForRequester");
+    expect(cloudQueries).toContain("deviceCommands:listUnacknowledgedForRequester");
+  });
+
+  test("admits only the two deterministic prepared-failure mutations", () => {
+    expect(cloudMutations.filter((name) => name.endsWith(":failPrepared"))).toEqual([
+      "commands:failPrepared",
+      "deviceCommands:failPrepared",
+    ]);
+  });
+
   test("exposes only daemon authority mutations for attention notifications", () => {
     expect(cloudQueries.filter((name) => name.startsWith("attentionNotifications:")))
       .toEqual([]);

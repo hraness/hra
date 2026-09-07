@@ -4,6 +4,8 @@ import { z } from "zod";
 
 import {
   WORK_ACTIVE_LIMIT,
+  WORK_APPLY_REQUEST_LEGACY_VERSION,
+  WORK_APPLY_REQUEST_VERSION,
   WORK_ARTIFACT_MAX_BYTES,
   WORK_ARTIFACT_PATH_MAX_BYTES,
   WORK_CRITERIA_LIMIT,
@@ -32,8 +34,8 @@ import {
   WORK_POLL_MAX_BYTES,
   WORK_PREPARED_EFFECT_MAX_BYTES,
   WORK_PROTOCOL,
+  WORK_PROTOCOL_DESCRIPTION_VERSION,
   WORK_PROTOCOL_REQUEST_MAX_BYTES,
-  WORK_PROTOCOL_VERSION,
   WORK_READ_HISTORY_LIMIT,
   WORK_RETAINED_LIMIT,
   WORK_ROUTE_LIMIT,
@@ -866,7 +868,7 @@ const errorTopic = {
     internal: [{ recovery: "none", retryable: false, exitCode: 1 }, { recovery: "retry_same_request", retryable: true, exitCode: 5 }],
   },
   invariants: [
-    "effect_unknown always means replay the canonical-equivalent closed operation with the same idempotencyKey; JSON member order is immaterial",
+    "effect_unknown always means replay the canonical-equivalent closed request version, authored preset contract when present, and operation with the same idempotencyKey; JSON member order is immaterial",
     "retry_same_request certifies that no provider effect occurred",
     "refresh_state_then_new_request certifies the rejected request had no effect and requires a new idempotencyKey",
     "error.exitCode equals the process exit status",
@@ -875,9 +877,12 @@ const errorTopic = {
 
 const topicValues = {
   envelopes: {
-    applyRequest: { closed: true, required: { protocol: { const: WORK_PROTOCOL }, version: { const: WORK_PROTOCOL_VERSION }, requestId: "RequestId", operation: "operation selected by operation.kind" }, optional: {} },
-    applySuccess: { closed: true, required: { protocol: { const: WORK_PROTOCOL }, version: { const: WORK_PROTOCOL_VERSION }, requestId: "RequestId", ok: { const: true }, result: "result selected by operation.kind" }, rules: ["requestId is non-null and exactly echoed", "result.kind equals operation.kind"] },
-    applyFailure: { closed: true, required: { protocol: { const: WORK_PROTOCOL }, version: { const: WORK_PROTOCOL_VERSION }, requestId: "RequestId|null", ok: { const: false }, error: "WorkError" }, rules: ["requestId may be null only before request admission"] },
+    applyRequests: {
+      v1: { closed: true, required: { protocol: { const: WORK_PROTOCOL }, version: { const: WORK_APPLY_REQUEST_LEGACY_VERSION }, requestId: "RequestId", operation: "operation selected by operation.kind" }, optional: {}, rules: ["exact historical replay is accepted before fresh-source checks", "fresh work.create or task.addBatch selecting High or Ultra is rejected", "fresh stable operations remain accepted"] },
+      v2: { closed: true, required: { protocol: { const: WORK_PROTOCOL }, version: { const: WORK_APPLY_REQUEST_VERSION }, requestId: "RequestId", operation: "operation selected by operation.kind" }, optional: { presetContract: { oneOf: [1, 2] } }, rules: ["presetContract is required exactly when work.create declares a High or Ultra route or task.addBatch adds a High or Ultra task", "fresh source-bound requests require the active contract", "exact historical replay precedes active-contract checks"] },
+    },
+    applySuccess: { closed: true, required: { protocol: { const: WORK_PROTOCOL }, version: { oneOf: [WORK_APPLY_REQUEST_LEGACY_VERSION, WORK_APPLY_REQUEST_VERSION] }, requestId: "RequestId", ok: { const: true }, result: "result selected by operation.kind" }, rules: ["version and requestId exactly echo the admitted request", "result.kind equals operation.kind"] },
+    applyFailure: { closed: true, required: { protocol: { const: WORK_PROTOCOL }, version: { oneOf: [WORK_APPLY_REQUEST_LEGACY_VERSION, WORK_APPLY_REQUEST_VERSION] }, requestId: "RequestId|null", ok: { const: false }, error: "WorkError" }, rules: ["admitted failures echo request version and requestId", "requestId may be null only before request admission"] },
     readSuccess: { closed: true, required: { ok: { const: true }, version: { const: 1 }, command: "exact work command kind", data: "command-selected result" }, rules: ["bounded-read caps cover this exact terminal-safe compact JSON document plus LF"] },
     readFailure: { closed: true, required: { ok: { const: false }, version: { const: 1 }, error: "CommandError" }, optional: {} },
     stream: {
@@ -926,7 +931,7 @@ const topicValues = {
   semantics: {
     authority: { actor: "exact session ID plus scoped bearer capability", attempt: "capability plus renewable lease plus monotonically fenced revision", route: "exact accountId/projectId/preset/fast", writer: "one local SQLite execution custodian" },
     transaction: ["durably record request", "atomically begin effect", "perform provider call", "durably finalize or quarantine unknown"],
-    idempotency: "same UUIDv7 plus canonical-equivalent closed operation preserves the durable decision and stable identities/capabilities, performs no new mutation or event, and reprojects mutable public records and workRevision from current state; replay is not byte-identical; retained work.release tombstone replay is the exact stored-result exception",
+    idempotency: "same UUIDv7 plus canonical-equivalent closed operation and apply-source identity preserves the durable decision and stable identities/capabilities, performs no new mutation or event, and reprojects mutable public records and workRevision from current state; v1 preserves the legacy operation-only digest while v2 binds request version and authored preset contract; replay is not byte-identical; retained work.release tombstone replay is the exact stored-result exception",
     sensitivity: { capability: "bearer authority; never log or expose", attemptReportIdempotencyKey: "stable public correlation identity; not authority and not a bearer secret" },
     readWireCaps: "protocolDocumentBytes, snapshotBytes, taskDetailBytes, taskHistoryPageBytes, pollBytes, and eventPageBytes bound the exact terminal-safe compact readSuccess envelope plus trailing LF; Unicode terminal-safety expansion counts",
     reconcile: { completed: "observed successful terminal outcome of the original accepted dispatch", failed: "observed failed or interrupted terminal outcome of the original accepted dispatch", no_effect: "durable proof dispatch failed before provider acceptance", still_unknown: "preserve quarantine; never speculate or redispatch" },
@@ -952,7 +957,7 @@ const canonicalJson = (value: unknown): string => {
 
 const contractSource = {
   protocol: WORK_PROTOCOL,
-  version: WORK_PROTOCOL_VERSION,
+  version: WORK_PROTOCOL_DESCRIPTION_VERSION,
   commands,
   operationContracts,
   typeDefinitions,
@@ -980,7 +985,7 @@ const referencesIn = (value: unknown, output = new Set<string>()): Set<string> =
 const rawProtocolDocument = (query: WorkProtocolQuery) => {
   const common = {
     protocol: WORK_PROTOCOL,
-    version: WORK_PROTOCOL_VERSION,
+    version: WORK_PROTOCOL_DESCRIPTION_VERSION,
     contractDigest: WORK_PROTOCOL_CONTRACT_DIGEST,
     query,
   } as const;
@@ -1029,7 +1034,7 @@ const protocolReadSuccessWireBytes = (document: WorkProtocolDocument): number =>
 
 export const workProtocolDocumentSchema = z.object({
   protocol: z.literal(WORK_PROTOCOL),
-  version: z.literal(WORK_PROTOCOL_VERSION),
+  version: z.literal(WORK_PROTOCOL_DESCRIPTION_VERSION),
   contractDigest: z.string().regex(/^[0-9a-f]{64}$/u),
   query: workProtocolQuerySchema,
   result: z.unknown(),
@@ -1117,14 +1122,20 @@ export type WorkAgentProtocolError = z.infer<typeof workAgentProtocolErrorSchema
 export const workAgentProtocolResponseSchema = z.discriminatedUnion("ok", [
   z.object({
     protocol: z.literal(WORK_PROTOCOL),
-    version: z.literal(WORK_PROTOCOL_VERSION),
+    version: z.union([
+      z.literal(WORK_APPLY_REQUEST_LEGACY_VERSION),
+      z.literal(WORK_APPLY_REQUEST_VERSION),
+    ]),
     requestId: z.string().uuid(),
     ok: z.literal(true),
     result: workOperationResultSchema,
   }).strict(),
   z.object({
     protocol: z.literal(WORK_PROTOCOL),
-    version: z.literal(WORK_PROTOCOL_VERSION),
+    version: z.union([
+      z.literal(WORK_APPLY_REQUEST_LEGACY_VERSION),
+      z.literal(WORK_APPLY_REQUEST_VERSION),
+    ]),
     requestId: z.string().uuid().nullable(),
     ok: z.literal(false),
     error: workAgentProtocolErrorSchema,

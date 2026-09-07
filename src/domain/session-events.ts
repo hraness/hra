@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { attachmentReferenceListSchema } from "./attachment-schemas";
+
 import { publicProviderIdentifierSchema } from "../public-provider-identifier";
 import { presetSchema, providerSchema } from "./presets";
 import { profileIdSchema, sessionIdSchema, unixMillisecondsSchema } from "./values";
@@ -92,6 +94,7 @@ export const SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS = 16_384;
 /** Who authored the message HRA sent to the provider. */
 export const sessionMessageActorSchema = z.enum([
   "human",
+  "automation",
   "autorespond",
   "peer_session",
   "provider_switch",
@@ -157,17 +160,21 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
     summary: toolSummarySchema.optional(),
   }).strict(),
   /**
-   * Exactly what HRA sent to the provider, with the actor that authored it.
-   * This is the record that lets HRA rebuild a conversation from its own
-   * storage rather than asking the provider for its transcript.
+   * The text HRA sent to the provider, its source class, and the optional
+   * byte-free attachment manifest. Attachment contents remain in local blob
+   * custody and are deliberately not embedded in an event.
    */
   z.object({
     type: z.literal("user_message"),
     // Null until the provider names the turn the message opened.
     turnId: publicProviderIdentifierSchema.nullable(),
+    // Stable HRA operation identity used to make transcript finalization
+    // idempotent after a lost response or a post-provider storage failure.
+    sourceId: boundedText(200).optional(),
     actor: sessionMessageActorSchema,
     text: boundedText(SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS),
     omittedCharacters: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    attachments: attachmentReferenceListSchema.optional(),
   }).strict(),
   /**
    * One session moved from one provider to another. The seed digest binds the
@@ -185,6 +192,8 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
     transcriptDigest: digestSchema,
     seedDigest: digestSchema,
     seedOmittedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    /** Earlier ledger history was unavailable when this seed was rendered. */
+    seedRetentionGapReason: sessionEventGapReasonSchema.optional(),
   }).strict(),
   z.object({
     type: z.literal("assistant_delta"),

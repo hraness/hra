@@ -152,7 +152,7 @@ export type CompactMessageActor = "human" | "autorespond";
  * Additive detail for a non-owner host-authored message. Unknown bounded
  * values remain non-owner and render neutrally instead of losing the chunk.
  */
-export type CompactMessageActorKind = "peer_session" | "provider_switch" | "unknown";
+export type CompactMessageActorKind = "automation" | "peer_session" | "provider_switch" | "unknown";
 
 /**
  * One attachment as the compact stream carries it: what it was called, what
@@ -342,7 +342,7 @@ function parseCompactMessageActorKind(value: unknown): CompactMessageActorKind |
     || value.length < 1
     || !compactMessageActorKindPattern.test(value)
   ) return null;
-  if (value === "peer_session" || value === "provider_switch") return value;
+  if (value === "automation" || value === "peer_session" || value === "provider_switch") return value;
   return "unknown";
 }
 

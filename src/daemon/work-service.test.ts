@@ -5,8 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { IndeterminateCodexEffectError } from "../codex";
+import { legacyPresetContract } from "../domain/presets";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
 import {
+  WORK_APPLY_REQUEST_VERSION,
   workEventPageSchema,
   workOperationResultSchema,
   workPollSchema,
@@ -14,6 +16,7 @@ import {
   workSnapshotSchema,
   workTaskDetailSchema,
   workTaskHistoryPageSchema,
+  type WorkOperation,
   type WorkPreparedEffect,
   type WorkTaskSpec,
 } from "../domain/work";
@@ -53,7 +56,7 @@ const effectiveRuntimeProfile = (
   processGeneration: authority.generation,
   observedAt: 10_000,
   preset,
-  model: preset === "low" ? "gpt-5.6-luna" : "gpt-6-astra",
+  model: preset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
   reasoningEffort: preset === "ultra" ? "ultra" : "max",
   serviceTier: fast ? "priority" : null,
   fast,
@@ -412,6 +415,7 @@ async function createActor(value: Fixture): Promise<Actor> {
     project: project.project.id,
     preset: "high",
     fast: false,
+    presetContract: 1,
   }, { signal }) as { session: { id: SessionId } };
   return {
     accountId: added.account.id,
@@ -427,6 +431,7 @@ async function createSiblingActor(value: Fixture, actor: Actor): Promise<Actor> 
     project: actor.projectId,
     preset: "high",
     fast: false,
+    presetContract: 1,
   }, { signal }) as { session: { id: SessionId } };
   return { ...actor, sessionId: started.session.id };
 }
@@ -460,6 +465,8 @@ async function createAndJoin(value: Fixture, actor: Actor) {
   const created = workOperationResultSchema.parse(await value.service.execute({
     kind: "work.apply",
     requestId: crypto.randomUUID(),
+    requestVersion: WORK_APPLY_REQUEST_VERSION,
+    presetContract: 1,
     operation: {
       kind: "work.create",
       idempotencyKey: nextKey(),
@@ -476,20 +483,21 @@ async function createAndJoin(value: Fixture, actor: Actor) {
     },
   }, { signal }));
   if (created.kind !== "work.create") throw new Error("Expected work creation.");
+  const joinOperation = {
+    kind: "work.join",
+    idempotencyKey: nextKey(),
+    workId: created.work.id,
+    coordinatorSessionId: actor.sessionId,
+    coordinatorCapability: created.coordinatorCapability,
+    actorSessionId: actor.sessionId,
+  } as const;
   const joined = workOperationResultSchema.parse(await value.service.execute({
     kind: "work.apply",
     requestId: crypto.randomUUID(),
-    operation: {
-      kind: "work.join",
-      idempotencyKey: nextKey(),
-      workId: created.work.id,
-      coordinatorSessionId: actor.sessionId,
-      coordinatorCapability: created.coordinatorCapability,
-      actorSessionId: actor.sessionId,
-    },
+    operation: joinOperation,
   }, { signal }));
   if (joined.kind !== "work.join") throw new Error("Expected work join.");
-  return { created, joined };
+  return { created, joined, joinOperation };
 }
 
 async function createJoinClaim(value: Fixture, actor: Actor) {
@@ -594,6 +602,13 @@ function beginNestedSend(
     attemptId: nested.attempt.id,
     sessionId: actor.sessionId,
     profileGeneration: effect.accountGeneration,
+    transcript: {
+      accountId: actor.accountId,
+      providerGeneration: effect.accountGeneration,
+      providerConnectionId: "30000000-0000-4000-8000-00000000000d",
+      actor: "automation",
+      message: nested.message,
+    },
     evidence: {
       kind: "session.send",
       providerThreadId: session.providerThreadId,
@@ -612,6 +627,78 @@ function beginNestedSend(
 }
 
 describe("HraService work protocol", () => {
+  test("preserves v1 replay identity while requiring current v2 source for rebound creation", async () => {
+    const value = await fixture();
+    const actor = await createActor(value);
+    const { joined, joinOperation } = await createAndJoin(value, actor);
+
+    expect(workOperationResultSchema.parse(await value.service.execute({
+      kind: "work.apply",
+      requestId: crypto.randomUUID(),
+      operation: structuredClone(joinOperation),
+    }, { signal }))).toEqual(joined);
+    await expect(value.service.execute({
+      kind: "work.apply",
+      requestId: crypto.randomUUID(),
+      requestVersion: WORK_APPLY_REQUEST_VERSION,
+      operation: structuredClone(joinOperation),
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      details: { reason: "IDEMPOTENCY_CONFLICT" },
+    });
+
+    const reboundOperation = {
+      kind: "work.create",
+      idempotencyKey: nextKey(),
+      clientRef: `source-bound-work-${String(keySequence)}`,
+      coordinatorSessionId: actor.sessionId,
+      objective: "Require a current caller-authored source contract.",
+      routes: [{
+        accountId: actor.accountId,
+        projectId: actor.projectId,
+        preset: "ultra",
+        fast: false,
+      }],
+      tasks: [taskSpec(actor, "source-bound-task")].map((task) => ({
+        ...task,
+        preset: "ultra" as const,
+      })),
+    } satisfies WorkOperation;
+    await expect(value.service.execute({
+      kind: "work.apply",
+      requestId: crypto.randomUUID(),
+      operation: reboundOperation,
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      details: { reason: "ROUTE_MISMATCH" },
+    });
+    await expect(value.service.execute({
+      kind: "work.apply",
+      requestId: crypto.randomUUID(),
+      requestVersion: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 2,
+      operation: reboundOperation,
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      details: { reason: "ROUTE_MISMATCH" },
+    });
+    const admitted = workOperationResultSchema.parse(await value.service.execute({
+      kind: "work.apply",
+      requestId: crypto.randomUUID(),
+      requestVersion: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 1,
+      operation: reboundOperation,
+    }, { signal }));
+    expect(admitted.kind).toBe("work.create");
+    expect(workOperationResultSchema.parse(await value.service.execute({
+      kind: "work.apply",
+      requestId: crypto.randomUUID(),
+      requestVersion: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 1,
+      operation: structuredClone(reboundOperation),
+    }, { signal }))).toEqual(admitted);
+  });
+
   test("advertises, coordinates, dispatches, and exactly replays through session authority", async () => {
     const value = await fixture();
     const actor = await createActor(value);
@@ -679,7 +766,7 @@ describe("HraService work protocol", () => {
         requests: {
           checkpoint: {
             protocol: "hra-work-local-v1",
-            version: 1,
+            version: WORK_APPLY_REQUEST_VERSION,
             requestId: "$PERSISTED_REQUEST_UUID",
             operation: { attemptCapability: claimed.attemptCapability },
           },
@@ -1010,6 +1097,8 @@ describe("HraService work protocol", () => {
     const created = workOperationResultSchema.parse(await value.service.execute({
       kind: "work.apply",
       requestId: crypto.randomUUID(),
+      requestVersion: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 1,
       operation: {
         kind: "work.create",
         idempotencyKey: nextKey(),
@@ -1175,7 +1264,45 @@ describe("HraService work protocol", () => {
     });
   });
 
-  test("lets an effect-started provider switch fence a competing Work claim", async () => {
+  test("refuses a cross-account provider switch before effects while the session belongs to live Work", async () => {
+    const value = await fixture();
+    const actor = await createActor(value);
+    await createJoinClaim(value, actor);
+    const target = await value.service.execute(
+      { kind: "account.add", label: "Switch target" },
+      { signal },
+    ) as { account: { id: ProfileId } };
+    await value.service.execute(
+      { kind: "account.login", account: target.account.id, deviceCode: false },
+      { signal },
+    );
+    const switchKey = nextKey();
+    const startsBefore = value.runtime.startSessionCount;
+
+    await expect(value.service.execute({
+      kind: "session.switch",
+      account: target.account.id,
+      idempotencyKey: switchKey,
+      presetContract: legacyPresetContract,
+      provider: "codex",
+      session: actor.sessionId,
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      details: { reason: "SESSION_PROVIDER_SWITCH_BLOCKED" },
+    });
+
+    expect(value.runtime.startSessionCount).toBe(startsBefore);
+    expect(value.runtime.startTurnCalls).toHaveLength(0);
+    expect(value.runtime.endSessionCount).toBe(0);
+    expect(value.store.readMutation(switchKey)).toBeNull();
+    expect(value.store.requireSession(actor.sessionId)).toMatchObject({
+      profileId: actor.accountId,
+      provider: "codex",
+      state: "idle",
+    });
+  });
+
+  test("lets an effect-started same-account provider switch fence a competing Work claim", async () => {
     const value = await fixture();
     const actor = await createActor(value);
     const coordinator = await createSiblingActor(value, actor);
@@ -1245,6 +1372,89 @@ describe("HraService work protocol", () => {
     expect(value.store.readMutation(switchKey)).toMatchObject({ state: "applied" });
     expect(switched.session.profileId).toBe(actor.accountId);
     expect(value.store.requireSession(actor.sessionId).preset).toBe("low");
+    expect(value.runtime.startSessionCount).toBe(startsBefore + 1);
+    expect(value.runtime.startTurnCalls).toHaveLength(1);
+    expect(value.runtime.endSessionCount).toBe(1);
+  });
+
+  test("lets an effect-started cross-account provider switch fence a competing Work claim", async () => {
+    const value = await fixture();
+    const actor = await createActor(value);
+    const coordinator = await createSiblingActor(value, actor);
+    const { created } = await createAndJoin(value, coordinator);
+    const target = await value.service.execute(
+      { kind: "account.add", label: "Concurrent switch target" },
+      { signal },
+    ) as { account: { id: ProfileId } };
+    await value.service.execute(
+      { kind: "account.login", account: target.account.id, deviceCode: false },
+      { signal },
+    );
+    let enterTargetStart = (): void => {};
+    const targetStartEntered = new Promise<void>((resolve) => { enterTargetStart = resolve; });
+    let releaseTargetStart = (): void => {};
+    const targetStartGate = new Promise<void>((resolve) => { releaseTargetStart = resolve; });
+    value.runtime.beforeStartSessionReturn = async () => {
+      delete value.runtime.beforeStartSessionReturn;
+      enterTargetStart();
+      await targetStartGate;
+    };
+    const startsBefore = value.runtime.startSessionCount;
+    const switchKey = nextKey();
+    const switchPromise = value.service.execute({
+      kind: "session.switch",
+      account: target.account.id,
+      idempotencyKey: switchKey,
+      presetContract: legacyPresetContract,
+      provider: "codex",
+      session: actor.sessionId,
+    }, { signal });
+    await targetStartEntered;
+
+    const joined = workOperationResultSchema.parse(await value.service.execute({
+      kind: "work.apply",
+      requestId: crypto.randomUUID(),
+      operation: {
+        kind: "work.join",
+        idempotencyKey: nextKey(),
+        workId: created.work.id,
+        coordinatorSessionId: coordinator.sessionId,
+        coordinatorCapability: created.coordinatorCapability,
+        actorSessionId: actor.sessionId,
+      },
+    }, { signal }));
+    if (joined.kind !== "work.join") throw new Error("Expected the switching actor to join.");
+
+    let claimFailure: unknown;
+    try {
+      await value.service.execute({
+        kind: "work.apply",
+        requestId: crypto.randomUUID(),
+        operation: {
+          kind: "task.claim",
+          idempotencyKey: nextKey(),
+          workId: created.work.id,
+          taskId: created.tasks[0]!.id,
+          expectedTaskRevision: created.tasks[0]!.revision,
+          actorSessionId: actor.sessionId,
+          actorCapability: joined.memberCapability,
+          leaseMs: 5_000,
+        },
+      }, { signal });
+    } catch (error: unknown) {
+      claimFailure = error;
+    }
+    releaseTargetStart();
+    const switched = await switchPromise as { session: { profileId: ProfileId } };
+
+    expect(claimFailure).toBeInstanceOf(CommandFailure);
+    expect(claimFailure).toMatchObject({
+      code: "CONFLICT",
+      details: { reason: "ROUTE_MISMATCH" },
+    });
+    expect(value.workStore.snapshot(created.work.id).tasks[0]?.status).toBe("ready");
+    expect(value.store.readMutation(switchKey)).toMatchObject({ state: "applied" });
+    expect(switched.session.profileId).toBe(target.account.id);
     expect(value.runtime.startSessionCount).toBe(startsBefore + 1);
     expect(value.runtime.startTurnCalls).toHaveLength(1);
     expect(value.runtime.endSessionCount).toBe(1);
@@ -1333,6 +1543,7 @@ describe("HraService work protocol", () => {
     const value = await fixture();
     const actor = await createActor(value);
     const { created, joined, claimed } = await createJoinClaim(value, actor);
+    value.store.bumpAutorespondCounter(actor.sessionId);
     const dispatched = workOperationResultSchema.parse(await value.service.execute({
       kind: "work.apply",
       requestId: crypto.randomUUID(),
@@ -1350,6 +1561,7 @@ describe("HraService work protocol", () => {
       },
     }, { signal }));
     if (dispatched.kind !== "attempt.dispatch") throw new Error("Expected dispatch result.");
+    expect(value.store.readAutorespondBudgets(actor.sessionId).consecutive).toBe(1);
 
     const queueKey = nextKey();
     const queued = workOperationResultSchema.parse(await value.service.execute({
@@ -1371,13 +1583,16 @@ describe("HraService work protocol", () => {
     if (queueEffect?.kind !== "signal") throw new Error("Expected internal queue effect.");
     const queueMutation = value.store.readMutation(queueEffect.nestedMutationKey);
     const queueResult = queueMutation?.result as { queueId?: unknown } | undefined;
+    if (typeof queueResult?.queueId !== "string") throw new Error("Expected queue id.");
+    expect(value.store.queueMessageActor(queueResult.queueId as `queue_${string}`))
+      .toBe("automation");
     expect(queued.signal).toMatchObject({
       deliveryState: "accepted",
       deliveryReceipt: {
         kind: "queue_created",
         mutationAttemptId: queueMutation?.id,
         accountGeneration: queued.signal.accountGeneration,
-        queueId: queueResult?.queueId,
+        queueId: queueResult.queueId,
       },
     });
 
@@ -1412,6 +1627,12 @@ describe("HraService work protocol", () => {
       },
     });
     expect(JSON.stringify(steered)).not.toContain("provider-turn-1");
+    const automationMessages = value.store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: actor.sessionId,
+    }).events.filter((event) =>
+      event.body.type === "user_message" && event.body.actor === "automation");
+    expect(automationMessages).toHaveLength(2);
   });
 
   test("never replays an unknown dispatch and later reprojects exact recovery proof", async () => {

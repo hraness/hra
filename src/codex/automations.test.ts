@@ -288,13 +288,17 @@ describe("parseCodexAutomationToml", () => {
 describe("readCodexAutomations", () => {
   test("returns the good automation, one diagnostic, and skips a directory with no file", async () => {
     const directory = await automationsRoot();
+    const unsafeDirectoryName =
+      `b-${String.fromCodePoint(0x2028)}malformed${String.fromCodePoint(0x2029)}`;
     await writeAutomation(directory, "a-good", WELL_FORMED);
-    await writeAutomation(directory, "b-malformed", MALFORMED);
+    await writeAutomation(directory, unsafeDirectoryName, MALFORMED);
     await writeAutomation(directory, "c-empty", null);
 
     const scan = await readCodexAutomations({ automationsDirectory: directory });
     expect(scan.automations).toEqual([EXPECTED]);
     expect(scan.diagnostics).toEqual([{ automationId: "b-malformed", reason: "invalid_toml" }]);
+    expect(JSON.stringify(scan.diagnostics)).not.toContain(String.fromCodePoint(0x2028));
+    expect(JSON.stringify(scan.diagnostics)).not.toContain(String.fromCodePoint(0x2029));
   });
 
   test("reports an invalid_fields diagnostic without failing the scan", async () => {

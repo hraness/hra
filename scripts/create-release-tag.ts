@@ -4,6 +4,10 @@ import {
   admitCommitCiRequiredJob,
   admitCommitCiRun,
 } from "./check-commit-ci-run";
+import {
+  assertCommittedInstallPinsForRelease,
+  type CommittedInstallPinSources,
+} from "./check-install-pins";
 import { publicRepository } from "./release-distribution-policy";
 
 const ownerUserId = 894_119;
@@ -75,6 +79,7 @@ function runCommand(command: readonly string[]): CommandResult {
       ...process.env,
       GCM_INTERACTIVE: "never",
       GH_PROMPT_DISABLED: "1",
+      GIT_NO_REPLACE_OBJECTS: "1",
       GIT_TERMINAL_PROMPT: "0",
       SSH_ASKPASS_REQUIRE: "never",
     },
@@ -99,6 +104,17 @@ function requireCommand(runner: CommandRunner, command: readonly string[]): stri
     throw new Error(`Release tag preflight command exceeded its output bound: ${commandText(command)}`);
   }
   return result.stdout.trim();
+}
+
+function requireRawCommand(runner: CommandRunner, command: readonly string[]): string {
+  const result = runner(command);
+  if (result.exitCode !== 0) {
+    throw new Error(`Release tag preflight command failed: ${commandText(command)}\n${result.stderr.trim()}`);
+  }
+  if (Buffer.byteLength(result.stdout) > maximumOutputBytes) {
+    throw new Error(`Release tag preflight command exceeded its output bound: ${commandText(command)}`);
+  }
+  return result.stdout;
 }
 
 function requireJson(runner: CommandRunner, command: readonly string[], label: string): unknown {
@@ -341,9 +357,58 @@ export function assertTransparentGitIndex(output: string): void {
   }
 }
 
+function committedInstallPinSources(
+  runner: CommandRunner,
+  sha: string,
+): CommittedInstallPinSources {
+  const show = (path: string) => requireRawCommand(
+    runner,
+    ["git", "show", `${sha}:${path}`],
+  );
+  return {
+    cli: show("src/cli.ts"),
+    manifest: show("package.json"),
+    normalizer: show("src/install-normalizer.ts"),
+    preflight: show("src/install-preflight.ts"),
+    runtime: show("src/install-preflight-runtime.ts"),
+  };
+}
+
+function assertStableReleaseCheckout(
+  runner: CommandRunner,
+  expectedSha: string,
+  stage: string,
+): void {
+  if (requireCommand(
+    runner,
+    ["git", "for-each-ref", "--format=%(refname)", "refs/replace"],
+  ).length !== 0) {
+    throw new Error(`Release tag creation refuses Git replacement refs ${stage}.`);
+  }
+  if (requireCommand(
+    runner,
+    ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+  ).length !== 0) {
+    throw new Error(`Release tag creation found working-tree drift ${stage}.`);
+  }
+  assertTransparentGitIndex(requireRawCommand(runner, ["git", "ls-files", "-v", "-z"]));
+  if (requireCommand(runner, ["git", "branch", "--show-current"]) !== defaultBranch) {
+    throw new Error(`Release tag creation left ${defaultBranch} ${stage}.`);
+  }
+  if (requireCommand(runner, ["git", "rev-parse", "--verify", "HEAD^{commit}"]) !== expectedSha) {
+    throw new Error(`Release tag creation found HEAD drift ${stage}.`);
+  }
+}
+
+type ReleasePinAsserter = (
+  sources: CommittedInstallPinSources,
+  releaseTag: string,
+) => Promise<void> | void;
+
 export async function createReleaseTag(
   runner: CommandRunner = runCommand,
   readManifest: () => Promise<unknown> = async () => Bun.file("package.json").json() as Promise<unknown>,
+  assertReleasePins: ReleasePinAsserter = assertCommittedInstallPinsForRelease,
 ): Promise<string> {
   const user = userSchema.parse(requireJson(runner, ["gh", "api", "user"], "GitHub user identity"));
   if (user.id !== ownerUserId || user.type !== "User") {
@@ -357,6 +422,12 @@ export async function createReleaseTag(
 
   const root = requireCommand(runner, ["git", "rev-parse", "--show-toplevel"]);
   if (root !== process.cwd()) throw new Error("Release tag creation must run from the repository root.");
+  if (requireCommand(
+    runner,
+    ["git", "for-each-ref", "--format=%(refname)", "refs/replace"],
+  ).length !== 0) {
+    throw new Error("Release tag creation refuses Git replacement refs.");
+  }
   if (requireCommand(runner, ["git", "status", "--porcelain=v1", "--untracked-files=all"]).length !== 0) {
     throw new Error("Release tag creation requires a clean working tree.");
   }
@@ -388,6 +459,11 @@ export async function createReleaseTag(
   }
   const tagInventory = requireCommand(runner, ["git", "ls-remote", "--tags", "origin", "refs/tags/v*"]);
   const plan = assertMonotonicReleaseTag(manifest.version, sha, parseRemoteTags(tagInventory));
+  // This must precede every local tag write. GitHub immutable releases reserve
+  // a tag forever, so discovering a stale public-installer digest in the tag
+  // workflow would be an unrecoverable release-name burn.
+  await assertReleasePins(committedInstallPinSources(runner, sha), plan.tag);
+  assertStableReleaseCheckout(runner, sha, "during committed installer proof");
 
   const rulesets = rulesetSummarySchema.parse(requireJson(
     runner,
@@ -443,6 +519,7 @@ export async function createReleaseTag(
   if (local.exitCode === 0) {
     throw new Error("The unreleased local tag already exists; refuse to adopt pre-existing tag authority.");
   } else if (local.exitCode === 1) {
+    assertStableReleaseCheckout(runner, sha, "during remote release preflight");
     requireCommand(runner, ["git", "-c", "tag.gpgSign=false", "tag", "-a", plan.tag, "-m", `Release ${plan.tag}`, sha]);
   } else {
     throw new Error("Local release tag inspection failed.");

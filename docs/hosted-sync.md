@@ -8,7 +8,7 @@ Never copy retired HRA v0 data, deployment URLs, deploy keys, authentication key
 
 The provider identity guard pins the intended Convex team to numeric ID `513923` and provider slug `cclrte`. Retired HRA v0 Convex project ID `2680173` and production deployment ID `4677913` remain permanent denylisted safety tombstones; neither may be recreated, renamed into, or selected by this runbook. The current source repository has GitHub repository ID `1343008607`, and the current web project has Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Provider names may change. The team identity and numeric resource IDs do not.
 
-Browser app project. The web app at `app.hra.sh` is a second Vercel project in the same team, separate from the website project above so the two never share an origin, a cache policy, or a Content Security Policy. It has no framework preset, root directory `app`, build command `cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app`, install command `true`, and output directory `dist`. Its tracked ignore command exits nonzero for production so Vercel builds `main` rather than skipping it, while preview deployments remain ignored. The app requires no deployment-secret input: its Convex deployment origin is pinned in source at `app/src/env.ts` and in the `connect-src` allowlist of `app/vercel.json`. It was created on 2026-09-04 as Vercel project `prj_3olYDT29BrwKO9PLByVq9HlgRkdA` (name `hra-app`, team `team_UAd1iD2XogJlbFg4h14mRaPM`, production branch `main`, domain `app.hra.sh`), alongside the website project `prj_8ciIt9t9foE3utG45frRN7cxckjS`.
+Browser app project. The web app at `app.hra.sh` is a second Vercel project in the same team, separate from the website project above so the two never share an origin, a cache policy, or a Content Security Policy. It has no framework preset, root directory `app`, build command `cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app`, install command `true`, and output directory `dist`; source files outside the root directory are enabled because that exact build intentionally enters the repository root. Its tracked ignore command is exactly `test "$VERCEL_ENV" != "production"`, so Vercel builds production and ignores previews. The app requires no deployment-secret input: its Convex deployment origin is pinned in source at `app/src/env.ts` and in the `connect-src` allowlist of `app/vercel.json`. It was created on 2026-09-04 as Vercel project `prj_3olYDT29BrwKO9PLByVq9HlgRkdA` (name `hra-app`, team `team_UAd1iD2XogJlbFg4h14mRaPM`, production branch `main`, domain `app.hra.sh`), alongside the website project `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Every production build must receive Vercel's exact lowercase 40-character `VERCEL_GIT_COMMIT_SHA`; a missing or malformed value stops the build. The bundle publishes that commit, repository identity, and package version at the no-store path `/.well-known/hra-app.json`, which is excluded from the SPA fallback.
 
 Live projection. Besides the compact stream of completed turns, the daemon streams the current turn's assistant text (and reasoning summaries only when show-thinking is enabled for the session, default off) to the `detail` stream about once per second in redacted, encrypted batches of at most 8 KiB. Detail chunks carry the `live_tail` retention class: each row expires six hours after it is written, a session keeps at most 200 rows, and the `live_tail_chunks` maintenance category sweeps expired rows behind a detail stream epoch so digest-chain verification of the surviving tail stays valid and both the chunk quota and the per-user `live_chunk` resource counter are released. Raw reasoning is never uploaded.
 
@@ -152,9 +152,428 @@ bun run hosted:deploy -- \
 
 The candidate intent requires its `before` attestation to equal the predecessor receipt's `after` attestation, requires the predecessor and candidate to name the same fixed target, names the predecessor evidence digest, advances deployment time and runtime revision, and binds `runtimeSourceCommit` to `N_COMMIT`. Choose a new, unused, source-qualified evidence path for every candidate. Never rename or overwrite an earlier receipt. A reviewed exact protected-main commit may be deployed as a candidate before a Git tag, GitHub Release, or npm publication exists. If hosted evidence is cited for a tagged release, the final deployed source commit must equal the tagged commit. When protected `main` advances after a candidate deployment, deploy another candidate from the new exact commit and chain it from the currently live candidate receipt. Do not bootstrap again. Losing CLI output never authorizes a speculative redeploy. A retry may finalize only when the durable intent, current runtime attestation, fixed target, and prior evidence still match exactly. Drift or an ambiguous provider read is a refusal. An exact completed evidence file replays through read-only attestation and target checks without deploying.
 
-There is one exceptional supersession path for a bootstrap intent that cannot deploy its source. Use it only with independent evidence that the failed Convex process stopped determinately before the remote `runPush` mutation boundary, local process cleanup is proven, the exact numeric target is reverified, and a fresh authority read exactly equals the failed intent's recorded `before` attestation. Launching Convex or performing read-only target resolution does not disqualify this path. Any possibility that `runPush` began prohibits it. Keep the failed source-qualified evidence path and its `.intent` unchanged as quarantine evidence. From a newer exact clean fixed commit, choose a different source-qualified evidence path in the same protected release directory and run bootstrap there under the single release authority. Never delete, rename, overwrite, or retry the failed path from the newer checkout. Once the new runtime binds, its non-null attestation makes the old null-before intent inert and any replay of the old path fails closed. An ambiguous mutation boundary, changed or unreadable runtime, unproven cleanup, target drift, reused path, or missing old intent prohibits supersession.
+There is one exceptional fresh-source supersession path for a bootstrap or candidate intent that cannot deploy its source. Use it only with independent evidence that the failed Convex process stopped determinately before the remote `/api/deploy2/start_push` mutation boundary, local process cleanup is proven, the exact numeric target is reverified, and a fresh authority read exactly equals the failed intent's recorded `before` attestation. Launching Convex, performing read-only target resolution, or completing the non-activating `/api/deploy2/evaluate_push` provider validation does not disqualify this path. Any possibility that the `start_push` request began prohibits it. Keep the failed source-qualified evidence path reserved, and keep its `.intent` byte-for-byte unchanged as quarantine evidence. From a newer exact clean fixed commit, choose a different source-qualified evidence path in the same protected release directory and run the same phase under the single release authority. Bootstrap again only while the runtime remains unbound. For a failed candidate, the runtime must remain bound to the failed intent's `before` attestation, and the fresh candidate must name the same protected, completed, currently live predecessor receipt that the failed candidate named. Never use the failed intent, its incomplete evidence path, or any synthesized replacement as predecessor evidence, and never bootstrap over a bound runtime. Never delete, rename, overwrite, or retry the failed path from the newer checkout. Once the fixed deployment binds, its changed attestation makes the old intent inert and any replay of the old path fails closed. An ambiguous mutation boundary, changed or unreadable runtime, unproven cleanup, target drift, predecessor drift, reused path, or missing old intent prohibits supersession.
 
 Deployment intents and final documents use canonical SHA-256 JSON, bounded no-follow reads, exclusive mode-`0600` files, descriptor and path identity checks, file and directory sync, and atomic no-replace publication. Retain the `.intent` beside its final evidence until the release is complete.
+
+### Converge command lifecycle capacity before writer rollout
+
+The additive command-lifecycle and durable-job-capacity deployment is a
+forward-only boundary as soon as it admits one command, creates one command
+lifecycle/security reservation, creates any account-deletion or
+device-revocation capacity row, or accepts a capacity-backed deletion or
+revocation job. The authority-reduction rows are the account identity/job pair
+and the device/job/security/receipt quartet for each non-revoked device. That
+is true for marker-absent traffic and migration repairs, not only after a
+marker-2 browser or daemon goes live. Once any such row exists, never redeploy
+a pre-capacity hosted predecessor: it cannot consume command reservations
+during settlement, account for the new physical job shape, exchange the
+authority-reduction rows, or erase every obligation during account deletion.
+Repair forward from the exact currently live candidate instead.
+
+Run the capacity operator immediately after the candidate deployment and
+before upgrading current daemons/executors or declaring current command
+writers available. The Vercel app can auto-build from `main` before this gate;
+an early UI deployment is not capacity readiness. Fresh marker-2 enqueue is
+refused before any command, quota, or security write until the hosted candidate
+has consumed the protected capacity evidence and stored its exact activation
+tuple. A marker-2 prepare or new effect-start transition is refused by the same
+exact-runtime gate. The operator publishes the final activation receipt only
+after reading that tuple back and re-proving its bindings; the receipt records
+the already-active gate and is required before declaring writers ready, but its
+local publication does not open the runtime gate. Exact same-key replay,
+terminal and cleanup paths, and marker-absent compatibility traffic remain
+available while the gate is closed. New identities/devices admitted by the candidate receive
+their physical authority-reduction sets atomically;
+anything admitted before candidate cutover remains explicit scan debt. Do not use a
+package-script alias or invoke the TypeScript operator directly. Define this
+stage-zero wrapper from the exact clean candidate checkout; it removes every
+supported Bun/native injection variable before the builtins-only launcher is
+evaluated. The launcher raw-proves the requested commit, creates a private
+detached tree, performs the pinned Bun 1.3.14 frozen copyfile install with
+scripts disabled, re-proves that tree, and runs the operator only from it:
+
+```sh
+run_command_capacity() (
+  unset BUN_OPTIONS NODE_OPTIONS LD_AUDIT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PRELOAD \
+    DYLD_FALLBACK_FRAMEWORK_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_FRAMEWORK_PATH \
+    DYLD_IMAGE_SUFFIX DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_ROOT_PATH \
+    DYLD_VERSIONED_FRAMEWORK_PATH DYLD_VERSIONED_LIBRARY_PATH &&
+  command bun --no-env-file --config=/dev/null \
+    ./scripts/verify-app-source-launcher.ts command-capacity "$@"
+)
+
+run_command_capacity status \
+  --source-commit <CANDIDATE_COMMIT> \
+  --deploy-evidence /protected/release/candidate-<CANDIDATE_COMMIT>-deploy.json \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud
+```
+
+The status command enumerates every identity to prove its account pair and
+every non-revoked device quartet, then enumerates both command tables in all three nonterminal
+states and all five terminal states with provider pages capped at eight maximal
+documents. Every internal page is fenced against the candidate receipt's exact
+runtime attestation tuple, and each complete scan is sandwiched by raw source,
+candidate-receipt, live-attestation, and numeric-target proofs. It reports
+`authorityReductionServiceDebt`, `authorityReductionUserDebt`, a bounded sample
+of opaque `authorityReductionUserCandidates`, `pendingPreparedDebt`,
+`lifecycleDebt` (unreserved `effect_started` rows),
+`unsafeTerminalCleanupDebt`, informational `terminalReceiptDebt`, and bounded
+typed retirement candidates. Candidate lists never include email addresses or
+provider stderr. A truncated list requires another status pass after the first
+bounded batch; never query or mutate these rows manually in the dashboard or
+with a raw Convex CLI call.
+
+For ordinary debt with quota headroom, run the exact same wrapper with:
+
+```sh
+run_command_capacity repair \
+  --source-commit <CANDIDATE_COMMIT> \
+  --deploy-evidence /protected/release/candidate-<CANDIDATE_COMMIT>-deploy.json \
+  --evidence-path /protected/release/command-capacity-<CANDIDATE_COMMIT>.json \
+  --execute --acknowledge-forward-only \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud
+```
+
+`repair` first backfills a real account identity/job reservation pair and a
+real device/job/security/receipt quartet for every non-revoked device. Each row
+contains its own 2 KiB capacity field and is additionally charged for normal
+document metadata.
+New identities and devices create these rows atomically with admission. Delete
+and revoke exchange each category-matched row for its exact authority patch,
+job, security event, or idempotency receipt with a non-growing aggregate quota
+delta; they never bypass the hard ceiling. The same repair installs the
+physical session (352 KiB) or device (24 KiB) command lifecycle reservation and
+the one-record security reservation before a legacy command may cross the
+effect boundary. It also removes unsafe cleanup timestamps from unobserved
+legacy terminals without adding bytes. It requires two complete, consecutive
+zero-debt scans for authority-reduction capacity, pending/prepared,
+effect-started, and unsafe cleanup debt before publishing the protected
+no-replace capacity evidence. That first file is not rollout or effect
+authority. The operator next asks the exact candidate runtime to store its
+candidate, target, lifecycle-version, evidence-digest, and full release-
+attestation tuple on the uncharged `serviceControl` singleton, exactly reads
+that state back, re-proves every binding, and publishes the separate protected
+`<evidence-path>.activated` receipt. Only that final receipt proves that the
+current runtime will admit marker-2 work. Exact replay re-proves the binding,
+repeats both scans, replays or verifies hosted activation, reads it back, and
+verifies both protected files; target, source, runtime, candidate, or protected-
+file drift refuses. A candidate redeploy changes the compiled release
+attestation and makes the prior hosted marker inert until a new bound operator
+run activates the replacement. Unfinished predecessor
+account-deletion and device-revocation jobs are drained by their no-growth
+compatibility paths; new jobs retain physical padding through every state, and
+account deletion releases that larger job charge before inserting its smaller
+completion receipt. Revocation never grows up to 10,000 session-head rows:
+active or idle heads whose execution device is revoked are projected as
+orphaned by every public session-head surface, while the stored spelling stays
+byte- and record-neutral and all execution authority remains fenced.
+
+A predecessor identity at a hard user, category, or service ceiling may lack
+the bytes or records needed to create its physical authority-reduction rows.
+That is a release blocker, not a soft warning: the mutation returns the closed
+`capacity_backfill_blocked` diagnostic and no capacity evidence or activation
+receipt is published.
+Do not upgrade an executor, announce current command availability, or treat an
+already auto-deployed UI as ready. The operator does not expose untrusted provider output and
+does not borrow from or raise a hard quota. Do not wait for 90-day aging; the
+retained encrypted history may have no expiry. Either complete a separately
+reviewed, source/runtime-bound ordinary-data erasure or legacy account-erasure
+remediation, then rerun the same repair, or abandon the writer/release rollout
+while leaving the additive candidate live. If code must change, chain a new
+source-qualified forward-repair candidate from that live receipt; never
+redeploy the predecessor. There is no supported manual dashboard edit or raw
+Convex mutation.
+
+The two zero passes are meaningful under concurrency: after the additive
+candidate is live, every newly admitted identity/device receives its complete
+capacity set in the admitting transaction, while an incomplete legacy
+backfill remains visible debt. A concurrent delete/revoke consumes its set and
+moves into a monotonically draining job, which is not new authority. Each scan
+and mutation is internally fenced to the receipt's exact runtime, and the
+operator re-proves source, candidate, attestation, and numeric target around
+both full passes, hosted activation and readback, and both publications. Accept
+the protected capacity evidence together with its exact `.activated` receipt
+before enabling a current executor or treating an ordinary current writer as
+effect-capable; the capacity evidence alone, a Vercel deployment, stdout
+status, or one clean pass is never rollout authority.
+
+The current HRA credential store also binds the unique active unverified auth
+subject to a newly inserted user in the same mutation that creates the user,
+account, and deletion pair. A predecessor interruption that committed an
+unverified user/account without that binding remains authority-reduction debt
+even if its physical pair is complete, so it cannot produce false readiness.
+A bounded retention scan preserves a fresh retry, live challenge/session,
+device, verified identity, or any ambiguous relationship; after 24 hours of
+inactivity it atomically releases the exact orphan account, optional matching
+unbound subject, deletion pair, user, and quota authority. Until that cleanup
+or a successful retry binds the subject, `repair` stays closed and no capacity
+evidence or activation receipt is published.
+
+If an expired legacy `pending` or `prepared` row cannot acquire capacity at a
+hard ceiling, select only an `eligible` typed candidate from status and add, at
+most 64 times per batch:
+
+```text
+--retire-no-effect-expired session:<COMMAND_UUID>
+```
+
+If a pre-reservation `effect_started` row cannot settle using its actual known
+terminal delta, first reconcile the owning daemon's durable effect journal and
+independently establish that replay is forbidden. Only an `eligible` status
+candidate with exactly one matching enqueue event and no terminal event may be
+selected with:
+
+```text
+--retire-effect-started device:<COMMAND_UUID>
+```
+
+Either irreversible form additionally requires all of:
+
+```text
+--retirement-evidence-path /protected/release/command-retirement-<BATCH>.json
+--acknowledge-resultless-ambiguous-retirement
+```
+
+The operator publishes a protected, source/candidate/runtime-bound `.intent`
+before the first irreversible mutation and an independent completed receipt
+after the replay-safe batch, even when readiness still has debt and needs a
+later batch. On interruption, rerun the identical arguments: the protected
+intent supplies the exact sorted IDs, committed mutations replay exactly, and
+a mismatch refuses. Effect retirement deliberately records a result-less
+`ambiguous` operator abandonment, drops execution authority, converts the
+unique enqueue audit row into the terminal audit row, and therefore loses the
+separate enqueue audit fact. Missing, duplicate, expired, cross-table-colliding,
+or relationship-mismatched evidence is a hard refusal. Never infer an ID from
+the aggregate debt count.
+
+`terminalReceiptDebt` can remain nonzero in readiness evidence. Current
+requester lists prioritize capacity-backed receipts so an old receipt cannot
+head-of-line block newer work, then expose legacy receipts with remaining
+slots. Their proof-bound acknowledgement uses the actual delta: it fails closed
+at a hard ceiling and succeeds after headroom returns. Revoked-requester legacy
+rows retire only after both the command and revocation clocks reach 30 days;
+acknowledged no-effect compatibility rows use a bounded persistent scan cursor
+without rewriting the original acknowledgement timestamp. `legacyRevoked` and
+`operatorAbandoned` are retained evidence counts, not executable debt.
+
+Keep the candidate deployment receipt, every retirement intent and receipt,
+the final capacity evidence, and its `.activated` receipt together under the
+protected release directory. An early auto-deployed browser is not ready or
+effect-capable merely because it exists: daemon upgrades, target marker
+admission, and release availability remain behind exact hosted activation. A failure after
+the forward-only boundary is repaired by another source-qualified candidate
+chained from the live receipt; it is never grounds for predecessor rollback.
+
+### Capture optional browser app source evidence
+
+This verifier produces optional operator evidence for diagnosing the separately
+deployed browser app. It is not a release gate, release authorization, or input
+to `bun run release:tag`. It does not prove exclusive Vercel writer custody, an
+atomic provider snapshot, or the absence of an unobserved move-away-and-restore
+between reads. Do not describe the output as authoritative release evidence.
+
+Run only the builtins-only launcher through the shell stage zero shown below,
+from the repository root at the exact current protected `main`. The invoking
+shell first removes runtime and native-library injection variables; Bun then
+starts with dotenv loading disabled and `/dev/null` as its only Bun
+configuration. The launcher refuses an invocation that does not retain those
+exact runtime flags or that still carries an injection variable. Before it
+opens the credential, the launcher requires
+the canonical repository root, exact `HEAD`, a clean tracked-and-untracked
+worktree, a transparent Git index with no `skip-worktree` or
+`assume-unchanged` entries, and no effective repository or worktree
+clean/smudge/process filter, external attributes file, automatic line-ending
+conversion, forced checkout EOL, or symlink emulation. It requires the stage-zero
+index manifest to equal the exact commit tree, then reads every tracked regular
+file or symlink without Git checkout conversion and requires its raw Git blob
+digest and executable mode to equal that commit. A `git status` result by itself
+is never source proof. The exact fetch and push origin must also match, and a
+public HTTPS readback must show that `refs/heads/main` still names
+`--source-commit`. Both the fetch and push origin must be the literal canonical
+`https://github.com/hraness/hra.git`; SSH and alternate spellings are refused.
+
+The launcher then creates a new private detached worktree, installs the
+committed lockfile with `--frozen-lockfile --ignore-scripts --backend=copyfile`,
+but first applies the complete source proof to the materialized worktree so Bun
+cannot parse checkout-converted package or lockfile bytes. After installation it
+repeats the configuration, raw-blob, index, origin, and protected-main checks in
+both worktrees. Only after those checks may the fresh dependency tree receive
+the credential descriptor. The launcher ignores ambient `TMPDIR` and creates
+its directory as a direct child of the canonical root-owned sticky `/tmp`
+directory, so another operating-system user cannot rename that entry. It
+removes its exact registered temporary worktree after the verifier returns,
+verifies that Git no longer lists it, removes the same private directory
+identity, and refuses if cleanup cannot be proven. Every child receives a fixed
+minimal environment: provider tokens, hook
+variables, proxy variables, custom CA paths, runtime preload options, and caller
+`PATH` never cross the launcher boundary. Git hooks and filesystem monitors are
+disabled explicitly, as are system and user attribute sources; an effective
+repository/worktree transform setting is refused and any committed or
+local-info attribute conversion is exposed by the raw-blob comparison. The
+protected-main read uses the literal public HTTPS repository URL from `/`,
+outside either repository's local configuration.
+
+This boundary avoids executing ignored `node_modules`, ambient Bun preloads,
+dotenv files, Bun configuration, or other ignored code from the invoking
+checkout. It relies on the invoking shell having started without hostile native
+injection, the pinned Bun runtime, system Git,
+the committed lockfile and package-integrity checks, and the absence of a
+hostile same-UID process racing the launcher's private temporary directory or
+credential. After the shell stage zero, the first JavaScript entrypoint is the
+builtins-only launcher file from the invoking checkout; its raw whole-tree check
+happens before secret access but is not an independent pre-execution attestation
+of that first file. It is not a sandbox and does not protect against a
+compromised invoking shell, runtime, registry artifact accepted by the lockfile,
+kernel, or same-UID account.
+
+Put a short-lived Vercel access token outside the release evidence directory in
+a regular invoking-user-owned file with one link, no ACL, mode `0600`, and at
+most 8 KiB. Use a JSON object with `token` and, optionally, an integer
+`expiresAt` Unix timestamp in seconds at least 15 minutes in the future:
+
+```json
+{"token":"<VERCEL_ACCESS_TOKEN>"}
+```
+
+Bind the observation to one exact deployment, lowercase 40-character commit,
+and canonical stable release version:
+
+```sh
+(
+  unset BUN_OPTIONS NODE_OPTIONS LD_AUDIT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PRELOAD \
+    DYLD_FALLBACK_FRAMEWORK_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_FRAMEWORK_PATH \
+    DYLD_IMAGE_SUFFIX DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_ROOT_PATH \
+    DYLD_VERSIONED_FRAMEWORK_PATH DYLD_VERSIONED_LIBRARY_PATH &&
+  command bun --no-env-file --config=/dev/null \
+    ./scripts/verify-app-source-launcher.ts prove \
+    --deployment-id <VERCEL_DEPLOYMENT_ID> \
+    --evidence-path /protected/release/app-source-proof.json \
+    --source-commit <EXACT_MERGED_COMMIT> \
+    --release-version <EXACT_RELEASE_VERSION> \
+    --vercel-auth-path /protected/credentials/vercel-auth.json
+)
+```
+
+The launcher, not the shell or package runner, opens the credential after
+sealing the source tree. It first checks the open descriptor's regular-file,
+owner, link-count, mode, and size identity, then passes it to the internal
+verifier on descriptor 3. The verifier repeats those checks, proves the absence
+of an ACL, reads the bytes twice under an unchanged identity, validates the
+bounded JSON and optional expiry, and closes its descriptor before any provider
+request.
+After the command returns, revoke the short-lived token and remove its file.
+Never retain that file, raw provider responses, or provider-authenticated output
+under the release evidence boundary.
+
+The command uses authenticated Vercel readbacks to require team
+`team_UAd1iD2XogJlbFg4h14mRaPM`, project
+`prj_3olYDT29BrwKO9PLByVq9HlgRkdA`, its GitHub link to repository ID
+`1343008607` on production branch `main`, a `READY` production Git deployment
+at the exact commit, and the `app.hra.sh` alias attached to that deployment. A
+project name, automatic hostname, or successful HTTP response is not a
+substitute for those stable identities. The deployment must not be prebuilt,
+and its best-effort provider `source` field must still say `git` as a
+conservative refusal guard against manual CLI uploads; that field is not used
+as standalone provenance. The current project must match the exact root,
+framework, build, install, output, and outside-root-source contract above; its
+dashboard ignore command may be unset because the tracked configuration owns
+that setting, but any other value is refused. The effective deployment must
+carry the exact tracked build, install, output, framework, and ignore command.
+Because the single-deployment response omits root and outside-root fields, a
+second bounded, cursor-paginated `/v7/deployments` readback locates the exact
+deployment under project, commit, branch, target, and state filters and binds
+its complete immutable settings snapshot too. A Git deployment with a
+per-deployment build override is therefore refused. The exact project-domain
+record must be verified,
+unredirected, production-scoped, and directly configured through a Vercel
+`A` or `CNAME` record rather than an HTTP proxy. The project must have no live
+bulk redirects, active rolling release, live project routing rules, or active
+valid WAF redirect rule. The alias must have no redirect or microfrontend
+routing authority that could serve another deployment. Skew Protection must be
+disabled: the project boundary must be absent and its maximum age absent or
+zero. Otherwise an old document, a deployment-qualified URL or header, or the
+Vercel deployment cookie can continue routing a client to an older deployment
+even while the production alias points at the candidate, so the verifier
+refuses that state.
+
+Between two complete provider samples, the command fetches a freshly
+cache-busted `https://app.hra.sh/.well-known/hra-app.json` without Vercel
+authentication and parses it as strict JSON. It requires exactly this document:
+
+```json
+{
+  "generation": 1,
+  "product": "HRA App",
+  "repository": {
+    "id": 1343008607,
+    "path": "hraness/hra"
+  },
+  "schemaVersion": 1,
+  "source": {
+    "commit": "<EXACT_MERGED_COMMIT>"
+  },
+  "version": "<EXACT_RELEASE_VERSION>"
+}
+```
+
+It also requires a standalone `no-store` response cache directive. The command
+accepts only when both normalized provider samples are identical and name the
+input deployment and commit, while the marker names the input commit and
+version. Each sample records the alias UID and provider `updatedAt` millisecond
+timestamp as change-detection signals. Vercel does not document that timestamp
+as a unique monotonic revision, so those fields do not make the sequential
+sample ABA-safe. A missing marker, an HTML fallback, an extra or malformed
+field, a cache-policy failure, a commit mismatch, a project or deployment
+build-setting mismatch, indirect or misconfigured DNS, a live bulk redirect,
+an active rolling release, active Skew Protection, any live project route, an
+active WAF redirect, an observed provider or protected-main change during the
+at-most-five-minute sample, or a non-READY deployment stops the observation.
+
+`--evidence-path` must be an absolute normalized path naming an absent direct
+child of a protected mode-`0700` evidence directory. The command publishes one
+schema-version-2 canonical, self-digested, mode-`0600`, single-link document
+through no-follow and atomic no-replace checks, then syncs and revalidates it.
+It never overwrites or treats an exact replay as success. Standard output is
+only a bounded non-secret echo for observation; shell redirection of stdout is
+not evidence. Standard error is one closed refusal code. Neither stream
+contains the access token or raw provider responses.
+
+Revalidate a retained file from a fresh exact-current-main verifier tree with:
+
+```sh
+(
+  unset BUN_OPTIONS NODE_OPTIONS LD_AUDIT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PRELOAD \
+    DYLD_FALLBACK_FRAMEWORK_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_FRAMEWORK_PATH \
+    DYLD_IMAGE_SUFFIX DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_ROOT_PATH \
+    DYLD_VERSIONED_FRAMEWORK_PATH DYLD_VERSIONED_LIBRARY_PATH &&
+  command bun --no-env-file --config=/dev/null \
+    ./scripts/verify-app-source-launcher.ts verify-retained \
+    --evidence-path /protected/release/app-source-proof.json \
+    --source-commit <EXACT_CURRENT_MAIN_COMMIT> \
+    --release-version <EXACT_RELEASE_VERSION>
+)
+```
+
+This reads the protected file with descriptor and path identity checks, verifies
+its strict schema and self-digest, and requires its internal marker, source,
+version, timing, and current-main bindings to agree. If capture was interrupted
+after atomic no-replace publication but before its temporary hard link was
+removed, this retained verification accepts only the one exact two-link file,
+removes that matching temporary link, syncs the directory, and then reports the
+proof verified. It does not repeat the live Vercel sample. The retained read is
+sandwiched between two exact current-main source checks. An advance of protected
+`main` makes the current-main invocation refuse an older file; capture a new
+observation if one is useful. Keep only the bounded optional proof, never its
+credential, under the evidence boundary.
 
 ## Configure secrets
 
@@ -177,10 +596,11 @@ protected-json-source | bun run hosted:configure -- \
   --deployment-url https://steady-otter-321.convex.cloud
 ```
 
-An agent can use a private nonterminal descriptor:
+An agent can use a private nonterminal descriptor. Invoke the entry point
+directly so descriptor 3 is preserved on Darwin:
 
 ```sh
-bun run hosted:configure -- \
+bun ./scripts/configure-hosted-sync.ts \
   --deployment steady-otter-321 \
   --team-id 513923 \
   --project-id 2854545 \
@@ -459,9 +879,15 @@ If issuance is refused after protected custody commits, do not repeat `issue` wi
 ## Operate open sign-up
 
 Two independent controls live on the single `serviceControl` row.
-`authAdmissions` is the break-glass: `frozen` refuses every authenticated
-path, including verification and device pairing for existing members, so it
-locks out the whole service and is never the way to close sign-up.
+`authAdmissions` is the authentication-admission break-glass: `frozen` blocks
+new OTP work, new auth sessions, refresh-session storage, invitation issuance,
+and fresh device registration. It does not make ordinary device-authority
+checks read service control, so an already-issued JWT and its active device
+binding can keep using authenticated paths until that token expires. The
+configured JWT lifetime is 15 minutes and refresh is refused while frozen.
+This is therefore a bounded eventual cutoff, not an immediate whole-service
+lockout, and it is never the way to close sign-up. This release has no global
+authenticated-traffic kill switch.
 `newIdentityAdmissions` is the narrow control: `invite_only` (the default, and
 the meaning of an absent stored value) or `open`. It is read in exactly one
 place, where a first `authSubjects` row would be inserted without an
@@ -533,6 +959,15 @@ it. Worst-case usage telemetry for one Codex account before any row becomes
 cleanup-eligible is 16,888,144 logical bytes, under a tenth of the tier; the
 tier holds twelve such accounts at once.
 
+Authority-reduction capacity is physical and is included in those same hard
+totals: two 2 KiB reservation documents per identity and four per non-revoked
+device, plus normal document metadata. It is intentionally not a virtual
+counter or an uncharged emergency exception. The rows slightly reduce space
+available to ordinary data, then are exchanged category-for-category when an
+account deletion or device revocation is accepted. Command lifecycle and
+terminal-security reservations are likewise charged while the command is in
+flight and consumed or released as its state shrinks.
+
 These constants are hard authority. A stored counter above the constant reads
 as corrupt and fails closed, so never lower a ceiling below what a deployment
 already stores. Read current usage first, and deploy a tier change through the
@@ -557,11 +992,200 @@ that finds a command it left at `effect_started` may only close it as
 `ambiguous`. That is what stops a `session_start` that may or may not have run
 from silently starting a second session.
 
+### Request commitment and rolling updates
+
+Every enqueue carries a keyed request commitment over the request fields that
+the execution daemon verifies. The requesting client computes an HMAC-SHA256
+with the account key. Its message is
+`hra-control-plane:<purpose>:v1:<json>`. A session command uses purpose
+`command-enqueue` and the exact JSON object key order shown below. A device
+command uses purpose `device-command-enqueue` and its separate exact order:
+
+```text
+session: {deadline, expectedTargetDevicePublicId, kind, payload, publicId, requestingDevicePublicId, sessionPublicId}
+device:  {deadline, expectedTargetDevicePublicId, kind, payload, publicId, requestingDevicePublicId}
+```
+
+The `v1` in the HMAC message is the fixed keyed-digest framing version. It is
+distinct from hosted request commitment marker 2 and local journal classifier
+3.
+
+The hosted enqueue authenticates the requesting device and stores that exact
+requester with the target, payload, and digest. The daemon fetches the exact
+row and recomputes the commitment from the stored requester. The hosted row
+records wire marker 2. A current local journal entry records
+`requestCommitmentVersion: 3`, meaning it verified that marker-2 requester
+commitment and retained the exact requesting device. Local journal markers 1
+and 2, plus pre-marker entries, are legacy recovery evidence, not current
+execution authority.
+
+Current verification runs first and is the only path that can reach a provider
+effect. If it fails, a daemon may recognize the older HMAC, which omitted
+`requestingDevicePublicId`, only to reach a non-executing terminal disposition.
+That legacy digest is never trusted as requester authority and is never rebound
+to the active browser or device. Apply this decision order:
+
+- An already-hosted terminal row takes precedence. It confirms its hosted
+  result and permits local journal retirement without replaying any local
+  outcome.
+- Otherwise, if the hosted row is nonterminal and either the local journal or
+  hosted row records `effect_started`, the hosted command becomes result-less
+  `ambiguous` and is never retried.
+- A legacy local terminal outcome over a hosted nonterminal row is not trusted.
+  The daemon discards that unauthenticated outcome and closes the hosted row
+  result-less `ambiguous` with `LOCAL_EFFECT_RECOVERY_REQUIRED`.
+- A fresh or local-`prepared` legacy request over a hosted `pending` or
+  `prepared` command becomes `failed` with
+  `LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT` through the table's dedicated
+  `failPrepared` mutation.
+
+When a fresh request's marker differs from the target's last stored registry
+marker, it fails before a command, quota charge, or security event is inserted.
+Each daemon publishes an internal
+`deviceRegistries.commandRequestVersion` marker before command processing. A
+fresh enqueue must exactly match its target: marker 2 matches marker 2, while an
+absent request marker matches an absent registry marker. Exact idempotency replay
+is resolved first, so a committed request remains replayable after its target
+upgrades or downgrades; changing the marker under the same key is still an
+idempotency conflict. The registry marker is not returned by `getRegistry` or
+`listRegistries`. An old daemon's next registry write omits and therefore clears
+the marker. If the current daemon cannot publish its registry, it skips both
+session- and device-command processing for that cycle while unrelated sync may
+continue.
+
+The stored command marker is also checked at `prepare` and
+`markEffectStarted`. A marker-2 row requires the current executor marker before
+either hosted transition, even if a stale registry still advertises marker 2.
+Legacy rows accept only the old-shaped executor marker. The current daemon uses
+those transitions only for its legacy recovery flows; it never promotes that
+evidence to current provider-effect authority. Because enqueue compares with
+the last stored registry marker, a stale matching marker can admit a row during
+an upgrade or downgrade window. That row still cannot pass `prepare` or
+`markEffectStarted` under a mismatched executor, and recovery classifies it
+without authorizing a provider effect.
+
+Never edit or delete the local journal, local CLI outbox, current tab's retained
+command handle, registry marker, or hosted row to work around a refusal. The
+browser creates an idempotency key internally but does not expose or persist a
+caller-reusable identity, ciphertext, or receipt proof. For a marker-2 session
+or device command, enqueue retains the established marker-2 response shape: it
+returns the command and authority fields, but does not echo the idempotency key
+or request digest. After validating that exact response, the browser derives
+the acknowledgement tuple from the exact request fields it just submitted and
+sends it to the separate mutation. Two requester-only, bounded hosted queries
+list the same browser device's server-stored unacknowledged session and device
+proof tuples; the unlocked app drains each family sequentially, so a lost
+response, tab close, or reload recovers acknowledgement without another enqueue
+and without a Web Storage or IndexedDB command outbox. The recovery read is
+inert and cannot start retention by itself. A different active device sees none
+of those requester rows and cannot acknowledge them.
+
+Marker-absent device requests retain their historical atomic enqueue-time
+acknowledgement while old and current browser writers coexist. Marker-absent
+session commands never had that compatibility behavior. They remain
+unacknowledged evidence until the exact requesting browser device loads the
+current app, at which point the same requester-only list supplies their stored
+proof. Refresh already-open browser writers after the hosted rollout and
+monitor unacknowledged rows until they drain. Inspect browser and device
+commands through the app or corresponding hosted query; do not treat a browser
+retry as exact replay.
+
+The browser deployment is global and may happen automatically when the release
+commit reaches the Vercel branch; there is no per-target browser or CLI enable
+switch. That early UI is not command-capacity readiness or effect authority.
+Until the hosted singleton contains the exact activation tuple and a target has
+published its current marker, fresh marker-2 enqueue and new provider-bound
+transitions remain fail-closed. Do not declare the writers ready until both the
+protected capacity evidence and its `.activated` readback receipt are accepted.
+Actively monitor expected refusals from ungated or mismatched targets. Old
+clients and old targets may continue their absent-to-absent protocol during
+this additive rollout, but any admitted command or capacity-backed job crosses
+the forward-only boundary described below.
+
+1. Deploy the additive Convex schema, per-target enqueue gate, executor marker
+   checks, exact `get`, session-command `getForOutboxRecovery`, both
+   `listUnacknowledgedForRequester` queries, exact receipt acknowledgement,
+   `failPrepared`, and requester-authenticated `enqueue` functions first. Both
+   legacy and marker-2 enqueue responses retain their prior exact shapes; proof
+   fields stay in hosted command custody and are never added as response echoes.
+2. While the additive candidate remains live, run the protected command-capacity
+   `status`/`repair` workflow above against that exact source, deployment receipt,
+   runtime attestation, and numeric target. Accept only its protected two-zero-pass
+   capacity evidence plus the exact `.activated` receipt produced after hosted
+   activation and readback. The first file alone is not readiness. A hard-full
+   legacy owner, partial capacity set, unreserved
+   command debt, unsafe cleanup shape, interrupted intent, candidate swap, or
+   concurrent debt blocks this step. An auto-deployed browser remains non-ready
+   and non-effect-capable while this step is incomplete.
+3. Upgrade daemons independently only after capacity evidence and activation
+   receipts are accepted.
+   After starting the current daemon on each
+   intended target, run `hra sync now --json` on that machine. Do not declare
+   current command availability or enable release admission until every
+   intended target's result has `ok: true`, `data.online: true`,
+   `data.errorCount: 0`, and
+   `data.commandRequestVersion: 2`. A pending device identity or failed
+   registry publication leaves the last field null. This forces an observable
+   successful marker-2 registry publication cycle; a current daemon publishes
+   marker 2 before it processes either command queue. A downgrade clears
+   eligibility on the next successful old-shaped registry write.
+4. Declare the global marker-emitting browser and CLI release ready only after
+   the capacity activation receipt and intended-target proofs above. Refresh already-open
+   browser tabs so their requester-only receipt recovery runs. If the release
+   deliberately exposes an ungated target, record that exception and monitor
+   its expected marker-mismatch refusals; the hosted gate rejects them before
+   command insertion. A stale matching marker may admit during a transition,
+   but the executor checks stop it before prepare or effect start.
+5. Let current daemons automatically classify and reconcile pre-existing
+   legacy journals, outboxes, and hosted rows through the recovery-only paths
+   above. Observe the result with `hra sync now --json`, retained local command
+   IDs, and the hosted command queries. Ordinary reconciliation never needs a
+   manual close. The exceptional hard-ceiling cases identified by the protected
+   capacity status may use only its typed, source/runtime-bound retirement flow
+   documented above; dashboard edits and raw Convex mutations remain forbidden.
+   Only a command proved `failed` before effect may be
+   attempted again, under a new idempotency key and a current client. Never
+   retry an `ambiguous` command. No account-wide drain or all-daemons-current
+   barrier is required before declaring the already-deployed global writer ready
+   once protected capacity activation and the intended target gates are complete.
+
+Retain the additive functions, internal target marker, stored requester fields,
+and legacy and version 2 parsing until all local journals and outboxes are
+reconciled and every related hosted row is terminal or expired, and until no
+deployed current client can create or call those recovery surfaces.
+
+Hosted rollback is unavailable once the additive capacity candidate admits any
+command or capacity-backed deletion/revocation job, or creates or repairs any
+command reservation. Waiting for a marker-2 client or daemon is not a rollback
+boundary. HRA has no global writer-freeze command or drain receipt, and a
+retained browser tab or CLI can still enqueue a request even after a visible
+writer deployment is replaced. Never redeploy a predecessor commit or reuse a
+predecessor deployment receipt. Instead, prepare a reviewed forward repair that
+reverses the unwanted behavior while retaining the additive schema fields,
+registry marker, enqueue gate, `prepare` and `markEffectStarted` checks, exact
+`get`, session-command `getForOutboxRecovery`, `failPrepared`, legacy and
+version 2 parsers, and every maintenance and recovery endpoint. Deploy that
+exact commit as the next candidate chained from the currently live receipt.
+Disabling known writer surfaces may reduce inflow but is not proof of
+quiescence. Remove compatibility only after a separately reviewed server-side
+admission fence and drain receipt
+exist, no deployed current client or daemon can call version 2 or recovery
+surfaces, all local journals and outboxes are reconciled, and every related
+hosted row is terminal or expired. Without all of that evidence, keep the
+compatibility surface and repair forward.
+
+Local binary downgrade is a separate and stricter decision. The current daemon
+writes local journal schema 5 and may migrate other local custody state. Once
+it has started against a state root, never launch an older daemon against that
+root, even if every hosted row is terminal or expired. Retain the current
+binary and recovery endpoints while it remains deployed, and then until its
+local journals and outboxes are reconciled.
+
 ### Kinds
 
 | Kind | Payload | Result |
 | --- | --- | --- |
-| `session_start` | `{accountPublicId, projectPublicId, prompt, preset, provider}` | `{sessionPublicId}` |
+| `session_start` | `{accountPublicId, projectPublicId, prompt, preset, presetContract?, provider}`; `presetContract` is required for High or Ultra and absent for stable presets | `{sessionPublicId}` |
 | `account_login_start` | `{accountPublicId,handoffVersion?:2}` | current: `{handoffVersion:2,loginUrl,userCode,expiresAt}`, single use; legacy results remain parser-only during rolling deployment |
 | `account_login_status` | current: `{accountPublicId}`; legacy: none | `{status, instruction}` |
 | `usage_refresh` | none | `{accountsRefreshed}` |
@@ -682,8 +1306,17 @@ path to another surface.
 `deviceCommands` is classified exactly like `sessionCommands`: quota category
 `command`, retention class `command_recovery`, deletion order 10. A pending row
 past its deadline is expired by the `pending_device_commands` maintenance
-category; a terminal row the requester has acknowledged is deleted by
-`terminal_device_commands` after the same 30-day retention. Account deletion
+category. An ordinary requester-retained terminal row becomes eligible for
+`terminal_device_commands` only after the exact requesting device acknowledges
+its hosted proof, then remains for the same 30-day retention. Explicit
+requester-revocation abandonment starts that clock without stamping a false
+acknowledgement. A pre-rollout row whose requester was already revoked uses the
+non-growing dual command/revocation-age rule, and a typed operator-abandoned
+legacy effect uses its separate 30-day clock plus exact terminal security
+evidence. A marker-2 browser recovers its ordinary proof from the
+requester-only hosted list after a lost response; a marker-absent device
+command keeps the mixed-rollout enqueue-time acknowledgement described above.
+Account deletion
 erases the table with the other command state, and device revocation cancels
 pending rows the revoked device owns while quarantining any that had already
 started.

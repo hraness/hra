@@ -171,8 +171,8 @@ const activeTurn = (thread: CodexThread): string | undefined =>
   [...thread.turns].reverse().find((turn) => turn.status === "inProgress")?.id;
 
 const textEncoder = new TextEncoder();
-const unsafeTerminalScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
-const sensitiveProviderTextHint = /(?:auth|cookie|token|key|pass|secret|otp|invite|code|Bearer|Basic|sk[_-]|re[_-]|gh[pousr]|github_pat|xox|AKIA|eyJ|PRIVATE KEY|[\p{Cc}\p{Cf}\p{Cs}\p{M}])/iu;
+const unsafeTerminalScalar = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
+const sensitiveProviderTextHint = /(?:auth|cookie|token|key|pass|secret|otp|invite|code|Bearer|Basic|sk[_-]|re[_-]|gh[pousr]|github_pat|xox|AKIA|eyJ|PRIVATE KEY|[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{M}])/iu;
 const uncPathHint = /\\\\[^\\/\s]/u;
 
 const sanitizeProviderText = (input: string, preserveLineFeeds: boolean): string => {

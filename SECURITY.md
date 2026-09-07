@@ -11,17 +11,18 @@ Do not open a public issue for a suspected vulnerability. Use GitHub's private v
 | Version | Status |
 | --- | --- |
 | `v0.7.0` | Release candidate. Supported once the release workflow admits it. |
-| `v0.6.0` | Independently owned runtime release; admission pending. |
-| `v0.5.0` | Supported beta until `v0.6.0` is admitted. Receives security fixes. |
+| `v0.6.0` | Immutable partial publication. The workflow did not complete final admission; unsupported. |
+| `v0.5.0` | Last fully admitted beta. Supported until `v0.7.0` is admitted. Receives security fixes. |
 | `v0.4.1` | Superseded by `v0.5.0`. Unsupported. |
 | `v0.4.0` | Superseded by `v0.4.1`. Unsupported. |
 | `v0.3.0` | Superseded by `v0.4.0`. Unsupported. |
 | `v0.2.1` | Superseded by `v0.3.0`. Unsupported. |
 | `v0.2.0` | Superseded by `v0.2.1`. Unsupported. |
 | `v0.1.6` | Superseded by `v0.2.0`. Unsupported. |
-| `v0.1.0` through `v0.1.5` | Unsupported. These tags produced no admitted npm package plus GitHub Release pair; `docs/beta-release.md` records each outcome. |
+| `v0.1.5` | Superseded by `v0.1.6`. Unsupported. |
+| `v0.1.0` through `v0.1.4` | Unsupported. These tags produced no admitted npm package plus GitHub Release pair; `docs/beta-release.md` records each outcome. |
 
-Only the latest published beta receives security fixes.
+Only the latest fully admitted beta receives security fixes.
 
 ## Product boundary
 

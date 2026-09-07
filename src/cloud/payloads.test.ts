@@ -3,6 +3,8 @@ import { describe, expect, test } from "bun:test";
 import { decryptBytes, encryptBytes, randomKeyBytes } from "./crypto";
 import {
   cloudPayloadAad,
+  activeRemoteDerivedCodexSelection,
+  activeRemotePresetSelection,
   decryptDeviceCommand,
   decryptDeviceCommandResult,
   decryptDeviceRegistry,
@@ -79,33 +81,77 @@ describe("closed encrypted payloads", () => {
   });
 
   test("admits every provider-specific preset in model and default-preset commands", () => {
-    for (const preset of ["high", "fable-max"] as const) {
-      expect(parseRemoteCommandPayload({ kind: "set_model", preset }))
-        .toEqual({ kind: "set_model", preset });
-      expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset }))
-        .toEqual({ kind: "set_default_preset", preset });
+    for (const preset of ["low", "high", "ultra", "fable-max"] as const) {
+      const selection = activeRemotePresetSelection(preset);
+      expect(parseRemoteCommandPayload({ kind: "set_model", ...selection }))
+        .toEqual({ kind: "set_model", ...selection });
+      expect(parseRemoteCommandPayload({ kind: "set_default_preset", ...selection }))
+        .toEqual({ kind: "set_default_preset", ...selection });
     }
     expect(parseRemoteCommandPayload({ kind: "set_model", preset: "fable" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_model", preset: "astra" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset: "astra" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_model", preset: "ultra" })).toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_model",
+      preset: "ultra",
+      presetContract: 2,
+    })).toBeNull();
   });
 
   test("admits a provider switch with an optional preset and refuses anything else", () => {
     expect(parseRemoteCommandPayload({ kind: "set_provider", provider: "claude" }))
       .toEqual({ kind: "set_provider", provider: "claude" });
-    expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "fable-max", provider: "claude" }))
-      .toEqual({ kind: "set_provider", preset: "fable-max", provider: "claude" });
+    const derivedCodex = activeRemoteDerivedCodexSelection();
+    expect(derivedCodex).toEqual({ presetContract: 1, provider: "codex" });
+    expect(parseRemoteCommandPayload({ kind: "set_provider", ...derivedCodex }))
+      .toEqual({ kind: "set_provider", ...derivedCodex });
+    expect(parseRemoteCommandPayload({ kind: "set_provider", provider: "codex" }))
+      .toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_provider",
+      presetContract: 2,
+      provider: "codex",
+    })).toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_provider",
+      presetContract: 1,
+      provider: "claude",
+    })).toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_provider",
+      ...activeRemotePresetSelection("fable-max"),
+      provider: "claude",
+    })).toEqual({
+      kind: "set_provider",
+      preset: "fable-max",
+      provider: "claude",
+    });
+    expect(parseRemoteCommandPayload({
+      kind: "set_provider",
+      ...activeRemotePresetSelection("high"),
+      provider: "codex",
+    })).toEqual({ kind: "set_provider", preset: "high", presetContract: 1, provider: "codex" });
     expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "astra", provider: "devin" }))
       .toBeNull();
     expect(parseRemoteCommandPayload({ kind: "set_provider", provider: "devin" })).toBeNull();
-    expect(parseRemoteCommandPayload({ kind: "set_model", preset: "astra" })).toBeNull();
-    expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset: "astra" })).toBeNull();
-    expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "high", provider: "codex" }))
-      .toEqual({ kind: "set_provider", preset: "high", provider: "codex" });
     for (const mismatch of [
       { kind: "set_provider", preset: "astra", provider: "codex" },
       { kind: "set_provider", preset: "fable-max", provider: "devin" },
-      { kind: "set_provider", preset: "ultra", provider: "claude" },
+      { kind: "set_provider", preset: "ultra", presetContract: 1, provider: "claude" },
     ]) expect(parseRemoteCommandPayload(mismatch)).toBeNull();
     expect(parseRemoteCommandPayload({ kind: "set_provider", provider: "gemini" })).toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_provider",
+      preset: "high",
+      provider: "codex",
+    })).toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_provider",
+      preset: "high",
+      presetContract: 2,
+      provider: "codex",
+    })).toBeNull();
     expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "fable", provider: "claude" }))
       .toBeNull();
     // A remote caller never picks the account: account selection is
@@ -350,7 +396,10 @@ describe("remote decision payloads", () => {
       value: "ultra",
     });
     try {
-      const parsed = parseRemoteCommandPayload({ kind: "set_provider", provider: "codex" });
+      const parsed = parseRemoteCommandPayload({
+        kind: "set_provider",
+        ...activeRemoteDerivedCodexSelection(),
+      });
       expect(parsed).not.toBeNull();
       expect(parsed && Object.hasOwn(parsed, "preset")).toBe(false);
       expect(parsed && "preset" in parsed ? parsed.preset : undefined).toBeUndefined();
@@ -366,8 +415,18 @@ describe("settings command payloads", () => {
       .toEqual({ kind: "set_approval_mode", mode: "auto:workspace", scope: "session" });
     expect(parseRemoteCommandPayload({ kind: "set_show_thinking", enabled: true, scope: "default" }))
       .toEqual({ enabled: true, kind: "set_show_thinking", scope: "default" });
+    expect(parseRemoteCommandPayload({
+      kind: "set_default_preset",
+      preset: "ultra",
+      presetContract: 1,
+    })).toEqual({ kind: "set_default_preset", preset: "ultra", presetContract: 1 });
     expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset: "ultra" }))
-      .toEqual({ kind: "set_default_preset", preset: "ultra" });
+      .toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_default_preset",
+      preset: "ultra",
+      presetContract: 2,
+    })).toBeNull();
     expect(parseRemoteCommandPayload({ kind: "archive_session", archived: true }))
       .toEqual({ archived: true, kind: "archive_session" });
     expect(parseRemoteCommandPayload({ kind: "rename_session", name: "Nightly review" }))
@@ -898,6 +957,7 @@ describe("device command payloads", () => {
     accountPublicId: "account_primary",
     kind: "session_start",
     preset: "ultra",
+    presetContract: 1,
     projectPublicId: "project_alpha",
     prompt: "continue the migration",
     provider: "codex",
@@ -906,13 +966,26 @@ describe("device command payloads", () => {
   test("accepts each kind in its exact shape", () => {
     expect(parseDeviceCommandPayload(sessionStart)).toEqual(sessionStart);
     expect(parseDeviceCommandPayload({
-      ...sessionStart,
+      accountPublicId: sessionStart.accountPublicId,
+      kind: sessionStart.kind,
       preset: "fable-max",
+      projectPublicId: sessionStart.projectPublicId,
+      prompt: sessionStart.prompt,
       provider: "claude",
-    })).toEqual({ ...sessionStart, preset: "fable-max", provider: "claude" });
+    })).toEqual({
+      accountPublicId: sessionStart.accountPublicId,
+      kind: sessionStart.kind,
+      preset: "fable-max",
+      projectPublicId: sessionStart.projectPublicId,
+      prompt: sessionStart.prompt,
+      provider: "claude",
+    });
     expect(parseDeviceCommandPayload({
-      ...sessionStart,
+      accountPublicId: sessionStart.accountPublicId,
+      kind: sessionStart.kind,
       preset: "astra",
+      projectPublicId: sessionStart.projectPublicId,
+      prompt: sessionStart.prompt,
       provider: "devin",
     })).toBeNull();
     expect(parseDeviceCommandPayload({
@@ -948,6 +1021,25 @@ describe("device command payloads", () => {
 
   test("refuses an extra key, a wrong scalar, and a session command kind", () => {
     expect(parseDeviceCommandPayload({ ...sessionStart, extra: 1 })).toBeNull();
+    expect(parseDeviceCommandPayload({
+      accountPublicId: sessionStart.accountPublicId,
+      kind: sessionStart.kind,
+      preset: sessionStart.preset,
+      projectPublicId: sessionStart.projectPublicId,
+      prompt: sessionStart.prompt,
+      provider: sessionStart.provider,
+    })).toBeNull();
+    expect(parseDeviceCommandPayload({
+      ...sessionStart,
+      presetContract: undefined,
+    })).toBeNull();
+    expect(parseDeviceCommandPayload({ ...sessionStart, presetContract: 2 })).toBeNull();
+    expect(parseDeviceCommandPayload({
+      ...sessionStart,
+      preset: "fable-max",
+      presetContract: 2,
+      provider: "claude",
+    })).toBeNull();
     expect(parseDeviceCommandPayload({ ...sessionStart, preset: "fable-max" })).toBeNull();
     expect(parseDeviceCommandPayload({ ...sessionStart, preset: "astra" })).toBeNull();
     expect(parseDeviceCommandPayload({ ...sessionStart, provider: "devin" })).toBeNull();

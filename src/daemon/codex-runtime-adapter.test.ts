@@ -1940,7 +1940,7 @@ describe("PinnedCodexRuntimeManager", () => {
   });
 
   test("projects a terminal-safe deterministic plugin catalog through the read-only client call", async () => {
-    const attack = "\u001b]0;owned\u0007\u202etxt";
+    const attack = "\u001b]0;owned\u0007\u202etxt\u2028line\u2029paragraph";
     const catalog: CodexPluginCatalog = {
       marketplaces: [
         {
@@ -2030,20 +2030,22 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(requests).toEqual([{ cwd: "/workspace/project", forceRefetch: true }]);
     expect(projected.marketplaces.map(({ name }) => name)).toEqual([
       "a",
-      "z�]0;owned��txt",
+      "z�]0;owned��txt�line�paragraph",
     ]);
     expect(projected.marketplaces[1]?.plugins.map(({ id }) => id)).toEqual([
       "a-plugin",
-      "z-files�]0;owned��txt",
+      "z-files�]0;owned��txt�line�paragraph",
     ]);
     expect(projected.featuredPluginIds).toEqual([
       "a-plugin",
-      "z-files�]0;owned��txt",
+      "z-files�]0;owned��txt�line�paragraph",
     ]);
     expect(projected.marketplaceLoadErrorCount).toBe(1);
     expect(JSON.stringify(projected)).not.toContain("\u001b");
     expect(JSON.stringify(projected)).not.toContain("\u0007");
     expect(JSON.stringify(projected)).not.toContain("\u202e");
+    expect(JSON.stringify(projected)).not.toContain("\u2028");
+    expect(JSON.stringify(projected)).not.toContain("\u2029");
     expect(projected.lifecycle).toEqual(catalog.lifecycle);
     await manager.close();
   });
@@ -2068,9 +2070,9 @@ describe("PinnedCodexRuntimeManager", () => {
     const connectionId = "71000000-0000-4000-8000-000000000006";
     const capabilities = (suffix: string): CodexCapabilitySnapshot => ({
       models: [{
-        id: "gpt-6-astra",
-        model: "gpt-6-astra",
-        displayName: "GPT-6 Astra",
+        id: "gpt-5.6-sol",
+        model: "gpt-5.6-sol",
+        displayName: "GPT-5.6 Sol",
         hidden: false,
         supportedReasoningEfforts: ["max", "ultra"],
         defaultReasoningEffort: "max",
@@ -2112,7 +2114,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       resolvePreset: (_snapshot: unknown, alias: string, _requirement: unknown, fast: boolean) => {
         events.push(`resolve:${alias}:${String(fast)}`);
-        return { alias, model: "gpt-6-astra", effort: "max", serviceTier: fast ? "priority" : null, fast };
+        return { alias, model: "gpt-5.6-sol", effort: "max", serviceTier: fast ? "priority" : null, fast };
       },
       startThread: async (input: unknown) => {
         events.push(`thread:${JSON.stringify(input)}`);
@@ -2121,7 +2123,7 @@ describe("PinnedCodexRuntimeManager", () => {
           value: {
             thread: { ...makeThread([]), ephemeral },
             cwd: "/workspace/project",
-            model: "gpt-6-astra",
+            model: "gpt-5.6-sol",
             modelProvider: "openai",
             reasoningEffort: "max",
             serviceTier: "priority",

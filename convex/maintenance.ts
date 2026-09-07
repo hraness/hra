@@ -1,9 +1,11 @@
 import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
+import { isCanonicalAuthEmail } from "../src/cloud/authCredentials";
 import { isSafePositiveInteger, isUuidV7 } from "../src/cloud/contracts";
 import { deviceCommandLoginResultLifetimeMs } from "../src/cloud/payloads";
 import { sha256Hex } from "../src/cloud/crypto";
+import { digestAuthEmail } from "./authEmail";
 import { maximumLiveOtpChallenges } from "./authPolicy";
 import {
   attentionNotificationGroupLimit,
@@ -20,6 +22,14 @@ import {
   releaseUnusedAttentionNotificationFaultCapacity,
 } from "./attentionNotificationControl";
 import { commandTerminalRetentionMs } from "./commands";
+import {
+  isLegacyNoEffectExpiredTerminal,
+  isOperatorAbandonedEffectTerminal,
+  requireOperatorAbandonedSecurityEvent,
+  terminalizeDeviceCommandWithLifecycleCapacity,
+  terminalizeSessionCommandWithLifecycleCapacity,
+} from "./commandLifecycle";
+import { loadAccountDeletionCapacity } from "./authorityReductionCapacity";
 import {
   ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS,
   CLOUD_USAGE_SNAPSHOT_RETENTION_MS,
@@ -38,9 +48,14 @@ import {
   releaseServiceQuotaForDelete,
   releaseSessionChunkQuotaForDelete,
   requireHardQuotaAuthority,
+  logicalDocumentBytes,
 } from "./quota";
-import { internalMutation, type MutationCtx } from "./server";
+import { internalMutation, type DataModel, type MutationCtx } from "./server";
 import { beginDetailRetentionEpoch } from "./sessions";
+import {
+  commandLifecycleCapacityVersion,
+  maximumCommandLifecycleBatch,
+} from "./validators";
 
 const maximumCleanupBatch = 200;
 const categoryQuantum = 20;
@@ -54,6 +69,7 @@ const maintenanceCategories = [
   "otp_challenges",
   "auth_invites",
   "abandoned_identities",
+  "orphaned_auth_users",
   "bind_challenges",
   "device_presence",
   "idempotency_receipts",
@@ -90,6 +106,12 @@ export const MAINTENANCE_RETENTION_STRATEGY = {
   authOtpChallenges: ["otp_challenges", "abandoned_identities"],
   authInvites: ["auth_invites"],
   devices: [],
+  accountDeletionIdentityReservations: [],
+  accountDeletionJobReservations: [],
+  deviceRevocationDeviceReservations: [],
+  deviceRevocationJobReservations: [],
+  deviceRevocationSecurityReservations: [],
+  deviceRevocationReceiptReservations: [],
   deviceSessions: [],
   deviceBindChallenges: ["bind_challenges"],
   deviceKeyEnvelopes: [],
@@ -108,6 +130,8 @@ export const MAINTENANCE_RETENTION_STRATEGY = {
     "device_command_login_results",
     "terminal_device_commands",
   ],
+  commandLifecycleReservations: ["pending_commands", "pending_device_commands"],
+  commandTerminalSecurityReservations: ["pending_commands", "pending_device_commands"],
   attentionNotificationOutbox: [
     "pending_attention_notifications",
     "started_attention_notifications",
@@ -148,6 +172,7 @@ export const cloudRetentionMs = Object.freeze({
 
 type CleanupCounts = {
   abandonedIdentities: number;
+  orphanedAuthUsers: number;
   accountDeletionReceipts: number;
   authAttempts: number;
   authInvites: number;
@@ -176,6 +201,7 @@ const countField = {
   otp_challenges: "otpChallenges",
   auth_invites: "authInvites",
   abandoned_identities: "abandonedIdentities",
+  orphaned_auth_users: "orphanedAuthUsers",
   bind_challenges: "bindChallenges",
   device_presence: "devicePresence",
   idempotency_receipts: "idempotencyReceipts",
@@ -326,13 +352,152 @@ async function cleanAbandonedIdentity(ctx: MutationCtx, now: number, limit: numb
     return limit - remaining;
   }
 
-  if (remaining < 2) return limit - remaining;
+  const capacity = await loadAccountDeletionCapacity(ctx, user._id);
+  const required = capacity.kind === "reserved" ? 4 : 2;
+  // Delete authority and its physical escape capacity in one transaction.
+  // An earlier bounded sweep must never leave an active unverified identity
+  // without the pair that guarantees account deletion at a hard ceiling.
+  if (remaining < required) return limit - remaining;
+  if (capacity.kind === "reserved") {
+    await releaseQuotaForDelete(ctx, user._id, "identity", capacity.identity);
+    await releaseQuotaForDelete(ctx, user._id, "job", capacity.job);
+    await ctx.db.delete(capacity.identity._id);
+    await ctx.db.delete(capacity.job._id);
+  }
   await releaseQuotaForDelete(ctx, user._id, "identity", subject);
   await releaseQuotaForStoredIdentity(ctx, user._id, user);
   await finalizeUserQuotaAuthorityForDelete(ctx, user._id);
   await ctx.db.delete(subject._id);
   await ctx.db.delete(user._id);
-  return limit - remaining + 2;
+  return limit - remaining + required;
+}
+
+const orphanedAuthUserMaximumDeletedRows = 5;
+
+async function cleanOrphanedAuthUsers(
+  ctx: MutationCtx,
+  now: number,
+  limit: number,
+  maintenance?: DataModel["maintenanceState"]["document"],
+): Promise<number> {
+  if (maintenance === undefined) throw new Error("Maintenance authority is corrupt.");
+  const numItems = Math.floor(limit / orphanedAuthUserMaximumDeletedRows);
+  if (numItems < 1) return 0;
+  const cursor = maintenance.orphanedAuthUserCursor;
+  const cursorId = cursor === undefined ? null : ctx.db.normalizeId("users", cursor);
+  if (cursor !== undefined && cursorId === null) {
+    throw new Error("Maintenance authority is corrupt.");
+  }
+  // Auth accounts are a complete, user-keyed inventory of the predecessor gap
+  // and let retention advance with an ordinary bounded index read. This avoids
+  // consuming Convex's single pagination slot before command retention runs.
+  const candidates = await ctx.db.query("authAccounts")
+    .withIndex("userIdAndProvider", (builder) =>
+      cursorId === null ? builder : builder.gt("userId", cursorId))
+    .take(numItems);
+  const cutoff = now - cloudRetentionMs.abandonedIdentity;
+  let processed = 0;
+  for (const candidate of candidates) {
+    const user = await ctx.db.get(candidate.userId);
+    if (user === null) continue;
+    if (
+      user._creationTime >= cutoff
+      || user.emailVerificationTime !== undefined
+      || user.phoneVerificationTime !== undefined
+      || user.isAnonymous !== undefined
+      || user.phone !== undefined
+    ) continue;
+    const [accounts, boundSubjects, challenges, deletionJob, device, session] = await Promise.all([
+      ctx.db.query("authAccounts")
+        .withIndex("userIdAndProvider", (builder) => builder.eq("userId", user._id))
+        .take(2),
+      ctx.db.query("authSubjects")
+        .withIndex("by_user", (builder) => builder.eq("userId", user._id))
+        .take(2),
+      ctx.db.query("authOtpChallenges")
+        .withIndex("by_user", (builder) => builder.eq("userId", user._id))
+        .take(1),
+      ctx.db.query("accountDeletionJobs")
+        .withIndex("by_user", (builder) => builder.eq("userId", user._id))
+        .first(),
+      ctx.db.query("devices")
+        .withIndex("by_user_and_public_id", (builder) => builder.eq("userId", user._id))
+        .first(),
+      ctx.db.query("authSessions")
+        .withIndex("userId", (builder) => builder.eq("userId", user._id))
+        .first(),
+    ]);
+    if (
+      accounts.length !== 1
+      || boundSubjects.length !== 0
+      || challenges.length !== 0
+      || deletionJob !== null
+      || device !== null
+      || session !== null
+    ) continue;
+    const account = accounts[0];
+    if (
+      account === undefined
+      || account._creationTime >= cutoff
+      || account.provider !== "hra-control-plane-otp-v1"
+      || account.emailVerified !== undefined
+      || !isCanonicalAuthEmail(account.providerAccountId)
+      || user.email !== account.providerAccountId
+    ) continue;
+    const emailDigest = await digestAuthEmail(account.providerAccountId);
+    const matchingSubjects = await ctx.db.query("authSubjects")
+      .withIndex("by_email_digest", (builder) => builder.eq("emailDigest", emailDigest))
+      .take(2);
+    if (matchingSubjects.length > 1) throw new Error("Maintenance authority is corrupt.");
+    const subject = matchingSubjects[0];
+    if (subject !== undefined) {
+      if (
+        subject.userId !== undefined
+        || subject.status !== "active"
+        || subject.verifiedAt !== undefined
+      ) continue;
+      // A retry may have just reserved the same identity against an older
+      // disconnected account. Preserve it until the full inactivity window
+      // has elapsed from both creation and last reservation activity.
+      if (subject.createdAt >= cutoff || subject.updatedAt >= cutoff) continue;
+    }
+    const verificationCode = await ctx.db.query("authVerificationCodes")
+      .withIndex("accountId", (builder) => builder.eq("accountId", account._id))
+      .first();
+    if (verificationCode !== null) continue;
+    const capacity = await loadAccountDeletionCapacity(ctx, user._id);
+    if (
+      capacity.kind === "reserved"
+      && (capacity.identity.createdAt >= cutoff || capacity.job.createdAt >= cutoff)
+    ) continue;
+    const required = (capacity.kind === "reserved" ? 4 : 2)
+      + (subject === undefined ? 0 : 1);
+    if (processed + required > limit) throw new Error("Maintenance category exceeded its budget.");
+    if (subject !== undefined) {
+      await releaseServiceQuotaForDelete(ctx, subject);
+    }
+    await releaseQuotaForDelete(ctx, user._id, "identity", account);
+    if (capacity.kind === "reserved") {
+      await releaseQuotaForDelete(ctx, user._id, "identity", capacity.identity);
+      await releaseQuotaForDelete(ctx, user._id, "job", capacity.job);
+    }
+    await releaseQuotaForStoredIdentity(ctx, user._id, user);
+    await finalizeUserQuotaAuthorityForDelete(ctx, user._id);
+    if (subject !== undefined) await ctx.db.delete(subject._id);
+    await ctx.db.delete(account._id);
+    if (capacity.kind === "reserved") {
+      await ctx.db.delete(capacity.identity._id);
+      await ctx.db.delete(capacity.job._id);
+    }
+    await ctx.db.delete(user._id);
+    processed += required;
+  }
+  await ctx.db.patch(maintenance._id, {
+    orphanedAuthUserCursor: candidates.length < numItems
+      ? undefined
+      : String(candidates.at(-1)?.userId),
+  });
+  return processed;
 }
 
 async function deleteExpiredBindChallenges(ctx: MutationCtx, now: number, limit: number): Promise<number> {
@@ -370,10 +535,11 @@ async function deleteExpiredIdempotency(ctx: MutationCtx, now: number, limit: nu
 
 async function expirePendingCommands(ctx: MutationCtx, now: number, limit: number): Promise<number> {
   const records = await ctx.db.query("sessionCommands")
-    .withIndex("by_state_and_deadline", (builder) => builder
+    .withIndex("by_state_capacity_and_deadline", (builder) => builder
       .eq("state", "pending")
+      .eq("lifecycleCapacityVersion", commandLifecycleCapacityVersion)
       .lt("deadline", now))
-    .take(limit);
+    .take(Math.min(limit, maximumCommandLifecycleBatch));
   for (const record of records) {
     const commandPatch = {
       nonterminal: false,
@@ -383,14 +549,71 @@ async function expirePendingCommands(ctx: MutationCtx, now: number, limit: numbe
         : { terminalCleanupAfter: now + cloudRetentionMs.terminalCommand }),
       updatedAt: now,
     };
-    await adjustCommandQuotaForPatch(ctx, record.userId, record, commandPatch);
-    await ctx.db.patch(record._id, commandPatch);
+    await terminalizeSessionCommandWithLifecycleCapacity(ctx, record, commandPatch);
   }
   return records.length;
 }
 
-async function deleteTerminalCommands(ctx: MutationCtx, now: number, limit: number): Promise<number> {
-  let remaining = limit;
+async function deleteTerminalCommands(
+  ctx: MutationCtx,
+  now: number,
+  limit: number,
+  maintenance?: DataModel["maintenanceState"]["document"],
+): Promise<Readonly<{ paginationDone: boolean; processed: number; usedPagination: boolean }>> {
+  if (maintenance === undefined) throw new Error("Maintenance authority is corrupt.");
+  const commandLimit = Math.min(limit, maximumCommandLifecycleBatch);
+  let remaining = commandLimit;
+  const noEffectCutoff = now - commandTerminalRetentionMs;
+  const noEffectQuery = () => ctx.db.query("sessionCommands")
+    .withIndex("by_acknowledged_no_effect_cleanup", (builder) => builder
+      .eq("state", "expired")
+      .eq("lifecycleCapacityVersion", undefined)
+      .eq("nonterminal", false)
+      .eq("terminalCleanupAfter", undefined)
+      .eq("receiptCapacityReservation", undefined)
+      .eq("requesterReceiptAbandonedAt", undefined)
+      .eq("operatorAbandonedAt", undefined)
+      .eq("resultCode", undefined)
+      .eq("resultDigest", undefined)
+      .gt("requesterAcknowledgedAt", 0));
+  const useNoEffectPagination = maintenance.sessionNoEffectCleanupCursor !== undefined
+    || (await noEffectQuery().take(1)).length !== 0;
+  const noEffectPage = useNoEffectPagination
+    ? await noEffectQuery().paginate({
+        cursor: maintenance.sessionNoEffectCleanupCursor ?? null,
+        numItems: remaining,
+      })
+    : undefined;
+  const noEffectRecords = noEffectPage?.page ?? [];
+  for (const record of noEffectRecords) {
+    // This broad physical index deliberately avoids adding a marker to an
+    // exact-ceiling legacy row. Non-matching and not-yet-old rows advance the
+    // bounded cursor without mutating externally visible receipt evidence.
+    if (!isLegacyNoEffectExpiredTerminal(record)) continue;
+    const [requester, target, session] = await Promise.all([
+      ctx.db.get(record.requestingDeviceId),
+      ctx.db.get(record.targetDeviceId),
+      ctx.db.get(record.sessionId),
+    ]);
+    if (
+      requester?.userId !== record.userId
+      || target?.userId !== record.userId
+      || session?.userId !== record.userId
+      || session.executionDeviceId !== record.targetDeviceId
+    ) throw new Error("Maintenance authority is corrupt.");
+    if (record.updatedAt < noEffectCutoff) {
+      await releaseCommandQuotaForDelete(ctx, record.userId, record);
+      await ctx.db.delete(record._id);
+    }
+  }
+  if (noEffectPage !== undefined) {
+    await ctx.db.patch(maintenance._id, {
+      sessionNoEffectCleanupCursor: noEffectPage.isDone
+        ? undefined
+        : noEffectPage.continueCursor,
+    });
+  }
+  remaining -= noEffectRecords.length;
   for (const state of ["applied", "failed", "ambiguous", "cancelled", "expired"] as const) {
     if (remaining === 0) break;
     const records = await ctx.db.query("sessionCommands")
@@ -400,12 +623,81 @@ async function deleteTerminalCommands(ctx: MutationCtx, now: number, limit: numb
         .lt("terminalCleanupAfter", now))
       .take(remaining);
     for (const record of records) {
+      const operatorAbandoned = isOperatorAbandonedEffectTerminal(record);
+      const requesterAcknowledged = record.requesterAcknowledgedAt !== undefined;
+      const requesterAbandoned = record.requesterReceiptAbandonedAt !== undefined;
+      if (
+        (record.operatorAbandonedAt !== undefined && !operatorAbandoned)
+        || (requesterAcknowledged && requesterAbandoned)
+        || record.receiptCapacityReservation !== undefined
+      ) throw new Error("Maintenance authority is corrupt.");
+      if (!operatorAbandoned && !requesterAcknowledged && !requesterAbandoned) {
+        const patch = { terminalCleanupAfter: undefined, updatedAt: now };
+        await adjustCommandQuotaForPatch(ctx, record.userId, record, patch);
+        await ctx.db.patch(record._id, patch);
+        continue;
+      }
+      if (operatorAbandoned) {
+        await requireOperatorAbandonedSecurityEvent(ctx, record);
+      }
       await releaseCommandQuotaForDelete(ctx, record.userId, record);
       await ctx.db.delete(record._id);
     }
     remaining -= records.length;
   }
-  return limit - remaining;
+  const legacyCutoff = now - commandTerminalRetentionMs;
+  let legacyScanRemaining = remaining;
+  for (const state of ["applied", "failed", "ambiguous", "cancelled", "expired"] as const) {
+    if (remaining === 0 || legacyScanRemaining === 0) break;
+    const records = await ctx.db.query("sessionCommands")
+      .withIndex("by_state_unreserved_receipt_and_updated_at", (builder) => builder
+        .eq("state", state)
+        .eq("receiptCapacityReservation", undefined)
+        .eq("requesterAcknowledgedAt", undefined)
+        .eq("requesterReceiptAbandonedAt", undefined)
+        .lt("updatedAt", legacyCutoff))
+      .take(legacyScanRemaining);
+    legacyScanRemaining -= records.length;
+    for (const record of records) {
+      const requester = await ctx.db.get(record.requestingDeviceId);
+      if (requester?.userId !== record.userId) {
+        throw new Error("Maintenance authority is corrupt.");
+      }
+      if (requester.status !== "revoked") {
+        const patch = { updatedAt: now };
+        if (logicalDocumentBytes({ ...record, ...patch }) > logicalDocumentBytes(record)) {
+          throw new Error("Maintenance authority is corrupt.");
+        }
+        await adjustCommandQuotaForPatch(ctx, record.userId, record, patch);
+        await ctx.db.patch(record._id, patch);
+        remaining -= 1;
+        continue;
+      }
+      if (
+        requester.revokedAt === undefined
+        || !Number.isSafeInteger(requester.revokedAt)
+        || requester.revokedAt < 1
+      ) throw new Error("Maintenance authority is corrupt.");
+      if (requester.revokedAt >= legacyCutoff) {
+        const patch = { updatedAt: Math.max(record.updatedAt, requester.revokedAt) };
+        if (logicalDocumentBytes({ ...record, ...patch }) > logicalDocumentBytes(record)) {
+          throw new Error("Maintenance authority is corrupt.");
+        }
+        await adjustCommandQuotaForPatch(ctx, record.userId, record, patch);
+        await ctx.db.patch(record._id, patch);
+        remaining -= 1;
+        continue;
+      }
+      await releaseCommandQuotaForDelete(ctx, record.userId, record);
+      await ctx.db.delete(record._id);
+      remaining -= 1;
+    }
+  }
+  return {
+    paginationDone: noEffectPage?.isDone ?? true,
+    processed: commandLimit - remaining,
+    usedPagination: noEffectPage !== undefined,
+  };
 }
 
 /*
@@ -416,10 +708,11 @@ async function deleteTerminalCommands(ctx: MutationCtx, now: number, limit: numb
  */
 async function expirePendingDeviceCommands(ctx: MutationCtx, now: number, limit: number): Promise<number> {
   const records = await ctx.db.query("deviceCommands")
-    .withIndex("by_state_and_deadline", (builder) => builder
+    .withIndex("by_state_capacity_and_deadline", (builder) => builder
       .eq("state", "pending")
+      .eq("lifecycleCapacityVersion", commandLifecycleCapacityVersion)
       .lt("deadline", now))
-    .take(limit);
+    .take(Math.min(limit, maximumCommandLifecycleBatch));
   for (const record of records) {
     const commandPatch = {
       nonterminal: false,
@@ -429,8 +722,7 @@ async function expirePendingDeviceCommands(ctx: MutationCtx, now: number, limit:
         : { terminalCleanupAfter: now + cloudRetentionMs.terminalCommand }),
       updatedAt: now,
     };
-    await adjustCommandQuotaForPatch(ctx, record.userId, record, commandPatch);
-    await ctx.db.patch(record._id, commandPatch);
+    await terminalizeDeviceCommandWithLifecycleCapacity(ctx, record, commandPatch);
   }
   return records.length;
 }
@@ -458,7 +750,20 @@ export const expireDeviceCommandLoginResult = internalMutation({
       .take(2);
     if (matches.length > 1) throw new Error("Maintenance authority is corrupt.");
     const record = matches[0];
-    if (record === undefined || record.resultExpiresAt !== args.resultExpiresAt) {
+    const legacyResultExpiresAt = record !== undefined
+      && record.resultExpiresAt === undefined
+      && record.kind === "account_login_start"
+      && !record.nonterminal
+      && record.state === "applied"
+      && record.resultSingleUse === true
+      && record.result !== undefined
+      && record.resultConsumedAt === undefined
+      ? record.updatedAt + deviceCommandLoginResultLifetimeMs
+      : undefined;
+    if (
+      record === undefined
+      || (record.resultExpiresAt ?? legacyResultExpiresAt) !== args.resultExpiresAt
+    ) {
       return { status: "retired" as const };
     }
     const now = Date.now();
@@ -518,9 +823,11 @@ async function expireDeviceCommandLoginResults(
   const remaining = limit - expired.length;
   if (remaining === 0) return limit;
 
-  // Rows settled before `resultExpiresAt` existed are backfilled once. An
-  // already-expired row is erased immediately; a still-live row receives both
-  // the server deadline and the same exact scheduled erasure as a new settle.
+  // Rows settled before `resultExpiresAt` existed cannot safely grow at a hard
+  // byte ceiling. An already-expired row is erased immediately; a still-live
+  // row is scheduled against the deterministic legacy deadline without a
+  // document patch. Repeated sweep scheduling during this bounded five-minute
+  // compatibility window is harmless because erasure is idempotent.
   const legacy = await ctx.db.query("deviceCommands")
     .withIndex("by_single_use_result_expiry", (builder) => builder
       .eq("resultSingleUse", true)
@@ -538,17 +845,16 @@ async function expireDeviceCommandLoginResults(
       throw new Error("Maintenance authority is corrupt.");
     }
     const erase = record.state !== "applied" || resultExpiresAt <= now;
-    const commandPatch = erase
-      ? {
-          result: undefined,
-          resultConsumedAt: now,
-          resultExpiresAt: undefined,
-          updatedAt: now,
-        }
-      : { resultExpiresAt };
-    await adjustCommandQuotaForPatch(ctx, record.userId, record, commandPatch);
-    await ctx.db.patch(record._id, commandPatch);
-    if (!erase) {
+    if (erase) {
+      const commandPatch = {
+        result: undefined,
+        resultConsumedAt: now,
+        resultExpiresAt: undefined,
+        updatedAt: now,
+      };
+      await adjustCommandQuotaForPatch(ctx, record.userId, record, commandPatch);
+      await ctx.db.patch(record._id, commandPatch);
+    } else {
       await ctx.scheduler.runAt(resultExpiresAt, expireLoginResult, {
         commandPublicId: record.publicId,
         resultExpiresAt,
@@ -558,33 +864,59 @@ async function expireDeviceCommandLoginResults(
   return expired.length + legacy.length;
 }
 
-async function deleteTerminalDeviceCommands(ctx: MutationCtx, now: number, limit: number): Promise<number> {
-  let remaining = limit;
-  let processed = 0;
-  const legacyRetentionCutoff = now - cloudRetentionMs.terminalCommand;
-
-  // Old web clients could close between enqueue and their separate receipt
-  // acknowledgement, leaving terminal rows without a cleanup deadline. Drain
-  // only rows already older than the ordinary retention window. Direct delete
-  // both avoids quota-growing patches at the hard ceiling and keeps every row
-  // counted against this category's strict budget.
-  for (const state of ["applied", "failed", "ambiguous", "cancelled", "expired"] as const) {
-    if (remaining === 0) break;
-    const legacy = await ctx.db.query("deviceCommands")
-      .withIndex("by_state_cleanup_after_updated_at", (builder) => builder
-        .eq("state", state)
-        .eq("terminalCleanupAfter", undefined)
-        .lt("updatedAt", legacyRetentionCutoff))
-      .take(remaining);
-    for (const record of legacy) {
-      if (record.nonterminal) throw new Error("Maintenance authority is corrupt.");
+async function deleteTerminalDeviceCommands(
+  ctx: MutationCtx,
+  now: number,
+  limit: number,
+  maintenance?: DataModel["maintenanceState"]["document"],
+): Promise<Readonly<{ paginationDone: boolean; processed: number; usedPagination: boolean }>> {
+  if (maintenance === undefined) throw new Error("Maintenance authority is corrupt.");
+  const commandLimit = Math.min(limit, maximumCommandLifecycleBatch);
+  let remaining = commandLimit;
+  const noEffectCutoff = now - commandTerminalRetentionMs;
+  const noEffectQuery = () => ctx.db.query("deviceCommands")
+    .withIndex("by_acknowledged_no_effect_cleanup", (builder) => builder
+      .eq("state", "expired")
+      .eq("lifecycleCapacityVersion", undefined)
+      .eq("nonterminal", false)
+      .eq("terminalCleanupAfter", undefined)
+      .eq("receiptCapacityReservation", undefined)
+      .eq("requesterReceiptAbandonedAt", undefined)
+      .eq("operatorAbandonedAt", undefined)
+      .eq("resultCode", undefined)
+      .eq("resultDigest", undefined)
+      .gt("requesterAcknowledgedAt", 0));
+  const useNoEffectPagination = maintenance.deviceNoEffectCleanupCursor !== undefined
+    || (await noEffectQuery().take(1)).length !== 0;
+  const noEffectPage = useNoEffectPagination
+    ? await noEffectQuery().paginate({
+        cursor: maintenance.deviceNoEffectCleanupCursor ?? null,
+        numItems: remaining,
+      })
+    : undefined;
+  const noEffectRecords = noEffectPage?.page ?? [];
+  for (const record of noEffectRecords) {
+    if (!isLegacyNoEffectExpiredTerminal(record)) continue;
+    const [requester, target] = await Promise.all([
+      ctx.db.get(record.requestingDeviceId),
+      ctx.db.get(record.targetDeviceId),
+    ]);
+    if (requester?.userId !== record.userId || target?.userId !== record.userId) {
+      throw new Error("Maintenance authority is corrupt.");
+    }
+    if (record.updatedAt < noEffectCutoff) {
       await releaseCommandQuotaForDelete(ctx, record.userId, record);
       await ctx.db.delete(record._id);
     }
-    processed += legacy.length;
-    remaining -= legacy.length;
   }
-
+  if (noEffectPage !== undefined) {
+    await ctx.db.patch(maintenance._id, {
+      deviceNoEffectCleanupCursor: noEffectPage.isDone
+        ? undefined
+        : noEffectPage.continueCursor,
+    });
+  }
+  remaining -= noEffectRecords.length;
   for (const state of ["applied", "failed", "ambiguous", "cancelled", "expired"] as const) {
     if (remaining === 0) break;
     const records = await ctx.db.query("deviceCommands")
@@ -594,13 +926,89 @@ async function deleteTerminalDeviceCommands(ctx: MutationCtx, now: number, limit
         .lt("terminalCleanupAfter", now))
       .take(remaining);
     for (const record of records) {
+      const operatorAbandoned = isOperatorAbandonedEffectTerminal(record);
+      const requesterAcknowledged = record.requesterAcknowledgedAt !== undefined;
+      const requesterAbandoned = record.requesterReceiptAbandonedAt !== undefined;
+      if (
+        (record.operatorAbandonedAt !== undefined && !operatorAbandoned)
+        || (requesterAcknowledged && requesterAbandoned)
+        || record.receiptCapacityReservation !== undefined
+      ) throw new Error("Maintenance authority is corrupt.");
+      if (!operatorAbandoned && !requesterAcknowledged && !requesterAbandoned) {
+        const patch = { terminalCleanupAfter: undefined, updatedAt: now };
+        await adjustCommandQuotaForPatch(ctx, record.userId, record, patch);
+        await ctx.db.patch(record._id, patch);
+        continue;
+      }
+      if (operatorAbandoned) {
+        await requireOperatorAbandonedSecurityEvent(ctx, record);
+      }
       await releaseCommandQuotaForDelete(ctx, record.userId, record);
       await ctx.db.delete(record._id);
     }
-    processed += records.length;
     remaining -= records.length;
   }
-  return processed;
+  const legacyCutoff = now - commandTerminalRetentionMs;
+  let legacyScanRemaining = remaining;
+  for (const state of ["applied", "failed", "ambiguous", "cancelled", "expired"] as const) {
+    if (remaining === 0 || legacyScanRemaining === 0) break;
+    const records = await ctx.db.query("deviceCommands")
+      .withIndex("by_state_unreserved_receipt_and_updated_at", (builder) => builder
+        .eq("state", state)
+        .eq("receiptCapacityReservation", undefined)
+        .eq("requesterAcknowledgedAt", undefined)
+        .eq("requesterReceiptAbandonedAt", undefined)
+        .lt("updatedAt", legacyCutoff))
+      .take(legacyScanRemaining);
+    legacyScanRemaining -= records.length;
+    for (const record of records) {
+      if (
+        record.resultSingleUse === true
+        && (
+          record.result !== undefined
+          || record.resultConsumedAt === undefined
+          || record.resultExpiresAt !== undefined
+        )
+      ) throw new Error("Maintenance authority is corrupt.");
+      const requester = await ctx.db.get(record.requestingDeviceId);
+      if (requester?.userId !== record.userId) {
+        throw new Error("Maintenance authority is corrupt.");
+      }
+      if (requester.status !== "revoked") {
+        const patch = { updatedAt: now };
+        if (logicalDocumentBytes({ ...record, ...patch }) > logicalDocumentBytes(record)) {
+          throw new Error("Maintenance authority is corrupt.");
+        }
+        await adjustCommandQuotaForPatch(ctx, record.userId, record, patch);
+        await ctx.db.patch(record._id, patch);
+        remaining -= 1;
+        continue;
+      }
+      if (
+        requester.revokedAt === undefined
+        || !Number.isSafeInteger(requester.revokedAt)
+        || requester.revokedAt < 1
+      ) throw new Error("Maintenance authority is corrupt.");
+      if (requester.revokedAt >= legacyCutoff) {
+        const patch = { updatedAt: Math.max(record.updatedAt, requester.revokedAt) };
+        if (logicalDocumentBytes({ ...record, ...patch }) > logicalDocumentBytes(record)) {
+          throw new Error("Maintenance authority is corrupt.");
+        }
+        await adjustCommandQuotaForPatch(ctx, record.userId, record, patch);
+        await ctx.db.patch(record._id, patch);
+        remaining -= 1;
+        continue;
+      }
+      await releaseCommandQuotaForDelete(ctx, record.userId, record);
+      await ctx.db.delete(record._id);
+      remaining -= 1;
+    }
+  }
+  return {
+    paginationDone: noEffectPage?.isDone ?? true,
+    processed: commandLimit - remaining,
+    usedPagination: noEffectPage !== undefined,
+  };
 }
 
 async function expirePendingAttentionNotifications(
@@ -763,12 +1171,46 @@ async function deleteTerminalAttentionNotifications(
   return limit - remaining;
 }
 
+async function deleteOperatorAbandonedCommandForSecurityEvent(
+  ctx: MutationCtx,
+  record: DataModel["securityEvents"]["document"],
+  now: number,
+): Promise<void> {
+  if (record.event !== "command_terminal") return;
+  const [sessionCommands, deviceCommands] = await Promise.all([
+    ctx.db.query("sessionCommands")
+      .withIndex("by_public_id", (builder) => builder.eq("publicId", record.entityId))
+      .take(2),
+    ctx.db.query("deviceCommands")
+      .withIndex("by_public_id", (builder) => builder.eq("publicId", record.entityId))
+      .take(2),
+  ]);
+  const commands = [...sessionCommands, ...deviceCommands];
+  const operatorCommands = commands.filter((command) =>
+    command.userId === record.userId
+    && command.operatorAbandonedAt !== undefined);
+  if (operatorCommands.length === 0) return;
+  const command = operatorCommands[0];
+  if (
+    command === undefined
+    || operatorCommands.length !== 1
+    || command.userId !== record.userId
+    || !isOperatorAbandonedEffectTerminal(command)
+    || command.terminalCleanupAfter === undefined
+    || command.terminalCleanupAfter >= now
+  ) throw new Error("Maintenance authority is corrupt.");
+  await requireOperatorAbandonedSecurityEvent(ctx, command);
+  await releaseCommandQuotaForDelete(ctx, command.userId, command);
+  await ctx.db.delete(command._id);
+}
+
 async function deleteExpiredSecurityEvents(ctx: MutationCtx, now: number, limit: number): Promise<number> {
   const records = await ctx.db.query("securityEvents")
     .withIndex("by_created_at", (builder) => builder
       .lt("createdAt", now - cloudRetentionMs.securityEvent))
-    .take(limit);
+    .take(Math.min(limit, maximumCommandLifecycleBatch));
   for (const record of records) {
+    await deleteOperatorAbandonedCommandForSecurityEvent(ctx, record, now);
     await releaseQuotaForDelete(ctx, record.userId, "security", record);
     await ctx.db.delete(record._id);
   }
@@ -926,10 +1368,8 @@ const handlers = {
   device_presence: deleteExpiredPresence,
   idempotency_receipts: deleteExpiredIdempotency,
   pending_commands: expirePendingCommands,
-  terminal_commands: deleteTerminalCommands,
   pending_device_commands: expirePendingDeviceCommands,
   device_command_login_results: expireDeviceCommandLoginResults,
-  terminal_device_commands: deleteTerminalDeviceCommands,
   pending_attention_notifications: expirePendingAttentionNotifications,
   started_attention_notifications: closeUnsettledAttentionNotifications,
   terminal_attention_notifications: deleteTerminalAttentionNotifications,
@@ -939,12 +1379,16 @@ const handlers = {
   account_deletion_receipts: deleteExpiredAccountReceipts,
   device_revocation_jobs: deleteCompletedRevocationJobs,
 } as const satisfies Readonly<Record<
-  MaintenanceCategory,
+  Exclude<
+    MaintenanceCategory,
+    "orphaned_auth_users" | "terminal_commands" | "terminal_device_commands"
+  >,
   (ctx: MutationCtx, now: number, limit: number) => Promise<number>
 >>;
 
 const emptyCounts = (): CleanupCounts => ({
   abandonedIdentities: 0,
+  orphanedAuthUsers: 0,
   accountDeletionReceipts: 0,
   authAttempts: 0,
   authInvites: 0,
@@ -978,31 +1422,66 @@ export const cleanupExpired = internalMutation({
       .withIndex("by_key", (builder) => builder.eq("key", "retention"))
       .take(2);
     if (states.length > 1) throw new Error("Maintenance authority is corrupt.");
-    const state = states[0];
+    let state = states[0];
     const start = state === undefined
       ? 0
       : maintenanceCategories.indexOf(state.nextCategory);
     if (start < 0) throw new Error("Maintenance authority is corrupt.");
+    if (state === undefined) {
+      const stateId = await ctx.db.insert("maintenanceState", {
+        key: "retention",
+        nextCategory: maintenanceCategories[0],
+        updatedAt: now,
+      });
+      state = await ctx.db.get(stateId) ?? undefined;
+      if (state === undefined) throw new Error("Maintenance authority is corrupt.");
+    }
     let visited = 0;
+    let forcedNextCategory: MaintenanceCategory | undefined;
     while (remaining > 0 && visited < maintenanceCategories.length) {
       const category = maintenanceCategories[(start + visited) % maintenanceCategories.length];
       if (category === undefined) throw new Error("Maintenance category is unavailable.");
       const budget = Math.min(categoryQuantum, remaining);
-      const processed = await handlers[category](ctx, now, budget);
+      let terminalResult: Readonly<{
+        paginationDone: boolean;
+        processed: number;
+        usedPagination: boolean;
+      }> | undefined;
+      let processed: number;
+      if (category === "orphaned_auth_users") {
+        terminalResult = undefined;
+        processed = await cleanOrphanedAuthUsers(ctx, now, budget, state);
+      } else if (category === "terminal_commands") {
+        terminalResult = await deleteTerminalCommands(ctx, now, budget, state);
+        processed = terminalResult.processed;
+      } else if (category === "terminal_device_commands") {
+        terminalResult = await deleteTerminalDeviceCommands(ctx, now, budget, state);
+        processed = terminalResult.processed;
+      } else {
+        terminalResult = undefined;
+        processed = await handlers[category](ctx, now, budget);
+      }
       if (!Number.isSafeInteger(processed) || processed < 0 || processed > budget) {
         throw new Error("Maintenance category exceeded its budget.");
       }
       counts[countField[category]] += processed;
       remaining -= processed;
       visited += 1;
+      // Convex permits one paginated query per function. Stop after either
+      // command cleanup page, but always advance the global category. The
+      // per-table cursor resumes on the next full rotation so a large rollout
+      // backlog cannot monopolize retention for every intervening cron run.
+      if (terminalResult?.usedPagination === true) {
+        forcedNextCategory = maintenanceCategories[
+          (start + visited) % maintenanceCategories.length
+        ];
+        break;
+      }
     }
-    const nextCategory = maintenanceCategories[(start + visited) % maintenanceCategories.length];
+    const nextCategory = forcedNextCategory
+      ?? maintenanceCategories[(start + visited) % maintenanceCategories.length];
     if (nextCategory === undefined) throw new Error("Maintenance category is unavailable.");
-    if (state === undefined) {
-      await ctx.db.insert("maintenanceState", { key: "retention", nextCategory, updatedAt: now });
-    } else {
-      await ctx.db.patch(state._id, { nextCategory, updatedAt: now });
-    }
+    await ctx.db.patch(state._id, { nextCategory, updatedAt: now });
     return {
       ...counts,
       nextCategory,

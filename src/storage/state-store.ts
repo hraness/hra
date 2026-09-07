@@ -32,15 +32,21 @@ import {
 } from "../domain/project-memory";
 import { canonicalMemoryCiphertextLimits } from "../domain/canonical-memory-sync";
 import {
+  attachmentByteLengthSchema,
   attachmentDigestSchema,
   attachmentMediaTypeSchema,
   attachmentNameSchema,
+  attachmentReferenceListSchema,
+  legacyAttachmentReferenceListSchema,
 } from "../domain/attachment-schemas";
 import {
   ATTACHMENT_MAX_BYTES,
   ATTACHMENT_MAX_COUNT,
+  isAttachmentName,
+  projectLegacyAttachmentReferences,
   type AttachmentManifestEntry,
   type AttachmentMediaType,
+  type AttachmentReference,
 } from "../domain/attachments";
 import {
   INTERACTION_MAX_PENDING_MS,
@@ -80,10 +86,13 @@ import {
   type SessionLocalObservationSnapshot,
 } from "../domain/observation";
 import {
+  activePresetBinding,
   assertPresetSupportedByProvider,
   assertSupportedProvider,
   isSupportedProvider,
   currentPresetContract,
+  devinPresetContract,
+  isReboundCodexPreset,
   legacyPresetContract,
   presetForProviderTier,
   presetContractSchema,
@@ -92,10 +101,13 @@ import {
   presetTiers,
   presetTierSchema,
   adoptableProviderSchema,
+  providerSwitchRequiresPresetContract,
   providerSchema,
-  type AdoptableProvider,
+  sharedActiveCodexPresetContract,
   supportedPresetSchema,
+  type AdoptableProvider,
   type Preset,
+  type PresetContract,
   type PresetRequirement,
   type Provider,
 } from "../domain/presets";
@@ -131,6 +143,7 @@ import {
   type SessionMessageActor,
 } from "../domain/session-events";
 import { SESSION_CONVERSATION_AUTOMATION_CAPABILITY } from "../domain/session-tasks";
+import { workPreparedEffectSchema } from "../domain/work";
 import {
   digestTranscriptSeed,
   sessionProviderSwitchDurableReceiptSchema,
@@ -183,8 +196,10 @@ import {
   WORK_SCHEMA_SQL,
   WorkStore,
   assertProviderVersion39WorkSchema,
+  assertProviderVersion40WorkSchema,
   assertReadonlyWorkSchema,
   assertWorkSchema,
+  installProviderVersion40WorkAuthoritySchema,
   type WorkCapabilityIssuer,
   type WorkCapabilityVerifier,
   type WorkCursorEncoder,
@@ -771,6 +786,8 @@ export type SessionEventStreamPosition = {
 
 export type SessionEventList = SessionEventStreamPosition & {
   gapReason: SessionEventGapReason | null;
+  /** Persistent evidence that some prefix of this stream was pruned. */
+  retentionGapReason: SessionEventGapReason | null;
   events: readonly SessionEvent[];
 };
 
@@ -2852,7 +2869,7 @@ const queueRecordRowSchema = z.object({
   id: queueIdSchema,
   session_id: sessionIdSchema,
   message: z.string(),
-  message_actor: sessionMessageActorSchema,
+  message_actor: z.enum(["human", "peer_session"]),
   peer_action_id: peerActionIdSchema.nullable(),
   peer_action_resolution_exists: z.union([z.literal(0), z.literal(1)]),
   state: queueStateSchema,
@@ -2909,6 +2926,181 @@ export type MutationAttemptRecord = {
   sessionStartId?: SessionId;
 };
 
+export const sessionUserMessageTranscriptStatusSchema = z.enum([
+  "none",
+  "pending",
+  "finalized",
+  "unavailable",
+  "abandoned",
+]);
+export type SessionUserMessageTranscriptStatus = z.infer<
+  typeof sessionUserMessageTranscriptStatusSchema
+>;
+
+const sessionUserMessageIntentSchema = z.object({
+  version: z.literal(1),
+  accountId: profileIdSchema,
+  providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  providerConnectionId: z.string().uuid().nullable(),
+  actor: sessionMessageActorSchema,
+  text: z.string().max(SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS),
+  omittedCharacters: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  attachments: attachmentReferenceListSchema.optional(),
+}).strict();
+
+const sessionUserMessageActorReceiptSchema = z.object({
+  version: z.literal(1),
+  actor: sessionMessageActorSchema,
+  hadAttachments: z.boolean(),
+}).strict();
+
+const sessionUserMessageSourcePayloadSchema = z.union([
+  sessionUserMessageIntentSchema,
+  sessionUserMessageActorReceiptSchema,
+]);
+
+export type SessionUserMessageIntent = z.infer<typeof sessionUserMessageIntentSchema>;
+
+export type SessionUserMessageSource = Readonly<{
+  status: SessionUserMessageTranscriptStatus;
+  intent?: SessionUserMessageIntent | z.infer<typeof sessionUserMessageActorReceiptSchema>;
+}>;
+
+export type SessionUserMessageIntentInput = Readonly<{
+  accountId: ProfileId;
+  providerGeneration: number;
+  providerConnectionId?: string | null;
+  actor: SessionMessageActor;
+  message: string;
+  attachments?: readonly AttachmentReference[];
+  storedAttachments?: readonly StoredMessageAttachment[];
+}>;
+
+const transcriptControlScalar = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
+
+const sanitizeTranscriptIntentText = (value: string): string => {
+  const redacted = redactCompleteSensitiveText(
+    redactAbsolutePaths(value),
+    "[protected]",
+  );
+  let output = "";
+  for (const scalar of redacted) {
+    output += scalar === "\n"
+      ? scalar
+      : transcriptControlScalar.test(scalar)
+        ? "�"
+        : scalar;
+  }
+  return output;
+};
+
+const canonicalSessionUserMessageIntent = (
+  input: SessionUserMessageIntentInput,
+): Readonly<{ intent: SessionUserMessageIntent; json: string }> => {
+  const message = z.string().min(1).max(262_144).parse(input.message);
+  // Recognize complete secrets before truncating; a boundary-split credential
+  // must never become an unrecognizable plaintext fragment in durable intent.
+  const text = sanitizeTranscriptIntentText(message)
+    .slice(0, SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS);
+  const attachments = input.attachments === undefined || input.attachments.length === 0
+    ? undefined
+    : attachmentReferenceListSchema.parse(input.attachments);
+  const intent = sessionUserMessageIntentSchema.parse({
+    version: 1,
+    accountId: input.accountId,
+    providerGeneration: input.providerGeneration,
+    providerConnectionId: input.providerConnectionId ?? null,
+    actor: input.actor,
+    text,
+    omittedCharacters: message.length - Math.min(
+      message.length,
+      SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
+    ),
+    ...(attachments === undefined ? {} : { attachments }),
+  });
+  const json = JSON.stringify(intent);
+  if (utf8Bytes(json) > SESSION_EVENT_MAX_BYTES) {
+    throw new Error("SESSION_USER_MESSAGE_INTENT_EXCEEDS_BOUND");
+  }
+  return { intent, json };
+};
+
+const sessionUserMessageActorReceiptJson = (input: Readonly<{
+  actor: SessionMessageActor;
+  attachments?: readonly AttachmentReference[];
+}>): string => JSON.stringify(sessionUserMessageActorReceiptSchema.parse({
+  version: 1,
+  actor: input.actor,
+  hadAttachments: (input.attachments?.length ?? 0) > 0,
+}));
+
+type MutationRequestAuthority = Readonly<{
+  kind: string;
+  authorityId: string;
+  authorityGeneration: number;
+  request: unknown;
+}>;
+
+export type SessionStartMutationRequest = Readonly<{
+  projectId: ProjectId;
+  provider: Provider;
+  preset: Preset;
+  presetContract?: PresetContract | undefined;
+  fast: boolean;
+}>;
+
+export const sessionStartMutationRequest = (input: Readonly<{
+  projectId: ProjectId;
+  provider: Provider;
+  preset: Preset;
+  presetContract?: PresetContract | undefined;
+  fast: boolean;
+}>): SessionStartMutationRequest => {
+  return {
+    projectId: input.projectId,
+    provider: input.provider,
+    preset: input.preset,
+    ...(input.presetContract === undefined ? {} : { presetContract: input.presetContract }),
+    fast: input.fast,
+  };
+};
+
+export type SessionProviderSwitchMutationRequest = Readonly<{
+  provider: Provider;
+  preset: Preset;
+  presetContract?: PresetContract | undefined;
+  targetProfileId: ProfileId;
+  seedDigest: string;
+}>;
+
+export const sessionProviderSwitchMutationRequest = (input: Readonly<{
+  provider: Provider;
+  preset: Preset;
+  presetContract?: PresetContract | undefined;
+  targetProfileId: ProfileId;
+  seedDigest: string;
+}>): SessionProviderSwitchMutationRequest => {
+  return {
+    provider: input.provider,
+    preset: input.preset,
+    ...(input.presetContract === undefined
+      ? {}
+      : { presetContract: input.presetContract }),
+    targetProfileId: input.targetProfileId,
+    seedDigest: input.seedDigest,
+  };
+};
+
+export const mutationRequestDigest = (input: MutationRequestAuthority): string =>
+  createHash("sha256")
+    .update(JSON.stringify({
+      kind: input.kind,
+      authorityId: input.authorityId,
+      authorityGeneration: input.authorityGeneration,
+      request: input.request,
+    }))
+    .digest("hex");
+
 export type PendingLoginAuthority = {
   attemptId: AttemptId;
   idempotencyKey: string;
@@ -2928,8 +3120,8 @@ export type MutationEffectEvidence =
   | { kind: "session.steer"; providerThreadId: string; baseline: SessionProviderBaseline; activeTurnId: string | null; clientMessageId: string; messageDigest: string; messageActor?: SessionMessageActor }
   | { kind: "session.stop"; providerThreadId: string; providerTimestampUnit?: "unix_milliseconds_v1"; baseline: SessionProviderBaseline; activeTurnId: string | null }
   | { kind: "session.rename"; providerThreadId: string; providerTimestampUnit?: "unix_milliseconds_v1"; baseline: SessionProviderBaseline; requestedName: string }
-  | { kind: "session.start"; projectId: ProjectId; clientMessageId: string | null; messageDigest: string | null; runtimeProfile?: ReviewedRuntimeProfile; conversationAutomationCapability?: typeof SESSION_CONVERSATION_AUTOMATION_CAPABILITY }
-  | { kind: "session.switch"; daemonGeneration?: number | undefined; requestedAccountId: ProfileId | null; requestedPreset: Preset | null; sourceProfileId: ProfileId; sourceProcessGeneration: number; sourceProvider: Provider; sourceProviderThreadId: string; sourcePreset: Preset; targetProfileId: ProfileId; targetProcessGeneration: number; targetProvider: Provider; targetProviderAccountKey?: string | undefined; targetHostCapabilities?: SessionProviderSwitchHostCapabilities | undefined; targetPreset: Preset; transcriptDigest: string; seedDigest: string; seedIncludedRecords: number; seedOmittedRecords: number; runtimeProfile: ReviewedRuntimeProfile }
+  | { kind: "session.start"; projectId: ProjectId; clientMessageId: string | null; messageDigest: string | null; presetContract?: PresetContract | undefined; runtimeProfile?: ReviewedRuntimeProfile; conversationAutomationCapability?: typeof SESSION_CONVERSATION_AUTOMATION_CAPABILITY }
+  | { kind: "session.switch"; daemonGeneration?: number | undefined; requestedAccountId: ProfileId | null; requestedPreset: Preset | null; sourceProfileId: ProfileId; sourceProcessGeneration: number; sourceProvider: Provider; sourceProviderThreadId: string; sourcePreset: Preset; targetProfileId: ProfileId; targetProcessGeneration: number; targetProvider: Provider; targetProviderAccountKey?: string | undefined; targetHostCapabilities?: SessionProviderSwitchHostCapabilities | undefined; targetPreset: Preset; presetContract?: PresetContract | undefined; transcriptDigest: string; seedDigest: string; seedIncludedRecords: number; seedOmittedRecords: number; seedRetentionGapReason?: SessionEventGapReason | undefined; runtimeProfile: ReviewedRuntimeProfile }
   | { kind: "account.login"; method: "browser" | "device_code" }
   | { kind: "account.claude-login"; provider: "claude"; baselineSignedIn: false }
   | { kind: "account.devin-login"; provider: "devin"; baselineSignedIn: false }
@@ -3036,7 +3228,7 @@ const mutationEffectEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.steer"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable(), clientMessageId: z.string().min(1).max(512), messageDigest: sha256Schema, messageActor: sessionMessageActorSchema.optional() }).strict(),
   z.object({ kind: z.literal("session.stop"), providerThreadId: providerThreadIdSchema, providerTimestampUnit: z.literal("unix_milliseconds_v1").optional(), baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable() }).strict(),
   z.object({ kind: z.literal("session.rename"), providerThreadId: providerThreadIdSchema, providerTimestampUnit: z.literal("unix_milliseconds_v1").optional(), baseline: providerBaselineSchema, requestedName: titleSchema }).strict(),
-  z.object({ kind: z.literal("session.start"), projectId: projectIdSchema, clientMessageId: z.string().min(1).max(512).nullable(), messageDigest: sha256Schema.nullable(), runtimeProfile: reviewedRuntimeProfileSchema.optional(), conversationAutomationCapability: z.literal(SESSION_CONVERSATION_AUTOMATION_CAPABILITY).optional() }).strict(),
+  z.object({ kind: z.literal("session.start"), projectId: projectIdSchema, clientMessageId: z.string().min(1).max(512).nullable(), messageDigest: sha256Schema.nullable(), presetContract: presetContractSchema.optional(), runtimeProfile: reviewedRuntimeProfileSchema.optional(), conversationAutomationCapability: z.literal(SESSION_CONVERSATION_AUTOMATION_CAPABILITY).optional() }).strict(),
   z.object({
     kind: z.literal("session.switch"),
     // Optional only so an unsettled receipt written by an older release can
@@ -3061,10 +3253,12 @@ const mutationEffectEvidenceSchema = z.discriminatedUnion("kind", [
     // the reviewed target capability document before provider I/O begins.
     targetHostCapabilities: sessionProviderSwitchHostCapabilitiesSchema.optional(),
     targetPreset: presetSchema,
+    presetContract: presetContractSchema.optional(),
     transcriptDigest: sha256Schema,
     seedDigest: sha256Schema,
     seedIncludedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     seedOmittedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    seedRetentionGapReason: sessionEventGapReasonSchema.optional(),
     runtimeProfile: reviewedRuntimeProfileSchema,
   }).strict(),
   z.object({ kind: z.literal("account.login"), method: z.enum(["browser", "device_code"]) }).strict(),
@@ -3198,11 +3392,9 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-// v40 is the released personal-session adoption schema. The timestamp-proof
-// guard is canonical v41, peer/local memory is v42, and hosted canonical memory
-// is v43. Exact private feature cohorts that used v40-v42 differently are
-// structurally recognized below; their numeric stamp alone is never trusted.
-const currentSchemaVersion = 43;
+// Preserve main's v40 adoption, v41 timestamp, v42 Work, and v43 transcript
+// contracts. Unreleased peer/local and canonical memory follow at v44/v45.
+const currentSchemaVersion = 45;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -3227,33 +3419,7 @@ const safeObservationTitle = (value: string): string => {
   }
   return titleSchema.parse(`${prefix.trimEnd()}${marker}`);
 };
-const unsafePublicTextScalarPattern = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 
-/**
- * Match the complete-prose sanitizer used by the session event stream.
- *
- * Callers pass the complete, already-bounded provider input so secret shapes
- * that straddle the public transcript cutoff cannot leave a near-complete
- * prefix behind. The sanitized projection is truncated separately while its
- * omission count remains anchored to the original provider input. Line feeds
- * remain useful transcript structure; every other control, format, or
- * surrogate scalar becomes an explicit replacement character.
- */
-const sanitizeSessionUserMessage = (value: string): string => {
-  const redacted = redactCompleteSensitiveText(
-    redactAbsolutePaths(value),
-    "[protected]",
-  );
-  let sanitized = "";
-  for (const scalar of redacted) {
-    sanitized += scalar === "\n"
-      ? scalar
-      : unsafePublicTextScalarPattern.test(scalar)
-      ? "�"
-      : scalar;
-  }
-  return sanitized;
-};
 const stateBusyTimeoutMs = 5_000;
 
 // The scrub checkpoint waits inside SQLite's busy handler for readers that
@@ -3432,51 +3598,785 @@ const assertSchemaVersion41TimestampProof = (database: Database): void => {
   }
 };
 
-const assertExactMigrationLedgerTail = (
+const assertSchemaMigrationLedgerTail = (
   database: Database,
-  expectedVersions: readonly number[],
-  code: string,
+  expected: readonly number[],
+  errorCode: string,
 ): void => {
-  const firstVersion = expectedVersions[0];
-  if (firstVersion === undefined) throw new Error(code);
   const ledger = z.object({
-    version: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    version: z.number().int(),
     applied_at: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
   }).strict().array().safeParse(database.query(
-    "SELECT version,applied_at FROM migrations WHERE version>=? ORDER BY version LIMIT ?",
-  ).all(firstVersion, expectedVersions.length + 1));
+    `SELECT version,applied_at FROM migrations WHERE version>=${String(expected[0])} ORDER BY version LIMIT ${String(expected.length + 1)}`,
+  ).all());
   if (
     !ledger.success
-    || ledger.data.length !== expectedVersions.length
-    || ledger.data.some((row, index) => row.version !== expectedVersions[index])
-  ) throw new Error(code);
+    || ledger.data.length !== expected.length
+    || ledger.data.some((row, index) => row.version !== expected[index])
+  ) throw new Error(errorCode);
+};
+
+const assertSchemaVersion40Authority = (database: Database): void => {
+  assertSchemaMigrationLedgerTail(
+    database,
+    [40],
+    "STATE_SCHEMA_V40_MIGRATION_LEDGER_INVALID",
+  );
 };
 
 const assertSchemaVersion41Authority = (database: Database): void => {
   assertSchemaVersion41TimestampProof(database);
-  assertExactMigrationLedgerTail(
+  assertSchemaMigrationLedgerTail(
     database,
-    [41],
+    [40, 41],
     "STATE_SCHEMA_V41_MIGRATION_LEDGER_INVALID",
   );
 };
 
 const assertSchemaVersion42Authority = (database: Database): void => {
   assertSchemaVersion41TimestampProof(database);
-  assertExactMigrationLedgerTail(
+  assertSchemaMigrationLedgerTail(
     database,
-    [41, 42],
+    [40, 41, 42],
     "STATE_SCHEMA_V42_MIGRATION_LEDGER_INVALID",
   );
 };
 
-const assertSchemaVersion43Authority = (database: Database): void => {
+// User-message bodies belong to the bounded transcript ledger, but exact
+// mutation/effect identities outlive that retention window. The source row
+// therefore owns one bounded, already-public intent and its status. This is
+// enough to finish an accepted effect without asking a provider again and does
+// not create an independently growing ledger.
+const schemaVersion43MutationTranscriptFinalizedColumn =
+  "ALTER TABLE mutation_attempts ADD COLUMN transcript_finalized INTEGER NOT NULL DEFAULT 0 "
+  + "CHECK(transcript_finalized IN (0,1))";
+const schemaVersion43QueueTranscriptFinalizedColumn =
+  "ALTER TABLE queue_entries ADD COLUMN transcript_finalized INTEGER NOT NULL DEFAULT 0 "
+  + "CHECK(transcript_finalized IN (0,1))";
+const schemaVersion43MutationTranscriptStatusColumn =
+  "ALTER TABLE mutation_attempts ADD COLUMN transcript_status TEXT NOT NULL DEFAULT 'none' "
+  + "CHECK(transcript_status IN ('none','pending','finalized','unavailable','abandoned'))";
+const schemaVersion43QueueTranscriptStatusColumn =
+  "ALTER TABLE queue_entries ADD COLUMN transcript_status TEXT NOT NULL DEFAULT 'none' "
+  + "CHECK(transcript_status IN ('none','pending','finalized','unavailable','abandoned'))";
+const schemaVersion43MutationTranscriptIntentColumn =
+  `ALTER TABLE mutation_attempts ADD COLUMN transcript_intent_json TEXT
+   CHECK(transcript_intent_json IS NULL OR (
+     json_valid(transcript_intent_json)
+     AND length(CAST(transcript_intent_json AS BLOB))<=${String(SESSION_EVENT_MAX_BYTES)}
+   ))`;
+const schemaVersion43QueueTranscriptIntentColumn =
+  `ALTER TABLE queue_entries ADD COLUMN transcript_intent_json TEXT
+   CHECK(transcript_intent_json IS NULL OR (
+     json_valid(transcript_intent_json)
+     AND length(CAST(transcript_intent_json AS BLOB))<=${String(SESSION_EVENT_MAX_BYTES)}
+   ))`;
+const schemaVersion9SessionEventsAccountAuthorityGuard = `
+CREATE TRIGGER IF NOT EXISTS session_events_account_authority_guard
+BEFORE INSERT ON session_events
+WHEN NOT EXISTS(
+  SELECT 1 FROM sessions s JOIN profiles p ON p.id=s.profile_id
+  WHERE s.id=NEW.session_id
+    AND s.profile_id=NEW.account_id
+    AND p.process_generation=NEW.provider_generation
+)
+BEGIN SELECT RAISE(ABORT, 'session event account authority mismatch'); END;
+`;
+const schemaVersion43SessionEventsAccountAuthorityGuard = `
+CREATE TRIGGER IF NOT EXISTS session_events_account_authority_guard
+BEFORE INSERT ON session_events
+WHEN NOT EXISTS(
+  SELECT 1 FROM sessions s JOIN profiles p ON p.id=s.profile_id
+  WHERE s.id=NEW.session_id
+    AND s.profile_id=NEW.account_id
+    AND (
+      p.process_generation=NEW.provider_generation
+      OR (
+        p.process_generation>NEW.provider_generation
+        AND json_extract(NEW.event_json,'$.body.type')='user_message'
+        AND (
+          EXISTS(
+            SELECT 1 FROM mutation_attempts m
+            WHERE m.authority_id=NEW.session_id
+              AND m.kind IN ('session.send','session.steer')
+              AND m.idempotency_key=json_extract(NEW.event_json,'$.body.sourceId')
+              AND m.state IN ('effect_started','applied','ambiguous')
+              AND m.transcript_status='pending'
+              AND m.transcript_finalized=0
+              AND json_extract(m.transcript_intent_json,'$.accountId')=NEW.account_id
+              AND json_extract(m.transcript_intent_json,'$.providerGeneration')=
+                  NEW.provider_generation
+              AND json_extract(m.transcript_intent_json,'$.providerConnectionId')
+                  IS NEW.provider_connection_id
+              AND json_extract(m.transcript_intent_json,'$.actor')=
+                  json_extract(NEW.event_json,'$.body.actor')
+              AND json_extract(m.transcript_intent_json,'$.text')=
+                  json_extract(NEW.event_json,'$.body.text')
+              AND json_extract(m.transcript_intent_json,'$.omittedCharacters')=
+                  json_extract(NEW.event_json,'$.body.omittedCharacters')
+              AND COALESCE(json_extract(m.transcript_intent_json,'$.attachments'),'[]')=
+                  COALESCE(json_extract(NEW.event_json,'$.body.attachments'),'[]')
+          )
+          OR EXISTS(
+            SELECT 1 FROM queue_entries q
+            WHERE q.session_id=NEW.session_id
+              AND q.id=json_extract(NEW.event_json,'$.body.sourceId')
+              AND q.state IN ('dispatching','applied','ambiguous')
+              AND q.transcript_status='pending'
+              AND q.transcript_finalized=0
+              AND json_extract(q.transcript_intent_json,'$.accountId')=NEW.account_id
+              AND json_extract(q.transcript_intent_json,'$.providerGeneration')=
+                  NEW.provider_generation
+              AND json_extract(q.transcript_intent_json,'$.providerConnectionId')
+                  IS NEW.provider_connection_id
+              AND json_extract(q.transcript_intent_json,'$.actor')=
+                  json_extract(NEW.event_json,'$.body.actor')
+              AND json_extract(q.transcript_intent_json,'$.text')=
+                  json_extract(NEW.event_json,'$.body.text')
+              AND json_extract(q.transcript_intent_json,'$.omittedCharacters')=
+                  json_extract(NEW.event_json,'$.body.omittedCharacters')
+              AND COALESCE(json_extract(q.transcript_intent_json,'$.attachments'),'[]')=
+                  COALESCE(json_extract(NEW.event_json,'$.body.attachments'),'[]')
+          )
+        )
+      )
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'session event account authority mismatch'); END;
+`;
+const schemaVersion43SessionUserMessageFinalizationGuards = `
+CREATE TRIGGER IF NOT EXISTS mutation_transcript_finalization_guard
+BEFORE UPDATE OF transcript_finalized,transcript_status,transcript_intent_json ON mutation_attempts
+WHEN NOT (
+  NEW.kind=OLD.kind
+  AND (
+    (NEW.transcript_finalized=OLD.transcript_finalized
+      AND NEW.transcript_status=OLD.transcript_status
+      AND NEW.transcript_intent_json IS OLD.transcript_intent_json)
+    OR (OLD.kind IN ('session.send','session.steer')
+      AND OLD.transcript_status='none' AND OLD.transcript_finalized=0
+      AND OLD.transcript_intent_json IS NULL
+      AND NEW.transcript_status='pending' AND NEW.transcript_finalized=0
+      AND NEW.transcript_intent_json IS NOT NULL)
+    OR (OLD.kind IN ('session.send','session.steer')
+      AND OLD.transcript_status='pending' AND OLD.transcript_finalized=0
+      AND NEW.transcript_status='finalized' AND NEW.transcript_finalized=1
+      AND json_extract(NEW.transcript_intent_json,'$.version')=1
+      AND json_extract(NEW.transcript_intent_json,'$.actor')=
+          json_extract(OLD.transcript_intent_json,'$.actor')
+      AND json_type(NEW.transcript_intent_json,'$.hadAttachments') IN ('true','false')
+      AND json_extract(NEW.transcript_intent_json,'$.hadAttachments')=
+          (COALESCE(json_array_length(
+            json_extract(OLD.transcript_intent_json,'$.attachments')),0)>0)
+      AND (SELECT count(*) FROM json_each(NEW.transcript_intent_json))=3)
+    OR (OLD.kind IN ('session.send','session.steer')
+      AND OLD.transcript_status='pending' AND OLD.transcript_finalized=0
+      AND NEW.transcript_status='abandoned' AND NEW.transcript_finalized=0
+      AND json_extract(NEW.transcript_intent_json,'$.version')=1
+      AND json_extract(NEW.transcript_intent_json,'$.actor')=
+          json_extract(OLD.transcript_intent_json,'$.actor')
+      AND json_type(NEW.transcript_intent_json,'$.hadAttachments') IN ('true','false')
+      AND json_extract(NEW.transcript_intent_json,'$.hadAttachments')=
+          (COALESCE(json_array_length(
+            json_extract(OLD.transcript_intent_json,'$.attachments')),0)>0)
+      AND (SELECT count(*) FROM json_each(NEW.transcript_intent_json))=3)
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'mutation transcript intent/status transition invalid'); END;
+CREATE TRIGGER IF NOT EXISTS queue_transcript_finalization_guard
+BEFORE UPDATE OF transcript_finalized,transcript_status,transcript_intent_json ON queue_entries
+WHEN NOT (
+  (NEW.transcript_finalized=OLD.transcript_finalized
+    AND NEW.transcript_status=OLD.transcript_status
+    AND NEW.transcript_intent_json IS OLD.transcript_intent_json)
+  OR (OLD.transcript_status='none' AND OLD.transcript_finalized=0
+    AND OLD.transcript_intent_json IS NULL
+    AND NEW.transcript_status='pending' AND NEW.transcript_finalized=0
+    AND NEW.transcript_intent_json IS NOT NULL)
+  OR (OLD.state='pending' AND NEW.state='pending'
+    AND OLD.transcript_status='pending' AND OLD.transcript_finalized=0
+    AND NEW.transcript_status='pending' AND NEW.transcript_finalized=0
+    AND json_extract(NEW.transcript_intent_json,'$.version')=1
+    AND json_extract(NEW.transcript_intent_json,'$.accountId')=(
+      SELECT s.profile_id FROM sessions s WHERE s.id=NEW.session_id)
+    AND json_extract(NEW.transcript_intent_json,'$.providerGeneration')=(
+      SELECT p.process_generation FROM sessions s JOIN profiles p
+      ON p.id=s.profile_id WHERE s.id=NEW.session_id)
+    AND json_type(NEW.transcript_intent_json,'$.providerConnectionId')
+      IN ('null','text')
+    AND json_extract(NEW.transcript_intent_json,'$.actor')=
+        json_extract(OLD.transcript_intent_json,'$.actor')
+    AND json_extract(NEW.transcript_intent_json,'$.text')=
+        json_extract(OLD.transcript_intent_json,'$.text')
+    AND json_extract(NEW.transcript_intent_json,'$.omittedCharacters')=
+        json_extract(OLD.transcript_intent_json,'$.omittedCharacters')
+    AND COALESCE(json_extract(NEW.transcript_intent_json,'$.attachments'),'[]')=
+        COALESCE(json_extract(OLD.transcript_intent_json,'$.attachments'),'[]')
+    AND (SELECT count(*) FROM json_each(NEW.transcript_intent_json)) IN (7,8))
+  OR (OLD.transcript_status='pending' AND OLD.transcript_finalized=0
+    AND NEW.transcript_status='finalized' AND NEW.transcript_finalized=1
+    AND json_extract(NEW.transcript_intent_json,'$.version')=1
+    AND json_extract(NEW.transcript_intent_json,'$.actor')=
+        json_extract(OLD.transcript_intent_json,'$.actor')
+    AND json_type(NEW.transcript_intent_json,'$.hadAttachments') IN ('true','false')
+    AND json_extract(NEW.transcript_intent_json,'$.hadAttachments')=
+        (COALESCE(json_array_length(
+          json_extract(OLD.transcript_intent_json,'$.attachments')),0)>0)
+    AND (SELECT count(*) FROM json_each(NEW.transcript_intent_json))=3)
+  OR (OLD.transcript_status='pending' AND OLD.transcript_finalized=0
+    AND NEW.transcript_status='abandoned' AND NEW.transcript_finalized=0
+    AND json_extract(NEW.transcript_intent_json,'$.version')=1
+    AND json_extract(NEW.transcript_intent_json,'$.actor')=
+        json_extract(OLD.transcript_intent_json,'$.actor')
+    AND json_type(NEW.transcript_intent_json,'$.hadAttachments') IN ('true','false')
+    AND json_extract(NEW.transcript_intent_json,'$.hadAttachments')=
+        (COALESCE(json_array_length(
+          json_extract(OLD.transcript_intent_json,'$.attachments')),0)>0)
+    AND (SELECT count(*) FROM json_each(NEW.transcript_intent_json))=3)
+)
+BEGIN SELECT RAISE(ABORT, 'queue transcript intent/status transition invalid'); END;
+`;
+
+// Every transition from pending to cancelled proves that no provider effect
+// occurred. Settle the already-staged transcript intent and release its blob
+// references at the database boundary so direct cancellation call sites
+// cannot accidentally strand user prose or attachment custody.
+const schemaVersion43QueueCancellationSettlement = `
+CREATE TRIGGER IF NOT EXISTS queue_transcript_cancellation_settlement
+AFTER UPDATE OF state ON queue_entries
+WHEN OLD.state='pending' AND NEW.state='cancelled'
+BEGIN
+  UPDATE queue_entries SET transcript_status='abandoned',
+    transcript_intent_json=json_object(
+      'version',1,
+      'actor',json_extract(transcript_intent_json,'$.actor'),
+      'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+        json_extract(transcript_intent_json,'$.attachments')),0)>0
+        THEN 'true' ELSE 'false' END))
+  WHERE id=NEW.id AND transcript_status='pending';
+  DELETE FROM message_attachments
+  WHERE session_id=NEW.session_id AND source_id=NEW.id;
+END;
+`;
+
+const schemaVersion43FinalizationTriggerSql = (
+  name: "mutation_transcript_finalization_guard" | "queue_transcript_finalization_guard",
+): string => {
+  const marker = `CREATE TRIGGER IF NOT EXISTS ${name}`;
+  const start = schemaVersion43SessionUserMessageFinalizationGuards.indexOf(marker);
+  const end = schemaVersion43SessionUserMessageFinalizationGuards.indexOf("END;", start);
+  if (start < 0 || end < 0) throw new Error("STATE_SCHEMA_V43_DEFINITION_INVALID");
+  return schemaVersion43SessionUserMessageFinalizationGuards.slice(start, end + 4);
+};
+
+const schemaVersion43QueueFinalizationGuardBeforeAuthorityRebind = (): string => {
+  const current = schemaVersion43FinalizationTriggerSql(
+    "queue_transcript_finalization_guard",
+  );
+  const start = current.indexOf("  OR (OLD.state='pending' AND NEW.state='pending'");
+  const end = current.indexOf(
+    "\n  OR (OLD.transcript_status='pending' AND OLD.transcript_finalized=0\n"
+      + "    AND NEW.transcript_status='finalized'",
+    start,
+  );
+  if (start < 0 || end < 0) throw new Error("STATE_SCHEMA_V43_DEFINITION_INVALID");
+  return current.slice(0, start) + current.slice(end);
+};
+
+const upgradeSchemaVersion43QueueTranscriptAuthorityGuard = (
+  database: Database,
+): void => {
+  const observed = z.object({ sql: z.string() }).strict().safeParse(
+    database.query(
+      `SELECT sql FROM sqlite_master
+       WHERE type='trigger' AND name='queue_transcript_finalization_guard'`,
+    ).get(),
+  );
+  if (!observed.success) {
+    throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+  }
+  const actual = normalizedTriggerSql(observed.data.sql);
+  const current = normalizedTriggerSql(schemaVersion43FinalizationTriggerSql(
+    "queue_transcript_finalization_guard",
+  ));
+  if (actual === current) return;
+  if (actual !== normalizedTriggerSql(
+    schemaVersion43QueueFinalizationGuardBeforeAuthorityRebind(),
+  )) throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+  database.exec("DROP TRIGGER queue_transcript_finalization_guard");
+  database.exec(schemaVersion43FinalizationTriggerSql(
+    "queue_transcript_finalization_guard",
+  ));
+};
+
+const normalizedTriggerSql = (sql: string): string => normalizeSqlStructure(
+  sql.replace(/\bIF NOT EXISTS\b/giu, ""),
+);
+
+const schemaVersion43QueueCancellationSettlementState = (
+  database: Database,
+): "exact" | "missing" => {
+  const value = database.query(
+    `SELECT type,sql FROM sqlite_master
+     WHERE name='queue_transcript_cancellation_settlement'`,
+  ).get();
+  if (value === null) return "missing";
+  const observed = z.object({
+    sql: z.string(),
+    type: z.literal("trigger"),
+  }).strict().safeParse(value);
+  if (
+    !observed.success
+    || normalizedTriggerSql(observed.data.sql)
+      !== normalizedTriggerSql(schemaVersion43QueueCancellationSettlement)
+  ) {
+    throw new Error("STATE_SCHEMA_V43_QUEUE_CANCELLATION_GUARD_COLLISION");
+  }
+  return "exact";
+};
+
+const installSchemaVersion43QueueCancellationSettlement = (
+  database: Database,
+): void => {
+  if (schemaVersion43QueueCancellationSettlementState(database) === "missing") {
+    database.exec(schemaVersion43QueueCancellationSettlement);
+  }
+};
+
+/**
+ * A short-lived pre-release v43 build could cancel a queue row before this
+ * database-boundary settlement trigger existed, then install the trigger on a
+ * later open. Repair both missing-trigger and already-reopened databases: fold
+ * pending prose, release every cancelled manifest, and retain scrub authority
+ * before the current authority surface is accepted.
+ */
+const repairSchemaVersion43CancelledQueueSettlements = (
+  database: Database,
+  repairedAt: number,
+): void => {
+  const rows = z.array(z.object({
+    id: queueIdSchema,
+    session_id: sessionIdSchema,
+    transcript_intent_json: z.string().nullable(),
+    transcript_status: sessionUserMessageTranscriptStatusSchema,
+  }).strict()).parse(database.query(
+    `SELECT id,session_id,transcript_status,transcript_intent_json
+     FROM queue_entries WHERE state='cancelled' ORDER BY session_id,id`,
+  ).all());
+  let repaired = false;
+  for (const row of rows) {
+    if (row.transcript_status === "pending") {
+      if (row.transcript_intent_json === null) {
+        throw new Error("STATE_SCHEMA_V43_QUEUE_CANCELLATION_SETTLEMENT_INVALID");
+      }
+      const intent = sessionUserMessageIntentSchema.parse(
+        JSON.parse(row.transcript_intent_json) as unknown,
+      );
+      const changed = database.query(
+        `UPDATE queue_entries
+         SET transcript_status='abandoned',transcript_intent_json=?
+         WHERE id=? AND session_id=? AND state='cancelled'
+           AND transcript_status='pending'`,
+      ).run(
+        sessionUserMessageActorReceiptJson({
+          actor: intent.actor,
+          ...(intent.attachments === undefined
+            ? {}
+            : { attachments: intent.attachments }),
+        }),
+        row.id,
+        row.session_id,
+      );
+      if (changed.changes !== 1) {
+        throw new Error("STATE_SCHEMA_V43_QUEUE_CANCELLATION_SETTLEMENT_CHANGED");
+      }
+      repaired = true;
+    }
+    const released = database.query(
+      "DELETE FROM message_attachments WHERE session_id=? AND source_id=?",
+    ).run(row.session_id, row.id);
+    repaired = released.changes > 0 || repaired;
+  }
+  if (repaired) requireQueueMessageScrub(database, repairedAt, true);
+};
+
+const assertSchemaVersion43QueueCancellationSettlement = (
+  database: Database,
+): void => {
+  try {
+    if (schemaVersion43QueueCancellationSettlementState(database) !== "exact") {
+      throw new Error("missing");
+    }
+  } catch {
+    throw new Error("STATE_SCHEMA_V43_QUEUE_CANCELLATION_GUARD_INVALID");
+  }
+  if (database.query(
+    `SELECT 1 FROM queue_entries q
+     WHERE q.state='cancelled' AND (
+       q.transcript_status='pending'
+       OR EXISTS (
+         SELECT 1 FROM message_attachments a
+         WHERE a.session_id=q.session_id AND a.source_id=q.id
+       )
+     ) LIMIT 1`,
+  ).get() !== null) {
+    throw new Error("STATE_SCHEMA_V43_QUEUE_CANCELLATION_SETTLEMENT_INVALID");
+  }
+};
+
+const installSchemaVersion43SessionEventsAccountAuthorityGuard = (
+  database: Database,
+): void => {
+  const observed = z.object({ sql: z.string() }).strict().safeParse(
+    database.query(
+      "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+    ).get("session_events_account_authority_guard"),
+  );
+  if (!observed.success) {
+    throw new Error("STATE_SCHEMA_V43_SESSION_EVENT_AUTHORITY_GUARD_COLLISION");
+  }
+  const observedSql = normalizedTriggerSql(observed.data.sql);
+  const predecessorSql = normalizedTriggerSql(
+    schemaVersion9SessionEventsAccountAuthorityGuard,
+  );
+  const currentSql = normalizedTriggerSql(
+    schemaVersion43SessionEventsAccountAuthorityGuard,
+  );
+  if (observedSql !== predecessorSql && observedSql !== currentSql) {
+    throw new Error("STATE_SCHEMA_V43_SESSION_EVENT_AUTHORITY_GUARD_COLLISION");
+  }
+  if (observedSql === predecessorSql) {
+    database.exec("DROP TRIGGER session_events_account_authority_guard");
+    database.exec(schemaVersion43SessionEventsAccountAuthorityGuard);
+  }
+};
+
+const removeExactSchemaVersion43FinalizationGuardsForMigration = (
+  database: Database,
+): void => {
+  for (const name of [
+    "mutation_transcript_finalization_guard",
+    "queue_transcript_finalization_guard",
+  ] as const) {
+    const observed = z.object({ sql: z.string() }).strict().safeParse(
+      database.query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").get(name),
+    );
+    if (!observed.success) continue;
+    const expected = schemaVersion43FinalizationTriggerSql(name)
+      .replace(/\bIF NOT EXISTS\b/giu, "");
+    if (
+      normalizeSqlStructure(observed.data.sql.replace(/\bIF NOT EXISTS\b/giu, ""))
+      !== normalizeSqlStructure(expected)
+    ) throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_GUARD_COLLISION");
+    database.exec(`DROP TRIGGER ${name}`);
+  }
+};
+
+const assertSchemaVersion43SessionUserMessageFinalizations = (
+  database: Database,
+  allowQueueGuardBeforeAuthorityRebind = false,
+): void => {
+  for (const table of ["mutation_attempts", "queue_entries"] as const) {
+    const column = z.object({
+      dflt_value: z.literal("0"),
+      name: z.literal("transcript_finalized"),
+      notnull: z.literal(1),
+      pk: z.literal(0),
+      type: z.literal("INTEGER"),
+    }).passthrough().safeParse(database.query(
+      `SELECT * FROM pragma_table_info('${table}') WHERE name='transcript_finalized'`,
+    ).get());
+    if (!column.success) {
+      throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+    }
+    if (database.query(
+      `SELECT 1 FROM ${table} WHERE transcript_finalized NOT IN (0,1) LIMIT 1`,
+    ).get() !== null) {
+      throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+    }
+    const statusColumn = z.object({
+      dflt_value: z.literal("'none'"),
+      name: z.literal("transcript_status"),
+      notnull: z.literal(1),
+      pk: z.literal(0),
+      type: z.literal("TEXT"),
+    }).passthrough().safeParse(database.query(
+      `SELECT * FROM pragma_table_info('${table}') WHERE name='transcript_status'`,
+    ).get());
+    const intentColumn = z.object({
+      dflt_value: z.null(),
+      name: z.literal("transcript_intent_json"),
+      notnull: z.literal(0),
+      pk: z.literal(0),
+      type: z.literal("TEXT"),
+    }).passthrough().safeParse(database.query(
+      `SELECT * FROM pragma_table_info('${table}') WHERE name='transcript_intent_json'`,
+    ).get());
+    if (!statusColumn.success || !intentColumn.success || database.query(
+      `SELECT 1 FROM ${table}
+       WHERE transcript_status NOT IN ('none','pending','finalized','unavailable','abandoned')
+          OR transcript_finalized!=(transcript_status='finalized')
+          OR (transcript_intent_json IS NOT NULL AND (
+            NOT json_valid(transcript_intent_json)
+            OR length(CAST(transcript_intent_json AS BLOB))>${String(SESSION_EVENT_MAX_BYTES)}
+          )) LIMIT 1`,
+    ).get() !== null) {
+      throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+    }
+  }
+  for (const name of [
+    "mutation_transcript_finalization_guard",
+    "queue_transcript_finalization_guard",
+  ] as const) {
+    const observed = z.object({ sql: z.string() }).strict().safeParse(
+      database.query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").get(name),
+    );
+    const expectedSql = schemaVersion43FinalizationTriggerSql(name)
+      .replace(/\bIF NOT EXISTS\b/giu, "");
+    const observedSql = observed.success
+      ? observed.data.sql.replace(/\bIF NOT EXISTS\b/giu, "")
+      : "";
+    const accepted = [normalizeSqlStructure(expectedSql)];
+    if (allowQueueGuardBeforeAuthorityRebind && name === "queue_transcript_finalization_guard") {
+      accepted.push(normalizeSqlStructure(
+        schemaVersion43QueueFinalizationGuardBeforeAuthorityRebind()
+          .replace(/\bIF NOT EXISTS\b/giu, ""),
+      ));
+    }
+    if (!observed.success || !accepted.includes(normalizeSqlStructure(observedSql))) {
+      throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+    }
+  }
+  const accountAuthorityGuard = z.object({ sql: z.string() }).strict().safeParse(
+    database.query(
+      "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+    ).get("session_events_account_authority_guard"),
+  );
+  if (
+    !accountAuthorityGuard.success
+    || normalizedTriggerSql(accountAuthorityGuard.data.sql)
+      !== normalizedTriggerSql(schemaVersion43SessionEventsAccountAuthorityGuard)
+  ) throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+};
+
+const assertSchemaVersion43BaseAuthority = (
+  database: Database,
+  allowQueueGuardBeforeAuthorityRebind = false,
+): void => {
   assertSchemaVersion41TimestampProof(database);
-  assertExactMigrationLedgerTail(
+  assertSchemaMigrationLedgerTail(
     database,
-    [41, 42, 43],
+    [40, 41, 42, 43],
     "STATE_SCHEMA_V43_MIGRATION_LEDGER_INVALID",
   );
+  assertSchemaVersion43SessionUserMessageFinalizations(
+    database,
+    allowQueueGuardBeforeAuthorityRebind,
+  );
+};
+
+const backfillSchemaVersion43SessionUserMessageFinalizations = (
+  database: Database,
+): void => {
+  // A v42 database may contain provider effects from before HRA began owning
+  // this transcript, or records already removed by retention. Fence every
+  // pre-v43 dispatched source rather than reviving unavailable prose during a
+  // later exact replay. Prepared mutations and pending queue entries remain
+  // eligible to dispatch and record normally after the migration.
+  database.query(
+    `UPDATE mutation_attempts
+     SET transcript_status=CASE WHEN EXISTS (
+       SELECT 1 FROM session_events e
+       WHERE e.session_id=mutation_attempts.authority_id
+         AND json_extract(e.event_json,'$.body.type')='user_message'
+         AND json_extract(e.event_json,'$.body.sourceId')=mutation_attempts.idempotency_key
+     ) THEN 'finalized' ELSE 'unavailable' END,
+         transcript_finalized=CASE WHEN EXISTS (
+       SELECT 1 FROM session_events e
+       WHERE e.session_id=mutation_attempts.authority_id
+         AND json_extract(e.event_json,'$.body.type')='user_message'
+         AND json_extract(e.event_json,'$.body.sourceId')=mutation_attempts.idempotency_key
+     ) THEN 1 ELSE 0 END
+     WHERE kind IN ('session.send','session.steer')
+       AND state IN ('effect_started','applied','ambiguous')`,
+  ).run();
+  database.query(
+    `UPDATE queue_entries
+     SET transcript_status=CASE WHEN EXISTS (
+       SELECT 1 FROM session_events e
+       WHERE e.session_id=queue_entries.session_id
+         AND json_extract(e.event_json,'$.body.type')='user_message'
+         AND json_extract(e.event_json,'$.body.sourceId')=queue_entries.id
+     ) THEN 'finalized' ELSE 'unavailable' END,
+         transcript_finalized=CASE WHEN EXISTS (
+       SELECT 1 FROM session_events e
+       WHERE e.session_id=queue_entries.session_id
+         AND json_extract(e.event_json,'$.body.type')='user_message'
+         AND json_extract(e.event_json,'$.body.sourceId')=queue_entries.id
+     ) THEN 1 ELSE 0 END
+     WHERE state IN ('dispatching','applied','ambiguous')`,
+  ).run();
+};
+
+const schemaVersion43LegacyAttachmentRowSchema = z.object({
+  byte_length: attachmentByteLengthSchema,
+  created_at: unixMillisecondsSchema,
+  digest: attachmentDigestSchema,
+  media_type: attachmentMediaTypeSchema,
+  name: z.string(),
+  position: z.number().int().min(0).max(ATTACHMENT_MAX_COUNT - 1),
+  session_id: sessionIdSchema,
+  source_id: z.string().min(1).max(200),
+}).strict();
+
+/**
+ * v42 accepted presentation names containing Unicode format and separator
+ * scalars. Project only that historical policy delta to a visible safe scalar
+ * in both the byte-free manifest and any still-pending transcript intent. This
+ * preserves unsent messages, effect evidence, user text, and exact blob
+ * custody while ensuring every current read and later replay parses safely.
+ *
+ * This is deliberately idempotent for pre-release v43 databases too: after
+ * the first successful transaction every manifest already has its current
+ * canonical presentation name.
+ */
+const normalizeSchemaVersion43LegacyAttachmentNames = (
+  database: Database,
+): void => {
+  const unsafeSources = new Map<string, { sessionId: SessionId; sourceId: string }>();
+  for (const value of database.query(
+    `SELECT session_id,source_id,position,digest,name,media_type,byte_length,created_at
+     FROM message_attachments
+     ORDER BY session_id,source_id,position`,
+  ).all()) {
+    const row = schemaVersion43LegacyAttachmentRowSchema.parse(value);
+    if (isAttachmentName(row.name)) continue;
+    const key = `${row.session_id}\u0000${row.source_id}`;
+    unsafeSources.set(key, { sessionId: row.session_id, sourceId: row.source_id });
+  }
+  if (unsafeSources.size === 0) return;
+
+  const pendingIntentUpdates: Array<Readonly<{
+    json: string;
+    sessionId: SessionId;
+    sourceId: string;
+    sourceKind: "mutation" | "queue";
+  }>> = [];
+  const normalizedManifests: Array<readonly z.infer<
+    typeof schemaVersion43LegacyAttachmentRowSchema
+  >[]> = [];
+  for (const { sessionId, sourceId } of unsafeSources.values()) {
+    const rows = schemaVersion43LegacyAttachmentRowSchema.array().parse(database.query(
+      `SELECT session_id,source_id,position,digest,name,media_type,byte_length,created_at
+       FROM message_attachments WHERE session_id=? AND source_id=?
+       ORDER BY position`,
+    ).all(sessionId, sourceId));
+    const references = rows.map((row) => ({
+      byteLength: row.byte_length,
+      digest: row.digest,
+      mediaType: row.media_type,
+      name: row.name,
+    }));
+    const projectedReferences = projectLegacyAttachmentReferences(references);
+    if (projectedReferences === null) {
+      throw new Error("STATE_SCHEMA_V43_ATTACHMENT_NAME_INVALID");
+    }
+    attachmentReferenceListSchema.parse(projectedReferences);
+    const normalized = rows.map((row, index) => ({
+      ...row,
+      name: projectedReferences[index]?.name ?? "",
+    }));
+
+    const queue = z.object({
+      transcript_intent_json: z.string().nullable(),
+      transcript_status: sessionUserMessageTranscriptStatusSchema,
+    }).strict().nullable().parse(
+      database.query(
+        `SELECT transcript_status,transcript_intent_json FROM queue_entries
+         WHERE id=? AND session_id=?`,
+      ).get(sourceId, sessionId),
+    );
+    const mutation = z.object({
+      transcript_intent_json: z.string().nullable(),
+      transcript_status: sessionUserMessageTranscriptStatusSchema,
+    }).strict().nullable().parse(database.query(
+      `SELECT transcript_status,transcript_intent_json FROM mutation_attempts
+       WHERE id=? AND authority_id=? AND kind IN ('session.send','session.steer')`,
+    ).get(sourceId, sessionId));
+    if (queue !== null && mutation !== null) {
+      throw new Error("STATE_SCHEMA_V43_ATTACHMENT_SOURCE_AMBIGUOUS");
+    }
+    const source = queue === null
+      ? mutation === null ? null : { ...mutation, sourceKind: "mutation" as const }
+      : { ...queue, sourceKind: "queue" as const };
+    if (source?.transcript_status === "pending") {
+      if (source.transcript_intent_json === null) {
+        throw new Error("STATE_SCHEMA_V43_ATTACHMENT_TRANSCRIPT_INTENT_INVALID");
+      }
+      const raw = z.object({ attachments: z.unknown() }).passthrough().parse(
+        JSON.parse(source.transcript_intent_json) as unknown,
+      );
+      const legacyIntentAttachments = legacyAttachmentReferenceListSchema.safeParse(
+        raw.attachments,
+      );
+      const attachments = legacyIntentAttachments.success
+        ? projectLegacyAttachmentReferences(legacyIntentAttachments.data)
+        : null;
+      if (attachments === null) {
+        throw new Error("STATE_SCHEMA_V43_ATTACHMENT_TRANSCRIPT_INTENT_INVALID");
+      }
+      const intent = sessionUserMessageIntentSchema.parse({ ...raw, attachments });
+      if (JSON.stringify(intent.attachments) !== JSON.stringify(projectedReferences)) {
+        throw new Error("STATE_SCHEMA_V43_ATTACHMENT_TRANSCRIPT_INTENT_MISMATCH");
+      }
+      pendingIntentUpdates.push({
+        json: JSON.stringify(intent),
+        sessionId,
+        sourceId,
+        sourceKind: source.sourceKind,
+      });
+    }
+    normalizedManifests.push(normalized);
+  }
+
+  if (pendingIntentUpdates.length > 0) {
+    removeExactSchemaVersion43FinalizationGuardsForMigration(database);
+    for (const update of pendingIntentUpdates) {
+      const table = update.sourceKind === "queue" ? "queue_entries" : "mutation_attempts";
+      const authorityColumn = update.sourceKind === "queue" ? "session_id" : "authority_id";
+      const changed = database.query(
+        `UPDATE ${table} SET transcript_intent_json=?
+         WHERE id=? AND ${authorityColumn}=? AND transcript_status='pending'`,
+      ).run(update.json, update.sourceId, update.sessionId);
+      if (changed.changes !== 1) {
+        throw new Error("STATE_SCHEMA_V43_ATTACHMENT_TRANSCRIPT_AUTHORITY_CHANGED");
+      }
+    }
+    database.exec(schemaVersion43SessionUserMessageFinalizationGuards);
+  }
+  for (const manifest of normalizedManifests) {
+    const first = manifest[0];
+    if (first === undefined) continue;
+    database.query(
+      "DELETE FROM message_attachments WHERE session_id=? AND source_id=?",
+    ).run(first.session_id, first.source_id);
+    for (const row of manifest) {
+      database.query(
+        `INSERT INTO message_attachments(
+           session_id,source_id,position,digest,name,media_type,byte_length,created_at
+         ) VALUES (?,?,?,?,?,?,?,?)`,
+      ).run(
+        row.session_id,
+        row.source_id,
+        row.position,
+        row.digest,
+        row.name,
+        row.media_type,
+        row.byte_length,
+        row.created_at,
+      );
+    }
+  }
 };
 
 const schemaVersion1 = `
@@ -3847,15 +4747,7 @@ CREATE INDEX IF NOT EXISTS session_events_age
 CREATE TRIGGER IF NOT EXISTS session_events_immutable_update
 BEFORE UPDATE ON session_events
 BEGIN SELECT RAISE(ABORT, 'session event is immutable'); END;
-CREATE TRIGGER IF NOT EXISTS session_events_account_authority_guard
-BEFORE INSERT ON session_events
-WHEN NOT EXISTS(
-  SELECT 1 FROM sessions s JOIN profiles p ON p.id=s.profile_id
-  WHERE s.id=NEW.session_id
-    AND s.profile_id=NEW.account_id
-    AND p.process_generation=NEW.provider_generation
-)
-BEGIN SELECT RAISE(ABORT, 'session event account authority mismatch'); END;
+${schemaVersion9SessionEventsAccountAuthorityGuard}
 CREATE TRIGGER IF NOT EXISTS session_events_accounting_insert
 AFTER INSERT ON session_events
 BEGIN
@@ -5560,7 +6452,7 @@ const splitSqlTableDefinitions = (sql: string): readonly string[] => {
 const schemaVersion39SessionProviderColumn =
   "ALTER TABLE sessions ADD COLUMN provider_v39 TEXT NOT NULL DEFAULT 'codex' "
   + "CHECK(provider_v39 IN ('codex','claude','devin') "
-  + `AND (provider_v39!='devin' OR preset_contract=${currentPresetContract}))`;
+  + `AND (provider_v39!='devin' OR preset_contract=${devinPresetContract}))`;
 
 const ensureSchemaVersion39SessionProviderColumn = (database: Database): void => {
   if (!hasTableColumn(database, "sessions", "provider_v39")) {
@@ -5607,14 +6499,14 @@ const assertSchemaVersion39ProviderAuthority = (database: Database): void => {
       !== normalizeSqlStructure(
         "provider_v39 TEXT NOT NULL DEFAULT 'codex' "
         + "CHECK(provider_v39 IN ('codex','claude','devin') "
-        + `AND (provider_v39!='devin' OR preset_contract=${currentPresetContract}))`,
+        + `AND (provider_v39!='devin' OR preset_contract=${devinPresetContract}))`,
       )
   ) {
     throw new Error("STATE_SCHEMA_V39_OBJECT_INVALID:sessions.provider_v39");
   }
   if (database.query(
     `SELECT 1 FROM sessions
-     WHERE provider_v39='devin' AND preset_contract!=${currentPresetContract}
+     WHERE provider_v39='devin' AND preset_contract!=${devinPresetContract}
      LIMIT 1`,
   ).get() !== null) {
     throw new Error("STATE_SCHEMA_V39_DEVIN_PRESET_CONTRACT_INVALID:sessions");
@@ -6923,11 +7815,14 @@ const applySchemaVersion40SessionAdoption = (
   `);
   database.exec(schemaVersion40SessionAccountAuthorityUpdateGuard);
   // Work's account and route guards reference the adoption authority tables.
-  // Rebuild their merged v40 bodies before quarantine constructs WorkStore;
-  // otherwise a legacy same-name trigger can survive CREATE IF NOT EXISTS.
+  // Install the additive objects so migration-only quarantine can use
+  // WorkStore. The two current/v40 differences guard only Work insertion and
+  // provider/preset updates; quarantine performs neither. Restore and prove
+  // the complete frozen v40 surface immediately afterward, before the v40
+  // waypoint can commit. Schema v42 owns the later current-body replacement.
   database.exec(WORK_SCHEMA_SQL);
-  assertWorkSchema(database);
   quarantineUnprovenProviderSessions(database, migratedAt);
+  installProviderVersion40WorkAuthoritySchema(database);
   ensureVersion40CandidateColumns(database);
   assertSchemaVersion40AdoptionObjects(database);
 };
@@ -7038,7 +7933,7 @@ CREATE TABLE IF NOT EXISTS session_message_event_sources (
   ),
   source_kind TEXT NOT NULL CHECK(source_kind IN ('mutation','queue')),
   session_id TEXT NOT NULL REFERENCES sessions(id),
-  actor TEXT NOT NULL CHECK(actor IN ('human','autorespond','peer_session','provider_switch')),
+  actor TEXT NOT NULL CHECK(actor IN ('human','automation','autorespond','peer_session','provider_switch')),
   body_digest TEXT NOT NULL CHECK(length(body_digest) = 64 AND body_digest NOT GLOB '*[^a-f0-9]*'),
   stream_epoch TEXT NOT NULL CHECK(length(stream_epoch) = 36),
   event_sequence INTEGER NOT NULL CHECK(event_sequence BETWEEN 1 AND 9007199254740991),
@@ -7094,6 +7989,16 @@ WHEN NOT (
                 AND action.target_session_id=mutation.authority_id
                 AND mutation.kind=('session.' || action.delivery)
             ) THEN 'peer_session'
+            WHEN EXISTS (
+              SELECT 1 FROM work_prepared_effects work
+              WHERE json_extract(work.instruction_json,'$.nestedMutationKey')=mutation.idempotency_key
+                AND json_extract(work.instruction_json,'$.targetSessionId')=mutation.authority_id
+                AND (
+                  (json_extract(work.instruction_json,'$.kind')='dispatch' AND mutation.kind='session.send')
+                  OR (json_extract(work.instruction_json,'$.kind')='signal'
+                    AND json_extract(work.instruction_json,'$.mode')='steer' AND mutation.kind='session.steer')
+                )
+            ) THEN 'automation'
             ELSE 'human'
           END
         )=NEW.actor
@@ -7108,7 +8013,11 @@ WHEN NOT (
           queue.state='applied'
           OR resolution.resolution_kind='proven_applied'
         )
-        AND queue.message_actor=NEW.actor
+        AND json_extract(queue.transcript_intent_json,'$.actor')=NEW.actor
+        AND (
+          (queue.message_actor='peer_session' AND NEW.actor='peer_session')
+          OR (queue.message_actor='human' AND NEW.actor!='peer_session')
+        )
     ))
   )
 )
@@ -8333,285 +9242,6 @@ BEGIN
 END;
 `;
 
-/*
- * A pre-release feature line wrote a second provider-switch state machine.
- * It was never the canonical switch authority and cannot safely be translated
- * into the mature mutation/target/seed/source-release receipt graph. Retain
- * its exact DDL only to identify that historical surface before removing an
- * empty journal during the v40/v41 collision migration.
- */
-const legacyFeatureProviderSwitchJournalSchema = `
-CREATE TABLE IF NOT EXISTS session_provider_switches (
-  attempt_id TEXT PRIMARY KEY REFERENCES mutation_attempts(id),
-  session_id TEXT NOT NULL REFERENCES sessions(id),
-  phase TEXT NOT NULL CHECK(phase IN (
-    'target_start_started','target_started','source_release_started',
-    'source_released','applied','failed','abandoned','state_unknown','ambiguous'
-  )),
-  ambiguous_from_phase TEXT CHECK(ambiguous_from_phase IS NULL OR ambiguous_from_phase IN (
-    'target_start_started','target_started','source_release_started','source_released'
-  )),
-  diagnostic_code TEXT CHECK(diagnostic_code IS NULL OR (
-    diagnostic_code GLOB '[A-Z]*' AND length(diagnostic_code) BETWEEN 1 AND 80
-  )),
-  source_profile_id TEXT NOT NULL REFERENCES profiles(id),
-  source_generation INTEGER NOT NULL CHECK(source_generation >= 0),
-  source_provider TEXT NOT NULL CHECK(source_provider IN ('codex','claude')),
-  source_preset TEXT NOT NULL CHECK(source_preset IN ('low','high','ultra','fable-max')),
-  source_preset_contract INTEGER NOT NULL CHECK(source_preset_contract IN (${legacyPresetContract},${currentPresetContract})),
-  source_thread_id TEXT NOT NULL CHECK(length(source_thread_id) BETWEEN 1 AND 200),
-  source_session_revision INTEGER NOT NULL CHECK(source_session_revision BETWEEN 1 AND 9007199254740991),
-  source_runtime_profile_json TEXT CHECK(source_runtime_profile_json IS NULL OR length(CAST(source_runtime_profile_json AS BLOB)) BETWEEN 2 AND 262144),
-  source_host_capabilities_json TEXT CHECK(source_host_capabilities_json IS NULL OR length(CAST(source_host_capabilities_json AS BLOB)) BETWEEN 2 AND 4096),
-  target_profile_id TEXT NOT NULL REFERENCES profiles(id),
-  target_generation INTEGER NOT NULL CHECK(target_generation >= 0),
-  target_provider TEXT NOT NULL CHECK(target_provider IN ('codex','claude')),
-  target_preset TEXT NOT NULL CHECK(target_preset IN ('low','high','ultra','fable-max')),
-  target_preset_contract INTEGER NOT NULL CHECK(target_preset_contract IN (${legacyPresetContract},${currentPresetContract})),
-  target_review_json TEXT NOT NULL CHECK(length(CAST(target_review_json AS BLOB)) BETWEEN 2 AND 262144),
-  project_id TEXT REFERENCES projects(id),
-  fast_enabled INTEGER NOT NULL CHECK(fast_enabled IN (0,1)),
-  target_thread_id TEXT CHECK(target_thread_id IS NULL OR length(target_thread_id) BETWEEN 1 AND 200),
-  target_state TEXT CHECK(target_state IS NULL OR target_state IN ('active','idle','terminal')),
-  target_active_turn_id TEXT CHECK(target_active_turn_id IS NULL OR length(target_active_turn_id) BETWEEN 1 AND 200),
-  target_provider_updated_at INTEGER CHECK(target_provider_updated_at IS NULL OR target_provider_updated_at >= 0),
-  target_runtime_profile_json TEXT CHECK(target_runtime_profile_json IS NULL OR length(CAST(target_runtime_profile_json AS BLOB)) BETWEEN 2 AND 262144),
-  preamble_version INTEGER NOT NULL CHECK(preamble_version BETWEEN 1 AND 9007199254740991),
-  preamble_digest TEXT NOT NULL CHECK(length(preamble_digest)=64 AND preamble_digest NOT GLOB '*[^a-f0-9]*'),
-  manifest_version INTEGER NOT NULL CHECK(manifest_version BETWEEN 1 AND 9007199254740991),
-  manifest_digest TEXT NOT NULL CHECK(length(manifest_digest)=64 AND manifest_digest NOT GLOB '*[^a-f0-9]*'),
-  transcript_digest TEXT NOT NULL CHECK(length(transcript_digest)=64 AND transcript_digest NOT GLOB '*[^a-f0-9]*'),
-  seed_text TEXT NOT NULL CHECK(length(CAST(seed_text AS BLOB)) BETWEEN 1 AND 98304),
-  seed_digest TEXT NOT NULL CHECK(length(seed_digest)=64 AND seed_digest NOT GLOB '*[^a-f0-9]*'),
-  seed_included_records INTEGER NOT NULL CHECK(seed_included_records BETWEEN 0 AND 100),
-  seed_omitted_records INTEGER NOT NULL CHECK(seed_omitted_records >= 0),
-  seed_idempotency_key TEXT NOT NULL UNIQUE CHECK(length(seed_idempotency_key)=36),
-  seed_state TEXT NOT NULL CHECK(seed_state IN ('pending','effect_started','applied','failed')),
-  seed_failure_code TEXT CHECK(seed_failure_code IS NULL OR length(seed_failure_code) BETWEEN 1 AND 80),
-  seed_turn_id TEXT CHECK(seed_turn_id IS NULL OR length(seed_turn_id) BETWEEN 1 AND 200),
-  final_result_json TEXT CHECK(final_result_json IS NULL OR length(CAST(final_result_json AS BLOB)) BETWEEN 2 AND 262144),
-  journal_digest TEXT NOT NULL CHECK(length(journal_digest)=64 AND journal_digest NOT GLOB '*[^a-f0-9]*'),
-  created_at INTEGER NOT NULL CHECK(created_at >= 0),
-  updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
-  source_provider_v40 TEXT NOT NULL DEFAULT 'codex'
-    CHECK(source_provider_v40 IN ('codex','claude','devin')),
-  source_preset_v40 TEXT NOT NULL DEFAULT 'ultra'
-    CHECK(source_preset_v40 IN ('low','high','ultra','fable-max','astra')),
-  target_provider_v40 TEXT NOT NULL DEFAULT 'codex'
-    CHECK(target_provider_v40 IN ('codex','claude','devin')),
-  target_preset_v40 TEXT NOT NULL DEFAULT 'ultra'
-    CHECK(target_preset_v40 IN ('low','high','ultra','fable-max','astra')),
-  target_preamble_version_v40 INTEGER
-    CHECK(target_preamble_version_v40 IS NULL OR target_preamble_version_v40 BETWEEN 1 AND 9007199254740991),
-  target_preamble_digest_v40 TEXT
-    CHECK(target_preamble_digest_v40 IS NULL OR (length(target_preamble_digest_v40)=64 AND target_preamble_digest_v40 NOT GLOB '*[^a-f0-9]*')),
-  target_manifest_version_v40 INTEGER
-    CHECK(target_manifest_version_v40 IS NULL OR target_manifest_version_v40 BETWEEN 1 AND 9007199254740991),
-  target_manifest_digest_v40 TEXT
-    CHECK(target_manifest_digest_v40 IS NULL OR (length(target_manifest_digest_v40)=64 AND target_manifest_digest_v40 NOT GLOB '*[^a-f0-9]*')),
-  authority_contract_v40 INTEGER NOT NULL DEFAULT 0 CHECK(authority_contract_v40 IN (0,1)),
-  CHECK((phase='ambiguous')=(ambiguous_from_phase IS NOT NULL)),
-  CHECK((target_thread_id IS NULL)=(target_state IS NULL)),
-  CHECK((target_thread_id IS NULL)=(target_runtime_profile_json IS NULL)),
-  CHECK(target_thread_id IS NOT NULL OR target_active_turn_id IS NULL),
-  CHECK(seed_state IN ('pending','effect_started') OR final_result_json IS NOT NULL),
-  CHECK(seed_state!='applied' OR seed_turn_id IS NOT NULL),
-  CHECK(seed_state!='failed' OR seed_failure_code IS NOT NULL)
-) STRICT;
-CREATE INDEX IF NOT EXISTS session_provider_switches_unsettled
-  ON session_provider_switches(session_id,created_at,attempt_id)
-  WHERE phase NOT IN ('failed','abandoned','state_unknown')
-    AND (phase!='applied' OR seed_state IN ('pending','effect_started'));
-CREATE UNIQUE INDEX IF NOT EXISTS session_provider_switches_target_thread
-  ON session_provider_switches(target_profile_id,target_thread_id)
-  WHERE target_thread_id IS NOT NULL;
-DROP TRIGGER IF EXISTS session_provider_switch_authority_immutable;
-CREATE TRIGGER session_provider_switch_authority_immutable
-BEFORE UPDATE OF attempt_id,session_id,source_profile_id,source_generation,
-  source_provider,source_preset,source_preset_contract,source_thread_id,source_session_revision,
-  source_runtime_profile_json,source_host_capabilities_json,target_profile_id,
-  target_generation,target_provider,target_preset,target_preset_contract,target_review_json,project_id,
-  fast_enabled,preamble_version,preamble_digest,manifest_version,manifest_digest,
-  transcript_digest,seed_text,seed_digest,seed_included_records,
-  seed_omitted_records,seed_idempotency_key,journal_digest,created_at
-ON session_provider_switches
-WHEN NEW.attempt_id IS NOT OLD.attempt_id
-  OR NEW.session_id IS NOT OLD.session_id
-  OR NEW.source_profile_id IS NOT OLD.source_profile_id
-  OR NEW.source_generation IS NOT OLD.source_generation
-  OR NEW.source_provider IS NOT OLD.source_provider
-  OR NEW.source_preset IS NOT OLD.source_preset
-  OR NEW.source_preset_contract IS NOT OLD.source_preset_contract
-  OR NEW.source_thread_id IS NOT OLD.source_thread_id
-  OR NEW.source_session_revision IS NOT OLD.source_session_revision
-  OR NEW.source_runtime_profile_json IS NOT OLD.source_runtime_profile_json
-  OR NEW.source_host_capabilities_json IS NOT OLD.source_host_capabilities_json
-  OR NEW.target_profile_id IS NOT OLD.target_profile_id
-  OR NEW.target_generation IS NOT OLD.target_generation
-  OR NEW.target_provider IS NOT OLD.target_provider
-  OR NEW.target_preset IS NOT OLD.target_preset
-  OR NEW.target_preset_contract IS NOT OLD.target_preset_contract
-  OR NEW.target_review_json IS NOT OLD.target_review_json
-  OR NEW.project_id IS NOT OLD.project_id
-  OR NEW.fast_enabled IS NOT OLD.fast_enabled
-  OR NEW.preamble_version IS NOT OLD.preamble_version
-  OR NEW.preamble_digest IS NOT OLD.preamble_digest
-  OR NEW.manifest_version IS NOT OLD.manifest_version
-  OR NEW.manifest_digest IS NOT OLD.manifest_digest
-  OR NEW.transcript_digest IS NOT OLD.transcript_digest
-  OR NEW.seed_text IS NOT OLD.seed_text
-  OR NEW.seed_digest IS NOT OLD.seed_digest
-  OR NEW.seed_included_records IS NOT OLD.seed_included_records
-  OR NEW.seed_omitted_records IS NOT OLD.seed_omitted_records
-  OR NEW.seed_idempotency_key IS NOT OLD.seed_idempotency_key
-  OR NEW.journal_digest IS NOT OLD.journal_digest
-  OR NEW.created_at IS NOT OLD.created_at
-BEGIN SELECT RAISE(ABORT, 'session provider switch authority is immutable'); END;
-DROP TRIGGER IF EXISTS session_provider_switch_transition_guard;
-CREATE TRIGGER session_provider_switch_transition_guard
-BEFORE UPDATE OF phase ON session_provider_switches
-WHEN NOT (
-  NEW.phase=OLD.phase
-  OR (OLD.phase='target_start_started' AND NEW.phase IN ('target_started','failed','abandoned','ambiguous'))
-  OR (OLD.phase='target_started' AND NEW.phase IN ('source_release_started','abandoned','ambiguous'))
-  OR (OLD.phase='source_release_started' AND NEW.phase IN ('source_released','ambiguous'))
-  OR (OLD.phase='source_released' AND NEW.phase IN ('applied','ambiguous'))
-  OR (OLD.phase='ambiguous' AND NEW.phase IN ('source_release_started','source_released','applied','abandoned'))
-  OR (OLD.phase IN ('target_start_started','target_started','source_release_started','source_released','applied','ambiguous')
-      AND NEW.phase='state_unknown')
-)
-BEGIN SELECT RAISE(ABORT, 'illegal session provider switch transition'); END;
-DROP TRIGGER IF EXISTS session_provider_switch_seed_transition_guard;
-CREATE TRIGGER session_provider_switch_seed_transition_guard
-BEFORE UPDATE OF seed_state ON session_provider_switches
-WHEN NOT (
-  NEW.seed_state=OLD.seed_state
-  OR (OLD.seed_state='pending' AND NEW.seed_state IN ('effect_started','failed'))
-  OR (OLD.seed_state='effect_started' AND NEW.seed_state IN ('applied','failed'))
-)
-BEGIN SELECT RAISE(ABORT, 'illegal session provider switch seed transition'); END;
-DROP TRIGGER IF EXISTS session_provider_switch_session_update_guard;
-CREATE TRIGGER session_provider_switch_session_update_guard
-BEFORE UPDATE ON sessions
-WHEN EXISTS (
-  SELECT 1 FROM session_provider_switches journal
-  WHERE journal.session_id=OLD.id
-    AND journal.phase NOT IN ('applied','failed','abandoned','state_unknown')
-)
-BEGIN SELECT RAISE(ABORT, 'session provider switch owns session authority'); END;
-DROP TRIGGER IF EXISTS session_provider_switch_session_delete_guard;
-CREATE TRIGGER session_provider_switch_session_delete_guard
-BEFORE DELETE ON sessions
-WHEN EXISTS (
-  SELECT 1 FROM session_provider_switches journal
-  WHERE journal.session_id=OLD.id
-    AND journal.phase NOT IN ('applied','failed','abandoned','state_unknown')
-)
-BEGIN SELECT RAISE(ABORT, 'session provider switch owns session authority'); END;
-DROP TRIGGER IF EXISTS session_provider_switch_delete_guard;
-CREATE TRIGGER session_provider_switch_delete_guard
-BEFORE DELETE ON session_provider_switches
-BEGIN SELECT RAISE(ABORT, 'session provider switch journal is immutable'); END;
-`;
-
-const legacyFeatureProviderSwitchAuthoritySchema = `
-DROP TRIGGER IF EXISTS session_provider_switch_v40_authority_guard;
-CREATE TRIGGER session_provider_switch_v40_authority_guard
-BEFORE INSERT ON session_provider_switches
-WHEN NEW.authority_contract_v40!=1
-  OR NEW.source_provider!=CASE NEW.source_provider_v40
-    WHEN 'claude' THEN 'claude' ELSE 'codex' END
-  OR NEW.target_provider!=CASE NEW.target_provider_v40
-    WHEN 'claude' THEN 'claude' ELSE 'codex' END
-  OR NEW.source_preset!=CASE NEW.source_preset_v40
-    WHEN 'astra' THEN 'ultra' ELSE NEW.source_preset_v40 END
-  OR NEW.target_preset!=CASE NEW.target_preset_v40
-    WHEN 'astra' THEN 'ultra' ELSE NEW.target_preset_v40 END
-  OR NOT (
-    (NEW.source_provider_v40='codex' AND NEW.source_preset_v40 IN ('low','high','ultra'))
-    OR (NEW.source_provider_v40='claude' AND NEW.source_preset_v40='fable-max')
-    OR (NEW.source_provider_v40='devin' AND NEW.source_preset_v40='astra')
-  )
-  OR NOT (
-    (NEW.target_provider_v40='codex' AND NEW.target_preset_v40 IN ('low','high','ultra'))
-    OR (NEW.target_provider_v40='claude' AND NEW.target_preset_v40='fable-max')
-    OR (NEW.target_provider_v40='devin' AND NEW.target_preset_v40='astra')
-  )
-  OR NOT (
-    (
-      NEW.target_provider_v40='devin'
-      AND NEW.target_preamble_version_v40 IS NULL
-      AND NEW.target_preamble_digest_v40 IS NULL
-      AND NEW.target_manifest_version_v40 IS NULL
-      AND NEW.target_manifest_digest_v40 IS NULL
-      AND NEW.preamble_version=1
-      AND NEW.preamble_digest='${"0".repeat(64)}'
-      AND NEW.manifest_version=1
-      AND NEW.manifest_digest='${"0".repeat(64)}'
-    ) OR (
-      NEW.target_provider_v40 IN ('codex','claude')
-      AND NEW.target_preamble_version_v40 IS NOT NULL
-      AND NEW.target_preamble_digest_v40 IS NOT NULL
-      AND NEW.target_manifest_version_v40 IS NOT NULL
-      AND NEW.target_manifest_digest_v40 IS NOT NULL
-      AND NEW.preamble_version=NEW.target_preamble_version_v40
-      AND NEW.preamble_digest=NEW.target_preamble_digest_v40
-      AND NEW.manifest_version=NEW.target_manifest_version_v40
-      AND NEW.manifest_digest=NEW.target_manifest_digest_v40
-    )
-  )
-BEGIN SELECT RAISE(ABORT, 'invalid v40 session provider switch authority'); END;
-DROP TRIGGER IF EXISTS session_provider_switch_v40_authority_immutable;
-CREATE TRIGGER session_provider_switch_v40_authority_immutable
-BEFORE UPDATE OF source_provider_v40,source_preset_v40,target_provider_v40,
-  target_preset_v40,target_preamble_version_v40,target_preamble_digest_v40,
-  target_manifest_version_v40,target_manifest_digest_v40,authority_contract_v40
-ON session_provider_switches
-WHEN NEW.source_provider_v40 IS NOT OLD.source_provider_v40
-  OR NEW.source_preset_v40 IS NOT OLD.source_preset_v40
-  OR NEW.target_provider_v40 IS NOT OLD.target_provider_v40
-  OR NEW.target_preset_v40 IS NOT OLD.target_preset_v40
-  OR NEW.target_preamble_version_v40 IS NOT OLD.target_preamble_version_v40
-  OR NEW.target_preamble_digest_v40 IS NOT OLD.target_preamble_digest_v40
-  OR NEW.target_manifest_version_v40 IS NOT OLD.target_manifest_version_v40
-  OR NEW.target_manifest_digest_v40 IS NOT OLD.target_manifest_digest_v40
-  OR NEW.authority_contract_v40 IS NOT OLD.authority_contract_v40
-BEGIN SELECT RAISE(ABORT, 'session provider switch v40 authority is immutable'); END;
-DROP TRIGGER IF EXISTS session_host_capability_binding_delete_guard;
-CREATE TRIGGER session_host_capability_binding_delete_guard
-BEFORE DELETE ON session_host_capability_bindings
-WHEN NOT EXISTS (
-  SELECT 1 FROM sessions s
-  WHERE s.id=OLD.session_id
-    AND s.state='starting'
-    AND s.provider_thread_id IS NULL
-    AND s.active_turn_id IS NULL
-    AND s.provider_updated_at IS NULL
-) AND NOT EXISTS (
-  SELECT 1 FROM mutation_attempts mutation
-  WHERE mutation.authority_id=OLD.session_id
-    AND mutation.kind='session.switch'
-    AND mutation.state='effect_started'
-    AND (
-      EXISTS (
-        SELECT 1 FROM session_provider_switches journal
-        WHERE journal.attempt_id=mutation.id
-          AND journal.session_id=OLD.session_id
-          AND journal.phase IN ('source_released','applied')
-      ) OR (
-        EXISTS (
-          SELECT 1 FROM session_provider_switch_targets target
-          WHERE target.attempt_id=mutation.id
-        )
-        AND EXISTS (
-          SELECT 1 FROM session_provider_switch_source_releases released
-          WHERE released.attempt_id=mutation.id
-        )
-      )
-    )
-)
-BEGIN SELECT RAISE(ABORT, 'session host capability binding is immutable'); END;
-`;
 
 const projectMemoryAuthoritiesTableSql = (): string => {
   const marker = "CREATE TABLE IF NOT EXISTS project_memory_authorities";
@@ -8767,7 +9397,7 @@ const applySchemaVersion40PeerSessions = (database: Database): void => {
 };
 
 /*
- * Hosted canonical memory is an additive v42 control-plane journal. It stores
+ * Hosted canonical memory is an additive v45 control-plane journal. It stores
  * only opaque routing identifiers, public heads/digests, and already-encrypted
  * operation envelopes. Portable descriptor/proof plaintext, data keys,
  * credentials, and project paths never cross this boundary.
@@ -9837,19 +10467,6 @@ const schemaVersion40Objects = [
   { name: "queue_peer_action_transition", table: "queue_entries", type: "trigger", source: schemaVersion40QueuePeerProvenance },
 ] as const;
 
-const legacyFeatureProviderSwitchObjects = [
-  { name: "session_provider_switches", table: "session_provider_switches", type: "table", source: legacyFeatureProviderSwitchJournalSchema },
-  { name: "session_provider_switches_unsettled", table: "session_provider_switches", type: "index", source: legacyFeatureProviderSwitchJournalSchema },
-  { name: "session_provider_switches_target_thread", table: "session_provider_switches", type: "index", source: legacyFeatureProviderSwitchJournalSchema },
-  { name: "session_provider_switch_authority_immutable", table: "session_provider_switches", type: "trigger", source: legacyFeatureProviderSwitchJournalSchema },
-  { name: "session_provider_switch_transition_guard", table: "session_provider_switches", type: "trigger", source: legacyFeatureProviderSwitchJournalSchema },
-  { name: "session_provider_switch_seed_transition_guard", table: "session_provider_switches", type: "trigger", source: legacyFeatureProviderSwitchJournalSchema },
-  { name: "session_provider_switch_session_update_guard", table: "sessions", type: "trigger", source: legacyFeatureProviderSwitchJournalSchema },
-  { name: "session_provider_switch_session_delete_guard", table: "sessions", type: "trigger", source: legacyFeatureProviderSwitchJournalSchema },
-  { name: "session_provider_switch_delete_guard", table: "session_provider_switches", type: "trigger", source: legacyFeatureProviderSwitchJournalSchema },
-  { name: "session_provider_switch_v40_authority_guard", table: "session_provider_switches", type: "trigger", source: legacyFeatureProviderSwitchAuthoritySchema },
-  { name: "session_provider_switch_v40_authority_immutable", table: "session_provider_switches", type: "trigger", source: legacyFeatureProviderSwitchAuthoritySchema },
-] as const;
 
 type EmbeddedSchemaObject = Readonly<{
   name: string;
@@ -10777,10 +11394,12 @@ const applySchemaVersion37AttentionEmailPolicy = (
 };
 
 // Preset aliases are durable user intent, but their exact model mapping has
-// changed once. Existing and provider-imported rows retain the legacy mapping;
-// HRA-created or explicitly reselected rows are stamped current at their write
-// boundary. `works` is installed by WorkStore in the same database and carries
-// the same contract so a claim cannot reinterpret its route mid-flight.
+// changed once. Existing rows retain the contract established by migration or
+// their earlier write. New and explicitly reselected session rows resolve
+// `activePresetBinding` at their write boundary; an active binding may select
+// either frozen contract. `works` is installed by WorkStore in the same
+// database and owns its separate creation-time contract, which claim admission
+// checks against the session without reinterpreting either route mid-flight.
 const schemaVersion38SessionPresetContractColumn =
   `ALTER TABLE sessions ADD COLUMN preset_contract INTEGER NOT NULL DEFAULT ${legacyPresetContract} `
   + `CHECK(preset_contract IN (${legacyPresetContract},${currentPresetContract}))`;
@@ -10865,12 +11484,21 @@ const assertPeerAndLocalMemoryObjects = (
     .map((row) => z.object({ name: z.string(), notnull: z.number().int(), type: z.string() }).passthrough().parse(row));
   const actor = queueColumns.find((column) => column.name === "message_actor");
   const action = queueColumns.find((column) => column.name === "peer_action_id");
+  const queueSql = normalizeSqlStructure(z.object({ sql: z.string() }).strict().parse(
+    database.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='queue_entries'").get(),
+  ).sql);
   if (
     actor?.type !== "TEXT"
     || actor.notnull !== 1
     || action?.type !== "TEXT"
     || action.notnull !== 0
+    || /--|\/\*/u.test(queueSql)
+    || !/[,()]\s*message_actor TEXT NOT NULL DEFAULT 'human' CHECK\(message_actor IN \('human','peer_session'\)\)\s*[,)]/u.test(queueSql)
+    || !/[,()]\s*peer_action_id TEXT REFERENCES peer_session_actions\(id\)\s*[,)]/u.test(queueSql)
   ) throw new Error(code);
+  if (database.query(
+    "SELECT 1 FROM queue_entries WHERE message_actor NOT IN ('human','peer_session') OR message_actor IS NULL LIMIT 1",
+  ).get() !== null) throw new Error(code);
   try {
     for (const row of database.query(
       "SELECT * FROM project_memory_authorities ORDER BY project_id",
@@ -11042,230 +11670,21 @@ const assertSchemaVersion41Objects = (database: Database): void => {
   ).get() !== null) throw new Error("STATE_SCHEMA_V41_CANONICAL_MEMORY_SYNC_INVALID");
 };
 
-// The memory branch used these numeric names before the released adoption and
-// timestamp-proof migrations claimed v40/v41. Keep its physical SQL and object
-// names stable for exact predecessor recognition, while exposing the canonical
-// ordering at the migration boundary: peer/local memory is v42 and hosted
-// canonical memory is v43.
-const applySchemaVersion42PeerSessions = applySchemaVersion40PeerSessions;
-const applySchemaVersion43CanonicalMemorySync = applySchemaVersion41CanonicalMemorySync;
-const assertSchemaVersion43CanonicalMemoryObjects = assertSchemaVersion41Objects;
+// Unreleased memory migrations follow main's immutable v40-v43 sequence.
+// The embedded SQL identifiers remain stable; only forward ledger slots move.
+const applySchemaVersion44PeerSessions = applySchemaVersion40PeerSessions;
+const applySchemaVersion45CanonicalMemorySync = applySchemaVersion41CanonicalMemorySync;
+const assertSchemaVersion44PeerObjects = assertSchemaVersion40Objects;
+const assertSchemaVersion45CanonicalMemoryObjects = assertSchemaVersion41Objects;
 
-const legacyFeaturePeerObjects: readonly EmbeddedSchemaObject[] = [
-  ...schemaVersion40Objects.map((object) => object.name === "session_host_capability_binding_delete_guard"
-    ? { ...object, source: legacyFeatureProviderSwitchAuthoritySchema }
-    : object),
-  ...legacyFeatureProviderSwitchObjects,
-];
-const legacyFeatureProviderSwitchObjectNames = legacyFeatureProviderSwitchObjects
-  .map((object) => object.name);
-
-const assertSchemaVersion42PeerObjects = (database: Database): void => {
-  assertSchemaVersion40Objects(database);
-  assertNoSchemaObjects(
-    database,
-    legacyFeatureProviderSwitchObjectNames,
-    "STATE_SCHEMA_LEGACY_PROVIDER_SWITCH_JOURNAL_PRESENT",
-  );
-};
-
-const assertLegacyFeaturePeerObjects = (database: Database): void => {
-  assertPeerAndLocalMemoryObjects(
-    database,
-    legacyFeaturePeerObjects,
-    "STATE_SCHEMA_LEGACY_PROVIDER_SWITCH_STRUCTURE_INVALID",
-  );
-};
-
-const dropEmptyLegacyFeatureProviderSwitchJournal = (database: Database): void => {
-  if (database.query("SELECT 1 FROM session_provider_switches LIMIT 1").get() !== null) {
-    throw new Error("STATE_SCHEMA_LEGACY_PROVIDER_SWITCH_RECOVERY_REFUSED");
-  }
-  database.exec(`
-    DROP TRIGGER session_host_capability_binding_delete_guard;
-    DROP TRIGGER session_provider_switch_session_update_guard;
-    DROP TRIGGER session_provider_switch_session_delete_guard;
-    DROP TRIGGER session_provider_switch_authority_immutable;
-    DROP TRIGGER session_provider_switch_transition_guard;
-    DROP TRIGGER session_provider_switch_seed_transition_guard;
-    DROP TRIGGER session_provider_switch_delete_guard;
-    DROP TRIGGER session_provider_switch_v40_authority_guard;
-    DROP TRIGGER session_provider_switch_v40_authority_immutable;
-    DROP TABLE session_provider_switches;
-  `);
-};
-
-type CollidingFeatureSchema =
-  | "none"
-  | "upstream-v40"
-  | "upstream-v41"
-  | "canonical-v42"
-  | "feature-v40"
-  | "feature-v41"
-  | "private-v41"
-  | "private-v42";
-
-const hasAnySchemaObject = (
-  database: Database,
-  names: readonly string[],
-): boolean => {
-  if (names.length === 0) return false;
-  return database.query(
-    `SELECT 1 FROM sqlite_master WHERE name IN (${names.map(() => "?").join(",")}) LIMIT 1`,
-  ).get(...names) !== null;
-};
-
-const assertNoSchemaObjects = (
-  database: Database,
-  names: readonly string[],
-  code: string,
-): void => {
-  if (hasAnySchemaObject(database, names)) throw new Error(code);
-};
-
-const assertFeatureEraMigrationTail = (
-  database: Database,
-  version: 40 | 41 | 42,
-  code = `STATE_SCHEMA_FEATURE_V${String(version)}_LEDGER_INVALID`,
-): void => {
-  const expected = version === 40 ? [40] : version === 41 ? [40, 41] : [40, 41, 42];
-  assertExactMigrationLedgerTail(database, expected, code);
-};
-
-/**
- * Disambiguate the two development lines that used v40/v41. A numeric stamp
- * is never enough: every accepted line must prove its exact authority surface
- * before the writable migration is allowed to add anything.
- */
-const classifyCollidingFeatureSchema = (
-  database: Database,
-  initialVersion: number,
-): CollidingFeatureSchema => {
-  if (initialVersion !== 40 && initialVersion !== 41 && initialVersion !== 42) {
-    return "none";
-  }
-  const adoptionNames = schemaVersion40AdoptionObjects.map((object) => object.name);
-  const peerNames = schemaVersion40Objects.map((object) => object.name);
-  const canonicalMemoryNames = schemaVersion41Objects.map((object) => object.name);
-  const legacyProviderSwitchNames = legacyFeatureProviderSwitchObjectNames;
-  const timestampProofNames = ["mutation_resolutions_timestamp_proof_insert"];
-  const hasAdoptionIdentity = hasTableColumn(database, "profiles", "codex_account_key")
-    || hasAnySchemaObject(database, adoptionNames);
-  const hasPeerIdentity = hasTableColumn(database, "queue_entries", "message_actor")
-    || hasTableColumn(database, "queue_entries", "peer_action_id")
-    || hasAnySchemaObject(database, [...peerNames, ...legacyProviderSwitchNames]);
-  const hasCanonicalMemoryIdentity = hasAnySchemaObject(database, canonicalMemoryNames);
-  const hasTimestampProofIdentity = hasAnySchemaObject(database, timestampProofNames);
-
-  const assertAdoptionPredecessor = (): void => {
-    assertCanonicalLabelKeys(database);
-    assertSchemaVersion35Objects(database);
-    assertSchemaVersion38PresetContracts(database);
-    assertSchemaVersion39ProviderAuthority(database);
-    assertSchemaVersion40AdoptionObjects(database);
-    assertExactSchemaVersion40AdoptionSurface(database);
-    assertWorkSchema(database);
-    assertSessionTaskSchema(database);
-    assertCompositeNotificationPolicy(database);
-  };
-
-  // A same-name timestamp object can never enter an unguarded compatibility
-  // cohort. Only an exact authoritative v41/v42 surface may prove it.
-  if (hasTimestampProofIdentity) {
-    if (
-      initialVersion === 41
-      && hasAdoptionIdentity
-      && !hasPeerIdentity
-      && !hasCanonicalMemoryIdentity
-    ) {
-      assertAdoptionPredecessor();
-      assertNoSchemaObjects(database, legacyProviderSwitchNames, "STATE_SCHEMA_V41_FEATURE_COLLISION");
-      assertSchemaVersion41Authority(database);
-      return "upstream-v41";
-    }
-    if (
-      initialVersion === 42
-      && hasAdoptionIdentity
-      && hasPeerIdentity
-      && !hasCanonicalMemoryIdentity
-    ) {
-      assertAdoptionPredecessor();
-      assertSchemaVersion42PeerObjects(database);
-      assertSchemaVersion42Authority(database);
-      return "canonical-v42";
-    }
-    throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
-  }
-
-  if (initialVersion === 40 && hasAdoptionIdentity) {
-    assertAdoptionPredecessor();
-    assertNoSchemaObjects(
-      database,
-      [...peerNames, ...legacyProviderSwitchNames],
-      "STATE_SCHEMA_V40_FEATURE_COLLISION",
-    );
-    assertNoSchemaObjects(database, canonicalMemoryNames, "STATE_SCHEMA_V40_FEATURE_COLLISION");
-    assertFeatureEraMigrationTail(
-      database,
-      40,
-      "STATE_SCHEMA_UPSTREAM_V40_LEDGER_INVALID",
-    );
-    return "upstream-v40";
-  }
-
-  if (hasAdoptionIdentity) {
-    assertAdoptionPredecessor();
-    if (initialVersion === 41 && hasPeerIdentity && !hasCanonicalMemoryIdentity) {
-      assertSchemaVersion42PeerObjects(database);
-      assertFeatureEraMigrationTail(
-        database,
-        41,
-        "STATE_SCHEMA_PRIVATE_V41_LEDGER_INVALID",
-      );
-      return "private-v41";
-    }
-    if (initialVersion === 42 && hasPeerIdentity && hasCanonicalMemoryIdentity) {
-      assertSchemaVersion42PeerObjects(database);
-      assertSchemaVersion43CanonicalMemoryObjects(database);
-      assertFeatureEraMigrationTail(
-        database,
-        42,
-        "STATE_SCHEMA_PRIVATE_V42_LEDGER_INVALID",
-      );
-      return "private-v42";
-    }
-    // An authoritative timestamp predecessor with its guard removed must fail
-    // as guard damage rather than being laundered into a private cohort.
-    if (
-      (initialVersion === 41 && !hasPeerIdentity && !hasCanonicalMemoryIdentity)
-      || (initialVersion === 42 && hasPeerIdentity && !hasCanonicalMemoryIdentity)
-    ) assertSchemaVersion41TimestampProof(database);
-    throw new Error(`STATE_SCHEMA_FEATURE_V${String(initialVersion)}_ADOPTION_COLLISION`);
-  }
-  if (initialVersion === 42) throw new Error("STATE_SCHEMA_FEATURE_V42_ADOPTION_COLLISION");
-  assertCanonicalLabelKeys(database);
-  assertSchemaVersion35Objects(database);
-  assertSchemaVersion38PresetContracts(database);
-  assertSchemaVersion39ProviderAuthority(database);
-  assertProviderVersion39WorkSchema(database);
-  assertSessionTaskSchema(database);
-  assertCompositeNotificationPolicy(database);
-  if (hasAnySchemaObject(database, legacyProviderSwitchNames)) {
-    assertLegacyFeaturePeerObjects(database);
-  } else {
-    assertSchemaVersion42PeerObjects(database);
-  }
-  if (initialVersion === 40) {
-    assertNoSchemaObjects(
-      database,
-      canonicalMemoryNames,
-      "STATE_SCHEMA_FEATURE_V40_HOSTED_MEMORY_COLLISION",
-    );
-  } else {
-    assertSchemaVersion43CanonicalMemoryObjects(database);
-  }
-  assertFeatureEraMigrationTail(database, initialVersion);
-  return initialVersion === 40 ? "feature-v40" : "feature-v41";
+const assertSchemaVersionMemoryAuthority = (database: Database, version: 44 | 45): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSchemaMigrationLedgerTail(database, version === 44 ? [40, 41, 42, 43, 44] : [40, 41, 42, 43, 44, 45],
+    `STATE_SCHEMA_V${String(version)}_MIGRATION_LEDGER_INVALID`);
+  assertSchemaVersion43SessionUserMessageFinalizations(database);
+  assertSchemaVersion43QueueCancellationSettlement(database);
+  assertSchemaVersion44PeerObjects(database);
+  if (version === 45) assertSchemaVersion45CanonicalMemoryObjects(database);
 };
 
 const assertSchemaVersion24Objects = (database: Database): void => {
@@ -12097,19 +12516,24 @@ const migrateWritableDatabase = (
   if (initialVersion > currentSchemaVersion) {
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
   }
-  const collidingFeatureSchema = classifyCollidingFeatureSchema(database, initialVersion);
-  const featureEraSchema = collidingFeatureSchema === "feature-v40"
-    || collidingFeatureSchema === "feature-v41";
-  const unguardedHistoricalTimestampSchema = collidingFeatureSchema === "feature-v41"
-    || collidingFeatureSchema === "private-v41"
-    || collidingFeatureSchema === "private-v42";
-  const hasLegacyFeatureProviderSwitchJournal = featureEraSchema
-    && hasAnySchemaObject(database, legacyFeatureProviderSwitchObjectNames);
+  if (initialVersion === 44 || initialVersion === 45) assertSchemaVersionMemoryAuthority(database, initialVersion);
+  else if (initialVersion === 43) {
+    // Pre-release v43 shipped briefly without the queue-cancellation trigger.
+    // Prove every other v43 authority object and reject a colliding object
+    // before the transactional, row-aware repair below is allowed to run.
+    assertSchemaVersion43BaseAuthority(database, true);
+    schemaVersion43QueueCancellationSettlementState(database);
+  }
+  else if (initialVersion === 42) assertSchemaVersion42Authority(database);
+  else if (initialVersion === 41) assertSchemaVersion41Authority(database);
+  else if (initialVersion === 40) assertSchemaVersion40Authority(database);
   if (
-    initialVersion < 40
-    && hasAnySchemaObject(database, ["mutation_resolutions_timestamp_proof_insert"])
-  ) throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
-  if (initialVersion === currentSchemaVersion) {
+    initialVersion < 41
+    && database.query("SELECT 1 FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'").get() !== null
+  ) {
+    throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
+  }
+  if (initialVersion >= 42) {
     // A current-version stamp is an assertion boundary, not permission to
     // reconstruct authority. Prove every provider/adoption execution guard
     // before the idempotent maintenance tail can touch any schema object.
@@ -12122,9 +12546,16 @@ const migrateWritableDatabase = (
     assertWorkSchema(database);
     assertSessionTaskSchema(database);
     assertCompositeNotificationPolicy(database);
-    assertSchemaVersion42PeerObjects(database);
-    assertSchemaVersion43CanonicalMemoryObjects(database);
-    assertSchemaVersion43Authority(database);
+  }
+  if (initialVersion === 40 || initialVersion === 41) {
+    // Timestamp v41 retains the released adoption-v40 contract-2 Work guards.
+    // Prove that exact surface before replacing only the reviewed Work guards.
+    assertCanonicalLabelKeys(database);
+    assertSchemaVersion39ProviderAuthority(database);
+    assertSchemaVersion40AdoptionObjects(database);
+    assertExactSchemaVersion40AdoptionSurface(database);
+    assertProviderVersion40WorkSchema(database);
+    assertSessionTaskSchema(database);
   }
   // Both pre-release adoption and notification builds used version 36. Freeze
   // their identity before any additive pre-application can blur the evidence.
@@ -12132,8 +12563,9 @@ const migrateWritableDatabase = (
     database,
     initialVersion,
   );
+  // Adoption became canonical at v40. Later migrations must not feed that
+  // released surface back through the pre-v40 footprint classifier.
   const legacySessionAdoption = initialVersion < 40
-    && collidingFeatureSchema === "none"
     ? classifyLegacySessionAdoptionSchema(database, initialVersion)
     : "absent";
   if (initialVersion === 39 && legacySessionAdoption === "absent") {
@@ -12155,9 +12587,6 @@ const migrateWritableDatabase = (
   const securityScrubPending = database.transaction(() => {
     let redacted = false;
     let version = initialVersion;
-    if (hasLegacyFeatureProviderSwitchJournal) {
-      dropEmptyLegacyFeatureProviderSwitchJournal(database);
-    }
     // v9-v12 databases may have committed URL-bearing MCP records or their
     // superseded bytes without retaining evidence that WAL truncation finished.
     // Materializing the v13 authority inside this transaction makes the byte
@@ -12198,7 +12627,7 @@ const migrateWritableDatabase = (
     // require those relations and the profile proof column to exist first.
     // This pre-application creates no authority rows or guards; v40 remains
     // responsible for backfill, quarantine, and the canonical trigger set.
-    if (version < 40 || featureEraSchema) {
+    if (version < 40) {
       ensureSchemaVersion40WorkAuthorityDependencies(database);
     }
 
@@ -12670,44 +13099,32 @@ const migrateWritableDatabase = (
       }
     }
 
-    if (version < 40 || featureEraSchema) {
+    if (version < 40) {
       const migratedAt = unixMillisecondsSchema.parse(now());
       applySchemaVersion40SessionAdoption(database, migratedAt);
-      if (version < 40) {
-        database.query(
-          "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
-        ).run(40, migratedAt);
-        database.exec("PRAGMA user_version = 40");
-        version = 40;
-      }
+      database.query(
+        "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
+      ).run(40, migratedAt);
+      database.exec("PRAGMA user_version = 40");
+      version = 40;
     }
 
-    // Released v39 owns the provider-authority columns. Reapply and assert that
-    // immutable predecessor after the bounded legacy-adoption bridge and before
-    // advancing into the canonical v40+ sequence.
-    applySchemaVersion39ProviderAuthority(database);
-    assertSchemaVersion39ProviderAuthority(database);
-
-    if (version < 41 || unguardedHistoricalTimestampSchema) {
-      // v40 remains an immutable predecessor. Canonical v41 adds one exact
-      // insert-only proof guard. An admitted unguarded private v41/v42 cohort
-      // receives that guard without rewriting its already-recorded ledger rows.
+    if (version < 41) {
+      // v40 remains an immutable predecessor. This migration adds one guard;
+      // a colliding same-name object is not silently replaced or trusted.
       database.exec(timestampMutationResolutionGuard);
       assertSchemaVersion41TimestampProof(database);
-      if (version < 41) {
-        database.query(
-          "INSERT INTO migrations(version, applied_at) VALUES (?, ?)",
-        ).run(41, unixMillisecondsSchema.parse(now()));
-        database.exec("PRAGMA user_version = 41");
-        version = 41;
-      }
+      database.query("INSERT INTO migrations(version, applied_at) VALUES (?, ?)").run(41, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version = 41");
+      version = 41;
     }
 
     if (version < 42) {
       const migratedAt = unixMillisecondsSchema.parse(now());
-      applySchemaVersion42PeerSessions(database);
+      database.exec(WORK_SCHEMA_SQL);
+      assertWorkSchema(database);
       database.query(
-        "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
+        "INSERT INTO migrations(version, applied_at) VALUES (?, ?)",
       ).run(42, migratedAt);
       database.exec("PRAGMA user_version = 42");
       version = 42;
@@ -12715,12 +13132,50 @@ const migrateWritableDatabase = (
 
     if (version < 43) {
       const migratedAt = unixMillisecondsSchema.parse(now());
-      applySchemaVersion43CanonicalMemorySync(database);
+      if (!hasTableColumn(database, "mutation_attempts", "transcript_finalized")) {
+        database.exec(schemaVersion43MutationTranscriptFinalizedColumn);
+      }
+      if (!hasTableColumn(database, "queue_entries", "transcript_finalized")) {
+        database.exec(schemaVersion43QueueTranscriptFinalizedColumn);
+      }
+      if (!hasTableColumn(database, "mutation_attempts", "transcript_status")) {
+        database.exec(schemaVersion43MutationTranscriptStatusColumn);
+      }
+      if (!hasTableColumn(database, "queue_entries", "transcript_status")) {
+        database.exec(schemaVersion43QueueTranscriptStatusColumn);
+      }
+      if (!hasTableColumn(database, "mutation_attempts", "transcript_intent_json")) {
+        database.exec(schemaVersion43MutationTranscriptIntentColumn);
+      }
+      if (!hasTableColumn(database, "queue_entries", "transcript_intent_json")) {
+        database.exec(schemaVersion43QueueTranscriptIntentColumn);
+      }
+      installSchemaVersion43SessionEventsAccountAuthorityGuard(database);
+      removeExactSchemaVersion43FinalizationGuardsForMigration(database);
+      backfillSchemaVersion43SessionUserMessageFinalizations(database);
+      database.exec(schemaVersion43SessionUserMessageFinalizationGuards);
+      installSchemaVersion43QueueCancellationSettlement(database);
+      assertSchemaVersion43SessionUserMessageFinalizations(database);
+      assertSchemaVersion43QueueCancellationSettlement(database);
       database.query(
-        "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
+        "INSERT INTO migrations(version, applied_at) VALUES (?, ?)",
       ).run(43, migratedAt);
       database.exec("PRAGMA user_version = 43");
       version = 43;
+    }
+
+    if (version < 44) {
+      applySchemaVersion44PeerSessions(database);
+      database.query("INSERT INTO migrations(version, applied_at) VALUES (?, ?)").run(44, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version = 44");
+      version = 44;
+    }
+
+    if (version < 45) {
+      applySchemaVersion45CanonicalMemorySync(database);
+      database.query("INSERT INTO migrations(version, applied_at) VALUES (?, ?)").run(45, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version = 45");
+      version = 45;
     }
 
     // Reapplying additive objects and idempotent authority backfills makes a
@@ -12766,6 +13221,13 @@ const migrateWritableDatabase = (
     applySchemaVersion31Archive(database);
     applySchemaVersion33DeviceCommands(database);
     applySchemaVersion34Attachments(database);
+    upgradeSchemaVersion43QueueTranscriptAuthorityGuard(database);
+    normalizeSchemaVersion43LegacyAttachmentNames(database);
+    repairSchemaVersion43CancelledQueueSettlements(
+      database,
+      unixMillisecondsSchema.parse(now()),
+    );
+    installSchemaVersion43QueueCancellationSettlement(database);
     applySchemaVersion35ProviderSwitchProgress(database);
     assertSchemaVersion35Objects(database);
     database.exec(schemaVersion36NotificationHours);
@@ -12774,11 +13236,9 @@ const migrateWritableDatabase = (
     assertSchemaVersion40AdoptionObjects(database);
     assertExactSchemaVersion40AdoptionSurface(database);
     assertWorkSchema(database);
-    applySchemaVersion42PeerSessions(database);
-    assertSchemaVersion42PeerObjects(database);
-    applySchemaVersion43CanonicalMemorySync(database);
-    assertSchemaVersion43CanonicalMemoryObjects(database);
-    assertSchemaVersion43Authority(database);
+    applySchemaVersion44PeerSessions(database);
+    applySchemaVersion45CanonicalMemorySync(database);
+    assertSchemaVersionMemoryAuthority(database, 45);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -13155,17 +13615,35 @@ const storedSessionEventEnvelopeSchema = z.object({
   body: z.unknown(),
 }).passthrough();
 
+/**
+ * Earlier event projections admitted Unicode format and separator scalars in
+ * attachment display names. Keep the immutable stored event intact, but
+ * replace exactly that historical policy delta before the current public
+ * schema is applied. Other malformed names still fail closed.
+ */
+const projectLegacyStoredAttachmentNames = (value: unknown): unknown => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const body = value as Readonly<Record<string, unknown>>;
+  if (body.type !== "user_message" || !Array.isArray(body.attachments)) return value;
+  const predecessor = legacyAttachmentReferenceListSchema.safeParse(body.attachments);
+  if (!predecessor.success) return value;
+  const attachments = projectLegacyAttachmentReferences(predecessor.data);
+  if (attachments === null) return value;
+  return { ...body, attachments };
+};
+
 const parseStoredSessionEvent = (
   value: string,
   projectionVersion: 1 | 2,
   projector: PublicProviderIdentifierProjector,
 ): SessionEvent => {
   const stored = storedSessionEventEnvelopeSchema.parse(JSON.parse(value) as unknown);
+  const projectedBody = projectionVersion === 2
+    ? stored.body
+    : projectPublicSessionEventBody(stored.body, projector);
   return sessionEventSchema.parse({
     ...stored,
-    body: projectionVersion === 2
-      ? stored.body
-      : projectPublicSessionEventBody(stored.body, projector),
+    body: projectLegacyStoredAttachmentNames(projectedBody),
   });
 };
 
@@ -13350,6 +13828,7 @@ const parseSessionProviderSwitchReceipt = (
     || receipt.providerThreadId !== targetProviderThreadId
     || receipt.request.accountId !== evidence.requestedAccountId
     || receipt.request.preset !== evidence.requestedPreset
+    || receipt.request.presetContract !== evidence.presetContract
     || receipt.request.provider !== evidence.targetProvider
     || receipt.from.account !== evidence.sourceProfileId
     || receipt.from.preset !== evidence.sourcePreset
@@ -13361,6 +13840,7 @@ const parseSessionProviderSwitchReceipt = (
     || receipt.seed.digest !== evidence.seedDigest
     || receipt.seed.includedRecords !== evidence.seedIncludedRecords
     || receipt.seed.omittedRecords !== evidence.seedOmittedRecords
+    || receipt.seed.retentionGapReason !== evidence.seedRetentionGapReason
     || receipt.seed.status !== seedTurnStatus
     || receipt.turnId !== seedTurnId
   ) throw new Error("SESSION_PROVIDER_SWITCH_RECEIPT_MISMATCH");
@@ -13478,17 +13958,7 @@ export class StateStore {
       } else {
         const version = readUserVersion(this.#database);
         if (version > currentSchemaVersion) throw new Error(`STATE_SCHEMA_NEWER:${version}:${currentSchemaVersion}`);
-        if (version < currentSchemaVersion) {
-          // Validate colliding v40-v42 identities before returning the normal
-          // readonly migration diagnostic. This is structural proof only: it
-          // never repairs a missing/altered v41 guard or malformed ledger.
-          classifyCollidingFeatureSchema(this.#database, version);
-          if (
-            version < 40
-            && hasAnySchemaObject(this.#database, ["mutation_resolutions_timestamp_proof_insert"])
-          ) throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
-          throw new Error(`STATE_SCHEMA_MIGRATION_REQUIRED:${version}:${currentSchemaVersion}`);
-        }
+        if (version < currentSchemaVersion) throw new Error(`STATE_SCHEMA_MIGRATION_REQUIRED:${version}:${currentSchemaVersion}`);
         if (hasPendingSecurityScrub(this.#database)) throw new Error("STATE_SECURITY_SCRUB_REQUIRED");
       }
       assertSchemaVersion24Objects(this.#database);
@@ -13497,7 +13967,7 @@ export class StateStore {
       assertSchemaVersion39ProviderAuthority(this.#database);
       assertSchemaVersion40AdoptionObjects(this.#database);
       assertExactSchemaVersion40AdoptionSurface(this.#database);
-      assertSchemaVersion43Authority(this.#database);
+      assertSchemaVersionMemoryAuthority(this.#database, 45);
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);
@@ -13506,8 +13976,6 @@ export class StateStore {
       assertAccountRateLimitResetPolicies(this.#database);
       assertSessionTaskSchema(this.#database);
       assertCompositeNotificationPolicy(this.#database);
-      assertSchemaVersion42PeerObjects(this.#database);
-      assertSchemaVersion43CanonicalMemoryObjects(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
       this.#database.close(false);
@@ -14857,8 +15325,9 @@ export class StateStore {
     assertSupportedProvider(provider);
     const preset = supportedPresetSchema.parse(input.preset);
     assertPresetSupportedByProvider(provider, preset);
+    const presetBinding = activePresetBinding(preset);
     const create = this.#database.transaction(() => {
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id, input.profileId, input.projectId ?? null, title, legacySessionProviderShadow(provider), provider, presetTiers[preset], currentPresetContract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id, input.profileId, input.projectId ?? null, title, legacySessionProviderShadow(provider), provider, presetTiers[preset], presetBinding.contract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       // This preparatory row has no provider-account observation yet. Clear the
       // legacy profile-derived hint in the same transaction so a later plain
       // bindSession cannot launder it into provider authority. Provider import
@@ -16498,14 +16967,6 @@ export class StateStore {
       claudeProcessIdentity: claudeProcessIdentitySchema.optional(),
     }).strict().parse(input);
     assertPresetSupportedByProvider(parsed.provider, parsed.preset);
-    const currentRequirement = presetRequirementForContract(
-      parsed.preset,
-      currentPresetContract,
-    );
-    if (
-      parsed.requirement.model !== currentRequirement.model
-      || parsed.requirement.effort !== currentRequirement.effort
-    ) throw new Error("SESSION_ADOPTION_PRESET_REQUIREMENT_MISMATCH");
     if ((parsed.provider === "claude") !== (parsed.claudeProcessIdentity !== undefined)) {
       throw new Error("SESSION_ADOPTION_CLAUDE_PROCESS_AUTHORITY_REQUIRED");
     }
@@ -16643,6 +17104,20 @@ export class StateStore {
         if (collisions.length > 0) throw new Error("SESSION_ADOPTION_SESSION_COLLISION");
       }
 
+      const activeBinding = activePresetBinding(parsed.preset);
+      const preservedBinding = priorBinding?.state === "active"
+        ? this.#requireSessionPresetBinding(priorBinding.sessionId)
+        : undefined;
+      if (preservedBinding !== undefined && preservedBinding.preset !== parsed.preset) {
+        throw new Error("SESSION_ADOPTION_PRESET_REQUIREMENT_MISMATCH");
+      }
+      const adoptionContract = preservedBinding?.contract ?? activeBinding.contract;
+      const adoptionRequirement = preservedBinding?.requirement ?? activeBinding.requirement;
+      if (
+        parsed.requirement.model !== adoptionRequirement.model
+        || parsed.requirement.effort !== adoptionRequirement.effort
+      ) throw new Error("SESSION_ADOPTION_PRESET_REQUIREMENT_MISMATCH");
+
       const requestedProjectId = parsed.projectId ?? candidate.projectId ?? undefined;
       const projectId = requestedProjectId !== undefined
         && this.#database.query("SELECT 1 FROM projects WHERE id=?").get(requestedProjectId) !== null
@@ -16658,7 +17133,7 @@ export class StateStore {
         ...(projectId === undefined ? {} : { projectId }),
         title: candidate.title,
         preset: parsed.preset,
-        presetContract: currentPresetContract,
+        presetContract: adoptionContract,
         fastEnabled: parsed.fastEnabled,
         state: candidate.providerState,
         ...(candidate.activeTurnId === null ? {} : { activeTurnId: candidate.activeTurnId }),
@@ -16675,7 +17150,7 @@ export class StateStore {
         priorBinding?.state !== "active"
         && (
           session.preset !== parsed.preset
-          || this.#requireSessionPresetBinding(session.id).contract !== currentPresetContract
+          || this.#requireSessionPresetBinding(session.id).contract !== adoptionContract
           || session.fastEnabled !== parsed.fastEnabled
         )
       ) {
@@ -16686,7 +17161,7 @@ export class StateStore {
            WHERE id=? AND revision=?`,
         ).run(
           presetTiers[parsed.preset],
-          currentPresetContract,
+          adoptionContract,
           parsed.fastEnabled ? 1 : 0,
           now,
           session.id,
@@ -19858,40 +20333,111 @@ export class StateStore {
     if (parsed.length === 0) return;
     const now = this.#now();
     const write = this.#database.transaction(() => {
-      for (const [position, attachment] of parsed.entries()) {
-        this.#database.query(
-          `INSERT INTO attachments(digest,media_type,byte_length,created_at,reference_count)
-           VALUES (?,?,?,?,0)
-           ON CONFLICT(digest) DO NOTHING`,
-        ).run(
-          attachment.digest,
-          attachment.canonicalMediaType,
-          attachment.byteLength,
-          now,
-        );
-        this.#database.query(
-          `INSERT INTO message_attachments(session_id,source_id,position,digest,name,media_type,byte_length,created_at)
-           VALUES (?,?,?,?,?,?,?,?)
-           ON CONFLICT(session_id,source_id,position) DO NOTHING`,
-        ).run(
-          parsedSessionId,
-          parsedSourceId,
-          position,
-          attachment.digest,
-          attachment.name,
-          attachment.mediaType,
-          attachment.byteLength,
-          now,
-        );
-      }
-      this.#database.query(
-        `DELETE FROM message_attachments WHERE session_id=? AND source_id NOT IN (
-           SELECT source_id FROM (
-             SELECT source_id, MAX(created_at) AS recent FROM message_attachments
-             WHERE session_id=? GROUP BY source_id ORDER BY recent DESC, source_id DESC LIMIT ?))`,
-      ).run(parsedSessionId, parsedSessionId, MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP);
+      this.#recordMessageAttachmentsInTransaction(
+        parsedSessionId,
+        parsedSourceId,
+        parsed,
+        now,
+      );
     });
     write.immediate();
+  }
+
+  #recordMessageAttachmentsInTransaction(
+    sessionId: SessionId,
+    sourceId: string,
+    attachments: readonly StoredMessageAttachment[],
+    recordedAt: number,
+  ): void {
+    for (const [position, attachment] of attachments.entries()) {
+      this.#database.query(
+        `INSERT INTO attachments(digest,media_type,byte_length,created_at,reference_count)
+         VALUES (?,?,?,?,0)
+         ON CONFLICT(digest) DO NOTHING`,
+      ).run(
+        attachment.digest,
+        attachment.canonicalMediaType,
+        attachment.byteLength,
+        recordedAt,
+      );
+      const custody = attachmentCustodyRowSchema.parse(this.#database.query(
+        `SELECT digest,media_type,byte_length,reference_count
+         FROM attachments WHERE digest=?`,
+      ).get(attachment.digest));
+      if (
+        custody.media_type !== attachment.canonicalMediaType
+        || custody.byte_length !== attachment.byteLength
+      ) throw new Error("ATTACHMENT_CUSTODY_IDENTITY_CONFLICT");
+      this.#database.query(
+        `INSERT INTO message_attachments(session_id,source_id,position,digest,name,media_type,byte_length,created_at)
+         VALUES (?,?,?,?,?,?,?,?)
+         ON CONFLICT(session_id,source_id,position) DO NOTHING`,
+      ).run(
+        sessionId,
+        sourceId,
+        position,
+        attachment.digest,
+        attachment.name,
+        attachment.mediaType,
+        attachment.byteLength,
+        recordedAt,
+      );
+      const linked = messageAttachmentRowSchema.parse(this.#database.query(
+        `SELECT digest,name,media_type,byte_length FROM message_attachments
+         WHERE session_id=? AND source_id=? AND position=?`,
+      ).get(sessionId, sourceId, position));
+      if (
+        linked.digest !== attachment.digest
+        || linked.name !== attachment.name
+        || linked.media_type !== attachment.mediaType
+        || linked.byte_length !== attachment.byteLength
+      ) throw new Error("MESSAGE_ATTACHMENT_IDENTITY_CONFLICT");
+    }
+    const linkedCount = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+      this.#database.query(
+        `SELECT count(*) AS count FROM message_attachments
+         WHERE session_id=? AND source_id=?`,
+      ).get(sessionId, sourceId),
+    ).count;
+    if (linkedCount !== attachments.length) {
+      throw new Error("MESSAGE_ATTACHMENT_COUNT_CONFLICT");
+    }
+    this.#database.query(
+      `DELETE FROM message_attachments
+       WHERE session_id=? AND source_id NOT IN (
+         SELECT source_id FROM (
+           SELECT linked.source_id, MAX(linked.created_at) AS recent
+           FROM message_attachments linked
+           WHERE linked.session_id=?
+             AND NOT EXISTS (
+               SELECT 1 FROM queue_entries q
+               WHERE q.session_id=linked.session_id
+                 AND q.id=linked.source_id
+                 AND q.transcript_status='pending'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM mutation_attempts m
+               WHERE m.authority_id=linked.session_id
+                 AND m.id=linked.source_id
+                 AND m.kind IN ('session.send','session.steer')
+                 AND m.transcript_status='pending'
+             )
+           GROUP BY linked.source_id
+           ORDER BY recent DESC, linked.source_id DESC LIMIT ?))
+         AND NOT EXISTS (
+           SELECT 1 FROM queue_entries q
+           WHERE q.session_id=message_attachments.session_id
+             AND q.id=message_attachments.source_id
+             AND q.transcript_status='pending'
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM mutation_attempts m
+           WHERE m.authority_id=message_attachments.session_id
+             AND m.id=message_attachments.source_id
+             AND m.kind IN ('session.send','session.steer')
+             AND m.transcript_status='pending'
+         )`,
+    ).run(sessionId, sessionId, MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP);
   }
 
   /** The bounded, byte-free manifest for one dispatched message. */
@@ -19914,6 +20460,275 @@ export class StateStore {
         name: parsed.name,
       };
     });
+  }
+
+  #stageSessionUserMessageIntentInTransaction(input: Readonly<{
+    sessionId: SessionId;
+    sourceKind: "mutation" | "queue";
+    sourceId: string;
+    intent: SessionUserMessageIntentInput;
+  }>): void {
+    const prepared = canonicalSessionUserMessageIntent(input.intent);
+    const storedAttachments = storedMessageAttachmentListSchema.parse(
+      input.intent.storedAttachments ?? [],
+    );
+    const storedReferences = storedAttachments.map((attachment) => ({
+      byteLength: attachment.byteLength,
+      digest: attachment.digest,
+      mediaType: attachment.mediaType,
+      name: attachment.name,
+    }));
+    if (JSON.stringify(storedReferences) !== JSON.stringify(prepared.intent.attachments ?? [])) {
+      throw new Error("SESSION_USER_MESSAGE_ATTACHMENT_INTENT_MISMATCH");
+    }
+    const source = input.sourceKind === "mutation"
+      ? z.object({
+          id: attemptIdSchema,
+          authority_id: sessionIdSchema,
+          kind: z.enum(["session.send", "session.steer"]),
+          transcript_status: sessionUserMessageTranscriptStatusSchema,
+          transcript_intent_json: z.string().nullable(),
+        }).strict().parse(this.#database.query(
+          `SELECT id,authority_id,kind,transcript_status,transcript_intent_json
+           FROM mutation_attempts WHERE id=?`,
+        ).get(attemptIdSchema.parse(input.sourceId)))
+      : z.object({
+          id: queueIdSchema,
+          session_id: sessionIdSchema,
+          transcript_status: sessionUserMessageTranscriptStatusSchema,
+          transcript_intent_json: z.string().nullable(),
+        }).strict().parse(this.#database.query(
+          `SELECT id,session_id,transcript_status,transcript_intent_json
+           FROM queue_entries WHERE id=?`,
+        ).get(queueIdSchema.parse(input.sourceId)));
+    const sourceSessionId = "authority_id" in source
+      ? source.authority_id
+      : source.session_id;
+    if (
+      sourceSessionId !== input.sessionId
+      || source.transcript_status !== "none"
+      || source.transcript_intent_json !== null
+    ) throw new Error("SESSION_USER_MESSAGE_INTENT_AUTHORITY_INVALID");
+    const changed = input.sourceKind === "mutation"
+      ? this.#database.query(
+          `UPDATE mutation_attempts
+           SET transcript_status='pending',transcript_intent_json=?
+           WHERE id=? AND authority_id=? AND transcript_status='none'
+             AND transcript_intent_json IS NULL`,
+        ).run(prepared.json, source.id, input.sessionId)
+      : this.#database.query(
+          `UPDATE queue_entries
+           SET transcript_status='pending',transcript_intent_json=?
+           WHERE id=? AND session_id=? AND transcript_status='none'
+             AND transcript_intent_json IS NULL`,
+        ).run(prepared.json, source.id, input.sessionId);
+    if (changed.changes !== 1) {
+      throw new Error("SESSION_USER_MESSAGE_INTENT_AUTHORITY_INVALID");
+    }
+    this.#recordMessageAttachmentsInTransaction(
+      input.sessionId,
+      source.id,
+      storedAttachments,
+      this.#now(),
+    );
+  }
+
+  readSessionUserMessageSource(
+    sessionId: SessionId,
+    sourceKind: "mutation" | "queue",
+    sourceId: string,
+  ): SessionUserMessageSource {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const parsedSourceId = z.string().min(1).max(200).parse(sourceId);
+    const row = sourceKind === "mutation"
+      ? this.#database.query(
+          `SELECT transcript_status,transcript_intent_json
+           FROM mutation_attempts
+           WHERE authority_id=? AND idempotency_key=?
+             AND kind IN ('session.send','session.steer')`,
+        ).get(parsedSessionId, parsedSourceId)
+      : this.#database.query(
+          `SELECT transcript_status,transcript_intent_json
+           FROM queue_entries WHERE session_id=? AND id=?`,
+        ).get(parsedSessionId, parsedSourceId);
+    if (row === null) throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+    const parsed = z.object({
+      transcript_status: sessionUserMessageTranscriptStatusSchema,
+      transcript_intent_json: z.string().nullable(),
+    }).strict().parse(row);
+    const intent = parsed.transcript_intent_json === null
+      ? undefined
+      : sessionUserMessageSourcePayloadSchema.parse(
+          JSON.parse(parsed.transcript_intent_json) as unknown,
+        );
+    if (
+      parsed.transcript_status === "pending"
+      && (intent === undefined || !("text" in intent))
+    ) {
+      throw new Error("SESSION_USER_MESSAGE_INTENT_MISSING");
+    }
+    return {
+      status: parsed.transcript_status,
+      ...(intent === undefined ? {} : { intent }),
+    };
+  }
+
+  hasPendingSessionUserMessageFinalization(sessionId: SessionId): boolean {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    return this.#database.query(
+      `SELECT 1 FROM mutation_attempts
+       WHERE authority_id=? AND kind IN ('session.send','session.steer')
+         AND transcript_status='pending'
+         AND state IN ('effect_started','applied','ambiguous')
+       UNION ALL
+       SELECT 1 FROM queue_entries
+       WHERE session_id=? AND transcript_status='pending'
+         AND state IN ('dispatching','applied','ambiguous')
+       LIMIT 1`,
+    ).get(parsedSessionId, parsedSessionId) !== null;
+  }
+
+  #finalizeSessionUserMessageSourceInTransaction(input: Readonly<{
+    sessionId: SessionId;
+    sourceKind: "mutation" | "queue";
+    sourceId: string;
+    turnId: string;
+    recordedAt: number;
+  }>): SessionEvent | null {
+    const row = input.sourceKind === "mutation"
+      ? this.#database.query(
+          `SELECT transcript_status,transcript_intent_json
+           FROM mutation_attempts
+           WHERE authority_id=? AND id=?
+             AND kind IN ('session.send','session.steer')`,
+        ).get(input.sessionId, attemptIdSchema.parse(input.sourceId))
+      : this.#database.query(
+          `SELECT transcript_status,transcript_intent_json
+           FROM queue_entries WHERE session_id=? AND id=?`,
+        ).get(input.sessionId, queueIdSchema.parse(input.sourceId));
+    if (row === null) throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+    const parsed = z.object({
+      transcript_status: sessionUserMessageTranscriptStatusSchema,
+      transcript_intent_json: z.string().nullable(),
+    }).strict().parse(row);
+    const source: SessionUserMessageSource = {
+      status: parsed.transcript_status,
+      ...(parsed.transcript_intent_json === null
+        ? {}
+        : {
+            intent: sessionUserMessageSourcePayloadSchema.parse(
+              JSON.parse(parsed.transcript_intent_json) as unknown,
+            ),
+          }),
+    };
+    if (source.status === "finalized") return null;
+    if (
+      source.status !== "pending"
+      || source.intent === undefined
+      || !("text" in source.intent)
+    ) {
+      throw new Error(`SESSION_USER_MESSAGE_SOURCE_${source.status.toUpperCase()}`);
+    }
+    const eventSourceId = input.sourceKind === "mutation"
+      ? z.object({ idempotency_key: z.string().min(1).max(200) }).strict().parse(
+          this.#database.query(
+            `SELECT idempotency_key FROM mutation_attempts
+             WHERE authority_id=? AND id=?`,
+          ).get(input.sessionId, attemptIdSchema.parse(input.sourceId)),
+        ).idempotency_key
+      : queueIdSchema.parse(input.sourceId);
+    const body = sessionEventBodySchema.parse(projectPublicSessionEventBody({
+      type: "user_message",
+      turnId: input.turnId,
+      sourceId: eventSourceId,
+      actor: source.intent.actor,
+      text: source.intent.text,
+      omittedCharacters: source.intent.omittedCharacters,
+      ...(source.intent.attachments === undefined
+        ? {}
+        : { attachments: source.intent.attachments }),
+    }, this.#publicProviderIdentifierProjector));
+    const event = this.#appendSessionEventInTransaction({
+      sessionId: input.sessionId,
+      accountId: source.intent.accountId,
+      providerGeneration: source.intent.providerGeneration,
+      providerConnectionId: source.intent.providerConnectionId,
+      body,
+      recordedAt: input.recordedAt,
+      userMessageSourceKind: input.sourceKind,
+      allowHistoricalTranscriptAuthority: true,
+    });
+    this.#database.query(
+      `INSERT INTO session_message_event_sources(
+         source_id,source_kind,session_id,actor,body_digest,stream_epoch,event_sequence,created_at
+       ) VALUES (?,?,?,?,?,?,?,?)`,
+    ).run(input.sourceId, input.sourceKind, input.sessionId, source.intent.actor,
+      digestJson(event.body), event.streamEpoch, event.sequence, input.recordedAt);
+    return event;
+  }
+
+  /** Finish a settled source using only its durable receipt and public intent. */
+  finalizeSessionUserMessageSource(input: Readonly<{
+    sessionId: SessionId;
+    sourceKind: "mutation" | "queue";
+    sourceId: string;
+    turnId: string;
+  }>): SessionEvent | null {
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const sourceId = z.string().min(1).max(200).parse(input.sourceId);
+    const turnId = z.string().min(1).max(200).parse(input.turnId);
+    const finalize = this.#database.transaction(() => {
+      // The settlement proof and append share one immediate write snapshot, so
+      // recovery cannot invalidate the proof between the check and the write.
+      const settled = input.sourceKind === "mutation"
+        ? this.#database.query(
+            `SELECT m.id FROM mutation_attempts m
+             LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+             WHERE m.authority_id=? AND m.idempotency_key=?
+               AND (m.state='applied' OR r.resolution_kind='proven_applied')`,
+          ).get(sessionId, sourceId)
+        : this.#database.query(
+            `SELECT q.id FROM queue_entries q
+             LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
+             WHERE q.session_id=? AND q.id=?
+               AND (q.state='applied' OR r.resolution_kind='proven_applied')`,
+          ).get(sessionId, sourceId);
+      if (settled === null) throw new Error("SESSION_USER_MESSAGE_SOURCE_NOT_SETTLED");
+      const sourceRowId = input.sourceKind === "mutation"
+        ? z.object({ id: attemptIdSchema }).strict().parse(settled).id
+        : z.object({ id: queueIdSchema }).strict().parse(settled).id;
+      return this.#finalizeSessionUserMessageSourceInTransaction({
+        sessionId,
+        sourceKind: input.sourceKind,
+        sourceId: sourceRowId,
+        turnId,
+        recordedAt: unixMillisecondsSchema.parse(this.#now()),
+      });
+    });
+    return finalize.immediate();
+  }
+
+  /** Whether this HRA operation already finalized its neutral user message. */
+  hasSessionUserMessageSource(
+    sessionId: SessionId,
+    sourceKind: "mutation" | "queue",
+    sourceId: string,
+  ): boolean {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const parsedSourceId = z.string().min(1).max(200).safeParse(sourceId);
+    if (!parsedSourceId.success) return false;
+    return sourceKind === "mutation"
+      ? this.#database.query(
+          `SELECT 1 FROM mutation_attempts
+           WHERE authority_id=? AND idempotency_key=?
+             AND kind IN ('session.send','session.steer')
+             AND transcript_status='finalized' AND transcript_finalized=1`,
+        ).get(parsedSessionId, parsedSourceId.data) !== null
+      : this.#database.query(
+          `SELECT 1 FROM queue_entries
+           WHERE session_id=? AND id=?
+             AND transcript_status='finalized' AND transcript_finalized=1`,
+        ).get(parsedSessionId, parsedSourceId.data) !== null;
   }
 
   /** The canonical media type a stored digest was admitted under, if any. */
@@ -20115,12 +20930,12 @@ export class StateStore {
     assertPresetSupportedByProvider(current.provider, preset);
     const fast = input.fastEnabled === undefined ? current.fastEnabled : input.fastEnabled;
     const project = requestedProjectId;
-    // Naming the preset is an explicit opt-in to the current mapping, even
+    // Naming the preset is an explicit opt-in to the active binding, even
     // when the alias itself did not change. Unrelated metadata preserves the
     // durable interpretation admitted for this session.
     const presetContract = input.preset === undefined
       ? currentPresetBinding.contract
-      : currentPresetContract;
+      : activePresetBinding(preset).contract;
     const now = this.#now();
     const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,preset_contract=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], presetContract, fast ? 1 : 0, project, now, current.id, current.revision);
     if (result.changes !== 1) throw new Error("Session metadata revision conflict.");
@@ -20487,6 +21302,9 @@ export class StateStore {
           transcriptDigest: evidence.transcriptDigest,
           seedDigest: evidence.seedDigest,
           seedOmittedRecords: evidence.seedOmittedRecords,
+          ...(evidence.seedRetentionGapReason === undefined
+            ? {}
+            : { seedRetentionGapReason: evidence.seedRetentionGapReason }),
         },
         providerConnectionId: null,
         providerGeneration: targetProfile.processGeneration,
@@ -20676,6 +21494,42 @@ export class StateStore {
            AND m.state IN ('effect_started','ambiguous')
            AND r.attempt_id IS NULL`,
       ).run(terminalizationEvidence, now, current.id, current.id);
+      // Provider deletion and managed-Claude account release are definitive:
+      // no source in this session can still produce a transcript event. Fold
+      // every staged intent to its bounded actor receipt in the same
+      // transaction as operation settlement, then release attachment custody.
+      // Otherwise a terminal source remains permanently "pending" and its
+      // manifest is exempt from the normal bounded-retention pruning path.
+      this.#database.query(
+        `UPDATE queue_entries SET transcript_status='abandoned',
+           transcript_intent_json=json_object(
+             'version',1,
+             'actor',json_extract(transcript_intent_json,'$.actor'),
+             'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+               json_extract(transcript_intent_json,'$.attachments')),0)>0
+               THEN 'true' ELSE 'false' END))
+         WHERE session_id=? AND transcript_status='pending'`,
+      ).run(current.id);
+      this.#database.query(
+        `UPDATE mutation_attempts SET transcript_status='abandoned',
+           transcript_intent_json=json_object(
+             'version',1,
+             'actor',json_extract(transcript_intent_json,'$.actor'),
+             'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+               json_extract(transcript_intent_json,'$.attachments')),0)>0
+               THEN 'true' ELSE 'false' END))
+         WHERE authority_id=? AND kind IN ('session.send','session.steer')
+           AND transcript_status='pending'`,
+      ).run(current.id);
+      const releasedAttachments = this.#database.query(
+        "DELETE FROM message_attachments WHERE session_id=?",
+      ).run(current.id);
+      if (releasedAttachments.changes > 0) {
+        // Secure deletion has already been enabled for this connection. The
+        // durable scrub authority additionally forces the superseded WAL
+        // frames out before this terminalization reports success.
+        requireQueueMessageScrub(this.#database, now, false);
+      }
       this.#database.query(
         `UPDATE session_tasks
          SET status='paused',revision=revision+1,next_due_at=NULL,
@@ -24484,6 +25338,41 @@ export class StateStore {
     return { action, attempt };
   }
 
+  #isWorkSessionMessageSource(input: Readonly<{
+    idempotencyKey: string;
+    sessionId: SessionId;
+    kind: "session.send" | "session.steer";
+    profileGeneration?: number;
+  }>): boolean {
+    const rows = this.#database.query(
+      `SELECT instruction_json,instruction_digest,work_id,subject_id,effect_kind
+       FROM work_prepared_effects
+       WHERE json_extract(instruction_json,'$.nestedMutationKey')=? LIMIT 2`,
+    ).all(input.idempotencyKey);
+    if (rows.length === 0) return false;
+    if (rows.length !== 1) throw new Error("SESSION_MESSAGE_ACTOR_AMBIGUOUS");
+    const row = z.object({
+      instruction_json: z.string(),
+      instruction_digest: sha256Schema,
+      work_id: z.string(),
+      subject_id: z.string(),
+      effect_kind: z.enum(["attempt_dispatch", "signal_send"]),
+    }).strict().parse(rows[0]);
+    const effect = workPreparedEffectSchema.parse(JSON.parse(row.instruction_json) as unknown);
+    if (
+      createHash("sha256").update(row.instruction_json).digest("hex") !== row.instruction_digest
+      || effect.workId !== row.work_id
+      || (effect.kind === "dispatch" ? effect.attemptId : effect.signalId) !== row.subject_id
+      || (effect.kind === "dispatch" ? "attempt_dispatch" : "signal_send") !== row.effect_kind
+      || effect.nestedMutationKey !== input.idempotencyKey
+      || effect.targetSessionId !== input.sessionId
+      || (effect.kind === "dispatch" ? input.kind !== "session.send"
+        : effect.mode !== "steer" || input.kind !== "session.steer")
+      || (input.profileGeneration !== undefined && effect.accountGeneration !== input.profileGeneration)
+    ) throw new Error("SESSION_WORK_MESSAGE_AUTHORITY_INVALID");
+    return true;
+  }
+
   sessionMessageActorForSource(
     sessionId: SessionId,
     sourceId: string,
@@ -24503,7 +25392,7 @@ export class StateStore {
         .strict().nullable().parse(this.#database.query(
           `SELECT message_actor FROM queue_entries WHERE id=? AND session_id=?`,
         ).get(parsedSourceId.data, parsedSessionId));
-      return queued?.message_actor ?? null;
+      return queued === null ? null : this.queueMessageActor(queueIdSchema.parse(parsedSourceId.data));
     }
     if (!attemptIdSchema.safeParse(parsedSourceId.data).success) return null;
     const mutation = z.object({
@@ -24534,6 +25423,11 @@ export class StateStore {
     if (this.isPeerSessionMessageSource(parsedSessionId, parsedSourceId.data)) {
       return "peer_session";
     }
+    if (this.#isWorkSessionMessageSource({
+      idempotencyKey: mutation.idempotency_key,
+      sessionId: parsedSessionId,
+      kind: mutation.kind,
+    })) return "automation";
     return "human";
   }
 
@@ -25292,16 +26186,32 @@ export class StateStore {
     return queued;
   }
 
-  enqueueIdempotent(input: { sessionId: SessionId; profileGeneration: number; message: string; idempotencyKey?: string }): QueueRecord {
+  enqueueIdempotent(input: {
+    sessionId: SessionId;
+    profileGeneration: number;
+    message: string;
+    actor?: SessionMessageActor;
+    attachments?: readonly AttachmentReference[];
+    storedAttachments?: readonly StoredMessageAttachment[];
+    providerConnectionId?: string | null;
+    idempotencyKey?: string;
+  }): QueueRecord {
     const parsedSessionId = sessionIdSchema.parse(input.sessionId);
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
     const parsedMessage = z.string().min(1).max(262_144).parse(input.message);
+    const actor = sessionMessageActorSchema.parse(input.actor ?? "human");
+    const attachments = input.attachments === undefined || input.attachments.length === 0
+      ? []
+      : attachmentReferenceListSchema.parse(input.attachments);
     let queueId: QueueId | undefined;
     const enqueue = this.#database.transaction(() => {
       const attempt = this.prepareMutation({
         kind: "session.queue",
         authorityId: parsedSessionId,
         authorityGeneration: parsedGeneration,
+        // Actor is durable receipt provenance, not caller-controlled request
+        // identity. Keeping the historical request digest preserves recovery
+        // of nested Work effects created by an older build.
         request: { message: parsedMessage },
         ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
       });
@@ -25309,23 +26219,117 @@ export class StateStore {
         if (attempt.state !== "applied" && attempt.state !== "reconciled") {
           throw new Error(`QUEUE_MUTATION_${attempt.state.toUpperCase()}`);
         }
-        queueId = z.object({ queueId: queueIdSchema }).strict().parse(attempt.result).queueId;
+        const replay = z.object({
+          queueId: queueIdSchema,
+          actor: sessionMessageActorSchema.optional(),
+        }).strict().parse(attempt.result);
+        if (replay.actor !== undefined && replay.actor !== actor) {
+          throw new Error("IDEMPOTENCY_CONFLICT");
+        }
+        queueId = replay.queueId;
+        const transcript = this.readSessionUserMessageSource(
+          parsedSessionId,
+          "queue",
+          replay.queueId,
+        );
+        if (transcript.intent !== undefined && transcript.intent.actor !== actor) {
+          throw new Error("IDEMPOTENCY_CONFLICT");
+        }
+        const manifest = this.messageAttachmentManifest(parsedSessionId, replay.queueId);
+        const hadAttachments = transcript.intent === undefined
+          ? undefined
+          : "text" in transcript.intent
+            ? (transcript.intent.attachments?.length ?? 0) > 0
+            : transcript.intent.hadAttachments;
+        if (manifest.length === 0 && hadAttachments === true) {
+          // Settled manifests have bounded retention. Once this one is pruned,
+          // no attachment-bearing replay can be proved exact, so fail closed
+          // without disturbing the already-applied queue receipt.
+          throw new Error("QUEUE_ATTACHMENT_REPLAY_EVIDENCE_PRUNED");
+        }
+        if (
+          (hadAttachments === false && manifest.length !== 0)
+          || JSON.stringify(manifest) !== JSON.stringify(attachments)
+        ) throw new Error("IDEMPOTENCY_CONFLICT");
         return;
       }
-      const authority = z.object({ process_generation: z.number().int().nonnegative(), session_state: sessionStateSchema }).strict().parse(
-        this.#database.query(`SELECT p.process_generation,s.state AS session_state FROM sessions s JOIN profiles p ON p.id=s.profile_id WHERE s.id=?`).get(parsedSessionId),
+      const authority = z.object({ profile_id: profileIdSchema, process_generation: z.number().int().nonnegative(), session_state: sessionStateSchema }).strict().parse(
+        this.#database.query(`SELECT s.profile_id,p.process_generation,s.state AS session_state FROM sessions s JOIN profiles p ON p.id=s.profile_id WHERE s.id=?`).get(parsedSessionId),
       );
       if (authority.process_generation !== parsedGeneration || authority.session_state === "recovery_required" || authority.session_state === "terminal") {
         throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       }
       const queued = this.#enqueuePrepared(parsedSessionId, parsedMessage);
       queueId = queued.id;
+      this.#stageSessionUserMessageIntentInTransaction({
+        sessionId: parsedSessionId,
+        sourceKind: "queue",
+        sourceId: queued.id,
+        intent: {
+          accountId: authority.profile_id,
+          providerGeneration: parsedGeneration,
+          providerConnectionId: input.providerConnectionId ?? null,
+          actor,
+          message: parsedMessage,
+          ...(attachments.length === 0 ? {} : { attachments }),
+          ...(input.storedAttachments === undefined
+            ? {}
+            : { storedAttachments: input.storedAttachments }),
+        },
+      });
       if (!this.transitionMutation(attempt.id, "prepared", "effect_started")) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-      if (!this.transitionMutation(attempt.id, "effect_started", "applied", { queueId: queued.id })) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+      if (!this.transitionMutation(attempt.id, "effect_started", "applied", {
+        queueId: queued.id,
+        ...(actor === "human" ? {} : { actor }),
+      })) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
     });
     enqueue.immediate();
     if (queueId === undefined) throw new Error("Queue transaction lost its durable receipt.");
     return this.requireQueue(queueId);
+  }
+
+  /** The durable source class admitted with a task occurrence or queue mutation. */
+  queueMessageActor(id: QueueId): SessionMessageActor {
+    const queueId = queueIdSchema.parse(id);
+    const source = this.#database.query(
+      "SELECT transcript_intent_json,message_actor FROM queue_entries WHERE id=?",
+    ).get(queueId);
+    if (source !== null) {
+      const row = z.object({
+        transcript_intent_json: z.string().nullable(),
+        message_actor: z.enum(["human", "peer_session"]),
+      }).strict().parse(source);
+      const intentJson = row.transcript_intent_json;
+      if (intentJson !== null) {
+        const actor = sessionUserMessageSourcePayloadSchema.parse(JSON.parse(intentJson) as unknown).actor;
+        if ((row.message_actor === "peer_session") !== (actor === "peer_session")) {
+          throw new Error("QUEUE_PEER_PROVENANCE_INVALID");
+        }
+        return actor;
+      }
+      if (row.message_actor === "peer_session") return "peer_session";
+    }
+    if (this.#database.query(
+      "SELECT 1 FROM session_task_occurrences WHERE queue_id=?",
+    ).get(queueId) !== null) return "automation";
+    const row = this.#database.query(
+      `SELECT json_extract(m.result_json,'$.actor') AS actor,
+              EXISTS(
+                SELECT 1 FROM work_prepared_effects w
+                WHERE json_extract(w.instruction_json,'$.nestedMutationKey')=m.idempotency_key
+              ) AS work_source
+       FROM mutation_attempts m
+       WHERE m.kind='session.queue'
+         AND m.state='applied'
+         AND json_extract(m.result_json,'$.queueId')=?
+       ORDER BY m.created_at,m.id LIMIT 1`,
+    ).get(queueId);
+    if (row === null) return "human";
+    const parsed = z.object({
+      actor: sessionMessageActorSchema.nullable(),
+      work_source: z.union([z.literal(0), z.literal(1)]),
+    }).strict().parse(row);
+    return parsed.actor ?? (parsed.work_source === 1 ? "automation" : "human");
   }
 
   listQueue(sessionId: SessionId): readonly QueueRecord[] {
@@ -25384,9 +26388,25 @@ export class StateStore {
     }
     const now = this.#now();
     const changed = z.object({ id: queueIdSchema }).strict().nullable().parse(
-      this.#database.query(
-        "UPDATE queue_entries SET state=?,updated_at=? WHERE id=? AND state=? RETURNING id",
-      ).get(parsedTo, now, id, parsedFrom),
+      parsedTo === "failed" || parsedTo === "cancelled"
+        ? this.#database.query(
+            `UPDATE queue_entries
+             SET state=?,updated_at=?,
+                 transcript_status=CASE WHEN transcript_status='pending'
+                   THEN 'abandoned' ELSE transcript_status END,
+                 transcript_intent_json=CASE WHEN transcript_status='pending'
+                   THEN json_object(
+                     'version',1,
+                     'actor',json_extract(transcript_intent_json,'$.actor'),
+                     'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+                       json_extract(transcript_intent_json,'$.attachments')),0)>0
+                       THEN 'true' ELSE 'false' END))
+                   ELSE transcript_intent_json END
+             WHERE id=? AND state=? RETURNING id`,
+          ).get(parsedTo, now, id, parsedFrom)
+        : this.#database.query(
+            "UPDATE queue_entries SET state=?,updated_at=? WHERE id=? AND state=? RETURNING id",
+          ).get(parsedTo, now, id, parsedFrom),
     );
     if (changed !== null && (parsedTo === "applied" || parsedTo === "failed" || parsedTo === "cancelled")) {
       completePendingSecurityScrub(this.#database, true, this.#securityScrubCheckpoint);
@@ -25465,11 +26485,15 @@ export class StateStore {
     queueId: QueueId;
     sessionId: SessionId;
     profileGeneration: number;
+    providerConnectionId: string;
     evidence: QueueEffectEvidence;
   }): QueueEffectEvidenceRecord {
     const queueId = queueIdSchema.parse(input.queueId);
     const sessionId = sessionIdSchema.parse(input.sessionId);
     const generation = z.number().int().nonnegative().parse(input.profileGeneration);
+    const providerConnectionId = z.string().uuid().parse(
+      input.providerConnectionId,
+    );
     const evidence = queueEffectEvidenceSchema.parse(input.evidence);
     if (evidence.queueId !== queueId || evidence.sessionId !== sessionId || evidence.profileGeneration !== generation) {
       throw new Error("QUEUE_EFFECT_REQUEST_MISMATCH");
@@ -25483,13 +26507,16 @@ export class StateStore {
         queue_state: z.literal("pending"),
         queue_session_id: sessionIdSchema,
         queue_message: z.string().min(1).max(262_144),
+        transcript_intent_json: z.string().nullable(),
+        transcript_status: sessionUserMessageTranscriptStatusSchema,
         profile_id: profileIdSchema,
         provider_thread_id: providerThreadIdSchema,
         session_state: z.literal("idle"),
         process_generation: z.number().int().nonnegative(),
         peer_action_id: peerActionIdSchema.nullable(),
       }).strict().parse(this.#database.query(`SELECT q.state AS queue_state,q.session_id AS queue_session_id,q.message AS queue_message,
-                                                     q.peer_action_id,s.profile_id,s.provider_thread_id,s.state AS session_state,p.process_generation
+                                                     q.peer_action_id,q.transcript_status,q.transcript_intent_json,
+                                                     s.profile_id,s.provider_thread_id,s.state AS session_state,p.process_generation
                                               FROM queue_entries q
                                               JOIN sessions s ON s.id=q.session_id
                                               JOIN profiles p ON p.id=s.profile_id
@@ -25512,6 +26539,92 @@ export class StateStore {
           || action.delivery !== "queue"
           || action.messageDigest !== evidence.messageDigest
         ) throw new Error("QUEUE_PEER_ACTION_AUTHORITY_CHANGED");
+      }
+      if (authority.transcript_status === "none") {
+        const storedAttachments = this.#database.query(
+          `SELECT ma.byte_length,ma.digest,ma.media_type,ma.name,
+                  a.media_type AS canonical_media_type
+           FROM message_attachments ma
+           JOIN attachments a ON a.digest=ma.digest
+           WHERE ma.session_id=? AND ma.source_id=? ORDER BY ma.position`,
+        ).all(sessionId, queueId).map((value) => {
+          const row = z.object({
+            byte_length: z.number().int().positive(),
+            canonical_media_type: attachmentMediaTypeSchema,
+            digest: attachmentDigestSchema,
+            media_type: attachmentMediaTypeSchema,
+            name: attachmentNameSchema,
+          }).strict().parse(value);
+          return storedMessageAttachmentSchema.parse({
+            byteLength: row.byte_length,
+            canonicalMediaType: row.canonical_media_type,
+            digest: row.digest,
+            mediaType: row.media_type,
+            name: row.name,
+          });
+        });
+        this.#stageSessionUserMessageIntentInTransaction({
+          sessionId,
+          sourceKind: "queue",
+          sourceId: queueId,
+          intent: {
+            accountId: authority.profile_id,
+            providerGeneration: generation,
+            providerConnectionId,
+            actor: this.queueMessageActor(queueId),
+            message: authority.queue_message,
+            ...(storedAttachments.length === 0
+              ? {}
+              : {
+                  attachments: storedAttachments.map((attachment) => ({
+                    byteLength: attachment.byteLength,
+                    digest: attachment.digest,
+                    mediaType: attachment.mediaType,
+                    name: attachment.name,
+                  })),
+                  storedAttachments,
+                }),
+          },
+        });
+      } else if (authority.transcript_status === "pending") {
+        if (authority.transcript_intent_json === null) {
+          throw new Error("QUEUE_EFFECT_TRANSCRIPT_AUTHORITY_CHANGED");
+        }
+        const prior = sessionUserMessageIntentSchema.parse(
+          JSON.parse(authority.transcript_intent_json) as unknown,
+        );
+        const rebound = canonicalSessionUserMessageIntent({
+          accountId: authority.profile_id,
+          providerGeneration: generation,
+          providerConnectionId,
+          actor: prior.actor,
+          message: authority.queue_message,
+          ...(prior.attachments === undefined
+            ? {}
+            : { attachments: prior.attachments }),
+        });
+        if (
+          prior.actor !== rebound.intent.actor
+          || prior.text !== rebound.intent.text
+          || prior.omittedCharacters !== rebound.intent.omittedCharacters
+          || JSON.stringify(prior.attachments ?? [])
+            !== JSON.stringify(rebound.intent.attachments ?? [])
+        ) throw new Error("QUEUE_EFFECT_TRANSCRIPT_AUTHORITY_CHANGED");
+        const reboundIntent = this.#database.query(
+          `UPDATE queue_entries SET transcript_intent_json=?
+           WHERE id=? AND session_id=? AND state='pending'
+             AND transcript_status='pending' AND transcript_intent_json=?`,
+        ).run(
+          rebound.json,
+          queueId,
+          sessionId,
+          authority.transcript_intent_json,
+        );
+        if (reboundIntent.changes !== 1) {
+          throw new Error("QUEUE_EFFECT_TRANSCRIPT_AUTHORITY_CHANGED");
+        }
+      } else {
+        throw new Error("QUEUE_EFFECT_TRANSCRIPT_AUTHORITY_CHANGED");
       }
       this.#database.query("INSERT INTO queue_effect_evidence(queue_id,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?)").run(queueId, canonical, digest, now);
       const changed = z.object({ id: queueIdSchema }).strict().nullable().parse(
@@ -25946,7 +27059,8 @@ export class StateStore {
              VALUES (?,?,?)`,
           ).run(row.session_id, targetTurnDigest, row.peer_action_id);
         }
-      } else if (row.peer_action_id !== null) {
+      } else {
+        if (row.peer_action_id !== null) {
         const actionChanged = this.#database.query(
           `UPDATE peer_session_actions
            SET state='failed',result_digest=?,updated_at=MAX(updated_at,?)
@@ -25960,6 +27074,17 @@ export class StateStore {
           evidence.messageDigest,
         );
         if (actionChanged.changes !== 1) throw new Error("QUEUE_PEER_ACTION_CAS_CONFLICT");
+        }
+        this.#database.query(
+          `UPDATE queue_entries SET transcript_status='abandoned',
+             transcript_intent_json=json_object(
+               'version',1,
+               'actor',json_extract(transcript_intent_json,'$.actor'),
+               'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+                 json_extract(transcript_intent_json,'$.attachments')),0)>0
+                 THEN 'true' ELSE 'false' END))
+           WHERE id=? AND transcript_status='pending'`,
+        ).run(queueId);
       }
       this.#database.query("INSERT INTO queue_effect_resolutions(queue_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)").run(
         queueId,
@@ -26332,8 +27457,7 @@ export class StateStore {
           !== directPeerSource.message_digest
       ) throw new Error("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
     }
-    const canonical = JSON.stringify({ kind: input.kind, authorityId: input.authorityId, authorityGeneration: input.authorityGeneration, request: input.request });
-    const digest = createHash("sha256").update(canonical).digest("hex");
+    const digest = mutationRequestDigest(input);
     const existing = this.readMutation(idempotencyKey);
     if (existing !== null) {
       if (
@@ -26366,7 +27490,23 @@ export class StateStore {
     }
     const now = this.#now();
     const resultJson = result === undefined ? null : JSON.stringify(result);
-    const update = this.#database.query("UPDATE mutation_attempts SET state=?,result_json=?,updated_at=? WHERE id=? AND state=?").run(to, resultJson, now, id, from);
+    const update = to === "failed" || to === "cancelled"
+      ? this.#database.query(
+          `UPDATE mutation_attempts
+           SET state=?,result_json=?,updated_at=?,
+               transcript_status=CASE WHEN transcript_status='pending'
+                 THEN 'abandoned' ELSE transcript_status END,
+               transcript_intent_json=CASE WHEN transcript_status='pending'
+                 THEN json_object(
+                   'version',1,
+                   'actor',json_extract(transcript_intent_json,'$.actor'),
+                   'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+                     json_extract(transcript_intent_json,'$.attachments')),0)>0
+                     THEN 'true' ELSE 'false' END))
+                 ELSE transcript_intent_json END
+           WHERE id=? AND state=?`,
+        ).run(to, resultJson, now, id, from)
+      : this.#database.query("UPDATE mutation_attempts SET state=?,result_json=?,updated_at=? WHERE id=? AND state=?").run(to, resultJson, now, id, from);
     return update.changes === 1;
   }
 
@@ -26378,10 +27518,12 @@ export class StateStore {
     | Readonly<{
         evidence: Extract<MutationEffectEvidence, { kind: "session.send" | "session.steer" }>;
         message: string;
+        transcript: SessionUserMessageIntentInput & Readonly<{ providerConnectionId: string }>;
       }>
     | Readonly<{
         evidence: Extract<MutationEffectEvidence, { kind: "session.stop" | "session.rename" }>;
         message?: never;
+        transcript?: never;
       }>
   )): MutationEffectEvidenceRecord {
     const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
@@ -26396,7 +27538,9 @@ export class StateStore {
       if (createHash("sha256").update(message, "utf8").digest("hex") !== parsedEvidence.messageDigest) {
         throw new Error("SESSION_MESSAGE_DIGEST_MISMATCH");
       }
-      const source = z.object({ idempotency_key: z.string().uuid() }).strict().parse(
+      // Retained native mutation keys predate the public UUID admission contract.
+      // Preserve their bounded source identity when deriving transcript authorship.
+      const source = z.object({ idempotency_key: z.string().min(1).max(200) }).strict().parse(
         this.#database.query(
           "SELECT idempotency_key FROM mutation_attempts WHERE id=?",
         ).get(parsedAttemptId),
@@ -26427,14 +27571,22 @@ export class StateStore {
         `SELECT 1 FROM autorespond_message_sources
          WHERE session_id=? AND source_id=? LIMIT 1`,
       ).get(parsedSessionId, parsedAttemptId) !== null;
-      if (Number(peerAuthored) + Number(autorespondAuthored) > 1) {
+      const workAuthored = this.#isWorkSessionMessageSource({
+        idempotencyKey: source.idempotency_key,
+        sessionId: parsedSessionId,
+        kind: parsedEvidence.kind,
+        profileGeneration: parsedGeneration,
+      });
+      if (Number(peerAuthored) + Number(autorespondAuthored) + Number(workAuthored) > 1) {
         throw new Error("SESSION_MESSAGE_ACTOR_AMBIGUOUS");
       }
       const messageActor: SessionMessageActor = peerAuthored
         ? "peer_session"
         : autorespondAuthored
           ? "autorespond"
-          : "human";
+          : workAuthored
+            ? "automation"
+            : "human";
       if (
         parsedEvidence.messageActor !== undefined
         && parsedEvidence.messageActor !== messageActor
@@ -26512,6 +27664,26 @@ export class StateStore {
             throw new Error("PEER_SESSION_MUTATION_JOIN_INVALID");
           }
         }
+      }
+      if (evidence.kind === "session.send" || evidence.kind === "session.steer") {
+        if (input.transcript === undefined) {
+          throw new Error("SESSION_USER_MESSAGE_INTENT_REQUIRED");
+        }
+        if (
+          input.transcript.accountId !== authority.profile_id
+          || input.transcript.providerGeneration !== parsedGeneration
+          || input.transcript.actor !== evidence.messageActor
+          || input.transcript.message !== input.message
+        ) throw new Error("SESSION_USER_MESSAGE_INTENT_AUTHORITY_CHANGED");
+        z.string().uuid().parse(input.transcript.providerConnectionId);
+        this.#stageSessionUserMessageIntentInTransaction({
+          sessionId: parsedSessionId,
+          sourceKind: "mutation",
+          sourceId: parsedAttemptId,
+          intent: input.transcript,
+        });
+      } else if (input.transcript !== undefined) {
+        throw new Error("SESSION_USER_MESSAGE_INTENT_UNEXPECTED");
       }
       this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
       if (
@@ -26596,13 +27768,32 @@ export class StateStore {
           manifestDigest: sha256Schema.parse(input.hostCapabilities.manifestDigest),
         };
     assertPresetSupportedByProvider(parsedProvider, parsedPreset);
+    const presetBinding = activePresetBinding(parsedPreset);
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
-    if (evidence.projectId !== parsedProjectId) throw new Error("MUTATION_EFFECT_REQUEST_MISMATCH");
+    const expectedPresetContract = isReboundCodexPreset(parsedPreset)
+      ? presetBinding.contract
+      : undefined;
+    const expectedRequestDigest = mutationRequestDigest({
+      kind: "session.start",
+      authorityId: parsedProfileId,
+      authorityGeneration: parsedGeneration,
+      request: sessionStartMutationRequest({
+        projectId: parsedProjectId,
+        provider: parsedProvider,
+        preset: parsedPreset,
+        presetContract: evidence.presetContract,
+        fast: input.fastEnabled,
+      }),
+    });
+    if (
+      evidence.projectId !== parsedProjectId
+      || evidence.presetContract !== expectedPresetContract
+    ) throw new Error("MUTATION_EFFECT_REQUEST_MISMATCH");
     if (evidence.runtimeProfile !== undefined) {
       assertRuntimeProfileRequirement(
         evidence.runtimeProfile,
         parsedPreset,
-        presetRequirementForContract(parsedPreset, currentPresetContract),
+        presetBinding.requirement,
         "MUTATION_EFFECT_RUNTIME_PROFILE_PRESET_CONTRACT_MISMATCH",
       );
     }
@@ -26622,13 +27813,14 @@ export class StateStore {
     const sessionId = createSessionId();
     const now = this.#now();
     const begin = this.#database.transaction(() => {
-      const authority = z.object({ kind: z.literal("session.start"), authority_id: profileIdSchema, authority_generation: z.number().int().nonnegative(), state: z.literal("prepared"), process_generation: z.number().int().nonnegative(), profile_state: profileStateSchema, provider_email: z.string().nullable() }).strict().parse(
-        this.#database.query(`SELECT m.kind,m.authority_id,m.authority_generation,m.state,p.process_generation,p.state AS profile_state,p.provider_email
+      const authority = z.object({ kind: z.literal("session.start"), authority_id: profileIdSchema, authority_generation: z.number().int().nonnegative(), request_digest: sha256Schema, state: z.literal("prepared"), process_generation: z.number().int().nonnegative(), profile_state: profileStateSchema, provider_email: z.string().nullable() }).strict().parse(
+        this.#database.query(`SELECT m.kind,m.authority_id,m.authority_generation,m.request_digest,m.state,p.process_generation,p.state AS profile_state,p.provider_email
                               FROM mutation_attempts m JOIN profiles p ON p.id=m.authority_id WHERE m.id=?`).get(parsedAttemptId),
       );
       if (
         authority.authority_id !== parsedProfileId
         || authority.authority_generation !== parsedGeneration
+        || authority.request_digest !== expectedRequestDigest
         || authority.process_generation !== parsedGeneration
         || !profileStateAllowsProviderSessionAuthority(
           parsedProvider,
@@ -26636,7 +27828,7 @@ export class StateStore {
         )
         || (parsedProvider === "codex" && authority.provider_email === null)
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", legacySessionProviderShadow(parsedProvider), parsedProvider, presetTiers[parsedPreset], currentPresetContract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", legacySessionProviderShadow(parsedProvider), parsedProvider, presetTiers[parsedPreset], presetBinding.contract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(sessionId, now);
       this.#bindSessionProviderAccountAuthorityLocked({
           sessionId,
@@ -26700,6 +27892,16 @@ export class StateStore {
     if (evidence.targetHostCapabilities === undefined) {
       throw new Error("SESSION_PROVIDER_SWITCH_HOST_CAPABILITY_MISMATCH");
     }
+    const targetPresetBinding = activePresetBinding(evidence.targetPreset);
+    const expectedPresetContract = providerSwitchRequiresPresetContract(
+      evidence.targetProvider,
+      evidence.requestedPreset ?? undefined,
+    )
+      ? sharedActiveCodexPresetContract()
+      : undefined;
+    if (evidence.presetContract !== expectedPresetContract) {
+      throw new Error("SESSION_PROVIDER_SWITCH_PRESET_CONTRACT_MISMATCH");
+    }
     const providerAuthentication = input.providerAuthentication === undefined
       ? undefined
       : providerAuthenticationSchema.parse(input.providerAuthentication);
@@ -26712,7 +27914,7 @@ export class StateStore {
     assertRuntimeProfileRequirement(
       evidence.runtimeProfile,
       evidence.targetPreset,
-      presetRequirementForContract(evidence.targetPreset, currentPresetContract),
+      targetPresetBinding.requirement,
       "SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_PRESET_CONTRACT_MISMATCH",
     );
     if (
@@ -26728,6 +27930,18 @@ export class StateStore {
     }
     const canonical = JSON.stringify(evidence);
     const digest = digestJson(evidence);
+    const expectedRequestDigest = mutationRequestDigest({
+      kind: "session.switch",
+      authorityId: sessionId,
+      authorityGeneration: evidence.targetProcessGeneration,
+      request: sessionProviderSwitchMutationRequest({
+        provider: evidence.targetProvider,
+        preset: evidence.targetPreset,
+        presetContract: evidence.presetContract,
+        targetProfileId: evidence.targetProfileId,
+        seedDigest: evidence.seedDigest,
+      }),
+    });
     const now = this.#now();
     const record = this.#database.transaction(() => {
       assertSupportedProvider(this.requireSession(sessionId).provider);
@@ -26736,6 +27950,7 @@ export class StateStore {
         kind: z.literal("session.switch"),
         authority_id: sessionIdSchema,
         authority_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        request_digest: sha256Schema,
         mutation_state: z.literal("prepared"),
         source_profile_id: profileIdSchema,
         source_process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -26748,7 +27963,7 @@ export class StateStore {
         target_provider_email: z.string().nullable(),
       }).strict().parse(this.#database.query(
         `SELECT (SELECT generation FROM daemon_state WHERE singleton=1) AS daemon_generation,
-                m.kind,m.authority_id,m.authority_generation,m.state AS mutation_state,
+                m.kind,m.authority_id,m.authority_generation,m.request_digest,m.state AS mutation_state,
                 s.profile_id AS source_profile_id,sp.process_generation AS source_process_generation,
                 s.provider_v39 AS source_provider,s.provider_thread_id AS source_provider_thread_id,
                 s.preset AS source_preset,s.state AS session_state,
@@ -26765,6 +27980,7 @@ export class StateStore {
         || authority.daemon_generation !== evidence.daemonGeneration
         || authority.authority_id !== sessionId
         || authority.authority_generation !== evidence.targetProcessGeneration
+        || authority.request_digest !== expectedRequestDigest
         || authority.source_profile_id !== evidence.sourceProfileId
         || authority.source_process_generation !== evidence.sourceProcessGeneration
         || authority.source_provider !== evidence.sourceProvider
@@ -28410,6 +29626,22 @@ export class StateStore {
           }, now);
         }
       }
+      if (effectEvidence.kind === "session.send" || effectEvidence.kind === "session.steer") {
+        if (resolution === "abandoned") {
+          this.#database.query(
+            `UPDATE mutation_attempts SET transcript_status='abandoned',
+               transcript_intent_json=json_object(
+                 'version',1,
+                 'actor',json_extract(transcript_intent_json,'$.actor'),
+                 'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+                   json_extract(transcript_intent_json,'$.attachments')),0)>0
+                   THEN 'true' ELSE 'false' END))
+             WHERE id=? AND transcript_status='pending'`,
+          ).run(parsedAttemptId);
+        } else if (resolution !== "proven_applied") {
+          throw new Error("SESSION_USER_MESSAGE_RECOVERY_RESOLUTION_INVALID");
+        }
+      }
       if (
         resolution === "proven_applied"
         && effectEvidence.kind === "session.start"
@@ -28496,6 +29728,9 @@ export class StateStore {
             transcriptDigest: effectEvidence.transcriptDigest,
             seedDigest: effectEvidence.seedDigest,
             seedOmittedRecords: effectEvidence.seedOmittedRecords,
+            ...(effectEvidence.seedRetentionGapReason === undefined
+              ? {}
+              : { seedRetentionGapReason: effectEvidence.seedRetentionGapReason }),
           },
           providerConnectionId: null,
           providerGeneration: targetProfile.processGeneration,
@@ -28528,23 +29763,39 @@ export class StateStore {
         resolution === "proven_applied"
         && (effectEvidence.kind === "session.send" || effectEvidence.kind === "session.steer")
       ) {
-        const message = z.string().min(1).max(262_144).parse(input.message);
         const recoveredTurn = effectEvidence.kind === "session.send"
           ? z.object({ turnId: z.string().min(1).max(200) }).passthrough().parse(input.receipt).turnId
           : z.object({ activeTurnId: z.string().min(1).max(200) }).passthrough().parse(input.receipt).activeTurnId;
         const resolvedSession = this.requireSession(sessionId);
         const resolvedProfile = this.requireProfileById(resolvedSession.profileId);
-        messageEvent = this.#appendSessionUserMessageEventOnceInTransaction({
-          sourceId: parsedAttemptId,
-          sessionId,
-          accountId: resolvedSession.profileId,
-          providerGeneration: resolvedProfile.processGeneration,
-          providerConnectionId: null,
-          turnId: recoveredTurn,
-          message,
-          recordedAt: now,
-        });
-        if (effectEvidence.kind === "session.send" && effectEvidence.messageActor === "human") {
+        if (input.message === undefined) {
+          const source = this.#database.query(
+            "SELECT transcript_status FROM mutation_attempts WHERE id=? AND authority_id=?",
+          ).get(parsedAttemptId, sessionId);
+          if (z.object({ transcript_status: sessionUserMessageTranscriptStatusSchema }).strict()
+            .parse(source).transcript_status === "pending") {
+            const event = this.#finalizeSessionUserMessageSourceInTransaction({
+              sourceId: parsedAttemptId,
+              sourceKind: "mutation",
+              sessionId,
+              turnId: recoveredTurn,
+              recordedAt: now,
+            });
+            if (event !== null) messageEvent = { event, appended: true };
+          }
+        } else {
+          messageEvent = this.#appendSessionUserMessageEventOnceInTransaction({
+            sourceId: parsedAttemptId,
+            sessionId,
+            accountId: resolvedSession.profileId,
+            providerGeneration: resolvedProfile.processGeneration,
+            providerConnectionId: null,
+            turnId: recoveredTurn,
+            message: z.string().min(1).max(262_144).parse(input.message),
+            recordedAt: now,
+          });
+        }
+        if (messageEvent?.appended === true && effectEvidence.kind === "session.send" && effectEvidence.messageActor === "human") {
           this.#database.query(
             `UPDATE session_autorespond_counters
              SET consecutive_count=0,updated_at=? WHERE session_id=?`,
@@ -30246,6 +31497,8 @@ export class StateStore {
     providerConnectionId: string | null;
     body: SessionEventBody;
     recordedAt: number;
+    userMessageSourceKind?: "mutation" | "queue";
+    allowHistoricalTranscriptAuthority?: boolean;
   }>): SessionEvent {
     const authority = z.object({
       profile_id: profileIdSchema,
@@ -30256,7 +31509,9 @@ export class StateStore {
     ).get(input.sessionId));
     if (
       authority.profile_id !== input.accountId
-      || authority.process_generation !== input.providerGeneration
+      || (input.allowHistoricalTranscriptAuthority === true
+        ? authority.process_generation < input.providerGeneration
+        : authority.process_generation !== input.providerGeneration)
     ) throw new Error("SESSION_EVENT_AUTHORITY_CHANGED");
     this.#ensureSessionEventStream(input.sessionId);
     const stream = z.object({
@@ -30298,6 +31553,67 @@ export class StateStore {
       eventJson,
       eventBytes,
     );
+    if (input.userMessageSourceKind !== undefined) {
+      if (input.body.type !== "user_message" || input.body.sourceId === undefined) {
+        throw new Error("SESSION_USER_MESSAGE_SOURCE_FINALIZATION_INVALID");
+      }
+      const finalized = input.userMessageSourceKind === "mutation"
+        ? this.#database.query(
+            `UPDATE mutation_attempts
+             SET transcript_finalized=1,transcript_status='finalized',
+                 transcript_intent_json=?
+             WHERE authority_id=? AND idempotency_key=?
+               AND kind IN ('session.send','session.steer')
+               AND transcript_finalized=0 AND transcript_status='pending'`,
+          ).run(
+            sessionUserMessageActorReceiptJson({
+              actor: input.body.actor,
+              ...(input.body.attachments === undefined
+                ? {}
+                : { attachments: input.body.attachments }),
+            }),
+            input.sessionId,
+            input.body.sourceId,
+          )
+        : this.#database.query(
+            `UPDATE queue_entries
+             SET transcript_finalized=1,transcript_status='finalized',
+                 transcript_intent_json=?
+             WHERE session_id=? AND id=?
+               AND transcript_finalized=0 AND transcript_status='pending'`,
+          ).run(
+            sessionUserMessageActorReceiptJson({
+              actor: input.body.actor,
+              ...(input.body.attachments === undefined
+                ? {}
+                : { attachments: input.body.attachments }),
+            }),
+            input.sessionId,
+            input.body.sourceId,
+          );
+      if (finalized.changes !== 1) {
+        throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+      }
+      // The first durable message finalization alone changes the consecutive
+      // autorespond budget: human prose reopens it and autorespond prose spends
+      // one. Keeping both changes in the event/source transaction makes exact
+      // replay neutral and leaves a failed finalization fully retryable.
+      if (input.body.actor === "human") {
+        this.#database.query(
+          `UPDATE session_autorespond_counters
+           SET consecutive_count=0,updated_at=? WHERE session_id=?`,
+        ).run(input.recordedAt, input.sessionId);
+      } else if (input.body.actor === "autorespond") {
+        this.#database.query(
+          `INSERT INTO session_autorespond_counters(
+             session_id,consecutive_count,updated_at
+           ) VALUES (?,1,?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             consecutive_count=consecutive_count+1,
+             updated_at=excluded.updated_at`,
+        ).run(input.sessionId, input.recordedAt);
+      }
+    }
     const advanced = this.#database.query(
       `UPDATE session_event_streams
        SET next_sequence=?,observed_through_sequence=?,updated_at=MAX(updated_at,?)
@@ -30346,6 +31662,7 @@ export class StateStore {
     providerGeneration: number;
     providerConnectionId: string | null;
     body: SessionEventBody;
+    userMessageSourceKind?: "mutation" | "queue";
   }): SessionEvent {
     const parsed = {
       sessionId: sessionIdSchema.parse(input.sessionId),
@@ -30355,6 +31672,9 @@ export class StateStore {
       providerConnectionId: z.string().uuid().nullable().parse(input.providerConnectionId),
       body: sessionEventBodySchema.parse(input.body),
       recordedAt: unixMillisecondsSchema.parse(this.#now()),
+      ...(input.userMessageSourceKind === undefined
+        ? {}
+        : { userMessageSourceKind: input.userMessageSourceKind }),
     };
     const append = this.#database.transaction(
       () => this.#appendSessionEventInTransaction(parsed),
@@ -30383,7 +31703,8 @@ export class StateStore {
    * projected body: those are derived from immutable effect evidence. A retry
    * returns the original retained event. Event retention removes its source
    * marker in the same delete statement, so the dedupe index shares the exact
-   * event-stream bounds.
+   * event-stream bounds. Durable v43 finalized status outlives that marker and
+   * refuses reappend after pruning; the retained marker is not sole authority.
    */
   appendSessionUserMessageEventOnce(input: Readonly<{
     sourceId: AttemptId;
@@ -30500,7 +31821,7 @@ export class StateStore {
     ) throw new Error("SESSION_MESSAGE_DIGEST_MISMATCH");
     return this.#appendUserMessageEventSourceInTransaction({
       ...input,
-      actor: source.message_actor,
+      actor: this.queueMessageActor(input.sourceId),
       message: input.message,
       sourceKind: "queue",
     });
@@ -30518,74 +31839,39 @@ export class StateStore {
     message: string;
     recordedAt: number;
   }>): SessionUserMessageEventAppendResult {
-    const message = z.string().min(1).max(262_144).parse(input.message);
-    const retainedRawLength = Math.min(
-      message.length,
-      SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
-    );
-    const text = sanitizeSessionUserMessage(message)
-      .slice(0, SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS);
-    const body = sessionEventBodySchema.parse(projectPublicSessionEventBody({
-      type: "user_message",
-      turnId: input.turnId,
-      actor: input.actor,
-      text,
-      omittedCharacters: message.length - retainedRawLength,
-    }, this.#publicProviderIdentifierProjector));
-    if (body.type !== "user_message") throw new Error("SESSION_MESSAGE_EVENT_BODY_INVALID");
-    const bodyDigest = digestJson(body);
-    const existingRow = this.#database.query(
-      `SELECT * FROM session_message_event_sources
-       WHERE source_id=?`,
-    ).get(input.sourceId);
-    if (existingRow !== null) {
-      const existing = mapSessionMessageEventSource(existingRow);
-      if (
-        existing.sessionId !== input.sessionId
-        || existing.sourceKind !== input.sourceKind
-        || existing.actor !== body.actor
-        || existing.bodyDigest !== bodyDigest
-      ) throw new Error("SESSION_MESSAGE_EVENT_SOURCE_CONFLICT");
-      const stored = z.object({
-        event_json: z.string(),
-        projection_version: z.union([z.literal(1), z.literal(2)]),
-      }).strict().nullable().parse(this.#database.query(
-        `SELECT event_json,projection_version FROM session_events
-         WHERE session_id=? AND stream_epoch=? AND sequence=?`,
-      ).get(existing.sessionId, existing.streamEpoch, existing.eventSequence));
+    const expected = canonicalSessionUserMessageIntent(input).intent;
+    const expectedTurn = sessionEventBodySchema.parse(projectPublicSessionEventBody(
+      { type: "turn_started", turnId: input.turnId },
+      this.#publicProviderIdentifierProjector,
+    ));
+    if (expectedTurn.type !== "turn_started") throw new Error("SESSION_MESSAGE_EVENT_BODY_INVALID");
+    const existing = this.readSessionMessageEventSource(input.sessionId, input.sourceId);
+    if (existing !== null) {
+      if (existing.sourceKind !== input.sourceKind || existing.actor !== input.actor) {
+        throw new Error("SESSION_MESSAGE_EVENT_SOURCE_CONFLICT");
+      }
+      const stored = z.object({ event_json: z.string(), projection_version: z.union([z.literal(1), z.literal(2)]) })
+        .strict().nullable().parse(this.#database.query(
+          "SELECT event_json,projection_version FROM session_events WHERE session_id=? AND stream_epoch=? AND sequence=?",
+        ).get(existing.sessionId, existing.streamEpoch, existing.eventSequence));
       if (stored === null) throw new Error("SESSION_MESSAGE_EVENT_SOURCE_ORPHANED");
-      const event = parseStoredSessionEvent(
-        stored.event_json,
-        stored.projection_version,
-        this.#publicProviderIdentifierProjector,
-      );
-      if (event.body.type !== "user_message" || digestJson(event.body) !== existing.bodyDigest) {
+      const event = parseStoredSessionEvent(stored.event_json, stored.projection_version, this.#publicProviderIdentifierProjector);
+      if (event.body.type !== "user_message" || digestJson(event.body) !== existing.bodyDigest
+        || event.body.actor !== input.actor || event.body.turnId !== expectedTurn.turnId
+        || event.body.text !== expected.text || event.body.omittedCharacters !== expected.omittedCharacters) {
         throw new Error("SESSION_MESSAGE_EVENT_SOURCE_CONFLICT");
       }
       return { event, appended: false };
     }
-    const event = this.#appendSessionEventInTransaction({
-      sessionId: input.sessionId,
-      accountId: input.accountId,
-      providerGeneration: input.providerGeneration,
-      providerConnectionId: input.providerConnectionId,
-      body,
-      recordedAt: input.recordedAt,
-    });
-    this.#database.query(
-      `INSERT INTO session_message_event_sources(
-         source_id,source_kind,session_id,actor,body_digest,stream_epoch,event_sequence,created_at
-       ) VALUES (?,?,?,?,?,?,?,?)`,
-    ).run(
-      input.sourceId,
-      input.sourceKind,
-      input.sessionId,
-      body.actor,
-      bodyDigest,
-      event.streamEpoch,
-      event.sequence,
-      input.recordedAt,
-    );
+    // Durable v43 source status owns finalization beyond transcript retention.
+    // A missing retained marker never authorizes replay of a finalized source.
+    const event = this.#finalizeSessionUserMessageSourceInTransaction(input);
+    if (event === null) throw new Error("SESSION_USER_MESSAGE_SOURCE_FINALIZED");
+    if (event.body.type !== "user_message" || event.body.actor !== input.actor
+      || event.body.turnId !== expectedTurn.turnId || event.body.text !== expected.text
+      || event.body.omittedCharacters !== expected.omittedCharacters) {
+      throw new Error("SESSION_MESSAGE_EVENT_SOURCE_CONFLICT");
+    }
     return { event, appended: true };
   }
 
@@ -30778,10 +32064,65 @@ export class StateStore {
       return {
         ...mapSessionEventStreamPosition(stream),
         gapReason: fellBehind ? stream.retention_gap_reason ?? "stream_restored" : null,
+        retentionGapReason: stream.retention_gap_reason === null
+          ? null
+          : sessionEventGapReasonSchema.parse(stream.retention_gap_reason),
         events,
       };
     });
     return maintenanceNow !== undefined && !this.#readonly ? read.immediate() : read();
+  }
+
+  /**
+   * Read every retained event that can affect a neutral transcript. This is a
+   * bounded tail/export path: the event ledger itself is capped by count and
+   * bytes, and operational-only rows are filtered in SQLite before parsing.
+   */
+  listRetainedTranscriptEvents(sessionId: SessionId): Readonly<{
+    events: readonly SessionEvent[];
+    gapReason: SessionEventGapReason | null;
+  }> {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const maintenanceNow = this.#readonly ? undefined : this.#now();
+    const read = this.#database.transaction(() => {
+      this.#ensureSessionEventStream(parsedSessionId);
+      if (maintenanceNow !== undefined && !this.#readonly) {
+        this.#applySessionEventRetention(parsedSessionId, maintenanceNow);
+      }
+      const stream = this.#readSessionEventStream(parsedSessionId);
+      const rows = this.#database.query(
+        `SELECT event_json,projection_version FROM session_events
+         WHERE session_id=?
+           AND json_extract(event_json,'$.body.type') IN (
+             'user_message','assistant_delta','reasoning_summary_delta',
+             'item_started','item_completed','provider_switched',
+             'turn_started','turn_completed','gap','connection'
+           )
+         ORDER BY sequence`,
+      ).all(parsedSessionId);
+      const events = rows.map((row) => {
+        const parsed = z.object({
+          event_json: z.string(),
+          projection_version: z.union([z.literal(1), z.literal(2)]),
+        }).strict().parse(row);
+        const event = parseStoredSessionEvent(
+          parsed.event_json,
+          parsed.projection_version,
+          this.#publicProviderIdentifierProjector,
+        );
+        if (event.sessionId !== parsedSessionId || event.streamEpoch !== stream.stream_epoch) {
+          throw new Error("SESSION_EVENT_STORED_AUTHORITY_MISMATCH");
+        }
+        return event;
+      });
+      return {
+        events,
+        gapReason: stream.retention_gap_reason === null
+          ? null
+          : sessionEventGapReasonSchema.parse(stream.retention_gap_reason),
+      };
+    });
+    return maintenanceNow === undefined || this.#readonly ? read() : read.immediate();
   }
 
   #requireInteractionRow(publicId: string): z.infer<typeof interactionRowSchema> {

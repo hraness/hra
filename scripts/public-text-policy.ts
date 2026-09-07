@@ -79,7 +79,10 @@ export function assertPublicText(value: string, label: string): void {
     const isNpmEnvironmentSubject = subjectStart >= 0
       && value.slice(subjectStart, subjectEnd) === npmEnvironmentSubject
       && isSubjectDelimiter(value[subjectStart - 1])
-      && isSubjectDelimiter(value[subjectEnd]);
+      && (
+        isSubjectDelimiter(value[subjectEnd])
+        || (value[subjectEnd] === "." && isSubjectDelimiter(value[subjectEnd + 1]))
+      );
     if (
       scope !== undefined
       && !allowedPublicScopes.has(scope)

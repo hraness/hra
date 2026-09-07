@@ -17,15 +17,18 @@ const reportedFailures: unknown[] = [];
 const unavailableCommands: string[] = [];
 let queryResult: unknown = commandRecord;
 let mutationCalls = 0;
-let mutationImplementation: () => Promise<unknown> = async () => {
+const observedMutations: Readonly<{ args: unknown; reference: unknown }>[] = [];
+let mutationImplementation: (reference: unknown, args: unknown) => Promise<unknown> = async () => {
   throw new Error("unexpected client mutation");
 };
+const functionReferences = await import("./functions");
 
 await mock.module("convex/react", () => ({
   useConvex: () => ({
-    mutation: async () => {
+    mutation: async (reference: unknown, args: unknown) => {
       mutationCalls += 1;
-      return await mutationImplementation();
+      observedMutations.push({ args, reference });
+      return await mutationImplementation(reference, args);
     },
   }),
   useQuery: (_reference: unknown, args: unknown) => {
@@ -85,6 +88,7 @@ beforeEach(() => {
   mountedSetHandle = undefined;
   mutationCalls = 0;
   mutationImplementation = async () => { throw new Error("unexpected client mutation"); };
+  observedMutations.length = 0;
   queryArgs.length = 0;
   queryResult = commandRecord;
   reportedFailures.length = 0;
@@ -215,5 +219,68 @@ describe("mounted device command observation", () => {
     })).rejects.toBe(authorityFailure);
     expect(mutationCalls).toBe(1);
     expect(reportedFailures).toEqual([authorityFailure]);
+  });
+
+  test("acknowledges the exact device receipt only after enqueue success", async () => {
+    mutationImplementation = async (reference, args) => {
+      const request = args as Record<string, unknown>;
+      if (reference === functionReferences.enqueueDeviceCommand) {
+        return {
+          publicId: request.publicId,
+          requestCommitmentVersion: 2,
+          replay: false,
+          requestingDevicePublicId: request.expectedRequestingDevicePublicId,
+          state: "pending",
+          targetDevicePublicId: request.expectedTargetDevicePublicId,
+        };
+      }
+      if (reference === functionReferences.acknowledgeDeviceCommandReceipt) {
+        return { acknowledgedAt: Date.now(), publicId: request.commandPublicId, replay: false };
+      }
+      throw new Error("unexpected mutation reference");
+    };
+    await renderMounted(<MountedSubmission />);
+    if (mountedSubmit === undefined) throw new Error("submission hook did not mount");
+    const submitted = await mountedSubmit({
+      payload: { kind: "usage_refresh" },
+      targetDevicePublicId: "device_daemon01",
+    });
+    expect(submitted).toBe((observedMutations[0]?.args as { publicId: string }).publicId);
+    expect(observedMutations).toHaveLength(2);
+    expect(observedMutations[1]).toEqual({
+      args: {
+        commandPublicId: submitted,
+        idempotencyKey: (observedMutations[0]?.args as { idempotencyKey: string }).idempotencyKey,
+        requestDigest: (observedMutations[0]?.args as { requestDigest: string }).requestDigest,
+      },
+      reference: functionReferences.acknowledgeDeviceCommandReceipt,
+    });
+  });
+
+  test("returns the committed identity when post-receipt acknowledgement fails", async () => {
+    const acknowledgementFailure = new Error("acknowledgement unavailable");
+    mutationImplementation = async (reference, args) => {
+      const request = args as Record<string, unknown>;
+      if (reference === functionReferences.enqueueDeviceCommand) {
+        return {
+          publicId: request.publicId,
+          requestCommitmentVersion: 2,
+          replay: false,
+          requestingDevicePublicId: request.expectedRequestingDevicePublicId,
+          state: "pending",
+          targetDevicePublicId: request.expectedTargetDevicePublicId,
+        };
+      }
+      throw acknowledgementFailure;
+    };
+    await renderMounted(<MountedSubmission />);
+    if (mountedSubmit === undefined) throw new Error("submission hook did not mount");
+    const submitted = await mountedSubmit({
+      payload: { kind: "usage_refresh" },
+      targetDevicePublicId: "device_daemon01",
+    });
+    expect(submitted).toBe((observedMutations[0]?.args as { publicId: string }).publicId);
+    expect(mutationCalls).toBe(2);
+    expect(reportedFailures).toEqual([acknowledgementFailure]);
   });
 });

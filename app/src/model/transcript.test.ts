@@ -76,6 +76,17 @@ describe("deriveTranscript", () => {
     expect(entries[0]).toMatchObject({ actor: "autorespond", kind: "user" });
   });
 
+  test("preserves automation attribution separately from the legacy autorespond actor", () => {
+    const entries = deriveTranscript(
+      [userMessage(1, "Perform the scheduled check", {
+        actor: "autorespond",
+        actorKind: "automation",
+      })],
+      { streamingText: "", turnId: null },
+    );
+    expect(entries[0]).toMatchObject({ actor: "automation", kind: "user" });
+  });
+
   test("labels peer-session messages by their actor", () => {
     const entries = deriveTranscript(
       [userMessage(1, "check this", { actor: "autorespond", actorKind: "peer_session" })],

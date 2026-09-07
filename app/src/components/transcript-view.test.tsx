@@ -4,6 +4,25 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { TranscriptView } from "./transcript-view";
 
 describe("TranscriptView", () => {
+  test("renders an automated message as automation, not an autoresponse or the owner", () => {
+    const markup = renderToStaticMarkup(
+      <TranscriptView
+        entries={[{
+          actor: "automation",
+          attachments: null,
+          key: "automation-message",
+          kind: "user",
+          text: "Perform the scheduled check.",
+        }]}
+        thinkingText=""
+      />,
+    );
+
+    expect(markup).toContain(">automation<");
+    expect(markup).not.toContain(">autorespond<");
+    expect(markup).not.toContain(">you<");
+  });
+
   test("renders a provider-switch seed as a provider handoff", () => {
     const markup = renderToStaticMarkup(
       <TranscriptView

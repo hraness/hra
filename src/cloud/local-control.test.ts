@@ -138,10 +138,14 @@ class FakeCloud {
   snapshots = new Map<string, unknown[]>();
   readonly commands = new Map<string, Readonly<{
     payload: EncryptedEnvelope;
+    requestCommitmentVersion?: 2;
     requestDigest: string;
+    requestingDevicePublicId: string;
     response: Readonly<{
       publicId: string;
+      requestCommitmentVersion?: 2;
       replay: boolean;
+      requestingDevicePublicId?: string;
       sessionPublicId: string;
       state: "pending";
       targetDevicePublicId: string;
@@ -166,6 +170,7 @@ class FakeCloud {
   readonly registrationAttempts: Readonly<Record<string, unknown>>[] = [];
   failNextApproveAfterEffect = false;
   failNextApproveBeforeEffect = false;
+  expandNextEnqueueResponse = false;
   failNextEnqueueAfterEffect = false;
   failNextEnqueueBeforeEffect = false;
   failNextAckAfterEffect = false;
@@ -405,7 +410,10 @@ class FakeCloud {
           if (
             typeof args.idempotencyKey !== "string"
             || typeof args.publicId !== "string"
+            || args.requestCommitmentVersion !== 2
             || typeof args.requestDigest !== "string"
+            || typeof args.expectedRequestingDevicePublicId !== "string"
+            || args.expectedRequestingDevicePublicId !== boundDevice
             || typeof args.sessionPublicId !== "string"
             || typeof args.expectedTargetDevicePublicId !== "string"
             || typeof args.kind !== "string"
@@ -422,15 +430,20 @@ class FakeCloud {
             !isRecord(head)
             || head.executionDevicePublicId !== args.expectedTargetDevicePublicId
           ) throw new Error("command target changed");
-          const scope = `${boundDevice ?? "none"}:${args.sessionPublicId}:${args.kind}:${args.idempotencyKey}`;
+          const scope = `${boundDevice}:${args.sessionPublicId}:${args.kind}:${args.idempotencyKey}`;
           const existing = this.commands.get(scope);
           if (existing !== undefined) {
-            if (existing.requestDigest !== args.requestDigest) throw new Error("IDEMPOTENCY_CONFLICT");
+            if (
+              existing.requestDigest !== args.requestDigest
+              || existing.requestCommitmentVersion !== args.requestCommitmentVersion
+            ) throw new Error("IDEMPOTENCY_CONFLICT");
             return { ...existing.response, replay: true };
           }
           const response = {
             publicId: args.publicId,
+            requestCommitmentVersion: 2 as const,
             replay: false,
+            requestingDevicePublicId: boundDevice,
             sessionPublicId: args.sessionPublicId,
             state: "pending" as const,
             targetDevicePublicId: args.expectedTargetDevicePublicId,
@@ -438,12 +451,22 @@ class FakeCloud {
           this.lastEnqueue = args as Readonly<Record<string, unknown>>;
           this.commands.set(scope, {
             payload: args.payload as EncryptedEnvelope,
+            requestCommitmentVersion: 2,
             requestDigest: args.requestDigest,
+            requestingDevicePublicId: boundDevice,
             response,
           });
           if (this.failNextEnqueueAfterEffect) {
             this.failNextEnqueueAfterEffect = false;
             throw new Error("lost command enqueue response");
+          }
+          if (this.expandNextEnqueueResponse) {
+            this.expandNextEnqueueResponse = false;
+            return {
+              ...response,
+              idempotencyKey: args.idempotencyKey,
+              requestDigest: args.requestDigest,
+            };
           }
           return response;
         }
@@ -458,6 +481,7 @@ class FakeCloud {
           if (
             command === undefined
             || command[1].requestDigest !== args.requestDigest
+            || command[1].requestingDevicePublicId !== boundDevice
             || !command[0].endsWith(`:${args.idempotencyKey}`)
           ) throw new Error("invalid command acknowledgement authority");
           this.acknowledgementAttempts += 1;
@@ -577,9 +601,19 @@ class FakeCloud {
           const limit = typeof args.limit === "number" ? args.limit : 0;
           return chunks.slice(Math.max(0, chunks.length - limit));
         }
-        if (name === "commands:get") {
-          const command = [...this.commands.values()].find((candidate) =>
+        if (name === "commands:get" || name === "commands:getForOutboxRecovery") {
+          const commandEntry = [...this.commands.entries()].find(([, candidate]) =>
             candidate.response.publicId === args.commandPublicId);
+          if (
+            name === "commands:getForOutboxRecovery"
+            && commandEntry !== undefined
+            && (
+              typeof args.idempotencyKey !== "string"
+              || !commandEntry[0].endsWith(`:${args.idempotencyKey}`)
+              || commandEntry[1].requestDigest !== args.requestDigest
+            )
+          ) throw new Error("Cloud authority is not current.");
+          const command = commandEntry?.[1];
           return command === undefined
             ? null
             : {
@@ -588,7 +622,11 @@ class FakeCloud {
                 kind: "set_fast",
                 payload: command.payload,
                 publicId: command.response.publicId,
+                ...(command.requestCommitmentVersion === undefined
+                  ? {}
+                  : { requestCommitmentVersion: command.requestCommitmentVersion }),
                 requestDigest: command.requestDigest,
+                requestingDevicePublicId: command.requestingDevicePublicId,
                 ...(this.commandResultCodes.has(command.response.publicId)
                   ? { resultCode: this.commandResultCodes.get(command.response.publicId) }
                   : {}),
@@ -793,6 +831,45 @@ function accountKey(custody: MemoryCustody): Uint8Array {
     throw new Error("invalid account key fixture");
   }
   return decodeBase64Url(decoded.key);
+}
+
+async function rewritePendingCommandOutbox(
+  custody: MemoryCustody,
+  mode: "legacy" | Readonly<{ requestingDevicePublicId: string }>,
+): Promise<Readonly<Record<string, unknown>>> {
+  const observation = custody.values.get("cloud-command-outbox");
+  if (observation === undefined) throw new Error("missing command outbox fixture");
+  const decoded: unknown = JSON.parse(observation.value) as unknown;
+  if (!isRecord(decoded)) throw new Error("invalid command outbox fixture");
+  const request = {
+    deadline: decoded.deadline,
+    expectedTargetDevicePublicId: decoded.targetDevicePublicId,
+    kind: decoded.kind,
+    payload: decoded.envelope,
+    publicId: decoded.commandPublicId,
+    ...(mode === "legacy" ? {} : {
+      requestingDevicePublicId: mode.requestingDevicePublicId,
+    }),
+    sessionPublicId: decoded.sessionPublicId,
+  };
+  const rewritten: Record<string, unknown> = {
+    ...decoded,
+    requestDigest: await hmacSha256Hex(
+      accountKey(custody),
+      "command-enqueue",
+      JSON.stringify(request),
+    ),
+    ...(mode === "legacy"
+      ? { version: 2 }
+      : { requestingDevicePublicId: mode.requestingDevicePublicId, version: 3 }),
+  };
+  if (mode === "legacy") delete rewritten.requestingDevicePublicId;
+  delete rewritten.requestCommitmentVersion;
+  custody.values.set("cloud-command-outbox", {
+    generation: observation.generation,
+    value: JSON.stringify(rewritten),
+  });
+  return rewritten;
 }
 
 function accountKeyIsProvisional(custody: MemoryCustody): boolean {
@@ -3759,6 +3836,19 @@ describe("local cloud control", () => {
     expect(custody.values.has("cloud-command-outbox")).toBe(false);
     const commandEnvelope = parseEncryptedEnvelope(cloud.lastEnqueue?.payload);
     if (commandEnvelope === null) throw new Error("missing encrypted command fixture");
+    expect(cloud.lastEnqueue?.requestDigest).toBe(await hmacSha256Hex(
+      key,
+      "command-enqueue",
+      JSON.stringify({
+        deadline: request.deadline,
+        expectedTargetDevicePublicId: pair.device.publicId,
+        kind: request.payload.kind,
+        payload: commandEnvelope,
+        publicId: request.commandPublicId,
+        requestingDevicePublicId: pair.device.publicId,
+        sessionPublicId,
+      }),
+    ));
     expect(await decryptRemoteCommand(commandEnvelope, key, {
       entityPublicId: request.commandPublicId,
       keyVersion: commandEnvelope.keyVersion,
@@ -3778,6 +3868,23 @@ describe("local cloud control", () => {
       state: "failed",
       targetDevicePublicId: pair.device.publicId,
     });
+
+    const expandedResponseRequest = {
+      ...request,
+      commandPublicId: "018bcfe5-6800-7000-8000-000000000009",
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000010",
+    };
+    cloud.expandNextEnqueueResponse = true;
+    await expect(adapter.enqueueRemoteCommand(expandedResponseRequest)).rejects.toThrow(
+      "Cloud remote command receipt is invalid",
+    );
+    expect(custody.values.has("cloud-command-outbox")).toBe(true);
+    expect(cloud.acknowledgedCommands.has(expandedResponseRequest.commandPublicId)).toBe(false);
+    expect(await adapter.enqueueRemoteCommand(expandedResponseRequest)).toMatchObject({
+      commandPublicId: expandedResponseRequest.commandPublicId,
+      replay: true,
+    });
+    expect(custody.values.has("cloud-command-outbox")).toBe(false);
 
     const racedRequest = {
       ...request,
@@ -3900,6 +4007,256 @@ describe("local cloud control", () => {
       replay: false,
     });
     expect(cloud.enqueueAttempts).toBe(attemptsBeforeFresh + 1);
+  });
+
+  test("preserves an absent legacy outbox until its delayed old enqueue appears", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const adapter = control(cloud, custody);
+    await authenticate(adapter);
+    const pair = await adapter.pairDevice(signal) as { device: { publicId: string } };
+    const sessionPublicId = "session_legacy_outbox_absent";
+    cloud.heads = [{
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: pair.device.publicId,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    }];
+    const request = {
+      commandPublicId: "018bcfe5-6800-7000-8000-000000000031",
+      deadline: fixedNow + 60_000,
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000032",
+      payload: { kind: "set_fast", enabled: true } as const,
+      selector: { executionDevicePublicId: pair.device.publicId, publicId: sessionPublicId },
+      signal,
+    };
+    cloud.failNextEnqueueBeforeEffect = true;
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      "enqueue unavailable before effect",
+    );
+    const legacy = await rewritePendingCommandOutbox(custody, "legacy");
+    const attempts = cloud.enqueueAttempts;
+
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      "Legacy pending cloud command is absent remotely but may still commit",
+    );
+    expect(cloud.enqueueAttempts).toBe(attempts);
+    expect(custody.values.has("cloud-command-outbox")).toBe(true);
+
+    const envelope = parseEncryptedEnvelope(legacy.envelope);
+    if (envelope === null || typeof legacy.requestDigest !== "string") {
+      throw new Error("missing delayed legacy enqueue fixture");
+    }
+    cloud.commands.set(
+      `${pair.device.publicId}:${sessionPublicId}:set_fast:${request.idempotencyKey}`,
+      {
+        payload: envelope,
+        requestDigest: legacy.requestDigest,
+        requestingDevicePublicId: pair.device.publicId,
+        response: {
+          publicId: request.commandPublicId,
+          replay: false,
+          sessionPublicId,
+          state: "pending",
+          targetDevicePublicId: pair.device.publicId,
+        },
+      },
+    );
+
+    expect(await adapter.enqueueRemoteCommand(request)).toMatchObject({
+      commandPublicId: request.commandPublicId,
+      replay: true,
+    });
+    expect(cloud.enqueueAttempts).toBe(attempts);
+    expect(cloud.acknowledgementAttempts).toBe(1);
+    expect(custody.values.has("cloud-command-outbox")).toBe(false);
+  });
+
+  test("drains a committed legacy outbox without replaying or rebinding its enqueue", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const adapter = control(cloud, custody);
+    await authenticate(adapter);
+    const pair = await adapter.pairDevice(signal) as { device: { publicId: string } };
+    const sessionPublicId = "session_legacy_outbox_remote";
+    cloud.heads = [{
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: pair.device.publicId,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    }];
+    const request = {
+      commandPublicId: "018bcfe5-6800-7000-8000-000000000033",
+      deadline: fixedNow + 60_000,
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000034",
+      payload: { kind: "set_fast", enabled: true } as const,
+      selector: { executionDevicePublicId: pair.device.publicId, publicId: sessionPublicId },
+      signal,
+    };
+    cloud.failNextEnqueueAfterEffect = true;
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      "lost command enqueue response",
+    );
+    const legacy = await rewritePendingCommandOutbox(custody, "legacy");
+    const committed = [...cloud.commands.entries()].find(([, command]) =>
+      command.response.publicId === request.commandPublicId);
+    if (committed === undefined || typeof legacy.requestDigest !== "string") {
+      throw new Error("missing committed legacy command fixture");
+    }
+    const { requestCommitmentVersion: removedCommitmentVersion, ...legacyCommand } = committed[1];
+    if (removedCommitmentVersion !== 2) throw new Error("missing current commitment marker");
+    cloud.commands.set(committed[0], {
+      ...legacyCommand,
+      requestDigest: legacy.requestDigest,
+    });
+    const attempts = cloud.enqueueAttempts;
+
+    expect(await adapter.enqueueRemoteCommand(request)).toMatchObject({ replay: true });
+    expect(cloud.enqueueAttempts).toBe(attempts);
+    expect(custody.values.has("cloud-command-outbox")).toBe(false);
+  });
+
+  test("preserves a rolled-over current outbox until its delayed enqueue appears", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const adapter = control(cloud, custody);
+    await authenticate(adapter);
+    const pair = await adapter.pairDevice(signal) as { device: { publicId: string } };
+    const sessionPublicId = "session_outbox_rollover";
+    cloud.heads = [{
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: pair.device.publicId,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    }];
+    const request = {
+      commandPublicId: "018bcfe5-6800-7000-8000-000000000035",
+      deadline: fixedNow + 60_000,
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000036",
+      payload: { kind: "set_fast", enabled: true } as const,
+      selector: { executionDevicePublicId: pair.device.publicId, publicId: sessionPublicId },
+      signal,
+    };
+    cloud.failNextEnqueueBeforeEffect = true;
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      "enqueue unavailable before effect",
+    );
+    const retiredRequester = "device_retired_requester";
+    const rewritten = await rewritePendingCommandOutbox(custody, {
+      requestingDevicePublicId: retiredRequester,
+    });
+    const attempts = cloud.enqueueAttempts;
+    const acknowledgementAttempts = cloud.acknowledgementAttempts;
+
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      "different requesting device and may still commit",
+    );
+    expect(cloud.enqueueAttempts).toBe(attempts);
+    expect(cloud.acknowledgementAttempts).toBe(acknowledgementAttempts);
+    expect(custody.values.has("cloud-command-outbox")).toBe(true);
+
+    const envelope = parseEncryptedEnvelope(rewritten.envelope);
+    if (envelope === null || typeof rewritten.requestDigest !== "string") {
+      throw new Error("missing delayed rollover enqueue fixture");
+    }
+    cloud.commands.set(
+      `${retiredRequester}:${sessionPublicId}:set_fast:${request.idempotencyKey}`,
+      {
+        payload: envelope,
+        requestDigest: rewritten.requestDigest,
+        requestingDevicePublicId: retiredRequester,
+        response: {
+          publicId: request.commandPublicId,
+          replay: false,
+          sessionPublicId,
+          state: "pending",
+          targetDevicePublicId: pair.device.publicId,
+        },
+      },
+    );
+
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      `Recovered cloud command ${request.commandPublicId}; retry the new command.`,
+    );
+    expect(cloud.enqueueAttempts).toBe(attempts);
+    expect(cloud.acknowledgementAttempts).toBe(acknowledgementAttempts);
+    expect(custody.values.has("cloud-command-outbox")).toBe(false);
+  });
+
+  test("retires a committed old-requester outbox without rebinding or acknowledging it", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const adapter = control(cloud, custody);
+    await authenticate(adapter);
+    const pair = await adapter.pairDevice(signal) as { device: { publicId: string } };
+    const sessionPublicId = "session_committed_outbox_rollover";
+    cloud.heads = [{
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: pair.device.publicId,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    }];
+    const request = {
+      commandPublicId: "018bcfe5-6800-7000-8000-000000000037",
+      deadline: fixedNow + 60_000,
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000038",
+      payload: { kind: "set_fast", enabled: true } as const,
+      selector: { executionDevicePublicId: pair.device.publicId, publicId: sessionPublicId },
+      signal,
+    };
+    cloud.failNextEnqueueAfterEffect = true;
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      "lost command enqueue response",
+    );
+    const retiredRequester = "device_retired_requester";
+    const rewritten = await rewritePendingCommandOutbox(custody, {
+      requestingDevicePublicId: retiredRequester,
+    });
+    const committed = [...cloud.commands.entries()].find(([, command]) =>
+      command.response.publicId === request.commandPublicId);
+    if (committed === undefined || typeof rewritten.requestDigest !== "string") {
+      throw new Error("missing committed rollover command fixture");
+    }
+    const { requestCommitmentVersion: removedCommitmentVersion, ...legacyCommand } = committed[1];
+    if (removedCommitmentVersion !== 2) throw new Error("missing current commitment marker");
+    cloud.commands.set(committed[0], {
+      ...legacyCommand,
+      requestDigest: rewritten.requestDigest,
+      requestingDevicePublicId: retiredRequester,
+    });
+    const enqueueAttempts = cloud.enqueueAttempts;
+    const acknowledgementAttempts = cloud.acknowledgementAttempts;
+
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      `Recovered cloud command ${request.commandPublicId}; retry the new command.`,
+    );
+    expect(cloud.enqueueAttempts).toBe(enqueueAttempts);
+    expect(cloud.acknowledgementAttempts).toBe(acknowledgementAttempts);
+    expect(cloud.commands.get(committed[0])).toMatchObject({
+      requestDigest: rewritten.requestDigest,
+      requestingDevicePublicId: retiredRequester,
+    });
+    expect(custody.values.has("cloud-command-outbox")).toBe(false);
   });
 
   test("does not dispatch a durable command after its deadline", async () => {

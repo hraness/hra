@@ -626,12 +626,21 @@ describe("encrypted session projections", () => {
       actorKind: "provider_switch",
     } as const;
     expect(parseCompactSessionEvents([providerSwitchMessage])).toEqual([providerSwitchMessage]);
+    const automationMessage = {
+      ...humanMessage,
+      actor: "autorespond",
+      actorKind: "automation",
+    } as const;
+    expect(parseCompactSessionEvents([automationMessage])).toEqual([automationMessage]);
 
     // This is a compatibility assertion against the frozen v0.5 actor rule,
     // not merely a round trip through the current parser. Its unknown-key
     // slack ignores actorKind while the legacy actor remains recognizable.
     expect(releasedV050AcceptsCompactUserMessage(peerMessage)).toBe(true);
     expect(releasedV050AcceptsCompactUserMessage(providerSwitchMessage)).toBe(true);
+    expect(releasedV050AcceptsCompactUserMessage(automationMessage)).toBe(true);
+    expect(parseCompactSessionEvents([{ ...automationMessage, actor: "automation" }])).toBeNull();
+    expect(parseCompactSessionEvents([{ ...humanMessage, actorKind: "automation" }])).toBeNull();
     expect(releasedV050AcceptsCompactUserMessage({
       ...humanMessage,
       actor: "peer_session",
