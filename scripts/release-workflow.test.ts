@@ -416,7 +416,10 @@ describe("release workflow", () => {
 
     expect(releaseNotes).toContain(installCommand);
     expect(releaseNotes).toContain("## Admitted v0.6.2 predecessor");
+    expect(releaseNotes).not.toContain("## Unreleased v0.6.2 candidate");
     expect(releaseNotes).toContain("`v0.6.2` admission does not admit `v0.7.0`");
+    expect(changelog).toContain("## v0.6.2\n");
+    expect(changelog).not.toContain("## v0.6.2 candidate (unreleased)");
     expect(readme).toContain(installCommand);
     expect(readme).toContain("Local v0.7.0 candidate; v0.6.2 artifacts admitted");
     expect(readme).toContain("Use the exact install command below only after immutable GitHub and npm release admission");
@@ -448,7 +451,7 @@ describe("release workflow", () => {
     expect(thirdPartyNotices).toContain("`@hraness/design-kit` v0.4.0");
     expect(thirdPartyNotices).not.toContain("`@hraness/design-kit` v0.3.0");
     expect(thirdPartyNotices).not.toContain("SPDX");
-    expect(changelog).toContain("## v0.7.0");
+    expect(changelog).toContain("## v0.7.0 (unreleased)");
     expect(changelog).toContain("Forward repair for the incomplete `v0.6.0` admission");
     expect(security).toContain("| `v0.7.0` | Release candidate. Supported once the release workflow admits it. |");
     expect(security).toContain("| `v0.6.2` | Fully admitted beta. Supported and receives security fixes. Hosted command-writer rollout remains capacity-gated. |");

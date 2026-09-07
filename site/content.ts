@@ -507,7 +507,9 @@ export const publicContent: PublicContent = {
       content: [
         text("Use the exact install command below only after immutable GitHub and npm release admission for "),
         code(`v${releaseVersion}`),
-        text(`. The v${admittedReleaseVersion} artifacts passed immutable GitHub and npm release admission. The website and optional hosted sync are live; candidate readiness and prior artifact admission do not authorize current-daemon startup or hosted command writers.`),
+        text(". The "),
+        link(`v${admittedReleaseVersion} artifacts`, `https://github.com/hraness/hra/releases/tag/v${admittedReleaseVersion}`),
+        text(" passed immutable GitHub and npm release admission. The website and optional hosted sync are live; candidate readiness and prior artifact admission do not authorize current-daemon startup or hosted command writers."),
       ],
     },
     { kind: "notice", label: "Current daemon rollout blocked", content: [text(daemonRolloutNotice)] },

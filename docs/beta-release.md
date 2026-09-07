@@ -4,6 +4,8 @@ Status: `v0.6.2` is the fully admitted public CLI beta, and integrated memory pl
 
 The separate `v0.6.2` authentication-hardening release completed immutable artifact admission on 2026-09-07. Its source appends authentication recovery schema 45 after the released automatic-approval schema 44. The integrated `v0.7.0` candidate retains that exact predecessor authority and reviewed main's default-off after-hours policy as schema 46, then appends peer and local-memory schema 47 and canonical-memory schema 48. The current README and website present `v0.7.0`; its own release admission remains pending independently of `v0.6.2`. Historical `v0.6.1` installer recovery still uses [its immutable release notes](https://github.com/hraness/hra/blob/v0.6.1/docs/beta-release-notes.md#install). The current admitted artifact is [v0.6.2](https://github.com/hraness/hra/releases/tag/v0.6.2). Candidate readiness is not artifact or runtime availability. Exact reviewed-main CI, matching installer pins, the protected tag path, and the immutable artifact workflow below remain required. The hosted capacity block and pending real-provider acceptance are unchanged.
 
+The separate `v0.6.3` after-hours-policy candidate was prepared through [PR 136](https://github.com/hraness/hra/pull/136) at `b1f7743626bc93c135efdd441e235ac85ddd4c42`. Its artifact admission remains pending independently of this integrated `v0.7.0` candidate. Neither candidate implicitly enables the default-off policy or clears runtime rollout gates.
+
 The former `v0.1.0` beta process depended on the HRA v0 Vercel deployment, its public fallback, and its paired provider readbacks. That dependency became invalid when HRA v0's Vercel and Convex resources were permanently retired. At retirement, `hraness/hra` had no `v0.1.0` tag, no draft release for that tag, and no published `v0.1.0` release.
 
 The former public `release:candidate` and `release:publish` package entries remain removed. Their fallback-bound implementation and tests, `scripts/release-candidate.ts` and `scripts/publish-beta-release.ts`, were deleted on 2026-09-02: no package script or workflow referenced them, and their tests ran on every pull request. The failure records below and Git history are the design record. Nothing may recreate a candidate, tag, draft, workflow lease, publication, or provider mutation from that path.
@@ -211,7 +213,7 @@ stable `0.1.5` to stable `0.1.6`, while the bootstrap
 seed remains available only as the explicitly named `bootstrap` version and dist-tag.
 Registry admission accepts either exact version metadata or a bounded full package document.
 Package documents must carry the exact package identity and own exact version entry; reads
-of `/latest` additionally require `dist-tags.latest` to name `0.7.0` during this release's admission. This keeps transient
+of `/latest` additionally require `dist-tags.latest` to name `0.6.1` during the historical `v0.6.1` admission. This keeps transient
 registry response shapes from weakening the distinction between version existence and
 stable latest promotion.
 
@@ -220,13 +222,15 @@ OIDs `.2` through `.6`. Current V2 claims from `.11` onward are matched as one c
 short-form DER UTF8String whose payload is bounded nonempty ASCII. Environment claim OID
 `.23` must be exactly `npm-release`. Repository-subject OID `.24` remains mandatory and
 exact: repository path `hraness/hra`, numeric owner ID `307125679`, numeric repository ID
-`1343008607`, and environment `npm-release`. The exact tag ref `refs/tags/v0.7.0` is
-independently required by the certificate URI and OIDs `.6`, `.14`, and `.18` for the current
-admitted release. The generated
+`1343008607`, and environment `npm-release`. The exact tag ref `refs/tags/v0.6.1` is
+independently required by the certificate URI and OIDs `.6`, `.14`, and `.18` for the historical `v0.6.1`
+admitted release. Every later candidate requires its own exact release version and tag; historical evidence never substitutes for current admission. The generated
 SLSA internal parameters must separately preserve exact event `push`, repository
 ID `1343008607`, and owner ID `307125679`. The already-published v0.5.0
 historical provenance uses that same `push` event. The encoding repair does not
 drop or weaken any workflow, commit, ref, run, visibility, owner, or repository claim.
+
+For the integrated v0.7.0 candidate, current admission requires `dist-tags.latest` to name `0.7.0` and independently binds the exact tag ref `refs/tags/v0.7.0` in the certificate URI and OIDs `.6`, `.14`, and `.18`. These are pending admission requirements, not a claim that historical v0.6.1 or admitted v0.6.2 evidence admits this candidate.
 
 ## Installer digest pins between releases
 

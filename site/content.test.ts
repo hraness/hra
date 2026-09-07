@@ -331,6 +331,8 @@ describe("public content contract", () => {
     expect(renderReadmeMarkdown()).toContain("v0.6.2 is the fully admitted public artifact");
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
       expect(surface).toContain("Local v0.7.0 candidate; v0.6.2 artifacts admitted; hosted sync live as an open beta");
+      expect(surface).not.toContain("The last admitted release is v0.6.1.");
+      expect(surface).toContain("https://github.com/hraness/hra/releases/tag/v0.6.2");
       expect(surface).toContain("only after immutable GitHub and npm release admission");
       expect(surface).toContain("passed immutable GitHub and npm release admission");
       expect(surface).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
