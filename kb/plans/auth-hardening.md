@@ -1,9 +1,11 @@
 # Authentication review and hardening
 
-Status: implementation and independent review complete; delivery gate pending.
+Status: implementation and independent review complete; current-main integration
+and release validation in progress.
 Review starts from `main` commit `136ad40` and preserves the Codex Effect boundary
 introduced by pull request 120. Integration includes the non-overlapping shared
-footer update from `main` commit `c3874c7`.
+footer update from `main` commit `c3874c7`, then the automatic-approval and
+after-hours policy foundation through `4b50465`.
 
 ## Scope and invariants
 
@@ -32,7 +34,7 @@ projection; do not introduce a second auth runtime or generic retry policy.
 - Production daemon startup advances profile generations before mutation
   recovery. Auth crash tests must execute that order and prove that unresolved
   attempts remain attached to exact recovery authority across repeated restarts.
-  Migration 44 adds a separate append-only auth successor chain bound to the
+  Migration 45 adds a separate append-only auth successor chain bound to the
   original request and effect evidence. Never infer authority from a numerically
   greater generation alone. Legacy attempts lacking that chain remain fenced;
   a quarantine-only path may preserve unrelated local use but cannot read
@@ -104,3 +106,35 @@ claimed by synthetic process or component tests.
   applicable production readback remain delivery requirements. Final receipts
   belong in the associated pull request and task closeout; a focused check is
   not substitute evidence for those gates.
+
+## Current-main integration
+
+The complete `bun run check` passed on auth checkpoint `a31e810` in an isolated
+full-history checkout containing only its exact governed ref. That historical
+checkpoint used the then-unshipped auth migration 44; it is not validation of
+the current-main join. Main subsequently assigned migration 44 to the
+after-hours budget foundation. The auth migration is therefore additive 45.
+Shipped migration 44, its guards, and its evidence migration remain unchanged.
+The auth SQL body also remains unchanged: 2130 bytes with SHA-256
+`fb82005326ab870a694287cf81a73c679dde6fbd7cc712d43588a8f774aec163`.
+
+The full joined storage suites pass 322 cases with 4392 assertions. They cover
+exact-43 repair, exact-44 upgrade preserving auth origins and budget state,
+current-45 drift refusal, successor-chain laws, and the shipped budget laws.
+The joined CLI upgrade checks pass five cases with 26 assertions. The exact
+legacy-43 service regression passes with 22 assertions, preserving unrelated
+accounts while unresolved auth authority remains fenced. Independent source
+review finds no auth conflict with main's approval-budget reservation or
+Effect request-lifecycle boundaries.
+
+Version 0.6.1 is already admitted and immutable. The 0.6.2 artifact candidate
+uses fresh exact installer URLs and release-consistent pins; it must still pass
+the documented tag and publication gates.
+Candidate site, release-workflow, and installer identity checks pass. The
+reviewed archive contains 161 filesystem entries (152 files), every file
+byte-identical to the source tree. Its canonical size inventory is 7491 bytes
+with SHA-256 `aaba8dd491003ebeeaa12170a3cc7c00b0990c4dfd0da336c98ec5419f024029`.
+Artifact publication does not authorize daemon upgrades or activate hosted
+commands. Protected capacity activation and intended-target marker proofs
+remain required; live two-device Codex and exact-pin Linux Claude acceptance
+are not claimed by this review. Managed macOS Claude sign-in stays closed.

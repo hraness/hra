@@ -299,8 +299,11 @@ is strictly older than 24 hours, then
 deletion-job, device, or partial-reservation shape returns
 `authority_reduction_topology_blocked`. Unknown failures remain the generic
 `provider_result_invalid`; provider details are never relabelled as quota.
-Each outcome is a release blocker, not a soft warning, and no capacity evidence
-or activation receipt is published. Successful per-user mutations and earlier
+Each outcome is a hard blocker for command-writer rollout and daemon upgrades,
+and no capacity evidence or activation receipt is published.
+Artifact publication remains independently gated by
+[`docs/beta-release.md`](beta-release.md); it does not clear this rollout gate.
+Successful per-user mutations and earlier
 pages commit before a later user blocks. Repeating the identical bound repair
 is idempotent and reclassifies current state before every write.
 
@@ -327,7 +330,7 @@ Do not upgrade an executor, announce current command availability, or treat an
 already auto-deployed UI as ready. The operator does not expose untrusted provider output and
 does not borrow from or raise a hard quota. Do not wait for unrelated 90-day
 retention; retained encrypted history may have no expiry. Rerun the same repair
-only after the applicable supported state change, or abandon the writer/release
+only after the applicable supported state change, or abandon the command-writer
 rollout while leaving the additive candidate live. If code must change, chain a new
 source-qualified forward-repair candidate from that live receipt; never
 redeploy the predecessor. There is no supported manual dashboard edit or raw

@@ -574,8 +574,8 @@ export type PermissionCategoryClass = "network" | "mcp" | "workspace" | "unknown
  * exact permission-category vocabulary is not published, so this errs
  * conservative: anything not recognisably workspace-local classifies as
  * `unknown`. These labels support safe presentation and the remote decline
- * policy; autorespond authority lives only in `src/daemon/autorespond.ts` and
- * never derives authority from this classifier.
+ * policy; autorespond uses its own eligibility policy and durable pre-effect
+ * budget admission, and never derives authority from this classifier.
  */
 export function classifyPermissionCategory(name: string): PermissionCategoryClass {
   const lower = name.toLowerCase();

@@ -57,8 +57,8 @@ export const socialCardLines = (content: PublicContent = publicContent): SocialC
   }
   return {
     commands: [`$ ${start.command}`, `$ ${direct.command}`],
-    comment: `# Current source: ${content.providerRoadmap}`,
-    tagline: `Release candidate v${content.releaseVersion} · hra.sh`,
+    comment: "# Rollout blocked on capacity; conditional examples",
+    tagline: `CLI v${content.releaseVersion} release-ready · hra.sh`,
     title: content.productName,
   };
 };
@@ -114,11 +114,11 @@ export const renderSocialCardPng = (content: PublicContent = publicContent): Uin
     layout.panel.radius,
     parseHexColor(palette.panel),
   );
-  const [firstBaseline, secondBaseline, commentBaseline] = layout.commandBaselines;
+  const [commentBaseline, firstBaseline, secondBaseline] = layout.commandBaselines;
   const [firstCommand, secondCommand] = lines.commands;
+  drawText(canvas, fonts.book, lines.comment, layout.commandX, commentBaseline, layout.commandSize, parseHexColor(palette.panelComment));
   drawText(canvas, fonts.book, firstCommand, layout.commandX, firstBaseline, layout.commandSize, parseHexColor(palette.panelText));
   drawText(canvas, fonts.book, secondCommand, layout.commandX, secondBaseline, layout.commandSize, parseHexColor(palette.panelText));
-  drawText(canvas, fonts.book, lines.comment, layout.commandX, commentBaseline, layout.commandSize, parseHexColor(palette.panelComment));
   drawText(canvas, fonts.book, lines.tagline, layout.margin, layout.tagBaseline, layout.tagSize, parseHexColor(palette.muted));
 
   return encodePng(SOCIAL_CARD_WIDTH, SOCIAL_CARD_HEIGHT, canvas.toRgbBytes());
@@ -136,7 +136,7 @@ const sansFamily = "Nebula Sans, ui-sans-serif, system-ui, sans-serif";
 /** Renders the same composition as SVG for the legacy `/social-card.svg` path. */
 export const renderSocialCardSvg = (content: PublicContent = publicContent): string => {
   const lines = socialCardLines(content);
-  const [firstBaseline, secondBaseline, commentBaseline] = layout.commandBaselines;
+  const [commentBaseline, firstBaseline, secondBaseline] = layout.commandBaselines;
   const [firstCommand, secondCommand] = lines.commands;
   const textLine = (text: string, x: number, y: number, size: number, fill: string, weight = 400): string =>
     `  <text x="${x}" y="${y}" fill="${fill}" font-family="${sansFamily}" font-size="${size}" font-weight="${weight}">${escapeXml(text)}</text>`;
@@ -147,9 +147,9 @@ export const renderSocialCardSvg = (content: PublicContent = publicContent): str
     `  <rect width="${SOCIAL_CARD_WIDTH}" height="${SOCIAL_CARD_HEIGHT}" fill="${palette.background}"/>`,
     textLine(lines.title, layout.margin, layout.titleBaseline, layout.titleSize, palette.ink, 700),
     `  <rect x="${layout.margin}" y="${layout.panel.y}" width="${layout.panel.width}" height="${layout.panel.height}" rx="${layout.panel.radius}" fill="${palette.panel}"/>`,
+    textLine(lines.comment, layout.commandX, commentBaseline, layout.commandSize, palette.panelComment),
     textLine(firstCommand, layout.commandX, firstBaseline, layout.commandSize, palette.panelText),
     textLine(secondCommand, layout.commandX, secondBaseline, layout.commandSize, palette.panelText),
-    textLine(lines.comment, layout.commandX, commentBaseline, layout.commandSize, palette.panelComment),
     textLine(lines.tagline, layout.margin, layout.tagBaseline, layout.tagSize, palette.muted),
     "</svg>",
     "",
