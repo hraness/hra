@@ -134,6 +134,14 @@ Candidate site, release-workflow, and installer identity checks pass. The
 reviewed archive contains 161 filesystem entries (152 files), every file
 byte-identical to the source tree. Its canonical size inventory is 7491 bytes
 with SHA-256 `aaba8dd491003ebeeaa12170a3cc7c00b0990c4dfd0da336c98ec5419f024029`.
+The first joined exact-tree gate on `35c39b9` passed lint, types, and the script
+and plugin suites, then stopped with three source-suite failures. One missed
+v24-upgrade fixture still expected schema 44 and its old ledger tail; both
+expectations now name 45. Two unchanged automation FIFO tests timed out in that
+aggregate run but passed the focused reproduction in 4 and 3 milliseconds.
+The focused schema/FIFO command passes four cases with 18 assertions. No
+production automation behavior or test timeout was changed. A fresh complete
+gate on the corrected commit remains required.
 Artifact publication does not authorize daemon upgrades or activate hosted
 commands. Protected capacity activation and intended-target marker proofs
 remain required; live two-device Codex and exact-pin Linux Claude acceptance

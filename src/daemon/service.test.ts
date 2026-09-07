@@ -12679,7 +12679,7 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
       ).all()).toEqual([
@@ -12703,6 +12703,7 @@ describe("HraService", () => {
         { version: 42 },
         { version: 43 },
         { version: 44 },
+        { version: 45 },
       ]);
     } finally {
       inspector.close(false);
