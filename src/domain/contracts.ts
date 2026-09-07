@@ -7,6 +7,7 @@ import {
   legacyAttachmentReferenceListSchema,
 } from "./attachment-schemas";
 import { isAttachmentName } from "./attachments";
+import { autorespondAfterHoursPolicySchema } from "./autorespond-after-hours";
 import {
   activePresetBinding,
   adoptableProviderSchema,
@@ -284,6 +285,14 @@ export type NotificationEmailCommandResult = z.infer<
   typeof notificationEmailCommandResultSchema
 >;
 
+export const autorespondAfterHoursCommandResultSchema = z.object({
+  policy: autorespondAfterHoursPolicySchema,
+}).strict();
+
+export type AutorespondAfterHoursCommandResult = z.infer<
+  typeof autorespondAfterHoursCommandResultSchema
+>;
+
 const notificationHoursSetCommandSchema = z.object({
   kind: z.literal("notification-hours.set"),
   expectedRevision: positiveRevisionSchema,
@@ -551,6 +560,12 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     key: gatewayKeySchema,
   }).strict(),
   z.object({ kind: z.literal("autorespond.gateway-clear") }).strict(),
+  // Separate local consent. Hosted and browser command unions do not admit it.
+  z.object({ kind: z.literal("autorespond-after-hours.status") }).strict(),
+  z.object({
+    kind: z.enum(["autorespond-after-hours.enable", "autorespond-after-hours.disable"]),
+    expectedRevision: positiveRevisionSchema.max(Number.MAX_SAFE_INTEGER),
+  }).strict(),
   z.object({ kind: z.literal("notification-hours.status") }).strict(),
   notificationHoursSetCommandSchema,
   z.object({ kind: z.literal("notification-email.status") }).strict(),

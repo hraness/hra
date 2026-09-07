@@ -28,6 +28,7 @@ import {
 } from "../codex/index";
 import {
   LOCAL_COMMAND_RESPONSE_MAX_BYTES,
+  autorespondAfterHoursCommandResultSchema,
   notificationEmailCommandResultSchema,
   notificationEmailHostedAuthoritySchema,
   notificationHoursCommandResultSchema,
@@ -35,6 +36,7 @@ import {
   type LocalCommand,
   type NotificationEmailHostedAuthority,
 } from "../domain/contracts";
+import { decideProtocolAutorespondAuthority } from "../domain/autorespond-protocol-policy";
 import {
   attachmentReferenceListSchema,
   legacyAttachmentReferenceListSchema,
@@ -1577,6 +1579,18 @@ export class HraService {
           const effective = this.#store.readSessionApprovalMode(session.id);
           return { version: 1, session: session.id, mode: effective.mode, source: effective.source };
         }
+        case "autorespond-after-hours.status":
+          return autorespondAfterHoursCommandResultSchema.parse({
+            policy: this.#store.readAutorespondAfterHoursPolicy(),
+          });
+        case "autorespond-after-hours.enable":
+        case "autorespond-after-hours.disable":
+          return autorespondAfterHoursCommandResultSchema.parse({
+            policy: this.#store.updateAutorespondAfterHoursPolicy({
+              enabled: command.kind === "autorespond-after-hours.enable",
+              expectedRevision: command.expectedRevision,
+            }),
+          });
         case "notification-hours.status":
           return this.#notificationHoursObservation(
             this.#store.readNotificationHours(),
@@ -2191,6 +2205,18 @@ export class HraService {
         )
       ) throw new CommandFailure("CONFLICT", error.message);
       if (error instanceof Error && error.message === "UNSETTLED_MUTATION_AUTHORITY") throw new CommandFailure("RECOVERY_REQUIRED", "This mutation authority has an unsettled earlier effect and rejects new idempotency keys.");
+      if (error instanceof Error && error.message === "AUTORESPOND_AFTER_HOURS_POLICY_CONFLICT") {
+        throw new CommandFailure(
+          "CONFLICT",
+          "After-hours autorespond policy changed. Run `hra autorespond-after-hours status` and retry with its revision.",
+        );
+      }
+      if (error instanceof Error && error.message === "AUTORESPOND_AFTER_HOURS_REVISION_EXHAUSTED") {
+        throw new CommandFailure(
+          "CONFLICT",
+          "After-hours autorespond policy revision capacity is exhausted; this setting cannot be updated further.",
+        );
+      }
       if (error instanceof Error && error.message === "NOTIFICATION_HOURS_REVISION_CONFLICT") {
         throw new CommandFailure(
           "CONFLICT",
@@ -6000,12 +6026,30 @@ export class HraService {
     });
   }
 
+  #protocolAutorespondDecision(
+    sessionId: SessionRecord["id"],
+    record: Pick<InteractionRecord, "display" | "kind">,
+    mode: ReturnType<StateStore["readSessionApprovalMode"]>["mode"],
+    now: number,
+  ): ReturnType<typeof decideAutorespond> {
+    const authority = decideProtocolAutorespondAuthority({ ...record, mode });
+    if (authority.action === "escalate") return authority;
+    return decideAutorespond({
+      budgets: this.#store.readAutorespondBudgets(sessionId, now),
+      display: record.display,
+      kind: record.kind,
+      mode,
+      selection: this.#store.readAutorespondAfterHoursSelection(
+        sessionId, "protocol", "eligible", now,
+      ),
+    });
+  }
+
   async #autorespondAdmitted(record: InteractionRecord, sessionId: SessionRecord["id"]): Promise<void> {
     const startedAt = this.#now();
     let { mode } = this.#store.readSessionApprovalMode(sessionId);
     const expectedMode = mode;
-    const budgets = this.#store.readAutorespondBudgets(sessionId, startedAt);
-    const decision = decideAutorespond({ budgets, display: record.display, kind: record.kind, mode });
+    const decision = this.#protocolAutorespondDecision(sessionId, record, mode, startedAt);
     const kind = record.kind as "command_approval" | "file_change_approval" | "permission_approval";
     if (decision.action === "escalate") {
       this.#store.recordAutorespondEvidence({
@@ -6039,12 +6083,9 @@ export class HraService {
           signal: this.#backgroundAbort.signal,
           autorespondAdmission: (current) => {
             mode = this.#store.readSessionApprovalMode(sessionId).mode;
-            const exactDecision = decideAutorespond({
-              budgets: this.#store.readAutorespondBudgets(sessionId),
-              display: current.display,
-              kind: current.kind,
-              mode,
-            });
+            const exactDecision = this.#protocolAutorespondDecision(
+              sessionId, current, mode, this.#now(),
+            );
             if (exactDecision.action === "escalate") {
               refusalCode = exactDecision.code;
             } else {
@@ -6346,10 +6387,16 @@ export class HraService {
                 sourceId: idempotencyKey,
                 expectedMode,
               });
-              if (reservation.state !== "reserved") {
-                finalGateFailure = reservation.state === "existing"
-                  ? "source_already_reserved"
-                  : reservation.code;
+              if (reservation.state === "refused") {
+                const code = reservation.code;
+                if (code === "not_an_approval"
+                  || code === "decision_unavailable"
+                  || code === "protected_authority_required") {
+                  throw new Error("PROSE_AUTORESPOND_BUDGET_POLICY_INVALID");
+                }
+                finalGateFailure = code;
+              } else if (reservation.state === "existing") {
+                finalGateFailure = "source_already_reserved";
               }
             }
             if (finalGateFailure !== undefined) {
@@ -6567,13 +6614,9 @@ export class HraService {
         || this.#scheduledAutorespondInteractions.has(interaction.publicId);
       if (!willAct && interaction.publicId === newlyRequestedInteractionId) {
         const { mode } = this.#store.readSessionApprovalMode(sessionId);
-        const budgets = this.#store.readAutorespondBudgets(sessionId, this.#now());
-        willAct = decideAutorespond({
-            budgets,
-            display: interaction.display,
-            kind: interaction.kind,
-            mode,
-          }).action === "accept";
+        willAct = this.#protocolAutorespondDecision(
+          sessionId, interaction, mode, this.#now(),
+        ).action === "accept";
       }
       if (!willAct) {
         representative = interaction;

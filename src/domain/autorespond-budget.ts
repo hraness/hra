@@ -19,6 +19,9 @@ export type AutorespondBudgetReservationInput = Readonly<{
 export type AutorespondBudgetRefusal =
   | "manual_mode"
   | "policy_changed"
+  | "protected_authority_required"
+  | "decision_unavailable"
+  | "not_an_approval"
   | "consecutive_limit"
   | "hourly_budget"
   | "daily_budget"

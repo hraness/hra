@@ -3,6 +3,7 @@ import { z } from "zod";
 import { formatAttachmentSize } from "../domain/attachments";
 import { attachmentReferenceListSchema } from "../domain/attachment-schemas";
 import {
+  autorespondAfterHoursCommandResultSchema,
   notificationEmailCommandResultSchema,
   notificationHoursCommandResultSchema,
   publicSessionListItemSchema,
@@ -1082,6 +1083,22 @@ const workResultMatchesOperation = (
 
 const assertCommandSuccessData = (command: LocalCommand, data: unknown): void => {
   if (
+    command.kind === "autorespond-after-hours.status"
+    || command.kind === "autorespond-after-hours.enable"
+    || command.kind === "autorespond-after-hours.disable"
+  ) {
+    const parsed = autorespondAfterHoursCommandResultSchema.safeParse(data);
+    if (!parsed.success) return invalidCommandResponse(command);
+    if (
+      command.kind !== "autorespond-after-hours.status"
+      && (
+        parsed.data.policy.revision !== command.expectedRevision + 1
+        || parsed.data.policy.enabled !== (command.kind === "autorespond-after-hours.enable")
+      )
+    ) invalidCommandResponse(command);
+    return;
+  }
+  if (
     command.kind === "notification-email.status"
     || command.kind === "notification-email.enable"
     || command.kind === "notification-email.disable"
@@ -1374,6 +1391,11 @@ const assertCommandSuccessData = (command: LocalCommand, data: unknown): void =>
 
 const publicInteractionData = (command: LocalCommand, data: unknown): unknown => {
   if (
+    command.kind === "autorespond-after-hours.status"
+    || command.kind === "autorespond-after-hours.enable"
+    || command.kind === "autorespond-after-hours.disable"
+  ) return autorespondAfterHoursCommandResultSchema.parse(data);
+  if (
     command.kind === "notification-email.status"
     || command.kind === "notification-email.enable"
     || command.kind === "notification-email.disable"
@@ -1570,6 +1592,20 @@ const renderNotificationHours = (data: unknown): string => {
     `Current: ${observation.withinHours ? "yes" : "no"}`,
     `Revision: ${String(observation.policy.revision)}`,
     `Observed: ${instant(observation.observedAt)}`,
+  ].join("\n");
+};
+
+const renderAutorespondAfterHours = (data: unknown): string => {
+  const { policy } = autorespondAfterHoursCommandResultSchema.parse(data);
+  return [
+    "After-hours automatic approval budgets",
+    `Local consent: ${policy.enabled ? "enabled" : "disabled"}`,
+    `Revision: ${String(policy.revision)}`,
+    "Separate consent from notification email and notification hours.",
+    "When enabled: eligible protocol approvals outside notification hours may use 6 consecutive, 20 per hour, and 80 per day with proven history.",
+    "Otherwise: 3 consecutive, 10 per hour, and 40 per day. Prose always keeps 3/10/40.",
+    "No approval categories are widened; session approval modes still apply.",
+    "Policy changes never reset counters or refund reservations.",
   ].join("\n");
 };
 
@@ -2836,6 +2872,12 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
       rows.push(table(report.recent as Record<string, unknown>[], ["occurredAt", "path", "kind", "rule", "decision", "outcome", "model", "sessionId"]));
     }
     output.writeStdout(`${rows.join("\n")}\n`);
+  } else if (
+    command.kind === "autorespond-after-hours.status"
+    || command.kind === "autorespond-after-hours.enable"
+    || command.kind === "autorespond-after-hours.disable"
+  ) {
+    output.writeStdout(`${renderAutorespondAfterHours(data)}\n`);
   } else if (
     command.kind === "notification-email.status"
     || command.kind === "notification-email.enable"

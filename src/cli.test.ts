@@ -185,6 +185,9 @@ const downgradeStateSchema = (databasePath: string): void => {
       DROP TRIGGER IF EXISTS sessions_autorespond_budget_history;
       DROP TABLE IF EXISTS autorespond_budget_history;
       DROP TABLE IF EXISTS autorespond_budget_reservations;
+      DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history;
+      DROP TABLE IF EXISTS autorespond_after_hours_policy;
+      DROP TABLE IF EXISTS autorespond_after_hours_history;
       PRAGMA user_version=35;
       PRAGMA foreign_keys=ON;
     `);
@@ -198,7 +201,7 @@ const downgradeStateSchema = (databasePath: string): void => {
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("PRAGMA user_version=46");
+    database.exec("PRAGMA user_version=47");
   } finally {
     database.close(false);
   }
@@ -6292,7 +6295,7 @@ describe("CLI entry point", () => {
       });
       expect(started.read().stderr).toBe("");
       expect(daemonStarts).toBe(1);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(45);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(46);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6316,7 +6319,7 @@ describe("CLI entry point", () => {
         error: {
           code: "RECOVERY_REQUIRED",
           details: { nextCommand: "hra daemon start" },
-          message: "The local state schema needs a migration (35 to 45); start the daemon to migrate it.",
+          message: "The local state schema needs a migration (35 to 46); start the daemon to migrate it.",
         },
         ok: false,
         version: 1,
@@ -6348,14 +6351,14 @@ describe("CLI entry point", () => {
       expect(JSON.parse(captured.read().stdout)).toEqual({
         error: {
           code: "RECOVERY_REQUIRED",
-          message: "This HRA build is older than the local state schema (46 vs 45); install the newer HRA.",
+          message: "This HRA build is older than the local state schema (47 vs 46); install the newer HRA.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
       expect(daemonStarts).toBe(0);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(46);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(47);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6377,7 +6380,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["The local state schema needs a migration (35 to 45). Run `hra daemon start` to migrate it."],
+          problems: ["The local state schema needs a migration (35 to 46). Run `hra daemon start` to migrate it."],
           state: { database: "invalid", initialized: false },
         },
       });
@@ -6404,7 +6407,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["This HRA build is older than the local state schema (46 vs 45). Install the newer HRA."],
+          problems: ["This HRA build is older than the local state schema (47 vs 46). Install the newer HRA."],
           state: { database: "invalid", initialized: false },
         },
       });

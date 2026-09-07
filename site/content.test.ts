@@ -48,6 +48,22 @@ const htmlVisibleText = (value: string): string => value
   .replaceAll("&amp;", "&");
 
 describe("public content contract", () => {
+  test("keeps after-hours consent, legacy reset, and prose limits explicit", () => {
+    const readme = renderReadmeMarkdown();
+    expect(readme).toContain("Unreleased after-hours protocol budgets are not included in v0.6.2.");
+    expect(readme).toContain("They use a separate local opt-in, disabled on new and upgraded installations.");
+    expect(readme).toContain("After artifact admission and the daemon rollout gates are satisfied");
+    expect(readme).toContain("hra autorespond-after-hours enable --revision <revision>");
+    expect(readme).toContain("hra autorespond-after-hours disable --revision <revision>");
+    expect(readme).toContain("Prose always stays at three, ten, and forty.");
+    expect(readme).toContain("Both paths spend the same counters.");
+    expect(readme).toContain("Policy changes and schedule boundaries never reset or refund them");
+    expect(readme).toContain("requires a newly finalized human message for every pre-44 session");
+    expect(readme).toContain("an unreadable schedule selects the baseline, while invalid consent or accounting refuses admission");
+    expect(readme).not.toContain("Notification hours do not change these eligibility rules or budgets.");
+    expect(readme).not.toContain("Protocol and prose share the same limits.");
+  });
+
   test("keeps durable automatic-approval limits and upgrade holds on both public surfaces", () => {
     const readme = renderReadmeMarkdown();
     const html = htmlVisibleText(renderSiteHtml(publicContent));

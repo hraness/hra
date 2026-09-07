@@ -12659,6 +12659,9 @@ describe("HraService", () => {
         legacy.exec(`DROP TABLE "${name}"`);
       }
       legacy.exec(`
+        DROP TRIGGER sessions_autorespond_after_hours_history;
+        DROP TABLE autorespond_after_hours_history;
+        DROP TABLE autorespond_after_hours_policy;
         DROP TRIGGER IF EXISTS sessions_autorespond_budget_history;
         DROP TABLE IF EXISTS autorespond_budget_history;
         DROP TABLE IF EXISTS autorespond_budget_reservations;
@@ -12679,7 +12682,7 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 46 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
       ).all()).toEqual([
@@ -12704,6 +12707,7 @@ describe("HraService", () => {
         { version: 43 },
         { version: 44 },
         { version: 45 },
+        { version: 46 },
       ]);
     } finally {
       inspector.close(false);
@@ -16371,6 +16375,9 @@ describe("HraService", () => {
       ALTER TABLE autorespond_evidence_v43 RENAME TO autorespond_evidence;
       CREATE INDEX autorespond_evidence_session ON autorespond_evidence(session_id, occurred_at DESC, id DESC);
       CREATE INDEX autorespond_evidence_recent ON autorespond_evidence(occurred_at DESC, id DESC);
+      DROP TRIGGER sessions_autorespond_after_hours_history;
+      DROP TABLE autorespond_after_hours_history;
+      DROP TABLE autorespond_after_hours_policy;
       DROP TABLE account_mutation_authority_rebinds;
       DROP TRIGGER sessions_autorespond_budget_history;
       DROP TABLE autorespond_budget_history;
@@ -23128,6 +23135,178 @@ describe("HraService autorespond", () => {
     expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(1);
   });
 
+  const configureAfterHours = async (
+    value: Awaited<ReturnType<typeof fixture>>,
+    enabled: boolean,
+  ): Promise<void> => {
+    await value.service.execute({
+      kind: "notification-hours.set", expectedRevision: 1, version: 1,
+      startMinute: 600, endMinute: 1_320, timeZone: "UTC",
+    }, { signal });
+    if (enabled) await value.service.execute({
+      kind: "autorespond-after-hours.enable", expectedRevision: 1,
+    }, { signal });
+  };
+
+  const acceptProtocolApprovals = async (
+    value: Awaited<ReturnType<typeof fixture>>,
+    sessionId: string,
+    count: number,
+    prefix: string,
+  ): Promise<void> => {
+    const before = value.codex.resolvedInteractions.length;
+    for (let index = 0; index < count; index += 1) {
+      const interaction = await requestCommandApproval(value, sessionId, `${prefix}-${String(index)}`);
+      await value.service.settled();
+      expect(value.store.requireInteraction(interaction.publicId).resolvedBy).toBe("autorespond");
+      expect(value.codex.resolvedInteractions).toHaveLength(before + index + 1);
+    }
+  };
+
+  test("keeps after-hours consent default-off and CAS-bound without changing notifications or resetting spend", async () => {
+    const now = Date.parse("2026-09-04T09:59:59.999Z");
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { sessionId } = await createIdleSession(value, "Separate after-hours consent");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    await acceptProtocolApprovals(value, sessionId, 1, "separate-consent");
+    const budgetsBefore = value.store.readAutorespondBudgets(sessionId);
+    const modeBefore = value.store.readSessionApprovalMode(sessionId);
+    const disabled = { policy: { kind: "autorespond_after_hours", version: 1, revision: 1, enabled: false } };
+    expect(await value.service.execute({ kind: "autorespond-after-hours.status" }, { signal })).toEqual(disabled);
+
+    await configureAfterHours(value, false);
+    await value.service.execute({ kind: "notification-email.enable", expectedRevision: 2 }, { signal });
+    expect(await value.service.execute({ kind: "autorespond-after-hours.status" }, { signal })).toEqual(disabled);
+    const hoursBefore = await value.service.execute({ kind: "notification-hours.status" }, { signal });
+    const emailBefore = await value.service.execute({ kind: "notification-email.status" }, { signal });
+    const callsBefore = [...value.codex.calls];
+    const enabled = { policy: { ...disabled.policy, enabled: true, revision: 2 } };
+    expect(await value.service.execute({ kind: "autorespond-after-hours.enable", expectedRevision: 1 }, { signal })).toEqual(enabled);
+    await expect(value.service.execute({ kind: "autorespond-after-hours.disable", expectedRevision: 1 }, { signal }))
+      .rejects.toMatchObject({ code: "CONFLICT", name: "CommandFailure" });
+    expect(await value.service.execute({ kind: "autorespond-after-hours.status" }, { signal })).toEqual(enabled);
+    expect(await value.service.execute({ kind: "autorespond-after-hours.disable", expectedRevision: 2 }, { signal }))
+      .toEqual({ policy: { ...disabled.policy, revision: 3 } });
+    expect(await value.service.execute({ kind: "notification-hours.status" }, { signal })).toEqual(hoursBefore);
+    expect(await value.service.execute({ kind: "notification-email.status" }, { signal })).toEqual(emailBefore);
+    expect(value.store.readAutorespondBudgets(sessionId)).toEqual(budgetsBefore);
+    expect(value.store.readSessionApprovalMode(sessionId)).toEqual(modeBefore);
+    expect(value.codex.calls).toEqual(callsBefore);
+  });
+
+  test.each([
+    { label: "enabled outside hours", enabled: true, instant: "2026-09-04T09:59:59.999Z", cap: 6 },
+    { label: "disabled outside hours", enabled: false, instant: "2026-09-04T09:59:59.999Z", cap: 3 },
+    { label: "enabled inside hours", enabled: true, instant: "2026-09-04T10:00:00.000Z", cap: 3 },
+  ])("keeps the protocol consecutive cap at $cap when $label", async ({ label, enabled, instant, cap }) => {
+    const now = Date.parse(instant);
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { sessionId } = await createIdleSession(value, label);
+    await configureAfterHours(value, enabled);
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    await acceptProtocolApprovals(value, sessionId, cap, `cap-${String(cap)}`);
+    const refused = await requestCommandApproval(value, sessionId, "after-hours-cap-refused");
+    await value.service.settled();
+    expect(value.codex.resolvedInteractions).toHaveLength(cap);
+    expect(value.store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: cap, lastHour: cap, lastDay: cap });
+    expect(value.store.requireInteraction(refused.publicId).state).toBe("pending");
+    expect(value.store.listAutorespondEvidence({ sessionId }).find((row) => row.interactionId === refused.publicId))
+      .toMatchObject({ decision: "consecutive_limit", outcome: "refused" });
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      state: "needs_approval", attention: true, reason: "autorespond_consecutive_limit",
+    });
+  });
+
+  test.each(["disable policy", "change notification hours", "cross exact start boundary"] as const)(
+    "rechecks after-hours authority after protocol validation: %s",
+    async (change) => {
+      let now = Date.parse("2026-09-04T09:59:59.999Z");
+      const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+      const { sessionId } = await createIdleSession(value, `After-hours ${change}`);
+      await configureAfterHours(value, true);
+      value.store.setSessionApprovalMode(sessionId, "auto:all");
+      await acceptProtocolApprovals(value, sessionId, 3, "before-authority-change");
+      const before = value.store.readAutorespondBudgets(sessionId);
+      let validationStarted = false;
+      let releaseValidation!: () => void;
+      const gate = new Promise<void>((resolve) => { releaseValidation = resolve; });
+      value.codex.beforeValidateInteractionResolutionReturn = async () => {
+        validationStarted = true;
+        await gate;
+      };
+      const interaction = await requestCommandApproval(value, sessionId, "after-hours-authority-race");
+      try {
+        await waitFor(() => validationStarted);
+        expect(value.codex.resolvedInteractions).toHaveLength(3);
+        if (change === "disable policy") {
+          await value.service.execute({ kind: "autorespond-after-hours.disable", expectedRevision: 2 }, { signal });
+        } else if (change === "change notification hours") {
+          await value.service.execute({
+            kind: "notification-hours.set", expectedRevision: 2, version: 1,
+            startMinute: 540, endMinute: 1_320, timeZone: "UTC",
+          }, { signal });
+        } else {
+          now = Date.parse("2026-09-04T10:00:00.000Z");
+        }
+      } finally {
+        releaseValidation();
+      }
+      await value.service.settled();
+      expect(value.codex.resolvedInteractions).toHaveLength(3);
+      expect(value.store.requireInteraction(interaction.publicId)).toMatchObject({
+        state: "pending", revision: interaction.revision,
+      });
+      expect(value.store.readAutorespondBudgets(sessionId)).toEqual(before);
+      expect(value.store.listAutorespondEvidence({ sessionId }).find((row) => row.interactionId === interaction.publicId))
+        .toMatchObject({ decision: "consecutive_limit", outcome: "refused" });
+      expect(value.store.readSessionState(sessionId)).toMatchObject({
+        state: "needs_approval", attention: true, reason: "autorespond_consecutive_limit",
+      });
+    },
+  );
+
+  test("reserves only the sixth after-hours slot across concurrent protocol approvals", async () => {
+    const now = Date.parse("2026-09-04T09:59:59.999Z");
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { sessionId } = await createIdleSession(value, "Concurrent after-hours approvals");
+    await configureAfterHours(value, true);
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    await acceptProtocolApprovals(value, sessionId, 5, "before-concurrent-after-hours");
+    let validationStarted = false;
+    let releaseValidation!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseValidation = resolve; });
+    value.codex.beforeValidateInteractionResolutionReturn = async () => {
+      validationStarted = true;
+      await gate;
+    };
+    const first = await requestCommandApproval(value, sessionId, "after-hours-concurrent-first");
+    let secondObserved = false;
+    let secondAdmission: Promise<InteractionRecord>;
+    try {
+      await waitFor(() => validationStarted);
+      secondAdmission = requestCommandApproval(value, sessionId, "after-hours-concurrent-second", async () => {
+        secondObserved = true;
+        await value.service.settled();
+      });
+      await waitFor(() => secondObserved);
+      expect(value.codex.resolvedInteractions).toHaveLength(5);
+      expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(5);
+    } finally {
+      releaseValidation();
+    }
+    const second = await secondAdmission;
+    await value.service.settled();
+    expect(value.codex.resolvedInteractions).toHaveLength(6);
+    expect(value.store.requireInteraction(first.publicId).resolvedBy).toBe("autorespond");
+    expect(value.store.requireInteraction(second.publicId).state).toBe("pending");
+    expect(value.store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 6, lastHour: 6, lastDay: 6 });
+    expect(value.store.listAutorespondEvidence({ sessionId }).find((row) => row.interactionId === second.publicId))
+      .toMatchObject({ decision: "consecutive_limit", outcome: "refused" });
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      state: "needs_approval", attention: true, reason: "autorespond_consecutive_limit",
+    });
+  });
+
   test.each([
     { code: "consecutive_limit", consecutive: 2, priorAcceptances: 0, ageMs: 0, limit: 3, field: "consecutive" },
     { code: "hourly_budget", consecutive: 0, priorAcceptances: 9, ageMs: 0, limit: 10, field: "lastHour" },
@@ -24195,9 +24374,21 @@ describe("HraService prose autorespond", () => {
     });
   });
 
-  test("escalates once the consecutive budget is spent and resumes after a human send", async () => {
-    const value = await proseFixture();
+  test.each([
+    { afterHoursEnabled: false, label: "disabled" },
+    { afterHoursEnabled: true, label: "enabled" },
+  ])("keeps prose at three approvals with after-hours consent $label and resumes only after a human send", async ({ afterHoursEnabled }) => {
+    const now = Date.parse("2026-09-04T09:59:59.999Z");
+    const value = await proseFixture({ now: () => now });
     const { sessionId } = await createIdleSession(value, "Prose budget");
+    await value.service.execute({
+      kind: "notification-hours.set", expectedRevision: 1, version: 1,
+      startMinute: 600, endMinute: 1_320, timeZone: "UTC",
+    }, { signal });
+    if (afterHoursEnabled) {
+      await value.service.execute({ kind: "autorespond-after-hours.enable", expectedRevision: 1 }, { signal });
+      expect(value.store.readAutorespondAfterHoursSelection(sessionId, "protocol", "eligible").tier).toBe("after_hours");
+    }
     value.store.setSessionApprovalMode(sessionId, "auto:all");
 
     // Each autoresponse must leave the fake provider idle so the next turn can
@@ -24223,6 +24414,7 @@ describe("HraService prose autorespond", () => {
       reason: "prose_autorespond_consecutive_limit",
     });
     expect(sent()).toBe(3);
+    expect(value.store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 3, lastHour: 3, lastDay: 3 });
 
     // Only a human-authored send clears the consecutive counter.
     await value.service.execute(
@@ -24230,6 +24422,7 @@ describe("HraService prose autorespond", () => {
       { signal },
     );
     expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+    expect(value.store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 0, lastHour: 3, lastDay: 3 });
   });
 
   test("does not reset the consecutive budget for a rejected human send", async () => {
