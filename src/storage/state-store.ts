@@ -1449,7 +1449,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 44;
+const currentSchemaVersion = 45;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -2232,6 +2232,81 @@ const assertSchemaVersion43BaseAuthority = (
 const assertSchemaVersion43Authority = (database: Database): void => {
   assertSchemaVersion43BaseAuthority(database);
   assertSchemaVersion43QueueCancellationSettlement(database);
+};
+
+// Account mutation attempts keep their original generation and effect bytes.
+// Only this append-only, exact +1 chain carries their reconciliation authority
+// through a daemon generation rollover. It never grants another dispatch.
+const schemaVersion45AccountMutationAuthority = `
+CREATE TABLE account_mutation_authority_rebinds (
+  attempt_id TEXT NOT NULL REFERENCES mutation_attempts(id),
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  kind TEXT NOT NULL CHECK(kind IN ('account.login','account.logout','account.login-cancel')),
+  evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*'),
+  from_generation INTEGER NOT NULL CHECK(from_generation>=0 AND from_generation<9007199254740991),
+  to_generation INTEGER NOT NULL CHECK(to_generation=from_generation+1),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at>=0 AND recorded_at<=9007199254740991),
+  PRIMARY KEY(attempt_id,from_generation)
+) STRICT;
+CREATE TRIGGER account_mutation_authority_rebinds_immutable_update
+BEFORE UPDATE ON account_mutation_authority_rebinds
+BEGIN SELECT RAISE(ABORT, 'account mutation authority rebind is immutable'); END;
+CREATE TRIGGER account_mutation_authority_rebinds_immutable_delete
+BEFORE DELETE ON account_mutation_authority_rebinds
+BEGIN SELECT RAISE(ABORT, 'account mutation authority rebind is immutable'); END;
+CREATE TRIGGER account_mutation_authority_rebinds_insert_guard
+BEFORE INSERT ON account_mutation_authority_rebinds
+WHEN NOT EXISTS (
+  SELECT 1 FROM mutation_attempts m
+  JOIN mutation_effect_evidence e ON e.attempt_id=m.id AND e.kind=m.kind
+  JOIN profiles p ON p.id=m.authority_id
+  WHERE m.id=NEW.attempt_id AND m.authority_id=NEW.profile_id
+    AND m.kind=NEW.kind AND e.evidence_digest=NEW.evidence_digest
+    AND m.state IN ('effect_started','ambiguous')
+    AND NOT EXISTS (SELECT 1 FROM mutation_resolutions r WHERE r.attempt_id=m.id)
+    AND p.state!='removed' AND p.process_generation=NEW.from_generation
+    AND (
+      m.authority_generation=NEW.from_generation
+      OR EXISTS (
+        SELECT 1 FROM account_mutation_authority_rebinds a
+        WHERE a.attempt_id=m.id AND a.profile_id=NEW.profile_id
+          AND a.kind=NEW.kind AND a.evidence_digest=NEW.evidence_digest
+          AND a.to_generation=NEW.from_generation
+      )
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'account mutation authority rebind has no exact predecessor'); END;
+`;
+
+const schemaVersion45AccountMutationAuthorityObjects = (() => {
+  const expected = new Database(":memory:");
+  try {
+    expected.exec(schemaVersion45AccountMutationAuthority);
+    return expected.query(
+      "SELECT name,sql,type FROM sqlite_master WHERE tbl_name='account_mutation_authority_rebinds' AND sql IS NOT NULL ORDER BY name",
+    ).all().map((row) => z.object({ name: z.string(), sql: z.string(), type: z.string() }).strict().parse(row));
+  } finally {
+    expected.close(false);
+  }
+})();
+
+const assertSchemaVersion45AccountMutationAuthority = (database: Database): void => {
+  const objects = database.query(
+    "SELECT name,sql,type FROM sqlite_master WHERE tbl_name='account_mutation_authority_rebinds' AND sql IS NOT NULL ORDER BY name",
+  ).all();
+  if (JSON.stringify(objects) !== JSON.stringify(schemaVersion45AccountMutationAuthorityObjects)) {
+    throw new Error("STATE_SCHEMA_V45_ACCOUNT_MUTATION_AUTHORITY_INVALID");
+  }
+};
+
+const assertSchemaVersion45Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSchemaMigrationLedgerTail(database, [40, 41, 42, 43, 44, 45], "STATE_SCHEMA_V45_MIGRATION_LEDGER_INVALID");
+  assertSchemaVersion43SessionUserMessageFinalizations(database);
+  assertSchemaVersion43QueueCancellationSettlement(database);
+  assertSchemaVersion44AutorespondObjects(database);
+  assertSchemaVersion44AutorespondEvidence(database);
+  assertSchemaVersion45AccountMutationAuthority(database);
 };
 
 // Display evidence has count retention and cannot prove a rolling budget.
@@ -7775,6 +7850,8 @@ const migrateWritableDatabase = (
     throw new Error("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_PREDECESSOR_COLLISION");
   }
   if (initialVersion === currentSchemaVersion) {
+    assertSchemaVersion45Authority(database);
+  } else if (initialVersion === 44) {
     assertSchemaVersion43Authority(database);
     assertSchemaVersion44Authority(database);
   } else if (initialVersion === 43) {
@@ -7793,7 +7870,7 @@ const migrateWritableDatabase = (
   ) {
     throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
   }
-  if (initialVersion === 42 || initialVersion === 43 || initialVersion === currentSchemaVersion) {
+  if (initialVersion === 42 || initialVersion === 43 || initialVersion === 44 || initialVersion === currentSchemaVersion) {
     // A current-version stamp is an assertion boundary, not permission to
     // reconstruct authority. Prove every provider/adoption execution guard
     // before the idempotent maintenance tail can touch any schema object.
@@ -8441,6 +8518,15 @@ const migrateWritableDatabase = (
       version = 44;
     }
 
+    if (version < 45) {
+      database.exec(schemaVersion45AccountMutationAuthority);
+      assertSchemaVersion45AccountMutationAuthority(database);
+      database.query("INSERT INTO migrations(version, applied_at) VALUES (?, ?)")
+        .run(45, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version = 45");
+      version = 45;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     applySchemaVersion32(database);
@@ -8496,8 +8582,7 @@ const migrateWritableDatabase = (
     database.exec(schemaVersion36NotificationHours);
     database.exec(schemaVersion37AttentionEmailPolicy);
     assertCompositeNotificationPolicy(database);
-    assertSchemaVersion43Authority(database);
-    assertSchemaVersion44Authority(database);
+    assertSchemaVersion45Authority(database);
     assertSchemaVersion40AdoptionObjects(database);
     assertExactSchemaVersion40AdoptionSurface(database);
     assertWorkSchema(database);
@@ -9197,8 +9282,7 @@ export class StateStore {
       assertSchemaVersion39ProviderAuthority(this.#database);
       assertSchemaVersion40AdoptionObjects(this.#database);
       assertExactSchemaVersion40AdoptionSurface(this.#database);
-      assertSchemaVersion43Authority(this.#database);
-      assertSchemaVersion44Authority(this.#database);
+      assertSchemaVersion45Authority(this.#database);
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);
@@ -9666,6 +9750,121 @@ export class StateStore {
     ) !== null;
   }
 
+  #readAccountMutationRecoveryOrigin(input: Readonly<{
+    attemptId: AttemptId;
+    profileId: ProfileId;
+    originGeneration: number;
+  }>) {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const profileId = profileIdSchema.parse(input.profileId);
+    const originGeneration = z.number().int().nonnegative().safe().parse(input.originGeneration);
+    const authority = z.object({
+      authority_id: profileIdSchema,
+      authority_generation: z.number().int().nonnegative().safe(),
+      kind: z.enum(["account.login", "account.logout", "account.login-cancel"]),
+      evidence_kind: z.enum(["account.login", "account.logout", "account.login-cancel"]),
+      evidence_json: z.string(),
+      evidence_digest: sha256Schema,
+      request_digest: sha256Schema,
+      process_generation: z.number().int().nonnegative().safe(),
+    }).strict().safeParse(this.#database.query(
+      `SELECT m.authority_id,m.authority_generation,m.kind,e.kind AS evidence_kind,
+         e.evidence_json,e.evidence_digest,m.request_digest,p.process_generation
+       FROM mutation_attempts m JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+       JOIN profiles p ON p.id=m.authority_id AND p.state!='removed'
+       WHERE m.id=?`,
+    ).get(attemptId));
+    if (!authority.success) return null;
+    const row = authority.data;
+    if (row.authority_id !== profileId || row.authority_generation !== originGeneration
+      || row.kind !== row.evidence_kind) return null;
+    try {
+      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      if (evidence.kind !== row.kind || digestJson(evidence) !== row.evidence_digest) return null;
+      const request = evidence.kind === "account.login"
+        ? { deviceCode: evidence.method === "device_code" }
+        : evidence.kind === "account.login-cancel" ? { loginId: evidence.loginId } : {};
+      if (mutationRequestDigest({
+        kind: row.kind, authorityId: profileId, authorityGeneration: originGeneration, request,
+      }) !== row.request_digest) return null;
+    } catch {
+      return null;
+    }
+    return row;
+  }
+
+  isAccountMutationAuthorityCurrent(input: Readonly<{
+    attemptId: AttemptId;
+    profileId: ProfileId;
+    originGeneration: number;
+  }>): boolean {
+    const row = this.#readAccountMutationRecoveryOrigin(input);
+    if (row === null) return false;
+    if (row.process_generation === input.originGeneration) return true;
+    return this.#database.query(
+      `WITH RECURSIVE authority_chain(generation) AS (
+         VALUES (?)
+         UNION ALL
+         SELECT r.to_generation FROM account_mutation_authority_rebinds r
+         JOIN authority_chain c ON r.from_generation=c.generation
+         WHERE r.attempt_id=? AND r.profile_id=? AND r.kind=? AND r.evidence_digest=?
+       ) SELECT 1 FROM authority_chain WHERE generation=? LIMIT 1`,
+    ).get(input.originGeneration, input.attemptId, input.profileId, row.kind, row.evidence_digest, row.process_generation) !== null;
+  }
+
+  #canQuarantineUnboundAccountMutation(input: Readonly<{
+    attemptId: AttemptId;
+    profileId: ProfileId;
+    originGeneration: number;
+  }>): boolean {
+    const origin = this.#readAccountMutationRecoveryOrigin(input);
+    // Old releases advanced profile generations without an account successor
+    // ledger. Validate those immutable bytes only to preserve a local fence.
+    // This predicate is never a provider-current or resolution authority.
+    return origin !== null && origin.authority_generation < origin.process_generation
+      && this.#database.query("SELECT 1 FROM account_mutation_authority_rebinds WHERE attempt_id=? LIMIT 1")
+        .get(input.attemptId) === null;
+  }
+
+  #recordAccountMutationAuthoritySuccessors(input: Readonly<{
+    fromGeneration: number;
+    now: number;
+    profileId: ProfileId;
+  }>): void {
+    for (const attempt of this.listUnsettledMutations({ authorityId: input.profileId })) {
+      if (attempt.kind !== "account.login" && attempt.kind !== "account.logout" && attempt.kind !== "account.login-cancel") continue;
+      const authority = {
+        attemptId: attempt.id, profileId: input.profileId, originGeneration: attempt.authorityGeneration,
+      };
+      if (attempt.evidence === undefined) throw new Error("ACCOUNT_MUTATION_SUCCESSOR_AUTHORITY_MISMATCH");
+      if (!this.isAccountMutationAuthorityCurrent(authority)) {
+        if (!this.#canQuarantineUnboundAccountMutation(authority)) throw new Error("ACCOUNT_MUTATION_SUCCESSOR_AUTHORITY_MISMATCH");
+        this.#database.query("UPDATE profiles SET state='recovery_required',updated_at=MAX(updated_at,?) WHERE id=? AND process_generation=? AND state!='removed'")
+          .run(input.now, input.profileId, input.fromGeneration);
+        continue;
+      }
+      this.#database.query(
+        `INSERT INTO account_mutation_authority_rebinds(
+           attempt_id,profile_id,kind,evidence_digest,from_generation,to_generation,recorded_at
+         ) VALUES (?,?,?,?,?,?,?)`,
+      ).run(attempt.id, input.profileId, attempt.kind, attempt.evidence.digest,
+        input.fromGeneration, input.fromGeneration + 1, input.now);
+    }
+  }
+
+  #hasExactRecoveringLoginCancellation(profile: ProfileRecord, loginId: string): boolean {
+    return profile.state === "recovery_required"
+      && this.listUnsettledMutations({ authorityId: profile.id }).some((attempt) =>
+        attempt.kind === "account.login-cancel"
+        && attempt.evidence?.evidence.kind === "account.login-cancel"
+        && attempt.evidence.evidence.loginId === loginId
+        && (this.isAccountMutationAuthorityCurrent({
+          attemptId: attempt.id, profileId: profile.id, originGeneration: attempt.authorityGeneration,
+        }) || this.#canQuarantineUnboundAccountMutation({
+          attemptId: attempt.id, profileId: profile.id, originGeneration: attempt.authorityGeneration,
+        })));
+  }
+
   hasNonterminalProviderSession(profileId: ProfileId, provider: Provider): boolean {
     const parsedProfileId = profileIdSchema.parse(profileId);
     const parsedProvider = providerSchema.parse(provider);
@@ -10048,16 +10247,19 @@ export class StateStore {
           profileId: current.id,
         });
       }
-      const activeLogin = this.#database.query(`SELECT attempt_id,process_generation
+      this.#recordAccountMutationAuthoritySuccessors({ profileId, fromGeneration: expectedGeneration, now });
+      const activeLogin = this.#database.query(`SELECT attempt_id,process_generation,login_id
                                                 FROM provider_login_authorities
                                                 WHERE profile_id=? AND state='active'`).all(profileId) as {
         attempt_id: string;
         process_generation: number;
+        login_id: string;
       }[];
       if (activeLogin.length > 1) throw new Error("LOGIN_GENERATION_AUTHORITY_AMBIGUOUS");
       if (activeLogin.length === 1) {
         if (
-          current.state !== "login_pending"
+          (current.state !== "login_pending"
+            && !this.#hasExactRecoveringLoginCancellation(current, activeLogin[0]?.login_id ?? ""))
           || activeLogin[0]?.process_generation !== expectedGeneration
         ) throw new Error("LOGIN_GENERATION_AUTHORITY_MISMATCH");
         const rebound = this.#database.query(`UPDATE provider_login_authorities
@@ -10070,9 +10272,10 @@ export class StateStore {
         );
         if (rebound.changes !== 1) throw new Error("LOGIN_GENERATION_AUTHORITY_CAS_CONFLICT");
       }
-      const state = current.state === "login_pending" && activeLogin.length === 0
+      const retainedState = this.requireProfileById(profileId).state;
+      const state = retainedState === "login_pending" && activeLogin.length === 0
         ? "recovery_required"
-        : current.state;
+        : retainedState;
       const affectedWorkIds = workStore?.prepareProfileAuthorityChange(
         profileId,
         expectedGeneration,
@@ -10304,7 +10507,8 @@ export class StateStore {
         this.#database.query(
           `SELECT COUNT(*) AS count FROM mutation_attempts m
            LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
-           WHERE m.authority_id=? AND m.authority_generation=?
+           WHERE m.authority_id=? AND (m.authority_generation=?
+             OR m.kind IN ('account.login','account.logout','account.login-cancel'))
              AND m.state IN ('effect_started','ambiguous')
              AND r.attempt_id IS NULL`,
         ).get(profileId, expectedGeneration),
@@ -10319,7 +10523,8 @@ export class StateStore {
       if (generic.count !== 0 || resets.count !== 0) {
         throw new Error("PROFILE_RECOVERY_AUTHORITY_UNSETTLED");
       }
-      const state = provider.signedIn ? "signed_in" : "signed_out";
+      const pendingLogin = this.readPendingLoginAuthority(profileId, expectedGeneration);
+      const state = provider.signedIn ? "signed_in" : pendingLogin === null ? "signed_out" : "login_pending";
       const now = unixMillisecondsSchema.parse(this.#now());
       const providerEmail = provider.signedIn ? provider.email ?? null : null;
       const changed = this.#database.query(
@@ -10337,7 +10542,7 @@ export class StateStore {
       if (changed.changes !== 1) {
         throw new Error("PROFILE_RECOVERY_AUTHORITY_CHANGED");
       }
-      this.#database.query(
+      if (state !== "login_pending") this.#database.query(
         `UPDATE provider_login_authorities
          SET state='settled',settlement=?,updated_at=?
          WHERE profile_id=? AND process_generation=? AND state='active'`,
@@ -14112,6 +14317,11 @@ export class StateStore {
         now,
         profileId: parsed.profileId,
       });
+      this.#recordAccountMutationAuthoritySuccessors({
+        fromGeneration: parsed.expectedGeneration,
+        now,
+        profileId: parsed.profileId,
+      });
       const profile = this.#database.query(
         `UPDATE profiles
          SET process_generation=process_generation+1,
@@ -17548,6 +17758,61 @@ export class StateStore {
     return settle.immediate();
   }
 
+  completeLoginCancelMutation(input: {
+    attemptId: AttemptId;
+    profileId: ProfileId;
+    processGeneration: number;
+    receipt: {
+      loginId: string;
+      providerStatus: "canceled" | "not_found";
+      provider: { signedIn: boolean; email?: string; plan?: string };
+    };
+  }): ProfileRecord {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const profileId = profileIdSchema.parse(input.profileId);
+    const processGeneration = z.number().int().nonnegative().safe().parse(input.processGeneration);
+    const receipt = z.object({
+      loginId: providerLoginIdSchema,
+      providerStatus: z.enum(["canceled", "not_found"]),
+      provider: z.object({ signedIn: z.boolean(), email: z.string().max(1_024).optional(), plan: z.string().max(128).optional() }).strict(),
+    }).strict().parse(input.receipt);
+    const complete = this.#database.transaction(() => {
+      const row = z.object({
+        authority_id: profileIdSchema,
+        authority_generation: z.number().int().nonnegative().safe(),
+        state: z.literal("effect_started"),
+        evidence_json: z.string(),
+      }).strict().parse(this.#database.query(
+        `SELECT m.authority_id,m.authority_generation,m.state,e.evidence_json
+         FROM mutation_attempts m JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+         WHERE m.id=? AND m.kind='account.login-cancel' AND e.kind=m.kind
+           AND NOT EXISTS (SELECT 1 FROM mutation_resolutions r WHERE r.attempt_id=m.id)`,
+      ).get(attemptId));
+      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      if (row.authority_id !== profileId || row.authority_generation !== processGeneration
+        || evidence.kind !== "account.login-cancel" || evidence.loginId !== receipt.loginId
+        || !this.isAccountMutationAuthorityCurrent({ attemptId, profileId, originGeneration: processGeneration })) {
+        throw new Error("LOGIN_CANCEL_MUTATION_AUTHORITY_MISMATCH");
+      }
+      this.settlePendingLogin({
+        profileId,
+        processGeneration,
+        loginId: receipt.loginId,
+        providerStatus: receipt.providerStatus,
+        provider: {
+          signedIn: receipt.provider.signedIn,
+          ...(receipt.provider.email === undefined ? {} : { email: receipt.provider.email }),
+          ...(receipt.provider.plan === undefined ? {} : { plan: receipt.provider.plan }),
+        },
+      });
+      if (!this.transitionMutation(attemptId, "effect_started", "applied", receipt)) {
+        throw new Error("LOGIN_CANCEL_MUTATION_CAS_CONFLICT");
+      }
+    });
+    complete.immediate();
+    return this.requireProfileById(profileId);
+  }
+
   /**
    * Records the effect evidence for an `account.login-cancel` attempt and moves
    * it to `effect_started` in one transaction, bound to the exact pending login
@@ -17617,12 +17882,17 @@ export class StateStore {
       const row = z.object({
         kind: z.literal("account.login-cancel"),
         state: z.enum(["effect_started", "ambiguous"]),
+        authority_id: profileIdSchema,
+        authority_generation: z.number().int().nonnegative().safe(),
       }).strict().parse(
-        this.#database.query(`SELECT m.kind,m.state FROM mutation_attempts m
+        this.#database.query(`SELECT m.kind,m.state,m.authority_id,m.authority_generation FROM mutation_attempts m
                               LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
                               WHERE m.id=? AND r.attempt_id IS NULL`).get(parsedAttemptId),
       );
       if (row.state !== expectedState) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
+      if (!this.isAccountMutationAuthorityCurrent({
+        attemptId: parsedAttemptId, profileId: row.authority_id, originGeneration: row.authority_generation,
+      })) throw new Error("ACCOUNT_MUTATION_RECOVERY_AUTHORITY_MISMATCH");
       const inserted = this.#database.query("INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)").run(
         parsedAttemptId,
         "provider_state_reconciled",
@@ -17653,7 +17923,8 @@ export class StateStore {
       .query(`SELECT m.id FROM mutation_attempts m
               LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
               LEFT JOIN desktop_switch_resolutions dr ON dr.attempt_id=m.id
-              WHERE m.authority_id=? AND m.authority_generation=?
+              WHERE m.authority_id=? AND (m.authority_generation=?
+                OR m.kind IN ('account.login','account.logout','account.login-cancel'))
                 AND m.state IN ('effect_started','ambiguous') AND r.attempt_id IS NULL AND dr.attempt_id IS NULL
               LIMIT 1`)
       .get(input.authorityId, input.authorityGeneration);
@@ -19837,6 +20108,10 @@ export class StateStore {
       );
       if (row.state !== input.expectedOriginalState || row.evidence_digest !== expectedDigest) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
       profileId = row.authority_id;
+      if (!this.isAccountMutationAuthorityCurrent({
+        attemptId: parsedAttemptId, profileId, originGeneration: row.authority_generation,
+      })) throw new Error("ACCOUNT_MUTATION_RECOVERY_AUTHORITY_MISMATCH");
+      const currentGeneration = this.requireProfileById(profileId).processGeneration;
       const providerEmail = input.provider.signedIn ? input.provider.email ?? null : null;
       const changed = this.#database.query(`UPDATE profiles SET state=?,provider_email=?,codex_account_key=?,provider_plan=?,updated_at=?
                                             WHERE id=? AND process_generation=? AND state='recovery_required'`).run(
@@ -19846,7 +20121,7 @@ export class StateStore {
         input.provider.plan ?? null,
         now,
         row.authority_id,
-        row.authority_generation,
+        currentGeneration,
       );
       if (changed.changes !== 1) throw new Error("MUTATION_RECOVERY_PROFILE_CAS_CONFLICT");
       this.#database.query("INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)").run(
@@ -19944,11 +20219,15 @@ export class StateStore {
             const profile = this.#database
               .query("SELECT state,process_generation FROM profiles WHERE id=?")
               .get(parsedProfile.data) as { state: string; process_generation: number } | null;
-            if (profile !== null && profile.process_generation === authorityGeneration) {
+            if (profile !== null && (this.isAccountMutationAuthorityCurrent({
+              attemptId: id, profileId: parsedProfile.data, originGeneration: authorityGeneration,
+            }) || this.#canQuarantineUnboundAccountMutation({
+              attemptId: id, profileId: parsedProfile.data, originGeneration: authorityGeneration,
+            }))) {
               if (profile.state !== "removed" && profile.state !== "recovery_required") {
                 this.#database
                   .query("UPDATE profiles SET state='recovery_required',updated_at=? WHERE id=? AND process_generation=?")
-                  .run(this.#now(), parsedProfile.data, authorityGeneration);
+                  .run(this.#now(), parsedProfile.data, profile.process_generation);
               }
               authorityResolved = true;
             }
@@ -23678,16 +23957,26 @@ export class StateStore {
       for (const sessionId of affectedInteractionSessions) {
         this.#repairRestartInteractionSessionStateInTransaction(sessionId, now);
       }
-      const invalidLoginAuthority = this.#database.query(`SELECT a.attempt_id
-                                                          FROM provider_login_authorities a
-                                                          LEFT JOIN profiles p ON p.id=a.profile_id
-                                                          WHERE a.state='active'
-                                                            AND (p.id IS NULL OR p.state!='login_pending' OR p.process_generation!=a.process_generation)
-                                                          LIMIT 1`).get();
-      if (invalidLoginAuthority !== null) {
-        throw new Error("LOGIN_RESTART_AUTHORITY_MISMATCH");
+      for (const raw of this.#database.query(
+        "SELECT profile_id,process_generation,login_id FROM provider_login_authorities WHERE state='active'",
+      ).all()) {
+        const active = z.object({
+          profile_id: profileIdSchema,
+          process_generation: z.number().int().nonnegative().safe(),
+          login_id: providerLoginIdSchema,
+        }).strict().parse(raw);
+        const profile = this.requireProfileById(active.profile_id);
+        if (profile.processGeneration !== active.process_generation
+          || (profile.state !== "login_pending" && !this.#hasExactRecoveringLoginCancellation(profile, active.login_id))) {
+          throw new Error("LOGIN_RESTART_AUTHORITY_MISMATCH");
+        }
       }
       for (const profile of this.listProfiles()) {
+        this.#recordAccountMutationAuthoritySuccessors({
+          fromGeneration: profile.processGeneration,
+          now,
+          profileId: profile.id,
+        });
         if (this.#sessionMutationAuthorityTuplesForProfile(profile.id).length === 0) continue;
         this.#recordSessionMutationAuthoritySuccessors({
           fromGeneration: profile.processGeneration,

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -403,7 +404,7 @@ describe("release workflow", () => {
       .not.toThrow();
   });
 
-  test("publishes the exact transactional installer in the forward release notes", async () => {
+  test("preserves the admitted installer while the current README prepares the next candidate", async () => {
     const [releaseNotes, readme, thirdPartyNotices, changelog, security] = await Promise.all([
       readFile(join(import.meta.dir, "..", "docs", "beta-release-notes.md"), "utf8"),
       readFile(join(import.meta.dir, "..", "README.md"), "utf8"),
@@ -413,8 +414,18 @@ describe("release workflow", () => {
     ]);
     const installCommand = buildHraGlobalInstallCommand(HRA_INSTALL_ARCHIVE_URL);
 
-    expect(releaseNotes).toContain(installCommand);
+    const admittedInstallCommand = releaseNotes.split("\n").find((line) => line.startsWith("test "));
+    expect(admittedInstallCommand).toBeDefined();
+    // Exact v0.6.1 command from protected source a75e7487594ce5b68345ccd3536974a10f7a93ee.
+    expect(createHash("sha256").update(admittedInstallCommand ?? "").digest("hex"))
+      .toBe("b6a0adb2b3eac4dd6d873486e5317b91bc2df0de701f96cb2b22b6fd73f3d361");
+    expect(releaseNotes).toContain("## Unreleased v0.6.2 candidate");
+    expect(releaseNotes).toContain("It has not completed artifact admission");
+    expect(releaseNotes).not.toContain(installCommand);
     expect(readme).toContain(installCommand);
+    expect(readme).toContain("Local CLI v0.6.2 is release-ready, not yet admitted");
+    expect(readme).toContain("Run the install command below only after immutable GitHub and npm release admission");
+    expect(readme).not.toContain("v0.6.2 artifacts are live");
     expect(readme).toContain("next invocation of that exact release's installer");
     expect(readme).toContain("`$BUN_INSTALL/install/hra/install-intent.json`");
     expect(readme).toContain("the exact immutable install command from the originating release's trusted README or release notes");
@@ -435,7 +446,10 @@ describe("release workflow", () => {
     expect(releaseNotes).not.toContain("runtime SPDX inventory");
     expect(releaseNotes).toContain("# HRA v0.6.1 local CLI beta");
     expect(thirdPartyNotices).toContain("exact tarball plus `SHA256SUMS`");
-    expect(thirdPartyNotices).toContain("immutable `v0.6.1` release source tag");
+    expect(thirdPartyNotices).toContain("The `v0.6.2` candidate records its build graph");
+    expect(thirdPartyNotices).toContain("This candidate is not yet admitted");
+    expect(thirdPartyNotices).toContain("must bind an immutable source tag");
+    expect(thirdPartyNotices).toContain("`@hraness/site-footer` v0.6.1");
     expect(thirdPartyNotices).toContain("`@hraness/design-kit` v0.4.0");
     expect(thirdPartyNotices).not.toContain("`@hraness/design-kit` v0.3.0");
     expect(thirdPartyNotices).not.toContain("SPDX");

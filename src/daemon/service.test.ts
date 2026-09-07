@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Database } from "bun:sqlite";
+import { z } from "zod";
 
 import {
   CodexError,
@@ -9794,6 +9795,33 @@ describe("HraService", () => {
     });
   });
 
+  test("refuses a new Claude login before probe or idle-session release while Codex auth is unbound", async () => {
+    const value = await claudeAccountFixture();
+    const added = await value.service.execute({ kind: "account.add", label: "Shared auth fence" }, { signal }) as { account: { id: `acct_${string}` } };
+    value.codex.beforeLoginReturn = async () => { throw new IndeterminateCodexEffectError("account/login/start", 12); };
+    await expect(value.service.execute({ kind: "account.login", account: added.account.id, deviceCode: true }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    value.store.nextProfileGeneration(added.account.id);
+    // Model retained local sibling state without importing new provider
+    // authority into an account that is already quarantined.
+    const starting = value.store.createSession({
+      profileId: added.account.id, provider: "claude", title: "Preserved Claude session",
+      preset: "fable-max", fastEnabled: false,
+    });
+    const idle = value.store.bindSession({
+      sessionId: starting.id, expectedRevision: starting.revision,
+      providerThreadId: "claude-shared-auth-fence", state: "idle",
+    });
+    const before = value.store.requireSession(idle.id);
+    const key = "00000000-0000-4000-8000-000000000723";
+    await expect(value.service.execute({ kind: "account.claude-login.prepare", account: added.account.id, idempotencyKey: key }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED", details: { reason: "account_mutation_unsettled" } });
+    expect(value.claudeReadCalls()).toBe(0);
+    expect(value.providerSessionCalls).toEqual([]);
+    expect(value.store.requireSession(idle.id)).toEqual(before);
+    expect(value.store.readMutation(key)).toBeNull();
+  });
+
   test("prepares managed Claude login without releasing an adopted personal Claude controller", async () => {
     const value = await adoptedClaudeFixture(
       "Personal Claude survives managed login",
@@ -12635,7 +12663,7 @@ describe("HraService", () => {
         DROP TABLE IF EXISTS autorespond_budget_history;
         DROP TABLE IF EXISTS autorespond_budget_reservations;
         DELETE FROM migrations WHERE version>=25;
-        DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=24;
+        DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=24;
         PRAGMA foreign_keys=ON;
       `);
     } finally {
@@ -12651,7 +12679,7 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
       ).all()).toEqual([
@@ -12675,6 +12703,7 @@ describe("HraService", () => {
         { version: 42 },
         { version: 43 },
         { version: 44 },
+        { version: 45 },
       ]);
     } finally {
       inspector.close(false);
@@ -16068,6 +16097,79 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(2);
   });
 
+  test("preserves an accepted cancellation when its following account read fails", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Cancel read failure" }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.loginResult = { status: "pending", loginId: "provider-login-read-failure" };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    codex.accountProjection = { signedIn: false };
+    codex.cancelLoginResult = { status: "canceled" };
+    codex.beforeReadAccountReturn = async () => { throw new Error("Account read failed after cancellation."); };
+    const idempotencyKey = "00000000-0000-4000-8000-000000000135";
+    await expect(service.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+      idempotencyKey,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+    expect(store.requireProfile(added.account.id).state).toBe("login_pending");
+    await expect(service.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
+
+    delete codex.beforeReadAccountReturn;
+    await expect(service.execute({ kind: "account.show", account: added.account.id }, { signal }))
+      .resolves.toMatchObject({ login: { status: "pending", loginId: "provider-login-read-failure" } });
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "reconciled", originalState: "ambiguous" });
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
+    codex.cancelLoginResult = { status: "not_found" };
+    await expect(service.execute({ kind: "account.login-cancel", account: added.account.id }, { signal }))
+      .resolves.toMatchObject({ status: "canceled", providerStatus: "not_found" });
+  });
+
+  test("rolls back cancellation settlement when its receipt compare-and-swap fails", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Cancel receipt failure" }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.loginResult = { status: "pending", loginId: "provider-login-receipt-failure" };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    codex.accountProjection = { signedIn: false };
+    const idempotencyKey = "00000000-0000-4000-8000-000000000140";
+    const transition = store.transitionMutation.bind(store);
+    store.transitionMutation = (id, from, to, result) => {
+      if (to === "applied" && store.readMutation(idempotencyKey)?.id === id) return false;
+      return transition(id, from, to, result);
+    };
+    await expect(service.execute({ kind: "account.login-cancel", account: added.account.id, idempotencyKey }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(store.requireProfile(added.account.id).state).toBe("login_pending");
+    expect(store.readPendingLoginAuthority(added.account.id, 1)?.loginId).toBe("provider-login-receipt-failure");
+    expect(store.readMutation(idempotencyKey)?.state).toBe("ambiguous");
+    store.transitionMutation = transition;
+    await expect(service.execute({ kind: "account.show", account: added.account.id }, { signal }))
+      .resolves.toMatchObject({ login: { status: "pending", loginId: "provider-login-receipt-failure" } });
+    expect(store.readMutation(idempotencyKey)?.state).toBe("reconciled");
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
+  });
+
+  test("leaves an accepted cancellation effect started when the account-read fence is lost", async () => {
+    const { service, codex, store, daemonAuthority } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Cancel read fence" }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.loginResult = { status: "pending", loginId: "provider-login-read-fence" };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    codex.accountProjection = { signedIn: false };
+    codex.beforeReadAccountReturn = async () => { daemonAuthority.invalidate(); };
+    const idempotencyKey = "00000000-0000-4000-8000-000000000136";
+    await expect(service.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+      idempotencyKey,
+    }, { signal })).rejects.toBeInstanceOf(DaemonAuthoritySafetyError);
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "effect_started" });
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
+  });
+
   test("quarantines an effect-started login cancellation at restart and reconciles it from the account read", async () => {
     const value = await fixture();
     const { service, codex, store } = value;
@@ -16111,14 +16213,207 @@ describe("HraService", () => {
 
     const shown = await restarted.execute({ kind: "account.show", account: added.account.id }, { signal });
     expect(shown).toMatchObject({
-      account: { processGeneration: 1, state: "signed_out" },
+      account: { processGeneration: 1, state: "login_pending" },
       recovery: { cleared: true, required: false, resolution: "provider_state_reconciled" },
     });
     expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "reconciled", originalState: "ambiguous" });
-    expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+    expect(store.readPendingLoginAuthority(added.account.id, 1)?.loginId).toBe("provider-login-crashed-cancel");
     expect(restartedCodex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
     await restarted.close();
     await service.close();
+  });
+
+  test("recovers a cancellation through the production daemon generation rollover", async () => {
+    const value = await fixture();
+    const { service, codex, store, paths } = value;
+    const added = await service.execute({ kind: "account.add", label: "Cancel production restart" }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.loginResult = { status: "pending", loginId: "provider-login-production-restart" };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    const idempotencyKey = "00000000-0000-4000-8000-000000000137";
+    const attempt = store.prepareMutation({
+      kind: "account.login-cancel",
+      authorityId: added.account.id,
+      authorityGeneration: 1,
+      request: { loginId: "provider-login-production-restart" },
+      idempotencyKey,
+    });
+    store.beginLoginCancelMutationEffect({
+      attemptId: attempt.id,
+      profileId: added.account.id,
+      processGeneration: 1,
+      loginId: "provider-login-production-restart",
+    });
+    store.nextDaemonGeneration(`boot_${"b".repeat(32)}`);
+    const restartedCodex = new FakeCodex();
+    restartedCodex.accountProjection = { signedIn: false };
+    const restarted = new HraService({
+      store, paths, codex: restartedCodex, cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined,
+    });
+    await expect(restarted.recover()).resolves.toBeUndefined();
+    expect(store.requireProfile(added.account.id)).toMatchObject({ processGeneration: 2, state: "recovery_required" });
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ authorityGeneration: 1, state: "ambiguous" });
+    // A second crash before status reconciliation must preserve the same
+    // immutable cancellation instead of rejecting its retained login fence.
+    store.nextDaemonGeneration(`boot_${"c".repeat(32)}`);
+    const again = new HraService({
+      store, paths, codex: restartedCodex, cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined,
+    });
+    await expect(again.recover()).resolves.toBeUndefined();
+    await expect(again.execute({ kind: "account.show", account: added.account.id }, { signal }))
+      .resolves.toMatchObject({ account: { processGeneration: 3, state: "login_pending" }, login: { loginId: "provider-login-production-restart", status: "pending" }, recovery: { required: false, cleared: true } });
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ authorityGeneration: 1, state: "reconciled" });
+    expect(restartedCodex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
+  });
+
+  test("reconciles cancellation racing successful sign-in without revoking its exact login authority", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Cancellation success race" }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.loginResult = { status: "pending", loginId: "provider-login-success-race" };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    codex.beforeCancelLoginReturn = async () => { throw new IndeterminateCodexEffectError("account/cancelLogin", 13); };
+    const idempotencyKey = "00000000-0000-4000-8000-000000000143";
+    await expect(service.execute({ kind: "account.login-cancel", account: added.account.id, idempotencyKey }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    store.recoverEffectStartedMutations();
+    // Recovery may already have quarantined a cancellation at startup.
+    store.setProfileState(added.account.id, 1, "recovery_required");
+    codex.accountProjection = { signedIn: true, email: "race@example.com" };
+    await expect(service.execute({ kind: "account.show", account: added.account.id }, { signal }))
+      .resolves.toMatchObject({ account: { state: "signed_in", processGeneration: 1, providerEmail: "race@example.com" }, recovery: { required: false, cleared: true } });
+    await service.settled();
+    expect(store.requireProfile(added.account.id)).toMatchObject({ state: "signed_in", processGeneration: 1 });
+    expect(store.readMutation(idempotencyKey)?.state).toBe("reconciled");
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
+  });
+
+  test("does not clear an ambiguous login after production daemon generation rollover", async () => {
+    const value = await fixture();
+    const { service, codex, store, paths } = value;
+    const added = await service.execute({ kind: "account.add", label: "Login production restart" }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.beforeLoginReturn = async () => { throw new IndeterminateCodexEffectError("account/login/start", 9); };
+    const idempotencyKey = "00000000-0000-4000-8000-000000000138";
+    await expect(service.execute({
+      kind: "account.login", account: added.account.id, deviceCode: true, idempotencyKey,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    store.nextDaemonGeneration(`boot_${"d".repeat(32)}`);
+    const restartedCodex = new FakeCodex();
+    restartedCodex.accountProjection = { signedIn: false };
+    const restarted = new HraService({
+      store, paths, codex: restartedCodex, cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined,
+    });
+    await restarted.recover();
+    await expect(restarted.execute({ kind: "account.show", account: added.account.id }, { signal }))
+      .resolves.toMatchObject({ account: { processGeneration: 2, state: "recovery_required" }, recovery: { required: true, cleared: false } });
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ authorityGeneration: 1, state: "ambiguous" });
+    await expect(restarted.execute({ kind: "account.login", account: added.account.id, deviceCode: true }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(restartedCodex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(0);
+
+    restartedCodex.accountProjection = { signedIn: true, email: "recovered@example.com" };
+    await expect(restarted.execute({ kind: "account.show", account: added.account.id }, { signal }))
+      .resolves.toMatchObject({ account: { processGeneration: 2, state: "signed_in" }, recovery: { required: false, cleared: true } });
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ authorityGeneration: 1, state: "reconciled" });
+    await expect(restarted.execute({ kind: "account.login", account: added.account.id, deviceCode: true, idempotencyKey }, { signal }))
+      .resolves.toMatchObject({ login: { status: "signed_in" } });
+    await expect(restarted.execute({ kind: "account.login", account: added.account.id, deviceCode: false, idempotencyKey }, { signal }))
+      .rejects.toThrow("IDEMPOTENCY_CONFLICT");
+    expect(restartedCodex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(0);
+  });
+
+  test("reports an unbound historical account mutation without reading or replacing provider authority", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Unbound historical login" }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.beforeLoginReturn = async () => { throw new IndeterminateCodexEffectError("account/login/start", 10); };
+    await expect(service.execute({ kind: "account.login", account: added.account.id, deviceCode: true }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    store.nextProfileGeneration(added.account.id);
+    const calls = [...codex.calls];
+    await expect(service.execute({ kind: "account.show", account: added.account.id }, { signal }))
+      .resolves.toMatchObject({ recovery: { required: true, cleared: false, reason: "account_mutation_authority_unbound" } });
+    for (const command of [
+      { kind: "account.login", account: added.account.id, deviceCode: true },
+      { kind: "account.logout", account: added.account.id },
+      { kind: "account.login-cancel", account: added.account.id },
+    ] as const) {
+      await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    }
+    expect(codex.calls).toEqual(calls);
+  });
+
+  test("keeps unrelated accounts usable across a legacy schema 43 unbound login upgrade", async () => {
+    const value = await fixture();
+    const { service, codex, store, paths } = value;
+    const added = await service.execute({ kind: "account.add", label: "Legacy login upgrade" }, { signal }) as { account: { id: `acct_${string}` } };
+    const other = await service.execute({ kind: "account.add", label: "Unaffected login" }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: other.account.id, deviceCode: false }, { signal });
+    codex.beforeLoginReturn = async () => { throw new IndeterminateCodexEffectError("account/login/start", 11); };
+    const idempotencyKey = "00000000-0000-4000-8000-000000000139";
+    await expect(service.execute({ kind: "account.login", account: added.account.id, deviceCode: true, idempotencyKey }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    store.nextProfileGeneration(added.account.id);
+    const original = store.readMutation(idempotencyKey);
+    // v43 advanced the profile without any account successor ledger. Build
+    // that exact predecessor surface; the v45 migration must not backfill it.
+    const legacy = new Database(paths.database, { strict: true });
+    const evidenceSql = z.object({ sql: z.string() }).strict().parse(legacy.query(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='autorespond_evidence'",
+    ).get()).sql;
+    expect(evidenceSql).toContain("'accepted','refused','unknown','sent'");
+    legacy.exec(evidenceSql
+      .replace("autorespond_evidence", "autorespond_evidence_v43")
+      .replace("'accepted','refused','unknown','sent'", "'accepted','refused','sent'"));
+    legacy.exec(`
+      INSERT INTO autorespond_evidence_v43 SELECT * FROM autorespond_evidence;
+      DROP TABLE autorespond_evidence;
+      ALTER TABLE autorespond_evidence_v43 RENAME TO autorespond_evidence;
+      CREATE INDEX autorespond_evidence_session ON autorespond_evidence(session_id, occurred_at DESC, id DESC);
+      CREATE INDEX autorespond_evidence_recent ON autorespond_evidence(occurred_at DESC, id DESC);
+      DROP TABLE account_mutation_authority_rebinds;
+      DROP TRIGGER sessions_autorespond_budget_history;
+      DROP TABLE autorespond_budget_history;
+      DROP TABLE autorespond_budget_reservations;
+      DELETE FROM migrations WHERE version>43;
+      PRAGMA user_version=43;
+    `);
+    legacy.close(false);
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const upgraded = new StateStore(paths);
+    stores.push(upgraded);
+    const restartedCodex = new FakeCodex();
+    const restarted = new HraService({
+      store: upgraded, paths, codex: restartedCodex, cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined,
+    });
+    for (const boot of ["e", "f"]) {
+      upgraded.nextDaemonGeneration(`boot_${boot.repeat(32)}`);
+      await expect(restarted.recover()).resolves.toBeUndefined();
+      const beforeRead = [...restartedCodex.calls];
+      await expect(restarted.execute({ kind: "account.show", account: added.account.id }, { signal }))
+        .resolves.toMatchObject({ account: { state: "recovery_required" }, recovery: { required: true, cleared: false, reason: "account_mutation_authority_unbound" } });
+      await expect(restarted.execute({ kind: "account.login", account: added.account.id, deviceCode: true }, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      expect(restartedCodex.calls).toEqual(beforeRead);
+      await restarted.observeCodexAccount({
+        id: added.account.id, generation: upgraded.requireProfile(added.account.id).processGeneration,
+        codexHome: "unused", desktopUserData: "unused",
+      }, { signedIn: true, email: "unsolicited@example.com" });
+      expect(upgraded.requireProfile(added.account.id).state).toBe("recovery_required");
+      await expect(restarted.execute({ kind: "account.usage", account: added.account.id, refresh: true }, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      expect(restartedCodex.calls).toEqual(beforeRead);
+      await expect(restarted.execute({ kind: "account.show", account: other.account.id }, { signal }))
+        .resolves.toMatchObject({ account: { state: "signed_in" } });
+      expect(upgraded.readMutation(idempotencyKey)).toMatchObject({ authorityGeneration: 1, state: "ambiguous", evidence: original?.evidence });
+    }
+    const inspector = new Database(paths.database, { readonly: true });
+    try {
+      expect(inspector.query("SELECT COUNT(*) AS count FROM account_mutation_authority_rebinds").get()).toEqual({ count: 0 });
+      expect(inspector.query("SELECT COUNT(*) AS count FROM mutation_resolutions WHERE attempt_id=?").get(original?.id ?? "")).toEqual({ count: 0 });
+    } finally { inspector.close(false); }
   });
 
   test("leaves a logout rejection unsettled when the daemon fence closes before exact controller release", async () => {
@@ -18852,7 +19147,7 @@ describe("HraService", () => {
     }, { signal })).resolves.toMatchObject({
       account: { state: "signed_out", processGeneration: 2 },
       providerProjection: { signedIn: false },
-      recovery: { required: false, cleared: true, resolution: "provider_state_reconciled" },
+      recovery: { required: false, cleared: true, resolution: "proven_applied" },
     });
   });
 

@@ -314,11 +314,12 @@ describe("durable autorespond admission", () => {
       DROP TRIGGER sessions_autorespond_budget_history;
       DROP TABLE autorespond_budget_history;
       DROP TABLE autorespond_budget_reservations;
-      DELETE FROM migrations WHERE version=44;
+      DROP TABLE account_mutation_authority_rebinds;
+      DELETE FROM migrations WHERE version>=44;
       PRAGMA user_version=43;
     `);
     predecessor.close(false);
-    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:44");
+    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:45");
     const migrated = new StateStore(paths, { now: () => clock.now });
     stores.push(migrated);
     const availableAt = clock.now + AUTORESPOND_DAY_MS;
@@ -362,25 +363,30 @@ describe("durable autorespond admission", () => {
     stores.splice(stores.indexOf(store), 1);
     store.close();
     const damaged = new Database(paths.database);
-    damaged.exec("DELETE FROM migrations WHERE version=44; PRAGMA user_version=43");
+    damaged.exec("DROP TABLE account_mutation_authority_rebinds; DELETE FROM migrations WHERE version>=44; PRAGMA user_version=43");
     expect(damaged.query("SELECT available_at FROM autorespond_budget_history WHERE session_id=?").get(sessionId))
       .toEqual({ available_at: 0 });
     damaged.close(false);
     expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_PREDECESSOR_COLLISION");
   });
 
-  test("never applies pre-release v43 trigger-repair allowances to canonical v44", async () => {
-    const { store } = await fixture();
-    const paths = store.paths;
-    stores.splice(stores.indexOf(store), 1);
-    store.close();
-    const damaged = new Database(paths.database);
-    damaged.exec("DROP TRIGGER queue_transcript_cancellation_settlement");
-    damaged.close(false);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V43_QUEUE_CANCELLATION_GUARD_INVALID");
-    const inspector = new Database(paths.database, { readonly: true });
-    try {
-      expect(inspector.query("SELECT 1 FROM sqlite_master WHERE name='queue_transcript_cancellation_settlement'").get()).toBeNull();
-    } finally { inspector.close(false); }
+  test("never applies pre-release v43 trigger-repair allowances to canonical v44 or v45", async () => {
+    for (const version of [44, 45]) {
+      const { store } = await fixture();
+      const paths = store.paths;
+      stores.splice(stores.indexOf(store), 1);
+      store.close();
+      const damaged = new Database(paths.database);
+      if (version === 44) {
+        damaged.exec("DROP TABLE account_mutation_authority_rebinds; DELETE FROM migrations WHERE version=45; PRAGMA user_version=44");
+      }
+      damaged.exec("DROP TRIGGER queue_transcript_cancellation_settlement");
+      damaged.close(false);
+      expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V43_QUEUE_CANCELLATION_GUARD_INVALID");
+      const inspector = new Database(paths.database, { readonly: true });
+      try {
+        expect(inspector.query("SELECT 1 FROM sqlite_master WHERE name='queue_transcript_cancellation_settlement'").get()).toBeNull();
+      } finally { inspector.close(false); }
+    }
   });
 });

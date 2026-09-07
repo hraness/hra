@@ -561,18 +561,20 @@ function ArchivedSessionRow({
 export function AccountBrowserLoginControls({
   account,
   busy,
+  handoffAvailable = false,
   onStart,
   onStatus,
 }: Readonly<{
   account: AccountRowView;
   busy: boolean;
+  handoffAvailable?: boolean;
   onStart: () => void;
   onStatus: () => void;
 }>) {
   if (!accountBrowserLoginAllowed(account)) return null;
   return (
     <div className="flex flex-wrap items-center gap-2">
-      {account.status === "signed_out" ? (
+      {account.status === "signed_out" && !handoffAvailable ? (
         <Button
           disabled={busy}
           onClick={onStart}
@@ -604,7 +606,7 @@ export function AccountBrowserLoginControls({
  * their shared ciphertext on the first read. Poll names this row's account and
  * returns only its status and a bounded local instruction.
  */
-function AccountRow({
+export function AccountRow({
   account,
   now,
   serverClockReady,
@@ -614,7 +616,10 @@ function AccountRow({
   const readResult = useReadDeviceCommandResult();
   const [relay, setRelay] = useState<AccountLoginRelayResult | null>(null);
   const [status, setStatus] = useState<string | null>(null);
-  const [consumeRetryCommand, setConsumeRetryCommand] = useState<string | null>(null);
+  const [consumeRetry, setConsumeRetry] = useState<Readonly<{
+    commandPublicId: string;
+    expiresAt: number;
+  }> | null>(null);
   const [consumeAttempt, setConsumeAttempt] = useState(0);
   const [loginAction, setLoginAction] = useState<AccountLoginActionState>(
     initialAccountLoginActionState,
@@ -627,6 +632,7 @@ function AccountRow({
   const localLoginCommand = account.provider === "codex"
     ? `hra account login ${account.publicId}`
     : `hra account login ${account.publicId} --provider ${account.provider}`;
+  const lostHandoffInstruction = `Check status first. If a login is still pending and you cannot finish it, run \`hra account login-cancel ${account.publicId}\` on ${account.machineLabel} before linking again.`;
   const busy = loginAction.phase !== "idle";
 
   const updateLoginAction = useCallback((next: AccountLoginActionState) => {
@@ -677,9 +683,9 @@ function AccountRow({
     // Fence by public id only after hosted time is ready, before the mutation,
     // so neither clock skew nor a relay-driven render can lose the one read.
     consumedCommand.current = command.publicId;
-    setConsumeRetryCommand(null);
+    setConsumeRetry(null);
     if (admission.status === "expired_or_invalid") {
-      setStatus("This login handoff expired. Start a new login.");
+      setStatus(`This browser's login handoff expired. ${lostHandoffInstruction}`);
       releaseLoginHandoff(command.publicId);
       return;
     }
@@ -690,7 +696,7 @@ function AccountRow({
       .then((result) => {
         if (!mounted.current || activeCommand.current !== command.publicId) return;
         if (result === null) {
-          setStatus("No login handoff was available. It expired, was already read, or requires an HRA update on the machine. Start a new login after checking the machine.");
+          setStatus(`No login handoff was available. It expired, was already read, or requires an HRA update on the machine. ${lostHandoffInstruction}`);
           releaseLoginHandoff(command.publicId);
           return;
         }
@@ -709,20 +715,20 @@ function AccountRow({
         if (failure instanceof DeviceCommandConsumePrecommitError) {
           // The hosted transaction definitely aborted, so retain custody of
           // this exact handoff and let the reader explicitly retry it.
-          setConsumeRetryCommand(command.publicId);
+          setConsumeRetry({ commandPublicId: command.publicId, expiresAt: admission.expiresAt });
           setStatus(failure.message);
           return;
         }
         if (failure instanceof DeviceCommandConsumedResultUnreadableError) {
           setStatus(
-            "The one-time login handoff was consumed but could not be read. Unlock this browser again, check the machine, then start a new login.",
+            `The one-time login handoff was consumed but could not be read. Unlock this browser again. ${lostHandoffInstruction}`,
           );
         } else {
           setStatus("The machine returned an incompatible login handoff. Update HRA on the machine before trying again.");
         }
         releaseLoginHandoff(command.publicId);
       });
-  }, [command, consumeAttempt, consumeResult, now, releaseLoginHandoff, serverClockReady]);
+  }, [command, consumeAttempt, consumeResult, lostHandoffInstruction, now, releaseLoginHandoff, serverClockReady]);
 
   // Failed, cancelled, ambiguous, and hosted-expired starts have no relay to
   // consume. An applied result consumed by another tab also releases the row,
@@ -737,23 +743,37 @@ function AccountRow({
       if (command.resultSingleUse && !command.resultConsumed) return;
       if (consumedCommand.current === command.publicId) return;
       setStatus(command.resultSingleUse
-        ? "No login handoff was available. It expired or was already read. Start a new login after checking the machine."
+        ? `No login handoff was available. It expired or was already read. ${lostHandoffInstruction}`
         : "The machine returned a legacy login handoff. Update HRA on the machine before trying again.");
     }
     releaseLoginHandoff(command.publicId);
-  }, [command, releaseLoginHandoff]);
+  }, [command, lostHandoffInstruction, releaseLoginHandoff]);
 
-  // The provider code is short lived. Server-corrected `now` handles clock
-  // skew, while the timer removes it from memory at the deadline between ticks.
+  // A registry read may lag the handoff, so signed-out alone cannot erase it.
+  // Positive sign-in or recovery evidence does close this browser's handoff.
   useEffect(() => {
-    if (relay === null) return;
+    if (account.status === "signed_in" || account.status === "recovery_required") {
+      setRelay(null);
+    }
+  }, [account.status, relay]);
+
+  // Server-corrected `now` handles clock skew. At the deadline, erase a read
+  // handoff or release a rejected read without requiring another consumption.
+  useEffect(() => {
+    const expiresAt = relay?.expiresAt ?? consumeRetry?.expiresAt;
+    if (expiresAt === undefined) return;
     const maximumBrowserTimerMs = 2_147_483_647;
-    const delay = Math.min(Math.max(0, relay.expiresAt - now), maximumBrowserTimerMs);
+    const delay = Math.min(Math.max(0, expiresAt - now), maximumBrowserTimerMs);
     const timer = setTimeout(() => {
       setRelay((current) => current === relay ? null : current);
+      if (consumeRetry !== null) {
+        setConsumeRetry(null);
+        releaseLoginHandoff(consumeRetry.commandPublicId);
+      }
+      setStatus(`This browser's login handoff expired. ${lostHandoffInstruction}`);
     }, delay);
     return () => { clearTimeout(timer); };
-  }, [now, relay]);
+  }, [consumeRetry, lostHandoffInstruction, now, relay, releaseLoginHandoff]);
 
   useEffect(() => {
     if (
@@ -772,6 +792,7 @@ function AccountRow({
           setStatus("The machine returned an incompatible login status. Update HRA on the machine before trying again.");
           return;
         }
+        if (result.status !== "pending") setRelay(null);
         setStatus(result.instruction);
       })
       .catch(() => {
@@ -790,8 +811,10 @@ function AccountRow({
     // one-time handoff: the action gate above holds that command through read.
     activeCommand.current = null;
     setCommandHandle(null);
-    setConsumeRetryCommand(null);
-    setRelay(null);
+    setConsumeRetry(null);
+    // A status read must preserve the code already consumed by this browser.
+    // It cannot be fetched again from the hosted single-use result.
+    if (payload.kind === "account_login_start") setRelay(null);
     setStatus(null);
     void submitDeviceCommand({ payload, targetDevicePublicId: account.targetDevicePublicId })
       .then((publicId) => {
@@ -839,6 +862,7 @@ function AccountRow({
         <AccountBrowserLoginControls
           account={account}
           busy={busy}
+          handoffAvailable={relay !== null && relay.expiresAt > now}
           onStart={() => { run(accountLoginStartCommand(account.publicId)); }}
           onStatus={() => { run(accountLoginStatusCommand(account.publicId)); }}
         />
@@ -867,11 +891,11 @@ function AccountRow({
           {observation.protocolWarning}
         </p>
       )}
-      {consumeRetryCommand === command?.publicId ? (
+      {consumeRetry !== null && consumeRetry.commandPublicId === command?.publicId ? (
         <Button
           onClick={() => {
             consumedCommand.current = null;
-            setConsumeRetryCommand(null);
+            setConsumeRetry(null);
             setStatus(null);
             setConsumeAttempt((attempt) => attempt + 1);
           }}

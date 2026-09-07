@@ -1,7 +1,7 @@
 {
   "name": "@hraness/hra",
-  "version": "0.6.1",
-  "description": "Control plane for Codex and Claude Code. Local CLI v0.6.1 artifacts are live; daemon and hosted command-writer rollout remains blocked on capacity.",
+  "version": "0.6.2",
+  "description": "Control plane for Codex and Claude Code. Local CLI v0.6.2 is release-ready, not yet admitted; daemon and hosted command-writer rollout remains blocked on capacity.",
   "license": "MIT",
   "publishConfig": {
     "access": "public",

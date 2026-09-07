@@ -41,6 +41,12 @@ const claudeAuthStatusDocumentSchema = z.object({
 
 export type ClaudeAuthAccountProjection = Readonly<{ signedIn: boolean }>;
 
+/** Private authority evidence, never an account identity or credential. */
+export type ClaudeAuthenticationObservation = Readonly<{
+  signedIn: boolean;
+  authentication: "claude_ai" | "other" | "none";
+}>;
+
 export type ClaudeAuthStatusReader = (input: Readonly<{
   configDir: string;
   signal: AbortSignal;
@@ -63,6 +69,8 @@ export type ClaudeAuthStatusProcessFactory = (input: Readonly<{
 
 export interface ReadClaudeAuthStatusOptions {
   readonly configDir: string;
+  /** Personal homes must retain Claude's canonical default-home resolution. */
+  readonly configHome?: "isolated" | "personal";
   readonly signal: AbortSignal;
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly deadlineMs?: number;
@@ -99,6 +107,8 @@ export interface RunClaudeForegroundLoginOptions {
   readonly stdio: Readonly<{ stderr: number; stdin: number; stdout: number }>;
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly signalGraceMs?: number;
+  /** Bounded join after forced termination, never a login-ceremony timeout. */
+  readonly forceJoinDeadlineMs?: number;
   readonly resolveRuntime?: (options: ResolvePinnedClaudeRuntimeOptions) => Promise<PinnedClaudeRuntime>;
   /** A just-preflighted runtime may be reused across the daemon launch grant. */
   readonly runtime?: PinnedClaudeRuntime;
@@ -129,6 +139,8 @@ const processSignalSource: ClaudeLoginSignalSource = {
 
 export interface ClaudeLoginSignalCustody {
   readonly interruptedBy: ClaudeLoginSignal | null;
+  /** Resolves after force was attempted, not as proof that the child exited. */
+  readonly forceBoundary: Promise<void>;
   attachChild(child: ClaudeForegroundLoginProcess): void;
   close(): void;
 }
@@ -149,11 +161,14 @@ export function createClaudeLoginSignalCustody(options: Readonly<{
   let abortObserved = false;
   let abortForwarded = false;
   let closed = false;
+  let resolveForceBoundary!: () => void;
+  const forceBoundary = new Promise<void>((resolve) => { resolveForceBoundary = resolve; });
   let forceTimer: ReturnType<typeof setTimeout> | undefined;
   const scheduleForce = (): void => {
     if (child === undefined || forceTimer !== undefined) return;
     forceTimer = setTimeout(() => {
       try { child?.forceTerminate(); } catch { /* Awaiting `exited` remains authoritative. */ }
+      resolveForceBoundary();
     }, signalGraceMs);
     forceTimer.unref();
   };
@@ -180,6 +195,7 @@ export function createClaudeLoginSignalCustody(options: Readonly<{
   if (abortRequested(options.signal)) onAbort();
   return {
     get interruptedBy() { return interruptedBy; },
+    forceBoundary,
     attachChild: (next) => {
       if (closed || child !== undefined) {
         throw new ClaudeError("INVALID_INPUT", "Claude login signal custody cannot be rebound.");
@@ -348,6 +364,14 @@ export function parseClaudeAuthStatus(input: Readonly<{
   exitCode: number;
   stdout: Uint8Array;
 }>): ClaudeAuthAccountProjection {
+  return { signedIn: parseClaudeAuthenticationObservation(input).signedIn };
+}
+
+function parseClaudeAuthenticationObservation(input: Readonly<{
+  configDir: string;
+  exitCode: number;
+  stdout: Uint8Array;
+}>): ClaudeAuthenticationObservation {
   if (!isAbsolute(input.configDir)) {
     throw new ClaudeError("INVALID_INPUT", "CLAUDE_CONFIG_DIR must be an absolute path");
   }
@@ -367,13 +391,27 @@ export function parseClaudeAuthStatus(input: Readonly<{
   if (!coherentSignedIn && !coherentSignedOut) {
     throw new ClaudeError("PROTOCOL_ERROR", "Claude returned an incoherent authentication status.");
   }
-  return { signedIn: coherentSignedIn };
+  return {
+    signedIn: coherentSignedIn,
+    authentication: !coherentSignedIn
+      ? "none"
+      : status.authMethod === "claude.ai"
+        ? "claude_ai"
+        : "other",
+  };
 }
 
-/** Runs the version-admitted CLI status command inside one isolated Claude home. */
+/** Projects only sign-in state for the managed account surface. */
 export async function readClaudeAuthStatus(
   options: ReadClaudeAuthStatusOptions,
 ): Promise<ClaudeAuthAccountProjection> {
+  return { signedIn: (await readClaudeAuthenticationObservation(options)).signedIn };
+}
+
+/** Runs one bounded, joined status process in the exact reviewed home mode. */
+export async function readClaudeAuthenticationObservation(
+  options: ReadClaudeAuthStatusOptions,
+): Promise<ClaudeAuthenticationObservation> {
   assertNotAborted(options.signal);
   const deadlineMs = boundedMilliseconds(
     options.deadlineMs ?? AUTH_STATUS_DEADLINE_MS,
@@ -381,8 +419,10 @@ export async function readClaudeAuthStatus(
     60_000,
   );
   const environment = options.environment ?? process.env;
+  const configHome = options.configHome ?? "isolated";
   const runtime = options.runtime ?? await (options.resolveRuntime ?? resolvePinnedClaudeRuntime)({
       configDir: options.configDir,
+      configHome,
       environment,
       signal: options.signal,
       versionProbeDeadlineMs: deadlineMs,
@@ -390,7 +430,7 @@ export async function readClaudeAuthStatus(
   assertNotAborted(options.signal);
 
   const childEnvironment = allowlistedEnvironment(environment);
-  childEnvironment.CLAUDE_CONFIG_DIR = options.configDir;
+  if (configHome === "isolated") childEnvironment.CLAUDE_CONFIG_DIR = options.configDir;
   childEnvironment.NO_COLOR = "1";
   let child: ClaudeAuthStatusProcess;
   try {
@@ -440,7 +480,7 @@ export async function readClaudeAuthStatus(
     // Draining stderr is a required bounded process join, never a diagnostic
     // source: provider output is not copied into an HRA result or log.
     void outcome.diagnostic;
-    return parseClaudeAuthStatus({
+    return parseClaudeAuthenticationObservation({
       configDir: options.configDir,
       exitCode: outcome.exitCode,
       stdout: outcome.output,
@@ -468,6 +508,11 @@ const descriptor = (value: number): number => {
 export async function runClaudeForegroundLogin(
   options: RunClaudeForegroundLoginOptions,
 ): Promise<ClaudeForegroundLoginResult> {
+  const forceJoinDeadlineMs = boundedMilliseconds(
+    options.forceJoinDeadlineMs ?? PROCESS_FORCE_JOIN_DEADLINE_MS,
+    "Claude foreground login forced join deadline",
+    10_000,
+  );
   const ownsSignalCustody = options.signalCustody === undefined;
   const signalCustody = options.signalCustody ?? createClaudeLoginSignalCustody({
     signal: options.signal,
@@ -538,7 +583,7 @@ export async function runClaudeForegroundLogin(
           };
     }
     signalCustody.attachChild(child);
-    const exitCode = await child.exited.catch((error: unknown) => {
+    const exit = child.exited.catch((error: unknown) => {
       // A rejected wait is not proof of exit. Force the exact child before
       // returning control; this port has no stronger post-rejection join.
       try { child.forceTerminate(); } catch { /* Preserve the original wait failure. */ }
@@ -546,6 +591,27 @@ export async function runClaudeForegroundLogin(
         cause: error,
       });
     });
+    let settled = false;
+    let exitCode: number;
+    try {
+      exitCode = await Promise.race([
+        exit,
+        signalCustody.forceBoundary.then(async () => {
+          // Ordinary provider interaction has no artificial deadline. Only
+          // interruption followed by the force boundary starts this final
+          // join. A timeout preserves the caller's durable launch fence.
+          if (!settled && !(await waitForPromise(exit, forceJoinDeadlineMs))) {
+            throw new ClaudeError(
+              "TIMEOUT",
+              "Claude foreground login could not be joined after forced termination.",
+            );
+          }
+          return await exit;
+        }),
+      ]);
+    } finally {
+      settled = true;
+    }
     return {
       state: "joined",
       exitCode,

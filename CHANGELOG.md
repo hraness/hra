@@ -2,6 +2,14 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## v0.6.2 candidate (unreleased)
+
+Authentication hardening after the admitted `v0.6.1` release. This candidate has not completed artifact admission and does not clear the blocked daemon or hosted command-writer rollout.
+
+- Codex authentication reads stop on cancellation before dispatch. Durable login and cancellation recovery binds exact successor authority without replaying an uncertain provider effect, and cancellation settlement is atomic. Additive schema 45 preserves the released schema 44 automatic-approval budget and quarantines older unbound authentication evidence.
+- Claude status distinguishes a subscription login from other authentication modes before attributing account identity. Interrupted foreground login has a bounded final process join; uncertain cleanup remains fenced. Linux-only support and the pending exact-pin authenticated acceptance remain unchanged.
+- Settings preserves the one-time Codex code during a pending status check and gives recovery guidance when the handoff expires or is lost. Email sign-in keeps the submitted identity fixed while its request is pending. Login codes still never enter browser clipboard or persistence APIs.
+
 ## v0.6.1
 
 Forward repair for the incomplete `v0.6.0` admission. The `v0.6.0` tag, GitHub Release, npm package, and failed workflow attempts remain immutable historical evidence. This release carries the intended v0.6 feature set forward with its routing, transcript, hosted-command, deployment-evidence, and provenance boundaries corrected.
