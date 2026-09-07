@@ -9,7 +9,11 @@ import {
 } from "../custody/registration";
 import { commandLifetimeMs } from "../env";
 import { createCloudUuidV7, encryptRemoteCommand, type RemoteCommandPayload } from "../hra/cloud";
-import { commandGet, enqueueCommand } from "./functions";
+import {
+  acknowledgeObservedCommandReceipt,
+  parseSessionCommandEnqueueReceipt,
+} from "./command-receipts";
+import { acknowledgeCommandReceipt, commandGet, enqueueCommand } from "./functions";
 import { parseCommandRecord, type CommandRecord } from "./wire";
 
 export type SubmitCommandInput = Readonly<{
@@ -53,12 +57,45 @@ export function useSubmitCommand(): SubmitCommand {
       publicId: commandPublicId,
       sessionPublicId: input.sessionPublicId,
     });
-    const requestDigest = await enqueueRequestDigest(unlocked.key, request);
+    const requestDigest = await enqueueRequestDigest(
+      unlocked.key,
+      request,
+      unlocked.identity.devicePublicId,
+    );
+    const wireRequest = {
+      ...request,
+      expectedRequestingDevicePublicId: unlocked.identity.devicePublicId,
+      idempotencyKey,
+      requestCommitmentVersion: 2 as const,
+      requestDigest,
+    };
+    let response: unknown;
     try {
-      await convex.mutation(enqueueCommand, { ...request, idempotencyKey, requestDigest });
+      response = await convex.mutation(enqueueCommand, wireRequest);
     } catch (failure: unknown) {
       report(failure);
       throw failure;
+    }
+    const proof = parseSessionCommandEnqueueReceipt(response, wireRequest);
+    // A resolved Convex mutation is committed even when a rolling-deployment
+    // mismatch makes its success body incompatible. Do not bind the original
+    // request proof to response authority we could not validate, but do return
+    // the generated identity: existing
+    // session-command callers otherwise present a retry that could create a
+    // second effect. The mounted requester-only recovery query supplies the
+    // authoritative proof and completes acknowledgement without an enqueue.
+    if (proof !== null) {
+      try {
+        await acknowledgeObservedCommandReceipt(
+          proof,
+          async (args) => await convex.mutation(acknowledgeCommandReceipt, args),
+        );
+      } catch (failure: unknown) {
+        // The enqueue is already committed. Returning its identity prevents a
+        // user retry from creating a second provider effect; the mounted
+        // requester-only recovery query will retry this exact acknowledgement.
+        report(failure);
+      }
     }
     return commandPublicId;
   }, [convex, report, unlocked]);

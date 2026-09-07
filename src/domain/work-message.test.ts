@@ -3,8 +3,8 @@ import { describe, expect, test } from "bun:test";
 import { messageSchema, utf8Bytes } from "./values";
 import {
   WORK_DEPENDENCY_PREVIEW_MAX_BYTES,
+  WORK_APPLY_REQUEST_VERSION,
   WORK_PROTOCOL,
-  WORK_PROTOCOL_VERSION,
   WORK_TASK_DEPENDENCY_LIMIT,
   WORK_WORKER_BRIEF_MAX_BYTES,
   workPreparedEffectSchema,
@@ -107,7 +107,7 @@ describe("work machine briefs", () => {
     ]);
     for (const request of Object.values(parsed.control.requests)) {
       expect(request.protocol).toBe(WORK_PROTOCOL);
-      expect(request.version).toBe(WORK_PROTOCOL_VERSION);
+      expect(request.version).toBe(WORK_APPLY_REQUEST_VERSION);
       expect(request.requestId).toBe("$PERSISTED_REQUEST_UUID");
       expect(request.operation.idempotencyKey).toBe("$PERSISTED_OPERATION_UUIDV7");
     }

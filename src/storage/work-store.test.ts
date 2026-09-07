@@ -13,6 +13,8 @@ import {
   type SessionId,
 } from "../domain/values";
 import {
+  WORK_APPLY_REQUEST_LEGACY_VERSION,
+  WORK_APPLY_REQUEST_VERSION,
   WORK_HISTORY_EVENT_LIMIT,
   WORK_HISTORY_RECOVERY_RESERVE,
   WORK_INLINE_RESULT_MAX_BYTES,
@@ -35,8 +37,11 @@ import {
   WORK_SCHEMA_SQL,
   WorkStore,
   WorkStoreError,
+  assertProviderVersion40WorkSchema,
   assertReadonlyWorkSchema,
   assertWorkSchema,
+  canonicalWorkJson,
+  installProviderVersion40WorkAuthoritySchema,
   workPreparedEffectMessage,
 } from "./work-store";
 
@@ -53,6 +58,35 @@ function randomUUID(): string {
   const timestamp = "01890f31a123";
   const suffix = (++uuidV7Sequence).toString(16).padStart(12, "0").slice(-12);
   return `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7000-8000-${suffix}`;
+}
+
+const requestDigest = (value: unknown): string => createHash("sha256")
+  .update(canonicalWorkJson(value))
+  .digest("hex");
+
+function rewriteIntentDigest(
+  value: Fixture,
+  idempotencyKey: string,
+  digest: string,
+): void {
+  value.database.exec("DROP TRIGGER work_intents_no_update;");
+  try {
+    value.database.query(
+      "UPDATE work_idempotency_intents SET request_digest=? WHERE idempotency_key=?",
+    ).run(digest, idempotencyKey);
+  } finally {
+    value.database.exec(WORK_SCHEMA_SQL);
+  }
+}
+
+function rewriteWorkPresetContract(value: Fixture, workId: string, contract: 1 | 2): void {
+  value.database.exec("DROP TRIGGER works_identity_immutable;");
+  try {
+    value.database.query("UPDATE works SET preset_contract=? WHERE id=?")
+      .run(contract, workId);
+  } finally {
+    value.database.exec(WORK_SCHEMA_SQL);
+  }
 }
 
 function queueReceipt(accountGeneration = 1) {
@@ -107,7 +141,7 @@ CREATE TABLE sessions(
   provider_v39 TEXT NOT NULL DEFAULT 'codex',
   provider_thread_id TEXT,
   preset TEXT NOT NULL,
-  preset_contract INTEGER NOT NULL DEFAULT 2 CHECK(preset_contract IN (1,2)),
+  preset_contract INTEGER NOT NULL DEFAULT 1 CHECK(preset_contract IN (1,2)),
   fast_enabled INTEGER NOT NULL,
   state TEXT NOT NULL
 ) STRICT;
@@ -600,7 +634,7 @@ describe("WorkStore schema and atomic plans", () => {
     const created = createWork(value);
     expect(value.database.query(
       "SELECT preset_contract FROM works WHERE id=?",
-    ).get(created.work.id)).toEqual({ preset_contract: 2 });
+    ).get(created.work.id)).toEqual({ preset_contract: 1 });
     const page = value.store.events(created.work.id, 0, 20);
     expect(page.events.map((event) => event.body.type)).toEqual(["work.created"]);
     expect(page.events[0]?.sequence).toBe(1);
@@ -630,6 +664,34 @@ describe("WorkStore schema and atomic plans", () => {
     ).run(created.work.id);
     expect(() => value.store.events(created.work.id, 0, 20)).toThrow(
       "WORK_EVENT_CHAIN_CORRUPT",
+    );
+  });
+
+  test("rejects a weakened same-name non-authority Work trigger", () => {
+    const weakenEventAppendOnlyGuard = (database: Database): void => {
+      database.exec(`
+        DROP TRIGGER work_events_no_update;
+        CREATE TRIGGER work_events_no_update
+        BEFORE UPDATE ON work_events
+        WHEN OLD.sequence < 0
+        BEGIN SELECT RAISE(ABORT,'WORK_EVENT_APPEND_ONLY'); END;
+      `);
+    };
+
+    const current = fixture();
+    weakenEventAppendOnlyGuard(current.database);
+    expect(() => assertWorkSchema(current.database)).toThrow(
+      "WORK_SCHEMA_STALE_TRIGGER:work_events_no_update",
+    );
+    expect(() => assertReadonlyWorkSchema(current.database)).toThrow(
+      "WORK_SCHEMA_STALE_TRIGGER:work_events_no_update",
+    );
+
+    const predecessor = fixture();
+    installProviderVersion40WorkAuthoritySchema(predecessor.database);
+    weakenEventAppendOnlyGuard(predecessor.database);
+    expect(() => assertProviderVersion40WorkSchema(predecessor.database)).toThrow(
+      "WORK_SCHEMA_STALE_TRIGGER:work_events_no_update",
     );
   });
 
@@ -755,7 +817,7 @@ describe("WorkStore schema and atomic plans", () => {
     databases.push(database);
     database.exec("PRAGMA foreign_keys=ON;");
     const legacyParentSchema = parentSchema.replace(
-      "  preset_contract INTEGER NOT NULL DEFAULT 2 CHECK(preset_contract IN (1,2)),\n",
+      "  preset_contract INTEGER NOT NULL DEFAULT 1 CHECK(preset_contract IN (1,2)),\n",
       "",
     );
     expect(legacyParentSchema).not.toBe(parentSchema);
@@ -766,6 +828,23 @@ describe("WorkStore schema and atomic plans", () => {
     );
     expect(() => assertReadonlyWorkSchema(database)).toThrow(
       "WORK_SCHEMA_STALE:sessions.preset_contract",
+    );
+  });
+
+  test("rejects a Sol-bound Work row owned by a historical Devin coordinator", () => {
+    const value = fixture();
+    createWork(value);
+    value.database.exec("DROP TRIGGER work_session_devin_contract_guard");
+    value.database.query(
+      "UPDATE sessions SET provider_v39='devin',preset_contract=2 WHERE id=?",
+    ).run(value.actorSessionId);
+    value.database.exec(WORK_SCHEMA_SQL);
+
+    expect(() => assertWorkSchema(value.database)).toThrow(
+      "WORK_SCHEMA_DEVIN_WORK_PRESET_CONTRACT_INVALID",
+    );
+    expect(() => assertReadonlyWorkSchema(value.database)).toThrow(
+      "WORK_SCHEMA_DEVIN_WORK_PRESET_CONTRACT_INVALID",
     );
   });
 
@@ -827,6 +906,100 @@ describe("WorkStore schema and atomic plans", () => {
     expect(value.database.query("SELECT COUNT(*) AS count FROM works").get()).toEqual({ count: 1 });
   });
 
+  test("admits fresh Work creation only from a current v2 source and replays historical sources", () => {
+    const value = fixture();
+    const operation = {
+      kind: "work.create",
+      idempotencyKey: randomUUID(),
+      clientRef: "source-bound-create",
+      coordinatorSessionId: value.actorSessionId,
+      objective: "Bind the caller-authored Work source.",
+      routes: [{
+        accountId: value.accountId,
+        projectId: value.projectId,
+        preset: "high",
+        fast: false,
+      }],
+      tasks: [taskSpec(value, "source-bound-high")],
+    } satisfies WorkOperation;
+    const counts = (): Readonly<{ intents: number; works: number }> => ({
+      intents: (value.database.query(
+        "SELECT COUNT(*) AS count FROM work_idempotency_intents",
+      ).get() as { count: number }).count,
+      works: (value.database.query("SELECT COUNT(*) AS count FROM works").get() as {
+        count: number;
+      }).count,
+    });
+
+    expect(() => value.store.apply(operation, operation.idempotencyKey, {
+      version: WORK_APPLY_REQUEST_LEGACY_VERSION,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(() => value.store.apply(operation, operation.idempotencyKey, {
+      version: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 2,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(counts()).toEqual({ intents: 0, works: 0 });
+
+    const applied = value.store.apply(operation, operation.idempotencyKey, {
+      version: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 1,
+    });
+    if (applied.kind !== "work.create") throw new Error("unexpected result");
+    expect(value.store.apply(structuredClone(operation), operation.idempotencyKey, {
+      version: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 1,
+    })).toEqual(applied);
+    expect(() => value.store.apply(operation, operation.idempotencyKey, {
+      version: WORK_APPLY_REQUEST_LEGACY_VERSION,
+    })).toThrow(new WorkStoreError("IDEMPOTENCY_CONFLICT"));
+    expect(() => value.store.apply(operation, operation.idempotencyKey, {
+      version: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 2,
+    })).toThrow(new WorkStoreError("IDEMPOTENCY_CONFLICT"));
+
+    rewriteIntentDigest(value, operation.idempotencyKey, requestDigest(operation));
+    rewriteWorkPresetContract(value, applied.work.id, 2);
+    expect(value.store.apply(operation, operation.idempotencyKey, {
+      version: WORK_APPLY_REQUEST_LEGACY_VERSION,
+    })).toEqual(applied);
+    expect(() => value.store.apply(operation, operation.idempotencyKey, {
+      version: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 2,
+    })).toThrow(new WorkStoreError("IDEMPOTENCY_CONFLICT"));
+
+    const historicalV2 = {
+      ...operation,
+      idempotencyKey: randomUUID(),
+      clientRef: "source-bound-historical-v2",
+    } satisfies WorkOperation;
+    const historicalResult = value.store.apply(historicalV2, historicalV2.idempotencyKey, {
+      version: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 1,
+    });
+    if (historicalResult.kind !== "work.create") throw new Error("unexpected result");
+    rewriteIntentDigest(value, historicalV2.idempotencyKey, requestDigest({
+      requestVersion: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 2,
+      operation: historicalV2,
+    }));
+    rewriteWorkPresetContract(value, historicalResult.work.id, 2);
+    expect(value.store.apply(historicalV2, historicalV2.idempotencyKey, {
+      version: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 2,
+    })).toEqual(historicalResult);
+
+    const beforeFreshStale = counts();
+    expect(() => value.store.apply({
+      ...historicalV2,
+      idempotencyKey: randomUUID(),
+      clientRef: "source-bound-fresh-stale-v2",
+    }, undefined, {
+      version: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 2,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(counts()).toEqual(beforeFreshStale);
+  });
+
   test("rejects unresolved graph references and route failures without partial admission", () => {
     const value = fixture();
     const created = createWork(value);
@@ -859,6 +1032,100 @@ describe("WorkStore schema and atomic plans", () => {
       "SELECT COUNT(*) AS count FROM work_tasks WHERE work_id=?",
     ).get(created.work.id)).toEqual({ count: 1 });
   });
+
+  test("rejects fresh rebound tasks on a legacy Work while preserving exact replay and stable additions", () => {
+    const value = fixture();
+    const created = createWork(value, [
+      taskSpec(value, "existing-high"),
+      taskSpec(value, "existing-low", { preset: "low" }),
+    ]);
+    const reboundOperation = {
+      kind: "task.addBatch",
+      idempotencyKey: randomUUID(),
+      workId: created.work.id,
+      expectedWorkRevision: created.work.revision,
+      coordinatorSessionId: value.actorSessionId,
+      coordinatorCapability: capability,
+      tasks: [taskSpec(value, "added-high")],
+    } satisfies WorkOperation;
+    const applied = value.store.apply(
+      reboundOperation,
+      reboundOperation.idempotencyKey,
+      { version: WORK_APPLY_REQUEST_VERSION, presetContract: 1 },
+    );
+    if (applied.kind !== "task.addBatch") throw new Error("unexpected result");
+    expect(() => value.store.apply(
+      reboundOperation,
+      reboundOperation.idempotencyKey,
+      { version: WORK_APPLY_REQUEST_VERSION, presetContract: 2 },
+    )).toThrow(new WorkStoreError("IDEMPOTENCY_CONFLICT"));
+
+    // Recreate an immutable Work written by the preceding contract. The exact
+    // applied intent remains historical, while any new rebound task must be
+    // admitted under the active Work contract.
+    rewriteWorkPresetContract(value, created.work.id, 2);
+    assertWorkSchema(value.database);
+    expect(value.store.apply(
+      structuredClone(reboundOperation),
+      reboundOperation.idempotencyKey,
+      { version: WORK_APPLY_REQUEST_VERSION, presetContract: 1 },
+    )).toEqual(applied);
+    rewriteIntentDigest(value, reboundOperation.idempotencyKey, requestDigest({
+      requestVersion: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 2,
+      operation: reboundOperation,
+    }));
+    expect(value.store.apply(
+      structuredClone(reboundOperation),
+      reboundOperation.idempotencyKey,
+      { version: WORK_APPLY_REQUEST_VERSION, presetContract: 2 },
+    )).toEqual(applied);
+
+    const taskCount = value.database.query(
+      "SELECT COUNT(*) AS count FROM work_tasks WHERE work_id=?",
+    ).get(created.work.id);
+    const intentCount = value.database.query(
+      "SELECT COUNT(*) AS count FROM work_idempotency_intents WHERE work_id=?",
+    ).get(created.work.id);
+    const freshHigh = {
+      ...reboundOperation,
+      idempotencyKey: randomUUID(),
+      expectedWorkRevision: applied.workRevision,
+      tasks: [taskSpec(value, "fresh-high")],
+    } satisfies WorkOperation;
+    expect(() => value.store.apply(freshHigh, undefined, {
+      version: WORK_APPLY_REQUEST_LEGACY_VERSION,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(() => value.store.apply(freshHigh, undefined, {
+      version: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 2,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(() => value.store.apply(freshHigh, undefined, {
+      version: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 1,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(value.database.query(
+      "SELECT COUNT(*) AS count FROM work_tasks WHERE work_id=?",
+    ).get(created.work.id)).toEqual(taskCount);
+    expect(value.database.query(
+      "SELECT COUNT(*) AS count FROM work_idempotency_intents WHERE work_id=?",
+    ).get(created.work.id)).toEqual(intentCount);
+
+    const stableV1 = value.store.apply({
+      ...reboundOperation,
+      idempotencyKey: randomUUID(),
+      expectedWorkRevision: applied.workRevision,
+      tasks: [taskSpec(value, "fresh-low", { preset: "low" })],
+    }, undefined, { version: WORK_APPLY_REQUEST_LEGACY_VERSION });
+    expect(stableV1).toMatchObject({ kind: "task.addBatch" });
+    const stableV2 = value.store.apply({
+      ...reboundOperation,
+      idempotencyKey: randomUUID(),
+      expectedWorkRevision: stableV1.workRevision,
+      tasks: [taskSpec(value, "fresh-low-v2", { preset: "low" })],
+    }, undefined, { version: WORK_APPLY_REQUEST_VERSION });
+    expect(stableV2).toMatchObject({ kind: "task.addBatch" });
+  });
 });
 
 describe("WorkStore claims, fences, and prepared effects", () => {
@@ -876,16 +1143,15 @@ describe("WorkStore claims, fences, and prepared effects", () => {
   test("refuses a claim when the session and immutable work preset contracts differ", () => {
     const value = fixture();
     const created = createWork(value);
-    value.database.query("UPDATE sessions SET preset_contract=1 WHERE id=?")
+    value.database.query("UPDATE sessions SET preset_contract=2 WHERE id=?")
       .run(value.actorSessionId);
-
     expect(() => claim(value, {
       workId: created.work.id,
       taskId: created.tasks[0]!.id,
       revision: created.tasks[0]!.revision,
     })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
 
-    value.database.query("UPDATE sessions SET preset_contract=2 WHERE id=?")
+    value.database.query("UPDATE sessions SET preset_contract=1 WHERE id=?")
       .run(value.actorSessionId);
     expect(claim(value, {
       workId: created.work.id,
@@ -893,8 +1159,90 @@ describe("WorkStore claims, fences, and prepared effects", () => {
       revision: created.tasks[0]!.revision,
     }).attempt.fence).toBe(1);
     expect(() => value.database.query(
-      "UPDATE sessions SET preset_contract=1 WHERE id=?",
+      "UPDATE sessions SET preset_contract=2 WHERE id=?",
     ).run(value.actorSessionId)).toThrow("WORK_SESSION_ATTEMPT_AUTHORITY");
+  });
+
+  test("reopens, authorizes, and settles an established contract-2 Codex Work dispatch", () => {
+    const value = fixture();
+    const created = createWork(value);
+
+    // Recreate the durable shape written by the earlier Astra-active build.
+    // Current writers cannot mutate this identity field, so the fixture drops
+    // only that guard, restores it immediately, and then opens a new store.
+    value.database.exec("DROP TRIGGER works_identity_immutable;");
+    try {
+      value.database.query("UPDATE works SET preset_contract=2 WHERE id=?")
+        .run(created.work.id);
+    } finally {
+      value.database.exec(WORK_SCHEMA_SQL);
+    }
+    value.database.query(
+      "UPDATE sessions SET provider_v39='codex',preset='high',preset_contract=2 WHERE id=?",
+    ).run(value.actorSessionId);
+    assertWorkSchema(value.database);
+
+    const reopened = new WorkStore(value.database, {
+      daemonGeneration: 8,
+      now: () => value.now.value,
+      encodeCursor,
+      issueCapability,
+      verifyCapability,
+      projectProviderIdentifier,
+    });
+    const reopenedValue: Fixture = { ...value, store: reopened };
+    expect(reopened.snapshot(created.work.id).work.id).toBe(created.work.id);
+    expect(value.database.query(
+      "SELECT preset_contract FROM works WHERE id=?",
+    ).get(created.work.id)).toEqual({ preset_contract: 2 });
+
+    const claimed = claim(reopenedValue, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    });
+    const dispatchKey = randomUUID();
+    const prepared = reopened.apply({
+      kind: "attempt.dispatch",
+      idempotencyKey: dispatchKey,
+      workId: created.work.id,
+      attemptId: claimed.attempt.id,
+      expectedAttemptRevision: claimed.attempt.revision,
+      fence: claimed.attempt.fence,
+      actorSessionId: value.actorSessionId,
+      attemptCapability: capability,
+      targetSessionId: value.actorSessionId,
+      mode: "send",
+    });
+    expect(prepared.kind).toBe("attempt.dispatch");
+    expect(reopened.authorizePreparedEffect(dispatchKey)).toMatchObject({
+      executable: true,
+      status: { state: "effect_started" },
+    });
+    const running = reopened.finalizeDispatch(dispatchKey, {
+      kind: "accepted",
+      receipt: turnStartedReceipt(),
+    });
+    expect(running.status).toBe("active");
+    expect(reopened.effectStatus(dispatchKey)).toMatchObject({ state: "accepted" });
+  });
+
+  test("rejects a retired Devin coordinator without weakening its historical session binding", () => {
+    const value = fixture();
+    value.database.query(
+      "UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=2 WHERE id=?",
+    ).run(value.actorSessionId);
+
+    expect(() => createWork(value)).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
+    expect(value.database.query(
+      "SELECT preset_contract,provider_v39 FROM sessions WHERE id=?",
+    ).get(value.actorSessionId)).toEqual({
+      preset_contract: 2,
+      provider_v39: "devin",
+    });
+    expect(() => value.database.query(
+      "UPDATE sessions SET preset_contract=1 WHERE id=?",
+    ).run(value.actorSessionId)).toThrow("WORK_DEVIN_PRESET_CONTRACT_MISMATCH");
   });
 
   test("treats the byte-identical low route as compatible across contracts", () => {
@@ -1095,6 +1443,7 @@ describe("WorkStore claims, fences, and prepared effects", () => {
       revision: created.tasks[0]!.revision,
     });
     value.database.exec("DROP TRIGGER work_session_attempt_authority_guard");
+    value.database.exec("DROP TRIGGER work_session_devin_contract_guard");
     value.database.query(
       "UPDATE sessions SET provider_v39='devin',preset_contract=2 WHERE id=?",
     ).run(value.actorSessionId);
@@ -1201,7 +1550,9 @@ describe("WorkStore claims, fences, and prepared effects", () => {
       body: "Prepared before this provider was retired.",
     };
     value.store.apply(command);
-    value.database.query("UPDATE sessions SET provider_v39='devin',preset='ultra' WHERE id=?")
+    value.database.query(
+      "UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=2 WHERE id=?",
+    )
       .run(value.reviewerSessionId);
     expect(value.store.authorizePreparedEffect(signalKey)).toMatchObject({ executable: false });
     expect(() => value.store.apply({ ...command, idempotencyKey: randomUUID() }))
@@ -1210,9 +1561,12 @@ describe("WorkStore claims, fences, and prepared effects", () => {
       .toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
     expect(value.database.query("SELECT COUNT(*) AS count FROM work_signals").get())
       .toEqual({ count: 1 });
-    value.database.query("UPDATE sessions SET provider_v39='devin',preset='ultra' WHERE id=?")
-      .run(value.actorSessionId);
-    expect(() => createWork(value)).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
+    expect(() => value.database.query(
+      "UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=2 WHERE id=?",
+    ).run(value.actorSessionId)).toThrow("WORK_DEVIN_PRESET_CONTRACT_MISMATCH");
+    expect(value.database.query(
+      "SELECT provider_v39,preset_contract FROM sessions WHERE id=?",
+    ).get(value.actorSessionId)).toEqual({ provider_v39: "codex", preset_contract: 1 });
   });
 
   test("fences provider identity and rechecks it before Codex task dispatch", () => {

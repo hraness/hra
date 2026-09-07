@@ -282,8 +282,10 @@ export const resolvedTargetAssertionCommand = [
   shellQuote(resolvedTargetAssertion),
 ].join(" ");
 
-const archivedConvexCli = (sourceRoot: string): string =>
+export const hostedOperationConvexCliPath = (sourceRoot: string): string =>
   resolve(sourceRoot, "node_modules", "convex", "bin", "main.js");
+
+const archivedConvexCli = hostedOperationConvexCliPath;
 
 const archivedTargetAssertionCommand = (sourceRoot: string): string => [
   shellQuote(process.execPath),
@@ -356,6 +358,8 @@ type ArchivedPathIdentity = Readonly<{
 type ArchivedSourceBinding = DeploymentBinding & Readonly<{
   revalidate: () => Promise<void>;
 }>;
+
+export type HostedOperationSourceBinding = ArchivedSourceBinding;
 
 const removeTemporaryTree: TemporaryTreeRemover = async (path, options) => {
   await rm(path, { force: options.force, recursive: true });
@@ -651,7 +655,7 @@ const prepareArchivedSource = async (
   repositoryRoot: string,
   environment: Readonly<Record<string, string>>,
   sourceCommit: string,
-  overlay: string,
+  overlay: string | undefined,
   temporaryRoot: string,
   removeSource: TemporaryTreeRemover,
 ): Promise<ArchivedSourceBinding> => {
@@ -691,6 +695,7 @@ const prepareArchivedSource = async (
     const scriptsPath = join(source, "scripts");
     const targetAssertionPath = join(scriptsPath, "assert-convex-deploy-target.ts");
     const archiveIdentities = await captureArchivedPathIdentities([
+      { kind: "file", path: process.execPath },
       { kind: "directory", path: directory },
       { kind: "directory", path: source },
       { kind: "file", path: packagePath },
@@ -765,14 +770,17 @@ const prepareArchivedSource = async (
       if (error instanceof HostedDeployError) throw error;
       throw new HostedDeployError("source_dependency_install_failed");
     }
-    if (dirname(attestationPath) !== join(source, "convex")) {
-      throw new HostedDeployError("source_changed");
-    }
-    await writeFile(attestationPath, overlay, { encoding: "utf8", flag: "w", mode: 0o600 });
-    if (await readFile(attestationPath, "utf8") !== overlay) {
-      throw new HostedDeployError("source_changed");
+    if (overlay !== undefined) {
+      if (dirname(attestationPath) !== join(source, "convex")) {
+        throw new HostedDeployError("source_changed");
+      }
+      await writeFile(attestationPath, overlay, { encoding: "utf8", flag: "w", mode: 0o600 });
+      if (await readFile(attestationPath, "utf8") !== overlay) {
+        throw new HostedDeployError("source_changed");
+      }
     }
     const launchIdentities = await captureArchivedPathIdentities([
+      { kind: "file", path: process.execPath },
       { kind: "directory", path: directory },
       { kind: "directory", path: source },
       { kind: "file", path: packagePath },
@@ -810,6 +818,22 @@ const prepareArchivedSource = async (
     throw error;
   }
 };
+
+export const prepareHostedOperationSource = async (options: Readonly<{
+  environment: Readonly<Record<string, string>>;
+  repositoryRoot: string;
+  runner: CommandRunner;
+  sourceCommit: string;
+  temporaryRoot?: string;
+}>): Promise<HostedOperationSourceBinding> => await prepareArchivedSource(
+  options.runner,
+  options.repositoryRoot,
+  options.environment,
+  options.sourceCommit,
+  undefined,
+  options.temporaryRoot ?? tmpdir(),
+  removeTemporaryTree,
+);
 
 type HostedDeployOptions = Readonly<{
   archivedSourceRemover?: TemporaryTreeRemover;

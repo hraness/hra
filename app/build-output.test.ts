@@ -7,6 +7,7 @@ import { beforeAll, describe, expect, test } from "bun:test";
 const appRoot = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = dirname(appRoot);
 const distributionRoot = join(appRoot, "dist");
+const buildSourceCommit = "0123456789abcdef0123456789abcdef01234567";
 
 /*
  * The shipped bundle has to survive the F1 Content Security Policy:
@@ -67,6 +68,33 @@ type Artifact = Readonly<{ name: string; text: string }>;
 let artifacts: readonly Artifact[] = [];
 let shell = "";
 
+async function runAppBuild(
+  overrides: Readonly<Record<string, string | undefined>>,
+): Promise<Readonly<{ status: number; stderr: string }>> {
+  const controlledNames = new Set([
+    "HRA_RELEASE_COMMIT",
+    "VERCEL",
+    "VERCEL_GIT_COMMIT_SHA",
+  ]);
+  const environment = Object.fromEntries([
+    ...Object.entries(process.env).filter(([name, value]) =>
+      value !== undefined && !controlledNames.has(name)),
+    ...Object.entries(overrides).filter((entry): entry is [string, string] =>
+      entry[1] !== undefined),
+  ]);
+  const build = Bun.spawn(["bun", "run", "build:app"], {
+    cwd: repositoryRoot,
+    env: environment,
+    stderr: "pipe",
+    stdout: "pipe",
+  });
+  const status = await build.exited;
+  return {
+    status,
+    stderr: await new Response(build.stderr).text(),
+  };
+}
+
 async function collect(root: string, prefix = ""): Promise<Artifact[]> {
   const found: Artifact[] = [];
   for (const entry of await readdir(root, { withFileTypes: true })) {
@@ -79,20 +107,34 @@ async function collect(root: string, prefix = ""): Promise<Artifact[]> {
 }
 
 beforeAll(async () => {
-  const build = Bun.spawn(["bun", "run", "build:app"], {
-    cwd: repositoryRoot,
-    stderr: "pipe",
-    stdout: "pipe",
+  const build = await runAppBuild({
+    VERCEL: "1",
+    VERCEL_GIT_COMMIT_SHA: buildSourceCommit,
   });
-  const status = await build.exited;
-  if (status !== 0) {
-    throw new Error(`build:app failed: ${await new Response(build.stderr).text()}`);
+  if (build.status !== 0) {
+    throw new Error(`build:app failed: ${build.stderr}`);
   }
   artifacts = await collect(distributionRoot);
   shell = await readFile(join(distributionRoot, "index.html"), "utf8");
 }, 180_000);
 
 describe("built shell", () => {
+  test("emits only the reviewed shell, marker, script, and stylesheet artifacts", () => {
+    const staticArtifacts = artifacts
+      .filter((artifact) => !artifact.name.startsWith("assets/"))
+      .map((artifact) => artifact.name)
+      .sort();
+    const scripts = artifacts.filter((artifact) => artifact.name.endsWith(".js"));
+    const stylesheets = artifacts.filter((artifact) => artifact.name.endsWith(".css"));
+
+    expect(staticArtifacts).toEqual([".well-known/hra-app.json", "index.html"]);
+    expect(scripts).toHaveLength(1);
+    expect(stylesheets).toHaveLength(1);
+    expect(scripts[0]?.name).toMatch(/^assets\/index-[A-Za-z0-9_-]+\.js$/u);
+    expect(stylesheets[0]?.name).toMatch(/^assets\/style-[A-Za-z0-9_-]+\.css$/u);
+    expect(artifacts).toHaveLength(4);
+  });
+
   test("emits one module entry point and one linked stylesheet", () => {
     expect(artifacts.some((artifact) => artifact.name === "index.html")).toBe(true);
     expect(artifacts.filter((artifact) => artifact.name.endsWith(".js")).length)
@@ -116,6 +158,69 @@ describe("built shell", () => {
       expect(artifact.text).not.toMatch(/<style[\s>]/u);
     }
   });
+
+  test("emits the exact deterministic app source marker", async () => {
+    const packageManifest = JSON.parse(
+      await readFile(join(repositoryRoot, "package.json"), "utf8"),
+    ) as { version?: unknown };
+    const expected = {
+      generation: 1,
+      product: "HRA App",
+      repository: {
+        id: 1_343_008_607,
+        path: "hraness/hra",
+      },
+      schemaVersion: 1,
+      source: {
+        commit: buildSourceCommit,
+      },
+      version: packageManifest.version,
+    };
+    const marker = artifacts.find((artifact) =>
+      artifact.name === ".well-known/hra-app.json");
+
+    expect(packageManifest.version).toBe("0.6.1");
+    expect(buildSourceCommit).toMatch(/^[0-9a-f]{40}$/u);
+    expect(marker?.text).toBe(`${JSON.stringify(expected, null, 2)}\n`);
+    expect(JSON.parse(marker?.text ?? "null")).toEqual(expected);
+  });
+
+  test("uses the root-site-compatible source fallbacks outside Vercel", async () => {
+    const releaseBuild = await runAppBuild({ HRA_RELEASE_COMMIT: buildSourceCommit });
+    expect(releaseBuild.status).toBe(0);
+    const releaseMarker = JSON.parse(
+      await readFile(join(distributionRoot, ".well-known/hra-app.json"), "utf8"),
+    ) as { source?: { commit?: unknown } };
+    expect(releaseMarker.source?.commit).toBe(buildSourceCommit);
+
+    const localBuild = await runAppBuild({});
+    expect(localBuild.status).toBe(0);
+    const localMarker = JSON.parse(
+      await readFile(join(distributionRoot, ".well-known/hra-app.json"), "utf8"),
+    ) as { source?: { commit?: unknown } };
+    expect(localMarker.source?.commit).toBe("local");
+  }, 180_000);
+
+  test("refuses a Vercel build without an exact lowercase source commit", async () => {
+    for (const sourceCommit of [
+      undefined,
+      "",
+      "not-a-commit",
+      "A".repeat(40),
+      "a".repeat(39),
+      "a".repeat(41),
+    ]) {
+      const build = await runAppBuild({
+        HRA_RELEASE_COMMIT: buildSourceCommit,
+        VERCEL: "1",
+        VERCEL_GIT_COMMIT_SHA: sourceCommit,
+      });
+      expect(build.status).not.toBe(0);
+      expect(build.stderr).toContain(
+        "A Vercel app build requires an exact source commit marker.",
+      );
+    }
+  }, 180_000);
 });
 
 describe("bundle invariants", () => {
@@ -209,6 +314,7 @@ type ProjectConfiguration = Readonly<{
   headers: { headers: { key: string; value: string }[]; source: string }[];
   ignoreCommand: string;
   outputDirectory: string;
+  rewrites: { destination: string; source: string }[];
 }>;
 
 async function readProjectConfiguration(): Promise<ProjectConfiguration> {
@@ -244,6 +350,22 @@ describe("vercel project headers", () => {
     expect(find("/(.*)", "Permissions-Policy")).toContain("clipboard-read=()");
     expect(find("/", "Cache-Control")).toBe("no-store");
     expect(find("/index.html", "Cache-Control")).toBe("no-store");
+    expect(find("/.well-known/hra-app.json", "Cache-Control")).toBe("no-store");
+  });
+
+  test("the SPA fallback cannot rewrite assets or well-known files", async () => {
+    const configuration = await readProjectConfiguration();
+    expect(configuration.rewrites).toEqual([{
+      destination: "/index.html",
+      source: "/((?!assets/|\\.well-known/).*)",
+    }]);
+    const fallback = configuration.rewrites[0];
+    if (fallback === undefined) throw new Error("missing SPA fallback fixture");
+    const matcher = new RegExp(`^${fallback.source}$`, "u");
+
+    expect(matcher.test("/sessions/session_12345678")).toBe(true);
+    expect(matcher.test("/assets/index-example.js")).toBe(false);
+    expect(matcher.test("/.well-known/hra-app.json")).toBe(false);
   });
 
   /*

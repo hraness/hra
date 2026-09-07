@@ -1,6 +1,10 @@
 import type { GenericId as Id } from "convex/values";
 
 import { isAuthDigest } from "./authPolicy";
+import {
+  consumeDeviceRevocationReceiptCapacity,
+  type DeviceReceiptReservation,
+} from "./authorityReductionCapacity";
 import { reserveQuotaForInsert } from "./quota";
 import type { MutationCtx } from "./server";
 
@@ -69,7 +73,7 @@ export async function loadIdempotencyReceipt(
   }
 }
 
-export async function storeIdempotencyReceipt(
+async function storeReceipt(
   ctx: MutationCtx,
   scope: IdempotencyScope,
   input: Readonly<{
@@ -77,6 +81,7 @@ export async function storeIdempotencyReceipt(
     requestDigest: string;
     response: unknown;
   }>,
+  revocationCapacity?: DeviceReceiptReservation,
 ): Promise<void> {
   const now = Date.now();
   validateIdempotencyInput(input.idempotencyKey, input.requestDigest, now);
@@ -99,6 +104,42 @@ export async function storeIdempotencyReceipt(
     scopeId: scope.scopeId,
     userId: scope.userId,
   } as const;
-  await reserveQuotaForInsert(ctx, scope.userId, "receipt", receiptDocument);
-  await ctx.db.insert("idempotencyReceipts", receiptDocument);
+  if (revocationCapacity !== undefined) {
+    if (scope.operation !== "device.revoke") {
+      throw new Error("Invalid authority-reduction receipt scope.");
+    }
+    await consumeDeviceRevocationReceiptCapacity(
+      ctx,
+      revocationCapacity,
+      receiptDocument,
+    );
+  } else {
+    await reserveQuotaForInsert(ctx, scope.userId, "receipt", receiptDocument);
+    await ctx.db.insert("idempotencyReceipts", receiptDocument);
+  }
+}
+
+export async function storeIdempotencyReceipt(
+  ctx: MutationCtx,
+  scope: IdempotencyScope,
+  input: Readonly<{
+    idempotencyKey: string;
+    requestDigest: string;
+    response: unknown;
+  }>,
+): Promise<void> {
+  await storeReceipt(ctx, scope, input);
+}
+
+export async function storeDeviceRevocationIdempotencyReceipt(
+  ctx: MutationCtx,
+  scope: IdempotencyScope,
+  input: Readonly<{
+    idempotencyKey: string;
+    requestDigest: string;
+    response: unknown;
+  }>,
+  revocationCapacity?: DeviceReceiptReservation,
+): Promise<void> {
+  await storeReceipt(ctx, scope, input, revocationCapacity);
 }

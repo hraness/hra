@@ -170,9 +170,13 @@ Resolve models and capabilities from the exact account generation and provider b
 | Alias | Provider | Requested profile |
 | --- | --- | --- |
 | `low` | Codex | `gpt-5.6-luna`, maximum supported reasoning |
-| `high` | Codex | `gpt-6-astra`, maximum supported reasoning |
-| `ultra` | Codex | `gpt-6-astra`, Ultra reasoning effort |
+| `high` | Codex | `gpt-5.6-sol`, maximum supported reasoning |
+| `ultra` | Codex | `gpt-5.6-sol`, Ultra reasoning effort |
 | `fable-max` | Claude Code | `claude-fable-5-1`, maximum reasoning |
+
+Devin and its `astra` alias remain historical schema values only. HRA reads
+their prior records and preserves provider-owned credentials, but exposes no
+new Devin session, provider switch, preset selection, or Work execution.
 
 Each adapter must validate its pinned runtime, model, effort, and supported capabilities. Codex additionally discovers collaboration modes, permission profiles, plugins, apps, and Fast support. An unavailable or wrong-provider alias fails closed with the advertised alternatives; HRA never silently changes quality.
 

@@ -27,7 +27,13 @@ import {
 } from "./authority";
 import { requireAuthAdmissionsOpen } from "./admissionControl";
 import {
+  consumeDeviceRevocationCapacity,
+  createDeviceRevocationCapacityForNewDevice,
+  loadDeviceRevocationCapacity,
+} from "./authorityReductionCapacity";
+import {
   loadIdempotencyReceipt,
+  storeDeviceRevocationIdempotencyReceipt,
   storeIdempotencyReceipt,
 } from "./idempotency";
 import {
@@ -44,7 +50,12 @@ import {
   type MutationCtx,
 } from "./server";
 import { presenceForDevice } from "./presence";
-import { deviceClass, encryptedEnvelope, wrappedKeyEnvelope } from "./validators";
+import {
+  deviceClass,
+  durableJobCapacityReservation,
+  encryptedEnvelope,
+  wrappedKeyEnvelope,
+} from "./validators";
 
 const bindChallengeLifetimeMs = 5 * 60 * 1_000;
 
@@ -283,6 +294,7 @@ export const register = mutation({
     const deviceId = await ctx.db.insert("devices", deviceDocument);
     const device = await ctx.db.get(deviceId);
     if (device === null) rejectAuthority();
+    await createDeviceRevocationCapacityForNewDevice(ctx, auth.userId, deviceId);
     await bindRegistrationToAuthSession(ctx, auth, device);
     if (args.bootstrapKeyEnvelope !== undefined) {
       const envelopeDocument = {
@@ -843,8 +855,58 @@ export const revoke = mutation({
       status: "revoked",
       updatedAt: now,
     } as const;
-    await adjustQuotaForPatch(ctx, authority.userId, "device", target, devicePatch);
-    await ctx.db.patch(target._id, devicePatch);
+    const capacity = await loadDeviceRevocationCapacity(
+      ctx,
+      authority.userId,
+      target._id,
+    );
+    const jobDocument = {
+      ...(capacity.kind === "reserved"
+        ? { capacityReservation: durableJobCapacityReservation }
+        : {}),
+      category: "sessions",
+      createdAt: now,
+      deviceId: target._id,
+      publicId: args.idempotencyKey,
+      state: "pending",
+      updatedAt: now,
+      userId: authority.userId,
+    } as const;
+    const securityDocument = {
+      actorDeviceId: authority.deviceId,
+      createdAt: now,
+      entityId: target.publicId,
+      event: "device_revoked",
+      userId: authority.userId,
+    } as const;
+    if (capacity.kind === "reserved") {
+      await consumeDeviceRevocationCapacity(
+        ctx,
+        capacity,
+        target,
+        devicePatch,
+        jobDocument,
+        securityDocument,
+      );
+    } else {
+      await adjustQuotaForPatch(
+        ctx,
+        authority.userId,
+        "device",
+        target,
+        devicePatch,
+      );
+      await reserveQuotaForInsert(ctx, authority.userId, "job", jobDocument);
+      await reserveQuotaForInsert(
+        ctx,
+        authority.userId,
+        "security",
+        securityDocument,
+      );
+      await ctx.db.patch(target._id, devicePatch);
+      await ctx.db.insert("deviceRevocationJobs", jobDocument);
+      await ctx.db.insert("securityEvents", securityDocument);
+    }
     if (presence !== null) {
       const presencePatch = { presenceUntil: now } as const;
       await adjustQuotaForPatch(
@@ -856,37 +918,17 @@ export const revoke = mutation({
       );
       await ctx.db.patch(presence._id, presencePatch);
     }
-    const jobDocument = {
-      category: "sessions",
-      createdAt: now,
-      deviceId: target._id,
-      publicId: args.idempotencyKey,
-      state: "pending",
-      updatedAt: now,
-      userId: authority.userId,
-    } as const;
-    await reserveQuotaForInsert(ctx, authority.userId, "job", jobDocument);
-    await ctx.db.insert("deviceRevocationJobs", jobDocument);
-    const securityDocument = {
-      actorDeviceId: authority.deviceId,
-      createdAt: now,
-      entityId: target.publicId,
-      event: "device_revoked",
-      userId: authority.userId,
-    } as const;
-    await reserveQuotaForInsert(ctx, authority.userId, "security", securityDocument);
-    await ctx.db.insert("securityEvents", securityDocument);
     const response = {
       deviceClass: deviceClassOf(target),
       publicId: target.publicId,
       revision: target.revision + 1,
       status: "revoked" as const,
     };
-    await storeIdempotencyReceipt(ctx, scope, {
+    await storeDeviceRevocationIdempotencyReceipt(ctx, scope, {
       idempotencyKey: args.idempotencyKey,
       requestDigest: args.requestDigest,
       response,
-    });
+    }, capacity.kind === "reserved" ? capacity.receipt : undefined);
     return response;
   },
 });
@@ -907,6 +949,8 @@ export const listKeyEnvelopes = query({
   },
 });
 
+// commandRequestVersion is intentionally absent: it is server-internal
+// admission authority, not part of the encrypted registry's public projection.
 function publicRegistry(registry: Readonly<{
   devicePublicId: string;
   envelope: Parameters<typeof parseEncryptedEnvelope>[0];
@@ -941,6 +985,7 @@ function publicRegistry(registry: Readonly<{
 // resolve what the rest of the account has published.
 export const updateRegistry = mutation({
   args: {
+    commandRequestVersion: v.optional(v.literal(2)),
     envelope: encryptedEnvelope,
     expectedRevision: v.number(),
     keyVersion: v.number(),
@@ -991,6 +1036,9 @@ export const updateRegistry = mutation({
     if (existing === undefined) {
       if (args.expectedRevision !== 0) throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
       const document = {
+        ...(args.commandRequestVersion === undefined
+          ? {}
+          : { commandRequestVersion: args.commandRequestVersion }),
         createdAt: now,
         deviceId: authority.deviceId,
         devicePublicId: authority.device.publicId,
@@ -1021,6 +1069,10 @@ export const updateRegistry = mutation({
       throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
     }
     const patch = {
+      // Omission is an intentional old-daemon capability signal. Clearing the
+      // field prevents a downgrade from retaining permission for marker-2
+      // commands that the currently running daemon cannot execute.
+      commandRequestVersion: args.commandRequestVersion,
       envelope: args.envelope,
       keyVersion: args.keyVersion,
       // An omitted envelope is an intentional old-daemon capability signal:

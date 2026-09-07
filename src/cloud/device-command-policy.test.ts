@@ -17,14 +17,15 @@ function payload(value: unknown): DeviceCommandPayload {
   return parsed;
 }
 
-const sessionStart = payload({
+const sessionStart = {
   accountPublicId: "account_primary",
   kind: "session_start",
   preset: "ultra",
+  presetContract: 1,
   projectPublicId: "project_alpha",
   prompt: "continue the migration",
   provider: "codex",
-});
+} as const satisfies DeviceCommandPayload;
 
 function input(overrides: Partial<DeviceCommandGuardInput> = {}): DeviceCommandGuardInput {
   return {
@@ -54,6 +55,8 @@ describe("device command guards", () => {
     const devinStart = {
       ...sessionStart,
       preset: "astra",
+      projectPublicId: sessionStart.projectPublicId,
+      prompt: sessionStart.prompt,
       provider: "devin",
     } as unknown as DeviceCommandPayload;
     expect(deviceCommandGuardDecision(input({

@@ -53,7 +53,7 @@ describe("public content contract", () => {
       doctorCommand: "hra doctor --offline",
       initCommand: "hra init --yes",
       installCommand: buildHraGlobalInstallCommand(
-        "https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz",
+        "https://github.com/hraness/hra/releases/download/v0.6.1/hraness-hra-0.6.1.tgz",
       ),
       links: {
         github: "https://github.com/hraness/hra",
@@ -135,12 +135,12 @@ describe("public content contract", () => {
     });
     expect(structured).not.toHaveProperty("softwareVersion");
     expect(publicContent.description).toContain("current source");
-    expect(publicContent.description).toContain("v0.6.0 is release-ready");
+    expect(publicContent.description).toContain("v0.6.1 is release-ready");
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
     expect(html).toContain(`<p class="hraness-marketing-hero__eyebrow">${publicContent.tagline}</p>`);
     expect(renderPreviewHtml()).toContain(`<p class="preview-eyebrow">${publicContent.tagline}</p>`);
     expect(publicContent.socialCard).toEqual({
-      alt: "HRA · Codex + Claude Code · v0.6.0 release-ready · hra.sh",
+      alt: "HRA · Codex + Claude Code · v0.6.1 release-ready · hra.sh",
       height: 630,
       path: "/social-card.png",
       width: 1200,
@@ -232,7 +232,7 @@ describe("public content contract", () => {
 
   test("highlights documentation commands without touching classified hero code", () => {
     const html = renderSiteHtml();
-    expect(html).toContain('<code class="hra-inline-code">v0.6.0</code>');
+    expect(html).toContain('<code class="hra-inline-code">v0.6.1</code>');
     expect(html).toContain('<pre class="command-list" tabindex="0"><code class="syntax-code language-shell">');
     expect(html).toContain('<pre class="install-command" tabindex="0"><code class="syntax-code language-shell">');
     expect(html).toContain('class="syntax-token syntax-token--command"');
@@ -251,7 +251,7 @@ describe("public content contract", () => {
       hostedSync: "live",
       website: "live",
     });
-    expect(renderReadmeMarkdown()).toContain("The local CLI v0.6.0 is release-ready");
+    expect(renderReadmeMarkdown()).toContain("The local CLI v0.6.1 is release-ready");
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
       expect(surface).toContain("Immutable local CLI release candidate; hosted sync live as an open beta");
       expect(surface).toContain("works once GitHub exposes the immutable");
@@ -260,10 +260,10 @@ describe("public content contract", () => {
       expect(surface).toContain("Local release boundary");
       expect(surface).toContain("become installable through the exact command above once its GitHub Release exists");
       expect(surface).not.toContain("Beta not yet live");
-      expect(surface).not.toContain("No published `v0.6.0` tag currently exposes these commands");
+      expect(surface).not.toContain("No published `v0.6.1` tag currently exposes these commands");
     }
-    expect(renderLlmsText()).toContain("Install after the v0.6.0 beta tag is live");
-    expect(renderLlmsText()).not.toContain("Install the live v0.6.0 beta");
+    expect(renderLlmsText()).toContain("Install after the v0.6.1 beta tag is live");
+    expect(renderLlmsText()).not.toContain("Install the live v0.6.1 beta");
   });
 
   test("states one hosted sign-up claim everywhere and switches it in one place", () => {
@@ -597,9 +597,12 @@ describe("public content contract", () => {
     const html = htmlVisibleText(renderSiteHtml());
     const surfaces = [markdown, html];
     expect(publicContent.installCommand).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
-    expect(publicContent.installCommand).toContain("| bun -e '");
+    expect(publicContent.installCommand).toContain("unset BUN_OPTIONS NODE_OPTIONS");
     expect(publicContent.installCommand).toContain(
-      "-- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz",
+      "| command bun --no-env-file --config=/dev/null -e '",
+    );
+    expect(publicContent.installCommand).toContain(
+      "-- https://github.com/hraness/hra/releases/download/v0.6.1/hraness-hra-0.6.1.tgz",
     );
     expect(publicContent.installCommand).toContain("hra-install-safe");
     expect(publicContent.installCommand).not.toContain("bun add --global");
@@ -617,7 +620,10 @@ describe("public content contract", () => {
       expect(surface).toContain("hra-install-safe");
       expect(surface).toContain("fresh random private staging root");
       expect(surface).toContain("GitHub repository ID 1343008607");
-      expect(surface).toContain("published immutable v0.6.0 release");
+      expect(surface).toContain("published immutable v0.6.1 release");
+      expect(surface).toContain("removes ambient Bun, Node, and native-library injection variables");
+      expect(surface).toContain("disables Bun dotenv loading");
+      expect(surface).toContain("/dev/null as the only Bun configuration");
       expect(surface).toContain("immutable release metadata");
       expect(surface).toContain("verified in-memory snapshot");
       expect(surface).toContain("bounded package-file manifest");
@@ -627,24 +633,181 @@ describe("public content contract", () => {
       expect(surface).toContain("complete staged tree");
       expect(surface).toContain("configured package registry trust boundary");
       expect(surface).toContain("does not claim to contain that dependency closure");
+      expect(surface).toContain("detached staging worker and its Bun package-install child repeat the runtime neutralization");
+      expect(surface).toContain("configured registry, proxy, and certificate trust inputs");
       expect(surface).toContain("prior verified command remains active throughout staging");
       expect(surface).toContain("atomically replaces only the $BUN_INSTALL/bin/hra symlink");
-      expect(surface).toContain("next invocation recovers or removes only the proven private stage");
+      expect(surface).toContain("next invocation of that exact release's installer recovers or removes only the proven private stage");
+      expect(surface).toContain("another release's installer refuses the durable intent");
+      expect(surface).toContain("invoking shell, PATH-selected pinned Bun binary");
       expect(surface).toContain("Existing trustedDependencies remain unchanged");
       expect(surface).toContain("hra daemon stop");
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
-      expect(surface).toContain("Do not install a moving branch");
-      expect(surface).toContain("verified repair installation of v0.6.0");
-      expect(surface).toContain("replace the tagged preflight and release archive references together");
+      expect(surface).toContain("verified repair installation for v0.6.1");
       expect(surface).not.toContain("bun remove --global hra");
       expect(surface).not.toContain("uninstall the package");
     }
-    const updateStart = markdown.indexOf("Before replacing the installed binary");
-    const updateDoctor = markdown.indexOf("hra doctor --offline", updateStart);
-    const updateRestart = markdown.indexOf("hra daemon start", updateStart);
-    expect(updateDoctor).toBeGreaterThan(updateStart);
-    expect(updateRestart).toBeGreaterThan(updateDoctor);
+  });
+
+  test("publishes the ordered update runbook with recovery and mixed-version boundaries", () => {
+    const markdown = renderReadmeMarkdown();
+    const rawHtml = renderSiteHtml();
+    const html = htmlVisibleText(rawHtml);
+    const install = publicContent.sections.find((section) => section.id === "install-and-update");
+    const procedure = install?.blocks.find(
+      (block) => block.kind === "ordered-list",
+    );
+
+    expect(procedure?.kind).toBe("ordered-list");
+    if (procedure?.kind !== "ordered-list") throw new Error("Missing update procedure.");
+    expect(procedure.items).toHaveLength(10);
+    expect(rawHtml).toContain('<ol class="procedure-list"><li><p>Settle any durable installer intent');
+
+    const claims = [
+      "Update runbook",
+      "Resolve every uncertain local mutation that depends on old alias or prepared authority before starting the current daemon",
+      "preserve remote-command evidence for the fail-closed reconciliation below",
+      "expected preflight digest, and expected version together with one exact reviewed immutable tag",
+      "Never install a moving branch on a release machine",
+      "never run an older daemon against this state root after the current daemon has started",
+      "Settle any durable installer intent left by an interrupted installation",
+      "$BUN_INSTALL/install/hra/install-intent.json",
+      "Do not edit or delete that file or its staging or version directories",
+      "the exact immutable install command from the originating release's trusted README or release notes",
+      "If that installer refuses the intent, stop for manual review",
+      "Establish the originating tag independently",
+      "never execute a URL or command copied only from the intent",
+      "This recovers only local installer state",
+      "It is not authorization to retry, rerun, or mutate that release's GitHub Actions workflow",
+      "replay the exact idempotency key using the originating release's own syntax and source evidence",
+      "Resolve an affected Work mutation by replaying its exact request document",
+      "Continue only when exact replay under the originating release",
+      "Otherwise the update remains blocked",
+      "do not invent an unsupported option",
+      "This command has no idempotency key",
+      "Block the update on any remaining prepared or indeterminate local mutation",
+      "HRA exposes no general command to cancel a prepared session start or provider switch",
+      "Do not generate a fresh key or edit SQLite as a workaround",
+      "durable local outbox",
+      "current tab's returned command handle and public ID",
+      "The app does not expose its internal idempotency key",
+      "Never edit or delete the local command journal, local outbox, tab state, or hosted row to force progress",
+      "Require the stop command itself to exit zero",
+      "Status alone does not prove authority release",
+      "data.running: false",
+      "report only the exact pending state-schema migration",
+      "protected two-pass zero-debt capacity evidence together with the exact .activated receipt",
+      "The capacity evidence alone is not readiness",
+      "This is the no-downgrade boundary",
+      "Require the post-start doctor command to succeed before sync",
+      "data.online: true",
+      "data.errorCount: 0",
+      "data.commandRequestVersion: 2",
+      "There is no per-target writer switch",
+      "Finish all intended target proofs before deploying marker-emitting writer clients globally",
+      "Old clients and targets whose markers are both absent remain compatible",
+      "Sync status reports projection recovery, not the command outbox",
+      "The current daemon never executes a legacy request commitment",
+      "An already-hosted terminal row takes precedence",
+      "LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT",
+      "if the hosted row remains nonterminal and either side records",
+      "close it result-less as",
+      "LOCAL_EFFECT_RECOVERY_REQUIRED",
+      "Never automatically retry an ambiguous command",
+      "Each daemon privately publishes its command-request version before processing commands",
+      "A fresh request is inserted only when its marker exactly matches the target's last stored registry marker",
+      "the hosted runtime's capacity activation tuple exactly matches its compiled release attestation",
+      "A marker or activation mismatch is rejected before the command, quota charge, or security event is written",
+      "a candidate redeploy invalidates the hosted activation",
+      "the executor checks stop a mismatched binary before prepare or provider effect",
+      "Exact same-key replay remains available across a later target or runtime change",
+      "A registry-publication failure skips both command queues for that cycle",
+      "current target and hosted activation markers before a new prepare or effect start",
+      "until capacity activation and target-marker proof exist",
+      "No all-daemons pause or account-wide legacy drain is required",
+    ];
+    for (const claim of claims) {
+      expect(markdown).toContain(claim);
+      expect(html).toContain(claim);
+    }
+
+    expect(markdown).toContain([
+      "6. Stop the daemon and prove that it released authority:",
+      "",
+      "   ```text",
+      "   hra daemon stop --json",
+      "   hra daemon status --json",
+      "   ```",
+      "",
+      "   Require the stop command itself to exit zero; its recovery path is the authority-release proof. Treat a status response containing `data.running: false` only as a secondary no-listener confirmation. Status alone does not prove authority release. Stop on any stop or recovery error.",
+    ].join("\n"));
+    expect(markdown).toContain([
+      "9. Start the current daemon. This is the no-downgrade boundary: after this command begins, never launch an older daemon against the same state root. Prove post-migration health before syncing, then inspect every retained CLI session-command ID:",
+      "",
+      "   ```text",
+      "   hra daemon start",
+      "   hra doctor --offline",
+      "   hra sync now --json",
+      "   hra sync status",
+      "   hra remote command <uuidv7>",
+      "   ```",
+    ].join("\n"));
+    expect(markdown.indexOf("1. Settle any durable installer intent")).toBeLessThan(
+      markdown.indexOf("10. Classify legacy remote commitments"),
+    );
+    expect(markdown).toContain("A fresh or local-prepared legacy request over hosted `pending` or `prepared` row closes as `failed` with `LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT`.");
+    expect(markdown).toContain("A legacy local terminal outcome over any hosted nonterminal row is unauthenticated evidence");
+    const runbookMarkdown = markdown.slice(
+      markdown.indexOf("### Update runbook"),
+      markdown.indexOf("### Optional full local-data removal"),
+    );
+    expect(runbookMarkdown.match(/^\d+\. /gmu)).toHaveLength(10);
+    const runbookStart = rawHtml.indexOf(">Update runbook</h3>");
+    expect(runbookStart).toBeGreaterThan(0);
+    const runbookHtml = rawHtml.slice(
+      runbookStart,
+      rawHtml.indexOf("Optional full local-data removal"),
+    );
+    expect(runbookHtml.match(/<li>/gu)).toHaveLength(10);
+    expect(htmlVisibleText(runbookHtml)).toMatch(/Stop the daemon[\s\S]+?hra daemon stop --json[\s\S]+?Status alone does not prove authority release/u);
+    expect(markdown).not.toContain("Before replacing the installed binary");
+  });
+
+  test("preserves versioned Work and historical alias-replay guidance on both shared surfaces", () => {
+    const markdown = renderReadmeMarkdown();
+    const html = htmlVisibleText(renderSiteHtml());
+    const claims: readonly (readonly [visible: string, markdown?: string])[] = [
+      ["The versioned source contract defines a narrow local coordination kernel"],
+      ["one strict version 1 or version 2 request"],
+      ["also carries the caller-authored top-level presetContract", "also carries the caller-authored top-level `presetContract`"],
+      ["version 2 forbids that field on stable operations"],
+      ["The request version and any authored preset contract are part of changed-intent detection"],
+      ["Each Work also freezes the meaning of its High and Ultra routes when it is created"],
+      ["A fresh affected version 1 request is refused"],
+      ["An existing contract 2 Work whose coordinator and participating session authorities remain supported keeps Astra for already-declared tasks"],
+      ["A Work associated with a retired Devin session remains readable but is fenced from mutation and execution"],
+      ["Current tooling does not append a new High or Ultra task to a historical contract 2 Work"],
+      ["Reusing that key with another version or contract is a conflict"],
+      [
+        "A source-sensitive Codex session start or provider-switch replay includes both --idempotency-key and its immutable --preset-contract",
+        "A source-sensitive Codex `session start` or provider-switch replay includes both `--idempotency-key` and its immutable `--preset-contract`",
+      ],
+      ["The preset-contract option is a source-binding field that requires an explicit idempotency key and is rejected for stable requests"],
+      ["With a key that has no stored row, only this build's active source contract may authorize the one fresh effect"],
+      ["An older session-start release did not print the source contract"],
+      ["--preset high --preset-contract 1", "`--preset high --preset-contract 1`"],
+      ["Neither selector can resume a contractless prepared row"],
+      ["If the originating meaning cannot be proved, use the retained old release rather than guessing"],
+      ["A contractless prepared row has no supported cancellation or retirement command"],
+      ["Do not use a fresh key or session abandon as a workaround", "Do not use a fresh key or `session abandon` as a workaround"],
+      ["session preset has no idempotency-key replay", "`session preset` has no idempotency-key replay"],
+    ];
+
+    for (const [visibleClaim, markdownClaim = visibleClaim] of claims) {
+      expect(markdown).toContain(markdownClaim);
+      expect(html).toContain(visibleClaim);
+    }
   });
 
   test("publishes first-session walkthroughs for humans and agents", () => {
@@ -669,6 +832,11 @@ describe("public content contract", () => {
       "hra session start personal --provider claude --preset fable-max --json",
       "hra session switch <session-id> --provider claude --preset fable-max",
       "hra session export <session-id> --format json",
+      "seeds a fresh provider-native runtime from the latest retained tail",
+      "does not move a provider-native thread",
+      "accepted direct, queued, Work and scheduled automation, autorespond, and provider-switch handoff messages with actor provenance",
+      "Attachments are represented only by byte-free manifests",
+      "Retention is capped at 50,000 events, 64 MiB, and seven days",
       "Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form.",
       "Scheduled work in the same conversation",
       "hra session task create <session-id> --name daily-review --every-minutes 1440",
@@ -691,10 +859,18 @@ describe("public content contract", () => {
     }
     expect(publicContent.hero.steps[0]).toMatchObject({
       command: "hra session start personal --provider codex --json",
-      detail: "Create an Astra Ultra Codex session under the account profile you name.",
+      detail: "Create a Sol Ultra Codex session under the account profile you name.",
     });
-    expect(markdown).toContain("Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping");
-    expect(html).toContain("Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping");
+    expect(publicContent.hero.steps[2]).toMatchObject({
+      command: "hra session switch <session-id> --provider claude --preset fable-max",
+      detail: "Move the next turns to your signed-in Claude Code profile. The bounded retained HRA conversation record remains available, with any retention gap stated explicitly.",
+    });
+    expect(markdown).toContain("New HRA-created Codex sessions that use `high` or `ultra`");
+    expect(html).toContain("New HRA-created Codex sessions that use high or ultra");
+    expect(markdown).toContain("The `low` and `fable-max` bindings are unchanged");
+    expect(markdown).not.toContain("every explicit preset selection use the Sol mapping");
+    expect(markdown).toContain("sessions already bound to historical contract 2 keep their exact Astra model and effort");
+    expect(html).toContain("sessions already bound to historical contract 2 keep their exact Astra model and effort");
     expect(markdown).not.toContain("session start personal --provider codex --preset high");
   });
 
@@ -744,6 +920,30 @@ describe("public content contract", () => {
     expect(documentedCommands).toContain("hra session watch <session> [--cursor <cursor>] [--jsonl]");
     expect(documentedCommands.some((command) => command.startsWith("hra session wait"))).toBe(false);
     expect(documentedCommands.some((command) => /<\d+-\d+>/u.test(command))).toBe(false);
+  });
+
+  test("publishes autorespond and provider-profile privacy boundaries", () => {
+    const markdown = renderReadmeMarkdown();
+    const html = htmlVisibleText(renderSiteHtml());
+    const claims = [
+      "Only an actual human-authored message resets the consecutive counter",
+      "Work and scheduled automation, autorespond, and provider-switch handoff messages do not",
+      "Configuring a gateway key explicitly enables the separate prose-approval path",
+      "openai/gpt-5-nano",
+      "one request with a 10-second deadline and no retry",
+      "The model cannot create arbitrary text that HRA will send",
+      "a byte-exact substring already present in the assistant message",
+      "Claude Code public profiles include the pinned CLI, model, reasoning effort, default permission mode, and stream formats",
+      "omits that custody identity and legacy isolation marker",
+      "managed and adopted personal-home sessions therefore share one non-identifying public shape",
+    ];
+
+    for (const claim of claims) {
+      expect(markdown).toContain(claim);
+      expect(html).toContain(claim);
+    }
+    expect(markdown).not.toContain("Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof");
+    expect(html).not.toContain("Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof");
   });
 
   test("keeps the public command reference in parity with CLI group help", () => {

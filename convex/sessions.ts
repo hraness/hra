@@ -58,6 +58,20 @@ type CompactEpochSummary = Readonly<{
   sessionPublicId: string;
 }>;
 
+function visibleSessionState(
+  session: Readonly<{ state: SessionSummary["state"] }>,
+  executionDevice: Readonly<{ status: "pending" | "active" | "revoked" }>,
+): SessionSummary["state"] {
+  // Pre-capacity revocation jobs cannot grow an idle/active head at a hard
+  // ceiling. A revoked execution device is nonetheless durable orphan
+  // authority, so public reads project the same state as a physically migrated
+  // current head.
+  return executionDevice.status === "revoked"
+      && (session.state === "active" || session.state === "idle")
+    ? "orphaned"
+    : session.state;
+}
+
 function parseSessionSummary(value: unknown): SessionSummary | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const record = value as Readonly<Record<string, unknown>>;
@@ -319,7 +333,7 @@ export const listHeads = query({
         metadataRevision: session.metadataRevision,
         projectionRevision: session.projectionRevision,
         publicId: session.publicId,
-        state: session.state,
+        state: visibleSessionState(session, executionDevice),
         updatedAt: session.updatedAt,
       };
     }));
@@ -360,7 +374,7 @@ export const listHeadsPage = query({
         metadataRevision: session.metadataRevision,
         projectionRevision: session.projectionRevision,
         publicId: session.publicId,
-        state: session.state,
+        state: visibleSessionState(session, executionDevice),
         updatedAt: session.updatedAt,
       };
     }));
@@ -409,7 +423,7 @@ export const getHead = query({
       metadataRevision: session.metadataRevision,
       projectionRevision: session.projectionRevision,
       publicId: session.publicId,
-      state: session.state,
+      state: visibleSessionState(session, executionDevice),
       updatedAt: session.updatedAt,
     };
   },
@@ -874,6 +888,18 @@ export const updateMetadata = mutation({
       scopeId: args.sessionPublicId,
       userId: authority.userId,
     } as const;
+    const sessions = await ctx.db
+      .query("sessionHeads")
+      .withIndex("by_user_and_public_id", (builder) => builder
+        .eq("userId", authority.userId)
+        .eq("publicId", args.sessionPublicId))
+      .take(2);
+    const session = sessions[0];
+    if (sessions.length !== 1 || session === undefined) {
+      throw new Error("SESSION_METADATA_CONFLICT");
+    }
+    const executionDevice = await ctx.db.get(session.executionDeviceId);
+    if (executionDevice?.userId !== authority.userId) rejectAuthority();
     const replay = await loadIdempotencyReceipt(
       ctx,
       scope,
@@ -883,19 +909,14 @@ export const updateMetadata = mutation({
     if (replay !== null) {
       const parsed = parseSessionSummary(replay);
       if (parsed === null) rejectAuthority();
-      return parsed;
+      return {
+        ...parsed,
+        state: visibleSessionState(parsed, executionDevice),
+      };
     }
-    const sessions = await ctx.db
-      .query("sessionHeads")
-      .withIndex("by_user_and_public_id", (builder) => builder
-        .eq("userId", authority.userId)
-        .eq("publicId", args.sessionPublicId))
-      .take(2);
-    const session = sessions[0];
-    if (
-      sessions.length !== 1
-      || session?.metadataRevision !== args.expectedRevision
-    ) throw new Error("SESSION_METADATA_CONFLICT");
+    if (session.metadataRevision !== args.expectedRevision) {
+      throw new Error("SESSION_METADATA_CONFLICT");
+    }
     const now = Date.now();
     const sessionPatch = {
       metadata: args.metadata,
@@ -908,7 +929,7 @@ export const updateMetadata = mutation({
       metadataRevision: session.metadataRevision + 1,
       projectionRevision: session.projectionRevision,
       publicId: session.publicId,
-      state: session.state,
+      state: visibleSessionState(session, executionDevice),
     };
     await storeIdempotencyReceipt(ctx, scope, {
       idempotencyKey: args.idempotencyKey,

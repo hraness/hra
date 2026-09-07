@@ -89,6 +89,9 @@ const renderInline = (content: readonly InlineContent[]): string =>
     })
     .join("");
 
+const renderCommandBlock = (commands: readonly string[]): string =>
+  `<pre class="command-list" tabindex="0">${renderShellCode(commands.join("\n"))}</pre>`;
+
 const renderBlock = (
   block: ContentBlock,
   sectionId: string,
@@ -97,11 +100,13 @@ const renderBlock = (
 ): string => {
   switch (block.kind) {
     case "commands":
-      return `<pre class="command-list" tabindex="0">${renderShellCode(block.commands.join("\n"))}</pre>`;
+      return renderCommandBlock(block.commands);
     case "list":
       return `<ul>${block.items.map((item) => `<li>${renderInline(item)}</li>`).join("")}</ul>`;
     case "notice":
       return `<aside class="notice" aria-label="${escapeHtml(block.label)}"><strong>${escapeHtml(block.label)}.</strong> ${renderInline(block.content)}</aside>`;
+    case "ordered-list":
+      return `<ol class="procedure-list">${block.items.map((item) => `<li><p>${renderInline(item.content)}</p>${item.commands === undefined ? "" : renderCommandBlock(item.commands)}${item.afterCommands === undefined ? "" : `<p>${renderInline(item.afterCommands)}</p>`}</li>`).join("")}</ol>`;
     case "paragraph":
       return `<p>${renderInline(block.content)}</p>`;
     case "subheading": {

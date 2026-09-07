@@ -4,6 +4,7 @@ import { createProfileId, createSessionId } from "../domain/values";
 import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 import {
   sanitizeInteractionDisplay,
+  sanitizeProviderProse,
   SessionEventStreamRedactor,
   type SessionEventWrite,
 } from "./streaming-redaction";
@@ -178,6 +179,39 @@ describe("SessionEventStreamRedactor", () => {
     expect(startBody.server).not.toContain(privatePathRoot);
     expect(startBody.server).not.toContain("\u001b");
     expect(JSON.stringify([...started, ...completed])).not.toContain("TOOL-IDENTITY-SECRET-1234");
+  });
+
+  test("replaces Unicode line and paragraph separators at one-line provider boundaries", () => {
+    expect(sanitizeProviderProse("tool\u2028forged\u2029label", false))
+      .toBe("tool�forged�label");
+    const redactor = createRedactor();
+    const output = [
+      ...redactor.accept(write({
+        type: "item_started",
+        turnId: "turn-separator",
+        itemId: "item-separator",
+        itemKind: "tool\u2028forged",
+        server: "server\u2029forged",
+        summary: "summary\u2028forged",
+      })),
+      ...redactor.accept(write({
+        type: "user_message",
+        turnId: null,
+        actor: "human",
+        text: "safe",
+        omittedCharacters: 0,
+        attachments: [{
+          byteLength: 4,
+          digest: "a".repeat(64),
+          mediaType: "text/plain",
+          name: "report\u2029forged.txt",
+        }],
+      })),
+    ];
+    const serialized = JSON.stringify(output);
+    expect(serialized).not.toContain("\u2028");
+    expect(serialized).not.toContain("\u2029");
+    expect(serialized).toContain("�");
   });
 
   test("redacts split authorization, device-code, token, and key assignments before release", () => {

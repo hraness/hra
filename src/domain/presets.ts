@@ -43,12 +43,17 @@ export type PresetTier = z.infer<typeof presetTierSchema>;
 /**
  * The durable interpretation of a stored preset alias.
  *
- * Contract 1 is the model mapping shipped before Astra. Contract 2 is the
- * current mapping. These integers are stored in SQLite, so never renumber or
- * reinterpret them.
+ * Contract 1 is the original Sol mapping. Contract 2 is the later Astra
+ * mapping. Both integers are stored in SQLite, so never renumber or
+ * reinterpret either contract. The active selection for a preset is separate
+ * from this frozen history and can return to an older contract.
  */
 export const legacyPresetContract = 1 as const;
 export const currentPresetContract = 2 as const;
+/** Semantic names for active choices; historical aliases remain API-compatible. */
+export const solCodexPresetContract = legacyPresetContract;
+export const astraPresetContract = currentPresetContract;
+export const devinPresetContract = astraPresetContract;
 export const presetContractSchema = z.union([
   z.literal(legacyPresetContract),
   z.literal(currentPresetContract),
@@ -86,8 +91,92 @@ const presetRequirementsByContract: Readonly<
   [currentPresetContract]: Object.freeze(currentPresetRequirements),
 });
 
-/** Contract-2 requirements, including retired aliases for historical readers. */
-export const presetRequirements = currentPresetRequirements;
+type ActivePresetBinding = Readonly<{
+  contract: PresetContract;
+  requirement: PresetRequirement;
+}>;
+
+/**
+ * One atomic, exhaustive binding for a new or explicitly selected preset.
+ *
+ * Codex High and Ultra select their immutable Sol meanings from contract 1.
+ * Low and Fable are byte-identical across both contracts, so they remain on
+ * contract 2 to minimize durable churn. The Astra entry exists only so exact
+ * historical records can be decoded; effect admission must first pass the
+ * supported provider and preset schemas.
+ */
+const activePresetBindings = Object.freeze({
+  low: Object.freeze({
+    contract: astraPresetContract,
+    requirement: currentPresetRequirements.low,
+  }),
+  high: Object.freeze({
+    contract: solCodexPresetContract,
+    requirement: legacyPresetRequirements.high,
+  }),
+  ultra: Object.freeze({
+    contract: solCodexPresetContract,
+    requirement: legacyPresetRequirements.ultra,
+  }),
+  "fable-max": Object.freeze({
+    contract: astraPresetContract,
+    requirement: currentPresetRequirements["fable-max"],
+  }),
+  astra: Object.freeze({
+    contract: devinPresetContract,
+    requirement: currentPresetRequirements.astra,
+  }),
+} as const satisfies Readonly<Record<Preset, ActivePresetBinding>>);
+
+export const activePresetBinding = <P extends Preset>(
+  preset: P,
+): (typeof activePresetBindings)[P] => activePresetBindings[preset];
+
+export const isReboundCodexPreset = (
+  preset: Preset | undefined,
+): preset is "high" | "ultra" => preset === "high" || preset === "ultra";
+
+/**
+ * Whether a provider-switch request can select one of the mutable Codex
+ * aliases. An omitted Codex preset is source-sensitive because the daemon
+ * derives the target tier from session state that the caller cannot inspect
+ * atomically with dispatch.
+ */
+export const providerSwitchRequiresPresetContract = (
+  provider: Provider,
+  preset: Preset | undefined,
+): boolean => provider === "codex"
+  && (preset === undefined || isReboundCodexPreset(preset));
+
+const activeReboundCodexPresetContract = (preset: "high" | "ultra"): PresetContract =>
+  activePresetBinding(preset).contract;
+
+/**
+ * The one active contract shared by Codex High and Ultra wherever a boundary
+ * can select either alias without observing which tier will win. Keep the
+ * equality check centralized so every such boundary fails closed if those
+ * aliases ever stop sharing one interpretation.
+ */
+export const sharedActiveCodexPresetContract = (): PresetContract => {
+  const high = activeReboundCodexPresetContract("high");
+  const ultra = activeReboundCodexPresetContract("ultra");
+  if (high !== ultra) {
+    throw new Error("Implicit Codex preset selection requires High and Ultra to share one active contract.");
+  }
+  return high;
+};
+
+/**
+ * Requirements exposed to runtime readers. Supported aliases use their active
+ * bindings; Astra retains only its exact historical tuple.
+ */
+export const presetRequirements = Object.freeze({
+  low: activePresetBindings.low.requirement,
+  high: activePresetBindings.high.requirement,
+  ultra: activePresetBindings.ultra.requirement,
+  "fable-max": activePresetBindings["fable-max"].requirement,
+  astra: activePresetBindings.astra.requirement,
+} as const satisfies Readonly<Record<Preset, PresetRequirement>>);
 
 type ContractRequirement<P extends Preset, C extends PresetContract> =
   C extends typeof currentPresetContract

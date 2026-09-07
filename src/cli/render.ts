@@ -54,8 +54,8 @@ import {
   type SessionTaskRecord,
 } from "../domain/session-tasks";
 import {
+  WORK_APPLY_REQUEST_LEGACY_VERSION,
   WORK_PROTOCOL,
-  WORK_PROTOCOL_VERSION,
   WORK_EVENT_PAGE_MAX_BYTES,
   WORK_POLL_MAX_BYTES,
   WORK_SNAPSHOT_MAX_BYTES,
@@ -93,7 +93,7 @@ export type Output = {
   writeStdoutAsync?(value: string, signal: AbortSignal): Promise<void>;
 };
 
-const unsafeTerminalScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const unsafeTerminalScalar = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
 const safeJoinControl = /[\u200c\u200d]/u;
 
 export const terminalSafe = (value: string, preserveLineFeeds = false): string => {
@@ -2724,7 +2724,7 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     if (command.kind === "work.apply") {
       output.writeStdout(`${safeJson(workAgentProtocolResponseSchema.parse({
         protocol: WORK_PROTOCOL,
-        version: WORK_PROTOCOL_VERSION,
+        version: command.requestVersion ?? WORK_APPLY_REQUEST_LEGACY_VERSION,
         requestId: command.requestId,
         ok: true,
         result: publicData,

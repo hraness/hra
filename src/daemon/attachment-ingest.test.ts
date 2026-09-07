@@ -52,6 +52,27 @@ describe("attachment ingest", () => {
     expect(await blobs.has(references[0]?.digest ?? "", "image/png")).toBe(true);
   });
 
+  test("admits a predecessor-only name solely when replay ingestion is explicit", async () => {
+    const { blobs, cwd } = await fixture();
+    const name = `legacy${String.fromCodePoint(0x2028)}notes.txt`;
+    await writeFile(join(cwd, name), "legacy body");
+    await expect(ingestAttachments(blobs, [name], cwd)).rejects.toThrow(
+      "does not have a usable attachment file name",
+    );
+    const references = await ingestAttachments(
+      blobs,
+      [name],
+      cwd,
+      { allowLegacyReplayName: true },
+    );
+    expect(references).toEqual([{
+      byteLength: 11,
+      digest: attachmentDigest(utf8("legacy body")),
+      mediaType: "text/plain",
+      name,
+    }]);
+  });
+
   test("refuses an unreviewed extension before it opens the file", async () => {
     const { blobs, cwd } = await fixture();
     await writeFile(join(cwd, "payload.dmg"), machO);

@@ -127,6 +127,39 @@ async function registryWorld() {
 }
 
 describe("device registry", () => {
+  test("keeps command capability internal and clears it when an old daemon republishes", async () => {
+    const world = await registryWorld();
+    const primary = await world.enrollDevice("command-capability", await world.enrollUser(
+      "command-capability",
+    ));
+    const runtime = world.asDevice(primary);
+
+    await runtime.mutation(updateRegistry, {
+      commandRequestVersion: 2,
+      envelope: envelopeWith("C".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
+    expect(await world.testRuntime.run(async (ctx) =>
+      (await ctx.db.query("deviceRegistries").unique())?.commandRequestVersion)).toBe(2);
+    expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
+      .not.toHaveProperty("commandRequestVersion");
+    const listed = await runtime.query(listRegistries, {});
+    expect(listed[0]).not.toHaveProperty("commandRequestVersion");
+
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("D".repeat(48)),
+      expectedRevision: 1,
+      keyVersion: 1,
+    });
+    const downgraded = await world.testRuntime.run(async (ctx) =>
+      await ctx.db.query("deviceRegistries").unique());
+    expect(downgraded).not.toBeNull();
+    expect(downgraded).not.toHaveProperty("commandRequestVersion");
+    expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
+      .toMatchObject({ revision: 2 });
+  });
+
   test("advances an exact revision chain for the calling device", async () => {
     const world = await registryWorld();
     const primary = await world.enrollDevice("primary", await world.enrollUser("primary"));

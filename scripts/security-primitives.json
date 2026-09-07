@@ -148,10 +148,10 @@
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
-    "immediateTransaction": 117,
+    "immediateTransaction": 120,
     "secureDelete": 2,
     "synchronousFull": 1,
-    "redactCompleteSensitiveText": 2
+    "redactCompleteSensitiveText": 3
   },
   "src/storage/work-capability.ts": {
     "timingSafeEqual": 1

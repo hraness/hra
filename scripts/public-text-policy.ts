@@ -47,6 +47,32 @@ const absoluteUserPaths = [
 ] as const;
 const scopedPackage = /@([a-z0-9][a-z0-9-]*)\/[a-z0-9][a-z0-9._-]*/gu;
 const gitTagReferencePackageShape = ["@refs", "tags"].join("/");
+const reviewedFulcioRepositorySubject =
+  "repo:hraness@307125679/hra@1343008607:environment:npm-release";
+const reviewedFulcioSubjectPrefix = "repo:hraness";
+const reviewedFulcioSubjectSuffix = "@1343008607:environment:npm-release";
+const provenanceSubjectCharacter = /[A-Za-z0-9._:@/-]/u;
+
+const isReviewedFulcioRepositorySubject = (
+  value: string,
+  packageStart: number,
+  packageEnd: number,
+): boolean => {
+  const subjectStart = packageStart - reviewedFulcioSubjectPrefix.length;
+  const subjectEnd = packageEnd + reviewedFulcioSubjectSuffix.length;
+  const trailing = value[subjectEnd] ?? "";
+  const afterTrailingPeriod = value[subjectEnd + 1] ?? "";
+  return subjectStart >= 0
+    && value.slice(subjectStart, subjectEnd) === reviewedFulcioRepositorySubject
+    && !provenanceSubjectCharacter.test(value[subjectStart - 1] ?? "")
+    && (
+      !provenanceSubjectCharacter.test(trailing)
+      || (
+        trailing === "."
+        && !provenanceSubjectCharacter.test(afterTrailingPeriod)
+      )
+    );
+};
 
 export class PublicTextPolicyError extends Error {
   constructor(
@@ -66,11 +92,17 @@ export function assertPublicText(value: string, label: string): void {
     const packageName = match[0];
     const matchEnd = match.index + packageName.length;
     const isGitTagReference = packageName === gitTagReferencePackageShape && value[matchEnd] === "/";
+    const isReviewedProvenanceSubject = isReviewedFulcioRepositorySubject(
+      value,
+      match.index,
+      matchEnd,
+    );
     if (
       scope !== undefined
       && !allowedPublicScopes.has(scope)
       && !allowedPublicScopedPackages.has(packageName)
       && !isGitTagReference
+      && !isReviewedProvenanceSubject
     ) {
       throw new PublicTextPolicyError("PRIVATE_SCOPE", label);
     }

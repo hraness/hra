@@ -38,6 +38,7 @@ export {
   isBase64Url,
   isCommandKind,
   isDeviceCommandKind,
+  isDigest,
   isFiniteTimestamp,
   isOpaqueIdentifier,
   isRecord,
@@ -82,6 +83,8 @@ export {
 } from "../../../src/cloud/projection";
 
 export {
+  activeRemoteDerivedCodexSelection,
+  activeRemotePresetSelection,
   cloudPayloadAad,
   decryptDeviceCommandResult,
   decryptDeviceRegistry,
@@ -100,6 +103,7 @@ export {
   parseRemoteCommandPayload,
   remoteInteractionAnswersFitCommandEnvelope,
   type CloudPayloadAuthority,
+  type ActiveRemotePresetSelection,
   type DeviceCommandPayload,
   type DeviceCommandResultPayload,
   type DeviceRegistryAccount,

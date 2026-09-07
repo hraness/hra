@@ -573,11 +573,13 @@ type PendingRemoteCommand = Readonly<{
   idempotencyKey: string;
   kind: RemoteCommandPayload["kind"];
   payloadDigest: string;
+  requestCommitmentVersion: 2 | null;
   requestDigest: string;
+  requestingDevicePublicId: string | null;
   requestedAt: number | null;
   sessionPublicId: string;
   targetDevicePublicId: string;
-  version: 1 | 2;
+  version: 1 | 2 | 3 | 4;
 }>;
 
 type SecretObservation<T> = Readonly<{
@@ -1526,14 +1528,23 @@ function parsePendingRemoteCommand(value: string): PendingRemoteCommand {
     "kind",
     "payloadDigest",
     "requestDigest",
-    ...(decoded.version === 2 ? ["requestedAt"] : []),
+    ...(decoded.version === 2 || decoded.version === 3 || decoded.version === 4
+      ? ["requestedAt"]
+      : []),
+    ...(decoded.version === 3 || decoded.version === 4
+      ? ["requestingDevicePublicId"]
+      : []),
+    ...(decoded.version === 4 ? ["requestCommitmentVersion"] : []),
     "sessionPublicId",
     "targetDevicePublicId",
     "version",
   ])) throw new Error("Pending cloud remote command is corrupt.");
   const envelope = parseEncryptedEnvelope(decoded.envelope);
   if (
-    (decoded.version !== 1 && decoded.version !== 2)
+    (decoded.version !== 1
+      && decoded.version !== 2
+      && decoded.version !== 3
+      && decoded.version !== 4)
     || !isUuidV7(decoded.commandPublicId)
     || !isFiniteTimestamp(decoded.deadline)
     || envelope === null
@@ -1541,8 +1552,11 @@ function parsePendingRemoteCommand(value: string): PendingRemoteCommand {
     || !isCommandKind(decoded.kind)
     || !isDigest(decoded.payloadDigest)
     || !isDigest(decoded.requestDigest)
-    || (decoded.version === 2
+    || ((decoded.version === 2 || decoded.version === 3 || decoded.version === 4)
       && (!isFiniteTimestamp(decoded.requestedAt) || decoded.requestedAt > decoded.deadline))
+    || ((decoded.version === 3 || decoded.version === 4)
+      && !isOpaqueIdentifier(decoded.requestingDevicePublicId))
+    || (decoded.version === 4 && decoded.requestCommitmentVersion !== 2)
     || !isOpaqueIdentifier(decoded.sessionPublicId)
     || !isOpaqueIdentifier(decoded.targetDevicePublicId)
   ) throw new Error("Pending cloud remote command is corrupt.");
@@ -1553,8 +1567,12 @@ function parsePendingRemoteCommand(value: string): PendingRemoteCommand {
     idempotencyKey: decoded.idempotencyKey,
     kind: decoded.kind,
     payloadDigest: decoded.payloadDigest,
+    requestCommitmentVersion: decoded.version === 4 ? 2 : null,
     requestDigest: decoded.requestDigest,
-    requestedAt: decoded.version === 2 ? decoded.requestedAt as number : null,
+    requestingDevicePublicId: decoded.version === 3 || decoded.version === 4
+      ? decoded.requestingDevicePublicId as string
+      : null,
+    requestedAt: decoded.version === 1 ? null : decoded.requestedAt as number,
     sessionPublicId: decoded.sessionPublicId,
     targetDevicePublicId: decoded.targetDevicePublicId,
     version: decoded.version,
@@ -1562,6 +1580,23 @@ function parsePendingRemoteCommand(value: string): PendingRemoteCommand {
 }
 
 function sameRemoteCommandIntent(
+  pending: PendingRemoteCommand,
+  desired: Readonly<{
+    commandPublicId: string;
+    idempotencyKey: string;
+    kind: RemoteCommandPayload["kind"];
+    payloadDigest: string;
+    requestingDevicePublicId: string;
+    sessionPublicId: string;
+    targetDevicePublicId: string;
+  }>,
+): boolean {
+  return sameRemoteCommandRequest(pending, desired)
+    && pending.requestCommitmentVersion === 2
+    && pending.requestingDevicePublicId === desired.requestingDevicePublicId;
+}
+
+function sameRemoteCommandRequest(
   pending: PendingRemoteCommand,
   desired: Readonly<{
     commandPublicId: string;
@@ -1925,14 +1960,18 @@ function parseRemoteCommandKind(value: unknown): RemoteCommandPayload["kind"] | 
 
 function parseRemoteCommandReceipt(value: unknown): Readonly<{
   publicId: string;
+  requestCommitmentVersion: 2;
   replay: boolean;
+  requestingDevicePublicId: string;
   sessionPublicId: string;
   state: CommandState;
   targetDevicePublicId: string;
 }> {
   if (!isRecord(value) || !hasExactKeys(value, [
     "publicId",
+    "requestCommitmentVersion",
     "replay",
+    "requestingDevicePublicId",
     "sessionPublicId",
     "state",
     "targetDevicePublicId",
@@ -1940,14 +1979,18 @@ function parseRemoteCommandReceipt(value: unknown): Readonly<{
   const state = parseCommandState(value.state);
   if (
     !isUuidV7(value.publicId)
+    || value.requestCommitmentVersion !== 2
     || typeof value.replay !== "boolean"
+    || !isOpaqueIdentifier(value.requestingDevicePublicId)
     || !isOpaqueIdentifier(value.sessionPublicId)
     || state === null
     || !isOpaqueIdentifier(value.targetDevicePublicId)
   ) throw new Error("Cloud remote command receipt is invalid.");
   return {
     publicId: value.publicId,
+    requestCommitmentVersion: 2,
     replay: value.replay,
+    requestingDevicePublicId: value.requestingDevicePublicId,
     sessionPublicId: value.sessionPublicId,
     state,
     targetDevicePublicId: value.targetDevicePublicId,
@@ -1957,7 +2000,9 @@ function parseRemoteCommandReceipt(value: unknown): Readonly<{
 function parseExactRemoteCommandReceipt(value: unknown): null | Readonly<{
   kind: RemoteCommandPayload["kind"];
   publicId: string;
+  requestCommitmentVersion: 2 | null;
   requestDigest: string;
+  requestingDevicePublicId: string;
   resultCode?: string;
   sessionPublicId: string;
   state: CommandState;
@@ -1968,7 +2013,9 @@ function parseExactRemoteCommandReceipt(value: unknown): null | Readonly<{
     !isRecord(value)
     || parseRemoteCommandKind(value.kind) === null
     || !isUuidV7(value.publicId)
+    || (value.requestCommitmentVersion !== undefined && value.requestCommitmentVersion !== 2)
     || !isDigest(value.requestDigest)
+    || !isOpaqueIdentifier(value.requestingDevicePublicId)
     || !isOpaqueIdentifier(value.sessionPublicId)
     || parseCommandState(value.state) === null
     || !isOpaqueIdentifier(value.targetDevicePublicId)
@@ -1979,7 +2026,9 @@ function parseExactRemoteCommandReceipt(value: unknown): null | Readonly<{
   return {
     kind: value.kind as RemoteCommandPayload["kind"],
     publicId: value.publicId,
+    requestCommitmentVersion: value.requestCommitmentVersion === 2 ? 2 : null,
     requestDigest: value.requestDigest,
+    requestingDevicePublicId: value.requestingDevicePublicId,
     ...(value.resultCode === undefined ? {} : { resultCode: value.resultCode }),
     sessionPublicId: value.sessionPublicId,
     state: value.state as CommandState,
@@ -3534,7 +3583,7 @@ export class LocalCloudControl implements CloudControlPort {
       );
       const pending = await this.#readPendingRemoteCommand();
       if (pending !== null) {
-        const sameIntent = sameRemoteCommandIntent(pending.value, {
+        const sameRequest = sameRemoteCommandRequest(pending.value, {
           commandPublicId: input.commandPublicId,
           idempotencyKey: input.idempotencyKey,
           kind: payload.kind,
@@ -3542,9 +3591,18 @@ export class LocalCloudControl implements CloudControlPort {
           sessionPublicId: selector.publicId,
           targetDevicePublicId: selector.executionDevicePublicId,
         });
-        const receipt = await this.#dispatchPendingRemoteCommand(pending, input.signal);
-        if (sameIntent) return receipt;
-        throw new Error(`Recovered cloud command ${receipt.commandPublicId}; retry the new command.`);
+        const recovered = await this.#dispatchPendingRemoteCommand(
+          pending,
+          account.device.publicId,
+          input.signal,
+        );
+        if (
+          sameRequest
+          && recovered.requestingDevicePublicId === account.device.publicId
+        ) return recovered.receipt;
+        throw new Error(
+          `Recovered cloud command ${recovered.receipt.commandPublicId}; retry the new command.`,
+        );
       }
       if (input.deadline <= now) throw new Error("Cloud remote command deadline has expired.");
       const headValue = await this.#transport.query("sessions:getHead", {
@@ -3569,6 +3627,7 @@ export class LocalCloudControl implements CloudControlPort {
         kind: payload.kind,
         payload: envelope,
         publicId: input.commandPublicId,
+        requestingDevicePublicId: account.device.publicId,
         sessionPublicId: selector.publicId,
       } as const;
       const requestDigest = await hmacSha256Hex(
@@ -3583,11 +3642,13 @@ export class LocalCloudControl implements CloudControlPort {
         idempotencyKey: input.idempotencyKey,
         kind: payload.kind,
         payloadDigest,
+        requestCommitmentVersion: 2,
         requestDigest,
+        requestingDevicePublicId: account.device.publicId,
         requestedAt: now,
         sessionPublicId: selector.publicId,
         targetDevicePublicId: selector.executionDevicePublicId,
-        version: 2,
+        version: 4,
       };
       const claimed = await this.#claimPendingRemoteCommand(prepared);
       if (!claimed.created) {
@@ -3596,14 +3657,25 @@ export class LocalCloudControl implements CloudControlPort {
           idempotencyKey: input.idempotencyKey,
           kind: payload.kind,
           payloadDigest,
+          requestingDevicePublicId: account.device.publicId,
           sessionPublicId: selector.publicId,
           targetDevicePublicId: selector.executionDevicePublicId,
         });
-        const receipt = await this.#dispatchPendingRemoteCommand(claimed.pending, input.signal);
-        if (sameIntent) return receipt;
-        throw new Error(`Recovered cloud command ${receipt.commandPublicId}; retry the new command.`);
+        const recovered = await this.#dispatchPendingRemoteCommand(
+          claimed.pending,
+          account.device.publicId,
+          input.signal,
+        );
+        if (sameIntent) return recovered.receipt;
+        throw new Error(
+          `Recovered cloud command ${recovered.receipt.commandPublicId}; retry the new command.`,
+        );
       }
-      return await this.#dispatchPendingRemoteCommand(claimed.pending, input.signal);
+      return (await this.#dispatchPendingRemoteCommand(
+        claimed.pending,
+        account.device.publicId,
+        input.signal,
+      )).receipt;
     });
   }
 
@@ -3698,69 +3770,112 @@ export class LocalCloudControl implements CloudControlPort {
 
   async #dispatchPendingRemoteCommand(
     observation: SecretObservation<PendingRemoteCommand>,
+    activeDevicePublicId: string,
     signal: AbortSignal,
-  ): Promise<CloudRemoteCommandReceipt> {
+  ): Promise<Readonly<{
+    receipt: CloudRemoteCommandReceipt;
+    requestingDevicePublicId: string;
+  }>> {
     abortBeforeEffect(signal);
+    const currentObservation = observation;
     const pending = observation.value;
     const now = this.#now();
+    const expired = now >= pending.deadline
+      || outboxIdempotencyExpired(pending.idempotencyKey, now);
     if (
-      now >= pending.deadline
-      || outboxIdempotencyExpired(pending.idempotencyKey, now)
+      expired
+      || pending.requestCommitmentVersion !== 2
+      || pending.requestingDevicePublicId === null
+      || pending.requestingDevicePublicId !== activeDevicePublicId
     ) {
       const recovered = parseExactRemoteCommandReceipt(await this.#transport.query(
-        "commands:get",
-        { commandPublicId: pending.commandPublicId },
+        "commands:getForOutboxRecovery",
+        {
+          commandPublicId: pending.commandPublicId,
+          idempotencyKey: pending.idempotencyKey,
+          requestDigest: pending.requestDigest,
+        },
       ));
-      if (recovered === null) {
-        await this.#clearExactSecret(commandOutboxSlot, observation);
+      if (recovered !== null) {
+        if (
+          recovered.publicId !== pending.commandPublicId
+          || recovered.kind !== pending.kind
+          || recovered.requestCommitmentVersion !== pending.requestCommitmentVersion
+          || recovered.requestDigest !== pending.requestDigest
+          || (pending.requestingDevicePublicId !== null
+            && recovered.requestingDevicePublicId !== pending.requestingDevicePublicId)
+          || recovered.sessionPublicId !== pending.sessionPublicId
+          || recovered.targetDevicePublicId !== pending.targetDevicePublicId
+        ) throw new Error("Recovered cloud command changed authority.");
+        if (recovered.requestingDevicePublicId === activeDevicePublicId) {
+          await this.#acknowledgeRemoteCommand(pending);
+        }
+        await this.#clearExactSecret(commandOutboxSlot, currentObservation);
+        return {
+          receipt: {
+            commandPublicId: recovered.publicId,
+            idempotencyKey: pending.idempotencyKey,
+            kind: pending.kind,
+            replay: true,
+            sessionPublicId: recovered.sessionPublicId,
+            state: recovered.state,
+            targetDevicePublicId: recovered.targetDevicePublicId,
+          },
+          requestingDevicePublicId: recovered.requestingDevicePublicId,
+        };
+      }
+      if (expired) {
+        await this.#clearExactSecret(commandOutboxSlot, currentObservation);
         throw new Error("Expired cloud command outbox was absent remotely and has been abandoned without dispatch.");
       }
-      if (
-        recovered.publicId !== pending.commandPublicId
-        || recovered.requestDigest !== pending.requestDigest
-        || recovered.sessionPublicId !== pending.sessionPublicId
-        || recovered.targetDevicePublicId !== pending.targetDevicePublicId
-      ) throw new Error("Recovered cloud command changed authority.");
-      await this.#acknowledgeRemoteCommand(pending);
-      await this.#clearExactSecret(commandOutboxSlot, observation);
-      return {
-        commandPublicId: recovered.publicId,
-        idempotencyKey: pending.idempotencyKey,
-        kind: pending.kind,
-        replay: true,
-        sessionPublicId: recovered.sessionPublicId,
-        state: recovered.state,
-        targetDevicePublicId: recovered.targetDevicePublicId,
-      };
+      if (pending.requestingDevicePublicId !== null) {
+        throw new Error(
+          "Pending cloud command belongs to a different requesting device and may still commit; retry it before its deadline.",
+        );
+      }
+      // A null exact read is not proof that the old enqueue cannot still
+      // commit after a lost response. Preserve the original legacy key,
+      // ciphertext, and digest until its deadline; a later exact retry can
+      // reconcile that row, while rebinding it here could create two meanings
+      // for one idempotency identity.
+      throw new Error(
+        "Legacy pending cloud command is absent remotely but may still commit; retry it before its deadline.",
+      );
     }
     const receipt = parseRemoteCommandReceipt(await this.#transport.mutation(
       "commands:enqueue",
       {
         deadline: pending.deadline,
+        expectedRequestingDevicePublicId: pending.requestingDevicePublicId,
         expectedTargetDevicePublicId: pending.targetDevicePublicId,
         idempotencyKey: pending.idempotencyKey,
         kind: pending.kind,
         payload: pending.envelope,
         publicId: pending.commandPublicId,
+        requestCommitmentVersion: 2,
         requestDigest: pending.requestDigest,
         sessionPublicId: pending.sessionPublicId,
       },
     ));
     if (
       receipt.publicId !== pending.commandPublicId
+      || receipt.requestingDevicePublicId !== pending.requestingDevicePublicId
       || receipt.sessionPublicId !== pending.sessionPublicId
       || receipt.targetDevicePublicId !== pending.targetDevicePublicId
     ) throw new Error("Cloud remote command receipt changed authority.");
     await this.#acknowledgeRemoteCommand(pending);
-    await this.#clearExactSecret(commandOutboxSlot, observation);
+    await this.#clearExactSecret(commandOutboxSlot, currentObservation);
     return {
-      commandPublicId: receipt.publicId,
-      idempotencyKey: pending.idempotencyKey,
-      kind: pending.kind,
-      replay: receipt.replay,
-      sessionPublicId: receipt.sessionPublicId,
-      state: receipt.state,
-      targetDevicePublicId: receipt.targetDevicePublicId,
+      receipt: {
+        commandPublicId: receipt.publicId,
+        idempotencyKey: pending.idempotencyKey,
+        kind: pending.kind,
+        replay: receipt.replay,
+        sessionPublicId: receipt.sessionPublicId,
+        state: receipt.state,
+        targetDevicePublicId: receipt.targetDevicePublicId,
+      },
+      requestingDevicePublicId: pending.requestingDevicePublicId,
     };
   }
 

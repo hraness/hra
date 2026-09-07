@@ -58,11 +58,20 @@
           "value": "no-store"
         }
       ]
+    },
+    {
+      "source": "/.well-known/hra-app.json",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store"
+        }
+      ]
     }
   ],
   "rewrites": [
     {
-      "source": "/((?!assets/).*)",
+      "source": "/((?!assets/|\\.well-known/).*)",
       "destination": "/index.html"
     }
   ]

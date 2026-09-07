@@ -93,6 +93,26 @@ describe("model routing shadow decisions", () => {
     ]);
   });
 
+  test("preserves a historical Devin Astra route only for an established session", () => {
+    const input = {
+      ...CODEX_INPUT,
+      boundary: "established",
+      selection: "existing",
+      effective: { provider: "devin", preset: "astra", fast: false },
+    } as const;
+
+    expect(modelRoutingInputSchema.safeParse(input).success).toBe(true);
+    expect(decideModelRouting(input)).toEqual({
+      schemaVersion: 1,
+      mode: "shadow",
+      runtimeMutationAllowed: false,
+      effective: input.effective,
+      rule: "preserve_established_route",
+      reason: "Established sessions retain their admitted effective route.",
+      candidates: [],
+    });
+  });
+
   test.each([
     {
       name: "established",
@@ -192,6 +212,22 @@ describe("model routing shadow decisions", () => {
     },
     {
       ...CODEX_INPUT,
+      selection: "explicit_family_default",
+      effective: { provider: "devin", preset: "astra", fast: false },
+    },
+    {
+      ...CODEX_INPUT,
+      selection: "explicit_preset",
+      effective: { provider: "devin", preset: "astra", fast: false },
+    },
+    {
+      ...CODEX_INPUT,
+      boundary: "established",
+      selection: "existing",
+      effective: { provider: "devin", preset: "astra", fast: true },
+    },
+    {
+      ...CODEX_INPUT,
       taskShape: "well_defined",
       taskRule: "mechanical_command_only",
     },
@@ -235,6 +271,15 @@ describe("model routing shadow decisions", () => {
             ? { ...candidate, blockers: ["capability_unproven"] }
             : candidate,
         ),
+      }).success,
+    ).toBe(false);
+    expect(
+      modelRoutingDecisionSchema.safeParse({
+        ...codexDecision,
+        effective: { provider: "devin", preset: "astra", fast: false },
+        rule: "preserve_explicit_preset",
+        reason: "Explicit preset choices retain their admitted effective route.",
+        candidates: [],
       }).success,
     ).toBe(false);
   });

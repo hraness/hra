@@ -10,6 +10,7 @@ import { ErrorBoundary } from "./components/error-boundary";
 import { CustodyProvider, useCustody } from "./custody/custody-context";
 import { EnrollmentScreen } from "./custody/enrollment-screen";
 import { LockScreen } from "./custody/lock-screen";
+import { CommandReceiptRecovery } from "./data/command-receipt-recovery";
 import { navigateBack, useRoute } from "./routing/router";
 import { GridScreen } from "./screens/grid-screen";
 import { SessionScreen } from "./screens/session-screen";
@@ -67,6 +68,7 @@ function CustodyGate() {
           )}
           onError={custody.reportAuthorityFailure}
         >
+          <CommandReceiptRecovery />
           <RoutedScreens />
         </ErrorBoundary>
       );

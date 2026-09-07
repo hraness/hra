@@ -3873,7 +3873,12 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
             command = { kind: "session.stop", session: session.id, idempotencyKey: input.idempotencyKey };
             break;
           case "set_model":
-            command = { kind: "session.preset", session: session.id, preset: input.payload.preset, idempotencyKey: input.idempotencyKey };
+            command = {
+              kind: "session.preset",
+              session: session.id,
+              preset: input.payload.preset,
+              idempotencyKey: input.idempotencyKey,
+            };
             break;
           // A provider switch is a provider effect, not a setting: it ends one
           // provider thread and starts another. It therefore runs on the
@@ -3883,7 +3888,10 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
               kind: "session.switch",
               session: session.id,
               provider: input.payload.provider,
-              ...(input.payload.preset === undefined ? {} : { preset: input.payload.preset }),
+              ...("preset" in input.payload ? { preset: input.payload.preset } : {}),
+              ...("presetContract" in input.payload
+                ? { presetContract: input.payload.presetContract }
+                : {}),
               idempotencyKey: input.idempotencyKey,
             };
             break;
@@ -4136,6 +4144,9 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         idempotencyKey: startKey,
         kind: "session.start",
         preset: payload.preset,
+        ...("presetContract" in payload
+          ? { presetContract: payload.presetContract }
+          : {}),
         project: payload.projectPublicId,
         provider: payload.provider,
       }, { signal });
@@ -4621,7 +4632,9 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
   }
 
   async sync(signal: AbortSignal): Promise<unknown> {
-    const daemon = await this.#bridge.cycle(signal);
+    const daemon = await this.#bridge.cycle(signal, {
+      forceDeviceRegistryPublication: true,
+    });
     const value = await this.#control.sync(signal);
     if (
       !isRecord(value)
@@ -4647,6 +4660,7 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
     return {
       control,
       daemon: {
+        commandRequestVersion: daemon.commandRequestVersion,
         commandsApplied: daemon.commandsApplied,
         commandsUnsettled: daemon.commandsUnsettled,
         errors: daemon.errors.slice(0, 32),

@@ -1,4 +1,5 @@
 import {
+  activeRemotePresetSelection,
   deviceCommandLoginResultLifetimeMs,
   deviceCommandLimits,
   parseDeviceCommandPayload,
@@ -19,7 +20,7 @@ import type { MachineView } from "./settings-view";
 
 export type PresetChoice = SupportedPreset;
 
-/** The UI default the plan names: Astra Ultra. */
+/** The stable Codex Ultra alias; the target daemon owns its exact active binding. */
 export const defaultSessionStartPreset: PresetChoice = "ultra";
 
 export type SessionStartProvider = "codex" | "claude";
@@ -79,7 +80,7 @@ export function sessionStartCommand(input: Readonly<{
   return build({
     accountPublicId: input.accountPublicId,
     kind: "session_start",
-    preset: input.preset,
+    ...activeRemotePresetSelection(input.preset),
     projectPublicId: input.projectPublicId,
     prompt,
     provider: input.provider,

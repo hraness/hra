@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { parseRemoteCommandPayload } from "../hra/cloud";
+import { activeRemotePresetSelection, parseRemoteCommandPayload } from "../hra/cloud";
 import {
   approvalModeCommand,
   approvalModeLabels,
@@ -14,6 +14,7 @@ import {
   presetLabels,
   sessionFastCommand,
   sessionFastCommandNotice,
+  sessionPresetCommand,
   settingsCommandLabel,
   showThinkingCommand,
   unarchiveSessionCommand,
@@ -53,14 +54,22 @@ describe("machine default builders", () => {
   test("default preset carries no scope and round trips for every preset", () => {
     for (const preset of presetChoices) {
       const payload = defaultPresetCommand(preset);
-      expect(payload).toEqual({ kind: "set_default_preset", preset });
+      expect(payload).toEqual({ kind: "set_default_preset", ...activeRemotePresetSelection(preset) });
       expect(accepted(payload)).toEqual(payload);
       expect(presetLabels[preset].length).toBeGreaterThan(0);
     }
-    expect(presetLabels.high).toBe("Astra Max");
-    expect(presetLabels.ultra).toBe("Astra Ultra");
+    expect(presetLabels.high).toBe("Codex High");
+    expect(presetLabels.ultra).toBe("Codex Ultra");
     expect(presetLabels.astra).toBe("Devin Astra (retired)");
     expect(presetChoices).not.toContain("astra");
+  });
+
+  test("session preset changes bind the alias to this build's exact contract", () => {
+    expect(sessionPresetCommand("high"))
+      .toEqual({ kind: "set_model", preset: "high", presetContract: 1 });
+    expect(sessionPresetCommand("ultra"))
+      .toEqual({ kind: "set_model", preset: "ultra", presetContract: 1 });
+    expect(accepted(sessionPresetCommand("ultra"))).toEqual(sessionPresetCommand("ultra"));
   });
 
   test("Fast is an explicit session command in both directions", () => {
@@ -112,14 +121,15 @@ describe("machine default builders", () => {
       .toBe(false);
   });
 
-  test("preset labels name the actual model and effort", () => {
+  test("remote Codex labels do not claim a binding registry v1 cannot prove", () => {
     expect(presetLabels).toEqual({
       "fable-max": "Fable Max",
       astra: "Devin Astra (retired)",
-      high: "Astra Max",
+      high: "Codex High",
       low: "Luna Max",
-      ultra: "Astra Ultra",
+      ultra: "Codex Ultra",
     });
+    expect(`${presetLabels.high} ${presetLabels.ultra}`).not.toMatch(/Sol|Astra/u);
   });
 
   test("unarchive is the session scoped archive command with archived false", () => {

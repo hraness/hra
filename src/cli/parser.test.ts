@@ -310,6 +310,26 @@ describe("CLI parser", () => {
     expect(parsed.kind).toBe("session.attach");
     if (parsed.kind !== "session.attach") return;
     expect(typeof parsed.command.idempotencyKey).toBe("string");
+    expect(parsed.legacyAttachmentReplay).toBe(false);
+
+    const key = "00000000-0000-4000-8000-000000000209";
+    for (const action of ["send", "steer"] as const) {
+      const replay = parseCli([
+        "session", action, "s", "--attach", "a.png", "hello",
+        "--idempotency-key", key,
+      ]);
+      expect(replay).toMatchObject({
+        kind: "session.attach",
+        legacyAttachmentReplay: true,
+      });
+    }
+    expect(parseCli([
+      "session", "queue", "s", "--attach", "a.png", "hello",
+      "--idempotency-key", key,
+    ])).toMatchObject({
+      kind: "session.attach",
+      legacyAttachmentReplay: false,
+    });
   });
 
   test("chooses a session provider and its default preset", () => {
@@ -330,20 +350,144 @@ describe("CLI parser", () => {
     // daemon, not by argument parsing.
     expect(parseCli(["session", "preset", "s", "fable-max"]))
       .toMatchObject({ command: { kind: "session.preset", preset: "fable-max" } });
+    expect(() => parseCli([
+      "session", "preset", "s", "high",
+      "--idempotency-key", "00000000-0000-4000-8000-000000000207",
+    ])).toThrow("--idempotency-key is not supported by session.preset");
     expect(parseCli(["remote", "preset", "s", "fable-max"]))
       .toMatchObject({ command: { kind: "remote.preset", preset: "fable-max" } });
     expect(() => parseCli(["remote", "preset", "s", "fable"]))
       .toThrow("Preset must be one of: `low`, `high`, `ultra`, `fable-max`.");
   });
 
-  test("parses a provider switch, an export, and the remote provider command", () => {
-    expect(parseCli(["session", "switch", "s", "--provider", "claude"]))
-      .toMatchObject({ command: { kind: "session.switch", provider: "claude", session: "s" } });
-    expect(parseCli([
-      "session", "switch", "s", "--provider", "codex", "--preset", "ultra", "--account", "work",
-    ])).toMatchObject({
-      command: { account: "work", kind: "session.switch", preset: "ultra", provider: "codex" },
+  test("authors and preserves the immutable source contract for rebound session starts", () => {
+    const generated = parseCli(["session", "start", "work", "--preset", "high"]);
+    expect(generated).toMatchObject({
+      kind: "command",
+      command: {
+        kind: "session.start",
+        preset: "high",
+        presetContract: 1,
+      },
     });
+    if (generated.kind !== "command" || generated.command.kind !== "session.start") {
+      throw new Error("Expected a generated session start command.");
+    }
+    expect(generated.command.idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+
+    const idempotencyKey = "00000000-0000-4000-8000-000000000204";
+    expect(parseCli([
+      "--preset-contract", "2",
+      "session", "start", "work", "--preset", "ultra",
+      "--idempotency-key", idempotencyKey,
+    ])).toMatchObject({
+      kind: "command",
+      command: {
+        idempotencyKey,
+        kind: "session.start",
+        preset: "ultra",
+        presetContract: 2,
+      },
+    });
+    expect(() => parseCli([
+      "session", "start", "work", "--preset", "high",
+      "--idempotency-key", idempotencyKey,
+    ])).toThrow("also requires --preset-contract");
+    expect(() => parseCli([
+      "session", "start", "work", "--preset", "high", "--preset-contract", "2",
+    ])).toThrow("requires an explicit --idempotency-key");
+  });
+
+  test("keeps stable starts byte-compatible and rejects source contracts elsewhere", () => {
+    const idempotencyKey = "00000000-0000-4000-8000-000000000205";
+    const stable = parseCli([
+      "session", "start", "work", "--provider", "claude",
+      "--idempotency-key", idempotencyKey,
+    ]);
+    if (stable.kind !== "command") throw new Error("Expected a stable session start command.");
+    const priorByteShape = {
+      kind: "session.start",
+      account: "work",
+      provider: "claude",
+      preset: "fable-max",
+      fast: false,
+      idempotencyKey,
+    };
+    expect(JSON.stringify(stable.command)).toBe(JSON.stringify(priorByteShape));
+    for (const argv of [
+      ["session", "start", "work", "--provider", "claude", "--preset-contract", "1", "--idempotency-key", idempotencyKey],
+      ["session", "status", "session", "--preset-contract", "1"],
+      ["status", "--preset-contract", "1"],
+      ["session", "start", "work", "--preset-contract", "3", "--idempotency-key", idempotencyKey],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+  });
+
+  test("parses a provider switch, an export, and the remote provider command", () => {
+    const stableSwitch = parseCli(["session", "switch", "s", "--provider", "claude"]);
+    expect(stableSwitch)
+      .toMatchObject({ command: { kind: "session.switch", provider: "claude", session: "s" } });
+    if (
+      stableSwitch.kind !== "command"
+      || stableSwitch.command.kind !== "session.switch"
+    ) throw new Error("Expected a stable provider switch.");
+    expect(stableSwitch.command.idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+    const reboundSwitch = parseCli([
+      "session", "switch", "s", "--provider", "codex", "--preset", "ultra", "--account", "work",
+    ]);
+    expect(reboundSwitch).toMatchObject({
+      command: {
+        account: "work",
+        kind: "session.switch",
+        preset: "ultra",
+        presetContract: 1,
+        provider: "codex",
+      },
+    });
+    if (
+      reboundSwitch.kind !== "command"
+      || reboundSwitch.command.kind !== "session.switch"
+    ) throw new Error("Expected a rebound provider switch.");
+    expect(reboundSwitch.command.idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+    expect(parseCli(["session", "switch", "s", "--provider", "codex"]))
+      .toMatchObject({ command: { presetContract: 1, provider: "codex" } });
+    const switchReplayKey = "00000000-0000-4000-8000-000000000206";
+    expect(parseCli([
+      "session", "switch", "s", "--provider", "codex", "--preset", "high",
+      "--idempotency-key", switchReplayKey, "--preset-contract", "2",
+    ])).toMatchObject({
+      command: {
+        idempotencyKey: switchReplayKey,
+        preset: "high",
+        presetContract: 2,
+        provider: "codex",
+      },
+    });
+    expect(() => parseCli([
+      "session", "switch", "s", "--provider", "codex", "--preset", "high",
+      "--idempotency-key", switchReplayKey,
+    ])).toThrow("also requires --preset-contract");
+    expect(() => parseCli([
+      "session", "switch", "s", "--provider", "codex", "--preset-contract", "2",
+    ])).toThrow("requires an explicit --idempotency-key");
+    expect(parseCli([
+      "session", "switch", "s", "--provider", "claude",
+      "--idempotency-key", switchReplayKey,
+    ])).toMatchObject({
+      command: {
+        idempotencyKey: switchReplayKey,
+        provider: "claude",
+      },
+    });
+    expect(() => parseCli([
+      "session", "switch", "s", "--provider", "claude",
+      "--idempotency-key", switchReplayKey, "--preset-contract", "1",
+    ])).toThrow("supported only for a source-sensitive Codex provider switch");
     expect(() => parseCli(["session", "switch", "s"]))
       .toThrow("Missing value for --provider.");
     expect(() => parseCli(["session", "switch", "s", "--provider", "gemini"]))
@@ -1721,6 +1865,10 @@ describe("CLI help", () => {
     expect(usage).toContain("Run `hra <group> --help` or `hra help <group> [<command>]` for command examples.");
     expect(usage).toContain("Codex provider commands run on macOS and Linux");
     expect(usage).toContain("Claude login, status,\n  sessions, and provider switches require Linux");
+    expect(usage).toContain("high        Sol Max         (codex)");
+    expect(usage).toContain("ultra       Sol Ultra       (codex)");
+    expect(usage).not.toContain("Astra Max       (codex)");
+    expect(usage).not.toContain("Astra Ultra     (codex)");
     for (const group of helpGroupNames) expect(usage).toContain(`hra ${group}`);
   });
 

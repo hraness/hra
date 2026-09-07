@@ -290,7 +290,7 @@ function adoptPersonalCodexSession(
       computerUse: true,
       enabledApps: [],
       fast: false,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       observedAt: 2_000,
       permissionProfile: ":workspace",
       pluginCapability: true,
@@ -341,6 +341,13 @@ function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, inp
   });
   value.store.beginSessionMutationEffect({
     attemptId: attempt.id,
+    transcript: {
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-00000000000b",
+      actor: "human",
+      message: "fixture",
+    },
     evidence: {
       baseline: { activeTurnId: null, providerUpdatedAt: session.providerUpdatedAt ?? null, status: "idle" },
       clientMessageId: attempt.id,
@@ -409,6 +416,7 @@ async function materializeScheduledTaskQueue(
     queueId: occurrence.queue.id,
     sessionId: current.id,
     profileGeneration: profile.processGeneration,
+    providerConnectionId: "10000000-0000-4000-8000-000000000001",
     evidence: {
       kind: "queue.dispatch",
       queueId: occurrence.queue.id,
@@ -623,6 +631,7 @@ describe("state-backed cloud daemon adapter", () => {
         sessionId: bound.id,
       },
       profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000002",
       queueId: queued.id,
       sessionId: bound.id,
     });
@@ -3706,13 +3715,14 @@ describe("state-backed cloud daemon adapter", () => {
         authority: authority as CloudLocalCommandAuthority,
         idempotencyKey: "00000000-0000-7000-8000-0000000000a2",
         leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
-        payload: { kind: "set_provider", provider: "codex" },
+        payload: { kind: "set_provider", presetContract: 1, provider: "codex" },
         sessionPublicId: value.sessionId,
         signal,
       })).toEqual({ code: "APPLIED", state: "applied" });
       expect(commands[1]).toEqual({
         idempotencyKey: "00000000-0000-7000-8000-0000000000a2",
         kind: "session.switch",
+        presetContract: 1,
         provider: "codex",
         session: value.sessionId,
       });
@@ -3775,6 +3785,21 @@ describe("state-backed cloud daemon adapter", () => {
         session: value.sessionId,
       });
 
+      expect(await adapter.execute({
+        authority: authority as CloudLocalCommandAuthority,
+        idempotencyKey: "00000000-0000-7000-8000-000000000007",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+        payload: { kind: "set_model", preset: "ultra", presetContract: 1 },
+        sessionPublicId: value.sessionId,
+        signal,
+      })).toEqual({ code: "APPLIED", state: "applied" });
+      expect(commands.at(-1)).toEqual({
+        idempotencyKey: "00000000-0000-7000-8000-000000000007",
+        kind: "session.preset",
+        preset: "ultra",
+        session: value.sessionId,
+      });
+
       const profile = value.store.requireProfileById((authority as CloudLocalCommandAuthority).profileId as Parameters<StateStore["requireProfileById"]>[0]);
       value.store.advanceProfileGeneration(profile.id, profile.processGeneration);
       expect(await adapter.execute({
@@ -3785,7 +3810,7 @@ describe("state-backed cloud daemon adapter", () => {
         sessionPublicId: value.sessionId,
         signal,
       })).toEqual({ code: "LOCAL_AUTHORITY_CHANGED", state: "failed" });
-      expect(commands).toHaveLength(2);
+      expect(commands).toHaveLength(3);
     } finally {
       await adapter.close();
       value.store.close();
@@ -3796,8 +3821,10 @@ describe("state-backed cloud daemon adapter", () => {
 describe("bridged cloud control", () => {
   test("manual sync runs the daemon bridge before the ordinary control pull", async () => {
     const calls: string[] = [];
+    const cycleOptions: unknown[] = [];
     const deviceSignals: AbortSignal[] = [];
     const cycle: CloudDaemonCycleResult = {
+      commandRequestVersion: 2,
       commandsApplied: 0,
       commandsUnsettled: 0,
       errors: [],
@@ -3821,7 +3848,11 @@ describe("bridged cloud control", () => {
     };
     const bridge: CloudDaemonBridge = {
       close: () => { calls.push("close"); return Promise.resolve(); },
-      cycle: () => { calls.push("bridge"); return Promise.resolve(cycle); },
+      cycle: (_signal, options) => {
+        calls.push("bridge");
+        cycleOptions.push(options);
+        return Promise.resolve(cycle);
+      },
       invalidateAttentionNotificationAuthority: () => {
         calls.push("attention-invalidate");
         return Promise.resolve({
@@ -3904,6 +3935,7 @@ describe("bridged cloud control", () => {
         usageSnapshotCount: 1,
       },
       daemon: {
+        commandRequestVersion: 2,
         commandsApplied: 0,
         commandsUnsettled: 0,
         errors: [],
@@ -3916,6 +3948,7 @@ describe("bridged cloud control", () => {
     expect(JSON.stringify(synced).length).toBeLessThan(2_048);
     expect(JSON.stringify(synced)).not.toContain("sentinel");
     expect(calls).toEqual(["bridge", "control"]);
+    expect(cycleOptions).toEqual([{ forceDeviceRegistryPublication: true }]);
 
     calls.length = 0;
     expect(await combined.observeAttentionNotificationAuthority(
@@ -5068,7 +5101,7 @@ describe("settings commands and the device registry", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -5479,6 +5512,7 @@ async function deviceCommandFixture(options: Readonly<{
     accountPublicId: account.id,
     kind: "session_start" as const,
     preset: "ultra" as const,
+    presetContract: 1 as const,
     projectPublicId: project.id,
     prompt: "continue the migration",
     provider: "codex" as const,
@@ -5798,9 +5832,11 @@ describe("device command execution", () => {
       const outcome = await world.adapter.executeDeviceCommand({
         idempotencyKey: "018bcfe5-6800-7000-8000-000000000101",
         payload: {
-          ...world.sessionStart,
           accountPublicId: account.publicId,
+          kind: world.sessionStart.kind,
           preset: "fable-max",
+          projectPublicId: world.sessionStart.projectPublicId,
+          prompt: world.sessionStart.prompt,
           provider: "claude",
         },
         requestingDevicePublicId: "device_browser1",
@@ -5813,6 +5849,7 @@ describe("device command execution", () => {
         preset: "fable-max",
         provider: "claude",
       });
+      expect(world.executed[0]).not.toHaveProperty("presetContract");
       expect(claude.readAccountCalls).toBe(2);
     } finally {
       await world.adapter.close();
@@ -5838,9 +5875,11 @@ describe("device command execution", () => {
       expect(await world.adapter.executeDeviceCommand({
         idempotencyKey: "018bcfe5-6800-7000-8000-000000000102",
         payload: {
-          ...world.sessionStart,
           accountPublicId: address.publicId,
+          kind: world.sessionStart.kind,
           preset: "fable-max",
+          projectPublicId: world.sessionStart.projectPublicId,
+          prompt: world.sessionStart.prompt,
           provider: "claude",
         },
         requestingDevicePublicId: "device_browser1",
@@ -5969,6 +6008,11 @@ describe("device command execution", () => {
       });
       expect(world.executed.map((command) => command.kind))
         .toEqual(["session.start", "session.send"]);
+      expect(world.executed[0]).toMatchObject({
+        kind: "session.start",
+        preset: "ultra",
+        presetContract: 1,
+      });
       // One device command, two local effects, two distinct derived keys.
       const keys = world.executed.map((command) =>
         (command as { idempotencyKey?: string }).idempotencyKey);
@@ -6007,6 +6051,7 @@ describe("device command execution", () => {
           accountPublicId: account.id,
           kind: "session_start",
           preset: "ultra",
+          presetContract: 1,
           projectPublicId: project.id,
           prompt: "continue",
           provider: "codex",

@@ -1,4 +1,4 @@
-# Devin provider and Astra defaults
+# Devin provider and preset authority
 
 ## Superseded: provider removal
 
@@ -79,11 +79,13 @@ APIs require separate `cog_` credential custody, create a different
 remote-session lifecycle, and cannot currently guarantee an arbitrary model
 selection.
 
-The existing Codex `high` and `ultra` presets move from `gpt-5.6-sol` to
-`gpt-6-astra`. Their reasoning efforts remain `max` and `ultra`, respectively.
-Existing sessions retain their durable preset contract and reviewed runtime
-history. New HRA sessions and explicit preset selections use the current Astra
-mapping; queued and recovered work cannot reinterpret an established contract.
+Codex `high` and `ultra` actively resolve to `gpt-5.6-sol` at `max` and `ultra`
+reasoning, respectively. New HRA sessions and explicit Codex preset selections
+bind the immutable Sol contract. Established contract 2 Codex sessions retain
+their exact Astra mapping and reviewed runtime history; queued and recovered
+work cannot reinterpret that evidence. At the superseded implementation point,
+Devin used an explicit `astra` preset on contract 2. Current HRA preserves those
+rows only as read-only history and exposes no Devin execution or selection.
 
 ## Authority and privacy invariants
 
@@ -172,7 +174,8 @@ the prompt result or child termination boundary.
   worktree or copying unfinished state.
 - **Acceptance:** Devin never enters Codex reset paths; the provider-usage branch
   can add `devin_acp` as a source without migrating this branch's meaning; model
-  routing recognizes the canonical Astra-backed Codex preset.
+  routing preserves frozen Codex contract 2 Astra evidence while active Codex
+  selections use Sol.
 
 ### 4. Verification and delivery
 

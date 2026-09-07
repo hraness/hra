@@ -8,4 +8,6 @@ The static hra.sh analytics asset incorporates `@hraness/posthog` version 0.1.2 
 
 The static hra.sh styles and footer use the MIT-licensed `@hraness/design-kit` v0.4.0 and `@hraness/site-footer` v0.4.6 packages; `bun.lock` binds both exact release tags.
 
-The immutable `v0.6.0` release source tag records the verified build graph in `bun.lock`, while the install tarball declares its direct runtime dependency versions in `package.json`. The GitHub Release publishes that exact tarball plus `SHA256SUMS`; npm publishes the same tarball through trusted publishing. The tarball does not vendor transitive dependencies. Dependency packages retain their own license texts and source metadata.
+HRA validates trajectory exports during development against Apache-2.0-licensed `@letta-ai/trajectory` 0.3.0 and MIT-licensed Ajv 8.20.0. These development dependencies are not runtime dependencies of the published CLI.
+
+The immutable `v0.6.1` release source tag records the verified build graph in `bun.lock`, while the install tarball declares its direct runtime dependency versions in `package.json`. The GitHub Release publishes that exact tarball plus `SHA256SUMS`; npm publishes the same tarball through trusted publishing. The tarball does not vendor transitive dependencies. Dependency packages retain their own license texts and source metadata.
