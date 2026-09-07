@@ -1765,6 +1765,295 @@ describe("StateStore", () => {
     expect(updated.fastEnabled).toBe(true);
   });
 
+  describe("Work project metadata authority", () => {
+    const liveStates = ["claimed", "dispatching", "running", "recovery_required"] as const;
+    type FixtureState = (typeof liveStates)[number] | "released" | "submitted";
+    const capability = `hrac1_${"A".repeat(43)}`;
+    let keySequence = 0;
+    const nextKey = () => `01890f31-a123-7000-8000-${(++keySequence).toString(16).padStart(12, "0")}`;
+
+    async function workFixture(state: FixtureState, options: Parameters<typeof fixture>[0] = {}) {
+      const { store, home } = await fixture(options);
+      const profile = signInProfile(store, "Project authority", "project-authority@example.com");
+      const repository = join(home, "project-authority");
+      await mkdir(repository);
+      const project = await store.createProject("Project authority", repository, true);
+      const session = createProvenTestSession(store, {
+        profileId: profile.id,
+        projectId: project.id,
+        preset: "ultra",
+        fastEnabled: false,
+      });
+      const work = store.createWorkStore(1, () => "unused-project-authority-cursor", {
+        issue: () => capability,
+        verify: (value) => value === capability,
+      });
+      const created = work.apply({
+        kind: "work.create",
+        idempotencyKey: nextKey(),
+        clientRef: "project-authority",
+        coordinatorSessionId: session.id,
+        objective: "Preserve a claimed session's exact project authority.",
+        routes: [{ accountId: profile.id, projectId: project.id, preset: "ultra", fast: false }],
+        tasks: [{
+          clientRef: "project-authority-task",
+          dependsOnRefs: [],
+          dependsOnTaskIds: [],
+          objective: "Keep project authority stable until the attempt settles.",
+          instructions: "Perform no provider effect in this storage fixture.",
+          criteria: ["Project changes cannot invalidate a live attempt."],
+          route: { accountId: profile.id, projectId: project.id },
+          preset: "ultra",
+          fast: false,
+          priority: 0,
+          maxAttempts: 3,
+          requiredReviews: 1,
+          resultKind: "text",
+          minEvidence: 0,
+        }],
+      });
+      if (created.kind !== "work.create") throw new Error("Expected created project-authority work.");
+      const task = created.tasks[0];
+      if (task === undefined) throw new Error("Expected one project-authority task.");
+      const claimed = work.apply({
+        kind: "task.claim",
+        idempotencyKey: nextKey(),
+        workId: created.work.id,
+        taskId: task.id,
+        expectedTaskRevision: task.revision,
+        actorSessionId: session.id,
+        actorCapability: capability,
+        leaseMs: 50_000,
+      });
+      if (claimed.kind !== "task.claim") throw new Error("Expected claimed project-authority task.");
+      if (state === "released") {
+        work.apply({
+          kind: "attempt.release",
+          idempotencyKey: nextKey(),
+          workId: created.work.id,
+          attemptId: claimed.attempt.id,
+          expectedAttemptRevision: claimed.attempt.revision,
+          fence: claimed.attempt.fence,
+          actorSessionId: session.id,
+          attemptCapability: capability,
+          reason: "Return the session's project authority.",
+        });
+      } else if (state !== "claimed") {
+        const dispatchKey = nextKey();
+        work.apply({
+          kind: "attempt.dispatch",
+          idempotencyKey: dispatchKey,
+          workId: created.work.id,
+          attemptId: claimed.attempt.id,
+          expectedAttemptRevision: claimed.attempt.revision,
+          fence: claimed.attempt.fence,
+          actorSessionId: session.id,
+          attemptCapability: capability,
+          targetSessionId: session.id,
+          mode: "send",
+        });
+        if (state !== "dispatching") {
+          expect(work.authorizePreparedEffect(dispatchKey).executable).toBe(true);
+          const settled = work.finalizeDispatch(dispatchKey, state === "recovery_required"
+            ? { kind: "unknown", code: "custodian_restart" }
+            : {
+                kind: "accepted",
+                receipt: {
+                  kind: "turn_started",
+                  turnId: `opaque_v2_${"a".repeat(64)}`,
+                  runtimeProfileDigest: "b".repeat(64),
+                  mutationAttemptId: createAttemptId(),
+                  accountGeneration: profile.processGeneration,
+                },
+              });
+          if (state === "submitted") {
+            work.apply({
+              kind: "attempt.report",
+              idempotencyKey: nextKey(),
+              workId: created.work.id,
+              attemptId: settled.id,
+              expectedAttemptRevision: settled.revision,
+              fence: settled.fence,
+              actorSessionId: session.id,
+              attemptCapability: capability,
+              report: { kind: "submit", summary: "Ready for independent review.", result: { kind: "text", text: "complete" }, evidence: [] },
+            });
+          }
+        }
+      }
+      const inspect = <T>(read: (database: Database) => T): T => {
+        const database = new Database(store.paths.database, { readonly: true, strict: true });
+        try { return read(database); } finally { database.close(false); }
+      };
+      expect(inspect((database) => database.query(
+        "SELECT [notnull] FROM pragma_table_info('sessions') WHERE name='project_id'",
+      ).get())).toEqual({ notnull: 0 });
+      expect(inspect((database) => database.query(
+        "SELECT state FROM work_attempts WHERE id=?",
+      ).get(claimed.attempt.id))).toEqual({ state });
+      const snapshot = () => inspect((database) => ({
+        session: database.query("SELECT * FROM sessions WHERE id=?").get(session.id),
+        attempt: database.query("SELECT * FROM work_attempts WHERE id=?").get(claimed.attempt.id),
+        taskState: database.query("SELECT * FROM work_task_states WHERE task_id=?").get(task.id),
+        events: database.query("SELECT * FROM work_events WHERE work_id=? ORDER BY sequence").all(created.work.id),
+        stream: database.query("SELECT * FROM session_event_streams WHERE session_id=?").get(session.id),
+        schema: database.query("SELECT name,sql FROM sqlite_master ORDER BY name").all(),
+        version: database.query("PRAGMA user_version").get(),
+      }));
+      return { store, home, project, session, snapshot };
+    }
+
+    for (const state of liveStates) {
+      test(`refuses clearing a real nullable project during ${state} without changing metadata or Work`, async () => {
+        const { store, session, snapshot } = await workFixture(state);
+        const before = snapshot();
+        expect(() => store.updateSessionMetadata({
+          sessionId: session.id,
+          expectedRevision: session.revision,
+          projectId: null,
+          title: "Must not commit",
+          note: "Must not commit either",
+        })).toThrow("WORK_SESSION_ATTEMPT_AUTHORITY");
+        expect(snapshot()).toEqual(before);
+      });
+
+      test(`preserves same-project and unrelated metadata updates during ${state}`, async () => {
+        const { store, project, session } = await workFixture(state);
+        const renamed = store.updateSessionMetadata({
+          sessionId: session.id,
+          expectedRevision: session.revision,
+          title: "Renamed without changing authority",
+        });
+        const updated = store.updateSessionMetadata({
+          sessionId: session.id,
+          expectedRevision: renamed.revision,
+          projectId: project.id,
+          note: "Same project is not a route change",
+        });
+        expect(updated).toMatchObject({
+          projectId: project.id,
+          title: renamed.title,
+          note: "Same project is not a route change",
+          revision: session.revision + 2,
+        });
+        expect(updated.updatedAt).toBeGreaterThan(renamed.updatedAt);
+      });
+    }
+
+    for (const state of ["released", "submitted"] as const) {
+      test(`allows clearing a project after the attempt is ${state}`, async () => {
+        const { store, session } = await workFixture(state);
+        const updated = store.updateSessionMetadata({
+          sessionId: session.id,
+          expectedRevision: session.revision,
+          projectId: null,
+        });
+        expect(updated.projectId).toBeUndefined();
+        expect(updated.revision).toBe(session.revision + 1);
+      });
+    }
+
+    test("allows clearing without a Work attempt and preserves the nullable result on reopen", async () => {
+      const { store, home } = await fixture();
+      const profile = store.createProfile("No Work attempt");
+      const repository = join(home, "no-work-attempt");
+      await mkdir(repository);
+      const project = await store.createProject("No Work attempt", repository, true);
+      const session = store.createSession({
+        profileId: profile.id,
+        projectId: project.id,
+        preset: "ultra",
+        fastEnabled: false,
+      });
+      const cleared = store.updateSessionMetadata({
+        sessionId: session.id,
+        expectedRevision: session.revision,
+        projectId: null,
+      });
+      expect(cleared.projectId).toBeUndefined();
+      const unchanged = store.updateSessionMetadata({
+        sessionId: session.id,
+        expectedRevision: cleared.revision,
+        projectId: null,
+        note: "An already-null project is not a route change",
+      });
+      expect(unchanged.projectId).toBeUndefined();
+      expect(unchanged.revision).toBe(session.revision + 2);
+      const paths = store.paths;
+      store.close();
+      stores.splice(stores.indexOf(store), 1);
+      const reopened = new StateStore(paths);
+      stores.push(reopened);
+      expect(reopened.requireSession(session.id)).toEqual(unchanged);
+    });
+
+    test("preserves wrong-project, malformed-project, stale-revision, and unknown-session refusals", async () => {
+      const { store, home, session, snapshot } = await workFixture("claimed");
+      const otherRepository = join(home, "different-work-project");
+      await mkdir(otherRepository);
+      const otherProject = await store.createProject("Different Work project", otherRepository, true);
+      const before = snapshot();
+      for (const projectId of [otherProject.id, "proj_ffffffffffffffffffffffffffffffff", "malformed-project"]) {
+        expect(() => store.updateSessionMetadata({
+          sessionId: session.id,
+          expectedRevision: session.revision,
+          projectId,
+        })).toThrow("WORK_SESSION_ATTEMPT_AUTHORITY");
+        expect(snapshot()).toEqual(before);
+      }
+      expect(() => store.updateSessionMetadata({
+        sessionId: session.id,
+        expectedRevision: session.revision - 1,
+        projectId: null,
+      })).toThrow("Session metadata revision conflict.");
+      expect(() => store.updateSessionMetadata({
+        sessionId: "sess_ffffffffffffffffffffffffffffffff",
+        expectedRevision: session.revision,
+        projectId: null,
+      })).toThrow(SelectionError);
+      expect(snapshot()).toEqual(before);
+    });
+
+    test("holds the SQLite write fence across metadata observation and timestamp sampling", async () => {
+      let tick = 1_000;
+      let onClock: (() => void) | undefined;
+      const { store, session, snapshot } = await workFixture("claimed", {
+        now: () => { onClock?.(); return tick++; },
+      });
+      const contender = new Database(store.paths.database, { create: false, strict: true });
+      contender.exec("PRAGMA busy_timeout=0");
+      let observedFence = false;
+      try {
+        onClock = () => {
+          onClock = undefined;
+          expect(() => contender.transaction(() => {
+            contender.query("UPDATE sessions SET note=?,revision=revision+1 WHERE id=?")
+              .run("Competing writer must not commit", session.id);
+          }).immediate()).toThrow("database is locked");
+          observedFence = true;
+        };
+        const renamed = store.updateSessionMetadata({
+          sessionId: session.id,
+          expectedRevision: session.revision,
+          title: "One atomic metadata observation",
+        });
+        expect(observedFence).toBe(true);
+        expect(renamed).toMatchObject({ title: "One atomic metadata observation", note: session.note });
+        const before = snapshot();
+        onClock = () => { throw new Error("Injected unavailable timestamp"); };
+        expect(() => store.updateSessionMetadata({
+          sessionId: session.id,
+          expectedRevision: renamed.revision,
+          note: "No partial update on clock failure",
+        })).toThrow("Injected unavailable timestamp");
+        expect(snapshot()).toEqual(before);
+      } finally {
+        onClock = undefined;
+        contender.close(false);
+      }
+    });
+  });
+
   test("uses active Sol bindings while preserving established contract 2", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Preset contracts", "preset-contracts@example.com");
