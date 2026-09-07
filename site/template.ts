@@ -305,8 +305,8 @@ const renderProductHero = (content: PublicContent): string => `<header class="hr
   <section class="hraness-marketing-install" data-hraness-marketing="install" id="install-command" aria-labelledby="install-command-heading">
     <div class="hraness-marketing-install__heading-group">
       <p class="hraness-marketing-install__eyebrow">Local release · v${escapeHtml(content.releaseVersion)}</p>
-      <h2 class="hraness-marketing-install__heading" id="install-command-heading">Install after release admission.</h2>
-      <p class="install-note">This candidate is release-ready, not yet admitted. Use this command only after immutable GitHub and npm release admission. It downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.</p>
+      <h2 class="hraness-marketing-install__heading" id="install-command-heading">Install the local CLI.</h2>
+      <p class="install-note">The v${escapeHtml(content.releaseVersion)} artifacts passed immutable GitHub and npm release admission. This command downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.</p>
     </div>
     <div class="hraness-marketing-install__commands">
       <pre class="install-command" tabindex="0">${renderShellCode(content.installCommand)}</pre>
