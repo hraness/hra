@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
   appSha256, parseAppPublication, readAppInventory, readAppOrdinary,
 } from "../scripts/build-app.ts";
+import { assertReviewedRuntimeStyleBoundary } from "./build-runtime-style-boundary.ts";
 
 const appRoot = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = dirname(appRoot);
@@ -229,7 +230,7 @@ describe("built shell", () => {
     expect(unlinked).toBe(authored);
   });
 
-  test("contains only the closed public graph and separate marker, with no receipts, maps, or source paths", () => {
+  test("contains only the closed public graph and separate marker, with no receipts, maps, or source paths", async () => {
     for (const artifact of artifacts) {
       expect(artifact.name === ".well-known/hra-app.json"
         || artifact.name === "index.html" || artifact.name === "stylex.css"
@@ -256,8 +257,12 @@ describe("built shell", () => {
     const javascript = artifacts.filter(({ name }) => name.endsWith(".js"));
     for (const artifact of javascript) {
       expect(artifact.text).not.toContain("@stylexjs/stylex/lib/stylex-inject");
-      expect(artifact.text).not.toMatch(/createElement\(["']style["']\)|\.insertRule\(/u);
     }
+    const reactDomRoot = dirname(fileURLToPath(import.meta.resolve("react-dom/package.json")));
+    assertReviewedRuntimeStyleBoundary(javascript, {
+      manifest: JSON.parse((await readAppOrdinary(join(reactDomRoot, "package.json"))).toString("utf8")) as unknown,
+      productionClientSha256: appSha256(await readAppOrdinary(join(reactDomRoot, "cjs/react-dom-client.production.js"))),
+    });
   });
 
   test("carries the mobile viewport with the safe-area opt in", () => {

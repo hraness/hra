@@ -109,9 +109,37 @@ jobs:
           sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=1
           test "$(/usr/sbin/sysctl --values kernel.apparmor_restrict_unprivileged_userns)" = "1"
 
+  browser:
+    name: Compiled app and site browser
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - name: Install frozen dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install package-pinned Chromium
+        run: bun ./node_modules/playwright-core/cli.js install --with-deps chromium
+      - name: Verify compiled browser surfaces
+        run: |
+          set -euo pipefail
+          CHROMIUM_EXECUTABLE_PATH="$(bun -e 'import { chromium } from "playwright-core"; console.log(chromium.executablePath())')"
+          export CHROMIUM_EXECUTABLE_PATH
+          test -x "$CHROMIUM_EXECUTABLE_PATH"
+          bun run check:browser
+
   required:
     name: Required
-    needs: check
+    needs: [check, browser]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -119,4 +147,5 @@ jobs:
       - name: Require every matrix check
         env:
           CHECK_RESULT: ${{ needs.check.result }}
-        run: test "$CHECK_RESULT" = "success"
+          BROWSER_RESULT: ${{ needs.browser.result }}
+        run: test "$CHECK_RESULT" = "success" && test "$BROWSER_RESULT" = "success"

@@ -131,7 +131,7 @@ export const sessionCardStyles = stylex.create({
     gap: "0.375rem",
     minWidth: 0,
     padding: 0,
-    textAlign: "left",
+    textAlign: "start",
   },
   quiet: {
     color: "var(--color-ink-muted)",

@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import * as stylex from "@stylexjs/stylex";
 import { renderToStaticMarkup } from "react-dom/server";
+import ts from "typescript";
 
 import { staticStylexClassName } from "../../lib/cn";
 import { Badge, type BadgeProps } from "./badge";
@@ -83,7 +84,7 @@ function openingTag(markup: string, name: string): string {
 }
 
 function expectedClassName(
-  ...styles: Parameters<typeof stylex.props>
+  ...styles: readonly stylex.StaticStyles[]
 ): string {
   const className = stylex.props(...styles).className;
   if (className === undefined) throw new Error("Expected extracted StyleX classes");
@@ -335,7 +336,49 @@ test("native primitive boundaries reject caller inline styles at runtime", () =>
   }
 });
 
-test("owned primitive sources contain no Tailwind utility presentation", async () => {
+function uncompiledClassNames(source: string): readonly string[] {
+  const file = ts.createSourceFile("primitive.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const invalid: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isJsxAttribute(node) && node.name.getText(file) === "className") {
+      const initializer = node.initializer;
+      const expression = initializer !== undefined && ts.isJsxExpression(initializer)
+        ? initializer.expression : undefined;
+      const composed = expression !== undefined && ts.isCallExpression(expression)
+        && ts.isIdentifier(expression.expression)
+        && expression.expression.text === "staticStylexClassName"
+        && expression.arguments.length >= 1 && expression.arguments.length <= 2
+        && expression.arguments.every((argument, index) => ts.isIdentifier(argument)
+          && (index === 0 || argument.text === "className"));
+      const extracted = expression !== undefined && ts.isPropertyAccessExpression(expression)
+        && expression.name.text === "className"
+        && ts.isCallExpression(expression.expression)
+        && ts.isPropertyAccessExpression(expression.expression.expression)
+        && ts.isIdentifier(expression.expression.expression.expression)
+        && expression.expression.expression.expression.text === "stylex"
+        && expression.expression.expression.name.text === "props";
+      if (!composed && !extracted) invalid.push(node.getText(file));
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return invalid;
+}
+
+test("primitive class guard checks JSX presentation, not CSS value substrings", () => {
+  expect(uncompiledClassNames(`
+    const recipe = { transitionProperty: "color, border-color, text-decoration-color" };
+    const first = <div className={staticStylexClassName(presentation, className)} />;
+    const second = <div className={stylex.props(styles.root, active && styles.active).className} />;
+  `)).toEqual([]);
+  for (const attribute of [
+    'className="p-4 text-sm"', 'className={"bg-red-500"}',
+    'className={cn("flex gap-2")}', 'className={legacyClasses}',
+    'className={staticStylexClassName(presentation, "border-2")}',
+  ]) expect(uncompiledClassNames(`<div ${attribute} />`)).toEqual([attribute]);
+});
+
+test("owned primitives route every class attribute through compiled presentation", async () => {
   const directory = new URL("./", import.meta.url);
   const paths = [
     "badge.tsx",
@@ -354,8 +397,7 @@ test("owned primitive sources contain no Tailwind utility presentation", async (
   const main = await Bun.file(new URL("../../main.tsx", directory)).text();
 
   for (const source of sources) {
-    expect(source).not.toMatch(/className=(?:"|\{cn\()/u);
-    expect(source).not.toMatch(/(?:^|\s)(?:bg|border|flex|gap|h|min-h|p|text|w)-/u);
+    expect(uncompiledClassNames(source)).toEqual([]);
   }
   expect(globalCss).not.toContain('@import "tailwindcss"');
   expect(globalCss).not.toContain("@theme");
@@ -366,6 +408,14 @@ test("owned primitive sources contain no Tailwind utility presentation", async (
   expect(main.indexOf('import "@hraness/ui/compiler-foundation.css"')).toBeLessThan(
     main.indexOf('import "./index.css"'),
   );
+});
+
+test("every primitive transition has a static reduced-motion branch", async () => {
+  const source = await Bun.file(new URL("./primitives.stylex.ts", import.meta.url)).text();
+  expect(source).toContain('const reducedMotion = "@media (prefers-reduced-motion: reduce)"');
+  const durations = [...source.matchAll(/transitionDuration:\s*([^\n]+),/gu)].map((match) => match[1]);
+  expect(durations).toHaveLength(3);
+  expect(durations.every((value) => value === '{ default: "150ms", [reducedMotion]: "0s" }')).toBe(true);
 });
 
 test("primitive text and native date-time controls retain the removed preflight contract", async () => {
@@ -419,5 +469,8 @@ test("primitive text and native date-time controls retain the removed preflight 
   ]) expect(globalCss).toContain(block);
   expect(globalCss).toContain(
     "line-height: 1.5;\n    tab-size: 4;\n    -webkit-tap-highlight-color: transparent;",
+  );
+  expect(globalCss).toContain(
+    "@media (forced-colors: active) {\n    :focus-visible {\n      outline-color: Highlight;\n    }\n  }",
   );
 });

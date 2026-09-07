@@ -11,7 +11,7 @@ const expected = {
   schemaVersion: 1,
   source: { commit },
   version: "0.6.1",
-};
+} as const;
 
 describe("app deployment source marker", () => {
   test("preserves the exact existing public identity and serialization", () => {

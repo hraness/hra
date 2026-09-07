@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { constants, closeSync, fstatSync, fsyncSync, lstatSync, openSync } from "node:fs";
+import { constants, closeSync, fstatSync, fsyncSync, lstatSync, openSync, readSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { COPYFILE_EXCL, O_NOFOLLOW, O_RDONLY } from "node:constants";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { Stats } from "node:fs";
 import {
   copyFile, lstat, mkdir, mkdtemp, open, opendir, realpath, rename, writeFile,
@@ -544,6 +544,150 @@ export type AppPublicationLock = Readonly<{
   release: () => void;
 }>;
 
+export const APP_PROCESS_CUSTODY_FILE = "process-custody.json";
+
+/** A durable fence remains authoritative after its kernel-lock owner exits. */
+export class AppProcessCustodyError extends Error {}
+
+export type AppProcessCustody = Readonly<{
+  assertHeld: () => void;
+  clearAfterCollection: () => void;
+}>;
+
+type AppProcessCustodyOwner = Readonly<{
+  controlDirectory: string;
+  lock: AppPublicationLock;
+}>;
+
+function assertNoAppProcessCustody(controlDirectory: string): void {
+  try { lstatSync(join(controlDirectory, APP_PROCESS_CUSTODY_FILE)); }
+  catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+    throw new AppProcessCustodyError("App process custody cannot be inspected; preserve it for recovery", { cause: error });
+  }
+  throw new AppProcessCustodyError("App process custody is retained; collection must be proved before another publication");
+}
+
+/** Persist both publication fences before a development child can exist. */
+export function beginAppProcessCustody(
+  owners: readonly [AppProcessCustodyOwner, AppProcessCustodyOwner],
+  run: string,
+): AppProcessCustody {
+  assert.ok(/^build-[A-Za-z0-9_-]{1,128}$/u.test(run), "Invalid app process custody run");
+  assert.equal(owners[1].controlDirectory, join(owners[0].controlDirectory, "dev"), "App process custody must fence the build and its dev owner");
+  const source = Buffer.from(`${JSON.stringify({
+    kind: "hra-app-process-custody", run, schemaVersion: 1, token: randomBytes(32).toString("hex"),
+  })}\n`);
+  assert.ok(source.byteLength <= 512);
+  const entries: {
+    descriptor: number;
+    directoryDescriptor: number;
+    directoryIdentity: Stats;
+    identity: Stats;
+    owner: AppProcessCustodyOwner;
+    path: string;
+  }[] = [];
+  let descriptorsClosed = false;
+  const closeDescriptors = (): void => {
+    if (descriptorsClosed) return;
+    descriptorsClosed = true;
+    for (const entry of entries) { closeSync(entry.descriptor); closeSync(entry.directoryDescriptor); }
+  };
+  const assertDirectory = (descriptor: number, path: string, before: Stats): void => {
+    const opened = fstatSync(descriptor);
+    const named = lstatSync(path);
+    assert.equal(realpathSync(path), path, "App custody directory ancestry changed");
+    for (const metadata of [opened, named]) {
+      assert.ok(metadata.isDirectory() && !metadata.isSymbolicLink());
+      assert.deepEqual(
+        [metadata.dev, metadata.ino, metadata.uid, metadata.mode],
+        [before.dev, before.ino, before.uid, before.mode],
+        "App custody directory identity changed",
+      );
+    }
+  };
+  const assertEntry = (entry: typeof entries[number]): void => {
+    entry.owner.lock.assertHeld();
+    assertDirectory(entry.directoryDescriptor, entry.owner.controlDirectory, entry.directoryIdentity);
+    const opened = fstatSync(entry.descriptor);
+    const named = lstatSync(entry.path);
+    for (const metadata of [opened, named]) {
+      assert.ok(metadata.isFile() && !metadata.isSymbolicLink() && metadata.nlink === 1);
+      assert.equal(metadata.uid, process.getuid?.());
+      assert.equal(metadata.mode & 0o777, 0o600);
+      assert.ok(sameIdentity(metadata, entry.identity)
+        && metadata.mtimeMs === entry.identity.mtimeMs && metadata.ctimeMs === entry.identity.ctimeMs,
+      "App process custody identity changed");
+    }
+    const actual = Buffer.alloc(source.byteLength);
+    assert.equal(readSync(entry.descriptor, actual, 0, actual.byteLength, 0), actual.byteLength);
+    assert.deepEqual(actual, source, "App process custody token or record changed");
+    assertSafeDarwinInstallAcl(entry.descriptor, opened.uid, entry.path);
+  };
+  try {
+    for (const owner of owners) owner.lock.assertHeld();
+    for (const owner of owners) {
+      owner.lock.assertHeld();
+      assert.equal(realpathSync(owner.controlDirectory), owner.controlDirectory);
+      const path = join(owner.controlDirectory, APP_PROCESS_CUSTODY_FILE);
+      const directoryDescriptor = openSync(owner.controlDirectory, constants.O_RDONLY | constants.O_NOFOLLOW);
+      let descriptor = -1;
+      try {
+        const directoryIdentity = fstatSync(directoryDescriptor);
+        assert.ok(directoryIdentity.isDirectory());
+        assert.equal(directoryIdentity.uid, process.getuid?.());
+        assert.equal(directoryIdentity.mode & 0o022, 0);
+        assertSafeDarwinInstallAcl(directoryDescriptor, directoryIdentity.uid, owner.controlDirectory);
+        assertDirectory(directoryDescriptor, owner.controlDirectory, directoryIdentity);
+        descriptor = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
+        writeFileSync(descriptor, source);
+        fsyncSync(descriptor);
+        fsyncSync(directoryDescriptor);
+        const identity = fstatSync(descriptor);
+        entries.push({ descriptor, directoryDescriptor, directoryIdentity, identity, owner, path });
+      } catch (error) {
+        if (descriptor >= 0) closeSync(descriptor);
+        closeSync(directoryDescriptor);
+        throw error;
+      }
+    }
+    for (const entry of entries) assertEntry(entry);
+  } catch (error) {
+    closeDescriptors();
+    // Even an incomplete pre-spawn record is retained. Admission never guesses
+    // whether a dead owner reached spawn after persisting its intent.
+    throw new AppProcessCustodyError("App process custody preparation failed; preserve its records for recovery", { cause: error });
+  }
+  let cleared = false;
+  const assertHeld = (): void => {
+    try {
+      assert.equal(cleared, false, "App process custody was already cleared");
+      for (const entry of entries) assertEntry(entry);
+    } catch (error) {
+      closeDescriptors();
+      throw new AppProcessCustodyError("App process custody revalidation failed; preserve its records for recovery", { cause: error });
+    }
+  };
+  return {
+    assertHeld,
+    clearAfterCollection: () => {
+      assertHeld();
+      try {
+        for (const entry of entries) {
+          assertEntry(entry);
+          unlinkSync(entry.path);
+          fsyncSync(entry.directoryDescriptor);
+        }
+        cleared = true;
+        closeDescriptors();
+      } catch (error) {
+        closeDescriptors();
+        throw new AppProcessCustodyError("Collected app process custody could not be cleared; preserve remaining records for recovery", { cause: error });
+      }
+    },
+  };
+}
+
 const flockExclusive = 2;
 const flockNonblocking = 4;
 const flockUnlock = 8;
@@ -616,7 +760,7 @@ function assertLockIdentity(descriptor: number, path: string): void {
   assertSafeDarwinInstallAcl(descriptor, uid, path);
 }
 
-/** A persistent file plus kernel flock: process death releases ownership safely. */
+/** Kernel locks serialize live owners; retained custody blocks owner-death recovery. */
 export function acquireAppPublicationLock(controlDirectory: string): AppPublicationLock {
   const lockPath = join(controlDirectory, "publication.lock");
   let descriptor = -1;
@@ -642,6 +786,7 @@ export function acquireAppPublicationLock(controlDirectory: string): AppPublicat
     );
     locked = true;
     assertLockIdentity(descriptor, lockPath);
+    assertNoAppProcessCustody(controlDirectory);
     let released = false;
     return {
       assertHeld: () => {
@@ -1148,7 +1293,7 @@ async function buildApp(): Promise<void> {
       controlDirectory: control,
       lock,
       pendingMarkerPath: staged.pendingMarkerPath,
-      previousMarker,
+      ...(previousMarker === undefined ? {} : { previousMarker }),
       projected: staged.projected,
       publishDirectory: staged.publishDirectory,
       rootDirectory: root,

@@ -6,6 +6,8 @@ import { highlightCode } from "@hraness/design-kit/syntax-highlighting";
 import { AskAiAboutThis } from "@hraness/ui";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { sitePresentationClasses, sitePresentationStyles, type SitePresentationSlot } from "./presentation.stylex.ts";
+import { renderMarketingHeader, renderMarketingPage, renderReferenceLabel } from "./marketing.tsx";
 
 import {
   findSection,
@@ -24,9 +26,12 @@ const escapeHtml = (value: string): string =>
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
 
+const classes = (hook: string, ...slots: readonly SitePresentationSlot[]): string =>
+  [hook, sitePresentationClasses(...slots)].filter(Boolean).join(" ");
+
 const renderShellCode = (value: string): string => {
   const highlighted = highlightCode(value, "shell");
-  return `<code class="${highlighted.className}">${highlighted.html}</code>`;
+  return `<code class="${classes(highlighted.className, "codeContent")}">${highlighted.html}</code>`;
 };
 
 export const HRA_MAILING_TURNSTILE_SITEKEY_ENV =
@@ -69,49 +74,61 @@ export const renderHraSiteFooter = (
 export const renderAskAiAboutThis = (canonicalUrl: string): string =>
   renderToStaticMarkup(createElement(AskAiAboutThis, {
     className: "hra-ask-ai",
+    xstyle: [sitePresentationStyles.resourceFrame, sitePresentationStyles.askAi],
     url: canonicalUrl,
   }));
 
 export const renderHraAnalyticsScript = (): string =>
   '<script src="/analytics.js" type="module"></script>';
 
-const renderInline = (content: readonly InlineContent[]): string =>
+const renderInline = (content: readonly InlineContent[], focusable = true, styleLinks = true): string =>
   content
     .map((part) => {
       switch (part.kind) {
         case "code":
-          return `<code class="hra-inline-code">${escapeHtml(part.value)}</code>`;
+          return `<code class="${classes("hra-inline-code", "inlineCode")}">${escapeHtml(part.value)}</code>`;
         case "link":
-          return `<a href="${escapeHtml(part.href)}">${escapeHtml(part.label)}</a>`;
+          return `<a${styleLinks ? ` class="${classes("", "proseLink", ...(focusable ? ["focusable"] as const : []))}"` : ""} href="${escapeHtml(part.href)}">${escapeHtml(part.label)}</a>`;
         case "text":
           return escapeHtml(part.value);
       }
     })
     .join("");
 
-const renderCommandBlock = (commands: readonly string[]): string =>
-  `<pre class="command-list" tabindex="0">${renderShellCode(commands.join("\n"))}</pre>`;
+const renderCommandBlock = (commands: readonly string[], slots: readonly SitePresentationSlot[] = []): string =>
+  `<pre class="${classes("command-list", "codeBlock", "commandList", "focusable", ...slots)}" tabindex="0">${renderShellCode(commands.join("\n"))}</pre>`;
+
+type ProseSurface = "reference" | "privacy" | "heroNotes";
 
 const renderBlock = (
   block: ContentBlock,
   sectionId: string,
   blockIndex: number,
   subheadingLevel: "h2" | "h3" = "h3",
+  surface: ProseSurface = "reference",
 ): string => {
+  const reference = surface !== "privacy";
+  const direct: readonly SitePresentationSlot[] = surface === "heroNotes" ? [] : ["documentationBody"];
+  const text: readonly SitePresentationSlot[] = reference ? ["referenceText"] : [];
+  const paragraph: readonly SitePresentationSlot[] = ["proseMeasure", ...text, ...(surface === "heroNotes" ? ["heroNotesParagraph"] as const : [])];
+  const listItem = (index: number): string => classes("", ...text, ...(index > 0 ? ["spacedListItem"] as const : []));
   switch (block.kind) {
     case "commands":
-      return renderCommandBlock(block.commands);
+      return renderCommandBlock(block.commands, ["proseMeasure", ...direct]);
     case "list":
-      return `<ul>${block.items.map((item) => `<li>${renderInline(item)}</li>`).join("")}</ul>`;
+      return `<ul class="${classes("", "proseMeasure", ...direct)}">${block.items.map((item, index) => `<li class="${listItem(index)}">${renderInline(item)}</li>`).join("")}</ul>`;
     case "notice":
-      return `<aside class="notice" aria-label="${escapeHtml(block.label)}"><strong>${escapeHtml(block.label)}.</strong> ${renderInline(block.content)}</aside>`;
+      return `<aside class="${classes("notice", "notice", "proseMeasure", ...text, ...direct)}" aria-label="${escapeHtml(block.label)}"><strong class="${classes("", "noticeStrong")}">${escapeHtml(block.label)}.</strong> ${renderInline(block.content)}</aside>`;
     case "ordered-list":
-      return `<ol class="procedure-list">${block.items.map((item) => `<li><p>${renderInline(item.content)}</p>${item.commands === undefined ? "" : renderCommandBlock(item.commands)}${item.afterCommands === undefined ? "" : `<p>${renderInline(item.afterCommands)}</p>`}</li>`).join("")}</ol>`;
+      return `<ol class="${classes("procedure-list", "proseMeasure", ...direct)}">${block.items.map((item, index) => `<li class="${listItem(index)}"><p class="${classes("", ...paragraph)}">${renderInline(item.content)}</p>${item.commands === undefined ? "" : renderCommandBlock(item.commands, ["proseMeasure"])}${item.afterCommands === undefined ? "" : `<p class="${classes("", ...paragraph)}">${renderInline(item.afterCommands)}</p>`}</li>`).join("")}</ol>`;
     case "paragraph":
-      return `<p>${renderInline(block.content)}</p>`;
+      return `<p class="${classes("", ...paragraph, ...direct)}">${renderInline(block.content)}</p>`;
     case "subheading": {
       const id = `${sectionId}-${blockIndex.toString()}-${block.text.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-").replaceAll(/(^-|-$)/g, "")}`;
-      return `<${subheadingLevel} id="${escapeHtml(id)}">${escapeHtml(block.text)}</${subheadingLevel}>`;
+      const heading: readonly SitePresentationSlot[] = subheadingLevel === "h2"
+        ? [reference ? "referenceH2" : "privacyH2", ...(reference ? ["proseMeasure"] as const : [])]
+        : ["proseH3", ...(reference ? ["proseMeasure"] as const : []), ...(surface === "reference" ? ["documentationH3"] as const : [])];
+      return `<${subheadingLevel} class="${classes("", ...heading, ...(subheadingLevel === "h2" && surface !== "heroNotes" ? ["documentationHeading"] as const : direct))}" id="${escapeHtml(id)}">${escapeHtml(block.text)}</${subheadingLevel}>`;
     }
   }
 };
@@ -120,15 +137,17 @@ const renderSection = (
   section: ContentSection,
   headingLevel: "h1" | "h2" = "h2",
   afterHeading = "",
+  surface: "reference" | "privacy" = "reference",
 ): string =>
-  `<section class="documentation-section" id="${escapeHtml(section.id)}" aria-labelledby="${escapeHtml(section.id)}-heading">
-  <${headingLevel} id="${escapeHtml(section.id)}-heading">${escapeHtml(section.heading)}</${headingLevel}>
+  `<section class="${classes("documentation-section", "documentationSection", ...(surface === "privacy" ? ["privacySection"] as const : []))}" id="${escapeHtml(section.id)}" aria-labelledby="${escapeHtml(section.id)}-heading">
+  <${headingLevel} class="${classes("", ...(headingLevel === "h2" ? [surface === "privacy" ? "privacyH2" : "referenceH2", ...(surface === "reference" ? ["proseMeasure"] as const : []), "documentationHeading"] as const : ["documentationBody"] as const))}" id="${escapeHtml(section.id)}-heading">${escapeHtml(section.heading)}</${headingLevel}>
   ${afterHeading}
   ${section.blocks.map((block, index) => renderBlock(
     block,
     section.id,
     index,
     headingLevel === "h1" ? "h2" : "h3",
+    surface,
   )).join("\n  ")}
 </section>`;
 
@@ -209,169 +228,33 @@ ${image.type === undefined ? "" : `<meta property="og:image:type" content="${esc
 <link rel="stylesheet" href="/styles.css">${structuredData}`;
 };
 
-const renderProjectResources = (content: PublicContent): string => `<aside aria-label="HRA project information" class="project-resources">
-  <p>${escapeHtml(content.productName)} is MIT licensed.</p>
-  <nav aria-label="Project links">
-    <a href="${escapeHtml(content.links.github)}">GitHub</a>
-    <a href="${escapeHtml(content.links.documentation)}">Documentation</a>
-    <a href="${escapeHtml(content.links.security)}">Security</a>
-    <a href="/privacy/">Privacy</a>
+const renderProjectResources = (content: PublicContent): string => `<aside aria-label="HRA project information" class="${classes("project-resources", "resourceFrame", "resources")}">
+  <p class="${classes("", "resourcesParagraph")}">${escapeHtml(content.productName)} is MIT licensed.</p>
+  <nav aria-label="Project links" class="${classes("", "resourcesNav")}">
+    <a class="${classes("", "proseLink", "focusable")}" href="${escapeHtml(content.links.github)}">GitHub</a>
+    <a class="${classes("", "proseLink", "focusable")}" href="${escapeHtml(content.links.documentation)}">Documentation</a>
+    <a class="${classes("", "proseLink", "focusable")}" href="${escapeHtml(content.links.security)}">Security</a>
+    <a class="${classes("", "proseLink", "focusable")}" href="/privacy/">Privacy</a>
   </nav>
 </aside>`;
-
-const renderSiteHeader = (
-  content: PublicContent,
-  currentPath: "/" | "/privacy/",
-): string => {
-  const link = (href: string, label: string, current = false): string =>
-    `<a href="${escapeHtml(href)}"${current ? ' aria-current="page"' : ""}>${escapeHtml(label)}</a>`;
-  return `<header class="hraness-marketing-header" data-hraness-marketing="header">
-  <div class="hraness-marketing-header__inner">
-    <a class="hraness-marketing-header__brand" href="/">${escapeHtml(content.productName)}</a>
-    <nav aria-label="Site" class="hraness-marketing-header__nav">
-      ${link("/#how-it-works", "How it works", currentPath === "/")}
-      ${link("/#install-command", "Install")}
-      ${link("/#reference", "Reference")}
-      ${link("/privacy/", "Privacy", currentPath === "/privacy/")}
-      ${link(content.links.github, "GitHub")}
-    </nav>
-    <div class="hraness-marketing-header__actions">
-      <a class="hraness-marketing-action" data-emphasis="primary" href="/#install-command">Install ${escapeHtml(content.productName)}</a>
-    </div>
-  </div>
-</header>`;
-};
-
-const renderHeroFrame = (content: PublicContent): string => {
-  const firstSession = findSection(content, "first-session");
-  const humanTerminal = firstSession.blocks.find(
-    (block): block is Extract<ContentBlock, { kind: "commands" }> => block.kind === "commands",
-  );
-  if (humanTerminal === undefined) {
-    throw new Error("Public content must publish the human-terminal first-session commands.");
-  }
-  return `<div class="hraness-marketing-hero__frame">
-      <figure class="hraness-marketing-proof-frame" data-hraness-marketing="proof-frame">
-        <div aria-hidden="true" class="hraness-marketing-proof-frame__chrome">
-          <span class="hraness-marketing-proof-frame__lights"><span></span><span></span><span></span></span>
-          <span class="hraness-marketing-proof-frame__title">hra · persistent shell</span>
-        </div>
-        <div class="hraness-marketing-proof-frame__content"><pre class="shell-transcript" tabindex="0">${renderShellCode(humanTerminal.commands.join("\n"))}</pre></div>
-        <figcaption class="hraness-marketing-proof-frame__caption">
-          <span>After the rollout prerequisite is satisfied, start a session, open the shell, select the account and session, then type a request. These conditional first-session commands are documented in the reference below.</span>
-          <small>v${escapeHtml(content.releaseVersion)}</small>
-        </figcaption>
-      </figure>
-    </div>`;
-};
-
-const renderProductHero = (content: PublicContent): string => `<header class="hraness-marketing-hero" data-hraness-marketing="hero" data-align="center" data-tone="paper" aria-labelledby="hra-title">
-    <div class="hraness-marketing-hero__copy">
-      <p class="hraness-marketing-hero__eyebrow">${escapeHtml(content.hero.eyebrow)}</p>
-      <p class="hraness-marketing-hero__name">${escapeHtml(content.productName)}</p>
-      <h1 class="hraness-marketing-hero__heading" id="hra-title">${escapeHtml(content.hero.heading)}</h1>
-      <p class="hraness-marketing-hero__summary">${escapeHtml(content.hero.summary)}</p>
-      <p class="hraness-marketing-hero__example">${escapeHtml(content.hero.example)}</p>
-      <div class="hraness-marketing-hero__actions">
-        <a class="hraness-marketing-action" data-emphasis="primary" href="${escapeHtml(content.hero.primaryAction.href)}">${escapeHtml(content.hero.primaryAction.label)}</a>
-        <a class="hraness-marketing-action" data-emphasis="secondary" href="${escapeHtml(content.hero.secondaryAction.href)}">${escapeHtml(content.hero.secondaryAction.label)}</a>
-      </div>
-      <p class="hraness-marketing-hero__boundary">${escapeHtml(content.hero.boundary)}</p>
-      <aside class="notice"><strong>Current daemon rollout blocked</strong><p>${escapeHtml(content.daemonRolloutNotice)}</p><p><a href="#install-and-update">Read the rollout and update runbook</a> before running the examples below.</p></aside>
-    </div>
-    ${renderHeroFrame(content)}
-    <dl class="hraness-marketing-facts" data-hraness-marketing="facts">
-      ${content.hero.facts.map((fact) => `<div><dt>${escapeHtml(fact.label)}</dt><dd><strong>${escapeHtml(fact.value)}</strong><span>${escapeHtml(fact.detail)}</span></dd></div>`).join("\n      ")}
-    </dl>
-  </header>
-  <dl class="hraness-marketing-pillars" data-hraness-marketing="pillars" aria-label="${escapeHtml(content.productName)} in three points">
-    ${content.hero.pillars.map((pillar) => `<div><dt>${escapeHtml(pillar.label)}</dt><dd>${escapeHtml(pillar.summary)}</dd></div>`).join("\n    ")}
-  </dl>
-  <section class="hraness-marketing-section" data-hraness-marketing="section" data-layout="split" id="how-it-works" aria-labelledby="how-it-works-heading">
-    <div class="hraness-marketing-section__heading-group">
-      <p class="hraness-marketing-section__label">How it works</p>
-      <h2 class="hraness-marketing-section__heading" id="how-it-works-heading">${escapeHtml(content.hero.proofLabel)}</h2>
-      <p class="hraness-marketing-section__summary">After the rollout prerequisite is satisfied, every step is one command with a JSON form, so a person in the shell and an agent in a subprocess drive the same session the same way.</p>
-    </div>
-    <div class="hraness-marketing-section__body">
-      <ol class="hraness-marketing-flow" data-hraness-marketing="flow" aria-label="First ${escapeHtml(content.productName)} request">
-        ${content.hero.steps.map((step, index) => `<li class="hraness-marketing-flow__step">
-          <span aria-hidden="true" class="hraness-marketing-flow__number">${String(index + 1).padStart(2, "0")}</span>
-          <div class="hraness-marketing-flow__body"><strong class="hraness-marketing-flow__label">${escapeHtml(step.label)}</strong><code class="hraness-marketing-flow__code">${escapeHtml(step.command)}</code><p class="hraness-marketing-flow__detail">${escapeHtml(step.detail)}</p></div>
-        </li>`).join("\n        ")}
-      </ol>
-    </div>
-  </section>
-  <section class="hraness-marketing-install" data-hraness-marketing="install" id="install-command" aria-labelledby="install-command-heading">
-    <div class="hraness-marketing-install__heading-group">
-      <p class="hraness-marketing-install__eyebrow">Local release · v${escapeHtml(content.releaseVersion)}</p>
-      <h2 class="hraness-marketing-install__heading" id="install-command-heading">Install the verified CLI.</h2>
-      <p class="install-note">One command downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.</p>
-    </div>
-    <div class="hraness-marketing-install__commands">
-      <pre class="install-command" tabindex="0">${renderShellCode(content.installCommand)}</pre>
-      <pre class="doctor-command" tabindex="0">${renderShellCode(content.doctorCommand)}</pre>
-      <aside class="notice"><strong>Before initialization</strong><p>${escapeHtml(content.daemonRolloutNotice)}</p><p><a href="#install-and-update">Read the rollout and update runbook.</a></p></aside>
-      <p>After the rollout prerequisite is satisfied, initialize:</p>
-      <pre class="init-command" tabindex="0">${renderShellCode(content.initCommand)}</pre>
-    </div>
-  </section>
-  <section class="hraness-marketing-trust" data-hraness-marketing="trust" id="local-by-design" aria-labelledby="local-by-design-heading">
-    <header class="hraness-marketing-trust__header">
-      <p class="hraness-marketing-trust__label">Local by design</p>
-      <h2 class="hraness-marketing-trust__heading" id="local-by-design-heading">Keep control of the accounts you already have.</h2>
-      <p>${escapeHtml(content.productName)} is infrastructure around the provider tools you chose, not a proxy in front of them.</p>
-    </header>
-    <dl class="hraness-marketing-trust-grid">
-      ${content.trust.map((item) => `<div class="hraness-marketing-trust-item"><dt>${escapeHtml(item.label)}</dt><dd>${escapeHtml(item.detail)}</dd></div>`).join("\n      ")}
-    </dl>
-  </section>
-  <section class="hraness-marketing-questions" data-hraness-marketing="questions" id="questions" aria-labelledby="questions-heading">
-    <header class="hraness-marketing-questions__header">
-      <p class="hraness-marketing-questions__label">Questions</p>
-      <h2 class="hraness-marketing-questions__heading" id="questions-heading">Before you install.</h2>
-    </header>
-    <div class="hraness-marketing-question-list">
-      ${content.questions.map((question) => `<details class="hraness-marketing-question"><summary>${escapeHtml(question.question)}</summary><div class="hraness-marketing-question__answer"><p>${renderInline(question.answer)}</p></div></details>`).join("\n      ")}
-    </div>
-  </section>
-  <section class="hraness-marketing-maker" data-hraness-marketing="maker" id="maker" aria-labelledby="maker-heading">
-    <header class="hraness-marketing-maker__header">
-      <p class="hraness-marketing-maker__label">Built by</p>
-      <h2 class="hraness-marketing-maker__heading" id="maker-heading">${escapeHtml(content.maker.heading)}</h2>
-    </header>
-    <div class="hraness-marketing-maker__body">
-      ${content.maker.bio.length === 0 ? "" : `<p>${renderInline(content.maker.bio)}</p>`}
-      <ul class="hraness-marketing-maker__links">
-        ${content.maker.links.map((entry) => `<li><a href="${escapeHtml(entry.href)}">${escapeHtml(entry.label)}</a></li>`).join("\n        ")}
-      </ul>
-    </div>
-  </section>
-  <section class="hraness-marketing-cta" data-hraness-marketing="cta" data-tone="paper" id="closing" aria-labelledby="closing-heading">
-    <h2 class="hraness-marketing-cta__heading" id="closing-heading">Give every session the same terminal.</h2>
-    <p class="hraness-marketing-cta__summary">Install and verify the live CLI artifact. After the rollout prerequisite is satisfied, initialize it, add one account, and start a session that outlives the tab it began in.</p>
-    <div class="hraness-marketing-cta__actions">
-      <a class="hraness-marketing-action" data-emphasis="primary" href="#install-command">Install ${escapeHtml(content.productName)}</a>
-      <a class="hraness-marketing-action" data-emphasis="secondary" href="${escapeHtml(content.links.github)}">Read the source</a>
-    </div>
-    <p class="hraness-marketing-cta__footnote">${escapeHtml(content.hero.boundary)}</p>
-  </section>
-  <div class="reference" id="reference">
-    <div class="reference__intro">
-      <p class="hraness-marketing-section__label">Reference</p>
-      <h2 class="reference__heading">Every command, boundary, and release claim.</h2>
-      <div class="hero-notes">
-        ${content.introduction.map((block, index) => renderBlock(block, "introduction", index)).join("\n        ")}
-      </div>
-    </div>`;
 
 export const renderSiteHtml = (
   content: PublicContent = publicContent,
   environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
 ): string => {
   const navigation = content.sections
-    .map((section) => `<a href="#${escapeHtml(section.id)}">${escapeHtml(section.heading)}</a>`)
+    .map((section) => `<a class="${classes("", "proseLink", "sectionNavLink", "focusable")}" href="#${escapeHtml(section.id)}">${escapeHtml(section.heading)}</a>`)
     .join("");
+
+  const reference = `<div class="${classes("reference__intro", "referenceIntro")}">
+  ${renderReferenceLabel()}
+  <h2 class="${classes("reference__heading", "referenceHeading", "proseMeasure")}">Every command, boundary, and release claim.</h2>
+  <div class="${classes("hero-notes", "heroNotes")}">
+    ${content.introduction.map((block, index) => renderBlock(block, "introduction", index, "h3", "heroNotes")).join("\n    ")}
+  </div>
+</div>
+<nav class="${classes("section-nav", "sectionNav")}" aria-label="Documentation">${navigation}</nav>
+${content.sections.map((section) => renderSection(section)).join("\n")}`;
 
   return `<!doctype html>
 <html lang="en">
@@ -383,15 +266,10 @@ ${renderHead(content, {
 })}
 </head>
 <body>
-<a class="skip-link" href="#content">Skip to content</a>
-${renderSiteHeader(content, "/")}
+<a class="${classes("skip-link", "skipLink", "focusable")}" href="#content">Skip to content</a>
+${renderMarketingHeader(content, "/")}
 <main id="content">
-<div class="hraness-marketing-page">
-  ${renderProductHero(content)}
-    <nav class="section-nav" aria-label="Documentation">${navigation}</nav>
-    ${content.sections.map((section) => renderSection(section)).join("\n    ")}
-  </div>
-</div>
+${renderMarketingPage(content, reference)}
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/`)}
 ${renderProjectResources(content)}
@@ -414,18 +292,16 @@ ${renderHead(content, {
   title: `${content.productName} | ${content.tagline}`,
 })}
 </head>
-<body class="preview-page">
-<main id="content" class="preview-shell">
-  <article class="preview-card" aria-labelledby="preview-title">
-    <p class="preview-eyebrow">${escapeHtml(content.tagline)}</p>
-    <h1 id="preview-title">${escapeHtml(content.productName)}</h1>
-    <p class="preview-summary">${escapeHtml(content.description)}</p>
-    <ul class="preview-capabilities" aria-label="HRA capabilities">
-      <li><strong>Accounts</strong><span>Isolated by default</span></li>
-      <li><strong>Sessions</strong><span>Live and durable</span></li>
-      <li><strong>Sync</strong><span>Optional and encrypted</span></li>
+<body class="${classes("preview-page", "previewPage")}">
+<main id="content" class="${classes("preview-shell", "previewShell")}">
+  <article class="${classes("preview-card", "previewCard")}" aria-labelledby="preview-title">
+    <p class="${classes("preview-eyebrow", "previewEyebrow")}">${escapeHtml(content.tagline)}</p>
+    <h1 class="${classes("", "previewHeading")}" id="preview-title">${escapeHtml(content.productName)}</h1>
+    <p class="${classes("preview-summary", "previewSummary")}">${escapeHtml(content.description)}</p>
+    <ul class="${classes("preview-capabilities", "previewCapabilities")}" aria-label="HRA capabilities">
+      ${[["Accounts", "Isolated by default"], ["Sessions", "Live and durable"], ["Sync", "Optional and encrypted"]].map(([label, detail], index) => `<li class="${classes("", "previewCapability", ...(index > 0 ? ["previewCapabilityFollowing"] as const : []))}"><strong class="${classes("", "previewCapabilityStrong")}">${label}</strong><span class="${classes("", "previewCapabilityDetail")}">${detail}</span></li>`).join("\n      ")}
     </ul>
-    <p class="preview-status">Local-first <span aria-hidden="true">·</span> Bun CLI</p>
+    <p class="${classes("preview-status", "previewStatus")}">Local-first <span aria-hidden="true">·</span> Bun CLI</p>
   </article>
 </main>
 </body>
@@ -447,11 +323,11 @@ ${renderHead(content, {
 })}
 </head>
 <body>
-<a class="skip-link" href="#content">Skip to content</a>
-${renderSiteHeader(content, "/privacy/")}
-<main id="content" class="narrow-page">
-  ${renderSection(privacy)}
-  <p>Report a suspected boundary violation through <a href="${escapeHtml(content.links.privateSecurityReport)}">private vulnerability reporting</a>.</p>
+<a class="${classes("skip-link", "skipLink", "focusable")}" href="#content">Skip to content</a>
+${renderMarketingHeader(content, "/privacy/")}
+<main id="content" class="${classes("narrow-page", "narrowPage")}">
+  ${renderSection(privacy, "h2", "", "privacy")}
+  <p class="${classes("", "proseMeasure")}">Report a suspected boundary violation through <a class="${classes("", "proseLink", "focusable")}" href="${escapeHtml(content.links.privateSecurityReport)}">private vulnerability reporting</a>.</p>
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/privacy/`)}
 ${renderProjectResources(content)}

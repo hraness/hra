@@ -1,6 +1,7 @@
 import * as stylex from "@stylexjs/stylex";
 
 const hoverCapable = "@media (hover: hover)";
+const reducedMotion = "@media (prefers-reduced-motion: reduce)";
 
 export const badgeStyles = stylex.create({
   root: {
@@ -85,7 +86,7 @@ export const buttonStyles = stylex.create({
     paddingRight: 0,
     paddingTop: 0,
     transitionDelay: "0s",
-    transitionDuration: "150ms",
+    transitionDuration: { default: "150ms", [reducedMotion]: "0s" },
     transitionProperty: "opacity",
     transitionTimingFunction: "cubic-bezier(0.4, 0, 0.2, 1)",
     cursor: { default: null, ":disabled": "not-allowed" },
@@ -348,8 +349,8 @@ export const dropdownMenuStyles = stylex.create({
     position: "absolute",
     zIndex: 10,
   },
-  listStart: { left: 0 },
-  listEnd: { right: 0 },
+  listStart: { insetInlineStart: 0 },
+  listEnd: { insetInlineEnd: 0 },
   item: {
     ":hover": {
       backgroundColor: { default: null, [hoverCapable]: "var(--color-surface-input)" },
@@ -381,7 +382,7 @@ export const dropdownMenuStyles = stylex.create({
     paddingRight: "0.75rem",
     paddingBottom: 0,
     paddingTop: 0,
-    textAlign: "left",
+    textAlign: "start",
     width: "100%",
   },
   itemDefault: { color: "var(--color-ink)" },
@@ -504,6 +505,7 @@ export const sheetStyles = stylex.create({
     marginRight: 0,
     marginTop: 0,
     maxHeight: "none",
+    maxWidth: "none",
     paddingRight: "calc(1rem + env(safe-area-inset-right))",
     width: "min(28rem, 100vw)",
   },
@@ -539,7 +541,7 @@ export const switchStyles = stylex.create({
     paddingRight: 0,
     paddingTop: 0,
     transitionDelay: "0s",
-    transitionDuration: "150ms",
+    transitionDuration: { default: "150ms", [reducedMotion]: "0s" },
     transitionProperty:
       "color, background-color, border-color, text-decoration-color, fill, stroke",
     transitionTimingFunction: "cubic-bezier(0.4, 0, 0.2, 1)",
@@ -556,12 +558,13 @@ export const switchStyles = stylex.create({
     display: "block",
     height: "1rem",
     pointerEvents: "none",
+    position: "relative",
     transitionDelay: "0s",
-    transitionDuration: "150ms",
-    transitionProperty: "transform",
+    transitionDuration: { default: "150ms", [reducedMotion]: "0s" },
+    transitionProperty: "inset-inline-start",
     transitionTimingFunction: "cubic-bezier(0.4, 0, 0.2, 1)",
     width: "1rem",
   },
-  knobChecked: { transform: "translateX(1.5rem)" },
-  knobUnchecked: { transform: "translateX(0.25rem)" },
+  knobChecked: { insetInlineStart: "1.5rem" },
+  knobUnchecked: { insetInlineStart: "0.25rem" },
 });

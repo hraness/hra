@@ -1,11 +1,13 @@
-import { link, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, test } from "bun:test";
 
+import { appDevelopmentConfig, appProductionConfig } from "../app/vite.config.ts";
 import {
-  acquireAppPublicationLock, APP_CSS_PLACEHOLDER, appPublicationRecord, appSha256, assertAppRunDirectory,
+  acquireAppPublicationLock, APP_CSS_PLACEHOLDER, APP_PROCESS_CUSTODY_FILE, AppProcessCustodyError,
+  appPublicationRecord, appSha256, assertAppRunDirectory, beginAppProcessCustody,
   commitAppPublication, createAppSourceMarkerEvidence, parseAppComplete, parseAppPublication, prepareAppShell,
   readAppInventory, reconcileAppPublication, revalidateAppSourceMarker, revalidateAppSourceMarkerInputs,
   snapshotAppGraph,
@@ -56,6 +58,29 @@ const complete = () => {
     unionPolicySha256: "1ceced1f1bf6359413ca6425ede61e1fdae272b897f4455c2347e2431d75caa1",
   };
 };
+
+describe("app compiler-owned Vite configuration", () => {
+  for (const [profile, configure] of [
+    ["production", appProductionConfig],
+    ["development", appDevelopmentConfig],
+  ] as const) {
+    test(`leaves ${profile} Vite root and graph output ownership to the public adapter`, () => {
+      const config = configure("/fixture", { directory: "/fixture/generation", planSha256: "a".repeat(64) });
+      expect(config.root).toBeUndefined();
+      expect(config.publicDir).toBeUndefined();
+      for (const key of ["assetsInlineLimit", "outDir", "assetsDir", "copyPublicDir", "cssCodeSplit", "emptyOutDir", "lib", "write", "sourcemap"] as const) {
+        expect(config.build?.[key]).toBeUndefined();
+      }
+      expect(config.build?.rollupOptions).toBeUndefined();
+      expect(config.build?.target).toBe("es2022");
+      expect(config.mode).toBe(profile);
+      expect(config.define?.["process.env.NODE_ENV"]).toBe(JSON.stringify(profile));
+      expect(config.configFile).toBe(false);
+      expect(config.envFile).toBe(false);
+      expect(config.build?.minify).toBe(profile === "development" ? false : undefined);
+    });
+  }
+});
 
 describe("app graph output values", () => {
   test("accepts only production or development runs below the exact control directory", () => {
@@ -211,18 +236,25 @@ describe("closed public projection and prior publication provenance", () => {
   });
 });
 
-type PublicationFixture = Readonly<{
+type PublicationFixtureBase = Readonly<{
   app: string;
   control: string;
   next: readonly AppArtifact[];
-  old?: readonly AppArtifact[];
   pendingMarker: string;
-  previousMarker?: Buffer;
   publish: string;
   root: string;
   run: string;
   sourceMarker: AppSourceMarkerEvidence;
 }>;
+type PriorPublicationFixture = PublicationFixtureBase & Readonly<{
+  old: readonly AppArtifact[];
+  previousMarker: Buffer<ArrayBuffer>;
+}>;
+type FreshPublicationFixture = PublicationFixtureBase & Readonly<{
+  old?: never;
+  previousMarker?: never;
+}>;
+type PublicationFixture = PriorPublicationFixture | FreshPublicationFixture;
 
 async function writePublicTree(
   root: string,
@@ -244,6 +276,8 @@ async function writePublicTree(
   return readAppInventory(root);
 }
 
+function publicationFixture(previous: true): Promise<PriorPublicationFixture>;
+function publicationFixture(previous: false): Promise<FreshPublicationFixture>;
 async function publicationFixture(previous: boolean): Promise<PublicationFixture> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "hra-build-publication-")));
   temporaryRoots.push(root);
@@ -292,6 +326,89 @@ async function withPublicationLock<Value>(
 }
 
 describe("durable app publication", () => {
+  test("a collected custody token clears both exact private records before readmission", async () => {
+    const fixture = await publicationFixture(false);
+    const dev = join(fixture.control, "dev");
+    await mkdir(dev, { mode: 0o700 });
+    const buildLock = acquireAppPublicationLock(fixture.control);
+    const devLock = acquireAppPublicationLock(dev);
+    try {
+      const custody = beginAppProcessCustody([
+        { controlDirectory: fixture.control, lock: buildLock },
+        { controlDirectory: dev, lock: devLock },
+      ], "build-fixture");
+      const bytes = await readFile(join(fixture.control, APP_PROCESS_CUSTODY_FILE));
+      expect(bytes.byteLength).toBeLessThanOrEqual(512);
+      expect(JSON.parse(bytes.toString())).toEqual({
+        kind: "hra-app-process-custody", run: "build-fixture", schemaVersion: 1, token: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      });
+      expect(await readFile(join(dev, APP_PROCESS_CUSTODY_FILE))).toEqual(bytes);
+      for (const directory of [fixture.control, dev]) {
+        expect((await lstat(join(directory, APP_PROCESS_CUSTODY_FILE))).mode & 0o777).toBe(0o600);
+      }
+      custody.assertHeld();
+      custody.clearAfterCollection();
+      for (const directory of [fixture.control, dev]) {
+        await expect(lstat(join(directory, APP_PROCESS_CUSTODY_FILE))).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      expect(() => custody.clearAfterCollection()).toThrow(AppProcessCustodyError);
+    } finally { devLock.release(); buildLock.release(); }
+    for (const directory of [fixture.control, dev]) acquireAppPublicationLock(directory).release();
+  });
+
+  for (const mutation of ["bytes", "identity"] as const) {
+    test(`preserves both custody records when ${mutation} change`, async () => {
+      const fixture = await publicationFixture(false);
+      const dev = join(fixture.control, "dev");
+      await mkdir(dev, { mode: 0o700 });
+      const buildLock = acquireAppPublicationLock(fixture.control);
+      const devLock = acquireAppPublicationLock(dev);
+      try {
+        const custody = beginAppProcessCustody([
+          { controlDirectory: fixture.control, lock: buildLock },
+          { controlDirectory: dev, lock: devLock },
+        ], "build-fixture");
+        const buildPath = join(fixture.control, APP_PROCESS_CUSTODY_FILE);
+        const devPath = join(dev, APP_PROCESS_CUSTODY_FILE);
+        const original = await readFile(buildPath);
+        if (mutation === "identity") {
+          await rename(devPath, join(dev, "retained-original.json"));
+          await writeFile(devPath, original, { flag: "wx", mode: 0o600 });
+        } else {
+          const changed = original.toString().replace(/"token":"[a-f0-9]{64}"/u, `"token":"${"0".repeat(64)}"`);
+          await writeFile(devPath, changed);
+        }
+        expect(() => custody.clearAfterCollection()).toThrow(AppProcessCustodyError);
+        expect(await readFile(buildPath)).toEqual(original);
+        expect((await lstat(devPath)).isFile()).toBe(true);
+      } finally { devLock.release(); buildLock.release(); }
+      for (const directory of [fixture.control, dev]) {
+        expect(() => acquireAppPublicationLock(directory)).toThrow(AppProcessCustodyError);
+      }
+    });
+  }
+
+  test("retains partial pre-spawn custody and refuses malformed existing fences", async () => {
+    const fixture = await publicationFixture(false);
+    const dev = join(fixture.control, "dev");
+    await mkdir(dev, { mode: 0o700 });
+    const buildLock = acquireAppPublicationLock(fixture.control);
+    const devLock = acquireAppPublicationLock(dev);
+    const foreign = "preserve this unknown record\n";
+    await writeFile(join(dev, APP_PROCESS_CUSTODY_FILE), foreign, { mode: 0o600 });
+    try {
+      expect(() => beginAppProcessCustody([
+        { controlDirectory: fixture.control, lock: buildLock },
+        { controlDirectory: dev, lock: devLock },
+      ], "build-fixture")).toThrow(AppProcessCustodyError);
+      expect((await readFile(join(fixture.control, APP_PROCESS_CUSTODY_FILE))).byteLength).toBeLessThanOrEqual(512);
+      expect(await readFile(join(dev, APP_PROCESS_CUSTODY_FILE), "utf8")).toBe(foreign);
+    } finally { devLock.release(); buildLock.release(); }
+    for (const directory of [fixture.control, dev]) {
+      expect(() => acquireAppPublicationLock(directory)).toThrow(AppProcessCustodyError);
+    }
+  });
+
   test("fences initial source-marker inputs across the compiler interval before marker emission", async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "hra-build-source-inputs-")));
     temporaryRoots.push(root);

@@ -24,7 +24,7 @@ export const transcriptStyles = stylex.create({
     paddingLeft: "0.75rem",
     paddingRight: "0.75rem",
     paddingTop: 0,
-    textAlign: "left",
+    textAlign: "start",
   },
   thinkingText: {
     borderTopColor: "var(--color-line)",
@@ -79,7 +79,7 @@ export const transcriptStyles = stylex.create({
     backgroundColor: "var(--color-surface-input)",
     borderColor: "var(--color-line)",
     borderRadius: "0.5rem",
-    borderTopRightRadius: "0.125rem",
+    borderStartEndRadius: "0.125rem",
     borderStyle: "solid",
     borderWidth: "1px",
     fontSize: "0.875rem",

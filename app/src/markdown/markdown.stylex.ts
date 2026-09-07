@@ -2,16 +2,16 @@ import * as stylex from "@stylexjs/stylex";
 
 export const markdownStyles = stylex.create({
   blockquote: {
-    borderLeftColor: "var(--color-line)",
-    borderLeftStyle: "solid",
-    borderLeftWidth: "2px",
+    borderInlineStartColor: "var(--color-line)",
+    borderInlineStartStyle: "solid",
+    borderInlineStartWidth: "2px",
     color: "var(--color-ink-muted)",
     marginBottom: "0.5rem",
     marginLeft: 0,
     marginRight: 0,
     marginTop: "0.5rem",
     overflowWrap: "normal",
-    paddingLeft: "0.75rem",
+    paddingInlineStart: "0.75rem",
   },
   codeBlock: {
     fontFamily: "var(--font-mono)",
@@ -84,7 +84,7 @@ export const markdownStyles = stylex.create({
     listStylePosition: "outside",
     marginBottom: "0.5rem",
     marginTop: "0.5rem",
-    paddingLeft: "1.25rem",
+    paddingInlineStart: "1.25rem",
   },
   orderedList: { listStyleType: "decimal" },
   paragraph: {
@@ -138,7 +138,7 @@ export const markdownStyles = stylex.create({
     paddingLeft: "0.5rem",
     paddingRight: "0.5rem",
     paddingTop: "0.25rem",
-    textAlign: "left",
+    textAlign: "start",
   },
   tableWrapper: {
     marginBottom: "0.5rem",

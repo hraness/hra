@@ -1,4 +1,5 @@
-import { link, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { link, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,16 +8,20 @@ import { afterAll, describe, expect, test } from "bun:test";
 import {
   appDevRevision,
   assertDevCacheCapacity,
+  collectDevProcessGroup,
   createDevRequestHandler,
   DevBuildCoordinator,
   DevCapacityError,
+  DevDependencyError,
   DevStaleBuildError,
   DevTransientBuildError,
+  DevUncollectedProcessError,
   HRA_DEV_CACHE_LIMITS,
   parseDevSecurityHeaders,
   prepareDevCache,
   prepareLockedDevCache,
   publishDevCandidate,
+  releaseCollectedDevOwner,
   runOwnedDevProcess,
   snapshotDevInputs,
   type DevBuildCandidate,
@@ -25,7 +30,7 @@ import {
   type DevStatus,
 } from "./dev-app.ts";
 import {
-  acquireAppPublicationLock, appSha256, createAppSourceMarkerEvidence, readAppInventory,
+  acquireAppPublicationLock, APP_PROCESS_CUSTODY_FILE, appSha256, createAppSourceMarkerEvidence, readAppInventory,
   type AppArtifact, type AppSourceEnvironmentSnapshot, type AppSourceMarkerEvidence,
 } from "./build-app.ts";
 import { APP_SOURCE_MARKER_PATH } from "./app-source-marker.ts";
@@ -96,6 +101,10 @@ function candidateFor(input: DevInputSnapshot, label: string): DevBuildCandidate
   };
 }
 
+function deferred<T>() {
+  return Promise.withResolvers<T>();
+}
+
 describe("compiled development input epochs", () => {
   test("separates source changes from restart-only dependency changes", async () => {
     const root = await temporaryRoot("hra-dev-input-");
@@ -164,6 +173,145 @@ describe("compiled development input epochs", () => {
 });
 
 describe("serial development rebuild coordinator", () => {
+  for (const terminal of ["restart", "close"] as const) {
+    for (const boundary of ["build", "snapshot", "publish", "resnapshot"] as const) {
+      for (const outcome of ["same", "changed", "dependency", "error", "dependency-error"] as const) {
+        test(`terminal fence ${terminal} during ${boundary} ${outcome}`, async () => {
+          const input = snapshot("initial");
+          const changed = snapshot("changed");
+          const dependency = snapshot("changed", "dependency-b");
+          const prior = published("prior");
+          const entered = deferred<void>();
+          const gate = deferred<void>();
+          const statuses: DevStatus[] = [];
+          let builds = 0;
+          let publications = 0;
+          let scans = 0;
+          let activeSignal: AbortSignal | undefined;
+          const pause = async (): Promise<void> => {
+            entered.resolve();
+            await gate.promise;
+            if (outcome === "error") throw new Error("fixture census failure");
+            if (outcome === "dependency-error") throw new DevDependencyError("fixture dependency failure");
+          };
+          const coordinator = new DevBuildCoordinator({
+            build: async (value, signal) => {
+              builds += 1;
+              activeSignal = signal;
+              if (boundary === "build") await pause();
+              return candidateFor(value, "candidate");
+            },
+            currentSnapshot: async () => {
+              scans += 1;
+              if (boundary === "snapshot" || (boundary === "resnapshot" && scans === 2)) {
+                await pause();
+                if (outcome === "changed") return changed;
+                if (outcome === "dependency") return dependency;
+              }
+              return input;
+            },
+            onStatus: (status) => statuses.push(status),
+            publish: async (_candidate, _snapshot, signal) => {
+              publications += 1;
+              expect(signal).toBe(activeSignal!);
+              if (boundary === "resnapshot") throw new DevStaleBuildError();
+              if (boundary === "publish") await pause();
+              return published("forbidden");
+            },
+          }, prior);
+          coordinator.notify(input);
+          await entered.promise;
+          let closing: Promise<void> | undefined;
+          if (terminal === "restart") coordinator.requireRestart("fixture-restart");
+          else closing = coordinator.close();
+          expect(activeSignal?.aborted).toBe(true);
+          const terminalStatuses = statuses.length;
+          let closed = false;
+          void closing?.then(() => { closed = true; });
+          await Promise.resolve();
+          expect(closed).toBe(false);
+          gate.resolve();
+          await coordinator.waitForIdle();
+          if (closing !== undefined) await closing;
+          expect(coordinator.latest).toBe(prior);
+          expect(builds).toBe(1);
+          expect(publications).toBe(boundary === "publish" || boundary === "resnapshot" ? 1 : 0);
+          expect(statuses.slice(terminalStatuses)).toEqual(terminal === "restart" ? [] : [{ diagnostic: null, latest: prior.revision, phase: "stopped" }]);
+          expect(coordinator.status).toEqual({
+            diagnostic: terminal === "restart" ? "fixture-restart" : null,
+            latest: prior.revision,
+            phase: terminal === "restart" ? "restart-required" : "stopped",
+          });
+          coordinator.notify(changed);
+          await coordinator.waitForIdle();
+          expect(builds).toBe(1);
+          await coordinator.close();
+        });
+      }
+    }
+  }
+
+  test("concurrent and reentrant close callers share the complete drain", async () => {
+    const gate = deferred<void>();
+    const entered = deferred<void>();
+    let reentrant: Promise<void> | undefined;
+    const coordinator = new DevBuildCoordinator({
+      build: async (input, signal) => {
+        signal.addEventListener("abort", () => { reentrant = coordinator.close(); }, { once: true });
+        entered.resolve();
+        await gate.promise;
+        return candidateFor(input, "closed");
+      },
+      currentSnapshot: async () => snapshot("input"),
+      publish: async () => published("forbidden"),
+    });
+    coordinator.notify(snapshot("input"));
+    await entered.promise;
+    const first = coordinator.close();
+    const second = coordinator.close();
+    expect(first).toBe(second);
+    expect(first).toBe(reentrant!);
+    let completed = 0;
+    void first.then(() => { completed += 1; });
+    void second.then(() => { completed += 1; });
+    await Promise.resolve();
+    expect(completed).toBe(0);
+    gate.resolve();
+    await Promise.all([first, second]);
+    expect(completed).toBe(2);
+    expect(coordinator.status.phase).toBe("stopped");
+  });
+
+  for (const terminal of ["running", "restart", "close"] as const) {
+    test(`retains process custody uncertainty after ${terminal}`, async () => {
+      const gate = deferred<void>();
+      const entered = deferred<void>();
+      const prior = published("prior");
+      const coordinator = new DevBuildCoordinator({
+        build: async () => {
+          entered.resolve();
+          await gate.promise;
+          throw new DevUncollectedProcessError("fixture collection unknown");
+        },
+        currentSnapshot: async () => snapshot("input"),
+        publish: async () => published("forbidden"),
+      }, prior);
+      coordinator.notify(snapshot("input"));
+      await entered.promise;
+      if (terminal === "restart") coordinator.requireRestart("original-fence");
+      const closing = terminal === "close" ? coordinator.close() : undefined;
+      gate.resolve();
+      await coordinator.waitForIdle();
+      await closing;
+      expect(coordinator.processCollectionUnproved).toBe(true);
+      expect(coordinator.latest).toBe(prior);
+      expect(coordinator.status.phase).toBe(terminal === "close" ? "stopped" : "restart-required");
+      if (terminal === "restart") expect(coordinator.status.diagnostic).toBe("original-fence");
+      await coordinator.close();
+      expect(coordinator.processCollectionUnproved).toBe(true);
+    });
+  }
+
   test("coalesces changes and never rebuilds a polled active epoch", async () => {
     const first = snapshot("first");
     const middle = snapshot("middle");
@@ -362,6 +510,97 @@ describe("immutable development routing", () => {
     return { artifacts, directory, revision: appDevRevision(artifacts, sourceMarker), sourceMarker };
   }
 
+  for (const boundary of ["before-start", "snapshot-1", "snapshot-2", "snapshot-3", "snapshot-4", "durable-commit", "live-commit"] as const) {
+    test(`publication cancellation preserves prior revision at ${boundary}`, async () => {
+      const root = await temporaryRoot("hra-dev-cancel-publication-");
+      const cache = await prepareDevCache(root);
+      const input = snapshot("publication");
+      const lock = acquireAppPublicationLock(cache.root);
+      const makeCandidate = async (label: string): Promise<DevBuildCandidate> => {
+        const run = `build-${label}`;
+        const publicDirectory = join(cache.runsDirectory, run, "public");
+        await mkdir(publicDirectory, { mode: 0o700, recursive: true });
+        const { artifacts, sourceMarker } = await writeRevisionTree(publicDirectory, label);
+        return {
+          artifacts, dependencyEpoch: input.dependencyEpoch, publicDirectory,
+          revision: appDevRevision(artifacts, sourceMarker), run,
+          sourceEpoch: input.sourceEpoch, sourceMarker,
+        };
+      };
+      try {
+        const priorCandidate = await makeCandidate("prior");
+        const prior = await publishDevCandidate({
+          cache, candidate: priorCandidate, currentSnapshot: async () => input,
+          lock, signal: new AbortController().signal, snapshot: input,
+        });
+        const candidate = await makeCandidate("next");
+        const controller = new AbortController();
+        const entered = deferred<void>();
+        const gate = deferred<void>();
+        let scans = 0;
+        let finalStageChecks = 0;
+        const finalReceipt = join(cache.receiptsDirectory, `000000000002-${candidate.revision}.json`);
+        const stagedReceipt = join(cache.runsDirectory, candidate.run, "dev-publication.json");
+        if (boundary === "before-start") controller.abort();
+        const publication = publishDevCandidate({
+          cache, candidate,
+          currentSnapshot: async () => {
+            scans += 1;
+            if (boundary === `snapshot-${String(scans)}`) {
+              entered.resolve();
+              await gate.promise;
+            }
+            return input;
+          },
+          lock: {
+            assertHeld: () => {
+              lock.assertHeld();
+              // After the fourth snapshot, the next held check follows the
+              // receipt fsync immediately before its append-only rename.
+              if (scans === 4 && existsSync(stagedReceipt)) finalStageChecks += 1;
+              if ((boundary === "durable-commit" && finalStageChecks === 2)
+                || (boundary === "live-commit" && existsSync(finalReceipt))) controller.abort();
+            },
+            release: () => lock.release(),
+          },
+          signal: controller.signal, snapshot: input,
+        });
+        // Observe settlement without entering Bun's promise matcher while the
+        // publication is intentionally parked behind our own deferred gate.
+        const outcome = publication.then(
+          () => ({ kind: "resolved" as const }),
+          (error: unknown) => ({ kind: "rejected" as const, error }),
+        );
+        if (boundary.startsWith("snapshot-")) {
+          const first = await Promise.race([
+            entered.promise.then(() => ({ kind: "entered" as const })),
+            outcome,
+          ]);
+          expect(first.kind).toBe("entered");
+          controller.abort();
+          gate.resolve();
+        }
+        const result = await outcome;
+        expect(result.kind).toBe("rejected");
+        if (result.kind !== "rejected") throw new Error("Cancelled publication resolved");
+        expect(String(result.error)).toMatch(/abort/iu);
+        expect(cache.latest).toBe(prior);
+        expect(cache.revisions.size).toBe(1);
+        expect(cache.revisions.get(prior.revision)).toBe(prior);
+        expect(await readAppInventory(prior.directory)).toEqual(prior.artifacts);
+        expect(cache.nextSequence).toBe(boundary === "live-commit" ? 3 : 2);
+        expect(await readdir(cache.receiptsDirectory)).toHaveLength(boundary === "live-commit" ? 2 : 1);
+        // A receipt already durably committed remains valid historical state;
+        // cancellation does not delete it or reuse its sequence number.
+        const recovered = await prepareDevCache(root);
+        expect(recovered.revisions.has(prior.revision)).toBe(true);
+        expect(recovered.latest?.revision).toBe(boundary === "live-commit" ? candidate.revision : prior.revision);
+      } finally {
+        lock.release();
+      }
+    });
+  }
+
   test("returns initial 503, redirects manual refresh, and retains old lazy assets", async () => {
     const old = await revisionFixture("old");
     const latest = await revisionFixture("latest");
@@ -467,6 +706,7 @@ describe("immutable development routing", () => {
         candidate,
         currentSnapshot: async () => input,
         lock,
+        signal: new AbortController().signal,
         snapshot: input,
       });
       expect(result.revision).toBe(revision);
@@ -500,6 +740,7 @@ describe("immutable development routing", () => {
         candidate: staleCandidate,
         currentSnapshot: async () => snapshot("changed"),
         lock: staleLock,
+        signal: new AbortController().signal,
         snapshot: input,
       })).rejects.toThrow(/inputs changed/u);
     } finally {
@@ -539,6 +780,7 @@ describe("immutable development routing", () => {
         candidate,
         currentSnapshot: async () => ++snapshots < 4 ? input : changed,
         lock,
+        signal: new AbortController().signal,
         snapshot: input,
       })).rejects.toThrow(/inputs changed/u);
     } finally {
@@ -552,7 +794,227 @@ describe("immutable development routing", () => {
   });
 });
 
+describe("pure development process collection", () => {
+  test("both publication owners stay held on uncertain collection", () => {
+    const released: string[] = [];
+    const buildOwner = { assertHeld: () => {}, release: () => { released.push("build"); } };
+    const devOwner = { assertHeld: () => {}, release: () => { released.push("dev"); } };
+    releaseCollectedDevOwner(buildOwner, true);
+    releaseCollectedDevOwner(devOwner, true);
+    expect(released).toEqual([]);
+    releaseCollectedDevOwner(buildOwner, false);
+    releaseCollectedDevOwner(devOwner, false);
+    expect(released).toEqual(["build", "dev"]);
+  });
+
+  test("requires positive absence and does not signal an already absent group", async () => {
+    let signals = 0;
+    let waits = 0;
+    expect(await collectDevProcessGroup({
+      probe: () => false,
+      signal: () => { signals += 1; },
+      wait: async () => { waits += 1; },
+    })).toBe(false);
+    expect(signals).toBe(0);
+    expect(waits).toBe(0);
+  });
+
+  test("collects a positively observed group within the bounded TERM window", async () => {
+    let present = true;
+    const signals: string[] = [];
+    let waits = 0;
+    expect(await collectDevProcessGroup({
+      probe: () => present,
+      signal: (signal) => { signals.push(signal); },
+      wait: async () => { waits += 1; present = false; },
+    })).toBe(true);
+    expect(signals).toEqual(["SIGTERM"]);
+    expect(waits).toBe(1);
+  });
+
+  for (const failure of ["initial-probe", "term", "later-probe", "wait", "kill", "survivor"] as const) {
+    test(`retains custody on ${failure} uncertainty without speculative retries`, async () => {
+      const uncertain = Object.assign(new Error("fixture probe or signal denied"), { code: "EPERM" });
+      const signals: string[] = [];
+      let probes = 0;
+      let waits = 0;
+      await expect(collectDevProcessGroup({
+        probe: () => {
+          probes += 1;
+          if (failure === "initial-probe" || (failure === "later-probe" && probes > 1)) throw uncertain;
+          return true;
+        },
+        signal: (signal) => {
+          signals.push(signal);
+          if ((failure === "term" && signal === "SIGTERM") || (failure === "kill" && signal === "SIGKILL")) throw uncertain;
+        },
+        wait: async () => {
+          waits += 1;
+          if (failure === "wait") throw uncertain;
+        },
+      })).rejects.toBeInstanceOf(DevUncollectedProcessError);
+      expect(signals).toEqual(failure === "initial-probe" ? [] : failure === "kill" || failure === "survivor" ? ["SIGTERM", "SIGKILL"] : ["SIGTERM"]);
+      expect(waits).toBe(failure === "survivor" ? 160 : failure === "kill" ? 80 : failure === "wait" ? 1 : 0);
+      expect(probes).toBeLessThanOrEqual(164);
+    });
+  }
+});
+
 describe("cache, security, and owned process boundaries", () => {
+  for (const outcome of ["success", "cancelled", "uncertain"] as const) {
+    test(`owner exit preserves correct publication admission after ${outcome} collection`, async () => {
+      const root = await temporaryRoot(`hra-dev-durable-${outcome}-`);
+      const buildModule = new URL("./build-app.ts", import.meta.url).href;
+      const devModule = new URL("./dev-app.ts", import.meta.url).href;
+      const childIdentity = join(root, "child-pid.json");
+      const childReady = join(root, "child-ready");
+      const resultPath = join(root, "owner-result.json");
+      // The test helper has no application state and self-expires if the test
+      // runner dies. The owner additionally records its exact PID before yield.
+      const childCode = `
+        import { writeFileSync } from "node:fs";
+        writeFileSync(${JSON.stringify(childReady)}, JSON.stringify({ pid: process.pid }), { flag: "wx", mode: 0o600 });
+        setTimeout(() => {}, ${outcome === "success" ? 150 : 12_000});
+      `;
+      const ownerCode = `
+        import assert from "node:assert/strict";
+        import { existsSync, writeFileSync } from "node:fs";
+        import { readFile } from "node:fs/promises";
+        const build = await import(${JSON.stringify(buildModule)});
+        const dev = await import(${JSON.stringify(devModule)});
+        const { cache, lock: devLock } = await dev.prepareLockedDevCache(${JSON.stringify(root)});
+        const control = ${JSON.stringify(join(root, "tmp", "build-app"))};
+        const buildLock = build.acquireAppPublicationLock(control);
+        const custody = build.beginAppProcessCustody([
+          { controlDirectory: control, lock: buildLock },
+          { controlDirectory: cache.root, lock: devLock },
+        ], "build-subprocess");
+        const controller = new AbortController();
+        let pid;
+        const execution = dev.runOwnedDevProcess({
+          command: [process.execPath, "-e", ${JSON.stringify(childCode)}],
+          custody, cwd: ${JSON.stringify(root)}, deadlineMilliseconds: 10000,
+          onSpawn: (value) => {
+            pid = value;
+            writeFileSync(${JSON.stringify(childIdentity)}, JSON.stringify({ pid }), { flag: "wx", mode: 0o600 });
+          },
+          signal: controller.signal,
+        }).then(() => ({ passed: true }), (error) => ({ passed: false, error }));
+        for (let attempt = 0; attempt < 300 && !existsSync(${JSON.stringify(childReady)}); attempt += 1) await Bun.sleep(10);
+        assert.equal(existsSync(${JSON.stringify(childReady)}), true, "Owned helper did not become ready");
+        const originalKill = process.kill;
+        if (${JSON.stringify(outcome)} === "uncertain") {
+          process.kill = (target, signal) => {
+            if (target === -pid) throw Object.assign(new Error("Fixture group observation denied"), { code: "EPERM" });
+            return originalKill.call(process, target, signal);
+          };
+        }
+        if (${JSON.stringify(outcome)} !== "success") controller.abort();
+        const result = await execution;
+        process.kill = originalKill;
+        const unproved = !result.passed && result.error instanceof dev.DevUncollectedProcessError;
+        assert.equal(unproved, ${JSON.stringify(outcome === "uncertain")});
+        assert.equal(result.passed, ${JSON.stringify(outcome === "success")});
+        const markers = [control, cache.root].map((directory) => directory + "/" + build.APP_PROCESS_CUSTODY_FILE);
+        assert.deepEqual(markers.map((path) => existsSync(path)), [unproved, unproved]);
+        dev.releaseCollectedDevOwner(buildLock, unproved);
+        dev.releaseCollectedDevOwner(devLock, unproved);
+        writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify({
+          pid, unproved, records: unproved ? await Promise.all(markers.map((path) => readFile(path, "utf8"))) : [],
+        }), { flag: "wx", mode: 0o600 });
+        // Exit closes kernel flocks even on the deliberately retained-owner path.
+        process.exit(0);
+      `;
+      const owner = Bun.spawn([process.execPath, "-e", ownerCode], { stderr: "inherit", stdout: "inherit" });
+      let ownerExited = false;
+      let childPid: number | undefined;
+      const probe = (pid: number): boolean => {
+        try { process.kill(-pid, 0); return true; }
+        catch (error) {
+          if (error instanceof Error && "code" in error && error.code === "ESRCH") return false;
+          throw error;
+        }
+      };
+      try {
+        const ownerExit = await owner.exited;
+        ownerExited = true;
+        expect(ownerExit).toBe(0);
+        const result: unknown = JSON.parse(await readFile(resultPath, "utf8"));
+        // Bun's asymmetric toMatchObject mutates received fields into matchers.
+        // Keep the exact primitive identity and retained bytes for later proofs.
+        expect(typeof result === "object" && result !== null && !Array.isArray(result)).toBe(true);
+        const resultRecord = result as { pid: number; unproved: boolean; records: string[] };
+        expect(Object.keys(resultRecord).sort()).toEqual(["pid", "records", "unproved"]);
+        expect(resultRecord.unproved).toBe(outcome === "uncertain");
+        expect(Array.isArray(resultRecord.records)).toBe(true);
+        expect(resultRecord.records.every((record) => typeof record === "string")).toBe(true);
+        expect(resultRecord.records).toHaveLength(outcome === "uncertain" ? 2 : 0);
+        expect(Number.isSafeInteger(resultRecord.pid) && resultRecord.pid > 1).toBe(true);
+        childPid = resultRecord.pid;
+        for (const identityPath of [childIdentity, childReady]) {
+          const identity: unknown = JSON.parse(await readFile(identityPath, "utf8"));
+          expect(identity).toEqual({ pid: childPid });
+        }
+        expect(probe(childPid)).toBe(outcome === "uncertain");
+        const contenderCode = `
+          import assert from "node:assert/strict";
+          const build = await import(${JSON.stringify(buildModule)});
+          const dev = await import(${JSON.stringify(devModule)});
+          const results = [];
+          for (const acquire of [
+            () => build.acquireAppPublicationLock(${JSON.stringify(join(root, "tmp", "build-app"))}),
+            async () => (await dev.prepareLockedDevCache(${JSON.stringify(root)})).lock,
+          ]) {
+            try { const lock = await acquire(); lock.release(); results.push("admitted"); }
+            catch (error) { assert.ok(error instanceof build.AppProcessCustodyError); results.push("retained"); }
+          }
+          assert.deepEqual(results, ${JSON.stringify(outcome === "uncertain" ? ["retained", "retained"] : ["admitted", "admitted"])});
+        `;
+        const contender = Bun.spawn([process.execPath, "-e", contenderCode], { stderr: "inherit", stdout: "inherit" });
+        expect(await contender.exited).toBe(0);
+        if (outcome === "uncertain") {
+          expect(probe(childPid)).toBe(true);
+          const records = await Promise.all([
+            join(root, "tmp", "build-app", APP_PROCESS_CUSTODY_FILE),
+            join(root, "tmp", "build-app", "dev", APP_PROCESS_CUSTODY_FILE),
+          ].map((path) => readFile(path, "utf8")));
+          expect(records).toEqual(resultRecord.records);
+          expect(records[0]).toBe(records[1]!);
+        }
+      } finally {
+        if (!ownerExited) { owner.kill("SIGKILL"); await owner.exited; }
+        try {
+          if (childPid === undefined) {
+            const identityPath = existsSync(childIdentity) ? childIdentity : existsSync(childReady) ? childReady : undefined;
+            if (identityPath === undefined) throw new Error("The test helper's spawn state is unknown; preserve its fixture");
+            const record: unknown = JSON.parse(await readFile(identityPath, "utf8"));
+            if (typeof record !== "object" || record === null || !("pid" in record)
+              || typeof record.pid !== "number" || !Number.isSafeInteger(record.pid) || record.pid <= 1) {
+              throw new Error("The test helper's exact identity is unavailable; preserve its fixture");
+            }
+            childPid = record.pid;
+          }
+          if (childPid !== undefined) {
+            const pid = childPid;
+            await collectDevProcessGroup({
+              probe: () => probe(pid),
+              signal: (signal) => {
+                try { process.kill(-pid, signal); }
+                catch (error) { if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error; }
+              },
+              wait: () => Bun.sleep(25),
+            });
+            expect(probe(pid)).toBe(false);
+          }
+        } catch (error) {
+          const index = temporaryRoots.indexOf(root);
+          if (index >= 0) temporaryRoots.splice(index, 1);
+          throw error;
+        }
+      }
+    }, 25_000);
+  }
+
   test("loads only bounded known cache state and preserves unknown entries", async () => {
     const root = await temporaryRoot("hra-dev-cache-");
     const cache = await prepareDevCache(root);

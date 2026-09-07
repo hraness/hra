@@ -9,7 +9,10 @@ import { fileURLToPath } from "node:url";
 
 import {
   acquireAppPublicationLock,
+  APP_PROCESS_CUSTODY_FILE,
+  AppProcessCustodyError,
   appSha256,
+  beginAppProcessCustody,
   createAppSourceMarkerEvidence,
   parseAppPublication,
   parseAppSourceMarkerEvidence,
@@ -19,6 +22,7 @@ import {
   stageAppBuild,
   type AppArtifact,
   type AppPublicationLock,
+  type AppProcessCustody,
   type AppSourceEnvironmentSnapshot,
   type AppSourceMarkerEvidence,
 } from "./build-app.ts";
@@ -185,6 +189,14 @@ export class DevTransientBuildError extends Error {
     super(message);
     this.name = "DevTransientBuildError";
   }
+}
+
+/** No caller may release either publication owner after this uncertainty. */
+export class DevUncollectedProcessError extends AppProcessCustodyError {}
+
+/** Both build and server shutdown use this same sticky custody fence. */
+export function releaseCollectedDevOwner(lock: AppPublicationLock, collectionUnproved: boolean): void {
+  if (!collectionUnproved) lock.release();
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -553,7 +565,7 @@ export async function defaultDevInputSpec(rootDirectory: string): Promise<DevInp
   const root = resolve(rootDirectory);
   const manifestUrl = import.meta.resolve("@hraness/ui/stylex-manifest.json");
   assert.ok(manifestUrl.startsWith("file:"), "The StyleX manifest must resolve to a local file");
-  const dependencyFiles: DevObservedInput[] = [
+  const dependencyFiles: DevObservedInput[] = ([
     ["package.json", "repository/package.json"],
     ["bun.lock", "repository/bun.lock"],
     ["tsconfig.json", "repository/tsconfig.json"],
@@ -562,7 +574,7 @@ export async function defaultDevInputSpec(rootDirectory: string): Promise<DevInp
     ["scripts/build-app.ts", "repository/scripts/build-app.ts"],
     ["scripts/dev-app.ts", "repository/scripts/dev-app.ts"],
     ["src/install-normalizer.ts", "repository/src/install-normalizer.ts"],
-  ].map(([path, logical]) => ({ absolutePath: join(root, ...path.split("/")), logicalPath: logical }));
+  ] as const).map(([path, logical]) => ({ absolutePath: join(root, ...path.split("/")), logicalPath: logical }));
   dependencyFiles.push(...await uiDependencyInputs(fileURLToPath(manifestUrl)));
   return {
     dependencyFiles,
@@ -766,7 +778,7 @@ async function recoverDevCache(directories: DevCacheDirectories): Promise<DevCac
   await inspectDevCache(root);
   const top = (await readdir(root)).sort();
   assert.ok(
-    top.every((name) => ["publication.lock", "receipts", "revisions", "runs"].includes(name)),
+    top.every((name) => ["publication.lock", APP_PROCESS_CUSTODY_FILE, "receipts", "revisions", "runs"].includes(name)),
     "Unknown development cache state; preserve it for review",
   );
   const physical = new Map<string, Readonly<{
@@ -850,43 +862,87 @@ function processGroupExists(pid: number): boolean {
 
 function signalOwnedProcessGroup(pid: number, signal: "SIGKILL" | "SIGTERM"): void {
   if (!processGroupExists(pid)) return;
-  process.kill(-pid, signal);
-}
-
-async function waitForOwnedProcessGroupExit(pid: number): Promise<boolean> {
-  for (let attempt = 0; attempt < 80; attempt += 1) {
-    if (!processGroupExists(pid)) return true;
-    await Bun.sleep(25);
+  try { process.kill(-pid, signal); } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
   }
-  return !processGroupExists(pid);
 }
 
-async function terminateOwnedChild(child: OwnedChild): Promise<void> {
-  signalOwnedProcessGroup(child.pid, "SIGTERM");
+/** Closed process-group operations allow deterministic uncertainty regressions. */
+export async function collectDevProcessGroup(operations: Readonly<{
+  probe: () => boolean;
+  signal: (signal: "SIGKILL" | "SIGTERM") => void;
+  wait: () => Promise<void>;
+}>): Promise<boolean> {
+  try {
+    if (!operations.probe()) return false;
+    operations.signal("SIGTERM");
+    for (let attempt = 0; attempt < DEV_CHILD_GRACE_MS / 25 && operations.probe(); attempt += 1) await operations.wait();
+    if (operations.probe()) operations.signal("SIGKILL");
+    for (let attempt = 0; attempt < DEV_CHILD_GRACE_MS / 25 && operations.probe(); attempt += 1) await operations.wait();
+    assert.equal(operations.probe(), false, "Owned development process group survived cleanup");
+    return true;
+  } catch (cause) {
+    throw new DevUncollectedProcessError("Development child collection is unproved; retain both publication owners", { cause });
+  }
+}
+
+async function terminateOwnedChild(child: OwnedChild): Promise<boolean> {
+  const descendants = await collectDevProcessGroup({
+    probe: () => processGroupExists(child.pid),
+    signal: (signal) => signalOwnedProcessGroup(child.pid, signal),
+    wait: () => Bun.sleep(25),
+  });
+  // Group absence is not a substitute for collecting the direct child handle.
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const stopped = await Promise.race([
-    child.exited.then(() => true),
-    new Promise<false>((resolveTimeout) => {
-      timer = setTimeout(() => resolveTimeout(false), DEV_CHILD_GRACE_MS);
-    }),
-  ]);
-  if (timer !== undefined) clearTimeout(timer);
-  if (!stopped || processGroupExists(child.pid)) signalOwnedProcessGroup(child.pid, "SIGKILL");
-  await child.exited;
-  assert.equal(await waitForOwnedProcessGroupExit(child.pid), true, "Owned development process group survived cleanup");
+  try {
+    await Promise.race([
+      child.exited,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("Development child exit was not collected")), DEV_CHILD_GRACE_MS);
+      }),
+    ]);
+  } catch (cause) {
+    throw new DevUncollectedProcessError("Development child handle collection is unproved; retain both publication owners", { cause });
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+  return descendants;
 }
 
-/** Spawn one direct child and prove timeout/abort never leaves it running. */
-export async function runOwnedDevProcess(options: Readonly<{
+type OwnedDevProcessOptions = Readonly<{
   command: readonly string[];
+  custody?: AppProcessCustody;
   cwd: string;
   deadlineMilliseconds: number;
   onSpawn?: (pid: number) => void;
   signal: AbortSignal;
-}>): Promise<void> {
+}>;
+
+/** Clear durable fences only after the direct child and its group are collected. */
+export async function runOwnedDevProcess(options: OwnedDevProcessOptions): Promise<void> {
+  let failure: unknown;
+  let failed = false;
+  try { await executeOwnedDevProcess(options); }
+  catch (error) { failed = true; failure = error; }
+  if (!(failure instanceof AppProcessCustodyError)) {
+    try { options.custody?.clearAfterCollection(); }
+    catch (error) {
+      failure = !failed ? error : new AppProcessCustodyError(
+        "Development process failed and its custody records require recovery",
+        { cause: new AggregateError([failure, error]) },
+      );
+      failed = true;
+    }
+  }
+  if (failed) throw failure;
+}
+
+/** Spawn one direct child and prove timeout/abort never leaves it running. */
+async function executeOwnedDevProcess(options: OwnedDevProcessOptions): Promise<void> {
   assert.ok(options.command.length > 0 && options.command.every((part) => part.length > 0));
   assert.ok(options.deadlineMilliseconds > 0 && options.deadlineMilliseconds <= DEV_BUILD_DEADLINE_MS);
   assert.equal(options.signal.aborted, false, "Development child was aborted before spawn");
+  options.custody?.assertHeld();
   const child = Bun.spawn([...options.command], {
     cwd: options.cwd,
     detached: true,
@@ -928,8 +984,7 @@ export async function runOwnedDevProcess(options: Readonly<{
       ? "Compiled app build exceeded its owned deadline"
       : "Compiled app build was aborted");
   }
-  if (processGroupExists(child.pid)) {
-    await terminateOwnedChild(child);
+  if (await terminateOwnedChild(child)) {
     throw new Error("Compiled app build left a descendant process running");
   }
   assert.equal(outcome.code, 0, `Compiled app build child failed with exit ${String(outcome.code)}`);
@@ -938,11 +993,13 @@ export async function runOwnedDevProcess(options: Readonly<{
 async function runBuildChild(
   rootDirectory: string,
   cache: DevCache,
+  devLock: AppPublicationLock,
   snapshot: DevInputSnapshot,
   signal: AbortSignal,
 ): Promise<DevBuildCandidate> {
   assertDevCacheCapacity(await inspectDevCache(cache.root));
   let buildLock: AppPublicationLock;
+  let collectionUnproved = false;
   try {
     buildLock = acquireAppPublicationLock(resolve(rootDirectory, "tmp", "build-app"));
   } catch (error) {
@@ -956,6 +1013,10 @@ async function runBuildChild(
     await assertOwnedDirectory(runDirectory);
     await syncEntry(cache.runsDirectory, true);
     const run = safeRun(runDirectory.slice(cache.runsDirectory.length + 1));
+    const custody = beginAppProcessCustody([
+      { controlDirectory: resolve(rootDirectory, "tmp", "build-app"), lock: buildLock },
+      { controlDirectory: cache.root, lock: devLock },
+    ], run);
     await runOwnedDevProcess({
       command: [
         process.execPath,
@@ -965,6 +1026,7 @@ async function runBuildChild(
         snapshot.sourceEpoch,
         snapshot.dependencyEpoch,
       ],
+      custody,
       cwd: rootDirectory,
       deadlineMilliseconds: DEV_BUILD_DEADLINE_MS,
       signal,
@@ -978,8 +1040,11 @@ async function runBuildChild(
     const publicDirectory = join(runDirectory, "public");
     assert.deepEqual(await readAppInventory(publicDirectory), result.artifacts, "Development child output changed");
     return { ...result, publicDirectory };
+  } catch (error) {
+    collectionUnproved = error instanceof AppProcessCustodyError;
+    throw error;
   } finally {
-    buildLock.release();
+    releaseCollectedDevOwner(buildLock, collectionUnproved);
   }
 }
 
@@ -1027,18 +1092,26 @@ export async function publishDevCandidate(options: Readonly<{
   candidate: DevBuildCandidate;
   currentSnapshot: () => Promise<DevInputSnapshot>;
   lock: AppPublicationLock;
+  signal: AbortSignal;
   snapshot: DevInputSnapshot;
 }>): Promise<DevPublishedRevision> {
-  options.lock.assertHeld();
+  const assertActive = (): void => {
+    options.lock.assertHeld();
+    options.signal.throwIfAborted();
+  };
+  const assertCurrent = async (): Promise<void> => {
+    const current = await options.currentSnapshot();
+    assertActive();
+    if (JSON.stringify(current) !== JSON.stringify(options.snapshot)) throw new DevStaleBuildError();
+  };
+  assertActive();
   assert.equal(options.candidate.sourceEpoch, options.snapshot.sourceEpoch);
   assert.equal(options.candidate.dependencyEpoch, options.snapshot.dependencyEpoch);
   assert.deepEqual(options.candidate.sourceMarker, options.snapshot.sourceMarker);
   assert.equal(options.candidate.revision, appDevRevision(options.candidate.artifacts, options.candidate.sourceMarker));
   const runDirectory = cacheRunDirectory(options.cache, options.candidate.run);
   assert.equal(options.candidate.publicDirectory, join(runDirectory, "public"), "Development output escaped its owned run");
-  if (JSON.stringify(await options.currentSnapshot()) !== JSON.stringify(options.snapshot)) {
-    throw new DevStaleBuildError();
-  }
+  await assertCurrent();
   await assertDevSourceMarker(options.candidate.publicDirectory, options.candidate.sourceMarker);
   const target = join(options.cache.revisionsDirectory, options.candidate.revision);
   const createsRevision = await pathAbsent(target);
@@ -1064,11 +1137,9 @@ export async function publishDevCandidate(options: Readonly<{
     await syncDevInventory(options.candidate.publicDirectory, options.candidate.artifacts);
     await assertDevSourceMarker(options.candidate.publicDirectory, options.candidate.sourceMarker);
     const sourceIdentity = await syncEntry(options.candidate.publicDirectory, true);
-    if (JSON.stringify(await options.currentSnapshot()) !== JSON.stringify(options.snapshot)) {
-      throw new DevStaleBuildError();
-    }
+    await assertCurrent();
     await assertDevSourceMarker(options.candidate.publicDirectory, options.candidate.sourceMarker);
-    options.lock.assertHeld();
+    assertActive();
     await rename(options.candidate.publicDirectory, target);
     const targetIdentity = await lstat(target);
     assertOwnedEntry(targetIdentity, true);
@@ -1081,21 +1152,21 @@ export async function publishDevCandidate(options: Readonly<{
   await assertRelativeRevisionShell(target);
   assert.deepEqual(await readAppInventory(target), options.candidate.artifacts, "Development revision changed after promotion");
   await assertDevSourceMarker(target, options.candidate.sourceMarker);
-  if (JSON.stringify(await options.currentSnapshot()) !== JSON.stringify(options.snapshot)) {
-    throw new DevStaleBuildError();
-  }
+  await assertCurrent();
   const stagedReceipt = join(runDirectory, "dev-publication.json");
   const receiptName = `${String(sequence).padStart(12, "0")}-${options.candidate.revision}.json`;
   const finalReceipt = join(options.cache.receiptsDirectory, receiptName);
+  assertActive();
   await writePrivateRecord(stagedReceipt, receipt);
   await syncEntry(runDirectory, true);
-  if (JSON.stringify(await options.currentSnapshot()) !== JSON.stringify(options.snapshot)) {
-    throw new DevStaleBuildError();
-  }
+  await assertCurrent();
   await assertDevSourceMarker(target, options.candidate.sourceMarker);
-  options.lock.assertHeld();
   const receiptIdentity = await syncEntry(stagedReceipt, false);
+  // Submitting the append-only rename is the durable commit boundary. A later
+  // cancellation retains that complete receipt but cannot move the live head.
+  assertActive();
   await rename(stagedReceipt, finalReceipt);
+  options.cache.nextSequence += 1;
   const finalIdentity = await lstat(finalReceipt);
   assertOwnedEntry(finalIdentity, false);
   assert.ok(sameObjectIdentity(receiptIdentity, finalIdentity), "Development receipt identity changed during publication");
@@ -1110,9 +1181,9 @@ export async function publishDevCandidate(options: Readonly<{
     revision: options.candidate.revision,
     sourceMarker: options.candidate.sourceMarker,
   };
+  assertActive();
   options.cache.revisions.set(published.revision, published);
   options.cache.latest = published;
-  options.cache.nextSequence += 1;
   return published;
 }
 
@@ -1127,7 +1198,7 @@ type CoordinatorOperations = Readonly<{
   build: (snapshot: DevInputSnapshot, signal: AbortSignal) => Promise<DevBuildCandidate>;
   currentSnapshot: () => Promise<DevInputSnapshot>;
   onStatus?: (status: DevStatus) => void;
-  publish: (candidate: DevBuildCandidate, snapshot: DevInputSnapshot) => Promise<DevPublishedRevision>;
+  publish: (candidate: DevBuildCandidate, snapshot: DevInputSnapshot, signal: AbortSignal) => Promise<DevPublishedRevision>;
 }>;
 
 function genericDiagnostic(error: unknown): string {
@@ -1151,6 +1222,8 @@ export class DevBuildCoordinator {
   #activeController: AbortController | undefined;
   #baselineDependencyEpoch: string | undefined;
   #closed = false;
+  #closing: Promise<void> | undefined;
+  #processCollectionUnproved = false;
   #desired: DevInputSnapshot | undefined;
   #lastGood: DevPublishedRevision | undefined;
   #lastPublishedSource: string | undefined;
@@ -1171,6 +1244,10 @@ export class DevBuildCoordinator {
 
   get status(): DevStatus {
     return this.#status;
+  }
+
+  get processCollectionUnproved(): boolean {
+    return this.#processCollectionUnproved;
   }
 
   #setStatus(phase: DevPhase, diagnostic: string | null): void {
@@ -1202,22 +1279,27 @@ export class DevBuildCoordinator {
   }
 
   requireRestart(diagnostic = "dependency-epoch-changed"): void {
-    if (this.#closed) return;
+    if (this.#closed || this.#status.phase === "restart-required") return;
     this.#desired = undefined;
-    this.#activeController?.abort();
     this.#setStatus("restart-required", diagnostic);
+    this.#activeController?.abort();
   }
 
   #startPump(): void {
-    if (this.#active !== undefined || this.#closed) return;
+    if (this.#active !== undefined || this.#cannotContinue()) return;
     this.#active = this.#pump().finally(() => {
       this.#active = undefined;
-      if (this.#desired !== undefined && !this.#closed) this.#startPump();
+      if (this.#desired !== undefined && !this.#cannotContinue()) this.#startPump();
     });
   }
 
+  // Read current state after every await; callbacks may require a restart.
+  #cannotContinue(): boolean {
+    return this.#closed || this.#status.phase === "restart-required";
+  }
+
   async #pump(): Promise<void> {
-    while (this.#desired !== undefined && !this.#closed && this.#status.phase !== "restart-required") {
+    while (this.#desired !== undefined && !this.#cannotContinue()) {
       const snapshot = this.#desired;
       this.#desired = undefined;
       this.#lastTriedSource = snapshot.sourceEpoch;
@@ -1225,17 +1307,20 @@ export class DevBuildCoordinator {
       this.#activeController = controller;
       this.#setStatus("building", null);
       try {
+        if (this.#cannotContinue()) continue;
         const candidate = await this.#operations.build(snapshot, controller.signal);
-        if (this.#closed || this.#status.phase === "restart-required") continue;
+        if (this.#cannotContinue()) continue;
         let current: DevInputSnapshot;
         try {
           current = await this.#operations.currentSnapshot();
         } catch (error) {
+          if (this.#cannotContinue()) continue;
           this.#lastTriedSource = undefined;
           if (error instanceof DevDependencyError) this.requireRestart("dependency-install-changed");
           else this.#setStatus("degraded", "source-census-failed");
           continue;
         }
+        if (this.#cannotContinue()) continue;
         if (current.dependencyEpoch !== this.#baselineDependencyEpoch) {
           this.requireRestart("dependency-epoch-changed");
           continue;
@@ -1245,19 +1330,28 @@ export class DevBuildCoordinator {
           this.#setStatus(this.#lastGood === undefined ? "building" : "ready", "stale-build");
           continue;
         }
-        const published = await this.#operations.publish(candidate, snapshot);
+        const published = await this.#operations.publish(candidate, snapshot, controller.signal);
+        if (this.#cannotContinue()) continue;
         this.#lastGood = published;
         this.#lastPublishedSource = snapshot.sourceEpoch;
         this.#setStatus("ready", null);
       } catch (error) {
-        if (this.#closed || this.#status.phase === "restart-required") continue;
+        // Record custody uncertainty even when close/restart raced the child.
+        if (error instanceof AppProcessCustodyError) {
+          this.#processCollectionUnproved = true;
+          this.requireRestart("process-collection-unproved");
+          console.error(error.message);
+        }
+        if (this.#cannotContinue()) continue;
         if (error instanceof DevStaleBuildError) {
           this.#lastTriedSource = undefined;
           try {
             const current = await this.#operations.currentSnapshot();
+            if (this.#cannotContinue()) continue;
             if (current.dependencyEpoch !== this.#baselineDependencyEpoch) this.requireRestart("dependency-epoch-changed");
             else this.#desired = current;
           } catch (snapshotError) {
+            if (this.#cannotContinue()) continue;
             if (snapshotError instanceof DevDependencyError) this.requireRestart("dependency-install-changed");
             else this.#setStatus("degraded", "source-census-failed");
           }
@@ -1281,13 +1375,14 @@ export class DevBuildCoordinator {
     while (this.#active !== undefined) await this.#active;
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    if (this.#closing !== undefined) return this.#closing;
+    // Install the shared promise before abort listeners can reenter close.
+    this.#closing = Promise.resolve().then(() => this.waitForIdle()).then(() => { this.#setStatus("stopped", null); });
     this.#closed = true;
     this.#desired = undefined;
     this.#activeController?.abort();
-    await this.waitForIdle();
-    this.#setStatus("stopped", null);
+    return this.#closing;
   }
 }
 
@@ -1324,7 +1419,8 @@ function responseHeaders(
   securityHeaders: readonly (readonly [string, string])[],
   cacheControl: "immutable" | "no-store",
 ): Headers {
-  const headers = new Headers(securityHeaders);
+  const headers = new Headers();
+  for (const [name, value] of securityHeaders) headers.append(name, value);
   headers.set("Cache-Control", cacheControl === "immutable"
     ? "public, max-age=31536000, immutable"
     : "no-store");
@@ -1377,7 +1473,7 @@ export function createDevRequestHandler(options: Readonly<{
       const headers = responseHeaders(options.securityHeaders, noStore ? "no-store" : "immutable");
       headers.set("Content-Length", String(bytes.byteLength));
       headers.set("Content-Type", contentType(path));
-      return new Response(request.method === "HEAD" ? null : bytes, { headers });
+      return new Response(request.method === "HEAD" ? null : Uint8Array.from(bytes), { headers });
     } catch (error) {
       console.error(`HRA immutable development artifact failed revalidation: ${error instanceof Error ? error.message.slice(0, MAX_DIAGNOSTIC_BYTES) : "unknown error"}`);
       return new Response(null, { headers: responseHeaders(options.securityHeaders, "no-store"), status: 500 });
@@ -1509,18 +1605,19 @@ async function runDevelopmentServer(): Promise<void> {
         return snapshotDevInputs(spec);
       };
       coordinator = new DevBuildCoordinator({
-        build: (snapshot, signal) => runBuildChild(root, cache, snapshot, signal),
+        build: (snapshot, signal) => runBuildChild(root, cache, devLock, snapshot, signal),
         currentSnapshot,
         onStatus: (status) => {
           if (status.phase === "ready" && status.diagnostic === null) console.log(`HRA development revision ready: ${status.latest ?? "unknown"}. Refresh the page to load it.`);
           if (status.phase === "restart-required") console.error("HRA development dependencies changed. Restart dev:app; no install was attempted.");
           if (status.phase === "capacity-blocked") console.error("HRA development cache is full. Stop dev:app and review tmp/build-app/dev before cleanup.");
         },
-        publish: (candidate, snapshot) => publishDevCandidate({
+        publish: (candidate, snapshot, signal) => publishDevCandidate({
           cache,
           candidate,
           currentSnapshot,
           lock: devLock,
+          signal,
           snapshot,
         }),
       }, cache.latest);
@@ -1575,7 +1672,7 @@ async function runDevelopmentServer(): Promise<void> {
       try {
         await server.stop(true);
       } finally {
-        devLock.release();
+        releaseCollectedDevOwner(devLock, coordinator?.processCollectionUnproved === true);
       }
     }
   }

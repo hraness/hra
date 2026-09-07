@@ -12,7 +12,7 @@ export function appProductionConfig(
   generation: StylexGenerationHandleV1,
 ): InlineConfig {
   return {
-    // The public adapter owns input, outDir, assetsInlineLimit: 0, publicDir,
+    // The public adapter owns root, input, outDir, assetsInlineLimit: 0, publicDir,
     // cssCodeSplit: false, emptyOutDir: false and sourcemap: false. Overriding
     // those here would bypass its complete graph/output receipt contract.
     build: { target: "es2022" },
@@ -21,7 +21,6 @@ export function appProductionConfig(
     envFile: false,
     mode: "production",
     plugins: [stylexVite({ generation, graphId: "client", rootDirectory }), react()],
-    root: rootDirectory,
   };
 }
 
@@ -38,7 +37,6 @@ export function appDevelopmentConfig(
     logLevel: "info",
     mode: "development",
     plugins: [stylexVite({ generation, graphId: "client", rootDirectory }), react()],
-    root: rootDirectory,
   };
 }
 

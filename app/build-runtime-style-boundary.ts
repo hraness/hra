@@ -1,0 +1,101 @@
+import { createHash } from "node:crypto";
+import ts from "typescript";
+
+type JavaScriptArtifact = Readonly<{ name: string; text: string }>;
+type ReactDomEvidence = Readonly<{
+  manifest: unknown;
+  productionClientSha256: string;
+}>;
+
+// React DOM can render a hoisted <style> when an application requests one. Its
+// dormant renderer capability is not StyleX injection and is not permission to
+// use it: the browser gate still rejects every style node/mutation and CSP error.
+// These fingerprints bind the reviewed 19.2.8 source and its complete parsed
+// acquireResource function in the production graph, not a nearby string/count.
+// A dependency or function-body change requires a new source review.
+const reviewedProductionClientSha256 = "6cf4932e0c20a4572ae395035ca2e512a42d7d49c1a659fa73d6197069c28df0";
+const reviewedResourceFunctionSha256 = "74ab0afc61ff2c3e1da3fe4d3b0785b82183692eaefb76e5d7d0d929de8ffd02";
+const stylexInjector = /stylex-inject|stylexInject|data-stylex|stylesheet-group/u;
+const unreviewedLiteralCall = /createElement\s*\(\s*["']style["']\s*\)|\.insertRule\s*\(/u;
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+function propertyName(expression: ts.Expression): string | undefined {
+  if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
+  if (ts.isElementAccessExpression(expression)
+    && ts.isStringLiteralLike(expression.argumentExpression)) {
+    return expression.argumentExpression.text;
+  }
+  return undefined;
+}
+
+export function assertReviewedRuntimeStyleBoundary(
+  artifacts: readonly JavaScriptArtifact[],
+  evidence: ReactDomEvidence,
+): void {
+  const manifest = evidence.manifest;
+  if (typeof manifest !== "object" || manifest === null || Array.isArray(manifest)
+    || !("name" in manifest) || manifest.name !== "react-dom"
+    || !("version" in manifest) || manifest.version !== "19.2.8"
+    || evidence.productionClientSha256 !== reviewedProductionClientSha256) {
+    throw new Error("Unreviewed React DOM dependency identity at the runtime style boundary");
+  }
+
+  let reviewedCalls = 0;
+  for (const artifact of artifacts) {
+    if (stylexInjector.test(artifact.text)) {
+      throw new Error(`StyleX runtime injector in ${artifact.name}`);
+    }
+    const source = ts.createSourceFile(
+      artifact.name, artifact.text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS,
+    );
+    // TypeScript exposes parser diagnostics on the parse result, but not on its
+    // public SourceFile interface. Fail closed if that parser contract changes.
+    const diagnostics: unknown = Reflect.get(source, "parseDiagnostics");
+    if (!Array.isArray(diagnostics) || diagnostics.length !== 0) {
+      throw new Error(`Cannot parse runtime style boundary in ${artifact.name}`);
+    }
+
+    const reviewedSpans: Readonly<{ start: number; end: number }>[] = [];
+    function visit(node: ts.Node): void {
+      if (ts.isCallExpression(node)) {
+        const method = propertyName(node.expression);
+        if (method === "insertRule") {
+          throw new Error(`Unreviewed insertRule call in ${artifact.name}`);
+        }
+        const tag = node.arguments[0];
+        if (method === "createElement" && tag !== undefined
+          && ts.isStringLiteralLike(tag) && tag.text.toLowerCase() === "style") {
+          let clause: ts.Node | undefined = node.parent;
+          while (clause !== undefined && !ts.isCaseClause(clause)
+            && !ts.isFunctionLike(clause)) clause = clause.parent;
+          let owner: ts.Node | undefined = clause;
+          while (owner !== undefined && !ts.isFunctionLike(owner)) owner = owner.parent;
+          if (clause === undefined || !ts.isCaseClause(clause)
+            || !ts.isStringLiteralLike(clause.expression) || clause.expression.text !== "style"
+            || owner === undefined || !ts.isFunctionDeclaration(owner)
+            || sha256(owner.getText(source)) !== reviewedResourceFunctionSha256) {
+            throw new Error(`Unreviewed style creation context in ${artifact.name}`);
+          }
+          reviewedCalls += 1;
+          if (reviewedCalls !== 1) throw new Error("Duplicate React DOM style creation context");
+          reviewedSpans.push({ start: owner.getStart(source), end: owner.end });
+        }
+      }
+      ts.forEachChild(node, visit);
+    }
+    visit(source);
+
+    // Retain the generic artifact guard outside the exact AST-owned function,
+    // including suspicious literal fragments that are not executable AST calls.
+    const reviewedSpan = reviewedSpans[0];
+    const unreviewed = reviewedSpan === undefined ? artifact.text
+      : artifact.text.slice(0, reviewedSpan.start) + artifact.text.slice(reviewedSpan.end);
+    if (unreviewedLiteralCall.test(unreviewed)) {
+      throw new Error(`Unreviewed runtime style call in ${artifact.name}`);
+    }
+  }
+  if (reviewedCalls !== 1) throw new Error("Missing reviewed React DOM style creation context");
+}

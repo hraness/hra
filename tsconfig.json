@@ -25,6 +25,7 @@
     "plugins/**/*.ts",
     "scripts/**/*.ts",
     "site/**/*.ts",
+    "site/**/*.tsx",
     "src/**/*.ts"
   ]
 }

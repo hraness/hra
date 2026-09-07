@@ -18,7 +18,7 @@ export const sessionScreenStyles = stylex.create({
     paddingLeft: "0.75rem",
     paddingRight: "0.75rem",
     paddingTop: 0,
-    textAlign: "left",
+    textAlign: "start",
     ":disabled": { cursor: "not-allowed", opacity: 0.5 },
   },
   choiceIdle: {

@@ -45,7 +45,7 @@ export const gridScreenStyles = stylex.create({
     paddingBottom: "0.75rem",
     paddingLeft: "max(1rem, env(safe-area-inset-left))",
     paddingRight: "max(1rem, env(safe-area-inset-right))",
-    paddingTop: "0.75rem",
+    paddingTop: "calc(0.75rem + env(safe-area-inset-top))",
     position: "sticky",
     top: 0,
     zIndex: 20,
@@ -102,7 +102,6 @@ export const gridScreenStyles = stylex.create({
     marginRight: "auto",
     maxWidth: "72rem",
     minHeight: "100dvh",
-    paddingTop: "env(safe-area-inset-top)",
     width: "100%",
   },
   select: {
