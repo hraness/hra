@@ -19,6 +19,7 @@
 /scripts/package-policy.ts @0thernet
 /scripts/publish-github-release.ts @0thernet
 /scripts/publish-npm-release.ts @0thernet
+/scripts/read-npm-attestations.ts @0thernet
 /scripts/release-repository-identity.ts @0thernet
 /scripts/release-artifact-checksum.ts @0thernet
 /scripts/release-distribution-policy.ts @0thernet
