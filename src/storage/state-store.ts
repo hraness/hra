@@ -1423,6 +1423,17 @@ const mapAccountRateLimitResetAttempt = (
   value: unknown,
 ): AccountRateLimitResetAttemptRecord => {
   const row = accountRateLimitResetAttemptRowSchema.parse(value);
+  // Preserve the historical table's cross-field contract at the read boundary.
+  // A scalar-valid corrupt row is not valid pending work or a terminal latch.
+  const terminalFieldsMatch = row.state === "settled"
+    ? row.outcome !== null && row.local_resolution === null
+    : row.state === "closed"
+      ? row.outcome === null && row.local_resolution !== null
+      : row.outcome === null && row.local_resolution === null;
+  if (row.current_process_generation < row.origin_process_generation
+    || row.updated_at < row.created_at || !terminalFieldsMatch) {
+    throw new Error("ACCOUNT_RATE_LIMIT_RESET_ATTEMPT_SHAPE_INVALID");
+  }
   return {
     attemptSequence: row.attempt_sequence,
     idempotencyKey: row.idempotency_key,
