@@ -2,9 +2,9 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
-## v0.6.3 candidate (unreleased)
+## v0.6.3
 
-This release-ready candidate adds the default-off after-hours policy after the admitted `v0.6.2` release. It has not completed artifact admission and does not clear the blocked daemon or hosted command-writer rollout.
+This admitted release adds the default-off after-hours policy after `v0.6.2`. Its immutable GitHub and npm artifacts are available; artifact admission does not clear the blocked daemon or hosted command-writer rollout. See the [exact release record](docs/beta-release.md#immutable-v063-successful-release-record).
 
 - After the rollout gates, a separate local opt-in can raise otherwise eligible protocol approval budgets to 6 consecutive, 20 rolling-hour, and 80 rolling-day reservations outside notification hours. Prose stays at 3/10/40 and shares the same accounting. Final transactional admission rechecks current consent, schedule, source authority, and spend. Additive schema 46 preserves schema 45 and requires a newly finalized human message before any pre-44 session can use the higher tier. Policy changes never reset counters or broaden approval categories.
 

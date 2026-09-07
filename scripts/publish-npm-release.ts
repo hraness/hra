@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
 import { readBoundedJsonResponse } from "./bounded-json-response";
+import { readNpmAttestations } from "./read-npm-attestations";
 import {
   npmRegistryReleaseMetadata,
   parseNpmRelease,
@@ -126,10 +127,7 @@ async function admitProvenance(
   try {
     await verifyNpmProvenance({
       attemptPolicy,
-      attestations: await registryJson(
-        `https://registry.npmjs.org/-/npm/v1/attestations/@hraness%2fhra@${inspection.version}`,
-        "npm Sigstore attestations",
-      ),
+      attestations: await readNpmAttestations(inspection.version),
       integrity: expectedIntegrity,
       maximumAttempt,
       registryKeys: await registryJson(
