@@ -112,6 +112,8 @@ export interface PublicContent {
   readonly badges: readonly Badge[];
   /** Qualified source-and-release positioning for package metadata, discovery, and llms.txt. */
   readonly description: string;
+  /** Operational prerequisite for every current-daemon initialization or start example. */
+  readonly daemonRolloutNotice: string;
   readonly doctorCommand: string;
   readonly endpoints: PublicEndpoints;
   readonly installCommand: string;
@@ -271,7 +273,7 @@ export const siteDocumentPaths: readonly string[] = [
   "/privacy/",
 ];
 
-export const publicReleaseState: "live" | "release-ready" | "staged" = "release-ready";
+export const publicReleaseState: "live" | "release-ready" | "staged" = "live";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
   "https://github.com/hraness/hra/releases/download/v0.6.1/hraness-hra-0.6.1.tgz",
@@ -281,6 +283,7 @@ const productName = "HRA";
 const tagline = "Control plane for Codex and Claude Code";
 const providerRoadmap = "Codex and Claude Code, side by side.";
 const releaseVersion = "0.6.1";
+const daemonRolloutNotice = `Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the v${releaseVersion} daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.`;
 
 /** Public runtime pins come from their authoritative source modules. */
 export const publicPins = {
@@ -338,15 +341,16 @@ export const publicContent: PublicContent = {
   providerRoadmap,
   releaseVersion,
   thesis: `${productName} runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.`,
-  description: `${tagline} in current source; v${releaseVersion} is release-ready. Run provider sessions side by side through one durable CLI.`,
-  statusLine: `Status: public beta. The local CLI v${releaseVersion} is release-ready: Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}.`,
+  description: `${tagline}. Local CLI v${releaseVersion} artifacts are live; daemon and hosted command-writer rollout remains blocked on capacity.`,
+  daemonRolloutNotice,
+  statusLine: `Status: public beta. Local CLI v${releaseVersion} artifacts are live: Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}. Current daemon and hosted command-writer rollout remains blocked on capacity.`,
   badges,
   maintainer: {
     name: "Hraness",
     url: links.hraness,
   },
   socialCard: {
-    alt: `${productName} · Codex + Claude Code · v${releaseVersion} release-ready · hra.sh`,
+    alt: `${productName} · local CLI beta v${releaseVersion} live · daemon rollout blocked on capacity · conditional session commands · hra.sh`,
     height: 630,
     path: "/social-card.png",
     width: 1200,
@@ -356,7 +360,7 @@ export const publicContent: PublicContent = {
   initCommand: "hra init --yes",
   doctorCommand: "hra doctor --offline",
   endpoints: {
-    betaTag: "release-ready",
+    betaTag: "live",
     githubRepository: "live",
     hostedSync: "live",
     website: "live",
@@ -367,8 +371,8 @@ export const publicContent: PublicContent = {
     eyebrow: tagline,
     heading: "One terminal for every Codex and Claude Code session",
     summary: "HRA keeps sessions alive behind a local daemon, isolates each account, and lets you or your agent direct any of them from a shell or JSON. Sync between machines is optional and encrypted.",
-    example: "Ask your agent to start a Codex session on your work account, then hand the next turn to Claude Code without losing the conversation.",
-    boundary: `Codex on macOS and Linux · Claude Code on Linux · local v${releaseVersion} release-ready · hosted sync live (${hostedBetaLabel})`,
+    example: "After the rollout prerequisite below is satisfied, ask your agent to start a Codex session on your work account, then hand the next turn to Claude Code without losing the conversation.",
+    boundary: `Local v${releaseVersion} artifacts live · current daemon and hosted command-writer rollout blocked on capacity · Codex on macOS and Linux · Claude Code on Linux · hosted sync live (${hostedBetaLabel})`,
     primaryAction: {
       href: "#install-command",
       label: "Install HRA",
@@ -458,11 +462,11 @@ export const publicContent: PublicContent = {
   questions: [
     {
       question: "Does HRA need an account?",
-      answer: [text("No. Install the CLI, add a Codex profile or sign into Claude Code inside its isolated directory, and start a session. An HRA cloud identity is only needed for optional sync between machines.")],
+      answer: [text("No. An HRA cloud identity is only needed for optional sync between machines. Once the current-daemon rollout prerequisite is satisfied, add a Codex profile or sign into Claude Code inside its isolated directory and start a session.")],
     },
     {
-      question: "What does the release candidate include?",
-      answer: [text(`The v${releaseVersion} local CLI release candidate runs Codex on macOS and Linux and Claude Code on Linux. It becomes public only after immutable GitHub and npm release admission. Hosted sync is live as an ${hostedBetaLabel}.`)],
+      question: "What is live, and what is still blocked?",
+      answer: [text(`The v${releaseVersion} local CLI artifacts passed immutable GitHub and npm release admission. They support Codex on macOS and Linux and Claude Code on Linux. Hosted sync is live as an ${hostedBetaLabel}, but current daemon and hosted command-writer rollout remains blocked on capacity. Install and verify the artifact now; wait for the documented rollout prerequisite before initialization or daemon startup.`)],
     },
     {
       question: "Does HRA use my API keys or provider subscription?",
@@ -495,13 +499,14 @@ export const publicContent: PublicContent = {
   introduction: [
     {
       kind: "notice",
-      label: `Immutable local CLI release candidate; hosted sync live as an ${hostedBetaLabel}`,
+      label: `Immutable local CLI artifacts live; hosted sync live as an ${hostedBetaLabel}`,
       content: [
-        text("The exact install command below works once GitHub exposes the immutable "),
+        text("The immutable "),
         code(`v${releaseVersion}`),
-        text(" GitHub Release and its verified archive. The website and optional hosted sync are live; the candidate becomes public only after exact admission."),
+        text(" artifacts passed immutable GitHub and npm release admission and are available through the exact install command below. The website and optional hosted sync are live. Artifact admission does not authorize daemon startup or hosted command writers."),
       ],
     },
+    { kind: "notice", label: "Current daemon rollout blocked", content: [text(daemonRolloutNotice)] },
     paragraph(
       text("HRA is one Bun CLI plus a local daemon. It isolates Codex and Claude Code profiles, gives both providers one compact session interface, and optionally syncs encrypted provider-neutral projections and commands across your enrolled machines."),
     ),
@@ -727,6 +732,7 @@ export const publicContent: PublicContent = {
       id: "first-account",
       heading: "First account",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         {
           kind: "commands",
           commands: [
@@ -802,8 +808,9 @@ export const publicContent: PublicContent = {
       id: "first-session",
       heading: "First session",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         paragraph(
-          text("Complete initialization and the first provider login before this walkthrough. Account login remains a dedicated one-shot command, and the session-start command returns the new session ID."),
+          text("Only after the rollout prerequisite is satisfied, complete initialization and the first provider login before this walkthrough. Account login remains a dedicated one-shot command, and the session-start command returns the new session ID."),
         ),
         { kind: "subheading", text: "Human terminal" },
         paragraph(
@@ -890,7 +897,7 @@ export const publicContent: PublicContent = {
           content: [
             text("These commands are part of the immutable "),
             code(`v${releaseVersion}`),
-            text(" local CLI release candidate and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol."),
+            text(" local CLI release and are available through the exact install command above. Hosted sync is not required for this local protocol; the current-daemon rollout prerequisite still applies before startup."),
           ],
         },
         paragraph(
@@ -994,6 +1001,7 @@ export const publicContent: PublicContent = {
       id: "cloud-sign-in-and-device-pairing",
       heading: "Cloud sign-in and device pairing",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         paragraph(
           text(`The hosted endpoint is live as an ${hostedBetaLabel}. An unset `),
           code("HRA_CONVEX_URL"),
@@ -1134,6 +1142,7 @@ export const publicContent: PublicContent = {
       id: "terminal-and-agent-interfaces",
       heading: "Terminal and agent interfaces",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         paragraph(
           text("Run "),
           code("hra"),
@@ -1274,6 +1283,7 @@ export const publicContent: PublicContent = {
       id: "presets-and-permissions",
       heading: "Presets and permissions",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         paragraph(
           text("HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; "),
           code("hra session show"),
@@ -1701,6 +1711,8 @@ export const renderReadmeMarkdown = (content: PublicContent = publicContent): st
     content.statusLine,
     `\`\`\`sh\n${content.installCommand}\n\`\`\``,
     `\`\`\`sh\n${content.doctorCommand}\n\`\`\``,
+    `> ${content.daemonRolloutNotice}`,
+    "After the rollout prerequisite is satisfied, initialize:",
     `\`\`\`sh\n${content.initCommand}\n\`\`\``,
     `## ${content.hero.heading}\n\n${content.hero.summary}\n\n${content.hero.boundary}`,
     `### ${content.hero.proofLabel}\n\n${content.hero.steps.map((step, index) => `${index + 1}. **${step.label}:** \`${step.command}\`. ${step.detail}`).join("\n")}`,
@@ -1732,9 +1744,10 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     content.thesis,
     content.statusLine,
     "",
-    `Install after the v${content.releaseVersion} beta tag is live: ${content.installCommand}`,
-    `Initialize: ${content.initCommand}`,
+    `Install the live v${content.releaseVersion} local CLI artifact: ${content.installCommand}`,
     `Verify local prerequisites without cloud access: ${content.doctorCommand}`,
+    content.daemonRolloutNotice,
+    `Initialize only after the rollout prerequisite is satisfied: ${content.initCommand}`,
     "",
     `Repository: ${content.links.github}`,
     `Documentation: ${content.links.documentation}`,

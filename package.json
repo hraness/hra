@@ -1,7 +1,7 @@
 {
   "name": "@hraness/hra",
   "version": "0.6.1",
-  "description": "Control plane for Codex and Claude Code in current source; v0.6.1 is release-ready. Run provider sessions side by side through one durable CLI.",
+  "description": "Control plane for Codex and Claude Code. Local CLI v0.6.1 artifacts are live; daemon and hosted command-writer rollout remains blocked on capacity.",
   "license": "MIT",
   "publishConfig": {
     "access": "public",
