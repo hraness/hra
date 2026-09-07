@@ -37,6 +37,7 @@ export default tseslint.config(
       "eslint.config.mjs",
       "node_modules/**",
       "site/dist/**",
+      "tmp/build-app/**",
     ],
   },
   eslint.configs.recommended,

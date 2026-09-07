@@ -1,3 +1,7 @@
+import * as stylex from "@stylexjs/stylex";
+
+import { accountLoginRelayStyles } from "./account-login-relay.stylex";
+
 export type AccountLoginRelayProps = Readonly<{
   expiresAt: number;
   loginUrl: string;
@@ -17,11 +21,11 @@ export function AccountLoginRelay({
   if (expiresAt <= now) return null;
 
   return (
-    <div className="space-y-1 text-xs text-ink-muted">
-      <p>Enter this one-time code after signing in:</p>
-      <code className="block font-mono text-ink">{userCode}</code>
-      <p>
-        <a className="underline" href={loginUrl} rel="noreferrer noopener" target="_blank">
+    <div {...stylex.props(accountLoginRelayStyles.root)}>
+      <p {...stylex.props(accountLoginRelayStyles.paragraph)}>Enter this one-time code after signing in:</p>
+      <code {...stylex.props(accountLoginRelayStyles.code)}>{userCode}</code>
+      <p {...stylex.props(accountLoginRelayStyles.paragraph)}>
+        <a {...stylex.props(accountLoginRelayStyles.link)} href={loginUrl} rel="noreferrer noopener" target="_blank">
           Open the provider login (single use, expires shortly)
         </a>
       </p>

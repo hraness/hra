@@ -1,4 +1,5 @@
 import { useAuthActions } from "@convex-dev/auth/react";
+import * as stylex from "@stylexjs/stylex";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { Badge } from "../components/ui/badge";
@@ -82,6 +83,7 @@ import {
   type CommandTarget,
   type MachineView,
 } from "../model/settings-view";
+import { settingsScreenStyles as styles } from "./settings-screen.stylex";
 
 /*
  * Settings.
@@ -167,7 +169,7 @@ function useSettingsCommand(): SettingsCommandRunner {
 
 function Notice({ children }: Readonly<{ children: string | null }>) {
   if (children === null) return null;
-  return <p className="text-xs text-ink-muted" role="status">{children}</p>;
+  return <p {...stylex.props(styles.quiet)} role="status">{children}</p>;
 }
 
 function openSession(sessionPublicId: string): void {
@@ -208,14 +210,13 @@ function GatewayKeyForm({
   };
 
   return (
-    <form className="flex flex-col gap-2" onSubmit={submit}>
-      <label className="text-xs text-ink-muted" htmlFor={inputId}>
+    <form {...stylex.props(styles.form)} onSubmit={submit}>
+      <label {...stylex.props(styles.quiet)} htmlFor={inputId}>
         Set the AI Gateway key for prose autorespond
       </label>
-      <div className="flex flex-wrap items-center gap-2">
+      <div {...stylex.props(styles.inlineRow)}>
         <Input
           autoComplete="off"
-          className="flex-1"
           disabled={disabled}
           id={inputId}
           onChange={(event) => { setValue(event.target.value); }}
@@ -223,12 +224,13 @@ function GatewayKeyForm({
           spellCheck={false}
           type="password"
           value={value}
+          xstyle={styles.growInput}
         />
         <Button disabled={disabled || value.length === 0} type="submit" variant="secondary">
           Set key
         </Button>
       </div>
-      {error === null ? null : <p className="text-xs text-danger" role="alert">{error}</p>}
+      {error === null ? null : <p {...stylex.props(styles.danger)} role="alert">{error}</p>}
     </form>
   );
 }
@@ -335,8 +337,8 @@ export function NotificationHoursForm({ machine }: Readonly<{ machine: MachineVi
 
   if (machine.notificationHours === null) {
     return machine.notificationHoursStatus === "unreadable"
-      ? <p className="text-xs text-danger">This machine’s notification hours could not be read.</p>
-      : <p className="text-xs text-ink-muted">Unavailable on this machine’s current daemon.</p>;
+      ? <p {...stylex.props(styles.danger)}>This machine’s notification hours could not be read.</p>
+      : <p {...stylex.props(styles.quiet)}>Unavailable on this machine’s current daemon.</p>;
   }
   const edit = (setter: (value: string) => void, value: string) => {
     setCommandHandle(null);
@@ -345,25 +347,25 @@ export function NotificationHoursForm({ machine }: Readonly<{ machine: MachineVi
     setter(value);
   };
   return (
-    <form className="flex flex-col gap-2" onSubmit={submitHours}>
-      <div className="flex flex-wrap items-center gap-2">
+    <form {...stylex.props(styles.form)} onSubmit={submitHours}>
+      <div {...stylex.props(styles.inlineRow)}>
         <Input aria-label="Notification hours start" disabled={!enabled || commandBusy} onChange={(event) => edit(setStart, event.target.value)} type="time" value={start} />
-        <span className="text-xs text-ink-muted">to</span>
+        <span {...stylex.props(styles.quiet)}>to</span>
         <Input aria-label="Notification hours end" disabled={!enabled || commandBusy} onChange={(event) => edit(setEnd, event.target.value)} type="time" value={end} />
-        <Input aria-label="Notification hours time zone" className="min-w-40 flex-1" disabled={!enabled || commandBusy} onChange={(event) => edit(setTimeZone, event.target.value)} value={timeZone} />
+        <Input aria-label="Notification hours time zone" disabled={!enabled || commandBusy} onChange={(event) => edit(setTimeZone, event.target.value)} value={timeZone} xstyle={styles.timeZoneInput} />
         <Button disabled={!enabled || commandBusy} size="small" type="submit" variant="secondary">Save</Button>
       </div>
-      <p className="text-xs text-ink-muted">Stored for future notification timing only. Notification delivery is not active, and approvals and autonomy do not read this schedule.</p>
+      <p {...stylex.props(styles.quiet)}>Stored for future notification timing only. Notification delivery is not active, and approvals and autonomy do not read this schedule.</p>
       {machine.deviceStatus === "active"
         ? null
-        : <p className="text-xs text-attention">This device is not active, so its schedule is read-only.</p>}
-      {error === null ? null : <p className="text-xs text-danger" role="alert">{error}</p>}
+        : <p {...stylex.props(styles.attention)}>This device is not active, so its schedule is read-only.</p>}
+      {error === null ? null : <p {...stylex.props(styles.danger)} role="alert">{error}</p>}
       {observation.protocolWarning === null ? null : (
-        <p className="text-xs text-danger" role="status">
+        <p {...stylex.props(styles.danger)} role="status">
           {observation.protocolWarning}
         </p>
       )}
-      {notice === null ? null : <p className={notice.tone === "error" ? "text-xs text-danger" : "text-xs text-ink-muted"} role="status">{notice.text}</p>}
+      {notice === null ? null : <p {...stylex.props(notice.tone === "error" ? styles.danger : styles.quiet)} role="status">{notice.text}</p>}
     </form>
   );
 }
@@ -394,7 +396,7 @@ function MachineCard({
         title={machine.label}
       >
         {target === null ? (
-          <p className="text-xs text-attention">
+          <p {...stylex.props(styles.attention)}>
             This machine has no live session, so session-routed settings cannot be sent from the browser.
             Notification hours use a machine-addressed command and do not need a live session; change other settings on the machine or start a session first.
           </p>
@@ -428,7 +430,7 @@ function MachineCard({
         description={attentionEmail.description}
         title="Attention email"
       >
-        <p className="text-xs text-ink-muted">
+        <p {...stylex.props(styles.quiet)}>
           Read-only here. This local opt-in does not by itself activate hosted delivery.
         </p>
         <CommandHint>hra notification-email status</CommandHint>
@@ -492,7 +494,7 @@ function MachineCard({
             key={provider}
             title={`${label} personal sessions`}
           >
-            <p className="text-xs text-ink-muted">
+            <p {...stylex.props(styles.quiet)}>
               Personal-home access can be changed only from this machine.
             </p>
             <CommandHint>{command}</CommandHint>
@@ -551,7 +553,7 @@ function ArchivedSessionRow({
       description={`${machine}, last updated ${formatRelativeTime(session.updatedAt, now)}${day === null ? "" : ` on ${day}`}`}
       title={session.title}
     >
-      {retired ? <p className="text-xs text-ink-muted">Devin retired · read-only</p> : null}
+      {retired ? <p {...stylex.props(styles.quiet)}>Devin retired · read-only</p> : null}
       <Notice>{command.notice}</Notice>
     </SettingsRow>
   );
@@ -571,7 +573,7 @@ export function AccountBrowserLoginControls({
 }>) {
   if (!accountBrowserLoginAllowed(account)) return null;
   return (
-    <div className="flex flex-wrap items-center gap-2">
+    <div {...stylex.props(styles.inlineRow)}>
       {account.status === "signed_out" ? (
         <Button
           disabled={busy}
@@ -834,7 +836,7 @@ function AccountRow({
       title={account.label}
     >
       {account.provider === "devin" ? (
-        <p className="text-xs text-ink-muted">Devin support is retired. This historical account is read-only.</p>
+        <p {...stylex.props(styles.quiet)}>Devin support is retired. This historical account is read-only.</p>
       ) : accountBrowserLoginAllowed(account) ? (
         <AccountBrowserLoginControls
           account={account}
@@ -846,7 +848,7 @@ function AccountRow({
         <>
           <CommandHint>{localLoginCommand}</CommandHint>
           {account.provider === "claude" ? (
-            <p className="text-xs text-ink-muted">
+            <p {...stylex.props(styles.quiet)}>
               Run this on its Linux custodian. Claude linking is not available in the browser,
               and macOS refuses before provider launch.
             </p>
@@ -863,7 +865,7 @@ function AccountRow({
         />
       )}
       {observation.protocolWarning === null ? null : (
-        <p className="text-xs text-danger" role="status">
+        <p {...stylex.props(styles.danger)} role="status">
           {observation.protocolWarning}
         </p>
       )}
@@ -882,14 +884,11 @@ function AccountRow({
         </Button>
       ) : null}
       {notice === null ? null : (
-        <p
-          className={notice.tone === "error" ? "text-xs text-danger" : "text-xs text-ink-muted"}
-          role="status"
-        >
+        <p {...stylex.props(notice.tone === "error" ? styles.danger : styles.quiet)} role="status">
           {notice.text}
         </p>
       )}
-      {status === null ? null : <p className="text-xs text-ink-muted">{status}</p>}
+      {status === null ? null : <p {...stylex.props(styles.quiet)}>{status}</p>}
     </SettingsRow>
   );
 }
@@ -943,22 +942,22 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
   const accounts = useMemo(() => accountRows(registries.machines), [registries.machines]);
 
   return (
-    <div className="mx-auto flex min-h-dvh w-full max-w-3xl flex-col pt-[env(safe-area-inset-top)]">
-      <header className="sticky top-0 z-10 flex items-center gap-2 border-b border-line bg-surface px-4 py-3">
+    <div {...stylex.props(styles.root)}>
+      <header {...stylex.props(styles.header)}>
         <Button aria-label="Back" onClick={onBack} size="icon" variant="ghost">
           <BackIcon />
         </Button>
-        <h1 className="text-sm font-semibold">Settings</h1>
+        <h1 {...stylex.props(styles.title)}>Settings</h1>
       </header>
 
-      <main className="flex flex-1 flex-col gap-6 px-4 py-4 pb-[calc(1rem+env(safe-area-inset-bottom))]">
+      <main {...stylex.props(styles.main)}>
         <SettingsSection
           description="Each machine publishes its own defaults. A change is sent as a durable command and applies when the daemon picks it up."
           title="Machines"
         >
           {registries.error === null
             ? null
-            : <p className="text-xs text-danger" role="alert">{registries.error}</p>}
+            : <p {...stylex.props(styles.danger)} role="alert">{registries.error}</p>}
           {registries.loading && registries.machines.length === 0 ? (
             <EmptyRow>Loading machines.</EmptyRow>
           ) : null}

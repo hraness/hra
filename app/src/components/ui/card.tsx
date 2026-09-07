@@ -1,6 +1,9 @@
 import type { HTMLAttributes } from "react";
+import * as stylex from "@stylexjs/stylex";
+import type { StyleXStyles } from "@stylexjs/stylex";
 
-import { cn } from "../../lib/cn";
+import { staticStylexClassName } from "../../lib/cn";
+import { cardStyles } from "./primitives.stylex";
 
 /**
  * `data-session-id` is declared rather than left to JSX's hyphen escape hatch,
@@ -8,38 +11,63 @@ import { cn } from "../../lib/cn";
  * it back through `elementFromPoint`, so the attribute has to survive the
  * spread onto the element.
  */
-export type CardProps = HTMLAttributes<HTMLDivElement> & Readonly<{
+export type CardProps = Omit<HTMLAttributes<HTMLDivElement>, "style"> & Readonly<{
   "data-session-id"?: string;
+  style?: never;
+  xstyle?: StyleXStyles;
 }>;
 
-export function Card({ className, ...rest }: CardProps) {
+function rejectInlineStyle(style: unknown): void {
+  if (style !== undefined) throw new Error("HRA primitives do not accept caller inline styles.");
+}
+
+export function Card({ className, style, xstyle, ...rest }: CardProps) {
+  rejectInlineStyle(style);
+  const presentation = stylex.props(cardStyles.root, xstyle);
   return (
     <div
-      className={cn(
-        "rounded-lg border border-line bg-surface-raised text-ink",
-        className,
-      )}
+      className={staticStylexClassName(presentation, className)}
       {...rest}
     />
   );
 }
 
-export function CardHeader({ className, ...rest }: CardProps) {
-  return <div className={cn("flex flex-col gap-1 p-3", className)} {...rest} />;
+export function CardHeader({ className, style, xstyle, ...rest }: CardProps) {
+  rejectInlineStyle(style);
+  const presentation = stylex.props(cardStyles.header, xstyle);
+  return <div className={staticStylexClassName(presentation, className)} {...rest} />;
 }
 
-export function CardTitle({ className, ...rest }: HTMLAttributes<HTMLHeadingElement>) {
-  return <h2 className={cn("text-sm font-semibold leading-snug", className)} {...rest} />;
+export type CardTitleProps = Omit<HTMLAttributes<HTMLHeadingElement>, "style"> & Readonly<{
+  style?: never;
+  xstyle?: StyleXStyles;
+}>;
+
+export function CardTitle({ className, style, xstyle, ...rest }: CardTitleProps) {
+  rejectInlineStyle(style);
+  const presentation = stylex.props(cardStyles.title, xstyle);
+  return <h2 className={staticStylexClassName(presentation, className)} {...rest} />;
 }
 
-export function CardDescription({ className, ...rest }: HTMLAttributes<HTMLParagraphElement>) {
-  return <p className={cn("text-xs text-ink-muted", className)} {...rest} />;
+export type CardDescriptionProps = Omit<HTMLAttributes<HTMLParagraphElement>, "style"> & Readonly<{
+  style?: never;
+  xstyle?: StyleXStyles;
+}>;
+
+export function CardDescription({ className, style, xstyle, ...rest }: CardDescriptionProps) {
+  rejectInlineStyle(style);
+  const presentation = stylex.props(cardStyles.description, xstyle);
+  return <p className={staticStylexClassName(presentation, className)} {...rest} />;
 }
 
-export function CardContent({ className, ...rest }: CardProps) {
-  return <div className={cn("px-3 pb-3", className)} {...rest} />;
+export function CardContent({ className, style, xstyle, ...rest }: CardProps) {
+  rejectInlineStyle(style);
+  const presentation = stylex.props(cardStyles.content, xstyle);
+  return <div className={staticStylexClassName(presentation, className)} {...rest} />;
 }
 
-export function CardFooter({ className, ...rest }: CardProps) {
-  return <div className={cn("flex items-center gap-2 px-3 pb-3", className)} {...rest} />;
+export function CardFooter({ className, style, xstyle, ...rest }: CardProps) {
+  rejectInlineStyle(style);
+  const presentation = stylex.props(cardStyles.footer, xstyle);
+  return <div className={staticStylexClassName(presentation, className)} {...rest} />;
 }

@@ -1,7 +1,9 @@
+import * as stylex from "@stylexjs/stylex";
 import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 
 import { streamingTailLines } from "../env";
 import { streamingTail } from "../model/session-model";
+import { streamingTailStyles } from "./streaming-tail.stylex";
 
 /**
  * Reports whether an element is intersecting the viewport.
@@ -66,7 +68,7 @@ export function StreamingTail({ label, text }: StreamingTailProps): ReactNode {
   return (
     <pre
       aria-label={label}
-      className="max-h-40 overflow-x-hidden overflow-y-auto border-t border-line px-3 py-2 font-mono text-xs leading-snug break-words whitespace-pre-wrap text-ink-muted"
+      {...stylex.props(streamingTailStyles.root)}
       ref={container}
       role="log"
     >

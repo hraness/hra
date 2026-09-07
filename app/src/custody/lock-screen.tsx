@@ -1,8 +1,10 @@
 import { useAuthActions } from "@convex-dev/auth/react";
+import * as stylex from "@stylexjs/stylex";
 
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import { useCustody } from "./custody-context";
+import { lockStyles } from "./lock-screen.stylex";
 
 /**
  * The locked state. The account key is not in memory, so nothing is decryptable
@@ -14,7 +16,7 @@ export function LockScreen() {
   const { signOut } = useAuthActions();
 
   return (
-    <main className="mx-auto flex min-h-dvh w-full max-w-md flex-col justify-center p-4">
+    <main {...stylex.props(lockStyles.root)}>
       <Card>
         <CardHeader>
           <CardTitle>Locked</CardTitle>
@@ -22,9 +24,9 @@ export function LockScreen() {
             The account key is not held in this tab. Unlock to read and steer your sessions.
           </CardDescription>
         </CardHeader>
-        <CardContent className="flex flex-col gap-3">
+        <CardContent xstyle={lockStyles.cardContent}>
           {custody.error === null ? null : (
-            <p className="text-sm text-danger" role="alert">{custody.error}</p>
+            <p {...stylex.props(lockStyles.error)} role="alert">{custody.error}</p>
           )}
           <Button disabled={custody.busy} onClick={() => { void custody.unlock(); }}>
             Unlock

@@ -1,7 +1,9 @@
 # Contents
 
 - `check-effect-architecture.ts` and its paired fixtures constrain the reviewed Effect programs; `check-codex-effect-architecture.ts` owns the Codex module-role policy.
-- Build scripts compile the CLI and generate the static website.
+- Build scripts compile the CLI, generate the static website, and finalize the browser app's complete StyleX graph.
+- `dev-app.ts` watches app source and serves completed immutable app revisions on a strict loopback port. It owns its build child, listener, timers, and bounded retained revision store; it does not run installs or inject a browser runtime.
+- `register-app-stylex-test-transform.ts` applies the public StyleX compiler only to app source loaded by app presentation tests, without changing the CLI or provider test runtime.
 - Check scripts verify package contents, README parity, dependencies, release metadata, and the absence of file-level import cycles under `src/`.
 - `check-security-primitives.ts` compares per-file counts of load-bearing security primitives against the reviewed `security-primitives.json` table; a count changes only with a deliberate `--update` after review.
 - `check-install-pins.ts` keeps the installer's embedded CLI and normalizer digests equal to the working tree (`--update` re-pins them) and, under a tag ref, proves the public command names the runtime bytes being released.

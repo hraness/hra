@@ -1,3 +1,4 @@
+import * as stylex from "@stylexjs/stylex";
 import { useId, useMemo, useState, type ReactNode } from "react";
 
 import { ChevronIcon, ScheduleIcon } from "./icons";
@@ -5,6 +6,7 @@ import { Badge } from "./ui/badge";
 import { useServerNow } from "../data/devices";
 import { useDeviceRegistries } from "../data/registry";
 import { sessionScheduledTasks } from "../model/scheduled-tasks";
+import { scheduledTaskStyles } from "./scheduled-tasks-badge.stylex";
 
 export type ScheduledTasksBadgeProps = Readonly<{ sessionPublicId: string }>;
 
@@ -34,11 +36,11 @@ export function ScheduledTasksBadge({ sessionPublicId }: ScheduledTasksBadgeProp
   if (view.rows.length === 0) return null;
 
   return (
-    <div className="border-b border-line px-[max(1rem,env(safe-area-inset-left))] py-2">
+    <div {...stylex.props(scheduledTaskStyles.root)}>
       <button
         aria-controls={open ? panelId : undefined}
         aria-expanded={open}
-        className="inline-flex min-h-11 items-center gap-2 rounded-md border border-line px-3 text-xs text-ink-muted hover:text-ink"
+        {...stylex.props(scheduledTaskStyles.trigger)}
         onClick={() => { setOpen((current) => !current); }}
         type="button"
       >
@@ -47,18 +49,18 @@ export function ScheduledTasksBadge({ sessionPublicId }: ScheduledTasksBadgeProp
         <ChevronIcon open={open} />
       </button>
       {open ? (
-        <div className="mt-2 flex flex-col gap-2 rounded-md border border-line p-3" id={panelId}>
-          <p className="text-xs text-ink-muted">
+        <div {...stylex.props(scheduledTaskStyles.panel)} id={panelId}>
+          <p {...stylex.props(scheduledTaskStyles.quiet)}>
             Read only. Create, edit, and delete a schedule in the session on its machine.
           </p>
           {view.rows.map((task) => (
-            <div className="flex flex-col gap-1" key={`${task.machineLabel}:${task.id}`}>
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-sm font-medium">{task.label}</span>
+            <div {...stylex.props(scheduledTaskStyles.row)} key={`${task.machineLabel}:${task.id}`}>
+              <div {...stylex.props(scheduledTaskStyles.rowHeader)}>
+                <span {...stylex.props(scheduledTaskStyles.label)}>{task.label}</span>
                 <Badge tone="neutral">{task.kindLabel}</Badge>
               </div>
-              <span className="text-xs text-ink-muted">{task.line}</span>
-              <span className="text-xs text-ink-muted">{task.machineLabel}</span>
+              <span {...stylex.props(scheduledTaskStyles.quiet)}>{task.line}</span>
+              <span {...stylex.props(scheduledTaskStyles.quiet)}>{task.machineLabel}</span>
             </div>
           ))}
         </div>

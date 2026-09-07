@@ -1,10 +1,12 @@
 import { useAuthActions } from "@convex-dev/auth/react";
+import * as stylex from "@stylexjs/stylex";
 import { useState } from "react";
 
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import { Input } from "../components/ui/input";
 import { otpProviderId } from "../env";
+import { signInStyles } from "./sign-in-screen.stylex";
 
 type Stage = "email" | "code";
 
@@ -45,7 +47,7 @@ export function SignInScreen() {
   };
 
   return (
-    <main className="mx-auto flex min-h-dvh w-full max-w-md flex-col justify-center p-4">
+    <main {...stylex.props(signInStyles.root)}>
       <Card>
         <CardHeader>
           <CardTitle>Sign in to HRA</CardTitle>
@@ -56,7 +58,7 @@ export function SignInScreen() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <form className="flex flex-col gap-3" onSubmit={submit}>
+          <form {...stylex.props(signInStyles.form)} onSubmit={submit}>
             {stage === "email" ? (
               <Input
                 aria-label="Email address"
@@ -86,7 +88,7 @@ export function SignInScreen() {
               />
             )}
             {error === null ? null : (
-              <p className="text-sm text-danger" role="alert">{error}</p>
+              <p {...stylex.props(signInStyles.error)} role="alert">{error}</p>
             )}
             <Button disabled={busy} type="submit">
               {stage === "email" ? "Send code" : "Verify code"}

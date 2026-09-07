@@ -1,3 +1,5 @@
+import * as stylex from "@stylexjs/stylex";
+import type { StyleXStyles } from "@stylexjs/stylex";
 import type { ReactNode } from "react";
 
 import { cn } from "../lib/cn";
@@ -7,19 +9,13 @@ import {
   type SessionTone,
 } from "../model/session-view";
 import type { SessionStateValue } from "../hra/cloud";
+import { stateIndicatorStyles } from "./state-indicator.stylex";
 
-const dotClasses: Readonly<Record<SessionTone, string>> = {
-  accent: "bg-accent",
-  attention: "bg-attention",
-  danger: "bg-danger",
-  neutral: "bg-ink-muted",
-};
-
-const textClasses: Readonly<Record<SessionTone, string>> = {
-  accent: "text-accent",
-  attention: "text-attention",
-  danger: "text-danger",
-  neutral: "text-ink-muted",
+const toneStyles: Readonly<Record<SessionTone, StyleXStyles>> = {
+  accent: stateIndicatorStyles.accent,
+  attention: stateIndicatorStyles.attention,
+  danger: stateIndicatorStyles.danger,
+  neutral: stateIndicatorStyles.neutral,
 };
 
 export type StateIndicatorProps = Readonly<{
@@ -36,11 +32,12 @@ export type StateIndicatorProps = Readonly<{
  */
 export function StateIndicator({ className, state }: StateIndicatorProps): ReactNode {
   const tone = sessionStateTone[state];
+  const presentation = stylex.props(stateIndicatorStyles.root, toneStyles[tone]);
   return (
-    <span className={cn("inline-flex items-center gap-1.5 text-xs", textClasses[tone], className)}>
+    <span {...presentation} className={cn(presentation.className, className)}>
       <span
         aria-hidden="true"
-        className={cn("inline-block h-2 w-2 shrink-0 rounded-full", dotClasses[tone])}
+        {...stylex.props(stateIndicatorStyles.dot, toneStyles[tone])}
       />
       {sessionStateLabel[state]}
     </span>
