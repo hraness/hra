@@ -4,6 +4,7 @@ import { join } from "node:path";
 import fc from "fast-check";
 
 import { CodexError, CodexRemoteError, IndeterminateCodexEffectError } from "../codex/index";
+import { HRA_SESSION_PREAMBLE_TEXT } from "../domain/hra-preamble";
 import type {
   CodexAppServerClient,
   CodexCapabilitySnapshot,
@@ -12,6 +13,7 @@ import type {
   CodexThread,
   CodexTurn,
   ConversationAutomationToolCall,
+  HraHostToolCall,
   LaunchPinnedCodexOptions,
 } from "../codex/index";
 import { presetRequirements } from "../domain/presets";
@@ -1417,11 +1419,16 @@ describe("PinnedCodexRuntimeManager", () => {
     await manager.close();
   });
 
-  test("binds conversation automation and its post-response wake to the exact live connection", async () => {
+  test("binds the HRA host service and its post-response wake to the exact live connection", async () => {
     const exactConnectionId = "70000000-0000-4000-8000-000000000777";
     let launched: LaunchPinnedCodexOptions | undefined;
-    const handled: ConversationAutomationToolCall[] = [];
-    const responseWritten: ConversationAutomationToolCall[] = [];
+    let liveHostToolCall: HraHostToolCall | undefined;
+    let markHostToolEntered!: () => void;
+    let releaseHostTool!: () => void;
+    const hostToolEntered = new Promise<void>((resolve) => { markHostToolEntered = resolve; });
+    const hostToolGate = new Promise<void>((resolve) => { releaseHostTool = resolve; });
+    const handled: HraHostToolCall[] = [];
+    const responseWritten: HraHostToolCall[] = [];
     const fake = {
       state: "ready",
       connectionId: exactConnectionId,
@@ -1429,6 +1436,21 @@ describe("PinnedCodexRuntimeManager", () => {
         authority: { profileId: authority.id, processGeneration: authority.generation },
         value: { account: null, requiresOpenaiAuth: true },
       }),
+      hasLiveHraHostToolCall: (input: {
+        authority: { profileId: string; processGeneration: number };
+        callId: string;
+        connectionId: string;
+        requestDigest: string;
+        threadId: string;
+        turnId: string;
+      }) => liveHostToolCall !== undefined
+        && liveHostToolCall.authority.profileId === input.authority.profileId
+        && liveHostToolCall.authority.processGeneration === input.authority.processGeneration
+        && liveHostToolCall.callId === input.callId
+        && liveHostToolCall.connectionId === input.connectionId
+        && liveHostToolCall.requestDigest === input.requestDigest
+        && liveHostToolCall.threadId === input.threadId
+        && liveHostToolCall.turnId === input.turnId,
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
     const manager = createRuntimeManager({
@@ -1439,11 +1461,18 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       observer: {
         account: () => undefined,
-        conversationAutomation: (_authority, call) => {
+        hraHostTool: async (_authority, call) => {
           handled.push(call);
-          return { scope: "conversation", task: { id: "stask_exact" } };
+          liveHostToolCall = call;
+          markHostToolEntered();
+          try {
+            await hostToolGate;
+            return { scope: "conversation", task: { id: "stask_exact" } };
+          } finally {
+            liveHostToolCall = undefined;
+          }
         },
-        conversationAutomationResponseWritten: (_authority, call) => {
+        hraHostToolResponseWritten: (_authority, call) => {
           responseWritten.push(call);
         },
         fact: () => undefined,
@@ -1452,11 +1481,11 @@ describe("PinnedCodexRuntimeManager", () => {
 
     await manager.readAccount({ authority, signal: new AbortController().signal });
     if (launched === undefined) throw new Error("Missing launch fixture.");
-    if (launched.onConversationAutomationToolCall === undefined) {
-      throw new Error("Missing conversation automation fixture.");
+    if (launched.onHraHostToolCall === undefined) {
+      throw new Error("Missing HRA host-tool fixture.");
     }
-    if (launched.onConversationAutomationToolResponseWritten === undefined) {
-      throw new Error("Missing conversation automation post-response fixture.");
+    if (launched.onHraHostToolResponseWritten === undefined) {
+      throw new Error("Missing HRA host-tool post-response fixture.");
     }
     const connectionId = fake.connectionId;
     expect(connectionId).toBe(exactConnectionId);
@@ -1476,25 +1505,63 @@ describe("PinnedCodexRuntimeManager", () => {
       },
     } as const satisfies ConversationAutomationToolCall;
 
-    await expect(launched.onConversationAutomationToolCall(call)).resolves.toEqual({
+    const hostCall = {
+      ...call,
+      tool: "automation_update",
+      input: call.operation,
+    } as const;
+    const liveAuthority = {
+      authority,
+      providerThreadId: hostCall.threadId,
+      connectionId: hostCall.connectionId,
+      turnId: hostCall.turnId,
+      callId: hostCall.callId,
+      requestDigest: hostCall.requestDigest,
+    };
+    expect(manager.hasLiveHostToolCall(liveAuthority)).toBe(false);
+    const pending = Promise.resolve(launched.onHraHostToolCall(hostCall));
+    void pending.catch(() => undefined);
+    await hostToolEntered;
+    try {
+      expect(manager.hasLiveHostToolCall(liveAuthority)).toBe(true);
+      expect(manager.hasLiveHostToolCall({
+        ...liveAuthority,
+        connectionId: "70000000-0000-4000-8000-999999999999",
+      })).toBe(false);
+      expect(manager.hasLiveHostToolCall({
+        ...liveAuthority,
+        requestDigest: "b".repeat(64),
+      })).toBe(false);
+    } finally {
+      releaseHostTool();
+    }
+    await expect(pending).resolves.toEqual({
       scope: "conversation",
       task: { id: "stask_exact" },
     });
-    expect(handled).toEqual([call]);
+    expect(manager.hasLiveHostToolCall(liveAuthority)).toBe(false);
+    expect(handled).toEqual([hostCall]);
     expect(responseWritten).toEqual([]);
-    await launched.onConversationAutomationToolResponseWritten(call);
-    expect(responseWritten).toEqual([call]);
+    await launched.onHraHostToolResponseWritten(hostCall);
+    expect(responseWritten).toEqual([hostCall]);
 
     const staleConnectionCall = {
       ...call,
       connectionId: "70000000-0000-4000-8000-999999999999",
     };
-    await expect(launched.onConversationAutomationToolCall(staleConnectionCall))
+    const staleHostCall = {
+      ...staleConnectionCall,
+      tool: "automation_update",
+      input: staleConnectionCall.operation,
+    } as const;
+    await expect(launched.onHraHostToolCall(staleHostCall))
       .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
-    await launched.onConversationAutomationToolResponseWritten(staleConnectionCall);
-    expect(handled).toEqual([call]);
-    expect(responseWritten).toEqual([call]);
-    await manager.close();
+    await launched.onHraHostToolResponseWritten(staleHostCall);
+    expect(handled).toEqual([hostCall]);
+    expect(responseWritten).toEqual([hostCall]);
+    const close = manager.close();
+    expect(manager.hasLiveHostToolCall(liveAuthority)).toBe(false);
+    await close;
   });
 
   test("an already canceled login never launches a Codex controller", async () => {
@@ -2098,6 +2165,7 @@ describe("PinnedCodexRuntimeManager", () => {
     const discoverySignals: Array<AbortSignal | undefined> = [];
     let ephemeral = false;
     let resumeCalls = 0;
+    const resumeDeveloperInstructions: string[] = [];
     let readCalls = 0;
     let turnListCalls = 0;
     let startTurnFailure: Error | undefined;
@@ -2180,8 +2248,9 @@ describe("PinnedCodexRuntimeManager", () => {
           },
         };
       },
-      resumeThread: async (threadId: string) => {
+      resumeThread: async (threadId: string, developerInstructions: string) => {
         resumeCalls += 1;
+        resumeDeveloperInstructions.push(developerInstructions);
         return { authority: providerAuthority, value: makeThread([], threadId) };
       },
       readThread: async (threadId: string, includeTurns: boolean) => {
@@ -2335,6 +2404,9 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(events[2]).toContain('"review":"auto_review"');
     expect(events[2]).toContain('"permissionProfile":":workspace"');
     expect(events[2]).toContain('"writableRoots":["/workspace/project"]');
+    expect(JSON.parse(events[2]!.slice("thread:".length))).toMatchObject({
+      developerInstructions: HRA_SESSION_PREAMBLE_TEXT,
+    });
     expect(events[13]).toContain('"review":"auto_review"');
     expect(started.effectiveRuntimeProfile).toMatchObject({ observedAt: 100, enabledApps: [{ id: "app-1", pluginDisplayNames: ["Plugin 1"] }] });
     expect(turned.effectiveRuntimeProfile).toMatchObject({ observedAt: 107, enabledApps: [{ id: "app-2", pluginDisplayNames: ["Plugin 2"] }] });
@@ -2349,6 +2421,7 @@ describe("PinnedCodexRuntimeManager", () => {
     });
     await expect(manager.observeSession({
       authority,
+      developerInstructions: HRA_SESSION_PREAMBLE_TEXT,
       providerThreadId: "thread-1",
       signal: new AbortController().signal,
     })).resolves.toMatchObject({ resumed: true });
@@ -2367,6 +2440,7 @@ describe("PinnedCodexRuntimeManager", () => {
     });
     await expect(manager.observeSession({
       authority,
+      developerInstructions: HRA_SESSION_PREAMBLE_TEXT,
       providerThreadId: "thread-1",
       signal: new AbortController().signal,
     })).resolves.toMatchObject({ resumed: true });
@@ -2375,12 +2449,17 @@ describe("PinnedCodexRuntimeManager", () => {
       resumeCalls: 2,
       turnListCalls: 3,
     });
+    expect(resumeDeveloperInstructions).toEqual([
+      HRA_SESSION_PREAMBLE_TEXT,
+      HRA_SESSION_PREAMBLE_TEXT,
+    ]);
     sandboxWritableRoots = [];
     const legacySandboxReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", requirement: presetRequirements.high, fast: true, signal: new AbortController().signal });
     emitDeletionDuringContextualDiscovery = true;
     await expect(manager.startSession({ authority, projectRoot: "/workspace/project", review: legacySandboxReview, signal: new AbortController().signal })).resolves.toMatchObject({ providerThreadId: "thread-1" });
     await expect(manager.observeSession({
       authority,
+      developerInstructions: HRA_SESSION_PREAMBLE_TEXT,
       providerThreadId: "thread-1",
       signal: new AbortController().signal,
     })).resolves.toMatchObject({ resumed: true });
@@ -2389,6 +2468,11 @@ describe("PinnedCodexRuntimeManager", () => {
       resumeCalls: 3,
       turnListCalls: 3,
     });
+    expect(resumeDeveloperInstructions).toEqual([
+      HRA_SESSION_PREAMBLE_TEXT,
+      HRA_SESSION_PREAMBLE_TEXT,
+      HRA_SESSION_PREAMBLE_TEXT,
+    ]);
     sandboxWritableRoots = ["/"];
     const broadRootReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", requirement: presetRequirements.high, fast: true, signal: new AbortController().signal });
     await expect(manager.startSession({ authority, projectRoot: "/workspace/project", review: broadRootReview, signal: new AbortController().signal })).rejects.toBeInstanceOf(IndeterminateCodexEffectError);
@@ -3611,8 +3695,8 @@ describe("PinnedCodexRuntimeManager", () => {
     };
     let onAccountAuthoritySignal: LaunchPinnedCodexOptions["onAccountAuthoritySignal"];
     let onFact: LaunchPinnedCodexOptions["onFact"];
-    let onConversationAutomationToolCall:
-      | LaunchPinnedCodexOptions["onConversationAutomationToolCall"]
+    let onHraHostToolCall:
+      | LaunchPinnedCodexOptions["onHraHostToolCall"]
       | undefined;
     let releaseRead!: () => void;
     let markReadStarted!: () => void;
@@ -3685,7 +3769,7 @@ describe("PinnedCodexRuntimeManager", () => {
           markObserverStarted();
           await observerGate;
         },
-        conversationAutomation: () => {
+        hraHostTool: () => {
           steps.push("dynamic:call");
           return { scope: "conversation", task: { id: "stask_barrier" } };
         },
@@ -3696,7 +3780,7 @@ describe("PinnedCodexRuntimeManager", () => {
       launchClient: async (options) => {
         onAccountAuthoritySignal = options.onAccountAuthoritySignal;
         onFact = options.onFact;
-        onConversationAutomationToolCall = options.onConversationAutomationToolCall;
+        onHraHostToolCall = options.onHraHostToolCall;
         return fake;
       },
     });
@@ -3731,7 +3815,7 @@ describe("PinnedCodexRuntimeManager", () => {
     if (
       onAccountAuthoritySignal === undefined
       || onFact === undefined
-      || onConversationAutomationToolCall === undefined
+      || onHraHostToolCall === undefined
     ) throw new Error("Missing account-barrier launch callbacks.");
 
     void onAccountAuthoritySignal(providerAuthority);
@@ -3767,7 +3851,11 @@ describe("PinnedCodexRuntimeManager", () => {
       kind: "command_approval",
       signal: new AbortController().signal,
     });
-    const dynamic = onConversationAutomationToolCall(call);
+    const dynamic = onHraHostToolCall({
+      ...call,
+      input: call.operation,
+      tool: "automation_update",
+    });
 
     await readStarted;
     expect(steps).toEqual(["account:read"]);

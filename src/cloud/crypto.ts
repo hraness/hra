@@ -106,9 +106,9 @@ export const gcmMessageBudgetPerKey = 2 ** 31;
 // encrypts this many messages, and each process start spends at most two
 // intervals of the budget by resuming from the mark.
 export const gcmMessageBudgetCheckpointInterval = 2 ** 14;
-// One process holds a handful of account keys; tests and long-lived daemons
-// stay far below this bound, and reaching it fails closed instead of evicting
-// a count.
+// One process may hold account and canonical-memory space keys; tests and
+// long-lived daemons stay far below this bound, and reaching it fails closed
+// instead of evicting a count.
 export const maximumTrackedGcmKeys = 65_536;
 const gcmFingerprintPattern = /^[0-9a-f]{32}$/u;
 
@@ -124,13 +124,15 @@ function requireGcmMessageBudgetKey(key: GcmMessageBudgetKey): string {
     || key.keyVersion < 1
     || !gcmFingerprintPattern.test(key.fingerprint)
   ) throw new Error("Invalid GCM message budget key.");
-  return `${key.keyVersion}:${key.fingerprint}`;
+  // AES-GCM safety is a property of the raw cryptographic key. A logical
+  // version relabel must never create a fresh nonce/message budget.
+  return key.fingerprint;
 }
 
-// Counts messages encrypted per (account key, key version) in this process.
-// Counts only rise; `restore` seeds a key the process has not counted yet
-// from its persisted high-water mark, and the map is bounded so an unexpected
-// key set fails closed instead of growing.
+// Counts messages encrypted per raw AES key in this process. Counts only rise;
+// `restore` seeds a key the process has not counted yet from its persisted
+// high-water mark, and the map is bounded so an unexpected key set fails
+// closed instead of growing. The logical key version remains diagnostic only.
 export class GcmMessageBudget {
   readonly #messages = new Map<string, number>();
 
@@ -177,7 +179,7 @@ export async function gcmMessageBudgetKey(
   if (!Number.isSafeInteger(keyVersion) || keyVersion < 1) {
     throw new Error("Invalid account data key.");
   }
-  const digest = await hmacSha256Hex(accountKey, "gcm-message-budget", String(keyVersion));
+  const digest = await hmacSha256Hex(accountKey, "gcm-message-budget", "raw-key");
   return { fingerprint: digest.slice(0, 32), keyVersion };
 }
 

@@ -17,6 +17,7 @@ import {
   SessionTaskStore,
   SessionTaskStoreError,
   assertSessionTaskSchema,
+  type SessionTaskExecutionAuthority,
   type SessionTaskStoreErrorCode,
 } from "./session-task-store";
 
@@ -49,9 +50,9 @@ CREATE TABLE sessions (
   id TEXT PRIMARY KEY,
   profile_id TEXT NOT NULL REFERENCES profiles(id),
   project_id TEXT REFERENCES projects(id),
-  provider_thread_id TEXT,
   provider TEXT NOT NULL DEFAULT 'codex',
   provider_v39 TEXT NOT NULL DEFAULT 'codex',
+  provider_thread_id TEXT,
   state TEXT NOT NULL
 ) STRICT;
 CREATE TABLE session_account_authorities (
@@ -132,6 +133,7 @@ type Fixture = Readonly<{
 }>;
 
 function fixture(input: Readonly<{
+  isExecutionAuthorityLive?: (authority: SessionTaskExecutionAuthority) => boolean;
   resolveProjectDirectory?: (root: string) => Promise<string | null>;
 }> = {}): Fixture {
   const database = new Database(":memory:", { strict: true });
@@ -158,6 +160,9 @@ function fixture(input: Readonly<{
   const now = { value: 1_000 };
   const store = new SessionTaskStore(database, {
     now: () => now.value,
+    ...(input.isExecutionAuthorityLive === undefined
+      ? {}
+      : { isExecutionAuthorityLive: input.isExecutionAuthorityLive }),
     resolveProjectDirectory: input.resolveProjectDirectory ?? (async (root) => root),
   });
   return { accountId, database, now, otherSessionId, sessionId, store };
@@ -754,7 +759,9 @@ describe("SessionTaskStore due materialization", () => {
   });
 
   test("materializes an adopted personal Claude task while its profile is signed out", async () => {
-    const value = fixture();
+    const value = fixture({
+      isExecutionAuthorityLive: (authority) => authority.provider === "claude",
+    });
     adoptPersonalClaudeSession(value);
     const created = createTask(value, {
       name: "Personal Claude follow-up",
@@ -1162,6 +1169,78 @@ describe("SessionTaskStore due materialization", () => {
     expect(await unusable.store.materializeDue({
       now: unusableTask.nextDueAt ?? dueAt,
     })).toEqual([]);
+  });
+
+  test("uses provider-specific readiness for signed-out Codex and adopted Claude sessions", async () => {
+    const codex = fixture();
+    const codexTask = createTask(codex);
+    codex.database.query("UPDATE profiles SET state='signed_out'").run();
+    expect(codex.store.nextDueAt()).toBeNull();
+    expect(await codex.store.materializeDue({ now: codexTask.nextDueAt ?? 0 })).toEqual([]);
+
+    const claude = fixture({ isExecutionAuthorityLive: () => true });
+    const claudeTask = createTask(claude);
+    adoptPersonalClaudeSession(claude);
+    expect(claude.store.nextDueAt()).toBe(claudeTask.nextDueAt);
+    await expect(claude.store.materializeDue({
+      now: claudeTask.nextDueAt ?? 0,
+    })).resolves.toMatchObject([{
+      task: { id: claudeTask.id },
+      queue: { sessionId: claude.sessionId },
+    }]);
+
+    const loginPending = fixture({ isExecutionAuthorityLive: () => true });
+    const loginPendingTask = createTask(loginPending);
+    adoptPersonalClaudeSession(loginPending);
+    loginPending.database.query("UPDATE profiles SET state='login_pending'").run();
+    expect(loginPending.store.nextDueAt()).toBeNull();
+    expect(await loginPending.store.materializeDue({
+      now: loginPendingTask.nextDueAt ?? 0,
+    })).toEqual([]);
+  });
+
+  test("does not commit a due Claude occurrence without this daemon's exact live binding", async () => {
+    const unproven = fixture();
+    const unprovenTask = createTask(unproven);
+    unproven.database.query("UPDATE sessions SET provider_v39='claude'").run();
+    expect(await unproven.store.materializeDue({
+      now: unprovenTask.nextDueAt ?? 0,
+    })).toEqual([]);
+    expect(unproven.store.listOccurrences(unproven.sessionId, unprovenTask.id)).toEqual([]);
+
+    let authorityState: "error" | "closed" | "live" = "error";
+    const seen: SessionTaskExecutionAuthority[] = [];
+    const value = fixture({
+      isExecutionAuthorityLive: (authority) => {
+        seen.push(authority);
+        if (authorityState === "error") throw new Error("authority proof unavailable");
+        return authority.provider !== "claude" || authorityState === "live";
+      },
+    });
+    const created = createTask(value);
+    adoptPersonalClaudeSession(value);
+    const dueAt = created.nextDueAt ?? 0;
+
+    await expect(value.store.materializeDue({ now: dueAt }))
+      .rejects.toThrow("authority proof unavailable");
+    authorityState = "closed";
+    expect(await value.store.materializeDue({ now: dueAt })).toEqual([]);
+    expect(value.store.listOccurrences(value.sessionId, created.id)).toEqual([]);
+    expect(value.store.require(value.sessionId, created.id).nextDueAt).toBe(dueAt);
+    expect(value.database.query("SELECT COUNT(*) AS count FROM queue_entries").get())
+      .toEqual({ count: 0 });
+    expect(seen.at(-1)).toMatchObject({
+      processGeneration: 1,
+      provider: "claude",
+      providerThreadId: `thread-${value.sessionId}`,
+      sessionId: value.sessionId,
+    });
+
+    authorityState = "live";
+    await expect(value.store.materializeDue({ now: dueAt })).resolves.toMatchObject([{
+      occurrence: { taskId: created.id },
+      queue: { sessionId: value.sessionId },
+    }]);
   });
 
   test("rolls back queue allocation, occurrence, and due advance as one unit", async () => {

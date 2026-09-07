@@ -49,6 +49,7 @@ import {
   type DeviceCommandPayload,
   type DeviceRegistryAccount,
   type DeviceRegistryPayload,
+  type MemorySummaryPayload,
   type DeviceRegistryScheduledTask,
   type RemoteCommandPayload,
 } from "./payloads";
@@ -127,6 +128,7 @@ import {
   type CompactRemoteInteractionPolicy,
   type CompactAttachment,
   type CompactMessageActor,
+  type CompactMessageActorKind,
   type CompactSessionEvent,
   type GitAction,
   type ModelPreset,
@@ -181,6 +183,7 @@ type LocalExecuteRemote = (
 type CompactSessionEventBody =
   | Readonly<{
       actor?: CompactMessageActor;
+      actorKind?: CompactMessageActorKind;
       attachments?: readonly CompactAttachment[];
       kind: "user_message" | "assistant_message";
       text: string;
@@ -1060,6 +1063,9 @@ function compactSessionEventBody(event: CompactSessionEvent): CompactSessionEven
     return {
       ...(event.kind === "user_message" && event.actor !== undefined
         ? { actor: event.actor }
+        : {}),
+      ...(event.kind === "user_message" && event.actorKind !== undefined
+        ? { actorKind: event.actorKind }
         : {}),
       ...(event.kind === "user_message" && event.attachments !== undefined
         ? { attachments: event.attachments }
@@ -2377,11 +2383,16 @@ function completedProjectionTurns(
     const text = scheduledTaskSource
       ? scheduledTaskPromptProjectionMarker
       : boundedText(message.text, 64_000);
-    // A user message HRA authored on the human's behalf is labelled so the web
-    // grid can tell an autoresponse from something the human actually typed.
-    const autorespondAuthored = message.role === "user"
-      && message.clientId !== undefined
-      && store.isAutorespondMessageSource(session.id, message.clientId);
+    // Resolve authorship from the one storage-owned source classifier. The
+    // legacy actor stays `autorespond` for every non-owner host message so the
+    // released v0.5 reader accepts it. New readers refine the label through an
+    // additive actorKind key that old readers ignore.
+    const messageActor = message.role === "user" && message.clientId !== undefined
+      ? store.sessionMessageActorForSource(session.id, message.clientId)
+      : null;
+    const actorKind = messageActor === "automation" || messageActor === "peer_session" || messageActor === "provider_switch"
+      ? messageActor
+      : null;
     // The manifest is local custody, keyed by the client message id the turn
     // was dispatched under. It names each file and its size; the bytes never
     // leave this machine.
@@ -2389,7 +2400,8 @@ function completedProjectionTurns(
       ? store.messageAttachmentManifest(session.id, message.clientId)
       : [];
     messages.push({
-      ...(autorespondAuthored ? { actor: "autorespond" as const } : {}),
+      ...(messageActor === null || messageActor === "human" ? {} : { actor: "autorespond" }),
+      ...(actorKind === null ? {} : { actorKind }),
       ...(manifest.length === 0 ? {} : { attachments: manifest }),
       kind: message.role === "user" ? "user_message" : "assistant_message",
       text,
@@ -2560,6 +2572,11 @@ export type StateBackedCloudDaemonAdapterOptions = Readonly<{
   liveThinking?: boolean;
   /** Display name for this machine in the device registry (default: the host name). */
   machineLabel?: string;
+  /** Optional at construction because memory is composed after cloud. */
+  memorySummarySource?: (input: Readonly<{
+    devicePublicId: string;
+    signal: AbortSignal;
+  }>) => Promise<MemorySummaryPayload>;
   now?: () => number;
   platform?: NodeJS.Platform;
   paths: StatePaths;
@@ -2640,6 +2657,12 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   readonly #liveThinking: boolean;
   readonly #gatewayKeyCustody: CloudGatewayKeyCustody;
   readonly #machineLabel: string;
+  readMemorySummary?: (
+    input: Readonly<{
+      devicePublicId: string;
+      signal: AbortSignal;
+    }>,
+  ) => Promise<MemorySummaryPayload>;
   readonly #registryNow: () => number;
   readonly #platform: NodeJS.Platform;
 
@@ -2648,6 +2671,15 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     this.#platform = options.platform ?? process.platform;
     this.#registryNow = options.now ?? Date.now;
     this.#machineLabel = registryLabel(options.machineLabel ?? hostname(), "This machine");
+    if (options.memorySummarySource !== undefined) {
+      this.readMemorySummary = async (input) => {
+        if (input.signal.aborted) throw input.signal.reason;
+        const summary = await options.memorySummarySource?.(input);
+        if (summary === undefined) throw new Error("Memory summary source is unavailable.");
+        throwIfAborted(input.signal);
+        return summary;
+      };
+    }
     // Without an injected custody the adapter reports no key and refuses to
     // store one: the CLI hands in the daemon's generational secret custody so
     // the key the hosted command stores is the key the responder reads.
@@ -3624,6 +3656,28 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     input: Readonly<{ signal: AbortSignal }>,
   ): Promise<CloudDeviceRegistryProjection> {
     return await this.#buildDeviceRegistryProjection(input);
+  }
+
+  /**
+   * The CLI composes cloud before the Oh coordinator. Bind exactly once after
+   * both exist; the bridge does not start cycling until daemon composition is
+   * complete, so no partially initialized summary can be published.
+   */
+  bindMemorySummarySource(
+    source: (input: Readonly<{
+      devicePublicId: string;
+      signal: AbortSignal;
+    }>) => Promise<MemorySummaryPayload>,
+  ): void {
+    if (this.readMemorySummary !== undefined) {
+      throw new Error("Memory summary source is already bound.");
+    }
+    this.readMemorySummary = async (input) => {
+      if (input.signal.aborted) throw input.signal.reason;
+      const summary = await source(input);
+      throwIfAborted(input.signal);
+      return summary;
+    };
   }
 
   async readAttentionNotificationSnapshot(input: Readonly<{

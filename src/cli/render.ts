@@ -7,6 +7,7 @@ import {
   notificationEmailCommandResultSchema,
   notificationHoursCommandResultSchema,
   publicSessionListItemSchema,
+  publicPeerSessionPolicySchema,
   publicSessionListPageSchema,
   signedOutSessionListMetadataSchema,
   type LocalCommand,
@@ -485,7 +486,13 @@ const renderSingleEvent = (event: SessionEvent): string => {
       ...(body.depth === undefined ? [] : [`  depth ${String(body.depth)}`]),
     ].join("\n");
     case "user_message": return [
-      body.actor === "human" ? "You" : body.actor === "autorespond" ? "Autorespond" : "Handoff",
+      body.actor === "human"
+        ? "You"
+        : body.actor === "autorespond"
+          ? "Autorespond"
+          : body.actor === "peer_session"
+            ? "Peer session"
+            : "Handoff",
       indented(body.text),
       ...(body.omittedCharacters === 0
         ? []
@@ -834,6 +841,10 @@ const projectPublicRuntimeProfile = (
   value: unknown,
 ): z.infer<typeof publicReviewedRuntimeProfileSchema> | null | undefined => {
   if (value === null) return null;
+  // Service responses already omit private runtime custody. Accept that exact
+  // public contract without requiring callers to restore the omitted fields.
+  const publicProfile = publicReviewedRuntimeProfileSchema.safeParse(value);
+  if (publicProfile.success) return publicProfile.data;
   const reviewed = reviewedRuntimeProfileSchema.safeParse(value);
   if (!reviewed.success) return undefined;
   const projected = publicReviewedRuntimeProfileSchema.safeParse(
@@ -1331,6 +1342,25 @@ const assertCommandSuccessData = (command: LocalCommand, data: unknown): void =>
     ) invalidCommandResponse(command);
     return;
   }
+  if (
+    command.kind === "session.peer-policy.get"
+    || command.kind === "session.peer-policy.set"
+  ) {
+    const parsed = publicPeerSessionPolicySchema.safeParse(data);
+    const exactSession = sessionIdSchema.safeParse(command.session);
+    if (
+      !parsed.success
+      || (exactSession.success && parsed.data.sessionId !== exactSession.data)
+      || (
+        command.kind === "session.peer-policy.set"
+        && (
+          parsed.data.mode !== command.mode
+          || parsed.data.revision !== command.expectedRevision + 1
+        )
+      )
+    ) invalidCommandResponse(command);
+    return;
+  }
   if (command.kind === "session.events") {
     const page = sessionEventPage(data);
     const exactSession = sessionIdSchema.safeParse(command.session);
@@ -1422,6 +1452,10 @@ const publicInteractionData = (command: LocalCommand, data: unknown): unknown =>
     || command.kind === "session.task.edit"
   ) return sessionTaskRecordSchema.parse(data);
   if (command.kind === "session.task.delete") return sessionTaskDeleteResultSchema.parse(data);
+  if (
+    command.kind === "session.peer-policy.get"
+    || command.kind === "session.peer-policy.set"
+  ) return publicPeerSessionPolicySchema.parse(data);
   if (command.kind === "device.list") {
     const parsed = parseCloudDeviceList(data);
     return parsed ?? { currentDevicePublicId: null, devices: [] };
@@ -1559,6 +1593,197 @@ const renderSessionTaskList = (data: unknown): string => {
     `Conversation tasks for ${line(listing.sessionId)}`,
     table(rows, ["name", "status", "every", "nextDue", "revision", "id"]),
   ].join("\n\n");
+};
+
+const renderMemoryHead = (label: string, value: unknown): string => {
+  const head = object(value);
+  if (head === null) return `${label}: none`;
+  return `${label}: sequence ${line(head.sequence)}, operation ${line(head.operationSha256)}, digest ${line(head.digest)}`;
+};
+
+const renderMemoryStatus = (data: unknown): string => {
+  const root = object(data);
+  const canonical = object(root?.canonical);
+  const working = object(root?.working);
+  const unsettled = object(root?.unsettledSubmission);
+  if (root === null || canonical === null || working === null) {
+    return "Memory status data is unavailable.";
+  }
+  const rows = [
+    `Session: ${line(root.sessionId)}`,
+    `Project: ${line(root.projectId)}`,
+    `Canonical: ${canonical.initialized === true ? line(canonical.syncState) : "not initialized"}${canonical.frozen === true ? " (frozen)" : ""}`,
+    `Canonical physical state: ${line(canonical.physicalState)}`,
+    `Canonical identity contract: ${line(canonical.identityContract)}`,
+    `Canonical authority: ${line(canonical.authorityDigest)}`,
+    `Canonical binding: ${line(canonical.bindingDigest)}`,
+    `Canonical revision: ${line(canonical.revision)}`,
+    `Canonical diagnostic: ${line(canonical.diagnosticCode)}`,
+    renderMemoryHead("Canonical expected head", canonical.expectedHead),
+    `Canonical last exchange: ${line(canonical.lastExchangeAt)}`,
+    renderMemoryHead("Canonical last exchange head", canonical.lastExchangeHead),
+    `Working: ${line(working.state)}${working.epoch === null || working.epoch === undefined ? "" : `, epoch ${line(working.epoch)}`}`,
+    `Working binding: ${line(working.bindingDigest)}`,
+    `Working owner matches session: ${line(working.ownerMatchesSession)}`,
+    renderMemoryHead("Working head", working.head),
+  ];
+  if (unsettled === null) {
+    rows.push("Unsettled submission: none");
+  } else {
+    rows.push(
+      `Unsettled submission: ${line(unsettled.id)} (${line(unsettled.kind)}, ${line(unsettled.state)})`,
+      renderMemoryHead("Submission expected head", unsettled.expectedHead),
+    );
+  }
+  return rows.join("\n");
+};
+
+const memoryRows = (value: unknown): readonly Record<string, unknown>[] =>
+  Array.isArray(value)
+    ? value.flatMap((entry) => {
+        const row = object(entry);
+        return row === null ? [] : [row];
+      })
+    : [];
+
+const renderMemoryQuery = (command: Extract<LocalCommand, { kind: "memory.query" }>, data: unknown): string => {
+  const root = object(data);
+  if (root === null) return "Memory query data is unavailable.";
+  const rows = memoryRows(root.rows);
+  const output = [
+    `Memory ${line(command.value.mode)}: ${String(rows.length)} row${rows.length === 1 ? "" : "s"}`,
+    `Scope: ${root.scope === "working" ? "working only" : "working + canonical"}`,
+    `Query: ${line(root.queryId)}`,
+  ];
+  if (command.value.mode === "get") {
+    if (rows.length === 0) output.push("No results.");
+    for (const row of rows) {
+      const provenance = object(row.provenance);
+      const chunkIndex = typeof row.chunkIndex === "number" && Number.isSafeInteger(row.chunkIndex)
+        ? row.chunkIndex + 1
+        : row.chunkIndex;
+      output.push(
+        "",
+        `[${line(row.lane)}] ${line(row.key)} — ${line(row.title)}`,
+        `Summary: ${line(row.summary)}`,
+        `Provenance: ${line(provenance?.verification)}; record ${line(row.recordSha256)}`,
+        `Body chunk ${line(chunkIndex)} of ${line(row.chunkCount)}:`,
+        indented(typeof row.bodyChunk === "string" ? row.bodyChunk : ""),
+      );
+    }
+  } else {
+    output.push(table(rows.map((row) => ({
+      row: row.row,
+      lane: row.lane,
+      key: row.key,
+      title: row.title,
+      summary: row.summary,
+      verification: object(row.provenance)?.verification,
+    })), ["row", "lane", "key", "title", "summary", "verification"]));
+  }
+  output.push(
+    `Continuation: ${line(root.continuation)}`,
+    root.scope === "working"
+      ? `Canonical: excluded${object(root.canonical)?.frozen === true ? " (frozen)" : ""}`
+      : renderMemoryHead("Canonical head", root.canonicalHead),
+    renderMemoryHead("Working head", root.workingHead),
+  );
+  return output.join("\n");
+};
+
+const renderMemoryMutation = (
+  command: Extract<LocalCommand, { kind: "memory.remember" | "memory.share" }>,
+  data: unknown,
+): string => {
+  const root = object(data);
+  const submission = object(root?.submission);
+  if (root === null || submission === null) return "Memory mutation data is unavailable.";
+  const noun = command.kind === "memory.remember" ? "Remember" : "Share";
+  const rows = [
+    `${noun}: ${root.ok === true ? "applied" : line(root.code)}${root.replay === true ? " (replay)" : ""}`,
+    `Submission: ${line(submission.id)} (${line(submission.state)})`,
+    `Idempotency key: ${line(command.idempotencyKey)}`,
+    `Idempotency retained until: ${line(root.idempotencyRetainedUntil)}`,
+  ];
+  if (command.kind === "memory.remember") {
+    const page = object(root.page);
+    rows.push(
+      `Page: ${line(page?.key)}, record ${line(page?.recordSha256)}`,
+      renderMemoryHead("Working head", root.workingHead),
+    );
+  } else {
+    const share = object(root.share);
+    const conflict = object(root.conflict);
+    if (share !== null) {
+      rows.push(
+        `Shared page: ${line(share.key)}, ${line(share.status)}, record ${line(share.recordSha256)}`,
+        renderMemoryHead("Canonical head", root.canonicalHead),
+      );
+    }
+    if (conflict !== null) {
+      rows.push(
+        `Conflict key: ${line(conflict.key)}`,
+        `Canonical record: ${line(conflict.canonicalRecordSha256)}`,
+        `Nominated record: ${line(conflict.nominatedRecordSha256)}`,
+        renderMemoryHead("Expected canonical head", conflict.expectedHead),
+        renderMemoryHead("Actual canonical head", conflict.actualHead),
+      );
+    }
+  }
+  if (root.receiptSha256 !== undefined) rows.push(`Receipt: ${line(root.receiptSha256)}`);
+  return rows.join("\n");
+};
+
+const renderHostedMemory = (
+  command: Extract<LocalCommand, { kind: `memory.hosted.${string}` }>,
+  data: unknown,
+): string => {
+  const root = object(data);
+  if (root === null) return "Hosted memory data is unavailable.";
+  if (command.kind === "memory.hosted.list") {
+    const spaces = memoryRows(root.spaces);
+    return [
+      `Hosted memory spaces: ${String(spaces.length)}`,
+      table(spaces, [
+        "hostedSpaceId",
+        "canonicalSpaceId",
+        "attachedProjectId",
+        "keyVersion",
+        "revision",
+      ]),
+    ].join("\n");
+  }
+  const attachment = object(root.attachment);
+  if (command.kind === "memory.hosted.create") {
+    return [
+      `Hosted memory created: ${line(root.hostedSpaceId)}`,
+      `Portable canonical space: ${line(root.canonicalSpaceId)}`,
+      `Project: ${line(root.projectId)}`,
+      `Attachment generation: ${line(attachment?.generation)}`,
+      `Idempotency key: ${line(command.idempotencyKey)}`,
+      `Replay: ${root.replay === true ? "yes" : "no"}`,
+    ].join("\n");
+  }
+  if (command.kind === "memory.hosted.attach") {
+    return [
+      `Hosted memory attached: ${line(attachment?.remoteSpaceId)}`,
+      `Project: ${line(attachment?.projectId ?? root.projectId)}`,
+      `Attachment generation: ${line(attachment?.generation)}`,
+    ].join("\n");
+  }
+  if (command.kind === "memory.hosted.detach") {
+    return [
+      `Hosted memory detached: ${line(attachment?.remoteSpaceId)}`,
+      `Project: ${line(attachment?.projectId ?? root.projectId)}`,
+      `Attachment generation: ${line(attachment?.generation)}`,
+    ].join("\n");
+  }
+  return [
+    `Hosted memory sync: ${line(root.state)}`,
+    `Project: ${line(root.projectId)}`,
+    `Operations: ${line(root.operations)}`,
+    `Complete: ${root.complete === true ? "yes" : "no"}`,
+  ].join("\n");
 };
 
 const renderSessionTask = (task: SessionTaskRecord): string => [
@@ -2822,6 +3047,19 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     output.writeStdout(`${renderAccountShow(data)}\n`);
   } else if (command.kind === "project.list" && Array.isArray(value.projects)) {
     output.writeStdout(`${table(value.projects as Record<string, unknown>[], ["label", "rootPath", "default", "id"])}\n`);
+  } else if (command.kind === "memory.status") {
+    output.writeStdout(`${renderMemoryStatus(data)}\n`);
+  } else if (command.kind.startsWith("memory.hosted.")) {
+    output.writeStdout(`${renderHostedMemory(
+      command as Extract<LocalCommand, { kind: `memory.hosted.${string}` }>,
+      data,
+    )}\n`);
+  } else if (command.kind === "memory.query") {
+    output.writeStdout(`${renderMemoryQuery(command, data)}\n`);
+  } else if (command.kind === "memory.explain") {
+    output.writeStdout(`Memory explanation for ${line(command.value.queryId)} row ${String(command.value.row)}:\n${safeJson(data, 2)}\n`);
+  } else if (command.kind === "memory.remember" || command.kind === "memory.share") {
+    output.writeStdout(`${renderMemoryMutation(command, data)}\n`);
   } else if (command.kind === "session.list" && Array.isArray(value.sessions)) {
     output.writeStdout(`${renderSessionList(command, publicData)}\n`);
   } else if (command.kind === "session.task.list") {
@@ -2846,6 +3084,17 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     output.writeStdout(report.state === null
       ? "State: not classified yet.\n"
       : `State: ${line(report.state)}${report.attention ? " (needs you)" : ""}\nReason: ${line(report.reason)}\nRevision: ${String(report.revision)}\n`);
+  } else if (
+    command.kind === "session.peer-policy.get"
+    || command.kind === "session.peer-policy.set"
+  ) {
+    const policy = publicPeerSessionPolicySchema.parse(publicData);
+    output.writeStdout([
+      `Peer policy: ${policy.mode}`,
+      `Session: ${policy.sessionId}`,
+      `Revision: ${String(policy.revision)}`,
+      `Updated: ${instant(policy.updatedAt)}`,
+    ].join("\n").concat("\n"));
   } else if (command.kind === "autorespond.status" || command.kind === "autorespond.set") {
     const report = value as {
       budgets?: { consecutive: number; lastDay: number; lastHour: number };

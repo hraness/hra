@@ -1,0 +1,42 @@
+Claude Code 2.1.260 host-tool capability capture
+Captured: 2026-09-04
+
+Wrapper package: @anthropic-ai/claude-code@2.1.260
+Wrapper tarball SHA-256: b429cb300fb9e1add440330019695fb6ec093684e4a83accd5bd23e2eaab67cc
+Native package: @anthropic-ai/claude-code-darwin-arm64@2.1.260
+Native tarball SHA-256: 49042e0a4b3b67304a9adfedca242329668f04cf5f37c3d5c30e5d652653a056
+Native executable SHA-256: 3c269f66801028823e24a63ced9fdd3988cb86cf85fccd9f03f87e463b9d3e3c
+
+Command: claude --version
+Output: 2.1.260 (Claude Code)
+
+Relevant lines captured from `claude --help`:
+
+  --append-system-prompt <prompt>       Append a system prompt to the default
+                                        system prompt
+  --mcp-config <configs...>             Load MCP servers from JSON files or
+                                        strings (space-separated)
+  --strict-mcp-config                   Only use MCP servers from --mcp-config,
+                                        ignoring all other MCP configurations
+  --system-prompt-snapshot <on|off>     Record the system prompt once per
+                                        conversation and reuse it verbatim on
+                                        every request and resume (recommended:
+                                        on). By default it is on for the
+                                        built-in prompt, and passing
+                                        --system-prompt or
+                                        --append-system-prompt turns it off so
+                                        the given text applies fresh each
+                                        launch. on: an existing record in the
+                                        conversation is sent as-is (a later
+                                        launch's different
+                                        --system-prompt/--append-system-prompt
+                                        is ignored until compaction); otherwise
+                                        the prompt is rendered with the append
+                                        included, sent, and recorded. off: never
+                                        record. No effect where system-prompt
+                                        recording is not yet enabled. (choices:
+                                        "on", "off")
+
+Only the capability-bearing lines required by HRA are retained here. The full
+help output was inspected from the exact native package before this fixture was
+written. Runtime tests own the reviewed argv and fail closed on version drift.

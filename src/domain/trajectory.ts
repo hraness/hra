@@ -171,9 +171,9 @@ const recordToTrajectory = (
   const timestamp = isoTimestamp(record.recordedAt);
   switch (record.kind) {
     case "user": {
-      // A handoff seed already opens with its own explicit header, so it is
-      // not labelled twice. Other actors cannot spoof that header to erase
-      // their durable provenance.
+      // A provider handoff seed already opens with its own explicit header, so
+      // it is not labelled twice. Other actors cannot spoof that header to
+      // erase their durable provenance.
       const prefix = record.actor === "human"
         ? record.text.startsWith(TRANSCRIPT_SEED_HEADER)
           ? "[hra human] "
@@ -182,9 +182,11 @@ const recordToTrajectory = (
           ? "[hra automation] "
           : record.actor === "autorespond"
             ? "[hra autorespond] "
-            : record.text.startsWith(TRANSCRIPT_SEED_HEADER)
-              ? ""
-              : "[hra provider handoff] ";
+            : record.actor === "peer_session"
+              ? "[hra peer session] "
+              : record.text.startsWith(TRANSCRIPT_SEED_HEADER)
+                ? ""
+                : "[hra provider handoff] ";
       return [{
         role: "user",
         content: `${prefix}${textWithOmission(record)}${trajectoryAttachmentSuffix(record)}`,

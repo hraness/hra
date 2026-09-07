@@ -73,6 +73,7 @@ import {
 import {
   cloudPayloadAad,
   decryptDeviceRegistry,
+  decryptMemorySummary,
   decryptDeviceCommandResult,
   decryptNotificationEmail,
   encryptDeviceCommand,
@@ -80,6 +81,7 @@ import {
   encryptRemoteCommand,
   type DeviceCommandPayload,
   type DeviceRegistryPayload,
+  type MemorySummaryPayload,
   type RemoteCommandPayload,
 } from "./payloads";
 import { encryptCompactEvents, type CompactSessionEvent } from "./projection";
@@ -2234,6 +2236,7 @@ function bridge(input: {
     : input.local;
   const upstreamTransport = input.transport ?? input.cloud.connect(input.device);
   let syntheticRegistryRevision = 0;
+  let syntheticRegistryKeyVersion: number | null = null;
   const transport: CloudTransport = needsSyntheticRegistrySource
     ? {
         action: (name, args) => upstreamTransport.action(name, args),
@@ -2244,6 +2247,9 @@ function bridge(input: {
           if (args.expectedRevision !== syntheticRegistryRevision) {
             throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
           }
+          if (typeof args.keyVersion !== "number" || !Number.isSafeInteger(args.keyVersion)
+            || args.keyVersion <= 0) throw new Error("INVALID_REGISTRY_KEY_VERSION");
+          syntheticRegistryKeyVersion = args.keyVersion;
           syntheticRegistryRevision += 1;
           return {
             devicePublicId: input.device,
@@ -2257,6 +2263,7 @@ function bridge(input: {
             ? null
             : {
                 devicePublicId: input.device,
+                keyVersion: syntheticRegistryKeyVersion,
                 revision: syntheticRegistryRevision,
                 updatedAt: input.cloud.now,
               };
@@ -6227,6 +6234,91 @@ describe("cloud daemon bridge", () => {
     expect(calls).toBeGreaterThanOrEqual(1);
     expect(closeCalls).toBe(1);
   });
+
+  test("does not confuse a polling failure with bridge quiescence failure", async () => {
+    const events: string[] = [];
+    const pollingFailure = new Error("polling cycle failed");
+    const lifecycle = new PollingCloudDaemonLifecycle({
+      bridge: {
+        async close() { events.push("bridge-close"); },
+        async cycle() {
+          events.push("cycle");
+          throw pollingFailure;
+        },
+        async pullRemoteSessions() { return []; },
+      },
+      intervalMs: 1_000,
+    });
+    lifecycle.start();
+    const joined = lifecycle.join();
+
+    await expect(joined).rejects.toBe(pollingFailure);
+    await expect(lifecycle.close()).resolves.toBeUndefined();
+    expect(events).toEqual(["cycle", "bridge-close"]);
+  });
+
+  test("reports bridge quiescence failure after a polling failure", async () => {
+    const pollingFailure = new Error("polling failed before shutdown");
+    const quiescenceFailure = new Error("bridge quiescence failed");
+    const lifecycle = new PollingCloudDaemonLifecycle({
+      bridge: {
+        async close() { throw quiescenceFailure; },
+        async cycle() { throw pollingFailure; },
+        async pullRemoteSessions() { return []; },
+      },
+      intervalMs: 1_000,
+    });
+    lifecycle.start();
+    const joined = lifecycle.join();
+
+    await expect(joined).rejects.toBe(pollingFailure);
+    await expect(lifecycle.close()).rejects.toBe(quiescenceFailure);
+  });
+
+  test("a polling failure cancels and joins the live projection loop", async () => {
+    const pollingFailure = new Error("polling cycle failed with live projection active");
+    let liveAborted = false;
+    let liveStartedResolve: (() => void) | undefined;
+    const liveStarted = new Promise<void>((resolve) => { liveStartedResolve = resolve; });
+    let bridgeCloseCalls = 0;
+    const lifecycle = new PollingCloudDaemonLifecycle({
+      bridge: {
+        async close() { bridgeCloseCalls += 1; },
+        async cycle() {
+          await liveStarted;
+          throw pollingFailure;
+        },
+        async liveTick(signal) {
+          liveStartedResolve?.();
+          await new Promise<void>((resolve) => {
+            const finish = (): void => {
+              liveAborted = true;
+              resolve();
+            };
+            if (signal.aborted) finish();
+            else signal.addEventListener("abort", finish, { once: true });
+          });
+          return { errors: [], sessionsUploaded: 0 };
+        },
+        async pullRemoteSessions() { return []; },
+      },
+      intervalMs: 1_000,
+    });
+    lifecycle.start();
+    const joined = lifecycle.join().then(
+      () => "resolved" as const,
+      (error: unknown) => error === pollingFailure ? "poll-failed" as const : "wrong-error" as const,
+    );
+    const firstOutcome = await Promise.race([
+      joined,
+      Bun.sleep(100).then(() => "timed-out" as const),
+    ]);
+    await expect(lifecycle.close()).resolves.toBeUndefined();
+
+    expect(firstOutcome).toBe("poll-failed");
+    expect(liveAborted).toBe(true);
+    expect(bridgeCloseCalls).toBe(1);
+  });
 });
 
 type ManualPushWake = Readonly<{
@@ -6549,6 +6641,8 @@ describe("device registry publication", () => {
       endMinute: number; revision: number; startMinute: number; timeZone: string; version: 1;
     }>>,
     readDeviceRegistryProjection?: () => Promise<CloudDeviceRegistryProjection>,
+    readMemorySummary?: NonNullable<CloudDaemonLocalSourcePort["readMemorySummary"]>,
+    sessionPublicId?: string,
   ) {
     const cloud = new FakeCloud();
     const device = "device_registry_1";
@@ -6557,44 +6651,86 @@ describe("device registry publication", () => {
       commandRequestVersion?: 2;
       envelope: EncryptedEnvelope;
       keyVersion: number;
+      memorySummaryEnvelope?: EncryptedEnvelope;
+      memorySummaryRevision?: number;
+      memorySummaryUpdatedAt?: number;
       notificationEmailEnvelope?: EncryptedEnvelope;
       notificationHoursEnvelope?: EncryptedEnvelope;
       notificationPolicyRevision?: number;
       revision: number;
     }>>();
     const writes: Array<Readonly<{ expectedRevision: number }>> = [];
-    const local: CloudDaemonLocalSourcePort = Object.assign(new EmptyLocal(), {
+    const summaryWrites: Array<Readonly<{ expectedRevision: number }>> = [];
+    const timeline: string[] = [];
+    let rejectMemorySummary = false;
+    const local: CloudDaemonLocalSourcePort = Object.assign(new EmptyLocal(sessionPublicId), {
       readDeviceRegistry,
       ...(readNotificationHours === undefined ? {} : { readNotificationHours }),
       ...(readDeviceRegistryProjection === undefined ? {} : { readDeviceRegistryProjection }),
+      ...(readMemorySummary === undefined ? {} : { readMemorySummary }),
     });
     const transport: CloudTransport = {
       action: (name, args) => inner.action(name, args),
       mutation: async (name, args) => {
-        if (name !== "devices:updateRegistry") return await inner.mutation(name, args);
-        const expectedRevision = args.expectedRevision as number;
-        writes.push({ expectedRevision });
-        const current = rows.get(device);
-        if ((current?.revision ?? 0) !== expectedRevision) {
-          throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
+        if (name === "devices:updateMemorySummary") {
+          const expectedRevision = args.expectedRevision as number;
+          summaryWrites.push({ expectedRevision });
+          if (rejectMemorySummary) throw new Error("QUOTA_EXCEEDED");
+          const current = rows.get(device);
+          if (current === undefined) throw new Error("DEVICE_REGISTRY_UNAVAILABLE");
+          if ((current.memorySummaryRevision ?? 0) !== expectedRevision) {
+            throw new Error("MEMORY_SUMMARY_REVISION_CONFLICT");
+          }
+          const withoutSummary = { ...current };
+          delete withoutSummary.memorySummaryEnvelope;
+          const revision = expectedRevision + 1;
+          rows.set(device, {
+            ...withoutSummary,
+            ...(args.envelope === undefined
+              ? {}
+              : { memorySummaryEnvelope: args.envelope as EncryptedEnvelope }),
+            memorySummaryRevision: revision,
+            memorySummaryUpdatedAt: cloud.now,
+          });
+          timeline.push("memory-summary-published");
+          return { devicePublicId: device, revision, updatedAt: cloud.now };
         }
-        const revision = expectedRevision + 1;
-        rows.set(device, {
-          ...(args.commandRequestVersion === 2 ? { commandRequestVersion: 2 as const } : {}),
-          envelope: args.envelope as unknown as EncryptedEnvelope,
-          keyVersion: args.keyVersion as number,
-          ...(args.notificationEmailEnvelope === undefined
-            ? {}
-            : { notificationEmailEnvelope: args.notificationEmailEnvelope as EncryptedEnvelope }),
-          ...(args.notificationHoursEnvelope === undefined
-            ? {}
-            : { notificationHoursEnvelope: args.notificationHoursEnvelope as EncryptedEnvelope }),
-          ...(args.notificationPolicyRevision === undefined
-            ? {}
-            : { notificationPolicyRevision: args.notificationPolicyRevision as number }),
-          revision,
-        });
-        return { devicePublicId: device, revision, updatedAt: cloud.now };
+        if (name === "devices:updateRegistry") {
+          const expectedRevision = args.expectedRevision as number;
+          writes.push({ expectedRevision });
+          const current = rows.get(device);
+          if ((current?.revision ?? 0) !== expectedRevision) {
+            throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
+          }
+          const revision = expectedRevision + 1;
+          rows.set(device, {
+            ...(args.commandRequestVersion === 2 ? { commandRequestVersion: 2 as const } : {}),
+            ...(current?.memorySummaryEnvelope === undefined
+              ? {}
+              : { memorySummaryEnvelope: current.memorySummaryEnvelope }),
+            ...(current?.memorySummaryRevision === undefined
+              ? {}
+              : { memorySummaryRevision: current.memorySummaryRevision }),
+            ...(current?.memorySummaryUpdatedAt === undefined
+              ? {}
+              : { memorySummaryUpdatedAt: current.memorySummaryUpdatedAt }),
+            envelope: args.envelope as unknown as EncryptedEnvelope,
+            keyVersion: args.keyVersion as number,
+            ...(args.notificationEmailEnvelope === undefined
+              ? {}
+              : { notificationEmailEnvelope: args.notificationEmailEnvelope as EncryptedEnvelope }),
+            ...(args.notificationHoursEnvelope === undefined
+              ? {}
+              : { notificationHoursEnvelope: args.notificationHoursEnvelope as EncryptedEnvelope }),
+            ...(args.notificationPolicyRevision === undefined
+              ? {}
+              : { notificationPolicyRevision: args.notificationPolicyRevision as number }),
+            revision,
+          });
+          timeline.push("registry-published");
+          return { devicePublicId: device, revision, updatedAt: cloud.now };
+        }
+        return await inner.mutation(name, args);
       },
       query: async (name, args) => {
         if (name !== "devices:getRegistry") return await inner.query(name, args);
@@ -6602,7 +6738,17 @@ describe("device registry publication", () => {
         return row === undefined ? null : { devicePublicId: device, ...row, updatedAt: cloud.now };
       },
     };
-    return { cloud, device, local, rows, transport, writes };
+    return {
+      cloud,
+      device,
+      local,
+      rows,
+      set rejectMemorySummary(value: boolean) { rejectMemorySummary = value; },
+      summaryWrites,
+      timeline,
+      transport,
+      writes,
+    };
   }
 
   test("publishes on start, republishes on change, and otherwise heartbeats at most once a minute", async () => {
@@ -6842,6 +6988,481 @@ describe("device registry publication", () => {
     const oldDaemon = bridge({ cloud: old.cloud, device: old.device, local: old.local, now: () => old.cloud.now, transport: old.transport });
     expect((await oldDaemon.cycle(new AbortController().signal)).errors).toEqual([]);
     expect(old.rows.get(old.device)?.notificationHoursEnvelope).toBeUndefined();
+  });
+
+  test("publishes memory supervision under separate AAD and clears it after a capability downgrade", async () => {
+    const digest = (scalar: string) => scalar.repeat(64);
+    const summary = {
+      coverage: { peerActions: "complete", peerPolicies: "complete", spaces: "complete" },
+      observedAt: 1_000,
+      peerActions: [],
+      peerPolicies: [],
+      spaces: [{
+        bindingDigest: digest("a"),
+        canonicalSpaceId: `hra:project:space-${"b".repeat(32)}`,
+        enrollment: "not_enrolled",
+        head: { digest: digest("c"), operationSha256: null, sequence: 0 },
+        lastExchangeAt: null,
+        projectLabel: "HRA",
+        recentRecords: [],
+        recordCount: 0,
+        remoteHead: null,
+        syncStatus: "local_only",
+      }],
+      version: 1,
+    } as const;
+    const payload = { ...registry, heartbeatAt: 1_000 } as const;
+    const observedSummary = { devicePublicId: null as string | null };
+    const world = registryWorld(
+      () => Promise.resolve(payload),
+      undefined,
+      undefined,
+      ({ devicePublicId }) => {
+        observedSummary.devicePublicId = devicePublicId;
+        return Promise.resolve(summary);
+      },
+    );
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, now: () => world.cloud.now, transport: world.transport });
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    const stored = world.rows.get(world.device);
+    expect(observedSummary.devicePublicId).toBe(world.device);
+    expect(stored?.memorySummaryEnvelope).toBeDefined();
+    expect(stored).toMatchObject({ memorySummaryRevision: 1, revision: 1 });
+    expect(await decryptMemorySummary(
+      stored?.memorySummaryEnvelope as EncryptedEnvelope,
+      key,
+      {
+        entityPublicId: world.device,
+        keyVersion: 1,
+        kind: "memory_summary",
+        userPublicId,
+      },
+    )).toEqual(summary);
+    // The broad registry bytes remain the exact v1 payload.
+    expect(await decryptDeviceRegistry(
+      stored?.envelope as EncryptedEnvelope,
+      key,
+      {
+        entityPublicId: world.device,
+        keyVersion: 1,
+        kind: "device_registry",
+        userPublicId,
+      },
+    )).toEqual(payload);
+
+    const old = registryWorld(() => Promise.resolve({ ...payload, heartbeatAt: 2_000 }));
+    old.rows.set(old.device, stored as NonNullable<typeof stored>);
+    const oldDaemon = bridge({ cloud: old.cloud, device: old.device, local: old.local, now: () => old.cloud.now, transport: old.transport });
+    expect((await oldDaemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    expect(old.rows.get(old.device)?.memorySummaryEnvelope).toBeUndefined();
+    expect(old.rows.get(old.device)).toMatchObject({ memorySummaryRevision: 2, revision: 2 });
+
+    const restartedOld = registryWorld(() =>
+      Promise.resolve({ ...payload, heartbeatAt: 3_000 }));
+    restartedOld.rows.set(
+      restartedOld.device,
+      old.rows.get(old.device) as NonNullable<typeof stored>,
+    );
+    const restartedOldDaemon = bridge({
+      cloud: restartedOld.cloud,
+      device: restartedOld.device,
+      local: restartedOld.local,
+      now: () => restartedOld.cloud.now,
+      transport: restartedOld.transport,
+    });
+    expect((await restartedOldDaemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    expect(restartedOld.summaryWrites).toEqual([]);
+    expect(restartedOld.rows.get(restartedOld.device)?.memorySummaryRevision).toBe(2);
+  });
+
+  test("reports a failed memory projection without suppressing the registry heartbeat", async () => {
+    const payload = { ...registry, heartbeatAt: 1_000 } as const;
+    const world = registryWorld(
+      () => Promise.resolve(payload),
+      undefined,
+      undefined,
+      () => Promise.reject(new Error("OH_SUMMARY_UNAVAILABLE")),
+    );
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, now: () => world.cloud.now, transport: world.transport });
+    expect((await daemon.cycle(new AbortController().signal)).errors)
+      .toEqual(["memory summary: OH_SUMMARY_UNAVAILABLE"]);
+    const stored = world.rows.get(world.device);
+    expect(stored?.memorySummaryEnvelope).toBeUndefined();
+    expect(await decryptDeviceRegistry(
+      stored?.envelope as EncryptedEnvelope,
+      key,
+      {
+        entityPublicId: world.device,
+        keyVersion: 1,
+        kind: "device_registry",
+        userPublicId,
+      },
+    )).toEqual(payload);
+  });
+
+  test("preserves the last good hosted summary across local read failures and retries a fresh read after backoff", async () => {
+    const payload = { ...registry, heartbeatAt: 1_000 } as const;
+    const summary: MemorySummaryPayload = {
+      coverage: { peerActions: "complete", peerPolicies: "complete", spaces: "complete" },
+      observedAt: 1_000,
+      peerActions: [],
+      peerPolicies: [],
+      spaces: [],
+      version: 1,
+    };
+    let attempts = 0;
+    let unavailable = false;
+    const world = registryWorld(
+      () => Promise.resolve(payload),
+      undefined,
+      undefined,
+      () => {
+        attempts += 1;
+        return unavailable
+          ? Promise.reject(new Error("OH_SUMMARY_UNAVAILABLE"))
+          : Promise.resolve(summary);
+      },
+    );
+    const daemon = bridge({
+      cloud: world.cloud,
+      device: world.device,
+      local: world.local,
+      now: () => world.cloud.now,
+      transport: world.transport,
+    });
+
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    const published = world.rows.get(world.device);
+    expect(published?.memorySummaryEnvelope).toBeDefined();
+    expect(published?.memorySummaryRevision).toBe(1);
+    expect(attempts).toBe(1);
+    expect(world.summaryWrites).toEqual([{ expectedRevision: 0 }]);
+
+    unavailable = true;
+    world.cloud.now += 60_000;
+    expect((await daemon.cycle(new AbortController().signal)).errors)
+      .toEqual(["memory summary: OH_SUMMARY_UNAVAILABLE"]);
+    expect(attempts).toBe(2);
+    expect(world.summaryWrites).toEqual([{ expectedRevision: 0 }]);
+    expect(world.rows.get(world.device)).toMatchObject({
+      memorySummaryEnvelope: published?.memorySummaryEnvelope,
+      memorySummaryRevision: 1,
+    });
+
+    world.cloud.now += 14_999;
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    expect(attempts).toBe(2);
+    world.cloud.now += 1;
+    expect((await daemon.cycle(new AbortController().signal)).errors)
+      .toEqual(["memory summary: OH_SUMMARY_UNAVAILABLE"]);
+    expect(attempts).toBe(3);
+    expect(world.summaryWrites).toEqual([{ expectedRevision: 0 }]);
+    await daemon.close();
+  });
+
+  test("rejects incoherent hosted summary companion state without mutating it", async () => {
+    const payload = { ...registry, heartbeatAt: 1_000 } as const;
+    const summary: MemorySummaryPayload = {
+      coverage: { peerActions: "complete", peerPolicies: "complete", spaces: "complete" },
+      observedAt: 1_000,
+      peerActions: [],
+      peerPolicies: [],
+      spaces: [],
+      version: 1,
+    };
+    const malformedStates: readonly Readonly<Record<string, unknown>>[] = [
+      { memorySummaryEnvelope: {} },
+      { memorySummaryRevision: 1 },
+      {
+        memorySummaryEnvelope: {
+          algorithm: "A256GCM",
+          ciphertext: "not_base64!",
+          keyVersion: 1,
+          nonce: "AAAAAAAAAAAAAAAA",
+        },
+        memorySummaryRevision: 1,
+        memorySummaryUpdatedAt: fixedNow,
+      },
+    ];
+
+    for (const malformedState of malformedStates) {
+      const world = registryWorld(
+        () => Promise.resolve(payload),
+        undefined,
+        undefined,
+        () => Promise.resolve(summary),
+      );
+      const transport: CloudTransport = {
+        ...world.transport,
+        query: async (name, args) => {
+          const value = await world.transport.query(name, args);
+          if (name !== "devices:getRegistry" || value === null || typeof value !== "object") {
+            return value;
+          }
+          return { ...value, ...malformedState };
+        },
+      };
+      const daemon = bridge({
+        cloud: world.cloud,
+        device: world.device,
+        local: world.local,
+        now: () => world.cloud.now,
+        transport,
+      });
+
+      expect((await daemon.cycle(new AbortController().signal)).errors)
+        .toEqual(["memory summary: Device memory summary response is invalid."]);
+      expect(world.writes).toEqual([{ expectedRevision: 0 }]);
+      expect(world.summaryWrites).toEqual([]);
+      await daemon.close();
+    }
+  });
+
+  test("rejects a summary mutation response that does not advance the exact CAS revision", async () => {
+    const payload = { ...registry, heartbeatAt: 1_000 } as const;
+    const summary: MemorySummaryPayload = {
+      coverage: { peerActions: "complete", peerPolicies: "complete", spaces: "complete" },
+      observedAt: 1_000,
+      peerActions: [],
+      peerPolicies: [],
+      spaces: [],
+      version: 1,
+    };
+    const world = registryWorld(
+      () => Promise.resolve(payload),
+      undefined,
+      undefined,
+      () => Promise.resolve(summary),
+    );
+    const transport: CloudTransport = {
+      ...world.transport,
+      mutation: async (name, args) => {
+        const result = await world.transport.mutation(name, args);
+        return name === "devices:updateMemorySummary" && typeof result === "object" && result !== null
+          ? { ...result, revision: 3 }
+          : result;
+      },
+    };
+    const daemon = bridge({
+      cloud: world.cloud,
+      device: world.device,
+      local: world.local,
+      now: () => world.cloud.now,
+      transport,
+    });
+
+    expect((await daemon.cycle(new AbortController().signal)).errors)
+      .toEqual(["memory summary: Memory summary publish response is invalid."]);
+    expect(world.writes).toEqual([{ expectedRevision: 0 }]);
+    expect(world.summaryWrites).toEqual([{ expectedRevision: 0 }]);
+    expect(world.rows.get(world.device)?.memorySummaryRevision).toBe(1);
+    await daemon.close();
+  });
+
+  test("reports an oversized memory projection without suppressing the registry heartbeat", async () => {
+    const payload = { ...registry, heartbeatAt: 1_000 } as const;
+    const oversized: MemorySummaryPayload = {
+      coverage: { peerActions: "complete", peerPolicies: "bounded", spaces: "complete" },
+      observedAt: 1_000,
+      peerActions: [],
+      peerPolicies: Array.from({ length: 200 }, (_, index) => ({
+        mode: "coordinate" as const,
+        projectLabel: "P".repeat(200),
+        session: {
+          label: "S".repeat(200),
+          ref: index.toString(16).padStart(64, "0"),
+        },
+        updatedAt: 1_000,
+      })),
+      spaces: [],
+      version: 1,
+    };
+    const world = registryWorld(
+      () => Promise.resolve(payload),
+      undefined,
+      undefined,
+      () => Promise.resolve(oversized),
+    );
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, now: () => world.cloud.now, transport: world.transport });
+    expect((await daemon.cycle(new AbortController().signal)).errors)
+      .toEqual(["memory summary: MEMORY_SUMMARY_PROJECTION_INVALID"]);
+    const stored = world.rows.get(world.device);
+    expect(stored?.memorySummaryEnvelope).toBeUndefined();
+    expect(await decryptDeviceRegistry(
+      stored?.envelope as EncryptedEnvelope,
+      key,
+      {
+        entityPublicId: world.device,
+        keyVersion: 1,
+        kind: "device_registry",
+        userPublicId,
+      },
+    )).toEqual(payload);
+  });
+
+  test("a stalled memory snapshot cannot delay a pending remote command", async () => {
+    const payload = { ...registry, heartbeatAt: 1_000 } as const;
+    const sessionPublicId = "session_memory_summary_stall";
+    let summaryAborted = false;
+    let releaseSummary!: () => void;
+    const world = registryWorld(
+      () => Promise.resolve(payload),
+      undefined,
+      undefined,
+      async ({ signal }) => await new Promise<never>((_resolve, reject) => {
+        releaseSummary = () => reject(new Error("summary read released after abort"));
+        const abort = () => {
+          summaryAborted = true;
+        };
+        if (signal.aborted) abort();
+        else signal.addEventListener("abort", abort, { once: true });
+      }),
+      sessionPublicId,
+    );
+    world.cloud.heads.set(sessionPublicId, {
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: world.device,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    });
+    const commandPublicId = uuidV7(9_901);
+    await world.cloud.enqueue(
+      "device_memory_summary_requester",
+      sessionPublicId,
+      commandPublicId,
+      { kind: "stop" },
+    );
+    const executor = new RecordingExecutor();
+    const daemon = bridge({
+      cloud: world.cloud,
+      device: world.device,
+      executor,
+      local: world.local,
+      now: () => world.cloud.now,
+      transport: world.transport,
+    });
+    const cycle = await Promise.race([
+      daemon.cycle(new AbortController().signal),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 250)),
+    ]);
+    expect(cycle).not.toBe("timeout");
+    if (cycle === "timeout") throw new Error("memory summary blocked command polling");
+    expect(cycle.commandsApplied).toBe(1);
+    expect(executor.calls).toHaveLength(1);
+    expect(world.cloud.requireCommand(commandPublicId).state).toBe("applied");
+    expect(world.writes).toEqual([{ expectedRevision: 0 }]);
+    expect(world.summaryWrites).toEqual([]);
+    let closeSettled = false;
+    const close = daemon.close().then(() => { closeSettled = true; });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(summaryAborted).toBe(true);
+    expect(closeSettled).toBe(false);
+    releaseSummary();
+    await close;
+    expect(closeSettled).toBe(true);
+  });
+
+  test("publishes a completed summary only after the pending command effect", async () => {
+    const payload = { ...registry, heartbeatAt: 1_000 } as const;
+    const sessionPublicId = "session_memory_summary_order";
+    const summary: MemorySummaryPayload = {
+      coverage: { peerActions: "complete", peerPolicies: "complete", spaces: "complete" },
+      observedAt: 1_000,
+      peerActions: [],
+      peerPolicies: [],
+      spaces: [],
+      version: 1,
+    };
+    const world = registryWorld(
+      () => Promise.resolve(payload),
+      undefined,
+      undefined,
+      () => Promise.resolve(summary),
+      sessionPublicId,
+    );
+    world.cloud.heads.set(sessionPublicId, {
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: world.device,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    });
+    await world.cloud.enqueue(
+      "device_memory_summary_requester",
+      sessionPublicId,
+      uuidV7(9_902),
+      { kind: "stop" },
+    );
+    const daemon = bridge({
+      cloud: world.cloud,
+      device: world.device,
+      executor: new TimelineExecutor(world.timeline),
+      local: world.local,
+      now: () => world.cloud.now,
+      transport: world.transport,
+    });
+    const result = await daemon.cycle(new AbortController().signal);
+    expect(result.commandsApplied).toBe(1);
+    expect(world.timeline).toEqual([
+      "registry-published",
+      "command-effect",
+      "memory-summary-published",
+    ]);
+    await daemon.close();
+  });
+
+  test("a rejected summary mutation cannot suppress the core registry publication", async () => {
+    const payload = { ...registry, heartbeatAt: 1_000 } as const;
+    const summary: MemorySummaryPayload = {
+      coverage: { peerActions: "complete", peerPolicies: "complete", spaces: "complete" },
+      observedAt: 1_000,
+      peerActions: [],
+      peerPolicies: [],
+      spaces: [],
+      version: 1,
+    };
+    const world = registryWorld(
+      () => Promise.resolve(payload),
+      undefined,
+      undefined,
+      () => Promise.resolve(summary),
+    );
+    world.rejectMemorySummary = true;
+    const daemon = bridge({
+      cloud: world.cloud,
+      device: world.device,
+      local: world.local,
+      now: () => world.cloud.now,
+      transport: world.transport,
+    });
+    const result = await daemon.cycle(new AbortController().signal);
+    expect(result.online).toBe(true);
+    expect(result.errors).toEqual(["memory summary: QUOTA_EXCEEDED"]);
+    expect(world.writes).toEqual([{ expectedRevision: 0 }]);
+    expect(world.summaryWrites).toEqual([{ expectedRevision: 0 }]);
+    const stored = world.rows.get(world.device);
+    expect(stored?.revision).toBe(1);
+    expect(stored?.memorySummaryEnvelope).toBeUndefined();
+    expect(await decryptDeviceRegistry(
+      stored?.envelope as EncryptedEnvelope,
+      key,
+      {
+        entityPublicId: world.device,
+        keyVersion: 1,
+        kind: "device_registry",
+        userPublicId,
+      },
+    )).toEqual(payload);
+    await daemon.close();
   });
 
   test("publishes email consent only from a coherent composite projection", async () => {
@@ -9112,7 +9733,7 @@ function attentionWorld(input: Readonly<{
       if (name === "devices:getRegistry") {
         return registryRevision === 0
           ? null
-          : { devicePublicId: device, revision: registryRevision };
+          : { devicePublicId: device, keyVersion: 1, revision: registryRevision };
       }
       if (name === "leases:current") leaseQueries += 1;
       return await inner.query(name, args);

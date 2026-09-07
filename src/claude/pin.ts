@@ -5,15 +5,31 @@
 //
 // Re-pinning procedure (mirrors `bun run codex:bump`, run by hand because the
 // Claude CLI is not an npm dependency of this package):
-//   1. `claude --version` inside an isolated `CLAUDE_CONFIG_DIR`.
+//   1. `claude --version` and `claude --help` inside an isolated `CLAUDE_CONFIG_DIR`.
 //   2. Re-capture `docs/providers/claude-fixtures/*.jsonl.txt` on that build.
 //   3. Update `CLAUDE_PIN`, `CLAUDE_PIN_MODEL`, and the digests below, then
 //      run `bun test src/claude` and re-read `docs/providers/claude.md`.
+
+/** Exact SHA-256 evidence for the reviewed npm artifacts and native executable. */
+export const PINNED_CLAUDE_ARTIFACT_DIGESTS = Object.freeze({
+  nativeExecutable: "3c269f66801028823e24a63ced9fdd3988cb86cf85fccd9f03f87e463b9d3e3c",
+  nativePackage: "49042e0a4b3b67304a9adfedca242329668f04cf5f37c3d5c30e5d652653a056",
+  wrapperPackage: "b429cb300fb9e1add440330019695fb6ec093684e4a83accd5bd23e2eaab67cc",
+} as const);
+
+/** SHA-256 of the immutable, reviewed provider-wire evidence fixtures. */
+export const PINNED_CLAUDE_EVIDENCE_DIGESTS = Object.freeze({
+  hostToolHelp: "1f3bc618d4f1987e2d9cd8f7b51f82a20031571ada13d17c71c43d3d2f45070b",
+  mcpHandshake: "bee276eb5f4d9fd27984f1e0854b73337ffbfec490afef358b37b417049fc2d4",
+} as const);
 
 /** Exact release semver, never a range or prerelease. */
 export type ClaudePinVersion = `${number}.${number}.${number}`;
 
 export const CLAUDE_PIN = "2.1.260" satisfies ClaudePinVersion;
+
+/** Exact MCP revision requested by the pinned CLI during stdio initialization. */
+export const CLAUDE_PIN_MCP_PROTOCOL_VERSION = "2025-11-25";
 
 /**
  * The exact Fable model id this pinned build accepts. Measured on the pinned
