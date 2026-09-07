@@ -2081,6 +2081,70 @@ describe("notification-email parsing", () => {
   });
 });
 
+describe("autorespond-after-hours parsing", () => {
+  test("parses local status and exact revision-bound consent updates", () => {
+    for (const json of [false, true]) {
+      const output = json ? ["--json"] : [];
+      expect(parseCli(["autorespond-after-hours", "status", ...output])).toEqual({
+        command: { kind: "autorespond-after-hours.status" }, kind: "command", json,
+      });
+      for (const action of ["enable", "disable"] as const) {
+        for (const expectedRevision of [1, 7, Number.MAX_SAFE_INTEGER]) {
+          expect(parseCli(["autorespond-after-hours", action, "--revision", String(expectedRevision), ...output]))
+            .toEqual({ command: { kind: `autorespond-after-hours.${action}`, expectedRevision }, kind: "command", json });
+        }
+      }
+    }
+  });
+
+  test("rejects missing, noncanonical, and unsafe revisions", () => {
+    for (const action of ["enable", "disable"]) {
+      expect(() => parseCli(["autorespond-after-hours", action])).toThrow(CliUsageError);
+      for (const revision of ["0", "-1", "1.5", "01", "+1", "1e2", " 1", "Infinity", "NaN", "9007199254740992"]) {
+        expect(() => parseCli(["autorespond-after-hours", action, "--revision", revision])).toThrow(CliUsageError);
+      }
+    }
+  });
+
+  test("rejects extra authority, unknown flags, duplicate options, and remote variants", () => {
+    for (const argv of [
+      ["autorespond-after-hours"],
+      ["autorespond-after-hours", "replace", "--revision", "1"],
+      ["autorespond-after-hours", "status", "--revision", "1"],
+      ["autorespond-after-hours", "status", "extra"],
+      ["autorespond-after-hours", "status", "--jsonl"],
+      ["autorespond-after-hours", "enable", "--revision", "1", "--revision", "1"],
+      ["autorespond-after-hours", "disable", "--revision", "1", "extra"],
+      ["autorespond-after-hours", "enable", "--revision", "1", "--enabled", "true"],
+      ["autorespond-after-hours", "enable", "--revision", "1", "--session", "sess_example"],
+      ["autorespond-after-hours", "enable", "--revision", "1", "--preset-contract", "2"],
+      ["remote", "autorespond-after-hours", "enable", "--revision", "1"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+    for (const action of ["status", "enable", "disable"]) {
+      expect(() => parseCli([
+        "autorespond-after-hours", action,
+        ...(action === "status" ? [] : ["--revision", "1"]),
+        "--idempotency-key", "00000000-0000-4000-8000-000000000204",
+      ])).toThrow("not supported");
+    }
+  });
+
+  test("documents separate consent and conditional examples without widening approvals", () => {
+    const help = usageForGroup("autorespond-after-hours");
+    expect(helpGroupNames).toContain("autorespond-after-hours");
+    expect(help).toContain("enable|disable --revision <n>");
+    expect(help).toContain("separate consent from notification email");
+    expect(help).toContain("6 consecutive, 20 per hour, and 80 per day");
+    expect(help).toContain("3 consecutive, 10 per hour, and 40 per day");
+    expect(help).toContain("Prose always keeps 3/10/40");
+    expect(help).toContain("Existing approval categories and session approval");
+    expect(help).toContain("never reset counters or refund reservations");
+    expect(help).toContain("Only if you choose to consent");
+    expect(help).toContain("enable --revision <current-revision>");
+    expect(help).not.toMatch(/enable --revision \d/u);
+  });
+});
+
 describe("autorespond parsing", () => {
   test("maps on, workspace, off, default, and status to approval modes", () => {
     expect(parseCli(["autorespond", "on"])).toEqual({

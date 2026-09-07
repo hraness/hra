@@ -245,6 +245,7 @@ Usage:
   hra session rename|recover|abandon|archive|unarchive|note|preset|fast|project
   hra notification-hours status|set
   hra notification-email status|enable|disable
+  hra autorespond-after-hours status|enable|disable
   hra work protocol|apply|snapshot|task|poll|events|watch
   hra interaction list|show|inspect|decide|grant|answer|submit
   hra remote list|show|command|send|queue|steer|stop|resolve|preset|fast|allow|deny|policy
@@ -390,6 +391,25 @@ Examples:
   hra notification-email status
   hra notification-email enable --revision 1
   hra notification-email disable --revision 2`,
+  "autorespond-after-hours": `HRA after-hours automatic approval budgets
+
+Usage:
+  hra autorespond-after-hours status [--json]
+  hra autorespond-after-hours enable|disable --revision <n> [--json]
+
+This machine-local setting is separate consent from notification email and
+notification hours. When enabled, eligible protocol approvals outside notification
+hours may use limits of 6 consecutive, 20 per hour, and 80 per day with proven
+history. Otherwise the limits are 3 consecutive, 10 per hour, and 40 per day.
+Prose always keeps 3/10/40. Existing approval categories and session approval
+modes still apply. Policy changes never reset counters or refund reservations.
+
+Examples:
+  hra autorespond-after-hours status
+  Only if you choose to consent, use the revision returned by status:
+  hra autorespond-after-hours enable --revision <current-revision>
+  To withdraw consent, use the revision returned by status:
+  hra autorespond-after-hours disable --revision <current-revision>`,
   session: `HRA session
 Session tasks always return to the selected conversation. They never create a standalone task or a new conversation.
 
@@ -2168,6 +2188,42 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
         endMinute,
         timeZone,
       }),
+      json,
+    };
+  }
+  if (group === "autorespond-after-hours") {
+    if (idempotencyKey !== undefined) {
+      throw new CliUsageError("--idempotency-key is not supported by autorespond-after-hours commands.");
+    }
+    const action = take(cursor, "autorespond-after-hours action");
+    if (action === "status") {
+      finish(cursor);
+      return {
+        kind: "command",
+        command: { kind: "autorespond-after-hours.status" },
+        json,
+      };
+    }
+    if (action !== "enable" && action !== "disable") {
+      throw new CliUsageError(
+        "Unknown autorespond-after-hours action. Use `status`, `enable`, or `disable`.",
+      );
+    }
+    const expectedRevision = boundedDecimal(
+      option(cursor, "--revision"),
+      "Autorespond-after-hours --revision",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    finish(cursor);
+    return {
+      kind: "command",
+      command: {
+        expectedRevision,
+        kind: action === "enable"
+          ? "autorespond-after-hours.enable"
+          : "autorespond-after-hours.disable",
+      },
       json,
     };
   }

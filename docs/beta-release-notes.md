@@ -8,6 +8,18 @@ The `history_unavailable` refusal can also mean that the local clock moved behin
 
 HRA is a persistent multi-provider CLI for isolated accounts and live local session control. Codex runs on macOS and Linux; Claude Code runs on Linux. Optional hosted encrypted sync has been live since 2026-09-03 and is now an open beta.
 
+## Unreleased after-hours policy
+
+This work is not included in the immutable `v0.6.2` artifact. It adds a separate local
+default-off policy, not notification consent. Once the rollout gates and an
+explicit owner opt-in are satisfied, otherwise eligible protocol approvals may
+use 6 consecutive, 20 rolling-hour, and 80 rolling-day reservations outside the
+configured notification hours. Prose remains at 3/10/40, and both paths use the
+same accounting. Policy changes and time boundaries never reset counters or
+refund reservations. Schema 46 conservatively requires a newly finalized human
+message before any pre-44 session can use the higher tier. This work does
+not enable workspace attestations or alter the existing hosted rollout hold.
+
 ## Unreleased v0.6.2 candidate
 
 The next candidate hardens Codex cancellation and exact recovery authority, Claude status and interrupted-login cleanup, and the web sign-in experience. Its additive schema 45 preserves schema 44's automatic-approval budget. It has not completed artifact admission. The install command below still names the admitted `v0.6.1` release, not the candidate. Neither these changes nor a later artifact admission clear the hosted capacity block, Claude's Linux-only boundary, or pending real-provider acceptance. See the [candidate changelog](../CHANGELOG.md#v062-candidate-unreleased) and [release controls](beta-release.md).

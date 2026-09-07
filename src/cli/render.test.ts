@@ -42,6 +42,67 @@ test("autorespond status distinguishes uncertain effects and an upgrade hold", (
 });
 
 const primarySessionId = `sess_${"1".repeat(32)}`;
+
+describe("after-hours approval consent output", () => {
+  test("renders exact consent and revision for every command in stable JSON", () => {
+    for (const kind of ["autorespond-after-hours.status", "autorespond-after-hours.enable", "autorespond-after-hours.disable"] as const) {
+      const command = kind === "autorespond-after-hours.status" ? { kind } : { kind, expectedRevision: 4 };
+      const data = { policy: { kind: "autorespond_after_hours", version: 1, revision: 5, enabled: kind === "autorespond-after-hours.enable" } };
+      const result = capture();
+      renderSuccess(command, data, true, result.output);
+      expect(JSON.parse(result.stdout.join("")) as unknown).toEqual({ command: kind, data, ok: true, version: 1 });
+      const reordered = capture();
+      renderSuccess(command, { policy: { enabled: data.policy.enabled, revision: 5, version: 1, kind: "autorespond_after_hours" } }, true, reordered.output);
+      expect(reordered.stdout).toEqual(result.stdout);
+      expect(result.stderr).toEqual([]);
+    }
+  });
+
+  test("keeps human output conditional, local, and explicit about unchanged safety", () => {
+    for (const enabled of [true, false]) {
+      const result = capture();
+      renderSuccess({ kind: "autorespond-after-hours.status" }, {
+        policy: { kind: "autorespond_after_hours", version: 1, revision: 4, enabled },
+      }, false, result.output);
+      expect(result.stdout.join("")).toBe([
+        "After-hours automatic approval budgets",
+        `Local consent: ${enabled ? "enabled" : "disabled"}`,
+        "Revision: 4",
+        "Separate consent from notification email and notification hours.",
+        "When enabled: eligible protocol approvals outside notification hours may use 6 consecutive, 20 per hour, and 80 per day with proven history.",
+        "Otherwise: 3 consecutive, 10 per hour, and 40 per day. Prose always keeps 3/10/40.",
+        "No approval categories are widened; session approval modes still apply.",
+        "Policy changes never reset counters or refund reservations.",
+        "",
+      ].join("\n"));
+      expect(result.stderr).toEqual([]);
+    }
+  });
+
+  test("rejects malformed and mismatched results before writing either output mode", () => {
+    for (const kind of ["autorespond-after-hours.enable", "autorespond-after-hours.disable"] as const) {
+      const command = { kind, expectedRevision: 4 };
+      const policy = { kind: "autorespond_after_hours", version: 1, revision: 5, enabled: kind === "autorespond-after-hours.enable" };
+      for (const data of [
+        { policy: { ...policy, enabled: !policy.enabled } },
+        { policy: { ...policy, revision: 4 } },
+        { policy: { ...policy, revision: 6 } },
+        { policy: { ...policy, revision: Number.MAX_SAFE_INTEGER + 1 } },
+        { policy: { ...policy, kind: "notification_email" } },
+        { policy: { ...policy, version: 2 } },
+        { policy: { ...policy, extra: true } },
+        { policy, hostedAuthority: { state: "not_observed" } },
+        { policy: null }, {},
+      ]) for (const json of [true, false]) {
+        const output = capture();
+        expect(() => renderSuccess(command, data, json, output.output)).toThrow(InvalidCommandResponseError);
+        expect(output.stdout).toEqual([]);
+        expect(output.stderr).toEqual([]);
+      }
+    }
+  });
+});
+
 const primaryProfileId = `acct_${"0".repeat(32)}`;
 const primaryProjectId = `proj_${"2".repeat(32)}`;
 const primaryTurnId = publicProviderId("turn-1");
