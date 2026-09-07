@@ -286,7 +286,7 @@ const productName = "HRA";
 const tagline = "Control plane for Codex and Claude Code";
 const providerRoadmap = "Codex and Claude Code, side by side.";
 const releaseVersion = "0.7.0";
-const admittedReleaseVersion = "0.6.2";
+const admittedReleaseVersion = "0.6.3";
 const daemonRolloutNotice = `Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the admitted v${admittedReleaseVersion} daemon or candidate v${releaseVersion} daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability, candidate readiness, and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.`;
 
 /** Public runtime pins come from their authoritative source modules. */
@@ -1234,7 +1234,7 @@ export const publicContent: PublicContent = {
           text(" shows the shared counters and the last twenty evidence rows. Only an actual human-authored message resets the consecutive counter; peer messages, Work and scheduled automation, autorespond, and provider-switch handoff messages do not. Notification consent never enables automatic approvals."),
         ),
         paragraph(
-          text("Unreleased after-hours protocol budgets are not included in v0.6.2. They use a separate local opt-in, disabled on new and upgraded installations. After artifact admission and the daemon rollout gates are satisfied, "),
+          text("After-hours protocol budgets were admitted in v0.6.3. They use a separate local opt-in, disabled on new and upgraded installations. The v0.7.0 candidate retains this policy without enabling it. After the applicable artifact admission and daemon rollout gates are satisfied, "),
           code("hra autorespond-after-hours status"),
           text(" reports that policy and its revision. To opt in explicitly, use "),
           code("hra autorespond-after-hours enable --revision <revision>"),

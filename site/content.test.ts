@@ -50,9 +50,10 @@ const htmlVisibleText = (value: string): string => value
 describe("public content contract", () => {
   test("keeps after-hours consent, legacy reset, and prose limits explicit", () => {
     const readme = renderReadmeMarkdown();
-    expect(readme).toContain("Unreleased after-hours protocol budgets are not included in v0.6.2.");
+    expect(readme).toContain("After-hours protocol budgets were admitted in v0.6.3.");
+    expect(readme).toContain("The v0.7.0 candidate retains this policy without enabling it.");
     expect(readme).toContain("They use a separate local opt-in, disabled on new and upgraded installations.");
-    expect(readme).toContain("After artifact admission and the daemon rollout gates are satisfied");
+    expect(readme).toContain("After the applicable artifact admission and daemon rollout gates are satisfied");
     expect(readme).toContain("hra autorespond-after-hours enable --revision <revision>");
     expect(readme).toContain("hra autorespond-after-hours disable --revision <revision>");
     expect(readme).toContain("Prose always stays at three, ten, and forty.");
@@ -163,13 +164,13 @@ describe("public content contract", () => {
     });
     expect(structured).not.toHaveProperty("softwareVersion");
     expect(publicContent.description).toContain("v0.7.0 is a release candidate");
-    expect(publicContent.description).toContain("v0.6.2 is the admitted artifact");
+    expect(publicContent.description).toContain("v0.6.3 is the admitted artifact");
     expect(publicContent.description).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
     expect(html).toContain(`<p class="hraness-marketing-hero__eyebrow">${publicContent.tagline}</p>`);
     expect(renderPreviewHtml()).toContain(`<p class="preview-eyebrow">${publicContent.tagline}</p>`);
     expect(publicContent.socialCard).toEqual({
-      alt: "HRA · v0.7.0 release candidate · v0.6.2 admitted · daemon rollout blocked on capacity · hra.sh",
+      alt: "HRA · v0.7.0 release candidate · v0.6.3 admitted · daemon rollout blocked on capacity · hra.sh",
       height: 630,
       path: "/social-card.png",
       width: 1200,
@@ -328,11 +329,11 @@ describe("public content contract", () => {
       website: "live",
     });
     expect(renderReadmeMarkdown()).toContain("Local CLI v0.7.0 is a release candidate");
-    expect(renderReadmeMarkdown()).toContain("v0.6.2 is the fully admitted public artifact");
+    expect(renderReadmeMarkdown()).toContain("v0.6.3 is the fully admitted public artifact");
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
-      expect(surface).toContain("Local v0.7.0 candidate; v0.6.2 artifacts admitted; hosted sync live as an open beta");
+      expect(surface).toContain("Local v0.7.0 candidate; v0.6.3 artifacts admitted; hosted sync live as an open beta");
       expect(surface).not.toContain("The last admitted release is v0.6.1.");
-      expect(surface).toContain("https://github.com/hraness/hra/releases/tag/v0.6.2");
+      expect(surface).toContain("https://github.com/hraness/hra/releases/tag/v0.6.3");
       expect(surface).toContain("only after immutable GitHub and npm release admission");
       expect(surface).toContain("passed immutable GitHub and npm release admission");
       expect(surface).toContain("daemon and hosted command-writer rollout remains blocked on capacity");

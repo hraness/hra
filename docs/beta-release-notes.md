@@ -1,6 +1,6 @@
 # HRA v0.7.0 local CLI beta candidate
 
-The v0.7.0 local CLI is a candidate and is not live. The immutable v0.6.2 artifacts are fully admitted; the v0.6.0 artifacts remain an immutable partial publication. Current daemon startup and command-writer rollout remain blocked by `authority_reduction_hard_quota`. Artifact admission, candidate status, downloading, or installation does not clear that gate. Before starting a current daemon, require the protected two-pass zero-debt capacity evidence and its exact `.activated` readback receipt from the [hosted rollout runbook](hosted-sync.md#converge-command-lifecycle-capacity-before-writer-rollout). After startup, prove each intended target's marker before declaring command availability. Do not reclaim account data or raise quotas without separate authority.
+The v0.7.0 local CLI is a candidate and is not live. The immutable v0.6.3 artifacts are fully admitted; the v0.6.0 artifacts remain an immutable partial publication. Current daemon startup and command-writer rollout remain blocked by `authority_reduction_hard_quota`. Artifact admission, candidate status, downloading, or installation does not clear that gate. Before starting a current daemon, require the protected two-pass zero-debt capacity evidence and its exact `.activated` readback receipt from the [hosted rollout runbook](hosted-sync.md#converge-command-lifecycle-capacity-before-writer-rollout). After startup, prove each intended target's marker before declaring command availability. Do not reclaim account data or raise quotas without separate authority.
 
 Automatic approvals reserve their shared budget before dispatch and recheck current consent after asynchronous review. Older display-log retention no longer controls hourly or daily limits. The first upgrade to local schema 44 places existing sessions on a durable 24-hour automatic-approval hold because their older budget history may be incomplete. It also closes the consecutive budget until the next real human message, which can be sent during that hold. Manual approvals remain available, and `hra autorespond status --session <session>` reports the hold's end and counters. New sessions have no migration hold. Prepared and uncertain approvals remain charged; do not downgrade the migrated state root.
 
@@ -8,9 +8,9 @@ The `history_unavailable` refusal can also mean that the local clock moved behin
 
 HRA is a persistent multi-provider CLI for isolated accounts and live local session control. Codex runs on macOS and Linux; Claude Code runs on Linux. Optional hosted encrypted sync has been live since 2026-09-03 and is now an open beta.
 
-## Unreleased v0.6.3 candidate
+## Admitted v0.6.3 predecessor
 
-The `v0.6.3` candidate is release-ready. It has not completed artifact admission. Its after-hours policy is not included in the admitted `v0.6.2` artifact. It adds a separate local
+The `v0.6.3` artifacts completed immutable admission through [release run 34165802848](https://github.com/hraness/hra/actions/runs/34165802848). Its [immutable README](https://github.com/hraness/hra/tree/v0.6.3#install-and-update) supplies the admitted installer. `v0.6.3` admission does not admit `v0.7.0`. The release adds a separate local
 default-off policy, not notification consent. Once the rollout gates and an
 explicit owner opt-in are satisfied, otherwise eligible protocol approvals may
 use 6 consecutive, 20 rolling-hour, and 80 rolling-day reservations outside the
