@@ -99,7 +99,7 @@ describe("social card", () => {
 
   test("keeps every card line inside its row and states the exact positioning text", () => {
     const lines = socialCardLines();
-    expect(lines.tagline).toBe("CLI v0.6.2 release-ready · hra.sh");
+    expect(lines.tagline).toBe("CLI v0.6.2 artifacts live · hra.sh");
     expect(lines.title).toBe("HRA");
     expect(lines.comment).toBe("# Rollout blocked on capacity; conditional examples");
     expect(lines.commands).toEqual([

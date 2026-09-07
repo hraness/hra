@@ -146,13 +146,13 @@ describe("public content contract", () => {
       maintainer: { "@type": "Organization", name: "Hraness", url: "https://hraness.com/" },
     });
     expect(structured).not.toHaveProperty("softwareVersion");
-    expect(publicContent.description).toContain("Local CLI v0.6.2 is release-ready, not yet admitted");
+    expect(publicContent.description).toContain("Local CLI v0.6.2 artifacts are live");
     expect(publicContent.description).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
     expect(html).toContain(`<p class="hraness-marketing-hero__eyebrow">${publicContent.tagline}</p>`);
     expect(renderPreviewHtml()).toContain(`<p class="preview-eyebrow">${publicContent.tagline}</p>`);
     expect(publicContent.socialCard).toEqual({
-      alt: "HRA · local CLI beta v0.6.2 release-ready · daemon rollout blocked on capacity · conditional session commands · hra.sh",
+      alt: "HRA · local CLI beta v0.6.2 artifacts live · daemon rollout blocked on capacity · conditional session commands · hra.sh",
       height: 630,
       path: "/social-card.png",
       width: 1200,
@@ -255,34 +255,37 @@ describe("public content contract", () => {
     expect(html).not.toMatch(/<code>(?:.|\n)*?<\/code>/u);
   });
 
-  test("keeps the candidate release-ready without claiming artifact admission or clearing runtime rollout", () => {
-    expect(publicReleaseState).toBe("release-ready");
+  test("publishes admitted artifacts without clearing runtime rollout or claiming provider acceptance", () => {
+    expect(publicReleaseState).toBe("live");
     expect(publicContent.endpoints).toEqual({
-      betaTag: "release-ready",
+      betaTag: "live",
       githubRepository: "live",
       hostedSync: "live",
       website: "live",
     });
-    expect(renderReadmeMarkdown()).toContain("Local CLI v0.6.2 is release-ready, not yet admitted");
+    expect(renderReadmeMarkdown()).toContain("Local CLI v0.6.2 artifacts are live");
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
-      expect(surface).toContain("Local CLI release-ready; hosted sync live as an open beta");
-      expect(surface).toContain("only after immutable GitHub and npm release admission");
+      expect(surface).toContain("Local CLI artifacts live; hosted sync live as an open beta");
+      expect(surface).toContain("passed immutable GitHub and npm release admission");
       expect(surface).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
-      expect(surface).toContain("release-ready");
-      expect(surface).toContain("not yet admitted");
-      expect(surface).not.toContain("v0.6.2 artifacts are live");
-      expect(surface).not.toContain("passed immutable GitHub and npm release admission");
+      expect(surface).toContain("Real authenticated acceptance for the exact Claude Code pin remains pending");
+      expect(surface).toContain("Claude Code on Linux");
+      expect(surface).not.toContain("release-ready");
+      expect(surface).not.toContain("not yet admitted");
+      expect(surface).not.toContain("only after immutable GitHub and npm release admission");
+      expect(surface).not.toContain("The last admitted release is v0.6.1");
       expect(surface).not.toContain("beta-not-yet-live");
       expect(surface).toContain("Local release boundary");
-      expect(surface).toContain("Its install command becomes usable only after");
-      expect(surface).toContain("https://github.com/hraness/hra/blob/v0.6.1/docs/beta-release-notes.md#install");
+      expect(surface).toContain("These commands are part of the admitted");
+      expect(surface).toContain("the current-daemon rollout prerequisite still applies before startup");
       expect(surface).not.toContain("Beta not yet live");
       expect(surface).not.toContain("No published `v0.6.1` tag currently exposes these commands");
     }
-    expect(renderLlmsText()).toContain("Only after immutable GitHub and npm release admission, install v0.6.2");
-    expect(renderLlmsText()).not.toContain("Install the live v0.6.2 local CLI artifact");
+    expect(renderLlmsText()).toContain("Install the live v0.6.2 local CLI artifact");
+    expect(renderLlmsText()).not.toContain("Only after immutable GitHub and npm release admission");
     const html = renderSiteHtml();
-    expect(html.indexOf("Install after release admission.")).toBeLessThan(html.indexOf('class="install-command"'));
+    expect(html.indexOf("Install the local CLI.")).toBeLessThan(html.indexOf('class="install-command"'));
+    expect(html).toContain("Installing and checking the binary does not start the daemon");
   });
 
   test("places the blocked rollout prerequisite before every prominent initialization and first-session flow", () => {
@@ -709,7 +712,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra daemon stop");
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
-      expect(surface).toContain("Only after v0.6.2 completes immutable GitHub and npm release admission");
+      expect(surface).toContain("Install the admitted v0.6.2 release");
       expect(surface).not.toContain("bun remove --global hra");
       expect(surface).not.toContain("uninstall the package");
     }

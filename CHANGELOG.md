@@ -2,9 +2,9 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
-## v0.6.2 candidate (unreleased)
+## v0.6.2
 
-Authentication hardening after the admitted `v0.6.1` release. This candidate has not completed artifact admission and does not clear the blocked daemon or hosted command-writer rollout.
+Authentication hardening after the admitted `v0.6.1` release. Admitted by the immutable release workflow on 2026-09-07. Artifact admission does not clear the blocked daemon or hosted command-writer rollout.
 
 - Codex authentication reads stop on cancellation before dispatch. Durable login and cancellation recovery binds exact successor authority without replaying an uncertain provider effect, and cancellation settlement is atomic. Additive schema 45 preserves the released schema 44 automatic-approval budget and quarantines older unbound authentication evidence.
 - Claude status distinguishes a subscription login from other authentication modes before attributing account identity. Interrupted foreground login has a bounded final process join; uncertain cleanup remains fenced. Linux-only support and the pending exact-pin authenticated acceptance remain unchanged.
