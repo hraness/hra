@@ -57,7 +57,8 @@ are not part of this checkpoint.
 2. Extend fresh configuration and make hosted status limitations explicit.
 3. Implement and review protected preparation and read-only reconciliation.
    Refuse every write-capable migration path with
-   `provider_add_only_unavailable`; the provider lacks conditional creation.
+   `provider_add_only_unavailable`; the inspected pinned CLI and documented API
+   provide no proven conditional-create mechanism.
 4. Run focused regressions, independent adversarial review, and the complete
    exact-tree repository gate. Deliver through a protected pull request and
    verify required checks on the exact merged main commit.
@@ -81,7 +82,8 @@ are not part of this checkpoint.
 A deployment without the dedicated key intentionally cannot send attention
 email. It must remain inactive until a separately authorized migration and
 readback complete. Sign-in is unaffected. This operator cannot apply a key:
-the provider lacks the required conditional-create primitive. A future native
+the inspected pinned CLI and documented API provide no proven conditional-create
+mechanism. A future native
 conditional mechanism or rigorously scoped operational custody protocol needs
 its own reviewed design and live handoff. Task ownership does not establish
 global provider-writer exclusion. Never relabel preparation evidence as proof
@@ -121,6 +123,10 @@ of an applied migration.
   A concurrent insertion can race that read. The source checkpoint therefore
   implements preparation/read-only reconciliation only, with a closed
   `provider_add_only_unavailable` refusal before any write-capable call.
+- The inspected Convex 1.45 client can retry POST requests after network errors
+  or HTTP 404 responses. One CLI invocation therefore does not prove one
+  dispatch. A later write design must address those transport retries or prove
+  conditional/idempotent semantics; this operator remains read-only.
 - Operator review found that a nonterminal descriptor alone does not prove
   private input, and an undiscovered key can be embedded in an otherwise
   allowlisted environment value. The operator requires a proven anonymous
