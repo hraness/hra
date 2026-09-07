@@ -3092,6 +3092,39 @@ describe("CodexAppServerClient", () => {
     await client.close();
   });
 
+  test("account status reads honor caller cancellation and tolerate the late provider response", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const requested = deferred<unknown>();
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
+      } else if (message.method === "account/read") {
+        requested.resolve(message.id);
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+    const controller = new AbortController();
+    const reason = new Error("account status caller departed");
+    const result = client.accountRead(false, controller.signal).catch((error: unknown) => error);
+    try {
+      const requestId = await requested.promise;
+      controller.abort(reason);
+      expect(await Promise.race([result, Bun.sleep(200).then(() => "still-pending")])).toBe(reason);
+      process.respond({ id: requestId, result: { account: null, requiresOpenaiAuth: true } });
+      await Bun.sleep(2);
+      expect(client.state).toBe("ready");
+    } finally {
+      await client.close();
+      await result;
+    }
+  });
+
   test("caller abort cancels the current page, prevents continuations, and tolerates its late response", async () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     let modelPage = 0;

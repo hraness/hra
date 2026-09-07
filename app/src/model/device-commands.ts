@@ -292,6 +292,8 @@ export function deviceCommandNotice(command: Readonly<{
     case "effect_started":
       return { text: "Running on the machine…", tone: "pending" };
     case "applied":
+      if (command.kind === "account_login_start") return { text: "Login started.", tone: "settled" };
+      if (command.kind === "account_login_status") return { text: "Status checked.", tone: "settled" };
       return command.kind === "session_start"
         ? { text: "Started. The new session appears here shortly.", tone: "settled" }
         : { text: "Done.", tone: "settled" };

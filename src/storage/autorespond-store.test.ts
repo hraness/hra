@@ -401,11 +401,12 @@ describe("durable autorespond admission", () => {
       DROP TRIGGER sessions_autorespond_budget_history;
       DROP TABLE autorespond_budget_history;
       DROP TABLE autorespond_budget_reservations;
-      DELETE FROM migrations WHERE version>43;
+      DROP TABLE account_mutation_authority_rebinds;
+      DELETE FROM migrations WHERE version>=44;
       PRAGMA user_version=43;
     `);
     predecessor.close(false);
-    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:46");
+    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:47");
     const migrated = new StateStore(paths, { now: () => clock.now });
     stores.push(migrated);
     const availableAt = clock.now + AUTORESPOND_DAY_MS;
@@ -450,23 +451,24 @@ describe("durable autorespond admission", () => {
     store.close();
     const damaged = new Database(paths.database);
     dropPeerAndHostedMemorySchema(damaged);
-    damaged.exec("DELETE FROM migrations WHERE version>43; PRAGMA user_version=43");
+    damaged.exec("DROP TABLE account_mutation_authority_rebinds; DELETE FROM migrations WHERE version>=44; PRAGMA user_version=43");
     expect(damaged.query("SELECT available_at FROM autorespond_budget_history WHERE session_id=?").get(sessionId))
       .toEqual({ available_at: 0 });
     damaged.close(false);
     expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_PREDECESSOR_COLLISION");
   });
 
-  for (const version of [44, 46]) test(`never applies pre-release v43 trigger-repair allowances to canonical v${String(version)}`, async () => {
+  for (const version of [44, 45, 46, 47]) test(`never applies pre-release v43 trigger-repair allowances to canonical v${String(version)}`, async () => {
     const { store } = await fixture();
     const paths = store.paths;
     stores.splice(stores.indexOf(store), 1);
     store.close();
     const damaged = new Database(paths.database);
-    if (version === 44) {
-      dropPeerAndHostedMemorySchema(damaged);
-      damaged.exec("DELETE FROM migrations WHERE version>44; PRAGMA user_version=44");
-    }
+    if (version <= 45) dropPeerAndHostedMemorySchema(damaged);
+    else if (version === 46) dropHostedMemorySchema(damaged);
+    if (version === 44) damaged.exec("DROP TABLE account_mutation_authority_rebinds");
+    damaged.query("DELETE FROM migrations WHERE version>?").run(version);
+    damaged.exec(`PRAGMA user_version=${String(version)}`);
     damaged.exec("DROP TRIGGER queue_transcript_cancellation_settlement");
     damaged.close(false);
     expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V43_QUEUE_CANCELLATION_GUARD_INVALID");

@@ -1564,6 +1564,113 @@ describe("PinnedCodexRuntimeManager", () => {
     await close;
   });
 
+  test("an already canceled login never launches a Codex controller", async () => {
+    let launches = 0;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => { launches += 1; throw new Error("unexpected launch"); },
+    });
+    const controller = new AbortController();
+    const reason = new Error("login caller departed");
+    controller.abort(reason);
+    try {
+      await expect(manager.login({ authority, method: "device_code", signal: controller.signal })).rejects.toBe(reason);
+      expect(launches).toBe(0);
+    } finally {
+      await manager.close();
+    }
+  });
+
+  test.each(["cancelLogin", "logout", "readAccount"] as const)("%s observes cancellation during controller launch before dispatch", async (operation) => {
+    const controller = new AbortController();
+    const reason = new Error("account caller departed during launch");
+    const calls: string[] = [];
+    const fake = {
+      state: "ready",
+      accountRead: async () => { calls.push("account/read"); return { value: { account: null, requiresOpenaiAuth: true } }; },
+      cancelManagedLogin: async () => { calls.push("account/login/cancel"); return { value: { status: "canceled" } }; },
+      logout: async () => { calls.push("account/logout"); return { value: {} }; },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => { controller.abort(reason); return fake; },
+    });
+    try {
+      await expect(manager[operation]({ authority, loginId: "exact-login", signal: controller.signal })).rejects.toBe(reason);
+      expect(calls).toEqual([]);
+    } finally {
+      await manager.close();
+    }
+  });
+
+  test.each(["login", "readAccount"] as const)("%s forwards the caller signal to its bounded account read", async (operation) => {
+    const controller = new AbortController();
+    const reason = new Error("status caller departed");
+    let requestSignal: AbortSignal | undefined;
+    let loginStarted = false;
+    const fake = {
+      state: "ready",
+      accountRead: async (refreshToken: boolean, signal?: AbortSignal) => {
+        expect(refreshToken).toBe(false);
+        requestSignal = signal;
+        controller.abort(reason);
+        signal?.throwIfAborted();
+        return { value: { account: null, requiresOpenaiAuth: true } };
+      },
+      startManagedLogin: async () => { loginStarted = true; throw new Error("unexpected login"); },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+    try {
+      await expect(manager[operation]({ authority, method: "device_code", signal: controller.signal })).rejects.toBe(reason);
+      expect(requestSignal).toBe(controller.signal);
+      expect(loginStarted).toBe(false);
+    } finally {
+      await manager.close();
+    }
+  });
+
+  test.each(["login", "cancelLogin", "logout"] as const)("%s retains an already dispatched result when the caller departs", async (operation) => {
+    const controller = new AbortController();
+    let mutations = 0;
+    const dispatched = () => { mutations += 1; controller.abort(new Error("caller departed after dispatch")); };
+    const fake = {
+      state: "ready",
+      accountRead: async () => ({ value: { account: null, requiresOpenaiAuth: true } }),
+      startManagedLogin: async () => {
+        dispatched();
+        return { value: { type: "chatgptDeviceCode", loginId: "exact-login", verificationUrl: "https://example.test/device", userCode: "CODE-1234" } };
+      },
+      cancelManagedLogin: async () => { dispatched(); return { value: { status: "canceled" } }; },
+      logout: async () => { dispatched(); return { value: {} }; },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+    try {
+      const result = await manager[operation]({ authority, method: "device_code", loginId: "exact-login", signal: controller.signal });
+      expect(controller.signal.aborted).toBe(true);
+      expect(mutations).toBe(1);
+      expect(result).toEqual(operation === "logout"
+        ? undefined
+        : operation === "cancelLogin"
+          ? { status: "canceled" }
+          : { status: "pending", loginId: "exact-login", verificationUrl: "https://example.test/device", userCode: "CODE-1234" });
+    } finally {
+      await manager.close();
+    }
+  });
+
   test("preserves the provider login ID and cancels only that exact current-generation login", async () => {
     const canceled: string[] = [];
     const fake = {

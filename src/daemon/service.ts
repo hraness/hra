@@ -6312,12 +6312,14 @@ export class HraService {
       if (
         profile.processGeneration !== authority.generation
       ) return;
+      if (this.#hasUnboundAccountMutation(profile)) return;
       this.#assertObservedCodexAccountAuthority(profile, account);
       const recoveryUnsettled = await this.#cloud
         .isCompactProjectionRecoveryUnsettledForProfile(profile.id);
       await this.#daemonAuthority.assertCurrent();
       const afterRecoveryRead = this.#store.requireProfileById(profile.id);
       if (afterRecoveryRead.processGeneration !== authority.generation) return;
+      if (this.#hasUnboundAccountMutation(afterRecoveryRead)) return;
       this.#assertObservedCodexAccountAuthority(afterRecoveryRead, account);
       if (recoveryUnsettled || this.#profileHasProjectionRecoveryInFlight(profile.id)) return;
       const apply = async (): Promise<void> => {
@@ -6329,6 +6331,7 @@ export class HraService {
           throw error;
         }
         if (current.processGeneration !== authority.generation) return;
+        if (this.#hasUnboundAccountMutation(current)) return;
         this.#assertObservedCodexAccountAuthority(current, account);
         if (this.#profileHasProjectionRecoveryInFlight(profile.id)) return;
         const blocked = await this.#cloud
@@ -6336,6 +6339,7 @@ export class HraService {
         await this.#daemonAuthority.assertCurrent();
         current = this.#store.requireProfileById(profile.id);
         if (current.processGeneration !== authority.generation) return;
+        if (this.#hasUnboundAccountMutation(current)) return;
         this.#assertObservedCodexAccountAuthority(current, account);
         if (blocked || this.#profileHasProjectionRecoveryInFlight(profile.id)) return;
         const accountAuthorityChanged = providerAccountAuthorityChanged(current, account);
@@ -6403,7 +6407,10 @@ export class HraService {
     const unsettled = this.#store.listUnsettledMutations({ authorityId: profile.id })
       .filter((attempt) => (attempt.originalState ?? attempt.state) !== "reconciled");
     const currentGeneration = unsettled.filter((attempt) =>
-      attempt.authorityGeneration === profile.processGeneration);
+      attempt.authorityGeneration === profile.processGeneration
+      || this.#store.isAccountMutationAuthorityCurrent({
+        attemptId: attempt.id, profileId: profile.id, originGeneration: attempt.authorityGeneration,
+      }));
     const candidates = currentGeneration.length > 0
       ? currentGeneration
       : profile.state === "recovery_required" && !account.signedIn
@@ -6426,8 +6433,10 @@ export class HraService {
     const [attempt] = candidates;
     if (attempt === undefined) return false;
     if (attempt.kind === "account.logout") return !account.signedIn;
-    if (attempt.kind === "account.login") return account.signedIn;
-    return attempt.kind === "account.login-cancel" && !account.signedIn;
+    // An unsettled login may still read signed out; a cancellation may race
+    // successful sign-in. Both observations belong to that exact auth attempt,
+    // not an unsolicited identity replacement that can retire its authority.
+    return attempt.kind === "account.login" || attempt.kind === "account.login-cancel";
   }
 
   /**
@@ -6471,6 +6480,7 @@ export class HraService {
         profile.processGeneration !== authority.generation
         || (profile.state !== "signed_in" && profile.state !== "recovery_required")
       ) return;
+      if (this.#hasUnboundAccountMutation(profile)) return;
       const key = this.#personalAccountAttestationKey("codex", profile.id);
       const accountKey = providerAccountAuthorityKey("codex", account);
       if (accountKey === null || accountKey !== profileCodexAccountAuthorityKey(profile)) {
@@ -9018,6 +9028,13 @@ export class HraService {
         this.#claudeLoginRecovery(unsettled),
       );
     }
+    const unsettledCodex = this.#store.listUnsettledMutations({ authorityId: profile.id })
+      .some((attempt) => attempt.kind === "account.login" || attempt.kind === "account.logout" || attempt.kind === "account.login-cancel");
+    if (unsettledCodex) throw new CommandFailure(
+      "RECOVERY_REQUIRED",
+      `An earlier Codex account mutation still fences this profile. Run \`hra account show ${profile.id}\` before starting a new Claude login.`,
+      { provider: "claude", reason: "account_mutation_unsettled" },
+    );
     this.#assertClaudeIsolationAccepted();
     const providerBlocker = this.#store.managedClaudeLoginAuthorityBlocker(
       profile.id,
@@ -9280,8 +9297,33 @@ export class HraService {
     };
   }
 
+  #hasUnboundAccountMutation(profile: ProfileRecord): boolean {
+    return this.#store.listUnsettledMutations({ authorityId: profile.id }).some((attempt) =>
+      (attempt.kind === "account.login" || attempt.kind === "account.logout" || attempt.kind === "account.login-cancel")
+      && !this.#store.isAccountMutationAuthorityCurrent({
+        attemptId: attempt.id, profileId: profile.id, originGeneration: attempt.authorityGeneration,
+      }));
+  }
+
+  #assertAccountMutationRecoveryBound(profile: ProfileRecord): void {
+    if (this.#hasUnboundAccountMutation(profile)) throw new CommandFailure(
+      "RECOVERY_REQUIRED",
+      "An earlier account mutation has no exact recovery authority for this generation. HRA preserved it without reading provider state or dispatching another account change.",
+      { reason: "account_mutation_authority_unbound" },
+    );
+  }
+
   async #showAccount(selector: string, signal: AbortSignal): Promise<unknown> {
     const profile = this.#store.requireProfile(selector);
+    if (this.#hasUnboundAccountMutation(profile)) return {
+      account: this.#publicProfile(profile),
+      recovery: {
+        required: true,
+        cleared: false,
+        reason: "account_mutation_authority_unbound",
+        diagnostic: "An earlier account mutation has no exact recovery authority for this generation. HRA preserved it without reading provider state or replaying the mutation.",
+      },
+    };
     const revocation = this.#store.readProfilePersonalAuthorityRevocation(profile.id);
     if (
       this.#profileAuthorityRevocationIsPending(profile.id, profile.processGeneration)
@@ -9381,16 +9423,25 @@ export class HraService {
     }
     if (profile.state === "recovery_required") {
       const unsettled = this.#store.listUnsettledMutations({ authorityId: profile.id })
-        .filter((attempt) => attempt.authorityGeneration === profile.processGeneration && (attempt.kind === "account.login" || attempt.kind === "account.logout"));
+        .filter((attempt) => (attempt.kind === "account.login" || attempt.kind === "account.logout")
+          && this.#store.isAccountMutationAuthorityCurrent({
+            attemptId: attempt.id, profileId: profile.id, originGeneration: attempt.authorityGeneration,
+          }));
       if (unsettled.length === 0) {
         const reconciled = this.#store.reconcileProfileRecoveryFromAccountRead({
           profileId: profile.id,
           expectedGeneration: profile.processGeneration,
           provider: account,
         });
+        const pendingLogin = reconciled.state === "login_pending"
+          ? this.#store.readPendingLoginAuthority(profile.id, profile.processGeneration)
+          : null;
         return {
           account: this.#publicProfile(reconciled),
           providerProjection: account,
+          ...(pendingLogin === null ? {} : { login: {
+            status: "pending", loginId: pendingLogin.loginId, next: `hra account login-cancel ${profile.id}`,
+          } }),
           recovery: {
             required: false,
             cleared: true,
@@ -9468,7 +9519,9 @@ export class HraService {
    */
   #resolveUnsettledLoginCancellations(profile: ProfileRecord, account: CodexAccountProjection): void {
     for (const attempt of this.#store.listUnsettledMutations({ authorityId: profile.id })) {
-      if (attempt.kind !== "account.login-cancel" || attempt.authorityGeneration !== profile.processGeneration) continue;
+      if (attempt.kind !== "account.login-cancel" || !this.#store.isAccountMutationAuthorityCurrent({
+        attemptId: attempt.id, profileId: profile.id, originGeneration: attempt.authorityGeneration,
+      })) continue;
       const originalState = attempt.originalState ?? attempt.state;
       if (originalState !== "effect_started" && originalState !== "ambiguous") continue;
       this.#store.resolveLoginCancelMutation({
@@ -9481,6 +9534,7 @@ export class HraService {
 
   async #login(selector: string, deviceCode: boolean, idempotencyKey: string | undefined, signal: AbortSignal): Promise<unknown> {
     const current = this.#store.requireProfile(selector);
+    this.#assertAccountMutationRecoveryBound(current);
     await this.#assertNoCompactProjectionRecoveryForProfile(current.id);
     if (current.state === "signed_in" && idempotencyKey === undefined) return { account: this.#publicProfile(current), login: { status: "signed_in" } };
     const key = idempotencyKey ?? randomUUID();
@@ -9501,7 +9555,11 @@ export class HraService {
     const canBegin = current.processGeneration + 1 === targetGeneration && (prior === null || prior.state === "prepared");
     const canReplayReboundPending = prior?.state === "applied"
       && reboundAuthority?.attemptId === prior.id;
-    if (current.processGeneration !== targetGeneration && !canBegin && !canReplayReboundPending) {
+    const canReconcileReboundAttempt = prior !== null && prior.state !== "prepared"
+      && this.#store.isAccountMutationAuthorityCurrent({
+        attemptId: prior.id, profileId: current.id, originGeneration: prior.authorityGeneration,
+      });
+    if (current.processGeneration !== targetGeneration && !canBegin && !canReplayReboundPending && !canReconcileReboundAttempt) {
       throw new CommandFailure("CONFLICT", "The login attempt belongs to a stale account generation.");
     }
     const authority = { ...current, processGeneration: targetGeneration };
@@ -9638,6 +9696,7 @@ export class HraService {
 
   async #cancelLogin(selector: string, idempotencyKey: string | undefined, signal: AbortSignal): Promise<unknown> {
     const profile = this.#store.requireProfile(selector);
+    this.#assertAccountMutationRecoveryBound(profile);
     await this.#assertNoCompactProjectionRecoveryForProfile(profile.id);
     const key = idempotencyKey ?? randomUUID();
     const prior = this.#store.readMutation(key);
@@ -9678,7 +9737,7 @@ export class HraService {
       );
     }
     const unsettledCancellations = this.#store.listUnsettledMutations({ authorityId: profile.id })
-      .filter((attempt) => attempt.kind === "account.login-cancel" && attempt.authorityGeneration === profile.processGeneration);
+      .filter((attempt) => attempt.kind === "account.login-cancel");
     if (unsettledCancellations.length > 0) {
       throw new CommandFailure(
         "RECOVERY_REQUIRED",
@@ -9710,37 +9769,46 @@ export class HraService {
           loginId: login.loginId,
           signal,
         }));
-        const provider = await this.#fencedEffect(async () => await this.#codex.readAccount({
-          authority,
-          signal,
-        }));
-        return loginCancelReceiptSchema.parse({
-          loginId: login.loginId,
-          providerStatus: canceled.status,
-          provider: {
-            signedIn: provider.signedIn,
-            ...(provider.email === undefined ? {} : { email: provider.email }),
-            ...(provider.plan === undefined ? {} : { plan: provider.plan }),
-          },
-        });
+        try {
+          const provider = await this.#fencedEffect(async () => await this.#codex.readAccount({
+            authority,
+            signal,
+          }));
+          return loginCancelReceiptSchema.parse({
+            loginId: login.loginId,
+            providerStatus: canceled.status,
+            provider: {
+              signedIn: provider.signedIn,
+              ...(provider.email === undefined ? {} : { email: provider.email }),
+              ...(provider.plan === undefined ? {} : { plan: provider.plan }),
+            },
+          });
+        } catch (error: unknown) {
+          if (error instanceof DaemonAuthoritySafetyError) throw error;
+          throw new IndeterminateLocalCommitError(
+            "Codex accepted the login cancellation, but its account state could not be reconciled.",
+            error,
+          );
+        }
       },
       receipt: (value) => loginCancelReceiptSchema.parse(value),
       restore: (value) => loginCancelReceiptSchema.parse(value),
-      commit: (attemptId, value, recorded) => {
-        this.#store.settlePendingLogin({
+      commit: (attemptId, _value, recorded) => {
+        const parsed = loginCancelReceiptSchema.parse(recorded);
+        this.#store.completeLoginCancelMutation({
+          attemptId,
           profileId: profile.id,
           processGeneration: profile.processGeneration,
-          loginId: value.loginId,
-          providerStatus: value.providerStatus,
-          provider: {
-            signedIn: value.provider.signedIn,
-            ...(value.provider.email === undefined ? {} : { email: value.provider.email }),
-            ...(value.provider.plan === undefined ? {} : { plan: value.provider.plan }),
+          receipt: {
+            loginId: parsed.loginId,
+            providerStatus: parsed.providerStatus,
+            provider: {
+              signedIn: parsed.provider.signedIn,
+              ...(parsed.provider.email === undefined ? {} : { email: parsed.provider.email }),
+              ...(parsed.provider.plan === undefined ? {} : { plan: parsed.provider.plan }),
+            },
           },
         });
-        if (!this.#store.transitionMutation(attemptId, "effect_started", "applied", recorded)) {
-          throw new Error("LOGIN_CANCEL_MUTATION_CAS_CONFLICT");
-        }
       },
     });
     return {
@@ -9754,6 +9822,7 @@ export class HraService {
 
   async #logout(selector: string, idempotencyKey: string | undefined, signal: AbortSignal): Promise<unknown> {
     const profile = this.#store.requireProfile(selector);
+    this.#assertAccountMutationRecoveryBound(profile);
     await this.#assertNoCompactProjectionRecoveryForProfile(profile.id);
     this.#work.assertProfileCanChangeAuthority(profile.id, "codex");
     if (this.#store.hasUnsettledSessionMutationAuthority(profile.id, "codex")) {
@@ -10337,6 +10406,7 @@ export class HraService {
     expectedFingerprint: string | null;
     signal: AbortSignal;
   }): Promise<string> {
+    this.#assertAccountMutationRecoveryBound(this.#store.requireProfileById(input.profile.id));
     const account = await this.#fencedEffect(async () =>
       await this.#codex.readAccount({
         authority: authorityFor(this.#paths, input.profile),
@@ -18690,6 +18760,7 @@ export class HraService {
   }
 
   #assertSignedIn(profile: ProfileRecord): void {
+    this.#assertAccountMutationRecoveryBound(profile);
     if (this.#profileAuthorityRevocationIsPending(
       profile.id,
       profile.processGeneration,

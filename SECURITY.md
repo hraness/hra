@@ -11,7 +11,8 @@ Do not open a public issue for a suspected vulnerability. Use GitHub's private v
 | Version | Status |
 | --- | --- |
 | `v0.7.0` | Release candidate. Supported once the release workflow admits it. |
-| `v0.6.1` | Fully admitted beta. Supported and receives security fixes. Hosted command-writer rollout remains capacity-gated. |
+| `v0.6.2` | Fully admitted beta. Supported and receives security fixes. Hosted command-writer rollout remains capacity-gated. |
+| `v0.6.1` | Superseded by `v0.6.2`. Unsupported. Do not bypass the update runbook to migrate. |
 | `v0.6.0` | Immutable partial publication. The workflow did not complete final admission; unsupported. |
 | `v0.5.0` | Superseded by `v0.6.1`. Unsupported. Do not bypass the update runbook to migrate. |
 | `v0.4.1` | Superseded by `v0.5.0`. Unsupported. |

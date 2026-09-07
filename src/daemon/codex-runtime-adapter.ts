@@ -829,10 +829,14 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
 
   async login(input: { authority: ProfileAuthority; method: "browser" | "device_code"; signal: AbortSignal }): Promise<CodexLoginOutcome> {
     return await this.#admit(async () => {
+      input.signal.throwIfAborted();
       const client = await this.#client(input.authority);
-      const before = accountProjection((await client.accountRead()).value);
+      input.signal.throwIfAborted();
+      const before = accountProjection((await client.accountRead(false, input.signal)).value);
+      input.signal.throwIfAborted();
       if (before.signedIn) return { status: "signed_in", account: { ...before, signedIn: true } };
-      if (input.signal.aborted) throw input.signal.reason;
+      // Caller cancellation fences admission only. Once login is dispatched,
+      // retain its exact result or uncertainty for the durable mutation owner.
       const login = (await client.startManagedLogin(input.method === "device_code" ? "device-code" : "browser")).value;
       return login.type === "chatgptDeviceCode"
         ? { status: "pending", loginId: login.loginId, verificationUrl: login.verificationUrl, userCode: login.userCode }
@@ -842,16 +846,20 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
 
   async cancelLogin(input: { authority: ProfileAuthority; loginId: string; signal: AbortSignal }): Promise<{ status: "canceled" | "not_found" }> {
     return await this.#admit(async () => {
-      if (input.signal.aborted) throw input.signal.reason;
-      const result = (await (await this.#client(input.authority)).cancelManagedLogin(input.loginId)).value;
+      input.signal.throwIfAborted();
+      const client = await this.#client(input.authority);
+      input.signal.throwIfAborted();
+      const result = (await client.cancelManagedLogin(input.loginId)).value;
       return { status: result.status === "notFound" ? "not_found" : "canceled" };
     });
   }
 
   async logout(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<void> {
     await this.#admit(async () => {
-      if (input.signal.aborted) throw input.signal.reason;
-      await (await this.#client(input.authority)).logout();
+      input.signal.throwIfAborted();
+      const client = await this.#client(input.authority);
+      input.signal.throwIfAborted();
+      await client.logout();
     });
   }
 
@@ -874,8 +882,10 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
 
   async readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection> {
     return await this.#admit(async () => {
-      if (input.signal.aborted) throw input.signal.reason;
-      return accountProjection((await (await this.#client(input.authority)).accountRead()).value);
+      input.signal.throwIfAborted();
+      const client = await this.#client(input.authority);
+      input.signal.throwIfAborted();
+      return accountProjection((await client.accountRead(false, input.signal)).value);
     });
   }
 

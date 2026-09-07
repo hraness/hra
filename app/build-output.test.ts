@@ -86,12 +86,15 @@ async function runAppBuild(
     cwd: repositoryRoot,
     env: environment,
     stderr: "pipe",
-    stdout: "pipe",
+    stdout: "ignore",
   });
-  const status = await build.exited;
+  const [status, stderr] = await Promise.all([
+    build.exited,
+    new Response(build.stderr).text(),
+  ]);
   return {
     status,
-    stderr: await new Response(build.stderr).text(),
+    stderr,
   };
 }
 
@@ -179,7 +182,7 @@ describe("built shell", () => {
     const marker = artifacts.find((artifact) =>
       artifact.name === ".well-known/hra-app.json");
 
-    expect(packageManifest.version).toBe("0.6.1");
+    expect(packageManifest.version).toBe("0.7.0");
     expect(buildSourceCommit).toMatch(/^[0-9a-f]{40}$/u);
     expect(marker?.text).toBe(`${JSON.stringify(expected, null, 2)}\n`);
     expect(JSON.parse(marker?.text ?? "null")).toEqual(expected);

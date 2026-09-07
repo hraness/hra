@@ -22,9 +22,10 @@ export function AccountLoginRelay({
       <code className="block font-mono text-ink">{userCode}</code>
       <p>
         <a className="underline" href={loginUrl} rel="noreferrer noopener" target="_blank">
-          Open the provider login (single use, expires shortly)
+          Open Codex sign-in
         </a>
       </p>
+      <p>Keep this HRA tab open until sign-in finishes. This code cannot be retrieved again.</p>
     </div>
   );
 }

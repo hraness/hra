@@ -147,13 +147,13 @@ describe("public content contract", () => {
     });
     expect(structured).not.toHaveProperty("softwareVersion");
     expect(publicContent.description).toContain("v0.7.0 is a release candidate");
-    expect(publicContent.description).toContain("v0.6.1 is the admitted artifact");
+    expect(publicContent.description).toContain("v0.6.2 is the admitted artifact");
     expect(publicContent.description).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
     expect(html).toContain(`<p class="hraness-marketing-hero__eyebrow">${publicContent.tagline}</p>`);
     expect(renderPreviewHtml()).toContain(`<p class="preview-eyebrow">${publicContent.tagline}</p>`);
     expect(publicContent.socialCard).toEqual({
-      alt: "HRA · v0.7.0 release candidate · v0.6.1 admitted · daemon rollout blocked on capacity · hra.sh",
+      alt: "HRA · v0.7.0 release candidate · v0.6.2 admitted · daemon rollout blocked on capacity · hra.sh",
       height: 630,
       path: "/social-card.png",
       width: 1200,
@@ -312,20 +312,23 @@ describe("public content contract", () => {
       website: "live",
     });
     expect(renderReadmeMarkdown()).toContain("Local CLI v0.7.0 is a release candidate");
-    expect(renderReadmeMarkdown()).toContain("v0.6.1 is the fully admitted public artifact");
+    expect(renderReadmeMarkdown()).toContain("v0.6.2 is the fully admitted public artifact");
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
-      expect(surface).toContain("Local v0.7.0 candidate; v0.6.1 artifacts admitted; hosted sync live as an open beta");
+      expect(surface).toContain("Local v0.7.0 candidate; v0.6.2 artifacts admitted; hosted sync live as an open beta");
+      expect(surface).toContain("only after immutable GitHub and npm release admission");
       expect(surface).toContain("passed immutable GitHub and npm release admission");
       expect(surface).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
       expect(surface).not.toContain("v0.7.0 artifacts are live");
       expect(surface).not.toContain("beta-not-yet-live");
       expect(surface).toContain("Local release boundary");
-      expect(surface).toContain("become installable through the exact command above once its GitHub Release exists");
+      expect(surface).toContain("Its install command becomes usable only after");
       expect(surface).not.toContain("Beta not yet live");
       expect(surface).not.toContain("No published `v0.7.0` tag currently exposes these commands");
     }
-    expect(renderLlmsText()).toContain("Install after the v0.7.0 beta tag is live");
+    expect(renderLlmsText()).toContain("Only after immutable GitHub and npm release admission, install v0.7.0");
     expect(renderLlmsText()).not.toContain("Install the live v0.7.0 local CLI artifact");
+    const html = renderSiteHtml();
+    expect(html.indexOf("Install after release admission.")).toBeLessThan(html.indexOf('class="install-command"'));
   });
 
   test("places the blocked rollout prerequisite before every prominent initialization and first-session flow", () => {
@@ -752,7 +755,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra daemon stop");
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
-      expect(surface).toContain("verified repair installation for v0.7.0");
+      expect(surface).toContain("Only after v0.7.0 completes immutable GitHub and npm release admission");
       expect(surface).not.toContain("bun remove --global hra");
       expect(surface).not.toContain("uninstall the package");
     }
