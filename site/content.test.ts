@@ -1063,7 +1063,8 @@ describe("public content contract", () => {
       const footer = /<footer\b[\s\S]*?<\/footer>/u.exec(document)?.[0];
       expect(footer).toContain('data-slot="hraness-site-footer"');
       expect(footer?.match(/data-slot="hraness-mark"/gu)).toHaveLength(1);
-      expect(footer?.match(/data-slot="social-icon"/gu)).toHaveLength(11);
+      expect(footer?.match(/data-slot="social-icon"/gu)).toHaveLength(5);
+      expect(footer).not.toContain("hraness-site-footer__wordmark");
       expect(footer).toContain('data-mailing-list="none"');
       expect(footer).toContain('href="https://substack.com/@hraness"');
       expect(
