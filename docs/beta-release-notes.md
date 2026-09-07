@@ -8,9 +8,9 @@ The `history_unavailable` refusal can also mean that the local clock moved behin
 
 HRA is a persistent multi-provider CLI for isolated accounts and live local session control. Codex runs on macOS and Linux; Claude Code runs on Linux. Optional hosted encrypted sync has been live since 2026-09-03 and is now an open beta.
 
-## Unreleased after-hours policy
+## Unreleased v0.6.3 candidate
 
-This work is not included in the immutable `v0.6.2` artifact. It adds a separate local
+The `v0.6.3` candidate is release-ready. It has not completed artifact admission. Its after-hours policy is not included in the admitted `v0.6.2` artifact. It adds a separate local
 default-off policy, not notification consent. Once the rollout gates and an
 explicit owner opt-in are satisfied, otherwise eligible protocol approvals may
 use 6 consecutive, 20 rolling-hour, and 80 rolling-day reservations outside the
@@ -18,11 +18,11 @@ configured notification hours. Prose remains at 3/10/40, and both paths use the
 same accounting. Policy changes and time boundaries never reset counters or
 refund reservations. Schema 46 conservatively requires a newly finalized human
 message before any pre-44 session can use the higher tier. This work does
-not enable workspace attestations or alter the existing hosted rollout hold.
+not enable workspace attestations or alter the existing hosted rollout hold. The candidate install command in the [current README](../README.md#install-and-update) becomes usable only after immutable GitHub and npm release admission. The historical install command below remains bound to `v0.6.1`.
 
-## Unreleased v0.6.2 candidate
+## Admitted v0.6.2 predecessor
 
-The next candidate hardens Codex cancellation and exact recovery authority, Claude status and interrupted-login cleanup, and the web sign-in experience. Its additive schema 45 preserves schema 44's automatic-approval budget. It has not completed artifact admission. The install command below still names the admitted `v0.6.1` release, not the candidate. Neither these changes nor a later artifact admission clear the hosted capacity block, Claude's Linux-only boundary, or pending real-provider acceptance. See the [candidate changelog](../CHANGELOG.md#v062-candidate-unreleased) and [release controls](beta-release.md).
+The admitted `v0.6.2` release hardens Codex cancellation and exact recovery authority, Claude status and interrupted-login cleanup, and the web sign-in experience. Its additive schema 45 preserves schema 44's automatic-approval budget. Release workflow `34156958618` completed successfully for exact source `5c5c02ee5964167fb85e92da53cdb80c87991890`. For the currently admitted installer, use the [immutable v0.6.2 README](https://github.com/hraness/hra/tree/v0.6.2#install-and-update); its artifact-admission prerequisite is satisfied, but its daemon-rollout prerequisite is not. The install command below preserves the earlier admitted `v0.6.1` release. Neither release clears the hosted capacity block, Claude's Linux-only boundary, or pending real-provider acceptance. See the [v0.6.2 changelog](../CHANGELOG.md#v062), [immutable v0.6.2 release](https://github.com/hraness/hra/releases/tag/v0.6.2), and [release controls](beta-release.md).
 
 ## Install
 

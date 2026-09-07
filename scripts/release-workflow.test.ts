@@ -419,13 +419,18 @@ describe("release workflow", () => {
     // Exact v0.6.1 command from protected source a75e7487594ce5b68345ccd3536974a10f7a93ee.
     expect(createHash("sha256").update(admittedInstallCommand ?? "").digest("hex"))
       .toBe("b6a0adb2b3eac4dd6d873486e5317b91bc2df0de701f96cb2b22b6fd73f3d361");
-    expect(releaseNotes).toContain("## Unreleased v0.6.2 candidate");
+    expect(releaseNotes).toContain("## Unreleased v0.6.3 candidate");
     expect(releaseNotes).toContain("It has not completed artifact admission");
+    expect(releaseNotes).toContain("## Admitted v0.6.2 predecessor");
+    expect(releaseNotes).not.toContain("## Unreleased v0.6.2 candidate");
+    expect(changelog).toContain("## v0.6.3 candidate (unreleased)");
+    expect(changelog).toContain("## v0.6.2\n");
+    expect(changelog).not.toContain("## v0.6.2 candidate (unreleased)");
     expect(releaseNotes).not.toContain(installCommand);
     expect(readme).toContain(installCommand);
-    expect(readme).toContain("Local CLI v0.6.2 is release-ready, not yet admitted");
+    expect(readme).toContain("Local CLI v0.6.3 is release-ready, not yet admitted");
     expect(readme).toContain("Run the install command below only after immutable GitHub and npm release admission");
-    expect(readme).not.toContain("v0.6.2 artifacts are live");
+    expect(readme).not.toContain("v0.6.3 artifacts are live");
     expect(readme).toContain("next invocation of that exact release's installer");
     expect(readme).toContain("`$BUN_INSTALL/install/hra/install-intent.json`");
     expect(readme).toContain("the exact immutable install command from the originating release's trusted README or release notes");
@@ -446,7 +451,7 @@ describe("release workflow", () => {
     expect(releaseNotes).not.toContain("runtime SPDX inventory");
     expect(releaseNotes).toContain("# HRA v0.6.1 local CLI beta");
     expect(thirdPartyNotices).toContain("exact tarball plus `SHA256SUMS`");
-    expect(thirdPartyNotices).toContain("The `v0.6.2` candidate records its build graph");
+    expect(thirdPartyNotices).toContain("The `v0.6.3` candidate records its build graph");
     expect(thirdPartyNotices).toContain("This candidate is not yet admitted");
     expect(thirdPartyNotices).toContain("must bind an immutable source tag");
     expect(thirdPartyNotices).toContain("`@hraness/site-footer` v0.6.1");
@@ -498,7 +503,7 @@ describe("release workflow", () => {
     expect(domainRecord).toContain("unresolved_prior_intent");
     expect(domainRecord).toContain("reasserts only the plan's exact source");
     expect(domainRecord).toContain("unresolved_current_intent");
-    expect(releaseRecord).toContain("Status: `v0.6.1` is the fully admitted public CLI beta.");
+    expect(releaseRecord).toContain("Status: `v0.6.2` is the fully admitted public CLI beta.");
     expect(releaseRecord).toContain("artifact release does not clear the blocked hosted command-writer rollout or authorize daemon upgrades");
     expect(releaseRecord).toContain("At retirement, `hraness/hra` had no `v0.1.0` tag");
     expect(releaseRecord).toContain("## Immutable v0.1.0 failure record");
@@ -616,7 +621,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("The package gate still scans `rev-list --all`");
     expect(releaseRecord).toContain("coordinate completed its non-executable bootstrap");
     expect(releaseRecord).toContain("npm trusted publishing has exactly one binding");
-    expect(releaseRecord).toContain("Stable `@hraness/hra@0.6.1` is the current admitted artifact");
+    expect(releaseRecord).toContain("Stable `@hraness/hra@0.6.2` is the current admitted artifact");
     expect(releaseRecord).toContain("The canonical README and website use a two-phase local-release surface");
     expect(releaseRecord).toContain("The website and `v0.6.1` local CLI artifacts are live");
     expect(releaseRecord).toContain("the install command names the admitted `v0.6.1` GitHub Release and verified archive");

@@ -276,13 +276,13 @@ export const siteDocumentPaths: readonly string[] = [
 export const publicReleaseState: "live" | "release-ready" | "staged" = "release-ready";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
-  "https://github.com/hraness/hra/releases/download/v0.6.2/hraness-hra-0.6.2.tgz",
+  "https://github.com/hraness/hra/releases/download/v0.6.3/hraness-hra-0.6.3.tgz",
 );
 
 const productName = "HRA";
 const tagline = "Control plane for Codex and Claude Code";
 const providerRoadmap = "Codex and Claude Code, side by side.";
-const releaseVersion = "0.6.2";
+const releaseVersion = "0.6.3";
 const daemonRolloutNotice = `Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the v${releaseVersion} daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.`;
 
 /** Public runtime pins come from their authoritative source modules. */
@@ -343,7 +343,7 @@ export const publicContent: PublicContent = {
   thesis: `${productName} runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.`,
   description: `${tagline}. Local CLI v${releaseVersion} is release-ready, not yet admitted; daemon and hosted command-writer rollout remains blocked on capacity.`,
   daemonRolloutNotice,
-  statusLine: `Status: public beta. Local CLI v${releaseVersion} is release-ready, not yet admitted. Run the install command below only after immutable GitHub and npm release admission. The last admitted release is v0.6.1. Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}. Current daemon and hosted command-writer rollout remains blocked on capacity.`,
+  statusLine: `Status: public beta. Local CLI v${releaseVersion} is release-ready, not yet admitted. Run the install command below only after immutable GitHub and npm release admission. The last admitted release is v0.6.2. Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}. Current daemon and hosted command-writer rollout remains blocked on capacity.`,
   badges,
   maintainer: {
     name: "Hraness",
@@ -466,7 +466,7 @@ export const publicContent: PublicContent = {
     },
     {
       question: "What is live, and what is still blocked?",
-      answer: [text(`The v${releaseVersion} local CLI candidate is release-ready, not yet admitted. Wait for immutable GitHub and npm release admission before using its install command. The last admitted release is v0.6.1. Codex runs on macOS and Linux and Claude Code on Linux. Hosted sync is live as an ${hostedBetaLabel}, but current daemon and hosted command-writer rollout remains blocked on capacity. Artifact admission does not authorize initialization or daemon startup.`)],
+      answer: [text(`The v${releaseVersion} local CLI candidate is release-ready, not yet admitted. Wait for immutable GitHub and npm release admission before using its install command. The last admitted release is v0.6.2. Codex runs on macOS and Linux and Claude Code on Linux. Hosted sync is live as an ${hostedBetaLabel}, but current daemon and hosted command-writer rollout remains blocked on capacity. Artifact admission does not authorize initialization or daemon startup.`)],
     },
     {
       question: "Does HRA use my API keys or provider subscription?",
@@ -504,7 +504,7 @@ export const publicContent: PublicContent = {
         text("The "),
         code(`v${releaseVersion}`),
         text(" candidate is not yet admitted. Use the exact install command below only after immutable GitHub and npm release admission. The last admitted release is "),
-        link("v0.6.1", "https://github.com/hraness/hra/blob/v0.6.1/docs/beta-release-notes.md#install"),
+        link("v0.6.2", "https://github.com/hraness/hra/releases/tag/v0.6.2"),
         text(". The website and optional hosted sync are live. Artifact admission does not authorize daemon startup or hosted command writers."),
       ],
     },
@@ -545,7 +545,7 @@ export const publicContent: PublicContent = {
           ],
         },
         paragraph(
-          text("After artifact admission, the single install command removes ambient Bun, Node, and native-library injection variables before either download or Bun startup, disables Bun dotenv loading, and selects /dev/null as the only Bun configuration. Curl and the loader independently cap the streamed preflight at 512 KiB, and the loader refuses an overrun before transpilation or installation. It then verifies and executes the exact v0.6.2 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.6.2 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The detached staging worker and its Bun package-install child repeat the runtime neutralization while retaining the configured registry, proxy, and certificate trust inputs needed for dependency resolution. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation of that exact release's installer recovers or removes only the proven private stage; another release's installer refuses the durable intent. The invoking shell, PATH-selected pinned Bun binary, configured package registry and transport trust, operating system, and same-UID account remain trust boundaries. Existing trustedDependencies remain unchanged."),
+          text("After artifact admission, the single install command removes ambient Bun, Node, and native-library injection variables before either download or Bun startup, disables Bun dotenv loading, and selects /dev/null as the only Bun configuration. Curl and the loader independently cap the streamed preflight at 512 KiB, and the loader refuses an overrun before transpilation or installation. It then verifies and executes the exact v0.6.3 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.6.3 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The detached staging worker and its Bun package-install child repeat the runtime neutralization while retaining the configured registry, proxy, and certificate trust inputs needed for dependency resolution. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation of that exact release's installer recovers or removes only the proven private stage; another release's installer refuses the durable intent. The invoking shell, PATH-selected pinned Bun binary, configured package registry and transport trust, operating system, and same-UID account remain trust boundaries. Existing trustedDependencies remain unchanged."),
         ),
         { kind: "subheading", text: "Update runbook" },
         paragraph(
@@ -603,7 +603,7 @@ export const publicContent: PublicContent = {
           },
           {
             content: [
-              text("Only after v0.6.2 completes immutable GitHub and npm release admission, install that exact release, then verify the installed version and offline health:"),
+              text("Only after v0.6.3 completes immutable GitHub and npm release admission, install that exact release, then verify the installed version and offline health:"),
             ],
             commands: [
               betaInstallCommand,
@@ -1197,7 +1197,7 @@ export const publicContent: PublicContent = {
           text(" shows the shared counters and the last twenty evidence rows. Only an actual human-authored message resets the consecutive counter; Work and scheduled automation, autorespond, and provider-switch handoff messages do not. Notification consent never enables automatic approvals."),
         ),
         paragraph(
-          text("Unreleased after-hours protocol budgets are not included in v0.6.2. They use a separate local opt-in, disabled on new and upgraded installations. After artifact admission and the daemon rollout gates are satisfied, "),
+          text("The v0.6.3 candidate includes after-hours protocol budgets; they are not part of the admitted v0.6.2 artifact. They use a separate local opt-in, disabled on new and upgraded installations. After artifact admission and the daemon rollout gates are satisfied, "),
           code("hra autorespond-after-hours status"),
           text(" reports that policy and its revision. To opt in explicitly, use "),
           code("hra autorespond-after-hours enable --revision <revision>"),
