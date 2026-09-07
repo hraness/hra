@@ -2,15 +2,15 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
-## Unreleased: after-hours policy
+## v0.6.3 candidate (unreleased)
 
-This work is not part of the immutable `v0.6.2` artifact and does not clear the blocked daemon or hosted command-writer rollout.
+This release-ready candidate adds the default-off after-hours policy after the admitted `v0.6.2` release. It has not completed artifact admission and does not clear the blocked daemon or hosted command-writer rollout.
 
 - After the rollout gates, a separate local opt-in can raise otherwise eligible protocol approval budgets to 6 consecutive, 20 rolling-hour, and 80 rolling-day reservations outside notification hours. Prose stays at 3/10/40 and shares the same accounting. Final transactional admission rechecks current consent, schedule, source authority, and spend. Additive schema 46 preserves schema 45 and requires a newly finalized human message before any pre-44 session can use the higher tier. Policy changes never reset counters or broaden approval categories.
 
-## v0.6.2 candidate (unreleased)
+## v0.6.2
 
-Authentication hardening after the admitted `v0.6.1` release. This candidate has not completed artifact admission and does not clear the blocked daemon or hosted command-writer rollout.
+Authentication hardening after the admitted `v0.6.1` release. Release workflow `34156958618` completed successfully for exact source `5c5c02ee5964167fb85e92da53cdb80c87991890`. Artifact admission does not clear the blocked daemon or hosted command-writer rollout.
 
 - Codex authentication reads stop on cancellation before dispatch. Durable login and cancellation recovery binds exact successor authority without replaying an uncertain provider effect, and cancellation settlement is atomic. Additive schema 45 preserves the released schema 44 automatic-approval budget and quarantines older unbound authentication evidence.
 - Claude status distinguishes a subscription login from other authentication modes before attributing account identity. Interrupted foreground login has a bounded final process join; uncertain cleanup remains fenced. Linux-only support and the pending exact-pin authenticated acceptance remain unchanged.
