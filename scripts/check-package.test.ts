@@ -307,11 +307,15 @@ describe("installed package generic command ownership", () => {
     const cache = join(root, "cache");
     const runChmod = async (...arguments_: string[]): Promise<void> => {
       const child = Bun.spawn(["/bin/chmod", ...arguments_], {
+        killSignal: "SIGKILL",
         stderr: "pipe",
         stdin: "ignore",
-        stdout: "pipe",
+        // An unread pipe can outlive chmod and interfere with later synchronous Git calls.
+        stdout: "ignore",
+        timeout: historyFixtureChildTimeoutMs,
       });
       const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+      expect(child.stdout).toBeUndefined();
       if (exitCode !== 0) throw new Error(`ACL fixture chmod failed: ${stderr}`);
     };
     try {
