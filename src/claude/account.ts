@@ -3,8 +3,10 @@ import { open } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
+import { z } from "zod";
+
+import { readClaudeAuthenticationObservation } from "./auth.ts";
 import { ClaudeError } from "./errors.ts";
-import { allowlistedEnvironment } from "./process.ts";
 import type { PinnedClaudeRuntime } from "./runtime.ts";
 
 export type ClaudeConfigurationHome = "isolated" | "personal";
@@ -26,7 +28,6 @@ export type ClaudeAuthStatusProbe = (input: Readonly<{
 }>) => Promise<unknown>;
 
 const ACCOUNT_DOCUMENT_MAX_BYTES = 128 * 1_024;
-const AUTH_STATUS_MAX_BYTES = 16 * 1_024;
 const AUTH_STATUS_TIMEOUT_MS = 3_000;
 const ACCOUNT_IDENTITY_MAX_BYTES = 320;
 const encoder = new TextEncoder();
@@ -60,8 +61,8 @@ export function claudeAccountDocumentPath(
  * Proves a currently authenticated Claude account without reading a token.
  * `claude auth status --json` supplies current sign-in state; two no-follow
  * reads of the scalar-only account metadata fence an identity change across
- * that status probe. API-key and provider modes remain signed in but carry no
- * stable email, so the daemon can refuse to grant session authority to them.
+ * that status probe. Other first-party authentication modes remain signed in
+ * but carry no OAuth identity, so stale metadata cannot grant session authority.
  */
 export async function readClaudeAccountProjection(input: Readonly<{
   configDir: string;
@@ -91,7 +92,9 @@ export async function readClaudeAccountProjection(input: Readonly<{
     );
   }
   if (!status.signedIn) return Object.freeze({ signedIn: false });
-  if (before === null) return Object.freeze({ signedIn: true });
+  if (before === null || status.authentication !== "claude_ai") {
+    return Object.freeze({ signedIn: true });
+  }
   return Object.freeze({
     signedIn: true,
     ...(before.accountUuid === null ? {} : { accountId: before.accountUuid }),
@@ -103,57 +106,14 @@ export async function readClaudeAccountProjection(input: Readonly<{
 }
 
 export const spawnClaudeAuthStatusProbe: ClaudeAuthStatusProbe = async (input) => {
-  input.signal.throwIfAborted();
-  const env = allowlistedEnvironment(process.env);
-  if (input.configHome === "isolated") env.CLAUDE_CONFIG_DIR = input.configDir;
-  env.NO_COLOR = "1";
-  const child = Bun.spawn([
-    input.runtime.executablePath,
-    "auth",
-    "status",
-    "--json",
-  ], {
-    env,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "ignore",
+  const status = await readClaudeAuthenticationObservation({
+    ...input,
+    deadlineMs: AUTH_STATUS_TIMEOUT_MS,
   });
-  const stdout = collectBoundedStdout(child.stdout, AUTH_STATUS_MAX_BYTES);
-  const completion = Promise.all([child.exited, stdout]);
-  void completion.catch(() => undefined);
-  let rejectBoundary!: (reason: unknown) => void;
-  const boundary = new Promise<never>((_resolve, reject) => {
-    rejectBoundary = reject;
+  return Object.freeze({
+    loggedIn: status.signedIn,
+    authentication: status.authentication,
   });
-  const stop = (reason: unknown): void => {
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // The closed failure below remains authoritative.
-    }
-    rejectBoundary(reason);
-  };
-  const onAbort = (): void => stop(input.signal.reason);
-  input.signal.addEventListener("abort", onAbort, { once: true });
-  const timer = setTimeout(
-    () => stop(new ClaudeError("TIMEOUT", "Claude account status did not settle in time.")),
-    AUTH_STATUS_TIMEOUT_MS,
-  );
-  timer.unref();
-  try {
-    const [exitCode, text] = await Promise.race([completion, boundary]);
-    if (exitCode !== 0) {
-      throw new ClaudeError("AUTHORITY_STALE", "Claude account status was unavailable.");
-    }
-    try {
-      return JSON.parse(text) as unknown;
-    } catch (cause: unknown) {
-      throw new ClaudeError("PROTOCOL_ERROR", "Claude account status was invalid.", { cause });
-    }
-  } finally {
-    clearTimeout(timer);
-    input.signal.removeEventListener("abort", onAbort);
-  }
 };
 
 async function readAccountMetadataDocument(path: string): Promise<unknown> {
@@ -221,11 +181,23 @@ async function readAccountMetadataDocument(path: string): Promise<unknown> {
   }
 }
 
-function parseAuthStatus(value: unknown): Readonly<{ signedIn: boolean }> {
-  if (!isRecord(value) || typeof value.loggedIn !== "boolean") {
-    throw new ClaudeError("PROTOCOL_ERROR", "Claude account status omitted its sign-in state.");
+const authStatusProjectionSchema = z.object({
+  loggedIn: z.boolean(),
+  authentication: z.enum(["claude_ai", "other", "none"]),
+}).strict().refine((value) => value.loggedIn === (value.authentication !== "none"));
+
+function parseAuthStatus(value: unknown): Readonly<{
+  signedIn: boolean;
+  authentication: "claude_ai" | "other" | "none";
+}> {
+  const parsed = authStatusProjectionSchema.safeParse(value);
+  if (!parsed.success) {
+    throw new ClaudeError("PROTOCOL_ERROR", "Claude account status omitted coherent authentication-mode evidence.");
   }
-  return Object.freeze({ signedIn: value.loggedIn });
+  return Object.freeze({
+    signedIn: parsed.data.loggedIn,
+    authentication: parsed.data.authentication,
+  });
 }
 
 function parseAccountIdentity(value: unknown): ClaudeAccountIdentity | null {
@@ -275,42 +247,6 @@ function sameAccountIdentity(
   return left?.accountUuid === right?.accountUuid
     && left?.email === right?.email
     && left?.organizationUuid === right?.organizationUuid;
-}
-
-async function collectBoundedStdout(
-  stream: ReadableStream<Uint8Array> | number | undefined,
-  maximumBytes: number,
-): Promise<string> {
-  if (stream === undefined || typeof stream === "number") {
-    throw new ClaudeError("PROCESS_EXITED", "Claude account status exposed no stdout stream.");
-  }
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    for (;;) {
-      const next = await reader.read();
-      if (next.done) break;
-      total += next.value.byteLength;
-      if (total > maximumBytes) {
-        throw new ClaudeError("PROTOCOL_LIMIT", "Claude account status exceeded its output bound.");
-      }
-      if (next.value.byteLength > 0) chunks.push(next.value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch (cause: unknown) {
-    throw new ClaudeError("PROTOCOL_ERROR", "Claude account status was not UTF-8.", { cause });
-  }
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {

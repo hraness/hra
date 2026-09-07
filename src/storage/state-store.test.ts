@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 
 import { Database, constants as sqliteConstants } from "bun:sqlite";
+import fc from "fast-check";
 import { z } from "zod";
 
 import { deriveDesktopProfilePaths } from "../desktop/profile";
@@ -402,7 +403,7 @@ const downgradeToExactProviderVersion39 = (database: Database): void => {
     ${providerVersion40WorkPresetContractGuardsSql}
     ALTER TABLE profiles DROP COLUMN codex_account_key;
     DELETE FROM migrations WHERE version>39;
-    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=39;
+    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=39;
   `);
 };
 
@@ -435,7 +436,7 @@ const downgradeToExactProviderVersion40 = (database: Database): void => {
     ${providerVersion40WorkPresetContractGuardsSql}
     DELETE FROM migrations WHERE version>40;
     DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert;
-    PRAGMA user_version=40;
+    DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=40;
   `);
 };
 
@@ -444,7 +445,7 @@ const downgradeToExactProviderVersion41 = (database: Database): void => {
   database.exec(`
     ${providerVersion40WorkPresetContractGuardsSql}
     DELETE FROM migrations WHERE version>41;
-    PRAGMA user_version=41;
+    DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=41;
   `);
 };
 
@@ -453,7 +454,16 @@ const downgradeToExactProviderVersion42 = (database: Database): void => {
   dropTranscriptFinalizationSchema(database);
   database.exec(`
     DELETE FROM migrations WHERE version>42;
-    PRAGMA user_version=42;
+    DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=42;
+  `);
+};
+
+/** Exact transcript-v43 surface, before account-mutation successor authority. */
+const downgradeToExactProviderVersion43 = (database: Database): void => {
+  database.exec(`
+    DROP TABLE account_mutation_authority_rebinds;
+    DELETE FROM migrations WHERE version>43;
+    PRAGMA user_version=43;
   `);
 };
 
@@ -475,7 +485,7 @@ const downgradeToHistoricalAdoptionVersion35 = (database: Database): void => {
     throw new Error("Historical adoption-v35 fixture digest mismatch.");
   }
   database.exec(schema);
-  database.exec("DELETE FROM migrations WHERE version>35; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=35;");
+  database.exec("DELETE FROM migrations WHERE version>35; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=35;");
 };
 
 const dropPostLegacyAdoptionVersion36Schema = (database: Database): void => {
@@ -625,7 +635,7 @@ const downgradeToExactLegacyAdoptionVersion36 = (database: Database): void => {
   database.exec(legacyAdoptionWorkAuthorityGuards);
   database.exec(`
     DELETE FROM migrations WHERE version > 36;
-    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=36;
+    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=36;
   `);
 };
 
@@ -773,7 +783,7 @@ const replaceAutorespondEvidenceWithVersion30Fixture = (
     ) VALUES (7,?,'00000000-0000-4000-8000-000000000731','command_approval','shell','accept','manual','accepted',17,1,1500)
   `).run(sessionId);
   database.query("DELETE FROM migrations WHERE version > 30").run();
-  database.exec("DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version = 30");
+  database.exec("DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version = 30");
 };
 
 // Pinned-reader tests prove the scrub fails once a reader outlives the whole
@@ -1033,7 +1043,7 @@ function seedLegacyMcpUrlInteraction(input: Readonly<{
     DROP TABLE IF EXISTS usage_cloud_upload_anchors;
     DROP TABLE IF EXISTS security_scrub_authority;
     DELETE FROM migrations WHERE version>10;
-    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=10;
+    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=10;
   `);
   const displayJson = JSON.stringify({
     kind: "mcp_elicitation",
@@ -1099,7 +1109,7 @@ function seedLegacyPermissionValueInteraction(input: Readonly<{
     DROP TRIGGER IF EXISTS provider_interactions_permission_value_guard_insert;
     DROP TRIGGER IF EXISTS provider_interactions_permission_value_guard_update;
     DELETE FROM migrations WHERE version>14;
-    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=14;
+    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=14;
   `);
   const legacyPrivatePath = ["", "Users", "alice", "private"].join("/");
   const displayJson = JSON.stringify({
@@ -1213,12 +1223,12 @@ function simulateLogicallyRedactedMcpDatabase(input: Readonly<{
         required_at INTEGER NOT NULL CHECK(required_at >= 0)
       ) STRICT;
       INSERT INTO migrations(version,applied_at) VALUES (13,9000);
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=13;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=13;
     `);
   } else if (input.targetVersion === 12) {
-    legacy.exec("DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=12");
+    legacy.exec("DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=12");
   } else {
-    legacy.exec("DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=11");
+    legacy.exec("DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=11");
   }
   expect(legacy.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toEqual({
     busy: 0,
@@ -1251,6 +1261,175 @@ function moveQueueTo(store: StateStore, queueId: ReturnType<StateStore["enqueue"
     expect(store.transitionQueue(queueId, "dispatching", state)).toBe(true);
   }
 }
+
+describe("account mutation successor authority", () => {
+  const seed = async (kind: "account.login" | "account.logout" | "account.login-cancel") => {
+    const { store } = await fixture();
+    const profile = store.createProfile(`Recovery ${kind}`);
+    const loginKey = crypto.randomUUID();
+    const login = store.prepareMutation({
+      kind: "account.login", authorityId: profile.id, authorityGeneration: 1,
+      request: { deviceCode: true }, idempotencyKey: loginKey,
+    });
+    completeCodexAccountMutationAuthorityRetirement(store, profile.id, 0);
+    store.beginAccountMutationEffect({
+      attemptId: login.id, profileId: profile.id, profileGeneration: 1,
+      evidence: { kind: "account.login", method: "device_code" },
+    });
+    if (kind === "account.login") return { store, profile, key: loginKey, attempt: login };
+    store.completeAccountLoginMutation({
+      attemptId: login.id, profileId: profile.id, processGeneration: 1,
+      receipt: kind === "account.logout"
+        ? { status: "signed_in", account: { signedIn: true, email: "recovery@example.com" } }
+        : { status: "pending", loginId: "exact-recovery-login" },
+    });
+    const key = crypto.randomUUID();
+    const attempt = store.prepareMutation({
+      kind, authorityId: profile.id, authorityGeneration: 1,
+      request: kind === "account.logout" ? {} : { loginId: "exact-recovery-login" },
+      idempotencyKey: key,
+    });
+    if (kind === "account.logout") {
+      completeCodexAccountMutationAuthorityRetirement(store, profile.id, 1);
+      store.beginAccountMutationEffect({
+        attemptId: attempt.id, profileId: profile.id, profileGeneration: 1,
+        evidence: { kind, baselineSignedIn: true },
+      });
+    } else {
+      store.beginLoginCancelMutationEffect({
+        attemptId: attempt.id, profileId: profile.id, processGeneration: 1,
+        loginId: "exact-recovery-login",
+      });
+    }
+    return { store, profile, key, attempt };
+  };
+
+  for (const kind of ["account.login", "account.logout", "account.login-cancel"] as const) {
+    test(`preserves immutable ${kind} through repeated exact daemon rollovers`, async () => {
+      const { store, profile, key, attempt } = await seed(kind);
+      const inspector = new Database(store.paths.database, { strict: true });
+      try {
+        const original = store.readMutation(key);
+        const bytes = inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id);
+        for (let restart = 1; restart <= 4; restart += 1) {
+          store.nextDaemonGeneration(`boot_${String(restart).repeat(32)}`);
+          expect(store.recoverEffectStartedMutations().unresolved).toEqual([]);
+          expect(store.isAccountMutationAuthorityCurrent({
+            attemptId: attempt.id, profileId: profile.id, originGeneration: 1,
+          })).toBe(true);
+          expect(store.requireProfileById(profile.id)).toMatchObject({ state: "recovery_required", processGeneration: restart + 1 });
+          expect(store.readMutation(key)).toMatchObject({ authorityGeneration: 1, state: "ambiguous", evidence: original?.evidence });
+          expect(inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id)).toEqual(bytes);
+        }
+        expect(inspector.query("SELECT from_generation,to_generation FROM account_mutation_authority_rebinds WHERE attempt_id=? ORDER BY from_generation").all(attempt.id))
+          .toEqual([1, 2, 3, 4].map((generation) => ({ from_generation: generation, to_generation: generation + 1 })));
+        if (kind === "account.login-cancel") {
+          store.resolveLoginCancelMutation({ attemptId: attempt.id, expectedOriginalState: "ambiguous", provider: { signedIn: false } });
+          store.reconcileProfileRecoveryFromAccountRead({ profileId: profile.id, expectedGeneration: 5, provider: { signedIn: false } });
+          expect(store.requireProfileById(profile.id).state).toBe("login_pending");
+          expect(store.readPendingLoginAuthority(profile.id, 5)?.loginId).toBe("exact-recovery-login");
+        } else {
+          if (original?.evidence === undefined) throw new Error("Expected exact account evidence.");
+          store.resolveAccountMutation({
+            attemptId: attempt.id, expectedOriginalState: "ambiguous", expectedEvidenceDigest: original.evidence.digest,
+            resolution: "proven_applied", resolutionEvidence: { source: "account/read", signedIn: kind === "account.login" },
+            provider: kind === "account.login" ? { signedIn: true, email: "recovery@example.com" } : { signedIn: false },
+          });
+        }
+        expect(store.readMutation(key)?.state).toBe("reconciled");
+      } finally { inspector.close(false); }
+    });
+  }
+
+  test("keeps origin and effect invariant for arbitrary bounded successor counts", async () => {
+    await fc.assert(fc.asyncProperty(
+      fc.constantFrom("account.login" as const, "account.logout" as const, "account.login-cancel" as const),
+      fc.integer({ min: 1, max: 8 }),
+      async (kind, rollovers) => {
+        const { store, profile, attempt, key } = await seed(kind);
+        const original = store.readMutation(key)?.evidence;
+        for (let index = 0; index < rollovers; index += 1) {
+          store.nextDaemonGeneration(`boot_${String(index).repeat(32)}`);
+          store.recoverEffectStartedMutations();
+          expect(store.isAccountMutationAuthorityCurrent({ attemptId: attempt.id, profileId: profile.id, originGeneration: 1 })).toBe(true);
+          expect(store.readMutation(key)).toMatchObject({ authorityGeneration: 1, evidence: original });
+        }
+        // A single unrecorded +1 rollover cannot be mistaken for this chain.
+        store.nextProfileGeneration(profile.id);
+        expect(store.isAccountMutationAuthorityCurrent({ attemptId: attempt.id, profileId: profile.id, originGeneration: 1 })).toBe(false);
+      },
+    ), { numRuns: 12, seed: 44 });
+  });
+
+  test("quarantines missing legacy chains without clearing account recovery or granting a fresh attempt", async () => {
+    const { store, profile, attempt, key } = await seed("account.login");
+    store.transitionMutation(attempt.id, "effect_started", "ambiguous");
+    store.nextProfileGeneration(profile.id);
+    expect(store.isAccountMutationAuthorityCurrent({ attemptId: attempt.id, profileId: profile.id, originGeneration: 1 })).toBe(false);
+    store.nextDaemonGeneration(`boot_${"f".repeat(32)}`);
+    expect(store.requireProfileById(profile.id)).toMatchObject({ processGeneration: 3, state: "recovery_required" });
+    expect(store.isAccountMutationAuthorityCurrent({ attemptId: attempt.id, profileId: profile.id, originGeneration: 1 })).toBe(false);
+    expect(() => store.reconcileProfileRecoveryFromAccountRead({ profileId: profile.id, expectedGeneration: 3, provider: { signedIn: false } }))
+      .toThrow("PROFILE_RECOVERY_AUTHORITY_UNSETTLED");
+    expect(() => store.prepareMutation({ kind: "account.login", authorityId: profile.id, authorityGeneration: 4, request: { deviceCode: true } }))
+      .toThrow("UNSETTLED_MUTATION_AUTHORITY");
+    expect(store.readMutation(key)?.state).toBe("ambiguous");
+  });
+
+  test("refuses a broken partial successor chain without inventing legacy authority", async () => {
+    const { store, profile, attempt } = await seed("account.login");
+    store.nextDaemonGeneration(`boot_${"b".repeat(32)}`);
+    store.recoverEffectStartedMutations();
+    store.nextProfileGeneration(profile.id);
+    const before = store.requireProfileById(profile.id);
+    expect(() => store.nextDaemonGeneration(`boot_${"c".repeat(32)}`)).toThrow("ACCOUNT_MUTATION_SUCCESSOR_AUTHORITY_MISMATCH");
+    expect(store.requireProfileById(profile.id)).toEqual(before);
+    expect(store.isAccountMutationAuthorityCurrent({ attemptId: attempt.id, profileId: profile.id, originGeneration: 1 })).toBe(false);
+  });
+
+  test("rejects forged successor fields, skipped generations, and immutable-ledger rewrites", async () => {
+    const { store, profile, attempt, key } = await seed("account.login");
+    const inspector = new Database(store.paths.database, { strict: true });
+    const other = store.createProfile("Other recovery authority");
+    const digest = store.readMutation(key)?.evidence?.digest;
+    if (digest === undefined) throw new Error("Expected effect digest.");
+    try {
+      const insert = inspector.query("INSERT INTO account_mutation_authority_rebinds(attempt_id,profile_id,kind,evidence_digest,from_generation,to_generation,recorded_at) VALUES (?,?,?,?,?,?,1000)");
+      for (const [profileId, kind, evidenceDigest, from, to] of [
+        [other.id, "account.login", digest, 1, 2],
+        [profile.id, "account.logout", digest, 1, 2],
+        [profile.id, "account.login", "0".repeat(64), 1, 2],
+        [profile.id, "account.login", digest, 1, 3],
+        [profile.id, "account.login", digest, 2, 3],
+      ] as const) {
+        expect(() => insert.run(attempt.id, profileId, kind, evidenceDigest, from, to)).toThrow();
+      }
+      store.nextDaemonGeneration(`boot_${"e".repeat(32)}`);
+      expect(() => inspector.query("UPDATE account_mutation_authority_rebinds SET recorded_at=2000 WHERE attempt_id=?").run(attempt.id)).toThrow("immutable");
+      expect(() => inspector.query("DELETE FROM account_mutation_authority_rebinds WHERE attempt_id=?").run(attempt.id)).toThrow("immutable");
+    } finally { inspector.close(false); }
+  });
+
+  test("rejects changed effect bytes instead of blessing them with a successor", async () => {
+    const { store, profile, attempt } = await seed("account.login");
+    const inspector = new Database(store.paths.database, { strict: true });
+    try {
+      inspector.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
+      inspector.query("UPDATE mutation_effect_evidence SET evidence_json=? WHERE attempt_id=?")
+        .run(JSON.stringify({ kind: "account.login", method: "browser" }), attempt.id);
+      expect(store.isAccountMutationAuthorityCurrent({ attemptId: attempt.id, profileId: profile.id, originGeneration: 1 })).toBe(false);
+      expect(() => store.nextDaemonGeneration(`boot_${"a".repeat(32)}`)).toThrow("MUTATION_EFFECT_EVIDENCE_DIGEST_MISMATCH");
+      expect(inspector.query("SELECT COUNT(*) AS count FROM account_mutation_authority_rebinds").get()).toEqual({ count: 0 });
+      const changed = JSON.stringify({ kind: "account.login", method: "browser" });
+      inspector.query("UPDATE mutation_effect_evidence SET evidence_digest=? WHERE attempt_id=?")
+        .run(createHash("sha256").update(changed).digest("hex"), attempt.id);
+      // Even internally consistent replacement effect bytes cannot change the
+      // device-code method bound by the original immutable request digest.
+      expect(store.isAccountMutationAuthorityCurrent({ attemptId: attempt.id, profileId: profile.id, originGeneration: 1 })).toBe(false);
+      expect(() => store.nextDaemonGeneration(`boot_${"a".repeat(32)}`)).toThrow("ACCOUNT_MUTATION_SUCCESSOR_AUTHORITY_MISMATCH");
+    } finally { inspector.close(false); }
+  });
+});
 
 describe("StateStore", () => {
   test("creates the main database as an exact private single-link file", async () => {
@@ -4107,7 +4286,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=35 ORDER BY version",
       ).all()).toEqual([
@@ -4120,6 +4299,7 @@ describe("StateStore", () => {
         { version: 41 },
         { version: 42 },
         { version: 43 },
+        { version: 44 },
       ]);
       expect(inspector.query(
         "SELECT name FROM pragma_table_info('session_adoption_candidates') WHERE name='provider_project_root'",
@@ -4204,7 +4384,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_ADOPTION_WORK_INVALID");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         `SELECT revision,claim_status FROM session_adoption_candidates
          WHERE provider=? AND provider_thread_id=?`,
@@ -5905,7 +6085,7 @@ describe("StateStore", () => {
     });
     try {
       dropSchemaAfterVersion34(legacy);
-      legacy.exec("DELETE FROM migrations WHERE version>34; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=34;");
+      legacy.exec("DELETE FROM migrations WHERE version>34; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=34;");
     } finally {
       legacy.close(false);
     }
@@ -10439,7 +10619,7 @@ describe("StateStore", () => {
       // Emulate a resolution committed before the timestamp and active-Work
       // migrations existed, using the exact released v40 authority surface.
       downgradeToExactProviderVersion40(inspector);
-      expect(() => new StateStore(store.paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:43");
+      expect(() => new StateStore(store.paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:44");
       inspector.query("INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,'proven_applied',?,?,1000)").run(attempt.id, resolutionBytes, JSON.stringify({ renamed: true }));
       const before = inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id);
       const stableSchemaBefore = inspector.query(
@@ -10449,6 +10629,7 @@ describe("StateStore", () => {
            'work_devin_preset_contract_guard',
            'work_session_devin_contract_guard'
          )
+         AND tbl_name!='account_mutation_authority_rebinds'
          ORDER BY type,name`,
       ).all();
       const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
@@ -10461,11 +10642,12 @@ describe("StateStore", () => {
            'work_devin_preset_contract_guard',
            'work_session_devin_contract_guard'
          )
+         AND tbl_name!='account_mutation_authority_rebinds'
          ORDER BY type,name`,
       ).all()).toEqual(stableSchemaBefore);
       expect(inspector.query("SELECT * FROM migrations WHERE version<41 ORDER BY version").all()).toEqual(ledgerBefore);
-      expect(inspector.query("SELECT version FROM migrations WHERE version>=40 ORDER BY version").all()).toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }]);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("SELECT version FROM migrations WHERE version>=40 ORDER BY version").all()).toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(reopened.readMutation(key)?.evidence).toEqual(original);
       expect(reopened.readMutation(key)?.resolution?.evidence).toEqual(JSON.parse(resolutionBytes));
       expect(inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id)).toEqual(before);
@@ -10474,7 +10656,7 @@ describe("StateStore", () => {
     } finally { inspector.close(false); }
   });
 
-  test("refuses missing or changed timestamp guards in current schema 43 without repairing them", async () => {
+  test("refuses missing or changed timestamp guards in current schema 44 without repairing them", async () => {
     for (const definition of ["missing", "weaker", "changed_literal"] as const) {
       const { store } = await fixture();
       const inspector = new Database(store.paths.database, { create: false, strict: true });
@@ -10492,7 +10674,7 @@ describe("StateStore", () => {
           expect(() => new StateStore(store.paths, { readonly })).toThrow("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID");
           expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
           expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledgerBefore);
-          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
         }
       } finally { inspector.close(false); }
     }
@@ -10522,7 +10704,7 @@ describe("StateStore", () => {
           "STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID",
         );
         expect(() => new StateStore(store.paths, { readonly: true })).toThrow(
-          "STATE_SCHEMA_MIGRATION_REQUIRED:41:43",
+          "STATE_SCHEMA_MIGRATION_REQUIRED:41:44",
         );
         expect(inspector.query(
           "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
@@ -10556,7 +10738,7 @@ describe("StateStore", () => {
           "STATE_SCHEMA_V40_MIGRATION_LEDGER_INVALID",
         );
         expect(() => new StateStore(store.paths, { readonly: true })).toThrow(
-          "STATE_SCHEMA_MIGRATION_REQUIRED:40:43",
+          "STATE_SCHEMA_MIGRATION_REQUIRED:40:44",
         );
         expect(inspector.query(
           "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
@@ -10602,7 +10784,7 @@ describe("StateStore", () => {
           "STATE_SCHEMA_V41_MIGRATION_LEDGER_INVALID",
         );
         expect(() => new StateStore(store.paths, { readonly: true })).toThrow(
-          "STATE_SCHEMA_MIGRATION_REQUIRED:41:43",
+          "STATE_SCHEMA_MIGRATION_REQUIRED:41:44",
         );
         expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
         expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledgerBefore);
@@ -10613,12 +10795,106 @@ describe("StateStore", () => {
     }
   });
 
-  test("refuses an invalid current schema 43 migration ledger without writes", async () => {
+  test("auth44 schema refuses current authority DDL drift without repair or retained-row changes", async () => {
+    for (const damage of ["missing_table", "missing_guard", "weaker_guard", "wrong_table_guard", "extra_index"] as const) {
+      const { store } = await fixture();
+      const profile = signInProfile(store, "Auth schema drift", "auth-schema@example.com");
+      const inspector = new Database(store.paths.database, { create: false, strict: true });
+      try {
+        if (damage === "missing_table") inspector.exec("DROP TABLE account_mutation_authority_rebinds");
+        else if (damage === "extra_index") inspector.exec("CREATE INDEX unreviewed_auth_index ON account_mutation_authority_rebinds(profile_id)");
+        else {
+          inspector.exec("DROP TRIGGER account_mutation_authority_rebinds_insert_guard");
+          if (damage === "weaker_guard") inspector.exec("CREATE TRIGGER account_mutation_authority_rebinds_insert_guard BEFORE INSERT ON account_mutation_authority_rebinds BEGIN SELECT 1; END");
+          if (damage === "wrong_table_guard") inspector.exec("CREATE TRIGGER account_mutation_authority_rebinds_insert_guard BEFORE INSERT ON profiles BEGIN SELECT 1; END");
+        }
+        const schemaBefore = inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all();
+        const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
+        const profileBefore = inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id);
+        for (const readonly of [false, true]) {
+          expect(() => new StateStore(store.paths, { readonly })).toThrow("STATE_SCHEMA_V44_ACCOUNT_MUTATION_AUTHORITY_INVALID");
+          expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
+          expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledgerBefore);
+          expect(inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id)).toEqual(profileBefore);
+          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
+        }
+      } finally { inspector.close(false); }
+    }
+  });
+
+  test("auth44 schema rejects colliding predecessor objects and rolls back the whole migration", async () => {
+    for (const collision of ["table", "trigger"] as const) {
+      const { store } = await fixture();
+      const profile = signInProfile(store, "Auth collision", "auth-collision@example.com");
+      const inspector = new Database(store.paths.database, { create: false, strict: true });
+      try {
+        downgradeToExactProviderVersion43(inspector);
+        if (collision === "table") inspector.exec("CREATE TABLE account_mutation_authority_rebinds(unreviewed TEXT) STRICT");
+        else inspector.exec("CREATE TRIGGER account_mutation_authority_rebinds_insert_guard BEFORE INSERT ON profiles BEGIN SELECT 1; END");
+        const schemaBefore = inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all();
+        const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
+        const profileBefore = inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id);
+        expect(() => new StateStore(store.paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:44");
+        expect(() => new StateStore(store.paths)).toThrow("already exists");
+        expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
+        expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledgerBefore);
+        expect(inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id)).toEqual(profileBefore);
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      } finally { inspector.close(false); }
+    }
+  });
+
+  test("auth44 schema migration adds no successor authority and preserves exact v43 evidence and sibling state", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Pending auth migration");
+    const sibling = signInProfile(store, "Sibling migration", "sibling-migration@example.com");
+    upsertProvenTestSession(store, {
+      profileId: sibling.id, provider: "claude", providerThreadId: "auth-schema-sibling-thread",
+      preset: "fable-max", fastEnabled: false, state: "idle",
+    });
+    store.recordUsage(sibling.id, 1, 10_000, { totalTokens: 100 });
+    const key = crypto.randomUUID();
+    const attempt = store.prepareMutation({
+      kind: "account.login", authorityId: profile.id, authorityGeneration: 1,
+      request: { deviceCode: true }, idempotencyKey: key,
+    });
+    completeCodexAccountMutationAuthorityRetirement(store, profile.id, 0);
+    store.beginAccountMutationEffect({
+      attemptId: attempt.id, profileId: profile.id, profileGeneration: 1,
+      evidence: { kind: "account.login", method: "device_code" },
+    });
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      downgradeToExactProviderVersion43(inspector);
+      const stableSchema = inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all();
+      const oldLedger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
+      const profiles = inspector.query("SELECT * FROM profiles ORDER BY id").all();
+      const sessions = inspector.query("SELECT * FROM sessions ORDER BY id").all();
+      const usage = store.latestUsage(sibling.id);
+      const mutation = inspector.query("SELECT * FROM mutation_attempts WHERE id=?").get(attempt.id);
+      const evidence = inspector.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id);
+      const reopened = new StateStore(store.paths, { now: () => 3_000 });
+      stores.push(reopened);
+      expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE tbl_name!='account_mutation_authority_rebinds' ORDER BY type,name").all()).toEqual(stableSchema);
+      expect(inspector.query("SELECT * FROM migrations WHERE version<44 ORDER BY version").all()).toEqual(oldLedger);
+      expect(inspector.query("SELECT * FROM profiles ORDER BY id").all()).toEqual(profiles);
+      expect(inspector.query("SELECT * FROM sessions ORDER BY id").all()).toEqual(sessions);
+      expect(reopened.latestUsage(sibling.id)).toEqual(usage);
+      expect(inspector.query("SELECT * FROM mutation_attempts WHERE id=?").get(attempt.id)).toEqual(mutation);
+      expect(inspector.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id)).toEqual(evidence);
+      expect(inspector.query("SELECT count(*) AS count FROM account_mutation_authority_rebinds").get()).toEqual({ count: 0 });
+      expect(inspector.query("SELECT count(*) AS count FROM mutation_resolutions WHERE attempt_id=?").get(attempt.id)).toEqual({ count: 0 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
+    } finally { inspector.close(false); }
+  });
+
+  test("refuses an invalid current schema 44 migration ledger without writes", async () => {
     for (const damage of [
       "missing_40",
       "missing_41",
       "missing_42",
       "missing_43",
+      "missing_44",
       "negative_time",
       "unsafe_time",
       "later_version",
@@ -10639,12 +10915,13 @@ describe("StateStore", () => {
         else if (damage === "missing_41") inspector.exec("DELETE FROM migrations WHERE version=41");
         else if (damage === "missing_42") inspector.exec("DELETE FROM migrations WHERE version=42");
         else if (damage === "missing_43") inspector.exec("DELETE FROM migrations WHERE version=43");
+        else if (damage === "missing_44") inspector.exec("DELETE FROM migrations WHERE version=44");
         else if (damage === "negative_time") {
-          inspector.exec("PRAGMA ignore_check_constraints=ON; UPDATE migrations SET applied_at=-1 WHERE version=43; PRAGMA ignore_check_constraints=OFF;");
+          inspector.exec("PRAGMA ignore_check_constraints=ON; UPDATE migrations SET applied_at=-1 WHERE version=44; PRAGMA ignore_check_constraints=OFF;");
         } else if (damage === "unsafe_time") {
-          inspector.query("UPDATE migrations SET applied_at=? WHERE version=43")
+          inspector.query("UPDATE migrations SET applied_at=? WHERE version=44")
             .run(Number.MAX_SAFE_INTEGER + 1);
-        } else inspector.exec("INSERT INTO migrations(version,applied_at) VALUES (44,1000)");
+        } else inspector.exec("INSERT INTO migrations(version,applied_at) VALUES (45,1000)");
         const schemaBefore = inspector.query(
           "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
         ).all();
@@ -10654,7 +10931,7 @@ describe("StateStore", () => {
 
         for (const readonly of [false, true]) {
           expect(() => new StateStore(store.paths, { readonly })).toThrow(
-            "STATE_SCHEMA_V43_MIGRATION_LEDGER_INVALID",
+            "STATE_SCHEMA_V44_MIGRATION_LEDGER_INVALID",
           );
           expect(inspector.query(
             "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
@@ -10665,7 +10942,7 @@ describe("StateStore", () => {
             .toEqual(sessionBefore);
           expect(inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id))
             .toEqual(profileBefore);
-          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
         }
       } finally { inspector.close(false); }
     }
@@ -11300,7 +11577,7 @@ describe("StateStore", () => {
       DROP TRIGGER IF EXISTS queue_effect_resolution_authority_guard;
       DROP TABLE IF EXISTS queue_message_scrub_authority;
       DELETE FROM migrations WHERE version>20;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=20;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=20;
     `);
     legacy.query(
       "UPDATE queue_entries SET message=? WHERE id=?",
@@ -11349,7 +11626,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -15221,7 +15498,7 @@ describe("StateStore", () => {
         DROP TRIGGER account_rate_limit_reset_policy_delete_guard;
         DROP TABLE account_rate_limit_reset_policies;
         DELETE FROM migrations WHERE version>27;
-        DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=27;
+        DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=27;
       `);
     } finally {
       legacy.close(false);
@@ -15298,7 +15575,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts",
       ).get()).toEqual({ count: 1 });
@@ -15328,7 +15605,7 @@ describe("StateStore", () => {
     const partial = new Database(paths.database, { create: false, strict: true });
     try {
       dropSchemaAfterVersion34(partial);
-      partial.exec("DELETE FROM migrations WHERE version>27; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=27");
+      partial.exec("DELETE FROM migrations WHERE version>27; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=27");
     } finally {
       partial.close(false);
     }
@@ -16958,9 +17235,9 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query("SELECT version FROM migrations ORDER BY version").all())
-        .toEqual(Array.from({ length: 43 }, (_, index) => ({ version: index + 1 })));
+        .toEqual(Array.from({ length: 44 }, (_, index) => ({ version: index + 1 })));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
         .toContainEqual(expect.objectContaining({ name: "attempt_sequence", type: "INTEGER", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
@@ -17149,7 +17426,7 @@ describe("StateStore", () => {
       foreignKeyViolations: 0,
       profileColumns: ["codex_account_key"],
       sqliteVersion: expect.stringMatching(/^3\./u),
-      userVersion: 43,
+      userVersion: 44,
     });
   });
 
@@ -17196,7 +17473,7 @@ describe("StateStore", () => {
     try {
       dropPostProviderSwitchSchema(legacy);
       dropProviderSwitchProgressSchema(legacy);
-      legacy.exec("DELETE FROM migrations WHERE version>=35; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=34;");
+      legacy.exec("DELETE FROM migrations WHERE version>=35; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=34;");
       expect(legacy.query(
         `SELECT COUNT(*) AS count FROM sqlite_master
          WHERE name LIKE 'session_provider_switch_%'
@@ -17208,7 +17485,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:44");
     const migrated = new StateStore(paths, { now: () => 4_000 });
     stores.push(migrated);
     expect(migrated.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtimeProfile);
@@ -17218,7 +17495,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
         .toEqual([
           { version: 35 },
@@ -17230,6 +17507,7 @@ describe("StateStore", () => {
           { version: 41 },
           { version: 42 },
           { version: 43 },
+          { version: 44 },
         ]);
       expect(inspector.query(
         `SELECT type,COUNT(*) AS count FROM sqlite_master
@@ -17257,7 +17535,7 @@ describe("StateStore", () => {
     const upstreamV35 = new Database(paths.database, { create: false, strict: true });
     try {
       dropPostProviderSwitchSchema(upstreamV35);
-      upstreamV35.exec("DELETE FROM migrations WHERE version>=36; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=35;");
+      upstreamV35.exec("DELETE FROM migrations WHERE version>=36; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=35;");
       expect(upstreamV35.query(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='session_provider_switch_targets'",
       ).get()).toEqual({ name: "session_provider_switch_targets" });
@@ -17272,7 +17550,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
         .toEqual([
           { version: 35 },
@@ -17284,6 +17562,7 @@ describe("StateStore", () => {
           { version: 41 },
           { version: 42 },
           { version: 43 },
+          { version: 44 },
         ]);
       expect(inspector.query(
         `SELECT name FROM sqlite_master WHERE type='table'
@@ -17329,7 +17608,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:44");
     const migrated = new StateStore(paths, { now: () => 2_000 });
     stores.push(migrated);
     expect(migrated.requireSession(session.id)).toMatchObject({
@@ -17338,7 +17617,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=39 ORDER BY version",
       ).all()).toEqual([
@@ -17347,6 +17626,7 @@ describe("StateStore", () => {
         { version: 41 },
         { version: 42 },
         { version: 43 },
+        { version: 44 },
       ]);
       expect(inspector.query(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
@@ -17397,7 +17677,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:41:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:41:44");
     const migrated = new StateStore(paths, { now: () => 2_000 });
     stores.push(migrated);
     expect(migrated.requireSession(session.id)).toMatchObject({
@@ -17407,10 +17687,10 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=40 ORDER BY version",
-      ).all()).toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }]);
+      ).all()).toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }]);
       expect(inspector.query(
         "SELECT type,tbl_name,sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'",
       ).get()).toEqual(timestampGuardBefore);
@@ -17513,7 +17793,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:42:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:42:44");
     const migrated = new StateStore(paths, { now: () => 4_300 });
     stores.push(migrated);
     expect(migrated.hasSessionUserMessageSource(session.id, "mutation", appliedMutationKey)).toBe(false);
@@ -17543,9 +17823,9 @@ describe("StateStore", () => {
       .toEqual([]);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query("SELECT version FROM migrations WHERE version>=40 ORDER BY version").all())
-        .toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }]);
+        .toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }]);
       expect(inspector.query(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='session_user_message_finalizations'",
       ).get()).toBeNull();
@@ -17615,6 +17895,7 @@ describe("StateStore", () => {
     const unsafeName = `pre-release${String.fromCodePoint(0x2029)}name.txt`;
     const predecessor = new Database(paths.database, { create: false, strict: true });
     try {
+      downgradeToExactProviderVersion43(predecessor);
       const triggers = z.array(z.object({ name: z.string(), sql: z.string() }).strict()).parse(
         predecessor.query(
           `SELECT name,sql FROM sqlite_master WHERE type='trigger'
@@ -17731,6 +18012,7 @@ describe("StateStore", () => {
     ];
     const damaged = new Database(paths.database, { create: false, strict: true });
     try {
+      downgradeToExactProviderVersion43(damaged);
       const triggers = z.array(z.object({ name: z.string(), sql: z.string() }).strict()).parse(
         damaged.query(
           `SELECT name,sql FROM sqlite_master WHERE type='trigger'
@@ -17782,13 +18064,14 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
     const damaged = new Database(paths.database, { create: false, strict: true });
     try {
+      downgradeToExactProviderVersion43(damaged);
       damaged.exec("DROP TRIGGER queue_transcript_cancellation_settlement");
     } finally {
       damaged.close(false);
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_V43_QUEUE_CANCELLATION_GUARD_INVALID");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:44");
     const repaired = new StateStore(paths);
     stores.push(repaired);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
@@ -17809,6 +18092,7 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
     const predecessor = new Database(paths.database, { create: false, strict: true });
     try {
+      downgradeToExactProviderVersion43(predecessor);
       const trigger = z.object({ sql: z.string() }).strict().parse(predecessor.query(
         `SELECT sql FROM sqlite_master
          WHERE type='trigger' AND name='queue_transcript_finalization_guard'`,
@@ -17829,7 +18113,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:44");
     const upgraded = new StateStore(paths);
     stores.push(upgraded);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
@@ -17878,6 +18162,7 @@ describe("StateStore", () => {
 
     const damaged = new Database(paths.database, { create: false, strict: true });
     try {
+      downgradeToExactProviderVersion43(damaged);
       const triggers = z.array(z.object({
         name: z.string(),
         sql: z.string(),
@@ -17913,7 +18198,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_V43_QUEUE_CANCELLATION_SETTLEMENT_INVALID");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:44");
     const repaired = new StateStore(paths, { now: () => 4_303 });
     stores.push(repaired);
     expect(repaired.requireQueue(queued.id)).toMatchObject({ state: "cancelled" });
@@ -18014,7 +18299,7 @@ describe("StateStore", () => {
       inspector.close(false);
     }
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:42:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:42:44");
   });
 
   test("refuses a missing or weakened v43 transcript authority guard without repair", async () => {
@@ -19053,7 +19338,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT 1 FROM pragma_table_info('session_adoption_candidates') WHERE name='last_live_observed_at'",
       ).get()).toEqual({ 1: 1 });
@@ -19107,7 +19392,7 @@ describe("StateStore", () => {
     try {
       dropPostLegacyAdoptionVersion36Schema(featureV35);
       dropProviderSwitchProgressSchema(featureV35);
-      featureV35.exec("DELETE FROM migrations WHERE version>=36; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=35;");
+      featureV35.exec("DELETE FROM migrations WHERE version>=36; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=35;");
       expect(featureV35.query(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
       ).get()).toEqual({ name: "session_adoption_policies" });
@@ -19221,7 +19506,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_adoption_candidates");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT name FROM pragma_table_info('session_adoption_candidates') WHERE name=?",
       ).get(column)).toBeNull();
@@ -19230,7 +19515,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v43 writable open never recreates missing provider-v39 authority", async () => {
+  test("current v44 writable open never recreates missing provider-v39 authority", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -19248,7 +19533,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_mutation_authority_rebinds_v39");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT name FROM sqlite_master WHERE name='session_mutation_authority_rebinds_v39'",
       ).get()).toBeNull();
@@ -19261,7 +19546,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v43 rejects a weakened same-name provider-v39 authority trigger without repair", async () => {
+  test("current v44 rejects a weakened same-name provider-v39 authority trigger without repair", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -19287,7 +19572,7 @@ describe("StateStore", () => {
     }
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         `SELECT sql FROM sqlite_master
          WHERE type='trigger'
@@ -19300,7 +19585,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v43 writable open never backfills a missing provider-v39 column", async () => {
+  test("current v44 writable open never backfills a missing provider-v39 column", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -19319,7 +19604,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:sessions.provider_v39");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT name FROM pragma_table_info('sessions') WHERE name='provider_v39'",
       ).get()).toBeNull();
@@ -19377,7 +19662,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_claude_process_authorities_live_identity");
     const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT sql FROM sqlite_master WHERE name='session_adoption_candidate_revision_guard'",
       ).get()).toEqual(expect.objectContaining({ sql: expect.stringContaining("SELECT 1") }));
@@ -19412,7 +19697,7 @@ describe("StateStore", () => {
     dropProviderSwitchProgressSchema(legacy);
     legacy.exec(`
       DELETE FROM migrations WHERE version > 25;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=25;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=25;
     `);
     legacy.close(false);
 
@@ -19430,7 +19715,7 @@ describe("StateStore", () => {
         .toContainEqual(expect.objectContaining({ name: "preset_contract", notnull: 1 }));
       expect(inspector.query("SELECT preset_contract FROM sessions WHERE id=?").get(session.id))
         .toEqual({ preset_contract: legacyPresetContract });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query("SELECT version FROM migrations WHERE version=38").get())
         .toEqual({ version: 38 });
     } finally {
@@ -19523,12 +19808,12 @@ describe("StateStore", () => {
     dropPostProviderSwitchSchema(mainV35);
     mainV35.exec(`
       DELETE FROM migrations WHERE version>=36;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=35;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=35;
     `);
     mainV35.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:44");
     const migrated = new StateStore(paths, {
       now: () => 8_000,
       resolveMachineTimeZone: () => "UTC",
@@ -19542,7 +19827,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT provider_thread_id,recorded_at FROM session_provider_switch_targets WHERE attempt_id=?",
       ).get(attempt.id)).toEqual({
@@ -19582,13 +19867,13 @@ describe("StateStore", () => {
     legacy.exec(`
       DROP TABLE attention_email_policy;
       DELETE FROM migrations WHERE version>=36;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=35;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=35;
     `);
     expect(providerSwitchSchemaObjectCount(legacy)).toBe(0);
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:44");
     const migrated = new StateStore(paths, {
       now: () => 9_000,
       resolveMachineTimeZone: () => {
@@ -19610,7 +19895,7 @@ describe("StateStore", () => {
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
     } finally {
       inspector.close(false);
     }
@@ -19630,12 +19915,12 @@ describe("StateStore", () => {
     dropSessionAdoptionAndPresetContractSchema(legacy);
     legacy.exec(`
       DELETE FROM migrations WHERE version>=37;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=36;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=36;
     `);
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:44");
 
     expect(() => new StateStore(paths))
       .toThrow("ATTENTION_EMAIL_POLICY_MIGRATION_OPT_IN_REFUSED");
@@ -19673,7 +19958,7 @@ describe("StateStore", () => {
     const legacy = new Database(paths.database, { create: false, strict: true });
     dropSessionAdoptionAndPresetContractSchema(legacy);
     dropProviderSwitchVersion35Objects(legacy);
-    legacy.exec("DELETE FROM migrations WHERE version>=37; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=36;");
+    legacy.exec("DELETE FROM migrations WHERE version>=37; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=36;");
     const before = legacy.query(
       `SELECT h.start_minute,h.end_minute,h.time_zone,h.revision AS hours_revision,
               e.enabled,e.revision AS email_revision,e.created_at,e.updated_at
@@ -19683,7 +19968,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:44");
     const migrated = new StateStore(paths, {
       now: () => 12_000,
       resolveMachineTimeZone: () => {
@@ -19711,7 +19996,7 @@ describe("StateStore", () => {
          FROM notification_hours h JOIN attention_email_policy e ON h.singleton=e.singleton`,
       ).get()).toEqual(before);
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
     } finally {
       inspector.close(false);
     }
@@ -19733,7 +20018,7 @@ describe("StateStore", () => {
     lookalike.exec(`
       CREATE INDEX attention_email_policy_untrusted ON attention_email_policy(enabled);
       DELETE FROM migrations WHERE version>=37;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=36;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=36;
     `);
     lookalike.close(false);
 
@@ -19845,12 +20130,12 @@ describe("StateStore", () => {
     dropProviderSwitchVersion35Objects(legacy);
     legacy.exec(`
       DELETE FROM migrations WHERE version>=35;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=34;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=34;
     `);
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:43");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:44");
     const unchanged = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
@@ -19908,7 +20193,7 @@ describe("StateStore", () => {
     const schemaInspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(schemaInspector)).toBe(21);
-      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
     } finally {
       schemaInspector.close(false);
     }
@@ -19924,7 +20209,7 @@ describe("StateStore", () => {
     dropProviderSwitchVersion35Objects(legacy);
     legacy.exec(`
       DELETE FROM migrations WHERE version>=35;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=34;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=34;
     `);
     legacy.close(false);
 
@@ -20221,7 +20506,7 @@ describe("StateStore", () => {
       // lowering its version stamp, matching the provider-v39 predecessor.
       dropSessionAdoptionSchema(legacy);
       legacy.exec("ALTER TABLE profiles DROP COLUMN codex_account_key");
-      legacy.exec("DELETE FROM migrations WHERE version>30; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=30;");
+      legacy.exec("DELETE FROM migrations WHERE version>30; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=30;");
       expect(legacy.query(
         "SELECT name FROM pragma_table_info('profiles') WHERE name='codex_account_key'",
       ).get()).toBeNull();
@@ -20250,13 +20535,13 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query("PRAGMA table_info(sessions)").all())
         .toContainEqual(expect.objectContaining({ name: "provider", dflt_value: "'codex'" }));
       expect(inspector.query("PRAGMA table_info(autorespond_evidence)").all())
         .toContainEqual(expect.objectContaining({ name: "path" }));
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 43 ORDER BY version",
+        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 44 ORDER BY version",
       ).all()).toEqual([
         { version: 30 },
         { version: 31 },
@@ -20272,6 +20557,7 @@ describe("StateStore", () => {
         { version: 41 },
         { version: 42 },
         { version: 43 },
+        { version: 44 },
       ]);
     } finally {
       inspector.close(false);
@@ -20485,7 +20771,7 @@ describe("StateStore", () => {
       DROP TRIGGER profiles_label_key_insert_guard;
       DROP TRIGGER profiles_label_key_immutable;
       DELETE FROM migrations WHERE version>23;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=23;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=23;
     `);
     legacy.query(
       `INSERT INTO profiles(
@@ -20526,7 +20812,7 @@ describe("StateStore", () => {
       DROP TRIGGER projects_label_key_insert_guard;
       DROP TRIGGER projects_label_key_immutable;
       DELETE FROM migrations WHERE version>23;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=23;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=23;
     `);
     legacy.query(
       `INSERT INTO projects(
@@ -20560,7 +20846,7 @@ describe("StateStore", () => {
       DROP TRIGGER IF EXISTS provider_interactions_response_fields_guard;
       DROP TRIGGER IF EXISTS provider_interactions_revision_guard;
       DELETE FROM migrations WHERE version>18;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=18;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=18;
     `);
     legacy.close(false);
 
@@ -20568,7 +20854,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -20667,7 +20953,7 @@ describe("StateStore", () => {
       grantRoot: null,
       allowsSessionApproval: false,
     }), files.publicId);
-    legacy.exec("DELETE FROM migrations WHERE version>17; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=17");
+    legacy.exec("DELETE FROM migrations WHERE version>17; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=17");
     legacy.close(false);
 
     const migrated = new StateStore(paths, { now: () => 9_000 });
@@ -20682,7 +20968,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -20727,7 +21013,7 @@ describe("StateStore", () => {
       DROP TRIGGER IF EXISTS provider_login_authority_immutable_delete;
       DROP TABLE provider_login_authorities;
       DELETE FROM migrations WHERE version>=17;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=16;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=16;
     `);
     legacy.close(false);
 
@@ -20804,7 +21090,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -20862,7 +21148,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -20952,7 +21238,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -21043,7 +21329,7 @@ describe("StateStore", () => {
         CREATE INDEX usage_cloud_upload_anchors_recent
           ON usage_cloud_upload_anchors(profile_id, source_revision DESC);
         INSERT INTO migrations(version,applied_at) VALUES (11,9000),(12,9000);
-        DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=12;
+        DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=12;
       `);
       expect(buggyMigration.query("PRAGMA wal_checkpoint(TRUNCATE)").get())
         .toEqual(expect.objectContaining({ busy: 1 }));
@@ -21059,7 +21345,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -21151,7 +21437,7 @@ describe("StateStore", () => {
     expect(reopened.listAutorespondEvidence({ sessionId: session.id })).toEqual([expectedEvidence]);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query("SELECT id,path,rule,model FROM autorespond_evidence").get()).toEqual({
         id: 7,
         path: "protocol",
@@ -21245,7 +21531,7 @@ describe("StateStore", () => {
         VALUES ('acct_00000000000000000000000000000000','Legacy','signed_in',3,1000,1000);
       INSERT INTO sessions(id,profile_id,title,note,preset,fast_enabled,state,revision,created_at,updated_at)
         VALUES ('sess_00000000000000000000000000000000','acct_00000000000000000000000000000000','Preserved','','high',0,'idle',1,1000,1000);
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version = 1;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version = 1;
     `);
     legacy.close(false);
     await chmod(paths.database, 0o600);
@@ -21261,7 +21547,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -21306,6 +21592,7 @@ describe("StateStore", () => {
         { version: 41, applied_at: 2000 },
         { version: 42, applied_at: 2000 },
         { version: 43, applied_at: 2000 },
+        { version: 44, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
       expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
@@ -21337,7 +21624,7 @@ describe("StateStore", () => {
       DROP TRIGGER IF EXISTS desktop_switch_transition_guard;
       DROP TABLE IF EXISTS desktop_switch_authority;
       DELETE FROM migrations WHERE version>2;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=2;
+      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=2;
     `);
     legacy.close(false);
 
@@ -21353,7 +21640,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -21373,9 +21660,9 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 44");
+    newer.exec("PRAGMA user_version = 45");
     newer.close(false);
     await chmod(paths.database, 0o600);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:44:43");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:45:44");
   });
 });

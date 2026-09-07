@@ -181,7 +181,7 @@ const downgradeStateSchema = (databasePath: string): void => {
       DROP TABLE IF EXISTS attention_email_policy;
       DROP TABLE IF EXISTS notification_hours;
       DELETE FROM migrations WHERE version>=36;
-      PRAGMA user_version=35;
+      DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=35;
       PRAGMA foreign_keys=ON;
     `);
   } finally {
@@ -194,7 +194,7 @@ const downgradeStateSchema = (databasePath: string): void => {
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("PRAGMA user_version=44");
+    database.exec("PRAGMA user_version=45");
   } finally {
     database.close(false);
   }
@@ -563,7 +563,7 @@ describe("CLI entry point", () => {
         probeAuthStatus: (input) => {
           expect(input.configDir).toBe(configDir);
           expect(input.configHome).toBe("isolated");
-          return Promise.resolve({ loggedIn: true });
+          return Promise.resolve({ loggedIn: true, authentication: "claude_ai" });
         },
       });
       expect(account).toMatchObject({
@@ -4286,8 +4286,8 @@ describe("CLI entry point", () => {
     }
   });
 
-  test("completes a typed spawn failure and preserves exact recovery on completion failure", async () => {
-    for (const mode of ["spawn", "timeout", "protocol"] as const) {
+  test("completes a typed spawn failure and preserves exact recovery on unproved exit or completion failure", async () => {
+    for (const mode of ["spawn", "timeout", "protocol", "unjoined"] as const) {
       const completionFailure = mode !== "spawn";
       const { installation, runRoot } = await upgradeFixture(`claude-complete-${mode}`);
       const digit = mode === "spawn" ? "6" : mode === "timeout" ? "5" : "9";
@@ -4308,9 +4308,12 @@ describe("CLI entry point", () => {
           interactive: true,
           isTerminalDescriptor: () => true,
           resolveClaudeRuntime: async () => cliClaudeRuntime,
-          runClaudeForegroundLogin: async () => completionFailure
-            ? { state: "joined", exitCode: 0, interruptedBy: null }
-            : { state: "not_started", reason: "spawn_failed" },
+          runClaudeForegroundLogin: async () => {
+            if (mode === "unjoined") throw new ClaudeError("TIMEOUT", "Native child exit remains unproved.");
+            return completionFailure
+              ? { state: "joined", exitCode: 0, interruptedBy: null }
+              : { state: "not_started", reason: "spawn_failed" };
+          },
           callDaemon: async (command) => {
             commands.push(command);
             if (command.kind === "account.show") return {
@@ -4355,12 +4358,17 @@ describe("CLI entry point", () => {
             };
           },
         });
-        expect(commands.at(-1)).toMatchObject({
-          kind: "account.claude-login.complete",
-          outcome: completionFailure
-            ? { state: "joined", exitCode: 0, interruptedBy: null }
-            : { state: "not_started", reason: "spawn_failed" },
-        });
+        if (mode === "unjoined") {
+          expect(commands.map((command) => command.kind)).toEqual(["account.show", "account.claude-login.prepare"]);
+          expect(captured.read().stdout).not.toContain("is signed in");
+        } else {
+          expect(commands.at(-1)).toMatchObject({
+            kind: "account.claude-login.complete",
+            outcome: completionFailure
+              ? { state: "joined", exitCode: 0, interruptedBy: null }
+              : { state: "not_started", reason: "spawn_failed" },
+          });
+        }
         if (completionFailure) {
           expect(exit).toBe(7);
           expect(JSON.stringify(captured.read())).toContain(attemptId);
@@ -6280,7 +6288,7 @@ describe("CLI entry point", () => {
       });
       expect(started.read().stderr).toBe("");
       expect(daemonStarts).toBe(1);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(43);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(44);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6304,7 +6312,7 @@ describe("CLI entry point", () => {
         error: {
           code: "RECOVERY_REQUIRED",
           details: { nextCommand: "hra daemon start" },
-          message: "The local state schema needs a migration (35 to 43); start the daemon to migrate it.",
+          message: "The local state schema needs a migration (35 to 44); start the daemon to migrate it.",
         },
         ok: false,
         version: 1,
@@ -6336,14 +6344,14 @@ describe("CLI entry point", () => {
       expect(JSON.parse(captured.read().stdout)).toEqual({
         error: {
           code: "RECOVERY_REQUIRED",
-          message: "This HRA build is older than the local state schema (44 vs 43); install the newer HRA.",
+          message: "This HRA build is older than the local state schema (45 vs 44); install the newer HRA.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
       expect(daemonStarts).toBe(0);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(44);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(45);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6365,7 +6373,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["The local state schema needs a migration (35 to 43). Run `hra daemon start` to migrate it."],
+          problems: ["The local state schema needs a migration (35 to 44). Run `hra daemon start` to migrate it."],
           state: { database: "invalid", initialized: false },
         },
       });
@@ -6392,7 +6400,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["This HRA build is older than the local state schema (44 vs 43). Install the newer HRA."],
+          problems: ["This HRA build is older than the local state schema (45 vs 44). Install the newer HRA."],
           state: { database: "invalid", initialized: false },
         },
       });

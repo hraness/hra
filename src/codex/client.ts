@@ -473,8 +473,8 @@ export class CodexAppServerClient {
     }
   }
 
-  async accountRead(refreshToken = false): Promise<FencedCodexValue<AccountReadResult>> {
-    return this.#closedRequest("account/read", { refreshToken }, parseAccountRead);
+  async accountRead(refreshToken = false, signal?: AbortSignal): Promise<FencedCodexValue<AccountReadResult>> {
+    return this.#closedRequest("account/read", { refreshToken }, parseAccountRead, signal);
   }
 
   /** Runtime-owner-only read used to settle an account-authority barrier. */
