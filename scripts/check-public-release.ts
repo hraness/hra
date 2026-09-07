@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
+import { readNpmAttestations } from "./read-npm-attestations";
 import {
   assertReleaseAssetBytes,
   npmRegistryReleaseMetadata,
@@ -158,10 +159,9 @@ if (
 ) throw new Error("npm release bytes do not match registry integrity metadata.");
 const tufCachePath = await mkdtemp(`${tmpdir()}/hra-sigstore-tuf-`);
 try {
-  const attestationsUrl = `https://registry.npmjs.org/-/npm/v1/attestations/@hraness%2fhra@${inspection.version}`;
   await verifyNpmProvenance({
     attemptPolicy: "same_run_not_later",
-    attestations: await json(attestationsUrl, "npm Sigstore attestations"),
+    attestations: await readNpmAttestations(inspection.version),
     integrity: npmRelease.integrity,
     maximumAttempt: preflightState === "exact" ? preflightRunAttempt : runAttempt,
     registryKeys: await json("https://registry.npmjs.org/-/npm/v1/keys", "npm registry keys"),

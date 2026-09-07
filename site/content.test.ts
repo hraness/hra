@@ -346,8 +346,13 @@ describe("public content contract", () => {
     }
     expect(renderLlmsText()).toContain("Only after immutable GitHub and npm release admission, install v0.7.0");
     expect(renderLlmsText()).not.toContain("Install the live v0.7.0 local CLI artifact");
+    expect(renderLlmsText()).toContain(publicContent.daemonRolloutNotice);
     const html = renderSiteHtml();
+    expect(html).toContain("Install after release admission.");
     expect(html.indexOf("Install after release admission.")).toBeLessThan(html.indexOf('class="install-command"'));
+    expect(html).toContain("Initialization remains blocked by the rollout prerequisite");
+    expect(html.indexOf("Initialization remains blocked by the rollout prerequisite"))
+      .toBeLessThan(html.indexOf('class="install-command"'));
   });
 
   test("places the blocked rollout prerequisite before every prominent initialization and first-session flow", () => {

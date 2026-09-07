@@ -14,7 +14,7 @@ Stable working and canonical project memory, attributed peer coordination, encry
 
 ## v0.6.3
 
-This separate release adds the default-off after-hours policy. Its immutable artifacts completed admission through [release run 34165802848](https://github.com/hraness/hra/actions/runs/34165802848). It does not clear the blocked daemon or hosted command-writer rollout. The integrated v0.7.0 candidate retains this policy without treating v0.6.3 admission as its own release admission.
+This admitted release adds the default-off after-hours policy after `v0.6.2`. Its immutable GitHub and npm artifacts are available; artifact admission does not clear the blocked daemon or hosted command-writer rollout. See the [exact release record](docs/beta-release.md#immutable-v063-successful-release-record). The integrated v0.7.0 candidate retains this policy without treating v0.6.3 admission as its own release admission.
 
 - After the rollout gates, a separate local opt-in, disabled on new and upgraded installations, can raise otherwise eligible protocol approval budgets to 6 consecutive, 20 rolling-hour, and 80 rolling-day reservations outside notification hours. Prose stays at 3/10/40 and shares the same accounting. Final transactional admission rechecks current consent, schedule, source authority, and spend. Additive schema 46 preserves schema 45 and requires a newly finalized human message before any pre-44 session can use the higher tier. Policy changes never reset counters or broaden approval categories.
 

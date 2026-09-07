@@ -425,7 +425,7 @@ describe("release workflow", () => {
     expect(releaseNotes).toContain("`v0.6.3` admission does not admit `v0.7.0`");
     expect(changelog).toContain("## v0.6.3\n");
     expect(changelog).not.toContain("## v0.6.3 candidate (unreleased)");
-    expect(changelog).toContain("https://github.com/hraness/hra/actions/runs/34165802848");
+    expect(changelog).toContain("docs/beta-release.md#immutable-v063-successful-release-record");
     expect(readme).toContain(installCommand);
     expect(readme).toContain("Local v0.7.0 candidate; v0.6.3 artifacts admitted");
     expect(readme).toContain("Use the exact install command below only after immutable GitHub and npm release admission");
@@ -461,6 +461,8 @@ describe("release workflow", () => {
     expect(changelog).toContain("Forward repair for the incomplete `v0.6.0` admission");
     expect(security).toContain("| `v0.7.0` | Release candidate. Supported once the release workflow admits it. |");
     expect(security).toContain("| `v0.6.3` | Fully admitted beta. Supported and receives security fixes. Hosted command-writer rollout remains capacity-gated. |");
+    expect(security).toContain("| `v0.6.2` | Superseded by `v0.6.3`. Unsupported. Do not bypass the update runbook to migrate. |");
+    expect(security).toContain("Only the latest fully admitted beta receives security fixes");
     expect(security).toContain("| `v0.6.0` | Immutable partial publication. The workflow did not complete final admission; unsupported. |");
     expect(security).toContain("| `v0.5.0` | Superseded by `v0.6.1`. Unsupported. Do not bypass the update runbook to migrate. |");
     expect(releaseNotes).toContain("Current daemon startup and command-writer rollout remain blocked by `authority_reduction_hard_quota`");
@@ -475,6 +477,34 @@ describe("release workflow", () => {
     expect(directHraCommands).toEqual(["hra --version", "hra doctor --offline"]);
     expect(releaseNotes.indexOf("Current daemon startup and command-writer rollout remain blocked"))
       .toBeLessThan(releaseNotes.indexOf("```sh"));
+  });
+
+  test("requires verified evidence before publishing v0.6.3 admission copy", async () => {
+    const releaseRecord = await readFile(join(import.meta.dir, "..", "docs", "beta-release.md"), "utf8");
+    expect(releaseRecord.includes("UNVERIFIED_LOCAL_DRAFT")).toBe(false);
+    expect(releaseRecord.split("## Immutable v0.6.3 successful release record\n")).toHaveLength(2);
+    const currentRecord = releaseRecord.split("## Immutable v0.6.3 successful release record\n")[1]
+      ?.split("\n## ")[0];
+    expect(currentRecord).toBeDefined();
+    expect(currentRecord).toContain("completed successfully");
+    expect(currentRecord).toContain("SHA-256");
+    expect(currentRecord).toContain("provenance");
+    expect(currentRecord).toContain("This is artifact admission only");
+    for (const evidence of [
+      "633308ebe11adffecfaff1a4bea1c199f762df2d",
+      "b1f7743626bc93c135efdd441e235ac85ddd4c42",
+      "8f0399c41fd384fc987e4e5ea2e280e5e4aab569",
+      "34164885896",
+      "34165802848",
+      "attempt 2",
+      "HTTP 404",
+      "Admit exact public npm and GitHub state",
+      "384339082",
+      "549449969",
+      "ae75cef126d32587fd9d3a1a755f8c126b2200107f55c5a412ccb15799363446",
+      "549450038",
+      "02f13245ceee5e8d0a85279fb08733de4d6ff4201baafec7e9ef58c8bb936766",
+    ]) expect(currentRecord).toContain(evidence);
   });
 
   test("keeps the retired fallback-bound path unreachable and exposes only the exact artifact workflow", async () => {
