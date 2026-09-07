@@ -89,6 +89,22 @@ setInterval(() => undefined, 1000);
 };
 
 const historyFixtureChildTimeoutMs = 5_000;
+const historyFixtureOutputMaximumBytes = 32 * 1024 * 1024;
+const historyFixtureEnvironment = (root: string) => ({
+  ...buildGitHistoryEnvironment(root, resolve(tmpdir())),
+  GIT_MERGE_AUTOEDIT: "no",
+});
+const historyFixtureCommandOptions = (
+  root: string,
+  timeout = historyFixtureChildTimeoutMs,
+  phase: "package-history-fixture-git" | "package-history-fixture-render" = "package-history-fixture-git",
+) => ({
+  cwd: root,
+  env: historyFixtureEnvironment(root),
+  outputMaximumBytes: historyFixtureOutputMaximumBytes,
+  phase,
+  timeoutMs: timeout,
+});
 const createHistoryRenderingBudget = (now: () => number = () => performance.now()) => {
   const deadline = now() + 20_000;
   return (): number => {
@@ -99,54 +115,69 @@ const createHistoryRenderingBudget = (now: () => number = () => performance.now(
 };
 const historyFixtureSpawnOptions = (root: string, timeout = historyFixtureChildTimeoutMs) => ({
   cwd: root,
-  env: { ...buildGitHistoryEnvironment(root, resolve(tmpdir())), GIT_MERGE_AUTOEDIT: "no" },
+  env: historyFixtureEnvironment(root),
   killSignal: "SIGKILL" as const,
-  maxBuffer: 32 * 1024 * 1024,
+  maxBuffer: historyFixtureOutputMaximumBytes,
   stderr: "pipe" as const,
   stdin: "ignore" as const,
   stdout: "pipe" as const,
   timeout,
 });
-const spawnHistoryFixtureGit = (
+const runHistoryFixtureGit = async (
   root: string,
   arguments_: readonly string[],
   timeout = historyFixtureChildTimeoutMs,
-) => Bun.spawnSync(
+) => await runPackageCommand(
+  "/usr/bin/git",
   [
-    "/usr/bin/git",
     "-c",
     "commit.gpgSign=false",
     "-c",
     "core.hooksPath=/dev/null",
     ...arguments_,
   ],
-  historyFixtureSpawnOptions(root, timeout),
+  historyFixtureCommandOptions(root, timeout),
 );
 
-const runHistoryFixtureGit = (root: string, ...arguments_: readonly string[]) =>
-  spawnHistoryFixtureGit(root, arguments_);
-const requireHistoryFixtureGitOutput = (result: ReturnType<typeof runHistoryFixtureGit>): string => {
-  if (result.exitCode !== 0 || result.exitedDueToMaxBuffer || result.exitedDueToTimeout) {
+const requireHistoryFixtureGitOutput = (
+  result: Awaited<ReturnType<typeof runHistoryFixtureGit>>,
+): string => {
+  if (result.exitCode !== 0) {
     throw new Error("Git history fixture command failed or exceeded its bound.");
   }
-  return Buffer.from(result.stdout).toString("utf8").trim();
+  return result.stdout.trim();
 };
-const requireHistoryFixtureGit = (root: string, ...arguments_: readonly string[]): string =>
-  requireHistoryFixtureGitOutput(runHistoryFixtureGit(root, ...arguments_));
+const requireHistoryFixtureGit = async (
+  root: string,
+  ...arguments_: readonly string[]
+): Promise<string> => requireHistoryFixtureGitOutput(
+  await runHistoryFixtureGit(root, arguments_),
+);
 
 const initializeHistoryFixture = async (
   root: string,
   body = "base\n",
   git = (...arguments_: readonly string[]) => requireHistoryFixtureGit(root, ...arguments_),
 ): Promise<string> => {
-  git("init", "--initial-branch=main");
-  git("config", "user.name", "HRA History Fixture");
-  git("config", "user.email", "history-fixture@example.invalid");
+  await git("init", "--initial-branch=main");
+  await git("config", "user.name", "HRA History Fixture");
+  await git("config", "user.email", "history-fixture@example.invalid");
   await writeFile(join(root, "document.txt"), body, "utf8");
-  git("add", "document.txt");
-  git("commit", "-m", "base");
-  return git("rev-parse", "HEAD");
+  await git("add", "document.txt");
+  await git("commit", "-m", "base");
+  return await git("rev-parse", "HEAD");
 };
+
+const runBoundedCanonicalHistoryPatch = async (
+  root: string,
+  commit: string,
+  kind: "public_patch" | "sensitive_patch",
+  timeout = historyFixtureChildTimeoutMs,
+) => await runPackageCommand(
+  "/usr/bin/git",
+  ["--no-pager", ...gitHistoryCommandArguments({ commit, kind })],
+  historyFixtureCommandOptions(root, timeout, "package-history-fixture-render"),
+);
 
 const runCanonicalHistoryPatch = (
   root: string,
@@ -310,7 +341,7 @@ describe("installed package generic command ownership", () => {
         killSignal: "SIGKILL",
         stderr: "pipe",
         stdin: "ignore",
-        // An unread pipe can outlive chmod and interfere with later synchronous Git calls.
+        // No stdout is consumed here, so do not retain an unread stream.
         stdout: "ignore",
         timeout: historyFixtureChildTimeoutMs,
       });
@@ -545,6 +576,15 @@ describe("installed package generic command ownership", () => {
       killSignal: "SIGKILL", maxBuffer: 32 * 1024 * 1024,
       stderr: "pipe", stdin: "ignore", stdout: "pipe", timeout: 5_000,
     });
+    expect(historyFixtureCommandOptions(root)).toEqual({
+      cwd: root,
+      env: { ...buildGitHistoryEnvironment(root, root), GIT_MERGE_AUTOEDIT: "no" },
+      outputMaximumBytes: 32 * 1024 * 1024,
+      phase: "package-history-fixture-git",
+      timeoutMs: 5_000,
+    });
+    expect(historyFixtureCommandOptions(root, 1_000, "package-history-fixture-render"))
+      .toMatchObject({ phase: "package-history-fixture-render", timeoutMs: 1_000 });
     let now = 0;
     const remaining = createHistoryRenderingBudget(() => now);
     expect(remaining()).toBe(5_000);
@@ -565,8 +605,9 @@ describe("installed package generic command ownership", () => {
     };
     phase("setup");
     const root = resolve(await mkdtemp(join(tmpdir(), "hra-history-rendering-")));
-    const git = (...arguments_: readonly string[]) =>
-      requireHistoryFixtureGitOutput(spawnHistoryFixtureGit(root, arguments_, remaining()));
+    const git = async (...arguments_: readonly string[]) => requireHistoryFixtureGitOutput(
+      await runHistoryFixtureGit(root, arguments_, remaining()),
+    );
     try {
       await initializeHistoryFixture(root, "first\n\nsecond\nthird\n", git);
       const contextPath = join(root, "context.txt");
@@ -575,8 +616,8 @@ describe("installed package generic command ownership", () => {
         "alpha\nnear-alpha\n\nblank-context\nkeep-five\nkeep-six\nkeep-seven\nkeep-eight\nnear-omega\nomega\n",
         "utf8",
       );
-      git("add", "context.txt");
-      git("commit", "-m", "context base");
+      await git("add", "context.txt");
+      await git("commit", "-m", "context base");
       const source = join(root, "document.txt");
       const destination = join(root, "\u03c0-document.txt");
       await rename(source, destination);
@@ -586,13 +627,18 @@ describe("installed package generic command ownership", () => {
         "alpha changed\nnear-alpha\n\nblank-context\nkeep-five\nkeep-six\nkeep-seven\nkeep-eight\nnear-omega\nomega changed\n",
         "utf8",
       );
-      git("add", "--all");
-      git("commit", "-m", "rendering target");
-      const commit = git("rev-parse", "HEAD");
+      await git("add", "--all");
+      await git("commit", "-m", "rendering target");
+      const commit = await git("rev-parse", "HEAD");
       phase("render_baseline");
-      const baseline = runCanonicalHistoryPatch(root, commit, "sensitive_patch", remaining());
+      const baseline = await runBoundedCanonicalHistoryPatch(
+        root,
+        commit,
+        "sensitive_patch",
+        remaining(),
+      );
       expect(baseline.exitCode).toBe(0);
-      expect(baseline.stderr.byteLength).toBe(0);
+      expect(baseline.stderr).toBe("");
 
       phase("config");
       for (const [key, value] of [
@@ -611,14 +657,17 @@ describe("installed package generic command ownership", () => {
         ["diff.relative", "true"],
         ["diff.submodule", "log"],
         ["diff.suppressBlankEmpty", "true"],
-      ] as const) git("config", key, value);
+      ] as const) await git("config", key, value);
 
       phase("render_hostile");
-      const hostile = runCanonicalHistoryPatch(root, commit, "sensitive_patch", remaining());
+      const hostile = await runBoundedCanonicalHistoryPatch(
+        root,
+        commit,
+        "sensitive_patch",
+        remaining(),
+      );
       expect(hostile.exitCode).toBe(0);
-      expect(hostile.exitedDueToMaxBuffer ?? false).toBe(false);
-      expect(hostile.exitedDueToTimeout ?? false).toBe(false);
-      expect(hostile.stderr.byteLength).toBe(0);
+      expect(hostile.stderr).toBe("");
       expect(hostile.stdout).toEqual(baseline.stdout);
     } finally {
       phase("cleanup");
@@ -719,17 +768,20 @@ describe("installed package generic command ownership", () => {
     try {
       await initializeHistoryFixture(root);
       const document = join(root, "document.txt");
-      requireHistoryFixtureGit(root, "checkout", "-b", "feature");
+      await requireHistoryFixtureGit(root, "checkout", "-b", "feature");
       await writeFile(document, "feature\n", "utf8");
-      requireHistoryFixtureGit(root, "commit", "-am", "feature");
-      requireHistoryFixtureGit(root, "checkout", "main");
+      await requireHistoryFixtureGit(root, "commit", "-am", "feature");
+      await requireHistoryFixtureGit(root, "checkout", "main");
       await writeFile(document, "main\n", "utf8");
-      requireHistoryFixtureGit(root, "commit", "-am", "main");
-      expect(runHistoryFixtureGit(root, "merge", "--no-ff", "--no-edit", "feature").exitCode).not.toBe(0);
+      await requireHistoryFixtureGit(root, "commit", "-am", "main");
+      expect((await runHistoryFixtureGit(
+        root,
+        ["merge", "--no-ff", "--no-edit", "feature"],
+      )).exitCode).not.toBe(0);
       const sentinel = ["sk", "proj", "B".repeat(24)].join("-");
       await writeFile(document, `resolved\n${sentinel}\n`, "utf8");
-      requireHistoryFixtureGit(root, "add", "document.txt");
-      requireHistoryFixtureGit(root, "commit", "-m", "resolution");
+      await requireHistoryFixtureGit(root, "add", "document.txt");
+      await requireHistoryFixtureGit(root, "commit", "-m", "resolution");
 
       await expect(assertCompleteGitHistoryPublic(root)).rejects.toThrow("SECRET_SHAPE");
     } finally {
@@ -749,17 +801,17 @@ describe("installed package generic command ownership", () => {
         const document = join(root, "document.txt");
         if (scenario === "deleted-root") {
           await writeFile(document, "safe\n", "utf8");
-          requireHistoryFixtureGit(root, "commit", "-am", "delete historical sentinel");
+          await requireHistoryFixtureGit(root, "commit", "-am", "delete historical sentinel");
         } else if (scenario === "side-ref") {
-          requireHistoryFixtureGit(root, "checkout", "-b", "side");
+          await requireHistoryFixtureGit(root, "checkout", "-b", "side");
           await writeFile(document, `${sentinel}\n`, "utf8");
-          requireHistoryFixtureGit(root, "commit", "-am", "side sentinel");
-          requireHistoryFixtureGit(root, "checkout", "main");
+          await requireHistoryFixtureGit(root, "commit", "-am", "side sentinel");
+          await requireHistoryFixtureGit(root, "checkout", "main");
         } else {
           await writeFile(document, `${sentinel}\n`, "utf8");
-          requireHistoryFixtureGit(root, "commit", "-am", "replace-hidden sentinel");
-          const secretCommit = requireHistoryFixtureGit(root, "rev-parse", "HEAD");
-          requireHistoryFixtureGit(root, "replace", secretCommit, rootCommit);
+          await requireHistoryFixtureGit(root, "commit", "-am", "replace-hidden sentinel");
+          const secretCommit = await requireHistoryFixtureGit(root, "rev-parse", "HEAD");
+          await requireHistoryFixtureGit(root, "replace", secretCommit, rootCommit);
         }
         await expect(assertCompleteGitHistoryPublic(root)).rejects.toThrow("SECRET_SHAPE");
       } finally {
@@ -787,7 +839,7 @@ describe("installed package generic command ownership", () => {
         join(root, "document.txt"),
         Buffer.concat([Buffer.from([0x00]), sentinel, Buffer.from("\n")]),
       );
-      requireHistoryFixtureGit(root, "commit", "-am", "binary-classified sentinel");
+      await requireHistoryFixtureGit(root, "commit", "-am", "binary-classified sentinel");
       await expect(assertCompleteGitHistoryPublic(root)).rejects.toThrow("SECRET_SHAPE");
     } finally {
       await rm(root, { force: true, recursive: true });
@@ -800,13 +852,13 @@ describe("installed package generic command ownership", () => {
       const head = await initializeHistoryFixture(root);
       const lockfile = join(root, "bun.lock");
       await writeFile(lockfile, `${["@", "private", "-", "scope", "/", "package"].join("")}\n`, "utf8");
-      requireHistoryFixtureGit(root, "add", "bun.lock");
-      requireHistoryFixtureGit(root, "commit", "-m", "lock scope");
+      await requireHistoryFixtureGit(root, "add", "bun.lock");
+      await requireHistoryFixtureGit(root, "commit", "-m", "lock scope");
       await expect(assertCompleteGitHistoryPublic(root)).resolves.toBeUndefined();
 
       const sentinel = ["sk", "proj", "D".repeat(24)].join("-");
       await writeFile(lockfile, `${sentinel}\n`, "utf8");
-      requireHistoryFixtureGit(root, "commit", "-am", "lock secret");
+      await requireHistoryFixtureGit(root, "commit", "-am", "lock secret");
       await expect(assertCompleteGitHistoryPublic(root)).rejects.toThrow("SECRET_SHAPE");
 
       await writeFile(join(root, ".git", "shallow"), `${head}\n`, "utf8");
