@@ -128,8 +128,11 @@ const run = async (
   return { exitCode, stderr, stdout };
 };
 
+// The public shell command clears these values before stage zero. Keep the
+// fixture hermetic when CI itself uses NODE_OPTIONS; hostile inheritance is
+// covered below by explicit per-scenario overrides.
 const installEnvironment = (root: string): NodeJS.ProcessEnv => ({
-  ...process.env,
+  ...sanitizeHraInstallChildEnvironment(process.env),
   BUN_INSTALL: join(root, "bun root"),
   HOME: join(root, "home"),
 });
