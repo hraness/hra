@@ -6,6 +6,7 @@ import {
   snapshotForeignJson,
 } from "./contracts";
 import { hmacSha256Hex } from "./crypto";
+import { snapshotUsageAccountKeyV2 } from "./usage-key-v2";
 
 export const USAGE_CONTEXT_V2_MAX_ORIGIN_BYTES = 4_096;
 
@@ -137,47 +138,13 @@ function parseUsageSourceContextV2(input: unknown): UsageSourceContextV2 | null 
   });
 }
 
-const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
-const typedArrayName = Object.getOwnPropertyDescriptor(typedArrayPrototype, Symbol.toStringTag);
-const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, "byteLength");
-const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, "buffer");
-const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength");
-const typedArraySet: Readonly<{
-  value?: (this: Uint8Array, source: Uint8Array) => void;
-}> | undefined = Object.getOwnPropertyDescriptor(typedArrayPrototype, "set");
-
-function snapshotAccountKey(input: Uint8Array): Uint8Array | null {
-  try {
-    if (
-      typedArrayName?.get === undefined
-      || typedArrayByteLength?.get === undefined
-      || typedArrayBuffer?.get === undefined
-      || arrayBufferByteLength?.get === undefined
-      || typedArraySet?.value === undefined
-      || typedArrayName.get.call(input) !== "Uint8Array"
-      || typedArrayByteLength.get.call(input) !== 32
-    ) return null;
-    const buffer: unknown = typedArrayBuffer.get.call(input);
-    // The ArrayBuffer getter rejects shared storage. A shared writer could
-    // otherwise change the bytes during this synchronous snapshot.
-    arrayBufferByteLength.get.call(buffer);
-    const copied = new Uint8Array(32);
-    // Native typed-array copying honors the view's offset without consulting
-    // caller iterators, species, methods or shadowed byte-length accessors.
-    typedArraySet.value.call(copied, input);
-    return copied;
-  } catch {
-    return null;
-  }
-}
-
 export async function deriveUsageSourcePublicIdV2(
   accountKey: Uint8Array,
   input: unknown,
 ): Promise<string> {
   // Capture the key before inspecting foreign context. Neither the caller's
   // mutable key nor its context is read after the first asynchronous boundary.
-  const key = snapshotAccountKey(accountKey);
+  const key = snapshotUsageAccountKeyV2(accountKey);
   const context = parseUsageSourceContextV2(input);
   if (key === null || context === null) throw new Error("Invalid usage source identity input.");
   const digest = await hmacSha256Hex(key, "usage-head-source", JSON.stringify([
