@@ -15,6 +15,10 @@ import { Database, constants as sqliteConstants } from "bun:sqlite";
 import { z } from "zod";
 import { assertCombined49AdoptionSchema } from "./combined49-adoption-schema";
 import {
+  mutationEffectEvidence49Schema as mutationEffectEvidenceSchema,
+  queueEffectEvidence49Schema as queueEffectEvidenceSchema,
+} from "./effect-evidence-codecs";
+import {
   assertSchemaCohortObjects,
   assertSchemaCohortMigrationTail,
   schemaCohortObjects,
@@ -1590,60 +1594,6 @@ const pendingLoginReceiptAuthoritySchema = z.object({
   status: z.literal("pending"),
   loginId: providerLoginIdSchema,
 }).passthrough();
-const providerBaselineSchema = z.object({
-  providerUpdatedAt: z.number().nonnegative().nullable(),
-  status: z.enum(["active", "idle", "terminal"]),
-  activeTurnId: z.string().min(1).max(200).nullable(),
-}).strict();
-const mutationEffectEvidenceSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("session.send"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, clientMessageId: z.string().min(1).max(512), messageDigest: sha256Schema, runtimeProfile: reviewedRuntimeProfileSchema.optional() }).strict(),
-  z.object({ kind: z.literal("session.steer"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable(), clientMessageId: z.string().min(1).max(512), messageDigest: sha256Schema }).strict(),
-  z.object({ kind: z.literal("session.stop"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable() }).strict(),
-  z.object({ kind: z.literal("session.rename"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, requestedName: titleSchema }).strict(),
-  z.object({ kind: z.literal("session.start"), projectId: projectIdSchema, clientMessageId: z.string().min(1).max(512).nullable(), messageDigest: sha256Schema.nullable(), runtimeProfile: reviewedRuntimeProfileSchema.optional(), conversationAutomationCapability: z.literal(SESSION_CONVERSATION_AUTOMATION_CAPABILITY).optional() }).strict(),
-  z.object({
-    kind: z.literal("session.switch"),
-    // Optional only so an unsettled receipt written by an older release can
-    // still be parsed after upgrade. New switch effects must bind this value
-    // to daemon_state before any provider process is started.
-    daemonGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
-    requestedAccountId: profileIdSchema.nullable(),
-    requestedPreset: presetSchema.nullable(),
-    sourceProfileId: profileIdSchema,
-    sourceProcessGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-    sourceProvider: providerSchema,
-    sourceProviderThreadId: providerThreadIdSchema,
-    sourcePreset: presetSchema,
-    targetProfileId: profileIdSchema,
-    targetProcessGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-    targetProvider: providerSchema,
-    // Optional only for parsing an unsettled switch written before the
-    // provider-account proof became durable. Every new effect requires it.
-    targetProviderAccountKey: providerAccountAuthorityKeySchema.optional(),
-    targetPreset: presetSchema,
-    transcriptDigest: sha256Schema,
-    seedDigest: sha256Schema,
-    seedIncludedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-    seedOmittedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-    runtimeProfile: reviewedRuntimeProfileSchema,
-  }).strict(),
-  z.object({ kind: z.literal("account.login"), method: z.enum(["browser", "device_code"]) }).strict(),
-  z.object({ kind: z.literal("account.claude-login"), provider: z.literal("claude"), baselineSignedIn: z.literal(false) }).strict(),
-  z.object({ kind: z.literal("account.devin-login"), provider: z.literal("devin"), baselineSignedIn: z.literal(false) }).strict(),
-  z.object({ kind: z.literal("account.logout"), baselineSignedIn: z.boolean() }).strict(),
-  z.object({ kind: z.literal("account.login-cancel"), loginId: providerLoginIdSchema }).strict(),
-]);
-const queueEffectEvidenceSchema = z.object({
-  kind: z.literal("queue.dispatch"),
-  queueId: queueIdSchema,
-  sessionId: sessionIdSchema,
-  providerThreadId: providerThreadIdSchema,
-  profileGeneration: z.number().int().nonnegative(),
-  baseline: providerBaselineSchema,
-  clientMessageId: z.string().min(1).max(512),
-  messageDigest: sha256Schema,
-  runtimeProfile: reviewedRuntimeProfileSchema,
-}).strict();
 const mutationResolutionKindSchema = z.enum(["proven_applied", "provider_state_reconciled", "abandoned"]);
 const desktopRecoveryResolutionSchema = z.enum(["resolved_applied", "resolved_not_applied"]);
 const desktopSwitchBeginSchema = z

@@ -1,8 +1,13 @@
 import { z } from "zod";
 
+// Retained V1 documents own these exact providers, presets and model tuples.
+// Future writer formats must not extend or reinterpret these definitions.
+export const providerV1Schema = z.enum(["codex", "claude", "devin"]);
+export type ProviderV1 = z.infer<typeof providerV1Schema>;
+
 /** Every provider HRA can drive. A session has one exact provider binding at a time. */
-export const providerSchema = z.enum(["codex", "claude", "devin"]);
-export type Provider = z.infer<typeof providerSchema>;
+export const providerSchema = providerV1Schema;
+export type Provider = ProviderV1;
 
 /** Providers whose existing personal-home sessions HRA can adopt. */
 export const adoptableProviderSchema = z.enum(["codex", "claude"]);
@@ -10,8 +15,10 @@ export type AdoptableProvider = z.infer<typeof adoptableProviderSchema>;
 
 export const DEFAULT_PROVIDER = "codex" satisfies Provider;
 
-export const presetSchema = z.enum(["low", "high", "ultra", "fable-max", "astra"]);
-export type Preset = z.infer<typeof presetSchema>;
+export const presetV1Schema = z.enum(["low", "high", "ultra", "fable-max", "astra"]);
+export type PresetV1 = z.infer<typeof presetV1Schema>;
+export const presetSchema = presetV1Schema;
+export type Preset = PresetV1;
 
 /**
  * The durable storage encoding of a preset. `sessions.preset` and
@@ -34,25 +41,28 @@ export const legacyPresetContract = 1 as const;
 export const currentPresetContract = 2 as const;
 // Persisted versions are independent of the default chosen for new writes.
 // Adding a contract must retain each shipped version and its exact mapping.
-export const presetContractSchema = z.union([
+export const presetContractV1Schema = z.union([
   z.literal(1),
   z.literal(2),
 ]);
-export type PresetContract = z.infer<typeof presetContractSchema>;
+export type PresetContractV1 = z.infer<typeof presetContractV1Schema>;
+export const presetContractSchema = presetContractV1Schema;
+export type PresetContract = PresetContractV1;
 
-export type PresetRequirement = Readonly<{
+export type PresetRequirementV1 = Readonly<{
   model: string;
   effort: "max" | "ultra" | "provider-default";
 }>;
+export type PresetRequirement = PresetRequirementV1;
 
-const presetContract1Requirements = {
+const presetContract1RequirementsV1 = {
   low: { model: "gpt-5.6-luna", effort: "max" },
   high: { model: "gpt-5.6-sol", effort: "max" },
   ultra: { model: "gpt-5.6-sol", effort: "ultra" },
   "fable-max": { model: "claude-fable-5-1", effort: "max" },
-} as const satisfies Partial<Record<Preset, PresetRequirement>>;
+} as const satisfies Partial<Record<PresetV1, PresetRequirementV1>>;
 
-const presetContract2Requirements = {
+const presetContract2RequirementsV1 = {
   low: { model: "gpt-5.6-luna", effort: "max" },
   high: { model: "gpt-6-astra", effort: "max" },
   ultra: { model: "gpt-6-astra", effort: "ultra" },
@@ -64,51 +74,54 @@ const presetContract2Requirements = {
   // reasoning-effort flag, so the reviewed profile records that fact rather
   // than inventing a provider setting.
   astra: { model: "gpt-6-astra", effort: "provider-default" },
-} as const satisfies Record<Preset, PresetRequirement>;
+} as const satisfies Record<PresetV1, PresetRequirementV1>;
 
-const presetRequirementsByContract: Readonly<
-  Record<PresetContract, Partial<Readonly<Record<Preset, PresetRequirement>>>>
+const presetRequirementsByContractV1: Readonly<
+  Record<PresetContractV1, Partial<Readonly<Record<PresetV1, PresetRequirementV1>>>>
 > = Object.freeze({
-  1: Object.freeze(presetContract1Requirements),
-  2: Object.freeze(presetContract2Requirements),
+  1: Object.freeze(presetContract1RequirementsV1),
+  2: Object.freeze(presetContract2RequirementsV1),
 });
 
 /** Current requirements used for every new or explicitly selected preset. */
-export const presetRequirements = presetContract2Requirements;
+export const presetRequirements = presetContract2RequirementsV1;
 
 /** Resolve one alias under its durable, session-owned interpretation. */
-export const presetRequirementForContract = (
-  preset: Preset,
-  contract: PresetContract,
-): PresetRequirement => {
-  const requirement = presetRequirementsByContract[contract][preset];
+export const presetRequirementForContractV1 = (
+  preset: PresetV1,
+  contract: PresetContractV1,
+): PresetRequirementV1 => {
+  const requirement = presetRequirementsByContractV1[contract][preset];
   if (requirement === undefined) {
     throw new Error("No preset requirement exists for that contract.");
   }
   return requirement;
 };
+export const presetRequirementForContract = presetRequirementForContractV1;
 
 /**
  * Historical runtime documents remain admissible only when they carry one of
  * the exact tuples HRA has shipped for that alias.
  */
-export const isAdmittedPresetRequirement = (
-  preset: Preset,
-  requirement: PresetRequirement,
+export const isAdmittedPresetRequirementV1 = (
+  preset: PresetV1,
+  requirement: PresetRequirementV1,
 ): boolean => ([1, 2] as const).some((contract) => {
-  const admitted = presetRequirementsByContract[contract][preset];
+  const admitted = presetRequirementsByContractV1[contract][preset];
   return admitted !== undefined
     && admitted.model === requirement.model
     && admitted.effort === requirement.effort;
 });
+export const isAdmittedPresetRequirement = isAdmittedPresetRequirementV1;
 
-export const presetProviders = {
+export const presetProvidersV1 = {
   low: "codex",
   high: "codex",
   ultra: "codex",
   "fable-max": "claude",
   astra: "devin",
-} as const satisfies Record<Preset, Provider>;
+} as const satisfies Record<PresetV1, ProviderV1>;
+export const presetProviders = presetProvidersV1;
 
 /** The presets a given provider owns, as a type. */
 export type ProviderPreset<P extends Provider> = {
