@@ -436,6 +436,18 @@ describe("public content contract", () => {
     }
   });
 
+  test("preserves the adopted provider-usage boundary on both generated public surfaces", () => {
+    for (const surface of [renderReadmeMarkdown(), htmlVisibleText(renderSiteHtml())]) {
+      expect(surface).toContain("Automatic account movement is not exposed yet.");
+      expect(surface).toContain("Explicit sessions and work tasks stay pinned to the account you selected.");
+      expect(surface).toContain("Claude and Devin accounts never rotate automatically, and HRA never replays a failed or ambiguous turn under another account.");
+      expect(surface).toContain("The experimental desktop switch never copies");
+      expect(surface).toContain("changes Keychain blindly, responds to a provider limit, or retries an uncertain switch.");
+      expect(surface).toContain("The separately adopted provider-usage contract permits bounded managed Codex movement only under fresh local authority; explicit sessions, work tasks, Claude accounts, and cross-machine execution remain outside that boundary.");
+      expect(surface).not.toContain("rotates accounts to evade a provider limit");
+    }
+  });
+
   test("publishes an explicit read-only plugin boundary", () => {
     const claims = [
       "hra plugin list <account> [--project <project>] [--refresh]",

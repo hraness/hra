@@ -1306,6 +1306,8 @@ type SessionListTraversalReplayState = {
   importReceiptCount: number;
 };
 
+type ServiceCommandContext = { signal: AbortSignal; afterResponse?: (callback: () => void) => void };
+
 export class HraService {
   readonly #store: StateStore;
   readonly #paths: StatePaths;
@@ -1402,6 +1404,20 @@ export class HraService {
   #terminalFactsMemoryRevision = 1;
   #terminalFactsMemoryReconciledRevision = 0;
   #closeTask: Promise<void> | undefined;
+
+  /** Retain this closure only at the authenticated local composition boundary.
+   * Ordinary command behavior is unchanged; it grants no new original-owner or automatic admission authority. */
+  static createLocalComposition(input: ConstructorParameters<typeof HraService>[0]): Readonly<{
+    service: HraService;
+    executeAuthenticatedLocal: (command: LocalCommand, context: ServiceCommandContext) => Promise<unknown>;
+  }> {
+    const service = new HraService(input);
+    return Object.freeze({
+      service,
+      executeAuthenticatedLocal: (command: LocalCommand, context: ServiceCommandContext) =>
+        service.#executeAuthenticatedLocal(command, context),
+    });
+  }
 
   constructor(input: {
     store: StateStore;
@@ -1940,7 +1956,15 @@ export class HraService {
     return { profile, providerAuthority };
   }
 
-  async execute(command: LocalCommand, context: { signal: AbortSignal; afterResponse?: (callback: () => void) => void }): Promise<unknown> {
+  execute(command: LocalCommand, context: ServiceCommandContext): Promise<unknown> {
+    return this.#executeWithLifecycle(command, context);
+  }
+
+  #executeAuthenticatedLocal(command: LocalCommand, context: ServiceCommandContext): Promise<unknown> {
+    return this.#executeWithLifecycle(command, context);
+  }
+
+  async #executeWithLifecycle(command: LocalCommand, context: ServiceCommandContext): Promise<unknown> {
     const finish = this.#beginOperation();
     try {
       await this.#daemonAuthority.assertCurrent();

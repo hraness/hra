@@ -110,9 +110,13 @@ If a Claude foreground parent or daemon fails after launch, `hra account show pe
 
 Devin foreground login uses the same one-child recovery fence. If its parent or daemon fails after launch, `hra account show personal --provider devin` returns the exact acknowledged cancellation command. Confirm that the original child has exited before running it. Recovery releases only HRA's local fence and does not stop Devin or read, change, or delete its credential.
 
+`hra account list --provider codex` or `hra account list --provider claude --json` reads cached provider order, default marker, readiness and observation times. It does not refresh providers or change account selection. Unknown observation times stay unknown; cached readiness is not current sign-in proof or quota freshness. The read verifies at most 10,000 live profiles and returns at most 10,000 accounts within a separate 3 MiB JSON limit, refusing oversized or inconsistent results without truncation. Unqualified `hra account list` keeps the existing profile listing.
+
 `hra account usage` is Codex-only and keeps the latest snapshot and 1-, 5-, and 15-minute observed token velocity. `hra account usage-history <profile>` reads the retained 24-hour local ledger in durable source order. Use UTC RFC3339 `--from` and `--through` bounds plus the returned opaque cursor for later pages; a cursor freezes that account and range and expires after five minutes. History rows contain only derived token observations or closed poll-failure codes; raw provider payloads are never returned.
 
-HRA automatically spends one available earned Codex rate-limit reset when a fresh read shows the exact seven-day Codex window at 99 percent used or higher. It records a private idempotency key before dispatch, retries only that key after an uncertain response, and rereads limits after every closed outcome. A successful redemption is latched to that weekly window, so a stale usage snapshot cannot spend another credit. Rate-limit notifications wake a coalesced authoritative read; the staggered 50-to-70-second poll remains the fallback. `hra account usage` reports the most recent local reset attempt with its source weekly-window boundary and suppresses a prior identity's snapshot after an account change. Credit IDs, descriptions, private keys, and account fingerprints never enter that reset status or its cloud projection.
+`hra usage auto status [codex|claude]` reads local automatic-policy configuration and its revision. Without a provider, `on|off` changes the inherited default, not a global kill switch. A provider's explicit `on` override remains enabled when that default is off; `inherit <codex|claude>` restores inheritance. Every change requires `--revision <n>` from status and a caller-owned `--idempotency-key <uuid>`. After a lost response, replay the exact command with the same key and revision. Its saved receipt is not the current configuration; read status again for that. These controls do not refresh providers, move accounts or sessions, or enable unavailable runtime capabilities. Devin has no automatic usage policy.
+
+When effective Codex automatic policy is enabled, HRA automatically spends one available earned Codex rate-limit reset when a fresh read shows the exact seven-day Codex window at 99 percent used or higher. It records a private idempotency key before dispatch, retries only that key after an uncertain response, and rereads limits after every closed outcome. Disabling suppresses new automatic reset dispatches, including retries, while retaining uncertain attempts under their original keys. A later disable does not cancel an already admitted operation or skip settlement and rereading after a closed outcome. A successful redemption is latched to that weekly window, so a stale usage snapshot cannot spend another credit. Rate-limit notifications wake a coalesced authoritative read; the staggered 50-to-70-second poll remains the fallback. `hra account usage` reports the most recent local reset attempt with its source weekly-window boundary and suppresses a prior identity's snapshot after an account change. Credit IDs, descriptions, private keys, and account fingerprints never enter that reset status or its cloud projection.
 
 Devin ACP session usage reports current context occupancy and capacity, plus cumulative provider cost only when Devin supplies it. HRA records those facts without interpreting them as an account allowance, remaining balance, billing settlement, or reset window. Devin ACP and `devin auth status` expose no documented machine-readable account allowance or reset operation, so `hra account show personal --provider devin` reports allowance `unknown` with source `devin_acp`. HRA never submits Devin's human-facing usage commands as hidden turns and never applies a Codex reset credit to Devin.
 
@@ -449,6 +453,9 @@ hra doctor [--offline] [--json]
 hra auth login --input-stdin|--input-fd <fd>
 hra auth status|logout
 hra auth delete --acknowledge-erasure
+hra usage auto status [codex|claude] [--json]
+hra usage auto on|off [codex|claude] --revision <n> --idempotency-key <uuid> [--json]
+hra usage auto inherit <codex|claude> --revision <n> --idempotency-key <uuid> [--json]
 hra notification-hours status [--json]
 hra notification-hours set --start <HH:MM> --end <HH:MM> --timezone <IANA-zone> --revision <n> [--json]
 hra notification-email status [--json]
@@ -465,6 +472,7 @@ hra account login-cancel <profile> --provider claude --attempt-id <attempt-id> -
 hra account login-cancel <profile> --provider devin --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
 hra account logout <profile>
 hra account list
+hra account list [--provider <codex|claude>] [--json]
 hra account show <profile> [--provider <codex|claude|devin>]
 hra account usage [profile] [--refresh]
 hra account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]

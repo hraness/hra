@@ -3667,9 +3667,9 @@ async function runDaemonLifecycle(
             }
             return await current.readProviderAccountProjectionForCloud(input);
           },
-          // Device commands run ordinary local commands, so they go through the
-          // same admitted service path a person's CLI uses, with the same
-          // idempotency, quarantine, and authority checks.
+          // Device commands retain ordinary service admission, idempotency,
+          // quarantine and authority checks. They do not receive the separate
+          // authenticated-local composition capability.
           executeLocal: async (command, options) => {
             const current = serviceReference.current;
             if (current === undefined) throw new Error("The local command service is not ready.");
@@ -3769,7 +3769,7 @@ async function runDaemonLifecycle(
           });
         })()
       : undefined;
-    const activeService = new HraService({
+    const { service: activeService, executeAuthenticatedLocal } = HraService.createLocalComposition({
       store: activeStore,
       paths,
       codex,
@@ -3855,7 +3855,7 @@ async function runDaemonLifecycle(
             requestStop,
           });
         }
-        const data = await activeService.execute(command, { signal: context.signal, afterResponse: (callback) => context.afterResponse(callback) });
+        const data = await executeAuthenticatedLocal(command, { signal: context.signal, afterResponse: (callback) => context.afterResponse(callback) });
         if (command.kind !== "daemon.status") return data;
         const daemon = identityFromReceipt(daemonLock.receipt);
         if (daemon === null) throw new Error("Daemon authority identity is not published.");
