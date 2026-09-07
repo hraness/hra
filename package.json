@@ -96,7 +96,7 @@
     "@eslint/js": "9.34.0",
     "@hraness/design-kit": "github:hraness/design-kit#v0.4.0",
     "@hraness/posthog": "github:hraness/posthog#v0.1.2",
-    "@hraness/site-footer": "github:hraness/site-footer#v0.6.0",
+    "@hraness/site-footer": "github:hraness/site-footer#v0.6.1",
     "@hraness/ui": "github:hraness/ui#v0.4.10",
     "@letta-ai/trajectory": "0.3.0",
     "@tailwindcss/vite": "4.3.3",

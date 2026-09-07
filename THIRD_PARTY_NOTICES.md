@@ -6,7 +6,7 @@ The Codex provider-session runtime uses Effect 3.22.1, licensed under the MIT Li
 
 The static hra.sh analytics asset incorporates `@hraness/posthog` version 0.1.2 and its `posthog-js` version 1.412.1 dependency. Both are licensed under the MIT License. HRA pins the immutable `@hraness/posthog` GitHub release tag, and `bun.lock` binds the exact dependency graph used to build the self-hosted browser asset.
 
-The static hra.sh styles and footer use the MIT-licensed `@hraness/design-kit` v0.4.0 and `@hraness/site-footer` v0.6.0 packages; `bun.lock` binds both exact release tags.
+The static hra.sh styles and footer use the MIT-licensed `@hraness/design-kit` v0.4.0 and `@hraness/site-footer` v0.6.1 packages; `bun.lock` binds both exact release tags.
 
 HRA validates trajectory exports during development against Apache-2.0-licensed `@letta-ai/trajectory` 0.3.0 and MIT-licensed Ajv 8.20.0. These development dependencies are not runtime dependencies of the published CLI.
 

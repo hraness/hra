@@ -148,6 +148,10 @@ tests. Its only failure was the app build-marker fixture still expecting the
 previous package version; that assertion now requires 0.6.2. The other 480 app
 tests passed. Remaining 0.6.1 literals describe admitted-release evidence or
 self-contained historical fixtures, not the current package identity.
+Main then merged the footer-only dependency update `7872886`. The auth branch
+preserves that exact package and lockfile change, with the matching third-party
+notice. It does not alter auth behavior or the packaged file-size inventory.
+The final gate must cover this joined tree.
 Artifact publication does not authorize daemon upgrades or activate hosted
 commands. Protected capacity activation and intended-target marker proofs
 remain required; live two-device Codex and exact-pin Linux Claude acceptance
