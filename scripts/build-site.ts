@@ -155,7 +155,7 @@ const analyticsEntryPath = fileURLToPath(
   new URL("../site/analytics-entry.ts", import.meta.url),
 );
 const siteFooterStylesPath = fileURLToPath(
-  import.meta.resolve("@hraness/site-footer/styles.css"),
+  import.meta.resolve("@hraness/site-footer/stylex.css"),
 );
 const designKitFontsStylesPath = fileURLToPath(
   import.meta.resolve("@hraness/design-kit/fonts.css"),
