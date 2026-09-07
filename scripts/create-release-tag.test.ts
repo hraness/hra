@@ -18,6 +18,7 @@ import {
 const sha = "1111111111111111111111111111111111111111";
 const object = "2222222222222222222222222222222222222222";
 const nextObject = "3333333333333333333333333333333333333333";
+const acceptReleasePins = async (): Promise<void> => {};
 
 function ruleset(name: string, rules: readonly string[], bypass = false): unknown {
   return {
@@ -33,10 +34,12 @@ function ruleset(name: string, rules: readonly string[], bypass = false): unknow
 }
 
 function fakeReleaseRunner(options: Readonly<{
+  dirtyOnStatusRead?: number;
   hiddenIndex?: "assume-unchanged" | "skip-worktree";
   mainAdvancesBeforePush?: boolean;
   published?: boolean;
   pushFails?: boolean;
+  replacementRef?: boolean;
   wrongUser?: boolean;
 }> = {}): { readonly calls: string[]; readonly runner: (command: readonly string[]) => {
   exitCode: number;
@@ -45,6 +48,7 @@ function fakeReleaseRunner(options: Readonly<{
 } } {
   const calls: string[] = [];
   let mainReadCount = 0;
+  let statusReadCount = 0;
   const result = (stdout = "", exitCode = 0, stderr = "") => ({ exitCode, stderr, stdout });
   const immutableMain = {
     bypass_actors: [],
@@ -101,7 +105,20 @@ function fakeReleaseRunner(options: Readonly<{
       visibility: "public",
     }));
     if (key === "git\u0000rev-parse\u0000--show-toplevel") return result(process.cwd());
-    if (key === "git\u0000status\u0000--porcelain=v1\u0000--untracked-files=all") return result();
+    if (key === "git\u0000for-each-ref\u0000--format=%(refname)\u0000refs/replace") {
+      return result(options.replacementRef === true
+        ? `refs/replace/${sha}\n`
+        : "");
+    }
+    if (key === "git\u0000status\u0000--porcelain=v1\u0000--untracked-files=all") {
+      statusReadCount += 1;
+      return result(
+        options.dirtyOnStatusRead !== undefined
+          && statusReadCount >= options.dirtyOnStatusRead
+          ? " M src/install-preflight.ts\n"
+          : "",
+      );
+    }
     if (key === "git\u0000ls-files\u0000-v\u0000-z") {
       if (options.hiddenIndex === "assume-unchanged") return result("h package.json\0");
       if (options.hiddenIndex === "skip-worktree") return result("S package.json\0");
@@ -116,7 +133,14 @@ function fakeReleaseRunner(options: Readonly<{
     }
     if (key === "git\u0000rev-parse\u0000--verify\u0000HEAD^{commit}") return result(sha);
     if (key === "git\u0000show\u0000HEAD:package.json") {
-      return result(JSON.stringify({ name: "@hraness/hra", version: "0.6.0" }));
+      return result(JSON.stringify({ name: "@hraness/hra", version: "0.6.1" }));
+    }
+    const committedSourcePrefix = `git\u0000show\u0000${sha}:`;
+    if (key.startsWith(committedSourcePrefix)) {
+      const path = key.slice(committedSourcePrefix.length);
+      return result(path === "package.json"
+        ? `${JSON.stringify({ name: "@hraness/hra", version: "0.6.1" })}\n`
+        : `// committed ${path}\n`);
     }
     if (key === "git\u0000ls-remote\u0000--heads\u0000origin\u0000refs/heads/main") {
       mainReadCount += 1;
@@ -124,9 +148,9 @@ function fakeReleaseRunner(options: Readonly<{
       return result(`${current}\trefs/heads/main\n`);
     }
     if (key === "git\u0000ls-remote\u0000--tags\u0000origin\u0000refs/tags/v*") {
-      const current = `${object}\trefs/tags/v0.5.0\n${sha}\trefs/tags/v0.5.0^{}\n`;
+      const current = `${object}\trefs/tags/v0.6.0\n${sha}\trefs/tags/v0.6.0^{}\n`;
       return result(options.published === true
-        ? `${current}${nextObject}\trefs/tags/v0.6.0\n${sha}\trefs/tags/v0.6.0^{}\n`
+        ? `${current}${nextObject}\trefs/tags/v0.6.1\n${sha}\trefs/tags/v0.6.1^{}\n`
         : current);
     }
     if (key.startsWith("gh\u0000api\u0000--method\u0000GET\u0000repos/hraness/hra/rulesets\u0000")) {
@@ -184,18 +208,18 @@ function fakeReleaseRunner(options: Readonly<{
       }],
       total_count: 1,
     }));
-    if (key === "git\u0000show-ref\u0000--verify\u0000--quiet\u0000refs/tags/v0.6.0") return result("", 1);
-    if (key === `git\u0000-c\u0000tag.gpgSign=false\u0000tag\u0000-a\u0000v0.6.0\u0000-m\u0000Release v0.6.0\u0000${sha}`) {
+    if (key === "git\u0000show-ref\u0000--verify\u0000--quiet\u0000refs/tags/v0.6.1") return result("", 1);
+    if (key === `git\u0000-c\u0000tag.gpgSign=false\u0000tag\u0000-a\u0000v0.6.1\u0000-m\u0000Release v0.6.1\u0000${sha}`) {
       return result();
     }
-    if (key === "git\u0000rev-parse\u0000--verify\u0000v0.6.0^{tag}") return result(nextObject);
-    if (key === "git\u0000push\u0000origin\u0000refs/tags/v0.6.0:refs/tags/v0.6.0") {
+    if (key === "git\u0000rev-parse\u0000--verify\u0000v0.6.1^{tag}") return result(nextObject);
+    if (key === "git\u0000push\u0000origin\u0000refs/tags/v0.6.1:refs/tags/v0.6.1") {
       return options.pushFails === true ? result("", 1, "push failed") : result();
     }
-    if (key === "git\u0000ls-remote\u0000--tags\u0000origin\u0000refs/tags/v0.6.0\u0000refs/tags/v0.6.0^{}") {
-      return result(`${nextObject}\trefs/tags/v0.6.0\n${sha}\trefs/tags/v0.6.0^{}\n`);
+    if (key === "git\u0000ls-remote\u0000--tags\u0000origin\u0000refs/tags/v0.6.1\u0000refs/tags/v0.6.1^{}") {
+      return result(`${nextObject}\trefs/tags/v0.6.1\n${sha}\trefs/tags/v0.6.1^{}\n`);
     }
-    if (key === `git\u0000update-ref\u0000-d\u0000refs/tags/v0.6.0\u0000${nextObject}`) return result();
+    if (key === `git\u0000update-ref\u0000-d\u0000refs/tags/v0.6.1\u0000${nextObject}`) return result();
     throw new Error(`Unexpected fake command: ${key}`);
   };
   return { calls, runner };
@@ -208,18 +232,29 @@ describe("owner-authorized release tag", () => {
       const fixture = fakeReleaseRunner({ hiddenIndex });
       await expect(createReleaseTag(fixture.runner, async () => ({
         name: "@hraness/hra",
-        version: "0.6.0",
+        version: "0.6.1",
       }))).rejects.toThrow("skip-worktree or assume-unchanged");
       expect(fixture.calls.some((call) => call.includes("\u0000tag\u0000-a\u0000"))).toBe(false);
       expect(fixture.calls.some((call) => call.includes("\u0000push\u0000"))).toBe(false);
     }
   });
 
+  test("refuses replacement refs before reading or tagging committed installer blobs", async () => {
+    const fixture = fakeReleaseRunner({ replacementRef: true });
+    await expect(createReleaseTag(fixture.runner, async () => ({
+      name: "@hraness/hra",
+      version: "0.6.1",
+    }), acceptReleasePins)).rejects.toThrow("replacement refs");
+    expect(fixture.calls.some((call) => call.startsWith(`git\u0000show\u0000${sha}:`))).toBe(false);
+    expect(fixture.calls.some((call) => call.includes("\u0000tag\u0000-a\u0000"))).toBe(false);
+    expect(fixture.calls.some((call) => call.startsWith("git\u0000push\u0000"))).toBe(false);
+  });
+
   test("uses the committed manifest as release authority", async () => {
     const fixture = fakeReleaseRunner();
     await expect(createReleaseTag(fixture.runner, async () => ({
       name: "@hraness/hra",
-      version: "0.6.1",
+      version: "0.6.2",
     }))).rejects.toThrow("does not match the exact committed package manifest");
     expect(fixture.calls.some((call) => call.includes("\u0000tag\u0000-a\u0000"))).toBe(false);
     expect(fixture.calls.some((call) => call.startsWith("git\u0000push\u0000"))).toBe(false);
@@ -242,17 +277,17 @@ describe("owner-authorized release tag", () => {
   });
 
   test("requires a new monotonic tag or proves the exact existing annotated tag", () => {
-    const existing = parseRemoteTags(`${object}\trefs/tags/v0.5.0\n${sha}\trefs/tags/v0.5.0^{}\n`);
-    expect(assertMonotonicReleaseTag("0.6.0", sha, existing)).toEqual({
+    const existing = parseRemoteTags(`${object}\trefs/tags/v0.6.0\n${sha}\trefs/tags/v0.6.0^{}\n`);
+    expect(assertMonotonicReleaseTag("0.6.1", sha, existing)).toEqual({
       alreadyPublished: false,
+      tag: "v0.6.1",
+    });
+    expect(assertMonotonicReleaseTag("0.6.0", sha, existing)).toEqual({
+      alreadyPublished: true,
       tag: "v0.6.0",
     });
-    expect(assertMonotonicReleaseTag("0.5.0", sha, existing)).toEqual({
-      alreadyPublished: true,
-      tag: "v0.5.0",
-    });
-    expect(() => assertMonotonicReleaseTag("0.4.9", sha, existing)).toThrow("not newer");
-    expect(() => assertMonotonicReleaseTag("0.5.0", object, existing)).toThrow("different or lightweight");
+    expect(() => assertMonotonicReleaseTag("0.5.0", sha, existing)).toThrow("not newer");
+    expect(() => assertMonotonicReleaseTag("0.6.0", object, existing)).toThrow("different or lightweight");
   });
 
   test("requires split creation and immutable rulesets with only the owner creation bypass", () => {
@@ -378,14 +413,44 @@ describe("owner-authorized release tag", () => {
     )).toThrow("hraness/hra as origin");
   });
 
+  test("refuses release-pin drift before any local tag effect", async () => {
+    const fake = fakeReleaseRunner();
+    let observedTag: string | undefined;
+    let observedSources: readonly string[] | undefined;
+    await expect(createReleaseTag(fake.runner, async () => ({
+      name: "@hraness/hra",
+      version: "0.6.1",
+    }), async (sources, tag) => {
+      observedTag = tag;
+      observedSources = Object.keys(sources).sort();
+      throw new Error("installer release pins drifted");
+    })).rejects.toThrow("installer release pins drifted");
+    expect(observedTag).toBe("v0.6.1");
+    expect(observedSources).toEqual(["cli", "manifest", "normalizer", "preflight", "runtime"]);
+    expect(fake.calls.some((call) => call.includes("\u0000tag\u0000-a\u0000"))).toBe(false);
+    expect(fake.calls.some((call) => call.startsWith("git\u0000push\u0000"))).toBe(false);
+  });
+
+  test("refuses checkout drift after pin proof and again before tag creation", async () => {
+    for (const dirtyOnStatusRead of [2, 3]) {
+      const fake = fakeReleaseRunner({ dirtyOnStatusRead });
+      await expect(createReleaseTag(fake.runner, async () => ({
+        name: "@hraness/hra",
+        version: "0.6.1",
+      }), acceptReleasePins)).rejects.toThrow("working-tree drift");
+      expect(fake.calls.some((call) => call.includes("\u0000tag\u0000-a\u0000"))).toBe(false);
+      expect(fake.calls.some((call) => call.startsWith("git\u0000push\u0000"))).toBe(false);
+    }
+  });
+
   test("revalidates current main immediately before one exact tag push", async () => {
     const fake = fakeReleaseRunner();
     await expect(createReleaseTag(fake.runner, async () => ({
       name: "@hraness/hra",
-      version: "0.6.0",
-    }))).resolves.toContain("Created immutable v0.6.0");
-    const tag = fake.calls.findIndex((call) => call.includes("\u0000tag\u0000-a\u0000v0.6.0"));
-    const push = fake.calls.indexOf("git\u0000push\u0000origin\u0000refs/tags/v0.6.0:refs/tags/v0.6.0");
+      version: "0.6.1",
+    }), acceptReleasePins)).resolves.toContain("Created immutable v0.6.1");
+    const tag = fake.calls.findIndex((call) => call.includes("\u0000tag\u0000-a\u0000v0.6.1"));
+    const push = fake.calls.indexOf("git\u0000push\u0000origin\u0000refs/tags/v0.6.1:refs/tags/v0.6.1");
     const ci = fake.calls.findIndex((call) => call.includes("actions/runs/10/jobs"));
     const finalMainRead = fake.calls.lastIndexOf(
       "git\u0000ls-remote\u0000--heads\u0000origin\u0000refs/heads/main",
@@ -394,7 +459,7 @@ describe("owner-authorized release tag", () => {
     expect(finalMainRead).toBe(tag + 2);
     expect(push).toBe(finalMainRead + 1);
     expect(fake.calls.at(-1)).toBe(
-      "git\u0000ls-remote\u0000--tags\u0000origin\u0000refs/tags/v0.6.0\u0000refs/tags/v0.6.0^{}",
+      "git\u0000ls-remote\u0000--tags\u0000origin\u0000refs/tags/v0.6.1\u0000refs/tags/v0.6.1^{}",
     );
   });
 
@@ -402,12 +467,12 @@ describe("owner-authorized release tag", () => {
     const fake = fakeReleaseRunner({ mainAdvancesBeforePush: true });
     await expect(createReleaseTag(fake.runner, async () => ({
       name: "@hraness/hra",
-      version: "0.6.0",
-    }))).rejects.toThrow("Remote main advanced during release tag preflight");
+      version: "0.6.1",
+    }), acceptReleasePins)).rejects.toThrow("Remote main advanced during release tag preflight");
     expect(fake.calls.some((call) => call.startsWith("git\u0000push\u0000"))).toBe(false);
     expect(fake.calls.slice(-2)).toEqual([
-      `git\u0000update-ref\u0000-d\u0000refs/tags/v0.6.0\u0000${nextObject}`,
-      "git\u0000show-ref\u0000--verify\u0000--quiet\u0000refs/tags/v0.6.0",
+      `git\u0000update-ref\u0000-d\u0000refs/tags/v0.6.1\u0000${nextObject}`,
+      "git\u0000show-ref\u0000--verify\u0000--quiet\u0000refs/tags/v0.6.1",
     ]);
   });
 
@@ -415,7 +480,7 @@ describe("owner-authorized release tag", () => {
     const fake = fakeReleaseRunner({ wrongUser: true });
     await expect(createReleaseTag(fake.runner, async () => ({
       name: "@hraness/hra",
-      version: "0.6.0",
+      version: "0.6.1",
     }))).rejects.toThrow("immutable owner User ID 894119");
     expect(fake.calls).toEqual(["gh\u0000api\u0000user"]);
   });
@@ -424,12 +489,12 @@ describe("owner-authorized release tag", () => {
     const fake = fakeReleaseRunner({ pushFails: true });
     await expect(createReleaseTag(fake.runner, async () => ({
       name: "@hraness/hra",
-      version: "0.6.0",
-    }))).rejects.toThrow("push failed");
-    const push = fake.calls.indexOf("git\u0000push\u0000origin\u0000refs/tags/v0.6.0:refs/tags/v0.6.0");
+      version: "0.6.1",
+    }), acceptReleasePins)).rejects.toThrow("push failed");
+    const push = fake.calls.indexOf("git\u0000push\u0000origin\u0000refs/tags/v0.6.1:refs/tags/v0.6.1");
     expect(fake.calls.slice(push + 1)).toEqual([
-      `git\u0000update-ref\u0000-d\u0000refs/tags/v0.6.0\u0000${nextObject}`,
-      "git\u0000show-ref\u0000--verify\u0000--quiet\u0000refs/tags/v0.6.0",
+      `git\u0000update-ref\u0000-d\u0000refs/tags/v0.6.1\u0000${nextObject}`,
+      "git\u0000show-ref\u0000--verify\u0000--quiet\u0000refs/tags/v0.6.1",
     ]);
   });
 
@@ -437,8 +502,8 @@ describe("owner-authorized release tag", () => {
     const fake = fakeReleaseRunner({ published: true });
     await expect(createReleaseTag(fake.runner, async () => ({
       name: "@hraness/hra",
-      version: "0.6.0",
-    }))).resolves.toBe(`Release tag v0.6.0 already immutably names ${sha}.`);
+      version: "0.6.1",
+    }), acceptReleasePins)).resolves.toBe(`Release tag v0.6.1 already immutably names ${sha}.`);
     expect(fake.calls.some((call) => call.includes("\u0000tag\u0000-a\u0000"))).toBe(false);
     expect(fake.calls.some((call) => call.startsWith("git\u0000push\u0000"))).toBe(false);
   });

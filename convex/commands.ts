@@ -28,51 +28,44 @@ import {
 } from "./commandRequestVersion";
 import { validateIdempotencyInput } from "./idempotency";
 import { requireLiveExecutionLease } from "./leases";
+import { COMMAND_TERMINAL_RETENTION_MS } from "./lifecyclePolicy";
 import {
-  adjustCommandQuotaForPatch,
   reserveNonterminalCommandQuotaForInsert,
   reserveQuotaForInsert,
 } from "./quota";
+import {
+  acknowledgeSessionCommandReceipt,
+  isLegacyNoEffectExpiredTerminal,
+  isOperatorAbandonedEffectTerminal,
+  patchSessionCommandWithLifecycleCapacity,
+  requireCommandCapacityReadiness,
+  requireOperatorAbandonedSecurityEvent,
+  reserveCommandLifecycleForInsert,
+  terminalizeSessionCommandWithLifecycleCapacity,
+} from "./commandLifecycle";
 import { mutation, query, type MutationCtx } from "./server";
 import {
   authorityTuple,
   commandKind,
+  commandLifecycleCapacityVersion,
   commandPayloadCiphertextCharacters,
+  commandReceiptCapacityReservation,
   encryptedEnvelope,
+  maximumCommandLifecycleBatch,
 } from "./validators";
 
 const maximumCommandLifetimeMs = 7 * 24 * 60 * 60 * 1_000;
-export const commandTerminalRetentionMs = 30 * 24 * 60 * 60 * 1_000;
-const legacyRequestCommitmentResultCode = "LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT";
+export const commandTerminalRetentionMs = COMMAND_TERMINAL_RETENTION_MS;
 const resultCodePattern = /^[A-Z][A-Z0-9_]{0,63}$/u;
 
 function terminalCleanupFields(
   command: Readonly<{ requesterAcknowledgedAt?: number }>,
   now: number,
-  terminalResultless: boolean,
-): Readonly<{ terminalCleanupAfter?: number; terminalResultless: boolean }> {
+): Readonly<{ terminalCleanupAfter?: number }> {
   return {
     ...(command.requesterAcknowledgedAt === undefined
       ? {}
       : { terminalCleanupAfter: now + commandTerminalRetentionMs }),
-    terminalResultless,
-  };
-}
-
-function preparedFailureCleanupFields(
-  command: Readonly<{ requesterAcknowledgedAt?: number }>,
-  now: number,
-  resultCode: string,
-): Readonly<{ terminalCleanupAfter?: number; terminalResultless: true }> {
-  // Legacy browser builds never acknowledge session-command receipts. The
-  // dedicated no-effect upgrade failure remains observable for a full normal
-  // retention window, then becomes collectible without weakening retention
-  // for any ordinary unacknowledged result-bearing command.
-  return {
-    ...(resultCode === legacyRequestCommitmentResultCode
-      ? { terminalCleanupAfter: now + commandTerminalRetentionMs }
-      : terminalCleanupFields(command, now, true)),
-    terminalResultless: true,
   };
 }
 
@@ -202,13 +195,23 @@ export const enqueue = mutation({
       targetDeviceId: session.executionDeviceId,
       userId: authority.userId,
     });
-    const duplicatePublicId = await commandByPublicId(ctx, args.publicId);
-    if (duplicatePublicId !== null) rejectAuthority();
+    await requireCommandCapacityReadiness(ctx, args.requestCommitmentVersion);
+    const [duplicatePublicId, crossTablePublicId] = await Promise.all([
+      commandByPublicId(ctx, args.publicId),
+      ctx.db.query("deviceCommands")
+        .withIndex("by_public_id", (builder) => builder.eq("publicId", args.publicId))
+        .first(),
+    ]);
+    // Security provenance and break-glass retirement use a command public id
+    // as their stable entity key, so the two command families share one id
+    // namespace even though their physical tables are distinct.
+    if (duplicatePublicId !== null || crossTablePublicId !== null) rejectAuthority();
     const commandDocument = {
       createdAt: now,
       deadline: args.deadline,
       idempotencyKey: args.idempotencyKey,
       kind: args.kind,
+      lifecycleCapacityVersion: commandLifecycleCapacityVersion,
       nonterminal: true,
       payload: args.payload,
       publicId: args.publicId,
@@ -225,6 +228,7 @@ export const enqueue = mutation({
     } as const;
     await reserveNonterminalCommandQuotaForInsert(ctx, authority.userId, commandDocument);
     await ctx.db.insert("sessionCommands", commandDocument);
+    await reserveCommandLifecycleForInsert(ctx, "session", commandDocument);
     const securityDocument = {
       actorDeviceId: authority.deviceId,
       createdAt: now,
@@ -270,6 +274,7 @@ function publicCommand(command: Readonly<{
     | "archive_session"
     | "rename_session"
     | "set_gateway_key";
+  lifecycleCapacityVersion?: 1;
   payload: Parameters<typeof parseEncryptedEnvelope>[0];
   publicId: string;
   requestCommitmentVersion?: 2;
@@ -315,6 +320,17 @@ function publicCommandMetadata(command: Parameters<typeof publicCommand>[0], ses
     ...(command.resultCode === undefined ? {} : { resultCode: command.resultCode }),
     state: command.state,
     updatedAt: command.updatedAt,
+  };
+}
+
+function publicCapacityCommandMetadata(
+  command: Parameters<typeof publicCommand>[0],
+  sessionPublicId: string,
+  lifecycleCapacityReady = command.lifecycleCapacityVersion === commandLifecycleCapacityVersion,
+) {
+  return {
+    ...publicCommandMetadata(command, sessionPublicId),
+    lifecycleCapacityReady,
   };
 }
 
@@ -430,6 +446,69 @@ export const getForOutboxRecovery = query({
   },
 });
 
+// Browser command custody stays server-side. A tab can disappear after the
+// enqueue transaction commits but before its mutation promise resolves, and
+// the browser deliberately persists neither command ciphertext nor receipt
+// proofs. On the next authenticated load, expose only this exact requester's
+// own unacknowledged proof tuples. Reading is not acknowledgement: the caller
+// must present one tuple back to `acknowledgeReceipt` before retention starts.
+export const listUnacknowledgedForRequester = query({
+  args: { limit: v.number() },
+  handler: async (ctx, args) => {
+    const authority = await requireDeviceAuthority(ctx);
+    if (!isSafePositiveInteger(args.limit) || args.limit > cloudLimits.pageSize) {
+      rejectAuthority();
+    }
+    const commandLimit = Math.min(args.limit, maximumCommandLifecycleBatch);
+    const currentNonterminal = await ctx.db
+      .query("sessionCommands")
+      .withIndex(
+        "by_requesting_device_nonterminal_capacity_ack_and_created_at",
+        (builder) => builder
+        .eq("requestingDeviceId", authority.deviceId)
+        .eq("nonterminal", true)
+        .eq("lifecycleCapacityVersion", commandLifecycleCapacityVersion)
+        .eq("requesterAcknowledgedAt", undefined),
+      )
+      .order("asc")
+      .take(commandLimit);
+    const remaining = commandLimit - currentNonterminal.length;
+    const currentTerminal = remaining === 0 ? [] : await ctx.db
+      .query("sessionCommands")
+      .withIndex(
+        "by_requesting_device_nonterminal_acknowledgement_and_cleanup",
+        (builder) => builder
+          .eq("requestingDeviceId", authority.deviceId)
+          .eq("nonterminal", false)
+          .eq("requesterAcknowledgedAt", undefined)
+          .eq("terminalCleanupAfter", undefined)
+          .eq("receiptCapacityReservation", commandReceiptCapacityReservation),
+      )
+      .order("asc")
+      .take(remaining);
+    const legacyRemaining = remaining - currentTerminal.length;
+    const legacy = legacyRemaining === 0 ? [] : await ctx.db
+      .query("sessionCommands")
+      .withIndex(
+        "by_requesting_device_acknowledgement_cleanup_capacity_and_created_at",
+        (builder) => builder
+          .eq("requestingDeviceId", authority.deviceId)
+          .eq("requesterAcknowledgedAt", undefined)
+          .eq("terminalCleanupAfter", undefined)
+          .eq("lifecycleCapacityVersion", undefined)
+          .eq("receiptCapacityReservation", undefined),
+      )
+      .order("asc")
+      .take(legacyRemaining);
+    const commands = [...currentNonterminal, ...currentTerminal, ...legacy];
+    return commands.map((command) => ({
+      idempotencyKey: command.idempotencyKey,
+      publicId: command.publicId,
+      requestDigest: command.requestDigest,
+    }));
+  },
+});
+
 export const acknowledgeReceipt = mutation({
   args: {
     commandPublicId: v.string(),
@@ -465,12 +544,10 @@ export const acknowledgeReceipt = mutation({
       ...(terminal
         ? {
             terminalCleanupAfter: now + commandTerminalRetentionMs,
-            terminalResultless: command.result === undefined,
           }
         : {}),
     };
-    await adjustCommandQuotaForPatch(ctx, authority.userId, command, commandPatch);
-    await ctx.db.patch(command._id, commandPatch);
+    await acknowledgeSessionCommandReceipt(ctx, command, commandPatch);
     return { acknowledgedAt: now, publicId: command.publicId, replay: false };
   },
 });
@@ -546,6 +623,46 @@ export const listNonterminalForTargetPage = query({
   },
 });
 
+// Additive, capacity-aware discovery for the reservation-aware daemon. The
+// predecessor query above intentionally retains its exact response keys for
+// server-first rolling upgrades.
+export const listCapacityNonterminalForTargetPage = query({
+  args: { paginationOpts: paginationOptsValidator },
+  handler: async (ctx, args) => {
+    const authority = await requireDeviceAuthority(ctx);
+    if (
+      !isSafePositiveInteger(args.paginationOpts.numItems)
+      || args.paginationOpts.numItems > maximumCommandLifecycleBatch
+    ) rejectAuthority();
+    const result = await ctx.db
+      .query("sessionCommands")
+      .withIndex("by_target_nonterminal_capacity_and_created_at", (builder) => builder
+        .eq("targetDeviceId", authority.deviceId)
+        .eq("nonterminal", true)
+        .eq("lifecycleCapacityVersion", commandLifecycleCapacityVersion))
+      .paginate(args.paginationOpts);
+    const legacyBySession = new Map<string, Promise<boolean>>();
+    const page = await Promise.all(result.page.map(async (command) => {
+      const session = await ctx.db.get(command.sessionId);
+      if (session?.userId !== authority.userId) rejectAuthority();
+      const sessionKey = String(command.sessionId);
+      let legacy = legacyBySession.get(sessionKey);
+      if (legacy === undefined) {
+        legacy = ctx.db.query("sessionCommands")
+          .withIndex("by_session_nonterminal_capacity_and_created_at", (builder) => builder
+            .eq("sessionId", command.sessionId)
+            .eq("nonterminal", true)
+            .eq("lifecycleCapacityVersion", undefined))
+          .first()
+          .then((row) => row !== null);
+        legacyBySession.set(sessionKey, legacy);
+      }
+      return publicCapacityCommandMetadata(command, session.publicId, !(await legacy));
+    }));
+    return { ...result, page };
+  },
+});
+
 async function requireCommandExecutionAuthority(
   ctx: MutationCtx,
   commandPublicId: string,
@@ -597,16 +714,14 @@ export const prepare = mutation({
       const commandPatch = {
         nonterminal: false,
         state: "expired",
-        ...terminalCleanupFields(current.command, now, true),
+        ...terminalCleanupFields(current.command, now),
         updatedAt: now,
       } as const;
-      await adjustCommandQuotaForPatch(
+      await terminalizeSessionCommandWithLifecycleCapacity(
         ctx,
-        current.authority.userId,
         current.command,
         commandPatch,
       );
-      await ctx.db.patch(current.command._id, commandPatch);
       return { publicId: current.command.publicId, replay: false, state: "expired" as const };
     }
     const disposition = commandAuthorityTransitionDisposition({
@@ -624,18 +739,16 @@ export const prepare = mutation({
     if (disposition.kind === "replay") {
       return { publicId: current.command.publicId, replay: true, state: "prepared" as const };
     }
+    await requireCommandCapacityReadiness(
+      ctx,
+      current.command.requestCommitmentVersion,
+    );
     if (disposition.kind === "rebound") {
       const commandPatch = {
         boundAuthority: disposition.boundAuthority,
         updatedAt: now,
       } as const;
-      await adjustCommandQuotaForPatch(
-        ctx,
-        current.authority.userId,
-        current.command,
-        commandPatch,
-      );
-      await ctx.db.patch(current.command._id, commandPatch);
+      await patchSessionCommandWithLifecycleCapacity(ctx, current.command, commandPatch);
       return { publicId: current.command.publicId, rebound: true, state: "prepared" as const };
     }
     const commandPatch = {
@@ -643,13 +756,7 @@ export const prepare = mutation({
       state: disposition.state,
       updatedAt: now,
     } as const;
-    await adjustCommandQuotaForPatch(
-      ctx,
-      current.authority.userId,
-      current.command,
-      commandPatch,
-    );
-    await ctx.db.patch(current.command._id, commandPatch);
+    await patchSessionCommandWithLifecycleCapacity(ctx, current.command, commandPatch);
     return { publicId: current.command.publicId, replay: false, state: "prepared" as const };
   },
 });
@@ -687,32 +794,28 @@ export const markEffectStarted = mutation({
       const commandPatch = {
         nonterminal: false,
         state: "expired",
-        ...terminalCleanupFields(current.command, now, true),
+        ...terminalCleanupFields(current.command, now),
         updatedAt: now,
       } as const;
-      await adjustCommandQuotaForPatch(
+      await terminalizeSessionCommandWithLifecycleCapacity(
         ctx,
-        current.authority.userId,
         current.command,
         commandPatch,
       );
-      await ctx.db.patch(current.command._id, commandPatch);
       return { publicId: current.command.publicId, replay: false, state: "expired" as const };
     }
     if (disposition.kind === "replay") {
       return { publicId: current.command.publicId, replay: true, state: "effect_started" as const };
     }
+    await requireCommandCapacityReadiness(
+      ctx,
+      current.command.requestCommitmentVersion,
+    );
     const commandPatch = {
       state: disposition.state,
       updatedAt: now,
     } as const;
-    await adjustCommandQuotaForPatch(
-      ctx,
-      current.authority.userId,
-      current.command,
-      commandPatch,
-    );
-    await ctx.db.patch(current.command._id, commandPatch);
+    await patchSessionCommandWithLifecycleCapacity(ctx, current.command, commandPatch);
     return { publicId: current.command.publicId, replay: false, state: "effect_started" as const };
   },
 });
@@ -782,11 +885,10 @@ export const failPrepared = mutation({
       const commandPatch = {
         nonterminal: false,
         state: "expired",
-        ...terminalCleanupFields(command, now, true),
+        ...terminalCleanupFields(command, now),
         updatedAt: now,
       } as const;
-      await adjustCommandQuotaForPatch(ctx, target.userId, command, commandPatch);
-      await ctx.db.patch(command._id, commandPatch);
+      await terminalizeSessionCommandWithLifecycleCapacity(ctx, command, commandPatch);
       return { publicId: command.publicId, replay: false, state: "expired" as const };
     }
     const commandPatch = {
@@ -794,11 +896,9 @@ export const failPrepared = mutation({
       resultCode: args.resultCode,
       resultDigest: args.resultDigest,
       state: "failed",
-      ...preparedFailureCleanupFields(command, now, args.resultCode),
+      ...terminalCleanupFields(command, now),
       updatedAt: now,
     } as const;
-    await adjustCommandQuotaForPatch(ctx, target.userId, command, commandPatch);
-    await ctx.db.patch(command._id, commandPatch);
     const securityDocument = {
       actorDeviceId: target.deviceId,
       createdAt: now,
@@ -806,8 +906,12 @@ export const failPrepared = mutation({
       event: "command_terminal",
       userId: target.userId,
     } as const;
-    await reserveQuotaForInsert(ctx, target.userId, "security", securityDocument);
-    await ctx.db.insert("securityEvents", securityDocument);
+    await terminalizeSessionCommandWithLifecycleCapacity(
+      ctx,
+      command,
+      commandPatch,
+      securityDocument,
+    );
     return { publicId: command.publicId, replay: false, state: "failed" as const };
   },
 });
@@ -840,20 +944,28 @@ export const confirmTerminalRecovery = mutation({
       ctx.db.get(command.sessionId),
       ctx.db.get(command.requestingDeviceId),
     ]);
+    const operatorAbandoned = isOperatorAbandonedEffectTerminal(command);
+    const legacyNoEffectExpired = isLegacyNoEffectExpiredTerminal(command);
+    if (operatorAbandoned) {
+      await requireOperatorAbandonedSecurityEvent(ctx, command);
+    }
     const terminalMatches = command.state === "cancelled"
       || command.state === "expired"
       || (
         command.state === "ambiguous"
         && args.localPhase === "effect_started"
-        && requester?.status === "revoked"
+        && (requester?.status === "revoked" || operatorAbandoned)
       );
     const boundMatches = command.boundAuthority === undefined
       ? args.localPhase === "prepared_no_effect"
+        || operatorAbandoned
+        || legacyNoEffectExpired
       : authorityMatches(storedAuthority(command.boundAuthority), args.staleAuthority);
     if (
       session?.userId !== target.userId
       || requester?.userId !== target.userId
       || command.nonterminal
+      || (command.operatorAbandonedAt !== undefined && !operatorAbandoned)
       || !boundMatches
       || !terminalMatches
       || command.result !== undefined
@@ -928,11 +1040,9 @@ export const settle = mutation({
       resultCode: args.resultCode,
       resultDigest: args.resultDigest,
       state: disposition.state,
-      ...terminalCleanupFields(command, now, args.result === undefined),
+      ...terminalCleanupFields(command, now),
       updatedAt: now,
     };
-    await adjustCommandQuotaForPatch(ctx, target.userId, command, commandPatch);
-    await ctx.db.patch(command._id, commandPatch);
     const securityDocument = {
       actorDeviceId: target.deviceId,
       createdAt: now,
@@ -940,8 +1050,12 @@ export const settle = mutation({
       event: "command_terminal",
       userId: target.userId,
     } as const;
-    await reserveQuotaForInsert(ctx, target.userId, "security", securityDocument);
-    await ctx.db.insert("securityEvents", securityDocument);
+    await terminalizeSessionCommandWithLifecycleCapacity(
+      ctx,
+      command,
+      commandPatch,
+      securityDocument,
+    );
     return { publicId: command.publicId, replay: false, state: args.state };
   },
 });
@@ -1002,11 +1116,9 @@ export const recoverEffectStarted = mutation({
       resultCode: args.resultCode,
       resultDigest: args.resultDigest,
       state: args.state,
-      ...terminalCleanupFields(command, now, true),
+      ...terminalCleanupFields(command, now),
       updatedAt: now,
     } as const;
-    await adjustCommandQuotaForPatch(ctx, target.userId, command, commandPatch);
-    await ctx.db.patch(command._id, commandPatch);
     const securityDocument = {
       actorDeviceId: target.deviceId,
       createdAt: now,
@@ -1014,8 +1126,12 @@ export const recoverEffectStarted = mutation({
       event: "command_terminal",
       userId: target.userId,
     } as const;
-    await reserveQuotaForInsert(ctx, target.userId, "security", securityDocument);
-    await ctx.db.insert("securityEvents", securityDocument);
+    await terminalizeSessionCommandWithLifecycleCapacity(
+      ctx,
+      command,
+      commandPatch,
+      securityDocument,
+    );
     return { publicId: command.publicId, replay: false, state: args.state };
   },
 });
@@ -1040,11 +1156,10 @@ export const cancelPending = mutation({
     const commandPatch = {
       nonterminal: false,
       state: "cancelled",
-      ...terminalCleanupFields(command, now, true),
+      ...terminalCleanupFields(command, now),
       updatedAt: now,
     } as const;
-    await adjustCommandQuotaForPatch(ctx, authority.userId, command, commandPatch);
-    await ctx.db.patch(command._id, commandPatch);
+    await terminalizeSessionCommandWithLifecycleCapacity(ctx, command, commandPatch);
     return { publicId: command.publicId, replay: false, state: "cancelled" as const };
   },
 });

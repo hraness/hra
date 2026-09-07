@@ -14,6 +14,10 @@ import {
   USAGE_LOCAL_SNAPSHOT_MAX_BYTES,
 } from "../src/storage/state-store";
 import { CLOUD_USAGE_SNAPSHOT_RETENTION_MS } from "./lifecyclePolicy";
+import {
+  createAccountDeletionCapacityForNewUser,
+  createDeviceRevocationCapacityForNewDevice,
+} from "./authorityReductionCapacity";
 import schema from "./schema";
 import { modules } from "./test.setup";
 import {
@@ -49,6 +53,7 @@ import {
   reserveSessionHeadQuotaForInsert,
 } from "./quota";
 import type { QuotaCategory } from "./quota";
+import { durableJobCapacityReservation } from "./validators";
 
 type Args = Readonly<Record<string, Value>>;
 type PresenceResponse = Readonly<{ online: boolean; sequence: number | null }>;
@@ -61,10 +66,12 @@ const genesisHardAuthority = makeFunctionReference<
 const connect = makeFunctionReference<"mutation", Args, PresenceResponse>("presence:connect");
 const heartbeat = makeFunctionReference<"mutation", Args, PresenceResponse>("presence:heartbeat");
 const auditDirectTablePage = makeFunctionReference<"query", Args, Readonly<{
+  category: QuotaCategory;
   continueCursor: string;
   isDone: boolean;
   logicalBytes: number;
   records: number;
+  table: string;
 }>>("quota:auditDirectTablePage");
 
 const envelope = {
@@ -955,5 +962,96 @@ describe("hosted quota authority", () => {
     expect(first).toMatchObject({ isDone: false, records: 2 });
     expect(second).toMatchObject({ isDone: true, records: 1 });
     expect(await categoryUsageFor(world.testRuntime, world.userId, "security")).toEqual(before);
+  });
+
+  test("shadow audit reconciles every physical authority-reduction reservation", async () => {
+    const world = await quotaWorld();
+    await world.testRuntime.run(async (ctx) => {
+      await createAccountDeletionCapacityForNewUser(ctx, world.userId);
+      await createDeviceRevocationCapacityForNewDevice(
+        ctx,
+        world.userId,
+        world.deviceId,
+      );
+    });
+    const expected = {
+      accountDeletionIdentityReservations: "identity",
+      accountDeletionJobReservations: "job",
+      deviceRevocationDeviceReservations: "device",
+      deviceRevocationJobReservations: "job",
+      deviceRevocationReceiptReservations: "receipt",
+      deviceRevocationSecurityReservations: "security",
+    } as const;
+    for (const [table, category] of Object.entries(expected)) {
+      const audit = await world.testRuntime.query(auditDirectTablePage, {
+        paginationOpts: { cursor: null, numItems: 1 },
+        table,
+        userId: world.userId,
+      });
+      expect(audit).toMatchObject({ category, isDone: true, records: 1, table });
+      expect(audit.logicalBytes).toBeGreaterThan(2_048);
+    }
+  });
+
+  test("shadow audit reconciles capacity-backed durable jobs as job-category rows", async () => {
+    const world = await quotaWorld();
+    const documents = await world.testRuntime.run(async (ctx) => {
+      const subject = await ctx.db.query("authSubjects")
+        .withIndex("by_user", (builder) => builder.eq("userId", world.userId))
+        .unique();
+      if (subject === null) throw new Error("missing job audit subject");
+      const accountDeletion = {
+        capacityReservation: durableJobCapacityReservation,
+        category: "commands_and_leases" as const,
+        createdAt: 1,
+        publicId: "job_audit_account",
+        state: "pending" as const,
+        statusCapabilityDigest: "a".repeat(64),
+        subjectId: subject._id,
+        updatedAt: 1,
+        userId: world.userId,
+      };
+      const deviceRevocation = {
+        capacityReservation: durableJobCapacityReservation,
+        category: "sessions" as const,
+        createdAt: 1,
+        deviceId: world.deviceId,
+        publicId: "job_audit_device",
+        state: "pending" as const,
+        updatedAt: 1,
+        userId: world.userId,
+      };
+      await reserveQuotaForInsert(ctx, world.userId, "job", accountDeletion);
+      await ctx.db.insert("accountDeletionJobs", accountDeletion);
+      await reserveQuotaForInsert(ctx, world.userId, "job", deviceRevocation);
+      await ctx.db.insert("deviceRevocationJobs", deviceRevocation);
+      return { accountDeletion, deviceRevocation };
+    });
+    const before = await categoryUsageFor(world.testRuntime, world.userId, "job");
+    const accountAudit = await world.testRuntime.query(auditDirectTablePage, {
+      paginationOpts: { cursor: null, numItems: 1 },
+      table: "accountDeletionJobs",
+      userId: world.userId,
+    });
+    const revocationAudit = await world.testRuntime.query(auditDirectTablePage, {
+      paginationOpts: { cursor: null, numItems: 1 },
+      table: "deviceRevocationJobs",
+      userId: world.userId,
+    });
+    expect(accountAudit).toMatchObject({
+      category: "job",
+      isDone: true,
+      logicalBytes: logicalDocumentBytes(documents.accountDeletion),
+      records: 1,
+      table: "accountDeletionJobs",
+    });
+    expect(revocationAudit).toMatchObject({
+      category: "job",
+      isDone: true,
+      logicalBytes: logicalDocumentBytes(documents.deviceRevocation),
+      records: 1,
+      table: "deviceRevocationJobs",
+    });
+    expect(await categoryUsageFor(world.testRuntime, world.userId, "job")).toEqual(before);
   });
 });

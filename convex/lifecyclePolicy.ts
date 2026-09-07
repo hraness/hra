@@ -1,5 +1,6 @@
 export const CLOUD_USAGE_SNAPSHOT_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
 export const ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+export const COMMAND_TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 
 // live_tail retention for detail-stream chunks: keep the current and
 // previous turn. The corpus this plan is based on (23,699 measured turns)
@@ -50,6 +51,12 @@ export const HOSTED_TABLE_LIFECYCLE = {
   authOtpChallenges: { owner: "user", quota: "identity", retention: "challenge_expiry", deletionOrder: 110, disposition: "erase" },
   authInvites: { owner: "capability", quota: "identity", retention: "invite_expiry", deletionOrder: 80, disposition: "expire" },
   devices: { owner: "user", quota: "device", retention: "active", deletionOrder: 70, disposition: "erase" },
+  accountDeletionIdentityReservations: { owner: "user", quota: "identity", retention: "active", deletionOrder: 80, disposition: "erase" },
+  accountDeletionJobReservations: { owner: "user", quota: "job", retention: "active", deletionOrder: 80, disposition: "erase" },
+  deviceRevocationDeviceReservations: { owner: "user", quota: "device", retention: "active", deletionOrder: 80, disposition: "erase" },
+  deviceRevocationJobReservations: { owner: "user", quota: "job", retention: "active", deletionOrder: 80, disposition: "erase" },
+  deviceRevocationSecurityReservations: { owner: "user", quota: "security", retention: "active", deletionOrder: 80, disposition: "erase" },
+  deviceRevocationReceiptReservations: { owner: "user", quota: "receipt", retention: "active", deletionOrder: 80, disposition: "erase" },
   deviceSessions: { owner: "user", quota: "custody", retention: "active", deletionOrder: 60, disposition: "erase" },
   deviceBindChallenges: { owner: "user", quota: "custody", retention: "challenge_expiry", deletionOrder: 60, disposition: "erase" },
   deviceKeyEnvelopes: { owner: "user", quota: "custody", retention: "active", deletionOrder: 60, disposition: "erase" },
@@ -62,6 +69,8 @@ export const HOSTED_TABLE_LIFECYCLE = {
   executionLeases: { owner: "user", quota: "session", retention: "lease_expiry", deletionOrder: 10, disposition: "erase" },
   sessionCommands: { owner: "user", quota: "command", retention: "command_recovery", deletionOrder: 10, disposition: "erase" },
   deviceCommands: { owner: "user", quota: "command", retention: "command_recovery", deletionOrder: 10, disposition: "erase" },
+  commandLifecycleReservations: { owner: "user", quota: "command", retention: "command_recovery", deletionOrder: 10, disposition: "erase" },
+  commandTerminalSecurityReservations: { owner: "user", quota: "security", retention: "command_recovery", deletionOrder: 10, disposition: "erase" },
   attentionNotificationOutbox: { owner: "user", quota: "command", retention: "attention_notification_7d", deletionOrder: 10, disposition: "erase" },
   attentionNotificationSafetyFaults: { owner: "service", quota: "security", retention: "attention_notification_7d", deletionOrder: 10, disposition: "expire" },
   codexAccounts: { owner: "user", quota: "account", retention: "active", deletionOrder: 50, disposition: "erase" },

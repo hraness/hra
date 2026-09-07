@@ -1803,7 +1803,7 @@ export function parseThreadStatus(value: unknown): CodexThreadStatus {
 }
 
 const canonicalTextEncoder = new TextEncoder();
-const unsafeDisplayScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const unsafeDisplayScalar = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
 
 const safeDisplayTextResult = (
   value: unknown,
@@ -1946,7 +1946,7 @@ const parseConversationAutomationName = (value: unknown): string => {
   if (canonicalTextEncoder.encode(parsed).byteLength > 160) {
     throw protocol("conversation automation name exceeds its UTF-8 byte limit");
   }
-  if (/\p{Cc}|\p{Cf}|\p{Cs}/u.test(parsed)) {
+  if (/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(parsed)) {
     throw protocol("conversation automation name contains unsupported characters");
   }
   return parsed;
@@ -2953,7 +2953,7 @@ export function parseBrokeredCodexServerRequest(input: {
   if (mode === "url") {
     throw new CodexError(
       "UNSUPPORTED_CAPABILITY",
-      "MCP URL elicitation requires a protected browser handoff that HRA 0.6.0 does not expose.",
+      "MCP URL elicitation requires a protected browser handoff that HRA 0.6.1 does not expose.",
     );
   }
   if (mode === "openai/form") throw unsupportedMcpForm();

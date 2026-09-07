@@ -82,7 +82,7 @@ const machine: MachineView = {
   accountLinkingAllowed: false,
   accounts: [],
   attentionEmailEnabled: false,
-  daemonVersion: "0.6.0",
+  daemonVersion: "0.6.1",
   defaultApprovalMode: "auto:all",
   defaultPreset: "ultra",
   deviceCommandsAllowed: true,

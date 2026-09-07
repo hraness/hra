@@ -3873,7 +3873,12 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
             command = { kind: "session.stop", session: session.id, idempotencyKey: input.idempotencyKey };
             break;
           case "set_model":
-            command = { kind: "session.preset", session: session.id, preset: input.payload.preset };
+            command = {
+              kind: "session.preset",
+              session: session.id,
+              preset: input.payload.preset,
+              idempotencyKey: input.idempotencyKey,
+            };
             break;
           // A provider switch is a provider effect, not a setting: it ends one
           // provider thread and starts another. It therefore runs on the
@@ -4627,7 +4632,9 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
   }
 
   async sync(signal: AbortSignal): Promise<unknown> {
-    const daemon = await this.#bridge.cycle(signal);
+    const daemon = await this.#bridge.cycle(signal, {
+      forceDeviceRegistryPublication: true,
+    });
     const value = await this.#control.sync(signal);
     if (
       !isRecord(value)
@@ -4653,6 +4660,7 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
     return {
       control,
       daemon: {
+        commandRequestVersion: daemon.commandRequestVersion,
         commandsApplied: daemon.commandsApplied,
         commandsUnsettled: daemon.commandsUnsettled,
         errors: daemon.errors.slice(0, 32),

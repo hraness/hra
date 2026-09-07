@@ -83,6 +83,19 @@ const definitionOf = (name: typeof WORK_PROTOCOL_TYPE_NAMES[number]): TypeDefini
   resultOf({ kind: "type", name }).definition as TypeDefinition;
 
 describe("queryable HRA work protocol", () => {
+  test("escapes Unicode line separators without folding safe join controls", () => {
+    const value = `before${String.fromCodePoint(0x2028)}middle${String.fromCodePoint(0x2029)}after`;
+    const joiners = `a${String.fromCodePoint(0x200c)}b${String.fromCodePoint(0x200d)}c`;
+    const serialized = terminalSafeJson({ joiners, value });
+
+    expect(serialized).not.toContain(String.fromCodePoint(0x2028));
+    expect(serialized).not.toContain(String.fromCodePoint(0x2029));
+    expect(serialized).toContain("\\u2028");
+    expect(serialized).toContain("\\u2029");
+    expect(serialized).toContain(joiners);
+    expect(JSON.parse(serialized) as unknown).toEqual({ joiners, value });
+  });
+
   test("serves deterministic, independently bounded shards under one digest", () => {
     const queries: WorkProtocolQuery[] = [
       { kind: "index" },

@@ -34,6 +34,35 @@ describe("domain laws", () => {
     );
   });
 
+  test("admits a predecessor attachment name only on keyed local send or steer", () => {
+    const attachment = {
+      byteLength: 4,
+      digest: "a".repeat(64),
+      mediaType: "text/plain",
+      name: `legacy${String.fromCodePoint(0x2028)}notes.txt`,
+    };
+    const key = "00000000-0000-4000-8000-000000000002";
+    for (const kind of ["session.send", "session.steer"] as const) {
+      const command = {
+        attachments: [attachment],
+        idempotencyKey: key,
+        kind,
+        message: "continue",
+        session: "session",
+      };
+      expect(localCommandSchema.safeParse(command).success).toBe(true);
+      expect(localCommandSchema.safeParse({ ...command, idempotencyKey: undefined }).success)
+        .toBe(false);
+    }
+    expect(localCommandSchema.safeParse({
+      attachments: [attachment],
+      idempotencyKey: key,
+      kind: "session.queue",
+      message: "continue",
+      session: "session",
+    }).success).toBe(false);
+  });
+
   test("requires one UUIDv7 caller key for device mutations in commands and envelopes", () => {
     const capability = "a".repeat(43);
     const requestId = "00000000-0000-4000-8000-000000000001";

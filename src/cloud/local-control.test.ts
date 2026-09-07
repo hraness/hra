@@ -154,6 +154,7 @@ class FakeCloud {
   readonly registrationAttempts: Readonly<Record<string, unknown>>[] = [];
   failNextApproveAfterEffect = false;
   failNextApproveBeforeEffect = false;
+  expandNextEnqueueResponse = false;
   failNextEnqueueAfterEffect = false;
   failNextEnqueueBeforeEffect = false;
   failNextAckAfterEffect = false;
@@ -442,6 +443,14 @@ class FakeCloud {
           if (this.failNextEnqueueAfterEffect) {
             this.failNextEnqueueAfterEffect = false;
             throw new Error("lost command enqueue response");
+          }
+          if (this.expandNextEnqueueResponse) {
+            this.expandNextEnqueueResponse = false;
+            return {
+              ...response,
+              idempotencyKey: args.idempotencyKey,
+              requestDigest: args.requestDigest,
+            };
           }
           return response;
         }
@@ -3086,6 +3095,23 @@ describe("local cloud control", () => {
       state: "failed",
       targetDevicePublicId: pair.device.publicId,
     });
+
+    const expandedResponseRequest = {
+      ...request,
+      commandPublicId: "018bcfe5-6800-7000-8000-000000000009",
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000010",
+    };
+    cloud.expandNextEnqueueResponse = true;
+    await expect(adapter.enqueueRemoteCommand(expandedResponseRequest)).rejects.toThrow(
+      "Cloud remote command receipt is invalid",
+    );
+    expect(custody.values.has("cloud-command-outbox")).toBe(true);
+    expect(cloud.acknowledgedCommands.has(expandedResponseRequest.commandPublicId)).toBe(false);
+    expect(await adapter.enqueueRemoteCommand(expandedResponseRequest)).toMatchObject({
+      commandPublicId: expandedResponseRequest.commandPublicId,
+      replay: true,
+    });
+    expect(custody.values.has("cloud-command-outbox")).toBe(false);
 
     const racedRequest = {
       ...request,

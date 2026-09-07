@@ -9,9 +9,13 @@ import {
   attachmentFileExtensions,
   attachmentMediaTypeForName,
   formatAttachmentSize,
+  isAttachmentName,
   type AttachmentReference,
 } from "../domain/attachments";
-import { attachmentNameSchema } from "../domain/attachment-schemas";
+import {
+  attachmentNameSchema,
+  legacyAttachmentNameSchema,
+} from "../domain/attachment-schemas";
 import type { AttachmentBlobStore } from "../storage/attachment-store";
 
 /*
@@ -72,6 +76,7 @@ export async function ingestAttachments(
   blobs: AttachmentBlobStore,
   paths: readonly string[],
   cwd: string,
+  options: Readonly<{ allowLegacyReplayName?: boolean }> = {},
 ): Promise<readonly AttachmentReference[]> {
   if (paths.length > ATTACHMENT_MAX_COUNT) {
     throw new AttachmentIngestError(
@@ -84,12 +89,26 @@ export async function ingestAttachments(
     const path = isAbsolute(candidate) ? resolve(candidate) : resolve(cwd, candidate);
     const name = basename(path);
     const parsedName = attachmentNameSchema.safeParse(name);
-    if (!parsedName.success) {
+    const legacyName = parsedName.success || !options.allowLegacyReplayName
+      ? null
+      : legacyAttachmentNameSchema.safeParse(name);
+    if (!parsedName.success && (legacyName === null || !legacyName.success)) {
       throw new AttachmentIngestError(
         `${candidate} does not have a usable attachment file name.`,
       );
     }
-    const mediaType = attachmentMediaTypeForName(parsedName.data);
+    const admittedName = parsedName.success ? parsedName.data : legacyName?.data;
+    if (admittedName === undefined) {
+      throw new AttachmentIngestError(
+        `${candidate} does not have a usable attachment file name.`,
+      );
+    }
+    if (!isAttachmentName(admittedName) && !options.allowLegacyReplayName) {
+      throw new AttachmentIngestError(
+        `${candidate} does not have a usable attachment file name.`,
+      );
+    }
+    const mediaType = attachmentMediaTypeForName(admittedName);
     if (mediaType === null) {
       throw new AttachmentIngestError(
         `${name} is not an accepted attachment type. Accepted extensions: ${attachmentFileExtensions().join(", ")}.`,
@@ -116,9 +135,8 @@ export async function ingestAttachments(
       byteLength: stored.value.byteLength,
       digest: stored.value.digest,
       mediaType,
-      name: parsedName.data,
+      name: admittedName,
     });
   }
   return references;
 }
-

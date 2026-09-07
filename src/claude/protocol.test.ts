@@ -475,6 +475,9 @@ describe("provider text safety", () => {
     expect(sanitizeClaudeText(absoluteFixture)).not.toContain("someone");
     expect(sanitizeClaudeText("token: abcdefghijklmnop")).toContain("[protected]");
     expect(sanitizeClaudeText("ab")).toBe("a�b");
+    expect(sanitizeClaudeText(
+      `a${String.fromCodePoint(0x2028)}b${String.fromCodePoint(0x2029)}c`,
+    )).toBe("a�b�c");
     expect(sanitizeClaudeText("line\nline", true)).toBe("line\nline");
   });
 

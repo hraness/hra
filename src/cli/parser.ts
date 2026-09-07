@@ -96,6 +96,7 @@ export type SessionAttachmentCliInvocation = Readonly<{
   }>;
   json: boolean;
   kind: "session.attach";
+  legacyAttachmentReplay: boolean;
 }>;
 
 export type SessionEventFollowCliInvocation = Readonly<{
@@ -111,10 +112,9 @@ export type SessionEventWatchCliInvocation = Readonly<{
 }>;
 
 /**
- * `hra session export` reads the provider-neutral transcript in bounded pages
- * and writes one document. It is a client-side flow over the paged
- * `session.transcript` command rather than one round trip, so the whole
- * conversation never has to fit in a single local response.
+ * `hra session export` reads the provider-neutral transcript's latest bounded
+ * retained tail in one local command and writes one document. Older retained
+ * records omitted by that tail remain represented by its exact omission count.
  */
 export type SessionExportCliInvocation = Readonly<{
   format: "trajectory" | "json";
@@ -404,7 +404,7 @@ Usage:
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
-  hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast] [--idempotency-key <uuid> --preset-contract <1|2>]
+  hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast] [--idempotency-key <uuid> [--preset-contract <1|2>]]
   hra session send|queue|steer <session> [--attach <path>]... <message>
   hra session stop|recover|abandon <session>
   hra session archive|unarchive <session>
@@ -416,7 +416,7 @@ Usage:
   hra session note get|edit|clear <session>
   hra session note set <session> <note>
   hra session preset <session> <low|high|ultra|fable-max>
-  hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>] [--idempotency-key <uuid> --preset-contract <1|2>]
+  hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>] [--idempotency-key <uuid> [--preset-contract <1|2>]]
   hra session export <session> [--format <trajectory|json>] [--out <path>]
   hra session fast <session> <on|off>
   hra session project <session> <project>
@@ -1456,7 +1456,7 @@ const parseSession = (
         );
       }
       if (idempotencyKey === undefined && presetContract !== undefined) {
-        throw new CliUsageError("--preset-contract is replay-only and requires --idempotency-key.");
+        throw new CliUsageError("--preset-contract requires an explicit --idempotency-key.");
       }
       return command({
         kind: "session.start",
@@ -1486,7 +1486,12 @@ const parseSession = (
         && parsed.kind !== "session.queue"
         && parsed.kind !== "session.steer"
       ) throw new CliUsageError("Session message command is invalid.");
-      return { attach, command: parsed, kind: "session.attach" };
+      return {
+        attach,
+        command: parsed,
+        kind: "session.attach",
+        legacyAttachmentReplay: idempotencyKey !== undefined && action !== "queue",
+      };
     }
     case "stop": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.stop", session }; }
     case "rename": { const session = take(cursor, "session"); return command({ kind: "session.rename", session, name: remainder(cursor, "name") }); }
@@ -1578,7 +1583,7 @@ const parseSession = (
         );
       }
       if (idempotencyKey === undefined && presetContract !== undefined) {
-        throw new CliUsageError("--preset-contract is replay-only and requires --idempotency-key.");
+        throw new CliUsageError("--preset-contract requires an explicit --idempotency-key.");
       }
       return command({
         kind: "session.switch",
@@ -2204,6 +2209,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   }
   let parsed: LocalCommand;
   let sessionAttach: readonly string[] = [];
+  let legacyAttachmentReplay = false;
   if (group === "account") {
     const account = parseAccount(cursor, idempotencyKey, json);
     if (
@@ -2248,6 +2254,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     }
     if (sessionCommand.kind === "session.attach") {
       sessionAttach = sessionCommand.attach;
+      legacyAttachmentReplay = sessionCommand.legacyAttachmentReplay;
       parsed = sessionCommand.command;
     } else {
       parsed = sessionCommand;
@@ -2428,7 +2435,13 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       && parsed.kind !== "session.queue"
       && parsed.kind !== "session.steer"
     ) throw new CliUsageError("Only session send, queue, and steer accept --attach.");
-    return { attach: sessionAttach, command: parsed, json, kind: "session.attach" };
+    return {
+      attach: sessionAttach,
+      command: parsed,
+      json,
+      kind: "session.attach",
+      legacyAttachmentReplay,
+    };
   }
   return { kind: "command", command: parsed, json };
 }

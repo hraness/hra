@@ -19,6 +19,11 @@ import {
   type EncryptedEnvelope,
 } from "../hra/cloud";
 import {
+  acknowledgeObservedCommandReceipt,
+  parseDeviceCommandEnqueueReceipt,
+} from "./command-receipts";
+import {
+  acknowledgeDeviceCommandReceipt,
   consumeDeviceCommandResult,
   deviceCommandGet,
   enqueueDeviceCommand,
@@ -76,14 +81,6 @@ export class DeviceCommandResponseInvalidError extends Error {
   }
 }
 
-function requireMatchingMutationResponse(value: unknown, publicId: string): void {
-  if (
-    typeof value !== "object"
-    || value === null
-    || (value as { publicId?: unknown }).publicId !== publicId
-  ) throw new DeviceCommandResponseInvalidError(publicId);
-}
-
 /**
  * Submit once through Convex's sync mutation client. The client retains and
  * re-sends this one request id across disconnects, so a transport interruption
@@ -98,7 +95,9 @@ export async function submitPreparedDeviceCommand(
   const response = await mutate(request);
   // Deliberately outside a mutation-rejection catch. An incompatible success
   // response is not proof that the transaction aborted and must not be retried.
-  requireMatchingMutationResponse(response, request.publicId);
+  if (parseDeviceCommandEnqueueReceipt(response, request) === null) {
+    throw new DeviceCommandResponseInvalidError(request.publicId);
+  }
   return request.publicId;
 }
 
@@ -158,21 +157,38 @@ export function useSubmitDeviceCommand(): SubmitDeviceCommand {
       request,
       unlocked.identity.devicePublicId,
     );
+    const wireRequest = {
+      ...request,
+      expectedRequestingDevicePublicId: unlocked.identity.devicePublicId,
+      idempotencyKey,
+      requestCommitmentVersion: 2 as const,
+      requestDigest,
+    };
+    let submittedPublicId: string;
     try {
-      return await submitPreparedDeviceCommand(
-        {
-          ...request,
-          expectedRequestingDevicePublicId: unlocked.identity.devicePublicId,
-          idempotencyKey,
-          requestCommitmentVersion: 2,
-          requestDigest,
-        },
+      submittedPublicId = await submitPreparedDeviceCommand(
+        wireRequest,
         async (args) => await convex.mutation(enqueueDeviceCommand, args),
       );
     } catch (failure: unknown) {
       report(deviceCommandMutationFailureCause(failure));
       throw failure;
     }
+    try {
+      await acknowledgeObservedCommandReceipt(
+        {
+          publicId: submittedPublicId,
+          idempotencyKey,
+          requestDigest,
+        },
+        async (args) => await convex.mutation(acknowledgeDeviceCommandReceipt, args),
+      );
+    } catch (failure: unknown) {
+      // The command is already committed and its exact identity must reach the
+      // tracker. Recovery will retry this proof without issuing another enqueue.
+      report(deviceCommandMutationFailureCause(failure));
+    }
+    return submittedPublicId;
   }, [convex, report, unlocked]);
 }
 

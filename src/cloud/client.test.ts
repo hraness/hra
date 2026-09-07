@@ -54,6 +54,8 @@ describe("bounded Convex transport", () => {
 
   test("admits the proof-bound session-command outbox recovery query", () => {
     expect(cloudQueries).toContain("commands:getForOutboxRecovery");
+    expect(cloudQueries).toContain("commands:listUnacknowledgedForRequester");
+    expect(cloudQueries).toContain("deviceCommands:listUnacknowledgedForRequester");
   });
 
   test("admits only the two deterministic prepared-failure mutations", () => {

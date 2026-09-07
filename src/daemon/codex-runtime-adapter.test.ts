@@ -1873,7 +1873,7 @@ describe("PinnedCodexRuntimeManager", () => {
   });
 
   test("projects a terminal-safe deterministic plugin catalog through the read-only client call", async () => {
-    const attack = "\u001b]0;owned\u0007\u202etxt";
+    const attack = "\u001b]0;owned\u0007\u202etxt\u2028line\u2029paragraph";
     const catalog: CodexPluginCatalog = {
       marketplaces: [
         {
@@ -1963,20 +1963,22 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(requests).toEqual([{ cwd: "/workspace/project", forceRefetch: true }]);
     expect(projected.marketplaces.map(({ name }) => name)).toEqual([
       "a",
-      "z�]0;owned��txt",
+      "z�]0;owned��txt�line�paragraph",
     ]);
     expect(projected.marketplaces[1]?.plugins.map(({ id }) => id)).toEqual([
       "a-plugin",
-      "z-files�]0;owned��txt",
+      "z-files�]0;owned��txt�line�paragraph",
     ]);
     expect(projected.featuredPluginIds).toEqual([
       "a-plugin",
-      "z-files�]0;owned��txt",
+      "z-files�]0;owned��txt�line�paragraph",
     ]);
     expect(projected.marketplaceLoadErrorCount).toBe(1);
     expect(JSON.stringify(projected)).not.toContain("\u001b");
     expect(JSON.stringify(projected)).not.toContain("\u0007");
     expect(JSON.stringify(projected)).not.toContain("\u202e");
+    expect(JSON.stringify(projected)).not.toContain("\u2028");
+    expect(JSON.stringify(projected)).not.toContain("\u2029");
     expect(projected.lifecycle).toEqual(catalog.lifecycle);
     await manager.close();
   });

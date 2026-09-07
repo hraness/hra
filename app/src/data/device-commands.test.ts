@@ -33,6 +33,14 @@ const enqueueRequest: WireDeviceEnqueueArgs = {
   requestCommitmentVersion: 2,
   requestDigest: receipt.requestDigest,
 };
+const enqueueResponse = {
+  publicId,
+  requestCommitmentVersion: 2,
+  replay: false,
+  requestingDevicePublicId: enqueueRequest.expectedRequestingDevicePublicId,
+  state: "pending",
+  targetDevicePublicId: enqueueRequest.expectedTargetDevicePublicId,
+} as const;
 
 function productionMutationError(functionName: string, code: string): Error {
   return new Error(
@@ -104,7 +112,7 @@ describe("device command submission transport contract", () => {
 
     await Promise.resolve();
     expect(calls).toBe(1);
-    settle?.({ publicId, replay: false, state: "pending" });
+    settle?.(enqueueResponse);
     expect(await submitted).toBe(publicId);
     expect(calls).toBe(1);
   });
@@ -125,6 +133,13 @@ describe("device command submission transport contract", () => {
     expect(failure).not.toHaveProperty("request");
     expect(failure).not.toHaveProperty("payload");
     expect(calls).toBe(1);
+  });
+
+  test("fails closed when a success expands the stable marker-2 response shape", async () => {
+    await expect(submitPreparedDeviceCommand(enqueueRequest, async () => ({
+      ...enqueueResponse,
+      requestDigest: receipt.requestDigest,
+    }))).rejects.toBeInstanceOf(DeviceCommandResponseInvalidError);
   });
 });
 

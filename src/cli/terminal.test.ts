@@ -37,9 +37,10 @@ function attackedSyncProjection(): unknown {
   const oversized = `${sentinel}:${"x".repeat(4_300_000)}`;
   const localPath = ["", "Users", "example", "Documents", "private", "state.json"].join("/");
   const bearer = ["Bearer", "secret-token-value-123456789"].join(" ");
-  const terminalAttack = "\u001b]0;owned\u0007\u0085\u202etxt";
+  const terminalAttack = "\u001b]0;owned\u0007\u0085\u202etxt\u2028line\u2029paragraph";
   return {
     daemon: {
+      commandRequestVersion: 2,
       commandsApplied: 2,
       commandsUnsettled: 1,
       errors: [
@@ -87,6 +88,7 @@ describe("terminal-safe CLI boundaries", () => {
       data: Record<string, unknown> & { errors: string[] };
     };
     expect(Object.keys(parsed.data).sort()).toEqual([
+      "commandRequestVersion",
       "commandsApplied",
       "commandsUnsettled",
       "errorCount",
@@ -97,6 +99,7 @@ describe("terminal-safe CLI boundaries", () => {
       "usageUploaded",
     ]);
     expect(parsed.data).toMatchObject({
+      commandRequestVersion: 2,
       commandsApplied: 2,
       commandsUnsettled: 1,
       errorCount: 25,
@@ -126,6 +129,8 @@ describe("terminal-safe CLI boundaries", () => {
     expect(captured.read().stdout).not.toContain("\u0007");
     expect(captured.read().stdout).not.toContain("\u0085");
     expect(captured.read().stdout).not.toContain("\u202e");
+    expect(captured.read().stdout).not.toContain("\u2028");
+    expect(captured.read().stdout).not.toContain("\u2029");
   });
 
   test("sync now human and failure output stay bounded and redact foreign diagnostics", async () => {
@@ -140,6 +145,7 @@ describe("terminal-safe CLI boundaries", () => {
     })).toBe(0);
     expect(human.read().stderr).toBe("");
     expect(human.read().stdout).toContain("Cloud sync: online");
+    expect(human.read().stdout).toContain("Command request contract: version 2 published");
     expect(human.read().stdout).toContain("9 more omitted");
     expect(human.read().stdout.length).toBeLessThan(16_384);
     expect(human.read().stdout).not.toContain("REMOTE_EVENT_SENTINEL_DO_NOT_RENDER");

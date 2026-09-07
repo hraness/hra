@@ -109,12 +109,10 @@ import {
   type ResolvePinnedClaudeRuntimeOptions,
 } from "./claude/index";
 import { localCommandSchema, type CommandResponse, type LocalCommand } from "./domain/contracts";
-import { adoptableProviderSchema, providerSchema, type Provider } from "./domain/presets";
+import { adoptableProviderSchema } from "./domain/presets";
 import {
-  digestTranscriptRecords,
   sessionTranscriptSchema,
   TRANSCRIPT_PAGE_LIMIT,
-  type TranscriptRecord,
 } from "./domain/transcript";
 import { transcriptToTrajectory } from "./domain/trajectory";
 import {
@@ -1170,10 +1168,11 @@ const syncDiagnosticMaximumBytes = 768;
 const syncDiagnosticTruncationMarker = " [truncated]";
 const privateKeyHeaderPattern = /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/iu;
 const secretLabelPattern = /(?:\bBearer\b|\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|api[_-]?key|authorization)\b|\b(?:sk|re)_|\beyJ)/iu;
-const unsafeTerminalScalarPattern = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const unsafeTerminalScalarPattern = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
 const underscoreAbsolutePathPattern = /(^|_)((?:file:\/\/+|~\/|[A-Za-z]:[\\/]|\\\\[^\\/\s"'`<>{}[\](),;]+[\\/]|\/(?!\/))[^\s"'`<>{}[\](),;_]*)/giu;
 
 type SyncNowSummary = Readonly<{
+  commandRequestVersion: 2 | null;
   online: boolean;
   commandsApplied: number;
   commandsUnsettled: number;
@@ -1909,6 +1908,9 @@ function parseSyncNowSummary(value: unknown): SyncNowSummary | null {
   const daemon = value.daemon;
   if (
     typeof daemon.online !== "boolean"
+    || (daemon.commandRequestVersion !== undefined
+      && daemon.commandRequestVersion !== 2
+      && daemon.commandRequestVersion !== null)
     || !isSafeNonNegativeInteger(daemon.commandsApplied)
     || !isSafeNonNegativeInteger(daemon.commandsUnsettled)
     || !isSafeNonNegativeInteger(daemon.sessionsUploaded)
@@ -1925,6 +1927,7 @@ function parseSyncNowSummary(value: unknown): SyncNowSummary | null {
     errors.push(sanitizeSyncDiagnostic(diagnostic));
   }
   return {
+    commandRequestVersion: daemon.commandRequestVersion === 2 ? 2 : null,
     online: daemon.online,
     commandsApplied: daemon.commandsApplied,
     commandsUnsettled: daemon.commandsUnsettled,
@@ -1950,6 +1953,7 @@ function renderSyncNowSuccess(data: unknown, json: boolean, output: Output): num
   }
   const rows = [
     `Cloud sync: ${summary.online ? "online" : "offline"}`,
+    `Command request contract: ${summary.commandRequestVersion === 2 ? "version 2 published" : "not published"}`,
     `Uploaded: ${String(summary.sessionsUploaded)} sessions; ${String(summary.usageUploaded)} usage snapshots`,
     `Commands: ${String(summary.commandsApplied)} applied; ${String(summary.commandsUnsettled)} unsettled`,
   ];
@@ -2654,13 +2658,7 @@ async function editSessionNote(
 }
 
 /**
- * The most transcript pages one export reads. An export is bounded twice: by
- * this budget and by the records one page returns.
- */
-const SESSION_EXPORT_PAGE_BUDGET = 20;
-
-/**
- * `hra session export` reads the provider-neutral transcript in bounded pages
+ * `hra session export` reads the provider-neutral retained tail
  * and writes one document: the letta-ai trajectory v1 shape by default, or
  * HRA's own neutral record shape with `--format json`.
  *
@@ -2672,62 +2670,27 @@ async function exportSessionTranscript(
   output: Output,
   callDaemon: (command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>,
 ): Promise<number> {
-  const records: TranscriptRecord[] = [];
-  let sessionId: string | null = null;
-  let after: number | undefined;
-  let omittedRecords = 0;
-  let omittedCharacters = 0;
-  let truncated = false;
-  for (let page = 0; page < SESSION_EXPORT_PAGE_BUDGET; page += 1) {
-    const response = await callDaemon({
-      kind: "session.transcript",
-      session: invocation.session,
-      ...(after === undefined ? {} : { after }),
-      limit: TRANSCRIPT_PAGE_LIMIT,
-    });
-    if (!response.ok) return renderFailure(response.error, invocation.json, output);
-    const parsed = sessionTranscriptSchema.safeParse(response.data);
-    if (!parsed.success) {
-      return renderFailure({
-        code: "INTERNAL",
-        message: "The daemon returned a transcript page HRA could not validate.",
-      }, invocation.json, output);
-    }
-    const transcript = parsed.data;
-    sessionId ??= transcript.sessionId;
-    if (transcript.sessionId !== sessionId) {
-      return renderFailure({
-        code: "CONFLICT",
-        message: "The transcript changed session identity between pages.",
-      }, invocation.json, output);
-    }
-    records.push(...transcript.records);
-    omittedRecords += transcript.omittedRecords;
-    omittedCharacters += transcript.omittedCharacters;
-    if (transcript.nextSequence === null) break;
-    after = transcript.nextSequence - 1;
-    if (page === SESSION_EXPORT_PAGE_BUDGET - 1) truncated = true;
-  }
-  if (sessionId === null) {
+  const response = await callDaemon({
+    kind: "session.transcript",
+    session: invocation.session,
+    limit: TRANSCRIPT_PAGE_LIMIT,
+    tail: true,
+  });
+  if (!response.ok) return renderFailure(response.error, invocation.json, output);
+  const parsed = sessionTranscriptSchema.safeParse(response.data);
+  if (!parsed.success || parsed.data.provider === undefined) {
     return renderFailure({
-      code: "NOT_FOUND",
-      message: "That session has no transcript.",
+      code: "INTERNAL",
+      message: "The daemon returned a transcript tail HRA could not validate.",
     }, invocation.json, output);
   }
-  const transcript = sessionTranscriptSchema.parse({
-    version: 1,
-    sessionId,
-    records: records.slice(0, TRANSCRIPT_PAGE_LIMIT),
-    throughSequence: records[records.length - 1]?.throughSequence ?? null,
-    nextSequence: null,
-    omittedRecords: omittedRecords + Math.max(0, records.length - TRANSCRIPT_PAGE_LIMIT),
-    omittedCharacters,
-    digest: digestTranscriptRecords(records.slice(0, TRANSCRIPT_PAGE_LIMIT)),
-  });
+  const transcript = parsed.data;
+  const provider = transcript.provider;
+  if (provider === undefined) throw new Error("Transcript provider narrowing failed.");
   const document = invocation.format === "trajectory"
     ? transcriptToTrajectory({
       transcript,
-      provider: await exportedSessionProvider(invocation.session, callDaemon),
+      provider,
       createdAt: Date.now(),
     })
     : transcript;
@@ -2735,24 +2698,22 @@ async function exportSessionTranscript(
   if (invocation.out === undefined) {
     output.writeStdout(serialized);
   } else {
-    await writeFile(resolve(invocation.out), serialized, { encoding: "utf8", mode: 0o600 });
-    output.writeStderr(`Wrote ${String(records.length)} transcript records${
-      truncated ? " (truncated at the export bound)" : ""}.\n`);
+    // Transcript text can be sensitive. Create one new private inode and
+    // refuse every existing path (including a symlink) instead of truncating
+    // or inheriting permissions from it.
+    await writeFile(resolve(invocation.out), serialized, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    output.writeStderr(`Wrote ${String(transcript.records.length)} transcript records${
+      transcript.omittedRecords > 0
+        || (transcript.retentionGapReason !== undefined
+          && transcript.retentionGapReason !== null)
+        ? " (older history omitted)"
+        : ""}.\n`);
   }
   return 0;
-}
-
-/** The provider the session runs on now; it labels the trajectory meta record. */
-async function exportedSessionProvider(
-  session: string,
-  callDaemon: (command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>,
-): Promise<Provider> {
-  const response = await callDaemon({ kind: "session.show", session, detail: false });
-  if (!response.ok) return "codex";
-  const parsed = z.object({
-    session: z.object({ provider: providerSchema }).passthrough(),
-  }).passthrough().safeParse(response.data);
-  return parsed.success ? parsed.data.session.provider : "codex";
 }
 
 function remoteFailure(error: unknown, json: boolean, output: Output): number {
@@ -6011,6 +5972,7 @@ async function executeInvocation(
         blobs,
         invocation.attach,
         input.attachmentCwd ?? process.cwd(),
+        { allowLegacyReplayName: invocation.legacyAttachmentReplay },
       );
     } catch (error: unknown) {
       if (error instanceof AttachmentIngestError) {

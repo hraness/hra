@@ -93,7 +93,7 @@ export type Output = {
   writeStdoutAsync?(value: string, signal: AbortSignal): Promise<void>;
 };
 
-const unsafeTerminalScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const unsafeTerminalScalar = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
 const safeJoinControl = /[\u200c\u200d]/u;
 
 export const terminalSafe = (value: string, preserveLineFeeds = false): string => {

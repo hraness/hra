@@ -14,10 +14,13 @@ import {
   type MutationCtx,
 } from "./server";
 import {
+  authorityReductionCapacityReservation,
+  authorityReductionCapacityVersion,
   quotaAccountResource,
   quotaCategory,
   quotaEnforcement,
   quotaUserResource,
+  maximumCommandLifecycleBatch,
 } from "./validators";
 
 export const QUOTA_CATEGORIES = [
@@ -334,7 +337,6 @@ async function applyQuotaDelta(
     category,
     "hard",
   );
-
   // The global ledger cannot legitimately be smaller than the user being
   // updated. This detects a damaged hard authority without an unbounded scan.
   if (
@@ -538,6 +540,71 @@ export async function releaseQuotaForDelete(
     logicalBytes: -logicalDocumentBytes(document),
     records: -1,
   });
+}
+
+type AuthorityReductionReservation = LogicalDocument & Readonly<{
+  capacityReservation: string;
+  capacityVersion: number;
+  category: QuotaCategory;
+  userId: Id<"users">;
+}>;
+
+function requireAuthorityReductionReservation(
+  reservation: AuthorityReductionReservation,
+  userId: Id<"users">,
+  category: QuotaCategory,
+): void {
+  requireUser(reservation, userId);
+  if (
+    reservation.capacityVersion !== authorityReductionCapacityVersion
+    || reservation.capacityReservation !== authorityReductionCapacityReservation
+    || reservation.category !== category
+  ) corrupt();
+}
+
+/**
+ * Exchange one real, category-charged authority-reduction reservation for its
+ * exact artifact. The aggregate ledger transition must be non-growing, so it
+ * remains valid even when user, category, and service are at their hard
+ * ceilings. This is intentionally not a generic quota bypass.
+ */
+export async function replaceAuthorityReductionReservationQuota(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+  category: QuotaCategory,
+  reservation: AuthorityReductionReservation,
+  replacement: LogicalDocument,
+): Promise<void> {
+  requireAuthorityReductionReservation(reservation, userId, category);
+  requireUser(replacement, userId);
+  const logicalBytes = logicalDocumentBytes(replacement)
+    - logicalDocumentBytes(reservation);
+  if (logicalBytes > 0) corrupt();
+  await applyQuotaDelta(ctx, userId, category, { logicalBytes, records: 0 });
+}
+
+/**
+ * Consume a same-category reservation while applying an authority-reducing
+ * patch to an existing row. Two charged records become one and the aggregate
+ * stored bytes must not grow.
+ */
+export async function consumeAuthorityReductionPatchReservationQuota(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+  category: QuotaCategory,
+  reservation: AuthorityReductionReservation,
+  document: LogicalDocument,
+  patch: LogicalDocument,
+): Promise<void> {
+  requireAuthorityReductionReservation(reservation, userId, category);
+  requireUser(document, userId);
+  const next = { ...document, ...patch };
+  requireUser(next, userId);
+  const logicalBytes = logicalDocumentBytes(next)
+    - logicalDocumentBytes(document)
+    - logicalDocumentBytes(reservation);
+  if (logicalBytes > 0) corrupt();
+  await applyQuotaDelta(ctx, userId, category, { logicalBytes, records: -1 });
 }
 
 export async function reserveParentAttributedQuotaForInsert(
@@ -756,6 +823,84 @@ export async function adjustCommandQuotaForPatch(
   }
 }
 
+/**
+ * Exchange a command and its already-charged lifecycle reservation as one
+ * physical quota obligation. This is deliberately narrower than an
+ * authority-reduction admission: callers cannot grow either the aggregate
+ * bytes or record count, so a command that was admitted before a device
+ * revocation/account deletion consumed the static emergency reserve can still
+ * finish its lifecycle without crossing either the ordinary or hard ceiling.
+ */
+export async function adjustCommandLifecycleQuotaForReplacement(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+  command: LogicalDocument,
+  commandPatch: LogicalDocument,
+  reservation: LogicalDocument,
+  reservationPatch: LogicalDocument | null,
+): Promise<void> {
+  requireUser(command, userId);
+  requireUser(reservation, userId);
+  if (
+    typeof command.publicId !== "string"
+    || reservation.commandPublicId !== command.publicId
+    || (reservation.commandType !== "session" && reservation.commandType !== "device")
+    || typeof reservation.capacityReservation !== "string"
+    || reservation.capacityReservation.length < 1
+    || !/^0+$/u.test(reservation.capacityReservation)
+    || command.nonterminal !== true
+  ) corrupt();
+  const nextCommand = { ...command, ...commandPatch };
+  requireUser(nextCommand, userId);
+  if (typeof nextCommand.nonterminal !== "boolean") corrupt();
+  const nextReservation = reservationPatch === null
+    ? null
+    : { ...reservation, ...reservationPatch };
+  if (nextReservation !== null) {
+    requireUser(nextReservation, userId);
+    if (
+      nextReservation.commandPublicId !== reservation.commandPublicId
+      || nextReservation.commandType !== reservation.commandType
+      || typeof nextReservation.capacityReservation !== "string"
+      || nextReservation.capacityReservation.length < 1
+      || !/^0+$/u.test(nextReservation.capacityReservation)
+    ) corrupt();
+  }
+  const logicalBytes = logicalDocumentBytes(nextCommand)
+    + (nextReservation === null ? 0 : logicalDocumentBytes(nextReservation))
+    - logicalDocumentBytes(command)
+    - logicalDocumentBytes(reservation);
+  const records = nextReservation === null ? -1 : 0;
+  if (logicalBytes > 0 || records > 0) corrupt();
+  await applyQuotaDelta(ctx, userId, "command", { logicalBytes, records });
+  if (!nextCommand.nonterminal) {
+    await applyUserResourceDelta(ctx, userId, "nonterminal_command", -1);
+  }
+}
+
+/** Replace one exact charged terminal-security placeholder with its event. */
+export async function adjustTerminalSecurityQuotaForReplacement(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+  reservation: LogicalDocument,
+  replacement: LogicalDocument,
+): Promise<void> {
+  requireUser(reservation, userId);
+  requireUser(replacement, userId);
+  if (
+    reservation.event !== "command_terminal"
+    || replacement.event !== "command_terminal"
+    || typeof reservation.entityId !== "string"
+    || replacement.entityId !== reservation.entityId
+    || replacement.actorDeviceId !== reservation.actorDeviceId
+    || (reservation.commandType !== "session" && reservation.commandType !== "device")
+  ) corrupt();
+  const logicalBytes = logicalDocumentBytes(replacement)
+    - logicalDocumentBytes(reservation);
+  if (logicalBytes > 0) corrupt();
+  await applyQuotaDelta(ctx, userId, "security", { logicalBytes, records: 0 });
+}
+
 export async function releaseCommandQuotaForDelete(
   ctx: MutationCtx,
   userId: Id<"users">,
@@ -875,6 +1020,12 @@ export const QUOTA_GENESIS_CHARGED_TABLES = [
   "authOtpChallenges",
   "authInvites",
   "devices",
+  "accountDeletionIdentityReservations",
+  "accountDeletionJobReservations",
+  "deviceRevocationDeviceReservations",
+  "deviceRevocationJobReservations",
+  "deviceRevocationSecurityReservations",
+  "deviceRevocationReceiptReservations",
   "deviceSessions",
   "deviceBindChallenges",
   "deviceKeyEnvelopes",
@@ -887,6 +1038,8 @@ export const QUOTA_GENESIS_CHARGED_TABLES = [
   "executionLeases",
   "sessionCommands",
   "deviceCommands",
+  "commandLifecycleReservations",
+  "commandTerminalSecurityReservations",
   "attentionNotificationOutbox",
   "attentionNotificationSafetyFaults",
   "codexAccounts",
@@ -923,6 +1076,12 @@ async function requireGenesisEmpty(ctx: MutationCtx): Promise<void> {
     hasAny(ctx.db.query("authOtpChallenges").take(1)),
     hasAny(ctx.db.query("authInvites").take(1)),
     hasAny(ctx.db.query("devices").take(1)),
+    hasAny(ctx.db.query("accountDeletionIdentityReservations").take(1)),
+    hasAny(ctx.db.query("accountDeletionJobReservations").take(1)),
+    hasAny(ctx.db.query("deviceRevocationDeviceReservations").take(1)),
+    hasAny(ctx.db.query("deviceRevocationJobReservations").take(1)),
+    hasAny(ctx.db.query("deviceRevocationSecurityReservations").take(1)),
+    hasAny(ctx.db.query("deviceRevocationReceiptReservations").take(1)),
     hasAny(ctx.db.query("deviceSessions").take(1)),
     hasAny(ctx.db.query("deviceBindChallenges").take(1)),
     hasAny(ctx.db.query("deviceKeyEnvelopes").take(1)),
@@ -935,6 +1094,8 @@ async function requireGenesisEmpty(ctx: MutationCtx): Promise<void> {
     hasAny(ctx.db.query("executionLeases").take(1)),
     hasAny(ctx.db.query("sessionCommands").take(1)),
     hasAny(ctx.db.query("deviceCommands").take(1)),
+    hasAny(ctx.db.query("commandLifecycleReservations").take(1)),
+    hasAny(ctx.db.query("commandTerminalSecurityReservations").take(1)),
     hasAny(ctx.db.query("attentionNotificationOutbox").take(1)),
     hasAny(ctx.db.query("attentionNotificationSafetyFaults").take(1)),
     hasAny(ctx.db.query("codexAccounts").take(1)),
@@ -1289,6 +1450,12 @@ export const hostedBootstrapStatus = internalQuery({
       authOtpChallenges,
       invites,
       devices,
+      accountDeletionIdentityReservations,
+      accountDeletionJobReservations,
+      deviceRevocationDeviceReservations,
+      deviceRevocationJobReservations,
+      deviceRevocationSecurityReservations,
+      deviceRevocationReceiptReservations,
       deviceSessions,
       deviceBindChallenges,
       deviceKeyEnvelopes,
@@ -1301,6 +1468,8 @@ export const hostedBootstrapStatus = internalQuery({
       executionLeases,
       sessionCommands,
       deviceCommands,
+      commandLifecycleReservations,
+      commandTerminalSecurityReservations,
       attentionNotificationOutbox,
       attentionNotificationSafetyFaults,
       codexAccounts,
@@ -1330,6 +1499,12 @@ export const hostedBootstrapStatus = internalQuery({
       ctx.db.query("authOtpChallenges").take(2),
       ctx.db.query("authInvites").take(2),
       ctx.db.query("devices").take(2),
+      ctx.db.query("accountDeletionIdentityReservations").take(2),
+      ctx.db.query("accountDeletionJobReservations").take(2),
+      ctx.db.query("deviceRevocationDeviceReservations").take(2),
+      ctx.db.query("deviceRevocationJobReservations").take(2),
+      ctx.db.query("deviceRevocationSecurityReservations").take(2),
+      ctx.db.query("deviceRevocationReceiptReservations").take(2),
       ctx.db.query("deviceSessions").take(2),
       ctx.db.query("deviceBindChallenges").take(2),
       ctx.db.query("deviceKeyEnvelopes").take(2),
@@ -1342,6 +1517,8 @@ export const hostedBootstrapStatus = internalQuery({
       ctx.db.query("executionLeases").take(2),
       ctx.db.query("sessionCommands").take(2),
       ctx.db.query("deviceCommands").take(2),
+      ctx.db.query("commandLifecycleReservations").take(2),
+      ctx.db.query("commandTerminalSecurityReservations").take(2),
       ctx.db.query("attentionNotificationOutbox").take(2),
       ctx.db.query("attentionNotificationSafetyFaults").take(2),
       ctx.db.query("codexAccounts").take(2),
@@ -1372,6 +1549,12 @@ export const hostedBootstrapStatus = internalQuery({
       authOtpChallenges,
       invites,
       devices,
+      accountDeletionIdentityReservations,
+      accountDeletionJobReservations,
+      deviceRevocationDeviceReservations,
+      deviceRevocationJobReservations,
+      deviceRevocationSecurityReservations,
+      deviceRevocationReceiptReservations,
       deviceSessions,
       deviceBindChallenges,
       deviceKeyEnvelopes,
@@ -1384,6 +1567,8 @@ export const hostedBootstrapStatus = internalQuery({
       executionLeases,
       sessionCommands,
       deviceCommands,
+      commandLifecycleReservations,
+      commandTerminalSecurityReservations,
       attentionNotificationOutbox,
       attentionNotificationSafetyFaults,
       codexAccounts,
@@ -1640,6 +1825,15 @@ const directlyAuditableTable = v.union(
   v.literal("sessionStreamEpochs"),
   v.literal("executionLeases"),
   v.literal("sessionCommands"),
+  v.literal("deviceCommands"),
+  v.literal("accountDeletionIdentityReservations"),
+  v.literal("accountDeletionJobReservations"),
+  v.literal("deviceRevocationDeviceReservations"),
+  v.literal("deviceRevocationJobReservations"),
+  v.literal("deviceRevocationSecurityReservations"),
+  v.literal("deviceRevocationReceiptReservations"),
+  v.literal("commandLifecycleReservations"),
+  v.literal("commandTerminalSecurityReservations"),
   v.literal("attentionNotificationOutbox"),
   v.literal("codexAccounts"),
   v.literal("deviceAccountBindings"),
@@ -1647,6 +1841,8 @@ const directlyAuditableTable = v.union(
   v.literal("idempotencyReceipts"),
   v.literal("securityEvents"),
   v.literal("devicePresence"),
+  v.literal("accountDeletionJobs"),
+  v.literal("deviceRevocationJobs"),
 );
 
 const DIRECT_TABLE_CATEGORY = {
@@ -1655,6 +1851,15 @@ const DIRECT_TABLE_CATEGORY = {
   sessionStreamEpochs: "chunk",
   executionLeases: "session",
   sessionCommands: "command",
+  deviceCommands: "command",
+  accountDeletionIdentityReservations: "identity",
+  accountDeletionJobReservations: "job",
+  deviceRevocationDeviceReservations: "device",
+  deviceRevocationJobReservations: "job",
+  deviceRevocationSecurityReservations: "security",
+  deviceRevocationReceiptReservations: "receipt",
+  commandLifecycleReservations: "command",
+  commandTerminalSecurityReservations: "security",
   attentionNotificationOutbox: "command",
   codexAccounts: "account",
   deviceAccountBindings: "account",
@@ -1662,10 +1867,13 @@ const DIRECT_TABLE_CATEGORY = {
   idempotencyReceipts: "receipt",
   securityEvents: "security",
   devicePresence: "device",
+  accountDeletionJobs: "job",
+  deviceRevocationJobs: "job",
 } as const;
 
 /**
- * Server-computed shadow audit page. Each call reads at most 200 documents.
+ * Server-computed shadow audit page. Each call reads at most 200 ordinary
+ * documents or eight potentially maximal command/capacity documents.
  * Parent-owned and capability-owned auth rows require schema attribution and
  * are deliberately excluded instead of guessing an owner.
  */
@@ -1676,10 +1884,17 @@ export const auditDirectTablePage = internalQuery({
     userId: v.id("users"),
   },
   handler: async (ctx, args) => {
+    const maximumPage = (
+      args.table === "sessionCommands"
+      || args.table === "deviceCommands"
+      || args.table === "commandLifecycleReservations"
+    )
+      ? maximumCommandLifecycleBatch
+      : 200;
     if (
       !Number.isSafeInteger(args.paginationOpts.numItems)
       || args.paginationOpts.numItems < 1
-      || args.paginationOpts.numItems > 200
+      || args.paginationOpts.numItems > maximumPage
     ) corrupt();
     const paginationOpts = args.paginationOpts;
     const result = await (async () => {
@@ -1702,6 +1917,42 @@ export const auditDirectTablePage = internalQuery({
             .paginate(paginationOpts);
         case "sessionCommands":
           return await ctx.db.query("sessionCommands")
+            .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "deviceCommands":
+          return await ctx.db.query("deviceCommands")
+            .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "accountDeletionIdentityReservations":
+          return await ctx.db.query("accountDeletionIdentityReservations")
+            .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "accountDeletionJobReservations":
+          return await ctx.db.query("accountDeletionJobReservations")
+            .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "deviceRevocationDeviceReservations":
+          return await ctx.db.query("deviceRevocationDeviceReservations")
+            .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "deviceRevocationJobReservations":
+          return await ctx.db.query("deviceRevocationJobReservations")
+            .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "deviceRevocationSecurityReservations":
+          return await ctx.db.query("deviceRevocationSecurityReservations")
+            .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "deviceRevocationReceiptReservations":
+          return await ctx.db.query("deviceRevocationReceiptReservations")
+            .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "commandLifecycleReservations":
+          return await ctx.db.query("commandLifecycleReservations")
+            .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "commandTerminalSecurityReservations":
+          return await ctx.db.query("commandTerminalSecurityReservations")
             .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
             .paginate(paginationOpts);
         case "attentionNotificationOutbox":
@@ -1730,6 +1981,14 @@ export const auditDirectTablePage = internalQuery({
             .paginate(paginationOpts);
         case "devicePresence":
           return await ctx.db.query("devicePresence")
+            .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "accountDeletionJobs":
+          return await ctx.db.query("accountDeletionJobs")
+            .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "deviceRevocationJobs":
+          return await ctx.db.query("deviceRevocationJobs")
             .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
             .paginate(paginationOpts);
       }

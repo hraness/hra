@@ -112,14 +112,23 @@ describe("release workflow", () => {
       expect(source).toContain('"1.3.6.1.4.1.57264.1.2": "push"');
       expect(source).toContain('"1.3.6.1.4.1.57264.1.11": der("github-hosted")');
       expect(source).toContain(
-        "`repo:${GITHUB_REPOSITORY_OWNER}@${GITHUB_REPOSITORY_OWNER_ID}/${GITHUB_REPOSITORY_NAME}@${GITHUB_REPOSITORY_ID}:ref:${ref}`",
+        '"1.3.6.1.4.1.57264.1.23": der("npm-release")',
       );
+      expect(source).toContain(
+        "`repo:${GITHUB_REPOSITORY_OWNER}@${GITHUB_REPOSITORY_OWNER_ID}/${GITHUB_REPOSITORY_NAME}@${GITHUB_REPOSITORY_ID}:environment:npm-release`",
+      );
+      expect(source).toContain('"1.3.6.1.4.1.57264.1.6": ref');
+      expect(source).toContain('"1.3.6.1.4.1.57264.1.14": der(ref)');
+      expect(source).toContain('"1.3.6.1.4.1.57264.1.18": der(identity)');
       expect(source).not.toContain("`repo:hraness/hra:ref:${ref}`");
     }
     expect(releaseRecord).toContain("Current V2 claims from `.11` onward");
-    expect(releaseRecord).toContain("repository path `hraness/hra`, numeric owner ID");
-    expect(releaseRecord).toContain("`307125679`, numeric repository ID `1343008607`");
-    expect(releaseRecord).toContain("ref `refs/tags/v0.6.0`");
+    expect(releaseRecord).toContain("Environment claim OID\n`.23` must be exactly `npm-release`");
+    expect(releaseRecord).toContain("Repository-subject OID `.24` remains mandatory");
+    expect(releaseRecord).toContain("repository path `hraness/hra`, numeric owner ID `307125679`");
+    expect(releaseRecord).toContain("numeric repository ID\n`1343008607`, and environment `npm-release`");
+    expect(releaseRecord).toContain("tag ref `refs/tags/v0.6.1`");
+    expect(releaseRecord).toContain("certificate URI and OIDs `.6`, `.14`, and `.18`");
   });
 
   test("gives GitHub publisher commands only their explicit non-OIDC environment", () => {
@@ -358,21 +367,21 @@ describe("release workflow", () => {
   test("binds residual draft identity to the exact same run and artifact authority", () => {
     const source = {
       GITHUB_EVENT_NAME: "push",
-      GITHUB_REF: "refs/tags/v0.6.0",
-      GITHUB_REF_NAME: "v0.6.0",
+      GITHUB_REF: "refs/tags/v0.6.1",
+      GITHUB_REF_NAME: "v0.6.1",
       GITHUB_REF_TYPE: "tag",
       GITHUB_REPOSITORY: "hraness/hra",
       GITHUB_REPOSITORY_ID: "1343008607",
       GITHUB_RUN_ATTEMPT: "2",
       GITHUB_RUN_ID: "123",
-      GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.6.0",
+      GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.6.1",
     };
-    const run = githubReleaseRun("v0.6.0", source);
+    const run = githubReleaseRun("v0.6.1", source);
     const input = {
       artifacts: [{ name: "hra.tgz", sha256: "c".repeat(64), size: 7 }],
       commitSha: "a".repeat(40),
       run,
-      tag: "v0.6.0",
+      tag: "v0.6.1",
       tagObjectSha: "b".repeat(40),
     } as const;
     const body = draftReleaseBody(input);
@@ -390,7 +399,7 @@ describe("release workflow", () => {
     });
     expect(() => parseReleaseBody(futureAttemptBody, input, "draft"))
       .toThrow("workflow-attempt ordering");
-    expect(() => githubReleaseRun("v0.6.0", { ...source, GITHUB_RUN_ATTEMPT: "3", GITHUB_RUN_ID: "124" }))
+    expect(() => githubReleaseRun("v0.6.1", { ...source, GITHUB_RUN_ATTEMPT: "3", GITHUB_RUN_ID: "124" }))
       .not.toThrow();
   });
 
@@ -406,6 +415,15 @@ describe("release workflow", () => {
 
     expect(releaseNotes).toContain(installCommand);
     expect(readme).toContain(installCommand);
+    expect(readme).toContain("next invocation of that exact release's installer");
+    expect(readme).toContain("`$BUN_INSTALL/install/hra/install-intent.json`");
+    expect(readme).toContain("the exact immutable install command from the originating release's trusted README or release notes");
+    expect(readme).toContain("If that installer refuses the intent, stop for manual review");
+    expect(readme).toContain("It is not authorization to retry, rerun, or mutate that release's GitHub Actions workflow");
+    expect(releaseNotes).toContain("A durable installer intent is release-bound");
+    expect(releaseNotes).toContain("An installer from another release fails closed without deleting it");
+    expect(releaseNotes).toContain("If that installer refuses the intent, stop for manual review");
+    expect(releaseNotes).toContain("This is local installer recovery, not authorization to retry or mutate");
     expect(releaseNotes).not.toContain("src/install-preflight.ts | bun -");
     expect(releaseNotes).not.toContain("bun add --global");
     expect(releaseNotes).not.toContain(
@@ -415,14 +433,17 @@ describe("release workflow", () => {
     expect(releaseNotes).not.toContain("Cloud enrollment is invitation-only");
     expect(releaseNotes).not.toContain("artifact-identity SPDX");
     expect(releaseNotes).not.toContain("runtime SPDX inventory");
-    expect(releaseNotes).toContain("# HRA v0.6.0 local CLI beta");
+    expect(releaseNotes).toContain("# HRA v0.6.1 local CLI beta");
     expect(thirdPartyNotices).toContain("exact tarball plus `SHA256SUMS`");
-    expect(thirdPartyNotices).toContain("immutable `v0.6.0` release source tag");
+    expect(thirdPartyNotices).toContain("immutable `v0.6.1` release source tag");
     expect(thirdPartyNotices).toContain("`@hraness/design-kit` v0.4.0");
     expect(thirdPartyNotices).not.toContain("`@hraness/design-kit` v0.3.0");
     expect(thirdPartyNotices).not.toContain("SPDX");
-    expect(changelog).toContain("## v0.6.0");
-    expect(security).toContain("| `v0.6.0` | Release candidate. Supported once the release workflow admits it. |");
+    expect(changelog).toContain("## v0.6.1");
+    expect(changelog).toContain("Forward repair for the incomplete `v0.6.0` admission");
+    expect(security).toContain("| `v0.6.1` | Release candidate. Supported once the release workflow admits it. |");
+    expect(security).toContain("| `v0.6.0` | Immutable partial publication. The workflow did not complete final admission; unsupported. |");
+    expect(security).toContain("| `v0.5.0` | Last fully admitted beta. Supported until `v0.6.1` is admitted. Receives security fixes. |");
   });
 
   test("keeps the retired fallback-bound path unreachable and exposes only the exact artifact workflow", async () => {
@@ -451,7 +472,7 @@ describe("release workflow", () => {
     expect(domainRecord).toContain("unresolved_prior_intent");
     expect(domainRecord).toContain("reasserts only the plan's exact source");
     expect(domainRecord).toContain("unresolved_current_intent");
-    expect(releaseRecord).toContain("Status: `v0.6.0` release-ready; immutable public `v0.5.0` remains the admitted release until exact `v0.6.0` admission.");
+    expect(releaseRecord).toContain("Status: `v0.6.1` release-ready; immutable public `v0.5.0` remains the last fully admitted release until exact `v0.6.1` admission.");
     expect(releaseRecord).toContain("At retirement, `hraness/hra` had no `v0.1.0` tag");
     expect(releaseRecord).toContain("## Immutable v0.1.0 failure record");
     expect(releaseRecord).toContain("Release workflow run `33363290345`, attempt 1");
@@ -570,14 +591,46 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("npm trusted publishing has exactly one binding");
     expect(releaseRecord).toContain("Stable `@hraness/hra@0.5.0` is authoritative until the next release is admitted");
     expect(releaseRecord).toContain("The canonical README and website use a two-phase local-release surface");
-    expect(releaseRecord).toContain("The website remains live and the `v0.6.0` local CLI tag stays release-ready until exact release admission");
-    expect(releaseRecord).toContain("the install command names the `v0.6.0` GitHub Release and verified archive that admission will publish");
+    expect(releaseRecord).toContain("The website remains live and the `v0.6.1` local CLI tag stays release-ready until exact release admission");
+    expect(releaseRecord).toContain("the install command names the `v0.6.1` GitHub Release and verified archive that admission will publish");
     expect(releaseRecord).toContain("Hosted sync went live separately on 2026-09-03");
+    expect(releaseRecord).toContain("Preserve old local state-protocol receipts, mutation intents, and evidence files");
+    expect(releaseRecord).toContain("The singleton `$BUN_INSTALL/install/hra/install-intent.json` is different");
+    expect(releaseRecord).toContain("settle it only with the exact immutable installer from its originating release");
+    expect(releaseRecord).toContain("never treat that local recovery as authorization to retry or mutate the historical release workflow");
     expect(releaseRecord).toContain("## Immutable v0.5.0 successful release record");
     expect(releaseRecord).toContain("tag object `b91b0d30168cc684b762483ea2f652d2a576fe3a`");
     expect(releaseRecord).toContain("Release workflow run `33903621032` completed on attempt 3");
     expect(releaseRecord).toContain("GitHub Release `382922988`");
     expect(releaseRecord).toContain("npm `latest` names `@hraness/hra@0.5.0`");
+    expect(releaseRecord).toContain("## Immutable v0.6.0 partial publication record");
+    expect(releaseRecord).toContain("tag object `c03c66a27398b2baf6f8dfc9bd04bcee5cc65459`");
+    expect(releaseRecord).toContain("commit `576ccd76a6742cd62759ab6176a6a41844846daa`, merged through PR 122");
+    expect(releaseRecord).toContain("Exact-main CI run `34056770875` passed");
+    expect(releaseRecord).toContain("Release workflow run `34057589482` failed on attempts 1 and 2");
+    expect(releaseRecord).toContain("final public admission was skipped on both attempts");
+    expect(releaseRecord).toContain("Attempt 1 verifier job `101552204026`, Ubuntu job `101552368631`, and macOS job `101552368651` succeeded");
+    expect(releaseRecord).toContain("Publish job `101552609010` proved the npm trusted-publisher exchange");
+    expect(releaseRecord).toContain("Attempt 2 verifier job `101555723682`, Ubuntu job `101555918855`, and macOS job `101555918878` succeeded");
+    expect(releaseRecord).toContain("Publish job `101556083200` found the exact npm bytes");
+    expect(releaseRecord).toContain("OID `.24` to end in `:ref:refs/tags/v0.6.0`");
+    expect(releaseRecord).toContain("DER UTF8String `npm-release` in OID `.23`");
+    expect(releaseRecord).toContain("`repo:hraness@307125679/hra@1343008607:environment:npm-release` in OID `.24`");
+    expect(releaseRecord).toContain("Actions artifact `9996840156`, named `hra-release-2`, is 1,101,922 bytes");
+    expect(releaseRecord).toContain("`sha256:874cde519d9297dbbb41d004cfc716d7ca5f7b589f18cd80297bc7e0d52aff4f`");
+    expect(releaseRecord).toContain("created at `2026-09-06T20:45:15Z`");
+    expect(releaseRecord).toContain("expires at `2026-09-13T20:45:13Z`");
+    expect(releaseRecord).toContain("GitHub Release `383705969`, node `RE_kwDOUAyvX84W3uNx`");
+    expect(releaseRecord).toContain("published at `2026-09-06T20:22:19Z`");
+    expect(releaseRecord).toContain("asset `547641759`, the 1,101,240-byte `hraness-hra-0.6.0.tgz`");
+    expect(releaseRecord).toContain("`f9f1bfecddd867e4ca781a2a045dc9573bd91eb9810fef75b2d28e8af0c37813`");
+    expect(releaseRecord).toContain("asset `547641805`, the 88-byte `SHA256SUMS`");
+    expect(releaseRecord).toContain("`659a510969f0e36f1f5f0e7fef739d4ee743ebb625c2052a2aba770ce30ef6fc`");
+    expect(releaseRecord).toContain("npm `latest` names `@hraness/hra@0.6.0`");
+    expect(releaseRecord).toContain("`bootstrap` remains `0.1.0-bootstrap.0`");
+    expect(releaseRecord).toContain("`sha512-u49sO2O8i2KUFVxUFdeDoPwkQetOLBV31ULsuz5jxQN5nh/BgT55+CnRvAyneoBUsyZ+dZ/u0PsoJeKnRH0vhA==`");
+    expect(releaseRecord).toContain("`16c4057d1a055d3f4bcecc4a070dc2b226060523`");
+    expect(releaseRecord).toContain("`v0.5.0` remains the last fully admitted public CLI until the `v0.6.1` forward repair completes exact admission");
     expect(releaseRecord).toContain("strict successful `Required` checks, resolved review conversations");
     expect(releaseRecord).toContain("These main-branch rulesets have no administrator bypass");
     expect(releaseRecord).toContain("GitHub does not currently require approving reviews, CODEOWNERS approval, or stale-approval dismissal");
@@ -597,7 +650,7 @@ describe("release workflow", () => {
     expect(releaseRecord).not.toContain("publication will move `latest`");
     expect(releaseRecord).toContain("every earlier attempt's bounded GitHub Jobs API record");
     expect(releaseRecord).toContain("again immediately before the POST");
-    expect(releaseRecord).toContain("`dist-tags.latest` to name `0.6.0`");
+    expect(releaseRecord).toContain("`dist-tags.latest` to name `0.6.1`");
     expect(releaseRecord).toContain("the owner-authorized exact annotated tag is the publication authorization");
     expect(releaseRecord).toContain("exact event `push`");
     expect(releaseRecord).not.toContain("must remove it before the next release");
@@ -606,7 +659,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("environment `npm-release`");
     expect(releaseRecord).toContain("permissions `publish, stage publish`");
     expect(releaseRecord).toContain("npm CLI 11.19.0");
-    expect(releaseRecord).toContain("numeric owner ID\n`307125679`");
+    expect(releaseRecord).toContain("numeric owner ID `307125679`");
     expect(releaseRecord).toContain("owner ID `307125679`");
     const workflow = await readFile(releaseWorkflow, "utf8");
     expect(workflow).toContain("id-token: write");

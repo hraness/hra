@@ -1,8 +1,10 @@
 # Session portability
 
-HRA owns a provider-neutral record of every session. On Linux, a conversation
-can move from Codex to Claude Code and back while it is running, and it can be
-exported in the letta-ai trajectory v1 shape for memory and search tooling.
+HRA owns a bounded, provider-neutral retained record from the point at which
+the v0.6 daemon begins recording a session. On Linux, that recorded portion of
+a conversation can move from Codex to Claude Code and back while it is running,
+and it can be exported as a schema-valid letta-ai trajectory v1 array for tools
+that accept that normalized record format.
 Codex switching remains available on macOS, but a switch into Claude is refused
 there until authenticated testing proves isolated Keychain custody and
 detached-daemon reads without a prompt.
@@ -21,12 +23,15 @@ obeys the bounds and redaction rules that already governed the event stream
 (`SESSION_EVENT_MAX_BYTES`, `containsAbsolutePath`, the secret patterns, and
 the projection's `forbiddenDetailKeyPattern`).
 
-- `user_message`, exactly what HRA sent to the provider, with the actor that
-  authored it: `human`, `autorespond`, or `provider_switch` for a handoff seed.
+- `user_message`, the bounded text HRA sent to the provider, with the actor that
+  authored it: `human`, `automation`, `autorespond`, or `provider_switch` for a
+  handoff seed.
   It is written after the provider accepted the message, so the transcript
   never claims HRA sent something the provider rejected. Text is capped at
   16,384 characters and the remainder is stated as an exact
-  `omittedCharacters` count.
+  `omittedCharacters` count. A message with attachments includes only a bounded
+  manifest (safe name, media type, byte length, and SHA-256); attachment bytes
+  remain in local blob custody and are never embedded in the ledger or handoff.
 - `item_started` / `item_completed`, already carried the item kind, MCP server,
   tool name, and status. They now also carry `callId`, the stable opaque
   identity a result binds back to its call, and `summary`, a bounded one-line
@@ -38,10 +43,12 @@ the projection's `forbiddenDetailKeyPattern`).
 - `provider_switched`, the boundary record: the providers and presets moved
   between, whether the account changed, the digest of the neutral transcript,
   the digest of the seed the target provider was given, and how many records
-  that seed omitted.
+  that seed omitted. If older ledger history had already been pruned, the event
+  also records the retention-gap reason; the number of unavailable older
+  records is unknowable and is never folded into the exact omission count.
 
-`src/domain/transcript.ts` reads those events back into an ordered, bounded,
-paged conversation with a SHA-256 digest over its canonical serialization. It
+`src/domain/transcript.ts` reads those events back into an ordered, bounded
+conversation with a SHA-256 digest over its canonical serialization. It
 is the one artifact the switch and the export both consume. Its record kinds
 are `user`, `assistant`, `reasoning`, `tool_call`, `tool_result`, and
 `provider_switch`. Assistant and reasoning deltas are coalesced per item; a
@@ -50,6 +57,25 @@ conversation (`agentMessage`, `reasoning`, `subAgentActivity`, and so on) is
 not treated as a tool call, and an unfamiliar kind is, so an unknown call is
 recorded rather than dropped.
 
+The event ledger retains at most 50,000 events, 64 MiB, and seven days per
+session. When any limit prunes a prefix, transcript tails and JSON exports carry
+`retentionGapReason`; no surface invents a count for the unavailable prefix.
+Ordinary transcript reads and the latest tail used by switching and export ask
+for at most 500 records. A result may contain fewer records when its serialized
+transcript must fit the daemon's 4 MiB local response envelope, which reserves
+64 KiB for response wrapping. A head page keeps the oldest records that fit and
+returns an exclusive `after` cursor immediately before the first omitted
+record. A tail keeps the newest records, reports the exact number additionally
+omitted from retained history, and has no continuation cursor.
+
+That retention marker does not describe an origin boundary. An adopted
+personal-home session does not import provider history from before HRA admitted
+it, and a session upgraded from v0.5 has no synthesized `user_message` or
+`provider_switched` events for its pre-v0.6 turns. Those older provider/local
+records may still exist on their original surfaces, but they are absent from
+the neutral transcript, their size is unknown, and the current
+`retentionGapReason` does not mark that absence.
+
 Nothing in the reader talks to a provider. A session whose provider thread is
 gone, whose provider runtime is not installed, or that has already switched
 still has a readable conversation.
@@ -57,8 +83,15 @@ still has a readable conversation.
 ## Switching provider
 
 ```
-hra session switch <session> --provider codex|claude [--preset <preset>] [--account <account>] [--idempotency-key <uuid>] [--preset-contract <1|2>]
+hra session switch <session> --provider codex|claude [--preset <preset>] [--account <account>] [--idempotency-key <uuid> [--preset-contract <1|2>]]
 ```
+
+`--preset-contract` is valid only when paired with an explicit
+`--idempotency-key` for a source-sensitive Codex switch. When that key already
+names a request, both values are immutable replay identity. When the key has no
+stored row, only the current build's active contract may authorize the one
+fresh request; this option cannot select a retired route. A stable switch replay
+uses `--idempotency-key` alone and rejects `--preset-contract`.
 
 In order, a switch:
 
@@ -119,7 +152,7 @@ A switch is refused, with no effect, when:
 
 ### What a switch preserves, and what it cannot
 
-**Preserved:** the conversation as HRA saw it, what was asked, what the
+**Preserved:** the retained conversation as HRA saw it, what was asked, what the
 assistant said, what its reasoning summaries said, which tools were called and
 whether they succeeded, and the switch boundary itself. Also the session's
 identity, its project, its note, its title, its queue, its session tasks, and
@@ -138,6 +171,15 @@ its event stream; the session id never changes.
 - anything the redaction rules removed on the way in: secrets, absolute paths,
   raw tool arguments, raw tool output. These were never stored and cannot
   reappear;
+- attachment contents. Only the byte-free manifest described above can cross a
+  provider handoff or trajectory export;
+- provider history from before HRA admitted an adopted personal-home session,
+  and pre-v0.6 user messages or switch boundaries in an upgraded session. HRA
+  does not backfill either origin prefix into the neutral transcript, and the
+  current retention-gap field does not mark it;
+- any ledger prefix removed by the seven-day, 50,000-event, or 64-MiB retention
+  limits. A switch and export disclose the retention-gap reason, but the number
+  of removed records is not recoverable;
 - turn ids and item ids from the old provider. They remain in the transcript as
   opaque identifiers, but they mean nothing to the new provider.
 
@@ -147,16 +189,20 @@ The seed is one user message, and it is built only from records that already
 passed HRA's redaction. It opens with the literal header
 `[HRA provider handoff]`, states which provider the conversation ran on and
 which it now runs on, states plainly that this is HRA's own record rather than
-the previous provider's transcript, states the exact number of omitted records,
-and instructs the model to ask rather than assume anything the summary does not
-state.
+the previous provider's transcript, and instructs the model to ask rather than
+assume anything the summary does not state. It states the exact number of
+otherwise-retained records omitted by the 500-record and 24,576-character
+bounds. If the ledger had already pruned older history, the header separately
+warns that earlier records are unavailable and their count is unknown.
+It cannot warn about a pre-admission or pre-v0.6 origin prefix because that
+prefix was never in the HRA ledger and has no current gap marker.
 
 It is capped at 24,576 characters. When the transcript does not fit, the
 **most recent** records are the ones kept: a handoff needs the end of a
-conversation more than its beginning. The omission count in the header is the
-truth about what was dropped, and the same count plus the seed's digest are
-recorded on the `provider_switched` event, so what the new provider was told is
-provable after the fact.
+conversation more than its beginning. The exact retained-tail omission count,
+any retention-gap reason, and the seed's digest are recorded on the
+`provider_switched` event, so the bounded text the new provider was told and
+the known-versus-unknown history boundary are provable after the fact.
 
 ## The remote surface
 
@@ -215,31 +261,56 @@ hra session export <session> [--format trajectory|json] [--out <path>]
 ```
 
 `--format json` writes HRA's own neutral transcript. `--format trajectory`
-(the default) writes the letta-ai trajectory v1 shape.
+(the default) writes the letta-ai trajectory v1 shape. With `--out`, the path
+must not already exist. HRA creates one new mode-`0600` file and refuses an
+existing file or symlink; use a path inside a current-user-owned private
+directory and remove it when it is no longer needed.
+
+Without `--out`, HRA writes the complete document to standard output. Use that
+only with a controlled pipe. Terminal scrollback, command capture, and shell
+redirection can disclose conversation content, and shell redirection does not
+inherit HRA's private-mode, no-overwrite file checks. Prefer `--out` when
+keeping an export.
 
 **Upstream is import-oriented.** `@letta-ai/trajectory` and its
 `schema/trajectory-v1.schema.json` exist to normalize many agent harnesses'
 native logs *into* that shape; the package does not convert back out of it.
-HRA emits the shape rather than depending on the package, so an HRA session can
-be fed to the memory and search tooling built around that format. The mapping
-below is HRA's, and `src/domain/trajectory.ts` is its only implementation.
+HRA's runtime emits the shape without calling that normalizer. Development
+pins `@letta-ai/trajectory` 0.3.0 and validates representative output against
+the JSON Schema and `validateTranscript(..., { partial: true })` runtime
+validator exported by that exact package. Partial mode is deliberate: a bounded
+retained tail may lack a user or assistant turn, and it may retain a tool result
+whose call fell outside the tail. Validation still enforces exact fields,
+timestamps, JSON-object argument strings, and unique tool-call ids. This proves
+the normalized document contract, not a round trip to a provider-native log or
+acceptance by every downstream tool. The mapping below is HRA's, and
+`src/domain/trajectory.ts` is its runtime implementation.
 
 | Neutral record | Trajectory record | Notes |
 | --- | --- | --- |
-|, | `meta` | Always first: `version`, `source: "hra"`, `session_id`, `provider`, `created_at`, `transcript_digest`, `omitted_records`. |
-| `user` | `user` | `content`, `timestamp`. An autorespond message is prefixed `[hra autorespond]`; a handoff seed keeps its own `[HRA provider handoff]` header and is not labelled twice. |
-| `assistant` | `assistant` | `content`, `timestamp`. |
-| `reasoning` | `reasoning` | The provider's reasoning *summary*, which is all HRA ever stored. |
-| `tool_call` | `tool_call` | `id` is the neutral call id; `name` is `server/tool` or the item kind; `arguments` is a stringified JSON object. |
-| `tool_result` | `tool` | `tool_call_id` links back to the call; `ok` is present only when the provider's status classifies; `content` says the output was never retained. |
+| (none) | `meta` | Always first and exactly `{ "role": "meta", "source": "hra" }`. Trajectory v1 forbids HRA-specific extension fields on this record. |
+| HRA export context | `observation` | Always second. Its `content` is an HRA-defined JSON string containing `hra_export_context: 1`, `session_id`, `provider`, `transcript_digest`, `omitted_records`, and optional `retention_gap_reason`; its `timestamp` is the export time. These are text inside a standard observation, not trajectory v1 properties. |
+| `user` | `user` | `role`, `content`, `timestamp`. Automation and autorespond messages are explicitly prefixed; a handoff seed keeps its own `[HRA provider handoff]` header and is not labelled twice. Attachment manifests are appended, but contents are not embedded. |
+| `assistant` | `assistant` | `role`, nonempty `content`, `timestamp`. A zero-length HRA assistant event becomes the explicit marker `[hra] assistant message was empty` because v1 forbids empty assistant prose. |
+| `reasoning` | `reasoning` | `role`, `content`, `timestamp`. The content is the provider's reasoning summary, which is all HRA ever stored. |
+| `tool_call` | `assistant` | `content` is `null`; `tool_calls` contains one entry whose `id` is deterministically derived from the provider, turn id, event sequence, and neutral call id, whose `name` is `server/tool` or the item kind, and whose `args` is a stringified JSON object. This keeps ids unique when providers or turns reuse a native id. |
+| `tool_result` | `tool` | `tool_call_id` links to that deterministic export id when the call is inside the same provider segment of the bounded export. A tail can begin after the call and retain only its result; partial-mode validation deliberately permits that orphan. `ok` is present only when the provider's status classifies; `content` says the output was never retained. |
 | `provider_switch` | `observation` | States the providers, presets, whether the account changed, and the seed digest. |
 
-`arguments` deserves a note. The format expects stringified JSON arguments, and
-HRA holds none: it never stored them. Rather than invent input or drop the
-field, HRA emits a stringified object that states exactly what it does hold, `{"hra_arguments_retained": false, "item_kind": …, "server": …, "tool": …,
-"summary": …}`. A consumer can always tell an HRA trajectory's tool call from
-one captured with real arguments.
+`args` deserves a note. The format requires a string, and HRA holds no raw
+arguments because it never stored them. Rather than invent provider input, HRA
+emits a stringified object that states exactly what it does hold:
+`{"hra_arguments_retained":false,"item_kind":"...","server":"...","tool":"...","summary":"..."}`.
+Optional keys are absent when HRA did not retain them. A consumer can therefore
+distinguish an HRA tool call from one captured with real arguments.
 
-Timestamps are ISO 8601 from the event's recorded time. Export reads the
-transcript in bounded pages and never asks a provider, so a session whose
-provider is gone still exports.
+Event-derived records use ISO 8601 timestamps from their recorded time; the HRA
+export-context observation uses export time. Export reads one latest bounded
+retained tail and never asks a provider, so a session whose provider is gone
+still exports. HRA JSON exposes typed `retentionGapReason` and `omittedRecords`
+fields. In a trajectory document, the corresponding HRA-only values are inside
+the export-context observation's JSON text, not the trajectory meta record.
+`omittedRecords` / `omitted_records` counts only known records dropped from the
+retained tail, never an already pruned prefix whose size is unknown. Neither
+format signals provider history from before personal-session admission or user
+turns from before the v0.6 neutral event types existed.

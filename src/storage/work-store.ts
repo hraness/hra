@@ -1151,36 +1151,48 @@ const exactWorkAuthorityTriggerNames = [
   "work_signal_account_authority_guard",
   "work_signal_ack_account_authority_guard",
 ] as const;
+const exactWorkAuthorityTriggerNameSet: ReadonlySet<string> = new Set(
+  exactWorkAuthorityTriggerNames,
+);
 
 const normalizeWorkSchemaSql = (sql: string): string =>
   sql.replace(/\bIF NOT EXISTS\b/giu, "").replace(/\s+/gu, " ").trim().replace(/;$/u, "");
 
+const workTriggerDefinitionSql = (name: string): string => {
+  const markers = [`CREATE TRIGGER ${name}\n`, `CREATE TRIGGER IF NOT EXISTS ${name}\n`];
+  const start = markers
+    .map((marker) => WORK_SCHEMA_SQL.indexOf(marker))
+    .find((offset) => offset >= 0) ?? -1;
+  const end = WORK_SCHEMA_SQL.indexOf("END;", start);
+  if (start < 0 || end < 0) throw new Error(`WORK_SCHEMA_DEFINITION_INVALID:${name}`);
+  return WORK_SCHEMA_SQL.slice(start, end + 4);
+};
+
+const exactWorkAuthorityTriggerDefinitionSql = new Map(
+  exactWorkAuthorityTriggerNames.map((name) => [
+    name,
+    workTriggerDefinitionSql(name),
+  ] as const),
+);
 const exactWorkAuthorityTriggerSql = new Map(
-  exactWorkAuthorityTriggerNames.map((name) => {
-    const markers = [`CREATE TRIGGER ${name}\n`, `CREATE TRIGGER IF NOT EXISTS ${name}\n`];
-    const start = markers
-      .map((marker) => WORK_SCHEMA_SQL.indexOf(marker))
-      .find((offset) => offset >= 0) ?? -1;
-    const end = WORK_SCHEMA_SQL.indexOf("END;", start);
-    if (start < 0 || end < 0) throw new Error(`WORK_SCHEMA_DEFINITION_INVALID:${name}`);
-    return [name, normalizeWorkSchemaSql(WORK_SCHEMA_SQL.slice(start, end + 4))] as const;
-  }),
+  [...exactWorkAuthorityTriggerDefinitionSql]
+    .map(([name, sql]) => [name, normalizeWorkSchemaSql(sql)] as const),
 );
 
 // Schema v39 shipped these exact contract-2 guards. Current Work routes use
 // the active Codex contract instead, so predecessor admission must compare
 // against frozen v39 SQL rather than deriving history from WORK_SCHEMA_SQL.
-const providerVersion39PresetContractGuardSql = new Map<string, string>([
-  ["work_devin_preset_contract_guard", normalizeWorkSchemaSql(`
+const providerVersion39PresetContractGuardDefinitionSql = new Map<string, string>([
+  ["work_devin_preset_contract_guard", `
 CREATE TRIGGER work_devin_preset_contract_guard
 BEFORE INSERT ON works
 WHEN NEW.preset_contract!=${devinPresetContract} AND EXISTS (
   SELECT 1 FROM sessions AS s
   WHERE s.id=NEW.coordinator_session_id AND s.provider_v39='devin'
 )
-BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END
-`)],
-  ["work_session_devin_contract_guard", normalizeWorkSchemaSql(`
+BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END;
+`],
+  ["work_session_devin_contract_guard", `
 CREATE TRIGGER work_session_devin_contract_guard
 BEFORE UPDATE OF provider_v39,preset_contract ON sessions
 WHEN NEW.provider_v39='devin' AND (
@@ -1191,13 +1203,44 @@ WHEN NEW.provider_v39='devin' AND (
       AND w.preset_contract!=${devinPresetContract}
   )
 )
-BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END
-  `)],
+BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END;
+  `],
 ]);
 
-const providerVersion40WorkAuthorityTriggerSql = new Map<string, string>(exactWorkAuthorityTriggerSql);
-for (const [name, sql] of providerVersion39PresetContractGuardSql) {
-  providerVersion40WorkAuthorityTriggerSql.set(name, sql);
+const providerVersion39PresetContractGuardSql = new Map(
+  [...providerVersion39PresetContractGuardDefinitionSql]
+    .map(([name, sql]) => [name, normalizeWorkSchemaSql(sql)] as const),
+);
+const providerVersion40WorkAuthorityTriggerDefinitionSql = new Map<string, string>(
+  exactWorkAuthorityTriggerDefinitionSql,
+);
+for (const [name, sql] of providerVersion39PresetContractGuardDefinitionSql) {
+  providerVersion40WorkAuthorityTriggerDefinitionSql.set(name, sql);
+}
+
+// The v40/v41 predecessor map intentionally starts from the current map only
+// while every other authority trigger remains byte-equivalent to that released
+// surface. Pin the complete normalized map so a later current-schema edit
+// cannot silently redefine which predecessor databases migration admits.
+const providerVersion40WorkAuthorityDefinitionEntries = exactWorkAuthorityTriggerNames.map((name) => {
+  const sql = providerVersion40WorkAuthorityTriggerDefinitionSql.get(name);
+  if (sql === undefined) throw new Error(`WORK_SCHEMA_V40_DEFINITION_MISSING:${name}`);
+  return [name, sql] as const;
+});
+const providerVersion40WorkAuthorityEntries = providerVersion40WorkAuthorityDefinitionEntries
+  .map(([name, sql]) => [name, normalizeWorkSchemaSql(sql)] as const);
+const providerVersion40WorkAuthorityTriggerSql = new Map(
+  providerVersion40WorkAuthorityEntries,
+);
+const providerVersion40WorkAuthorityDigest = createHash("sha256")
+  .update(JSON.stringify(providerVersion40WorkAuthorityEntries))
+  .digest("hex");
+const frozenProviderVersion40WorkAuthorityDigest =
+  "91f02f0c7af299245be21bc28b8005392d536de426875eb5f2804d11744d5ca2";
+if (providerVersion40WorkAuthorityDigest !== frozenProviderVersion40WorkAuthorityDigest) {
+  throw new Error(
+    `WORK_SCHEMA_V40_DEFINITION_DIGEST_INVALID:${providerVersion40WorkAuthorityDigest}`,
+  );
 }
 
 const providerVersion39AddedAuthorityTriggerNames = new Set([
@@ -1336,6 +1379,30 @@ const requiredWorkTriggers = [
   "work_nested_effect_settlements_no_delete",
 ] as const;
 
+// Every other required trigger was unchanged across v40-v42. Compare its body
+// as well as its name, and pin that shared surface so a future current-schema
+// edit cannot silently redefine a predecessor. The v39 assertion below omits
+// the authority additions that version had not shipped yet.
+const exactNonAuthorityWorkTriggerEntries = requiredWorkTriggers
+  .filter((name) => !exactWorkAuthorityTriggerNameSet.has(name))
+  .map((name) => [
+    name,
+    normalizeWorkSchemaSql(workTriggerDefinitionSql(name)),
+  ] as const);
+const exactNonAuthorityWorkTriggerSql: ReadonlyMap<string, string> = new Map(
+  exactNonAuthorityWorkTriggerEntries,
+);
+const nonAuthorityWorkTriggerDigest = createHash("sha256")
+  .update(JSON.stringify(exactNonAuthorityWorkTriggerEntries))
+  .digest("hex");
+const frozenNonAuthorityWorkTriggerDigest =
+  "b2973f3c9279e5b6af86c49fbdc59659384451b003c202522e12e7c890eef4b4";
+if (nonAuthorityWorkTriggerDigest !== frozenNonAuthorityWorkTriggerDigest) {
+  throw new Error(
+    `WORK_SCHEMA_NON_AUTHORITY_DEFINITION_DIGEST_INVALID:${nonAuthorityWorkTriggerDigest}`,
+  );
+}
+
 const assertWorkSchemaShape = (
   database: Database,
   expectedAuthorityTriggerSql: ReadonlyMap<string, string> = exactWorkAuthorityTriggerSql,
@@ -1357,23 +1424,34 @@ const assertWorkSchemaShape = (
     if (tables.get(name) !== 1) throw new Error(`WORK_SCHEMA_NOT_STRICT:${name}`);
   }
   const triggerRows = database.query(
-    "SELECT name FROM sqlite_master WHERE type='trigger'",
-  ).all() as Array<{ name?: unknown }>;
-  const triggers = new Set(
-    triggerRows.flatMap((row) => typeof row.name === "string" ? [row.name] : []),
-  );
+    "SELECT name,type,tbl_name,sql FROM sqlite_master WHERE type='trigger'",
+  ).all() as Array<{
+    name?: unknown;
+    type?: unknown;
+    tbl_name?: unknown;
+    sql?: unknown;
+  }>;
+  const triggers = new Map(triggerRows.flatMap((row) =>
+    typeof row.name === "string" ? [[row.name, row] as const] : []));
   for (const name of requiredWorkTriggers) {
     if (!triggers.has(name)) throw new Error(`WORK_SCHEMA_MISSING_TRIGGER:${name}`);
   }
   for (const name of exactWorkAuthorityTriggerNames) {
-    const row = database.query(
-      "SELECT type,tbl_name,sql FROM sqlite_master WHERE name=?",
-    ).get(name) as { type?: unknown; tbl_name?: unknown; sql?: unknown } | null;
+    const row = triggers.get(name);
     if (
       row?.type !== "trigger"
       || typeof row.tbl_name !== "string"
       || typeof row.sql !== "string"
       || normalizeWorkSchemaSql(row.sql) !== expectedAuthorityTriggerSql.get(name)
+    ) throw new Error(`WORK_SCHEMA_STALE_TRIGGER:${name}`);
+  }
+  for (const [name, expected] of exactNonAuthorityWorkTriggerSql) {
+    const row = triggers.get(name);
+    if (
+      row?.type !== "trigger"
+      || typeof row.tbl_name !== "string"
+      || typeof row.sql !== "string"
+      || normalizeWorkSchemaSql(row.sql) !== expected
     ) throw new Error(`WORK_SCHEMA_STALE_TRIGGER:${name}`);
   }
   const requiredColumns: Readonly<Record<string, readonly string[]>> = {
@@ -1463,6 +1541,21 @@ export function assertWorkSchema(database: Database): void {
   if (integrity.length !== 0) throw new Error("WORK_SCHEMA_FOREIGN_KEY_VIOLATION");
 }
 
+/**
+ * Restore the complete frozen Work authority surface owned by provider schema
+ * v40/v41. Callers first install the additive Work objects, then use this
+ * bounded replacement before the v40 migration waypoint can commit.
+ */
+export function installProviderVersion40WorkAuthoritySchema(database: Database): void {
+  for (const name of exactWorkAuthorityTriggerNames) {
+    database.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  }
+  for (const [, sql] of providerVersion40WorkAuthorityDefinitionEntries) {
+    database.exec(sql);
+  }
+  assertProviderVersion40WorkSchema(database);
+}
+
 /** Exact Work authority surface shipped with adoption schema v40. */
 export function assertProviderVersion40WorkSchema(database: Database): void {
   assertWorkSchemaShape(database, providerVersion40WorkAuthorityTriggerSql);
@@ -1515,6 +1608,16 @@ export function assertProviderVersion39WorkSchema(database: Database): void {
       ? providerVersion39SignalMemberGuardSql
       : providerVersion39PresetContractGuardSql.get(name)
         ?? exactWorkAuthorityTriggerSql.get(name);
+    if (
+      row?.type !== "trigger"
+      || typeof row.tbl_name !== "string"
+      || typeof row.sql !== "string"
+      || normalizeWorkSchemaSql(row.sql) !== expected
+    ) throw new Error(`WORK_SCHEMA_V39_STALE_TRIGGER:${name}`);
+  }
+  for (const [name, expected] of exactNonAuthorityWorkTriggerSql) {
+    if (providerVersion39AddedAuthorityTriggerNames.has(name)) continue;
+    const row = triggers.get(name);
     if (
       row?.type !== "trigger"
       || typeof row.tbl_name !== "string"

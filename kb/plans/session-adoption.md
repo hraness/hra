@@ -271,12 +271,21 @@ typed store refuses invalid new proofs before writes. Schema 41 adds one insert-
 SQLite guard, `mutation_resolutions_timestamp_proof_insert`, and its migration
 ledger entry. The guard refuses invalid new stop/rename resolutions, requires
 the proof to agree with the resulting session snapshot, and requires SQL NULL
-receipts for non-proven resolutions. Current schema 41 opens require the exact
-stored guard definition and one migration-41 ledger row with a nonnegative safe
-integer application time before maintenance; missing or altered guards are
-refused without repair. Schema 40 remains an immutable predecessor, and readonly
-older databases retain the migration-required policy. Public and cloud projections
-omit the private unit marker.
+receipts for non-proven resolutions. Exact schema 40 writable migration
+admission requires its migration ledger row and frozen Work authority surface.
+Exact schema 41 admission requires the exact stored timestamp guard and the
+exact `[40, 41]` ledger tail with nonnegative safe-integer application times
+before the Work migration. Schema 42 retains that exact timestamp guard and
+ledger history, then replaces only the reviewed Work authority guards for
+active Sol routing and records its own migration entry. Schema 43 adds
+append-only transcript-finalization bits to the existing mutation and queue
+source-authority rows, fencing pre-v43 dispatched sources without retaining a
+second per-message ledger. Current schema 43 opens require the exact
+`[40, 41, 42, 43]` ledger tail and all current authority surfaces before
+maintenance; missing or altered guards are refused without repair.
+Schemas 40 and 41 remain immutable predecessors, and readonly older databases
+retain the migration-required policy. Public and cloud projections omit the
+private unit marker.
 
 Acceptance requires real-parser legacy-unit regressions, positive and invalid
 marked observations, typed and raw SQL atomic refusal, unchanged historical

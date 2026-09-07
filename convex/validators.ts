@@ -5,10 +5,12 @@ import { cloudEnvelopeLimits } from "../src/domain/cloud-envelope-contract";
 export const authAttemptKind = v.union(v.literal("send"), v.literal("verify"));
 export const authSubjectStatus = v.union(v.literal("active"), v.literal("disabled"));
 export const authAdmissionState = v.union(v.literal("open"), v.literal("frozen"));
-// Break-glass admission (`authAdmissionState`) gates every authenticated path.
-// New-identity admission is the separate, narrower control that decides whether
-// a first `authSubjects` row may be created without an invitation. An absent
-// stored value always means `invite_only`.
+// Break-glass auth admission gates new OTP work, session issue/refresh, invite
+// issue, and fresh device registration. Already-issued JWT/device authority is
+// intentionally checked at its own boundary until that token expires.
+// New-identity admission is the separate, narrower control that decides
+// whether a first `authSubjects` row may be created without an invitation. An
+// absent stored value always means `invite_only`.
 export const newIdentityAdmissionState = v.union(
   v.literal("invite_only"),
   v.literal("open"),
@@ -86,6 +88,64 @@ export const commandState = v.union(
   v.literal("cancelled"),
   v.literal("expired"),
 );
+
+// These strings are physical hosted capacity, not virtual counters. A fresh
+// command reserves enough command-category bytes for its widest legal
+// terminal shape, while a terminal command that has not yet been observed by
+// its requester keeps a small inline receipt reserve until acknowledgement.
+export const commandLifecycleCapacityCharacters = Object.freeze({
+  device: 24 * 1_024,
+  session: 352 * 1_024,
+});
+export const commandLifecycleCapacityVersion = 1 as const;
+export const commandReceiptCapacityReservation = "0".repeat(256);
+export const commandType = v.union(v.literal("session"), v.literal("device"));
+export const runtimeReleaseAttestation = v.union(
+  v.object({
+    bound: v.literal(false),
+    schemaIdentity: v.literal("hra-release-attestation-v1"),
+    schemaVersion: v.literal(1),
+  }),
+  v.object({
+    bound: v.literal(true),
+    deployedAtMs: v.number(),
+    previousDeployDigest: v.union(v.string(), v.null()),
+    runtimeRevision: v.string(),
+    runtimeSourceCommit: v.string(),
+    schemaIdentity: v.literal("hra-release-attestation-v1"),
+    schemaVersion: v.literal(1),
+  }),
+);
+// This uncharged singleton field is the hosted half of the protected
+// command-capacity receipt. Marker-2 work is executable only when the stored
+// tuple still names the exact compiled release attestation.
+export const commandCapacityReadinessState = v.object({
+  activatedAt: v.number(),
+  candidateDeployDigest: v.string(),
+  evidenceDigest: v.string(),
+  lifecycleCapacityVersion: v.literal(commandLifecycleCapacityVersion),
+  runtimeAttestation: runtimeReleaseAttestation,
+  schemaIdentity: v.literal("hra-command-capacity-readiness-v1"),
+  schemaVersion: v.literal(1),
+  targetDigest: v.string(),
+});
+// Eight maximal command/reservation pairs stay comfortably below Convex's
+// transaction read/write byte ceilings, including quota and index overhead.
+export const maximumCommandLifecycleBatch = 8;
+// Account deletion and device revocation accept authority-changing work before
+// their durable jobs advance through several differently sized states. Keep a
+// physical byte obligation on each new job so every later state change (and,
+// for account deletion, the completion receipt) remains possible at a hard
+// quota ceiling. The resize helpers permit a little extra room when a shorter
+// state re-expands back to the immutable initial charged size.
+export const durableJobCapacityReservation = "0".repeat(256);
+export const maximumDurableJobCapacityCharacters = 512;
+// New identities and devices prepay the exact record slots and ample bytes
+// required to disable/delete or revoke them later. These rows are charged to
+// the same category as the artifact they replace; the authority-reducing
+// mutation only performs a physically non-growing exchange.
+export const authorityReductionCapacityVersion = 1 as const;
+export const authorityReductionCapacityReservation = "0".repeat(2 * 1_024);
 export const attentionNotificationState = v.union(
   v.literal("pending"),
   v.literal("effect_started"),
@@ -208,6 +268,7 @@ export const maintenanceCategory = v.union(
   v.literal("otp_challenges"),
   v.literal("auth_invites"),
   v.literal("abandoned_identities"),
+  v.literal("orphaned_auth_users"),
   v.literal("bind_challenges"),
   v.literal("device_presence"),
   v.literal("idempotency_receipts"),

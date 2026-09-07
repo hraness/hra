@@ -1,21 +1,26 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { makeFunctionReference } from "convex/server";
 import type { GenericId as Id, Value } from "convex/values";
 import { convexTest } from "convex-test";
 
+import { parseAuthCredentials } from "../src/cloud/authCredentials";
 import {
   PINNED_CONVEX_AUTH_QUOTA_TABLE_MATRIX,
   PINNED_CONVEX_AUTH_STORE_OPERATIONS,
   runQuotaAwareAuthStoreForTest,
   store,
 } from "./auth";
+import { digestAuthEmail } from "./authEmail";
 import {
   digestInviteCapability,
   generateInviteAuthority,
   invitePublicIdFromCapabilityDigest,
   minimumInviteLifetimeMs,
 } from "./authInvites";
-import { adjustParentAttributedQuotaForPatch } from "./quota";
+import {
+  adjustParentAttributedQuotaForPatch,
+  reserveServiceQuotaForInsert,
+} from "./quota";
 import schema from "./schema";
 import { modules } from "./test.setup";
 
@@ -43,6 +48,17 @@ const transitionAdmission = makeFunctionReference<
   { expectedGeneration: number; mutationId: string; state: "frozen" | "open" },
   unknown
 >("admissionControl:transition");
+const hmacEnvironmentName = "HRA_AUTH_HMAC_SECRET";
+const priorHmacSecret = process.env[hmacEnvironmentName];
+
+beforeAll(() => {
+  process.env[hmacEnvironmentName] = "auth-quota-test-secret-at-least-thirty-two-characters";
+});
+
+afterAll(() => {
+  if (priorHmacSecret === undefined) delete process.env.HRA_AUTH_HMAC_SECRET;
+  else process.env[hmacEnvironmentName] = priorHmacSecret;
+});
 
 async function hardRuntime() {
   const runtime = convexTest(schema, authModules);
@@ -131,7 +147,9 @@ describe("Convex Auth hard quota boundary", () => {
       publicId: invite.publicId,
       purpose: "identity",
     });
-    const emailDigest = "a".repeat(64);
+    const parsedEmail = parseAuthCredentials({ email: "reader@example.com" });
+    if (parsedEmail.kind !== "request_code") throw new Error("email fixture is invalid");
+    const emailDigest = await digestAuthEmail(parsedEmail.email);
     const reservation = await runtime.mutation(reserveAttempt, {
       emailDigest,
       inviteCapabilityDigest: capabilityDigest,
@@ -151,6 +169,15 @@ describe("Convex Auth hard quota boundary", () => {
       account: { _id: Id<"authAccounts"> };
       user: { _id: Id<"users"> };
     };
+    const boundBeforeChallenge = await runtime.run(async (ctx) =>
+      await ctx.db.query("authSubjects")
+        .withIndex("by_email_digest", (builder) => builder.eq("emailDigest", emailDigest))
+        .unique());
+    expect(boundBeforeChallenge).toMatchObject({
+      status: "active",
+      userId: created.user._id,
+    });
+    expect(boundBeforeChallenge?.verifiedAt).toBeUndefined();
     const challengeId = await runtime.mutation(storeChallenge, {
       accountId: created.account._id,
       authEpoch: 1,
@@ -162,8 +189,19 @@ describe("Convex Auth hard quota boundary", () => {
     expect(challengeId).toBeString();
 
     const beforeReplay = await quotaSnapshot(runtime, created.user._id);
-    expect(beforeReplay.identity?.records).toBe(4);
-    expect(beforeReplay.service).toMatchObject({ identities: 1, records: 6 });
+    expect(beforeReplay.identity?.records).toBe(5);
+    expect(beforeReplay.service).toMatchObject({ identities: 1, records: 8 });
+    expect(await runtime.run(async (ctx) => ({
+      identity: await ctx.db.query("accountDeletionIdentityReservations")
+        .withIndex("by_user", (builder) => builder.eq("userId", created.user._id))
+        .unique(),
+      job: await ctx.db.query("accountDeletionJobReservations")
+        .withIndex("by_user", (builder) => builder.eq("userId", created.user._id))
+        .unique(),
+    }))).toMatchObject({
+      identity: { category: "identity" },
+      job: { category: "job" },
+    });
 
     await runtime.run(async (ctx) => {
       const user = await ctx.db.get(created.user._id);
@@ -183,8 +221,8 @@ describe("Convex Auth hard quota boundary", () => {
       kind: "send",
     })).toMatchObject({ authEpoch: 1, inviteBinding: "not_required" });
     const afterVerifiedReauth = await quotaSnapshot(runtime, created.user._id);
-    expect(afterVerifiedReauth.identity?.records).toBe(4);
-    expect(afterVerifiedReauth.service?.records).toBe(7);
+    expect(afterVerifiedReauth.identity?.records).toBe(5);
+    expect(afterVerifiedReauth.service?.records).toBe(9);
     expect(await runtime.run(async (ctx) =>
       await ctx.db.query("authSubjects").first())).toMatchObject({
       userId: created.user._id,
@@ -214,8 +252,8 @@ describe("Convex Auth hard quota boundary", () => {
     }) as { sessionId: Id<"authSessions">; userId: Id<"users"> };
     expect(signedIn.userId).toBe(created.user._id);
     expect(await quotaSnapshot(runtime, created.user._id)).toMatchObject({
-      identity: { records: 5 },
-      service: { identities: 1, records: 8 },
+      identity: { records: 6 },
+      service: { identities: 1, records: 10 },
     });
     await runtime.mutation(authStore, {
       args: { type: "invalidateSessions", userId: created.user._id },
@@ -288,6 +326,10 @@ describe("Convex Auth hard quota boundary", () => {
       user: null,
       verification: null,
     });
+    expect(await runtime.run(async (ctx) => ({
+      identity: await ctx.db.query("accountDeletionIdentityReservations").collect(),
+      job: await ctx.db.query("accountDeletionJobReservations").collect(),
+    }))).toEqual({ identity: [], job: [] });
     expect(await quotaSnapshot(runtime, ids.userId)).toMatchObject({
       identity: { logicalBytes: 0, records: 0 },
       service: { identities: 0, logicalBytes: 0, records: 0 },
@@ -339,5 +381,44 @@ describe("Convex Auth hard quota boundary", () => {
         "futureOperation" as never,
         async () => undefined,
       ))).rejects.toThrow("Authentication storage could not be completed.");
+
+    const mismatchedIdentity = await hardRuntime();
+    const canonicalEmail = "binding-proof@example.com";
+    const parsedEmail = parseAuthCredentials({ email: canonicalEmail });
+    if (parsedEmail.kind !== "request_code") throw new Error("email fixture is invalid");
+    const emailDigest = await digestAuthEmail(parsedEmail.email);
+    await mismatchedIdentity.run(async (ctx) => {
+      const subject = {
+        authEpoch: 1,
+        createdAt: Date.now(),
+        emailDigest,
+        status: "active" as const,
+        updatedAt: Date.now(),
+      };
+      await reserveServiceQuotaForInsert(ctx, subject);
+      await ctx.db.insert("authSubjects", subject);
+    });
+    await expect(mismatchedIdentity.run(async (ctx) =>
+      await runQuotaAwareAuthStoreForTest(
+        ctx,
+        "createAccountFromCredentials",
+        async (quotaCtx) => await quotaCtx.db.insert("users", {
+          email: "different@example.com",
+        }),
+        { email: canonicalEmail, emailDigest },
+      ))).rejects.toThrow("Authentication storage could not be completed.");
+    const mismatchedState = await mismatchedIdentity.run(async (ctx) => ({
+      identityCapacity: await ctx.db.query("accountDeletionIdentityReservations").collect(),
+      jobCapacity: await ctx.db.query("accountDeletionJobReservations").collect(),
+      subject: await ctx.db.query("authSubjects").unique(),
+      users: await ctx.db.query("users").collect(),
+    }));
+    expect(mismatchedState).toMatchObject({
+      identityCapacity: [],
+      jobCapacity: [],
+      subject: { emailDigest },
+      users: [],
+    });
+    expect(mismatchedState.subject).not.toHaveProperty("userId");
   });
 });

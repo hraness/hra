@@ -137,7 +137,7 @@ const AUTOMATION_FILE_NAME = "automation.toml";
 const RRULE_PREFIX = "RRULE:";
 
 /** Mirrors the control scalars refused by `containsUnsafeTerminalScalar`. */
-const unsafeScalarPattern = /[\p{Cc}\p{Cf}\p{Cs}]/gu;
+const unsafeScalarPattern = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu;
 
 const EMPTY_SCAN: CodexAutomationScan = Object.freeze({
   automations: Object.freeze([]),

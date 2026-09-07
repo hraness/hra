@@ -9,7 +9,7 @@ import {
   reserveQuotaForStoredIdentity,
 } from "./quota";
 import schema from "./schema";
-import { modules } from "./test.setup";
+import { modules, trackedCommandCapacityReadiness } from "./test.setup";
 
 type Args = Readonly<Record<string, Value>>;
 const register = makeFunctionReference<"mutation", Args, unknown>("devices:register");
@@ -38,6 +38,12 @@ const getCommandForOutboxRecovery = makeFunctionReference<"query", Args, unknown
 );
 const acknowledgeCommand = makeFunctionReference<"mutation", Args, unknown>(
   "commands:acknowledgeReceipt",
+);
+const listUnacknowledgedCommands = makeFunctionReference<"query", Args, unknown>(
+  "commands:listUnacknowledgedForRequester",
+);
+const cancelPendingCommand = makeFunctionReference<"mutation", Args, unknown>(
+  "commands:cancelPending",
 );
 const listPendingCommandPage = makeFunctionReference<"query", Args, unknown>(
   "commands:listPendingForTargetPage",
@@ -101,6 +107,11 @@ async function authenticatedWorld() {
   const testRuntime = convexTest(schema, modules);
   await testRuntime.mutation(genesisQuota, {});
   const ids = await testRuntime.run(async (ctx) => {
+    const control = await ctx.db.query("serviceControl").unique();
+    if (control === null) throw new Error("missing service control fixture");
+    await ctx.db.patch(control._id, {
+      commandCapacityReadiness: trackedCommandCapacityReadiness,
+    });
     const userId = await ctx.db.insert("users", {
       email: "reader@example.com",
       emailVerificationTime: Date.now(),
@@ -143,6 +154,19 @@ async function sessionCommandWriteState(world: Awaited<ReturnType<typeof authent
   }));
 }
 
+async function setTrackedCommandCapacityReady(
+  world: Awaited<ReturnType<typeof authenticatedWorld>>,
+  ready: boolean,
+): Promise<void> {
+  await world.testRuntime.run(async (ctx) => {
+    const control = await ctx.db.query("serviceControl").unique();
+    if (control === null) throw new Error("missing service control fixture");
+    await ctx.db.patch(control._id, {
+      commandCapacityReadiness: ready ? trackedCommandCapacityReadiness : undefined,
+    });
+  });
+}
+
 describe("cloud transactions", () => {
   test("admits session command versions per target and binds executable transitions", async () => {
     const world = await authenticatedWorld();
@@ -183,8 +207,13 @@ describe("cloud transactions", () => {
       requestDigest: "3".repeat(64),
       sessionPublicId: "session_command_version",
     } as const;
-    expect(await world.runtime.mutation(enqueueCommand, legacy))
-      .toMatchObject({ replay: false });
+    expect(await world.runtime.mutation(enqueueCommand, legacy)).toEqual({
+      publicId: legacy.publicId,
+      replay: false,
+      sessionPublicId: legacy.sessionPublicId,
+      state: "pending",
+      targetDevicePublicId: legacy.expectedTargetDevicePublicId,
+    });
 
     const currentWhileAbsent = {
       ...legacy,
@@ -207,8 +236,21 @@ describe("cloud transactions", () => {
       expectedRevision: 0,
       keyVersion: 1,
     });
-    expect(await world.runtime.mutation(enqueueCommand, legacy))
-      .toMatchObject({ publicId: legacy.publicId, replay: true });
+    await setTrackedCommandCapacityReady(world, false);
+    const beforeCapacityGate = await sessionCommandWriteState(world);
+    await expectPromiseToReject(
+      world.runtime.mutation(enqueueCommand, currentWhileAbsent),
+      "COMMAND_CAPACITY_NOT_READY",
+    );
+    expect(await sessionCommandWriteState(world)).toEqual(beforeCapacityGate);
+    await setTrackedCommandCapacityReady(world, true);
+    expect(await world.runtime.mutation(enqueueCommand, legacy)).toEqual({
+      publicId: legacy.publicId,
+      replay: true,
+      sessionPublicId: legacy.sessionPublicId,
+      state: "pending",
+      targetDevicePublicId: legacy.expectedTargetDevicePublicId,
+    });
     await expectPromiseToReject(world.runtime.mutation(enqueueCommand, {
       ...legacy,
       expectedRequestingDevicePublicId: "device_command_version",
@@ -221,8 +263,15 @@ describe("cloud transactions", () => {
       publicId: uuidV7(now, "c008"),
       requestDigest: "5".repeat(64),
     } as const;
-    expect(await world.runtime.mutation(enqueueCommand, current))
-      .toMatchObject({ replay: false, requestCommitmentVersion: 2 });
+    expect(await world.runtime.mutation(enqueueCommand, current)).toEqual({
+      publicId: current.publicId,
+      replay: false,
+      requestCommitmentVersion: 2,
+      requestingDevicePublicId: "device_command_version",
+      sessionPublicId: current.sessionPublicId,
+      state: "pending",
+      targetDevicePublicId: current.expectedTargetDevicePublicId,
+    });
     const legacyWhileCurrent = {
       ...legacy,
       idempotencyKey: uuidV7(now, "c009"),
@@ -243,6 +292,14 @@ describe("cloud transactions", () => {
       localPhase: "prepared_no_effect",
     }), "COMMAND_EXECUTOR_VERSION_UNSUPPORTED");
     expect(await sessionCommandWriteState(world)).toEqual(beforeOldExecutor);
+    await setTrackedCommandCapacityReady(world, false);
+    await expectPromiseToReject(world.runtime.mutation(prepareCommand, {
+      authority,
+      commandPublicId: current.publicId,
+      executorRequestVersion: 2,
+      localPhase: "prepared_no_effect",
+    }), "COMMAND_CAPACITY_NOT_READY");
+    await setTrackedCommandCapacityReady(world, true);
     await world.runtime.mutation(prepareCommand, {
       authority,
       commandPublicId: current.publicId,
@@ -255,19 +312,39 @@ describe("cloud transactions", () => {
       commandPublicId: current.publicId,
     }), "COMMAND_EXECUTOR_VERSION_UNSUPPORTED");
     expect(await sessionCommandWriteState(world)).toEqual(beforeOldEffect);
+    await setTrackedCommandCapacityReady(world, false);
+    await expectPromiseToReject(world.runtime.mutation(markEffectStarted, {
+      authority,
+      commandPublicId: current.publicId,
+      executorRequestVersion: 2,
+    }), "COMMAND_CAPACITY_NOT_READY");
+    await setTrackedCommandCapacityReady(world, true);
     await world.runtime.mutation(markEffectStarted, {
       authority,
       commandPublicId: current.publicId,
       executorRequestVersion: 2,
     });
+    await setTrackedCommandCapacityReady(world, false);
+    expect(await world.runtime.mutation(markEffectStarted, {
+      authority,
+      commandPublicId: current.publicId,
+      executorRequestVersion: 2,
+    })).toMatchObject({ replay: true, state: "effect_started" });
 
     await world.runtime.mutation(updateRegistry, {
       envelope: encryptedEnvelope,
       expectedRevision: 1,
       keyVersion: 1,
     });
-    expect(await world.runtime.mutation(enqueueCommand, current))
-      .toMatchObject({ publicId: current.publicId, replay: true });
+    expect(await world.runtime.mutation(enqueueCommand, current)).toEqual({
+      publicId: current.publicId,
+      replay: true,
+      requestCommitmentVersion: 2,
+      requestingDevicePublicId: "device_command_version",
+      sessionPublicId: current.sessionPublicId,
+      state: "effect_started",
+      targetDevicePublicId: current.expectedTargetDevicePublicId,
+    });
     const legacyShape: Record<string, Value> = { ...current };
     delete legacyShape.expectedRequestingDevicePublicId;
     delete legacyShape.requestCommitmentVersion;
@@ -295,6 +372,94 @@ describe("cloud transactions", () => {
     await world.runtime.mutation(markEffectStarted, {
       authority,
       commandPublicId: legacy.publicId,
+    });
+  });
+
+  test("retains a terminal session command until lost-response proof recovery acknowledges it", async () => {
+    const world = await authenticatedWorld();
+    const now = Date.now();
+    await world.runtime.mutation(register, {
+      bootstrapKeyEnvelope: wrappedKeyEnvelope,
+      encryptedLabel: encryptedEnvelope,
+      idempotencyKey: uuidV7(now, "d001"),
+      keyVersion: 1,
+      publicId: "device_receipt_recovery",
+      requestDigest: "1".repeat(64),
+      signingPublicKey: publicKey,
+      wrappingPublicKey: publicKey,
+    });
+    await world.runtime.mutation(createSession, {
+      idempotencyKey: uuidV7(now, "d002"),
+      publicId: "session_receipt_recovery",
+      requestDigest: "2".repeat(64),
+    });
+    await world.runtime.mutation(updateRegistry, {
+      commandRequestVersion: 2,
+      envelope: encryptedEnvelope,
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
+    const request = {
+      deadline: now + 60_000,
+      expectedRequestingDevicePublicId: "device_receipt_recovery",
+      expectedTargetDevicePublicId: "device_receipt_recovery",
+      idempotencyKey: uuidV7(now, "d003"),
+      kind: "stop",
+      payload: encryptedEnvelope,
+      publicId: uuidV7(now, "d004"),
+      requestCommitmentVersion: 2,
+      requestDigest: "3".repeat(64),
+      sessionPublicId: "session_receipt_recovery",
+    } as const;
+    // Model a committed enqueue whose response was lost: no acknowledgement
+    // follows the returned exact receipt in this process.
+    expect(await world.runtime.mutation(enqueueCommand, request)).toEqual({
+      publicId: request.publicId,
+      replay: false,
+      requestCommitmentVersion: 2,
+      requestingDevicePublicId: request.expectedRequestingDevicePublicId,
+      sessionPublicId: request.sessionPublicId,
+      state: "pending",
+      targetDevicePublicId: request.expectedTargetDevicePublicId,
+    });
+    expect(await world.runtime.mutation(cancelPendingCommand, {
+      commandPublicId: request.publicId,
+    })).toMatchObject({ state: "cancelled" });
+    expect(await world.testRuntime.run(async (ctx) => {
+      const row = (await ctx.db.query("sessionCommands").collect())
+        .find((entry) => entry.publicId === request.publicId);
+      return row === undefined ? null : {
+        requesterAcknowledgedAt: row.requesterAcknowledgedAt,
+        state: row.state,
+        terminalCleanupAfter: row.terminalCleanupAfter,
+      };
+    })).toEqual({
+      requesterAcknowledgedAt: undefined,
+      state: "cancelled",
+      terminalCleanupAfter: undefined,
+    });
+    expect(await world.runtime.query(listUnacknowledgedCommands, { limit: 10 })).toEqual([{
+      idempotencyKey: request.idempotencyKey,
+      publicId: request.publicId,
+      requestDigest: request.requestDigest,
+    }]);
+
+    expect(await world.runtime.mutation(acknowledgeCommand, {
+      commandPublicId: request.publicId,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: request.requestDigest,
+    })).toMatchObject({ publicId: request.publicId, replay: false });
+    expect(await world.runtime.query(listUnacknowledgedCommands, { limit: 10 })).toEqual([]);
+    expect(await world.testRuntime.run(async (ctx) => {
+      const row = (await ctx.db.query("sessionCommands").collect())
+        .find((entry) => entry.publicId === request.publicId);
+      return row === undefined ? null : {
+        requesterAcknowledgedAt: row.requesterAcknowledgedAt,
+        terminalCleanupAfter: row.terminalCleanupAfter,
+      };
+    })).toEqual({
+      requesterAcknowledgedAt: expect.any(Number),
+      terminalCleanupAfter: expect.any(Number),
     });
   });
 
@@ -356,6 +521,13 @@ describe("cloud transactions", () => {
       requestDigest,
       sessionPublicId: "session_outbox_rollover",
     });
+
+    expect(await world.runtime.query(listUnacknowledgedCommands, { limit: 10 })).toEqual([{
+      idempotencyKey,
+      publicId: commandPublicId,
+      requestDigest,
+    }]);
+    expect(await newDevice.query(listUnacknowledgedCommands, { limit: 10 })).toEqual([]);
 
     await expectPromiseToReject(
       newDevice.query(getCommand, { commandPublicId }),
@@ -646,10 +818,11 @@ describe("cloud transactions", () => {
       requestDigest: "e".repeat(64),
       sessionPublicId: "session_12345678",
     } as const;
-    expect(await world.runtime.mutation(enqueueCommand, currentCommandRequest)).toMatchObject({
+    expect(await world.runtime.mutation(enqueueCommand, currentCommandRequest)).toEqual({
       publicId: commandPublicId,
       requestCommitmentVersion: 2,
       requestingDevicePublicId: "device_12345678",
+      replay: false,
       sessionPublicId: "session_12345678",
       state: "pending",
       targetDevicePublicId: "device_12345678",
@@ -824,9 +997,9 @@ describe("cloud transactions", () => {
     });
     expect(legacyFailure).toMatchObject({
       resultCode: "LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT",
-      terminalCleanupAfter: expect.any(Number),
     });
     expect(legacyFailure.requesterAcknowledgedAt).toBeUndefined();
+    expect(legacyFailure.terminalCleanupAfter).toBeUndefined();
 
     const rejectedExpiredPublicId = uuidV7(now, "a3");
     await world.runtime.mutation(enqueueCommand, {
@@ -954,7 +1127,6 @@ describe("cloud transactions", () => {
           nonterminal: false,
           resultCode,
           state: "cancelled",
-          terminalResultless: true,
           updatedAt: Date.now(),
         });
       });

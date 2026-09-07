@@ -602,6 +602,13 @@ function beginNestedSend(
     attemptId: nested.attempt.id,
     sessionId: actor.sessionId,
     profileGeneration: effect.accountGeneration,
+    transcript: {
+      accountId: actor.accountId,
+      providerGeneration: effect.accountGeneration,
+      providerConnectionId: "30000000-0000-4000-8000-00000000000d",
+      actor: "automation",
+      message: nested.message,
+    },
     evidence: {
       kind: "session.send",
       providerThreadId: session.providerThreadId,
@@ -1411,6 +1418,7 @@ describe("HraService work protocol", () => {
     const value = await fixture();
     const actor = await createActor(value);
     const { created, joined, claimed } = await createJoinClaim(value, actor);
+    value.store.bumpAutorespondCounter(actor.sessionId);
     const dispatched = workOperationResultSchema.parse(await value.service.execute({
       kind: "work.apply",
       requestId: crypto.randomUUID(),
@@ -1428,6 +1436,7 @@ describe("HraService work protocol", () => {
       },
     }, { signal }));
     if (dispatched.kind !== "attempt.dispatch") throw new Error("Expected dispatch result.");
+    expect(value.store.readAutorespondBudgets(actor.sessionId).consecutive).toBe(1);
 
     const queueKey = nextKey();
     const queued = workOperationResultSchema.parse(await value.service.execute({
@@ -1449,13 +1458,16 @@ describe("HraService work protocol", () => {
     if (queueEffect?.kind !== "signal") throw new Error("Expected internal queue effect.");
     const queueMutation = value.store.readMutation(queueEffect.nestedMutationKey);
     const queueResult = queueMutation?.result as { queueId?: unknown } | undefined;
+    if (typeof queueResult?.queueId !== "string") throw new Error("Expected queue id.");
+    expect(value.store.queueMessageActor(queueResult.queueId as `queue_${string}`))
+      .toBe("automation");
     expect(queued.signal).toMatchObject({
       deliveryState: "accepted",
       deliveryReceipt: {
         kind: "queue_created",
         mutationAttemptId: queueMutation?.id,
         accountGeneration: queued.signal.accountGeneration,
-        queueId: queueResult?.queueId,
+        queueId: queueResult.queueId,
       },
     });
 
@@ -1490,6 +1502,12 @@ describe("HraService work protocol", () => {
       },
     });
     expect(JSON.stringify(steered)).not.toContain("provider-turn-1");
+    const automationMessages = value.store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: actor.sessionId,
+    }).events.filter((event) =>
+      event.body.type === "user_message" && event.body.actor === "automation");
+    expect(automationMessages).toHaveLength(2);
   });
 
   test("never replays an unknown dispatch and later reprojects exact recovery proof", async () => {

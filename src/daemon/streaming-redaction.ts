@@ -53,7 +53,7 @@ type ActiveItem = Readonly<{
   turnId: string;
 }>;
 
-const publicControlScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const publicControlScalar = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
 const providerToolLabelMaximumUtf8Bytes = 256;
 const textEncoder = new TextEncoder();
 
@@ -261,6 +261,14 @@ const sanitizeCompleteBody = (
       ...body,
       turnId: body.turnId === null ? null : publicId(body.turnId),
       text: safe(body.text),
+      ...(body.attachments === undefined
+        ? {}
+        : {
+            attachments: body.attachments.map((attachment) => ({
+              ...attachment,
+              name: safeInline(attachment.name),
+            })),
+          }),
     };
     case "provider_switched": return body;
     case "tool_progress": return {

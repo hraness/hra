@@ -23,6 +23,7 @@ import {
   type SessionTranscript,
 } from "../domain/transcript";
 import {
+  hraTrajectoryExportContextSchema,
   transcriptToTrajectory,
   trajectoryRecordSchema,
 } from "../domain/trajectory";
@@ -1849,6 +1850,7 @@ describe("provider portability", () => {
       account: targetAccountId,
       idempotencyKey,
       kind: "session.switch",
+      presetContract: legacyPresetContract,
       provider: "codex",
       session: sessionId,
     }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -1914,6 +1916,7 @@ describe("provider portability", () => {
       account: targetAccountId,
       idempotencyKey,
       kind: "session.switch",
+      presetContract: legacyPresetContract,
       provider: "codex",
       session: sessionId,
     }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -1980,6 +1983,7 @@ describe("provider portability", () => {
       account: targetAccountId,
       idempotencyKey,
       kind: "session.switch",
+      presetContract: legacyPresetContract,
       provider: "codex",
       session: sessionId,
     }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -2012,6 +2016,7 @@ describe("provider portability", () => {
         account: targetAccountId,
         idempotencyKey,
         kind: "session.switch",
+        presetContract: legacyPresetContract,
         provider: "codex",
         session: sessionId,
       }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -2067,6 +2072,7 @@ describe("provider portability", () => {
       account: targetAccountId,
       idempotencyKey,
       kind: "session.switch",
+      presetContract: legacyPresetContract,
       provider: "codex",
       session: sessionId,
     }, { signal }).catch((error: unknown) => error);
@@ -2268,6 +2274,7 @@ describe("provider portability", () => {
     await leaveFinalSwitchCommitUnsettled(value, {
       account: targetAccountId,
       idempotencyKey,
+      presetContract: legacyPresetContract,
       provider: "codex",
       session: sessionId,
     });
@@ -3094,35 +3101,38 @@ describe("provider portability", () => {
       createdAt: 1_700_000_000_000,
     });
     for (const record of trajectory) trajectoryRecordSchema.parse(record);
-    expect(trajectory[0]).toMatchObject({
+    expect(trajectory[0]).toEqual({ role: "meta", source: "hra" });
+    const context = trajectory[1];
+    if (context?.role !== "observation") throw new Error("Expected the HRA export context observation.");
+    expect(hraTrajectoryExportContextSchema.parse(JSON.parse(context.content))).toMatchObject({
       omitted_records: 0,
       provider: "claude",
       session_id: sessionId,
-      source: "hra",
       transcript_digest: transcript.digest,
-      type: "meta",
-      version: 1,
     });
-    const types = trajectory.map((record) => record.type);
-    expect(types).toContain("user");
-    expect(types).toContain("observation");
-    const call = trajectory.find((record) => record.type === "tool_call");
-    const tool = trajectory.find((record) => record.type === "tool");
-    if (call?.type !== "tool_call" || tool?.type !== "tool") {
+    const roles = trajectory.map((record) => record.role);
+    expect(roles).toContain("user");
+    expect(roles).toContain("observation");
+    const callRecord = trajectory.find((record) =>
+      record.role === "assistant" && "tool_calls" in record);
+    const tool = trajectory.find((record) => record.role === "tool");
+    if (callRecord?.role !== "assistant" || !("tool_calls" in callRecord) || tool?.role !== "tool") {
       throw new Error("Expected one trajectory tool call and one tool record.");
     }
+    const call = callRecord.tool_calls[0];
+    if (call === undefined) throw new Error("Expected one trajectory tool call.");
     // The tool record links to its call, and neither carries a raw argument or
     // raw output: HRA never stored either.
     expect(tool.tool_call_id).toBe(call.id);
     expect(tool.ok).toBe(true);
     expect(call.name).toBe("github/create_issue");
-    expect(JSON.parse(call.arguments)).toMatchObject({ hra_arguments_retained: false });
+    expect(JSON.parse(call.args)).toMatchObject({ hra_arguments_retained: false });
     expect(tool.content).toContain("never retained");
     // The handoff seed keeps exactly one explicit label.
     const handoff = trajectory.filter((record) =>
-      record.type === "user" && record.content.includes("HRA provider handoff"));
+      record.role === "user" && record.content.includes("HRA provider handoff"));
     expect(handoff).toHaveLength(1);
-    expect(handoff[0]?.type === "user" && handoff[0].content.startsWith(TRANSCRIPT_SEED_HEADER))
+    expect(handoff[0]?.role === "user" && handoff[0].content.startsWith(TRANSCRIPT_SEED_HEADER))
       .toBe(true);
   });
 });

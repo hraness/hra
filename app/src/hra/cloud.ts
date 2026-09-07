@@ -38,6 +38,7 @@ export {
   isBase64Url,
   isCommandKind,
   isDeviceCommandKind,
+  isDigest,
   isFiniteTimestamp,
   isOpaqueIdentifier,
   isRecord,

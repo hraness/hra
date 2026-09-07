@@ -39,6 +39,7 @@ describe("authority containment refusal rendering", () => {
       ["bootstrap-hosted-sync.ts", 2],
       ["deploy-hosted-sync.ts", 2],
       ["manage-hosted-admission.ts", 2],
+      ["manage-command-lifecycle-capacity.ts", 2],
       ["manage-hosted-invites.ts", 2],
       ["migrate-hosted-reply-to.ts", 2],
       ["replace-hosted-convex-target.ts", 2],

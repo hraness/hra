@@ -194,7 +194,7 @@ const downgradeStateSchema = (databasePath: string): void => {
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("PRAGMA user_version=42");
+    database.exec("PRAGMA user_version=44");
   } finally {
     database.close(false);
   }
@@ -907,6 +907,81 @@ describe("CLI entry point", () => {
       expect(rendered.error.message).toContain("before reading local status");
       expect(rendered.error.message).not.toContain("starting the daemon");
       expect(captured.read().stderr).toBe("");
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("exports a transcript only to a new private file and never overwrites it", async () => {
+    const runRoot = await realpath(await mkdtemp(join(tmpdir(), "hra-transcript-export-")));
+    const outputPath = join(runRoot, "transcript.json");
+    const sessionId = `sess_${"e".repeat(32)}`;
+    const transcript = {
+      version: 1 as const,
+      sessionId,
+      provider: "codex" as const,
+      records: [{
+        sequence: 1,
+        throughSequence: 1,
+        recordedAt: 1_700_000_000_000,
+        kind: "user" as const,
+        actor: "human" as const,
+        turnId: null,
+        text: "private transcript body",
+        omittedCharacters: 0,
+      }],
+      throughSequence: 1,
+      nextSequence: null,
+      omittedRecords: 0,
+      omittedCharacters: 0,
+      digest: "a".repeat(64),
+    };
+    const callDaemon = (command: LocalCommand): Promise<CommandResponse> => {
+      expect(command).toMatchObject({
+        kind: "session.transcript",
+        limit: 500,
+        session: sessionId,
+        tail: true,
+      });
+      return Promise.resolve({
+        ok: true,
+        version: 1,
+        requestId: crypto.randomUUID(),
+        data: transcript,
+      });
+    };
+    try {
+      const first = capture();
+      expect(await main([
+        "session",
+        "export",
+        sessionId,
+        "--format",
+        "json",
+        "--out",
+        outputPath,
+      ], first.output, { callDaemon })).toBe(0);
+      expect(first.read().stdout).toBe("");
+      expect(first.read().stderr).toBe("Wrote 1 transcript records.\n");
+      expect((await lstat(outputPath)).mode & 0o777).toBe(0o600);
+      expect(JSON.parse(await readFile(outputPath, "utf8"))).toEqual(transcript);
+
+      const before = await readFile(outputPath, "utf8");
+      const second = capture();
+      expect(await main([
+        "session",
+        "export",
+        sessionId,
+        "--format",
+        "json",
+        "--out",
+        outputPath,
+      ], second.output, { callDaemon })).toBe(1);
+      expect(second.read().stdout).toBe("");
+      expect(second.read().stderr).toBe(
+        "hra: HRA failed before a safe command response was available.\n",
+      );
+      expect(await readFile(outputPath, "utf8")).toBe(before);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -1993,7 +2068,7 @@ describe("CLI entry point", () => {
         ok: true,
         version: 1,
         command: "version",
-        data: { version: "0.6.0" },
+        data: { version: "0.6.1" },
       });
       expect(version.read().stderr).toBe("");
     }
@@ -2692,7 +2767,7 @@ describe("CLI entry point", () => {
   test("version is sourced from package metadata", async () => {
     const captured = capture();
     expect(await main(["--version"], captured.output)).toBe(0);
-    expect(captured.read()).toEqual({ stdout: "hra 0.6.0\n", stderr: "" });
+    expect(captured.read()).toEqual({ stdout: "hra 0.6.1\n", stderr: "" });
   });
 
   test("completes protected interaction input outside argv and never renders its value", async () => {
@@ -6205,7 +6280,7 @@ describe("CLI entry point", () => {
       });
       expect(started.read().stderr).toBe("");
       expect(daemonStarts).toBe(1);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(41);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(43);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6229,7 +6304,7 @@ describe("CLI entry point", () => {
         error: {
           code: "RECOVERY_REQUIRED",
           details: { nextCommand: "hra daemon start" },
-          message: "The local state schema needs a migration (35 to 41); start the daemon to migrate it.",
+          message: "The local state schema needs a migration (35 to 43); start the daemon to migrate it.",
         },
         ok: false,
         version: 1,
@@ -6261,14 +6336,14 @@ describe("CLI entry point", () => {
       expect(JSON.parse(captured.read().stdout)).toEqual({
         error: {
           code: "RECOVERY_REQUIRED",
-          message: "This HRA build is older than the local state schema (42 vs 41); install the newer HRA.",
+          message: "This HRA build is older than the local state schema (44 vs 43); install the newer HRA.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
       expect(daemonStarts).toBe(0);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(42);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(44);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6290,7 +6365,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["The local state schema needs a migration (35 to 41). Run `hra daemon start` to migrate it."],
+          problems: ["The local state schema needs a migration (35 to 43). Run `hra daemon start` to migrate it."],
           state: { database: "invalid", initialized: false },
         },
       });
@@ -6317,7 +6392,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["This HRA build is older than the local state schema (42 vs 41). Install the newer HRA."],
+          problems: ["This HRA build is older than the local state schema (44 vs 43). Install the newer HRA."],
           state: { database: "invalid", initialized: false },
         },
       });

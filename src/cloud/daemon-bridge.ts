@@ -155,6 +155,7 @@ const maximumEventsPerChunk = 128;
 const maximumChunksPerRemoteSession = 8;
 const maximumProjectionRecoveryBaselineInteractions = 200;
 const maximumCommandsPerCycle = 32;
+const maximumCapacityBackedCommandsPerPage = 8;
 const maximumJournalRecoveriesPerCycle = 4;
 // Device commands are foreground requests. A small per-cycle budget keeps a
 // burst from crowding out session steering, and the daily cap bounds the rest.
@@ -497,6 +498,7 @@ export type CloudDaemonActivity = Readonly<{
 
 export type CloudDaemonCycleResult = Readonly<{
   activity?: CloudDaemonActivity;
+  commandRequestVersion: 2 | null;
   commandsApplied: number;
   commandsUnsettled: number;
   errors: readonly string[];
@@ -504,6 +506,11 @@ export type CloudDaemonCycleResult = Readonly<{
   remoteSessions: readonly RemoteCloudSession[];
   sessionsUploaded: number;
   usageUploaded: number;
+}>;
+
+export type CloudDaemonCycleOptions = Readonly<{
+  /** Bypass the heartbeat cache so an explicit sync proves current hosted capability. */
+  forceDeviceRegistryPublication?: boolean;
 }>;
 
 export type CompactProjectionRecoveryResult = Readonly<{
@@ -638,7 +645,10 @@ export type CloudLiveTickResult = Readonly<{
 
 export interface CloudDaemonBridge {
   close?(): Promise<void>;
-  cycle(signal: AbortSignal): Promise<CloudDaemonCycleResult>;
+  cycle(
+    signal: AbortSignal,
+    options?: CloudDaemonCycleOptions,
+  ): Promise<CloudDaemonCycleResult>;
   observeAttentionNotificationAuthority?(
     signal: AbortSignal,
   ): Promise<NotificationEmailHostedAuthority>;
@@ -808,7 +818,9 @@ type ExactCloudCommand = CloudCommand & Readonly<{
   targetDevicePublicId: string;
 }>;
 
-type CloudCommandMetadata = Omit<CloudCommand, "payload">;
+type CloudCommandMetadata = Omit<CloudCommand, "payload"> & Readonly<{
+  lifecycleCapacityReady: boolean;
+}>;
 
 type CloudCommandMetadataPage = Readonly<{
   continueCursor: string;
@@ -1507,7 +1519,7 @@ function isResultBearingDeviceCommandTerminal(command: CloudDeviceCommand): bool
 type CloudDeviceCommandMetadata = Omit<
   CloudDeviceCommand,
   "payload" | "requestDigest" | "requestingDevicePublicId" | "targetDevicePublicId"
->;
+> & Readonly<{ lifecycleCapacityReady: boolean }>;
 
 function parseCloudDeviceCommandMetadataPage(value: unknown): Readonly<{
   continueCursor: string;
@@ -1547,6 +1559,7 @@ function parseCloudDeviceCommandMetadataPage(value: unknown): Readonly<{
         "createdAt",
         "deadline",
         "kind",
+        "lifecycleCapacityReady",
         "publicId",
         "state",
         "updatedAt",
@@ -1554,6 +1567,7 @@ function parseCloudDeviceCommandMetadataPage(value: unknown): Readonly<{
       || (entry.boundAuthority !== undefined && boundAuthority === null)
       || !isFiniteTimestamp(entry.createdAt)
       || !isFiniteTimestamp(entry.deadline)
+      || typeof entry.lifecycleCapacityReady !== "boolean"
       || !isFiniteTimestamp(entry.updatedAt)
       || !isDeviceCommandKind(entry.kind)
       || !isUuidV7(entry.publicId)
@@ -1572,6 +1586,7 @@ function parseCloudDeviceCommandMetadataPage(value: unknown): Readonly<{
       createdAt: entry.createdAt,
       deadline: entry.deadline,
       kind: entry.kind,
+      lifecycleCapacityReady: entry.lifecycleCapacityReady,
       publicId: entry.publicId,
       ...(entry.requestCommitmentVersion === 2
         ? { requestCommitmentVersion: 2 as const }
@@ -1757,6 +1772,7 @@ function parseCloudCommandMetadata(value: unknown): CloudCommandMetadata {
     "createdAt",
     "deadline",
     "kind",
+    "lifecycleCapacityReady",
     "publicId",
     "sessionPublicId",
     "state",
@@ -1771,6 +1787,7 @@ function parseCloudCommandMetadata(value: unknown): CloudCommandMetadata {
     (value.boundAuthority !== undefined && boundAuthority === null)
     || !isFiniteTimestamp(value.createdAt)
     || !isFiniteTimestamp(value.deadline)
+    || typeof value.lifecycleCapacityReady !== "boolean"
     || kind === null
     || !isUuidV7(value.publicId)
     || (value.requestCommitmentVersion !== undefined && value.requestCommitmentVersion !== 2)
@@ -1786,6 +1803,7 @@ function parseCloudCommandMetadata(value: unknown): CloudCommandMetadata {
     createdAt: value.createdAt,
     deadline: value.deadline,
     kind,
+    lifecycleCapacityReady: value.lifecycleCapacityReady,
     publicId: value.publicId,
     ...(value.requestCommitmentVersion === 2 ? { requestCommitmentVersion: 2 as const } : {}),
     ...(typeof value.resultCode === "string" ? { resultCode: value.resultCode } : {}),
@@ -2465,11 +2483,15 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     await this.#disconnectPresenceBestEffort();
   }
 
-  async cycle(signal: AbortSignal): Promise<CloudDaemonCycleResult> {
+  async cycle(
+    signal: AbortSignal,
+    options: CloudDaemonCycleOptions = {},
+  ): Promise<CloudDaemonCycleResult> {
     if (this.#closed) throw new Error("The cloud daemon bridge is closed.");
     return await this.#exclusive(async () => {
       const result = {
         activity: { localTurnActive: false, peerDevicePresent: false } as CloudDaemonActivity,
+        commandRequestVersion: null as 2 | null,
         commandsApplied: 0,
         commandsUnsettled: 0,
         errors: [] as string[],
@@ -2496,7 +2518,9 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           publishedNotificationPolicyRevision = await this.#publishDeviceRegistry(
             identity,
             signal,
+            options.forceDeviceRegistryPublication === true,
           );
+          result.commandRequestVersion = 2;
         } catch (error: unknown) {
           if (signal.aborted) throw error;
           // A target must not execute commands until its marker-2 capability
@@ -4109,6 +4133,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   async #publishDeviceRegistry(
     identity: ActiveCloudIdentity,
     signal: AbortSignal,
+    forcePublication: boolean,
   ): Promise<number | null> {
     const readProjection = this.#local.readDeviceRegistryProjection?.bind(this.#local);
     const readRegistry = this.#local.readDeviceRegistry?.bind(this.#local);
@@ -4152,7 +4177,8 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     const now = this.#now();
     const cached = this.#deviceRegistryState;
     if (
-      cached !== null
+      !forcePublication
+      && cached !== null
       && cached.digest === digest
       && now - cached.publishedAt < deviceRegistryHeartbeatMs
     ) return notificationPolicyRevision ?? null;
@@ -5029,7 +5055,19 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           continue;
         }
         if (entry.phase === "terminal") {
-          const retained = await this.#readDeviceCommandRecovery(entry, identity);
+          // A terminal journal entry no longer carries its pre-terminal phase.
+          // Reconstruct the only phase that could have produced it so an exact
+          // result-less hosted terminal can be confirmed without replaying the
+          // provider effect. Prepared failures are the sole no-effect terminal
+          // shape; every other locally terminal result crossed effect_started.
+          const recoveryEntry: Extract<
+            CloudDeviceCommandJournalEntry,
+            { phase: "prepared" | "effect_started" }
+          > = entry.terminalState === "failed"
+              && preparedFailureResultCodes.has(entry.resultCode)
+            ? { ...entry, phase: "prepared" }
+            : { ...entry, phase: "effect_started" };
+          const retained = await this.#readDeviceCommandRecovery(recoveryEntry, identity);
           if (retained === null) {
             await this.#mutateJournal((state) =>
               removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
@@ -5041,6 +5079,20 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
             // replaying a local settle is neither necessary nor permitted.
             await this.#mutateJournal((state) =>
               removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+            continue;
+          }
+          if (
+            retained.command.resultCode === undefined
+            && (
+              retained.command.state === "cancelled"
+              || retained.command.state === "expired"
+              || retained.command.state === "ambiguous"
+            )
+          ) {
+            await this.#confirmDeviceCommandTerminalRecovery(
+              recoveryEntry,
+              retained.command.state,
+            );
             continue;
           }
           if (
@@ -5080,8 +5132,8 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
 
     if (commandBudgetRemaining > 0) {
       const nonterminal = parseCloudDeviceCommandMetadataPage(await this.#transport.query(
-        "deviceCommands:listNonterminalForTargetPage",
-        { paginationOpts: { cursor: null, numItems: maximumDeviceCommandsPerCycle } },
+        "deviceCommands:listCapacityRecoverableForTarget",
+        { limit: maximumDeviceCommandsPerCycle },
       ));
       await this.#assertDaemonCurrent(signal);
       for (const metadata of nonterminal.page) {
@@ -5471,7 +5523,16 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       // Only a terminal won while the command was still pending can legitimately
       // have no bound daemon authority. The confirming mutation below must still
       // prove that exact terminal before local evidence is retired.
-      else if (remote.state !== "cancelled" && remote.state !== "expired") {
+      else if (
+        remote.state !== "cancelled"
+        && remote.state !== "expired"
+        // A source-bound break-glass migration may abandon a pre-reservation
+        // effect as result-less ambiguous and drop its bound authority to fund
+        // the cleanup evidence. This read alone grants nothing: the exact
+        // server-side operatorAbandonedAt shape and converted security event
+        // still have to pass confirmTerminalRecovery below.
+        && !(remote.state === "ambiguous" && entry.phase === "effect_started")
+      ) {
         throw new Error("Cloud device command recovery authority is invalid.");
       }
     }
@@ -6018,8 +6079,8 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     let pendingScanComplete = false;
     for (let pageNumber = 0; pageNumber < 50 && !pendingScanComplete; pageNumber += 1) {
       const result = parseCloudCommandMetadataPage(await this.#transport.query(
-        "commands:listNonterminalForTargetPage",
-        { paginationOpts: { cursor, numItems: cloudLimits.pageSize } },
+        "commands:listCapacityNonterminalForTargetPage",
+        { paginationOpts: { cursor, numItems: maximumCapacityBackedCommandsPerPage } },
       ));
       for (const command of result.page) {
         if (nonterminalIds.has(command.publicId) || isTerminalCommandState(command.state)) {
@@ -6048,6 +6109,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       selectedLaneKeys.add(laneKey);
       if (
         command.state !== "pending"
+        || !command.lifecycleCapacityReady
         || alreadyJournaled.has(command.publicId)
         || (!decisionLane && initiallyBlockedSessionIds.has(command.sessionPublicId))
       ) continue;
@@ -6157,6 +6219,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     const missingRecovery = nonterminal
       .filter((command) =>
         (command.state === "prepared" || command.state === "effect_started")
+        && command.lifecycleCapacityReady
         && !journalIds.has(command.publicId))
       .sort((left, right) =>
         Number(right.state === "effect_started") - Number(left.state === "effect_started")

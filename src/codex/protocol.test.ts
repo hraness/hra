@@ -719,6 +719,14 @@ describe("pinned server requests and safe notifications", () => {
       prompt: "continue",
       schedule: { kind: "interval_minutes", minutes: 15 },
     })).toThrow(CodexError);
+    for (const separator of [String.fromCodePoint(0x2028), String.fromCodePoint(0x2029)]) {
+      expect(() => parseArguments({
+        mode: "create",
+        name: `Review${separator}forged`,
+        prompt: "continue",
+        schedule: { kind: "interval_minutes", minutes: 15 },
+      })).toThrow(CodexError);
+    }
     expect(() => parseArguments({
       mode: "create",
       name: "Review",
@@ -751,6 +759,19 @@ describe("pinned server requests and safe notifications", () => {
       expect(parsed.provider.requestDigest).toMatch(/^[a-f0-9]{64}$/u);
       expect(JSON.stringify(parsed.display)).not.toContain("git push origin main");
     }
+
+    const lineSeparated = parseBrokeredCodexServerRequest({
+      authority: { profileId: "profile-a", processGeneration: 9 },
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      requestId: { type: "string", value: "line-separated" },
+      method: "item/commandExecution/requestApproval",
+      params: {
+        ...(brokeredFixtures["item/commandExecution/requestApproval"] as Record<string, unknown>),
+        reason: `line${String.fromCodePoint(0x2028)}forged${String.fromCodePoint(0x2029)}paragraph`,
+      },
+    });
+    expect(JSON.stringify(lineSeparated.display)).not.toContain(String.fromCodePoint(0x2028));
+    expect(JSON.stringify(lineSeparated.display)).not.toContain(String.fromCodePoint(0x2029));
 
     const fileChange = parseBrokeredCodexServerRequest({
       authority: { profileId: "profile-a", processGeneration: 9 },

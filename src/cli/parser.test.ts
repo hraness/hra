@@ -310,6 +310,26 @@ describe("CLI parser", () => {
     expect(parsed.kind).toBe("session.attach");
     if (parsed.kind !== "session.attach") return;
     expect(typeof parsed.command.idempotencyKey).toBe("string");
+    expect(parsed.legacyAttachmentReplay).toBe(false);
+
+    const key = "00000000-0000-4000-8000-000000000209";
+    for (const action of ["send", "steer"] as const) {
+      const replay = parseCli([
+        "session", action, "s", "--attach", "a.png", "hello",
+        "--idempotency-key", key,
+      ]);
+      expect(replay).toMatchObject({
+        kind: "session.attach",
+        legacyAttachmentReplay: true,
+      });
+    }
+    expect(parseCli([
+      "session", "queue", "s", "--attach", "a.png", "hello",
+      "--idempotency-key", key,
+    ])).toMatchObject({
+      kind: "session.attach",
+      legacyAttachmentReplay: false,
+    });
   });
 
   test("chooses a session provider and its default preset", () => {
@@ -377,7 +397,7 @@ describe("CLI parser", () => {
     ])).toThrow("also requires --preset-contract");
     expect(() => parseCli([
       "session", "start", "work", "--preset", "high", "--preset-contract", "2",
-    ])).toThrow("replay-only and requires --idempotency-key");
+    ])).toThrow("requires an explicit --idempotency-key");
   });
 
   test("keeps stable starts byte-compatible and rejects source contracts elsewhere", () => {
@@ -454,7 +474,7 @@ describe("CLI parser", () => {
     ])).toThrow("also requires --preset-contract");
     expect(() => parseCli([
       "session", "switch", "s", "--provider", "codex", "--preset-contract", "2",
-    ])).toThrow("replay-only and requires --idempotency-key");
+    ])).toThrow("requires an explicit --idempotency-key");
     expect(parseCli([
       "session", "switch", "s", "--provider", "claude",
       "--idempotency-key", switchReplayKey,

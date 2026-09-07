@@ -274,13 +274,13 @@ export const siteDocumentPaths: readonly string[] = [
 export const publicReleaseState: "live" | "release-ready" | "staged" = "release-ready";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
-  "https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz",
+  "https://github.com/hraness/hra/releases/download/v0.6.1/hraness-hra-0.6.1.tgz",
 );
 
 const productName = "HRA";
 const tagline = "Control plane for Codex and Claude Code";
 const providerRoadmap = "Codex and Claude Code, side by side.";
-const releaseVersion = "0.6.0";
+const releaseVersion = "0.6.1";
 
 /** Public runtime pins come from their authoritative source modules. */
 export const publicPins = {
@@ -406,7 +406,7 @@ export const publicContent: PublicContent = {
       {
         label: "Switch",
         command: "hra session switch <session-id> --provider claude --preset fable-max",
-        detail: "Move the next turns to your signed-in Claude Code profile. The HRA conversation stays intact.",
+        detail: "Move the next turns to your signed-in Claude Code profile. The bounded retained HRA conversation record remains available, with any retention gap stated explicitly.",
       },
       {
         label: "Direct",
@@ -538,7 +538,7 @@ export const publicContent: PublicContent = {
           ],
         },
         paragraph(
-          text("The single install command streams the exact v0.6.0 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.6.0 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation recovers or removes only the proven private stage. Existing trustedDependencies remain unchanged."),
+          text("The single install command removes ambient Bun, Node, and native-library injection variables before either download or Bun startup, disables Bun dotenv loading, and selects /dev/null as the only Bun configuration. Curl and the loader independently cap the streamed preflight at 512 KiB, and the loader refuses an overrun before transpilation or installation. It then verifies and executes the exact v0.6.1 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.6.1 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The detached staging worker and its Bun package-install child repeat the runtime neutralization while retaining the configured registry, proxy, and certificate trust inputs needed for dependency resolution. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation of that exact release's installer recovers or removes only the proven private stage; another release's installer refuses the durable intent. The invoking shell, PATH-selected pinned Bun binary, configured package registry and transport trust, operating system, and same-UID account remain trust boundaries. Existing trustedDependencies remain unchanged."),
         ),
         { kind: "subheading", text: "Update runbook" },
         paragraph(
@@ -547,9 +547,18 @@ export const publicContent: PublicContent = {
         orderedList(
           {
             content: [
+              text("Settle any durable installer intent left by an interrupted installation. An installer refuses "),
+              code("$BUN_INSTALL/install/hra/install-intent.json"),
+              text(" when the intent is invalid or belongs to another release. Do not edit or delete that file or its staging or version directories. Rerun the exact immutable install command from the originating release's trusted README or release notes and require the exact "),
+              code("hra-install-safe"),
+              text(" success output. If that installer refuses the intent, stop for manual review; after success, restart this runbook with the current release. Establish the originating tag independently; never execute a URL or command copied only from the intent, and stop for manual review if the tag is uncertain. This recovers only local installer state. It is not authorization to retry, rerun, or mutate that release's GitHub Actions workflow, tag, GitHub Release, or npm publication."),
+            ],
+          },
+          {
+            content: [
               text("Resolve keyed local mutations under the installed release. For a Codex High or Ultra "),
               code("session start"),
-              text(", or a source-sensitive provider switch that explicitly or implicitly selects either alias, replay the exact idempotency key using the originating release's own syntax and source evidence. Resolve an affected Work mutation by replaying its exact request document. Continue only when exact replay under the originating release, or that release's documented kind-specific recovery, reaches a terminal settlement. Otherwise the update remains blocked. If that release has no explicit source-contract flag, use only its exact syntax; do not invent an unsupported option or infer an old alias meaning from the new release."),
+              text(", or a source-sensitive provider switch that explicitly or implicitly selects either alias, replay the exact idempotency key using the originating release's own syntax and source evidence. Resolve an affected Work mutation by replaying its exact request document. A v42 attachment-bearing send or steer should likewise be replayed under v42 before updating whenever that release remains usable; retain the exact original message, attachment path and basename, and explicit key if migration has already occurred and the narrow v43 bridge below is required. Continue only when exact replay under the originating release, or that release's documented kind-specific recovery, reaches a terminal settlement. Otherwise the update remains blocked. If that release has no explicit source-contract flag, use only its exact syntax; do not invent an unsupported option or infer an old alias meaning from the new release."),
             ],
           },
           {
@@ -570,7 +579,7 @@ export const publicContent: PublicContent = {
             content: [
               text("Reconcile every uncertain CLI session-command enqueue by repeating the exact remote request with its exact idempotency key. Let HRA's durable local outbox reconcile the response, retain every returned session-command ID, and inspect each one with "),
               code("hra remote command <uuidv7>"),
-              text(". For a browser or device command, use the current tab's retained command handle and idempotency identity, then inspect it through the app or the corresponding hosted query. Never edit or delete the local command journal, local outbox, tab state, or hosted row to force progress."),
+              text(". For a browser or device command, retain the current tab's returned command handle and public ID, then inspect it through the app or the corresponding hosted query. The app does not expose its internal idempotency key and must not synthesize a resend. Never edit or delete the local command journal, local outbox, tab state, or hosted row to force progress."),
             ],
           },
           {
@@ -587,7 +596,7 @@ export const publicContent: PublicContent = {
           },
           {
             content: [
-              text("Install the exact immutable release, then verify the installed version and offline health. This is the verified repair installation for v0.6.0:"),
+              text("Install the exact immutable release, then verify the installed version and offline health. This is the verified repair installation for v0.6.1:"),
             ],
             commands: [
               betaInstallCommand,
@@ -600,17 +609,30 @@ export const publicContent: PublicContent = {
           },
           {
             content: [
+              text("Before starting any current daemon, require the hosted operator to deploy the additive candidate from this release's exact reviewed source, then run the source- and runtime-bound command-capacity status and repair workflow in "),
+              code("docs/hosted-sync.md"),
+              text(". Accept only its protected two-pass zero-debt capacity evidence together with the exact .activated receipt produced after hosted activation and readback for that candidate and numeric target. The capacity evidence alone is not readiness. The hosted activation tuple opens the exact-runtime gate; the later local .activated publication proves the readback and is required before declaring writers ready, but does not itself open that gate. A hard-full legacy owner, partial capacity set, unreserved command debt, unsafe cleanup shape, interrupted intent, candidate swap, concurrent debt, missing activation, or failed readback blocks the update. The Vercel app may auto-deploy earlier, but that UI is not command readiness or effect authority and its commands should receive expected pre-insertion refusals while the runtime gate is closed."),
+            ],
+          },
+          {
+            content: [
               text("Start the current daemon. This is the no-downgrade boundary: after this command begins, never launch an older daemon against the same state root. Prove post-migration health before syncing, then inspect every retained CLI session-command ID:"),
             ],
             commands: [
               "hra daemon start",
               "hra doctor --offline",
-              "hra sync now",
+              "hra sync now --json",
               "hra sync status",
               "hra remote command <uuidv7>",
             ],
             afterCommands: [
-              text("Require the post-start doctor command to succeed before sync. Sync status reports projection recovery, not the command outbox. Use retained CLI session-command IDs for remote-command inspection; inspect browser and device commands through the app or corresponding hosted query."),
+              text("Require the post-start doctor command to succeed before sync. If migration retained a v42 send or steer that stopped after preparation but before its attachment manifest or provider effect, replay it now with the same command kind, session, message, original attachment path and basename, and explicit idempotency key. The current CLI admits an earlier-policy-only basename only on this keyed local replay, and the daemon requires the original durable request digest before resolving the blob or contacting a provider. Any missing or changed field fails without a new mutation; fresh sends, steers, queued messages, and hosted payloads remain on the current name rule. For every intended target, require the sync-now response to contain "),
+              code("data.online: true"),
+              text(" and "),
+              code("data.errorCount: 0"),
+              text(", and "),
+              code("data.commandRequestVersion: 2"),
+              text("; a pending device identity or failed registry publication leaves the last field null, and the command exits zero even when its bounded diagnostics report a registry-publication failure. There is no per-target writer switch. Finish all intended target proofs before deploying marker-emitting writer clients globally, or accept and monitor the expected pre-insertion refusals on ungated or mismatched targets. Old clients and targets whose markers are both absent remain compatible. Sync status reports projection recovery, not the command outbox. Use retained CLI session-command IDs for remote-command inspection; inspect browser and device commands through the app or corresponding hosted query."),
             ],
           },
           {
@@ -629,7 +651,15 @@ export const publicContent: PublicContent = {
               code("failed"),
               text(" with "),
               code("LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT"),
-              text(". Retry only a failed-before-effect request, only after its initiating client is also current, and use a fresh idempotency key. Retain the new command ID. Never automatically retry an ambiguous command. Each daemon privately publishes its command-request version before processing commands. Fresh requests must exactly match that target: current-to-current and legacy-to-legacy are accepted, while either mixed-version direction is rejected before a command or quota record is written. Exact same-key replay remains available across a later target upgrade or downgrade, but changing versions under one key conflicts. A registry-publication failure skips both command queues for that cycle, and every marker-2 command also requires a current executor marker before prepare or effect start. Hosted operators deploy the additive gate first, then may upgrade daemons and marker-emitting clients independently per target; no all-daemons pause or account-wide legacy drain is required."),
+              text(". Retry only a failed-before-effect request, only after its initiating client is also current, and use a fresh idempotency key. Retain the new command ID. Never automatically retry an ambiguous command. Each daemon privately publishes its command-request version before processing commands. A fresh request is inserted only when its marker exactly matches the target's last stored registry marker and the hosted runtime's capacity activation tuple exactly matches its compiled release attestation. A marker or activation mismatch is rejected before the command, quota charge, or security event is written. A stale matching target marker can exist during an upgrade or downgrade window, but a candidate redeploy invalidates the hosted activation, and the executor checks stop a mismatched binary before prepare or provider effect while recovery paths classify retained rows conservatively. Exact same-key replay remains available across a later target or runtime change, but changing versions under one key conflicts. A registry-publication failure skips both command queues for that cycle, and every marker-2 command also requires current target and hosted activation markers before a new prepare or effect start. The hosted tuple, not the local receipt publication, opens the runtime gate. Accept the protected capacity evidence and its .activated readback receipt from the prerequisite above before declaring writers ready. Require one "),
+              code("hra sync now --json"),
+              text(" result with "),
+              code("data.online: true"),
+              text(" and "),
+              code("data.errorCount: 0"),
+              text(", and "),
+              code("data.commandRequestVersion: 2"),
+              text(", before treating marker-emitting writers as globally available. The Vercel app can auto-deploy from main earlier; that UI is not readiness, and its commands should receive expected pre-insertion refusals until capacity activation and target-marker proof exist. No all-daemons pause or account-wide legacy drain is required."),
             ],
           },
         ),
@@ -819,7 +849,7 @@ export const publicContent: PublicContent = {
         ),
         { kind: "subheading", text: "Claude Code and provider switching" },
         paragraph(
-          text("Start directly with Claude Code by selecting its provider and reviewed preset, or move an idle session between providers. A switch preserves HRA's provider-neutral conversation record but starts a fresh provider-native runtime; it refuses an active turn, an unsettled provider effect, an unsigned target profile, or a preset that belongs to another provider. If a Claude controller is no longer available, HRA can recover the exact conversation with "),
+          text("Start directly with Claude Code by selecting its provider and reviewed preset, or move an idle session between providers. A switch seeds a fresh provider-native runtime from the latest retained tail of HRA's provider-neutral conversation record; it does not move a provider-native thread. From the point the v0.6 daemon begins recording a session, that record covers accepted direct, queued, Work and scheduled automation, autorespond, and provider-switch handoff messages with actor provenance. It does not backfill provider history from before a personal-home session was admitted or user turns from before a v0.5 installation was upgraded, and those origin gaps do not set the current retention-gap field. Attachments are represented only by byte-free manifests containing bounded names, media types, sizes, and digests. Retention is capped at 50,000 events, 64 MiB, and seven days; when pruning has occurred, switch seeds and exports state the retention reason and leave the unavailable older count unknown. A switch refuses an active turn, an unsettled provider effect, an unsigned target profile, or a preset that belongs to another provider. If a Claude controller is no longer available, HRA can recover the exact conversation with "),
           code("--resume"),
           text(" only after prior-process exit or an already-completed exact process release is proven. Ambiguous custody stays fenced in recovery without launching another process."),
         ),
@@ -1153,7 +1183,16 @@ export const publicContent: PublicContent = {
           code("default"),
           text(" to clear the override. Questions and MCP forms are never answered automatically. A session stops autoresponding after three consecutive answers without a human message, ten in an hour, or forty in a day, and "),
           code("hra autorespond status"),
-          text(" shows the counters and the last twenty evidence rows. Notification hours do not change these eligibility rules or budgets."),
+          text(" shows the counters and the last twenty evidence rows. Only an actual human-authored message resets the consecutive counter; Work and scheduled automation, autorespond, and provider-switch handoff messages do not. Notification hours do not change these eligibility rules or budgets."),
+        ),
+        paragraph(
+          text("Configuring a gateway key explicitly enables the separate prose-approval path. After strict local gates establish that a completed final assistant message asks only for consent, HRA sends at most its final 4,000 characters plus session-state and approval-reason metadata to Vercel AI Gateway model "),
+          code("openai/gpt-5-nano"),
+          text(". It makes one request with a 10-second deadline and no retry. The model cannot create arbitrary text that HRA will send: the daemon emits either "),
+          code("The human has approved. Proceed accordingly."),
+          text(" or a byte-exact substring already present in the assistant message. A timeout, refusal, or other failure leaves the turn for the human. "),
+          code("hra autorespond gateway clear"),
+          text(" disables this prose path."),
         ),
         paragraph(
           text("For snapshot-to-stream continuity, start selected-session monitoring at the atomic status cursor. "),
@@ -1233,7 +1272,11 @@ export const publicContent: PublicContent = {
         paragraph(
           text("HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; "),
           code("hra session show"),
-          text(" displays it with the provider-neutral transcript. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof, and stream formats. Each provider remains authoritative for its native permissions, tools, and hidden runtime state."),
+          text(" displays the bound provider's history and recorded public profile. Read the provider-neutral HRA record with "),
+          code("hra session export"),
+          text(" or the transcript endpoint. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code public profiles include the pinned CLI, model, reasoning effort, default permission mode, and stream formats. HRA privately reviews the exact config-home authority for every Claude effect but omits that custody identity and legacy isolation marker from "),
+          code("session show"),
+          text("; managed and adopted personal-home sessions therefore share one non-identifying public shape. Each provider remains authoritative for its native permissions, tools, and hidden runtime state."),
         ),
         list(
           [code("low"), text(": Codex Luna Max, currently "), code("gpt-5.6-luna"), text(" with "), code("max"), text(" reasoning.")],
@@ -1440,7 +1483,7 @@ export const publicContent: PublicContent = {
             "hra session watch <session> [--cursor <cursor>] [--jsonl]",
             "hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
             "hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]",
-            "hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast] [--idempotency-key <uuid> --preset-contract <1|2>]",
+            "hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast] [--idempotency-key <uuid> [--preset-contract <1|2>]]",
             "hra session send|queue|steer <session> [--attach <path>]... <message>",
             "hra session stop|recover|abandon <session>",
             "hra session rename <session> <name>",
@@ -1449,7 +1492,7 @@ export const publicContent: PublicContent = {
             "hra session note set <session> <note>",
             "hra session state <session> [--json]",
             "hra session preset <session> <low|high|ultra|fable-max>",
-            "hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>] [--idempotency-key <uuid> --preset-contract <1|2>]",
+            "hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>] [--idempotency-key <uuid> [--preset-contract <1|2>]]",
             "hra session export <session> [--format <trajectory|json>] [--out <path>]",
             "hra session fast <session> <on|off>",
             "hra session project <session> <project>",
@@ -1505,7 +1548,7 @@ export const publicContent: PublicContent = {
           code("--idempotency-key"),
           text(" and its immutable "),
           code("--preset-contract"),
-          text("; do not omit or change either after an update. The preset-contract option is replay-only and is rejected for stable requests. A source-matched applied request replays its result, an effect-started request remains recovery-required, and a fresh absent or inactive source contract is refused before a provider effect."),
+          text("; do not omit or change either after an update. The preset-contract option is a source-binding field that requires an explicit idempotency key and is rejected for stable requests. With an existing key, a source-matched applied request replays its result and an effect-started request remains recovery-required. With a key that has no stored row, only this build's active source contract may authorize the one fresh effect; the field cannot select a retired route."),
         ),
         paragraph(
           text("An older session-start release did not print the source contract, so its exact historical alias meaning must be supplied explicitly when replaying its key. For a v0.5.0 Codex start that omitted the then-default preset, preserve every other original option and add "),

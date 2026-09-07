@@ -2,7 +2,11 @@ import { isAbsolute, normalize } from "node:path";
 
 import { z } from "zod";
 
-import { attachmentReferenceListSchema } from "./attachment-schemas";
+import {
+  attachmentReferenceListSchema,
+  legacyAttachmentReferenceListSchema,
+} from "./attachment-schemas";
+import { isAttachmentName } from "./attachments";
 import {
   activePresetBinding,
   adoptableProviderSchema,
@@ -85,6 +89,7 @@ const projectPathSchema = z.string().min(1).max(4096).refine(
 export const LOCAL_DAEMON_PROTOCOL = "hra-control-plane-local-v2" as const;
 export const LOCAL_COMMAND_REQUEST_VERSION = 2 as const;
 export const LOCAL_COMMAND_REQUEST_MAX_BYTES = 4 * 1024 * 1024;
+export const LOCAL_COMMAND_RESPONSE_MAX_BYTES = 4 * 1024 * 1024;
 
 const daemonStopAuthoritySchema = z.object({
   protocol: z.literal(LOCAL_DAEMON_PROTOCOL),
@@ -425,9 +430,9 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   // attachment serializes exactly as it did before attachments existed. The
   // references name digests in local custody; no path ever crosses this
   // boundary.
-  z.object({ kind: z.literal("session.send"), session: selectorSchema, message: messageSchema, attachments: attachmentReferenceListSchema.optional(), idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("session.send"), session: selectorSchema, message: messageSchema, attachments: legacyAttachmentReferenceListSchema.optional(), idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.queue"), session: selectorSchema, message: messageSchema, attachments: attachmentReferenceListSchema.optional(), idempotencyKey: idempotencyKeySchema }).strict(),
-  z.object({ kind: z.literal("session.steer"), session: selectorSchema, message: messageSchema, attachments: attachmentReferenceListSchema.optional(), idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("session.steer"), session: selectorSchema, message: messageSchema, attachments: legacyAttachmentReferenceListSchema.optional(), idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.stop"), session: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.rename"), session: selectorSchema, name: titleSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.archive"), session: selectorSchema, archived: z.boolean() }).strict(),
@@ -476,6 +481,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     session: selectorSchema,
     after: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     limit: z.number().int().min(1).max(TRANSCRIPT_PAGE_LIMIT),
+    tail: z.boolean().optional(),
   }).strict(),
   z.object({ kind: z.literal("session.fast"), session: selectorSchema, enabled: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.project"), session: selectorSchema, project: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
@@ -640,6 +646,17 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     waitMs: z.number().int().min(0).max(WORK_WAIT_MAX_MS),
   }).strict(),
 ]).superRefine((command, context) => {
+  if (
+    (command.kind === "session.send" || command.kind === "session.steer")
+    && command.attachments?.some((attachment) => !isAttachmentName(attachment.name)) === true
+    && command.idempotencyKey === undefined
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["attachments"],
+      message: "A predecessor attachment name is accepted only for an explicit idempotent send or steer replay.",
+    });
+  }
   if (
     command.kind === "session.start"
     && !isReboundCodexPreset(command.preset)

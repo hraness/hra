@@ -182,6 +182,7 @@ type FakeCommand = {
   createdAt: number;
   deadline: number;
   kind: CommandKind;
+  lifecycleCapacityReady?: boolean;
   payload: EncryptedEnvelope;
   publicId: string;
   requestCommitmentVersion?: 2;
@@ -206,6 +207,8 @@ type FakeDeviceCommand = {
   createdAt: number;
   deadline: number;
   kind: DeviceCommandKind;
+  lifecycleCapacityReady?: boolean;
+  operatorAbandonedAt?: number;
   payload: EncryptedEnvelope;
   publicId: string;
   requestCommitmentVersion?: 2;
@@ -370,6 +373,7 @@ class FakeCloud {
   readonly deviceCommandPrepareCalls: string[] = [];
   readonly deviceCommandPreparedFailureCalls: string[] = [];
   readonly deviceCommandRecoveryCalls: Readonly<Record<string, unknown>>[] = [];
+  readonly deviceCommandTerminalRecoveryCalls: Readonly<Record<string, unknown>>[] = [];
   readonly deviceCommandSettleCalls: Readonly<Record<string, unknown>>[] = [];
   readonly accounts = new Map<string, {
     encryptedLocalReference: EncryptedEnvelope;
@@ -512,6 +516,10 @@ class FakeCloud {
       state: command.state,
       updatedAt: command.updatedAt,
     });
+    const publicCapacityCommandMetadata = (command: FakeCommand) => ({
+      ...publicCommandMetadata(command),
+      lifecycleCapacityReady: command.lifecycleCapacityReady !== false,
+    });
     const publicDeviceCommand = (command: FakeDeviceCommand) => ({
       ...(command.boundAuthority === undefined
         ? {}
@@ -541,6 +549,10 @@ class FakeCloud {
       delete projected.requestingDevicePublicId;
       return projected;
     };
+    const publicCapacityDeviceCommandMetadata = (command: FakeDeviceCommand) => ({
+      ...publicDeviceCommandMetadata(command),
+      lifecycleCapacityReady: command.lifecycleCapacityReady !== false,
+    });
     const publicPresence = (presence: FakePresence | undefined) => ({
       connectionId: presence?.connectionId ?? null,
       lastSeenAt: presence?.lastSeenAt ?? null,
@@ -998,8 +1010,12 @@ class FakeCloud {
           const command = this.requireCommand(args.commandPublicId);
           const localPhase = args.localPhase as "prepared_no_effect" | "effect_started";
           const staleAuthority = args.staleAuthority as AuthorityTuple;
+          const legacyNoEffectExpired = command.state === "expired"
+            && command.boundAuthority === undefined
+            && command.resultCode === undefined
+            && command.resultDigest === undefined;
           const authorityMatches = command.boundAuthority === undefined
-            ? localPhase === "prepared_no_effect"
+            ? localPhase === "prepared_no_effect" || legacyNoEffectExpired
             : sameAuthorityTuple(command.boundAuthority, staleAuthority);
           const terminalMatches = command.state === "cancelled"
             || command.state === "expired"
@@ -1196,6 +1212,7 @@ class FakeCloud {
           return { publicId: command.publicId, replay: true, state: "ambiguous" };
         }
         if (name === "deviceCommands:confirmTerminalRecovery") {
+          this.deviceCommandTerminalRecoveryCalls.push(args);
           if (this.failTerminalRecoveryConfirmationOnce) {
             this.failTerminalRecoveryConfirmationOnce = false;
             throw new Error("terminal recovery confirmation unavailable");
@@ -1203,14 +1220,28 @@ class FakeCloud {
           const command = this.requireDeviceCommand(args.commandPublicId);
           const localPhase = args.localPhase as "prepared_no_effect" | "effect_started";
           const staleAuthority = args.staleAuthority as AuthorityTuple;
+          const operatorAbandoned = command.operatorAbandonedAt !== undefined
+            && command.state === "ambiguous"
+            && command.boundAuthority === undefined;
+          const legacyNoEffectExpired = command.state === "expired"
+            && command.boundAuthority === undefined
+            && command.result === undefined
+            && command.resultCode === undefined
+            && command.resultDigest === undefined
+            && command.singleUseResult === undefined;
           const authorityMatches = command.boundAuthority === undefined
             ? localPhase === "prepared_no_effect"
+              || operatorAbandoned
+              || legacyNoEffectExpired
             : sameAuthorityTuple(command.boundAuthority, staleAuthority);
           const terminalMatches = command.state === "cancelled"
             || command.state === "expired"
             || (command.state === "ambiguous"
               && localPhase === "effect_started"
-              && this.revokedDevices.has(command.requestingDevicePublicId));
+              && (
+                this.revokedDevices.has(command.requestingDevicePublicId)
+                || operatorAbandoned
+              ));
           if (
             !authorityMatches
             || !terminalMatches
@@ -1323,17 +1354,23 @@ class FakeCloud {
           name === "commands:listPendingForTarget"
           || name === "commands:listPendingForTargetPage"
           || name === "commands:listNonterminalForTargetPage"
+          || name === "commands:listCapacityNonterminalForTargetPage"
         ) {
           const commands = [...this.commands.values()]
             .filter((command) =>
               command.targetDevicePublicId === devicePublicId
               && (name === "commands:listNonterminalForTargetPage"
+                || name === "commands:listCapacityNonterminalForTargetPage"
                 ? !["applied", "failed", "ambiguous", "cancelled", "expired"]
                   .includes(command.state)
                 : command.state === "pending"))
-            .map((command) => name === "commands:listNonterminalForTargetPage"
-              ? publicCommandMetadata(command)
-              : publicCommand(command));
+            .filter((command) => name !== "commands:listCapacityNonterminalForTargetPage"
+              || command.lifecycleCapacityReady !== false)
+            .map((command) => name === "commands:listCapacityNonterminalForTargetPage"
+              ? publicCapacityCommandMetadata(command)
+              : name === "commands:listNonterminalForTargetPage"
+                ? publicCommandMetadata(command)
+                : publicCommand(command));
           if (name === "commands:listPendingForTarget") return commands;
           if (this.forcePendingPaginationIncomplete) return {
             continueCursor: "0",
@@ -1447,6 +1484,18 @@ class FakeCloud {
             continueCursor: String(next),
             isDone: next >= commands.length,
             page,
+          };
+        }
+        if (name === "deviceCommands:listCapacityRecoverableForTarget") {
+          const commands = [...this.deviceCommands.values()]
+            .filter((command) =>
+              command.lifecycleCapacityReady !== false
+              && (command.state === "prepared" || command.state === "effect_started"))
+            .map(publicCapacityDeviceCommandMetadata);
+          return {
+            continueCursor: "capacity-recoverable-complete",
+            isDone: true,
+            page: commands.slice(0, args.limit as number),
           };
         }
         if (name === "deviceCommands:get") {
@@ -2634,7 +2683,12 @@ describe("cloud daemon bridge", () => {
 
     const result = await adapter.cycle(new AbortController().signal);
 
-    expect(result).toMatchObject({ errors: [], online: true, sessionsUploaded: 0 });
+    expect(result).toMatchObject({
+      commandRequestVersion: null,
+      errors: [],
+      online: true,
+      sessionsUploaded: 0,
+    });
     expect(registrationCalls).toBe(1);
     expect(cloud.presences.get("device_pending2")).toMatchObject({ sequence: 0 });
     expect(cloud.sessionHeadListCalls).toBe(0);
@@ -4497,6 +4551,61 @@ describe("cloud daemon bridge", () => {
     expect((await journal.read()).state.commands).toEqual([]);
   });
 
+  test("retires a predecessor session effect-started journal after no-effect operator expiry", async () => {
+    const cloud = new FakeCloud();
+    const executor = new RecordingExecutor();
+    const journal = new MemoryCloudDaemonJournal();
+    const sessionPublicId = "session_operator_expired";
+    const commandPublicId = uuidV7(7_217);
+    const staleAuthority = { bootGeneration: 1, bootId: "boot_12345678", fence: 1 };
+    await installRecoverableHead(cloud, sessionPublicId);
+    await cloud.enqueue(
+      "device_22222222",
+      sessionPublicId,
+      commandPublicId,
+      { kind: "stop" },
+    );
+    const command = cloud.requireCommand(commandPublicId);
+    // The predecessor advances local custody before hosted markEffectStarted.
+    // The operator later proves the hosted row stayed no-effect prepared and
+    // closes it without retaining the no-longer-live bound authority.
+    command.state = "expired";
+    delete command.boundAuthority;
+    const observed = await journal.read();
+    await journal.compareAndSwap(observed.generation, {
+      ...observed.state,
+      commands: [{
+        authority: staleAuthority,
+        commandPublicId,
+        kind: "stop",
+        localAuthorityDigest: "a".repeat(64),
+        payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+        phase: "effect_started",
+        requestCommitmentVersion: 3,
+        requestingDevicePublicId: command.requestingDevicePublicId,
+        sessionPublicId,
+      }],
+    });
+
+    const result = await bridge({
+      cloud,
+      daemonAuthority: staleAuthority,
+      device: "device_11111111",
+      executor,
+      journal,
+      local: new EmptyLocal(sessionPublicId),
+    }).cycle(new AbortController().signal);
+
+    expect(result.errors).toEqual([]);
+    expect(executor.calls).toEqual([]);
+    expect(cloud.commandTerminalRecoveryCalls).toEqual([{
+      commandPublicId,
+      localPhase: "effect_started",
+      staleAuthority,
+    }]);
+    expect((await journal.read()).state.commands).toEqual([]);
+  });
+
   test("rejects a saturated command journal before prepare or local provider effect", async () => {
     const cloud = new FakeCloud();
     const sessionPublicId = "session_capacity_0001";
@@ -6067,6 +6176,7 @@ describe("cloud daemon bridge", () => {
         // abort precedes the wait; the loop must not sleep the full interval.
         closing ??= lifecycle.close();
         return {
+          commandRequestVersion: 2 as const,
           commandsApplied: 0,
           commandsUnsettled: 0,
           errors: [],
@@ -6097,6 +6207,7 @@ describe("cloud daemon bridge", () => {
         async cycle() {
           calls += 1;
           return {
+            commandRequestVersion: 2 as const,
             commandsApplied: 0,
             commandsUnsettled: 0,
             errors: [],
@@ -6506,7 +6617,9 @@ describe("device registry publication", () => {
     });
     const signal = new AbortController().signal;
 
-    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    const first = await daemon.cycle(signal);
+    expect(first.errors).toEqual([]);
+    expect(first.commandRequestVersion).toBe(2);
     expect(world.writes).toEqual([{ expectedRevision: 0 }]);
     const stored = world.rows.get(world.device);
     expect(stored?.revision).toBe(1);
@@ -6537,6 +6650,55 @@ describe("device registry publication", () => {
     world.cloud.now += 60_000;
     expect((await daemon.cycle(signal)).errors).toEqual([]);
     expect(world.writes).toHaveLength(3);
+    expect(world.rows.get(world.device)?.revision).toBe(3);
+  });
+
+  test("an explicit sync revalidates capability publication inside the heartbeat window", async () => {
+    const world = registryWorld(() => Promise.resolve({ ...registry, heartbeatAt: 1_000 }));
+    const daemon = bridge({
+      cloud: world.cloud,
+      device: world.device,
+      local: world.local,
+      now: () => world.cloud.now,
+      transport: world.transport,
+    });
+    const signal = new AbortController().signal;
+
+    expect((await daemon.cycle(signal)).commandRequestVersion).toBe(2);
+    const published = world.rows.get(world.device);
+    expect(published?.revision).toBe(1);
+
+    // Simulate an older daemon overwriting the registry inside this process's
+    // heartbeat cache window without publishing marker-2 capability.
+    world.rows.set(world.device, {
+      envelope: published?.envelope as EncryptedEnvelope,
+      keyVersion: published?.keyVersion as number,
+      revision: 2,
+    });
+    expect((await daemon.cycle(signal)).commandRequestVersion).toBe(2);
+    expect(world.writes).toEqual([{ expectedRevision: 0 }]);
+
+    // A user-requested sync must attempt a real publication. The conflicting
+    // cached revision fails closed and clears the cache instead of claiming
+    // readiness from stale local state.
+    const conflicted = await daemon.cycle(signal, { forceDeviceRegistryPublication: true });
+    expect(conflicted.commandRequestVersion).toBeNull();
+    expect(conflicted.errors).toEqual([
+      "device registry: DEVICE_REGISTRY_REVISION_CONFLICT",
+    ]);
+    expect(world.writes).toEqual([{ expectedRevision: 0 }, { expectedRevision: 1 }]);
+
+    // Retrying the explicit sync reads the current server revision and restores
+    // marker-2 capability under optimistic concurrency.
+    const repaired = await daemon.cycle(signal, { forceDeviceRegistryPublication: true });
+    expect(repaired.errors).toEqual([]);
+    expect(repaired.commandRequestVersion).toBe(2);
+    expect(world.writes).toEqual([
+      { expectedRevision: 0 },
+      { expectedRevision: 1 },
+      { expectedRevision: 2 },
+    ]);
+    expect(world.rows.get(world.device)?.commandRequestVersion).toBe(2);
     expect(world.rows.get(world.device)?.revision).toBe(3);
   });
 
@@ -6598,6 +6760,7 @@ describe("device registry publication", () => {
     });
 
     const result = await daemon.cycle(new AbortController().signal);
+    expect(result.commandRequestVersion).toBeNull();
     expect(result.commandsApplied).toBe(0);
     expect(result.errors).toContain("device registry: registry unavailable");
     expect(executor.calls).toEqual([]);
@@ -8115,6 +8278,118 @@ describe("device command execution", () => {
     expect(second.errors).toEqual([]);
     expect(deviceExecutor.calls).toHaveLength(1);
     expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({ state: "ambiguous" });
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  test("retires a terminal device journal after an operator-abandoned effect", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    const staleAuthority = { bootGeneration: 1, bootId: "boot_00000000", fence: 1 };
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    const command = cloud.requireDeviceCommand(commandPublicId);
+    // Model the source-bound break-glass mutation after the provider outcome
+    // was already durable locally but ordinary hosted settlement lacked quota.
+    command.state = "ambiguous";
+    command.operatorAbandonedAt = fixedNow;
+    delete command.boundAuthority;
+    delete command.result;
+    delete command.resultCode;
+    delete command.resultConsumed;
+    delete command.resultDigest;
+    delete command.singleUseResult;
+    const observed = await journal.read();
+    await journal.compareAndSwap(observed.generation, {
+      ...observed.state,
+      deviceCommands: [{
+        authority: staleAuthority,
+        commandPublicId,
+        kind: "usage_refresh",
+        payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+        phase: "terminal",
+        requestCommitmentVersion: 3,
+        requestingDevicePublicId: "device_browser1",
+        resultCode: "APPLIED",
+        resultDigest: "a".repeat(64),
+        terminalState: "applied",
+      }],
+    });
+
+    const result = await bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    }).cycle(new AbortController().signal);
+
+    expect(result.errors).toEqual([]);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.deviceCommandSettleCalls).toEqual([]);
+    expect(cloud.deviceCommandTerminalRecoveryCalls).toEqual([{
+      commandPublicId,
+      localPhase: "effect_started",
+      staleAuthority,
+    }]);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({
+      operatorAbandonedAt: fixedNow,
+      state: "ambiguous",
+    });
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  test("retires a predecessor effect-started journal after no-effect operator expiry", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    const staleAuthority = { bootGeneration: 1, bootId: "boot_12345678", fence: 1 };
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    const command = cloud.requireDeviceCommand(commandPublicId);
+    // The predecessor journal advances before hosted markEffectStarted. The
+    // source-bound operator later proves hosted stayed prepared/no-effect and
+    // retires it as an exact result-less expired compatibility terminal.
+    command.state = "expired";
+    delete command.boundAuthority;
+    const observed = await journal.read();
+    await journal.compareAndSwap(observed.generation, {
+      ...observed.state,
+      deviceCommands: [{
+        authority: staleAuthority,
+        commandPublicId,
+        kind: "usage_refresh",
+        payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+        phase: "effect_started",
+        requestCommitmentVersion: 3,
+        requestingDevicePublicId: "device_browser1",
+      }],
+    });
+
+    const result = await bridge({
+      cloud,
+      daemonAuthority: staleAuthority,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    }).cycle(new AbortController().signal);
+
+    expect(result.errors).toEqual([]);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.deviceCommandTerminalRecoveryCalls).toEqual([{
+      commandPublicId,
+      localPhase: "effect_started",
+      staleAuthority,
+    }]);
     expect((await journal.read()).state.deviceCommands).toEqual([]);
   });
 

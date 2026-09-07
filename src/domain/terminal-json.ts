@@ -1,4 +1,4 @@
-const unsafeTerminalScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const unsafeTerminalScalar = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
 const safeJoinControl = /[\u200c\u200d]/u;
 
 const jsonEscapeScalar = (scalar: string): string => {

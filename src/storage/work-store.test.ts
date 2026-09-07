@@ -37,9 +37,11 @@ import {
   WORK_SCHEMA_SQL,
   WorkStore,
   WorkStoreError,
+  assertProviderVersion40WorkSchema,
   assertReadonlyWorkSchema,
   assertWorkSchema,
   canonicalWorkJson,
+  installProviderVersion40WorkAuthoritySchema,
   workPreparedEffectMessage,
 } from "./work-store";
 
@@ -662,6 +664,34 @@ describe("WorkStore schema and atomic plans", () => {
     ).run(created.work.id);
     expect(() => value.store.events(created.work.id, 0, 20)).toThrow(
       "WORK_EVENT_CHAIN_CORRUPT",
+    );
+  });
+
+  test("rejects a weakened same-name non-authority Work trigger", () => {
+    const weakenEventAppendOnlyGuard = (database: Database): void => {
+      database.exec(`
+        DROP TRIGGER work_events_no_update;
+        CREATE TRIGGER work_events_no_update
+        BEFORE UPDATE ON work_events
+        WHEN OLD.sequence < 0
+        BEGIN SELECT RAISE(ABORT,'WORK_EVENT_APPEND_ONLY'); END;
+      `);
+    };
+
+    const current = fixture();
+    weakenEventAppendOnlyGuard(current.database);
+    expect(() => assertWorkSchema(current.database)).toThrow(
+      "WORK_SCHEMA_STALE_TRIGGER:work_events_no_update",
+    );
+    expect(() => assertReadonlyWorkSchema(current.database)).toThrow(
+      "WORK_SCHEMA_STALE_TRIGGER:work_events_no_update",
+    );
+
+    const predecessor = fixture();
+    installProviderVersion40WorkAuthoritySchema(predecessor.database);
+    weakenEventAppendOnlyGuard(predecessor.database);
+    expect(() => assertProviderVersion40WorkSchema(predecessor.database)).toThrow(
+      "WORK_SCHEMA_STALE_TRIGGER:work_events_no_update",
     );
   });
 

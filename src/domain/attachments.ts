@@ -74,6 +74,7 @@ const encoder = new TextEncoder();
 const utf8Bytes = (value: string): number => encoder.encode(value).byteLength;
 
 const attachmentDigestPattern = /^[0-9a-f]{64}$/u;
+const unsafeAttachmentNameScalar = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
 
 /** Lower-case hex SHA-256 of the exact bytes. */
 export function isAttachmentDigest(value: unknown): value is string {
@@ -88,12 +89,144 @@ export function isAttachmentDigest(value: unknown): value is string {
 export function isAttachmentName(value: string): boolean {
   if (value.length === 0 || value === "." || value === "..") return false;
   if (utf8Bytes(value) > ATTACHMENT_NAME_MAX_BYTES) return false;
+  if (unsafeAttachmentNameScalar.test(value)) return false;
+  for (const scalar of value) {
+    if (scalar === "/" || scalar === "\\") return false;
+  }
+  return true;
+}
+
+/**
+ * The exact attachment-name rule released before format, surrogate, and
+ * Unicode line-separator scalars were excluded. It exists only so a caller
+ * can finish an already-durable idempotent send or steer across that policy
+ * boundary; new attachment admission must use `isAttachmentName`.
+ */
+export function isLegacyAttachmentName(value: string): boolean {
+  if (value.length === 0 || value === "." || value === "..") return false;
+  if (utf8Bytes(value) > ATTACHMENT_NAME_MAX_BYTES) return false;
   for (const scalar of value) {
     if (scalar === "/" || scalar === "\\") return false;
     const code = scalar.codePointAt(0) ?? 0;
     if (code < 0x20 || code === 0x7f) return false;
   }
   return true;
+}
+
+/** Project one predecessor-valid presentation name onto the current rule. */
+export function projectLegacyAttachmentName(value: string): string | null {
+  if (isAttachmentName(value)) return value;
+  if (!isLegacyAttachmentName(value)) return null;
+  const replace = (replacement: string): string => {
+    let projected = "";
+    for (const scalar of value) {
+      projected += unsafeAttachmentNameScalar.test(scalar)
+        ? replacement
+        : scalar;
+    }
+    return projected;
+  };
+  const visible = replace("�");
+  if (isAttachmentName(visible)) return visible;
+  // U+FFFD is three UTF-8 bytes. At the predecessor 255-byte ceiling, use a
+  // one-byte visible replacement so the projected name remains bounded.
+  const bounded = replace("_");
+  return isAttachmentName(bounded) ? bounded : null;
+}
+
+const attachmentPresentationKey = (digest: string, name: string): string =>
+  `${digest}\u0000${name}`;
+
+const truncateUtf8 = (value: string, maximumBytes: number): string => {
+  let output = "";
+  let bytes = 0;
+  for (const scalar of value) {
+    const scalarBytes = utf8Bytes(scalar);
+    if (bytes + scalarBytes > maximumBytes) break;
+    output += scalar;
+    bytes += scalarBytes;
+  }
+  return output;
+};
+
+const suffixedAttachmentName = (base: string, suffix: string): string | null => {
+  const suffixBytes = utf8Bytes(suffix);
+  if (suffixBytes >= ATTACHMENT_NAME_MAX_BYTES) return null;
+  const dot = base.lastIndexOf(".");
+  if (dot > 0) {
+    const extension = base.slice(dot);
+    const extensionBytes = utf8Bytes(extension);
+    if (suffixBytes + extensionBytes < ATTACHMENT_NAME_MAX_BYTES) {
+      const stem = truncateUtf8(
+        base.slice(0, dot),
+        ATTACHMENT_NAME_MAX_BYTES - suffixBytes - extensionBytes,
+      );
+      const candidate = `${stem}${suffix}${extension}`;
+      if (isAttachmentName(candidate)) return candidate;
+    }
+  }
+  const candidate = `${truncateUtf8(
+    base,
+    ATTACHMENT_NAME_MAX_BYTES - suffixBytes,
+  )}${suffix}`;
+  return isAttachmentName(candidate) ? candidate : null;
+};
+
+/**
+ * Project a predecessor-valid manifest without collapsing two distinct
+ * `(digest, name)` positions onto the same current key. Current-safe names are
+ * reserved first, then colliding historical projections receive a stable
+ * position suffix with UTF-8-safe trimming. Order, bytes, media type, and
+ * digest are never changed.
+ */
+export function projectLegacyAttachmentReferences(
+  values: readonly AttachmentReference[],
+): readonly AttachmentReference[] | null {
+  const originalKeys = new Set<string>();
+  const reservedCurrentKeys = new Set<string>();
+  for (const value of values) {
+    if (!isLegacyAttachmentName(value.name)) return null;
+    const originalKey = attachmentPresentationKey(value.digest, value.name);
+    if (originalKeys.has(originalKey)) return null;
+    originalKeys.add(originalKey);
+    if (isAttachmentName(value.name)) reservedCurrentKeys.add(originalKey);
+  }
+
+  const usedKeys = new Set<string>();
+  const projected: AttachmentReference[] = [];
+  for (const [index, value] of values.entries()) {
+    const base = projectLegacyAttachmentName(value.name);
+    if (base === null) return null;
+    let name = base;
+    let key = attachmentPresentationKey(value.digest, name);
+    if (
+      !isAttachmentName(value.name)
+      && (usedKeys.has(key) || reservedCurrentKeys.has(key))
+    ) {
+      name = "";
+      for (let discriminator = 1; discriminator <= ATTACHMENT_MAX_COUNT + 1; discriminator += 1) {
+        const suffix = discriminator === 1
+          ? `~${String(index + 1)}`
+          : `~${String(index + 1)}-${String(discriminator)}`;
+        const candidate = suffixedAttachmentName(base, suffix);
+        if (candidate === null) continue;
+        const candidateKey = attachmentPresentationKey(value.digest, candidate);
+        if (!usedKeys.has(candidateKey) && !reservedCurrentKeys.has(candidateKey)) {
+          name = candidate;
+          key = candidateKey;
+          break;
+        }
+      }
+      if (name.length === 0) return null;
+    } else if (usedKeys.has(key)) {
+      // A repeated current-safe key was already invalid under the predecessor
+      // list contract and must not be guessed into a distinct attachment.
+      return null;
+    }
+    usedKeys.add(key);
+    projected.push({ ...value, name });
+  }
+  return projected;
 }
 
 /**
