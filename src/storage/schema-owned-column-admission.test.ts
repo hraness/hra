@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { canonicalAdoption40DatabaseBytes } from "../../scripts/fixtures/canonical-adoption40";
+import { combined49DatabaseBytes } from "../../scripts/fixtures/combined49";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
 import { normalizeSchemaSql } from "./schema-cohort";
 import { StateStore } from "./state-store";
@@ -12,13 +13,14 @@ import { StateStore } from "./state-store";
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const dispose of cleanup.splice(0).reverse()) await dispose(); });
 
-const fixture = async (cohort: "current49" | "canonical40") => {
+const fixture = async (cohort: "current49" | "canonical40" | "combined49") => {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-owned-column-ddl-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   cleanup.push(async () => { await rm(home, { recursive: true, force: true }); });
-  if (cohort === "canonical40") {
-    await writeFile(paths.database, canonicalAdoption40DatabaseBytes());
+  if (cohort !== "current49") {
+    await writeFile(paths.database, cohort === "canonical40"
+      ? canonicalAdoption40DatabaseBytes() : combined49DatabaseBytes());
     await chmod(paths.database, 0o600);
   } else {
     const store = new StateStore(paths);
@@ -74,7 +76,7 @@ const replaceTable = (database: Database, table: string, change: (sql: string) =
   expect(database.query(`SELECT * FROM ${table}`).all()).toEqual(rows);
 };
 
-for (const cohort of ["current49", "canonical40"] as const) {
+for (const cohort of ["current49", "canonical40", "combined49"] as const) {
   test(`full ${cohort} admission rejects a weakened account key CHECK camouflaged by quoted text`, async () => {
     const { paths, database } = await fixture(cohort);
     const trusted = normalizeSchemaSql(accountColumn);
@@ -95,7 +97,7 @@ for (const cohort of ["current49", "canonical40"] as const) {
     expect(snapshot(database)).toEqual(before);
   });
 
-  const comments = cohort === "current49" ? ["block", "line", "header"] as const : ["block"] as const;
+  const comments = cohort !== "canonical40" ? ["block", "line", "header"] as const : ["block"] as const;
   for (const comment of comments) test(`full ${cohort} admission rejects a weakened provider CHECK camouflaged by a ${comment} comment`, async () => {
     const { paths, database } = await fixture(cohort);
     const trusted = normalizeSchemaSql(providerColumn);

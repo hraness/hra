@@ -165,11 +165,14 @@ const assertFrozenWorkSchema = (
   const tables = tableNames.map((name) => objectSchema.parse(database.query(
     "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE type='table' AND name=?",
   ).get(name)));
-  // These authentic cohorts have identical Work table SQL, including the
-  // historical preset_contract ALTER and every CHECK/UNIQUE/FK declaration.
-  // Reproduce from scripts/fixtures/{canonical-adoption40,private-task48}.ts.
-  if (schemaCohortDigest(tables)
-    !== "ff5fea682951978d5e7f4a925369741cb21dbc72382abe0f73b6e0c6a6830836") {
+  // Captured fresh cohorts put works.preset_contract after objective. The
+  // shipped v38 upgrade appends it after updated_at, before the final CHECK.
+  // Authentic canonical30 table metadata plus that exact ALTER reproduces
+  // the second digest. All 22 other tables and every constraint are identical;
+  // no arbitrary column order or suffix is admitted by these two manifests.
+  const tablesDigest = schemaCohortDigest(tables);
+  if (tablesDigest !== "ff5fea682951978d5e7f4a925369741cb21dbc72382abe0f73b6e0c6a6830836"
+    && tablesDigest !== "cef36b01d26bb66d0489db319afdbaff6be36681aa15ff8da521863094935487") {
     throw new Error(`WORK_SCHEMA_COHORT_INVALID:${cohort}`);
   }
   const names: readonly string[] = cohort !== "private48"

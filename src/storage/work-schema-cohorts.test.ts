@@ -5,9 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { canonicalAdoption40DatabaseBytes } from "../../scripts/fixtures/canonical-adoption40";
+import { canonical30WorkFixture } from "../../scripts/fixtures/canonical30-work";
 import { combined49DatabaseBytes } from "../../scripts/fixtures/combined49";
 import { combined49RetiredDatabaseBytes, combined49RetiredFixture } from "../../scripts/fixtures/combined49-retired";
 import { privateTask48DatabaseBytes } from "../../scripts/fixtures/private-task48";
+import { schemaCohortDigest } from "./schema-cohort";
 import {
   assertCanonicalAdoption40WorkSchema,
   assertCombined49WorkSchema,
@@ -57,13 +59,105 @@ const snapshot = (database: Database) => ({
   })),
 });
 
+const canonical30Works = canonical30WorkFixture.workObjects.find(
+  (object) => object.type === "table" && object.name === "works",
+);
+if (canonical30Works === undefined) throw new Error("Expected the archived canonical30 works table.");
+const archivedWorksSql = canonical30Works.sql;
+const historicalPresetColumn = "preset_contract INTEGER NOT NULL DEFAULT 1 CHECK(preset_contract IN (1,2))";
+const workTableNames = canonical30WorkFixture.workObjects
+  .filter((object) => object.type === "table")
+  .map((object) => object.name);
+
+// Build a synthetic component variant, not a restamped historical database.
+// Only works is rebuilt from archived v30 SQL, then receives the literal v38
+// ALTER. The enclosing cohort's original objects and all rows stay unchanged.
+// No current WORK_SCHEMA_SQL, StateStore migration or provider producer runs.
+const replaceEmptyWorksWithAlterLayout = (
+  database: Database,
+  variant: { column?: string; middle?: boolean; extra?: boolean } = {},
+): void => {
+  const before = snapshot(database);
+  expect(before.rows.works).toEqual([]);
+  expect(archivedWorksSql).not.toContain("preset_contract");
+  const otherSchema = () => database.query(
+    "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name!='works' ORDER BY type,name",
+  ).all();
+  const preservedSchema = otherSchema();
+  const ownedObjects = database.query<{ sql: string }, []>(
+    "SELECT sql FROM sqlite_master WHERE tbl_name='works' AND type IN ('trigger','index') AND sql IS NOT NULL ORDER BY type,name",
+  ).all();
+  database.exec("PRAGMA foreign_keys=OFF");
+  database.exec("DROP TABLE works");
+  if (variant.middle === true) {
+    const wrongPosition = archivedWorksSql.replace(
+      "  coordinator_session_id TEXT",
+      `  ${historicalPresetColumn},\n  coordinator_session_id TEXT`,
+    );
+    expect(wrongPosition).not.toBe(archivedWorksSql);
+    database.exec(wrongPosition);
+  } else {
+    database.exec(archivedWorksSql);
+    database.exec(`ALTER TABLE works ADD COLUMN ${variant.column ?? historicalPresetColumn}`);
+  }
+  if (variant.extra === true) database.exec("ALTER TABLE works ADD COLUMN unexpected INTEGER DEFAULT 0");
+  for (const { sql } of ownedObjects) database.exec(sql);
+  database.exec("PRAGMA foreign_keys=ON");
+  expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+  expect(otherSchema()).toEqual(preservedSchema);
+  const after = snapshot(database);
+  expect(after.rows).toEqual(before.rows);
+  expect(after.version).toEqual(before.version);
+  expect(after.changes).toEqual(before.changes);
+};
+
 describe("frozen Work cohort admission", () => {
   for (const cohort of cohorts) {
     for (const readonly of [false, true]) {
-      test(`accepts authentic ${cohort.name} table ALTER history on ${readonly ? "readonly" : "writable"} connection without rewriting it`, async () => {
+      test(`accepts the captured ${cohort.name} Work table layout on ${readonly ? "readonly" : "writable"} connection without rewriting it`, async () => {
         const database = await openFixture(cohort.bytes(), readonly);
         const before = snapshot(database);
         expect(() => cohort.assert(database)).not.toThrow();
+        expect(snapshot(database)).toEqual(before);
+      });
+    }
+
+    test(`accepts the literal v38 ALTER component layout in ${cohort.name} without changing retained history`, async () => {
+      const database = await openFixture(cohort.bytes());
+      replaceEmptyWorksWithAlterLayout(database);
+      expect(workTableNames).toHaveLength(23);
+      const tables = workTableNames.map((name) => {
+        const table = database.query<{
+          type: "table"; name: string; tbl_name: string; sql: string;
+        }, [string]>(
+          "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE type='table' AND name=?",
+        ).get(name);
+        if (table === null) throw new Error("Expected every archived Work table.");
+        return table;
+      });
+      expect(schemaCohortDigest(tables)).toBe("cef36b01d26bb66d0489db319afdbaff6be36681aa15ff8da521863094935487");
+      expect(database.query<{ name: string }, []>("PRAGMA table_info(works)").all().map((row) => row.name))
+        .toEqual([
+          "id", "client_ref", "coordinator_session_id", "objective", "state", "revision",
+          "stream_epoch", "next_sequence", "head_hash", "created_at", "updated_at", "preset_contract",
+        ]);
+      const before = snapshot(database);
+      expect(() => cohort.assert(database)).not.toThrow();
+      expect(snapshot(database)).toEqual(before);
+    });
+
+    for (const variant of [
+      { name: "wrong preset default", column: historicalPresetColumn.replace("DEFAULT 1", "DEFAULT 2") },
+      { name: "widened preset check", column: historicalPresetColumn.replace("IN (1,2)", "IN (1,2,3)") },
+      { name: "nullable preset", column: historicalPresetColumn.replace("NOT NULL ", "") },
+      { name: "unshipped middle-column placement", middle: true },
+      { name: "extra column after the ALTER tail", extra: true },
+    ] as const) {
+      test(`refuses ${cohort.name} ALTER-lookalike with ${variant.name} without repair`, async () => {
+        const database = await openFixture(cohort.bytes());
+        replaceEmptyWorksWithAlterLayout(database, variant);
+        const before = snapshot(database);
+        expect(() => cohort.assert(database)).toThrow(`WORK_SCHEMA_COHORT_INVALID:${cohort.name}`);
         expect(snapshot(database)).toEqual(before);
       });
     }

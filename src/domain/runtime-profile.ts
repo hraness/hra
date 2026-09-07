@@ -3,7 +3,6 @@ import { z } from "zod";
 import {
   isAdmittedPresetRequirement,
   presetProviders,
-  presetRequirements,
   presetSchema,
   type Provider,
 } from "./presets";
@@ -128,7 +127,11 @@ export const effectiveClaudeRuntimeProfileSchema = z.union([
   currentEffectiveClaudeRuntimeProfileSchema,
   legacyEffectiveClaudeRuntimeProfileSchema,
 ]).superRefine((value, context) => {
-  if (value.model !== presetRequirements[value.preset].model) {
+  // Immutable reviews retain shipped tuples when new-write defaults change.
+  if (!isAdmittedPresetRequirement(value.preset, {
+    model: value.model,
+    effort: value.reasoningEffort,
+  })) {
     context.addIssue({ code: "custom", message: "The effective model must match the exact HRA preset." });
   }
 });
@@ -205,7 +208,10 @@ export const publicEffectiveClaudeRuntimeProfileSchema = z.object({
   inputFormat: z.literal("stream-json"),
   nativeFallback: claudeNativeFallbackSchema.optional(),
 }).strict().superRefine((value, context) => {
-  if (value.model !== presetRequirements[value.preset].model) {
+  if (!isAdmittedPresetRequirement(value.preset, {
+    model: value.model,
+    effort: value.reasoningEffort,
+  })) {
     context.addIssue({ code: "custom", message: "The effective model must match the exact HRA preset." });
   }
 });

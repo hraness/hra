@@ -12547,6 +12547,7 @@ describe("StateStore", () => {
       title: "Recovered Codex target",
       providerUpdatedAt: 20,
     });
+    expect(store.requireSessionPresetContract(recoveredTarget.id)).toBe(2);
     expect(recoveredTarget).toMatchObject({
       profileId: codexProfile.id,
       provider: "codex",
@@ -14288,6 +14289,9 @@ describe("StateStore", () => {
         expect(store.readClaudeProcessAuthority(processInput)).toEqual(beforeProcess);
       } else {
         expect(bind()).toMatchObject({ provider: "claude", profileId: target.id, state: "recovery_required" });
+        // Fable's model/effort pair exists in both historical contracts.
+        // Legacy recovery retains the shipped [2,1] precedence, not a future default.
+        expect(store.requireSessionPresetContract(session.id)).toBe(2);
         expect(store.readClaudeProcessAuthority(processInput)).toMatchObject({
           state: "bound", providerAuthority: targetAuthority, profileGeneration: target.processGeneration,
         });

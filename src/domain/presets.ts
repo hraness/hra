@@ -32,9 +32,11 @@ export type PresetTier = z.infer<typeof presetTierSchema>;
  */
 export const legacyPresetContract = 1 as const;
 export const currentPresetContract = 2 as const;
+// Persisted versions are independent of the default chosen for new writes.
+// Adding a contract must retain each shipped version and its exact mapping.
 export const presetContractSchema = z.union([
-  z.literal(legacyPresetContract),
-  z.literal(currentPresetContract),
+  z.literal(1),
+  z.literal(2),
 ]);
 export type PresetContract = z.infer<typeof presetContractSchema>;
 
@@ -43,14 +45,14 @@ export type PresetRequirement = Readonly<{
   effort: "max" | "ultra" | "provider-default";
 }>;
 
-const legacyPresetRequirements = {
+const presetContract1Requirements = {
   low: { model: "gpt-5.6-luna", effort: "max" },
   high: { model: "gpt-5.6-sol", effort: "max" },
   ultra: { model: "gpt-5.6-sol", effort: "ultra" },
   "fable-max": { model: "claude-fable-5-1", effort: "max" },
 } as const satisfies Partial<Record<Preset, PresetRequirement>>;
 
-const currentPresetRequirements = {
+const presetContract2Requirements = {
   low: { model: "gpt-5.6-luna", effort: "max" },
   high: { model: "gpt-6-astra", effort: "max" },
   ultra: { model: "gpt-6-astra", effort: "ultra" },
@@ -67,12 +69,12 @@ const currentPresetRequirements = {
 const presetRequirementsByContract: Readonly<
   Record<PresetContract, Partial<Readonly<Record<Preset, PresetRequirement>>>>
 > = Object.freeze({
-  [legacyPresetContract]: Object.freeze(legacyPresetRequirements),
-  [currentPresetContract]: Object.freeze(currentPresetRequirements),
+  1: Object.freeze(presetContract1Requirements),
+  2: Object.freeze(presetContract2Requirements),
 });
 
 /** Current requirements used for every new or explicitly selected preset. */
-export const presetRequirements = currentPresetRequirements;
+export const presetRequirements = presetContract2Requirements;
 
 /** Resolve one alias under its durable, session-owned interpretation. */
 export const presetRequirementForContract = (
@@ -93,7 +95,7 @@ export const presetRequirementForContract = (
 export const isAdmittedPresetRequirement = (
   preset: Preset,
   requirement: PresetRequirement,
-): boolean => [legacyPresetContract, currentPresetContract].some((contract) => {
+): boolean => ([1, 2] as const).some((contract) => {
   const admitted = presetRequirementsByContract[contract][preset];
   return admitted !== undefined
     && admitted.model === requirement.model

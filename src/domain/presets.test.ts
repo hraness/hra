@@ -27,6 +27,32 @@ import {
 } from "./runtime-profile";
 
 describe("model presets and providers", () => {
+  test("retains every shipped preset tuple under its literal historical contract", () => {
+    const historical = [
+      [1, "low", "gpt-5.6-luna", "max"],
+      [1, "high", "gpt-5.6-sol", "max"],
+      [1, "ultra", "gpt-5.6-sol", "ultra"],
+      [1, "fable-max", "claude-fable-5-1", "max"],
+      [2, "low", "gpt-5.6-luna", "max"],
+      [2, "high", "gpt-6-astra", "max"],
+      [2, "ultra", "gpt-6-astra", "ultra"],
+      [2, "fable-max", "claude-fable-5-1", "max"],
+      [2, "astra", "gpt-6-astra", "provider-default"],
+    ] as const;
+    // Expectations must not follow the current default or derive from the
+    // production lookup: existing session and capsule digests own these tuples.
+    for (const [contract, preset, model, effort] of historical) {
+      expect(presetContractSchema.parse(contract)).toBe(contract);
+      expect(presetRequirementForContract(preset, contract)).toEqual({ model, effort });
+      expect(isAdmittedPresetRequirement(preset, { model, effort })).toBe(true);
+    }
+    expect(() => presetRequirementForContract("astra", 1))
+      .toThrow("No preset requirement exists for that contract.");
+    for (const contract of [0, 3, 1.5, "1", "2", null]) {
+      expect(presetContractSchema.safeParse(contract).success).toBe(false);
+    }
+  });
+
   test("names exactly the five presets and three providers", () => {
     expect(presetSchema.options).toEqual(["low", "high", "ultra", "fable-max", "astra"]);
     expect(providerSchema.options).toEqual(["codex", "claude", "devin"]);

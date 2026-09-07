@@ -13,6 +13,7 @@ import { isAbsolute, resolve } from "node:path";
 
 import { Database, constants as sqliteConstants } from "bun:sqlite";
 import { z } from "zod";
+import { assertCombined49AdoptionSchema } from "./combined49-adoption-schema";
 import {
   assertSchemaCohortObjects,
   assertSchemaCohortMigrationTail,
@@ -8917,7 +8918,7 @@ const splitSqlTableDefinitions = (sql: string): readonly string[] => {
 const schemaVersion39SessionProviderColumn =
   "ALTER TABLE sessions ADD COLUMN provider_v39 TEXT NOT NULL DEFAULT 'codex' "
   + "CHECK(provider_v39 IN ('codex','claude','devin') "
-  + `AND (provider_v39!='devin' OR preset_contract=${currentPresetContract}))`;
+  + "AND (provider_v39!='devin' OR preset_contract=2))";
 
 const ensureSchemaVersion39SessionProviderColumn = (database: Database): void => {
   if (!hasTableColumn(database, "sessions", "provider_v39")) {
@@ -8964,14 +8965,14 @@ const assertSchemaVersion39ProviderAuthority = (database: Database): void => {
       !== normalizeSqlStructure(
         "provider_v39 TEXT NOT NULL DEFAULT 'codex' "
         + "CHECK(provider_v39 IN ('codex','claude','devin') "
-        + `AND (provider_v39!='devin' OR preset_contract=${currentPresetContract}))`,
+        + "AND (provider_v39!='devin' OR preset_contract=2))",
       )
   ) {
     throw new Error("STATE_SCHEMA_V39_OBJECT_INVALID:sessions.provider_v39");
   }
   if (database.query(
     `SELECT 1 FROM sessions
-     WHERE provider_v39='devin' AND preset_contract!=${currentPresetContract}
+     WHERE provider_v39='devin' AND preset_contract!=2
      LIMIT 1`,
   ).get() !== null) {
     throw new Error("STATE_SCHEMA_V39_DEVIN_PRESET_CONTRACT_INVALID:sessions");
@@ -11232,12 +11233,14 @@ const applySchemaVersion37AttentionEmailPolicy = (
 // HRA-created or explicitly reselected rows are stamped current at their write
 // boundary. `works` is installed by WorkStore in the same database and carries
 // the same contract so a claim cannot reinterpret its route mid-flight.
+// These shipped DDL and audit versions stay literal when new-write defaults
+// change; widening them requires an appended migration and its own audit.
 const schemaVersion38SessionPresetContractColumn =
-  `ALTER TABLE sessions ADD COLUMN preset_contract INTEGER NOT NULL DEFAULT ${legacyPresetContract} `
-  + `CHECK(preset_contract IN (${legacyPresetContract},${currentPresetContract}))`;
+  "ALTER TABLE sessions ADD COLUMN preset_contract INTEGER NOT NULL DEFAULT 1 "
+  + "CHECK(preset_contract IN (1,2))";
 const schemaVersion38WorkPresetContractColumn =
-  `ALTER TABLE works ADD COLUMN preset_contract INTEGER NOT NULL DEFAULT ${legacyPresetContract} `
-  + `CHECK(preset_contract IN (${legacyPresetContract},${currentPresetContract}))`;
+  "ALTER TABLE works ADD COLUMN preset_contract INTEGER NOT NULL DEFAULT 1 "
+  + "CHECK(preset_contract IN (1,2))";
 
 const applySchemaVersion38PresetContracts = (database: Database): void => {
   if (!hasTableColumn(database, "sessions", "preset_contract")) {
@@ -11257,7 +11260,7 @@ const assertSchemaVersion38PresetContracts = (database: Database): void => {
   }
   if (database.query(
     `SELECT 1 FROM sessions
-     WHERE preset_contract IS NULL OR preset_contract NOT IN (${legacyPresetContract},${currentPresetContract})
+     WHERE preset_contract IS NULL OR preset_contract NOT IN (1,2)
      LIMIT 1`,
   ).get() !== null) {
     throw new Error("STATE_SCHEMA_V38_SESSION_PRESET_CONTRACT_INVALID");
@@ -11270,7 +11273,7 @@ const assertSchemaVersion38PresetContracts = (database: Database): void => {
   }
   if (workTableExists && database.query(
     `SELECT 1 FROM works
-     WHERE preset_contract IS NULL OR preset_contract NOT IN (${legacyPresetContract},${currentPresetContract})
+     WHERE preset_contract IS NULL OR preset_contract NOT IN (1,2)
      LIMIT 1`,
   ).get() !== null) {
     throw new Error("STATE_SCHEMA_V38_WORK_PRESET_CONTRACT_INVALID");
@@ -12457,8 +12460,8 @@ const classifyStateSchemaCohort = (
   if (version === 49) {
     assertSchemaCohortMigrationTail(database, 49);
     assertTaskOwnershipCohort(database);
-    assertSchemaVersion40AdoptionObjects(database, { useExactProviderProcessCustody: true });
-    assertExactSchemaVersion40AdoptionSurface(database);
+    assertCombined49AdoptionSchema(database);
+    assertSchemaVersion40ProfileCodexAccountKeys(database);
     assertCombined49WorkSchema(database);
     assertCombined49SessionTaskSchema(database);
     auditClaudeProcessCustody(database);
@@ -12495,8 +12498,8 @@ const migrateWritableDatabase = (
     // before the idempotent maintenance tail can touch any schema object.
     assertCanonicalLabelKeys(database);
     assertSchemaVersion39ProviderAuthority(database);
-    assertSchemaVersion40AdoptionObjects(database, { useExactProviderProcessCustody: true });
-    assertExactSchemaVersion40AdoptionSurface(database);
+    assertCombined49AdoptionSchema(database);
+    assertSchemaVersion40ProfileCodexAccountKeys(database);
     assertCombined49WorkSchema(database);
     assertCombined49SessionTaskSchema(database);
   }
@@ -13515,20 +13518,23 @@ const assertRuntimeProfileRequirement = (
   ) throw new Error(code);
 };
 
-const presetContractForRuntimeProfile = (
+// Legacy switch evidence predates an explicit target contract. Preserve its
+// shipped [2,1] inference order, including aliases with identical tuples;
+// a future new-write default must not relabel an old effect or recovery.
+const presetContractForLegacySwitchRuntimeProfile = (
   profile: ReviewedRuntimeProfile,
   preset: Preset,
 ): z.infer<typeof presetContractSchema> => {
-  const current = presetRequirementForContract(preset, currentPresetContract);
-  if (profile.model === current.model && profile.reasoningEffort === current.effort) {
-    return currentPresetContract;
+  const contract2 = presetRequirementForContract(preset, 2);
+  if (profile.model === contract2.model && profile.reasoningEffort === contract2.effort) {
+    return 2;
   }
-  const legacy = presetRequirementForContract(preset, legacyPresetContract);
+  const contract1 = presetRequirementForContract(preset, 1);
   if (
-    profile.model === legacy.model
-    && profile.reasoningEffort === legacy.effort
+    profile.model === contract1.model
+    && profile.reasoningEffort === contract1.effort
   ) {
-    return legacyPresetContract;
+    return 1;
   }
   throw new Error("SESSION_RUNTIME_PROFILE_PRESET_CONTRACT_UNADMITTED");
 };
@@ -13937,7 +13943,7 @@ const sessionSwitchRowSchema = z.object({
   source_preset: presetSchema,
   target_preset: presetSchema,
   source_preset_contract: presetContractSchema,
-  target_preset_contract: z.literal(currentPresetContract),
+  target_preset_contract: z.literal(2),
   source_runtime_profile_revision: positiveGenerationSchema,
   source_runtime_profile_digest: sha256Schema,
   source_runtime_row_source_kind: runtimeProfileSourceKindSchema.nullable(),
@@ -16025,8 +16031,13 @@ export class StateStore {
       assertSchemaVersion35Objects(this.#database);
       assertSchemaVersion38PresetContracts(this.#database);
       assertSchemaVersion39ProviderAuthority(this.#database);
-      assertSchemaVersion40AdoptionObjects(this.#database, { useExactProviderProcessCustody: true });
-      assertExactSchemaVersion40AdoptionSurface(this.#database);
+      if (this.#readonly) {
+        assertCombined49AdoptionSchema(this.#database);
+        assertSchemaVersion40ProfileCodexAccountKeys(this.#database);
+      } else {
+        assertSchemaVersion40AdoptionObjects(this.#database, { useExactProviderProcessCustody: true });
+        assertExactSchemaVersion40AdoptionSurface(this.#database);
+      }
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);
@@ -26406,7 +26417,7 @@ export class StateStore {
     if ((provider === "claude") !== (claudeProcessIdentity !== undefined)) {
       throw new Error("SESSION_PROVIDER_SWITCH_CLAUDE_PROCESS_AUTHORITY_REQUIRED");
     }
-    const targetPresetContract = presetContractForRuntimeProfile(runtimeProfile, preset);
+    const targetPresetContract = presetContractForLegacySwitchRuntimeProfile(runtimeProfile, preset);
     const providerThreadId = providerThreadIdSchema.parse(input.providerThreadId);
     const seedTurnId = providerThreadIdSchema.parse(input.seedTurnId);
     const now = this.#now();
@@ -30325,7 +30336,7 @@ export class StateStore {
       }
       const frozenAuthorities = this.#requireLegacySessionSwitchAuthorities(attemptId, evidence);
       const targetAuthority = this.requireProviderAccountAuthority(evidence.targetProfileId, evidence.targetProvider);
-      const targetPresetContract = presetContractForRuntimeProfile(
+      const targetPresetContract = presetContractForLegacySwitchRuntimeProfile(
         evidence.runtimeProfile,
         evidence.targetPreset,
       );
