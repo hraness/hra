@@ -212,7 +212,7 @@ Required fixtures cover authentic private-48 and combined-49 Devin bindings, ori
 | 4 | Crash-safe manual session/account switching | 2 | switch attempt storage, daemon switch/recovery/locking, switch tests | none |
 | 5 | Pure exhaustion policy, durable configuration, and explanations | 3 | usage-policy domain, policy store, tests, no provider effects | 4 for domain-only work; storage waits for convergence |
 | 6 | Durable automatic action authority, then supported runtime actions | 4; 5 for storage/runtime | automatic action migration and renderer, daemon coordinator, existing reset integration, pointer and switch-and-forward actuation, focused tests | 5, pure renderer only; storage and runtime remain sequential join gates |
-| 7 | CLI account order, activation, optional start account, usage, and policy controls | 6 | CLI parser/client/renderers and command schemas | none |
+| 7 | CLI account order, activation, optional start account, usage, and policy controls | 6; policy controls need only 5 and reset admission | CLI parser/client/renderers and command schemas | 6 for policy controls only |
 | 8 | Hosted current usage and session-join contract | 7 | cloud payloads/adapters/Convex, daemon upload, hosted docs | none |
 | 9 | Browser settings usage visualization | 8 | app wire/data/model/screens and app tests | none |
 | 10 | Contract convergence, final review, aggregate validation, and delivery | 9 | maintained docs, plan status/log, convergence artifacts only if proven | none |
@@ -487,8 +487,8 @@ The storage checkpoint must prove both writer orderings, same-key independent ho
 
 ## Phase 7: CLI account and usage contract
 
-- **Status:** Not started
-- **Depends on:** Phase 6
+- **Status:** In progress, automatic-policy controls only
+- **Depends on:** Phase 6 for account selection, managed routing and integrated usage explanations. Automatic-policy controls depend only on the completed configuration store and reset-admission guard, so that bounded slice may proceed independently.
 - **Objective:** Give human and JSON callers one exact contract for order, activation, optional account resolution, policy controls, observations, and explanations.
 - **Scope:** CLI grammar/help, daemon commands and public schemas, JSON/text renderers, parser and command tests.
 - **Out of scope:** Hosted/browser surfaces.
@@ -503,6 +503,10 @@ The storage checkpoint must prove both writer orderings, same-key independent ho
   - `hra usage auto on|off` changes the inherited default; `hra usage auto on|off|inherit <provider>` changes only that provider override, and `status [provider]` reads it. Fresh configuration is default on with both overrides inherited and automatic-policy revision 1.
   - An omitted local account selector is part of the original request. Same-key replay resolves its immutable receipt before looking up the mutable active pointer, so later activation cannot redirect a retried start.
 - **Validation:** `bun test ./src/cli ./src/cli.test.ts ./src/daemon/service.test.ts --isolate --max-concurrency=1`
+
+The initial policy-control command requires `--revision <n>` and `--idempotency-key <uuid>` for every change. Status supplies the revision; the caller retains the exact key, revision and change for response-loss replay. Do not fill a missing revision from the current head on retry, which could turn an old request into a new mutation. The command returns the immutable accepted configuration, not a claim about the latest head. Status remains a separate read. Both text and JSON validate the configuration and derived effective provider settings before output. These local controls neither refresh providers nor move an account or session. The remaining Phase 7 commands and full phase acceptance are still pending.
+
+The bounded current-source command guide is [Automatic usage settings](../../docs/usage-management.md). It states the independent reset-disable behavior without claiming the unfinished movement, fallback or browser features.
 
 ## Phase 8: Hosted current usage and session-join contract
 
@@ -583,6 +587,12 @@ The storage checkpoint must prove both writer orderings, same-key independent ho
 - Never reuse a validation receipt for the required final integration, merge, release, deployment, or production readback.
 
 ## Implementation log
+
+- 2026-09-07, bounded CLI policy controls verified: `hra usage auto status [provider]` and revision/key-bound default or provider-override changes now reach the existing atomic configuration receipt store. Both output modes validate exact public fields, effective settings and request binding; a replay reports its original configuration, never a newly read head. Known occupied original-send keys report conflict while corrupt ownership stays recovery-required. A real CLI response-loss regression failed before adding the command to the unchanged-request replay guidance and passed afterward, two tests with 60 assertions. No automatic retry or provider operation was added.
+
+  The converged domain/parser/renderer gate passed 126 tests with 6,357 assertions. A throwing refinement on continuable invalid revisions was repaired and now has seeded totality coverage. A later test-only literal typing correction passed its five-test, 856-assertion rerun. The final service command gate passed 14 tests with 188 assertions, including two-store CAS, unchanged unrelated receipts, immutable historical replay, sanitized failures and public disable preventing reset consumption. Its earlier failures were a superseded test-history shape and missing required fake-constructor/service options; the final typed fixtures passed unchanged behavioral assertions. Twelve real-storage key-ordering cases passed 240 assertions after correcting a queue fixture to use the existing account-key admission API. Review rejected the proposed reservation-key restriction: invocation reservations grant retention only, and final command admission owns the key. No storage code, historical guard or migration changed.
+
+  Final typecheck, changed-code lint, the 46-file security inventory, generated working-tree installer pins, three installer-pin tests and whitespace checks passed. Actual CLI help runs with the documented grammar. Independent reviews approved this slice and the current-source guide. The upstream memory merge remains uncommitted and its separate approvals and validation are pending; main is now `c3874c71350631b145abf9934a8b14472a8710eb`, which does not contain this branch. The separate footer operator reports its canonical promotion complete, not deployment of this feature. Managed routing, remaining account controls, hosted/browser work, the full repository gate, PR, merge, release and usage-feature deployment remain incomplete.
 
 - 2026-09-07, automatic reset disable repaired: 13 genuine service/storage failures proved that the existing reset path ignored effective Codex configuration. The repair reads that policy before reset maintenance, again after identity proof, and inside the existing immediate begin transaction before authority evidence or dispatch state. A typed refusal preserves the original key and reports uncertainty separately from suppression. In-flight settlement and authoritative reread remain unchanged. Independent code review approved the bounded repair; no migration, account movement or authentication change is included.
 

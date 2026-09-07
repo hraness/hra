@@ -137,6 +137,7 @@ import {
   type UsageVelocityWindow,
 } from "../domain/usage-metrics";
 import { resolveAutomaticUsagePolicy } from "../domain/usage-policy";
+import { createAutomaticUsagePolicyCommandResult } from "../domain/usage-policy-command";
 import {
   WORK_TASK_HISTORY_DEFAULT_ITEM_LIMIT,
   workActionCursorPayloadSchema,
@@ -202,6 +203,7 @@ import {
   type StateStore,
   type StoredMessageAttachment,
 } from "../storage/state-store";
+import { SessionSendOwnershipError } from "../storage/session-send-owner";
 import {
   WorkStoreError,
   canonicalWorkJson,
@@ -2030,6 +2032,8 @@ export class HraService {
           const profile = this.#store.requireProfile(command.account);
           return this.#usageHistory({ ...command, account: profile.id });
         }
+        case "usage.auto.status":
+        case "usage.auto.set": return this.#automaticUsagePolicyCommand(command);
         case "account.switch": { const profile = this.#store.requireProfile(command.account); return await this.#serialize("desktop-switch", async () => this.#switchAccount(profile.id, command.idempotencyKey, context.signal)); }
         case "account.switch-recover": return await this.#serialize("desktop-switch", async () => this.#recoverDesktopSwitch(context.signal));
         case "plugin.list": {
@@ -10388,6 +10392,54 @@ export class HraService {
       throw new CommandFailure("RECOVERY_REQUIRED", "Codex logged out, but its local account state could not be committed. Run `hra account show` to reconcile it.");
     }
     return { account: this.#publicProfile(this.#store.requireProfile(profile.id)), idempotencyKey: key };
+  }
+
+  #automaticUsagePolicyCommand(
+    command: Extract<LocalCommand, { kind: "usage.auto.status" | "usage.auto.set" }>,
+  ): ReturnType<typeof createAutomaticUsagePolicyCommandResult> {
+    try {
+      // The storage transaction owns replay and CAS. In particular, do not
+      // read the mutable head before resolving an old update key.
+      const configuration = command.kind === "usage.auto.status"
+        ? this.#store.readAutomaticUsagePolicyConfiguration()
+        : this.#store.updateAutomaticUsagePolicyConfiguration({
+          idempotencyKey: command.idempotencyKey,
+          expectedAutomaticPolicyRevision: command.expectedAutomaticPolicyRevision,
+          change: command.change,
+        });
+      return createAutomaticUsagePolicyCommandResult(
+        configuration,
+        command.kind === "usage.auto.status" ? command.provider : undefined,
+      );
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        if (error.message === "AUTOMATIC_USAGE_POLICY_REVISION_CONFLICT") {
+          throw new CommandFailure(
+            "CONFLICT",
+            "Automatic usage policy changed since that revision. Run `hra usage auto status` before submitting a new change.",
+          );
+        }
+        if (error.message === "AUTOMATIC_USAGE_POLICY_REVISION_EXHAUSTED") {
+          throw new CommandFailure(
+            "CONFLICT",
+            "Automatic usage policy revision capacity is exhausted; this setting cannot be updated further.",
+          );
+        }
+        if (error.message === "IDEMPOTENCY_CONFLICT"
+          || (error instanceof SessionSendOwnershipError && error.code === "SESSION_SEND_OWNED_API_REQUIRED")) {
+          throw new CommandFailure(
+            "CONFLICT",
+            "The automatic usage policy key belongs to a different request. Replay the original request or use a new key for a new change.",
+          );
+        }
+      }
+      // No storage error or corrupt receipt may leak through either renderer,
+      // and an unreadable setting must never be replaced with default-on.
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "Automatic usage policy could not be verified. No automatic setting was reinitialized; inspect local recovery before retrying.",
+      );
+    }
   }
 
   async #usage(selector: string | undefined, refresh: boolean, signal: AbortSignal): Promise<unknown> {

@@ -17,6 +17,7 @@ import {
   type Provider,
 } from "../domain/presets";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "../domain/usage-metrics";
+import { usageProviderSchema } from "../domain/provider-usage";
 import { createCloudUuidV7, isUuidV7 } from "../domain/uuid-v7";
 import { parseAuthCredentials } from "../cloud/authCredentials";
 import {
@@ -235,6 +236,7 @@ Usage:
   hra doctor [--offline] [--json]
   hra daemon start|status|stop|run
   hra account add|list|show|login|login-cancel|logout|usage|usage-history|switch|switch-recover
+  hra usage auto status|on|off|inherit
   hra plugin list <account> [--project <project>] [--refresh]
   hra plugin show <account> <plugin> [--project <project>] [--refresh]
   hra project add|list|use
@@ -286,6 +288,27 @@ Recommended profiles:
 Run \`hra <group> --help\` or \`hra help <group> [<command>]\` for command examples.`;
 
 const groupUsage = {
+  usage: `HRA usage
+
+Usage:
+  hra usage auto status [codex|claude] [--json]
+  hra usage auto on|off [codex|claude] --revision <n> --idempotency-key <uuid> [--json]
+  hra usage auto inherit <codex|claude> --revision <n> --idempotency-key <uuid> [--json]
+
+Notes:
+  Without a provider, on/off changes the inherited default, not a global kill switch.
+  A provider override of on can remain enabled when the inherited default is off.
+  inherit requires a provider and removes that provider's override.
+  Mutations require both --revision from status and a caller-owned --idempotency-key.
+  Reuse the same key and revision after a lost response. A replay returns the saved
+  receipt, not the current policy head; run status to read the current configuration.
+  status accepts no mutation flags. Only Codex and Claude have usage-auto policy.
+
+Examples:
+  hra usage auto status --json
+  hra usage auto off --revision 1 --idempotency-key 11111111-1111-4111-8111-111111111111
+  hra usage auto on codex --revision 2 --idempotency-key 22222222-2222-4222-8222-222222222222
+  hra usage auto inherit claude --revision 3 --idempotency-key 33333333-3333-4333-8333-333333333333`,
   status: `HRA status
 
 Usage:
@@ -2011,6 +2034,45 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       throw new CliUsageError("--idempotency-key is not supported by status.");
     }
     return { kind: "status", json };
+  }
+  if (group === "usage") {
+    if (cursor.literalDelimiter) throw new CliUsageError("Literal arguments are not supported by usage auto.");
+    if (take(cursor, "usage command") !== "auto") {
+      throw new CliUsageError("Unknown usage command. Run `hra usage --help` for supported commands.");
+    }
+    const action = take(cursor, "usage auto action");
+    if (action !== "status" && action !== "on" && action !== "off" && action !== "inherit") {
+      throw new CliUsageError("Unknown usage auto action. Use `status`, `on`, `off`, or `inherit`.");
+    }
+    const revision = action === "status" ? undefined : option(cursor, "--revision");
+    const providerValue = takeOptional(cursor);
+    const provider = providerValue === undefined ? undefined : usageProviderSchema.safeParse(providerValue);
+    if (provider !== undefined && !provider.success) {
+      throw new CliUsageError("Usage-auto provider must be `codex` or `claude`.");
+    }
+    finish(cursor);
+    if (action === "status") {
+      if (idempotencyKey !== undefined) {
+        throw new CliUsageError("--idempotency-key is not supported by usage auto status.");
+      }
+      return { kind: "command", json, command: command({
+        kind: "usage.auto.status", ...(provider === undefined ? {} : { provider: provider.data }),
+      }) };
+    }
+    if (action === "inherit" && provider === undefined) {
+      throw new CliUsageError("usage auto inherit requires a provider.");
+    }
+    if (idempotencyKey === undefined) {
+      throw new CliUsageError("usage auto mutations require --idempotency-key <uuid>.");
+    }
+    return { kind: "command", json, command: command({
+      kind: "usage.auto.set",
+      idempotencyKey,
+      expectedAutomaticPolicyRevision: boundedDecimal(revision, "--revision", 1, Number.MAX_SAFE_INTEGER),
+      change: provider === undefined
+        ? { kind: "set_default", enabled: action === "on" }
+        : { kind: "set_override", provider: provider.data, override: action },
+    }) };
   }
   if (group === "init") { const yes = flag(cursor, "--yes"); finish(cursor); return { kind: "init", yes, json }; }
   if (group === "doctor") { const offline = flag(cursor, "--offline"); finish(cursor); return { kind: "command", command: { kind: "doctor", offline }, json }; }

@@ -18,6 +18,8 @@ import {
 } from "./session-events";
 import { TRANSCRIPT_PAGE_LIMIT } from "./transcript";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "./usage-metrics";
+import { usageProviderSchema } from "./provider-usage";
+import { automaticUsagePolicyConfigurationUpdateSchema } from "./usage-policy";
 import {
   sessionTaskIntervalMinutesSchema,
   sessionTaskNameSchema,
@@ -371,6 +373,11 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("account.login-cancel"), account: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("account.logout"), account: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("account.usage"), account: selectorSchema.optional(), refresh: z.boolean() }).strict(),
+  z.object({ kind: z.literal("usage.auto.status"), provider: usageProviderSchema.optional() }).strict(),
+  z.object({
+    kind: z.literal("usage.auto.set"),
+    ...automaticUsagePolicyConfigurationUpdateSchema.shape,
+  }).strict(),
   z.object({
     kind: z.literal("account.usage-history"),
     account: selectorSchema,

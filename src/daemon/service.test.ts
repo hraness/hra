@@ -72,6 +72,7 @@ import {
   type GatewayKeyPort,
 } from "../storage/gateway-key-custody";
 import { StateStore, type SessionRecord } from "../storage/state-store";
+import { SessionSendOwnershipError } from "../storage/session-send-owner";
 import { canonicalAdoption40DatabaseBytes, canonicalAdoption40Fixture } from "../../scripts/fixtures/canonical-adoption40";
 import {
   DeterministicProseResponder,
@@ -9137,6 +9138,265 @@ describe("HraService", () => {
     expect(value.codex.committedStartTurns).toBe(0);
   });
 
+  describe("automatic policy commands", () => {
+    type Configuration = ReturnType<StateStore["readAutomaticUsagePolicyConfiguration"]>;
+    type Change = Parameters<StateStore["updateAutomaticUsagePolicyConfiguration"]>[0]["change"];
+    const initial: Configuration = { version: 1, defaultEnabled: true,
+      overrides: { codex: "inherit", claude: "inherit" }, automaticPolicyRevision: 1 };
+    const recoveryMessage = "Automatic usage policy could not be verified. No automatic setting was reinitialized; inspect local recovery before retrying.";
+    const revisionMessage = "Automatic usage policy changed since that revision. Run `hra usage auto status` before submitting a new change.";
+    const keyMessage = "The automatic usage policy key belongs to a different request. Replay the original request or use a new key for a new change.";
+    const projection = (configuration: Configuration, providers: readonly ("codex" | "claude")[] = ["codex", "claude"]) => ({
+      version: 1, configuration,
+      effective: providers.map((provider) => ({ provider,
+        enabled: configuration.overrides[provider] === "inherit" ? configuration.defaultEnabled : configuration.overrides[provider] === "on",
+        source: configuration.overrides[provider] === "inherit" ? "default" : "override",
+        automaticPolicyRevision: configuration.automaticPolicyRevision,
+      })),
+    });
+    const request = (expectedAutomaticPolicyRevision = 1, change: Change = { kind: "set_default", enabled: false }) => ({
+      kind: "usage.auto.set", idempotencyKey: crypto.randomUUID(), expectedAutomaticPolicyRevision, change,
+    });
+    const execute = (service: HraService, command: unknown) => service.execute(localCommandSchema.parse(command), { signal });
+    const setup = async () => {
+      const now = 1_800_000_000_000;
+      const claude = new FakeClaude("isolated", {
+        pid: 63_042, pidDomain: "darwin", procStart: "automatic-policy-command-fake-process",
+      });
+      const desktop = new FakeDesktop();
+      const value = await fixture(desktop, new FakeCloud(), () => undefined, () => now, undefined, { claude });
+      const profiles = ["primary", "secondary"].map((label) => {
+        const current = value.store.nextProfileGeneration(value.store.createProfile(`Automatic ${label}`).id);
+        expect(value.store.setProfileState(current.id, current.processGeneration, "signed_in", {
+          email: `automatic-${label}@example.com`, plan: "Plus",
+        })).toBe(true);
+        return value.store.requireProfileById(current.id);
+      });
+      const primary = profiles[0];
+      if (primary === undefined) throw new Error("Expected a seeded account.");
+      const session = value.store.createSession({ profileId: primary.id, provider: "codex", preset: "high", fastEnabled: false });
+      value.store.bindSession({ sessionId: session.id, expectedRevision: session.revision,
+        providerThreadId: "automatic-policy-preserved-thread", state: "idle" });
+      const resetInput = { profileId: primary.id, processGeneration: primary.processGeneration,
+        accountFingerprint: createHash("sha256").update("automatic-primary@example.com").digest("hex"),
+        weeklyWindowResetsAt: now + 86_400_000 };
+      expect(value.store.authorizeAccountRateLimitResetPolicy({ ...resetInput, weeklyWindowDurationMinutes: 10_080 }).decision).toBe("allow");
+      value.store.prepareAccountRateLimitReset({ ...resetInput, observedUsedPercent: 99 });
+      value.store.prepareMutation({ idempotencyKey: crypto.randomUUID(), kind: "test.policy-preserved",
+        authorityId: "test-policy-preserved", authorityGeneration: 1, request: { preserve: true } });
+      const snapshot = (unrelated = false) => {
+        const db = new Database(value.paths.database, { readonly: true, strict: true });
+        try {
+          const names = db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all();
+          return {
+            version: db.query("PRAGMA user_version").get(),
+            schema: db.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
+            tables: names.filter(({ name }) => !unrelated || name !== "automatic_usage_policy_revisions")
+              .map(({ name }) => ({ name, rows: db.query(`SELECT * FROM "${name.replaceAll('"', '""')}"${
+                unrelated && name === "mutation_attempts" ? " WHERE kind<>'usage.auto.configure'" : ""
+              }`).all() })),
+          };
+        } finally { db.close(false); }
+      };
+      const expectNoProviderWork = () => {
+        expect(value.codex.calls).toEqual([]);
+        expect(value.codex.resetIdempotencyKeys).toEqual([]);
+        expect(value.codex.turnEffectTrace).toEqual([]);
+        expect(claude.calls).toEqual([]);
+        expect(desktop.calls).toEqual([]);
+      };
+      return { ...value, claude, desktop, now, sessionId: session.id, snapshot, expectNoProviderWork };
+    };
+
+    test("reports defaults and exact provider filters without any write or provider call", async () => {
+      const value = await setup();
+      const before = value.snapshot();
+      expect(await execute(value.service, { kind: "usage.auto.status" })).toEqual(projection(initial));
+      for (const provider of ["codex", "claude"] as const) {
+        expect(await execute(value.service, { kind: "usage.auto.status", provider })).toEqual(projection(initial, [provider]));
+      }
+      expect(value.snapshot()).toEqual(before);
+      value.expectNoProviderWork();
+    });
+
+    test("updates the effective default and override matrix without touching existing sessions, resets or pointers", async () => {
+      const value = await setup();
+      const before = value.snapshot(true);
+      let configuration = initial;
+      const changes: Change[] = [
+        { kind: "set_default", enabled: false },
+        { kind: "set_override", provider: "codex", override: "on" },
+        { kind: "set_override", provider: "claude", override: "off" },
+        { kind: "set_default", enabled: true },
+        { kind: "set_override", provider: "codex", override: "off" },
+        { kind: "set_override", provider: "claude", override: "on" },
+        { kind: "set_override", provider: "codex", override: "inherit" },
+        { kind: "set_override", provider: "claude", override: "inherit" },
+        { kind: "set_default", enabled: true },
+      ];
+      for (const change of changes) {
+        const command = request(configuration.automaticPolicyRevision, change);
+        configuration = { ...configuration, overrides: { ...configuration.overrides },
+          automaticPolicyRevision: configuration.automaticPolicyRevision + 1 };
+        if (change.kind === "set_default") configuration.defaultEnabled = change.enabled;
+        else configuration.overrides[change.provider] = change.override;
+        expect(await execute(value.service, command)).toEqual(projection(configuration));
+        expect(await execute(value.service, { kind: "usage.auto.status", provider: "claude" }))
+          .toEqual(projection(configuration, ["claude"]));
+        expect(value.store.readMutation(command.idempotencyKey)).toMatchObject({
+          kind: "usage.auto.configure", authorityId: "automatic-usage-policy",
+          authorityGeneration: command.expectedAutomaticPolicyRevision, state: "applied",
+          result: { version: 1, automaticPolicyRevision: configuration.automaticPolicyRevision },
+        });
+        expect(value.snapshot(true)).toEqual(before);
+      }
+      value.expectNoProviderWork();
+    });
+
+    test("replays the original receipt before a changed live head without rewriting anything", async () => {
+      const value = await setup();
+      const original = request();
+      const first = await execute(value.service, original);
+      expect(first).toEqual(projection({ ...initial, defaultEnabled: false, automaticPolicyRevision: 2 }));
+      const latest = await execute(value.service, request(2, { kind: "set_override", provider: "codex", override: "on" }));
+      expect(latest).not.toEqual(first);
+      const before = value.snapshot();
+      Object.defineProperty(value.store, "readAutomaticUsagePolicyConfiguration", {
+        configurable: true, value: () => { throw new Error("A historical replay must not preflight the live head."); },
+      });
+      try { expect(await execute(value.service, original)).toEqual(first); }
+      finally { Reflect.deleteProperty(value.store, "readAutomaticUsagePolicyConfiguration"); }
+      expect(value.snapshot()).toEqual(before);
+      expect(await execute(value.service, { kind: "usage.auto.status" })).toEqual(latest);
+      value.expectNoProviderWork();
+    });
+
+    test("rejects conflicting keys and stale revisions without intent or state changes", async () => {
+      const value = await setup();
+      const accepted = request();
+      await execute(value.service, accepted);
+      const foreign = request(2);
+      value.store.prepareMutation({ idempotencyKey: foreign.idempotencyKey, kind: "test.other",
+        authorityId: "test-policy-key", authorityGeneration: 1, request: {} });
+      for (const [command, message] of [
+        [{ ...accepted, change: { kind: "set_default", enabled: true } }, keyMessage],
+        [{ ...accepted, expectedAutomaticPolicyRevision: 2 }, keyMessage],
+        [foreign, keyMessage],
+        [request(1), revisionMessage],
+      ] as const) {
+        const before = value.snapshot();
+        await expect(execute(value.service, command)).rejects.toMatchObject({ code: "CONFLICT", message, details: undefined });
+        expect(value.snapshot()).toEqual(before);
+      }
+      value.expectNoProviderWork();
+    });
+
+    test("reports an owned session-send key as an inert conflict", async () => {
+      const value = await setup();
+      const command = request();
+      const owner = value.store.prepareOwnedSessionSend({ kind: "session.send", session: value.sessionId,
+        message: "Preserve the original send owner", attachments: [], idempotencyKey: command.idempotencyKey });
+      const history = value.store.readOwnedSessionSend(command.idempotencyKey);
+      expect(history).toMatchObject({ kind: "owned", ownerDigest: owner.ownerDigest });
+      const before = value.snapshot();
+      await expect(execute(value.service, command)).rejects.toMatchObject({ code: "CONFLICT", message: keyMessage, details: undefined });
+      expect(value.snapshot()).toEqual(before);
+      expect(value.store.readOwnedSessionSend(command.idempotencyKey)).toEqual(history);
+      value.expectNoProviderWork();
+    });
+
+    test("keeps corrupt session-send ownership a sanitized recovery refusal", async () => {
+      const value = await setup();
+      const before = value.snapshot();
+      const failure = new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
+      failure.message = `${failure.code} ${privatePathRoot}/owner-private-sentinel`;
+      Object.defineProperty(value.store, "updateAutomaticUsagePolicyConfiguration", {
+        configurable: true, value: () => { throw failure; },
+      });
+      await expect(execute(value.service, request()))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED", message: recoveryMessage, details: undefined });
+      expect(value.snapshot()).toEqual(before);
+      value.expectNoProviderWork();
+    });
+
+    test("admits exactly one revision contender across two real service/store connections", async () => {
+      const value = await setup();
+      const contenderStore = new StateStore(value.paths, { now: () => value.now });
+      stores.push(contenderStore);
+      const contender = new HraService({ store: contenderStore, paths: value.paths,
+        codex: value.codex, claude: value.claude, desktop: value.desktop, cloud: value.cloud,
+        daemonAuthority: new FakeDaemonAuthority(), daemonGeneration: value.daemonGeneration,
+        daemonBootId: value.daemonBootId, eventCursors: value.eventCursors, now: () => value.now,
+        requestStop: () => undefined,
+      });
+      const commands = [request(), request(1, { kind: "set_override", provider: "codex", override: "off" })];
+      const before = value.snapshot(true);
+      try {
+        const results = await Promise.allSettled(commands.map((command, index) => execute(index === 0 ? value.service : contender, command)));
+        expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+        expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+        for (const [index, result] of results.entries()) {
+          const command = commands[index];
+          if (command === undefined) throw new Error("Expected contender request.");
+          if (result.status === "rejected") {
+            expect(result.reason).toMatchObject({ code: "CONFLICT", message: revisionMessage, details: undefined });
+            expect(value.store.readMutation(command.idempotencyKey)).toBeNull();
+          } else expect(result.value).toMatchObject({ configuration: { automaticPolicyRevision: 2 } });
+        }
+        expect(value.store.readAutomaticUsagePolicyConfiguration().automaticPolicyRevision).toBe(2);
+        expect(contenderStore.readAutomaticUsagePolicyConfiguration()).toEqual(value.store.readAutomaticUsagePolicyConfiguration());
+        expect(value.snapshot(true)).toEqual(before);
+        value.expectNoProviderWork();
+      } finally { await contender.close(); }
+    });
+
+    for (const operation of ["status", "set"] as const) {
+      for (const failure of ["throw", "malformed_result"] as const) {
+        test(`sanitizes ${operation} ${failure} inside the policy boundary without reinitializing state`, async () => {
+          const value = await setup();
+          const sentinel = `${privatePathRoot}/policy-secret-sentinel`;
+          const before = value.snapshot();
+          Object.defineProperty(value.store, operation === "status" ? "readAutomaticUsagePolicyConfiguration" : "updateAutomaticUsagePolicyConfiguration", {
+            configurable: true,
+            value: () => {
+              if (failure === "throw") throw new Error(`AUTOMATIC_USAGE_POLICY_INVALID ${sentinel}`);
+              return { ...initial, automaticPolicyRevision: 0, privateDetail: sentinel };
+            },
+          });
+          await expect(execute(value.service, operation === "status" ? { kind: "usage.auto.status" } : request()))
+            .rejects.toMatchObject({ code: "RECOVERY_REQUIRED", message: recoveryMessage, details: undefined });
+          expect(value.snapshot()).toEqual(before);
+          value.expectNoProviderWork();
+        });
+      }
+    }
+
+    test("reports exhausted revision capacity as a closed inert conflict", async () => {
+      const value = await setup();
+      const before = value.snapshot();
+      Object.defineProperty(value.store, "updateAutomaticUsagePolicyConfiguration", {
+        configurable: true, value: () => { throw new Error("AUTOMATIC_USAGE_POLICY_REVISION_EXHAUSTED"); },
+      });
+      await expect(execute(value.service, request())).rejects.toMatchObject({ code: "CONFLICT", details: undefined,
+        message: "Automatic usage policy revision capacity is exhausted; this setting cannot be updated further." });
+      expect(value.snapshot()).toEqual(before);
+      value.expectNoProviderWork();
+    });
+
+    test("rejects unknown wire fields and unsupported providers before service admission", () => {
+      for (const command of [
+        { kind: "usage.auto.status", provider: "devin" },
+        { kind: "usage.auto.status", extra: true },
+        { ...request(), extra: true },
+        { ...request(), expectedAutomaticPolicyRevision: 0 },
+        { ...request(), expectedAutomaticPolicyRevision: Number.MAX_SAFE_INTEGER + 1 },
+        { ...request(), change: { kind: "set_default", enabled: false, extra: true } },
+        { ...request(), change: { kind: "set_override", provider: "codex", override: "disabled" } },
+        { ...request(), change: { kind: "set_override", provider: "devin", override: "off" } },
+      ]) expect(localCommandSchema.safeParse(command).success).toBe(false);
+    });
+  });
+
   test("reports and CAS-updates notification hours with the injected clock only", async () => {
     let now = Date.parse("2026-09-04T12:30:00.000Z");
     const value = await fixture(
@@ -13786,6 +14046,28 @@ describe("HraService", () => {
       expect(value.store.readProviderAccountState("codex")).toEqual(pointer);
       expect(value.codex.committedStartTurns).toBe(0);
       expect(effectRows(value).sessions).toEqual([]);
+    });
+
+    test("automatic policy commands disable Codex before an exhausted usage refresh", async () => {
+      const value = await setup();
+      const command = { kind: "usage.auto.set", idempotencyKey: crypto.randomUUID(), expectedAutomaticPolicyRevision: 1,
+        change: { kind: "set_override", provider: "codex", override: "off" } };
+      expect(await value.service.execute(localCommandSchema.parse(command), { signal })).toMatchObject({
+        configuration: { automaticPolicyRevision: 2, overrides: { codex: "off", claude: "inherit" } },
+        effective: [{ provider: "codex", enabled: false, source: "override", automaticPolicyRevision: 2 },
+          { provider: "claude", enabled: true, source: "default", automaticPolicyRevision: 2 }],
+      });
+      expect(await value.service.execute(localCommandSchema.parse({ kind: "usage.auto.status", provider: "codex" }), { signal }))
+        .toMatchObject({ effective: [{ provider: "codex", enabled: false, source: "override", automaticPolicyRevision: 2 }] });
+      const before = effectRows(value);
+      const callsBefore = value.codex.calls.length;
+      expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: {
+        refresh: { state: "suppressed", reason: "automatic_policy_disabled" },
+      } }] });
+      expect(value.codex.calls.slice(callsBefore)).toEqual(["readAccount", "usage", "readAccount"]);
+      expect(value.store.usageRange({ profileId: value.profileId })).toHaveLength(1);
+      expect(value.codex.resetIdempotencyKeys).toEqual([]);
+      expect(effectRows(value)).toEqual(before);
     });
 
     test("fails closed before reset when automatic policy cannot be read", async () => {

@@ -3523,6 +3523,41 @@ describe("CLI entry point", () => {
     }
   });
 
+  test("an uncertain automatic policy response preserves the original key and revision without retrying", async () => {
+    const idempotencyKey = "00000000-0000-4000-8000-000000000151";
+    for (const json of [false, true]) {
+      const captured = capture();
+      const calls: unknown[] = [];
+      expect(await main([
+        "usage", "auto", "off", "codex", "--revision", "7",
+        "--idempotency-key", idempotencyKey, ...(json ? ["--json"] : []),
+      ], captured.output, {
+        callDaemon: (command) => {
+          calls.push(command);
+          throw new LocalDaemonIndeterminateError("private-policy-transport-sentinel");
+        },
+      })).toBe(7);
+      expect(calls).toEqual([{
+        kind: "usage.auto.set", idempotencyKey, expectedAutomaticPolicyRevision: 7,
+        change: { kind: "set_override", provider: "codex", override: "off" },
+      }]);
+      const rendered = captured.read();
+      expect(rendered.stdout + rendered.stderr).not.toContain("private-policy-transport-sentinel");
+      expect(rendered.stdout + rendered.stderr).toContain("original command unchanged");
+      if (json) {
+        expect(JSON.parse(rendered.stdout)).toMatchObject({
+          error: { code: "RECOVERY_REQUIRED", details: {
+            idempotencyKey, sameKeyReplay: true,
+            replayArguments: ["--idempotency-key", idempotencyKey],
+          } },
+        });
+      } else {
+        expect(rendered.stdout).toBe("");
+        expect(rendered.stderr).toContain(idempotencyKey);
+      }
+    }
+  });
+
   test("surfaces same-key replay arguments for every indeterminate local mutation without echoing its payload", async () => {
     const privatePayload = "message-private-sentinel";
     const commands = [

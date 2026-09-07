@@ -45,6 +45,7 @@ import {
   automaticRateLimitResetStatusSchema,
 } from "../domain/usage-metrics";
 import { sessionStateReportSchema } from "../domain/session-state";
+import { automaticUsagePolicyCommandResultSchema } from "../domain/usage-policy-command";
 import { profileIdSchema, projectIdSchema, sessionIdSchema } from "../domain/values";
 import { publicProviderIdentifierSchema } from "../public-provider-identifier";
 import {
@@ -1373,6 +1374,27 @@ const assertCommandSuccessData = (command: LocalCommand, data: unknown): void =>
 };
 
 const publicInteractionData = (command: LocalCommand, data: unknown): unknown => {
+  if (command.kind === "usage.auto.status" || command.kind === "usage.auto.set") {
+    const parsed = automaticUsagePolicyCommandResultSchema.safeParse(data);
+    if (!parsed.success) return invalidCommandResponse(command);
+    const result = parsed.data;
+    const providers = command.kind === "usage.auto.status" && command.provider !== undefined
+      ? [command.provider] : ["codex", "claude"];
+    if (result.effective.length !== providers.length
+      || result.effective.some((entry, index) => entry.provider !== providers[index])) {
+      return invalidCommandResponse(command);
+    }
+    if (command.kind === "usage.auto.set") {
+      const change = command.change;
+      if (result.configuration.automaticPolicyRevision !== command.expectedAutomaticPolicyRevision + 1
+        || (change.kind === "set_default"
+          ? result.configuration.defaultEnabled !== change.enabled
+          : result.configuration.overrides[change.provider] !== change.override)) {
+        return invalidCommandResponse(command);
+      }
+    }
+    return result;
+  }
   if (
     command.kind === "notification-email.status"
     || command.kind === "notification-email.enable"
@@ -2753,7 +2775,19 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     return;
   }
   const value = publicData as Record<string, unknown>;
-  if (command.kind === "doctor") {
+  if (command.kind === "usage.auto.status" || command.kind === "usage.auto.set") {
+    const result = automaticUsagePolicyCommandResultSchema.parse(publicData);
+    const lines = [
+      `Automatic usage policy ${command.kind === "usage.auto.set" ? "receipt" : "status"}, revision ${String(result.configuration.automaticPolicyRevision)}.`,
+      `Inherited default: ${result.configuration.defaultEnabled ? "on" : "off"}. Provider overrides take precedence.`,
+      ...result.effective.map((entry) => `${entry.provider}: ${entry.enabled ? "on" : "off"} (${entry.source === "default"
+        ? "inherits default" : `override ${result.configuration.overrides[entry.provider]}`}).`),
+    ];
+    if (command.kind === "usage.auto.set") {
+      lines.push("This is the saved receipt. Run `hra usage auto status` for the current policy.");
+    }
+    output.writeStdout(`${lines.join("\n")}\n`);
+  } else if (command.kind === "doctor") {
     output.writeStdout(`${renderDoctor(data)}\n`);
   } else if (command.kind === "account.login") {
     const login = object(value.login);

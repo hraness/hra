@@ -6686,6 +6686,7 @@ export async function main(
       && (
         invocation.command.kind === "account.logout"
         || invocation.command.kind === "account.switch"
+        || invocation.command.kind === "usage.auto.set"
         || invocation.command.kind === "session.start"
         || invocation.command.kind === "session.send"
         || invocation.command.kind === "session.queue"
