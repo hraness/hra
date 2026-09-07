@@ -129,7 +129,7 @@ const makeDeployEvidenceHarness = async () => {
   );
   await chmod(evidenceDirectory, 0o700);
   let activeSourceCommit = sourceCommit;
-  let providerResult: "deployed" | "failed-before-push" = "deployed";
+  let providerResult: "deployed" | "failed-before-start-push" = "deployed";
   let runtime: RuntimeReleaseAttestation | null = null;
   let deploymentCalls = 0;
   let authorityReads = 0;
@@ -148,8 +148,8 @@ const makeDeployEvidenceHarness = async () => {
       return { exitCode: 0, stderr: "", stdout: "installed" };
     }
     deploymentCalls += 1;
-    if (providerResult === "failed-before-push") {
-      return { exitCode: 1, stderr: "typecheck stopped before runPush", stdout: "" };
+    if (providerResult === "failed-before-start-push") {
+      return { exitCode: 1, stderr: "provider validation stopped before start_push", stdout: "" };
     }
     const overlay = await readFile(join(request.cwd, "convex", "releaseAttestation.ts"), "utf8");
     const match = /Object\.freeze\((\{.*\}) as const\)/u.exec(overlay);
@@ -174,7 +174,7 @@ const makeDeployEvidenceHarness = async () => {
       now: number;
       phase: "bootstrap" | "candidate";
       previousEvidenceName?: string;
-      providerResult?: "deployed" | "failed-before-push";
+      providerResult?: "deployed" | "failed-before-start-push";
       revision: string;
       sourceCommit: string;
       target?: ConvexTarget;
@@ -1096,7 +1096,7 @@ describe("verified hosted deployment", () => {
     }
   });
 
-  test("supersedes a proven pre-push stop only through a fresh source path", async () => {
+  test("supersedes a proven pre-mutation stop only through a fresh source path", async () => {
     const oldSourceCommit = "a".repeat(40);
     const fixedSourceCommit = "b".repeat(40);
     const repositoryRoot = await makeTemporaryDirectory("hra-hosted-supersession-source-");
@@ -1130,7 +1130,7 @@ describe("verified hosted deployment", () => {
       }
       providerCalls += 1;
       if (failBeforePush) {
-        return { exitCode: 1, stderr: "typecheck stopped before runPush", stdout: "" };
+        return { exitCode: 1, stderr: "provider validation stopped before start_push", stdout: "" };
       }
       const overlay = await readFile(join(request.cwd, "convex", "releaseAttestation.ts"), "utf8");
       const match = /Object\.freeze\((\{.*\}) as const\)/u.exec(overlay);
@@ -1198,7 +1198,7 @@ describe("verified hosted deployment", () => {
     expect(await readdir(temporaryRoot)).toEqual([]);
   });
 
-  test("supersedes a proven pre-push candidate stop from the same live predecessor", async () => {
+  test("supersedes a proven pre-mutation candidate stop from the same live predecessor", async () => {
     const harness = await makeDeployEvidenceHarness();
     const oldSourceCommit = "b".repeat(40);
     const fixedSourceCommit = "c".repeat(40);
@@ -1220,7 +1220,7 @@ describe("verified hosted deployment", () => {
       now: 2_000,
       phase: "candidate",
       previousEvidenceName: "bootstrap.json",
-      providerResult: "failed-before-push",
+      providerResult: "failed-before-start-push",
       revision: "00000000-0000-4000-8000-000000000054",
       sourceCommit: oldSourceCommit,
     })).rejects.toThrow("convex_deploy_failed");
