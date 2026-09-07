@@ -129,6 +129,7 @@ const makeDeployEvidenceHarness = async () => {
   );
   await chmod(evidenceDirectory, 0o700);
   let activeSourceCommit = sourceCommit;
+  let providerResult: "deployed" | "failed-before-start-push" = "deployed";
   let runtime: RuntimeReleaseAttestation | null = null;
   let deploymentCalls = 0;
   let authorityReads = 0;
@@ -147,6 +148,9 @@ const makeDeployEvidenceHarness = async () => {
       return { exitCode: 0, stderr: "", stdout: "installed" };
     }
     deploymentCalls += 1;
+    if (providerResult === "failed-before-start-push") {
+      return { exitCode: 1, stderr: "provider validation stopped before start_push", stdout: "" };
+    }
     const overlay = await readFile(join(request.cwd, "convex", "releaseAttestation.ts"), "utf8");
     const match = /Object\.freeze\((\{.*\}) as const\)/u.exec(overlay);
     if (match?.[1] === undefined) throw new Error("missing attestation overlay");
@@ -161,17 +165,22 @@ const makeDeployEvidenceHarness = async () => {
     get deploymentCalls() {
       return deploymentCalls;
     },
+    get runtime() {
+      return runtime;
+    },
     evidenceDirectory,
     async deploy(options: Readonly<{
       evidenceName: string;
       now: number;
       phase: "bootstrap" | "candidate";
       previousEvidenceName?: string;
+      providerResult?: "deployed" | "failed-before-start-push";
       revision: string;
       sourceCommit: string;
       target?: ConvexTarget;
     }>) {
       activeSourceCommit = options.sourceCommit;
+      providerResult = options.providerResult ?? "deployed";
       return await deployHostedSync({
         evidencePath: join(evidenceDirectory, options.evidenceName),
         now: () => options.now,
@@ -1087,7 +1096,7 @@ describe("verified hosted deployment", () => {
     }
   });
 
-  test("supersedes a proven pre-push stop only through a fresh source path", async () => {
+  test("supersedes a proven pre-mutation stop only through a fresh source path", async () => {
     const oldSourceCommit = "a".repeat(40);
     const fixedSourceCommit = "b".repeat(40);
     const repositoryRoot = await makeTemporaryDirectory("hra-hosted-supersession-source-");
@@ -1121,7 +1130,7 @@ describe("verified hosted deployment", () => {
       }
       providerCalls += 1;
       if (failBeforePush) {
-        return { exitCode: 1, stderr: "typecheck stopped before runPush", stdout: "" };
+        return { exitCode: 1, stderr: "provider validation stopped before start_push", stdout: "" };
       }
       const overlay = await readFile(join(request.cwd, "convex", "releaseAttestation.ts"), "utf8");
       const match = /Object\.freeze\((\{.*\}) as const\)/u.exec(overlay);
@@ -1187,6 +1196,74 @@ describe("verified hosted deployment", () => {
     )).toBeTrue();
     expect(await readFile(`${oldEvidencePath}.intent`, "utf8")).toBe(oldIntentDocument);
     expect(await readdir(temporaryRoot)).toEqual([]);
+  });
+
+  test("supersedes a proven pre-mutation candidate stop from the same live predecessor", async () => {
+    const harness = await makeDeployEvidenceHarness();
+    const oldSourceCommit = "b".repeat(40);
+    const fixedSourceCommit = "c".repeat(40);
+    const bootstrap = await harness.deploy({
+      evidenceName: "bootstrap.json",
+      now: 1_000,
+      phase: "bootstrap",
+      revision: "00000000-0000-4000-8000-000000000053",
+      sourceCommit,
+    });
+    if (bootstrap === undefined) throw new Error("missing bootstrap evidence");
+    const bootstrapDocument = await readFile(
+      join(harness.evidenceDirectory, "bootstrap.json"),
+      "utf8",
+    );
+
+    await expect(harness.deploy({
+      evidenceName: `candidate-${oldSourceCommit}.json`,
+      now: 2_000,
+      phase: "candidate",
+      previousEvidenceName: "bootstrap.json",
+      providerResult: "failed-before-start-push",
+      revision: "00000000-0000-4000-8000-000000000054",
+      sourceCommit: oldSourceCommit,
+    })).rejects.toThrow("convex_deploy_failed");
+    const oldEvidencePath = join(
+      harness.evidenceDirectory,
+      `candidate-${oldSourceCommit}.json`,
+    );
+    const oldIntentDocument = await readFile(`${oldEvidencePath}.intent`, "utf8");
+    expect(harness.runtime).toEqual(bootstrap.after);
+    expect(harness.deploymentCalls).toBe(2);
+    expect(await Bun.file(oldEvidencePath).exists()).toBeFalse();
+
+    const fixed = await harness.deploy({
+      evidenceName: `candidate-${fixedSourceCommit}.json`,
+      now: 3_000,
+      phase: "candidate",
+      previousEvidenceName: "bootstrap.json",
+      revision: "00000000-0000-4000-8000-000000000055",
+      sourceCommit: fixedSourceCommit,
+    });
+    if (fixed === undefined) throw new Error("missing fixed candidate evidence");
+    expect(fixed).toMatchObject({
+      before: bootstrap.after,
+      phase: "candidate",
+      previousDeployDigest: bootstrap.selfDigest,
+      sourceCommit: fixedSourceCommit,
+    });
+    expect(harness.runtime).toEqual(fixed.after);
+    expect(harness.deploymentCalls).toBe(3);
+    expect(await readFile(`${oldEvidencePath}.intent`, "utf8")).toBe(oldIntentDocument);
+    expect(await readFile(join(harness.evidenceDirectory, "bootstrap.json"), "utf8"))
+      .toBe(bootstrapDocument);
+
+    await expect(harness.deploy({
+      evidenceName: `candidate-${oldSourceCommit}.json`,
+      now: 4_000,
+      phase: "candidate",
+      previousEvidenceName: "bootstrap.json",
+      revision: "00000000-0000-4000-8000-000000000099",
+      sourceCommit: oldSourceCommit,
+    })).rejects.toThrow("source_changed");
+    expect(harness.deploymentCalls).toBe(3);
+    expect(await readFile(`${oldEvidencePath}.intent`, "utf8")).toBe(oldIntentDocument);
   });
 
   test("surfaces every preserved deploy root and durable intent without postflight", async () => {
