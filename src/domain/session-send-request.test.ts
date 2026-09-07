@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
+import { z } from "zod";
 
 import { attachmentReferenceListSchema } from "./attachment-schemas";
 import {
@@ -13,6 +14,7 @@ import {
 import { localCommandSchema, selectorSchema } from "./contracts";
 import {
   fingerprintSessionSendRequest,
+  sessionSendAttachmentReferencesDigest,
   sessionSendRequestFingerprintSchema,
   sessionSendRequestSchema,
   type SessionSendRequest,
@@ -166,6 +168,24 @@ describe("original session-send request", () => {
 });
 
 describe("content-free session-send fingerprint", () => {
+  test("reference-only hashing preserves the original v1 preimage and rejects malformed input", () => {
+    const references = [reference, otherReference];
+    const expected = hash("attachment-references", JSON.stringify([
+      [5, "a".repeat(64), "text/plain", "private-input.txt"],
+      [7, "b".repeat(64), "text/markdown", "other.md"],
+    ]));
+    expect(sessionSendAttachmentReferencesDigest(references)).toBe(expected);
+    expect(fingerprintSessionSendRequest(request({ attachments: references })).attachmentReferencesDigest).toBe(expected);
+    expect(sessionSendAttachmentReferencesDigest([])).toBe(hash("attachment-references", "[]"));
+    expect(sessionSendAttachmentReferencesDigest([otherReference, reference])).not.toBe(expected);
+    for (const invalid of [
+      undefined, null, {}, "[]", [null], [{ ...reference, canonicalMediaType: "text/plain" }],
+      [{ ...reference, name: "\ud800.txt" }], [reference, reference],
+      [{ ...reference, byteLength: 0 }], [{ ...reference, digest: "not-a-digest" }],
+    ]) expect(() => sessionSendAttachmentReferencesDigest(invalid)).toThrow();
+    expect(references).toEqual([reference, otherReference]);
+  });
+
   test("version one binds explicit domain-separated serialization", () => {
     const input = request({ message: "exact 🦊\n", attachments: [reference, otherReference] });
     const fingerprint = fingerprintSessionSendRequest(input);
@@ -260,6 +280,7 @@ describe("content-free session-send fingerprint", () => {
       expect(sessionSendRequestFingerprintSchema.parse(JSON.parse(JSON.stringify(first)))).toEqual(first);
       expect(first.inputUtf8Bytes).toBe(utf8Bytes(input.message));
       expect(first.inputDigest).toBe(hash("input", input.message));
+      expect(sessionSendAttachmentReferencesDigest(input.attachments)).toBe(first.attachmentReferencesDigest);
     }), { numRuns: 100, seed: 6145 });
   });
 
@@ -268,5 +289,18 @@ describe("content-free session-send fingerprint", () => {
       expect(() => sessionSendRequestSchema.safeParse(value)).not.toThrow();
       expect(() => sessionSendRequestFingerprintSchema.safeParse(value)).not.toThrow();
     }), { numRuns: 100, seed: 6146 });
+  });
+
+  test("reference-only hashing agrees with request parsing for foreign JSON", () => {
+    fc.assert(fc.property(fc.jsonValue(), (value) => {
+      const parsed = sessionSendRequestSchema.safeParse({ ...request(), attachments: value });
+      if (parsed.success) {
+        expect(sessionSendAttachmentReferencesDigest(value)).toBe(
+          fingerprintSessionSendRequest(parsed.data).attachmentReferencesDigest,
+        );
+      } else {
+        expect(() => sessionSendAttachmentReferencesDigest(value)).toThrow(z.ZodError);
+      }
+    }), { numRuns: 100, seed: 6147 });
   });
 });

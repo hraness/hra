@@ -216,7 +216,7 @@ import {
   parseQueueAttachmentReferences, queueAttachmentManifestDigest, queueAttachmentRequestDigest, queueAttachmentQuarantineUnsettled,
   queueAttachmentsProtectedSql, readQueueAttachmentIdentity, readVerifiedQueueAttachmentManifest,
 } from "./queue-attachment-identity";
-import { fingerprintSessionSendRequest, sessionSendRequestSchema, sessionSendRequestFingerprintSchema,
+import { fingerprintSessionSendRequest, sessionSendAttachmentReferencesDigest, sessionSendRequestSchema, sessionSendRequestFingerprintSchema,
   type SessionSendRequest, type SessionSendRequestFingerprint } from "../domain/session-send-request";
 import { appendSessionSendOutcome, applySessionSendOwnerSchema, assertLegacyMutationOwnership,
   assertUnsettledSessionSendOwners, auditSessionSendOwners, classifySessionSendOwnership,
@@ -29041,18 +29041,50 @@ export class StateStore {
     attemptId: AttemptId; ownerDigest: string; requestFingerprint: SessionSendRequestFingerprint;
     daemonGeneration: number; bootId: string; expectedSessionRevision: number; executionAuthority: ProviderAccountAuthority;
     evidence: z.infer<typeof ownedDirectSendEvidenceSchema>;
+    attachments?: readonly StoredMessageAttachment[];
   }>): SessionSendOwnerHistory & { dispatchGranted: true } {
     const fingerprint = sessionSendRequestFingerprintSchema.parse(input.requestFingerprint);
     const executionAuthority = providerAccountAuthoritySchema.parse(input.executionAuthority);
     const evidence = ownedDirectSendEvidenceSchema.parse(input.evidence);
+    const suppliedAttachments = input.attachments;
+    const parsedAttachments = storedMessageAttachmentListSchema.safeParse(
+      suppliedAttachments === undefined ? [] : suppliedAttachments,
+    );
+    if (!parsedAttachments.success) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_INVALID_INPUT");
+    const attachments = parsedAttachments.data;
+    const references = attachments.map(({ byteLength, digest, mediaType, name }) => ({ byteLength, digest, mediaType, name }));
+    let originalReferencesDigest: string;
+    try {
+      originalReferencesDigest = sessionSendAttachmentReferencesDigest(references);
+    } catch (error: unknown) {
+      if (error instanceof z.ZodError) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_INVALID_INPUT");
+      throw error;
+    }
     return this.#database.transaction(() => {
       const history = requireSessionSendOwner(this.#database, { attemptId: input.attemptId });
       const custody = readAttachmentParent(this.#database, history.owner.attemptId);
-      if (history.owner.fingerprint.attachmentCount > 0 && (custody.custody === null || custody.custody.releasedBy !== null)) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
+      if (history.owner.fingerprint.attachmentCount > 0
+        && (suppliedAttachments === undefined || custody.custody === null || custody.custody.releasedBy !== null)) {
+        throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
+      }
       if (history.ownerDigest !== input.ownerDigest || JSON.stringify(fingerprint) !== JSON.stringify(history.owner.fingerprint)) {
         throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
       }
       if (history.state !== "input_required") throw new SessionSendOwnershipError("SESSION_SEND_CLAIM_CONFLICT");
+      // Original-request and custody references use distinct frozen digest
+      // domains. Bind both ordered identities without conflating their message
+      // hashes or requiring the retained origin to belong to the current boot.
+      if (attachments.length !== history.owner.fingerprint.attachmentCount
+        || originalReferencesDigest !== history.owner.fingerprint.attachmentReferencesDigest
+        || (custody.proof !== null && (custody.proof.referenceCount !== attachments.length
+          || custody.proof.referenceDigest !== attachmentReferencesDigest(references)
+          || attachments.some((attachment, index) => {
+            const member = custody.proof?.members[index];
+            return member === undefined || member.digest !== attachment.digest
+              || member.byteLength !== attachment.byteLength || member.canonicalMediaType !== attachment.canonicalMediaType;
+          })))) {
+        throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
+      }
       const session = this.requireSession(history.owner.sessionId);
       const captured = this.requireCapturedSessionProviderAuthority(session.id);
       if (session.revision !== history.owner.sourceSessionRevision || input.expectedSessionRevision !== session.revision
@@ -29092,6 +29124,20 @@ export class StateStore {
           executionAuthority.providerAccountId, executionAuthority.profileId, executionAuthority.provider,
           executionAuthority.bindingGeneration, executionAuthority.processGeneration) !== null) {
         throw new SessionSendOwnershipError("SESSION_SEND_CLAIM_CONFLICT");
+      }
+      // Manifest inserts must happen while prepared. The writer's normal
+      // bounded pruning and accounting updates roll back with any later claim
+      // refusal, including the unchanged current-daemon SQL fence.
+      try {
+        this.#recordMessageAttachments({ sessionId: history.owner.sessionId,
+          sourceId: history.owner.attemptId, attachments });
+        if (JSON.stringify(this.messageAttachmentManifest(history.owner.sessionId, history.owner.attemptId))
+          !== JSON.stringify(references)) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_CORRUPT");
+      } catch (error: unknown) {
+        if (error instanceof QueueAttachmentIdentityError || error instanceof z.ZodError) {
+          throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_CORRUPT");
+        }
+        throw error;
       }
       const record = insertSessionSendExecutionClaim(this.#database, history, {
         version: 1, mode: "direct", attemptId: history.owner.attemptId, ownerDigest: history.ownerDigest,

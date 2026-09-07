@@ -29,6 +29,19 @@ const wellFormedUnicode = (value: string): boolean => {
   return true;
 };
 
+const sessionSendAttachmentReferencesSchema = z.union([z.tuple([]), attachmentReferenceListSchema])
+  .transform((references) => [...references]).superRefine((references, context) => {
+    for (const [index, reference] of references.entries()) {
+      if (!wellFormedUnicode(reference.name)) {
+        context.addIssue({
+          code: "custom",
+          path: [index, "name"],
+          message: "An attachment name must contain well-formed Unicode.",
+        });
+      }
+    }
+  });
+
 /**
  * The original, already-parsed user input, not a resolved execution target.
  * The caller supplies its generated key if the wire request omitted one.
@@ -41,8 +54,7 @@ export const sessionSendRequestSchema = z.object({
   session: selectorSchema.refine(wellFormedUnicode),
   message: z.string().max(MESSAGE_MAX_BYTES).refine(wellFormedUnicode)
     .refine((value) => utf8Bytes(value) <= MESSAGE_MAX_BYTES),
-  attachments: z.union([z.tuple([]), attachmentReferenceListSchema])
-    .transform((references) => [...references]).default([]),
+  attachments: sessionSendAttachmentReferencesSchema.default([]),
   idempotencyKey: sendCommandSchema.shape.idempotencyKey.unwrap(),
 }).strict().superRefine((value, context) => {
   if (value.attachments.length === 0 && !messageSchema.safeParse(value.message).success) {
@@ -52,15 +64,6 @@ export const sessionSendRequestSchema = z.object({
       message: "A send requires message text or an attachment reference.",
     });
   }
-  for (const [index, reference] of value.attachments.entries()) {
-    if (!wellFormedUnicode(reference.name)) {
-      context.addIssue({
-        code: "custom",
-        path: ["attachments", index, "name"],
-        message: "An attachment name must contain well-formed Unicode.",
-      });
-    }
-  }
 });
 
 export type SessionSendRequest = z.infer<typeof sessionSendRequestSchema>;
@@ -68,6 +71,14 @@ export type SessionSendRequest = z.infer<typeof sessionSendRequestSchema>;
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 const digestText = (domain: string, value: string): string => createHash("sha256")
   .update(`hra:session-send-${domain}:v1\0`, "utf8").update(value, "utf8").digest("hex");
+
+/** Original-request v1 identity, distinct from custody and queue reference digests. */
+export function sessionSendAttachmentReferencesDigest(value: unknown): string {
+  const references = sessionSendAttachmentReferencesSchema.parse(value);
+  return digestText("attachment-references", JSON.stringify(references.map((reference) => [
+    reference.byteLength, reference.digest, reference.mediaType, reference.name,
+  ])));
+}
 
 const fingerprintFieldsSchema = z.object({
   version: z.literal(SESSION_SEND_REQUEST_VERSION),
@@ -122,11 +133,7 @@ export function fingerprintSessionSendRequest(value: unknown): SessionSendReques
     selectorDigest: digestText("selector", request.session),
     inputDigest: digestText("input", request.message),
     inputUtf8Bytes: utf8Bytes(request.message),
-    attachmentReferencesDigest: digestText("attachment-references", JSON.stringify(
-      request.attachments.map((reference) => [
-        reference.byteLength, reference.digest, reference.mediaType, reference.name,
-      ]),
-    )),
+    attachmentReferencesDigest: sessionSendAttachmentReferencesDigest(request.attachments),
     attachmentCount: request.attachments.length,
   } satisfies z.infer<typeof fingerprintFieldsSchema>;
   return Object.freeze(sessionSendRequestFingerprintSchema.parse({
