@@ -1,10 +1,46 @@
 import { describe, expect, test } from "bun:test";
 
+import type { SessionEventBody } from "../domain/session-events";
 import { SessionStateTracker } from "./session-state-tracker";
 
 const turn = "turn_00000000000000000000000001";
 
 describe("session state tracker", () => {
+  test("completed source identity survives metadata but never a newer identical question", () => {
+    const tracker = new SessionStateTracker();
+    const finish = (turnId: string): void => {
+      tracker.observe("sess_source", { type: "turn_started", turnId });
+      tracker.observe("sess_source", { type: "assistant_delta", turnId, itemId: "item", text: "Should I proceed?" });
+      tracker.observe("sess_source", { type: "turn_completed", turnId, status: "completed" });
+    };
+    finish("first");
+    const source = tracker.completedSource("sess_source");
+    expect(source).toEqual({ turnId: "first", text: "Should I proceed?" });
+    tracker.observe("sess_source", { type: "session_status", status: "idle", activeTurnId: null });
+    expect(tracker.completedSource("sess_source")).toBe(source);
+    finish("second");
+    expect(tracker.completedSource("sess_source")).not.toBe(source);
+    expect(tracker.completedSource("sess_source")?.turnId).toBe("second");
+  });
+
+  test.each([
+    { type: "turn_started", turnId: "new" },
+    { type: "user_message", turnId: null, text: "Different task.", actor: "human", omittedCharacters: 0 },
+    { type: "session_status", status: "terminal", activeTurnId: null },
+    { type: "session_status", status: "active", activeTurnId: "new" },
+    { type: "interaction_requested", interactionId: "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b", interactionKind: "user_input", summary: "Choose", blocking: true, revision: 1 },
+    { type: "interaction_state", interactionId: "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b", state: "resolved", revision: 2 },
+    { type: "subagent_activity", turnId: turn, agentId: "agent", kind: "started" },
+  ] satisfies SessionEventBody[])("invalidates completed source on $type", (event) => {
+    const tracker = new SessionStateTracker();
+    tracker.observe("sess_source", { type: "turn_started", turnId: turn });
+    tracker.observe("sess_source", { type: "assistant_delta", turnId: turn, itemId: "item", text: "Should I proceed?" });
+    tracker.observe("sess_source", { type: "turn_completed", turnId: turn, status: "completed" });
+    expect(tracker.completedSource("sess_source")).not.toBeNull();
+    tracker.observe("sess_source", event);
+    expect(tracker.completedSource("sess_source")).toBeNull();
+  });
+
   test("marks a session working on turn start and classifies the accumulated text on completion", () => {
     let now = 1_000;
     const tracker = new SessionStateTracker(() => now);

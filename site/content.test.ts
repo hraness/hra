@@ -48,6 +48,18 @@ const htmlVisibleText = (value: string): string => value
   .replaceAll("&amp;", "&");
 
 describe("public content contract", () => {
+  test("keeps durable automatic-approval limits and upgrade holds on both public surfaces", () => {
+    const readme = renderReadmeMarkdown();
+    const html = htmlVisibleText(renderSiteHtml(publicContent));
+    for (const surface of [readme, html]) {
+      expect(surface).toContain("reserves its budget before provider dispatch");
+      expect(surface).toContain("pauses automatic approvals for 24 hours");
+      expect(surface).toContain("requires a new human message to reopen its consecutive budget");
+      expect(surface).toContain("hra autorespond status --session <session>");
+      expect(surface).not.toMatch(/hra autorespond status`? (?:shows the counters|reports the hold)/u);
+      expect(surface).toContain("A newer question or changed authority cancels the stale reply");
+    }
+  });
   test("publishes the exact HRA release identity", () => {
     expect(publicContent).toMatchObject({
       doctorCommand: "hra doctor --offline",

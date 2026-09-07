@@ -7904,7 +7904,7 @@ describe("HraService personal-session adoption", () => {
     expect(value.store.readAutorespondBudgets(value.session.id).consecutive).toBe(0);
   });
 
-  test("does not credit autorespond when an adopted Codex account drifts after provider write", async () => {
+  test("keeps an adopted autoresponse charged but unknown when its account drifts after provider write", async () => {
     const value = await adoptedCodexFixture(
       "Adopted post-write account drift",
       "personal-thread-post-write-account-drift",
@@ -7979,16 +7979,16 @@ describe("HraService personal-session adoption", () => {
       state: "resolution_unknown",
     });
     expect(value.store.readAutorespondBudgets(value.session.id)).toMatchObject({
-      consecutive: 0,
-      lastDay: 0,
-      lastHour: 0,
+      consecutive: 1,
+      lastDay: 1,
+      lastHour: 1,
     });
     expect(value.store.listAutorespondEvidence({ sessionId: value.session.id })[0])
       .toMatchObject({
         decision: "once",
         interactionId: seeded.interaction.publicId,
         mode: "auto:all",
-        outcome: "refused",
+        outcome: "unknown",
       });
     expect(value.store.readProviderRuntimeAccountRevocation({
       profileId: value.accountId,
@@ -12631,6 +12631,9 @@ describe("HraService", () => {
         legacy.exec(`DROP TABLE "${name}"`);
       }
       legacy.exec(`
+        DROP TRIGGER IF EXISTS sessions_autorespond_budget_history;
+        DROP TABLE IF EXISTS autorespond_budget_history;
+        DROP TABLE IF EXISTS autorespond_budget_reservations;
         DELETE FROM migrations WHERE version>=25;
         DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; PRAGMA user_version=24;
         PRAGMA foreign_keys=ON;
@@ -12648,7 +12651,7 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
       ).all()).toEqual([
@@ -12671,6 +12674,7 @@ describe("HraService", () => {
         { version: 41 },
         { version: 42 },
         { version: 43 },
+        { version: 44 },
       ]);
     } finally {
       inspector.close(false);
@@ -21457,14 +21461,8 @@ describe("HraService", () => {
   });
 
   test("does not dispatch a response prepared on the deadline clock edge", async () => {
-    let baseNow = 90_000;
-    let postValidationRead: number | null = null;
-    const now = () => {
-      if (postValidationRead === null) return baseNow;
-      postValidationRead += 1;
-      return postValidationRead <= 2 ? 90_999 : 91_000;
-    };
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, now);
+    let now = 90_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, "Deadline prepare edge");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -21505,10 +21503,16 @@ describe("HraService", () => {
     });
     const interaction = value.store.listInteractions({ sessionId, pendingOnly: true })[0];
     if (interaction === undefined) throw new Error("Expected a pending interaction.");
-    baseNow = 90_999;
-    value.codex.beforeValidateInteractionResolutionReturn = async () => {
-      postValidationRead = 0;
-    };
+    now = 90_999;
+    const prepare = value.store.prepareInteractionResponse.bind(value.store);
+    Object.defineProperty(value.store, "prepareInteractionResponse", {
+      configurable: true,
+      value: (input: Parameters<typeof prepare>[0]): ReturnType<typeof prepare> => {
+        const prepared = prepare(input);
+        if (input.intendedTerminalState === "resolved") now = 91_000;
+        return prepared;
+      },
+    });
     const deadlineFailure = await value.service.execute({
       kind: "interaction.resolve",
       interaction: interaction.publicId,
@@ -22670,6 +22674,7 @@ describe("HraService autorespond", () => {
     value: Awaited<ReturnType<typeof fixture>>,
     sessionId: string,
     requestId: string,
+    afterObservation?: () => Promise<void>,
   ) => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -22707,7 +22712,8 @@ describe("HraService autorespond", () => {
         availableDecisions: ["once", "session", "decline", "cancel"],
       },
     });
-    const interaction = value.store.listInteractions({ sessionId, limit: 10 })
+    if (afterObservation !== undefined) await afterObservation();
+    const interaction = value.store.listInteractions({ sessionId, limit: 50 })
       .find((candidate) => candidate.authority.requestId.value === requestId);
     if (interaction === undefined) throw new Error("Expected a command approval interaction.");
     return interaction;
@@ -22825,6 +22831,136 @@ describe("HraService autorespond", () => {
     expect(value.store.requireInteraction(interaction.publicId).state).not.toBe("pending");
     expect(value.store.requireInteraction(interaction.publicId).resolvedBy).toBe("autorespond");
     expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(1);
+  });
+
+  test.each([
+    { code: "consecutive_limit", consecutive: 2, priorAcceptances: 0, ageMs: 0, limit: 3, field: "consecutive" },
+    { code: "hourly_budget", consecutive: 0, priorAcceptances: 9, ageMs: 0, limit: 10, field: "lastHour" },
+    { code: "daily_budget", consecutive: 0, priorAcceptances: 39, ageMs: 2 * 60 * 60 * 1_000, limit: 40, field: "lastDay" },
+  ] as const)("enforces $code across concurrently admitted protocol approvals", async (budget) => {
+    let now = 1_900_000_000_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { sessionId } = await createIdleSession(value, `Concurrent ${budget.code}`);
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    for (let count = 0; count < budget.consecutive; count += 1) {
+      value.store.bumpAutorespondCounter(sessionId);
+    }
+    for (let count = 0; count < budget.priorAcceptances; count += 1) {
+      if (budget.code === "daily_budget" && count > 0 && count % 9 === 0) {
+        now += 2 * 60 * 60 * 1_000;
+      }
+      value.store.setSessionApprovalMode(sessionId, "manual");
+      const prior = await requestCommandApproval(value, sessionId, `${budget.code}-prior-${count}`);
+      await value.service.settled();
+      value.store.setSessionApprovalMode(sessionId, "auto:all");
+      expect(value.store.reserveAutorespondBudget({
+        sessionId,
+        sourceId: prior.publicId,
+        sourceKind: "protocol",
+        expectedMode: "auto:all",
+      })).toEqual({ state: "reserved" });
+      value.store.resetAutorespondCounter(sessionId);
+    }
+    now += budget.ageMs;
+    expect(value.store.readAutorespondBudgets(sessionId)[budget.field]).toBe(budget.limit - 1);
+
+    let validationStarted!: () => void;
+    const validationAdmission = new Promise<void>((resolve) => { validationStarted = resolve; });
+    let releaseValidation!: () => void;
+    const validationGate = new Promise<void>((resolve) => { releaseValidation = resolve; });
+    value.codex.beforeValidateInteractionResolutionReturn = async () => {
+      validationStarted();
+      await validationGate;
+    };
+
+    const first = await requestCommandApproval(value, sessionId, `${budget.code}-first`);
+    await validationAdmission;
+    let secondObserved!: () => void;
+    const secondObservation = new Promise<void>((resolve) => { secondObserved = resolve; });
+    const secondAdmission = requestCommandApproval(value, sessionId, `${budget.code}-second`, async () => {
+      secondObserved();
+      await value.service.settled();
+    });
+    await secondObservation;
+    releaseValidation();
+    const second = await secondAdmission;
+    await value.service.settled();
+
+    expect(value.codex.resolvedInteractions).toHaveLength(1);
+    expect(value.store.requireInteraction(first.publicId).resolvedBy).toBe("autorespond");
+    expect(value.store.requireInteraction(second.publicId).state).toBe("pending");
+    const evidence = value.store.listAutorespondEvidence({ sessionId, limit: 50 })
+      .filter((row) => row.interactionId === first.publicId || row.interactionId === second.publicId);
+    expect(evidence).toHaveLength(2);
+    expect(evidence.find((row) => row.interactionId === first.publicId))
+      .toMatchObject({ decision: "once", outcome: "accepted" });
+    expect(evidence.find((row) => row.interactionId === second.publicId))
+      .toMatchObject({ decision: budget.code, outcome: "refused" });
+    expect(value.store.readAutorespondBudgets(sessionId)[budget.field]).toBe(budget.limit);
+  });
+
+  test("rechecks manual mode after protocol validation before resolving an approval", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Protocol policy race");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    let validationStarted!: () => void;
+    const validationAdmission = new Promise<void>((resolve) => { validationStarted = resolve; });
+    let releaseValidation!: () => void;
+    const validationGate = new Promise<void>((resolve) => { releaseValidation = resolve; });
+    value.codex.beforeValidateInteractionResolutionReturn = async () => {
+      validationStarted();
+      await validationGate;
+    };
+
+    const interaction = await requestCommandApproval(value, sessionId, "protocol-policy-race");
+    await validationAdmission;
+    await value.service.execute({ kind: "autorespond.set", session: sessionId, mode: "manual" }, { signal });
+    releaseValidation();
+    await value.service.settled();
+
+    expect(value.codex.resolvedInteractions).toHaveLength(0);
+    expect(value.store.requireInteraction(interaction.publicId).state).toBe("pending");
+    expect(value.store.listAutorespondEvidence({ sessionId })).toEqual([
+      expect.objectContaining({
+        decision: "manual_mode",
+        interactionId: interaction.publicId,
+        mode: "manual",
+        outcome: "refused",
+      }),
+    ]);
+  });
+
+  test("keeps an indeterminate protocol autoresponse charged after reopening storage", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Uncertain protocol budget");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    value.store.bumpAutorespondCounter(sessionId);
+    value.store.bumpAutorespondCounter(sessionId);
+    value.codex.resolveInteractionError = new CodexError(
+      "INDETERMINATE_EFFECT",
+      "the response write may have reached the provider",
+    );
+
+    const interaction = await requestCommandApproval(value, sessionId, "uncertain-protocol-budget");
+    await value.service.settled();
+    expect(value.codex.resolvedInteractions).toHaveLength(1);
+    expect(value.store.requireInteraction(interaction.publicId).state).toBe("resolution_unknown");
+    expect(value.store.readAutorespondBudgets(sessionId)).toMatchObject({
+      consecutive: 3,
+      lastHour: 1,
+      lastDay: 1,
+    });
+
+    await value.service.close();
+    value.store.close();
+    const reopened = new StateStore(value.paths);
+    stores.push(reopened);
+    expect(reopened.readAutorespondBudgets(sessionId)).toMatchObject({
+      consecutive: 3,
+      lastHour: 1,
+      lastDay: 1,
+    });
+    expect(reopened.requireInteraction(interaction.publicId).state).toBe("resolution_unknown");
   });
 
   test("keeps command approvals pending under auto:workspace without trusting their display class", async () => {
@@ -23214,7 +23350,306 @@ describe("HraService prose autorespond", () => {
     expect(value.store.readAutorespondBudgets(sessionId).lastHour).toBe(1);
   });
 
-  test("commits an accepted autoresponse receipt, transcript, and budget together", async () => {
+  test.each([
+    { change: "manual mode", mode: "manual", outcome: "gate_failed:manual_mode" },
+    { change: "gateway authorization", mode: "auto:all", outcome: "gate_failed:policy_changed" },
+  ] as const)("rechecks $change after the prose responder returns before sending", async (policy) => {
+    let responderStarted!: () => void;
+    const responderAdmission = new Promise<void>((resolve) => { responderStarted = resolve; });
+    let releaseResponder!: () => void;
+    const responderGate = new Promise<void>((resolve) => { releaseResponder = resolve; });
+    const delegate = new DeterministicProseResponder();
+    const value = await proseFixture({
+      responder: {
+        respond: async (input, responderSignal) => {
+          responderStarted();
+          await responderGate;
+          return delegate.respond(input, responderSignal);
+        },
+      },
+    });
+    const { sessionId } = await createIdleSession(value, "Prose policy race");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    const sends = value.codex.calls.filter((call) => call === "send").length;
+
+    await completeTurn(value, sessionId, "prose-policy-race", "The refactor is staged. Should I proceed?");
+    await responderAdmission;
+    await value.service.execute(policy.change === "manual mode"
+      ? { kind: "autorespond.set", session: sessionId, mode: "manual" }
+      : { kind: "autorespond.gateway-clear" }, { signal });
+    releaseResponder();
+    await value.service.settled();
+
+    expect(value.codex.calls.filter((call) => call === "send")).toHaveLength(sends);
+    expect(proseEvidence(value, sessionId)).toHaveLength(1);
+    expect(proseEvidence(value, sessionId)[0])
+      .toMatchObject({ decision: "refuse", mode: policy.mode, outcome: policy.outcome });
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: true,
+      state: "needs_approval",
+      reason: policy.outcome.replace("gate_failed:", "prose_autorespond_"),
+    });
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+  });
+
+  test("rechecks manual mode after the final prose runtime review before sending", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Prose dispatch policy race");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    const sends = value.codex.calls.filter((call) => call === "send").length;
+    let reviewStarted!: () => void;
+    const reviewAdmission = new Promise<void>((resolve) => { reviewStarted = resolve; });
+    let releaseReview!: () => void;
+    const reviewGate = new Promise<void>((resolve) => { releaseReview = resolve; });
+    value.codex.beforeReviewTurnStartReturn = async () => {
+      reviewStarted();
+      await reviewGate;
+    };
+
+    await completeTurn(value, sessionId, "prose-dispatch-policy-race", "Ready to apply. Should I proceed?");
+    await reviewAdmission;
+    await value.service.execute({ kind: "autorespond.set", session: sessionId, mode: "manual" }, { signal });
+    releaseReview();
+    await value.service.settled();
+
+    expect(value.codex.calls.filter((call) => call === "send")).toHaveLength(sends);
+    expect(proseEvidence(value, sessionId)).toHaveLength(1);
+    expect(proseEvidence(value, sessionId)[0])
+      .toMatchObject({ decision: "refuse", mode: "manual", outcome: "gate_failed:manual_mode" });
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+    await expect(value.service.execute({
+      kind: "session.send",
+      session: sessionId,
+      message: "The human will review the patch now.",
+    }, { signal })).resolves.toMatchObject({ turnId: "turn-next" });
+    expect(value.codex.calls.filter((call) => call === "send")).toHaveLength(sends + 1);
+  });
+
+  test("refuses a prose response while gateway-key removal is still in progress", async () => {
+    let responderStarted!: () => void;
+    const responderAdmission = new Promise<void>((resolve) => { responderStarted = resolve; });
+    let releaseResponder!: () => void;
+    const responderGate = new Promise<void>((resolve) => { releaseResponder = resolve; });
+    let clearStarted!: () => void;
+    const clearAdmission = new Promise<void>((resolve) => { clearStarted = resolve; });
+    let releaseClear!: () => void;
+    const clearGate = new Promise<void>((resolve) => { releaseClear = resolve; });
+    const keys = new InMemoryGatewayKeyStore(testGatewayKey);
+    const delegate = new DeterministicProseResponder();
+    const value = await proseFixture({
+      gatewayKeys: {
+        isConfigured: () => keys.isConfigured(),
+        read: () => keys.read(),
+        set: (key) => keys.set(key),
+        clear: async () => {
+          clearStarted();
+          await clearGate;
+          return keys.clear();
+        },
+      },
+      responder: {
+        respond: async (input, responderSignal) => {
+          responderStarted();
+          await responderGate;
+          return delegate.respond(input, responderSignal);
+        },
+      },
+    });
+    const { sessionId } = await createIdleSession(value, "Prose gateway removal race");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    const sends = value.codex.calls.filter((call) => call === "send").length;
+
+    await completeTurn(value, sessionId, "prose-gateway-removal-race", "Ready to apply. Should I proceed?");
+    await responderAdmission;
+    const clearing = value.service.execute({ kind: "autorespond.gateway-clear" }, { signal });
+    await clearAdmission;
+    releaseResponder();
+    await value.service.settled();
+    releaseClear();
+    await clearing;
+
+    expect(value.codex.calls.filter((call) => call === "send")).toHaveLength(sends);
+    expect(proseEvidence(value, sessionId)).toHaveLength(1);
+    expect(proseEvidence(value, sessionId)[0])
+      .toMatchObject({ decision: "refuse", outcome: "gate_failed:policy_changed" });
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+    expect(await keys.isConfigured()).toBe(false);
+  });
+
+  test.each([
+    {
+      scenario: "fixed approval",
+      sourceText: "The refactor is staged. Should I proceed?",
+      nextText: "The requested summary is complete.",
+      nextState: "done",
+      invalidReply: false,
+    },
+    {
+      scenario: "unmatched verbatim reply before a newer question",
+      sourceText: 'The refactor is staged. Please reply with "APPROVE PATCH" to continue.',
+      nextText: "Which database should we use?",
+      nextState: "needs_answer",
+      invalidReply: true,
+    },
+  ])("refuses a stale prose response after a newer completed turn changes its source ($scenario)", async (source) => {
+    let responderStarted!: () => void;
+    const responderAdmission = new Promise<void>((resolve) => { responderStarted = resolve; });
+    let releaseResponder!: () => void;
+    const responderGate = new Promise<void>((resolve) => { releaseResponder = resolve; });
+    const delegate = new DeterministicProseResponder(source.invalidReply
+      ? { reply: () => "not the requested literal" }
+      : {});
+    const value = await proseFixture({
+      responder: {
+        respond: async (input, responderSignal) => {
+          responderStarted();
+          await responderGate;
+          return delegate.respond(input, responderSignal);
+        },
+      },
+    });
+    const { sessionId } = await createIdleSession(value, "Prose source race");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    const sends = value.codex.calls.filter((call) => call === "send").length;
+
+    await completeTurn(value, sessionId, "prose-source-old", source.sourceText);
+    await responderAdmission;
+    let newerStateCommitted!: () => void;
+    const newerStateCommit = new Promise<void>((resolve) => { newerStateCommitted = resolve; });
+    const upsert = value.store.upsertSessionState.bind(value.store);
+    Object.defineProperty(value.store, "upsertSessionState", {
+      configurable: true,
+      value: (input: Parameters<typeof upsert>[0]): ReturnType<typeof upsert> => {
+        const result = upsert(input);
+        if (input.sessionId === sessionId && input.state === source.nextState) newerStateCommitted();
+        return result;
+      },
+    });
+    await completeTurn(value, sessionId, "prose-source-new", source.nextText);
+    await newerStateCommit;
+    const latestState = value.store.readSessionState(sessionId);
+    releaseResponder();
+    await value.service.settled();
+
+    expect(value.codex.calls.filter((call) => call === "send")).toHaveLength(sends);
+    expect(proseEvidence(value, sessionId)).toHaveLength(1);
+    expect(proseEvidence(value, sessionId)[0])
+      .toMatchObject({ decision: "refuse", outcome: "gate_failed:source_changed" });
+    expect(value.store.readSessionState(sessionId)).toEqual(latestState);
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+  });
+
+  test("distinguishes a newer identical prose approval from the stale turn being answered", async () => {
+    let responderStarted!: () => void;
+    const responderAdmission = new Promise<void>((resolve) => { responderStarted = resolve; });
+    let releaseResponder!: () => void;
+    const responderGate = new Promise<void>((resolve) => { releaseResponder = resolve; });
+    const delegate = new DeterministicProseResponder();
+    let responderCalls = 0;
+    const value = await proseFixture({
+      responder: {
+        respond: async (input, responderSignal) => {
+          responderCalls += 1;
+          if (responderCalls === 1) {
+            responderStarted();
+            await responderGate;
+          }
+          return delegate.respond(input, responderSignal);
+        },
+      },
+    });
+    const { sessionId } = await createIdleSession(value, "Identical prose source race");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    value.codex.turnStatus = "completed";
+    const sends = value.codex.calls.filter((call) => call === "send").length;
+    const question = "The refactor is staged. Should I proceed?";
+
+    await completeTurn(value, sessionId, "identical-prose-old", question);
+    await responderAdmission;
+    await completeTurn(value, sessionId, "identical-prose-new", question);
+    releaseResponder();
+    await value.service.settled();
+
+    expect(value.codex.calls.filter((call) => call === "send")).toHaveLength(sends + 1);
+    expect(proseEvidence(value, sessionId)).toHaveLength(2);
+    expect(proseEvidence(value, sessionId).find((row) => row.outcome === "gate_failed:source_changed"))
+      .toMatchObject({ decision: "refuse" });
+    expect(proseEvidence(value, sessionId).find((row) => row.outcome === "sent"))
+      .toMatchObject({ decision: "send" });
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(1);
+  });
+
+  test("refuses a prose response when a provider interaction became pending while the responder ran", async () => {
+    let responderStarted!: () => void;
+    const responderAdmission = new Promise<void>((resolve) => { responderStarted = resolve; });
+    let releaseResponder!: () => void;
+    const responderGate = new Promise<void>((resolve) => { releaseResponder = resolve; });
+    const delegate = new DeterministicProseResponder();
+    const value = await proseFixture({
+      responder: {
+        respond: async (input, responderSignal) => {
+          responderStarted();
+          await responderGate;
+          return delegate.respond(input, responderSignal);
+        },
+      },
+    });
+    const { sessionId } = await createIdleSession(value, "Prose pending interaction race");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    const sends = value.codex.calls.filter((call) => call === "send").length;
+
+    await completeTurn(value, sessionId, "prose-pending-race", "The refactor is staged. Should I proceed?");
+    await responderAdmission;
+    // File-change approvals remain manual even under auto:all, so no competing
+    // automatic resolution can remove this request before the prose gate.
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const connectionId = value.codex.observationConnectionId;
+    await value.service.observeCodexFact({
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    }, {
+      type: "interactionRequested",
+      connectionId,
+      provider: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId,
+        requestId: { type: "string", value: "prose-new-pending" },
+        method: "item/fileChange/requestApproval",
+        requestDigest: createHash("sha256").update("prose-new-pending").digest("hex"),
+        threadId: session.providerThreadId,
+        turnId: "prose-pending-race",
+        itemId: "prose-pending-race-file",
+        approvalId: null,
+      },
+      kind: "file_change_approval",
+      blocking: true,
+      display: {
+        kind: "file_change_approval",
+        summary: "Apply reviewed file changes",
+        reason: null,
+        grantRoot: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+    });
+    releaseResponder();
+    await value.service.settled();
+
+    expect(value.codex.calls.filter((call) => call === "send")).toHaveLength(sends);
+    expect(value.store.listInteractions({ sessionId, pendingOnly: true })).toEqual([
+      expect.objectContaining({ kind: "file_change_approval", state: "pending" }),
+    ]);
+    expect(proseEvidence(value, sessionId)).toHaveLength(1);
+    expect(proseEvidence(value, sessionId)[0])
+      .toMatchObject({ decision: "refuse", outcome: "gate_failed:pending_interaction" });
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+  });
+
+  test("commits an accepted autoresponse receipt and transcript without charging its reserved budget twice", async () => {
     const value = await proseFixture();
     const { sessionId } = await createIdleSession(value, "Prose transcript replay");
     value.store.setSessionApprovalMode(sessionId, "auto:all");
@@ -23224,7 +23659,7 @@ describe("HraService prose autorespond", () => {
     Object.defineProperty(value.store, "completeSessionTurnEffect", {
       configurable: true,
       value: (write: Parameters<typeof complete>[0]): ReturnType<typeof complete> => {
-        expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+        expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(1);
         const result = complete(write);
         expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(1);
         completedAtomically = true;
@@ -23280,7 +23715,7 @@ describe("HraService prose autorespond", () => {
     });
     expect(value.codex.calls.filter((call) => call === "send").length).toBe(sends + 1);
     expect(value.store.readAutorespondBudgets(sessionId)).toMatchObject({
-      consecutive: 0,
+      consecutive: 1,
       lastHour: 1,
     });
     const [attempt] = value.store.listUnsettledMutations({ sessionId })
@@ -23486,6 +23921,11 @@ describe("HraService prose autorespond", () => {
     await waitFor(() => proseEvidence(value, sessionId).length === 4);
     expect(proseEvidence(value, sessionId)[0]).toMatchObject({
       outcome: "gate_failed:consecutive_limit",
+    });
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: true,
+      state: "needs_approval",
+      reason: "prose_autorespond_consecutive_limit",
     });
     expect(sent()).toBe(3);
 
