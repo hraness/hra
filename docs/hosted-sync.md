@@ -219,14 +219,23 @@ states and all five terminal states with provider pages capped at eight maximal
 documents. Every internal page is fenced against the candidate receipt's exact
 runtime attestation tuple, and each complete scan is sandwiched by raw source,
 candidate-receipt, live-attestation, and numeric-target proofs. It reports
-`authorityReductionServiceDebt`, `authorityReductionUserDebt`, a bounded sample
-of opaque `authorityReductionUserCandidates`, `pendingPreparedDebt`,
-`lifecycleDebt` (unreserved `effect_started` rows),
+`authorityReductionServiceDebt`, `authorityReductionUserDebt`, and the
+aggregate `authorityReductionCapacityMissingDebt`,
+`authorityReductionOrphanCleanupPendingDebt`,
+`authorityReductionOrphanCleanupEligibleDebt`, and
+`authorityReductionTopologyBlockedDebt` classifications. The legacy
+`authorityReductionUserCandidates` and
+`authorityReductionUserCandidatesTruncated` fields remain present but are
+always `[]` and `false`. Command-capacity stdout is version 2; protected
+readiness evidence remains schema version 1. Status cannot infer a hard quota
+without attempting a transactional reservation, so
+`authorityReductionHardQuotaBlockedThisRun` is zero on a read-only run. The
+remaining fields include `pendingPreparedDebt`, `lifecycleDebt` (unreserved `effect_started` rows),
 `unsafeTerminalCleanupDebt`, informational `terminalReceiptDebt`, and bounded
-typed retirement candidates. Candidate lists never include email addresses or
-provider stderr. A truncated list requires another status pass after the first
-bounded batch; never query or mutate these rows manually in the dashboard or
-with a raw Convex CLI call.
+typed command-retirement candidates. Authority-reduction output never includes
+user ids, email addresses, timestamps, quota totals, or provider stderr. Never
+query or mutate these rows manually in the dashboard or with a raw Convex CLI
+call.
 
 For ordinary debt with quota headroom, run the exact same wrapper with:
 
@@ -243,8 +252,11 @@ run_command_capacity repair \
   --deployment-url https://steady-otter-321.convex.cloud
 ```
 
-`repair` first backfills a real account identity/job reservation pair and a
-real device/job/security/receipt quartet for every non-revoked device. Each row
+`repair` classifies and, in the same runtime-fenced server operation,
+transactionally reclassifies each prospective mutation. It writes only the
+exact `capacity_missing` state. It then backfills a real account identity/job
+reservation pair and a real device/job/security/receipt quartet for every
+non-revoked device. Each row
 contains its own 2 KiB capacity field and is additionally charged for normal
 document metadata.
 New identities and devices create these rows atomically with admission. Delete
@@ -279,16 +291,47 @@ byte- and record-neutral and all execution authority remains fenced.
 
 A predecessor identity at a hard user, category, or service ceiling may lack
 the bytes or records needed to create its physical authority-reduction rows.
-That is a release blocker, not a soft warning: the mutation returns the closed
-`capacity_backfill_blocked` diagnostic and no capacity evidence or activation
-receipt is published.
+The exact rolled-back quota outcome returns
+`authority_reduction_hard_quota`. An exact disconnected predecessor OTP shape
+returns `authority_reduction_orphan_cleanup_pending` until every relevant write
+is strictly older than 24 hours, then
+`authority_reduction_orphan_cleanup_eligible`. Every other invalid auth,
+deletion-job, device, or partial-reservation shape returns
+`authority_reduction_topology_blocked`. Unknown failures remain the generic
+`provider_result_invalid`; provider details are never relabelled as quota.
+Each outcome is a hard blocker for command-writer rollout and daemon upgrades,
+and no capacity evidence or activation receipt is published.
+Artifact publication remains independently gated by
+[`docs/beta-release.md`](beta-release.md); it does not clear this rollout gate.
+Successful per-user mutations and earlier
+pages commit before a later user blocks. Repeating the identical bound repair
+is idempotent and reclassifies current state before every write.
+
+Handle each closed result separately:
+
+- For `authority_reduction_hard_quota`, reclaim ordinary data only through an
+  already-supported, separately authorized product path. The aggregate result
+  neither identifies an identity nor authorizes erasure. Use
+  `hra auth delete --acknowledge-erasure` only while deliberately signed in as
+  the current identity whose account the owner intends to delete. Never use it
+  to guess which identity caused an aggregate blocker.
+- For `authority_reduction_orphan_cleanup_pending`, leave the candidate live
+  and observe the scheduled retention pass after the strict inactivity window,
+  or let the known intended owner complete the ordinary OTP flow. Never guess
+  the identity from the aggregate result.
+- For `authority_reduction_orphan_cleanup_eligible`, observe another guarded
+  status after the scheduled pass. Do not trigger maintenance manually.
+- For `authority_reduction_topology_blocked`, stop. A source-qualified forward
+  fix must prove the exact non-destructive state transition before any mutation.
+- For `provider_result_invalid`, diagnose the guarded provider boundary without
+  copying provider stderr into output or treating the failure as quota.
+
 Do not upgrade an executor, announce current command availability, or treat an
 already auto-deployed UI as ready. The operator does not expose untrusted provider output and
-does not borrow from or raise a hard quota. Do not wait for 90-day aging; the
-retained encrypted history may have no expiry. Either complete a separately
-reviewed, source/runtime-bound ordinary-data erasure or legacy account-erasure
-remediation, then rerun the same repair, or abandon the writer/release rollout
-while leaving the additive candidate live. If code must change, chain a new
+does not borrow from or raise a hard quota. Do not wait for unrelated 90-day
+retention; retained encrypted history may have no expiry. Rerun the same repair
+only after the applicable supported state change, or abandon the command-writer
+rollout while leaving the additive candidate live. If code must change, chain a new
 source-qualified forward-repair candidate from that live receipt; never
 redeploy the predecessor. There is no supported manual dashboard edit or raw
 Convex mutation.
@@ -312,11 +355,17 @@ account, and deletion pair. A predecessor interruption that committed an
 unverified user/account without that binding remains authority-reduction debt
 even if its physical pair is complete, so it cannot produce false readiness.
 A bounded retention scan preserves a fresh retry, live challenge/session,
-device, verified identity, or any ambiguous relationship; after 24 hours of
-inactivity it atomically releases the exact orphan account, optional matching
-unbound subject, deletion pair, user, and quota authority. Until that cleanup
+device, verified identity, or any ambiguous relationship. Once every relevant
+write is strictly older than 24 hours, it atomically releases the exact orphan
+account, optional matching unbound subject, deletion pair, user, and quota authority. Until that cleanup
 or a successful retry binds the subject, `repair` stays closed and no capacity
-evidence or activation receipt is published.
+evidence or activation receipt is published. The existing bounded retention
+cron runs every 15 minutes, but `orphaned_auth_users` receives only its fair
+rotation within the shared 200-row limit and 20-row category quanta. Eligibility
+does not promise deletion on the next run. Repeat guarded status only after
+sufficient full rotations. Do not invoke broad maintenance manually: it spans
+unrelated retention categories, is not bound to the candidate receipt, and may
+delete unrelated eligible rows.
 
 If an expired legacy `pending` or `prepared` row cannot acquire capacity at a
 hard ceiling, select only an `eligible` typed candidate from status and add, at

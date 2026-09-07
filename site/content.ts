@@ -112,6 +112,8 @@ export interface PublicContent {
   readonly badges: readonly Badge[];
   /** Qualified source-and-release positioning for package metadata, discovery, and llms.txt. */
   readonly description: string;
+  /** Operational prerequisite for every current-daemon initialization or start example. */
+  readonly daemonRolloutNotice: string;
   readonly doctorCommand: string;
   readonly endpoints: PublicEndpoints;
   readonly installCommand: string;
@@ -284,6 +286,8 @@ const productName = "HRA";
 const tagline = "Control plane for Codex and Claude Code";
 const providerRoadmap = "Codex and Claude Code, side by side.";
 const releaseVersion = "0.7.0";
+const admittedReleaseVersion = "0.6.1";
+const daemonRolloutNotice = `Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the admitted v${admittedReleaseVersion} daemon or candidate v${releaseVersion} daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability, candidate readiness, and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.`;
 
 /** Public runtime pins come from their authoritative source modules. */
 export const publicPins = {
@@ -341,15 +345,16 @@ export const publicContent: PublicContent = {
   providerRoadmap,
   releaseVersion,
   thesis: `${productName} runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.`,
-  description: `${tagline} in current source; v${releaseVersion} is release-ready. Run provider sessions side by side through one durable CLI.`,
-  statusLine: `Status: public beta. The local CLI v${releaseVersion} is release-ready: Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}.`,
+  description: `${tagline}. Local CLI v${releaseVersion} is a release candidate; v${admittedReleaseVersion} is the admitted artifact, while daemon and hosted command-writer rollout remains blocked on capacity.`,
+  daemonRolloutNotice,
+  statusLine: `Status: public beta. Local CLI v${releaseVersion} is a release candidate, while v${admittedReleaseVersion} is the fully admitted public artifact. Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}. Current daemon and hosted command-writer rollout remains blocked on capacity.`,
   badges,
   maintainer: {
     name: "Hraness",
     url: links.hraness,
   },
   socialCard: {
-    alt: `${productName} · Codex + Claude Code · v${releaseVersion} release-ready · hra.sh`,
+    alt: `${productName} · v${releaseVersion} release candidate · v${admittedReleaseVersion} admitted · daemon rollout blocked on capacity · hra.sh`,
     height: 630,
     path: "/social-card.png",
     width: 1200,
@@ -370,8 +375,8 @@ export const publicContent: PublicContent = {
     eyebrow: tagline,
     heading: "One terminal for every Codex and Claude Code session",
     summary: "HRA keeps sessions alive behind a local daemon, isolates each account, and lets you or your agent direct any of them from a shell or JSON. Sync between machines is optional and encrypted.",
-    example: "Ask your agent to start a Codex session on your work account, then hand the next turn to Claude Code without losing the conversation.",
-    boundary: `Codex on macOS and Linux · Claude Code on Linux · local v${releaseVersion} release-ready · hosted sync live (${hostedBetaLabel})`,
+    example: "After the rollout prerequisite below is satisfied, ask your agent to start a Codex session on your work account, then hand the next turn to Claude Code without losing the conversation.",
+    boundary: `Local v${releaseVersion} release candidate · v${admittedReleaseVersion} artifacts admitted · current daemon and hosted command-writer rollout blocked on capacity · Codex on macOS and Linux · Claude Code on Linux · hosted sync live (${hostedBetaLabel})`,
     primaryAction: {
       href: "#install-command",
       label: "Install HRA",
@@ -461,11 +466,11 @@ export const publicContent: PublicContent = {
   questions: [
     {
       question: "Does HRA need an account?",
-      answer: [text("No. Install the CLI, add a Codex profile or sign into Claude Code inside its isolated directory, and start a session. An HRA cloud identity is only needed for optional sync between machines.")],
+      answer: [text("No. An HRA cloud identity is only needed for optional sync between machines. Once the current-daemon rollout prerequisite is satisfied, add a Codex profile or sign into Claude Code inside its isolated directory and start a session.")],
     },
     {
-      question: "What does the release candidate include?",
-      answer: [text(`The v${releaseVersion} local CLI release candidate runs Codex on macOS and Linux and Claude Code on Linux. It becomes public only after immutable GitHub and npm release admission. Hosted sync is live as an ${hostedBetaLabel}.`)],
+      question: "What is live, and what is still blocked?",
+      answer: [text(`The v${admittedReleaseVersion} local CLI artifacts passed immutable GitHub and npm release admission. The v${releaseVersion} candidate does not become public until its own exact admission. Both support Codex on macOS and Linux and Claude Code on Linux. Hosted sync is live as an ${hostedBetaLabel}, but current daemon and hosted command-writer rollout remains blocked on capacity. The candidate install command becomes usable only after publication; wait for the documented rollout prerequisite before initialization or daemon startup.`)],
     },
     {
       question: "Does HRA use my API keys or provider subscription?",
@@ -498,13 +503,14 @@ export const publicContent: PublicContent = {
   introduction: [
     {
       kind: "notice",
-      label: `Immutable local CLI release candidate; hosted sync live as an ${hostedBetaLabel}`,
+      label: `Local v${releaseVersion} candidate; v${admittedReleaseVersion} artifacts admitted; hosted sync live as an ${hostedBetaLabel}`,
       content: [
         text("The exact install command below works once GitHub exposes the immutable "),
         code(`v${releaseVersion}`),
-        text(" GitHub Release and its verified archive. The website and optional hosted sync are live; the candidate becomes public only after exact admission."),
+        text(` GitHub Release and its verified archive. The v${admittedReleaseVersion} artifacts passed immutable GitHub and npm release admission. The website and optional hosted sync are live; candidate readiness and prior artifact admission do not authorize current-daemon startup or hosted command writers.`),
       ],
     },
+    { kind: "notice", label: "Current daemon rollout blocked", content: [text(daemonRolloutNotice)] },
     paragraph(
       text("HRA is one Bun CLI plus a local daemon. It isolates Codex and Claude Code profiles, gives both providers one compact session interface, and optionally syncs encrypted provider-neutral projections and commands across your enrolled machines."),
     ),
@@ -529,7 +535,7 @@ export const publicContent: PublicContent = {
       heading: "Install and update",
       blocks: [
         paragraph(
-          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install one reviewed immutable tag, then verify the binary before initialization:"),
+          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. After this candidate passes immutable release admission, install its reviewed tag, then verify the binary before initialization:"),
         ),
         {
           kind: "commands",
@@ -730,6 +736,7 @@ export const publicContent: PublicContent = {
       id: "first-account",
       heading: "First account",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         {
           kind: "commands",
           commands: [
@@ -805,8 +812,9 @@ export const publicContent: PublicContent = {
       id: "first-session",
       heading: "First session",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         paragraph(
-          text("Complete initialization and the first provider login before this walkthrough. Account login remains a dedicated one-shot command, and the session-start command returns the new session ID."),
+          text("Only after the rollout prerequisite is satisfied, complete initialization and the first provider login before this walkthrough. Account login remains a dedicated one-shot command, and the session-start command returns the new session ID."),
         ),
         { kind: "subheading", text: "Human terminal" },
         paragraph(
@@ -891,9 +899,9 @@ export const publicContent: PublicContent = {
           kind: "notice",
           label: "Local release boundary",
           content: [
-            text("These commands are part of the immutable "),
+            text("These commands are part of the "),
             code(`v${releaseVersion}`),
-            text(" local CLI release candidate and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol."),
+            text(" local CLI candidate and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol; the current-daemon rollout prerequisite still applies before startup."),
           ],
         },
         paragraph(
@@ -997,6 +1005,7 @@ export const publicContent: PublicContent = {
       id: "cloud-sign-in-and-device-pairing",
       heading: "Cloud sign-in and device pairing",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         paragraph(
           text(`The hosted endpoint is live as an ${hostedBetaLabel}. An unset `),
           code("HRA_CONVEX_URL"),
@@ -1170,6 +1179,7 @@ export const publicContent: PublicContent = {
       id: "terminal-and-agent-interfaces",
       heading: "Terminal and agent interfaces",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         paragraph(
           text("Run "),
           code("hra"),
@@ -1218,15 +1228,20 @@ export const publicContent: PublicContent = {
           text(" to override one session and "),
           code("default"),
           text(" to clear the override. Questions and MCP forms are never answered automatically. A session stops autoresponding after three consecutive answers without a human message, ten in an hour, or forty in a day, and "),
-          code("hra autorespond status"),
+          code("hra autorespond status --session <session>"),
           text(" shows the counters and the last twenty evidence rows. Only an actual human-authored message resets the consecutive counter; Work and scheduled automation, autorespond, and provider-switch handoff messages do not. Notification hours do not change these eligibility rules or budgets."),
+        ),
+        paragraph(
+          text("Each automatic approval reserves its budget before provider dispatch. Reservations survive uncertain results, daemon restarts, and pruning of the display log; a reserved attempt can remain charged even if a later step proves unsent. Protocol and prose share the same limits. Upgrading an existing session to local schema 44 pauses automatic approvals for 24 hours because older retained logs cannot prove its complete budget history, and requires a new human message to reopen its consecutive budget. You can send that message during the hold. "),
+          code("hra autorespond status --session <session>"),
+          text(" reports the hold's end and the consecutive counter. Manual approvals remain available."),
         ),
         paragraph(
           text("Configuring a gateway key explicitly enables the separate prose-approval path. After strict local gates establish that a completed final assistant message asks only for consent, HRA sends at most its final 4,000 characters plus session-state and approval-reason metadata to Vercel AI Gateway model "),
           code("openai/gpt-5-nano"),
           text(". It makes one request with a 10-second deadline and no retry. The model cannot create arbitrary text that HRA will send: the daemon emits either "),
           code("The human has approved. Proceed accordingly."),
-          text(" or a byte-exact substring already present in the assistant message. A timeout, refusal, or other failure leaves the turn for the human. "),
+          text(" or a byte-exact substring already present in the assistant message. Immediately before dispatch, HRA checks current consent, the exact completed question, pending interactions, and shared budget again. A newer question or changed authority cancels the stale reply. A timeout, refusal, or other failure leaves the turn for the human. "),
           code("hra autorespond gateway clear"),
           text(" disables this prose path."),
         ),
@@ -1305,6 +1320,7 @@ export const publicContent: PublicContent = {
       id: "presets-and-permissions",
       heading: "Presets and permissions",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         paragraph(
           text("HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. For Codex, that refresh includes model, reasoning effort, Fast service tier, permission profile, computer-use capability, and accessible apps. For Claude, HRA admits only the pinned Fable profile and reviewed host-tool boundary. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; "),
           code("hra session show"),
@@ -1748,6 +1764,8 @@ export const renderReadmeMarkdown = (content: PublicContent = publicContent): st
     content.statusLine,
     `\`\`\`sh\n${content.installCommand}\n\`\`\``,
     `\`\`\`sh\n${content.doctorCommand}\n\`\`\``,
+    `> ${content.daemonRolloutNotice}`,
+    "After the rollout prerequisite is satisfied, initialize:",
     `\`\`\`sh\n${content.initCommand}\n\`\`\``,
     `## ${content.hero.heading}\n\n${content.hero.summary}\n\n${content.hero.boundary}`,
     `### ${content.hero.proofLabel}\n\n${content.hero.steps.map((step, index) => `${index + 1}. **${step.label}:** \`${step.command}\`. ${step.detail}`).join("\n")}`,
@@ -1780,8 +1798,9 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     content.statusLine,
     "",
     `Install after the v${content.releaseVersion} beta tag is live: ${content.installCommand}`,
-    `Initialize: ${content.initCommand}`,
     `Verify local prerequisites without cloud access: ${content.doctorCommand}`,
+    content.daemonRolloutNotice,
+    `Initialize only after the rollout prerequisite is satisfied: ${content.initCommand}`,
     "",
     `Repository: ${content.links.github}`,
     `Documentation: ${content.links.documentation}`,

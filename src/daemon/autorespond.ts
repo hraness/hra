@@ -12,10 +12,13 @@
  */
 
 import type { ApprovalMode, InteractionDisplay, InteractionKind } from "../domain/interactions";
+import {
+  AUTORESPOND_CONSECUTIVE_LIMIT,
+  AUTORESPOND_HOURLY_BUDGET,
+  AUTORESPOND_DAILY_BUDGET,
+} from "../domain/autorespond-budget";
 
-export const AUTORESPOND_CONSECUTIVE_LIMIT = 3;
-export const AUTORESPOND_HOURLY_BUDGET = 10;
-export const AUTORESPOND_DAILY_BUDGET = 40;
+export { AUTORESPOND_CONSECUTIVE_LIMIT, AUTORESPOND_HOURLY_BUDGET, AUTORESPOND_DAILY_BUDGET };
 
 export type AutorespondBudgets = Readonly<{
   consecutive: number;
@@ -128,6 +131,10 @@ export type ProseAutorespondGateFailure =
   | "message_too_long"
   | "not_an_approval_cue"
   | "pending_interaction"
+  | "policy_changed"
+  | "source_changed"
+  | "source_already_reserved"
+  | "history_unavailable"
   | "verbatim_literal_missing";
 
 export const PROSE_AUTORESPOND_MAX_MESSAGE_CHARACTERS = 4_000;

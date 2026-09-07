@@ -301,6 +301,59 @@ describe("bounded cloud retention", () => {
     }
   });
 
+  test("skips fresh partial OTP capacity before deep validation and fails closed once old", async () => {
+    jest.useFakeTimers();
+    const createdAt = 1_800_050_000_000;
+    jest.setSystemTime(createdAt);
+    try {
+      const runtime = convexTest(schema, modules);
+      await runtime.mutation(genesisQuota, {});
+      const email = "partial-capacity-interrupted-account@example.com";
+      const userId = await runtime.run(async (ctx) => {
+        const userId = await ctx.db.insert("users", { email });
+        await initializeUserQuotaAuthority(ctx, userId);
+        const user = await ctx.db.get(userId);
+        if (user === null) throw new Error("missing partial-capacity interrupted user");
+        await reserveQuotaForStoredIdentity(ctx, userId, user);
+        await createAccountDeletionCapacityForNewUser(ctx, userId);
+        const account = {
+          provider: "hra-control-plane-otp-v1",
+          providerAccountId: email,
+          userId,
+        };
+        await reserveQuotaForInsert(ctx, userId, "identity", account);
+        await ctx.db.insert("authAccounts", account);
+        const identityCapacity = await ctx.db.query("accountDeletionIdentityReservations")
+          .withIndex("by_user", (builder) => builder.eq("userId", userId))
+          .unique();
+        if (identityCapacity === null) throw new Error("missing capacity corruption fixture");
+        await ctx.db.delete(identityCapacity._id);
+        await ctx.db.insert("maintenanceState", {
+          key: "retention",
+          nextCategory: "orphaned_auth_users",
+          updatedAt: createdAt,
+        });
+        return userId;
+      });
+      jest.setSystemTime(createdAt + cloudRetentionMs.abandonedIdentity);
+      expect(await runtime.mutation(cleanupExpired, { limit: 200 })).toMatchObject({
+        orphanedAuthUsers: 0,
+      });
+      expect(await runtime.run(async (ctx) => await ctx.db.get(userId))).not.toBeNull();
+      jest.setSystemTime(createdAt + cloudRetentionMs.abandonedIdentity + 1);
+      await runtime.run(async (ctx) => {
+        const state = await ctx.db.query("maintenanceState").unique();
+        if (state === null) throw new Error("missing partial-capacity maintenance state");
+        await ctx.db.patch(state._id, { nextCategory: "orphaned_auth_users" });
+      });
+      await expect(runtime.mutation(cleanupExpired, { limit: 200 }))
+        .rejects.toThrow("AUTHORITY_REDUCTION_CAPACITY_CORRUPT");
+      expect(await runtime.run(async (ctx) => await ctx.db.get(userId))).not.toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test("preserves a fresh retry and retires a bound pre-challenge identity only when stale", async () => {
     jest.useFakeTimers();
     const createdAt = 1_800_100_000_000;

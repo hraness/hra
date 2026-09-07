@@ -88,7 +88,30 @@ setInterval(() => undefined, 1000);
 `;
 };
 
-const runHistoryFixtureGit = (root: string, ...arguments_: readonly string[]) => Bun.spawnSync(
+const historyFixtureChildTimeoutMs = 5_000;
+const createHistoryRenderingBudget = (now: () => number = () => performance.now()) => {
+  const deadline = now() + 20_000;
+  return (): number => {
+    const remaining = Math.floor(deadline - now());
+    if (remaining < 1) throw new Error("Git history rendering fixture exhausted its time budget.");
+    return Math.min(historyFixtureChildTimeoutMs, remaining);
+  };
+};
+const historyFixtureSpawnOptions = (root: string, timeout = historyFixtureChildTimeoutMs) => ({
+  cwd: root,
+  env: { ...buildGitHistoryEnvironment(root, resolve(tmpdir())), GIT_MERGE_AUTOEDIT: "no" },
+  killSignal: "SIGKILL" as const,
+  maxBuffer: 32 * 1024 * 1024,
+  stderr: "pipe" as const,
+  stdin: "ignore" as const,
+  stdout: "pipe" as const,
+  timeout,
+});
+const spawnHistoryFixtureGit = (
+  root: string,
+  arguments_: readonly string[],
+  timeout = historyFixtureChildTimeoutMs,
+) => Bun.spawnSync(
   [
     "/usr/bin/git",
     "-c",
@@ -97,43 +120,42 @@ const runHistoryFixtureGit = (root: string, ...arguments_: readonly string[]) =>
     "core.hooksPath=/dev/null",
     ...arguments_,
   ],
-  { cwd: root, env: { ...process.env, GIT_MERGE_AUTOEDIT: "no" } },
+  historyFixtureSpawnOptions(root, timeout),
 );
 
-const requireHistoryFixtureGit = (root: string, ...arguments_: readonly string[]): string => {
-  const result = runHistoryFixtureGit(root, ...arguments_);
-  if (result.exitCode !== 0) {
-    throw new Error(`Git history fixture command failed: ${arguments_[0] ?? "unknown"}.`);
+const runHistoryFixtureGit = (root: string, ...arguments_: readonly string[]) =>
+  spawnHistoryFixtureGit(root, arguments_);
+const requireHistoryFixtureGitOutput = (result: ReturnType<typeof runHistoryFixtureGit>): string => {
+  if (result.exitCode !== 0 || result.exitedDueToMaxBuffer || result.exitedDueToTimeout) {
+    throw new Error("Git history fixture command failed or exceeded its bound.");
   }
   return Buffer.from(result.stdout).toString("utf8").trim();
 };
+const requireHistoryFixtureGit = (root: string, ...arguments_: readonly string[]): string =>
+  requireHistoryFixtureGitOutput(runHistoryFixtureGit(root, ...arguments_));
 
-const initializeHistoryFixture = async (root: string, body = "base\n"): Promise<string> => {
-  requireHistoryFixtureGit(root, "init", "--initial-branch=main");
-  requireHistoryFixtureGit(root, "config", "user.name", "HRA History Fixture");
-  requireHistoryFixtureGit(root, "config", "user.email", "history-fixture@example.invalid");
+const initializeHistoryFixture = async (
+  root: string,
+  body = "base\n",
+  git = (...arguments_: readonly string[]) => requireHistoryFixtureGit(root, ...arguments_),
+): Promise<string> => {
+  git("init", "--initial-branch=main");
+  git("config", "user.name", "HRA History Fixture");
+  git("config", "user.email", "history-fixture@example.invalid");
   await writeFile(join(root, "document.txt"), body, "utf8");
-  requireHistoryFixtureGit(root, "add", "document.txt");
-  requireHistoryFixtureGit(root, "commit", "-m", "base");
-  return requireHistoryFixtureGit(root, "rev-parse", "HEAD");
+  git("add", "document.txt");
+  git("commit", "-m", "base");
+  return git("rev-parse", "HEAD");
 };
 
 const runCanonicalHistoryPatch = (
   root: string,
   commit: string,
   kind: "public_patch" | "sensitive_patch",
+  timeout = historyFixtureChildTimeoutMs,
 ) => Bun.spawnSync(
   ["/usr/bin/git", "--no-pager", ...gitHistoryCommandArguments({ commit, kind })],
-  {
-    cwd: root,
-    env: buildGitHistoryEnvironment(root, resolve(tmpdir())),
-    killSignal: "SIGKILL",
-    maxBuffer: 32 * 1024 * 1024,
-    stderr: "pipe",
-    stdin: "ignore",
-    stdout: "pipe",
-    timeout: 60_000,
-  },
+  historyFixtureSpawnOptions(root, timeout),
 );
 
 describe("installed package daemon ownership", () => {
@@ -511,18 +533,46 @@ describe("installed package generic command ownership", () => {
     ])).toThrow("synthetic-path evidence changed");
   });
 
+  test("bounds history fixture children independently of ambient configuration and the outer deadline", () => {
+    const root = resolve(tmpdir());
+    const options = historyFixtureSpawnOptions(root);
+    expect(options.env).toEqual({ ...buildGitHistoryEnvironment(root, root), GIT_MERGE_AUTOEDIT: "no" });
+    expect(options).toMatchObject({
+      killSignal: "SIGKILL", maxBuffer: 32 * 1024 * 1024,
+      stderr: "pipe", stdin: "ignore", stdout: "pipe", timeout: 5_000,
+    });
+    let now = 0;
+    const remaining = createHistoryRenderingBudget(() => now);
+    expect(remaining()).toBe(5_000);
+    now = 19_000;
+    expect(remaining()).toBe(1_000);
+    now = 19_999;
+    expect(remaining()).toBe(1);
+    now = 20_000;
+    expect(remaining).toThrow("exhausted its time budget");
+  });
+
   test("makes reviewed patch rendering independent of hostile repository configuration", async () => {
+    const remaining = createHistoryRenderingBudget();
+    // Fixed phase labels identify a stall even if the outer test timeout fires.
+    // Never print fixture paths, command arguments, configuration, or Git output.
+    const phase = (value: "setup" | "render_baseline" | "config" | "render_hostile" | "cleanup") => {
+      console.error(`[hra-history-rendering-fixture] ${value}`);
+    };
+    phase("setup");
     const root = resolve(await mkdtemp(join(tmpdir(), "hra-history-rendering-")));
+    const git = (...arguments_: readonly string[]) =>
+      requireHistoryFixtureGitOutput(spawnHistoryFixtureGit(root, arguments_, remaining()));
     try {
-      await initializeHistoryFixture(root, "first\n\nsecond\nthird\n");
+      await initializeHistoryFixture(root, "first\n\nsecond\nthird\n", git);
       const contextPath = join(root, "context.txt");
       await writeFile(
         contextPath,
         "alpha\nnear-alpha\n\nblank-context\nkeep-five\nkeep-six\nkeep-seven\nkeep-eight\nnear-omega\nomega\n",
         "utf8",
       );
-      requireHistoryFixtureGit(root, "add", "context.txt");
-      requireHistoryFixtureGit(root, "commit", "-m", "context base");
+      git("add", "context.txt");
+      git("commit", "-m", "context base");
       const source = join(root, "document.txt");
       const destination = join(root, "\u03c0-document.txt");
       await rename(source, destination);
@@ -532,13 +582,15 @@ describe("installed package generic command ownership", () => {
         "alpha changed\nnear-alpha\n\nblank-context\nkeep-five\nkeep-six\nkeep-seven\nkeep-eight\nnear-omega\nomega changed\n",
         "utf8",
       );
-      requireHistoryFixtureGit(root, "add", "--all");
-      requireHistoryFixtureGit(root, "commit", "-m", "rendering target");
-      const commit = requireHistoryFixtureGit(root, "rev-parse", "HEAD");
-      const baseline = runCanonicalHistoryPatch(root, commit, "sensitive_patch");
+      git("add", "--all");
+      git("commit", "-m", "rendering target");
+      const commit = git("rev-parse", "HEAD");
+      phase("render_baseline");
+      const baseline = runCanonicalHistoryPatch(root, commit, "sensitive_patch", remaining());
       expect(baseline.exitCode).toBe(0);
       expect(baseline.stderr.byteLength).toBe(0);
 
+      phase("config");
       for (const [key, value] of [
         ["color.ui", "always"],
         ["core.abbrev", "5"],
@@ -555,16 +607,20 @@ describe("installed package generic command ownership", () => {
         ["diff.relative", "true"],
         ["diff.submodule", "log"],
         ["diff.suppressBlankEmpty", "true"],
-      ] as const) requireHistoryFixtureGit(root, "config", key, value);
+      ] as const) git("config", key, value);
 
-      const hostile = runCanonicalHistoryPatch(root, commit, "sensitive_patch");
+      phase("render_hostile");
+      const hostile = runCanonicalHistoryPatch(root, commit, "sensitive_patch", remaining());
       expect(hostile.exitCode).toBe(0);
       expect(hostile.exitedDueToMaxBuffer ?? false).toBe(false);
       expect(hostile.exitedDueToTimeout ?? false).toBe(false);
       expect(hostile.stderr.byteLength).toBe(0);
       expect(hostile.stdout).toEqual(baseline.stdout);
     } finally {
-      await rm(root, { force: true, recursive: true });
+      phase("cleanup");
+      await rm(root, { force: true, recursive: true }).catch(() => {
+        throw new Error("Git history rendering fixture cleanup failed.");
+      });
     }
   }, 30_000);
 

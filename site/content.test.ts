@@ -48,6 +48,18 @@ const htmlVisibleText = (value: string): string => value
   .replaceAll("&amp;", "&");
 
 describe("public content contract", () => {
+  test("keeps durable automatic-approval limits and upgrade holds on both public surfaces", () => {
+    const readme = renderReadmeMarkdown();
+    const html = htmlVisibleText(renderSiteHtml(publicContent));
+    for (const surface of [readme, html]) {
+      expect(surface).toContain("reserves its budget before provider dispatch");
+      expect(surface).toContain("pauses automatic approvals for 24 hours");
+      expect(surface).toContain("requires a new human message to reopen its consecutive budget");
+      expect(surface).toContain("hra autorespond status --session <session>");
+      expect(surface).not.toMatch(/hra autorespond status`? (?:shows the counters|reports the hold)/u);
+      expect(surface).toContain("A newer question or changed authority cancels the stale reply");
+    }
+  });
   test("publishes the exact HRA release identity", () => {
     expect(publicContent).toMatchObject({
       doctorCommand: "hra doctor --offline",
@@ -125,7 +137,7 @@ describe("public content contract", () => {
     expect(publicContent.tagline).toBe("Control plane for Codex and Claude Code");
     expect(publicContent.providerRoadmap).toBe("Codex and Claude Code, side by side.");
     expect(packageJson.description).toBe(publicContent.description);
-    expect(publicContent.description).toStartWith(`${publicContent.tagline} in current source;`);
+    expect(publicContent.description).toStartWith(`${publicContent.tagline}.`);
     expect(structured).toMatchObject({
       "@type": "SoftwareApplication",
       applicationSubCategory: publicContent.tagline,
@@ -134,13 +146,14 @@ describe("public content contract", () => {
       maintainer: { "@type": "Organization", name: "Hraness", url: "https://hraness.com/" },
     });
     expect(structured).not.toHaveProperty("softwareVersion");
-    expect(publicContent.description).toContain("current source");
-    expect(publicContent.description).toContain("v0.7.0 is release-ready");
+    expect(publicContent.description).toContain("v0.7.0 is a release candidate");
+    expect(publicContent.description).toContain("v0.6.1 is the admitted artifact");
+    expect(publicContent.description).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
     expect(html).toContain(`<p class="hraness-marketing-hero__eyebrow">${publicContent.tagline}</p>`);
     expect(renderPreviewHtml()).toContain(`<p class="preview-eyebrow">${publicContent.tagline}</p>`);
     expect(publicContent.socialCard).toEqual({
-      alt: "HRA · Codex + Claude Code · v0.7.0 release-ready · hra.sh",
+      alt: "HRA · v0.7.0 release candidate · v0.6.1 admitted · daemon rollout blocked on capacity · hra.sh",
       height: 630,
       path: "/social-card.png",
       width: 1200,
@@ -290,7 +303,7 @@ describe("public content contract", () => {
     expect(html).not.toMatch(/<code>(?:.|\n)*?<\/code>/u);
   });
 
-  test("marks the local release candidate release-ready while the website and hosted sync stay live", () => {
+  test("keeps the local candidate pre-live without erasing the admitted release or blocked rollout", () => {
     expect(publicReleaseState).toBe("release-ready");
     expect(publicContent.endpoints).toEqual({
       betaTag: "release-ready",
@@ -298,11 +311,13 @@ describe("public content contract", () => {
       hostedSync: "live",
       website: "live",
     });
-    expect(renderReadmeMarkdown()).toContain("The local CLI v0.7.0 is release-ready");
+    expect(renderReadmeMarkdown()).toContain("Local CLI v0.7.0 is a release candidate");
+    expect(renderReadmeMarkdown()).toContain("v0.6.1 is the fully admitted public artifact");
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
-      expect(surface).toContain("Immutable local CLI release candidate; hosted sync live as an open beta");
-      expect(surface).toContain("works once GitHub exposes the immutable");
-      expect(surface).toContain("candidate becomes public only after exact admission");
+      expect(surface).toContain("Local v0.7.0 candidate; v0.6.1 artifacts admitted; hosted sync live as an open beta");
+      expect(surface).toContain("passed immutable GitHub and npm release admission");
+      expect(surface).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
+      expect(surface).not.toContain("v0.7.0 artifacts are live");
       expect(surface).not.toContain("beta-not-yet-live");
       expect(surface).toContain("Local release boundary");
       expect(surface).toContain("become installable through the exact command above once its GitHub Release exists");
@@ -310,7 +325,53 @@ describe("public content contract", () => {
       expect(surface).not.toContain("No published `v0.7.0` tag currently exposes these commands");
     }
     expect(renderLlmsText()).toContain("Install after the v0.7.0 beta tag is live");
-    expect(renderLlmsText()).not.toContain("Install the live v0.7.0 beta");
+    expect(renderLlmsText()).not.toContain("Install the live v0.7.0 local CLI artifact");
+  });
+
+  test("places the blocked rollout prerequisite before every prominent initialization and first-session flow", () => {
+    const markdown = renderReadmeMarkdown();
+    const html = htmlVisibleText(renderSiteHtml());
+    const llms = renderLlmsText();
+    const prerequisite = publicContent.daemonRolloutNotice;
+    expect(prerequisite).toContain("Do not initialize, start, or autostart");
+    expect(prerequisite).toContain("protected two-pass zero-debt capacity evidence");
+    expect(prerequisite).toContain("protected two-pass zero-debt capacity evidence and its exact .activated readback receipt");
+    expect(prerequisite).toContain("target marker-2 proofs before globally enabling hosted writers");
+    for (const surface of [markdown, html, llms]) {
+      expect(surface).toContain(prerequisite);
+      expect(surface.indexOf(prerequisite)).toBeLessThan(surface.indexOf(publicContent.initCommand));
+      expect(surface.indexOf(publicContent.doctorCommand)).toBeLessThan(surface.indexOf(publicContent.initCommand));
+    }
+    expect(html.indexOf(prerequisite)).toBeLessThan(html.indexOf("hra session start personal --provider codex"));
+    expect(markdown.indexOf(prerequisite)).toBeLessThan(markdown.indexOf(publicContent.hero.steps[0]!.command));
+    const installPanel = htmlVisibleText(renderSiteHtml().split('id="install-command"')[1]!.split("</section>")[0]!);
+    expect(installPanel).toContain("Installing and checking the binary does not start the daemon");
+    expect(installPanel.indexOf(prerequisite)).toBeLessThan(installPanel.indexOf(publicContent.initCommand));
+    expect(installPanel).toContain("After the rollout prerequisite is satisfied");
+    expect(html).not.toContain("Then check the host and initialize");
+    expect(html).not.toContain("Install the CLI, add one account, and start a session");
+  });
+
+  test.each([
+    ["first-account", "First account", "hra account add personal"],
+    ["first-session", "First session", "hra session start personal --provider codex"],
+    ["cloud-sign-in-and-device-pairing", "Cloud sign-in and device pairing", "hra auth login --input-stdin"],
+    ["terminal-and-agent-interfaces", "Terminal and agent interfaces", "hra"],
+    ["presets-and-permissions", "Presets and permissions", "hra init --yes"],
+  ])("guards the directly linked %s first-run section before its startup instructions", (id, heading, command) => {
+    const section = publicContent.sections.find((entry) => entry.id === id);
+    expect(section?.blocks[0]).toEqual({
+      kind: "notice",
+      label: "Conditional walkthrough",
+      content: [{ kind: "text", value: publicContent.daemonRolloutNotice }],
+    });
+    const markdownSection = renderReadmeMarkdown().split(`## ${heading}\n\n`)[1]!.split("\n## ")[0]!;
+    const htmlSection = htmlVisibleText(renderSiteHtml().split(`id="${id}"`)[1]!.split("</section>")[0]!);
+    for (const surface of [markdownSection, htmlSection]) {
+      expect(surface).toContain(publicContent.daemonRolloutNotice);
+      expect(surface).toContain(command);
+      expect(surface.indexOf(publicContent.daemonRolloutNotice)).toBeLessThan(surface.indexOf(command));
+    }
   });
 
   test("states one hosted sign-up claim everywhere and switches it in one place", () => {
@@ -1110,7 +1171,8 @@ describe("public content contract", () => {
       const footer = /<footer\b[\s\S]*?<\/footer>/u.exec(document)?.[0];
       expect(footer).toContain('data-slot="hraness-site-footer"');
       expect(footer?.match(/data-slot="hraness-mark"/gu)).toHaveLength(1);
-      expect(footer?.match(/data-slot="social-icon"/gu)).toHaveLength(11);
+      expect(footer?.match(/data-slot="social-icon"/gu)).toHaveLength(5);
+      expect(footer).not.toContain("hraness-site-footer__wordmark");
       expect(footer).toContain('data-mailing-list="none"');
       expect(footer).toContain('href="https://substack.com/@hraness"');
       expect(

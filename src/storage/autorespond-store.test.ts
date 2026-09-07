@@ -2,11 +2,101 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import { z } from "zod";
+
+import { AUTORESPOND_DAY_MS, AUTORESPOND_HOUR_MS } from "../domain/autorespond-budget";
 
 import { initializeStatePaths, resolveStatePaths } from "./paths";
 import { StateStore } from "./state-store";
 
 const stores: StateStore[] = [];
+
+// These fixtures admit the shipped v43/v44 predecessor surfaces, not a private
+// memory cohort stamped with an older user_version.
+const dropHostedMemorySchema = (database: Database): void => {
+  const hostedObjects = z.object({
+    name: z.string().regex(/^[a-z0-9_]+$/u),
+    type: z.enum(["index", "trigger"]),
+  }).strict().array().parse(database.query(`
+    SELECT name,type FROM sqlite_master
+    WHERE type IN ('index','trigger') AND (
+      name LIKE 'project_memory_hosted_%'
+      OR name LIKE 'project_memory_sync_%'
+      OR name LIKE 'project_memory_portable_adoption_%'
+      OR name='canonical_memory_sync_share_fence'
+    )
+    ORDER BY CASE type WHEN 'trigger' THEN 0 ELSE 1 END,name
+  `).all());
+  for (const object of hostedObjects) {
+    database.exec(`DROP ${object.type.toUpperCase()} IF EXISTS "${object.name}"`);
+  }
+  database.exec(`
+    DROP TABLE IF EXISTS project_memory_sync_spool;
+    DROP TABLE IF EXISTS project_memory_sync_intents;
+    DROP TABLE IF EXISTS project_memory_hosted_create_intents;
+    DROP TABLE IF EXISTS project_memory_portable_adoption_proofs;
+    DROP TABLE IF EXISTS project_memory_hosted_attachments;
+  `);
+};
+
+const dropPeerAndHostedMemorySchema = (database: Database): void => {
+  dropHostedMemorySchema(database);
+  const featureObjects = z.object({
+    name: z.string().regex(/^[a-z0-9_]+$/u),
+    type: z.enum(["index", "trigger"]),
+  }).strict().array().parse(database.query(`
+    SELECT name,type FROM sqlite_master
+    WHERE type IN ('index','trigger') AND (
+      name LIKE 'peer_session_%'
+      OR name LIKE 'session_peer_%'
+      OR name LIKE 'session_message_event_source%'
+      OR name LIKE 'session_host_capability%'
+      OR name LIKE 'project_memory_%'
+      OR name LIKE 'memory_%'
+      OR name LIKE 'queue_peer_%'
+      OR name IN (
+        'session_provider_switch_authority_immutable',
+        'session_provider_switch_transition_guard',
+        'session_provider_switch_seed_transition_guard',
+        'session_provider_switch_session_update_guard',
+        'session_provider_switch_session_delete_guard',
+        'session_provider_switch_delete_guard',
+        'session_provider_switch_v40_authority_guard',
+        'session_provider_switch_v40_authority_immutable'
+      )
+    )
+    ORDER BY CASE type WHEN 'trigger' THEN 0 ELSE 1 END,name
+  `).all());
+  for (const object of featureObjects) {
+    database.exec(`DROP ${object.type.toUpperCase()} IF EXISTS "${object.name}"`);
+  }
+  database.exec(`
+    DROP TABLE IF EXISTS memory_page_attestation_refs;
+    DROP TABLE IF EXISTS memory_working_attestation_forks;
+    DROP TABLE IF EXISTS memory_working_attestation_heads;
+    DROP TABLE IF EXISTS memory_page_attestations;
+    DROP TABLE IF EXISTS memory_submissions;
+    DROP TABLE IF EXISTS project_memory_authorities;
+    DROP TABLE IF EXISTS session_provider_switches;
+    DROP TABLE IF EXISTS peer_session_direct_message_sources;
+    DROP TABLE IF EXISTS peer_session_turn_origins;
+    DROP TABLE IF EXISTS peer_session_action_roots;
+    DROP TABLE IF EXISTS peer_session_action_visits;
+    DROP TABLE IF EXISTS peer_session_action_parents;
+    DROP TABLE IF EXISTS peer_session_actions;
+    DROP TABLE IF EXISTS session_peer_policies;
+    DROP TABLE IF EXISTS session_message_event_sources;
+    DROP TABLE IF EXISTS session_host_capability_bindings;
+  `);
+  if (database.query(
+    "SELECT 1 FROM pragma_table_info('queue_entries') WHERE name='peer_action_id'",
+  ).get() !== null) database.exec("ALTER TABLE queue_entries DROP COLUMN peer_action_id");
+  if (database.query(
+    "SELECT 1 FROM pragma_table_info('queue_entries') WHERE name='message_actor'",
+  ).get() !== null) database.exec("ALTER TABLE queue_entries DROP COLUMN message_actor");
+};
 
 afterEach(() => {
   for (const store of stores.splice(0)) store.close();
@@ -19,9 +109,57 @@ async function fixture(): Promise<{ store: StateStore; sessionId: string; clock:
   const clock = { now: 1_000_000 };
   const store = new StateStore(paths, { now: () => clock.now });
   stores.push(store);
-  const profile = store.createProfile("Personal");
-  const session = store.createSession({ profileId: profile.id, title: "Autorespond", preset: "high", fastEnabled: false });
+  const profile = store.nextProfileGeneration(store.createProfile("Personal").id);
+  store.setProfileState(profile.id, profile.processGeneration, "signed_in", { email: "autorespond@example.com" });
+  const session = provenSession(store, profile.id, "Autorespond");
   return { store, sessionId: session.id, clock };
+}
+
+function provenSession(store: StateStore, profileId: string, title: string) {
+  const email = store.requireProfile(profileId).providerEmail;
+  if (email === undefined) throw new Error("missing fixture account authority");
+  return store.upsertProviderSession({
+    profileId, title, provider: "codex", providerThreadId: `thread-${crypto.randomUUID()}`,
+    providerAccountKey: `v1:codex:${createHash("sha256").update(email).digest("hex")}`,
+    preset: "high", fastEnabled: false, state: "idle",
+  });
+}
+
+function protocolSource(store: StateStore, sessionId: string): string {
+  const session = store.requireSession(sessionId);
+  const profile = store.requireProfile(session.profileId);
+  const publicId = crypto.randomUUID();
+  store.admitInteraction({
+    publicId,
+    sessionId,
+    authority: {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      connectionId: "44000000-0000-4000-8000-999999999999",
+      requestId: { type: "string", value: publicId },
+      method: "item/commandExecution/requestApproval",
+      requestDigest: "a".repeat(64),
+      threadId: session.providerThreadId ?? null,
+      turnId: null,
+      itemId: null,
+      approvalId: null,
+    },
+    kind: "command_approval",
+    blocking: true,
+    display: {
+      kind: "command_approval",
+      summary: "Review command",
+      reason: null,
+      commandClass: "test",
+      workingDirectory: null,
+      availableDecisions: ["once", "decline", "cancel"],
+    },
+  });
+  return publicId;
+}
+
+function reserveProtocol(store: StateStore, sessionId: string, sourceId = protocolSource(store, sessionId)) {
+  return store.reserveAutorespondBudget({ sessionId, sourceId, sourceKind: "protocol", expectedMode: "auto:all" });
 }
 
 describe("autorespond store", () => {
@@ -38,7 +176,7 @@ describe("autorespond store", () => {
     expect(() => store.setSessionApprovalMode("sess_00000000000000000000000000000000", "manual")).toThrow();
   });
 
-  test("counts consecutive autoresponses until a human reset and windows evidence by hour and day", async () => {
+  test("counts consecutive admission until a human reset and windows reservations independently of evidence", async () => {
     const { store, sessionId, clock } = await fixture();
     expect(store.bumpAutorespondCounter(sessionId)).toBe(1);
     expect(store.bumpAutorespondCounter(sessionId)).toBe(2);
@@ -58,13 +196,15 @@ describe("autorespond store", () => {
       subagent: false,
     });
     record("accepted");
+    expect(reserveProtocol(store, sessionId)).toEqual({ state: "reserved" });
     clock.now += 2 * 60 * 60 * 1_000;
     record("accepted");
+    expect(reserveProtocol(store, sessionId)).toEqual({ state: "reserved" });
     record("refused");
     const budgets = store.readAutorespondBudgets(sessionId);
     expect(budgets.lastHour).toBe(1);
     expect(budgets.lastDay).toBe(2);
-    expect(store.countAutorespondEvidence({ sessionId })).toEqual({ accepted: 2, refused: 1 });
+    expect(store.countAutorespondEvidence({ sessionId })).toEqual({ accepted: 2, refused: 1, unknown: 0 });
     const recent = store.listAutorespondEvidence({ sessionId, limit: 2 });
     expect(recent).toHaveLength(2);
     expect(recent[0]?.outcome).toBe("refused");
@@ -113,9 +253,9 @@ describe("prose autorespond evidence", () => {
       outcome: "sent",
       path: "prose",
     });
-    // A sent prose reply spends the same per-session budget as a protocol accept.
-    expect(store.readAutorespondBudgets(sessionId)).toMatchObject({ lastDay: 1, lastHour: 1 });
-    expect(store.countAutorespondEvidence({ sessionId })).toEqual({ accepted: 1, refused: 1 });
+    // Display evidence has no admission authority. Actual sends reserve first.
+    expect(store.readAutorespondBudgets(sessionId)).toMatchObject({ lastDay: 0, lastHour: 0 });
+    expect(store.countAutorespondEvidence({ sessionId })).toEqual({ accepted: 1, refused: 1, unknown: 0 });
   });
 
   test("refuses an outcome outside the closed vocabulary", async () => {
@@ -140,5 +280,200 @@ describe("prose autorespond evidence", () => {
     expect(store.isAutorespondMessageSource(sessionId, "attempt_one")).toBe(true);
     expect(store.isAutorespondMessageSource(sessionId, "attempt_two")).toBe(false);
     expect(store.isAutorespondMessageSource(sessionId, "")).toBe(false);
+  });
+});
+
+describe("durable autorespond admission", () => {
+  test("serializes competing stores and exact-key replay before any success is recorded", async () => {
+    const { store, sessionId, clock } = await fixture();
+    const other = new StateStore(store.paths, { now: () => clock.now });
+    stores.push(other);
+    const sourceId = protocolSource(store, sessionId);
+    expect(reserveProtocol(store, sessionId, sourceId)).toEqual({ state: "reserved" });
+    expect(reserveProtocol(other, sessionId, sourceId)).toEqual({ state: "existing" });
+    expect(reserveProtocol(other, sessionId)).toEqual({ state: "reserved" });
+    expect(reserveProtocol(store, sessionId)).toEqual({ state: "reserved" });
+    expect(reserveProtocol(other, sessionId)).toEqual({ state: "refused", code: "consecutive_limit" });
+    expect(store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 3, lastHour: 3, lastDay: 3 });
+  });
+
+  test("rechecks mode and source authority without charging refusals", async () => {
+    const { store, sessionId } = await fixture();
+    const sourceId = protocolSource(store, sessionId);
+    store.setSessionApprovalMode(sessionId, "manual");
+    expect(reserveProtocol(store, sessionId, sourceId)).toEqual({ state: "refused", code: "manual_mode" });
+    store.setSessionApprovalMode(sessionId, "auto:workspace");
+    expect(reserveProtocol(store, sessionId, sourceId)).toEqual({ state: "refused", code: "policy_changed" });
+    store.setSessionApprovalMode(sessionId, "auto:all");
+    expect(() => reserveProtocol(store, sessionId, crypto.randomUUID())).toThrow("AUTORESPOND_BUDGET_SOURCE_AUTHORITY_INVALID");
+    expect(store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 0, lastHour: 0, lastDay: 0 });
+  });
+
+  test("refusal churn and unknown outcomes cannot erase charged rolling budgets", async () => {
+    const { store, sessionId, clock } = await fixture();
+    for (let index = 0; index < 10; index += 1) {
+      store.resetAutorespondCounter(sessionId);
+      expect(reserveProtocol(store, sessionId)).toEqual({ state: "reserved" });
+    }
+    store.resetAutorespondCounter(sessionId);
+    for (let index = 0; index < 501; index += 1) {
+      store.recordAutorespondEvidence({
+        sessionId, interactionId: crypto.randomUUID(), kind: "command_approval",
+        approvalClass: "command:test", mode: "auto:all", decision: "unavailable",
+        outcome: index === 500 ? "unknown" : "refused", latencyMs: 0, subagent: false,
+      });
+    }
+    expect(store.countAutorespondEvidence({ sessionId })).toEqual({ accepted: 0, refused: 499, unknown: 1 });
+    expect(reserveProtocol(store, sessionId)).toEqual({ state: "refused", code: "hourly_budget" });
+    clock.now += AUTORESPOND_HOUR_MS;
+    expect(reserveProtocol(store, sessionId)).toEqual({ state: "refused", code: "hourly_budget" });
+    clock.now += 1;
+    expect(reserveProtocol(store, sessionId)).toEqual({ state: "reserved" });
+    expect(store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 1, lastHour: 1, lastDay: 11 });
+  });
+
+  test("enforces the shared daily ceiling and releases only expired rolling reservations", async () => {
+    const { store, sessionId, clock } = await fixture();
+    const start = clock.now;
+    for (let hour = 0; hour < 4; hour += 1) {
+      clock.now = start + hour * (AUTORESPOND_HOUR_MS + 1);
+      for (let index = 0; index < 10; index += 1) {
+        store.resetAutorespondCounter(sessionId);
+        expect(reserveProtocol(store, sessionId)).toEqual({ state: "reserved" });
+      }
+    }
+    clock.now += AUTORESPOND_HOUR_MS + 1;
+    store.resetAutorespondCounter(sessionId);
+    expect(reserveProtocol(store, sessionId)).toEqual({ state: "refused", code: "daily_budget" });
+    clock.now = start + AUTORESPOND_DAY_MS;
+    expect(reserveProtocol(store, sessionId)).toEqual({ state: "refused", code: "daily_budget" });
+    clock.now += 1;
+    expect(reserveProtocol(store, sessionId)).toEqual({ state: "reserved" });
+    expect(store.readAutorespondBudgets(sessionId).lastDay).toBe(31);
+    const inspector = new Database(store.paths.database, { readonly: true });
+    try {
+      expect(inspector.query("SELECT COUNT(*) AS total FROM autorespond_budget_reservations").get()).toEqual({ total: 31 });
+    } finally { inspector.close(false); }
+  });
+
+  test("clock rewind cannot reopen spend after a successful or refused retention attempt", async () => {
+    const { store, sessionId, clock } = await fixture();
+    const start = clock.now;
+    for (let index = 0; index < 10; index += 1) {
+      store.resetAutorespondCounter(sessionId);
+      expect(reserveProtocol(store, sessionId)).toEqual({ state: "reserved" });
+    }
+    store.bumpAutorespondCounter(sessionId);
+    store.bumpAutorespondCounter(sessionId);
+    clock.now += AUTORESPOND_DAY_MS + 1;
+    expect(reserveProtocol(store, sessionId)).toEqual({ state: "refused", code: "consecutive_limit" });
+    clock.now = start;
+    store.resetAutorespondCounter(sessionId);
+    expect(reserveProtocol(store, sessionId)).toEqual({ state: "refused", code: "hourly_budget" });
+    clock.now += AUTORESPOND_DAY_MS + 1;
+    expect(reserveProtocol(store, sessionId)).toEqual({ state: "reserved" });
+    clock.now = start;
+    store.resetAutorespondCounter(sessionId);
+    expect(reserveProtocol(store, sessionId)).toEqual({ state: "refused", code: "history_unavailable" });
+  });
+
+  test("holds only preexisting sessions for a full day after v43 migration and keeps the hold on reopen", async () => {
+    const { store, sessionId, clock } = await fixture();
+    const paths = store.paths;
+    const sessionProfile = store.requireSession(sessionId).profileId;
+    const alreadyLimited = provenSession(store, sessionProfile, "Already limited");
+    for (let count = 0; count < 4; count += 1) store.bumpAutorespondCounter(alreadyLimited.id);
+    stores.splice(stores.indexOf(store), 1);
+    store.close();
+    const predecessor = new Database(paths.database);
+    dropPeerAndHostedMemorySchema(predecessor);
+    // Reproduce the actual v31->v43 table spelling: SQLite quotes a table name
+    // after ALTER TABLE RENAME, even when the original CREATE was unquoted.
+    const evidenceSql = (predecessor.query(
+      "SELECT sql FROM sqlite_master WHERE name='autorespond_evidence'",
+    ).get() as { sql: string }).sql
+      .replace("autorespond_evidence", "autorespond_evidence_next")
+      .replace("'refused','unknown'", "'refused'");
+    predecessor.exec("DROP TABLE autorespond_evidence");
+    predecessor.exec(evidenceSql);
+    predecessor.exec("ALTER TABLE autorespond_evidence_next RENAME TO autorespond_evidence");
+    predecessor.exec(`
+      DROP TRIGGER sessions_autorespond_budget_history;
+      DROP TABLE autorespond_budget_history;
+      DROP TABLE autorespond_budget_reservations;
+      DELETE FROM migrations WHERE version>43;
+      PRAGMA user_version=43;
+    `);
+    predecessor.close(false);
+    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:46");
+    const migrated = new StateStore(paths, { now: () => clock.now });
+    stores.push(migrated);
+    const availableAt = clock.now + AUTORESPOND_DAY_MS;
+    expect(migrated.readAutorespondBudgets(sessionId).consecutive).toBe(3);
+    expect(migrated.readAutorespondBudgets(alreadyLimited.id).consecutive).toBe(4);
+    expect(migrated.readAutorespondBudgetHistoryAvailableAt(sessionId)).toBe(availableAt);
+    expect(reserveProtocol(migrated, sessionId)).toEqual({ state: "refused", code: "history_unavailable" });
+    const session = migrated.requireSession(sessionId);
+    const fresh = provenSession(migrated, session.profileId, "New after migration");
+    expect(migrated.readAutorespondBudgetHistoryAvailableAt(fresh.id)).toBeNull();
+    expect(reserveProtocol(migrated, fresh.id)).toEqual({ state: "reserved" });
+    // The normal human-message reset may happen during the hold. Reopening
+    // must not reinstall the migration floor after that reset.
+    migrated.resetAutorespondCounter(sessionId);
+    clock.now = availableAt - 1;
+    const reopened = new StateStore(paths, { now: () => clock.now });
+    stores.push(reopened);
+    expect(reopened.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+    expect(reopened.readAutorespondBudgetHistoryAvailableAt(sessionId)).toBe(availableAt);
+    expect(reserveProtocol(reopened, sessionId)).toEqual({ state: "refused", code: "history_unavailable" });
+    clock.now = availableAt;
+    expect(reopened.readAutorespondBudgetHistoryAvailableAt(sessionId)).toBeNull();
+    expect(reserveProtocol(reopened, sessionId)).toEqual({ state: "reserved" });
+  });
+
+  test("rejects a current-version missing admission guard without repairing it", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    stores.splice(stores.indexOf(store), 1);
+    store.close();
+    const damaged = new Database(paths.database);
+    damaged.exec("DROP TRIGGER autorespond_budget_reservations_immutable");
+    damaged.close(false);
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_AUTHORITY_INVALID");
+    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_AUTHORITY_INVALID");
+  });
+
+  test("rejects predecessor budget-object collisions instead of blessing zero history holds", async () => {
+    const { store, sessionId } = await fixture();
+    const paths = store.paths;
+    stores.splice(stores.indexOf(store), 1);
+    store.close();
+    const damaged = new Database(paths.database);
+    dropPeerAndHostedMemorySchema(damaged);
+    damaged.exec("DELETE FROM migrations WHERE version>43; PRAGMA user_version=43");
+    expect(damaged.query("SELECT available_at FROM autorespond_budget_history WHERE session_id=?").get(sessionId))
+      .toEqual({ available_at: 0 });
+    damaged.close(false);
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_PREDECESSOR_COLLISION");
+  });
+
+  for (const version of [44, 46]) test(`never applies pre-release v43 trigger-repair allowances to canonical v${String(version)}`, async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    stores.splice(stores.indexOf(store), 1);
+    store.close();
+    const damaged = new Database(paths.database);
+    if (version === 44) {
+      dropPeerAndHostedMemorySchema(damaged);
+      damaged.exec("DELETE FROM migrations WHERE version>44; PRAGMA user_version=44");
+    }
+    damaged.exec("DROP TRIGGER queue_transcript_cancellation_settlement");
+    damaged.close(false);
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V43_QUEUE_CANCELLATION_GUARD_INVALID");
+    const inspector = new Database(paths.database, { readonly: true });
+    try {
+      expect(inspector.query("SELECT 1 FROM sqlite_master WHERE name='queue_transcript_cancellation_settlement'").get()).toBeNull();
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: version });
+    } finally { inspector.close(false); }
   });
 });

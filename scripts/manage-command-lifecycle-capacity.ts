@@ -116,12 +116,33 @@ const terminalPage = pageBase.extend({
   unsafeCleanup: publicIds,
 }).strict();
 const authorityReductionHeadroomPage = z.object({
+  capacityMissing: z.number().int().min(0).max(pageSize),
   continueCursor: z.string().max(4_096),
+  hardQuotaBlocked: z.number().int().min(0).max(pageSize),
   isDone: z.boolean(),
+  mode: z.enum(["audit", "repair"]),
+  orphanCleanupEligible: z.number().int().min(0).max(pageSize),
+  orphanCleanupPending: z.number().int().min(0).max(pageSize),
+  ready: z.number().int().min(0).max(pageSize),
+  repaired: z.number().int().min(0).max(pageSize),
   scanned: z.number().int().min(0).max(pageSize),
-  serviceReady: z.boolean(),
-  unready: z.array(z.string().min(1).max(1_024)).max(pageSize),
-}).strict();
+  schemaVersion: z.literal(1),
+  topologyBlocked: z.number().int().min(0).max(pageSize),
+}).strict().superRefine((value, context) => {
+  if (
+    value.ready
+    + value.capacityMissing
+    + value.repaired
+    + value.hardQuotaBlocked
+    + value.orphanCleanupPending
+    + value.orphanCleanupEligible
+    + value.topologyBlocked
+    !== value.scanned
+    || (value.mode === "audit"
+      && (value.repaired !== 0 || value.hardQuotaBlocked !== 0))
+    || (value.mode === "repair" && value.capacityMissing !== 0)
+  ) context.addIssue({ code: "custom", message: "authority_reduction_counts_invalid" });
+});
 const lifecycleRepair = z.object({
   state: z.enum(["absent", "terminal", "terminalized", "reserved", "exact"]),
 }).strict();
@@ -311,7 +332,10 @@ type CapacityArguments = Readonly<{
   target: ConvexTarget;
 }>;
 type CapacityFailureCode =
-  | "capacity_backfill_blocked"
+  | "authority_reduction_hard_quota"
+  | "authority_reduction_orphan_cleanup_eligible"
+  | "authority_reduction_orphan_cleanup_pending"
+  | "authority_reduction_topology_blocked"
   | "candidate_deploy_evidence_invalid"
   | "convex_target_refused"
   | "operation_binding_changed"
@@ -330,7 +354,13 @@ class CapacityOperatorError extends Error {
 }
 
 export type CommandCapacityResult = Readonly<{
+  authorityReductionCapacityMissingDebt: number;
+  authorityReductionHardQuotaBlockedThisRun: number;
+  authorityReductionOrphanCleanupEligibleDebt: number;
+  authorityReductionOrphanCleanupPendingDebt: number;
+  authorityReductionRepairedThisRun: number;
   authorityReductionServiceDebt: number;
+  authorityReductionTopologyBlockedDebt: number;
   authorityReductionUserCandidates: readonly string[];
   authorityReductionUserCandidatesTruncated: boolean;
   authorityReductionUserDebt: number;
@@ -530,7 +560,13 @@ const parseProviderJson = <T>(stdout: string, schema: z.ZodType<T>): T => {
 };
 
 type ScanTotals = Readonly<{
+  authorityReductionCapacityMissingDebt: number;
+  authorityReductionHardQuotaBlockedThisRun: number;
+  authorityReductionOrphanCleanupEligibleDebt: number;
+  authorityReductionOrphanCleanupPendingDebt: number;
+  authorityReductionRepairedThisRun: number;
   authorityReductionServiceDebt: number;
+  authorityReductionTopologyBlockedDebt: number;
   authorityReductionUserCandidates: CommandCapacityResult[
     "authorityReductionUserCandidates"
   ];
@@ -1285,9 +1321,15 @@ export async function manageCommandLifecycleCapacity(
   };
 
   const scanRows = async (repair: boolean): Promise<ScanTotals> => {
+    let authorityReductionCapacityMissingDebt = 0;
+    let authorityReductionHardQuotaBlockedThisRun = 0;
+    let authorityReductionOrphanCleanupEligibleDebt = 0;
+    let authorityReductionOrphanCleanupPendingDebt = 0;
+    let authorityReductionRepairedThisRun = 0;
     let authorityReductionServiceDebt = 0;
     const authorityReductionUserCandidates: string[] = [];
-    let authorityReductionUserCandidatesTruncated = false;
+    const authorityReductionUserCandidatesTruncated = false;
+    let authorityReductionTopologyBlockedDebt = 0;
     let authorityReductionUserDebt = 0;
     const effectRetirementCandidates: Array<
       CommandCapacityResult["effectRetirementCandidates"][number]
@@ -1311,48 +1353,28 @@ export async function manageCommandLifecycleCapacity(
         "commandLifecycle:auditAuthorityReductionHeadroomPage",
         {
           expectedRuntimeAttestation: candidate.after,
+          mode: repair ? "repair" : "audit",
           paginationOpts: { cursor: headroomCursor, numItems: pageSize },
         },
         "authority-reduction-headroom-audit",
         authorityReductionHeadroomPage,
       );
-      authorityReductionUserDebt += page.unready.length;
-      for (const userId of page.unready) {
-        if (repair) {
-          try {
-            await invokeParsed(
-              "commandLifecycle:reserveAuthorityReductionCapacity",
-              {
-                expectedRuntimeAttestation: candidate.after,
-                userId,
-              },
-              "authority-reduction-capacity-backfill",
-              z.object({ reserved: z.number().int().min(0).max(17) }).strict(),
-            );
-          } catch (error: unknown) {
-            if (
-              isAuthorityContainmentUnavailable(error)
-              || isBoundedProcessCleanupUnprovenError(error)
-              || isBoundedProcessRecoveryJournalError(error)
-              || (error instanceof CapacityOperatorError
-                && (error.code === "operation_binding_changed"
-                  || error.code === "release_attestation_invalid"
-                  || error.code === "source_changed"))
-            ) throw error;
-            // The protected status pass already exposes a bounded candidate
-            // set to the operator. Mutation failure is intentionally reduced
-            // to one closed code: provider stderr can contain account data,
-            // quota internals, or an untrusted forged diagnostic.
-            throw new CapacityOperatorError("capacity_backfill_blocked");
-          }
-        }
-        if (authorityReductionUserCandidates.length < pageSize) {
-          authorityReductionUserCandidates.push(userId);
-        } else {
-          authorityReductionUserCandidatesTruncated = true;
-        }
+      if (page.mode !== (repair ? "repair" : "audit")) {
+        throw new CapacityOperatorError("provider_result_invalid");
       }
-      if (!page.serviceReady) authorityReductionServiceDebt = 1;
+      authorityReductionCapacityMissingDebt += page.capacityMissing;
+      authorityReductionHardQuotaBlockedThisRun += page.hardQuotaBlocked;
+      authorityReductionOrphanCleanupEligibleDebt += page.orphanCleanupEligible;
+      authorityReductionOrphanCleanupPendingDebt += page.orphanCleanupPending;
+      authorityReductionRepairedThisRun += page.repaired;
+      authorityReductionTopologyBlockedDebt += page.topologyBlocked;
+      const pageDebt = page.capacityMissing
+        + page.hardQuotaBlocked
+        + page.orphanCleanupEligible
+        + page.orphanCleanupPending
+        + page.topologyBlocked;
+      authorityReductionUserDebt += pageDebt;
+      if (pageDebt !== 0) authorityReductionServiceDebt = 1;
       if (page.isDone) break;
       if (page.continueCursor.length === 0 || page.continueCursor === headroomCursor) {
         throw new CapacityOperatorError("provider_result_invalid");
@@ -1478,7 +1500,13 @@ export async function manageCommandLifecycleCapacity(
       }
     }
     return {
+      authorityReductionCapacityMissingDebt,
+      authorityReductionHardQuotaBlockedThisRun,
+      authorityReductionOrphanCleanupEligibleDebt,
+      authorityReductionOrphanCleanupPendingDebt,
+      authorityReductionRepairedThisRun,
       authorityReductionServiceDebt,
+      authorityReductionTopologyBlockedDebt,
       authorityReductionUserCandidates,
       authorityReductionUserCandidatesTruncated,
       authorityReductionUserDebt,
@@ -1508,7 +1536,18 @@ export async function manageCommandLifecycleCapacity(
   if (options.action === "status") {
     const observed = await scan(false);
     return {
+      authorityReductionCapacityMissingDebt:
+        observed.authorityReductionCapacityMissingDebt,
+      authorityReductionHardQuotaBlockedThisRun:
+        observed.authorityReductionHardQuotaBlockedThisRun,
+      authorityReductionOrphanCleanupEligibleDebt:
+        observed.authorityReductionOrphanCleanupEligibleDebt,
+      authorityReductionOrphanCleanupPendingDebt:
+        observed.authorityReductionOrphanCleanupPendingDebt,
+      authorityReductionRepairedThisRun: 0,
       authorityReductionServiceDebt: observed.authorityReductionServiceDebt,
+      authorityReductionTopologyBlockedDebt:
+        observed.authorityReductionTopologyBlockedDebt,
       authorityReductionUserCandidates: observed.authorityReductionUserCandidates,
       authorityReductionUserCandidatesTruncated:
         observed.authorityReductionUserCandidatesTruncated,
@@ -1573,7 +1612,13 @@ export async function manageCommandLifecycleCapacity(
     return {
       activationReceiptDigest: activationReceipt.selfDigest,
       activationReceiptPath: `${evidencePath}.activated`,
+      authorityReductionCapacityMissingDebt: 0,
+      authorityReductionHardQuotaBlockedThisRun: 0,
+      authorityReductionOrphanCleanupEligibleDebt: 0,
+      authorityReductionOrphanCleanupPendingDebt: 0,
+      authorityReductionRepairedThisRun: 0,
       authorityReductionServiceDebt: existingEvidence.authorityReductionServiceDebt,
+      authorityReductionTopologyBlockedDebt: 0,
       authorityReductionUserCandidates:
         existingEvidence.authorityReductionUserCandidates,
       authorityReductionUserCandidatesTruncated:
@@ -1706,12 +1751,26 @@ export async function manageCommandLifecycleCapacity(
     }
   }
 
+  let repairedAuthorityReduction = 0;
   let repairedLifecycle = 0;
   let repairedReceipts = 0;
   for (let attempt = 0; attempt < maximumRepairPasses; attempt += 1) {
     const repaired = await scan(true);
+    repairedAuthorityReduction += repaired.authorityReductionRepairedThisRun;
     repairedLifecycle += repaired.repairedLifecycle;
     repairedReceipts += repaired.repairedReceipts;
+    if (repaired.authorityReductionHardQuotaBlockedThisRun !== 0) {
+      throw new CapacityOperatorError("authority_reduction_hard_quota");
+    }
+    if (repaired.authorityReductionTopologyBlockedDebt !== 0) {
+      throw new CapacityOperatorError("authority_reduction_topology_blocked");
+    }
+    if (repaired.authorityReductionOrphanCleanupEligibleDebt !== 0) {
+      throw new CapacityOperatorError("authority_reduction_orphan_cleanup_eligible");
+    }
+    if (repaired.authorityReductionOrphanCleanupPendingDebt !== 0) {
+      throw new CapacityOperatorError("authority_reduction_orphan_cleanup_pending");
+    }
     const first = await scan(false);
     if (
       first.authorityReductionServiceDebt !== 0
@@ -1771,7 +1830,13 @@ export async function manageCommandLifecycleCapacity(
     return {
       activationReceiptDigest: activationReceipt.selfDigest,
       activationReceiptPath: `${evidencePath}.activated`,
+      authorityReductionCapacityMissingDebt: 0,
+      authorityReductionHardQuotaBlockedThisRun: 0,
+      authorityReductionOrphanCleanupEligibleDebt: 0,
+      authorityReductionOrphanCleanupPendingDebt: 0,
+      authorityReductionRepairedThisRun: repairedAuthorityReduction,
       authorityReductionServiceDebt: 0,
+      authorityReductionTopologyBlockedDebt: 0,
       authorityReductionUserCandidates: [],
       authorityReductionUserCandidatesTruncated: false,
       authorityReductionUserDebt: 0,
@@ -1866,7 +1931,7 @@ export async function executeCommandLifecycleCapacity(options: ExecuteOptions): 
       ...result,
       candidateDeployEvidence: parsed.deployEvidencePath,
       sourceCommit: parsed.sourceCommit,
-      version: 1,
+      version: 2,
     })}\n`);
     return 0;
   } catch (error: unknown) {

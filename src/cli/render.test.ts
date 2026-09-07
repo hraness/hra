@@ -27,6 +27,21 @@ const capture = (): { output: Output; stdout: string[]; stderr: string[] } => {
   };
 };
 
+test("autorespond status distinguishes uncertain effects and an upgrade hold", () => {
+  const result = capture();
+  renderSuccess({ kind: "autorespond.status" }, {
+    version: 1,
+    mode: "auto:all",
+    source: "default",
+    counts: { accepted: 2, refused: 3, unknown: 1 },
+    budgets: { consecutive: 3, lastHour: 3, lastDay: 3 },
+    budgetHistoryAvailableAt: Date.parse("2026-09-08T00:00:00.000Z"),
+  }, false, result.output);
+  expect(result.stdout.join("")).toContain("2 accepted, 3 escalated, 1 unknown");
+  expect(result.stdout.join("")).toContain("paused until 2026-09-08T00:00:00.000Z");
+  expect(result.stdout.join("")).toContain("previous budget history is incomplete");
+});
+
 const primarySessionId = `sess_${"1".repeat(32)}`;
 const primaryProfileId = `acct_${"0".repeat(32)}`;
 const primaryProjectId = `proj_${"2".repeat(32)}`;

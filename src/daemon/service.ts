@@ -1310,6 +1310,8 @@ export class HraService {
   readonly #sessionStateTracker = new SessionStateTracker(() => this.#now());
   readonly #gatewayKeys: GatewayKeyPort | undefined;
   readonly #proseResponder: ProseResponder | undefined;
+  #proseGatewayRevision = 0;
+  #proseGatewayChangesInFlight = 0;
   /** Last turn per session that already spent its one prose autoresponse. */
   readonly #proseAutorespondedTurns = new Map<string, string>();
   readonly #factsMemory: HraFactsMemoryLifecyclePort | undefined;
@@ -1842,19 +1844,34 @@ export class HraService {
             // Status carries only whether a key exists, never any part of it.
             gateway: await this.#gatewayConfigured() ? "configured" : "not configured",
             counts: this.#store.countAutorespondEvidence(session === null ? {} : { sessionId: session.id }),
-            ...(session === null ? {} : { budgets: this.#store.readAutorespondBudgets(session.id) }),
+            ...(session === null ? {} : {
+              budgets: this.#store.readAutorespondBudgets(session.id),
+              budgetHistoryAvailableAt: this.#store.readAutorespondBudgetHistoryAvailableAt(session.id),
+            }),
             recent: this.#store.listAutorespondEvidence({ ...(session === null ? {} : { sessionId: session.id }), limit: 20 }),
           };
         }
         case "autorespond.gateway-set": {
           const custody = this.#requireGatewayKeys();
-          await custody.set(command.key);
-          return { version: 1, gateway: "configured" };
+          this.#proseGatewayRevision += 1;
+          this.#proseGatewayChangesInFlight += 1;
+          try {
+            await custody.set(command.key);
+            return { version: 1, gateway: "configured" };
+          } finally {
+            this.#proseGatewayChangesInFlight -= 1;
+          }
         }
         case "autorespond.gateway-clear": {
           const custody = this.#requireGatewayKeys();
-          const cleared = await custody.clear();
-          return { version: 1, cleared, gateway: "not configured" };
+          this.#proseGatewayRevision += 1;
+          this.#proseGatewayChangesInFlight += 1;
+          try {
+            const cleared = await custody.clear();
+            return { version: 1, cleared, gateway: "not configured" };
+          } finally {
+            this.#proseGatewayChangesInFlight -= 1;
+          }
         }
         case "autorespond.set": {
           if (command.session === undefined) {
@@ -7146,7 +7163,8 @@ export class HraService {
 
   async #autorespondAdmitted(record: InteractionRecord, sessionId: SessionRecord["id"]): Promise<void> {
     const startedAt = this.#now();
-    const { mode } = this.#store.readSessionApprovalMode(sessionId);
+    let { mode } = this.#store.readSessionApprovalMode(sessionId);
+    const expectedMode = mode;
     const budgets = this.#store.readAutorespondBudgets(sessionId, startedAt);
     const decision = decideAutorespond({ budgets, display: record.display, kind: record.kind, mode });
     const kind = record.kind as "command_approval" | "file_change_approval" | "permission_approval";
@@ -7168,7 +7186,8 @@ export class HraService {
     const resolution = record.kind === "permission_approval"
       ? { kind: "permission_grant" as const, permissions: permissionNamesOf(record.display), scope: null }
       : { kind: "approval_decision" as const, decision: decision.decision };
-    let outcome: "accepted" | "refused" = "accepted";
+    let outcome: "accepted" | "refused" | "unknown" = "accepted";
+    let refusalCode: string | undefined;
     try {
       await this.#resolveInteraction(
         {
@@ -7177,17 +7196,51 @@ export class HraService {
           expectedRevision: record.revision,
           resolution,
         },
-        { signal: this.#backgroundAbort.signal },
+        {
+          signal: this.#backgroundAbort.signal,
+          autorespondAdmission: (current) => {
+            mode = this.#store.readSessionApprovalMode(sessionId).mode;
+            const exactDecision = decideAutorespond({
+              budgets: this.#store.readAutorespondBudgets(sessionId),
+              display: current.display,
+              kind: current.kind,
+              mode,
+            });
+            if (exactDecision.action === "escalate") {
+              refusalCode = exactDecision.code;
+            } else {
+              const reservation = this.#store.reserveAutorespondBudget({
+                sessionId,
+                sourceKind: "protocol",
+                sourceId: current.publicId,
+                expectedMode,
+              });
+              if (reservation.state !== "reserved") {
+                refusalCode = reservation.state === "existing"
+                  ? "source_already_reserved"
+                  : reservation.code;
+              }
+            }
+            if (refusalCode !== undefined) {
+              throw new CommandFailure("CONFLICT", "The automatic approval no longer has current policy and budget authority.");
+            }
+          },
+        },
       );
       this.#store.markInteractionResolvedBy(record.publicId, "autorespond");
-      this.#store.bumpAutorespondCounter(sessionId);
     } catch (error: unknown) {
-      outcome = "refused";
+      const latest = this.#store.requireInteraction(record.publicId);
+      outcome = latest.state === "response_prepared"
+        || latest.state === "resolution_unknown"
+        || latest.state === "response_written"
+        || latest.state === "resolved"
+        ? "unknown"
+        : "refused";
       if (!(error instanceof CommandFailure)) throw error;
     } finally {
       this.#store.recordAutorespondEvidence({
         approvalClass: decision.approvalClass,
-        decision: decision.decision,
+        decision: refusalCode ?? decision.decision,
         interactionId: record.publicId,
         kind,
         latencyMs: this.#now() - startedAt,
@@ -7197,7 +7250,9 @@ export class HraService {
         subagent: false,
       });
       if (outcome === "refused") {
-        this.#escalatePendingAutorespondInteraction(record, "autorespond_resolution_refused");
+        this.#escalatePendingAutorespondInteraction(record, refusalCode === undefined
+          ? "autorespond_resolution_refused"
+          : `autorespond_${refusalCode}`);
       }
     }
   }
@@ -7256,9 +7311,70 @@ export class HraService {
     const responder = this.#proseResponder;
     if (responder === undefined) return;
     const startedAt = this.#now();
-    const { mode } = this.#store.readSessionApprovalMode(sessionId);
+    let { mode } = this.#store.readSessionApprovalMode(sessionId);
+    const expectedMode = mode;
     const rule = classification.matchedRule;
     const finalText = this.#sessionStateTracker.finalAssistantText(sessionId);
+    const source = this.#sessionStateTracker.completedSource(sessionId);
+    const gatewayRevision = this.#proseGatewayRevision;
+    const authoritySnapshot = (): string => {
+      const session = this.#store.requireSession(sessionId);
+      return JSON.stringify([
+        session.provider,
+        session.profileId,
+        this.#store.requireProfileById(session.profileId).processGeneration,
+        session.providerThreadId,
+        session.projectId,
+        session.projectId === undefined ? null : this.#store.requireProject(session.projectId).rootPath,
+        session.preset,
+        this.#store.requireSessionPresetRequirement(sessionId).requirement,
+        session.fastEnabled,
+      ]);
+    };
+    const originalAuthority = authoritySnapshot();
+    const escalateCurrentSource = (reason: string, state: "needs_approval" | "needs_answer" = "needs_approval"): void => {
+      const session = this.#store.requireSession(sessionId);
+      const currentClassification = this.#sessionStateTracker.classification(sessionId);
+      if (
+        source === null
+        || source !== this.#sessionStateTracker.completedSource(sessionId)
+        || session.state === "terminal"
+        || session.state === "recovery_required"
+        || currentClassification?.state !== "needs_approval"
+        || currentClassification.matchedRule !== "approval_cue"
+        || this.#store.listInteractions({ sessionId, pendingOnly: true, limit: 1 }).length > 0
+        || originalAuthority !== authoritySnapshot()
+      ) return;
+      this.#escalateSessionState(sessionId, reason, state);
+    };
+    const currentGateFailure = (): ProseAutorespondGateFailure | null => {
+      mode = this.#store.readSessionApprovalMode(sessionId).mode;
+      if (mode === "manual") return "manual_mode";
+      if (mode !== expectedMode || gatewayRevision !== this.#proseGatewayRevision
+        || this.#proseGatewayChangesInFlight > 0) return "policy_changed";
+      if (this.#store.listInteractions({ sessionId, pendingOnly: true, limit: 1 }).length > 0) {
+        return "pending_interaction";
+      }
+      const currentClassification = this.#sessionStateTracker.classification(sessionId);
+      const currentState = this.#store.requireSession(sessionId).state;
+      if (
+        source === null
+        || currentState === "terminal"
+        || currentState === "recovery_required"
+        || source.turnId !== turnId
+        || source !== this.#sessionStateTracker.completedSource(sessionId)
+        || source.text !== finalText
+        || currentClassification?.state !== "needs_approval"
+        || currentClassification.matchedRule !== "approval_cue"
+        || originalAuthority !== authoritySnapshot()
+      ) return "source_changed";
+      if (this.#store.readAutorespondBudgetHistoryAvailableAt(sessionId) !== null) return "history_unavailable";
+      const decision = decideProseAutorespond({
+        budgets: this.#store.readAutorespondBudgets(sessionId),
+        mode,
+      });
+      return decision.action === "escalate" ? decision.code : null;
+    };
     const refuse = (code: ProseAutorespondGateFailure): void => {
       this.#store.recordProseAutorespondEvidence({
         decision: "refuse",
@@ -7269,6 +7385,10 @@ export class HraService {
         rule,
         sessionId,
       });
+      // Prose attention belongs to the exact completed question, never to
+      // a newer turn or a provider interaction. Use a distinct reason family
+      // so interaction recovery cannot clear this human-owned attention.
+      escalateCurrentSource(`prose_autorespond_${code}`);
     };
 
     // The positive gate. Each clause must hold before a model is consulted.
@@ -7291,16 +7411,14 @@ export class HraService {
       return refuse("message_too_long");
     }
     if (!await this.#gatewayConfigured()) return refuse("gateway_key_missing");
+    const reviewedGateFailure = currentGateFailure();
+    if (reviewedGateFailure !== null) return refuse(reviewedGateFailure);
     const verbatimLiteral = classification.verbatimRequired
       ? classification.verbatimLiteral
       : undefined;
     if (classification.verbatimRequired && verbatimLiteral === undefined) {
       return refuse("verbatim_literal_missing");
     }
-    const budgets = this.#store.readAutorespondBudgets(sessionId, startedAt);
-    const decision = decideProseAutorespond({ budgets, mode });
-    if (decision.action === "escalate") return refuse(decision.code);
-
     const durable = this.#store.readSessionState(sessionId);
     let result: Awaited<ReturnType<ProseResponder["respond"]>>;
     try {
@@ -7331,8 +7449,12 @@ export class HraService {
         rule,
         sessionId,
       });
+      escalateCurrentSource("prose_autorespond_responder_failed");
       return;
     }
+
+    const responseGateFailure = currentGateFailure();
+    if (responseGateFailure !== null) return refuse(responseGateFailure);
 
     /*
      * The responder is never trusted with free text. A verbatim ask must come
@@ -7351,14 +7473,15 @@ export class HraService {
           rule,
           sessionId,
         });
-        this.#escalateSessionState(sessionId, "autorespond_verbatim_mismatch");
+        escalateCurrentSource("autorespond_verbatim_mismatch", "needs_answer");
         return;
       }
       reply = result.reply;
     }
 
     const idempotencyKey = proseAutorespondIdempotencyKey(sessionId, turnId);
-    let outcome: "sent" | "responder_failed" = "sent";
+    let outcome: "sent" | "responder_failed" | "unknown" = "sent";
+    let finalGateFailure: ProseAutorespondGateFailure | undefined;
     let recoveryFailure: unknown;
     try {
       const session = this.#store.requireSession(sessionId);
@@ -7371,6 +7494,29 @@ export class HraService {
           this.#backgroundAbort.signal,
           undefined,
           "autorespond",
+          [],
+          [],
+          () => {
+            const failure = currentGateFailure();
+            if (failure !== null) {
+              finalGateFailure = failure;
+            } else {
+              const reservation = this.#store.reserveAutorespondBudget({
+                sessionId,
+                sourceKind: "prose",
+                sourceId: idempotencyKey,
+                expectedMode,
+              });
+              if (reservation.state !== "reserved") {
+                finalGateFailure = reservation.state === "existing"
+                  ? "source_already_reserved"
+                  : reservation.code;
+              }
+            }
+            if (finalGateFailure !== undefined) {
+              throw new CommandFailure("CONFLICT", "The automatic reply no longer has current consent and source authority.");
+            }
+          },
         ),
         {
           replay: ({ finalizePending }) => {
@@ -7391,24 +7537,34 @@ export class HraService {
       );
     } catch (error: unknown) {
       if (isProviderAcceptedLocalCommitFailure(error, sessionId, idempotencyKey)) {
-        // The provider accepted this response, but its receipt, transcript,
-        // and consecutive budget rolled back together. Exact recovery owns the
+        // The provider accepted this response, but its receipt and transcript
+        // rolled back together. Its pre-effect budget remains spent. Recovery owns the
         // ambiguous mutation; replaying here could duplicate the provider turn.
         recoveryFailure = error;
       } else {
-        outcome = "responder_failed";
+        const attempt = this.#store.readMutation(idempotencyKey);
+        outcome = attempt?.state === "effect_started" || attempt?.state === "ambiguous"
+          ? "unknown"
+          : "responder_failed";
         if (!(error instanceof CommandFailure) && !(error instanceof SelectionError)) throw error;
       }
     } finally {
-      this.#store.recordProseAutorespondEvidence({
-        decision: outcome === "sent" ? "send" : "refuse",
-        latencyMs: this.#now() - startedAt,
-        mode,
-        model: result.model,
-        outcome,
-        rule,
-        sessionId,
-      });
+      if (finalGateFailure !== undefined) {
+        refuse(finalGateFailure);
+      } else {
+        this.#store.recordProseAutorespondEvidence({
+          decision: outcome === "sent" ? "send" : outcome === "unknown" ? "unknown" : "refuse",
+          latencyMs: this.#now() - startedAt,
+          mode,
+          model: result.model,
+          outcome,
+          rule,
+          sessionId,
+        });
+        if (outcome === "responder_failed") {
+          escalateCurrentSource("prose_autorespond_resolution_refused");
+        }
+      }
       if (recoveryFailure !== undefined) {
         // The provider accepted the response, so neither its evidence nor its
         // budget may be reported as a refusal. Stop this daemon generation and
@@ -12164,7 +12320,7 @@ export class HraService {
 
   async #resolveInteraction(
     command: Extract<LocalCommand, { kind: "interaction.resolve" }>,
-    context: { signal: AbortSignal; afterResponse?: (callback: () => void) => void },
+    context: { signal: AbortSignal; afterResponse?: (callback: () => void) => void; autorespondAdmission?: (current: InteractionRecord) => void },
   ): Promise<unknown> {
     return await this.#serializeInteractionAuthority(command.interaction, async () =>
       await this.#resolveInteractionLocked(command, context));
@@ -12172,7 +12328,7 @@ export class HraService {
 
   async #resolveInteractionLocked(
     command: Extract<LocalCommand, { kind: "interaction.resolve" }>,
-    context: { signal: AbortSignal; afterResponse?: (callback: () => void) => void },
+    context: { signal: AbortSignal; afterResponse?: (callback: () => void) => void; autorespondAdmission?: (current: InteractionRecord) => void },
   ): Promise<unknown> {
     const signal = context.signal;
     return await (async () => {
@@ -12256,7 +12412,23 @@ export class HraService {
       if (this.#now() >= current.deadlineAt) {
         await this.#rejectManualResolutionAtDeadline(current);
       }
-      await this.#assertPersonalInteractionAccountAuthority(current, profile, signal);
+      await this.#daemonAuthority.assertCurrent();
+      const exactProfile = this.#store.requireProfileById(profile.id);
+      this.#assertProviderProfileState(exactProfile, provider);
+      if (exactProfile.processGeneration !== current.authority.processGeneration) {
+        throw new CommandFailure("RECOVERY_REQUIRED", "The interaction belongs to a stale account authority.");
+      }
+      await this.#assertPersonalInteractionAccountAuthority(current, exactProfile, signal);
+      if (this.#now() >= current.deadlineAt) {
+        await this.#rejectManualResolutionAtDeadline(current);
+      }
+      const exactInteraction = this.#store.requireInteraction(current.publicId);
+      if (exactInteraction.state !== "pending" || exactInteraction.revision !== current.revision) {
+        throw new CommandFailure("CONFLICT", "The interaction changed before provider dispatch.");
+      }
+      // All asynchronous review is complete. Policy admission, its durable
+      // charge, preparation, and provider invocation have no intervening await.
+      context.autorespondAdmission?.(exactInteraction);
       let prepared: InteractionRecord;
       try {
         prepared = this.#store.prepareInteractionResponse({
@@ -12273,23 +12445,10 @@ export class HraService {
           focalInteraction: current,
         });
       }
-      if (this.#now() >= prepared.deadlineAt) {
-        await this.#rejectPreparedManualResolutionAtDeadline(prepared);
-      }
       try {
-        await this.#daemonAuthority.assertCurrent();
-        const exactProfile = this.#store.requireProfileById(profile.id);
-        this.#assertProviderProfileState(exactProfile, provider);
-        if (exactProfile.processGeneration !== prepared.authority.processGeneration) {
-          throw new CommandFailure(
-            "RECOVERY_REQUIRED",
-            "The interaction belongs to a stale account authority.",
-          );
-        }
         if (this.#now() >= prepared.deadlineAt) {
           await this.#rejectPreparedManualResolutionAtDeadline(prepared);
         }
-        await this.#assertPersonalInteractionAccountAuthority(prepared, exactProfile, signal);
         await runtime.resolveInteraction({
           authority: this.#authorityForInteraction(prepared, profile),
           provider: prepared.authority,
@@ -16524,6 +16683,7 @@ export class HraService {
     actor: SessionMessageActor = "human",
     attachmentReferences: readonly AttachmentReference[] = [],
     requestAttachmentReferences: readonly AttachmentReference[] = attachmentReferences,
+    autorespondAdmission?: () => void,
   ): Promise<unknown> {
     const request = {
       message,
@@ -16566,6 +16726,7 @@ export class HraService {
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) throw new CommandFailure("CONFLICT", "The session already has an active turn. Use `session steer` or `session queue`.");
       startedResult = await this.#fencedEffect(async () => {
         this.#assertObservedProviderConnection(session.id, observedProviderConnectionId);
+        autorespondAdmission?.();
         return await this.#runtimeForSession(session).startTurn({
           authority: this.#authorityForSession(session, profile),
           providerThreadId: session.providerThreadId,

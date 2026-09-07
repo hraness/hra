@@ -1,11 +1,9 @@
 import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
-import { isCanonicalAuthEmail } from "../src/cloud/authCredentials";
 import { isSafePositiveInteger, isUuidV7 } from "../src/cloud/contracts";
 import { deviceCommandLoginResultLifetimeMs } from "../src/cloud/payloads";
 import { sha256Hex } from "../src/cloud/crypto";
-import { digestAuthEmail } from "./authEmail";
 import { maximumLiveOtpChallenges } from "./authPolicy";
 import {
   attentionNotificationGroupLimit,
@@ -29,7 +27,11 @@ import {
   terminalizeDeviceCommandWithLifecycleCapacity,
   terminalizeSessionCommandWithLifecycleCapacity,
 } from "./commandLifecycle";
-import { loadAccountDeletionCapacity } from "./authorityReductionCapacity";
+import {
+  authorityReductionOrphanRetentionMs,
+  inspectLegacyOtpOrphanCandidate,
+  loadAccountDeletionCapacity,
+} from "./authorityReductionCapacity";
 import {
   ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS,
   CLOUD_USAGE_SNAPSHOT_RETENTION_MS,
@@ -158,7 +160,7 @@ export const MAINTENANCE_RETENTION_STRATEGY = {
 >>;
 
 export const cloudRetentionMs = Object.freeze({
-  abandonedIdentity: 24 * 60 * 60 * 1_000,
+  abandonedIdentity: authorityReductionOrphanRetentionMs,
   accountDeletionReceipt: 7 * 24 * 60 * 60 * 1_000,
   authAttemptMaximum: 24 * 60 * 60 * 1_000,
   bindChallengeMaximum: 5 * 60 * 1_000,
@@ -395,81 +397,13 @@ async function cleanOrphanedAuthUsers(
     .withIndex("userIdAndProvider", (builder) =>
       cursorId === null ? builder : builder.gt("userId", cursorId))
     .take(numItems);
-  const cutoff = now - cloudRetentionMs.abandonedIdentity;
   let processed = 0;
   for (const candidate of candidates) {
     const user = await ctx.db.get(candidate.userId);
     if (user === null) continue;
-    if (
-      user._creationTime >= cutoff
-      || user.emailVerificationTime !== undefined
-      || user.phoneVerificationTime !== undefined
-      || user.isAnonymous !== undefined
-      || user.phone !== undefined
-    ) continue;
-    const [accounts, boundSubjects, challenges, deletionJob, device, session] = await Promise.all([
-      ctx.db.query("authAccounts")
-        .withIndex("userIdAndProvider", (builder) => builder.eq("userId", user._id))
-        .take(2),
-      ctx.db.query("authSubjects")
-        .withIndex("by_user", (builder) => builder.eq("userId", user._id))
-        .take(2),
-      ctx.db.query("authOtpChallenges")
-        .withIndex("by_user", (builder) => builder.eq("userId", user._id))
-        .take(1),
-      ctx.db.query("accountDeletionJobs")
-        .withIndex("by_user", (builder) => builder.eq("userId", user._id))
-        .first(),
-      ctx.db.query("devices")
-        .withIndex("by_user_and_public_id", (builder) => builder.eq("userId", user._id))
-        .first(),
-      ctx.db.query("authSessions")
-        .withIndex("userId", (builder) => builder.eq("userId", user._id))
-        .first(),
-    ]);
-    if (
-      accounts.length !== 1
-      || boundSubjects.length !== 0
-      || challenges.length !== 0
-      || deletionJob !== null
-      || device !== null
-      || session !== null
-    ) continue;
-    const account = accounts[0];
-    if (
-      account === undefined
-      || account._creationTime >= cutoff
-      || account.provider !== "hra-control-plane-otp-v1"
-      || account.emailVerified !== undefined
-      || !isCanonicalAuthEmail(account.providerAccountId)
-      || user.email !== account.providerAccountId
-    ) continue;
-    const emailDigest = await digestAuthEmail(account.providerAccountId);
-    const matchingSubjects = await ctx.db.query("authSubjects")
-      .withIndex("by_email_digest", (builder) => builder.eq("emailDigest", emailDigest))
-      .take(2);
-    if (matchingSubjects.length > 1) throw new Error("Maintenance authority is corrupt.");
-    const subject = matchingSubjects[0];
-    if (subject !== undefined) {
-      if (
-        subject.userId !== undefined
-        || subject.status !== "active"
-        || subject.verifiedAt !== undefined
-      ) continue;
-      // A retry may have just reserved the same identity against an older
-      // disconnected account. Preserve it until the full inactivity window
-      // has elapsed from both creation and last reservation activity.
-      if (subject.createdAt >= cutoff || subject.updatedAt >= cutoff) continue;
-    }
-    const verificationCode = await ctx.db.query("authVerificationCodes")
-      .withIndex("accountId", (builder) => builder.eq("accountId", account._id))
-      .first();
-    if (verificationCode !== null) continue;
-    const capacity = await loadAccountDeletionCapacity(ctx, user._id);
-    if (
-      capacity.kind === "reserved"
-      && (capacity.identity.createdAt >= cutoff || capacity.job.createdAt >= cutoff)
-    ) continue;
+    const orphan = await inspectLegacyOtpOrphanCandidate(ctx, user, now, "maintenance");
+    if (orphan?.disposition !== "orphan_cleanup_eligible") continue;
+    const { account, capacity, subject } = orphan;
     const required = (capacity.kind === "reserved" ? 4 : 2)
       + (subject === undefined ? 0 : 1);
     if (processed + required > limit) throw new Error("Maintenance category exceeded its budget.");

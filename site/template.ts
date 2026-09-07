@@ -258,7 +258,7 @@ const renderHeroFrame = (content: PublicContent): string => {
         </div>
         <div class="hraness-marketing-proof-frame__content"><pre class="shell-transcript" tabindex="0">${renderShellCode(humanTerminal.commands.join("\n"))}</pre></div>
         <figcaption class="hraness-marketing-proof-frame__caption">
-          <span>Start a session, open the shell, select the account and session, then type a request. These are the first-session commands from the reference below.</span>
+          <span>After the rollout prerequisite is satisfied, start a session, open the shell, select the account and session, then type a request. These conditional first-session commands are documented in the reference below.</span>
           <small>v${escapeHtml(content.releaseVersion)}</small>
         </figcaption>
       </figure>
@@ -277,6 +277,7 @@ const renderProductHero = (content: PublicContent): string => `<header class="hr
         <a class="hraness-marketing-action" data-emphasis="secondary" href="${escapeHtml(content.hero.secondaryAction.href)}">${escapeHtml(content.hero.secondaryAction.label)}</a>
       </div>
       <p class="hraness-marketing-hero__boundary">${escapeHtml(content.hero.boundary)}</p>
+      <aside class="notice"><strong>Current daemon rollout blocked</strong><p>${escapeHtml(content.daemonRolloutNotice)}</p><p><a href="#install-and-update">Read the rollout and update runbook</a> before running the examples below.</p></aside>
     </div>
     ${renderHeroFrame(content)}
     <dl class="hraness-marketing-facts" data-hraness-marketing="facts">
@@ -290,7 +291,7 @@ const renderProductHero = (content: PublicContent): string => `<header class="hr
     <div class="hraness-marketing-section__heading-group">
       <p class="hraness-marketing-section__label">How it works</p>
       <h2 class="hraness-marketing-section__heading" id="how-it-works-heading">${escapeHtml(content.hero.proofLabel)}</h2>
-      <p class="hraness-marketing-section__summary">Every step is one command with a JSON form, so a person in the shell and an agent in a subprocess drive the same session the same way.</p>
+      <p class="hraness-marketing-section__summary">After the rollout prerequisite is satisfied, every step is one command with a JSON form, so a person in the shell and an agent in a subprocess drive the same session the same way.</p>
     </div>
     <div class="hraness-marketing-section__body">
       <ol class="hraness-marketing-flow" data-hraness-marketing="flow" aria-label="First ${escapeHtml(content.productName)} request">
@@ -305,14 +306,14 @@ const renderProductHero = (content: PublicContent): string => `<header class="hr
     <div class="hraness-marketing-install__heading-group">
       <p class="hraness-marketing-install__eyebrow">Local release · v${escapeHtml(content.releaseVersion)}</p>
       <h2 class="hraness-marketing-install__heading" id="install-command-heading">Install the verified CLI.</h2>
-      <p class="install-note">One command downloads the immutable release, verifies its digest, and installs it. Then check the host and initialize.</p>
+      <p class="install-note">Once the candidate is admitted, one command downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.</p>
     </div>
     <div class="hraness-marketing-install__commands">
       <pre class="install-command" tabindex="0">${renderShellCode(content.installCommand)}</pre>
-      <div class="install-checks">
-        <pre class="doctor-command" tabindex="0">${renderShellCode(content.doctorCommand)}</pre>
-        <pre class="init-command" tabindex="0">${renderShellCode(content.initCommand)}</pre>
-      </div>
+      <pre class="doctor-command" tabindex="0">${renderShellCode(content.doctorCommand)}</pre>
+      <aside class="notice"><strong>Before initialization</strong><p>${escapeHtml(content.daemonRolloutNotice)}</p><p><a href="#install-and-update">Read the rollout and update runbook.</a></p></aside>
+      <p>After the rollout prerequisite is satisfied, initialize:</p>
+      <pre class="init-command" tabindex="0">${renderShellCode(content.initCommand)}</pre>
     </div>
   </section>
   <section class="hraness-marketing-trust" data-hraness-marketing="trust" id="local-by-design" aria-labelledby="local-by-design-heading">
@@ -348,7 +349,7 @@ const renderProductHero = (content: PublicContent): string => `<header class="hr
   </section>
   <section class="hraness-marketing-cta" data-hraness-marketing="cta" data-tone="paper" id="closing" aria-labelledby="closing-heading">
     <h2 class="hraness-marketing-cta__heading" id="closing-heading">Give every session the same terminal.</h2>
-    <p class="hraness-marketing-cta__summary">Install the CLI, add one account, and start a session that outlives the tab it began in.</p>
+    <p class="hraness-marketing-cta__summary">After the candidate is admitted, install and verify its CLI artifact. After the rollout prerequisite is satisfied, initialize it, add one account, and start a session that outlives the tab it began in.</p>
     <div class="hraness-marketing-cta__actions">
       <a class="hraness-marketing-action" data-emphasis="primary" href="#install-command">Install ${escapeHtml(content.productName)}</a>
       <a class="hraness-marketing-action" data-emphasis="secondary" href="${escapeHtml(content.links.github)}">Read the source</a>
