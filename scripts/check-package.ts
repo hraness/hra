@@ -439,7 +439,10 @@ type GitHistoryCommand =
 
 type GitHistoryPatchKind = "public_patch" | "sensitive_patch";
 
+type ReviewedSyntheticHistoryFixture = "memory_summary" | "sanitized_message";
+
 type ReviewedSyntheticHistoryPatchEvidence = Readonly<{
+  fixtures: readonly ReviewedSyntheticHistoryFixture[];
   publicPatchSha256: string;
   sensitivePatchSha256: string;
 }>;
@@ -448,36 +451,65 @@ const reviewedSyntheticHistoryPatchEvidence: Readonly<
   Record<string, ReviewedSyntheticHistoryPatchEvidence>
 > = Object.freeze({
   "313ed3e3e1ddbe5b6464fc098926717f177418a8": Object.freeze({
+    fixtures: Object.freeze(["sanitized_message"] as const),
     publicPatchSha256: "38922e6d214028499463e193e62b7fde97835cad271693f76e4876af080e5a27",
     sensitivePatchSha256: "38922e6d214028499463e193e62b7fde97835cad271693f76e4876af080e5a27",
   }),
+  "5039f0bfe37706f97bd93e68f8db2dff4aa16013": Object.freeze({
+    fixtures: Object.freeze(["memory_summary"] as const),
+    publicPatchSha256: "b3dbdd5504acb92dc2bb0f7e1ebf6e56e7911498bd96fc8f8b7080af924fe42b",
+    sensitivePatchSha256: "b3dbdd5504acb92dc2bb0f7e1ebf6e56e7911498bd96fc8f8b7080af924fe42b",
+  }),
+  "72fcb44fb81a79c93ade6da3a127dbb3ae1dd6f9": Object.freeze({
+    fixtures: Object.freeze(["memory_summary"] as const),
+    publicPatchSha256: "cb571ed9e6f3c71cf062169d36fd1d403c7da42cf409fbc1e2bf64256e222911",
+    sensitivePatchSha256: "ddc5655f80d0a9308dbcf319d2247c429f6a411a14aca2fa68c3efb2113c6d50",
+  }),
+  b48fdb71ca201d951b9b1343a909b5f18277bc36: Object.freeze({
+    fixtures: Object.freeze(["sanitized_message", "memory_summary"] as const),
+    publicPatchSha256: "1b6df43d22fb500c41291b5ab8c57c06f475aa80515dd57735b6f57fa70eed46",
+    sensitivePatchSha256: "59089938773a6ea6574c7df54b7a3da73272a827920845e4805a3e4735b2f812",
+  }),
   f39747b917b064ff593c58dea2a05e4481319b26: Object.freeze({
+    fixtures: Object.freeze(["sanitized_message"] as const),
     publicPatchSha256: "1aa2ed40e2d437c2871a6975f177f9bb5bd078c68856fa66f63511a47144fc4a",
     sensitivePatchSha256: "1aa2ed40e2d437c2871a6975f177f9bb5bd078c68856fa66f63511a47144fc4a",
   }),
 });
-const reviewedSyntheticHistoryPath = ["", "Users", "private", "project", ""].join("/");
+const reviewedSyntheticHistoryPaths: Readonly<Record<ReviewedSyntheticHistoryFixture, string>> = Object.freeze({
+  memory_summary: ["", "Users", "operator", "private"].join("/"),
+  sanitized_message: ["", "Users", "private", "project", ""].join("/"),
+});
 const reviewedSyntheticHistoryPathReplacement = "[reviewed-synthetic-absolute-path]";
 
 export const normalizeReviewedSyntheticHistoryPatch = (
   patch: string,
   expectedPatchSha256: string,
+  fixtures: readonly ReviewedSyntheticHistoryFixture[],
 ): string => {
+  if (fixtures.length < 1 || fixtures.length > 2 || new Set(fixtures).size !== fixtures.length) {
+    throw new Error("Reviewed Git history synthetic-path fixture selection is invalid.");
+  }
   const patchSha256 = createHash("sha256").update(patch, "utf8").digest("hex");
-  const firstOccurrence = patch.indexOf(reviewedSyntheticHistoryPath);
-  const secondOccurrence = firstOccurrence < 0
-    ? -1
-    : patch.indexOf(reviewedSyntheticHistoryPath, firstOccurrence + reviewedSyntheticHistoryPath.length);
-  if (
-    patchSha256 !== expectedPatchSha256
-    || firstOccurrence < 0
-    || secondOccurrence >= 0
-  ) {
+  if (patchSha256 !== expectedPatchSha256) {
     throw new Error("Reviewed Git history synthetic-path evidence changed.");
   }
-  return `${patch.slice(0, firstOccurrence)}${reviewedSyntheticHistoryPathReplacement}${patch.slice(
-    firstOccurrence + reviewedSyntheticHistoryPath.length,
-  )}`;
+  let normalized = patch;
+  for (const fixture of fixtures) {
+    const fragment = reviewedSyntheticHistoryPaths[fixture];
+    if (typeof fragment !== "string") {
+      throw new Error("Reviewed Git history synthetic-path fixture is unknown.");
+    }
+    const firstOccurrence = patch.indexOf(fragment);
+    const secondOccurrence = firstOccurrence < 0
+      ? -1
+      : patch.indexOf(fragment, firstOccurrence + fragment.length);
+    if (firstOccurrence < 0 || secondOccurrence >= 0) {
+      throw new Error("Reviewed Git history synthetic-path evidence changed.");
+    }
+    normalized = normalized.replace(fragment, reviewedSyntheticHistoryPathReplacement);
+  }
+  return normalized;
 };
 
 export const normalizeGitHistoryPatchForPublicScan = (
@@ -490,7 +522,7 @@ export const normalizeGitHistoryPatchForPublicScan = (
   const expectedPatchSha256 = kind === "public_patch"
     ? evidence.publicPatchSha256
     : evidence.sensitivePatchSha256;
-  return normalizeReviewedSyntheticHistoryPatch(patch, expectedPatchSha256);
+  return normalizeReviewedSyntheticHistoryPatch(patch, expectedPatchSha256, evidence.fixtures);
 };
 
 type GitHistorySpawnResult = Readonly<{

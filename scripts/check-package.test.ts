@@ -358,10 +358,25 @@ describe("installed package generic command ownership", () => {
     expect(() => parseGitHistoryCommitList(overBound)).toThrow("over its commit bound");
   });
 
-  test("normalizes only the exact reviewed historical synthetic path evidence", () => {
-    const syntheticPath = ["", "Users", "private", "project", ""].join("/");
-    const originalCommit = "f39747b917b064ff593c58dea2a05e4481319b26";
-    const repairCommit = "313ed3e3e1ddbe5b6464fc098926717f177418a8";
+  test.each([
+    {
+      fixture: "sanitized_message",
+      originalCommit: "f39747b917b064ff593c58dea2a05e4481319b26",
+      repairCommit: "313ed3e3e1ddbe5b6464fc098926717f177418a8",
+      syntheticPath: ["", "Users", "private", "project", ""].join("/"),
+    },
+    {
+      fixture: "memory_summary",
+      originalCommit: "72fcb44fb81a79c93ade6da3a127dbb3ae1dd6f9",
+      repairCommit: "5039f0bfe37706f97bd93e68f8db2dff4aa16013",
+      syntheticPath: ["", "Users", "operator", "private"].join("/"),
+    },
+  ] as const)("normalizes only exact historical $fixture evidence", ({
+    fixture,
+    originalCommit,
+    repairCommit,
+    syntheticPath,
+  }) => {
     const repositoryRoot = resolve(import.meta.dir, "..");
     const historyPatch = (commit: string, kind: "public_patch" | "sensitive_patch"): string => {
       const result = runCanonicalHistoryPatch(repositoryRoot, commit, kind);
@@ -385,6 +400,16 @@ describe("installed package generic command ownership", () => {
         expect(() => assertReviewedPatch(normalized, "reviewed history fixture")).not.toThrow();
         expect(() => normalizeGitHistoryPatchForPublicScan(commit, kind, `${patch}mutation\n`))
           .toThrow("synthetic-path evidence changed");
+        const otherCommit = commit === originalCommit ? repairCommit : originalCommit;
+        expect(() => normalizeGitHistoryPatchForPublicScan(otherCommit, kind, patch))
+          .toThrow("synthetic-path evidence changed");
+        if (fixture === "memory_summary" && commit === originalCommit) {
+          const otherKind = kind === "public_patch" ? "sensitive_patch" : "public_patch";
+          const otherPatch = historyPatch(commit, otherKind);
+          expect(otherPatch).not.toBe(patch);
+          expect(() => normalizeGitHistoryPatchForPublicScan(commit, kind, otherPatch))
+            .toThrow("synthetic-path evidence changed");
+        }
       }
     }
 
@@ -400,14 +425,14 @@ describe("installed package generic command ownership", () => {
 
     const duplicatePatch = `${syntheticPath}\n${syntheticPath}\n`;
     const duplicateDigest = createHash("sha256").update(duplicatePatch, "utf8").digest("hex");
-    expect(() => normalizeReviewedSyntheticHistoryPatch(duplicatePatch, duplicateDigest))
+    expect(() => normalizeReviewedSyntheticHistoryPatch(duplicatePatch, duplicateDigest, [fixture]))
       .toThrow("synthetic-path evidence changed");
     for (const missingPatch of [
       "safe history patch\n",
       [["", "Users", "private", "other", ""].join("/"), "changed path\n"].join(""),
     ]) {
       const missingDigest = createHash("sha256").update(missingPatch, "utf8").digest("hex");
-      expect(() => normalizeReviewedSyntheticHistoryPatch(missingPatch, missingDigest))
+      expect(() => normalizeReviewedSyntheticHistoryPatch(missingPatch, missingDigest, [fixture]))
         .toThrow("synthetic-path evidence changed");
     }
     expect(() => assertPublicSensitiveText(syntheticPath, "current tree fixture"))
@@ -421,7 +446,14 @@ describe("installed package generic command ownership", () => {
     const normalizedSensitivePatch = normalizeReviewedSyntheticHistoryPatch(
       retainedSensitivePatch,
       retainedDigest,
+      [fixture],
     );
+    const otherFixture = fixture === "memory_summary" ? "sanitized_message" : "memory_summary";
+    expect(() => normalizeReviewedSyntheticHistoryPatch(
+      retainedSensitivePatch,
+      retainedDigest,
+      [otherFixture],
+    )).toThrow("synthetic-path evidence changed");
     expect(() => assertPublicSensitiveText(normalizedSensitivePatch, "retained history fixture"))
       .toThrow("SECRET_SHAPE");
 
@@ -433,9 +465,50 @@ describe("installed package generic command ownership", () => {
     const normalizedPublicPatch = normalizeReviewedSyntheticHistoryPatch(
       retainedPublicPatch,
       retainedPublicDigest,
+      [fixture],
     );
     expect(() => assertPublicText(normalizedPublicPatch, "retained public history fixture"))
       .toThrow("PRIVATE_SCOPE");
+  });
+
+  test("normalizes both exact synthetic fixtures in their reviewed first-parent merge patch", () => {
+    const root = resolve(import.meta.dir, "..");
+    const commit = "b48fdb71ca201d951b9b1343a909b5f18277bc36";
+    const messagePath = ["", "Users", "private", "project", ""].join("/");
+    const summaryPath = ["", "Users", "operator", "private"].join("/");
+    for (const kind of ["sensitive_patch", "public_patch"] as const) {
+      const result = runCanonicalHistoryPatch(root, commit, kind);
+      expect(result.exitCode).toBe(0);
+      expect(result.exitedDueToMaxBuffer ?? false).toBe(false);
+      expect(result.exitedDueToTimeout ?? false).toBe(false);
+      expect(result.stderr.byteLength).toBe(0);
+      const patch = result.stdout.toString("utf8");
+      expect(patch.split(messagePath)).toHaveLength(2);
+      expect(patch.split(summaryPath)).toHaveLength(2);
+      const normalized = normalizeGitHistoryPatchForPublicScan(commit, kind, patch);
+      expect(normalized).toBe(patch
+        .replace(messagePath, "[reviewed-synthetic-absolute-path]")
+        .replace(summaryPath, "[reviewed-synthetic-absolute-path]"));
+      const assertReviewedPatch = kind === "public_patch" ? assertPublicText : assertPublicSensitiveText;
+      expect(() => assertReviewedPatch(normalized, "reviewed merge fixture")).not.toThrow();
+      expect(() => normalizeGitHistoryPatchForPublicScan(commit, kind, `${patch}changed\n`))
+        .toThrow("synthetic-path evidence changed");
+    }
+
+    const patch = `${messagePath}\n${summaryPath}\n`;
+    const digest = createHash("sha256").update(patch, "utf8").digest("hex");
+    expect(() => normalizeReviewedSyntheticHistoryPatch(patch, digest, []))
+      .toThrow("fixture selection is invalid");
+    expect(() => normalizeReviewedSyntheticHistoryPatch(patch, digest, ["memory_summary", "memory_summary"]))
+      .toThrow("fixture selection is invalid");
+    expect(() => normalizeReviewedSyntheticHistoryPatch(patch, digest, [
+      "sanitized_message", "memory_summary", "sanitized_message",
+    ])).toThrow("fixture selection is invalid");
+    const extraOccurrence = `${patch}${summaryPath}\n`;
+    const extraDigest = createHash("sha256").update(extraOccurrence, "utf8").digest("hex");
+    expect(() => normalizeReviewedSyntheticHistoryPatch(extraOccurrence, extraDigest, [
+      "sanitized_message", "memory_summary",
+    ])).toThrow("synthetic-path evidence changed");
   });
 
   test("makes reviewed patch rendering independent of hostile repository configuration", async () => {
