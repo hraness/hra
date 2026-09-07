@@ -117,11 +117,18 @@ const emptyProvider: CommandRunner = async (request) => {
   const call = requestCall(request);
   if (call.name === "commandLifecycle:auditAuthorityReductionHeadroomPage") {
     return providerResult({
+      capacityMissing: 0,
       continueCursor: "done",
+      hardQuotaBlocked: 0,
       isDone: true,
+      mode: call.args.mode,
+      orphanCleanupEligible: 0,
+      orphanCleanupPending: 0,
+      ready: 0,
+      repaired: 0,
       scanned: 0,
-      serviceReady: true,
-      unready: [],
+      schemaVersion: 1,
+      topologyBlocked: 0,
     });
   }
   if (call.name === "commandLifecycle:auditReservationPage") {
@@ -420,6 +427,35 @@ describe("hosted command lifecycle capacity operator", () => {
     ]) expect(() => parseCommandCapacityArguments(arguments_)).toThrow("usage_invalid");
   });
 
+  test("emits aggregate-only command-capacity stdout version 2", async () => {
+    const harness = await makeHarness();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    expect(await executeCommandLifecycleCapacity({
+      arguments: [
+        "status",
+        "--source-commit",
+        sourceCommit,
+        "--deploy-evidence",
+        harness.deployEvidencePath,
+        ...targetArguments,
+      ],
+      readAttestation: harness.common.readAttestation,
+      prepareProviderSource: harness.common.prepareProviderSource,
+      repositoryRoot: harness.common.repositoryRoot,
+      runner: harness.common.runner,
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: harness.common.verifyTarget,
+    })).toBe(0);
+    expect(stderr).toEqual([]);
+    expect(JSON.parse(stdout.join("")) as unknown).toMatchObject({
+      authorityReductionUserCandidates: [],
+      authorityReductionUserCandidatesTruncated: false,
+      version: 2,
+    });
+  });
+
   test("repairs bounded IDs, proves two zero-debt passes, and publishes bound no-replace evidence", async () => {
     const requests: CommandRequest[] = [];
     let repaired = false;
@@ -433,17 +469,22 @@ describe("hosted command lifecycle capacity operator", () => {
           repaired = true;
           return providerResult({ state: "reserved" });
         }
-        if (call.name === "commandLifecycle:reserveAuthorityReductionCapacity") {
-          authorityCapacityRepaired = true;
-          return providerResult({ reserved: 2 });
-        }
         if (call.name === "commandLifecycle:auditAuthorityReductionHeadroomPage") {
+          const repairing = call.args.mode === "repair" && !authorityCapacityRepaired;
+          if (repairing) authorityCapacityRepaired = true;
           return providerResult({
+            capacityMissing: 0,
             continueCursor: "done",
+            hardQuotaBlocked: 0,
             isDone: true,
+            mode: call.args.mode,
+            orphanCleanupEligible: 0,
+            orphanCleanupPending: 0,
+            ready: repairing ? 0 : 1,
+            repaired: repairing ? 1 : 0,
             scanned: 1,
-            serviceReady: authorityCapacityRepaired,
-            unready: authorityCapacityRepaired ? [] : ["user_capacity_debt"],
+            schemaVersion: 1,
+            topologyBlocked: 0,
           });
         }
         expect(call.args).toMatchObject({ paginationOpts: { cursor: null, numItems: 8 } });
@@ -487,6 +528,7 @@ describe("hosted command lifecycle capacity operator", () => {
       evidencePath: harness.evidencePath,
       legacyRevoked: 2,
       lifecycleDebt: 0,
+      authorityReductionRepairedThisRun: 1,
       repairedLifecycle: 1,
       repairedReceipts: 0,
       state: "ready",
@@ -521,10 +563,7 @@ describe("hosted command lifecycle capacity operator", () => {
       status: "activated",
     });
     expect(harness.activationWrites).toBe(1);
-    expect(requests).toHaveLength(53);
-    expect(requests.some((request) =>
-      requestCall(request).name === "commandLifecycle:reserveAuthorityReductionCapacity"))
-      .toBe(true);
+    expect(requests).toHaveLength(52);
     expect(harness.attestationReads).toBe(11);
     expect(harness.targetChecks).toBe(
       (harness.providerCalls * 2) + (harness.attestationReads * 2),
@@ -672,9 +711,7 @@ describe("hosted command lifecycle capacity operator", () => {
     });
   });
 
-  test("reports bounded authority-reduction headroom owners and service debt", async () => {
-    const userIds = Array.from({ length: 9 }, (_, index) =>
-      `authority-reduction-user-${String(index + 1).padStart(2, "0")}`);
+  test("reports bounded authority-reduction categories without owner identifiers", async () => {
     const harness = await makeHarness({
       provider: async (request) => {
         const call = requestCall(request);
@@ -685,19 +722,33 @@ describe("hosted command lifecycle capacity operator", () => {
           call.args.paginationOpts as Readonly<Record<string, unknown>>
         ).cursor === null) {
           return providerResult({
+            capacityMissing: 0,
             continueCursor: "headroom-next",
+            hardQuotaBlocked: 0,
             isDone: false,
+            mode: call.args.mode,
+            orphanCleanupEligible: 0,
+            orphanCleanupPending: 0,
+            ready: 0,
+            repaired: 0,
             scanned: 8,
-            serviceReady: false,
-            unready: userIds.slice(0, 8),
+            schemaVersion: 1,
+            topologyBlocked: 8,
           });
         }
         return providerResult({
+          capacityMissing: 0,
           continueCursor: "done",
+          hardQuotaBlocked: 0,
           isDone: true,
+          mode: call.args.mode,
+          orphanCleanupEligible: 0,
+          orphanCleanupPending: 1,
+          ready: 0,
+          repaired: 0,
           scanned: 1,
-          serviceReady: false,
-          unready: userIds.slice(8),
+          schemaVersion: 1,
+          topologyBlocked: 0,
         });
       },
     });
@@ -705,33 +756,40 @@ describe("hosted command lifecycle capacity operator", () => {
       action: "status",
       ...harness.common,
     })).toMatchObject({
+      authorityReductionOrphanCleanupPendingDebt: 1,
       authorityReductionServiceDebt: 1,
-      authorityReductionUserCandidates: userIds.slice(0, 8),
-      authorityReductionUserCandidatesTruncated: true,
+      authorityReductionTopologyBlockedDebt: 8,
+      authorityReductionUserCandidates: [],
+      authorityReductionUserCandidatesTruncated: false,
       authorityReductionUserDebt: 9,
       state: "debt",
     });
   });
 
-  test("refuses a blocked physical-capacity backfill without leaking the owner", async () => {
+  test("reports partial repair plus exact hard quota without leaking provider text", async () => {
     const privateUserId = "private-legacy-user-at-hard-quota";
     const harness = await makeHarness({
       provider: async (request) => {
         const call = requestCall(request);
         if (call.name === "commandLifecycle:auditAuthorityReductionHeadroomPage") {
-          return providerResult({
+          const value = {
+            capacityMissing: 0,
             continueCursor: "done",
+            hardQuotaBlocked: call.args.mode === "repair" ? 1 : 0,
             isDone: true,
-            scanned: 1,
-            serviceReady: false,
-            unready: [privateUserId],
-          });
-        }
-        if (call.name === "commandLifecycle:reserveAuthorityReductionCapacity") {
+            mode: call.args.mode,
+            orphanCleanupEligible: 0,
+            orphanCleanupPending: 0,
+            ready: call.args.mode === "repair" ? 0 : 1,
+            repaired: call.args.mode === "repair" ? 1 : 0,
+            scanned: 2,
+            schemaVersion: 1,
+            topologyBlocked: 0,
+          };
           return {
-            exitCode: 1,
-            stderr: `QUOTA_EXCEEDED:${privateUserId}`,
-            stdout: "",
+            exitCode: 0,
+            stderr: `untrusted-provider-detail:${privateUserId}`,
+            stdout: JSON.stringify(value),
           };
         }
         return await emptyProvider(request);
@@ -762,7 +820,7 @@ describe("hosted command lifecycle capacity operator", () => {
     })).toBe(1);
     expect(stdout).toEqual([]);
     expect(stderr.join("")).toBe(
-      "Hosted command-capacity operation refused (capacity_backfill_blocked).\n",
+      "Hosted command-capacity operation refused (authority_reduction_hard_quota).\n",
     );
     expect(stderr.join("")).not.toContain(privateUserId);
     expect(() => readProtectedJson(
@@ -772,9 +830,7 @@ describe("hosted command lifecycle capacity operator", () => {
   });
 
   test("detects authority debt introduced between the two bound readiness scans", async () => {
-    const concurrentUserId = "concurrent-legacy-authority";
     let headroomAudits = 0;
-    let backfillCalls = 0;
     const harness = await makeHarness({
       provider: async (request) => {
         const call = requestCall(request);
@@ -782,16 +838,19 @@ describe("hosted command lifecycle capacity operator", () => {
           headroomAudits += 1;
           const debtVisible = headroomAudits >= 3;
           return providerResult({
+            capacityMissing: debtVisible && call.args.mode === "audit" ? 1 : 0,
             continueCursor: "done",
+            hardQuotaBlocked: debtVisible && call.args.mode === "repair" ? 1 : 0,
             isDone: true,
+            mode: call.args.mode,
+            orphanCleanupEligible: 0,
+            orphanCleanupPending: 0,
+            ready: 0,
+            repaired: 0,
             scanned: debtVisible ? 1 : 0,
-            serviceReady: !debtVisible,
-            unready: debtVisible ? [concurrentUserId] : [],
+            schemaVersion: 1,
+            topologyBlocked: 0,
           });
-        }
-        if (call.name === "commandLifecycle:reserveAuthorityReductionCapacity") {
-          backfillCalls += 1;
-          return { exitCode: 1, stderr: "QUOTA_EXCEEDED", stdout: "" };
         }
         return await emptyProvider(request);
       },
@@ -800,9 +859,8 @@ describe("hosted command lifecycle capacity operator", () => {
       action: "repair",
       evidencePath: harness.evidencePath,
       ...harness.common,
-    })).rejects.toThrow("capacity_backfill_blocked");
+    })).rejects.toThrow("authority_reduction_hard_quota");
     expect(headroomAudits).toBe(4);
-    expect(backfillCalls).toBe(1);
     expect(harness.attestationReads).toBeGreaterThanOrEqual(7);
     expect(() => readProtectedJson(
       harness.evidencePath,

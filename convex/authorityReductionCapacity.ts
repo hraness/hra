@@ -28,7 +28,7 @@ type DeviceSecurityReservation =
 export type DeviceReceiptReservation =
   DataModel["deviceRevocationReceiptReservations"]["document"];
 
-type AccountDeletionCapacity = Readonly<{
+export type AccountDeletionCapacity = Readonly<{
   identity: AccountIdentityReservation;
   job: AccountJobReservation;
   kind: "reserved";
@@ -44,9 +44,32 @@ export type DeviceRevocationCapacity = Readonly<{
 
 type LogicalDocument = Readonly<Record<string, Value | undefined>>;
 const hraOtpProviderId = "hra-control-plane-otp-v1";
+export const authorityReductionOrphanRetentionMs = 24 * 60 * 60 * 1_000;
+
+export type AuthorityReductionCapacityDisposition =
+  | "ready"
+  | "capacity_missing"
+  | "orphan_cleanup_pending"
+  | "orphan_cleanup_eligible"
+  | "topology_blocked";
+
+export type LegacyOtpOrphanCandidate = Readonly<{
+  account: DataModel["authAccounts"]["document"];
+  capacity: AccountDeletionCapacity;
+  disposition: "orphan_cleanup_eligible";
+  subject?: DataModel["authSubjects"]["document"];
+}> | Readonly<{ disposition: "orphan_cleanup_pending" }>;
 
 function corrupt(): never {
   throw new Error("AUTHORITY_REDUCTION_CAPACITY_CORRUPT");
+}
+
+function isCapacityCorruption(error: unknown): boolean {
+  return error instanceof Error
+    && (
+      error.message === "AUTHORITY_REDUCTION_CAPACITY_CORRUPT"
+      || error.message === "DURABLE_JOB_CAPACITY_CORRUPT"
+    );
 }
 
 async function hasExactHraAuthTopology(
@@ -286,10 +309,120 @@ export async function createDeviceRevocationCapacityForNewDevice(
   }
 }
 
-export async function auditAuthorityReductionCapacityForUser(
+// This is the single structural and age predicate used both by rollout
+// classification and by the scheduled deletion sweep. Callers may observe an
+// eligible orphan, but only maintenance owns its deletion.
+export async function inspectLegacyOtpOrphanCandidate(
+  ctx: QueryCtx | MutationCtx,
+  user: DataModel["users"]["document"],
+  now: number,
+  validation: "diagnostic" | "maintenance" = "diagnostic",
+): Promise<LegacyOtpOrphanCandidate | null> {
+  const cutoff = now - authorityReductionOrphanRetentionMs;
+  // Preserve the cleanup sweep's historical staging: a fresh predecessor
+  // write is skipped before any later ambiguity or partial-capacity probe can
+  // abort the cron. Diagnostic callers still validate the entire shape.
+  if (validation === "maintenance" && user._creationTime >= cutoff) {
+    return { disposition: "orphan_cleanup_pending" };
+  }
+  if (
+    user.emailVerificationTime !== undefined
+    || user.phoneVerificationTime !== undefined
+    || user.isAnonymous !== undefined
+    || user.phone !== undefined
+  ) return null;
+  const [accounts, boundSubjects, challenges, deletionJob, device, session] = await Promise.all([
+    ctx.db.query("authAccounts")
+      .withIndex("userIdAndProvider", (builder) => builder.eq("userId", user._id))
+      .take(2),
+    ctx.db.query("authSubjects")
+      .withIndex("by_user", (builder) => builder.eq("userId", user._id))
+      .take(2),
+    ctx.db.query("authOtpChallenges")
+      .withIndex("by_user", (builder) => builder.eq("userId", user._id))
+      .take(1),
+    ctx.db.query("accountDeletionJobs")
+      .withIndex("by_user", (builder) => builder.eq("userId", user._id))
+      .first(),
+    ctx.db.query("devices")
+      .withIndex("by_user_and_public_id", (builder) => builder.eq("userId", user._id))
+      .first(),
+    ctx.db.query("authSessions")
+      .withIndex("userId", (builder) => builder.eq("userId", user._id))
+      .first(),
+  ]);
+  if (
+    accounts.length !== 1
+    || boundSubjects.length !== 0
+    || challenges.length !== 0
+    || deletionJob !== null
+    || device !== null
+    || session !== null
+  ) return null;
+  const account = accounts[0];
+  if (
+    account === undefined
+    || account.provider !== hraOtpProviderId
+    || account.emailVerified !== undefined
+    || !isCanonicalAuthEmail(account.providerAccountId)
+    || user.email !== account.providerAccountId
+  ) return null;
+  if (validation === "maintenance" && account._creationTime >= cutoff) {
+    return { disposition: "orphan_cleanup_pending" };
+  }
+  const emailDigest = await digestAuthEmail(account.providerAccountId);
+  const matchingSubjects = await ctx.db.query("authSubjects")
+    .withIndex("by_email_digest", (builder) => builder.eq("emailDigest", emailDigest))
+    .take(2);
+  if (matchingSubjects.length > 1) corrupt();
+  const subject = matchingSubjects[0];
+  if (
+    subject !== undefined
+    && (
+      subject.userId !== undefined
+      || subject.status !== "active"
+      || subject.verifiedAt !== undefined
+    )
+  ) return null;
+  if (
+    validation === "maintenance"
+    && subject !== undefined
+    && (subject.createdAt >= cutoff || subject.updatedAt >= cutoff)
+  ) return { disposition: "orphan_cleanup_pending" };
+  const verificationCode = await ctx.db.query("authVerificationCodes")
+    .withIndex("accountId", (builder) => builder.eq("accountId", account._id))
+    .first();
+  if (verificationCode !== null) return null;
+  const capacity = await loadAccountDeletionCapacity(ctx, user._id);
+  if (
+    validation === "maintenance"
+    && capacity.kind === "reserved"
+    && (capacity.identity.createdAt >= cutoff || capacity.job.createdAt >= cutoff)
+  ) return { disposition: "orphan_cleanup_pending" };
+  const eligible = user._creationTime < cutoff
+    && account._creationTime < cutoff
+    && (subject === undefined
+      || (subject.createdAt < cutoff && subject.updatedAt < cutoff))
+    && (capacity.kind === "legacy"
+      || (capacity.identity.createdAt < cutoff && capacity.job.createdAt < cutoff));
+  return eligible
+    ? {
+        account,
+        capacity,
+        disposition: "orphan_cleanup_eligible",
+        ...(subject === undefined ? {} : { subject }),
+      }
+    : { disposition: "orphan_cleanup_pending" };
+}
+
+export async function classifyAuthorityReductionCapacityForUser(
   ctx: QueryCtx | MutationCtx,
   userId: Id<"users">,
-): Promise<Readonly<{ missing: number }>> {
+  now: number,
+): Promise<Readonly<{
+  disposition: AuthorityReductionCapacityDisposition;
+  missing: number;
+}>> {
   const [user, deletionJobs, devices] = await Promise.all([
     ctx.db.get(userId),
     ctx.db.query("accountDeletionJobs")
@@ -299,39 +432,40 @@ export async function auditAuthorityReductionCapacityForUser(
       .withIndex("by_user_and_public_id", (builder) => builder.eq("userId", userId))
       .take(17),
   ]);
-  if (
-    user === null
-    || deletionJobs.length > 1
-    || devices.length > 16
-  ) corrupt();
-  // A deletion job has already consumed the account reservation and is
-  // monotonically erasing every remaining device reservation. It admits no
-  // further user authority, so it is not rollout debt.
-  const deletionJob = deletionJobs[0];
-  if (deletionJob !== undefined) {
-    return {
-      missing: await hasExactDrainingDeletionTopology(ctx, user, deletionJob)
-        ? 0
-        : 1,
-    };
+  if (user === null || deletionJobs.length > 1 || devices.length > 16) {
+    return { disposition: "topology_blocked", missing: 1 };
   }
-  let missing = (await loadAccountDeletionCapacity(ctx, userId)).kind === "legacy"
-    ? 1
-    : 0;
-  // A committed unverified Auth user without its bound subject is the only
-  // durable shape left by the predecessor's multi-mutation OTP creation gap.
-  // Physical deletion capacity alone must not make rollout readiness claim
-  // that this disconnected identity is healthy.
-  if (!(await hasExactHraAuthTopology(ctx, user))) missing += 1;
-  for (const device of devices) {
-    const capacity = await loadDeviceRevocationCapacity(ctx, userId, device._id);
-    if (device.status === "revoked") {
-      if (capacity.kind !== "legacy") corrupt();
-      continue;
+  try {
+    const deletionJob = deletionJobs[0];
+    if (deletionJob !== undefined) {
+      return await hasExactDrainingDeletionTopology(ctx, user, deletionJob)
+        ? { disposition: "ready", missing: 0 }
+        : { disposition: "topology_blocked", missing: 1 };
     }
-    if (capacity.kind === "legacy") missing += 1;
+    if (!(await hasExactHraAuthTopology(ctx, user))) {
+      const orphan = await inspectLegacyOtpOrphanCandidate(ctx, user, now);
+      return orphan === null
+        ? { disposition: "topology_blocked", missing: 1 }
+        : { disposition: orphan.disposition, missing: 1 };
+    }
+    let missing = (await loadAccountDeletionCapacity(ctx, userId)).kind === "legacy" ? 1 : 0;
+    for (const device of devices) {
+      const capacity = await loadDeviceRevocationCapacity(ctx, userId, device._id);
+      if (device.status === "revoked") {
+        if (capacity.kind !== "legacy") return { disposition: "topology_blocked", missing: 1 };
+      } else if (capacity.kind === "legacy") {
+        missing += 1;
+      }
+    }
+    return missing === 0
+      ? { disposition: "ready", missing: 0 }
+      : { disposition: "capacity_missing", missing };
+  } catch (error: unknown) {
+    if (isCapacityCorruption(error)) {
+      return { disposition: "topology_blocked", missing: 1 };
+    }
+    throw error;
   }
-  return { missing };
 }
 
 export async function backfillAuthorityReductionCapacityForUser(

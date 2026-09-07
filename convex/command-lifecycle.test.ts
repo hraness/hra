@@ -6,6 +6,8 @@ import { convexTest } from "convex-test";
 import { parseAuthCredentials } from "../src/cloud/authCredentials";
 import { cloudLimits } from "../src/cloud/contracts";
 import {
+  authorityReductionOrphanRetentionMs,
+  classifyAuthorityReductionCapacityForUser,
   createAccountDeletionCapacityForNewUser,
   createDeviceRevocationCapacityForNewDevice,
 } from "./authorityReductionCapacity";
@@ -18,6 +20,7 @@ import {
   patchSessionCommandWithLifecycleCapacity,
   reserveCommandLifecycleForInsert,
   requireCommandCapacityReadiness,
+  runAuthorityReductionHeadroomPage,
   terminalizeDeviceCommandWithLifecycleCapacity,
   terminalizeSessionCommandWithLifecycleCapacity,
 } from "./commandLifecycle";
@@ -87,16 +90,32 @@ const auditReservationPage = makeFunctionReference<"query", Args, AuditResult>(
 const auditTerminalReceiptCapacityPage = makeFunctionReference<"query", Args, AuditResult>(
   "commandLifecycle:auditTerminalReceiptCapacityPage",
 );
-const auditAuthorityReductionHeadroomPage = makeFunctionReference<"query", Args, Readonly<{
+const auditAuthorityReductionHeadroomPage = makeFunctionReference<"action", Args, Readonly<{
+  capacityMissing: number;
   continueCursor: string;
+  hardQuotaBlocked: number;
   isDone: boolean;
+  mode: "audit" | "repair";
+  orphanCleanupEligible: number;
+  orphanCleanupPending: number;
+  ready: number;
+  repaired: number;
   scanned: number;
-  serviceReady: boolean;
-  unready: readonly string[];
+  schemaVersion: 1;
+  topologyBlocked: number;
 }>>("commandLifecycle:auditAuthorityReductionHeadroomPage");
 const reserveAuthorityReductionCapacity = makeFunctionReference<"mutation", Args, Readonly<{
+  disposition?: "ready" | "capacity_missing" | "orphan_cleanup_pending"
+    | "orphan_cleanup_eligible" | "topology_blocked";
   reserved: number;
+  state: "absent" | "ready" | "reclassified" | "repaired";
 }>>("commandLifecycle:reserveAuthorityReductionCapacity");
+const requestAccountDeletion = makeFunctionReference<"mutation", Args, unknown>(
+  "accountDeletion:request",
+);
+const drainAccountDeletion = makeFunctionReference<"mutation", Args, Readonly<{
+  kind: "advanced" | "complete" | "drained" | "idle";
+}>>("accountDeletion:drain");
 const reserveExisting = makeFunctionReference<"mutation", Args, unknown>(
   "commandLifecycle:reserveExisting",
 );
@@ -666,22 +685,31 @@ describe("command lifecycle physical quota reservations", () => {
 
   test("audits and atomically backfills physical revoke/delete capacity", async () => {
     const world = await lifecycleWorld();
-    expect(await world.testRuntime.query(auditAuthorityReductionHeadroomPage, {
+    expect(await world.testRuntime.action(auditAuthorityReductionHeadroomPage, {
       expectedRuntimeAttestation: trackedRuntimeAttestation,
+      mode: "audit",
       paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
     })).toMatchObject({
+      capacityMissing: 1,
+      ready: 0,
       scanned: 1,
-      serviceReady: false,
-      unready: [String(world.userId)],
+      topologyBlocked: 0,
     });
-    expect(await world.testRuntime.mutation(reserveAuthorityReductionCapacity, {
+    expect(await world.testRuntime.action(auditAuthorityReductionHeadroomPage, {
       expectedRuntimeAttestation: trackedRuntimeAttestation,
-      userId: world.userId,
-    })).toEqual({ reserved: 2 });
-    expect(await world.testRuntime.query(auditAuthorityReductionHeadroomPage, {
-      expectedRuntimeAttestation: trackedRuntimeAttestation,
+      mode: "repair",
       paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
-    })).toMatchObject({ scanned: 1, serviceReady: true, unready: [] });
+    })).toMatchObject({
+      capacityMissing: 0,
+      hardQuotaBlocked: 0,
+      repaired: 1,
+      scanned: 1,
+    });
+    expect(await world.testRuntime.action(auditAuthorityReductionHeadroomPage, {
+      expectedRuntimeAttestation: trackedRuntimeAttestation,
+      mode: "audit",
+      paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
+    })).toMatchObject({ capacityMissing: 0, ready: 1, scanned: 1 });
     const concurrentEmail = "concurrent-current-authority@example.com";
     const parsedConcurrentEmail = parseAuthCredentials({ email: concurrentEmail });
     if (parsedConcurrentEmail.kind !== "request_code") {
@@ -736,10 +764,11 @@ describe("command lifecycle physical quota reservations", () => {
       const deviceId = await ctx.db.insert("devices", device);
       await createDeviceRevocationCapacityForNewDevice(ctx, userId, deviceId);
     });
-    expect(await world.testRuntime.query(auditAuthorityReductionHeadroomPage, {
+    expect(await world.testRuntime.action(auditAuthorityReductionHeadroomPage, {
       expectedRuntimeAttestation: trackedRuntimeAttestation,
+      mode: "audit",
       paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
-    })).toMatchObject({ scanned: 2, serviceReady: true, unready: [] });
+    })).toMatchObject({ capacityMissing: 0, ready: 2, scanned: 2 });
     expect(await world.testRuntime.run(async (ctx) => ({
       accountIdentity: await ctx.db.query("accountDeletionIdentityReservations").collect(),
       accountJob: await ctx.db.query("accountDeletionJobReservations").collect(),
@@ -770,16 +799,112 @@ describe("command lifecycle physical quota reservations", () => {
 
     const saturated = await lifecycleWorld();
     await saturateUserAndServiceCeilings(saturated);
+    const beforeBlockedRepair = await saturated.testRuntime.run(async (ctx) => ({
+      accountIdentity: await ctx.db.query("accountDeletionIdentityReservations").collect(),
+      accountJob: await ctx.db.query("accountDeletionJobReservations").collect(),
+      device: await ctx.db.query("deviceRevocationDeviceReservations").collect(),
+      deviceJob: await ctx.db.query("deviceRevocationJobReservations").collect(),
+      deviceReceipt: await ctx.db.query("deviceRevocationReceiptReservations").collect(),
+      deviceSecurity: await ctx.db.query("deviceRevocationSecurityReservations").collect(),
+      serviceUsage: await ctx.db.query("storageUsageService").collect(),
+      userUsage: await ctx.db.query("storageUsageByUser").collect(),
+    }));
     await expect(saturated.testRuntime.mutation(reserveAuthorityReductionCapacity, {
       expectedRuntimeAttestation: trackedRuntimeAttestation,
       userId: saturated.userId,
-    })).rejects.toThrow("QUOTA_EXCEEDED");
-    expect(await saturated.testRuntime.query(auditAuthorityReductionHeadroomPage, {
+    })).rejects.toThrow("authority_reduction_hard_quota");
+    expect(await saturated.testRuntime.action(auditAuthorityReductionHeadroomPage, {
       expectedRuntimeAttestation: trackedRuntimeAttestation,
+      mode: "audit",
       paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
     })).toMatchObject({
-      serviceReady: false,
-      unready: [String(saturated.userId)],
+      capacityMissing: 1,
+      ready: 0,
+    });
+    expect(await saturated.testRuntime.action(auditAuthorityReductionHeadroomPage, {
+      expectedRuntimeAttestation: trackedRuntimeAttestation,
+      mode: "repair",
+      paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
+    })).toMatchObject({
+      capacityMissing: 0,
+      hardQuotaBlocked: 1,
+      repaired: 0,
+      scanned: 1,
+    });
+    expect(await saturated.testRuntime.run(async (ctx) => ({
+      accountIdentity: await ctx.db.query("accountDeletionIdentityReservations").collect(),
+      accountJob: await ctx.db.query("accountDeletionJobReservations").collect(),
+      device: await ctx.db.query("deviceRevocationDeviceReservations").collect(),
+      deviceJob: await ctx.db.query("deviceRevocationJobReservations").collect(),
+      deviceReceipt: await ctx.db.query("deviceRevocationReceiptReservations").collect(),
+      deviceSecurity: await ctx.db.query("deviceRevocationSecurityReservations").collect(),
+      serviceUsage: await ctx.db.query("storageUsageService").collect(),
+      userUsage: await ctx.db.query("storageUsageByUser").collect(),
+    }))).toEqual(beforeBlockedRepair);
+  });
+
+  test("does not relabel an unknown repair failure as hard quota", async () => {
+    const world = await lifecycleWorld();
+    await world.testRuntime.run(async (ctx) => {
+      const service = await ctx.db.query("storageUsageService").unique();
+      if (service === null) throw new Error("missing service quota fixture");
+      await ctx.db.delete(service._id);
+    });
+    await expect(world.testRuntime.action(auditAuthorityReductionHeadroomPage, {
+      expectedRuntimeAttestation: trackedRuntimeAttestation,
+      mode: "repair",
+      paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
+    })).rejects.toThrow("QUOTA_AUTHORITY_CORRUPT");
+  });
+
+  test("counts a user deleted between page classification and repair as ready", async () => {
+    const world = await lifecycleWorld();
+    await world.testRuntime.run(async (ctx) => {
+      const authSession = await ctx.db.get(world.authSessionId);
+      if (authSession === null) throw new Error("missing deletion-race auth session");
+      await reserveQuotaForInsert(ctx, world.userId, "identity", authSession);
+      await createAccountDeletionCapacityForNewUser(ctx, world.userId);
+    });
+    let deletionCompleted = false;
+    const result = await runAuthorityReductionHeadroomPage({
+      runMutation: async (reference, args) =>
+        await world.testRuntime.mutation(reference, args),
+      runQuery: async (reference, args) => {
+        const page = await world.testRuntime.query(reference, args);
+        expect(page).toMatchObject({
+          classified: [{ disposition: "capacity_missing", userId: world.userId }],
+          scanned: 1,
+        });
+        await world.actor.mutation(requestAccountDeletion, {
+          jobId: "delete_job_capacity_race_AAAAAAAAAAAAAAAAAAAA",
+          statusCapability: "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-ABCDE",
+        });
+        for (let iteration = 0; iteration < 100; iteration += 1) {
+          const drained = await world.testRuntime.mutation(drainAccountDeletion, {
+            limit: 200,
+          });
+          if (drained.kind === "complete") {
+            deletionCompleted = true;
+            break;
+          }
+        }
+        if (!deletionCompleted) throw new Error("account deletion race did not complete");
+        expect(await world.testRuntime.run(async (ctx) =>
+          await ctx.db.get(world.userId))).toBeNull();
+        return page;
+      },
+    }, {
+      expectedRuntimeAttestation: trackedRuntimeAttestation,
+      mode: "repair",
+      paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
+    });
+    expect(result).toMatchObject({
+      capacityMissing: 0,
+      hardQuotaBlocked: 0,
+      ready: 1,
+      repaired: 0,
+      scanned: 1,
+      topologyBlocked: 0,
     });
   });
 
@@ -807,18 +932,57 @@ describe("command lifecycle physical quota reservations", () => {
       await ctx.db.insert("authAccounts", account);
       return userId;
     });
-    expect(await runtime.query(auditAuthorityReductionHeadroomPage, {
+    expect(await runtime.action(auditAuthorityReductionHeadroomPage, {
       expectedRuntimeAttestation: trackedRuntimeAttestation,
+      mode: "audit",
       paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
     })).toMatchObject({
+      orphanCleanupPending: 1,
       scanned: 1,
-      serviceReady: false,
-      unready: [String(userId)],
+      topologyBlocked: 0,
     });
-    await expect(runtime.mutation(reserveAuthorityReductionCapacity, {
+    const newestOrphanWrite = await runtime.run(async (ctx) => {
+      const [user, account, identity, job] = await Promise.all([
+        ctx.db.get(userId),
+        ctx.db.query("authAccounts")
+          .withIndex("userIdAndProvider", (builder) => builder.eq("userId", userId))
+          .unique(),
+        ctx.db.query("accountDeletionIdentityReservations")
+          .withIndex("by_user", (builder) => builder.eq("userId", userId))
+          .unique(),
+        ctx.db.query("accountDeletionJobReservations")
+          .withIndex("by_user", (builder) => builder.eq("userId", userId))
+          .unique(),
+      ]);
+      if (user === null || account === null || identity === null || job === null) {
+        throw new Error("missing OTP gap boundary fixture");
+      }
+      return Math.max(
+        user._creationTime,
+        account._creationTime,
+        identity.createdAt,
+        job.createdAt,
+      );
+    });
+    for (const [offset, disposition] of [
+      [0, "orphan_cleanup_pending"],
+      [1, "orphan_cleanup_eligible"],
+    ] as const) {
+      expect(await runtime.run(async (ctx) =>
+        await classifyAuthorityReductionCapacityForUser(
+          ctx,
+          userId,
+          newestOrphanWrite + authorityReductionOrphanRetentionMs + offset,
+        ))).toMatchObject({ disposition });
+    }
+    expect(await runtime.mutation(reserveAuthorityReductionCapacity, {
       expectedRuntimeAttestation: trackedRuntimeAttestation,
       userId,
-    })).rejects.toThrow("AUTHORITY_REDUCTION_CAPACITY_CORRUPT");
+    })).toEqual({
+      disposition: "orphan_cleanup_pending",
+      reserved: 0,
+      state: "reclassified",
+    });
     await runtime.run(async (ctx) => {
       const subject = {
         admittedBy: "open" as const,
@@ -832,10 +996,11 @@ describe("command lifecycle physical quota reservations", () => {
       await reserveQuotaForInsert(ctx, userId, "identity", subject);
       await ctx.db.insert("authSubjects", subject);
     });
-    expect(await runtime.query(auditAuthorityReductionHeadroomPage, {
+    expect(await runtime.action(auditAuthorityReductionHeadroomPage, {
       expectedRuntimeAttestation: trackedRuntimeAttestation,
+      mode: "audit",
       paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
-    })).toMatchObject({ scanned: 1, serviceReady: true, unready: [] });
+    })).toMatchObject({ ready: 1, scanned: 1 });
   });
 
   test("requires exact HRA identity topology before certifying or backfilling capacity", async () => {
@@ -900,17 +1065,22 @@ describe("command lifecycle physical quota reservations", () => {
             await ctx.db.patch(subject._id, { verifiedAt: world.now + 1 });
         }
       });
-      expect(await world.testRuntime.query(auditAuthorityReductionHeadroomPage, {
+      expect(await world.testRuntime.action(auditAuthorityReductionHeadroomPage, {
         expectedRuntimeAttestation: trackedRuntimeAttestation,
+        mode: "audit",
         paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
       })).toMatchObject({
-        serviceReady: false,
-        unready: [String(world.userId)],
+        ready: 0,
+        topologyBlocked: 1,
       });
-      await expect(world.testRuntime.mutation(reserveAuthorityReductionCapacity, {
+      expect(await world.testRuntime.mutation(reserveAuthorityReductionCapacity, {
         expectedRuntimeAttestation: trackedRuntimeAttestation,
         userId: world.userId,
-      })).rejects.toThrow("AUTHORITY_REDUCTION_CAPACITY_CORRUPT");
+      })).toEqual({
+        disposition: "topology_blocked",
+        reserved: 0,
+        state: "reclassified",
+      });
     }
 
     const lazyVerified = await lifecycleWorld();
@@ -925,10 +1095,11 @@ describe("command lifecycle physical quota reservations", () => {
       if (subject === null) throw new Error("missing lazy verification fixture");
       await ctx.db.patch(subject._id, { verifiedAt: undefined });
     });
-    expect(await lazyVerified.testRuntime.query(auditAuthorityReductionHeadroomPage, {
+    expect(await lazyVerified.testRuntime.action(auditAuthorityReductionHeadroomPage, {
       expectedRuntimeAttestation: trackedRuntimeAttestation,
+      mode: "audit",
       paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
-    })).toMatchObject({ serviceReady: true, unready: [] });
+    })).toMatchObject({ ready: 1, topologyBlocked: 0 });
   });
 
   test("certifies only an exact monotonically draining account deletion job", async () => {
@@ -985,18 +1156,23 @@ describe("command lifecycle physical quota reservations", () => {
         await reserveQuotaForInsert(ctx, world.userId, "job", job);
         await ctx.db.insert("accountDeletionJobs", job);
       });
-      expect(await world.testRuntime.query(auditAuthorityReductionHeadroomPage, {
+      expect(await world.testRuntime.action(auditAuthorityReductionHeadroomPage, {
         expectedRuntimeAttestation: trackedRuntimeAttestation,
+        mode: "audit",
         paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
       })).toMatchObject(valid
-        ? { serviceReady: true, unready: [] }
-        : { serviceReady: false, unready: [String(world.userId)] });
+        ? { ready: 1, topologyBlocked: 0 }
+        : { ready: 0, topologyBlocked: 1 });
       const mutation = world.testRuntime.mutation(reserveAuthorityReductionCapacity, {
         expectedRuntimeAttestation: trackedRuntimeAttestation,
         userId: world.userId,
       });
-      if (valid) expect(await mutation).toEqual({ reserved: 0 });
-      else await expect(mutation).rejects.toThrow("AUTHORITY_REDUCTION_CAPACITY_CORRUPT");
+      if (valid) expect(await mutation).toEqual({ reserved: 0, state: "ready" });
+      else expect(await mutation).toEqual({
+        disposition: "topology_blocked",
+        reserved: 0,
+        state: "reclassified",
+      });
     }
   });
 
@@ -1023,14 +1199,15 @@ describe("command lifecycle physical quota reservations", () => {
       return await ctx.db.insert("accountDeletionJobs", job);
     });
     const assertReady = async () => {
-      expect(await world.testRuntime.query(auditAuthorityReductionHeadroomPage, {
+      expect(await world.testRuntime.action(auditAuthorityReductionHeadroomPage, {
         expectedRuntimeAttestation: trackedRuntimeAttestation,
+        mode: "audit",
         paginationOpts: { cursor: null, numItems: maximumCommandLifecycleBatch },
-      })).toMatchObject({ serviceReady: true, unready: [] });
+      })).toMatchObject({ ready: 1, topologyBlocked: 0 });
       expect(await world.testRuntime.mutation(reserveAuthorityReductionCapacity, {
         expectedRuntimeAttestation: trackedRuntimeAttestation,
         userId: world.userId,
-      })).toEqual({ reserved: 0 });
+      })).toEqual({ reserved: 0, state: "ready" });
     };
     await assertReady();
     const drainingCategories = [

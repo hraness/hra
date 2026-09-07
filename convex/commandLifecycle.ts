@@ -1,5 +1,5 @@
-import { paginationOptsValidator } from "convex/server";
-import { v } from "convex/values";
+import { makeFunctionReference, paginationOptsValidator } from "convex/server";
+import { ConvexError, v } from "convex/values";
 import type { GenericId as Id, Value } from "convex/values";
 
 import {
@@ -20,13 +20,15 @@ import {
   reserveQuotaForInsert,
 } from "./quota";
 import {
-  auditAuthorityReductionCapacityForUser,
   backfillAuthorityReductionCapacityForUser,
+  classifyAuthorityReductionCapacityForUser,
+  type AuthorityReductionCapacityDisposition,
 } from "./authorityReductionCapacity";
 import { COMMAND_TERMINAL_RETENTION_MS } from "./lifecyclePolicy";
 import {
   internalMutation,
   internalQuery,
+  internalAction,
   type DataModel,
   type MutationCtx,
   type QueryCtx,
@@ -1595,7 +1597,7 @@ export const auditReservationPage = internalQuery({
 // rollout proof that predecessor users have been backfilled without partial
 // reservation sets. A hard-full legacy user remains explicit debt until
 // ordinary data is deleted or expires; the audit never invents headroom.
-export const auditAuthorityReductionHeadroomPage = internalQuery({
+export const classifyAuthorityReductionHeadroomPage = internalQuery({
   args: {
     expectedRuntimeAttestation: runtimeFenceValidator,
     paginationOpts: paginationOptsValidator,
@@ -1607,18 +1609,24 @@ export const auditAuthorityReductionHeadroomPage = internalQuery({
       || args.paginationOpts.numItems > maximumCommandLifecycleBatch
     ) return corrupt();
     const page = await ctx.db.query("users").paginate(args.paginationOpts);
-    const unready: string[] = [];
+    const now = Date.now();
+    const classified: Array<Readonly<{
+      disposition: AuthorityReductionCapacityDisposition;
+      userId: Id<"users">;
+    }>> = [];
     for (const user of page.page) {
-      if ((await auditAuthorityReductionCapacityForUser(ctx, user._id)).missing !== 0) {
-        unready.push(String(user._id));
-      }
+      const result = await classifyAuthorityReductionCapacityForUser(
+        ctx,
+        user._id,
+        now,
+      );
+      classified.push({ disposition: result.disposition, userId: user._id });
     }
     return {
+      classified,
       continueCursor: page.continueCursor,
       isDone: page.isDone,
       scanned: page.page.length,
-      serviceReady: unready.length === 0,
-      unready,
     };
   },
 });
@@ -1630,9 +1638,205 @@ export const reserveAuthorityReductionCapacity = internalMutation({
   },
   handler: async (ctx, args) => {
     requireRuntimeFence(args.expectedRuntimeAttestation);
-    await requireHardQuotaAuthority(ctx);
-    return await backfillAuthorityReductionCapacityForUser(ctx, args.userId);
+    if (await ctx.db.get(args.userId) === null) {
+      return { reserved: 0, state: "absent" as const };
+    }
+    const classification = await classifyAuthorityReductionCapacityForUser(
+      ctx,
+      args.userId,
+      Date.now(),
+    );
+    if (classification.disposition === "ready") {
+      return { reserved: 0, state: "ready" as const };
+    }
+    if (classification.disposition !== "capacity_missing") {
+      return {
+        disposition: classification.disposition,
+        reserved: 0,
+        state: "reclassified" as const,
+      };
+    }
+    try {
+      await requireHardQuotaAuthority(ctx);
+      const result = await backfillAuthorityReductionCapacityForUser(ctx, args.userId);
+      return { ...result, state: "repaired" as const };
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message === "QUOTA_EXCEEDED") {
+        throw new ConvexError({
+          code: "authority_reduction_hard_quota",
+          schemaVersion: 1,
+        });
+      }
+      throw error;
+    }
   },
+});
+
+type AuthorityReductionHeadroomPage = Readonly<{
+  classified: readonly Readonly<{
+    disposition: AuthorityReductionCapacityDisposition;
+    userId: Id<"users">;
+  }>[];
+  continueCursor: string;
+  isDone: boolean;
+  scanned: number;
+}>;
+
+type AuthorityReductionHeadroomQueryArgs = Readonly<{
+  expectedRuntimeAttestation: RuntimeFence;
+  paginationOpts: Readonly<{ cursor: string | null; numItems: number }>;
+}>;
+
+type AuthorityReductionReservationResult = Readonly<{
+  disposition?: AuthorityReductionCapacityDisposition;
+  reserved: number;
+  state: "absent" | "ready" | "reclassified" | "repaired";
+}>;
+
+type AuthorityReductionReservationArgs = Readonly<{
+  expectedRuntimeAttestation: RuntimeFence;
+  userId: Id<"users">;
+}>;
+
+const classifyAuthorityReductionHeadroomPageReference = makeFunctionReference<
+  "query",
+  AuthorityReductionHeadroomQueryArgs,
+  AuthorityReductionHeadroomPage
+>("commandLifecycle:classifyAuthorityReductionHeadroomPage");
+
+const reserveAuthorityReductionCapacityReference = makeFunctionReference<
+  "mutation",
+  AuthorityReductionReservationArgs,
+  AuthorityReductionReservationResult
+>("commandLifecycle:reserveAuthorityReductionCapacity");
+
+const isExactAuthorityReductionHardQuota = (error: unknown): boolean => {
+  if (!(error instanceof ConvexError)) return false;
+  const data: unknown = error.data;
+  if (typeof data !== "object" || data === null) return false;
+  const value = data as Readonly<Record<string, unknown>>;
+  return Object.keys(value).length === 2
+    && value.code === "authority_reduction_hard_quota"
+    && value.schemaVersion === 1;
+};
+
+type AuthorityReductionHeadroomArgs = Readonly<{
+  expectedRuntimeAttestation: RuntimeFence;
+  mode: "audit" | "repair";
+  paginationOpts: Readonly<{ cursor: string | null; numItems: number }>;
+}>;
+
+type AuthorityReductionHeadroomRunner = Readonly<{
+  runMutation: (
+    reference: typeof reserveAuthorityReductionCapacityReference,
+    args: AuthorityReductionReservationArgs,
+  ) => Promise<AuthorityReductionReservationResult>;
+  runQuery: (
+    reference: typeof classifyAuthorityReductionHeadroomPageReference,
+    args: AuthorityReductionHeadroomQueryArgs,
+  ) => Promise<AuthorityReductionHeadroomPage>;
+}>;
+
+export async function runAuthorityReductionHeadroomPage(
+  ctx: AuthorityReductionHeadroomRunner,
+  args: AuthorityReductionHeadroomArgs,
+) {
+    requireRuntimeFence(args.expectedRuntimeAttestation);
+    if (
+      !isSafePositiveInteger(args.paginationOpts.numItems)
+      || args.paginationOpts.numItems > maximumCommandLifecycleBatch
+    ) return corrupt();
+    const page = await ctx.runQuery(classifyAuthorityReductionHeadroomPageReference, {
+      expectedRuntimeAttestation: args.expectedRuntimeAttestation,
+      paginationOpts: args.paginationOpts,
+    });
+    const counts = {
+      capacityMissing: 0,
+      hardQuotaBlocked: 0,
+      orphanCleanupEligible: 0,
+      orphanCleanupPending: 0,
+      ready: 0,
+      repaired: 0,
+      topologyBlocked: 0,
+    };
+    const countDisposition = (disposition: AuthorityReductionCapacityDisposition): void => {
+      switch (disposition) {
+        case "ready": counts.ready += 1; break;
+        case "capacity_missing": counts.capacityMissing += 1; break;
+        case "orphan_cleanup_pending": counts.orphanCleanupPending += 1; break;
+        case "orphan_cleanup_eligible": counts.orphanCleanupEligible += 1; break;
+        case "topology_blocked": counts.topologyBlocked += 1; break;
+      }
+    };
+    for (const entry of page.classified) {
+      if (args.mode !== "repair" || entry.disposition !== "capacity_missing") {
+        countDisposition(entry.disposition);
+        continue;
+      }
+      try {
+        const result = await ctx.runMutation(reserveAuthorityReductionCapacityReference, {
+          expectedRuntimeAttestation: args.expectedRuntimeAttestation,
+          userId: entry.userId,
+        });
+        if (
+          result.state === "repaired"
+          && isSafePositiveInteger(result.reserved)
+          && result.reserved <= 17
+          && result.disposition === undefined
+        ) {
+          counts.repaired += 1;
+        } else if (
+          (result.state === "absent" || result.state === "ready")
+          && result.reserved === 0
+          && result.disposition === undefined
+        ) {
+          counts.ready += 1;
+        } else if (
+          result.state === "reclassified"
+          && result.reserved === 0
+          && result.disposition !== undefined
+          && result.disposition !== "ready"
+          && result.disposition !== "capacity_missing"
+        ) {
+          countDisposition(result.disposition);
+        } else {
+          return corrupt();
+        }
+      } catch (error: unknown) {
+        if (isExactAuthorityReductionHardQuota(error)) {
+          counts.hardQuotaBlocked += 1;
+          continue;
+        }
+        throw error;
+      }
+    }
+    if (
+      counts.ready
+      + counts.capacityMissing
+      + counts.repaired
+      + counts.hardQuotaBlocked
+      + counts.orphanCleanupPending
+      + counts.orphanCleanupEligible
+      + counts.topologyBlocked
+      !== page.scanned
+    ) return corrupt();
+    return {
+      ...counts,
+      continueCursor: page.continueCursor,
+      isDone: page.isDone,
+      mode: args.mode,
+      scanned: page.scanned,
+      schemaVersion: 1 as const,
+    };
+}
+
+export const auditAuthorityReductionHeadroomPage = internalAction({
+  args: {
+    expectedRuntimeAttestation: runtimeFenceValidator,
+    mode: v.union(v.literal("audit"), v.literal("repair")),
+    paginationOpts: paginationOptsValidator,
+  },
+  handler: async (ctx, args) => await runAuthorityReductionHeadroomPage(ctx, args),
 });
 
 export const auditTerminalReceiptCapacityPage = internalQuery({
