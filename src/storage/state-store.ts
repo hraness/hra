@@ -13,6 +13,7 @@ import { isAbsolute, resolve } from "node:path";
 
 import { Database, constants as sqliteConstants } from "bun:sqlite";
 import { z } from "zod";
+import { snapshotForeignJson } from "../domain/guards";
 import { assertCombined49AdoptionSchema } from "./combined49-adoption-schema";
 import {
   mutationEffectEvidence49Schema as mutationEffectEvidenceSchema,
@@ -475,6 +476,27 @@ const providerAccountListingRowSchema = z.object({
   owner_process_generation: profileRowSchema.shape.process_generation,
 }).strict();
 
+// Private cached identity input, not the narrower V1 account-match admission.
+// Bound SQLite text before materializing it; never truncate an identity.
+const providerUsageIdentityMaxBytes = 3_072;
+const providerUsageSourceRequestSchema = z.object({
+  provider: usageProviderSchema,
+  providerAccountId: usageProviderAccountIdSchema,
+}).strict().refine((value) => value.providerAccountId.startsWith(value.provider === "codex" ? "acct_" : "pact_"));
+const providerUsageSourceRowSchema = z.object({
+  ...providerAccountRowSchema.pick({ id: true, profile_id: true, provider: true,
+    readiness: true, binding_generation: true, process_generation: true,
+    readiness_observed_at: true }).shape,
+  owner_id: profileIdSchema,
+  owner_state: profileStateSchema,
+  owner_process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  provider_identity_absent: z.union([z.literal(0), z.literal(1)]),
+  provider_email: z.instanceof(Uint8Array).refine((value) => value.byteLength <= providerUsageIdentityMaxBytes).nullable(),
+  provider_email_bytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  owner_email: z.instanceof(Uint8Array).refine((value) => value.byteLength <= providerUsageIdentityMaxBytes).nullable(),
+  owner_email_bytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+}).strict();
+
 const sessionProviderAuthorityRowSchema = z.object({
   session_id: sessionIdSchema,
   provider_account_id: providerAccountIdSchema,
@@ -689,6 +711,66 @@ export type ProviderAccountState = Readonly<{
   createdAt: number;
   updatedAt: number;
 }>;
+
+type CachedUsageSourceIdentity =
+  | Readonly<{ state: "cached"; email: string }>
+  | Readonly<{ state: "unavailable"; reason: "identity_unavailable" | "snapshot_conflict" | "representation_limit" }>;
+type CachedUsageSourceBase = Readonly<{
+  state: "cached";
+  providerAccountId: ProviderAccountId;
+  profileId: ProfileId;
+  bindingGeneration: number;
+  processGeneration: number;
+  readiness: Exclude<ProviderAccountReadiness, "removed">;
+  readinessObservedAt: number | null;
+}>;
+
+/** Private cached inputs only, not a full usage snapshot or dispatch authority. */
+export type ProviderUsageSourceMetadata = Readonly<{
+  source:
+    | (CachedUsageSourceBase & Readonly<{ provider: "codex"; identity: CachedUsageSourceIdentity }>)
+    | (CachedUsageSourceBase & Readonly<{ provider: "claude";
+        identity: Readonly<{ state: "unavailable"; reason: "provider_unsupported" }> }>)
+    | Readonly<{ state: "unavailable"; reason: "source_unavailable" | "snapshot_conflict" }>;
+  order:
+    | Readonly<{ state: "cached"; orderRevision: number; pointerRevision: number;
+        accountCount: number; orderPosition: number; active: boolean }>
+    | Readonly<{ state: "unavailable"; reason: "snapshot_conflict" | "representation_limit" }>;
+  automaticPolicy:
+    | Readonly<{ state: "configured"; configuration: Readonly<Omit<AutomaticUsagePolicyConfiguration, "overrides">> &
+        Readonly<{ overrides: Readonly<AutomaticUsagePolicyConfiguration["overrides"]> }> }>
+    | Readonly<{ state: "unavailable"; reason: "configuration_unavailable" }>;
+}>;
+
+const unavailableUsageSourceMetadata: ProviderUsageSourceMetadata = Object.freeze({
+  source: Object.freeze({ state: "unavailable", reason: "snapshot_conflict" }),
+  order: Object.freeze({ state: "unavailable", reason: "snapshot_conflict" }),
+  automaticPolicy: Object.freeze({ state: "unavailable", reason: "configuration_unavailable" }),
+});
+
+const cachedUsageSourceIdentity = (row: z.infer<typeof providerUsageSourceRowSchema>): CachedUsageSourceIdentity => {
+  const decode = (value: Uint8Array | null): string | null => {
+    try { return value === null ? null : new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(value); }
+    catch { return null; }
+  };
+  const email = decode(row.provider_email);
+  const ownerEmail = decode(row.owner_email);
+  if ((row.provider_email_bytes !== null && row.provider_email_bytes > providerUsageIdentityMaxBytes)
+    || (row.owner_email_bytes !== null && row.owner_email_bytes > providerUsageIdentityMaxBytes)
+    || (email !== null && email.length > 1_024) || (ownerEmail !== null && ownerEmail.length > 1_024)) {
+    return Object.freeze({ state: "unavailable", reason: "representation_limit" });
+  }
+  const sameBytes = row.provider_email === null || row.owner_email === null
+    ? row.provider_email === row.owner_email
+    : Buffer.compare(row.provider_email, row.owner_email) === 0;
+  if (!sameBytes) return Object.freeze({ state: "unavailable", reason: "snapshot_conflict" });
+  if (email === null || email.trim().length === 0 || /[\p{Cc}\p{Cs}]/u.test(email)) {
+    return Object.freeze({ state: "unavailable", reason: "identity_unavailable" });
+  }
+  // Preserve the raw preimage. Reset and account-match derivations normalize
+  // differently; neither belongs in this read, and neither proves live auth.
+  return Object.freeze({ state: "cached", email });
+};
 
 export type SessionProviderAuthority = ProviderAccountAuthority & Readonly<{
   sessionId: SessionId;
@@ -16395,6 +16477,105 @@ export class StateStore {
     } catch (error: unknown) {
       if (error instanceof ProviderAccountListingError) throw error;
       throw new ProviderAccountListingError("PROVIDER_ACCOUNT_LIST_INVALID");
+    }
+  }
+
+  /**
+   * Capture only source/order/configuration metadata in one read snapshot.
+   * Quota, reset recovery and evaluations must later join inside the same
+   * enclosing transaction; composing separately returned reads is not enough.
+   * This method performs no refresh, repair, derivation or publication.
+   */
+  readProviderUsageSourceMetadata(input: unknown): ProviderUsageSourceMetadata {
+    try {
+      const snapshot = snapshotForeignJson(input);
+      if (!snapshot.ok) return unavailableUsageSourceMetadata;
+      const request = providerUsageSourceRequestSchema.parse(snapshot.value);
+      return this.#database.transaction((): ProviderUsageSourceMetadata => {
+        let source = unavailableUsageSourceMetadata.source;
+        let order = unavailableUsageSourceMetadata.order;
+        let automaticPolicy = unavailableUsageSourceMetadata.automaticPolicy;
+        try {
+          const raw = this.#database.query(
+            `SELECT a.id,a.profile_id,a.provider,a.readiness,a.binding_generation,
+                    a.process_generation,a.readiness_observed_at,
+                    p.id AS owner_id,p.state AS owner_state,
+                    CASE WHEN a.provider='codex' THEN p.process_generation ELSE 0 END AS owner_process_generation,
+                    a.provider_email IS NULL AND a.provider_plan IS NULL AS provider_identity_absent,
+                    CASE WHEN a.provider='codex' AND length(CAST(a.provider_email AS BLOB))<=${providerUsageIdentityMaxBytes}
+                         THEN CAST(a.provider_email AS BLOB) ELSE NULL END AS provider_email,
+                    CASE WHEN a.provider='codex' THEN length(CAST(a.provider_email AS BLOB)) ELSE NULL END AS provider_email_bytes,
+                    CASE WHEN a.provider='codex' AND length(CAST(p.provider_email AS BLOB))<=${providerUsageIdentityMaxBytes}
+                         THEN CAST(p.provider_email AS BLOB) ELSE NULL END AS owner_email,
+                    CASE WHEN a.provider='codex' THEN length(CAST(p.provider_email AS BLOB)) ELSE NULL END AS owner_email_bytes
+             FROM provider_accounts a LEFT JOIN profiles p ON p.id=a.profile_id WHERE a.id=?`,
+          ).get(request.providerAccountId);
+          if (raw === null) {
+            source = Object.freeze({ state: "unavailable", reason: "source_unavailable" });
+          } else {
+            const row = providerUsageSourceRowSchema.parse(raw);
+            if (row.id !== request.providerAccountId || row.provider !== request.provider
+              || row.owner_id !== row.profile_id || (row.provider === "codex" && row.id !== row.profile_id)) {
+              throw new Error("PROVIDER_USAGE_SOURCE_INVALID");
+            }
+            const inverse = this.#database.query(
+              "SELECT id FROM provider_accounts WHERE profile_id=? AND provider=? ORDER BY id LIMIT 2",
+            ).all(row.profile_id, row.provider);
+            const inverseIds = z.array(z.object({ id: usageProviderAccountIdSchema }).strict()).length(1).parse(inverse);
+            if (inverseIds[0]?.id !== row.id) throw new Error("PROVIDER_USAGE_SOURCE_INVALID");
+            if (row.readiness === "removed" || row.owner_state === "removed") {
+              source = Object.freeze({ state: "unavailable", reason: "source_unavailable" });
+            } else {
+              if ((row.provider === "codex" && (row.readiness !== row.owner_state
+                || row.process_generation !== row.owner_process_generation))
+                || (row.provider === "claude" && row.provider_identity_absent !== 1)) {
+                throw new Error("PROVIDER_USAGE_SOURCE_INVALID");
+              }
+              const base: CachedUsageSourceBase = {
+                state: "cached", providerAccountId: row.id, profileId: row.profile_id,
+                bindingGeneration: row.binding_generation, processGeneration: row.process_generation,
+                readiness: row.readiness, readinessObservedAt: row.readiness_observed_at,
+              };
+              source = row.provider === "codex"
+                ? Object.freeze({ ...base, provider: "codex", identity: cachedUsageSourceIdentity(row) })
+                : Object.freeze({ ...base, provider: "claude",
+                    identity: Object.freeze({ state: "unavailable", reason: "provider_unsupported" }) });
+            }
+          }
+        } catch {
+          // Source attribution failure is not evidence that policy or retained
+          // reset recovery is absent. Do not manufacture identity from order.
+          source = unavailableUsageSourceMetadata.source;
+        }
+        if (source.state === "cached") {
+          const selectedSource = source;
+          try {
+            const listing = this.readProviderAccountListing(request.provider);
+            const member = listing.accounts.find((account) => account.id === selectedSource.providerAccountId);
+            if (member === undefined || member.profileId !== selectedSource.profileId
+              || member.readiness !== selectedSource.readiness || member.readinessObservedAt !== selectedSource.readinessObservedAt) {
+              throw new Error("PROVIDER_USAGE_SOURCE_ORDER_INVALID");
+            }
+            order = Object.freeze({ state: "cached", orderRevision: listing.orderRevision,
+              pointerRevision: listing.pointerRevision, accountCount: listing.accounts.length,
+              orderPosition: member.orderPosition, active: member.active });
+          } catch (error: unknown) {
+            order = Object.freeze({ state: "unavailable", reason: error instanceof ProviderAccountListingError
+              && error.code === "PROVIDER_ACCOUNT_LIST_LIMIT" ? "representation_limit" : "snapshot_conflict" });
+          }
+        }
+        try {
+          const configuration = this.readAutomaticUsagePolicyConfiguration();
+          automaticPolicy = Object.freeze({ state: "configured", configuration: Object.freeze({
+            ...configuration, overrides: Object.freeze({ ...configuration.overrides }),
+          }) });
+        } catch {
+          automaticPolicy = unavailableUsageSourceMetadata.automaticPolicy;
+        }
+        return Object.freeze({ source, order, automaticPolicy });
+      })();
+    } catch {
+      return unavailableUsageSourceMetadata;
     }
   }
 
