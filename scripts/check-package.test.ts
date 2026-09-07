@@ -336,28 +336,33 @@ describe("installed package generic command ownership", () => {
     if (process.platform !== "darwin") return;
     const root = await realpath(await mkdtemp(join(tmpdir(), "hra-package-cache-acl-")));
     const cache = join(root, "cache");
-    const runChmod = async (...arguments_: string[]): Promise<void> => {
-      const child = Bun.spawn(["/bin/chmod", ...arguments_], {
+    const runChmod = (...arguments_: string[]): void => {
+      // Keep this short fixture mutation fully synchronous. A retained async
+      // Bun subprocess can stall later synchronous native identity discovery.
+      const child = Bun.spawnSync(["/bin/chmod", ...arguments_], {
         killSignal: "SIGKILL",
+        maxBuffer: 4_096,
         stderr: "pipe",
         stdin: "ignore",
-        // No stdout is consumed here, so do not retain an unread stream.
         stdout: "ignore",
         timeout: historyFixtureChildTimeoutMs,
       });
-      const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-      expect(child.stdout).toBeUndefined();
-      if (exitCode !== 0) throw new Error(`ACL fixture chmod failed: ${stderr}`);
+      if (child.exitCode !== 0 || !child.success
+        || child.exitedDueToTimeout === true || child.exitedDueToMaxBuffer === true
+        || child.stderr.byteLength !== 0) throw new Error("ACL fixture chmod failed or exceeded its bound.");
     };
     try {
       await mkdir(cache, { mode: 0o700 });
-      await runChmod("+a", "everyone allow delete", cache);
+      runChmod("+a", "everyone allow delete", cache);
       await expect(withPackageDependencyCacheCustody(cache, async () => undefined)).rejects.toThrow(
         "dangerous non-owner Darwin ALLOW ACL",
       );
     } finally {
-      await runChmod("-N", cache).catch(() => undefined);
-      await rm(root, { force: true, recursive: true });
+      try {
+        runChmod("-N", cache);
+      } finally {
+        await rm(root, { force: true, recursive: true });
+      }
     }
   });
 
