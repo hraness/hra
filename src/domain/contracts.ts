@@ -297,7 +297,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   // The parser emits an unbound stop request. The CLI must bind it to the
   // observed daemon authority before it crosses the local transport boundary.
   z.object({ kind: z.literal("daemon.stop"), expected: daemonStopAuthoritySchema.optional() }).strict(),
-  z.object({ kind: z.literal("account.list") }).strict(),
+  z.object({ kind: z.literal("account.list"), provider: usageProviderSchema.optional() }).strict(),
   z.object({ kind: z.literal("account.add"), label: labelSchema }).strict(),
   z.object({ kind: z.literal("account.show"), account: selectorSchema, provider: providerSchema.optional() }).strict(),
   z.object({ kind: z.literal("account.login"), account: selectorSchema, deviceCode: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),

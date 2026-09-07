@@ -1,6 +1,21 @@
-# Automatic usage settings
+# Provider accounts and automatic usage settings
 
 In current source, `hra usage auto` reads or changes this machine's automatic usage policy. A policy change does not call a provider, move an account or session, or enable an unavailable runtime capability.
+
+## List cached provider accounts
+
+Read the stored account order, default marker and readiness for one provider:
+
+```sh
+hra account list --provider codex
+hra account list --provider claude --json
+```
+
+The provider-qualified result is versioned separately from the unchanged `hra account list` profile listing. It includes the order and pointer revisions, provider account IDs, profile IDs and labels, and each account's last stored readiness observation. An unknown observation time stays unknown. Readiness is cached local evidence, not current sign-in proof or quota freshness. The default marker does not authorize dispatch or change an existing session's account.
+
+Listing does not request a provider refresh or change account selection. It verifies at most 10,000 live profiles and returns at most 10,000 accounts, with a separate 3 MiB canonical JSON result limit. It refuses oversized or inconsistent snapshots instead of truncating them. Order/activation commands and provider refresh are not part of this listing.
+
+## Read automatic usage policy
 
 Read the current configuration and its revision:
 

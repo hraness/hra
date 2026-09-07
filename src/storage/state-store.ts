@@ -131,6 +131,12 @@ import {
   type SessionRoutingProvenance,
 } from "../domain/provider-accounts";
 import {
+  PROVIDER_ACCOUNT_LIST_MAX_BYTES,
+  PROVIDER_ACCOUNT_LIST_MAX_COUNT,
+  providerAccountListResultSchema,
+  type ProviderAccountListResult,
+} from "../domain/provider-account-list";
+import {
   effectiveDevinRuntimeProfileSchema,
   isCodexRuntimeProfile,
   isDevinRuntimeProfile,
@@ -174,6 +180,7 @@ import {
   type ProviderUsageComponent,
   type ProviderUsageComponentKind,
   type ProviderUsageObservationV2,
+  type UsageProvider,
 } from "../domain/provider-usage";
 import {
   automaticUsagePolicyConfigurationSchema,
@@ -449,6 +456,23 @@ const providerAccountStateRowSchema = z.object({
   pointer_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   created_at: unixMillisecondsSchema,
   updated_at: unixMillisecondsSchema,
+}).strict();
+
+const providerAccountListingProfileRowSchema = z.object({
+  id: profileIdSchema,
+  label: z.string(),
+  label_key: z.string(),
+  binding_id: providerAccountIdSchema,
+}).strict();
+
+const providerAccountListingRowSchema = z.object({
+  ...providerAccountRowSchema.pick({ id: true, profile_id: true, readiness: true,
+    readiness_observed_at: true, order_position: true, process_generation: true }).shape,
+  owner_id: profileIdSchema,
+  label: z.string(),
+  label_key: z.string(),
+  owner_state: profileStateSchema.exclude(["removed"]),
+  owner_process_generation: profileRowSchema.shape.process_generation,
 }).strict();
 
 const sessionProviderAuthorityRowSchema = z.object({
@@ -15874,6 +15898,13 @@ export class ProviderUsageTurnNotBoundError extends Error {
   }
 }
 
+export class ProviderAccountListingError extends Error {
+  constructor(readonly code: "PROVIDER_ACCOUNT_LIST_INVALID" | "PROVIDER_ACCOUNT_LIST_LIMIT") {
+    super(code);
+    this.name = "ProviderAccountListingError";
+  }
+}
+
 export class AutomaticRateLimitResetPolicyDisabledError extends Error {
   constructor() {
     super("ACCOUNT_RATE_LIMIT_RESET_AUTOMATIC_POLICY_DISABLED");
@@ -16293,6 +16324,67 @@ export class StateStore {
         "SELECT * FROM provider_account_states WHERE provider=?",
       ).get(providerSchema.parse(provider)));
     })();
+  }
+
+  readProviderAccountListing(provider: UsageProvider): ProviderAccountListResult {
+    try {
+      const parsedProvider = usageProviderSchema.parse(provider);
+      return this.#database.transaction(() => {
+        // Keep the Codex automatic-pointer head proof and all following joins
+        // in one snapshot. This read never repairs a missing binding or order.
+        const state = this.readProviderAccountState(parsedProvider);
+        const rows = this.#database.query(
+          `SELECT a.id,a.profile_id,a.readiness,a.readiness_observed_at,a.order_position,
+                  a.process_generation,p.id AS owner_id,p.label,p.label_key,
+                  p.state AS owner_state,p.process_generation AS owner_process_generation
+           FROM provider_accounts a LEFT JOIN profiles p ON p.id=a.profile_id
+           WHERE a.provider=? AND a.readiness!='removed'
+           ORDER BY a.order_position,a.id LIMIT ?`,
+        ).all(parsedProvider, PROVIDER_ACCOUNT_LIST_MAX_COUNT + 1);
+        // A removed provider binding is intentional exclusion, not a missing
+        // binding. Bound verification of the inverse join independently too.
+        const profiles = this.#database.query(
+          `SELECT p.id,p.label,p.label_key,a.id AS binding_id
+           FROM (SELECT id,label,label_key FROM profiles WHERE state!='removed'
+                 ORDER BY id LIMIT ?) p
+           LEFT JOIN provider_accounts a ON a.profile_id=p.id AND a.provider=?`,
+        ).all(PROVIDER_ACCOUNT_LIST_MAX_COUNT + 1, parsedProvider);
+        if (rows.length > PROVIDER_ACCOUNT_LIST_MAX_COUNT || profiles.length > PROVIDER_ACCOUNT_LIST_MAX_COUNT) {
+          throw new ProviderAccountListingError("PROVIDER_ACCOUNT_LIST_LIMIT");
+        }
+        const labelKeys = new Set<string>();
+        for (const raw of profiles) {
+          const profile = providerAccountListingProfileRowSchema.parse(raw);
+          const label = canonicalLabelIdentity(profile.label, "ACCOUNT");
+          if (label.key !== profile.label_key || labelKeys.has(label.key)) {
+            throw new ProviderAccountListingError("PROVIDER_ACCOUNT_LIST_INVALID");
+          }
+          labelKeys.add(label.key);
+        }
+        const accounts = rows.map((raw) => {
+          const account = providerAccountListingRowSchema.parse(raw);
+          if (account.owner_id !== account.profile_id
+            || canonicalLabelIdentity(account.label, "ACCOUNT").key !== account.label_key
+            || (parsedProvider === "codex" && (account.process_generation !== account.owner_process_generation
+              || account.readiness !== account.owner_state))) {
+            throw new ProviderAccountListingError("PROVIDER_ACCOUNT_LIST_INVALID");
+          }
+          return { id: account.id, profileId: account.profile_id, label: account.label,
+            readiness: account.readiness, readinessObservedAt: account.readiness_observed_at,
+            orderPosition: account.order_position, active: account.id === state.activeProviderAccountId };
+        });
+        const result = { version: 1 as const, provider: parsedProvider,
+          orderRevision: state.orderRevision, pointerRevision: state.pointerRevision,
+          activeProviderAccountId: state.activeProviderAccountId, accounts };
+        if (utf8Bytes(JSON.stringify(result)) > PROVIDER_ACCOUNT_LIST_MAX_BYTES) {
+          throw new ProviderAccountListingError("PROVIDER_ACCOUNT_LIST_LIMIT");
+        }
+        return providerAccountListResultSchema.parse(result);
+      })();
+    } catch (error: unknown) {
+      if (error instanceof ProviderAccountListingError) throw error;
+      throw new ProviderAccountListingError("PROVIDER_ACCOUNT_LIST_INVALID");
+    }
   }
 
   requireProviderAccountAuthority(

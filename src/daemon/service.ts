@@ -82,10 +82,12 @@ import {
   type ProviderAccountAuthority,
   type ProviderAccountReadiness,
 } from "../domain/provider-accounts";
+import { providerAccountListResultSchema, type ProviderAccountListResult } from "../domain/provider-account-list";
 import {
   createClaudeAccountingUsageComponent,
   createClaudeQuotaUsageComponent,
   type ProviderUsageComponent,
+  type UsageProvider,
 } from "../domain/provider-usage";
 import {
   projectPublicReviewedRuntimeProfile,
@@ -177,6 +179,7 @@ import { AttachmentCustodyError, type AttachmentDaemon, type AttachmentIngressIn
 import { WorkCapabilityCodec } from "../storage/work-capability";
 import {
   AutomaticRateLimitResetPolicyDisabledError,
+  ProviderAccountListingError,
   ProviderUsageTurnNotBoundError,
   SelectionError,
   SessionSwitchStoreError,
@@ -1985,7 +1988,10 @@ export class HraService {
           "INVALID_INPUT",
           "Daemon stop commands must be admitted by the exact local authority boundary.",
         );
-        case "account.list": return { accounts: this.#store.listProfiles().map((profile) => this.#publicProfile(profile)) };
+        case "account.list": {
+          if (command.provider !== undefined) return this.#providerAccountListing(command.provider);
+          return { accounts: this.#store.listProfiles().map((profile) => this.#publicProfile(profile)) };
+        }
         case "account.add": return await this.#addAccount(command.label);
         case "account.show": {
           const profile = this.#store.requireProfile(command.account);
@@ -10392,6 +10398,19 @@ export class HraService {
       throw new CommandFailure("RECOVERY_REQUIRED", "Codex logged out, but its local account state could not be committed. Run `hra account show` to reconcile it.");
     }
     return { account: this.#publicProfile(this.#store.requireProfile(profile.id)), idempotencyKey: key };
+  }
+
+  #providerAccountListing(provider: UsageProvider): ProviderAccountListResult {
+    try {
+      const result = providerAccountListResultSchema.parse(this.#store.readProviderAccountListing(provider));
+      if (result.provider !== provider) throw new ProviderAccountListingError("PROVIDER_ACCOUNT_LIST_INVALID");
+      return result;
+    } catch (error: unknown) {
+      if (error instanceof ProviderAccountListingError && error.code === "PROVIDER_ACCOUNT_LIST_LIMIT") {
+        throw new CommandFailure("UNAVAILABLE", "Cached provider accounts exceed the bounded listing capacity. No account state was changed.");
+      }
+      throw new CommandFailure("RECOVERY_REQUIRED", "Cached provider accounts could not be verified. No account state was changed.");
+    }
   }
 
   #automaticUsagePolicyCommand(

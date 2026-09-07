@@ -46,6 +46,7 @@ import {
 } from "../domain/usage-metrics";
 import { sessionStateReportSchema } from "../domain/session-state";
 import { automaticUsagePolicyCommandResultSchema } from "../domain/usage-policy-command";
+import { providerAccountListResultSchema } from "../domain/provider-account-list";
 import { profileIdSchema, projectIdSchema, sessionIdSchema } from "../domain/values";
 import { publicProviderIdentifierSchema } from "../public-provider-identifier";
 import {
@@ -1374,6 +1375,11 @@ const assertCommandSuccessData = (command: LocalCommand, data: unknown): void =>
 };
 
 const publicInteractionData = (command: LocalCommand, data: unknown): unknown => {
+  if (command.kind === "account.list" && command.provider !== undefined) {
+    const parsed = providerAccountListResultSchema.safeParse(data);
+    if (!parsed.success || parsed.data.provider !== command.provider) return invalidCommandResponse(command);
+    return parsed.data;
+  }
   if (command.kind === "usage.auto.status" || command.kind === "usage.auto.set") {
     const parsed = automaticUsagePolicyCommandResultSchema.safeParse(data);
     if (!parsed.success) return invalidCommandResponse(command);
@@ -2805,6 +2811,24 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     } else {
       output.writeStdout("Login state is unavailable.\n");
     }
+  } else if (command.kind === "account.list" && command.provider !== undefined) {
+    const result = providerAccountListResultSchema.parse(publicData);
+    const rows = result.accounts.map((account) => ({
+      order: account.orderPosition,
+      label: account.label,
+      cachedReadiness: account.readiness,
+      observedAt: account.readinessObservedAt === null ? "unknown" : instant(account.readinessObservedAt),
+      active: account.active ? "yes" : "no",
+      id: account.id,
+      profileId: account.profileId,
+    }));
+    output.writeStdout(`${[
+      `Provider accounts: ${result.provider} (cached).`,
+      "Readiness is last observed state, not current usage or quota. No provider refresh was requested.",
+      `Order revision: ${String(result.orderRevision)}. Pointer revision: ${String(result.pointerRevision)}.`,
+      `Active provider account: ${result.activeProviderAccountId ?? "none"}.`,
+      table(rows, ["order", "label", "cachedReadiness", "observedAt", "active", "id", "profileId"]),
+    ].join("\n")}\n`);
   } else if (command.kind === "account.list" && Array.isArray(value.accounts)) {
     output.writeStdout(`${table(value.accounts as Record<string, unknown>[], ["label", "state", "providerPlan", "id"])}\n`);
   } else if (command.kind === "account.add") {

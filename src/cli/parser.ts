@@ -236,6 +236,7 @@ Usage:
   hra doctor [--offline] [--json]
   hra daemon start|status|stop|run
   hra account add|list|show|login|login-cancel|logout|usage|usage-history|switch|switch-recover
+  hra account list --provider codex|claude
   hra usage auto status|on|off|inherit
   hra plugin list <account> [--project <project>] [--refresh]
   hra plugin show <account> <plugin> [--project <project>] [--refresh]
@@ -352,12 +353,18 @@ Usage:
   hra account login-cancel <profile> --provider claude --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
   hra account login-cancel <profile> --provider devin --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
   hra account logout <profile>
-  hra account list
+  hra account list [--provider <codex|claude>] [--json]
   hra account show <profile> [--provider <codex|claude|devin>]
   hra account usage [profile] [--refresh]
   hra account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]
   hra account switch <profile>
   hra account switch-recover
+
+Provider listing:
+  --provider lists cached readiness, ordering, and the active pointer for Codex
+  or Claude. Readiness is last observed state, not current usage or quota.
+  This read does not refresh providers, sign in, or change the active account.
+  Without --provider, account list keeps the existing profile listing.
 
 Platform:
   Codex and Devin account commands run on macOS and Linux. Claude login and status
@@ -368,6 +375,8 @@ Examples:
   hra account login personal --device-code --handoff-file /private/path/login.json
   hra account login personal --provider claude
   hra account login personal --provider devin --manual-token-flow
+  hra account list --provider codex
+  hra account list --provider claude --json
   hra account show personal --provider claude
   hra account login-cancel personal
   hra account usage personal --refresh
@@ -1106,7 +1115,13 @@ const parseAccount = (
 ): LocalCommand | AccountLoginCliInvocation | ClaudeAccountAuthCliInvocation | DevinAccountAuthCliInvocation => {
   const action = take(cursor, "account action");
   switch (action) {
-    case "list": finish(cursor); return { kind: "account.list" };
+    case "list": {
+      const provider = option(cursor, "--provider");
+      finish(cursor);
+      if (provider === undefined) return { kind: "account.list" };
+      if (cursor.literalDelimiter) throw new CliUsageError("Provider account listing does not accept literal arguments.");
+      return command({ kind: "account.list", provider });
+    }
     case "add": { const label = remainder(cursor, "account label"); return command({ kind: "account.add", label }); }
     case "show": {
       const provider = selectedProvider(option(cursor, "--provider") ?? "codex");
