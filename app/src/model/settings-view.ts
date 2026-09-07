@@ -57,15 +57,17 @@ export type MachineOnlineInput = Readonly<{
 /**
  * A machine is online when the hosted presence table still holds its device
  * connection, and otherwise when its registry heartbeat is recent enough that
- * presence has simply not caught up. A revoked or missing device row is always
- * offline, whatever the last published heartbeat said.
+ * presence has simply not caught up. A future heartbeat does not establish
+ * freshness. A revoked or missing device row is always offline, whatever the
+ * last published heartbeat said.
  */
 export function isMachineOnline(input: MachineOnlineInput): boolean {
   const { device, heartbeatAt, now } = input;
   if (device === null || device.status !== "active") return false;
   if (device.online) return true;
   if (!Number.isFinite(heartbeatAt) || heartbeatAt <= 0 || !Number.isFinite(now)) return false;
-  return now - heartbeatAt <= registryHeartbeatToleranceMs;
+  const age = now - heartbeatAt;
+  return age >= 0 && age <= registryHeartbeatToleranceMs;
 }
 
 export type ScheduledTaskKindLabel = "HRA";

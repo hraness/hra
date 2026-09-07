@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import fc from "fast-check";
 
 import { parseDeviceRegistryPayload, type DeviceRegistryPayload } from "../hra/cloud";
 import {
@@ -110,9 +111,63 @@ describe("isMachineOnline", () => {
       now,
     })).toBe(false);
   });
+
+  test("does not use a future heartbeat as evidence that a machine is online", () => {
+    for (const heartbeatAt of [now + 1, now + 10 * registryHeartbeatToleranceMs, Number.MAX_SAFE_INTEGER]) {
+      expect(isMachineOnline({ device: { online: false, status: "active" }, heartbeatAt, now })).toBe(false);
+    }
+  });
+
+  test("includes both boundaries of the recent heartbeat interval", () => {
+    for (const age of [0, registryHeartbeatToleranceMs]) {
+      expect(isMachineOnline({ device: { online: false, status: "active" }, heartbeatAt: now - age, now })).toBe(true);
+    }
+  });
+
+  test("requires finite clock inputs only when relying on the heartbeat fallback", () => {
+    for (const heartbeatAt of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -1, now + 1]) {
+      expect(isMachineOnline({ device: { online: false, status: "active" }, heartbeatAt, now })).toBe(false);
+      expect(isMachineOnline({ device: { online: true, status: "active" }, heartbeatAt, now })).toBe(true);
+    }
+    for (const invalidNow of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(isMachineOnline({ device: { online: false, status: "active" }, heartbeatAt: now, now: invalidNow })).toBe(false);
+      expect(isMachineOnline({ device: { online: true, status: "active" }, heartbeatAt: now, now: invalidNow })).toBe(true);
+    }
+  });
+
+  test("bounds fallback freshness in both time directions without changing presence or device status", () => {
+    fc.assert(fc.property(
+      fc.integer({ min: 1_000_000, max: 2_000_000_000_000 }),
+      fc.integer({ min: -2 * registryHeartbeatToleranceMs, max: 2 * registryHeartbeatToleranceMs }),
+      (clock, offset) => {
+        const heartbeatAt = clock + offset;
+        const expected = heartbeatAt >= clock - registryHeartbeatToleranceMs && heartbeatAt <= clock;
+        expect(isMachineOnline({ device: { online: false, status: "active" }, heartbeatAt, now: clock })).toBe(expected);
+        expect(isMachineOnline({ device: { online: true, status: "active" }, heartbeatAt, now: clock })).toBe(true);
+        for (const status of ["pending", "revoked"] as const) {
+          expect(isMachineOnline({ device: { online: true, status }, heartbeatAt, now: clock })).toBe(false);
+        }
+        expect(isMachineOnline({ device: null, heartbeatAt, now: clock })).toBe(false);
+      },
+    ), { seed: 68103, numRuns: 200 });
+  });
 });
 
 describe("toMachineView", () => {
+  test("preserves a future registry heartbeat without presenting it as live presence", () => {
+    const heartbeatAt = now + minute;
+    const view = toMachineView({
+      device: { online: false, status: "active" },
+      devicePublicId: "dev_one",
+      now,
+      payload: registry({ heartbeatAt }),
+      revision: 7,
+      updatedAt: now,
+    });
+    expect(view.heartbeatAt).toBe(heartbeatAt);
+    expect(view.online).toBe(false);
+  });
+
   test("decodes a registry into the row the machine card renders", () => {
     const notificationHours = {
       endMinute: 1_320,
