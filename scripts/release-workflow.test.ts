@@ -449,7 +449,7 @@ describe("release workflow", () => {
     expect(thirdPartyNotices).toContain("The `v0.6.2` candidate records its build graph");
     expect(thirdPartyNotices).toContain("This candidate is not yet admitted");
     expect(thirdPartyNotices).toContain("must bind an immutable source tag");
-    expect(thirdPartyNotices).toContain("`@hraness/site-footer` v0.6.0");
+    expect(thirdPartyNotices).toContain("`@hraness/site-footer` v0.6.1");
     expect(thirdPartyNotices).toContain("`@hraness/design-kit` v0.4.0");
     expect(thirdPartyNotices).not.toContain("`@hraness/design-kit` v0.3.0");
     expect(thirdPartyNotices).not.toContain("SPDX");
