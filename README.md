@@ -2,7 +2,7 @@
 [![npm version](https://img.shields.io/npm/v/%40hraness%2Fhra)](https://www.npmjs.com/package/@hraness/hra) [![provenance: sigstore](https://img.shields.io/badge/provenance-sigstore-2e7d32)](https://www.npmjs.com/package/@hraness/hra#provenance) [![CI](https://img.shields.io/github/actions/workflow/status/hraness/hra/ci.yml?branch=main&label=CI)](https://github.com/hraness/hra/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/npm/l/%40hraness%2Fhra)](https://github.com/hraness/hra/blob/main/LICENSE) [![Bun 1.3.14](https://img.shields.io/badge/Bun-1.3.14-14151a)](https://bun.sh) [![runtime: Codex 0.153.2](https://img.shields.io/badge/runtime-Codex%200.153.2-0b5fa5)](https://www.npmjs.com/package/@openai/codex/v/0.153.2) [![runtime: Claude Code 2.1.260](https://img.shields.io/badge/runtime-Claude%20Code%202.1.260-6f42c1)](https://github.com/hraness/hra/blob/main/docs/providers/claude.md)\
 HRA runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.
 
-Status: public beta. The local CLI v0.6.1 is release-ready: Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an open beta.
+Status: public beta. Local CLI v0.6.1 artifacts are live: Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an open beta. Current daemon and hosted command-writer rollout remains blocked on capacity.
 
 ```sh
 test "$(unset BUN_OPTIONS NODE_OPTIONS LD_AUDIT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PRELOAD DYLD_FALLBACK_FRAMEWORK_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_FRAMEWORK_PATH DYLD_IMAGE_SUFFIX DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_ROOT_PATH DYLD_VERSIONED_FRAMEWORK_PATH DYLD_VERSIONED_LIBRARY_PATH && curl -fsSL --connect-timeout 10 --max-time 60 --max-filesize 524288 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.1/src/install-preflight-runtime.ts | command bun --no-env-file --config=/dev/null -e 'const n=["BUN_OPTIONS","NODE_OPTIONS","LD_AUDIT","LD_LIBRARY_PATH","LD_ORIGIN_PATH","LD_PRELOAD","DYLD_FALLBACK_FRAMEWORK_PATH","DYLD_FALLBACK_LIBRARY_PATH","DYLD_FRAMEWORK_PATH","DYLD_IMAGE_SUFFIX","DYLD_INSERT_LIBRARIES","DYLD_LIBRARY_PATH","DYLD_ROOT_PATH","DYLD_VERSIONED_FRAMEWORK_PATH","DYLD_VERSIONED_LIBRARY_PATH"],x=process.execArgv;const c=x.filter(v=>v==="-c"||v.startsWith("--config"));if(n.some(k=>process.env[k]!==undefined)||x.filter(v=>v==="--no-env-file").length!==1||c.length!==1||c[0]!=="--config=/dev/null"||x.some(v=>v.startsWith("-r")||v==="--preload"||v.startsWith("--preload=")||v==="--require"||v.startsWith("--require=")||v==="--import"||v.startsWith("--import=")||v==="--env-file"||v.startsWith("--env-file=")))throw new Error("The tagged HRA preflight requires a neutral Bun stage zero.");const[a,h]=process.argv.slice(1);const r=Bun.stdin.stream().getReader(),q=[];let z=0;try{for(;;){const o=await r.read();if(o.done)break;z+=o.value.byteLength;if(z>524288)throw new Error("The tagged HRA preflight exceeds its byte limit.");q.push(o.value)}}finally{r.releaseLock()}const b=new Uint8Array(z);let p=0;for(const v of q){b.set(v,p);p+=v.byteLength}const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.1/hraness-hra-0.6.1.tgz edb018df5667f0f0936d189c7f173cf8b105ae3f329104438e384edc33c4bd84)" = hra-install-safe
@@ -12,6 +12,10 @@ test "$(unset BUN_OPTIONS NODE_OPTIONS LD_AUDIT LD_LIBRARY_PATH LD_ORIGIN_PATH L
 hra doctor --offline
 ```
 
+> Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the v0.6.1 daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.
+
+After the rollout prerequisite is satisfied, initialize:
+
 ```sh
 hra init --yes
 ```
@@ -20,7 +24,7 @@ hra init --yes
 
 HRA keeps sessions alive behind a local daemon, isolates each account, and lets you or your agent direct any of them from a shell or JSON. Sync between machines is optional and encrypted.
 
-Codex on macOS and Linux · Claude Code on Linux · local v0.6.1 release-ready · hosted sync live (open beta)
+Local v0.6.1 artifacts live · current daemon and hosted command-writer rollout blocked on capacity · Codex on macOS and Linux · Claude Code on Linux · hosted sync live (open beta)
 
 ### One request, one account, one session.
 
@@ -29,7 +33,9 @@ Codex on macOS and Linux · Claude Code on Linux · local v0.6.1 release-ready �
 3. **Switch:** `hra session switch <session-id> --provider claude --preset fable-max`. Move the next turns to your signed-in Claude Code profile. The bounded retained HRA conversation record remains available, with any retention gap stated explicitly.
 4. **Direct:** `hra session send <session-id> -- "Review this project."`. Send the next request to that session and provider.
 
-> **Immutable local CLI release candidate; hosted sync live as an open beta.** The exact install command below works once GitHub exposes the immutable `v0.6.1` GitHub Release and its verified archive. The website and optional hosted sync are live; the candidate becomes public only after exact admission.
+> **Immutable local CLI artifacts live; hosted sync live as an open beta.** The immutable `v0.6.1` artifacts passed immutable GitHub and npm release admission and are available through the exact install command below. The website and optional hosted sync are live. Artifact admission does not authorize daemon startup or hosted command writers.
+
+> **Current daemon rollout blocked.** Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the v0.6.1 daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.
 
 HRA is one Bun CLI plus a local daemon. It isolates Codex and Claude Code profiles, gives both providers one compact session interface, and optionally syncs encrypted provider-neutral projections and commands across your enrolled machines.
 
@@ -120,6 +126,8 @@ An agent must resolve the canonical exact state-directory path, present that pat
 
 ## First account
 
+> **Conditional walkthrough.** Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the v0.6.1 daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.
+
 ```text
 hra account add personal
 hra account login personal --provider codex --device-code
@@ -151,7 +159,9 @@ HRA cloud identity is separate from every Codex or Claude Code account. Use the 
 
 ## First session
 
-Complete initialization and the first provider login before this walkthrough. Account login remains a dedicated one-shot command, and the session-start command returns the new session ID.
+> **Conditional walkthrough.** Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the v0.6.1 daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.
+
+Only after the rollout prerequisite is satisfied, complete initialization and the first provider login before this walkthrough. Account login remains a dedicated one-shot command, and the session-start command returns the new session ID.
 
 ### Human terminal
 
@@ -206,7 +216,7 @@ hra session task delete <session-id> <task-id> --revision <revision>
 
 ## Agent work protocol
 
-> **Local release boundary.** These commands are part of the immutable `v0.6.1` local CLI release candidate and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol.
+> **Local release boundary.** These commands are part of the immutable `v0.6.1` local CLI release and are available through the exact install command above. Hosted sync is not required for this local protocol; the current-daemon rollout prerequisite still applies before startup.
 
 The versioned source contract defines a narrow local coordination kernel for agents operating several already-existing provider sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex and Claude Code still own their provider-native execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine.
 
@@ -251,6 +261,8 @@ This release is an explicit logical destructive purge, not a forensic-erasure pr
 Local SQLite is the only execution authority for work admission, claims, fences, dispatch receipts, submissions, reviews, signals, and the work-scoped event cursor. The initial work protocol has no cloud execution or cross-device takeover path. Turso is deferred behind a repository boundary and cannot be added as a second authority beside SQLite or encrypted Convex projections.
 
 ## Cloud sign-in and device pairing
+
+> **Conditional walkthrough.** Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the v0.6.1 daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.
 
 The hosted endpoint is live as an open beta. An unset `HRA_CONVEX_URL` selects HRA's hosted deployment. Set it to an explicit empty value before the first daemon starts to disable cloud transport. A nonempty HTTPS value selects a self-managed Convex deployment. The first valid selection permanently binds that local state root; a later mismatch fails closed instead of moving credentials or recovery state. After deliberately disabling a bound state root, `hra sync status` and `hra doctor` report its exact restart prerequisite: unset `HRA_CONVEX_URL` for the hosted deployment, or restore the bound URL for a self-managed deployment. HRA accepts cloud credentials only as protected JSON on standard input or a nonterminal file descriptor. It rejects email addresses, identity invites, and verification codes on the command line:
 
@@ -301,6 +313,8 @@ Cloud-account erasure is an explicit and irreversible fallback, not the default 
 - Optional encrypted sync: paired devices share a bounded session projection and submit commands to the one machine holding the execution lease.
 
 ## Terminal and agent interfaces
+
+> **Conditional walkthrough.** Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the v0.6.1 daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.
 
 Run `hra` in a TTY to open a persistent shell. Account and session selections stay in the prompt, live updates redraw wrapped partial input without moving its logical cursor, protected answers are read without terminal echo, and `/exit` leaves the daemon running. Pasted command lines use a bounded queue. An overflow or interrupted line flushes the current native terminal queue, retains input custody while discarding through EOF, and exits without executing the tail. Protected terminal documents require a visible stderr TTY plus unpredictable begin and return phrases while raw no-echo mode is active. A failed protected boundary keeps echo disabled while discarding the tail, then closes shell input instead of returning ambiguous bytes to an ordinary prompt. Display loss, termination, and job-control signals restore or fence raw mode before propagation. Live display is buffered while a foreground or protected prompt owns the terminal, and updates from an old session generation are discarded before a new selection is announced. Slow-terminal backpressure drops additional updates behind one explicit omission notice instead of growing memory without bound. One-shot commands provide the same control surface to scripts and agents.
 
@@ -360,6 +374,8 @@ For non-streaming `--json` commands, stdout contains exactly one versioned succe
 `interaction show` intentionally returns only a durable safe summary. Before approving a command or permission request, run `hra interaction inspect <interaction-id> --revision <n>` to read the complete authority still held by the live provider callback. A foreground human receives bounded detail on the protected stderr terminal. An agent or other noninteractive caller must first create an empty mode-0600 regular file under a current-user-owned mode-0700 directory and pass its absolute canonical path with `--handoff-file`; ordinary stdout receives only safe binding and cleanup metadata. On macOS, neither the directory nor file may have an extended ACL, and HRA rechecks both held descriptors before and after writing. Detail larger than 64 KiB also requires this file path. Read it within that protected boundary and remove it after deciding. HRA durably admits a bounded file-change prompt so it remains observable and may be declined, but refuses every acceptance because pinned Codex 0.153.2 does not provide the exact affected paths or change detail needed for informed approval.
 
 ## Presets and permissions
+
+> **Conditional walkthrough.** Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the v0.6.1 daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.
 
 HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; `hra session show` displays the bound provider's history and recorded public profile. Read the provider-neutral HRA record with `hra session export` or the transcript endpoint. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code public profiles include the pinned CLI, model, reasoning effort, default permission mode, and stream formats. HRA privately reviews the exact config-home authority for every Claude effect but omits that custody identity and legacy isolation marker from `session show`; managed and adopted personal-home sessions therefore share one non-identifying public shape. Each provider remains authoritative for its native permissions, tools, and hidden runtime state.
 

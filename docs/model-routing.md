@@ -201,8 +201,11 @@ model name does not prove that HRA's pinned runtime can select and verify that
 exact profile.
 
 For the same reason, Phase 3 does not translate general claims such as “faster,”
-“cheaper,” or “stronger” into a live rule. Candidate admission belongs to later
-phases and requires a canonical profile, exact capability evidence, reviewed
-runtime support, private non-inferiority evidence, and the applicable latency,
-price, effort, and safety evidence. This document intentionally records those
-missing proof classes rather than volatile benchmark results.
+“cheaper,” or “stronger” into a live rule. Technical profile admission in
+Phase 4 requires a canonical identity, exact pinned-runtime and current-account
+capability evidence, and reviewed runtime support. It permits explicit selection,
+not automatic routing. Automatic routing in Phase 6 additionally requires private
+non-inferiority evidence and the applicable latency, price, effort, and safety
+evidence. Identity inventory and design for already supported profiles need not
+wait for new-model capability or a private holdout. This document records those
+distinct missing proof classes rather than volatile benchmark results.
