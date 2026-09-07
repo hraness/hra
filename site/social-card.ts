@@ -58,7 +58,7 @@ export const socialCardLines = (content: PublicContent = publicContent): SocialC
   return {
     commands: [`$ ${start.command}`, `$ ${direct.command}`],
     comment: "# Rollout blocked on capacity; conditional examples",
-    tagline: `CLI v${content.releaseVersion} release-ready · hra.sh`,
+    tagline: `CLI v${content.releaseVersion} artifacts live · hra.sh`,
     title: content.productName,
   };
 };
