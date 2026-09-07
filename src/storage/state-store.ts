@@ -179,6 +179,7 @@ import {
   automaticUsagePolicyConfigurationSchema,
   automaticUsagePolicyConfigurationUpdateSchema,
   initialAutomaticUsagePolicyConfiguration,
+  resolveAutomaticUsagePolicy,
   type AutomaticUsagePolicyConfiguration,
   type AutomaticUsagePolicyConfigurationUpdate,
 } from "../domain/usage-policy";
@@ -15873,6 +15874,13 @@ export class ProviderUsageTurnNotBoundError extends Error {
   }
 }
 
+export class AutomaticRateLimitResetPolicyDisabledError extends Error {
+  constructor() {
+    super("ACCOUNT_RATE_LIMIT_RESET_AUTOMATIC_POLICY_DISABLED");
+    this.name = "AutomaticRateLimitResetPolicyDisabledError";
+  }
+}
+
 export type SessionSwitchStoreErrorCode =
   | "IDEMPOTENCY_CONFLICT"
   | "SESSION_SWITCH_NOT_FOUND"
@@ -27934,7 +27942,7 @@ export class StateStore {
     }
     const row = this.#database
       .query(`SELECT m.id,m.idempotency_key,m.kind,m.authority_id,m.authority_generation,m.request_digest,m.state,m.result_json,
-                     e.evidence_json,e.evidence_digest,e.recorded_at,
+                     e.kind AS evidence_kind,e.evidence_json,e.evidence_digest,e.recorded_at,
                      r.resolution_kind,r.evidence_json AS resolution_evidence_json,r.receipt_json,r.created_at AS resolution_created_at,
                      s.session_id AS session_start_id
               FROM mutation_attempts m
@@ -27951,6 +27959,7 @@ export class StateStore {
         request_digest: string;
         state: Exclude<MutationState, "reconciled">;
         result_json: string | null;
+        evidence_kind: string | null;
         evidence_json: string | null;
         evidence_digest: string | null;
         recorded_at: number | null;
@@ -27968,6 +27977,9 @@ export class StateStore {
       const parsedEvidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown) as MutationEffectEvidence;
       const parsedDigest = sha256Schema.parse(row.evidence_digest);
       if (digestJson(parsedEvidence) !== parsedDigest) throw new Error("MUTATION_EFFECT_EVIDENCE_DIGEST_MISMATCH");
+      if (row.evidence_kind !== row.kind || parsedEvidence.kind !== row.kind) {
+        throw new Error("MUTATION_EFFECT_EVIDENCE_KIND_MISMATCH");
+      }
       evidence = {
         attemptId: attemptIdSchema.parse(row.id),
         digest: parsedDigest,
@@ -35929,6 +35941,13 @@ export class StateStore {
         throw new Error("ACCOUNT_RATE_LIMIT_RESET_AUTHORITY_CHANGED");
       }
       const providerAuthority = providerAccountAuthoritySchema.parse(providerAuthorityInput);
+      // The policy snapshot and reset begin share one writer transaction.
+      // A disable that wins admission prevents both a new consume and an
+      // ambiguous same-key retry, without rewriting either attempt's history.
+      if (!resolveAutomaticUsagePolicy({
+        configuration: this.readAutomaticUsagePolicyConfiguration(),
+        provider: "codex",
+      }).enabled) throw new AutomaticRateLimitResetPolicyDisabledError();
       this.#recordAccountRateLimitResetProviderAuthority({
         attempt: row,
         authority: providerAuthority,

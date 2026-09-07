@@ -189,6 +189,20 @@ describe("automaticRateLimitResetStatusSchema", () => {
   };
   const weeklyWindowResetsAt = 2_000_000_000_000;
 
+  test("admits only the closed automatic-policy-disabled refresh without private evidence", () => {
+    const value = { ...base, lastAttempt: null, refresh: { state: "suppressed", reason: "automatic_policy_disabled" } };
+    const result = automaticRateLimitResetStatusSchema.safeParse(value);
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected the disabled automatic reset status.");
+    expect(result.data as unknown).toEqual(value);
+    for (const refresh of [
+      { state: "suppressed", reason: "automatic_policy_disabled_future" },
+      { state: "waiting", reason: "automatic_policy_disabled" },
+      { ...value.refresh, idempotencyKey: "private-key" },
+      { ...value.refresh, automaticPolicyRevision: 1 },
+    ]) expect(automaticRateLimitResetStatusSchema.safeParse({ ...value, refresh }).success).toBe(false);
+  });
+
   test("accepts only exact privacy-safe attempt state pairings", () => {
     const attempts: unknown[] = [
       null,

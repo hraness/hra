@@ -13534,6 +13534,277 @@ describe("HraService", () => {
     expect(codex.resetIdempotencyKeys).toEqual([]);
   });
 
+  describe("automatic policy reset admission", () => {
+    const fingerprint = createHash("sha256").update("person@example.com").digest("hex");
+    const limits = (usedPercent = 99, credits = 1, resetsAt = automaticResetWindowResetsAtSeconds) => ({
+      rateLimits: {
+        primary: {
+          limitId: "codex",
+          primary: { usedPercent, windowDurationMins: 10_080, resetsAt },
+          secondary: null,
+        },
+        byLimitId: null,
+        resetCreditsAvailable: credits,
+      },
+    });
+    const configure = (
+      store: StateStore,
+      change: Parameters<StateStore["updateAutomaticUsagePolicyConfiguration"]>[0]["change"],
+    ) => store.updateAutomaticUsagePolicyConfiguration({
+      idempotencyKey: crypto.randomUUID(),
+      expectedAutomaticPolicyRevision: store.readAutomaticUsagePolicyConfiguration().automaticPolicyRevision,
+      change,
+    });
+    const setup = async () => {
+      const value = await fixture(undefined, new FakeCloud(), () => undefined,
+        () => automaticResetWindowResetsAt - 3 * 24 * 60 * 60_000);
+      const added = await value.service.execute({ kind: "account.add", label: "Policy reset" }, { signal }) as {
+        account: { id: `acct_${string}` };
+      };
+      await value.service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+      value.codex.usageResult = { revision: 1, observedAt: 2_000, payload: limits() };
+      return { ...value, profileId: added.account.id };
+    };
+    const refresh = (value: Awaited<ReturnType<typeof setup>>) => value.service.execute({
+      kind: "account.usage", account: value.profileId, refresh: true,
+    }, { signal });
+    const effectRows = (value: Awaited<ReturnType<typeof setup>>) => {
+      const db = new Database(value.paths.database, { readonly: true, strict: true });
+      try {
+        return {
+          attempts: db.query("SELECT * FROM account_rate_limit_reset_attempts ORDER BY idempotency_key").all(),
+          authorities: db.query("SELECT * FROM account_rate_limit_reset_provider_authorities ORDER BY idempotency_key,process_generation,policy_revision").all(),
+          rebinds: db.query("SELECT * FROM account_rate_limit_reset_rebinds ORDER BY idempotency_key,from_process_generation").all(),
+          policies: db.query("SELECT * FROM account_rate_limit_reset_policies ORDER BY profile_id").all(),
+          sessions: db.query("SELECT * FROM sessions ORDER BY id").all(),
+          mutations: db.query("SELECT * FROM mutation_attempts ORDER BY id").all(),
+          pointers: db.query("SELECT * FROM provider_account_states ORDER BY provider").all(),
+        };
+      } finally { db.close(false); }
+    };
+
+    for (const scenario of [
+      { name: "inherited default off", defaultEnabled: false, codex: "inherit", claude: "inherit", enabled: false },
+      { name: "Codex off overrides default on", defaultEnabled: true, codex: "off", claude: "on", enabled: false },
+      { name: "Codex on overrides default off", defaultEnabled: false, codex: "on", claude: "off", enabled: true },
+      { name: "Claude off does not disable Codex", defaultEnabled: true, codex: "inherit", claude: "off", enabled: true },
+      { name: "inherited default on", defaultEnabled: true, codex: "inherit", claude: "inherit", enabled: true },
+    ] as const) {
+      test(`honors effective policy: ${scenario.name}`, async () => {
+        const value = await setup();
+        configure(value.store, { kind: "set_default", enabled: scenario.defaultEnabled });
+        configure(value.store, { kind: "set_override", provider: "codex", override: scenario.codex });
+        configure(value.store, { kind: "set_override", provider: "claude", override: scenario.claude });
+        const before = effectRows(value);
+        const callsBefore = value.codex.calls.length;
+        const response = await refresh(value);
+        expect(response).toMatchObject({ usage: [{ automaticReset: { refresh: scenario.enabled
+          ? { state: "settled", outcome: "reset" }
+          : { state: "suppressed", reason: "automatic_policy_disabled" } } }] });
+        expect(value.codex.resetIdempotencyKeys).toHaveLength(scenario.enabled ? 1 : 0);
+        expect(value.codex.committedStartTurns).toBe(0);
+        expect(value.codex.turnEffectTrace).toEqual([]);
+        expect(value.store.usageRange({ profileId: value.profileId })).toHaveLength(scenario.enabled ? 2 : 1);
+        expect(effectRows(value).pointers).toEqual(before.pointers);
+        expect(effectRows(value).sessions).toEqual(before.sessions);
+        if (!scenario.enabled) {
+          expect(value.codex.calls.slice(callsBefore)).toEqual(["readAccount", "usage", "readAccount"]);
+          expect(effectRows(value)).toEqual(before);
+          const passiveCalls = value.codex.calls.length;
+          await value.service.execute({ kind: "account.usage", account: value.profileId, refresh: false }, { signal });
+          expect(value.codex.calls).toHaveLength(passiveCalls);
+          expect(effectRows(value)).toEqual(before);
+        }
+      });
+    }
+
+    for (const state of ["prepared", "retryable", "ambiguous", "effect_started"] as const) {
+      test(`keeps disabled ${state} attempt immutable without reset or turn`, async () => {
+        const value = await setup();
+        const profile = value.store.requireProfileById(value.profileId);
+        expect(value.store.authorizeAccountRateLimitResetPolicy({
+          profileId: profile.id, processGeneration: profile.processGeneration,
+          accountFingerprint: fingerprint, weeklyWindowDurationMinutes: 10_080,
+          weeklyWindowResetsAt: automaticResetWindowResetsAt,
+        }).decision).toBe("allow");
+        const attempt = value.store.prepareAccountRateLimitReset({
+          profileId: profile.id, processGeneration: profile.processGeneration,
+          accountFingerprint: fingerprint, weeklyWindowResetsAt: automaticResetWindowResetsAt,
+          observedUsedPercent: 99,
+        });
+        if (state !== "prepared") {
+          value.store.beginAccountRateLimitReset(attempt.idempotencyKey,
+            value.store.requireProviderAccountAuthority(profile.id, "codex"));
+          if (state !== "effect_started") value.store.deferAccountRateLimitReset(attempt.idempotencyKey, state);
+        }
+        configure(value.store, { kind: "set_override", provider: "codex", override: "off" });
+        const before = effectRows(value);
+        const callsBefore = value.codex.calls.length;
+        for (const payload of [limits(), limits(0, 0, automaticResetWindowResetsAtSeconds + 86_400)]) {
+          value.codex.usageResult = { revision: 2, observedAt: 2_001, payload };
+          expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: { refresh:
+            state === "ambiguous" || state === "effect_started"
+              ? { state: "recovery_pending" }
+              : { state: "suppressed", reason: "automatic_policy_disabled" },
+          } }] });
+          expect(effectRows(value)).toEqual(before);
+          expect(value.store.readRecoverableAccountRateLimitReset(profile.id, fingerprint))
+            .toMatchObject({ idempotencyKey: attempt.idempotencyKey, state, outcome: null, localResolution: null });
+        }
+        expect(value.codex.resetIdempotencyKeys).toEqual([]);
+        expect(value.codex.calls.slice(callsBefore)).toEqual([
+          "readAccount", "usage", "readAccount", "readAccount", "usage", "readAccount",
+        ]);
+        expect(value.codex.committedStartTurns).toBe(0);
+        expect(value.codex.turnEffectTrace).toEqual([]);
+      });
+    }
+
+    test("re-enabling reconciles the same disabled ambiguous key after rollover", async () => {
+      const value = await setup();
+      value.codex.resetError = new IndeterminateCodexEffectError("account/rateLimitResetCredit/consume", 99);
+      expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: { refresh: { state: "recovery_pending" } } }] });
+      const key = value.codex.resetIdempotencyKeys[0];
+      if (key === undefined) throw new Error("Expected original ambiguous key.");
+      configure(value.store, { kind: "set_default", enabled: false });
+      const before = effectRows(value);
+      value.codex.resetError = undefined;
+      value.codex.resetOutcome = "alreadyRedeemed";
+      value.codex.usageResult = { revision: 2, observedAt: 2_001,
+        payload: limits(0, 0, automaticResetWindowResetsAtSeconds + 86_400) };
+      expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: {
+        lastAttempt: { state: "recovery_pending" }, refresh: { state: "recovery_pending" },
+      } }] });
+      expect(value.codex.resetIdempotencyKeys).toEqual([key]);
+      expect(effectRows(value)).toEqual(before);
+      configure(value.store, { kind: "set_override", provider: "codex", override: "on" });
+      const usageBefore = value.store.usageRange({ profileId: value.profileId }).length;
+      expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: {
+        lastAttempt: { state: "settled", outcome: "alreadyRedeemed" },
+        refresh: { state: "settled", outcome: "alreadyRedeemed" },
+      } }] });
+      expect(value.codex.resetIdempotencyKeys).toEqual([key, key]);
+      expect(value.store.latestAccountRateLimitResetAttempt(value.profileId, fingerprint))
+        .toMatchObject({ idempotencyKey: key, state: "settled", outcome: "alreadyRedeemed" });
+      expect(value.store.usageRange({ profileId: value.profileId })).toHaveLength(usageBefore + 2);
+      expect(effectRows(value).pointers).toEqual(before.pointers);
+      expect(effectRows(value).sessions).toEqual(before.sessions);
+      expect(value.codex.committedStartTurns).toBe(0);
+    });
+
+    test("rechecks disable after the awaited final identity proof", async () => {
+      const value = await setup();
+      let accountReads = 0;
+      let disabled = false;
+      value.codex.beforeReadAccountReturn = async () => {
+        accountReads += 1;
+        if (accountReads === 3) {
+          await Promise.resolve();
+          configure(value.store, { kind: "set_override", provider: "codex", override: "off" });
+          disabled = true;
+        }
+      };
+      const pointer = value.store.readProviderAccountState("codex");
+      expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: {
+        refresh: { state: "suppressed", reason: "automatic_policy_disabled" },
+      } }] });
+      expect(disabled).toBe(true);
+      expect(accountReads).toBe(3);
+      expect(value.codex.resetIdempotencyKeys).toEqual([]);
+      expect(value.store.latestAccountRateLimitResetAttempt(value.profileId, fingerprint)).toBeNull();
+      expect(value.store.readProviderAccountState("codex")).toEqual(pointer);
+      expect(value.codex.committedStartTurns).toBe(0);
+      expect(effectRows(value).sessions).toEqual([]);
+    });
+
+    for (const state of ["fresh", "ambiguous"] as const) {
+      test(`handles a final begin refusal for ${state} without rewriting recovery evidence`, async () => {
+        const value = await setup();
+        if (state === "ambiguous") {
+          value.codex.resetError = new IndeterminateCodexEffectError("account/rateLimitResetCredit/consume", 99);
+          expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: { refresh: { state: "recovery_pending" } } }] });
+          value.codex.resetError = undefined;
+        }
+        const originalKeys = [...value.codex.resetIdempotencyKeys];
+        const begin = value.store.beginAccountRateLimitReset.bind(value.store);
+        const begins: ReturnType<typeof effectRows>[] = [];
+        Object.defineProperty(value.store, "beginAccountRateLimitReset", {
+          configurable: true,
+          value: (...args: Parameters<StateStore["beginAccountRateLimitReset"]>) => {
+            // Commit through the real configuration API at the final boundary.
+            // The real begin transaction, not a synthetic thrown error, refuses.
+            configure(value.store, { kind: "set_override", provider: "codex", override: "off" });
+            begins.push(effectRows(value));
+            return begin(...args);
+          },
+        });
+        expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: { refresh: state === "ambiguous"
+          ? { state: "recovery_pending" }
+          : { state: "suppressed", reason: "automatic_policy_disabled" },
+        } }] });
+        expect(begins).toHaveLength(1);
+        const before = begins[0];
+        if (before === undefined) throw new Error("Expected the real final begin boundary.");
+        expect(effectRows(value)).toEqual(before);
+        expect(value.codex.resetIdempotencyKeys).toEqual(originalKeys);
+        expect(value.store.readRecoverableAccountRateLimitReset(value.profileId, fingerprint))
+          .toMatchObject({ state: state === "ambiguous" ? "ambiguous" : "prepared", outcome: null, localResolution: null });
+        expect(value.codex.committedStartTurns).toBe(0);
+        expect(value.codex.turnEffectTrace).toEqual([]);
+      });
+    }
+
+    test("settles and rereads an admitted in-flight success after disable", async () => {
+      const value = await setup();
+      let signalReset!: () => void;
+      const resetStarted = new Promise<void>((resolve) => { signalReset = resolve; });
+      let releaseReset!: () => void;
+      const resetGate = new Promise<void>((resolve) => { releaseReset = resolve; });
+      value.codex.beforeResetReturn = async () => { signalReset(); await resetGate; };
+      const pointer = value.store.readProviderAccountState("codex");
+      const pending = refresh(value);
+      try {
+        await resetStarted;
+        expect(value.store.readRecoverableAccountRateLimitReset(value.profileId, fingerprint))
+          .toMatchObject({ state: "effect_started" });
+        configure(value.store, { kind: "set_default", enabled: false });
+        value.codex.usageResult = { revision: 2, observedAt: 2_001, payload: limits(0, 0) };
+      } finally { releaseReset(); }
+      expect(await pending).toMatchObject({ usage: [{
+        automaticReset: { lastAttempt: { state: "settled", outcome: "reset" }, refresh: { state: "settled", outcome: "reset" } },
+        snapshot: { sourceRevision: 2, payload: limits(0, 0) },
+      }] });
+      const key = value.codex.resetIdempotencyKeys[0];
+      if (key === undefined) throw new Error("Expected admitted reset key.");
+      expect(value.store.latestAccountRateLimitResetAttempt(value.profileId, fingerprint))
+        .toMatchObject({ idempotencyKey: key, state: "settled", outcome: "reset" });
+      expect(value.store.usageRange({ profileId: value.profileId }).map((row) => row.sourceRevision)).toEqual([1, 2]);
+      expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: {
+        refresh: { state: "suppressed", reason: "automatic_policy_disabled" },
+      } }] });
+      expect(value.codex.resetIdempotencyKeys).toEqual([key]);
+      expect(value.store.readProviderAccountState("codex")).toEqual(pointer);
+      expect(value.codex.committedStartTurns).toBe(0);
+      expect(effectRows(value).sessions).toEqual([]);
+    });
+
+    test("fails closed before reset when automatic policy cannot be read", async () => {
+      const value = await setup();
+      const before = effectRows(value);
+      Object.defineProperty(value.store, "readAutomaticUsagePolicyConfiguration", {
+        configurable: true,
+        value: () => { throw new Error("test automatic policy unavailable"); },
+      });
+      await expect(refresh(value)).rejects.toMatchObject({
+        code: "UNAVAILABLE",
+        message: "A required local or provider capability is unavailable.",
+      });
+      expect(value.codex.resetIdempotencyKeys).toEqual([]);
+      expect(effectRows(value)).toEqual(before);
+      expect(value.codex.committedStartTurns).toBe(0);
+    });
+  });
+
   test("automatically consumes one reset at one percent remaining and rereads limits", async () => {
     const { service, codex, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Auto reset" }, { signal }) as { account: { id: `acct_${string}` } };

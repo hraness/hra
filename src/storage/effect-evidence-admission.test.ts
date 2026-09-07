@@ -227,7 +227,7 @@ const corruptions: readonly Corruption[] = [
 
 const preserveThroughReopens = async (
   input: Parameters<Parameters<typeof withEffectFixture>[1]>[0],
-  read: "invalid_shape" | "invalid_digest" | "unchecked",
+  read: "invalid_shape" | "invalid_digest" | "invalid_kind",
 ): Promise<void> => {
   const { database, paths, staged } = input;
   expect(database.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toEqual({ busy: 0, log: 0, checkpointed: 0 });
@@ -242,6 +242,7 @@ const preserveThroughReopens = async (
       expect(snapshot(database)).toEqual(expected);
       if (read === "invalid_shape") expect(() => reopened.readMutation(staged.key)).toThrow();
       if (read === "invalid_digest") expect(() => reopened.readMutation(staged.key)).toThrow("MUTATION_EFFECT_EVIDENCE_DIGEST_MISMATCH");
+      if (read === "invalid_kind") expect(() => reopened.readMutation(staged.key)).toThrow("MUTATION_EFFECT_EVIDENCE_KIND_MISMATCH");
       expect(reopened.requireSession(staged.session.id)).toEqual(staged.session);
       if (!readonly) {
         expect(reopened.recoverEffectStartedMutations()).toEqual({
@@ -302,9 +303,9 @@ for (const kind of ["session.stop", "session.rename"] as const) {
           digest: hash(json),
           ...(mismatch === "stored evidence kind" ? { kind: otherKind } : {}),
         });
-        // readMutation historically does not validate these kind joins. This
-        // test promises only admission preservation and recovery containment.
-        await preserveThroughReopens(input, "unchecked");
+        // Malformed history remains retained, but a typed lookup must not
+        // return one mutation's evidence under another mutation's kind.
+        await preserveThroughReopens(input, "invalid_kind");
       });
     });
   }

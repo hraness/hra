@@ -2127,6 +2127,8 @@ const automaticResetRows = (value: unknown): readonly string[] => {
         ? "same-key recovery pending"
         : refresh.state === "retry_pending"
           ? "same-key retry pending"
+          : refresh.state === "suppressed" && refresh.reason === "automatic_policy_disabled"
+            ? "suppressed (automatic management is off)"
           : `${refresh.state.replaceAll("_", " ")} (${detail})`;
     rows.push(`  automatic reset refresh: ${line(label)}`);
   }

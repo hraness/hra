@@ -136,6 +136,7 @@ import {
   type AutomaticRateLimitResetRefreshStatus,
   type UsageVelocityWindow,
 } from "../domain/usage-metrics";
+import { resolveAutomaticUsagePolicy } from "../domain/usage-policy";
 import {
   WORK_TASK_HISTORY_DEFAULT_ITEM_LIMIT,
   workActionCursorPayloadSchema,
@@ -174,6 +175,7 @@ import { QueueAttachmentIdentityError } from "../storage/queue-attachment-identi
 import { AttachmentCustodyError, type AttachmentDaemon, type AttachmentIngressInput, type AttachmentReservation } from "../storage/attachment-custody";
 import { WorkCapabilityCodec } from "../storage/work-capability";
 import {
+  AutomaticRateLimitResetPolicyDisabledError,
   ProviderUsageTurnNotBoundError,
   SelectionError,
   SessionSwitchStoreError,
@@ -10591,12 +10593,33 @@ export class HraService {
     return { accountFingerprint, snapshot };
   }
 
+  #disabledAutomaticRateLimitResetResult(
+    profileId: ProfileRecord["id"],
+    accountFingerprint: string,
+  ): AutomaticRateLimitResetAttemptResult {
+    const attempt = this.#store.readRecoverableAccountRateLimitReset(profileId, accountFingerprint);
+    return {
+      authoritativeReread: false,
+      refresh: attempt?.state === "ambiguous" || attempt?.state === "effect_started"
+        ? { state: "recovery_pending" }
+        : { state: "suppressed", reason: "automatic_policy_disabled" },
+    };
+  }
+
   async #attemptAutomaticRateLimitReset(
     profile: ProfileRecord,
     accountFingerprint: string,
     providerPayload: unknown,
     signal: AbortSignal,
   ): Promise<AutomaticRateLimitResetAttemptResult> {
+    if (!resolveAutomaticUsagePolicy({
+      configuration: this.#store.readAutomaticUsagePolicyConfiguration(),
+      provider: "codex",
+    }).enabled) {
+      // Disabled observations remain readable without rebinding or closing an
+      // unsettled reset. Even same-key reconciliation can consume a credit.
+      return this.#disabledAutomaticRateLimitResetResult(profile.id, accountFingerprint);
+    }
     const now = this.#now();
     const observation = automaticRateLimitResetObservation({
       providerPayload,
@@ -10714,6 +10737,12 @@ export class HraService {
       || accountFingerprintForProfile(dispatchProfile) !== accountFingerprint
     ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_AUTHORITY_CHANGED");
     const dispatchProviderAuthority = this.#providerAuthority(dispatchProfile, "codex");
+    if (!resolveAutomaticUsagePolicy({
+      configuration: this.#store.readAutomaticUsagePolicyConfiguration(),
+      provider: "codex",
+    }).enabled) {
+      return this.#disabledAutomaticRateLimitResetResult(dispatchProfile.id, accountFingerprint);
+    }
     const dispatchPolicyDecision = this.#store.authorizeAccountRateLimitResetPolicy({
       profileId: dispatchProfile.id,
       processGeneration: dispatchProfile.processGeneration,
@@ -10783,10 +10812,16 @@ export class HraService {
     }
 
     signal.throwIfAborted();
-    const begun = this.#store.beginAccountRateLimitReset(
-      attempt.idempotencyKey,
-      dispatchProviderAuthority,
-    );
+    let begun: AccountRateLimitResetAttemptRecord;
+    try {
+      begun = this.#store.beginAccountRateLimitReset(
+        attempt.idempotencyKey,
+        dispatchProviderAuthority,
+      );
+    } catch (error: unknown) {
+      if (!(error instanceof AutomaticRateLimitResetPolicyDisabledError)) throw error;
+      return this.#disabledAutomaticRateLimitResetResult(dispatchProfile.id, accountFingerprint);
+    }
     if (begun.state !== "effect_started") {
       throw new Error("ACCOUNT_RATE_LIMIT_RESET_BEGIN_STATE_INVALID");
     }

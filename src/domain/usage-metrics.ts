@@ -90,6 +90,7 @@ export const automaticRateLimitResetRefreshStatusSchema = z.union([
   z.object({
     state: z.literal("suppressed"),
     reason: z.enum([
+      "automatic_policy_disabled",
       "reconciliation_required",
       "reconciliation_window",
       "weekly_window_unavailable",

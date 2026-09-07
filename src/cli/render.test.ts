@@ -3236,6 +3236,37 @@ describe("CLI rendering", () => {
     expect(rendered).not.toContain("must-not-render");
   });
 
+  test("explains disabled automatic reset management while retaining machine-readable status", () => {
+    const command = { account: "work", kind: "account.usage" as const, refresh: true };
+    const automaticReset = {
+      threshold: { remainingPercent: 1, usedPercent: 99 },
+      policy: { state: "active" },
+      observation: { state: "unavailable", reason: "weekly_window_unavailable" },
+      lastAttempt: null,
+      refresh: { state: "suppressed", reason: "automatic_policy_disabled" },
+    };
+    const data = { usage: [{ account: { id: "acct_" + "0".repeat(32), label: "Work" }, automaticReset }] };
+    const human = capture();
+    renderSuccess(command, data, false, human.output);
+    expect(human.stdout.join("")).toContain("automatic reset refresh: suppressed (automatic management is off)");
+    const json = capture();
+    renderSuccess(command, data, true, json.output);
+    expect(JSON.parse(json.stdout.join("")) as unknown).toMatchObject({ data: { usage: [{ automaticReset }] } });
+    for (const refresh of [
+      { state: "suppressed", reason: "automatic_policy_disabled", idempotencyKey: "private-key" },
+      { state: "suppressed", reason: "automatic_policy_disabled", automaticPolicyRevision: 1 },
+      { state: "suppressed", reason: "automatic_policy_disabled_future" },
+    ]) {
+      for (const asJson of [false, true]) {
+        const refused = capture();
+        expect(() => renderSuccess(command, {
+          usage: [{ ...data.usage[0], automaticReset: { ...automaticReset, refresh } }],
+        }, asJson, refused.output)).toThrow(InvalidCommandResponseError);
+        expect(refused.stdout).toEqual([]);
+      }
+    }
+  });
+
   test("rejects malformed or private automatic-reset fields before human or JSON output", () => {
     const command = {
       account: "work",
