@@ -13,6 +13,16 @@ import { isAbsolute, resolve } from "node:path";
 
 import { Database, constants as sqliteConstants } from "bun:sqlite";
 import { z } from "zod";
+import {
+  AUTORESPOND_CONSECUTIVE_LIMIT,
+  AUTORESPOND_HOURLY_BUDGET,
+  AUTORESPOND_DAILY_BUDGET,
+  AUTORESPOND_HOUR_MS,
+  AUTORESPOND_DAY_MS,
+  AUTORESPOND_RESERVATIONS_PER_SESSION_CAP,
+  type AutorespondBudgetReservationInput,
+  type AutorespondBudgetReservationResult,
+} from "../domain/autorespond-budget";
 
 import {
   containsUnsafeTerminalScalar,
@@ -534,6 +544,9 @@ const restartInteractionSessionStateReasons: ReadonlySet<string> = new Set([
   "autorespond_consecutive_limit",
   "autorespond_hourly_budget",
   "autorespond_daily_budget",
+  "autorespond_policy_changed",
+  "autorespond_history_unavailable",
+  "autorespond_source_already_reserved",
   "autorespond_resolution_refused",
   "autorespond_failed",
 ]);
@@ -545,7 +558,7 @@ const restartInteractionSessionStateReasons: ReadonlySet<string> = new Set([
  * family, which names exactly which positive-gate clause refused the turn.
  */
 export const autorespondEvidenceOutcomeSchema = z.union([
-  z.enum(["accepted", "refused", "sent", "verbatim_mismatch", "responder_failed"]),
+  z.enum(["accepted", "refused", "unknown", "sent", "verbatim_mismatch", "responder_failed"]),
   z.string().regex(/^gate_failed:[a-z_]{1,48}$/u),
 ]);
 
@@ -1436,7 +1449,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 43;
+const currentSchemaVersion = 44;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -2207,7 +2220,7 @@ const assertSchemaVersion43BaseAuthority = (
   assertSchemaVersion41TimestampProof(database);
   assertSchemaMigrationLedgerTail(
     database,
-    [40, 41, 42, 43],
+    readUserVersion(database) === 44 ? [40, 41, 42, 43, 44] : [40, 41, 42, 43],
     "STATE_SCHEMA_V43_MIGRATION_LEDGER_INVALID",
   );
   assertSchemaVersion43SessionUserMessageFinalizations(
@@ -2219,6 +2232,68 @@ const assertSchemaVersion43BaseAuthority = (
 const assertSchemaVersion43Authority = (database: Database): void => {
   assertSchemaVersion43BaseAuthority(database);
   assertSchemaVersion43QueueCancellationSettlement(database);
+};
+
+// Display evidence has count retention and cannot prove a rolling budget.
+// Keep content-free admission authority independently, preserving unsettled
+// prose keys until their already-charged transcript is finalized.
+const schemaVersion44AutorespondBudget = `
+CREATE TABLE IF NOT EXISTS autorespond_budget_history (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  available_at INTEGER NOT NULL CHECK(available_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS autorespond_budget_history_immutable
+BEFORE UPDATE ON autorespond_budget_history
+BEGIN SELECT RAISE(ABORT, 'autorespond budget history is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS sessions_autorespond_budget_history
+AFTER INSERT ON sessions
+BEGIN
+  INSERT INTO autorespond_budget_history(session_id,available_at) VALUES (NEW.id,0);
+END;
+CREATE TABLE IF NOT EXISTS autorespond_budget_reservations (
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  source_kind TEXT NOT NULL CHECK(source_kind IN ('protocol','prose')),
+  source_id TEXT NOT NULL CHECK(length(source_id) BETWEEN 1 AND 200),
+  mode TEXT NOT NULL CHECK(mode IN ('auto:all','auto:workspace')),
+  reserved_at INTEGER NOT NULL CHECK(reserved_at BETWEEN 0 AND 9007199254740991),
+  PRIMARY KEY(session_id,source_kind,source_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS autorespond_budget_reservations_window
+  ON autorespond_budget_reservations(session_id,reserved_at);
+CREATE TRIGGER IF NOT EXISTS autorespond_budget_reservations_immutable
+BEFORE UPDATE ON autorespond_budget_reservations
+BEGIN SELECT RAISE(ABORT, 'autorespond budget reservation is immutable'); END;
+`;
+
+const schemaVersion44AutorespondObjects = (() => {
+  const expected = new Database(":memory:");
+  try {
+    expected.exec("CREATE TABLE sessions(id TEXT PRIMARY KEY) STRICT");
+    expected.exec(schemaVersion44AutorespondBudget);
+    return z.array(z.object({ name: z.string(), sql: z.string(), type: z.string() }).strict()).parse(
+      expected.query("SELECT name,sql,type FROM sqlite_master WHERE name LIKE '%autorespond_budget%' AND sql IS NOT NULL ORDER BY name").all(),
+    );
+  } finally {
+    expected.close(false);
+  }
+})();
+
+const assertSchemaVersion44AutorespondObjects = (database: Database): void => {
+  for (const expected of schemaVersion44AutorespondObjects) {
+    const observed = z.object({ sql: z.string(), type: z.string() }).strict().safeParse(
+      database.query("SELECT sql,type FROM sqlite_master WHERE name=?").get(expected.name),
+    );
+    if (!observed.success || observed.data.type !== expected.type
+      || normalizedTriggerSql(observed.data.sql) !== normalizedTriggerSql(expected.sql)) {
+      throw new Error("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_AUTHORITY_INVALID");
+    }
+  }
+};
+
+const assertSchemaVersion44Authority = (database: Database): void => {
+  assertSchemaVersion44AutorespondObjects(database);
+  assertSchemaVersion44AutorespondEvidence(database);
+  assertSchemaMigrationLedgerTail(database, [40, 41, 42, 43, 44], "STATE_SCHEMA_V44_MIGRATION_LEDGER_INVALID");
 };
 
 const backfillSchemaVersion43SessionUserMessageFinalizations = (
@@ -3777,6 +3852,46 @@ CREATE TABLE IF NOT EXISTS autorespond_message_sources (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS autorespond_message_sources_recent ON autorespond_message_sources(session_id, created_at DESC);
 `;
+
+const schemaVersion44AutorespondEvidence = schemaVersion31Statements[0]
+  .replace("autorespond_evidence_next", "autorespond_evidence")
+  .replace("'accepted','refused','sent'", "'accepted','refused','unknown','sent'");
+
+const schemaVersion44AutorespondEvidencePredecessor = (() => {
+  const expected = new Database(":memory:");
+  try {
+    expected.exec(schemaVersion31Statements[0]);
+    expected.exec("ALTER TABLE autorespond_evidence_next RENAME TO autorespond_evidence");
+    return z.object({ sql: z.string() }).strict().parse(expected.query(
+      "SELECT sql FROM sqlite_master WHERE name='autorespond_evidence'",
+    ).get()).sql;
+  } finally { expected.close(false); }
+})();
+
+const assertSchemaVersion44AutorespondEvidence = (database: Database): void => {
+  const row = z.object({ sql: z.string() }).strict().safeParse(database.query(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='autorespond_evidence'",
+  ).get());
+  if (!row.success || normalizedTriggerSql(row.data.sql)
+    !== normalizedTriggerSql(schemaVersion44AutorespondEvidence)) {
+    throw new Error("STATE_SCHEMA_V44_AUTORESPOND_EVIDENCE_INVALID");
+  }
+};
+
+const migrateSchemaVersion44AutorespondEvidence = (database: Database): void => {
+  const row = z.object({ sql: z.string() }).strict().parse(database.query(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='autorespond_evidence'",
+  ).get());
+  if (normalizedTriggerSql(row.sql) === normalizedTriggerSql(schemaVersion44AutorespondEvidence)) return;
+  if (normalizedTriggerSql(row.sql) !== normalizedTriggerSql(schemaVersion44AutorespondEvidencePredecessor)) {
+    throw new Error("STATE_SCHEMA_V44_AUTORESPOND_EVIDENCE_PREDECESSOR_INVALID");
+  }
+  database.exec("ALTER TABLE autorespond_evidence RENAME TO autorespond_evidence_v43");
+  database.exec(schemaVersion44AutorespondEvidence);
+  database.exec("INSERT INTO autorespond_evidence SELECT * FROM autorespond_evidence_v43");
+  database.exec("DROP TABLE autorespond_evidence_v43");
+  database.exec(schemaVersion31Objects);
+};
 /** Per-session autorespond-authored message sources kept for projection labelling. */
 export const AUTORESPOND_MESSAGE_SOURCE_PER_SESSION_CAP = 500;
 // Session archive and the settings projection's daemon-level defaults (W2
@@ -7654,7 +7769,15 @@ const migrateWritableDatabase = (
   if (initialVersion > currentSchemaVersion) {
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
   }
+  if (initialVersion < 44 && database.query(
+    "SELECT 1 FROM sqlite_master WHERE name LIKE '%autorespond_budget%' LIMIT 1",
+  ).get() !== null) {
+    throw new Error("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_PREDECESSOR_COLLISION");
+  }
   if (initialVersion === currentSchemaVersion) {
+    assertSchemaVersion43Authority(database);
+    assertSchemaVersion44Authority(database);
+  } else if (initialVersion === 43) {
     // Pre-release v43 shipped briefly without the queue-cancellation trigger.
     // Prove every other v43 authority object and reject a colliding object
     // before the transactional, row-aware repair below is allowed to run.
@@ -7670,7 +7793,7 @@ const migrateWritableDatabase = (
   ) {
     throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
   }
-  if (initialVersion === 42 || initialVersion === currentSchemaVersion) {
+  if (initialVersion === 42 || initialVersion === 43 || initialVersion === currentSchemaVersion) {
     // A current-version stamp is an assertion boundary, not permission to
     // reconstruct authority. Prove every provider/adoption execution guard
     // before the idempotent maintenance tail can touch any schema object.
@@ -8289,6 +8412,35 @@ const migrateWritableDatabase = (
       version = 43;
     }
 
+    if (version < 44) {
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      migrateSchemaVersion44AutorespondEvidence(database);
+      database.exec(schemaVersion44AutorespondBudget);
+      assertSchemaVersion44AutorespondObjects(database);
+      // A retained display audit cannot establish how many older successes
+      // were evicted. Existing sessions wait one complete budget window;
+      // sessions inserted after this migration receive available_at=0.
+      // Predecessor success could commit before its separate counter bump.
+      // The consecutive horizon is unbounded, so only a human message can
+      // clear this once-only conservative floor, even after the day expires.
+      database.query(
+        `INSERT INTO session_autorespond_counters(session_id,consecutive_count,updated_at)
+         SELECT id,?,? FROM sessions s WHERE NOT EXISTS (
+           SELECT 1 FROM autorespond_budget_history h WHERE h.session_id=s.id
+         )
+         ON CONFLICT(session_id) DO UPDATE SET
+           consecutive_count=MAX(consecutive_count,excluded.consecutive_count),
+           updated_at=MAX(updated_at,excluded.updated_at)`,
+      ).run(AUTORESPOND_CONSECUTIVE_LIMIT, migratedAt);
+      database.query(
+        `INSERT OR IGNORE INTO autorespond_budget_history(session_id,available_at)
+         SELECT id,? FROM sessions`,
+      ).run(unixMillisecondsSchema.parse(migratedAt + AUTORESPOND_DAY_MS));
+      database.query("INSERT INTO migrations(version,applied_at) VALUES (?,?)").run(44, migratedAt);
+      database.exec("PRAGMA user_version = 44");
+      version = 44;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     applySchemaVersion32(database);
@@ -8345,6 +8497,7 @@ const migrateWritableDatabase = (
     database.exec(schemaVersion37AttentionEmailPolicy);
     assertCompositeNotificationPolicy(database);
     assertSchemaVersion43Authority(database);
+    assertSchemaVersion44Authority(database);
     assertSchemaVersion40AdoptionObjects(database);
     assertExactSchemaVersion40AdoptionSurface(database);
     assertWorkSchema(database);
@@ -9045,6 +9198,7 @@ export class StateStore {
       assertSchemaVersion40AdoptionObjects(this.#database);
       assertExactSchemaVersion40AdoptionSurface(this.#database);
       assertSchemaVersion43Authority(this.#database);
+      assertSchemaVersion44Authority(this.#database);
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);
@@ -14916,6 +15070,7 @@ export class StateStore {
     lastHour: number;
   }> {
     const parsedSessionId = sessionIdSchema.parse(sessionId);
+    unixMillisecondsSchema.parse(now);
     const counter = this.#database.query(
       "SELECT consecutive_count FROM session_autorespond_counters WHERE session_id=?",
     ).get(parsedSessionId);
@@ -14923,19 +15078,104 @@ export class StateStore {
       ? 0
       : z.object({ consecutive_count: z.number().int().nonnegative() }).strict().parse(counter).consecutive_count;
     const count = (since: number): number => {
-      // Both paths spend the same per-session budget: a protocol approval that
-      // was accepted and a prose approval that was actually sent.
+      // Admission spends the budget before the effect can begin. Display
+      // evidence, failures, ambiguity, and later pruning cannot refund it.
       const row = this.#database.query(
-        `SELECT COUNT(*) AS total FROM autorespond_evidence
-         WHERE session_id=? AND outcome IN ('accepted','sent') AND occurred_at>=?`,
+        `SELECT COUNT(*) AS total FROM autorespond_budget_reservations
+         WHERE session_id=? AND reserved_at>=?`,
       ).get(parsedSessionId, since);
       return z.object({ total: z.number().int().nonnegative() }).strict().parse(row).total;
     };
     return {
       consecutive,
-      lastDay: count(now - 24 * 60 * 60 * 1_000),
-      lastHour: count(now - 60 * 60 * 1_000),
+      lastDay: count(now - AUTORESPOND_DAY_MS),
+      lastHour: count(now - AUTORESPOND_HOUR_MS),
     };
+  }
+
+  readAutorespondBudgetHistoryAvailableAt(sessionId: SessionId, now: number = this.#now()): number | null {
+    const row = z.object({ available_at: unixMillisecondsSchema }).strict().parse(
+      this.#database.query("SELECT available_at FROM autorespond_budget_history WHERE session_id=?")
+        .get(sessionIdSchema.parse(sessionId)),
+    );
+    return row.available_at > unixMillisecondsSchema.parse(now) ? row.available_at : null;
+  }
+
+  reserveAutorespondBudget(input: AutorespondBudgetReservationInput): AutorespondBudgetReservationResult {
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const sourceKind = z.enum(["protocol", "prose"]).parse(input.sourceKind);
+    const sourceId = z.string().min(1).max(200).parse(input.sourceId);
+    if (sourceKind === "protocol") z.string().uuid().parse(sourceId);
+    const expectedMode = approvalModeSchema.parse(input.expectedMode);
+    const reserve = this.#database.transaction((): AutorespondBudgetReservationResult => {
+      this.requireSession(sessionId);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const mode = this.readSessionApprovalMode(sessionId).mode;
+      if (mode === "manual") return { state: "refused", code: "manual_mode" };
+      if (mode !== expectedMode) return { state: "refused", code: "policy_changed" };
+      const existing = this.#database.query(
+        `SELECT mode FROM autorespond_budget_reservations
+         WHERE session_id=? AND source_kind=? AND source_id=?`,
+      ).get(sessionId, sourceKind, sourceId);
+      if (existing !== null) {
+        const originalMode = z.object({ mode: approvalModeSchema }).strict().parse(existing).mode;
+        return originalMode === mode ? { state: "existing" } : { state: "refused", code: "policy_changed" };
+      }
+      const source = sourceKind === "protocol"
+        ? this.#database.query(
+            `SELECT 1 FROM provider_interactions WHERE public_id=? AND session_id=?
+             AND state='pending' AND kind IN ('command_approval','file_change_approval','permission_approval')`,
+          ).get(sourceId, sessionId)
+        : this.#database.query(
+            `SELECT 1 FROM mutation_attempts WHERE idempotency_key=? AND authority_id=?
+             AND kind='session.send' AND state='effect_started' AND transcript_status='pending'
+             AND json_extract(transcript_intent_json,'$.actor')='autorespond'`,
+          ).get(sourceId, sessionId);
+      if (source === null) throw new Error("AUTORESPOND_BUDGET_SOURCE_AUTHORITY_INVALID");
+      if (this.readAutorespondBudgetHistoryAvailableAt(sessionId, now) !== null) {
+        return { state: "refused", code: "history_unavailable" };
+      }
+      // Every committed prune also inserts a new reservation at this time.
+      // That remaining high-water row detects a clock rewind instead of
+      // silently reopening budget whose older rows were already removed.
+      if (this.#database.query(
+        "SELECT 1 FROM autorespond_budget_reservations WHERE session_id=? AND reserved_at>? LIMIT 1",
+      ).get(sessionId, now) !== null) return { state: "refused", code: "history_unavailable" };
+      const retained = z.object({ total: z.number().int().nonnegative() }).strict().parse(
+        this.#database.query(`SELECT COUNT(*) AS total FROM autorespond_budget_reservations
+          WHERE session_id=? AND (reserved_at>=? OR (source_kind='prose' AND EXISTS (
+            SELECT 1 FROM mutation_attempts m WHERE m.authority_id=session_id
+              AND m.idempotency_key=source_id AND m.kind='session.send' AND m.transcript_status='pending'
+          )))`).get(sessionId, now - AUTORESPOND_DAY_MS),
+      ).total;
+      if (retained >= AUTORESPOND_RESERVATIONS_PER_SESSION_CAP) {
+        return { state: "refused", code: "history_unavailable" };
+      }
+      const budgets = this.readAutorespondBudgets(sessionId, now);
+      if (budgets.consecutive >= AUTORESPOND_CONSECUTIVE_LIMIT) return { state: "refused", code: "consecutive_limit" };
+      if (budgets.lastHour >= AUTORESPOND_HOURLY_BUDGET) return { state: "refused", code: "hourly_budget" };
+      if (budgets.lastDay >= AUTORESPOND_DAILY_BUDGET) return { state: "refused", code: "daily_budget" };
+      this.#database.query(
+        `DELETE FROM autorespond_budget_reservations
+         WHERE session_id=? AND reserved_at<? AND NOT (
+           source_kind='prose' AND EXISTS (
+             SELECT 1 FROM mutation_attempts m WHERE m.authority_id=session_id
+               AND m.idempotency_key=source_id AND m.kind='session.send'
+               AND m.transcript_status='pending'
+           )
+         )`,
+      ).run(sessionId, now - AUTORESPOND_DAY_MS);
+      this.#database.query(
+        `INSERT INTO autorespond_budget_reservations(session_id,source_kind,source_id,mode,reserved_at)
+         VALUES (?,?,?,?,?)`,
+      ).run(sessionId, sourceKind, sourceId, mode, now);
+      this.#database.query(
+        `INSERT INTO session_autorespond_counters(session_id,consecutive_count,updated_at) VALUES (?,1,?)
+         ON CONFLICT(session_id) DO UPDATE SET consecutive_count=consecutive_count+1,updated_at=excluded.updated_at`,
+      ).run(sessionId, now);
+      return { state: "reserved" };
+    });
+    return reserve.immediate();
   }
 
   bumpAutorespondCounter(sessionId: SessionId): number {
@@ -14996,7 +15236,7 @@ export class StateStore {
     kind: "command_approval" | "file_change_approval" | "permission_approval";
     latencyMs: number;
     mode: ApprovalMode;
-    outcome: "accepted" | "refused";
+    outcome: "accepted" | "refused" | "unknown";
     sessionId: SessionId;
     subagent: boolean;
   }): void {
@@ -15622,16 +15862,16 @@ export class StateStore {
 
   /*
    * `accepted` counts the autoresponses that actually reached the provider on
-   * either path; `refused` counts every other recorded attempt, including the
-   * bounded `gate_failed:<reason>` family.
+   * either path; `unknown` keeps indeterminate effects separate and `refused`
+   * counts other attempts, including the bounded `gate_failed:<reason>` family.
    */
-  countAutorespondEvidence(input: { sessionId?: SessionId } = {}): Readonly<{ accepted: number; refused: number }> {
+  countAutorespondEvidence(input: { sessionId?: SessionId } = {}): Readonly<{ accepted: number; refused: number; unknown: number }> {
     const rows = input.sessionId === undefined
       ? this.#database.query("SELECT outcome, COUNT(*) AS total FROM autorespond_evidence GROUP BY outcome").all()
       : this.#database.query(
           "SELECT outcome, COUNT(*) AS total FROM autorespond_evidence WHERE session_id=? GROUP BY outcome",
         ).all(sessionIdSchema.parse(input.sessionId));
-    const counts = { accepted: 0, refused: 0 };
+    const counts = { accepted: 0, refused: 0, unknown: 0 };
     for (const row of rows) {
       const parsed = z.object({
         outcome: autorespondEvidenceOutcomeSchema,
@@ -15639,6 +15879,8 @@ export class StateStore {
       }).strict().parse(row);
       if (parsed.outcome === "accepted" || parsed.outcome === "sent") {
         counts.accepted += parsed.total;
+      } else if (parsed.outcome === "unknown") {
+        counts.unknown += parsed.total;
       } else {
         counts.refused += parsed.total;
       }
@@ -21343,16 +21585,19 @@ export class StateStore {
       if (finalized.changes !== 1) {
         throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
       }
-      // The first durable message finalization alone changes the consecutive
-      // autorespond budget: human prose reopens it and autorespond prose spends
-      // one. Keeping both changes in the event/source transaction makes exact
-      // replay neutral and leaves a failed finalization fully retryable.
+      // Human prose resets consecutive admission. Current autorespond prose
+      // already reserved its spend before dispatch; only historical unreserved
+      // sources spend on their first finalization. The event/source transaction
+      // keeps exact replay neutral and failed finalization fully retryable.
       if (input.body.actor === "human") {
         this.#database.query(
           `UPDATE session_autorespond_counters
            SET consecutive_count=0,updated_at=? WHERE session_id=?`,
         ).run(input.recordedAt, input.sessionId);
-      } else if (input.body.actor === "autorespond") {
+      } else if (input.body.actor === "autorespond" && this.#database.query(
+        `SELECT 1 FROM autorespond_budget_reservations
+         WHERE session_id=? AND source_kind='prose' AND source_id=?`,
+      ).get(input.sessionId, input.body.sourceId) === null) {
         this.#database.query(
           `INSERT INTO session_autorespond_counters(
              session_id,consecutive_count,updated_at

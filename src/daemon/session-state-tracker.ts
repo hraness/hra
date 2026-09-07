@@ -42,6 +42,7 @@ type TurnAccumulator = {
 
 type SessionTracking = {
   active: TurnAccumulator | null;
+  completedSource: Readonly<{ turnId: string; text: string }> | null;
   lastClassification: SessionStateClassification | null;
   lastFinalText: string;
   lastTurnStatus: "completed" | "interrupted" | "failed";
@@ -80,6 +81,11 @@ export class SessionStateTracker {
     return this.#sessions.get(sessionId)?.lastFinalText ?? "";
   }
 
+  /** An object-identity fence for one completed question, never restored from history. */
+  completedSource(sessionId: string): Readonly<{ turnId: string; text: string }> | null {
+    return this.#sessions.get(sessionId)?.completedSource ?? null;
+  }
+
   forget(sessionId: string): void {
     this.#sessions.delete(sessionId);
   }
@@ -106,10 +112,12 @@ export class SessionStateTracker {
     const tracking = this.#tracking(sessionId);
     switch (body.type) {
       case "turn_started": {
+        tracking.completedSource = null;
         tracking.active = { turnId: body.turnId, text: "", truncated: false };
         return this.#emit(sessionId, tracking, this.#working("turn active"));
       }
       case "assistant_delta": {
+        tracking.completedSource = null;
         if (tracking.active === null) {
           tracking.active = { turnId: body.turnId, text: "", truncated: false };
         }
@@ -127,19 +135,27 @@ export class SessionStateTracker {
       case "turn_completed": {
         const active = tracking.active;
         tracking.lastFinalText = active !== null && active.turnId === body.turnId ? active.text : "";
+        tracking.completedSource = body.status === "completed" && active?.turnId === body.turnId
+          ? { turnId: body.turnId, text: tracking.lastFinalText }
+          : null;
         tracking.lastTurnStatus = body.status;
         tracking.active = null;
         return this.#emit(sessionId, tracking, this.#classify(tracking, context));
       }
       case "interaction_requested":
       case "interaction_state": {
+        tracking.completedSource = null;
         if (tracking.active !== null && context.pendingInteraction === undefined) {
           return this.#emit(sessionId, tracking, this.#working("turn active"));
         }
         return this.#emit(sessionId, tracking, this.#classify(tracking, context));
       }
       case "session_status": {
+        if (body.status === "active" || body.activeTurnId !== null) {
+          tracking.completedSource = null;
+        }
         if (body.status === "terminal" || body.status === "system_error") {
+          tracking.completedSource = null;
           tracking.active = null;
           tracking.lastTurnStatus = body.status === "terminal" ? tracking.lastTurnStatus : "failed";
           return this.#emit(sessionId, tracking, this.#classify(tracking, context));
@@ -149,6 +165,7 @@ export class SessionStateTracker {
       // Presence, not a count of announcements: the same agent may be
       // announced more than once, so membership is what rises and falls.
       case "subagent_activity": {
+        tracking.completedSource = null;
         if (body.kind === "started" || body.kind === "interacted") {
           if (tracking.openSubagentIds.size < OPEN_SUBAGENT_LIMIT) {
             tracking.openSubagentIds.add(body.agentId);
@@ -163,6 +180,10 @@ export class SessionStateTracker {
       case "gap":
       case "user_message":
       case "provider_switched":
+      case "error":
+      case "protocol_incompatible":
+        tracking.completedSource = null;
+        return null;
       case "item_started":
       case "item_completed":
       case "reasoning_summary_delta":
@@ -173,8 +194,6 @@ export class SessionStateTracker {
       case "token_usage":
       case "session_state":
       case "warning":
-      case "error":
-      case "protocol_incompatible":
         return null;
     }
   }
@@ -194,6 +213,7 @@ export class SessionStateTracker {
     }>,
   ): Extract<SessionEventBody, { type: "session_state" }> {
     const tracking = this.#tracking(sessionId);
+    tracking.completedSource = null;
     const classification: SessionStateClassification = {
       state: input.state,
       attention: input.attention,
@@ -230,7 +250,9 @@ export class SessionStateTracker {
    * from the membership this tracker maintains.
    */
   setOpenSubagents(sessionId: string, count: number): void {
-    this.#tracking(sessionId).openSubagents = Math.max(0, Math.floor(count));
+    const tracking = this.#tracking(sessionId);
+    tracking.completedSource = null;
+    tracking.openSubagents = Math.max(0, Math.floor(count));
   }
 
   #tracking(sessionId: string): SessionTracking {
@@ -238,6 +260,7 @@ export class SessionStateTracker {
     if (tracking === undefined) {
       tracking = {
         active: null,
+        completedSource: null,
         lastClassification: null,
         lastFinalText: "",
         lastTurnStatus: "completed",

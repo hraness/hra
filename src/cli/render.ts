@@ -2813,7 +2813,8 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
   } else if (command.kind === "autorespond.status" || command.kind === "autorespond.set") {
     const report = value as {
       budgets?: { consecutive: number; lastDay: number; lastHour: number };
-      counts?: { accepted: number; refused: number };
+      budgetHistoryAvailableAt?: number | null;
+      counts?: { accepted: number; refused: number; unknown?: number };
       gateway?: unknown;
       mode?: unknown;
       recent?: unknown[];
@@ -2823,10 +2824,13 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     // Only the configured/not-configured fact is ever shown for the key.
     if (report.gateway !== undefined) rows.push(`Gateway: ${line(report.gateway)}`);
     if (report.counts !== undefined) {
-      rows.push(`Autoresponses: ${String(report.counts.accepted)} accepted, ${String(report.counts.refused)} escalated`);
+      rows.push(`Autoresponses: ${String(report.counts.accepted)} accepted, ${String(report.counts.refused)} escalated, ${String(report.counts.unknown ?? 0)} unknown`);
     }
     if (report.budgets !== undefined) {
       rows.push(`Budgets: ${String(report.budgets.consecutive)} consecutive, ${String(report.budgets.lastHour)} this hour, ${String(report.budgets.lastDay)} today`);
+    }
+    if (typeof report.budgetHistoryAvailableAt === "number") {
+      rows.push(`Automatic approvals paused until ${new Date(report.budgetHistoryAvailableAt).toISOString()}: previous budget history is incomplete.`);
     }
     if (Array.isArray(report.recent) && report.recent.length > 0) {
       rows.push(table(report.recent as Record<string, unknown>[], ["occurredAt", "path", "kind", "rule", "decision", "outcome", "model", "sessionId"]));

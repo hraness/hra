@@ -1,5 +1,9 @@
 # HRA v0.6.1 local CLI beta
 
+Automatic approvals reserve their shared budget before dispatch and recheck current consent after asynchronous review. Older display-log retention no longer controls hourly or daily limits. The first upgrade to local schema 44 places existing sessions on a durable 24-hour automatic-approval hold because their older budget history may be incomplete. It also closes the consecutive budget until the next real human message, which can be sent during that hold. Manual approvals remain available, and `hra autorespond status --session <session>` reports the hold's end and counters. New sessions have no migration hold. Prepared and uncertain approvals remain charged; do not downgrade the migrated state root.
+
+The `history_unavailable` refusal can also mean that the local clock moved behind a retained approval or that unresolved prose recovery filled the bounded reservation ledger. A hold timestamp describes only the upgrade hold. Wait for the clock to catch up or complete the exact pending recovery; do not clear the ledger or the audit log to reopen automatic approvals.
+
 HRA is a persistent multi-provider CLI for isolated accounts and live local session control. Codex runs on macOS and Linux; Claude Code runs on Linux. Optional hosted encrypted sync has been live since 2026-09-03 and is now an open beta.
 
 ## Install
