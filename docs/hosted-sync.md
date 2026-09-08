@@ -629,10 +629,23 @@ credential, under the evidence boundary.
 `bun run hosted:configure` accepts one strict JSON object with exactly these fields:
 
 ```json
-{"authEmailReplyTo":"ben@substrate.run","resendApiKey":"<secret>","siteUrl":"https://hra.sh"}
+{"attentionResendApiKey":"<attention-secret>","authEmailReplyTo":"ben@substrate.run","resendApiKey":"<sign-in-secret>","siteUrl":"https://hra.sh"}
 ```
 
 `siteUrl` must be one HTTPS origin. For the HRA `v0.1.0` authority it is exactly `https://hra.sh`, the final canonical origin. Do not substitute `https://try-hra.vercel.app` or an automatic deployment hostname: configuration is one-shot, while staging aliases move and rehearsal may replace candidate deployments. `resendApiKey` must be a Resend sending key. HRA pins every OTP sender to `HRA sign-in <hra@auth.hraness.com>` in source; the operator cannot replace it with an environment value. `authEmailReplyTo` must be one lowercase canonical mailbox without an apostrophe that is monitored and verified to receive mail. The sending-only `auth.hraness.com` and `news.hraness.com` domains are rejected. If the runtime variable is absent, HRA falls back to the receive-capable `ben@substrate.run` mailbox. The helper generates a fresh 2048-bit RS256 private key, its matching public JWKS, and a 256-bit HMAC secret locally with WebCrypto.
+
+`attentionResendApiKey` is a separate sending key for attention email. Both
+keys must use the strict `re_` token format, be 8 to 512 characters long, and
+have different values. Keep the sign-in key scoped to `auth.hraness.com` and
+the attention key scoped to `news.hraness.com` in the intended Resend account.
+Local syntax and inequality checks do not prove provider account identity,
+domain scope, verification, deliverability, or permission to activate sending.
+Attention email retains `HRA attention <notifications@news.hraness.com>` and
+the subject `HRA needs your attention`. Its body version 1 and idempotency
+contract are unchanged. A missing, malformed, or shared attention key stops
+the production drain before it claims an attempt; it does not fall back to
+the sign-in key or consume a network retry. Configuring these secrets does not
+enable attention notifications.
 
 Pass the JSON from a protected secret source through standard input:
 
@@ -667,6 +680,7 @@ The helper reads at most 8 KiB, rejects a terminal descriptor, and ignores inher
 - `JWKS`
 - `HRA_AUTH_HMAC_SECRET`
 - `HRA_RESEND_API_KEY`
+- `HRA_ATTENTION_RESEND_API_KEY`
 - `HRA_AUTH_EMAIL_REPLY_TO`
 
 If any target name already exists, the names response is ambiguous, Convex refuses the batch, or the final names readback is incomplete, the helper closes with a generic error. A failure after the batch may have left a complete or partial provider write. Do not retry or overwrite. Inspect names only, then replace the still-unused deployment if the result is uncertain.
@@ -731,6 +745,72 @@ custody, authority containment, or unproven process cleanup fails closed. Keep
 both the receipt and its `.intent`; do not delete or rewrite either to force a
 retry.
 
+### Prepare an existing deployment for a separate attention key
+
+Existing deployments need a separately scoped attention key before the new
+runtime can send attention email. The checkout-only helper below is
+**preparation and read-only reconciliation**, not a migration writer. The
+pinned Convex 1.45 environment importer reads existing names and then submits
+an unconditional `{changes}` update. Its non-force mode cannot prevent a
+concurrent insertion between those calls, so it does not provide atomic
+add-only creation. The helper has no environment-write transport or apply
+phase. It never overwrites a key or treats task ownership as exclusive
+provider custody.
+
+From the exact clean candidate checkout, provide one strict JSON document
+through an anonymous shell pipe from a protected secret source. This operator
+rejects terminal input, redirected regular files, named FIFOs, sockets, and
+unproved descriptor identities before reading the secret. It retains the
+8 KiB and 15-second input limits:
+
+```json
+{"attentionResendApiKey":"<attention-secret>"}
+```
+
+```sh
+protected-json-source | bun ./scripts/migrate-hosted-attention-key.ts \
+  --phase prepare \
+  --source-commit <EXACT_CANDIDATE_COMMIT> \
+  --deploy-evidence /protected/release/candidate-deploy.json \
+  --evidence-path /protected/release/attention-key-preparation.json \
+  --deployment <CURRENT_DEFAULT_DEPLOYMENT_NAME> \
+  --team-id <CURRENT_TEAM_ID> \
+  --project-id <CURRENT_PROJECT_ID> \
+  --deployment-id <CURRENT_DEFAULT_DEPLOYMENT_ID> \
+  --deployment-url <CURRENT_DEFAULT_DEPLOYMENT_URL>
+```
+
+The candidate receipt, source commit, current numeric target, runtime
+attestation, and untouched inactive control must agree. The control must be
+absent at generation zero with zero outbox and safety-fault occupancy. The
+operator reads the existing sign-in key only into bounded process memory,
+requires a strictly valid distinct intended key, and observes whether the
+attention key is absent, equal, or different. Sequential samples detect
+observed drift; they do not lock the provider or prove an atomic snapshot.
+
+For a later read-only observation, repeat the same bindings and protected
+input, change `--phase` to `reconcile`, add
+`--preparation-evidence /protected/release/attention-key-preparation.json`, and
+choose a distinct new `--evidence-path`. A changed binding or ambiguous state
+refuses. Protected mode-`0600` observation evidence contains a
+domain-separated intended-key digest but never a credential. Keep this
+evidence private. Standard output contains only bounded non-secret status;
+provider responses and key digests are not printed.
+
+Both supported phases report `provider_add_only_unavailable` with
+`effect: "none"`, `status: "refused"`, and exit one even when the observation
+was saved. The protected document says `observed_only`, never applied or
+migrated. An equal value is an observation, not proof that this operator
+installed it. Do not reinterpret old Reply-To evidence or remove evidence to
+force a write. A future provider-native conditional mechanism or explicitly
+reviewed operational custody protocol requires a separate design and live
+handoff. Until then, this command cannot complete key migration or authorize
+attention activation. Sign-in credentials and delivery remain unchanged.
+
+The initial untouched inactive cron is a quiet no-op, even before the separate
+key is provisioned. Previously used, enabled, occupied, or ambiguous state is
+not that initial state and cannot skip configuration validation before a claim.
+
 ## Read hosted preflight status
 
 Before a controlled live-acceptance run, an operator can read one bounded,
@@ -761,16 +841,28 @@ row per table and reports only zero-or-one occupancy; it does not expose a
 candidate, recipient, delivery record, fault record, or execution lease. Keep
 this flag on the inactive checkpoint only; a later reviewed enablement phase
 must define its own production proof.
+Add `--require-attention-key-ready` together with `--require-passed` to require
+the current runtime's separate boolean credential check. Its named internal
+query returns only `{dedicatedKeyReady}`, which hosted status exposes as
+`attentionSending.dedicatedKeyReady`: both sign-in and
+attention keys have the strict token format and their values differ. A false
+value exits one even when the ordinary hosted state is `live` or the attention
+control is inactive. Without this flag, status makes no credential-readiness
+claim. A true value does not prove Resend account identity, key domain scope,
+sender verification, consent, or notification enablement. Combine it with
+`--require-attention-inactive` when checking a still-inactive configured target.
 Malformed, unavailable, or ambiguous provider reads exit one; unresolved local
 custody exits 75.
 
-The record exposes only the release-attestation binding state, whether all six
+The record exposes only the release-attestation binding state, whether all seven
 HRA-managed environment *names* are present and which of those static names
 are missing, a capped count of occupied bootstrap tables plus a closed
 bootstrap classification, and the safe admission generation, state, and
 new-identity admission value. When the inactive gate is requested, it also
 includes the closed global-attention state, generation, zero-or-one outbox and
-safety-fault occupancy, and the derived inactive verdict. A deployment that predates the new-identity
+safety-fault occupancy, and the derived inactive verdict. The optional
+credential check adds only the dedicated-key boolean; it exposes no key or
+digest. A deployment that predates the new-identity
 control reports no value, which the operator reads as `invite_only` exactly as
 the authority does. It never
 emits environment values, unrelated environment names, invitation material,
@@ -779,7 +871,7 @@ Convex-owned runtime configuration, not an HRA-managed protected value, so it
 is intentionally neither required nor reported by this command.
 
 `preflight_passed` means the bound release attestation names the supplied
-source commit, the six managed names are present, and the deployment presents
+source commit, the seven managed names are present, and the deployment presents
 the exact first-bootstrap authority frame with open generation-zero admission.
 `live` means the same runtime and environment facts hold, the first invitation
 was accepted (the control row carries a durable accepted timestamp ordered

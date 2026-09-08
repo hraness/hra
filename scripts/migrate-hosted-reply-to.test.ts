@@ -394,6 +394,7 @@ describe("hosted Reply-To migration operator", () => {
     expect([...HOSTED_ENVIRONMENT_NAMES]).toEqual([
       ...HOSTED_REPLY_TO_MIGRATION_PREREQUISITES,
       hraOtpReplyToEnvironmentName,
+      "HRA_ATTENTION_RESEND_API_KEY",
     ]);
   });
 
