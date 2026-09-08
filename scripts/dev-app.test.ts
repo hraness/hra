@@ -1227,7 +1227,7 @@ describe("cache, security, and owned process boundaries", () => {
           const grandchild: unknown = JSON.parse(await readFile(grandchildReady, "utf8"));
           assert.ok(typeof parent === "object" && parent !== null && "childPid" in parent);
           assert.ok(typeof parent.childPid === "number" && Number.isSafeInteger(parent.childPid) && parent.childPid > 1);
-          expect<unknown>(parent).toEqual({ childPid: parent.childPid, pid });
+          assert.deepEqual(parent, { childPid: parent.childPid, pid });
           expect(grandchild).toEqual({ parentPid: pid, pid: parent.childPid });
           grandchildPid = parent.childPid;
           controller.abort();
