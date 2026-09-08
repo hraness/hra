@@ -322,6 +322,8 @@ Peer coordination is separate from Work. It creates no Work, task, attempt, revi
 
 HRA refuses self-addressing, stale target revisions, causal cycles, and a ninth hop. It admits at most 120 new peer actions per actor and per project in a rolling hour, at most 16 distinct targets per actor in that hour, and at most 64 unsettled inbound queue entries or 1 MiB of their text per target. Complete replay and causal evidence remains for at least seven days. Protected recovery ancestry is never pruned to make room, and the 25,000-action project cap fails closed when protected rows consume it.
 
+Abandoning an uncertain peer delivery does not prove that its message was ignored. HRA refuses new peer messages from an affected active turn while preserving inspection and owner controls, including stop. A subsequent distinct turn can coordinate again. Older unreleased recovery records with no affected-turn identity conservatively fence that provider thread until the owner explicitly replaces it; a new message alone does not repair missing historical evidence.
+
 ## Terminal and agent interfaces
 
 > **Conditional walkthrough.** Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the admitted v0.6.3 daemon or candidate v0.7.0 daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability, candidate readiness, and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.

@@ -1335,6 +1335,351 @@ const codexRuntimeProfile = (
   enabledApps: [],
 });
 
+const peerAbandonmentFenceFixture = async (delivery: "send" | "steer" | "queue") => {
+  let now = 50_000;
+  const created = await fixture({ now: () => now });
+  let store = created.store;
+  const root = join(created.home, "peer-abandonment-fence");
+  await mkdir(root);
+  const project = await store.createProject("Peer abandonment fence", root);
+  const profile = signInProfile(store, "Peer abandonment fence", "peer-fence@example.com");
+  const createSession = (name: string, active: boolean) => {
+    const initial = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    return store.bindSession({
+      sessionId: initial.id,
+      expectedRevision: initial.revision,
+      providerThreadId: `thread-peer-fence-${name}`,
+      state: active ? "active" : "idle",
+      ...(active ? { activeTurnId: `turn-peer-fence-${name}` } : {}),
+    });
+  };
+  const source = createSession("source", true);
+  const target = createSession("target", delivery === "steer");
+  const spare = createSession("spare", true);
+  const targetTurnId = "turn-peer-fence-target";
+  let nextKey = 94_000;
+  const request = (
+    actorId: SessionRecord["id"],
+    targetId: SessionRecord["id"],
+    kind: "send" | "steer" | "queue",
+    message: string,
+  ): Parameters<StateStore["admitPeerSessionAction"]>[0] => ({
+    actorSessionId: actorId,
+    actorTurnId: store.requireSession(actorId).activeTurnId!,
+    targetSessionId: targetId,
+    expectedTargetRevision: store.requireSession(targetId).revision,
+    delivery: kind,
+    requestDigest: testDigest(`fence request ${String(nextKey)}`),
+    messageDigest: testDigest(message),
+    reasonDigest: testDigest("fence reason"),
+    idempotencyKey: peerIdempotencyKey(nextKey++),
+    ...(kind === "queue" ? { message } : {}),
+  });
+  const message = "uncertain peer message with durable abandonment authority";
+  const incomingRequest = request(source.id, target.id, delivery, message);
+  const incoming = store.admitPeerSessionAction(incomingRequest);
+  const runtime = codexRuntimeProfile(profile);
+  const direct = delivery === "queue" ? undefined : store.prepareMutation({
+    kind: delivery === "send" ? "session.send" : "session.steer",
+    authorityId: target.id,
+    authorityGeneration: profile.processGeneration,
+    request: { message },
+    idempotencyKey: incomingRequest.idempotencyKey,
+  });
+  let effectDigest: string;
+  if (delivery === "queue") {
+    const queue = incoming.queue;
+    if (queue === undefined) throw new Error("Missing peer fence queue");
+    effectDigest = store.beginQueueEffect({
+      queueId: queue.id,
+      sessionId: target.id,
+      profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000099",
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: queue.id,
+        sessionId: target.id,
+        providerThreadId: target.providerThreadId!,
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: queue.id,
+        messageDigest: testDigest(message),
+        runtimeProfile: runtime,
+      },
+    }).digest;
+  } else {
+    if (direct === undefined) throw new Error("Missing peer fence mutation");
+    const common = {
+      providerThreadId: target.providerThreadId!,
+      clientMessageId: direct.id,
+      messageDigest: testDigest(message),
+      messageActor: "peer_session" as const,
+    };
+    effectDigest = store.beginSessionMutationEffect({
+      attemptId: direct.id,
+      sessionId: target.id,
+      profileGeneration: profile.processGeneration,
+      message,
+      transcript: {
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000099",
+        actor: "peer_session",
+        message,
+      },
+      evidence: delivery === "send" ? {
+        ...common,
+        kind: "session.send",
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        runtimeProfile: runtime,
+      } : {
+        ...common,
+        kind: "session.steer",
+        baseline: { providerUpdatedAt: null, status: "active", activeTurnId: targetTurnId },
+        activeTurnId: targetTurnId,
+      },
+    }).digest;
+  }
+
+  // An observed active target can admit work before the original response is
+  // classified as uncertain. Effect begin must recheck the later fence.
+  if (delivery !== "steer") {
+    store.setSessionTurnState({
+      sessionId: target.id,
+      expectedRevision: store.requireSession(target.id).revision,
+      state: "active",
+      activeTurnId: targetTurnId,
+    });
+  }
+  const completedRequest = request(target.id, spare.id, "steer", "already completed peer work");
+  const completed = store.admitPeerSessionAction(completedRequest).action;
+  store.beginPeerSessionActionEffect(completed.id);
+  store.settlePeerSessionAction({
+    actionId: completed.id,
+    expectedState: "effect_started",
+    state: "applied",
+    targetTurnId: spare.activeTurnId!,
+    resultDigest: testDigest("completed fence fixture receipt"),
+  });
+  const pending = store.admitPeerSessionAction(
+    request(target.id, source.id, "steer", "preadmitted peer return"),
+  ).action;
+  if (incoming.queue !== undefined) {
+    store.markQueueEffectAmbiguous(incoming.queue.id, effectDigest);
+  } else {
+    if (direct === undefined) throw new Error("Missing direct peer ambiguity authority");
+    expect(store.transitionMutation(direct.id, "effect_started", "ambiguous")).toBeTrue();
+    store.quarantineSession(target.id);
+    store.settlePeerSessionAction({
+      actionId: incoming.action.id,
+      expectedState: "effect_started",
+      state: "ambiguous",
+    });
+  }
+  const baseResolutionEvidence = { action: "user_abandon", providerEffectRetried: false };
+  const abandon = (
+    resolutionEvidence: unknown = baseResolutionEvidence,
+    active = true,
+    activeTurnId: string | null = targetTurnId,
+  ) => {
+    const provider = {
+      providerThreadId: target.providerThreadId!,
+      title: "Abandoned uncertain peer target",
+      status: active ? "active" as const : "idle" as const,
+      ...(active && activeTurnId !== null ? { activeTurnId } : {}),
+    };
+    if (incoming.queue !== undefined) {
+      return store.resolveQueueEffect({
+        queueId: incoming.queue.id,
+        expectedEvidenceDigest: effectDigest,
+        resolution: "abandoned",
+        resolutionEvidence,
+        provider,
+      });
+    }
+    if (direct === undefined) throw new Error("Missing direct peer recovery authority");
+    const resolved = store.resolveSessionMutation({
+      attemptId: direct.id,
+      expectedOriginalState: "ambiguous",
+      expectedEvidenceDigest: effectDigest,
+      resolution: "abandoned",
+      resolutionEvidence,
+      provider,
+    });
+    store.settlePeerSessionAction({
+      actionId: incoming.action.id,
+      expectedState: "ambiguous",
+      state: "failed",
+      resultDigest: testDigest("abandoned peer nested resolution"),
+    });
+    return resolved;
+  };
+  const resolutionEvidence = () => incoming.queue === undefined
+    ? store.readMutation(incomingRequest.idempotencyKey)?.resolution?.evidence
+    : store.readQueueEffect(incoming.queue.id)?.resolution?.evidence;
+  const changeTurn = (sessionId: SessionRecord["id"], turnId: string | null) =>
+    store.setSessionTurnState({
+      sessionId,
+      expectedRevision: store.requireSession(sessionId).revision,
+      state: turnId === null ? "idle" : "active",
+      ...(turnId === null ? {} : { activeTurnId: turnId }),
+    });
+  const appendAbandonedSteers = (count: number) => {
+    if (delivery !== "steer" || direct === undefined) throw new Error("Steer receipt corpus required");
+    const receipts = [{ attemptId: direct.id, actionId: incoming.action.id, turnId: targetTurnId }];
+    for (let index = 0; index < count; index += 1) {
+      const turnId = `turn-peer-fence-page-${String(index)}`;
+      changeTurn(target.id, turnId);
+      const nextRequest = request(source.id, target.id, "steer", message);
+      const action = store.admitPeerSessionAction(nextRequest).action;
+      const attempt = store.prepareMutation({
+        kind: "session.steer",
+        authorityId: target.id,
+        authorityGeneration: profile.processGeneration,
+        request: { message },
+        idempotencyKey: nextRequest.idempotencyKey,
+      });
+      const effect = store.beginSessionMutationEffect({
+        attemptId: attempt.id,
+        sessionId: target.id,
+        profileGeneration: profile.processGeneration,
+        message,
+        transcript: {
+          accountId: profile.id,
+          providerGeneration: profile.processGeneration,
+          providerConnectionId: "10000000-0000-4000-8000-000000000099",
+          actor: "peer_session",
+          message,
+        },
+        evidence: {
+          kind: "session.steer",
+          providerThreadId: target.providerThreadId!,
+          clientMessageId: attempt.id,
+          messageDigest: testDigest(message),
+          messageActor: "peer_session",
+          baseline: { providerUpdatedAt: null, status: "active", activeTurnId: turnId },
+          activeTurnId: turnId,
+        },
+      });
+      expect(store.transitionMutation(attempt.id, "effect_started", "ambiguous")).toBeTrue();
+      store.quarantineSession(target.id);
+      store.settlePeerSessionAction({ actionId: action.id, expectedState: "effect_started", state: "ambiguous" });
+      store.resolveSessionMutation({
+        attemptId: attempt.id,
+        expectedOriginalState: "ambiguous",
+        expectedEvidenceDigest: effect.digest,
+        resolution: "abandoned",
+        resolutionEvidence: baseResolutionEvidence,
+        provider: {
+          providerThreadId: target.providerThreadId!,
+          title: "Independent historical peer turn",
+          status: "idle",
+        },
+      });
+      store.settlePeerSessionAction({
+        actionId: action.id,
+        expectedState: "ambiguous",
+        state: "failed",
+        resultDigest: testDigest("abandoned peer pagination receipt"),
+      });
+      receipts.push({ attemptId: attempt.id, actionId: action.id, turnId });
+    }
+    return receipts;
+  };
+  const close = () => {
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+  };
+  const reopen = () => {
+    const paths = store.paths;
+    close();
+    store = new StateStore(paths, { now: () => now });
+    stores.push(store);
+  };
+  const prune = () => {
+    changeTurn(source.id, null);
+    changeTurn(spare.id, "turn-peer-fence-maintainer");
+    now += PEER_SESSION_ACTION_RETAIN_AGE_MS + 1;
+    store.admitPeerSessionAction(request(spare.id, source.id, "send", "retention maintenance"));
+    expect(() => store.requirePeerSessionAction(incoming.action.id)).toThrow("PEER_SESSION_NOT_FOUND");
+  };
+  const rewriteLegacyMarker = (marker: unknown, options: Readonly<{
+    rawMarkerJson?: string;
+    legacySteerTurnNull?: boolean;
+  }> = {}) => {
+    const paths = store.paths;
+    close();
+    const writer = new Database(paths.database, { create: false, strict: true });
+    const table = incoming.queue === undefined ? "mutation_resolutions" : "queue_effect_resolutions";
+    const identity = incoming.queue?.id ?? direct?.id;
+    const column = incoming.queue === undefined ? "attempt_id" : "queue_id";
+    const triggerName = `${table}_immutable_update`;
+    try {
+      const trigger = z.object({ sql: z.string() }).strict().parse(writer.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+      ).get(triggerName));
+      const row = z.object({ evidence_json: z.string() }).strict().parse(
+        writer.query(`SELECT evidence_json FROM ${table} WHERE ${column}=?`).get(identity!),
+      );
+      const evidence = z.record(z.string(), z.unknown()).parse(JSON.parse(row.evidence_json) as unknown);
+      if (marker === undefined) delete evidence.peerCausalFence;
+      else evidence.peerCausalFence = marker;
+      const resolutionJson = options.rawMarkerJson === undefined
+        ? JSON.stringify(evidence)
+        : `${JSON.stringify(evidence).slice(0, -1)},"peerCausalFence":${options.rawMarkerJson}}`;
+      // Represent a pre-fence immutable receipt or corrupt legacy value. Restore
+      // the exact guard before reopening; production never rewrites a receipt.
+      writer.exec(`DROP TRIGGER ${triggerName}`);
+      try {
+        writer.query(`UPDATE ${table} SET evidence_json=? WHERE ${column}=?`)
+          .run(resolutionJson, identity!);
+      } finally {
+        writer.exec(trigger.sql);
+      }
+      if (options.legacySteerTurnNull === true) {
+        if (delivery !== "steer" || direct === undefined) throw new Error("Legacy steer fixture required");
+        const effectTrigger = z.object({ sql: z.string() }).strict().parse(writer.query(
+          "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='mutation_effect_evidence_immutable_update'",
+        ).get());
+        const effectRow = z.object({ evidence_json: z.string() }).strict().parse(writer.query(
+          "SELECT evidence_json FROM mutation_effect_evidence WHERE attempt_id=?",
+        ).get(direct.id));
+        const effect = z.record(z.string(), z.unknown()).parse(JSON.parse(effectRow.evidence_json) as unknown);
+        effect.activeTurnId = null;
+        const effectJson = JSON.stringify(effect);
+        writer.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
+        try {
+          writer.query("UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?")
+            .run(effectJson, testDigest(effectJson), direct.id);
+        } finally {
+          writer.exec(effectTrigger.sql);
+        }
+      }
+    } finally {
+      writer.close(false);
+      store = new StateStore(paths, { now: () => now });
+      stores.push(store);
+    }
+  };
+  const returnRequest = () => request(
+    target.id,
+    source.id,
+    store.requireSession(source.id).state === "idle" ? "send" : "steer",
+    "new peer return after abandonment",
+  );
+  return {
+    abandon, appendAbandonedSteers, baseResolutionEvidence, changeTurn, completed, completedRequest,
+    incoming, pending, prune, reopen, resolutionEvidence, returnRequest,
+    rewriteLegacyMarker, source, spare, target, targetTurnId,
+    get store() { return store; },
+  };
+};
+
 const prepareAuthorizedReset = (
   store: StateStore,
   input: Parameters<StateStore["prepareAccountRateLimitReset"]>[0],
@@ -25591,10 +25936,222 @@ describe("StateStore", () => {
         status: "idle",
       },
     });
+    const storedResolution = restarted.readQueueEffect(abandoned.queue.id)?.resolution;
+    if (storedResolution === undefined) throw new Error("Missing normalized peer queue resolution");
+    expect(storedResolution.evidence).toEqual({
+      source: "exact_provider_absence",
+      peerCausalFence: {
+        version: 1,
+        providerThreadId: abandoned.providerThreadId,
+        activeTurnId: null,
+      },
+    });
     expect(restarted.requirePeerSessionAction(abandoned.action.id)).toMatchObject({
       state: "failed",
-      resultDigest: testDigest(JSON.stringify({ source: "exact_provider_absence" })),
+      resultDigest: testDigest(JSON.stringify(storedResolution.evidence)),
     });
+  });
+
+  test.each(["send", "steer", "queue"] as const)(
+    "peer abandonment fence persists for %s across restart and action pruning",
+    async (delivery) => {
+      const f = await peerAbandonmentFenceFixture(delivery);
+      expect(f.abandon()).toMatchObject({ state: "active", activeTurnId: f.targetTurnId });
+      const expectedEvidence = {
+        ...f.baseResolutionEvidence,
+        peerCausalFence: {
+          version: 1,
+          providerThreadId: f.target.providerThreadId,
+          activeTurnId: f.targetTurnId,
+        },
+      };
+      expect(f.resolutionEvidence()).toEqual(expectedEvidence);
+      expect(f.store.requirePeerSessionAction(f.incoming.action.id).state).toBe("failed");
+      if (delivery === "queue") {
+        expect(f.store.requirePeerSessionAction(f.incoming.action.id).resultDigest)
+          .toBe(testDigest(JSON.stringify(f.resolutionEvidence())));
+      }
+      expect(f.store.readPeerSessionTurnOrigins({
+        sessionId: f.target.id,
+        turnId: f.targetTurnId,
+      })).toEqual([]);
+      const denied = f.returnRequest();
+      expect(() => f.store.admitPeerSessionAction(denied)).toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      expect(f.store.readPeerSessionActionByIdempotencyKey(denied.idempotencyKey)).toBeNull();
+      expect(() => f.store.beginPeerSessionActionEffect(f.pending.id))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      expect(f.store.requirePeerSessionAction(f.pending.id).state).toBe("prepared");
+      expect(f.store.admitPeerSessionAction(f.completedRequest)).toMatchObject({
+        replay: true, action: { id: f.completed.id, state: "applied" },
+      });
+      expect(f.store.assertPeerSessionInspection({
+        actorSessionId: f.target.id,
+        actorTurnId: f.targetTurnId,
+        targetSessionId: f.source.id,
+        expectedTargetRevision: f.store.requireSession(f.source.id).revision,
+      }).id).toBe(f.source.id);
+
+      f.reopen();
+      expect(f.resolutionEvidence()).toEqual(expectedEvidence);
+      expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      expect(f.store.admitPeerSessionAction(f.completedRequest).replay).toBeTrue();
+      f.prune();
+      expect(f.resolutionEvidence()).toEqual(expectedEvidence);
+      expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      f.reopen();
+      expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      f.changeTurn(f.target.id, "turn-peer-fence-next");
+      expect(f.store.admitPeerSessionAction(f.returnRequest()).action.state).toBe("prepared");
+    },
+  );
+
+  test.each(["send", "queue"] as const)(
+    "peer abandonment fence retains a conservative legacy %s thread fence",
+    async (delivery) => {
+      const f = await peerAbandonmentFenceFixture(delivery);
+      f.abandon();
+      f.prune();
+      f.rewriteLegacyMarker(undefined);
+      expect(f.resolutionEvidence()).toEqual(f.baseResolutionEvidence);
+      expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      f.changeTurn(f.target.id, "turn-peer-fence-legacy-next");
+      expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+    },
+  );
+
+  test("peer abandonment fence reaches an affected receipt beyond one candidate page", async () => {
+    const f = await peerAbandonmentFenceFixture("steer");
+    f.abandon(f.baseResolutionEvidence, false);
+    const receipts = f.appendAbandonedSteers(17).sort((left, right) =>
+      left.attemptId < right.attemptId ? -1 : left.attemptId > right.attemptId ? 1 : 0);
+    expect(receipts).toHaveLength(18);
+    const affected = receipts.at(-1)!;
+    expect(receipts.slice(0, -1).every((receipt) => receipt.turnId !== affected.turnId)).toBeTrue();
+    f.prune();
+    for (const receipt of receipts) {
+      expect(() => f.store.requirePeerSessionAction(receipt.actionId)).toThrow("PEER_SESSION_NOT_FOUND");
+    }
+    f.reopen();
+    // UUID order, not creation time, is the immutable resolution cursor. Only
+    // its final row targets this turn; the preceding 17 rows are valid and safe.
+    f.changeTurn(f.target.id, affected.turnId);
+    const refused = f.returnRequest();
+    expect(() => f.store.admitPeerSessionAction(refused)).toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+    expect(f.store.readPeerSessionActionByIdempotencyKey(refused.idempotencyKey)).toBeNull();
+    f.changeTurn(f.target.id, "turn-peer-fence-after-all-pages");
+    expect(f.store.admitPeerSessionAction(f.returnRequest()).action.state).toBe("prepared");
+  });
+
+  test("peer abandonment fence retains the exact legacy steer turn without guessing later turns", async () => {
+    const f = await peerAbandonmentFenceFixture("steer");
+    f.abandon();
+    f.prune();
+    f.rewriteLegacyMarker(undefined);
+    expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+      .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+    f.changeTurn(f.target.id, "turn-peer-fence-legacy-steer-next");
+    expect(f.store.admitPeerSessionAction(f.returnRequest()).action.state).toBe("prepared");
+    f.rewriteLegacyMarker(undefined, { legacySteerTurnNull: true });
+    expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+      .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+  });
+
+  test.each(["send", "steer", "queue"] as const)(
+    "peer abandonment fence rejects caller markers and malformed retained authority for %s",
+    async (delivery) => {
+      const f = await peerAbandonmentFenceFixture(delivery);
+      for (const reserved of [undefined, null, { version: 1 }]) {
+        expect(() => f.abandon({ ...f.baseResolutionEvidence, peerCausalFence: reserved }))
+          .toThrow("PEER_SESSION_CAUSAL_FENCE_RESERVED");
+        expect(f.resolutionEvidence()).toBeUndefined();
+        expect(f.store.requireSession(f.target.id).state).toBe("recovery_required");
+        expect(f.store.requirePeerSessionAction(f.incoming.action.id).state).toBe("ambiguous");
+      }
+      expect(() => f.abandon(f.baseResolutionEvidence, true, null)).toThrow();
+      expect(f.resolutionEvidence()).toBeUndefined();
+      expect(f.store.requireSession(f.target.id).state).toBe("recovery_required");
+      expect(f.store.requirePeerSessionAction(f.incoming.action.id).state).toBe("ambiguous");
+      f.abandon();
+      f.prune();
+      // A valid marker for the old turn would allow this actor. A refusal now
+      // demonstrates malformed authority, not an incidental turn match.
+      f.changeTurn(f.target.id, "turn-peer-fence-malformed-control");
+      expect(f.store.admitPeerSessionAction(f.returnRequest()).action.state).toBe("prepared");
+      // Provider identifiers use JavaScript string bounds, not UTF-8 bytes or
+      // SQLite's Unicode-scalar/NUL-terminated length interpretation.
+      for (const activeTurnId of ["x".repeat(200), "é".repeat(200), "😀".repeat(100), `x\u0000${"x".repeat(198)}`]) {
+        f.rewriteLegacyMarker({ version: 1, providerThreadId: f.target.providerThreadId, activeTurnId });
+        expect(
+          f.store.admitPeerSessionAction(f.returnRequest()).action.state,
+          `Valid ${delivery} fence turn: ${JSON.stringify(activeTurnId)}`,
+        ).toBe("prepared");
+      }
+      for (const malformed of [
+        null,
+        {},
+        { version: 2, providerThreadId: f.target.providerThreadId, activeTurnId: f.targetTurnId },
+        { version: "1", providerThreadId: f.target.providerThreadId, activeTurnId: f.targetTurnId },
+        { version: 1, providerThreadId: "different-thread", activeTurnId: f.targetTurnId },
+        { version: 1, providerThreadId: "", activeTurnId: f.targetTurnId },
+        { version: 1, providerThreadId: "x".repeat(201), activeTurnId: f.targetTurnId },
+        { version: 1, providerThreadId: f.target.providerThreadId, activeTurnId: "" },
+        { version: 1, providerThreadId: f.target.providerThreadId, activeTurnId: "x".repeat(201) },
+        { version: 1, providerThreadId: f.target.providerThreadId, activeTurnId: "😀".repeat(101) },
+        { version: 1, providerThreadId: f.target.providerThreadId, activeTurnId: `x\u0000${"x".repeat(200)}` },
+        { version: 1, providerThreadId: f.target.providerThreadId },
+        { version: 1, providerThreadId: f.target.providerThreadId, activeTurnId: f.targetTurnId, extra: true },
+      ]) {
+        f.rewriteLegacyMarker(malformed);
+        expect(
+          () => f.store.admitPeerSessionAction(f.returnRequest()),
+          `Malformed ${delivery} fence: ${JSON.stringify(malformed)}`,
+        ).toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      }
+      for (const duplicateVersion of [1, 2]) {
+        f.rewriteLegacyMarker(undefined, {
+          rawMarkerJson: `{"version":1,"version":${String(duplicateVersion)},"providerThreadId":${JSON.stringify(f.target.providerThreadId)},"activeTurnId":${JSON.stringify(f.targetTurnId)}}`,
+        });
+        expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+          .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      }
+      const duplicateMarker = { version: 1, providerThreadId: f.target.providerThreadId, activeTurnId: null };
+      f.rewriteLegacyMarker(duplicateMarker, { rawMarkerJson: JSON.stringify(duplicateMarker) });
+      expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      fc.assert(fc.property(fc.integer({ min: 2, max: 1_000 }), (version) => {
+        f.rewriteLegacyMarker({ version, providerThreadId: f.target.providerThreadId, activeTurnId: null });
+        expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+          .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      }), { numRuns: 5 });
+    },
+  );
+
+  test("peer abandonment fence distinguishes a new inactive observation from missing legacy evidence", async () => {
+    for (const delivery of ["send", "steer", "queue"] as const) {
+      const f = await peerAbandonmentFenceFixture(delivery);
+      expect(f.abandon(f.baseResolutionEvidence, false)).toMatchObject({ state: "idle" });
+      expect(f.resolutionEvidence()).toEqual({
+        ...f.baseResolutionEvidence,
+        peerCausalFence: {
+          version: 1,
+          providerThreadId: f.target.providerThreadId,
+          activeTurnId: null,
+        },
+      });
+      f.reopen();
+      if (delivery === "steer") {
+        f.changeTurn(f.target.id, f.targetTurnId);
+        expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+          .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      }
+      f.changeTurn(f.target.id, "turn-peer-fence-after-idle");
+      expect(f.store.admitPeerSessionAction(f.returnRequest()).action.state).toBe("prepared");
+    }
   });
 
   test("refuses peer self, scope, policy, stale revision, and target-state violations distinctly", async () => {

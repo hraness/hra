@@ -3356,6 +3356,90 @@ const queueEffectEvidenceSchema = z.object({
   runtimeProfile: reviewedRuntimeProfileSchema,
 }).strict();
 const mutationResolutionKindSchema = z.enum(["proven_applied", "provider_state_reconciled", "abandoned"]);
+const peerCausalFenceSchema = z.object({
+  version: z.literal(1),
+  providerThreadId: providerThreadIdSchema,
+  activeTurnId: z.string().min(1).max(200).nullable(),
+}).strict();
+
+function assertPeerCausalFenceNotSupplied(evidence: unknown): void {
+  if (typeof evidence === "object" && evidence !== null
+    && Object.hasOwn(evidence, "peerCausalFence")) {
+    throw new Error("PEER_SESSION_CAUSAL_FENCE_RESERVED");
+  }
+}
+
+function peerCausalResolutionEvidence(
+  evidence: unknown,
+  effectThreadId: string,
+  provider: Readonly<{
+    providerThreadId: string;
+    status: "active" | "idle" | "terminal";
+    activeTurnId?: string;
+  }>,
+): Readonly<Record<string, unknown>> {
+  if (provider.providerThreadId !== effectThreadId) {
+    throw new Error("PEER_SESSION_CAUSAL_FENCE_THREAD_MISMATCH");
+  }
+  return {
+    ...z.record(z.string(), z.unknown()).parse(evidence),
+    peerCausalFence: peerCausalFenceSchema.parse({
+      version: 1,
+      providerThreadId: effectThreadId,
+      activeTurnId: provider.status === "active" ? provider.activeTurnId : null,
+    }),
+  };
+}
+
+const peerCausalFenceCandidateSchema = z.object({
+  resolution_id: z.union([attemptIdSchema, queueIdSchema]),
+  effect_kind: z.enum(["session.send", "session.steer", "queue.dispatch"]),
+  effect_turn_id: z.string().max(600).nullable(),
+  marker_present: z.union([z.literal(0), z.literal(1)]),
+  marker_json: z.string().max(4_096).nullable(),
+  marker_keys_unique: z.union([z.literal(0), z.literal(1)]),
+}).strict();
+
+// SQLite bounds returned bytes and preserves duplicate-key evidence. The one
+// Zod schema above owns marker validation: SQLite length(text) counts Unicode
+// code points and stops at NUL, unlike JavaScript's UTF-16 string bound.
+const peerCausalFenceCandidatePageSql = `
+  SELECT resolution_id,effect_kind,
+    CASE WHEN json_type(effect_json,'$.activeTurnId')='text'
+      AND length(CAST(json_extract(effect_json,'$.activeTurnId') AS BLOB))<=600
+      THEN json_extract(effect_json,'$.activeTurnId') ELSE NULL END AS effect_turn_id,
+    json_type(resolution_json,'$.peerCausalFence') IS NOT NULL AS marker_present,
+    CASE WHEN length(CAST(json_quote(json_extract(resolution_json,'$.peerCausalFence')) AS BLOB))<=4096
+      THEN json_quote(json_extract(resolution_json,'$.peerCausalFence')) ELSE NULL END AS marker_json,
+    ((SELECT COUNT(*) FROM json_each(resolution_json) WHERE key='peerCausalFence')=1
+      AND (SELECT COUNT(*) FROM json_each(resolution_json,'$.peerCausalFence'))=
+        (SELECT COUNT(DISTINCT key) FROM json_each(resolution_json,'$.peerCausalFence'))
+    ) AS marker_keys_unique
+  FROM candidate
+  WHERE effect_thread_id=? AND resolution_id>?
+  ORDER BY resolution_id LIMIT 16
+`;
+
+function peerCausalFenceRefusesTurn(
+  candidate: z.infer<typeof peerCausalFenceCandidateSchema>,
+  providerThreadId: string,
+  turnId: string,
+): boolean {
+  if (candidate.effect_kind === "session.steer") {
+    const target = z.string().min(1).max(200).safeParse(candidate.effect_turn_id);
+    if (target.success && target.data === turnId) return true;
+    if (candidate.marker_present === 0) return !target.success;
+  } else if (candidate.marker_present === 0) {
+    // Old send/queue abandonment did not retain its accepted turn. A newer
+    // human receipt or wall-clock comparison cannot reconstruct that fact.
+    return true;
+  }
+  if (candidate.marker_json === null || candidate.marker_keys_unique !== 1) return true;
+  const marker = peerCausalFenceSchema.safeParse(JSON.parse(candidate.marker_json) as unknown);
+  return !marker.success
+    || marker.data.providerThreadId !== providerThreadId
+    || marker.data.activeTurnId === turnId;
+}
 const desktopRecoveryResolutionSchema = z.enum(["resolved_applied", "resolved_not_applied"]);
 const desktopSwitchBeginSchema = z
   .object({
@@ -25541,6 +25625,74 @@ export class StateStore {
     }
   }
 
+  #assertPeerSessionTurnCausalCompleteness(actor: SessionRecord, turnId: string): void {
+    // This guard adds no provider-binding requirement to the store API. The
+    // service independently proves the actor's exact live host capability.
+    if (actor.providerThreadId === undefined) return;
+    // Both callers already hold an immediate transaction. Immutable resolution
+    // keys provide coherent pagination, independent of wall-clock ordering.
+    // Each page contains at most 16 bounded marker projections, not complete
+    // effect or transcript history. This still may scan historical records;
+    // it is a memory/result bound, not a constant database-work claim.
+    const sources = [`
+      WITH candidate AS (
+        SELECT resolution.attempt_id AS resolution_id,mutation.kind AS effect_kind,
+               evidence.evidence_json AS effect_json,
+               resolution.evidence_json AS resolution_json,
+               json_extract(evidence.evidence_json,'$.providerThreadId') AS effect_thread_id
+        FROM mutation_attempts mutation
+        JOIN mutation_effect_evidence evidence ON evidence.attempt_id=mutation.id
+        JOIN mutation_resolutions resolution ON resolution.attempt_id=mutation.id
+        WHERE mutation.authority_id=?
+          AND mutation.kind IN ('session.send','session.steer')
+          AND resolution.resolution_kind='abandoned'
+          AND (
+            json_type(resolution.evidence_json,'$.peerCausalFence') IS NOT NULL
+            OR NOT (
+              (json_extract(evidence.evidence_json,'$.messageActor') IS NULL
+                OR json_extract(evidence.evidence_json,'$.messageActor') IN ('human','automation','autorespond','provider_switch'))
+              AND (json_extract(mutation.transcript_intent_json,'$.actor') IS NULL
+                OR json_extract(mutation.transcript_intent_json,'$.actor') IN ('human','automation','autorespond','provider_switch'))
+              AND (json_extract(evidence.evidence_json,'$.messageActor') IS NOT NULL
+                OR json_extract(mutation.transcript_intent_json,'$.actor') IS NOT NULL)
+            )
+          )
+      )
+    `, `
+      WITH candidate AS (
+        SELECT resolution.queue_id AS resolution_id,'queue.dispatch' AS effect_kind,
+               evidence.evidence_json AS effect_json,
+               resolution.evidence_json AS resolution_json,
+               json_extract(evidence.evidence_json,'$.providerThreadId') AS effect_thread_id
+        FROM queue_entries queue
+        JOIN queue_effect_evidence evidence ON evidence.queue_id=queue.id
+        JOIN queue_effect_resolutions resolution ON resolution.queue_id=queue.id
+        WHERE queue.session_id=? AND resolution.resolution_kind='abandoned'
+          AND (queue.message_actor='peer_session'
+            OR json_type(resolution.evidence_json,'$.peerCausalFence') IS NOT NULL)
+      )
+    `] as const;
+    for (const source of sources) {
+      let after = "";
+      for (;;) {
+        const page = this.#database.query(`${source}${peerCausalFenceCandidatePageSql}`)
+          .all(actor.id, actor.providerThreadId, after)
+          .map((row) => peerCausalFenceCandidateSchema.parse(row));
+        for (const candidate of page) {
+          if (peerCausalFenceRefusesTurn(candidate, actor.providerThreadId, turnId)) {
+            throw new PeerSessionRefusalError("PEER_SESSION_ACTOR_TURN_REFUSED");
+          }
+        }
+        if (page.length < 16) break;
+        const last = page.at(-1);
+        if (last === undefined || last.resolution_id <= after) {
+          throw new Error("PEER_SESSION_CAUSAL_FENCE_CURSOR_INVALID");
+        }
+        after = last.resolution_id;
+      }
+    }
+  }
+
   #assertPeerSessionActionAuthority(
     action: PeerSessionActionRecord,
     phase: "admission_replay" | "direct_begin" | "queued_begin",
@@ -25580,6 +25732,9 @@ export class StateStore {
       || actor.activeTurnId === undefined
       || digestPeerTurnId(actor.activeTurnId) !== action.actorTurnDigest
     ) throw new PeerSessionRefusalError("PEER_SESSION_ACTOR_TURN_REFUSED");
+    if (phase === "direct_begin") {
+      this.#assertPeerSessionTurnCausalCompleteness(actor, actor.activeTurnId);
+    }
     if (target.revision !== action.targetExpectedRevision) {
       throw new PeerSessionRefusalError("PEER_SESSION_REVISION_CONFLICT");
     }
@@ -26393,6 +26548,7 @@ export class StateStore {
       if (actor.state !== "active" || actor.activeTurnId !== actorTurnId) {
         throw new PeerSessionRefusalError("PEER_SESSION_ACTOR_TURN_REFUSED");
       }
+      this.#assertPeerSessionTurnCausalCompleteness(actor, actorTurnId);
       if (target.revision !== expectedTargetRevision) {
         throw new PeerSessionRefusalError("PEER_SESSION_REVISION_CONFLICT");
       }
@@ -27747,6 +27903,7 @@ export class StateStore {
     receipt?: unknown;
     provider: { providerThreadId: string; title: string; status: "active" | "idle" | "terminal"; activeTurnId?: string; providerUpdatedAt?: number };
   }): SessionEffectResolutionResult {
+    assertPeerCausalFenceNotSupplied(input.resolutionEvidence);
     completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const queueId = queueIdSchema.parse(input.queueId);
     const expectedDigest = sha256Schema.parse(input.expectedEvidenceDigest);
@@ -27758,11 +27915,12 @@ export class StateStore {
         session_id: sessionIdSchema,
         state: z.literal("ambiguous"),
         peer_action_id: peerActionIdSchema.nullable(),
+        message_actor: z.enum(["human", "peer_session"]),
         message: z.string().min(1).max(262_144),
         evidence_json: z.string(),
         evidence_digest: sha256Schema,
       }).strict().parse(
-        this.#database.query(`SELECT q.session_id,q.state,q.peer_action_id,q.message,e.evidence_json,e.evidence_digest
+        this.#database.query(`SELECT q.session_id,q.state,q.peer_action_id,q.message_actor,q.message,e.evidence_json,e.evidence_digest
                               FROM queue_entries q JOIN queue_effect_evidence e ON e.queue_id=q.id
                               LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
                               WHERE q.id=? AND r.queue_id IS NULL`).get(queueId),
@@ -27782,6 +27940,10 @@ export class StateStore {
       if (session.providerThreadId !== input.provider.providerThreadId || evidence.providerThreadId !== input.provider.providerThreadId) {
         throw new Error("QUEUE_RECOVERY_THREAD_MISMATCH");
       }
+      const resolutionEvidence = input.resolution === "abandoned" && row.message_actor === "peer_session"
+        ? peerCausalResolutionEvidence(input.resolutionEvidence, evidence.providerThreadId, input.provider)
+        : input.resolutionEvidence;
+      const resolutionJson = JSON.stringify(resolutionEvidence);
       const changed = this.#database.query(`UPDATE sessions SET title=?,state=?,active_turn_id=?,provider_updated_at=?,revision=revision+1,updated_at=?
                                             WHERE id=? AND revision=? AND state='recovery_required'`).run(
         titleSchema.parse(input.provider.title),
@@ -27831,7 +27993,7 @@ export class StateStore {
            WHERE id=? AND target_session_id=? AND delivery='queue'
              AND message_digest=? AND state='ambiguous'`,
         ).run(
-          digestJson(input.resolutionEvidence),
+          digestJson(resolutionEvidence),
           now,
           row.peer_action_id,
           row.session_id,
@@ -27853,7 +28015,7 @@ export class StateStore {
       this.#database.query("INSERT INTO queue_effect_resolutions(queue_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)").run(
         queueId,
         input.resolution,
-        JSON.stringify(input.resolutionEvidence),
+        resolutionJson,
         input.receipt === undefined ? null : JSON.stringify(input.receipt),
         now,
       );
@@ -30251,10 +30413,11 @@ export class StateStore {
     provider?: { providerThreadId: string; title: string; status: "active" | "idle" | "terminal"; activeTurnId?: string; providerUpdatedAt?: number };
     acknowledgeProviderStateUnknown?: boolean;
   }): SessionEffectResolutionResult {
+    assertPeerCausalFenceNotSupplied(input.resolutionEvidence);
     const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
     const expectedDigest = sha256Schema.parse(input.expectedEvidenceDigest);
     const resolution = mutationResolutionKindSchema.parse(input.resolution);
-    const resolutionJson = JSON.stringify(input.resolutionEvidence);
+    let resolutionJson = JSON.stringify(input.resolutionEvidence);
     let receiptJson = input.receipt === undefined ? null : JSON.stringify(input.receipt);
     const now = this.#now();
     let resolvedSessionId: SessionId | undefined;
@@ -30267,7 +30430,9 @@ export class StateStore {
         evidence_digest: sha256Schema,
         evidence_json: z.string(),
         session_start_id: sessionIdSchema.nullable(),
-      }).strict().parse(this.#database.query(`SELECT m.authority_id,m.kind,m.state,e.evidence_digest,e.evidence_json,s.session_id AS session_start_id
+        transcript_intent_json: z.string().nullable(),
+      }).strict().parse(this.#database.query(`SELECT m.authority_id,m.kind,m.state,e.evidence_digest,e.evidence_json,
+                                                     s.session_id AS session_start_id,m.transcript_intent_json
                                               FROM mutation_attempts m
                                               JOIN mutation_effect_evidence e ON e.attempt_id=m.id
                                               LEFT JOIN session_start_attempts s ON s.attempt_id=m.id
@@ -30315,6 +30480,29 @@ export class StateStore {
       const sessionId = row.session_start_id ?? sessionIdSchema.parse(row.authority_id);
       resolvedSessionId = sessionId;
       const session = mapSession(this.#database.query("SELECT * FROM sessions WHERE id=?").get(sessionId));
+      if (resolution === "abandoned"
+        && (effectEvidence.kind === "session.send" || effectEvidence.kind === "session.steer")) {
+        const transcriptActor = row.transcript_intent_json === null
+          ? undefined
+          : z.object({ actor: sessionMessageActorSchema.optional() }).passthrough()
+            .parse(JSON.parse(row.transcript_intent_json) as unknown).actor;
+        // Old candidates can lack the explicit immutable actor. A durable
+        // transcript actor is sufficient; wholly unknown provenance remains
+        // conservative even after the detailed peer source/action is pruned.
+        const peerOrUnknown = effectEvidence.messageActor === "peer_session"
+          || transcriptActor === "peer_session"
+          || (effectEvidence.messageActor === undefined && transcriptActor === undefined);
+        if (peerOrUnknown) {
+          if (input.provider === undefined) {
+            throw new Error("MUTATION_RECOVERY_PROVIDER_PROJECTION_REQUIRED");
+          }
+          resolutionJson = JSON.stringify(peerCausalResolutionEvidence(
+            input.resolutionEvidence,
+            effectEvidence.providerThreadId,
+            input.provider,
+          ));
+        }
+      }
       if (input.provider !== undefined) {
         if (session.providerThreadId === undefined || session.providerThreadId !== input.provider.providerThreadId) {
           throw new Error("MUTATION_RECOVERY_THREAD_MISMATCH");
