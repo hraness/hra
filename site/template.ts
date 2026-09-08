@@ -305,8 +305,8 @@ const renderProductHero = (content: PublicContent): string => `<header class="hr
   <section class="hraness-marketing-install" data-hraness-marketing="install" id="install-command" aria-labelledby="install-command-heading">
     <div class="hraness-marketing-install__heading-group">
       <p class="hraness-marketing-install__eyebrow">Local release · v${escapeHtml(content.releaseVersion)}</p>
-      <h2 class="hraness-marketing-install__heading" id="install-command-heading">Install after release admission.</h2>
-      <p class="install-note">This release candidate is not yet admitted. Use this command only after immutable GitHub and npm release admission. It downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.</p>
+      <h2 class="hraness-marketing-install__heading" id="install-command-heading">Install the admitted release.</h2>
+      <p class="install-note">This CLI artifact passed immutable GitHub and npm release admission. The command downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.</p>
     </div>
     <div class="hraness-marketing-install__commands">
       <pre class="install-command" tabindex="0">${renderShellCode(content.installCommand)}</pre>
@@ -349,7 +349,7 @@ const renderProductHero = (content: PublicContent): string => `<header class="hr
   </section>
   <section class="hraness-marketing-cta" data-hraness-marketing="cta" data-tone="paper" id="closing" aria-labelledby="closing-heading">
     <h2 class="hraness-marketing-cta__heading" id="closing-heading">Give every session the same terminal.</h2>
-    <p class="hraness-marketing-cta__summary">After the candidate is admitted, install and verify its CLI artifact. After the rollout prerequisite is satisfied, initialize it, add one account, and start a session that outlives the tab it began in.</p>
+    <p class="hraness-marketing-cta__summary">Install and verify the admitted CLI artifact. After the rollout prerequisite is satisfied, initialize it, add one account, and start a session that outlives the tab it began in.</p>
     <div class="hraness-marketing-cta__actions">
       <a class="hraness-marketing-action" data-emphasis="primary" href="#install-command">Install ${escapeHtml(content.productName)}</a>
       <a class="hraness-marketing-action" data-emphasis="secondary" href="${escapeHtml(content.links.github)}">Read the source</a>
