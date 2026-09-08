@@ -28,15 +28,19 @@ check. PR140's usage owner acknowledged that reservation; its later migration
 tail remains unallocated until this exact source is reviewed and integrated.
 The StyleX branch still uses schema49. No number alone admits a predecessor.
 The complete session/Work migration slice is being validated separately in
-[draft PR151](https://github.com/hraness/hra/pull/151), on
+[PR151](https://github.com/hraness/hra/pull/151), on
 `codex/canonical-profile-migration-20260908`; it is not released or activated.
 PR139 merged at `109655a8f7d6edd8916f6d7df277e3402b70a44f`, and PR148 retains
 the candidate-release window. PR148 then merged as protected main
 `a4b1931eb2ca6b43d699ff8d286c2c77cc14cf6f`; that actual source is now joined
 here. Its owner completed exact-main CI and package/install verification and
-released the main integration window. Schema50 still requires its own final
-aggregate, protected merge and exact-main proof; candidate release retains
-separate live acceptance and installer-repair gates.
+released the main integration window. The joined07faf46 exact-tree local
+aggregate passed, but both protected CI jobs reached their 20-minute limits.
+The installer owner now retains the main window for [PR153](https://github.com/hraness/hra/pull/153)
+while this branch repairs CI partitioning under [issue152](https://github.com/hraness/hra/issues/152).
+Join that actual main before the next archive review and final gates. Schema50
+still requires passing protected CI, normal merge and exact-main proof;
+candidate release retains separate live acceptance and installer-repair gates.
 
 The delivered foundation's reviewed tree is
 `978bdc30b6fb9d259c92d0ca91335a854227d6f4`. Its companion module,
@@ -622,7 +626,57 @@ previous receipts and pinned source inputs remain unchanged. These are fresh
 copy-only executions with explicit working-merge parents, not final-commit,
 artifact-installation, provider or production receipts.
 
-Remaining integration work includes the required exact-tree gates. Keep shaped fixtures distinct
-from untouched historical captures and the bounded coverage of each proof.
-Do not mark this migration, candidate admission or release complete from the
-current working source or these focused receipts.
+### Complete local gate and bounded CI partition
+
+Joined head `07faf46885539b85c7634b26c83328b4e089481e`, tree
+`20f4027895ef8fb19efe3c8daa831915f00d2ae2`, passed the exclusive exact-tree
+`bun run check` in a clean isolated checkout with complete history and its
+sole governed ref. It passed 1,110 scripts tests with one existing skip,
+108 local-plugin, 29 cloud-plugin, 3,986 source, 394 hosted/site, 500 app and
+11 package-policy tests. Source tests took 413.63 seconds. Pins, security,
+lint, types and builds passed; package verification completed isolated local
+and global installs, restored PTY and global daemon lifecycle with exit zero.
+The retained complete log SHA-256 is
+`ef3c2db755dbe24c9440a31110e963310740c5030d5fbea4d1a442231bb13e75`.
+This receipt belongs only to that tree.
+
+Protected [CI34259494781](https://github.com/hraness/hra/actions/runs/34259494781)
+cancelled both platform jobs near the unchanged 20-minute limit; Required
+failed. Ubuntu passed all 3,986 source tests in 856.03 seconds and reached
+package verification, whose final internal cancellation point is not known.
+macOS passed 3,253 source tests before cancellation and did not complete that
+suite. Policy/lint/types took 160.24 seconds on Ubuntu and 315.79 on macOS;
+scripts/plugins added 100.91 and 133.50 seconds. Separate
+[CodeQL34259490765](https://github.com/hraness/hra/actions/runs/34259490765)
+passed. No unchanged retry, timeout increase or gate waiver was issued.
+
+A controlled local comparison used three warmup pairs and 12 alternating
+measured pairs of fresh roots, with integrity, foreign-key and schema checks.
+Median fresh-open cost was 125.456 ms on actual maina4b1931 and 137.346 ms
+on the joined schema50 source; read-only reopen was 17.160 and 17.537 ms,
+and read/write reopen was 61.060 and 64.228 ms. Those bounded local results
+do not prove CI timing or justify removing authority checks. The separately
+instrumented four-column addition took 6.654 ms. All measured source inputs
+remained unchanged.
+
+Issue152 partitions CI into `source` and `remainder` on each existing operating
+system. Each phase retains pinned setup, complete governed history and native
+verification. The four jobs retain the 20-minute limit, and `Required` still
+requires the entire matrix to succeed. The default `check` and `test` scripts
+are byte-unchanged. Regression tests prove exact expanded command coverage,
+multiplicity, unchanged remainder order and closed phase dispatch; they reject
+omissions, duplication, optional commands, missing references and cycles.
+The source suite keeps its serial isolation and runs on both platforms.
+
+The initial focused regression was red on the old workflow: 23 passed and two
+failed. The partition passes all 25 tests and 802 assertions. Final scoped
+typed lint and strict TypeScript passed. Independent source review found no
+P0-P2 issue, including native prerequisites, isolated phase inputs and active
+release readback. The joined installer archive, next exact-tree full local
+gate and fresh protected CI remain required. Passing focused checks does not establish
+that both phases fit on either hosted runner. Keep shaped fixtures distinct
+from untouched historical captures and retain each proof's bounded coverage.
+The two added scripts change the packed manifest. The old inventory is retained
+only until the combined installer archive is inspected; it is not a receipt for
+this working manifest. No candidate admission, package publication or runtime activation follows
+from this CI repair.

@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   check:
-    name: Check (${{ matrix.os }})
+    name: Check (${{ matrix.os }}, ${{ matrix.gate }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -24,6 +24,9 @@ jobs:
         os:
           - macos-15
           - ubuntu-24.04
+        gate:
+          - source
+          - remainder
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -101,7 +104,17 @@ jobs:
           # Typed ESLint loads the complete repository project graph and can
           # exceed V8's default heap on the 7 GiB macOS runner.
           NODE_OPTIONS: "--max-old-space-size=4096"
-        run: bun run check
+          CI_GATE: ${{ matrix.gate }}
+        run: |
+          set -euo pipefail
+          case "$CI_GATE" in
+            source) bun run test:source ;;
+            remainder) bun run check:ci-remainder ;;
+            *)
+              echo "::error::Unexpected CI gate"
+              exit 1
+              ;;
+          esac
 
       - name: Restore Ubuntu user-namespace restriction
         if: ${{ always() && runner.os == 'Linux' }}

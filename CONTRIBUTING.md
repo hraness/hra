@@ -9,6 +9,20 @@ HRA is in public beta development. Open an issue before a large change so the au
 3. Run the focused test beside the code you change.
 4. Run `bun run check` before submitting a change.
 
+## Continuous integration
+
+CI runs the complete gate in two isolated phases on both macOS and Ubuntu.
+`bun run test:source` runs the source tests; `bun run check:ci-remainder` runs
+every other command from `bun run check`, in its original order. Both phases
+retain the same pinned dependencies, complete governed Git history, Linux native
+verification and 20-minute job limit. The `Required` check succeeds only when
+all four jobs succeed.
+
+The workflow regression tests compare the expanded phase commands with the
+full gate and reject omitted or duplicated commands. Update that contract when
+changing the gate. The split does not replace the local exact-tree final gate:
+contributors and the integration owner still run `bun run check`.
+
 ## Change requirements
 
 - Add a deterministic regression for each corrected failure.
