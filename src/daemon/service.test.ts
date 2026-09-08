@@ -15913,7 +15913,7 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
       ).all()).toEqual([
@@ -15941,6 +15941,7 @@ describe("HraService", () => {
         { version: 46 },
         { version: 47 },
         { version: 48 },
+        { version: 49 },
       ]);
     } finally {
       inspector.close(false);
@@ -19618,6 +19619,7 @@ describe("HraService", () => {
       DROP TABLE autorespond_budget_history;
       DROP TABLE autorespond_budget_reservations;
       DELETE FROM migrations WHERE version>43;
+      DROP TRIGGER work_session_project_authority_guard;
       PRAGMA user_version=43;
     `);
     legacy.close(false);

@@ -100,6 +100,7 @@ const dropPeerAndHostedMemorySchema = (database: Database): void => {
 
 function dropAfterHoursSchema(database: Database): void {
   database.exec(`
+    DROP TRIGGER IF EXISTS work_session_project_authority_guard;
     DROP TRIGGER sessions_autorespond_after_hours_history;
     DROP TABLE autorespond_after_hours_history;
     DROP TABLE autorespond_after_hours_policy;
@@ -417,7 +418,7 @@ describe("durable autorespond admission", () => {
       PRAGMA user_version=43;
     `);
     predecessor.close(false);
-    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:48");
+    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:49");
     const migrated = new StateStore(paths, { now: () => clock.now });
     stores.push(migrated);
     const availableAt = clock.now + AUTORESPOND_DAY_MS;
@@ -462,19 +463,20 @@ describe("durable autorespond admission", () => {
     store.close();
     const damaged = new Database(paths.database);
     dropPeerAndHostedMemorySchema(damaged);
-    damaged.exec("DROP TABLE account_mutation_authority_rebinds; DELETE FROM migrations WHERE version>=44; PRAGMA user_version=43");
+    damaged.exec("DROP TRIGGER work_session_project_authority_guard; DROP TABLE account_mutation_authority_rebinds; DELETE FROM migrations WHERE version>=44; PRAGMA user_version=43");
     expect(damaged.query("SELECT available_at FROM autorespond_budget_history WHERE session_id=?").get(sessionId))
       .toEqual({ available_at: 0 });
     damaged.close(false);
     expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_PREDECESSOR_COLLISION");
   });
 
-  for (const version of [44, 45, 46, 47, 48]) test(`never applies pre-release v43 trigger-repair allowances to canonical v${String(version)}`, async () => {
+  for (const version of [44, 45, 46, 47, 48, 49]) test(`never applies pre-release v43 trigger-repair allowances to canonical v${String(version)}`, async () => {
     const { store } = await fixture();
     const paths = store.paths;
     stores.splice(stores.indexOf(store), 1);
     store.close();
     const damaged = new Database(paths.database);
+    if (version < 49) damaged.exec("DROP TRIGGER work_session_project_authority_guard");
     if (version <= 45) {
       dropPeerAndHostedMemorySchema(damaged);
       dropAfterHoursSchema(damaged);
@@ -555,10 +557,10 @@ describe("after-hours autorespond storage authority", () => {
     const ledger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
     const rows = ["sessions", "profiles", "autorespond_budget_history", "autorespond_budget_reservations", "session_autorespond_counters", "account_mutation_authority_rebinds"]
       .map((name) => ({ name, rows: inspector.query(`SELECT * FROM ${name}`).all() }));
-    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:45:48");
+    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:45:49");
     const migrated = new StateStore(paths, { now: () => clock.now });
     stores.push(migrated);
-    expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+    expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
     const migratedSchema = inspector.query(
       "SELECT name,sql,type FROM sqlite_master WHERE sql IS NOT NULL AND name!='queue_entries' ORDER BY name",
     ).all();
@@ -609,6 +611,7 @@ describe("after-hours autorespond storage authority", () => {
       const inspector = new Database(paths.database);
       if (damage === "collision") {
         dropPeerAndHostedMemorySchema(inspector);
+        inspector.exec("DROP TRIGGER work_session_project_authority_guard");
         inspector.exec("DELETE FROM migrations WHERE version>=46; PRAGMA user_version=45");
       } else if (damage === "missing_guard" || damage === "weak_guard") {
         inspector.exec("DROP TRIGGER autorespond_after_hours_history_update_guard");
@@ -632,7 +635,7 @@ describe("after-hours autorespond storage authority", () => {
         inspector.query("DELETE FROM autorespond_after_hours_history WHERE session_id=?").run(sessionId);
         inspector.exec(sql);
       } else if (damage === "missing_ledger") inspector.exec("DELETE FROM migrations WHERE version=46");
-      else inspector.exec("INSERT INTO migrations(version,applied_at) VALUES (49,1000000)");
+      else inspector.exec("INSERT INTO migrations(version,applied_at) VALUES (50,1000000)");
       const before = inspector.query("SELECT * FROM sqlite_master ORDER BY type,name").all();
       const ledger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
       for (const readonly of [true, false]) {
