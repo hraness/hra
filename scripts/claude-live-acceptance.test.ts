@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, rmdir, writeFile, type FileHandle } from "node:fs/promises";
+import { closeSync, fstatSync, openSync } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, realpath, rm, rmdir, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -795,66 +796,56 @@ describe("dedicated Claude live acceptance runner", () => {
 });
 
 describe("Claude cleanup-only recovery", () => {
-  async function withHighRecoveryDescriptor(
-    path: string,
-    task: (handle: FileHandle) => void | Promise<void>,
-  ): Promise<void> {
-    const handles: FileHandle[] = [];
+  function openHighRecoveryDescriptor(path: string): number {
+    // Exercise the allocator state of a long-running suite without retaining
+    // pressure descriptors or changing the runner's 3..255 input contract.
+    const heldDescriptors: number[] = [];
     try {
-      // Reproduce descriptor pressure without depending on suite execution order.
-      for (let attempt = 0; attempt < 256; attempt += 1) {
-        const handle = await open(path, "r");
-        handles.push(handle);
-        if (handle.fd > 255) {
-          await task(handle);
-          return;
-        }
+      for (let count = 0; count < 256; count += 1) {
+        const descriptor = openSync("/dev/null", "r");
+        heldDescriptors.push(descriptor);
+        if (descriptor >= 255) return openSync(path, "r");
       }
-      throw new Error("Could not allocate the bounded high-descriptor fixture");
+      throw new Error("Could not allocate the bounded high-descriptor fixture.");
     } finally {
-      await Promise.all(handles.map((handle) => handle.close()));
+      for (const descriptor of heldDescriptors) closeSync(descriptor);
     }
   }
 
-  function finishCleanupWithMappedDescriptor(descriptor: number): void {
-    const modulePath = new URL("./claude-live-acceptance.ts", import.meta.url).href;
-    const program = `
-import { runClaudeLiveAcceptance } from ${JSON.stringify(modulePath)};
-let workerEffects = 0;
-const forbidden = () => {
-  workerEffects += 1;
-  throw new Error("Provider operation forbidden during authorized cleanup");
-};
-const result = await runClaudeLiveAcceptance(["--resume-fd", "3"], {
-  createLogout: forbidden,
-  createReadback: forbidden,
-  recoverProcessJournal: async () => undefined,
-  sourceAttestation: async () => (${JSON.stringify(candidate)}),
-  startWorker: async () => forbidden(),
-});
-process.stdout.write(JSON.stringify({ result, workerEffects }));
-`;
-    // The parent may have any descriptor number; only this explicit child slot
-    // participates in the runner's bounded descriptor contract.
-    const child = spawnSync(process.execPath, ["--eval", program], {
+  function runMappedRecovery(descriptor: number) {
+    const source = `
+      import { closeSync } from "node:fs";
+      import { runClaudeLiveAcceptance } from "./scripts/claude-live-acceptance";
+      let workerEffects = 0;
+      const forbidden = () => {
+        workerEffects += 1;
+        throw new Error("cleanup fixture effect forbidden");
+      };
+      try {
+        const result = await runClaudeLiveAcceptance(["--resume-fd", "3"], {
+          createLogout: forbidden,
+          createReadback: forbidden,
+          recoverProcessJournal: async () => undefined,
+          sourceAttestation: async () => (${JSON.stringify(candidate)}),
+          startWorker: async () => forbidden(),
+        });
+        process.stdout.write(JSON.stringify({ result, workerEffects }));
+      } catch {
+        process.stdout.write(JSON.stringify({ failed: true, workerEffects }));
+        process.exitCode = 1;
+      } finally {
+        closeSync(3);
+      }
+    `;
+    // The child owns only FD3, duplicated from our exact receipt. A synchronous
+    // joined child avoids adding asynchronous exit/pipe listeners to this test.
+    return spawnSync(process.execPath, ["--eval", source], {
+      cwd: join(import.meta.dir, ".."),
       encoding: "utf8",
       killSignal: "SIGKILL",
-      maxBuffer: 4_096,
+      maxBuffer: 1_024,
       stdio: ["ignore", "pipe", "pipe", descriptor],
-      timeout: 5_000,
-    });
-    expect({
-      error: child.error?.message,
-      signal: child.signal,
-      status: child.status,
-      stderr: child.stderr,
-      stdout: child.stdout,
-    }).toEqual({
-      error: undefined,
-      signal: null,
-      status: 0,
-      stderr: "",
-      stdout: JSON.stringify({ result: null, workerEffects: 0 }),
+      timeout: 10_000,
     });
   }
 
@@ -917,45 +908,57 @@ process.stdout.write(JSON.stringify({ result, workerEffects }));
       receiptPath: layout.receiptPath,
       runId: layout.descriptor.runId,
     });
-    await AtomicPrivateJsonReceipt.create(
+    const receipt = await AtomicPrivateJsonReceipt.create(
       receiptValue,
       claudeLiveAcceptanceRecoveryPolicy,
     );
     await owner.releasePreserving();
-    return { layout, receiptValue };
+    const descriptor = openHighRecoveryDescriptor(receipt.value.receiptPath);
+    return { descriptor, layout, receiptValue };
   }
 
   test.each([true, false])(
     "finishes already-authorized cleanup when the private root exists=%s",
     async (rootExists) => {
       await withPrivateDirectory(async (directory) => {
-        const { layout, receiptValue } = await recoveryFixture(directory, rootExists);
-        const authorization = receiptValue.cleanupAuthorization;
-        if (authorization === undefined) throw new Error("cleanup authorization missing");
-        const { bindingDigest, ...authorizationBase } = authorization;
-        void bindingDigest;
-        const readyAuthorizationBase = { ...authorizationBase, workerPid: 91_002 };
-        expect(() => claudeLiveAcceptanceRecoveryReceiptSchema.parse({
-          ...receiptValue,
-          cleanupAuthorization: {
-            ...readyAuthorizationBase,
-            bindingDigest: canonicalDigest({
+        const { descriptor, layout, receiptValue } = await recoveryFixture(directory, rootExists);
+        try {
+          expect(descriptor).toBeGreaterThan(255);
+          expect(() => parseClaudeLiveAcceptanceArguments(["--resume-fd", String(descriptor)]))
+            .toThrow("claude_live_acceptance_input_invalid");
+          const authorization = receiptValue.cleanupAuthorization;
+          if (authorization === undefined) throw new Error("cleanup authorization missing");
+          const { bindingDigest, ...authorizationBase } = authorization;
+          void bindingDigest;
+          const readyAuthorizationBase = { ...authorizationBase, workerPid: 91_002 };
+          expect(() => claudeLiveAcceptanceRecoveryReceiptSchema.parse({
+            ...receiptValue,
+            cleanupAuthorization: {
               ...readyAuthorizationBase,
-              domain: "hra.claude.live-acceptance.cleanup-authorization.v1",
-            }),
-          },
-          worker: { pid: 91_002, state: "ready" },
-        })).toThrow("Cleanup authorization scope does not match this run");
-        await withHighRecoveryDescriptor(layout.receiptPath, (handle) => {
-          expect(handle.fd).toBeGreaterThan(255);
-          expect(() => parseClaudeLiveAcceptanceArguments([
-            "--resume-fd", String(handle.fd),
-          ])).toThrow("claude_live_acceptance_input_invalid");
-          finishCleanupWithMappedDescriptor(handle.fd);
-        });
+              bindingDigest: canonicalDigest({
+                ...readyAuthorizationBase,
+                domain: "hra.claude.live-acceptance.cleanup-authorization.v1",
+              }),
+            },
+            worker: { pid: 91_002, state: "ready" },
+          })).toThrow("Cleanup authorization scope does not match this run");
+          const child = runMappedRecovery(descriptor);
+          expect(child.error).toBeUndefined();
+          expect(child.signal).toBeNull();
+          expect(child.status).toBe(0);
+          expect(child.stderr).toBe("");
+          const result: unknown = JSON.parse(child.stdout);
+          expect(result).toEqual({ result: null, workerEffects: 0 });
+          // Child closure cannot close the owned parent descriptor. Its unlinked
+          // inode proves cleanup reached the actual protected receipt.
+          expect(fstatSync(descriptor).nlink).toBe(0);
+        } finally {
+          closeSync(descriptor);
+        }
         await expect(lstat(layout.receiptPath)).rejects.toMatchObject({ code: "ENOENT" });
         await expect(lstat(layout.runRoot.path)).rejects.toMatchObject({ code: "ENOENT" });
       });
     },
+    15_000,
   );
 });

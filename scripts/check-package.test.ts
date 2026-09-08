@@ -18,6 +18,7 @@ import {
   projectGitHistorySpawnResult,
   requireGitHistoryOutput,
   runPackageCommand,
+  selectReviewedGitHistoryPatchEvidence,
   waitForOwnedInstalledDaemonReady,
   withPackageDependencyCacheCustody,
 } from "./check-package";
@@ -400,6 +401,68 @@ describe("installed package generic command ownership", () => {
     expect(() => parseGitHistoryCommitList(overBound)).toThrow("over its commit bound");
   });
 
+  test("selects only the exact immutable historical commit and patch-kind evidence", async () => {
+    // These are approval identities, not required objects in a squash-merged clone.
+    const expected = [
+      {
+        commit: "313ed3e3e1ddbe5b6464fc098926717f177418a8",
+        fixtures: ["sanitized_message"],
+        public_patch: "38922e6d214028499463e193e62b7fde97835cad271693f76e4876af080e5a27",
+        sensitive_patch: "38922e6d214028499463e193e62b7fde97835cad271693f76e4876af080e5a27",
+      },
+      {
+        commit: "5039f0bfe37706f97bd93e68f8db2dff4aa16013",
+        fixtures: ["memory_summary"],
+        public_patch: "b3dbdd5504acb92dc2bb0f7e1ebf6e56e7911498bd96fc8f8b7080af924fe42b",
+        sensitive_patch: "b3dbdd5504acb92dc2bb0f7e1ebf6e56e7911498bd96fc8f8b7080af924fe42b",
+      },
+      {
+        commit: "72fcb44fb81a79c93ade6da3a127dbb3ae1dd6f9",
+        fixtures: ["memory_summary"],
+        public_patch: "cb571ed9e6f3c71cf062169d36fd1d403c7da42cf409fbc1e2bf64256e222911",
+        sensitive_patch: "ddc5655f80d0a9308dbcf319d2247c429f6a411a14aca2fa68c3efb2113c6d50",
+      },
+      {
+        commit: "b48fdb71ca201d951b9b1343a909b5f18277bc36",
+        fixtures: ["sanitized_message", "memory_summary"],
+        public_patch: "1b6df43d22fb500c41291b5ab8c57c06f475aa80515dd57735b6f57fa70eed46",
+        sensitive_patch: "59089938773a6ea6574c7df54b7a3da73272a827920845e4805a3e4735b2f812",
+      },
+      {
+        commit: "f39747b917b064ff593c58dea2a05e4481319b26",
+        fixtures: ["sanitized_message"],
+        public_patch: "1aa2ed40e2d437c2871a6975f177f9bb5bd078c68856fa66f63511a47144fc4a",
+        sensitive_patch: "1aa2ed40e2d437c2871a6975f177f9bb5bd078c68856fa66f63511a47144fc4a",
+      },
+    ] as const;
+    // Freeze the closed inventory without exporting a second authorization surface.
+    const source = await readFile(join(import.meta.dir, "check-package.ts"), "utf8");
+    const inventory = source.slice(
+      source.indexOf("const reviewedSyntheticHistoryPatchEvidence:"),
+      source.indexOf("const reviewedSyntheticHistoryPaths:"),
+    );
+    const commits = [...inventory.matchAll(/^ {2}"?([0-9a-f]{40})"?: Object\.freeze\(/gmu)]
+      .map((match) => match[1]);
+    expect(commits).toEqual(expected.map(({ commit }) => commit));
+    for (const row of expected) {
+      for (const kind of ["public_patch", "sensitive_patch"] as const) {
+        const evidence = selectReviewedGitHistoryPatchEvidence(row.commit, kind);
+        expect(evidence).toEqual({ fixtures: row.fixtures, patchSha256: row[kind] });
+        expect(Object.isFrozen(evidence)).toBe(true);
+        expect(Object.isFrozen(evidence?.fixtures)).toBe(true);
+        expect(selectReviewedGitHistoryPatchEvidence(row.commit.toUpperCase(), kind)).toBeUndefined();
+        expect(selectReviewedGitHistoryPatchEvidence(row.commit.slice(0, 39), kind)).toBeUndefined();
+      }
+    }
+    for (const kind of ["public_patch", "sensitive_patch"] as const) {
+      for (const commit of ["a".repeat(40), "constructor", "toString", "__proto__", "hasOwnProperty"]) {
+        expect(selectReviewedGitHistoryPatchEvidence(commit, kind)).toBeUndefined();
+        expect(normalizeGitHistoryPatchForPublicScan(commit, kind, "unapproved bytes\n"))
+          .toBe("unapproved bytes\n");
+      }
+    }
+  });
+
   test.each([
     {
       fixture: "sanitized_message",
@@ -563,6 +626,11 @@ describe("installed package generic command ownership", () => {
         .toThrow("synthetic-path evidence changed");
     }
 
+    expect(() => normalizeReviewedSyntheticHistoryPatch(
+      patch,
+      digest,
+      ["unknown"] as unknown as Parameters<typeof normalizeReviewedSyntheticHistoryPatch>[2],
+    )).toThrow("fixture is unknown");
     expect(() => normalizeReviewedSyntheticHistoryPatch(patch, digest, []))
       .toThrow("fixture selection is invalid");
     expect(() => normalizeReviewedSyntheticHistoryPatch(patch, digest, ["memory_summary", "memory_summary"]))
@@ -576,6 +644,165 @@ describe("installed package generic command ownership", () => {
       "sanitized_message", "memory_summary",
     ])).toThrow("synthetic-path evidence changed");
   });
+
+  test.each([
+    {
+      fixture: "sanitized_message",
+      patchDigests: {
+        original: {
+          public_patch: "28d7ad4616d89eb6d6daeac1b833c7acb32c1a47d81a32f10fcb7798686d6b00",
+          sensitive_patch: "28d7ad4616d89eb6d6daeac1b833c7acb32c1a47d81a32f10fcb7798686d6b00",
+        },
+        repair: {
+          public_patch: "0e673517458fa8b50a6ec21674116ebef4acd17dd71009b0bc89562e851f434b",
+          sensitive_patch: "0e673517458fa8b50a6ec21674116ebef4acd17dd71009b0bc89562e851f434b",
+        },
+      },
+      syntheticPath: ["", "Users", "private", "project", ""].join("/"),
+    },
+    {
+      fixture: "memory_summary",
+      patchDigests: {
+        original: {
+          public_patch: "57838c9f69e9b4b755597235daa2a56a2d248e5bacfab495012b1eb801fb747c",
+          sensitive_patch: "7b068a95c057cb9a10732df95755efb2daefd7575f303430447cc46671cc35cc",
+        },
+        repair: {
+          public_patch: "8a0bda01dd830cd1f9b5708ef072bc67e297f409a1e0039874cb1cfd72cd0f78",
+          sensitive_patch: "c4e4bb17bc5741276460e7867f57b6772c83415f2645dbba146a3d4a06b31cf7",
+        },
+      },
+      syntheticPath: ["", "Users", "operator", "private"].join("/"),
+    },
+  ] as const)("renders self-contained original and repaired $fixture evidence", async ({
+    fixture,
+    patchDigests,
+    syntheticPath,
+  }) => {
+    const remaining = createHistoryRenderingBudget();
+    const root = resolve(await mkdtemp(join(tmpdir(), "hra-history-synthetic-")));
+    const git = async (...arguments_: readonly string[]) => requireHistoryFixtureGitOutput(
+      await runHistoryFixtureGit(root, arguments_, remaining()),
+    );
+    try {
+      await initializeHistoryFixture(root, "base\n", git);
+      const document = join(root, "document.txt");
+      await writeFile(document, `synthetic fixture ${syntheticPath}\n`, "utf8");
+      if (fixture === "memory_summary") await writeFile(join(root, "bun.lock"), "original lock marker\n", "utf8");
+      await git("add", "--all");
+      await git("commit", "-m", "original synthetic fixture");
+      const originalCommit = await git("rev-parse", "HEAD");
+      await writeFile(document, "repaired synthetic fixture\n", "utf8");
+      if (fixture === "memory_summary") await writeFile(join(root, "bun.lock"), "repaired lock marker\n", "utf8");
+      await git("commit", "-am", "repaired synthetic fixture");
+      const repairCommit = await git("rev-parse", "HEAD");
+      const rendered = [];
+      for (const [phase, commit] of [["original", originalCommit], ["repair", repairCommit]] as const) {
+        for (const kind of ["public_patch", "sensitive_patch"] as const) {
+          const result = await runBoundedCanonicalHistoryPatch(root, commit, kind, remaining());
+          const patch = requireGitHistoryOutput("Synthetic history rendering", result);
+          rendered.push({ commit, digest: createHash("sha256").update(patch, "utf8").digest("hex"), kind, patch, phase });
+        }
+      }
+      // Pins bind canonical Git bytes independently of the normalizer's own hash check.
+      expect(rendered.map(({ digest, kind, phase }) => ({ digest, kind, phase })))
+        .toEqual(rendered.map(({ kind, phase }) => ({ digest: patchDigests[phase][kind], kind, phase })));
+      for (const { commit, kind, patch, phase } of rendered) {
+        const digest = patchDigests[phase][kind];
+        expect(patch.split(syntheticPath)).toHaveLength(2);
+        const normalized = normalizeReviewedSyntheticHistoryPatch(patch, digest, [fixture]);
+        expect(normalized).toBe(patch.replace(syntheticPath, "[reviewed-synthetic-absolute-path]"));
+        const assertReviewedPatch = kind === "public_patch" ? assertPublicText : assertPublicSensitiveText;
+        expect(() => assertReviewedPatch(normalized, "synthetic history fixture")).not.toThrow();
+        expect(() => normalizeReviewedSyntheticHistoryPatch(`${patch}mutation\n`, digest, [fixture]))
+          .toThrow("synthetic-path evidence changed");
+        const otherPhase = phase === "original" ? "repair" : "original";
+        expect(() => normalizeReviewedSyntheticHistoryPatch(patch, patchDigests[otherPhase][kind], [fixture]))
+          .toThrow("synthetic-path evidence changed");
+        if (fixture === "memory_summary") {
+          const otherKind = kind === "public_patch" ? "sensitive_patch" : "public_patch";
+          expect(() => normalizeReviewedSyntheticHistoryPatch(patch, patchDigests[phase][otherKind], [fixture]))
+            .toThrow("synthetic-path evidence changed");
+        }
+        // Scratch evidence never acquires authority in the real historical scan.
+        expect(selectReviewedGitHistoryPatchEvidence(commit, kind)).toBeUndefined();
+        expect(normalizeGitHistoryPatchForPublicScan(commit, kind, patch)).toBe(patch);
+        expect(() => assertReviewedPatch(patch, "unreviewed scratch history"))
+          .toThrow("ABSOLUTE_USER_PATH");
+      }
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+
+  }, 30_000);
+
+  test("renders both synthetic fixtures in a self-contained first-parent merge patch", async () => {
+    const remaining = createHistoryRenderingBudget();
+    const root = resolve(await mkdtemp(join(tmpdir(), "hra-history-synthetic-merge-")));
+    const git = async (...arguments_: readonly string[]) => requireHistoryFixtureGitOutput(
+      await runHistoryFixtureGit(root, arguments_, remaining()),
+    );
+    const messagePath = ["", "Users", "private", "project", ""].join("/");
+    const summaryPath = ["", "Users", "operator", "private"].join("/");
+    const patchDigests = {
+      public_patch: "e2c35a07337e0d199ef8d8159a0bafb55e3dfc1cafd3d2b926ed18700b301822",
+      sensitive_patch: "46127d9492578f992291367db7d4a591b2a50654cb1d4e2ab5f6a4862215ee36",
+    };
+    try {
+      await initializeHistoryFixture(root, "base\n", git);
+      const document = join(root, "document.txt");
+      await git("checkout", "-b", "feature");
+      await writeFile(document, "feature\n", "utf8");
+      await git("commit", "-am", "feature");
+      await git("checkout", "main");
+      await writeFile(document, "main\n", "utf8");
+      await git("commit", "-am", "main");
+      expect((await runHistoryFixtureGit(root, ["merge", "--no-ff", "--no-edit", "feature"], remaining())).exitCode)
+        .not.toBe(0);
+      await writeFile(document, `resolved\n${messagePath}\n${summaryPath}\n`, "utf8");
+      await writeFile(join(root, "bun.lock"), "merge-only lock marker\n", "utf8");
+      await git("add", "--all");
+      await git("commit", "-m", "synthetic resolution");
+      const commit = await git("rev-parse", "HEAD");
+      expect((await git("rev-list", "--parents", "-n", "1", commit)).split(" ")).toHaveLength(3);
+      const rendered = [];
+      for (const kind of ["public_patch", "sensitive_patch"] as const) {
+        const result = await runBoundedCanonicalHistoryPatch(root, commit, kind, remaining());
+        const patch = requireGitHistoryOutput("Synthetic merge rendering", result);
+        rendered.push({ digest: createHash("sha256").update(patch, "utf8").digest("hex"), kind, patch });
+      }
+      expect(rendered.map(({ digest, kind }) => ({ digest, kind })))
+        .toEqual(rendered.map(({ kind }) => ({ digest: patchDigests[kind], kind })));
+      for (const { kind, patch } of rendered) {
+        expect(patch).toContain("-main\n+resolved\n");
+        expect(patch).not.toContain("-feature\n");
+        expect(patch.split(messagePath)).toHaveLength(2);
+        expect(patch.split(summaryPath)).toHaveLength(2);
+        const normalized = normalizeReviewedSyntheticHistoryPatch(
+          patch, patchDigests[kind], ["sanitized_message", "memory_summary"],
+        );
+        expect(normalized).toBe(patch
+          .replace(messagePath, "[reviewed-synthetic-absolute-path]")
+          .replace(summaryPath, "[reviewed-synthetic-absolute-path]"));
+        const assertReviewedPatch = kind === "public_patch" ? assertPublicText : assertPublicSensitiveText;
+        expect(() => assertReviewedPatch(normalized, "synthetic merge fixture")).not.toThrow();
+        expect(() => normalizeReviewedSyntheticHistoryPatch(
+          `${patch}changed\n`, patchDigests[kind], ["sanitized_message", "memory_summary"],
+        )).toThrow("synthetic-path evidence changed");
+        const otherKind = kind === "public_patch" ? "sensitive_patch" : "public_patch";
+        expect(() => normalizeReviewedSyntheticHistoryPatch(
+          patch, patchDigests[otherKind], ["sanitized_message", "memory_summary"],
+        )).toThrow("synthetic-path evidence changed");
+        expect(selectReviewedGitHistoryPatchEvidence(commit, kind)).toBeUndefined();
+        expect(normalizeGitHistoryPatchForPublicScan(commit, kind, patch)).toBe(patch);
+        expect(() => assertReviewedPatch(patch, "unreviewed merge fixture"))
+          .toThrow("ABSOLUTE_USER_PATH");
+      }
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+
+  }, 30_000);
 
   test("bounds history fixture children independently of ambient configuration and the outer deadline", () => {
     const root = resolve(tmpdir());
