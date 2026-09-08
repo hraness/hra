@@ -539,7 +539,13 @@ pre code {
   margin: 0;
 }
 
+/* A wrapping mobile header has no fixed height. Keep it in document flow so
+ * fragment navigation cannot hide the destination behind a guessed offset. */
 @media (max-width: 48rem) {
+  .hraness-marketing-header {
+    position: static;
+  }
+
   .install-checks {
     grid-template-columns: 1fr;
   }
