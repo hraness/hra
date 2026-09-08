@@ -105,8 +105,8 @@ const expectConservative = (
 };
 
 describe("StreamingSensitiveRedactor", () => {
-  test("is at least as conservative as complete redaction at every one- and two-split partition", () => {
-    for (const fixture of fixtures) {
+  for (const [index, fixture] of fixtures.entries()) {
+    test(`is at least as conservative as complete redaction at every one- and two-split partition (fixture ${index + 1})`, () => {
       for (let first = 0; first <= fixture.text.length; first += 1) {
         expectConservative(fixture, [
           fixture.text.slice(0, first),
@@ -120,8 +120,8 @@ describe("StreamingSensitiveRedactor", () => {
           ]);
         }
       }
-    }
-  });
+    });
+  }
 
   test("protects complete grammar beyond the carry bound at every split", () => {
     for (const fixture of longAuthorizationFixtures) {

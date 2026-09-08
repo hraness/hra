@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeSync, openSync } from "node:fs";
 import { PassThrough } from "node:stream";
+import { z } from "zod";
 
 import packageMetadata from "../package.json";
 
@@ -124,14 +125,26 @@ const hostedMemoryTableNames = [
   "project_memory_portable_adoption_proofs",
 ] as const;
 
-// An install written by the peer/local-memory predecessor is at v47 but predates
-// hosted-memory authority. Storage migration tests cover older released-schema
-// bridges in depth; this CLI fixture proves daemon start owns the pending v48/v49
-// migrations instead of silently opening a stale schema from a non-daemon command.
+// Deliberately shape a current install as the v47 peer/local-memory predecessor,
+// not an authentic released-source capture. Storage tests own those upgrade
+// proofs; this CLI fixture proves daemon start owns the pending v48/v49/v50
+// migrations instead of silently opening a stale schema from another command.
 const downgradeStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
     database.exec("PRAGMA foreign_keys=OFF");
+    for (const name of [
+      "canonical_profile_session_insert_guard",
+      "canonical_profile_session_update_guard",
+      "canonical_profile_work_route_insert_guard",
+      "canonical_profile_work_task_insert_guard",
+      "canonical_profile_work_attempt_insert_guard",
+      "canonical_profile_work_attempt_immutable_guard",
+      "canonical_profile_session_live_attempt_guard",
+    ] as const) database.exec(`DROP TRIGGER ${name}`);
+    for (const table of ["sessions", "work_routes", "work_tasks", "work_attempts"] as const) {
+      database.exec(`ALTER TABLE ${table} DROP COLUMN canonical_profile_key`);
+    }
     database.exec("DROP TRIGGER IF EXISTS work_session_project_authority_guard");
     const laterSchemaObjects = database.query(`
       SELECT name,type FROM sqlite_master
@@ -168,12 +181,12 @@ const downgradeStateSchema = (databasePath: string): void => {
   }
 };
 
-// An install written by a newer HRA build than this one. No migration exists for
-// it, so every entry point must refuse instead of guessing.
+// A deliberately unknown future-version sentinel, not a claimed schema51
+// implementation. Every entry point must refuse before inspecting or changing it.
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("PRAGMA user_version=50");
+    database.exec("PRAGMA user_version=51");
   } finally {
     database.close(false);
   }
@@ -186,6 +199,32 @@ const stateSchemaVersion = (databasePath: string): number => {
   } finally {
     database.close(false);
   }
+};
+
+// Compare all logical database content, including immutable evidence, complete
+// schema SQL, column metadata, ledger and user_version. Only row order is sorted.
+const stateSchemaSnapshot = (databasePath: string): string => {
+  const database = new Database(databasePath, { readonly: true, strict: true });
+  const read = (sql: string) => {
+    const statement = database.prepare(sql);
+    try { return statement.all(); } finally { statement.finalize(); }
+  };
+  try {
+    return database.transaction(() => {
+      const schema = read("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name");
+      const tables = z.array(z.object({ type: z.string(), name: z.string().regex(/^[A-Za-z0-9_]+$/u) }))
+        .parse(schema).filter((row) => row.type === "table");
+      return JSON.stringify({
+        schema,
+        tables: tables.map(({ name }) => ({
+          name,
+          columns: read(`PRAGMA table_xinfo("${name}")`),
+          rows: read(`SELECT * FROM "${name}"`).map((row) => JSON.stringify(row)).sort(),
+        })),
+        version: read("PRAGMA user_version"),
+      });
+    }).deferred();
+  } finally { database.close(false); }
 };
 
 const upgradeFixture = async (
@@ -6299,7 +6338,7 @@ describe("CLI entry point", () => {
       });
       expect(started.read().stderr).toBe("");
       expect(daemonStarts).toBe(1);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(49);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(50);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6316,6 +6355,7 @@ describe("CLI entry point", () => {
       const initialized = capture();
       expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);
       downgradeStateSchema(installation.paths.database);
+      const before = stateSchemaSnapshot(installation.paths.database);
 
       const captured = capture();
       expect(await main(["status", "--json"], captured.output, input)).toBe(7);
@@ -6323,13 +6363,14 @@ describe("CLI entry point", () => {
         error: {
           code: "RECOVERY_REQUIRED",
           details: { nextCommand: "hra daemon start" },
-          message: "The local state schema needs a migration (47 to 49); start the daemon to migrate it.",
+          message: "The local state schema needs a migration (47 to 50); start the daemon to migrate it.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
       expect(stateSchemaVersion(installation.paths.database)).toBe(47);
+      expect(stateSchemaSnapshot(installation.paths.database)).toBe(before);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6349,20 +6390,22 @@ describe("CLI entry point", () => {
       const initialized = capture();
       expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);
       advanceStateSchema(installation.paths.database);
+      const before = stateSchemaSnapshot(installation.paths.database);
 
       const captured = capture();
       expect(await main(["daemon", "start", "--json"], captured.output, input)).toBe(7);
       expect(JSON.parse(captured.read().stdout)).toEqual({
         error: {
           code: "RECOVERY_REQUIRED",
-          message: "This HRA build is older than the local state schema (50 vs 49); install the newer HRA.",
+          message: "This HRA build is older than the local state schema (51 vs 50); install the newer HRA.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
       expect(daemonStarts).toBe(0);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(50);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(51);
+      expect(stateSchemaSnapshot(installation.paths.database)).toBe(before);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6376,6 +6419,7 @@ describe("CLI entry point", () => {
       const store = new StateStore(statePaths);
       store.close();
       downgradeStateSchema(statePaths.database);
+      const before = stateSchemaSnapshot(statePaths.database);
       const captured = capture();
       expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths })).toBe(1);
       const rendered = JSON.parse(captured.read().stdout) as unknown;
@@ -6384,12 +6428,13 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["The local state schema needs a migration (47 to 49). Run `hra daemon start` to migrate it."],
+          problems: ["The local state schema needs a migration (47 to 50). Run `hra daemon start` to migrate it."],
           state: { database: "invalid", initialized: false },
         },
       });
       expect(JSON.stringify(rendered)).not.toContain(temporary);
       expect(captured.read().stderr).toBe("");
+      expect(stateSchemaSnapshot(statePaths.database)).toBe(before);
     } finally {
       await rm(temporary, { force: true, recursive: true });
     }
@@ -6403,6 +6448,7 @@ describe("CLI entry point", () => {
       const store = new StateStore(statePaths);
       store.close();
       advanceStateSchema(statePaths.database);
+      const before = stateSchemaSnapshot(statePaths.database);
       const captured = capture();
       expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths })).toBe(1);
       const rendered = JSON.parse(captured.read().stdout) as unknown;
@@ -6411,12 +6457,13 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["This HRA build is older than the local state schema (50 vs 49). Install the newer HRA."],
+          problems: ["This HRA build is older than the local state schema (51 vs 50). Install the newer HRA."],
           state: { database: "invalid", initialized: false },
         },
       });
       expect(JSON.stringify(rendered)).not.toContain(temporary);
       expect(captured.read().stderr).toBe("");
+      expect(stateSchemaSnapshot(statePaths.database)).toBe(before);
     } finally {
       await rm(temporary, { force: true, recursive: true });
     }
@@ -7253,9 +7300,9 @@ describe("CLI entry point", () => {
     }
   });
 
-  test("offline doctor separates unusable project roots from a healthy database", async () => {
-    const problem = "A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
-    for (const scenario of ["missing", "symlink", "non_traversable"] as const) {
+  for (const scenario of ["missing", "symlink", "non_traversable"] as const) {
+    test(`offline doctor separates unusable project roots from a healthy database: ${scenario}`, async () => {
+      const problem = "A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
       const temporary = await realpath(await mkdtemp(join(tmpdir(), `hra-doctor-project-${scenario}-`)));
       const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
       const documents = join(temporary, "Documents");
@@ -7290,8 +7337,8 @@ describe("CLI entry point", () => {
         if (scenario === "non_traversable") await chmod(documents, 0o700).catch(() => undefined);
         await rm(temporary, { force: true, recursive: true });
       }
-    }
-  });
+    });
+  }
 
   test("online doctor keeps its envelope and exit code in agreement over validated health", async () => {
     const invalid = "HRA checks returned an invalid local result.";
