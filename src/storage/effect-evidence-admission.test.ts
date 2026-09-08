@@ -1,12 +1,14 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 
-import { mutationEffectEvidence49Schema } from "./effect-evidence-codecs";
+import { canonical41TimestampsDatabaseBytes, canonical41TimestampsFixture } from "../../scripts/fixtures/canonical41-timestamps";
+import { readMutationEffectEvidenceProvenance } from "./effect-evidence-provenance";
+import { joinedMutationEffectEvidenceSchema } from "./joined-effect-evidence-codecs";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
 import { StateStore } from "./state-store";
 
@@ -50,7 +52,7 @@ const snapshot = (database: Database) => {
   return value;
 };
 
-const stageEffect = (store: StateStore, profile: ReturnType<StateStore["requireProfile"]>, kind: GenericKind, suffix: string) => {
+const stageEffect = (store: StateStore, profile: ReturnType<StateStore["requireProfile"]>, kind: GenericKind, suffix: string, marked = false) => {
   const providerThreadId = `synthetic-evidence-admission-${suffix}`;
   const session = store.upsertProviderSession({
     profileId: profile.id,
@@ -75,9 +77,10 @@ const stageEffect = (store: StateStore, profile: ReturnType<StateStore["requireP
     idempotencyKey: key,
   });
   const baseline = { providerUpdatedAt: 10, status: "idle" as const, activeTurnId: null };
+  const timestamp = marked ? { providerTimestampUnit: "unix_milliseconds_v1" as const } : {};
   const evidence: GenericEvidence = kind === "session.stop"
-    ? { kind, providerThreadId, baseline, activeTurnId: null }
-    : { kind, providerThreadId, baseline, requestedName: "After rename" };
+    ? { kind, providerThreadId, ...timestamp, baseline, activeTurnId: null }
+    : { kind, providerThreadId, ...timestamp, baseline, requestedName: "After rename" };
   const record = store.beginSessionMutationEffect({
     attemptId: attempt.id,
     sessionId: session.id,
@@ -118,7 +121,7 @@ const withEffectFixture = async (
     const staged = stageEffect(store, profile, kind, "subject");
     // Keep a real, nonempty resolved receipt alongside the unresolved subject;
     // whole-database snapshots below must preserve its original evidence too.
-    const sentinel = stageEffect(store, profile, "session.rename", "sentinel");
+    const sentinel = stageEffect(store, profile, "session.rename", "sentinel", true);
     expect(store.transitionMutation(sentinel.attempt.id, "effect_started", "ambiguous", { code: "LOST_RESPONSE" })).toBe(true);
     store.quarantineSession(sentinel.session.id);
     store.resolveSessionMutation({
@@ -126,7 +129,8 @@ const withEffectFixture = async (
       expectedOriginalState: "ambiguous",
       expectedEvidenceDigest: sentinel.record.digest,
       resolution: "proven_applied",
-      resolutionEvidence: { source: "thread/read", providerUpdatedAt: 11 },
+      resolutionEvidence: { kind: "session.rename", providerThreadId: sentinel.evidence.providerThreadId,
+        providerTimestampUnit: "unix_milliseconds_v1", providerUpdatedAt: 11, requestedName: "After rename" },
       receipt: { renamed: true },
       provider: { providerThreadId: sentinel.evidence.providerThreadId, title: "After rename", status: "idle", providerUpdatedAt: 11 },
     });
@@ -135,9 +139,13 @@ const withEffectFixture = async (
     store = undefined;
     database = new Database(paths.database, { create: false, strict: true });
     database.exec("PRAGMA foreign_keys=ON");
-    expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+    expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
     expect(database.query("SELECT version FROM migrations ORDER BY version").all())
-      .toEqual(Array.from({ length: 49 }, (_, index) => ({ version: index + 1 })));
+      .toEqual(Array.from({ length: 60 }, (_, index) => ({ version: index + 1 })));
+    expect(database.query("SELECT DISTINCT format FROM mutation_effect_evidence_provenance").all())
+      .toEqual([{ format: "joined_v1" }]);
+    expect(readMutationEffectEvidenceProvenance(database, staged.attempt.id))
+      .toMatchObject({ kind: "parsed", format: "joined_v1", evidence: staged.record.evidence });
     expect(database.query("SELECT profile_id,next_revision FROM usage_revision_authority").all())
       .toEqual([{ profile_id: profile.id, next_revision: 2 }]);
     expect(database.query("SELECT * FROM usage_snapshots").all()).toEqual([]);
@@ -152,8 +160,9 @@ const withEffectFixture = async (
   }
 };
 
-// Real current49 API-created rows followed by deliberately synthetic corruption.
-// These are not archived provider effects and do not claim historical provenance.
+// Deliberately synthetic corruption of a retained row. Current60 tests leave its
+// original provenance/anchor unchanged; the canonical41 test corrupts before
+// admission. Neither corruption is claimed as an archived producer operation.
 const corruptEvidence = (database: Database, attemptId: string, replacement: {
   json: string;
   digest: string;
@@ -186,7 +195,7 @@ const corruptEvidence = (database: Database, attemptId: string, replacement: {
     .toThrow("mutation effect evidence is immutable");
 };
 
-const jsonWithLaterUnit = (evidence: GenericEvidence): string => JSON.stringify({
+const jsonWithTimestampUnit = (evidence: GenericEvidence): string => JSON.stringify({
   kind: evidence.kind,
   providerThreadId: evidence.providerThreadId,
   providerTimestampUnit: "unix_milliseconds_v1",
@@ -198,22 +207,22 @@ type Corruption = {
   name: string;
   json: (evidence: GenericEvidence) => string;
   wrongDigest?: true;
-  valid49Document?: true;
+  validJoinedDocument?: true;
   sqlUnit?: "unix_milliseconds_v1";
   nonJson?: true;
 };
 const corruptions: readonly Corruption[] = [
-  { name: "later unit with matching byte digest", json: jsonWithLaterUnit, sqlUnit: "unix_milliseconds_v1" },
-  { name: "later unit with wrong digest", json: jsonWithLaterUnit, wrongDigest: true, sqlUnit: "unix_milliseconds_v1" },
-  { name: "unknown field rejected by both dialects", json: (evidence) => JSON.stringify({ ...evidence, unexpected: true }) },
+  { name: "valid joined timestamp unit with matching replacement digest", json: jsonWithTimestampUnit, validJoinedDocument: true, sqlUnit: "unix_milliseconds_v1" },
+  { name: "valid joined timestamp unit with wrong digest", json: jsonWithTimestampUnit, wrongDigest: true, validJoinedDocument: true, sqlUnit: "unix_milliseconds_v1" },
+  { name: "unknown field", json: (evidence) => JSON.stringify({ ...evidence, unexpected: true }) },
   {
-    name: "later unit plus unknown field rejected by both dialects",
-    json: (evidence) => `${jsonWithLaterUnit(evidence).slice(0, -1)},"unexpected":true}`,
+    name: "timestamp unit plus unknown field",
+    json: (evidence) => `${jsonWithTimestampUnit(evidence).slice(0, -1)},"unexpected":true}`,
     sqlUnit: "unix_milliseconds_v1",
   },
   {
-    name: "duplicate unit keys rejected by both dialects",
-    json: (evidence) => `${jsonWithLaterUnit(evidence).slice(0, -1)},"providerTimestampUnit":null}`,
+    name: "duplicate unit keys with an invalid final value",
+    json: (evidence) => `${jsonWithTimestampUnit(evidence).slice(0, -1)},"providerTimestampUnit":null}`,
     sqlUnit: "unix_milliseconds_v1",
   },
   {
@@ -222,12 +231,11 @@ const corruptions: readonly Corruption[] = [
     sqlUnit: "unix_milliseconds_v1",
     nonJson: true,
   },
-  { name: "valid49 document with wrong digest", json: JSON.stringify, wrongDigest: true, valid49Document: true },
+  { name: "valid joined document with wrong digest", json: JSON.stringify, wrongDigest: true, validJoinedDocument: true },
 ];
 
-const preserveThroughReopens = async (
+const refuseCurrentTamperThroughReopens = async (
   input: Parameters<Parameters<typeof withEffectFixture>[1]>[0],
-  read: "invalid_shape" | "invalid_digest" | "invalid_kind",
 ): Promise<void> => {
   const { database, paths, staged } = input;
   expect(database.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toEqual({ busy: 0, log: 0, checkpointed: 0 });
@@ -235,29 +243,23 @@ const preserveThroughReopens = async (
   // It cannot write and holds no transaction spanning a writable reopen.
   database.exec("PRAGMA query_only=ON");
   const expected = snapshot(database);
+  expect(() => readMutationEffectEvidenceProvenance(database, staged.attempt.id))
+    .toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
   for (const readonly of [false, true, false, true]) {
     const beforeBytes = hash(await readFile(paths.database));
-    const reopened = new StateStore(paths, { ...options, readonly });
-    try {
-      expect(snapshot(database)).toEqual(expected);
-      if (read === "invalid_shape") expect(() => reopened.readMutation(staged.key)).toThrow();
-      if (read === "invalid_digest") expect(() => reopened.readMutation(staged.key)).toThrow("MUTATION_EFFECT_EVIDENCE_DIGEST_MISMATCH");
-      if (read === "invalid_kind") expect(() => reopened.readMutation(staged.key)).toThrow("MUTATION_EFFECT_EVIDENCE_KIND_MISMATCH");
-      expect(reopened.requireSession(staged.session.id)).toEqual(staged.session);
-      if (!readonly) {
-        expect(reopened.recoverEffectStartedMutations()).toEqual({
-          recovered: [],
-          unresolved: [{ id: staged.attempt.id, kind: staged.evidence.kind, authorityId: staged.session.id }],
-        });
-        // A second pass must neither invent a resolution nor quarantine a
-        // session from an untrusted timestamp, mismatched kind or bad digest.
-        expect(reopened.recoverEffectStartedMutations()).toEqual({
-          recovered: [],
-          unresolved: [{ id: staged.attempt.id, kind: staged.evidence.kind, authorityId: staged.session.id }],
-        });
-      }
-      expect(snapshot(database)).toEqual(expected);
-    } finally { reopened.close(); }
+    if (!readonly) {
+      // Current writable startup audits every immutable provenance anchor. It
+      // must not recapture changed bytes as a newly admitted opaque history row.
+      expect(() => new StateStore(paths, options)).toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+    } else {
+      // Readonly startup checks schema; the selected-effect read owns this
+      // row-level proof. Do not require an unrelated eager whole-history scan.
+      const reopened = new StateStore(paths, { ...options, readonly: true });
+      try {
+        expect(() => reopened.readMutation(staged.key)).toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+        expect(reopened.requireSession(staged.session.id)).toEqual(staged.session);
+      } finally { reopened.close(); }
+    }
     expect(snapshot(database)).toEqual(expected);
     if (readonly) expect(hash(await readFile(paths.database))).toBe(beforeBytes);
   }
@@ -265,31 +267,31 @@ const preserveThroughReopens = async (
 
 for (const kind of ["session.stop", "session.rename"] as const) {
   for (const corruption of corruptions) {
-    test(`current49 preserves unresolved ${kind}: ${corruption.name}`, async () => {
+    test(`current60 refuses anchored ${kind} tamper: ${corruption.name}`, async () => {
       await withEffectFixture(kind, async (input) => {
         const { database, staged } = input;
         const json = corruption.json(staged.evidence);
         const digest = corruption.wrongDigest === true ? "0".repeat(64) : hash(json);
         expect(digest === hash(json)).toBe(corruption.wrongDigest !== true);
         if (corruption.nonJson === true) expect(() => JSON.parse(json) as unknown).toThrow();
-        else expect(mutationEffectEvidence49Schema.safeParse(JSON.parse(json) as unknown).success)
-          .toBe(corruption.valid49Document === true);
+        else expect(joinedMutationEffectEvidenceSchema.safeParse(JSON.parse(json) as unknown).success)
+          .toBe(corruption.validJoinedDocument === true);
         corruptEvidence(database, staged.attempt.id, { json, digest });
         const retained = evidenceRowSchema.parse(database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(staged.attempt.id));
         expect(retained).toEqual({ attempt_id: staged.attempt.id, kind, evidence_json: json, evidence_digest: digest, recorded_at: recordedAt });
         if (corruption.sqlUnit !== undefined) {
           // Raw SQL JSON extraction is not evidence validation. These probes
-          // include malformed-both, duplicate-key and JSON5 counterexamples.
+          // include unknown-field, duplicate-key and JSON5 counterexamples.
           expect(database.query("SELECT json_extract(evidence_json,'$.providerTimestampUnit') AS unit FROM mutation_effect_evidence WHERE attempt_id=?").get(staged.attempt.id))
             .toEqual({ unit: corruption.sqlUnit });
         }
-        await preserveThroughReopens(input, corruption.valid49Document === true ? "invalid_digest" : "invalid_shape");
+        await refuseCurrentTamperThroughReopens(input);
       });
     });
   }
 
   for (const mismatch of ["stored evidence kind", "parsed evidence kind"] as const) {
-    test(`current49 preserves unresolved ${kind} with mismatched ${mismatch}`, async () => {
+    test(`current60 refuses anchored ${kind} with mismatched ${mismatch}`, async () => {
       await withEffectFixture(kind, async (input) => {
         const { database, staged } = input;
         const otherKind = kind === "session.stop" ? "session.rename" : "session.stop";
@@ -297,20 +299,18 @@ for (const kind of ["session.stop", "session.rename"] as const) {
           ? { kind: otherKind, providerThreadId: staged.evidence.providerThreadId, baseline: staged.evidence.baseline, activeTurnId: null }
           : { kind: otherKind, providerThreadId: staged.evidence.providerThreadId, baseline: staged.evidence.baseline, requestedName: "Other mutation" };
         const json = JSON.stringify(mismatch === "stored evidence kind" ? staged.evidence : otherEvidence);
-        expect(mutationEffectEvidence49Schema.safeParse(JSON.parse(json) as unknown).success).toBe(true);
+        expect(joinedMutationEffectEvidenceSchema.safeParse(JSON.parse(json) as unknown).success).toBe(true);
         corruptEvidence(database, staged.attempt.id, {
           json,
           digest: hash(json),
           ...(mismatch === "stored evidence kind" ? { kind: otherKind } : {}),
         });
-        // Malformed history remains retained, but a typed lookup must not
-        // return one mutation's evidence under another mutation's kind.
-        await preserveThroughReopens(input, "invalid_kind");
+        await refuseCurrentTamperThroughReopens(input);
       });
     });
   }
 
-  test(`valid current49 ${kind} control still enters existing restart containment`, async () => {
+  test(`valid current60 ${kind} control still enters existing restart containment`, async () => {
     await withEffectFixture(kind, async ({ paths, database, staged }) => {
       const expected = snapshot(database);
       const reopened = new StateStore(paths, options);
@@ -328,5 +328,95 @@ for (const kind of ["session.stop", "session.rename"] as const) {
         expect(reopened.recoverEffectStartedMutations()).toEqual({ recovered: [], unresolved: [] });
       } finally { reopened.close(); }
     });
+  });
+}
+
+// Unlike the current60 tamper tests, these begin with exact captured canonical41
+// bytes. The one negative deliberately changes an original unresolved row BEFORE
+// migration; only that change is synthetic. No current database is restamped,
+// no generator executes, and neither case claims combined49 or native acceptance.
+for (const corrupt of [false, true]) {
+  test(`canonical41 original timestamp effects migrate and reopen ${corrupt ? "with one explicitly corrupted opaque row" : "without rewriting their six preimages"}`, async () => {
+    const fixture = canonical41TimestampsFixture;
+    expect(fixture.sourceRevision).toBe("576ccd76a6742cd62759ab6176a6a41844846daa");
+    const bytes = canonical41TimestampsDatabaseBytes();
+    expect(hash(bytes)).toBe("ad4842496d9ee5f8d51210ef9a99e255d76e6c42505cc3f6e996c919b2caa106");
+    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical41-effect-admission-")));
+    let database: Database | undefined;
+    let store: StateStore | undefined;
+    try {
+      const paths = resolveStatePaths({ rootDirectory: root });
+      await initializeStatePaths(paths);
+      await writeFile(paths.database, bytes, { mode: 0o600, flag: "wx" });
+      database = new Database(paths.database, { create: false, strict: true });
+      database.exec("PRAGMA foreign_keys=ON");
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      const original = snapshot(database);
+      expect(database.query("SELECT * FROM mutation_effect_evidence ORDER BY attempt_id").all())
+        .toEqual([...fixture.effects]);
+      expect(database.query("SELECT * FROM mutation_resolutions ORDER BY attempt_id").all())
+        .toEqual([...fixture.resolutions]);
+      expect(() => new StateStore(paths, { ...options, readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:41:60");
+      expect(snapshot(database)).toEqual(original);
+      const subject = fixture.scenarios["stop-marked_unresolved"];
+      if (corrupt) {
+        const json = JSON.stringify({ ...subject.originalEffect.evidence, unexpected: true });
+        corruptEvidence(database, subject.attemptId, { json, digest: hash(json) });
+      }
+      const admittedHistory = snapshot(database);
+      store = new StateStore(paths, options);
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(database.query("SELECT DISTINCT format FROM mutation_effect_evidence_provenance").all())
+        .toEqual([{ format: "canonical41_v1" }]);
+      const afterMigration = snapshot(database);
+      expect(afterMigration.rows.mutation_effect_evidence).toEqual(admittedHistory.rows.mutation_effect_evidence);
+      expect(afterMigration.rows.mutation_resolutions).toEqual(original.rows.mutation_resolutions);
+      expect(database.query("SELECT version,applied_at FROM migrations WHERE version<=41 ORDER BY version").all())
+        .toEqual(original.ledger);
+      // Close the first migrator before establishing the repeat-open baseline.
+      // New columns, sidecars and quarantine rows are legitimate migration work;
+      // they are not included in a false all-table-before/after equality claim.
+      store.close();
+      store = undefined;
+      expect(database.query("PRAGMA wal_checkpoint(TRUNCATE)").get())
+        .toEqual({ busy: 0, log: 0, checkpointed: 0 });
+      database.exec("PRAGMA query_only=ON");
+      const baseline = snapshot(database);
+      for (const readonly of [true, false, true, false]) {
+        const beforeBytes = hash(await readFile(paths.database));
+        const reopened = new StateStore(paths, { ...options, readonly });
+        store = reopened;
+        try {
+          for (const scenario of Object.values(fixture.scenarios)) {
+            const selected = readMutationEffectEvidenceProvenance(database, scenario.attemptId);
+            if (corrupt && scenario.attemptId === subject.attemptId) {
+              expect(selected).toEqual({ kind: "opaque", format: "canonical41_v1", reason: "invalid_shape" });
+              expect(() => reopened.readMutation(scenario.idempotencyKey))
+                .toThrow("MUTATION_EFFECT_EVIDENCE_UNAVAILABLE");
+              expect(database.query("SELECT projection_json,opaque_reason FROM mutation_effect_evidence_provenance WHERE attempt_id=?")
+                .get(scenario.attemptId)).toEqual({ projection_json: null, opaque_reason: "invalid_shape" });
+            } else {
+              expect(selected).toMatchObject({ kind: "parsed", format: "canonical41_v1",
+                evidence: scenario.originalEffect.evidence, digest: scenario.originalEffect.digest });
+              expect(reopened.readMutation(scenario.idempotencyKey)).toMatchObject({
+                id: scenario.attemptId, evidence: { digest: scenario.originalEffect.digest,
+                  evidence: scenario.originalEffect.evidence },
+              });
+            }
+          }
+          expect(snapshot(database)).toEqual(baseline);
+        } finally {
+          reopened.close();
+          store = undefined;
+        }
+        expect(snapshot(database)).toEqual(baseline);
+        if (readonly) expect(hash(await readFile(paths.database))).toBe(beforeBytes);
+      }
+    } finally {
+      store?.close();
+      database?.close(false);
+      await rm(root, { recursive: true, force: true });
+    }
   });
 }

@@ -122,6 +122,17 @@ export type CloudCommandJournalEntry = Readonly<{
   payloadDigest: string;
   sessionPublicId: string;
 }> & (
+  | Readonly<{
+      /** 1=legacy HMAC, 2=requester HMAC without marker, 3=marker-2 requester HMAC. */
+      requestCommitmentVersion: 1 | 2 | 3;
+      requestingDevicePublicId: string;
+    }>
+  | Readonly<{
+      /** Absent only on a journal entry admitted before requester-bound commitments. */
+      requestCommitmentVersion?: never;
+      requestingDevicePublicId?: never;
+    }>
+) & (
   | Readonly<{ phase: "prepared" }>
   | Readonly<{ phase: "effect_started" }>
   | Readonly<{
@@ -145,6 +156,15 @@ export type CloudDeviceCommandJournalEntry = Readonly<{
   payloadDigest: string;
   requestingDevicePublicId: string;
 }> & (
+  | Readonly<{
+      /** 1=legacy HMAC, 2=requester HMAC without marker, 3=marker-2 requester HMAC. */
+      requestCommitmentVersion: 1 | 2 | 3;
+    }>
+  | Readonly<{
+      /** Absent only on a journal entry admitted before requester-bound commitments. */
+      requestCommitmentVersion?: never;
+    }>
+) & (
   | Readonly<{ phase: "prepared" }>
   | Readonly<{ phase: "effect_started" }>
   | Readonly<{
@@ -883,6 +903,7 @@ function sameDeviceCommandBase(
   return left.commandPublicId === right.commandPublicId
     && left.kind === right.kind
     && left.payloadDigest === right.payloadDigest
+    && left.requestCommitmentVersion === right.requestCommitmentVersion
     && left.requestingDevicePublicId === right.requestingDevicePublicId;
 }
 
@@ -982,6 +1003,8 @@ function sameCommandBase(
     && JSON.stringify(left.localAuthority) === JSON.stringify(right.localAuthority)
     && left.localAuthorityDigest === right.localAuthorityDigest
     && left.payloadDigest === right.payloadDigest
+    && left.requestCommitmentVersion === right.requestCommitmentVersion
+    && left.requestingDevicePublicId === right.requestingDevicePublicId
     && left.sessionPublicId === right.sessionPublicId;
 }
 
@@ -1100,6 +1123,37 @@ export function transitionCloudCommandJournalEntry(
   if (canonicalReplacement.phase !== "terminal") {
     assertCloudDaemonJournalFutureCapacity(next);
   }
+  return next;
+}
+
+/**
+ * Persist the hosted lease rebind of a command that is still provably before
+ * its provider effect. This is deliberately separate from the ordinary phase
+ * transition: no generic transition may change execution authority while it
+ * advances to `effect_started`.
+ */
+export function rebindPreparedCloudCommandJournalEntry(
+  state: CloudDaemonJournalState,
+  replacement: Extract<CloudCommandJournalEntry, { phase: "prepared" }>,
+): CloudDaemonJournalState {
+  const canonical = parseCloudDaemonJournal(state);
+  const canonicalReplacement = parseCommand(replacement);
+  const index = canonical.commands.findIndex((candidate) =>
+    candidate.commandPublicId === canonicalReplacement.commandPublicId);
+  const current = canonical.commands[index];
+  if (index < 0 || current === undefined) {
+    throw new Error("Cloud command journal entry is missing.");
+  }
+  if (JSON.stringify(current) === JSON.stringify(canonicalReplacement)) return canonical;
+  if (
+    current.phase !== "prepared"
+    || canonicalReplacement.phase !== "prepared"
+    || !sameCommandBase(current, canonicalReplacement)
+  ) throw new Error("Cloud command journal authority rebind is invalid.");
+  const commands = [...canonical.commands];
+  commands[index] = canonicalReplacement;
+  const next = parseCloudDaemonJournal({ ...canonical, commands });
+  assertCloudDaemonJournalFutureCapacity(next);
   return next;
 }
 
@@ -1430,6 +1484,11 @@ function parseDeviceCommand(
 ): CloudDeviceCommandJournalEntry {
   if (!isRecord(value)) throw new Error("Cloud daemon journal is corrupt.");
   const terminal = value.phase === "terminal";
+  const requestCommitmentVersion = value.requestCommitmentVersion === 1
+      || value.requestCommitmentVersion === 2
+      || value.requestCommitmentVersion === 3
+    ? value.requestCommitmentVersion
+    : null;
   const hasLegacyResultMissing = terminal && Object.hasOwn(value, "legacyResultMissing");
   const hasResult = terminal && Object.hasOwn(value, "result");
   const hasSingleUseResult = terminal && Object.hasOwn(value, "singleUseResult");
@@ -1441,6 +1500,7 @@ function parseDeviceCommand(
         ...(hasLegacyResultMissing ? ["legacyResultMissing"] : []),
         "payloadDigest",
         "phase",
+        ...(requestCommitmentVersion === null ? [] : ["requestCommitmentVersion"]),
         "requestingDevicePublicId",
         ...(hasResult ? ["result"] : []),
         "resultCode",
@@ -1454,6 +1514,7 @@ function parseDeviceCommand(
         "kind",
         "payloadDigest",
         "phase",
+        ...(requestCommitmentVersion === null ? [] : ["requestCommitmentVersion"]),
         "requestingDevicePublicId",
       ];
   const authority = parseAuthorityTuple(value.authority);
@@ -1463,6 +1524,7 @@ function parseDeviceCommand(
     || !isUuidV7(value.commandPublicId)
     || !isDeviceCommandKind(value.kind)
     || !isDigest(value.payloadDigest)
+    || (Object.hasOwn(value, "requestCommitmentVersion") && requestCommitmentVersion === null)
     || (value.phase !== "prepared"
       && value.phase !== "effect_started"
       && value.phase !== "terminal")
@@ -1475,7 +1537,16 @@ function parseDeviceCommand(
     payloadDigest: value.payloadDigest,
     requestingDevicePublicId: value.requestingDevicePublicId,
   };
-  if (value.phase !== "terminal") return { ...base, phase: value.phase };
+  if (value.phase === "prepared") {
+    return requestCommitmentVersion === null
+      ? { ...base, phase: "prepared" }
+      : { ...base, phase: "prepared", requestCommitmentVersion };
+  }
+  if (value.phase === "effect_started") {
+    return requestCommitmentVersion === null
+      ? { ...base, phase: "effect_started" }
+      : { ...base, phase: "effect_started", requestCommitmentVersion };
+  }
   const result = hasResult
     ? parseEncryptedEnvelope(value.result, maximumDeviceCommandResultCiphertextCharacters)
     : undefined;
@@ -1504,16 +1575,20 @@ function parseDeviceCommand(
       && value.terminalState !== "failed"
       && value.terminalState !== "ambiguous")
   ) throw new Error("Cloud daemon journal is corrupt.");
-  return {
+  const terminalState: "applied" | "failed" | "ambiguous" = value.terminalState;
+  const terminalEntry = {
     ...base,
-    phase: value.phase,
+    phase: "terminal" as const,
     ...(value.legacyResultMissing === true ? { legacyResultMissing: true as const } : {}),
     ...(result == null ? {} : { result }),
     resultCode: value.resultCode,
     resultDigest: value.resultDigest,
     ...(value.singleUseResult === true ? { singleUseResult: true as const } : {}),
-    terminalState: value.terminalState,
+    terminalState,
   };
+  return requestCommitmentVersion === null
+    ? terminalEntry
+    : { ...terminalEntry, requestCommitmentVersion };
 }
 
 function parseCommandLocalAuthority(value: unknown): CloudCommandLocalAuthority {
@@ -1558,6 +1633,11 @@ function parseCommandLocalAuthority(value: unknown): CloudCommandLocalAuthority 
 function parseCommand(value: unknown): CloudCommandJournalEntry {
   if (!isRecord(value)) throw new Error("Cloud daemon journal is corrupt.");
   const terminal = value.phase === "terminal";
+  const requestCommitmentVersion = value.requestCommitmentVersion === 1
+      || value.requestCommitmentVersion === 2
+      || value.requestCommitmentVersion === 3
+    ? value.requestCommitmentVersion
+    : null;
   const legacyExpected = terminal
     ? [
         "authority",
@@ -1566,6 +1646,9 @@ function parseCommand(value: unknown): CloudCommandJournalEntry {
         "localAuthorityDigest",
         "payloadDigest",
         "phase",
+        ...(requestCommitmentVersion !== null
+          ? ["requestCommitmentVersion", "requestingDevicePublicId"]
+          : []),
         "resultCode",
         "resultDigest",
         "sessionPublicId",
@@ -1578,6 +1661,9 @@ function parseCommand(value: unknown): CloudCommandJournalEntry {
         "localAuthorityDigest",
         "payloadDigest",
         "phase",
+        ...(requestCommitmentVersion !== null
+          ? ["requestCommitmentVersion", "requestingDevicePublicId"]
+          : []),
         "sessionPublicId",
       ];
   const providerBoundExpected = [
@@ -1597,6 +1683,9 @@ function parseCommand(value: unknown): CloudCommandJournalEntry {
     || kind === null
     || !isDigest(value.localAuthorityDigest)
     || !isDigest(value.payloadDigest)
+    || (Object.hasOwn(value, "requestCommitmentVersion") && requestCommitmentVersion === null)
+    || (Object.hasOwn(value, "requestingDevicePublicId") !== (requestCommitmentVersion !== null))
+    || (requestCommitmentVersion !== null && !isOpaqueIdentifier(value.requestingDevicePublicId))
     || (value.phase !== "prepared"
       && value.phase !== "effect_started"
       && value.phase !== "terminal")
@@ -1629,7 +1718,27 @@ function parseCommand(value: unknown): CloudCommandJournalEntry {
         payloadDigest: value.payloadDigest,
         sessionPublicId: value.sessionPublicId,
       };
-  if (value.phase !== "terminal") return { ...base, phase: value.phase };
+  const requester = value.requestingDevicePublicId as string;
+  if (value.phase === "prepared") {
+    return requestCommitmentVersion === null
+      ? { ...base, phase: "prepared" }
+      : {
+          ...base,
+          phase: "prepared",
+          requestCommitmentVersion,
+          requestingDevicePublicId: requester,
+        };
+  }
+  if (value.phase === "effect_started") {
+    return requestCommitmentVersion === null
+      ? { ...base, phase: "effect_started" }
+      : {
+          ...base,
+          phase: "effect_started",
+          requestCommitmentVersion,
+          requestingDevicePublicId: requester,
+        };
+  }
   if (
     typeof value.resultCode !== "string"
     || !/^[A-Z][A-Z0-9_]{0,63}$/u.test(value.resultCode)
@@ -1638,13 +1747,21 @@ function parseCommand(value: unknown): CloudCommandJournalEntry {
       && value.terminalState !== "failed"
       && value.terminalState !== "ambiguous")
   ) throw new Error("Cloud daemon journal is corrupt.");
-  return {
+  const terminalState: "applied" | "failed" | "ambiguous" = value.terminalState;
+  const terminalEntry = {
     ...base,
-    phase: value.phase,
+    phase: "terminal" as const,
     resultCode: value.resultCode,
     resultDigest: value.resultDigest,
-    terminalState: value.terminalState,
+    terminalState,
   };
+  return requestCommitmentVersion === null
+    ? terminalEntry
+    : {
+        ...terminalEntry,
+        requestCommitmentVersion,
+        requestingDevicePublicId: requester,
+      };
 }
 
 function parseUsageCursor(value: unknown): CloudUsageAccountCursor {

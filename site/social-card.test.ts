@@ -91,15 +91,17 @@ describe("social card", () => {
     };
     expect(darkPixelsIn(88, 90, 340, 180)).toBeGreaterThan(4_000);
     expect(darkPixelsIn(400, 90, 1100, 180)).toBe(0);
-    expect(lightPixelsIn(128, 280, 700, 306)).toBeGreaterThan(500);
+    // The capacity warning owns the first row; the first bright command now follows it.
+    expect(lightPixelsIn(128, 280, 700, 306)).toBe(0);
+    expect(lightPixelsIn(128, 328, 700, 354)).toBeGreaterThan(500);
     expect(darkPixelsIn(88, 495, 940, 525)).toBeGreaterThan(1_000);
   });
 
   test("keeps every card line inside its row and states the exact positioning text", () => {
     const lines = socialCardLines();
-    expect(lines.tagline).toBe("Release candidate v0.6.0 · hra.sh");
+    expect(lines.tagline).toBe("Release candidate v0.7.0 · hra.sh");
     expect(lines.title).toBe("HRA");
-    expect(lines.comment).toBe("# Current source: Codex, Claude Code, and Devin.");
+    expect(lines.comment).toBe("# Rollout blocked on capacity; conditional examples");
     expect(lines.commands).toEqual([
       `$ ${publicContent.hero.steps[0]!.command}`,
       `$ ${publicContent.hero.steps[3]!.command}`,
@@ -119,6 +121,11 @@ describe("social card", () => {
     expect(svg).toContain("<title id=\"title\">HRA</title>");
     expect(svg).toContain(`<desc id="description">${publicContent.socialCard.alt}</desc>`);
     expect(svg).toContain("&lt;session-id&gt;");
+    expect(svg.indexOf("# Rollout blocked on capacity; conditional examples")).toBeLessThan(
+      svg.indexOf("$ hra session start"),
+    );
+    expect(svg).toMatch(/<text x="128" y="302"[^>]*># Rollout blocked on capacity; conditional examples<\/text>/u);
+    expect(svg).toMatch(/<text x="128" y="350"[^>]*>\$ hra session start/u);
     expect(svg).toContain('font-family="Nebula Sans, ui-sans-serif, system-ui, sans-serif"');
     expect(svg).not.toContain("<script");
     expect(svg).not.toContain("url(");

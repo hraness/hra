@@ -8,9 +8,13 @@ import { providerAccountAuthoritySchema, type ProviderAccountAuthority } from ".
 import { reviewedRuntimeProfileSchema } from "../domain/runtime-profile";
 import { sessionIdSchema, unixMillisecondsSchema, utf8Bytes } from "../domain/values";
 import { ATTACHMENT_CUSTODY_COLUMNS, type InitialAttachmentInput } from "./attachment-custody-schema";
-import { requireSessionSendOwner } from "./session-send-owner";
+import { historicalSessionSendOwnerAuditFormatSchema, requireHistoricalSessionSendOwnerForAudit, requireSessionSendOwner } from "./session-send-owner";
 import { queueAttachmentIdentityDigest, queueAttachmentManifestDigest, readQueueAttachmentIdentity } from "./queue-attachment-identity";
 import { normalizeSchemaSql } from "./schema-cohort";
+import { schemaSqlBeforeJoinedTranscriptColumns, type UsageSchemaColumnMode } from "./joined-transcript-columns";
+import { checkMutationEvidenceEnvelope, EFFECT_EVIDENCE_JSON_MAX_BYTES, historicalEffectEvidenceFormatSchema } from "./effect-evidence-reader";
+import { readMutationEffectEvidenceProvenance } from "./effect-evidence-provenance";
+import { assertJoinedAttachmentTerminalGuard, installJoinedAttachmentTerminalGuard } from "./joined-attachment-terminal-guard";
 
 export class AttachmentCustodyError extends Error {
   constructor(readonly code: "ATTACHMENT_CUSTODY_CORRUPT" | "ATTACHMENT_CUSTODY_REQUEST_CONFLICT"
@@ -404,13 +408,23 @@ export function applyAttachmentCustodySchema(db: Database): void {
     INSERT INTO attachment_custody_anchors(id,kind,original_key,attempt_id,proof_json)
     SELECT 'legacy:'||attempt_id,'legacy_unknown',original_key,attempt_id,origin_json FROM attachment_legacy_cleanup_blockers;`);
 }
-export function assertAttachmentCustodySchema(db: Database): void {
+export function assertAttachmentCustodySchema(db: Database, mode: UsageSchemaColumnMode = "historical"): void {
   const row = db.query("SELECT sql FROM sqlite_master WHERE name='mutation_attempts' AND type='table'").get() as { sql: string } | null;
-  if (row === null || !normalizeSchemaSql(row.sql).endsWith(`${ATTACHMENT_CUSTODY_COLUMNS.map(normalizeSchemaSql).join(", ")}) STRICT`)) fail();
+  const parentSql = row === null ? null : schemaSqlBeforeJoinedTranscriptColumns(db, "mutation_attempts", row.sql, mode);
+  if (parentSql === null || !parentSql.endsWith(`${ATTACHMENT_CUSTODY_COLUMNS.map(normalizeSchemaSql).join(", ")}) STRICT`)) fail();
   for (const object of ATTACHMENT_CUSTODY_SCHEMA_OBJECTS) {
+    if (mode === "joined" && object.name === "attachment_terminal_projection_guard") {
+      assertJoinedAttachmentTerminalGuard(db, object.sql);
+      continue;
+    }
     const actual = db.query("SELECT type,tbl_name,sql FROM sqlite_master WHERE name=?").get(object.name) as { type: string; tbl_name: string; sql: string } | null;
     if (actual === null || actual.type !== object.type || actual.tbl_name !== object.table || normalizeSchemaSql(actual.sql) !== normalizeSchemaSql(object.sql)) fail();
   }
+}
+export function applyJoinedAttachmentTerminalGuard(db: Database): void {
+  const predecessor = ATTACHMENT_CUSTODY_SCHEMA_OBJECTS.find((object) => object.name === "attachment_terminal_projection_guard");
+  if (predecessor === undefined) fail();
+  installJoinedAttachmentTerminalGuard(db, predecessor.sql);
 }
 export function hasAttachmentCustodyArtifacts(db: Database): boolean {
   const names = ATTACHMENT_CUSTODY_SCHEMA_OBJECTS.map((object) => object.name);
@@ -422,9 +436,18 @@ export function assertAttachmentDaemon(db: Database, input: AttachmentDaemon): v
   if (db.query("SELECT 1 FROM daemon_state WHERE singleton=1 AND generation=? AND boot_id=? AND stopped_at IS NULL").get(parsed.daemonGeneration, parsed.bootId) === null) fail("ATTACHMENT_CUSTODY_AUTHORITY_CHANGED");
 }
 const decode = <T>(schema: z.ZodType<T>, json: string): T => { try { return schema.parse(JSON.parse(json) as unknown); } catch { return fail(); } };
+const custodyAuditOptionsSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("source_selected") }).strict(),
+  z.object({ kind: z.literal("historical"), format: historicalEffectEvidenceFormatSchema }).strict(),
+]);
+export type AttachmentCustodyAuditOptions = Readonly<z.infer<typeof custodyAuditOptionsSchema>>;
+const sourceSelectedCustodyEvidence: AttachmentCustodyAuditOptions = { kind: "source_selected" };
 const setRowSchema = z.object({ id: custodyId, original_key: z.string().uuid(), origin_json: z.string(), digest, released_by: digest.nullable() }).strict();
 export type CustodySet = Readonly<{ origin: Origin; digest: string; releasedBy: string | null; parentAttemptId: string | null }>;
 export function readAttachmentSet(db: Database, id: string): CustodySet {
+  return readAttachmentSetWithEvidence(db, id, sourceSelectedCustodyEvidence);
+}
+function readAttachmentSetWithEvidence(db: Database, id: string, evidence: AttachmentCustodyAuditOptions): CustodySet {
   const row = setRowSchema.safeParse(db.query("SELECT * FROM attachment_custody_sets WHERE id=?").get(id));
   if (!row.success) fail();
   const value = row.data;
@@ -447,7 +470,7 @@ export function readAttachmentSet(db: Database, id: string): CustodySet {
   let parentAttemptId: string | null = null;
   let previous: DispositionRow | undefined;
   for (const item of disposition) {
-    validateDisposition(db, origin, item, previous);
+    validateDisposition(db, origin, item, evidence, previous);
     if (item.kind === "mutation_owned") parentAttemptId = item.attempt_id;
     previous = item;
   }
@@ -466,13 +489,13 @@ export function readAttachmentSet(db: Database, id: string): CustodySet {
     if (primary === null || primary.provider_account_id !== origin.input.authority.providerAccountId || primary.profile_id !== origin.input.authority.profileId
       || primary.provider !== origin.input.authority.provider || primary.binding_generation !== origin.input.authority.bindingGeneration
       || primary.process_generation !== origin.input.authority.processGeneration) fail();
-    if (parent.attachment_cleanup_terminal_digest !== null && attachmentTerminalProof(db, parent.id) !== parent.attachment_cleanup_terminal_digest) fail();
+    if (parent.attachment_cleanup_terminal_digest !== null && attachmentTerminalProofWithEvidence(db, parent.id, evidence) !== parent.attachment_cleanup_terminal_digest) fail();
   }
   return { origin, digest: value.digest, releasedBy: terminal, parentAttemptId };
 }
 type DispositionRow = { custody_id: string; ordinal: number; original_key: string; predecessor: string | null; kind: string; attempt_id: string | null; proof_json: string; digest: string; recorded_at: number };
 function dispositionDigest(row: Omit<DispositionRow, "digest">): string { return proofDigest(row); }
-function validateDisposition(db: Database, origin: Origin, row: DispositionRow, previous?: DispositionRow): void {
+function validateDisposition(db: Database, origin: Origin, row: DispositionRow, evidence: AttachmentCustodyAuditOptions, previous?: DispositionRow): void {
   const { digest: actual, ...body } = row;
   if (row.custody_id !== origin.id || row.original_key !== origin.input.idempotencyKey || row.ordinal !== (previous === undefined ? 1 : 2) || row.predecessor !== (previous?.digest ?? null)
     || dispositionDigest(body) !== actual || row.recorded_at < origin.createdAt || (previous !== undefined && previous.kind !== "mutation_owned")) fail();
@@ -480,7 +503,7 @@ function validateDisposition(db: Database, origin: Origin, row: DispositionRow, 
     if (previous !== undefined || row.attempt_id === null || row.proof_json !== JSON.stringify({ attemptId: row.attempt_id, requestDigest: origin.input.requestDigest })) fail();
   } else if (row.kind === "terminal") {
     if (row.attempt_id === null || previous?.attempt_id !== row.attempt_id) fail();
-    const terminal = attachmentTerminalProof(db, row.attempt_id);
+    const terminal = attachmentTerminalProofWithEvidence(db, row.attempt_id, evidence);
     if (terminal === null || row.proof_json !== JSON.stringify({ terminalDigest: terminal })) fail();
   } else if (row.kind === "queue_transferred") {
     if (previous !== undefined || row.attempt_id !== null) fail();
@@ -498,6 +521,9 @@ function validateDisposition(db: Database, origin: Origin, row: DispositionRow, 
   } else fail();
 }
 export function assertLiveAttachmentClosure(db: Database): readonly CustodySet[] {
+  return assertLiveAttachmentClosureWithEvidence(db, sourceSelectedCustodyEvidence);
+}
+function assertLiveAttachmentClosureWithEvidence(db: Database, evidence: AttachmentCustodyAuditOptions): readonly CustodySet[] {
   const ids = new Set<string>();
   for (const sql of [
     "SELECT id FROM attachment_custody_sets WHERE released_by IS NULL LIMIT 65",
@@ -506,7 +532,7 @@ export function assertLiveAttachmentClosure(db: Database): readonly CustodySet[]
     "SELECT custody_id AS id FROM attachment_custody_slots LIMIT 65",
   ]) for (const row of db.query(sql).all() as { id: string }[]) ids.add(row.id);
   if (ids.size > 64) fail();
-  return [...ids].map((id) => readAttachmentSet(db, id));
+  return [...ids].map((id) => readAttachmentSetWithEvidence(db, id, evidence));
 }
 export function reserveAttachmentSet(db: Database, input: AttachmentIngressInput, now: number, requestDigest?: string): AttachmentReservation {
   assertAttachmentDaemon(db, input);
@@ -588,14 +614,17 @@ export function bindAttachmentParent(db: Database, attemptId: string, set: Custo
   readAttachmentSet(db, set.origin.id);
 }
 export function readAttachmentParent(db: Database, attemptId: string): { format: "empty_v1" | "retained_v1" | null; proof: InputProof | null; custody: CustodySet | null } {
+  return readAttachmentParentWithEvidence(db, attemptId, sourceSelectedCustodyEvidence);
+}
+function readAttachmentParentWithEvidence(db: Database, attemptId: string, evidence: AttachmentCustodyAuditOptions): { format: "empty_v1" | "retained_v1" | null; proof: InputProof | null; custody: CustodySet | null } {
   const row = db.query("SELECT * FROM mutation_attempts WHERE id=?").get(attemptId) as ParentRow | null;
   if (row === null) fail();
-  if (row.attachment_input_format === null) { assertUnknownParent(db, row); return { format: null, proof: null, custody: null }; }
+  if (row.attachment_input_format === null) { assertUnknownParent(db, row, evidence); return { format: null, proof: null, custody: null }; }
   let proof: InputProof;
   let custody: CustodySet | null = null;
   if (row.attachment_input_format === "retained_v1") {
     if (row.attachment_custody_id === null) fail();
-    custody = readAttachmentSet(db, row.attachment_custody_id);
+    custody = readAttachmentSetWithEvidence(db, row.attachment_custody_id, evidence);
     if (custody.parentAttemptId !== row.id || custody.digest !== row.attachment_input_digest) fail();
     proof = custody.origin.input;
   } else if (row.attachment_input_format === "empty_v1") {
@@ -610,7 +639,7 @@ export function readAttachmentParent(db: Database, attemptId: string): { format:
     { provider_account_id: string; profile_id: string; provider: string; binding_generation: number; process_generation: number } | null;
   if (authority === null || authority.provider_account_id !== proof.authority.providerAccountId || authority.profile_id !== proof.authority.profileId
     || authority.provider !== proof.authority.provider || authority.binding_generation !== proof.authority.bindingGeneration || authority.process_generation !== proof.authority.processGeneration) fail();
-  if (row.attachment_cleanup_terminal_digest !== null && attachmentTerminalProof(db, row.id) !== row.attachment_cleanup_terminal_digest) fail();
+  if (row.attachment_cleanup_terminal_digest !== null && attachmentTerminalProofWithEvidence(db, row.id, evidence) !== row.attachment_cleanup_terminal_digest) fail();
   return { format: row.attachment_input_format, proof, custody };
 }
 type ParentRow = { id: string; idempotency_key: string; kind: string; authority_id: string; authority_generation: number; request_digest: string;
@@ -618,7 +647,7 @@ type ParentRow = { id: string; idempotency_key: string; kind: string; authority_
   attachment_custody_id: string | null; attachment_input_digest: string | null; attachment_cleanup_terminal_digest: string | null };
 const unknownProof = (row: ParentRow) => ({ attemptId: row.id, idempotencyKey: row.idempotency_key, kind: row.kind, sessionId: row.authority_id,
   authorityGeneration: row.authority_generation, requestDigest: row.request_digest, requestFormat: row.request_format });
-function assertUnknownParent(db: Database, row: ParentRow): void {
+function assertUnknownParent(db: Database, row: ParentRow, evidence: AttachmentCustodyAuditOptions): void {
   const blocker = db.query("SELECT * FROM attachment_legacy_cleanup_blockers WHERE attempt_id=?").get(row.id) as
     { original_key: string; origin_json: string; terminal_digest: string | null } | null;
   const anchor = db.query("SELECT * FROM attachment_custody_anchors WHERE id=?").get(`legacy:${row.id}`) as
@@ -627,31 +656,63 @@ function assertUnknownParent(db: Database, row: ParentRow): void {
   if (blocker === null || anchor === null || blocker.original_key !== row.idempotency_key || blocker.origin_json !== json
     || anchor.kind !== "legacy_unknown" || anchor.original_key !== row.idempotency_key || anchor.attempt_id !== row.id || anchor.proof_json !== json || anchor.digest !== null
     || blocker.terminal_digest !== row.attachment_cleanup_terminal_digest || anchor.released_by !== row.attachment_cleanup_terminal_digest) fail();
-  if (row.attachment_cleanup_terminal_digest !== null && attachmentTerminalProof(db, row.id) !== row.attachment_cleanup_terminal_digest) fail();
+  if (row.attachment_cleanup_terminal_digest !== null && attachmentTerminalProofWithEvidence(db, row.id, evidence) !== row.attachment_cleanup_terminal_digest) fail();
 }
 /** Conservatively returns null when the existing effect contract cannot prove
  * terminality. SQL state labels and session/provider retirement are not proofs. */
 export function attachmentTerminalProof(db: Database, attemptId: string): string | null {
+  return attachmentTerminalProofWithEvidence(db, attemptId, sourceSelectedCustodyEvidence);
+}
+function attachmentTerminalProofWithEvidence(db: Database, attemptId: string, context: AttachmentCustodyAuditOptions): string | null {
   const row = db.query("SELECT * FROM mutation_attempts WHERE id=?").get(attemptId) as ParentRow | null;
   if (row === null) fail();
   if (row.request_format !== null) {
-    const owner = requireSessionSendOwner(db, { attemptId });
+    const owner = context.kind === "historical"
+      ? requireHistoricalSessionSendOwnerForAudit(db, { attemptId }, historicalSessionSendOwnerAuditFormatSchema.parse(context.format))
+      : requireSessionSendOwner(db, { attemptId });
     if (!["accepted", "abandoned", "cancelled"].includes(owner.state)) return null;
     return proofDigest({ attemptId, ownerDigest: owner.ownerDigest, outcomes: owner.outcomes });
   }
-  const effect = db.query("SELECT kind,evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attemptId) as
-    { kind: string; evidence_json: string; evidence_digest: string } | null;
+  const effect = db.query("SELECT kind,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attemptId) as
+    { kind: string; evidence_digest: string } | null;
   if (row.state === "cancelled" && effect === null && row.result_json === null) return proofDigest({ attemptId, state: "cancelled", requestDigest: row.request_digest });
-  if (effect === null || effect.kind !== row.kind || sha(effect.evidence_json) !== effect.evidence_digest) return null;
+  if (effect === null || effect.kind !== row.kind) return null;
+  const selected = (() => {
+    try {
+      if (context.kind === "historical") {
+        if (!db.inTransaction) return null;
+        const raw = z.object({ bytes: z.instanceof(Uint8Array) }).strict().safeParse(db.query(`SELECT
+          CASE WHEN length(CAST(evidence_json AS BLOB))<=? THEN CAST(evidence_json AS BLOB) ELSE NULL END AS bytes
+          FROM mutation_effect_evidence WHERE attempt_id=?`).get(EFFECT_EVIDENCE_JSON_MAX_BYTES, attemptId));
+        if (!raw.success) return null;
+        const json = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw.data.bytes);
+        const checked = checkMutationEvidenceEnvelope({ format: context.format, json, digest: effect.evidence_digest,
+          evidenceKind: effect.kind, parentKind: row.kind });
+        return checked.kind === "checked_envelope" && checked.canonicalJson === json
+          ? { format: checked.format, evidence: checked.value } : null;
+      }
+      const checked = readMutationEffectEvidenceProvenance(db, attemptId);
+      return checked.kind === "parsed" && checked.digest === effect.evidence_digest
+        ? { format: checked.format, evidence: checked.evidence } : null;
+    } catch { return null; }
+  })();
+  if (selected === null || (selected.evidence.kind !== "session.send" && selected.evidence.kind !== "session.steer")
+    || selected.evidence.clientMessageId !== row.id || selected.evidence.kind !== row.kind) return null;
+  const evidence = selected.evidence;
+  // Before the joined replacement is installed, the frozen terminal SQL never
+  // admitted actor-bearing generic effects. Preserve that historical release
+  // boundary; subsequent source-selected reconciliation uses the joined guard.
+  if (context.kind === "historical" && "messageActor" in evidence && evidence.messageActor !== undefined) return null;
+  if (selected.format === "joined_v1") {
+    const transcript = db.query(`SELECT CASE WHEN length(CAST(transcript_intent_json AS BLOB))<=?
+      THEN transcript_intent_json ELSE NULL END AS transcript_intent_json FROM mutation_attempts WHERE id=?`)
+      .get(EFFECT_EVIDENCE_JSON_MAX_BYTES, attemptId) as { transcript_intent_json: string | null };
+    try {
+      const actor = z.object({ actor: z.string() }).passthrough().parse(JSON.parse(transcript.transcript_intent_json ?? "null") as unknown).actor;
+      if (!("messageActor" in evidence) || evidence.messageActor === undefined || evidence.messageActor !== actor) return null;
+    } catch { return null; }
+  }
   const nativeId = z.string().min(1).max(200);
-  const baseline = z.object({ providerUpdatedAt: z.number().nonnegative().nullable(), status: z.enum(["active", "idle", "terminal"]), activeTurnId: nativeId.nullable() }).strict();
-  const effectSchema = z.discriminatedUnion("kind", [
-    z.object({ kind: z.literal("session.send"), providerThreadId: nativeId, baseline, clientMessageId: nativeId, messageDigest: digest, runtimeProfile: reviewedRuntimeProfileSchema.optional() }).strict(),
-    z.object({ kind: z.literal("session.steer"), providerThreadId: nativeId, baseline, activeTurnId: nativeId.nullable(), clientMessageId: nativeId, messageDigest: digest }).strict(),
-  ]);
-  const parsedEffect = (() => { try { return effectSchema.safeParse(JSON.parse(effect.evidence_json) as unknown); } catch { return null; } })();
-  if (parsedEffect === null || !parsedEffect.success || parsedEffect.data.clientMessageId !== row.id || parsedEffect.data.kind !== row.kind) return null;
-  const evidence = parsedEffect.data;
   const primaryRow = db.query("SELECT provider_account_id,profile_id,provider,binding_generation,process_generation FROM mutation_provider_authorities WHERE attempt_id=? AND role='primary'").get(row.id) as
     { provider_account_id: string; profile_id: string; provider: string; binding_generation: number; process_generation: number } | null;
   if (primaryRow === null) return null;
@@ -706,10 +767,13 @@ export function attachmentTerminalProof(db: Database, attemptId: string): string
   return null;
 }
 export function settleAttachmentParent(db: Database, attemptId: string, now: number): void {
+  settleAttachmentParentWithEvidence(db, attemptId, now, sourceSelectedCustodyEvidence);
+}
+function settleAttachmentParentWithEvidence(db: Database, attemptId: string, now: number, evidence: AttachmentCustodyAuditOptions): void {
   const row = db.query("SELECT * FROM mutation_attempts WHERE id=? AND kind IN ('session.send','session.steer')").get(attemptId) as ParentRow | null;
   if (row === null) return;
-  const parent = readAttachmentParent(db, attemptId);
-  const terminal = attachmentTerminalProof(db, attemptId);
+  const parent = readAttachmentParentWithEvidence(db, attemptId, evidence);
+  const terminal = attachmentTerminalProofWithEvidence(db, attemptId, evidence);
   if (terminal === null || row.attachment_cleanup_terminal_digest !== null) return;
   // A terminal pointer is a derived, one-way projection of immutable proof.
   db.query("UPDATE mutation_attempts SET attachment_cleanup_terminal_digest=? WHERE id=? AND attachment_cleanup_terminal_digest IS NULL").run(terminal, attemptId);
@@ -717,7 +781,7 @@ export function settleAttachmentParent(db: Database, attemptId: string, now: num
     db.query("UPDATE attachment_legacy_cleanup_blockers SET terminal_digest=? WHERE attempt_id=?").run(terminal, attemptId);
     db.query("UPDATE attachment_custody_anchors SET released_by=? WHERE id=?").run(terminal, `legacy:${attemptId}`);
   } else if (parent.custody !== null) appendDisposition(db, parent.custody, "terminal", attemptId, { terminalDigest: terminal }, now);
-  readAttachmentParent(db, attemptId);
+  readAttachmentParentWithEvidence(db, attemptId, evidence);
 }
 export function hasUnknownAttachmentCustody(db: Database): boolean {
   const rows = [
@@ -728,9 +792,12 @@ export function hasUnknownAttachmentCustody(db: Database): boolean {
   for (const row of rows) if (row !== null) readAttachmentParent(db, row.id);
   return rows.some((row) => row !== null);
 }
-export function auditAttachmentCustody(db: Database): void {
-  assertAttachmentCustodySchema(db);
-  assertLiveAttachmentClosure(db);
+export function auditAttachmentCustody(db: Database, options: AttachmentCustodyAuditOptions = sourceSelectedCustodyEvidence): void {
+  const parsed = custodyAuditOptionsSchema.safeParse(options);
+  if (!parsed.success || (parsed.data.kind === "historical" && !db.inTransaction)) fail();
+  const evidence = parsed.data;
+  assertAttachmentCustodySchema(db, evidence.kind === "historical" ? "historical" : "joined");
+  assertLiveAttachmentClosureWithEvidence(db, evidence);
   for (const [table, column] of [["mutation_attempts", "id"], ["attachment_custody_sets", "id"], ["attachment_custody_anchors", "id"], ["attachment_legacy_cleanup_blockers", "attempt_id"],
     ["attachment_custody_members", "custody_id"], ["attachment_custody_dispositions", "custody_id"]] as const) {
     let cursor = "";
@@ -738,22 +805,24 @@ export function auditAttachmentCustody(db: Database): void {
       const rows = db.query(`SELECT ${column} AS id FROM ${table} WHERE ${column}>? ${table === "mutation_attempts" ? "AND kind IN ('session.send','session.steer')" : ""} GROUP BY ${column} ORDER BY ${column} LIMIT 100`).all(cursor) as { id: string }[];
       if (rows.length === 0) break;
       for (const row of rows) {
-        if (table === "attachment_custody_sets" || table === "attachment_custody_members" || table === "attachment_custody_dispositions") readAttachmentSet(db, row.id);
+        if (table === "attachment_custody_sets" || table === "attachment_custody_members" || table === "attachment_custody_dispositions") readAttachmentSetWithEvidence(db, row.id, evidence);
         else if (table === "attachment_custody_anchors") {
           const a = db.query("SELECT kind,attempt_id FROM attachment_custody_anchors WHERE id=?").get(row.id) as { kind: string; attempt_id: string | null };
-          if (a.kind === "custody") readAttachmentSet(db, row.id); else if (a.attempt_id === null) fail(); else readAttachmentParent(db, a.attempt_id);
-        } else readAttachmentParent(db, row.id);
+          if (a.kind === "custody") readAttachmentSetWithEvidence(db, row.id, evidence); else if (a.attempt_id === null) fail(); else readAttachmentParentWithEvidence(db, a.attempt_id, evidence);
+        } else readAttachmentParentWithEvidence(db, row.id, evidence);
         cursor = row.id;
       }
     }
   }
 }
-export function reconcileAttachmentTerminals(db: Database, now: number): void {
+export function reconcileAttachmentTerminals(db: Database, now: number, options: AttachmentCustodyAuditOptions = sourceSelectedCustodyEvidence): void {
+  const parsed = custodyAuditOptionsSchema.safeParse(options);
+  if (!parsed.success || (parsed.data.kind === "historical" && !db.inTransaction)) fail();
   let cursor = "";
   for (;;) {
     const rows = db.query("SELECT id FROM mutation_attempts WHERE id>? AND kind IN ('session.send','session.steer') AND attachment_cleanup_terminal_digest IS NULL ORDER BY id LIMIT 100").all(cursor) as { id: string }[];
     if (rows.length === 0) break;
-    for (const row of rows) { settleAttachmentParent(db, row.id, now); cursor = row.id; }
+    for (const row of rows) { settleAttachmentParentWithEvidence(db, row.id, now, parsed.data); cursor = row.id; }
   }
 }
 /** Missed legacy bulk settlement hooks may conservatively leave a projection.

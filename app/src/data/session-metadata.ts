@@ -9,6 +9,7 @@ export type SessionMetadata = Readonly<{
   archived: boolean;
   name: string | null;
   note: string | null;
+  retiredProvider?: "devin";
 }>;
 
 export const emptySessionMetadata: SessionMetadata = Object.freeze({
@@ -53,6 +54,7 @@ function toMetadata(payload: SessionMetadataPayload): SessionMetadata {
     archived: payload.archived ?? false,
     name: payload.name,
     note: payload.note,
+    ...(payload.retiredProvider === undefined ? {} : { retiredProvider: payload.retiredProvider }),
   };
 }
 

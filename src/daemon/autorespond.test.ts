@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
 import type { InteractionDisplay } from "../domain/interactions";
+import { selectAutorespondAfterHoursTier } from "../domain/autorespond-after-hours";
+import { approvalClassOf } from "../domain/autorespond-protocol-policy";
 
 import {
-  approvalClassOf,
   AUTORESPOND_CONSECUTIVE_LIMIT,
   AUTORESPOND_DAILY_BUDGET,
   AUTORESPOND_HOURLY_BUDGET,
@@ -45,6 +46,41 @@ const workspacePermission: InteractionDisplay = {
 };
 
 describe("autorespond policy", () => {
+  const selection = selectAutorespondAfterHoursTier({
+    sourceKind: "protocol",
+    approvalEligibility: "eligible",
+    historyEligibility: "proven",
+    policy: { kind: "autorespond_after_hours", version: 1, revision: 1, enabled: true },
+    schedule: { version: 1, revision: 1, startMinute: 600, endMinute: 1320, timeZone: "UTC" },
+    observedAt: Date.parse("2026-09-07T23:00:00Z"),
+  });
+
+  test("uses a provisional after-hours tier without widening approval authority or prose", () => {
+    expect(selection.tier).toBe("after_hours");
+    expect(decideAutorespond({ budgets: { ...quiet, consecutive: 3 }, display: command,
+      kind: command.kind, mode: "auto:all", selection })).toMatchObject({ action: "accept" });
+    for (const [field, limit, code] of [
+      ["consecutive", 6, "consecutive_limit"],
+      ["lastHour", 20, "hourly_budget"],
+      ["lastDay", 80, "daily_budget"],
+    ] as const) {
+      expect(decideAutorespond({ budgets: { ...quiet, [field]: limit - 1 }, display: command,
+        kind: command.kind, mode: "auto:all", selection })).toMatchObject({ action: "accept" });
+      expect(decideAutorespond({ budgets: { ...quiet, [field]: limit }, display: command,
+        kind: command.kind, mode: "auto:all", selection })).toMatchObject({ action: "escalate", code });
+    }
+    for (const display of [command, network, workspacePermission, fileChange]) {
+      expect(decideAutorespond({ budgets: quiet, display, kind: display.kind,
+        mode: "auto:workspace", selection })).toMatchObject({
+        action: "escalate", code: "protected_authority_required",
+      });
+    }
+    expect(decideAutorespond({ budgets: quiet, display: command, kind: command.kind,
+      mode: "manual", selection })).toMatchObject({ action: "escalate", code: "manual_mode" });
+    expect(decideProseAutorespond({ budgets: { ...quiet, consecutive: 3 }, mode: "auto:all" }))
+      .toMatchObject({ action: "escalate", code: "consecutive_limit" });
+  });
+
   test("accepts commands and permissions at once scope under auto:all", () => {
     for (const display of [command, network]) {
       const decision = decideAutorespond({ budgets: quiet, display, kind: display.kind, mode: "auto:all" });

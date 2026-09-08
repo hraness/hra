@@ -415,6 +415,16 @@ describe("protected login output", () => {
 
     for (const invalid of [
       {
+        account,
+        login: {
+          loginId: `provider${String.fromCodePoint(0x2028)}login${String.fromCodePoint(0x2029)}`,
+          next: `hra account login-cancel ${account.id}`,
+          status: "pending" as const,
+          userCode: "ABCD-EFGH",
+          verificationUrl: "https://example.test/device",
+        },
+      },
+      {
         account: { ...account, id: `acct_${"2".repeat(32)}` },
         login: {
           loginId: "provider-login",

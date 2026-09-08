@@ -1,5 +1,5 @@
 /**
- * Switching a live session between Codex, Claude Code, and Devin.
+ * Switching a live session between Codex and Claude Code.
  *
  * This module is the single alignment point for the `set_provider` remote
  * command. The daemon-side kind is being added in parallel, so the payload is
@@ -11,33 +11,37 @@
  * structurally over the three fields a command record carries, the same way
  * `deviceCommandNotice` is, so the settling line is provable without a client.
  */
-import { isCommandKind, type ModelPreset, type RemoteCommandPayload } from "../hra/cloud";
+import {
+  activeRemoteDerivedCodexSelection,
+  activeRemotePresetSelection,
+  isCommandKind,
+  parseRemoteCommandPayload,
+  type RemoteCommandPayload,
+  type SupportedPreset,
+} from "../hra/cloud";
 
-export type SessionProvider = "codex" | "claude" | "devin";
+export type SessionProvider = "codex" | "claude";
 
 export type SessionPresetOption = Readonly<{
   label: string;
-  value: ModelPreset;
+  value: SupportedPreset;
 }>;
 
 const codexPresetOptions: readonly SessionPresetOption[] = Object.freeze([
   { label: "Luna Max", value: "low" },
-  { label: "Astra Max", value: "high" },
-  { label: "Astra Ultra", value: "ultra" },
+  // These are remote aliases, not proof of the target daemon's active
+  // contract. Registry v1 cannot distinguish a rolling Sol/Astra binding.
+  { label: "Codex High", value: "high" },
+  { label: "Codex Ultra", value: "ultra" },
 ]);
 
 const claudePresetOptions: readonly SessionPresetOption[] = Object.freeze([
   { label: "Claude Fable Max", value: "fable-max" },
 ]);
 
-const devinPresetOptions: readonly SessionPresetOption[] = Object.freeze([
-  { label: "GPT-6 Astra", value: "astra" },
-]);
-
 const allPresetOptions: readonly SessionPresetOption[] = Object.freeze([
   ...codexPresetOptions,
   ...claudePresetOptions,
-  ...devinPresetOptions,
 ]);
 
 /**
@@ -52,14 +56,12 @@ export function sessionPresetOptionsForProvider(
 ): readonly SessionPresetOption[] {
   if (provider === "codex") return codexPresetOptions;
   if (provider === "claude") return claudePresetOptions;
-  if (provider === "devin") return devinPresetOptions;
   return allPresetOptions;
 }
 
 /** The pinned preset sent atomically with a provider switch. */
-export function defaultSessionPresetForProvider(provider: SessionProvider): ModelPreset {
+export function defaultSessionPresetForProvider(provider: SessionProvider): SupportedPreset {
   if (provider === "claude") return "fable-max";
-  if (provider === "devin") return "astra";
   return "ultra";
 }
 
@@ -69,7 +71,6 @@ export const providerSwitchOptions: readonly Readonly<{
 }>[] = Object.freeze([
   { label: "Run on Codex", provider: "codex" },
   { label: "Run on Claude Code (Linux machine only)", provider: "claude" },
-  { label: "Run on Devin", provider: "devin" },
 ]);
 
 /**
@@ -91,22 +92,28 @@ export const setProviderCommandKind = "set_provider";
  *
  * `preset` is optional: with it, the switch and the model choice are one
  * command, so a session cannot land on the new provider under a preset that
- * provider does not have. The cast is the seam: `set_provider` is not in the
- * repository's `CommandKind` union yet, and this assertion is the only place
- * the two shapes meet.
+ * provider does not have. A rebound Codex High or Ultra selection also carries
+ * this build's immutable contract. A preset-omitted Codex switch carries the
+ * shared High/Ultra contract because the daemon derives its target alias. That
+ * makes rolling mismatches fail before switching without changing stable
+ * explicit preset shapes.
  */
 export function buildSetProviderPayload(input: Readonly<{
-  preset?: ModelPreset;
+  preset?: SupportedPreset;
   provider: SessionProvider;
 }>): RemoteCommandPayload {
-  const payload: Readonly<{
-    kind: string;
-    preset?: ModelPreset;
-    provider: SessionProvider;
-  }> = input.preset === undefined
-    ? { kind: setProviderCommandKind, provider: input.provider }
-    : { kind: setProviderCommandKind, preset: input.preset, provider: input.provider };
-  return payload as unknown as RemoteCommandPayload;
+  const payload = input.preset === undefined
+    ? input.provider === "codex"
+      ? { kind: setProviderCommandKind, ...activeRemoteDerivedCodexSelection() }
+      : { kind: setProviderCommandKind, provider: input.provider }
+    : {
+        kind: setProviderCommandKind,
+        ...activeRemotePresetSelection(input.preset),
+        provider: input.provider,
+      };
+  const parsed = parseRemoteCommandPayload(payload);
+  if (parsed === null) throw new Error("The provider switch payload is not valid.");
+  return parsed;
 }
 
 /** Build the atomic provider-and-default-preset switch used by the session menu. */
@@ -167,7 +174,7 @@ export function providerSwitchNotice(
   if (command === null || provider === null) return null;
   const name = provider === "claude"
     ? "Claude Code"
-    : provider === "devin" ? "Devin" : "Codex";
+    : "Codex";
   switch (command.state) {
     case "pending":
       return { settled: false, text: `Waiting for the machine to pick up the switch to ${name}.` };

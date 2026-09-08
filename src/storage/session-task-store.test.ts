@@ -19,6 +19,7 @@ import {
   SessionTaskStoreError,
   assertSessionTaskSchema,
   type SessionTaskQueueRecord,
+  type SessionTaskExecutionAuthority,
   type SessionTaskStoreErrorCode,
 } from "./session-task-store";
 
@@ -51,9 +52,9 @@ CREATE TABLE sessions (
   id TEXT PRIMARY KEY,
   profile_id TEXT NOT NULL REFERENCES profiles(id),
   project_id TEXT REFERENCES projects(id),
-  provider_thread_id TEXT,
   provider TEXT NOT NULL DEFAULT 'codex',
   provider_v39 TEXT NOT NULL DEFAULT 'codex',
+  provider_thread_id TEXT,
   state TEXT NOT NULL
 ) STRICT;
 CREATE TABLE provider_accounts(
@@ -239,6 +240,7 @@ type Fixture = Readonly<{
 }>;
 
 function fixture(input: Readonly<{
+  isExecutionAuthorityLive?: (authority: SessionTaskExecutionAuthority) => boolean;
   resolveProjectDirectory?: (root: string) => Promise<string | null>;
   enqueue?: false;
   afterEnqueue?: (queue: SessionTaskQueueRecord) => SessionTaskQueueRecord;
@@ -282,6 +284,9 @@ function fixture(input: Readonly<{
   };
   const options = {
     now: () => now.value,
+    ...(input.isExecutionAuthorityLive === undefined
+      ? {}
+      : { isExecutionAuthorityLive: input.isExecutionAuthorityLive }),
     resolveProjectDirectory: input.resolveProjectDirectory ?? (async (root) => root),
     ...(input.enqueue === false ? {} : { enqueue }),
   };
@@ -343,6 +348,46 @@ const expectStoreCode = (
     expect((error as SessionTaskStoreError).code).toBe(code);
   }
 };
+
+describe("retired provider schedules", () => {
+  test("retains historical tasks without deadlines, new admission, or queue materialization", async () => {
+    let validations = 0;
+    const value = fixture({ resolveProjectDirectory: async (root) => { validations += 1; return root; } });
+    const key = idempotencyKey();
+    const active = createTask(value, { idempotencyKey: key });
+    const paused = createTask(value, { name: "Paused legacy task", status: "paused" });
+    value.database.query("UPDATE sessions SET provider_v39='devin' WHERE id=?").run(value.sessionId);
+    expect(value.store.nextDueAt()).toBeNull();
+    expect(await value.store.materializeDue({ now: active.nextDueAt! })).toEqual([]);
+    expect(validations).toBe(0);
+    expect(value.store.require(value.sessionId, active.id)).toEqual(active);
+    expect(value.store.listOccurrences(value.sessionId, active.id)).toEqual([]);
+    expect(value.database.query("SELECT * FROM queue_entries").all()).toEqual([]);
+    expectStoreCode(() => createTask(value), "PROVIDER_RETIRED");
+    expectStoreCode(() => createTask(value, { status: "paused" }), "PROVIDER_RETIRED");
+    expectStoreCode(() => value.store.edit({ sessionId: value.sessionId, taskId: paused.id,
+      expectedRevision: paused.revision, patch: { status: "active" }, idempotencyKey: idempotencyKey() }), "PROVIDER_RETIRED");
+    expect(createTask(value, { idempotencyKey: key })).toEqual(active);
+    expect(value.store.edit({ sessionId: value.sessionId, taskId: active.id,
+      expectedRevision: active.revision, patch: { status: "paused" }, idempotencyKey: idempotencyKey() }))
+      .toMatchObject({ status: "paused", nextDueAt: null });
+    expect(value.store.delete({ sessionId: value.sessionId, taskId: paused.id,
+      expectedRevision: paused.revision, idempotencyKey: idempotencyKey() })).toMatchObject({ deleted: true });
+  });
+
+  test("rechecks retirement after asynchronous project validation before writing an occurrence", async () => {
+    const value = fixture({ resolveProjectDirectory: async (root) => {
+      value.database.query("UPDATE sessions SET provider_v39='devin' WHERE id=?").run(value.sessionId);
+      return root;
+    } });
+    const active = createTask(value);
+    expect(await value.store.materializeDue({ now: active.nextDueAt! })).toEqual([]);
+    expect(value.store.nextDueAt()).toBeNull();
+    expect(value.store.require(value.sessionId, active.id)).toEqual(active);
+    expect(value.store.listOccurrences(value.sessionId, active.id)).toEqual([]);
+    expect(value.database.query("SELECT * FROM queue_entries").all()).toEqual([]);
+  });
+});
 
 describe("SessionTaskStore schema authority", () => {
   const databaseWithSchema = (schema: string): Database => {
@@ -977,8 +1022,12 @@ describe("SessionTaskStore due materialization", () => {
   });
 
 
-  test("materializes a managed Devin task once while its durable profile is signed out", async () => {
+  test("retains an inert managed Devin task while its durable profile is signed out", async () => {
     const value = fixture();
+    const created = createTask(value, {
+      name: "Managed Devin follow-up",
+      prompt: "Continue the native Devin conversation.",
+    });
     value.database.query(
       "UPDATE profiles SET state='signed_out',provider_email=NULL,codex_account_key=NULL WHERE id=?",
     ).run(value.accountId);
@@ -988,28 +1037,19 @@ describe("SessionTaskStore due materialization", () => {
     value.database.query(
       "DELETE FROM session_provider_account_authorities WHERE session_id=?",
     ).run(value.sessionId);
-    const created = createTask(value, {
-      name: "Managed Devin follow-up",
-      prompt: "Continue the native Devin conversation.",
-    });
     const dueAt = created.nextDueAt ?? 0;
 
-    expect(value.store.nextDueAt()).toBe(dueAt);
-    expect(await value.store.materializeDue({ now: dueAt })).toMatchObject([{
-      task: { id: created.id, sessionId: value.sessionId },
-      occurrence: { taskId: created.id, sessionId: value.sessionId },
-      queue: {
-        message: "Continue the native Devin conversation.",
-        sessionId: value.sessionId,
-        state: "pending",
-      },
-    }]);
+    expect(value.store.nextDueAt()).toBeNull();
     expect(await value.store.materializeDue({ now: dueAt })).toEqual([]);
-    expect(value.store.listOccurrences(value.sessionId, created.id)).toHaveLength(1);
+    expect(value.store.listOccurrences(value.sessionId, created.id)).toEqual([]);
+    expect(value.store.require(value.sessionId, created.id)).toEqual(created);
+    expect(value.database.query("SELECT * FROM queue_entries").all()).toEqual([]);
   });
 
   test("materializes an adopted personal Claude task while its profile is signed out", async () => {
-    const value = fixture();
+    const value = fixture({
+      isExecutionAuthorityLive: (authority) => authority.provider === "claude",
+    });
     adoptPersonalClaudeSession(value);
     const created = createTask(value, {
       name: "Personal Claude follow-up",
@@ -1097,6 +1137,34 @@ describe("SessionTaskStore due materialization", () => {
       expect(value.database.query("SELECT COUNT(*) AS count FROM queue_entries WHERE session_id=?")
         .get(value.sessionId)).toEqual({ count: 0 });
     }
+  });
+
+  test("checks Claude runtime liveness with its captured provider generation rather than the Codex shadow", async () => {
+    const seen: SessionTaskExecutionAuthority[] = [];
+    const value = fixture({
+      isExecutionAuthorityLive: (authority) => {
+        seen.push(authority);
+        return authority.provider === "claude" && authority.processGeneration === 7;
+      },
+    });
+    value.database.query(
+      "UPDATE provider_accounts SET process_generation=7 WHERE profile_id=? AND provider='claude'",
+    ).run(value.accountId);
+    adoptPersonalClaudeSession(value);
+    const created = createTask(value);
+    expect(value.database.query("SELECT process_generation FROM profiles WHERE id=?").get(value.accountId))
+      .toEqual({ process_generation: 1 });
+    expect(await value.store.materializeDue({ now: created.nextDueAt ?? 0 })).toMatchObject([{
+      task: { id: created.id },
+      queue: { sessionId: value.sessionId },
+    }]);
+    expect(seen).toEqual([0, 1].map(() => ({
+      processGeneration: 7,
+      profileId: value.accountId,
+      provider: "claude",
+      providerThreadId: `thread-${value.sessionId}`,
+      sessionId: value.sessionId,
+    })));
   });
 
   test("rechecks personal Claude binding authority after project validation", async () => {
@@ -1438,6 +1506,81 @@ describe("SessionTaskStore due materialization", () => {
     expect(await unusable.store.materializeDue({
       now: unusableTask.nextDueAt ?? dueAt,
     })).toEqual([]);
+  });
+
+  test("uses provider-specific readiness for signed-out Codex and adopted Claude sessions", async () => {
+    const codex = fixture();
+    const codexTask = createTask(codex);
+    codex.database.query("UPDATE profiles SET state='signed_out'").run();
+    expect(codex.store.nextDueAt()).toBeNull();
+    expect(await codex.store.materializeDue({ now: codexTask.nextDueAt ?? 0 })).toEqual([]);
+
+    const claude = fixture({ isExecutionAuthorityLive: () => true });
+    const claudeTask = createTask(claude);
+    adoptPersonalClaudeSession(claude);
+    expect(claude.store.nextDueAt()).toBe(claudeTask.nextDueAt);
+    await expect(claude.store.materializeDue({
+      now: claudeTask.nextDueAt ?? 0,
+    })).resolves.toMatchObject([{
+      task: { id: claudeTask.id },
+      queue: { sessionId: claude.sessionId },
+    }]);
+
+    const loginPending = fixture({ isExecutionAuthorityLive: () => true });
+    const loginPendingTask = createTask(loginPending);
+    adoptPersonalClaudeSession(loginPending);
+    loginPending.database.query("UPDATE profiles SET state='login_pending'").run();
+    expect(loginPending.store.nextDueAt()).toBe(loginPendingTask.nextDueAt);
+    expect(await loginPending.store.materializeDue({
+      now: loginPendingTask.nextDueAt ?? 0,
+    })).toMatchObject([{
+      task: { id: loginPendingTask.id },
+      queue: { sessionId: loginPending.sessionId },
+    }]);
+  });
+
+  test("does not commit a due Claude occurrence without this daemon's exact live binding", async () => {
+    const unproven = fixture();
+    const unprovenTask = createTask(unproven);
+    unproven.database.query("UPDATE sessions SET provider_v39='claude'").run();
+    expect(await unproven.store.materializeDue({
+      now: unprovenTask.nextDueAt ?? 0,
+    })).toEqual([]);
+    expect(unproven.store.listOccurrences(unproven.sessionId, unprovenTask.id)).toEqual([]);
+
+    let authorityState: "error" | "closed" | "live" = "error";
+    const seen: SessionTaskExecutionAuthority[] = [];
+    const value = fixture({
+      isExecutionAuthorityLive: (authority) => {
+        seen.push(authority);
+        if (authorityState === "error") throw new Error("authority proof unavailable");
+        return authority.provider !== "claude" || authorityState === "live";
+      },
+    });
+    const created = createTask(value);
+    adoptPersonalClaudeSession(value);
+    const dueAt = created.nextDueAt ?? 0;
+
+    await expect(value.store.materializeDue({ now: dueAt }))
+      .rejects.toThrow("authority proof unavailable");
+    authorityState = "closed";
+    expect(await value.store.materializeDue({ now: dueAt })).toEqual([]);
+    expect(value.store.listOccurrences(value.sessionId, created.id)).toEqual([]);
+    expect(value.store.require(value.sessionId, created.id).nextDueAt).toBe(dueAt);
+    expect(value.database.query("SELECT COUNT(*) AS count FROM queue_entries").get())
+      .toEqual({ count: 0 });
+    expect(seen.at(-1)).toMatchObject({
+      processGeneration: 1,
+      provider: "claude",
+      providerThreadId: `thread-${value.sessionId}`,
+      sessionId: value.sessionId,
+    });
+
+    authorityState = "live";
+    await expect(value.store.materializeDue({ now: dueAt })).resolves.toMatchObject([{
+      occurrence: { taskId: created.id },
+      queue: { sessionId: value.sessionId },
+    }]);
   });
 
   test("rolls back queue allocation, occurrence, and due advance as one unit", async () => {

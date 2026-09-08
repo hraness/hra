@@ -14,6 +14,156 @@ tags:
 
 # Provider usage management
 
+## Current delivery checkpoint
+
+The active delivery is the existing usage observation, cached visibility,
+manual-switch and policy-control foundation. Managed automatic movement,
+Claude native fallback activation and the unfinished hosted/browser publisher
+remain dormant. Phases 6 through 9 are not complete.
+
+The September 8 integration with canonical main `7ab3478` is uncommitted.
+Source conflict markers are resolved, and the focused joined migration matrix
+passes. Integration and delivery gates remain incomplete. PR 140 remains a
+draft at `8f05930`; no merge, usage release or
+production deployment is claimed. Earlier exact-tree checks do not cover this
+integration. Canonical schema 50 is now governed by PR 151's merge at
+`d5376e34dcf2ace99009fd6eeaed3dcae917bcca`, tree
+`14ccd71d668411851ec5f65e03f16f6e63ec78f7`. The exact fully qualified main
+ref was refreshed after the merge. This usage candidate still needs to join
+that ancestry and validate its own changes. Usage slots 51 through 59 and the
+joined evidence/recovery bridge at 60 remain private candidate allocations;
+recheck competing ownership before push, review readiness or merge. The
+canonical owner's successful gates are not this branch's acceptance evidence.
+
+The candidate runs canonical upgrades before usage installation. For admitted
+private-48 and combined-49 inputs, it relocates the nine original usage ledger
+rows in descending order without changing their timestamps or replaying their
+installers. Immutable source evidence is sealed before current interpretation;
+canonical schemas 43 through 46 use their separately frozen source dialect.
+The new current-version open is assertion-only. It cannot reconstruct missing
+provenance, move a ledger or replay historical installers.
+
+The repaired matrix covers fresh creation and actual canonical-39/40/43/45/49,
+private-48 and combined-49 archives, including a populated prepared switch.
+The 30-case history, adoption and runtime-profile group passes with 48,053
+assertions. Retained custody selects an explicitly historical audit context;
+queue layout recognition admits only the exact appended canonical-43/47 tail.
+Canonical-50 profile backfill preserves every original session field under a
+transactional replacement fence and restores the exact original switch guard.
+Its five positive/fault cases pass with 119 assertions, including complete
+rollback after a late migration failure. Frozen historical DDL remains intact.
+
+Current switch containment is explicit, not repair-on-open. Five cases with
+104 assertions preserve valid execution-context evidence through containment
+and reject missing or changed context/anchor evidence without writes. The
+effect-admission suite passes 22 cases and 29,620 assertions; peer authority
+projection passes six cases and 185 assertions. These are storage-contract
+proofs, not native provider acceptance.
+
+Current-schema writable open now retains the same read-only row-integrity
+audits it previously skipped. All 33 automatic-policy cases pass with 210
+assertions, including readonly/writable refusal and unchanged database rows.
+The repaired Work/session-task group passes 126 cases and 1,360 assertions;
+14 current autorespond cases pass with 100 assertions. Current login-cancellation
+restart now uses immutable, paired transition intents and anchors tied to the
+original login, exact cancellation and actual binding update. Its 26 focused
+cases pass with 477 assertions. The authentic canonical-45 upgrade and all 31
+account-successor controls pass together with 4,866 assertions. That archived
+writer advanced the pending login while recording only the cancellation's
+account-successor chain, not the later login-successor ledgers. The narrow
+compatibility path requires exact selected historical evidence to establish
+the captured import baseline, then proves every later transition. It neither
+synthesizes missing historical edges nor changes frozen DDL. Broad regressions,
+the final typecheck, aggregate and delivery gates remain outstanding.
+
+The joined attachment terminal guard now admits source-selected current
+message actors while preserving its exact historical codec. All 68 focused
+reservation, custody and terminal-guard cases pass with 422 assertions. The
+bounded schema-guard reread passes 13 cases with 52 assertions, and two real
+applied/cancelled reopen controls pass with 19 assertions. Terminal attachment
+release cannot rely on a wider raw parser or an inferred historical actor.
+
+Current switch execution context seals the actual target preset contract while
+retaining the frozen journal's legacy contract-2 shadow. Its 21 context cases
+pass with 1,312 assertions; 15 joined storage, contract-1/2 rebind and seed-receipt
+cases pass with 503 assertions. A missing context anchor still refuses the SQL
+session update and rolls back the transaction. An exact existing host-capability
+binding is retained unchanged, rather than deleted and recreated; conflicting
+bindings refuse. The pre-provider-call race reproduced target construction
+after a conflicting binding arrived during the daemon await. The repaired
+six-case group passes with 84 assertions: both providers issue no target call,
+source release or seed; the exact no-effect receipt remains, the Claude launch
+is cancelled, and replay is inert. Four post-release conflict variants preserve
+all rows and schema. The broader daemon group still fails integration cases.
+
+Historical canonical-43/45 fixture capture passed after the complete script
+and installed scheduler were reviewed and the unchanged invocation received
+renewed automatic approval. Both archived writers reopened their actual output
+unchanged through writable and readonly APIs. The schema-43 image hash is
+`b541c3d22359e4c02b8c499b23b13e9f9e39c0f12d830e29f9f1ed58ef841f82`;
+schema 45 is
+`532c3c694567528f215f445b7f30fe8ddd90cee399b4b1cdbbc1df28c0ecfea4`.
+These originals are packed and their repair cases run against real archived
+bytes. A supplemental capture records synthetic runtime profiles through the
+same exact archived APIs, after initializing daemon custody. Its canonical-43
+hash is `7ab3b21f2cafabb0e1494a20bae58c77e08e17a82423a337976651bee61a3322`;
+canonical 45 is
+`a9bc642ef88af111b9a7d8dc358dc2819b6ca1cf710bffb9a186950316157dc0`.
+Both archived writable/readonly reopens preserve the supplemental images.
+A further exact-writer capture now supplies canonical-44/45/46 authentication
+and budget fixtures, including the real legacy pending-login cancellation.
+Their original 17-case migration group had 16 passes and one canonical-45
+compatibility failure; the original failing upgrade now passes in the 32-case
+account-successor group above. The captures, generator and exact input
+metadata remain checked fixture inputs. No newer database was restamped, no
+original unsafe row was fabricated, and no provider/network effect or scheduler
+bypass occurred. Synthetic runtime records do not establish an actual provider
+process observation.
+
+Protected main includes peer-causal recovery PR 148 and installer
+receipt-parser PR 153. Their semantic join remains in progress.
+Peer recovery must select proven evidence before filtering actor or thread,
+retain missing or opaque candidates as refusals, and use finite keyset pages.
+The installer parser source and its four original regressions pass with 1,570
+assertions. Its generated pins and final governed-main ancestry still need
+convergence. A joined-only queue transcript guard now uses the captured queue
+and exact current provider tuple, preserving divergent Claude generations;
+its 20 SQL controls pass with 52 assertions. The peer-causal group passes 18
+cases with 76 assertions, including multi-page missing-evidence refusal,
+reserved-marker rejection, actor contradictions, turn boundaries and capacity.
+The new cancellation representation is a terminal control-plane receipt under
+the original global request key, never an invented provider effect or
+attachment-input proof. Its 20 cases pass with 605 assertions, including
+ordinary-input positive controls, key retention after actual causal pruning,
+and terminal settlement of genuinely retained attachment custody. The lost
+switch-response replay also passes without another provider effect. The full
+peer-queue file passes 12 cases with 94 assertions. The legacy switch's exact
+synthetic process-exit cleanup passes without changing product custody. Three
+test-only typing errors from the last typecheck are repaired, with scoped lint
+passing; a fresh final typecheck is still required.
+
+The final governed-main comparison also identifies daemon-lock observation
+race handling, CLI recovery boundaries, hosted configuration recovery and the
+eight-job complete CI partition that are not yet part of this old-main merge.
+Join that exact ancestry before the final gate; copying selected semantic
+fixes is not a complete main integration. Focused checks do not authorize a
+release or production activation.
+
+The join preserves source-selected historical evidence bytes and adds immutable
+format provenance before current readers or SQL authority can consume them.
+Malformed bounded historical payloads stay opaque. New switch requests use V2,
+retain an omitted caller contract as `null`, and commit renderer V2 and exact
+target host capabilities before provider IO. Historical V1 keeps its original
+request bytes, renderer and capability behavior; it cannot silently replan.
+Fresh target starts require the active preset contract. Sealed queued input
+retains its original provider tuple and cannot cross a switch implicitly.
+
+Devin is retired in this integration. Historical account, runtime, mutation,
+queue and joined-close records remain readable and auditable, with existing
+cleanup paths. No new capture, joined receipt, consumption, process successor,
+session, login or dispatch is admitted. Inert account-order housekeeping remains
+compatible with profile creation/removal and grants no execution authority.
+
 ## Outcome
 
 HRA will expose one truthful usage-management model for Codex and Claude without pretending that the providers expose equivalent data. Each machine will keep an ordered, provider-scoped account list and one active default account per provider. Codex will preserve its existing weekly reset-credit behavior and may move an automatically managed session to the next fresh, signed-in Codex account after reset handling is exhausted. Claude sessions will start with the pinned CLI's native Fable-to-Opus fallback armed at max effort only when automatic usage management is enabled and the exact pinned live-acceptance gate has passed; otherwise the fallback remains visibly unavailable. HRA will not infer a model-specific Claude quota or speculatively replay a turn.
@@ -52,8 +202,8 @@ The supplied implementation prompt is not executable as written. This plan adopt
 - Provider readiness is separate. Codex continues to derive it from the existing supervised account authority. Claude uses the released bounded `claude auth status --json` parser in the profile's isolated configuration directory. Its exact first-party exit/status/auth-method matrix admits signed-in or signed-out status and discards optional identity fields. Invalid or unavailable evidence remains `unverified`. New Claude work requires exact signed-in proof; an unverified observation cannot authorize dispatch or automatic movement. This replaces the earlier task-base signed-out-only probe. Native model fallback remains independently unavailable until its exact live acceptance gate passes.
 - Provider-account generation is an execution fence, not display metadata. New session, turn, interaction, switch, queue, reset, and remote-command evidence binds the provider, binding ID, binding generation, and the applicable provider-scoped runtime process generation. The legacy profile process generation remains the Codex compatibility mirror; Claude and Devin own independent process generations. Legacy Codex account-scoped login, usage, reset, and desktop-switch evidence decodes through that compatibility binding; non-Codex foreground login records preserve their original provider. A sibling restart or readiness transition cannot silently replace another provider's authority. A binding transition never rewrites a session's captured authority in place: stale sessions and effects remain fenced until a separately proved journaled rebind.
 - An exact unsettled foreground login grant retains its original provider process authority across daemon restart because the invoking CLI owns the child. Completion proves that original immutable account, binding and process before and after reading authentication. Historical terminal replay and a proven not-started child require no provider read. A changed binding cannot settle the original login from replacement credentials.
-- Devin's context and optional session cost remain informational. Devin cannot enter subscription quota schemas, reset handling, automatic policy or managed following. Its released load-after-joined-writer recovery remains supported under exact authority; it does not inherit Claude's no-resume behavior or authorize in-place generation rewriting.
-- Devin continuation after restart requires a durable intent captured from an actual live, activated, idle native writer before close, followed by exact all-child join proof. A one-use receipt may authorize only the immediately following daemon's captured-session successor; the existing mutation and runtime evidence remains immutable. Empty managers, old connection caches, daemon stop markers, counter arithmetic, unproved legacy sessions and crashed or failed closes never provide that proof. A second restart without loading the session cannot renew consumed proof and reports recovery required. This bounded repair does not introduce personal-session adoption or an unproved chain of never-loaded restarts.
+- Retained Devin context and optional session cost are historical information only. Devin cannot enter subscription quota schemas, reset handling, automatic policy or managed following. Provider retirement closes new login, start, continuation, switch and dispatch paths while preserving historical readback and cleanup.
+- Earlier task checkpoints captured joined-writer close evidence and one-use restart successors. Those immutable records retain their exact historical interpretation. The current join neither creates nor consumes another close receipt and never advances a retired Devin process generation. Empty managers, old connection caches, daemon stop markers and counter arithmetic cannot revive execution.
 - Claude's admitted auth status does not expose stable subscription identity. Its binding generation fences only HRA-owned transitions and observed readiness changes; it cannot detect an out-of-band credential replacement that remains logged in. Claude observations therefore remain turn-local under an opaque machine binding, never form a cumulative account counter, and cannot authorize automatic account movement.
 
 ### Active/default account

@@ -10,6 +10,43 @@ import { DETAIL_CHUNK_RETENTION, HOSTED_TABLE_LIFECYCLE } from "./lifecyclePolic
 import { QUOTA_GENESIS_CHARGED_TABLES, USER_QUOTA_RESOURCES, USER_RESOURCE_QUOTAS } from "./quota";
 
 describe("hosted schema invariants", () => {
+  test("every hosted table and index name satisfies the provider identifier contract", () => {
+    const providerIdentifier = /^[A-Za-z][A-Za-z0-9_]*$/u;
+    const providerReservedIndexNames = new Set(["by_creation_time", "by_id"]);
+    const tables = (schema as unknown as {
+      readonly tables: Readonly<Record<string, unknown>>;
+    }).tables;
+    const indexSchema = z.object({ indexDescriptor: z.string() }).passthrough();
+    const tableSchema = z.object({
+      indexes: z.array(indexSchema),
+      searchIndexes: z.array(indexSchema),
+      stagedDbIndexes: z.array(indexSchema),
+      stagedSearchIndexes: z.array(indexSchema),
+      stagedVectorIndexes: z.array(indexSchema),
+      vectorIndexes: z.array(indexSchema),
+    }).passthrough();
+    for (const [tableName, value] of Object.entries(tables)) {
+      expect(tableName).toMatch(providerIdentifier);
+      expect(tableName.length).toBeLessThanOrEqual(64);
+      const table = tableSchema.parse(value);
+      const indexNames = [
+        ...table.indexes,
+        ...table.searchIndexes,
+        ...table.stagedDbIndexes,
+        ...table.stagedSearchIndexes,
+        ...table.stagedVectorIndexes,
+        ...table.vectorIndexes,
+      ]
+        .map((index) => index.indexDescriptor);
+      expect(new Set(indexNames).size).toBe(indexNames.length);
+      for (const indexName of indexNames) {
+        expect(indexName).toMatch(providerIdentifier);
+        expect(indexName.length).toBeLessThanOrEqual(64);
+        expect(providerReservedIndexNames.has(indexName)).toBeFalse();
+      }
+    }
+  });
+
   test("every schema table has exactly one lifecycle, quota, retention, and erasure classification", () => {
     const schemaTables = Object.keys(schema.tables).sort();
     const classifiedTables = Object.keys(HOSTED_TABLE_LIFECYCLE).sort();

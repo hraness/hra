@@ -3,13 +3,16 @@ import type { Database } from "bun:sqlite";
 import { z } from "zod";
 
 import { providerAccountAuthoritySchema, sessionRoutingProvenanceSchema } from "../domain/provider-accounts";
-import { reviewedRuntimeProfileProvider, reviewedRuntimeProfileSchema } from "../domain/runtime-profile";
+import { reviewedRuntimeProfileProviderV1 as reviewedRuntimeProfileProvider, reviewedRuntimeProfileV1Schema as reviewedRuntimeProfileSchema } from "../domain/runtime-profile";
 import { sessionSendRequestFingerprintSchema } from "../domain/session-send-request";
 import { attemptIdSchema, sessionIdSchema, unixMillisecondsSchema } from "../domain/values";
 import { assertNoAutomaticPointerMoveOwnership, AutomaticPointerMoveStoreError } from "./automatic-pointer-move";
 import { assertQueueAttachmentMutationIntegrity, QueueAttachmentIdentityError } from "./queue-attachment-identity";
 import { ATTACHMENT_CUSTODY_COLUMNS, assertAttachmentCustodyNamespace, AttachmentCustodyNamespaceError, type InitialAttachmentInput } from "./attachment-custody-schema";
 import { normalizeSchemaSql } from "./schema-cohort";
+import { schemaSqlBeforeJoinedTranscriptColumns, type UsageSchemaColumnMode } from "./joined-transcript-columns";
+import { checkMutationEvidenceEnvelope, historicalEffectEvidenceFormatSchema } from "./effect-evidence-reader";
+import { insertJoinedMutationEffectEvidence, readMutationEffectEvidenceProvenance } from "./effect-evidence-provenance";
 
 export const SESSION_SEND_REQUEST_FORMAT = "original_send_v1";
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
@@ -241,15 +244,15 @@ export function applySessionSendOwnerSchema(database: Database): void {
   }
   for (const object of SESSION_SEND_OWNER_SCHEMA_OBJECTS) database.exec(object.sql);
 }
-export function assertSessionSendOwnerSchema(database: Database): void {
+export function assertSessionSendOwnerSchema(database: Database, mode: UsageSchemaColumnMode = "historical"): void {
   const column = database.query("SELECT type,\"notnull\" AS required,dflt_value FROM pragma_table_info('mutation_attempts') WHERE name='request_format'").get() as
     { type: string; required: number; dflt_value: string | null } | null;
   if (column?.type !== "TEXT" || column.required !== 0 || column.dflt_value !== null) throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
   const parent = database.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='mutation_attempts'").get() as { sql: string } | null;
   const suffix = `, request_format TEXT CHECK(request_format IS NULL OR request_format='${SESSION_SEND_REQUEST_FORMAT}')`;
   const custodySuffix = ATTACHMENT_CUSTODY_COLUMNS.map(normalizeSchemaSql).join(", ");
-  const parentSql = parent === null ? "" : normalizeSchemaSql(parent.sql);
-  if (parent === null || /\/\*|--/u.test(parent.sql)
+  const parentSql = parent === null ? null : schemaSqlBeforeJoinedTranscriptColumns(database, "mutation_attempts", parent.sql, mode);
+  if (parent === null || parentSql === null || /\/\*|--/u.test(parent.sql)
     || (!parentSql.endsWith(`${suffix}) STRICT`) && !parentSql.endsWith(`${suffix}, ${custodySuffix}) STRICT`))) {
     throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
   }
@@ -274,7 +277,17 @@ const canonical = <T>(schema: z.ZodType<T>, json: unknown): T => {
   if (JSON.stringify(value) !== source) throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
   return value;
 };
+const sessionSendOwnerAuditOptionsSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("source_selected") }).strict(),
+  z.object({ kind: z.literal("historical"), format: historicalEffectEvidenceFormatSchema }).strict(),
+]);
+export type SessionSendOwnerAuditOptions = z.infer<typeof sessionSendOwnerAuditOptionsSchema>;
+
 export function classifySessionSendOwnership(database: Database, lookup: SessionSendOwnershipLookup): SessionSendOwnership {
+  return classifySessionSendOwnershipWithEvidence(database, lookup, { kind: "source_selected" });
+}
+function classifySessionSendOwnershipWithEvidence(database: Database, lookup: SessionSendOwnershipLookup,
+  evidenceMode: SessionSendOwnerAuditOptions): SessionSendOwnership {
   try { assertAttachmentCustodyNamespace(database, lookup); }
   catch (error: unknown) {
     if (!(error instanceof AttachmentCustodyNamespaceError)) throw error;
@@ -291,7 +304,7 @@ export function classifySessionSendOwnership(database: Database, lookup: Session
     throw new SessionSendOwnershipError(error.code === "AUTOMATIC_POINTER_MOVE_CORRUPT"
       ? "SESSION_SEND_OWNER_CORRUPT" : "SESSION_SEND_OWNED_API_REQUIRED");
   }
-  assertSessionSendOwnerSchema(database);
+  assertSessionSendOwnerSchema(database, evidenceMode.kind === "historical" ? "historical" : "joined");
   const byKey = "idempotencyKey" in lookup;
   const value = byKey ? z.string().uuid().parse(lookup.idempotencyKey) : z.string().min(1).max(200).parse(lookup.attemptId);
   const ids = database.query(`SELECT id AS attempt_id FROM mutation_attempts WHERE ${byKey ? "idempotency_key" : "id"}=?
@@ -352,6 +365,18 @@ export function classifySessionSendOwnership(database: Database, lookup: Session
         || reviewedRuntimeProfileProvider(claim.evidence.runtimeProfile) !== claim.executionAuthority.provider
         || claim.evidenceDigest !== sessionSendEvidenceDigest(claim.evidence) || effect?.evidence_digest !== claim.evidenceDigest
         || effect.kind !== "session.send" || effect.evidence_json !== JSON.stringify(claim.evidence) || effect.recorded_at !== claim.createdAt) throw new Error("claim mismatch");
+      if (evidenceMode.kind === "historical") {
+        // Only the outer, exact-cohort migration audit supplies this format.
+        // Historical interpretation never authorizes a current runtime read.
+        const checked = checkMutationEvidenceEnvelope({ format: evidenceMode.format, json: effect.evidence_json,
+          digest: effect.evidence_digest, evidenceKind: effect.kind, parentKind: raw.kind });
+        if (checked.kind !== "checked_envelope" || checked.canonicalJson !== effect.evidence_json) throw new Error("historical effect mismatch");
+      } else {
+        const checked = readMutationEffectEvidenceProvenance(database, attemptId);
+        if (checked.kind !== "parsed" || checked.evidence.kind !== "session.send"
+          || checked.canonicalJson !== effect.evidence_json || checked.digest !== claim.evidenceDigest
+          || checked.recordedAt !== claim.createdAt) throw new Error("selected effect mismatch");
+      }
     }
     const outcomes = rawOutcomes.map((item) => canonical(sessionSendOutcomeSchema, item.outcome_json));
     if (outcomes.length > 2) throw new Error("outcome overflow");
@@ -399,8 +424,11 @@ export function assertLegacyMutationOwnership(database: Database, lookup: Sessio
     if (session.success) assertUnsettledSessionSendOwners(database, session.data);
   }
 }
-export function auditSessionSendOwners(database: Database): void {
-  assertSessionSendOwnerSchema(database);
+/** Historical mode is for a separately admitted pre-bridge cohort, never a runtime fallback. */
+export function auditSessionSendOwners(database: Database, options: SessionSendOwnerAuditOptions = { kind: "source_selected" }): void {
+  const parsedOptions = sessionSendOwnerAuditOptionsSchema.safeParse(options);
+  if (!parsedOptions.success) throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
+  assertSessionSendOwnerSchema(database, parsedOptions.data.kind === "historical" ? "historical" : "joined");
   let after = "";
   for (;;) {
     const rows = database.query(`SELECT id AS attempt_id FROM mutation_attempts WHERE request_format IS NOT NULL AND id>?
@@ -410,12 +438,31 @@ export function auditSessionSendOwners(database: Database): void {
       UNION SELECT attempt_id FROM session_send_owner_outcomes WHERE attempt_id>?
       ORDER BY attempt_id LIMIT 100`).all(after, after, after, after, after) as Array<{ attempt_id: string }>;
     if (rows.length === 0) break;
-    for (const row of rows) { classifySessionSendOwnership(database, { attemptId: row.attempt_id }); after = row.attempt_id; }
+    for (const row of rows) { classifySessionSendOwnershipWithEvidence(database, { attemptId: row.attempt_id }, parsedOptions.data); after = row.attempt_id; }
   }
 }
 
 export function requireSessionSendOwner(database: Database, lookup: SessionSendOwnershipLookup): SessionSendOwnerHistory {
   const record = classifySessionSendOwnership(database, lookup);
+  if (record.kind !== "owned") throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
+  return record;
+}
+export const historicalSessionSendOwnerAuditFormatSchema = z.enum(["private_task48_v1", "combined49_v1"]);
+export type HistoricalSessionSendOwnerAuditFormat = z.infer<typeof historicalSessionSendOwnerAuditFormatSchema>;
+
+/** Read-only preflight for an independently admitted historical cohort. Never a runtime fallback. */
+export function requireHistoricalSessionSendOwnerForAudit(database: Database, lookup: SessionSendOwnershipLookup,
+  format: HistoricalSessionSendOwnerAuditFormat): SessionSendOwnerHistory {
+  const parsedLookup = z.union([
+    z.object({ attemptId: attemptIdSchema }).strict(),
+    z.object({ idempotencyKey: z.string().uuid() }).strict(),
+  ]).safeParse(lookup);
+  const parsedFormat = historicalSessionSendOwnerAuditFormatSchema.safeParse(format);
+  if (!database.inTransaction || !parsedLookup.success || !parsedFormat.success) {
+    throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
+  }
+  const record = classifySessionSendOwnershipWithEvidence(database, parsedLookup.data,
+    { kind: "historical", format: parsedFormat.data });
   if (record.kind !== "owned") throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
   return record;
 }
@@ -443,6 +490,7 @@ export function insertSessionSendOwner(database: Database, input: SessionSendOwn
   return requireSessionSendOwner(database, { attemptId: owner.attemptId });
 }
 export function insertSessionSendExecutionClaim(database: Database, history: SessionSendOwnerHistory, input: SessionSendExecutionClaim): SessionSendOwnerHistory {
+  if (!database.inTransaction) throw new SessionSendOwnershipError("SESSION_SEND_CLAIM_CONFLICT");
   const claim = sessionSendExecutionClaimSchema.parse(input);
   if (history.state !== "input_required" || history.claim !== null || claim.attemptId !== history.owner.attemptId || claim.ownerDigest !== history.ownerDigest) {
     throw new SessionSendOwnershipError("SESSION_SEND_CLAIM_CONFLICT");
@@ -452,8 +500,10 @@ export function insertSessionSendExecutionClaim(database: Database, history: Ses
     .run(claim.attemptId, history.owner.idempotencyKey, JSON.stringify(claim), claimDigest);
   database.query("INSERT INTO session_send_owner_anchors(attempt_id,original_key,kind,digest) VALUES(?,?,'claim',?)")
     .run(claim.attemptId, history.owner.idempotencyKey, claimDigest);
-  database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES(?,'session.send',?,?,?)")
-    .run(claim.attemptId, JSON.stringify(claim.evidence), claim.evidenceDigest, claim.createdAt);
+  const effect = insertJoinedMutationEffectEvidence(database, { attemptId: claim.attemptId, evidence: claim.evidence, recordedAt: claim.createdAt });
+  if (effect.canonicalJson !== JSON.stringify(claim.evidence) || effect.digest !== claim.evidenceDigest) {
+    throw new SessionSendOwnershipError("SESSION_SEND_CLAIM_CONFLICT");
+  }
   const changed = database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'")
     .run(claim.createdAt, claim.attemptId);
   if (changed.changes !== 1) throw new SessionSendOwnershipError("SESSION_SEND_CLAIM_CONFLICT");

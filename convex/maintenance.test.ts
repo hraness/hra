@@ -1,14 +1,20 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, jest, test } from "bun:test";
 import { makeFunctionReference } from "convex/server";
 import type { Value } from "convex/values";
 import { convexTest } from "convex-test";
 
+import { parseAuthCredentials } from "../src/cloud/authCredentials";
 import { sha256Hex } from "../src/cloud/crypto";
 import { buildHraAttentionEmailBody } from "./attentionEmail";
 import { attentionNotificationQuotaReservations } from "./attentionNotifications";
 import { reserveAttentionNotificationFaultCapacity } from "./attentionNotificationControl";
+import { createAccountDeletionCapacityForNewUser } from "./authorityReductionCapacity";
+import { digestAuthEmail } from "./authEmail";
+import { reserveCommandLifecycleForInsert } from "./commandLifecycle";
+import { cloudRetentionMs } from "./maintenance";
 import {
   adjustCommandQuotaForPatch,
+  adjustServiceQuotaForPatch,
   initializeAccountUsageQuotaAuthority,
   initializeUserQuotaAuthority,
   logicalDocumentBytes,
@@ -25,6 +31,7 @@ import {
 } from "./quota";
 import schema from "./schema";
 import { modules } from "./test.setup";
+import { commandLifecycleCapacityVersion } from "./validators";
 
 type Args = Readonly<Record<string, Value>>;
 const cleanupExpired = makeFunctionReference<"mutation", Args, Readonly<{
@@ -42,6 +49,7 @@ const cleanupExpired = makeFunctionReference<"mutation", Args, Readonly<{
   expiredPendingDeviceCommands: number;
   idempotencyReceipts: number;
   nextCategory: string;
+  orphanedAuthUsers: number;
   otpChallenges: number;
   processed: number;
   securityEvents: number;
@@ -58,6 +66,23 @@ const genesisQuota = makeFunctionReference<"mutation", Record<string, never>, un
 const consumeOtpChallenge = makeFunctionReference<"mutation", Args, unknown>(
   "authDelivery:consumeOtpChallenge",
 );
+const hmacEnvironmentName = "HRA_AUTH_HMAC_SECRET";
+const priorHmacSecret = process.env[hmacEnvironmentName];
+
+beforeAll(() => {
+  process.env[hmacEnvironmentName] = "maintenance-test-secret-at-least-thirty-two-characters";
+});
+
+afterAll(() => {
+  if (priorHmacSecret === undefined) delete process.env.HRA_AUTH_HMAC_SECRET;
+  else process.env[hmacEnvironmentName] = priorHmacSecret;
+});
+
+async function digestForEmail(email: string): Promise<string> {
+  const parsed = parseAuthCredentials({ email });
+  if (parsed.kind !== "request_code") throw new Error("email fixture is invalid");
+  return await digestAuthEmail(parsed.email);
+}
 
 describe("bounded cloud retention", () => {
   test("does not create maintenance state before hard genesis", async () => {
@@ -66,6 +91,344 @@ describe("bounded cloud retention", () => {
       .rejects.toThrow("QUOTA_AUTHORITY_CORRUPT");
     expect(await runtime.run(async (ctx) =>
       (await ctx.db.query("maintenanceState").collect()).length)).toBe(0);
+  });
+
+  test("atomically erases an abandoned identity with its physical deletion pair", async () => {
+    for (const reserved of [false, true]) {
+      const runtime = convexTest(schema, modules);
+      await runtime.mutation(genesisQuota, {});
+      const now = Date.now();
+      const userId = await runtime.run(async (ctx) => {
+        const userId = await ctx.db.insert("users", {
+          email: `abandoned-capacity-${String(reserved)}@example.com`,
+        });
+        await initializeUserQuotaAuthority(ctx, userId);
+        const user = await ctx.db.get(userId);
+        if (user === null) throw new Error("missing abandoned capacity user");
+        await reserveQuotaForStoredIdentity(ctx, userId, user);
+        if (reserved) await createAccountDeletionCapacityForNewUser(ctx, userId);
+        const subject = {
+          authEpoch: 1,
+          createdAt: now - 2 * 24 * 60 * 60 * 1_000,
+          emailDigest: (reserved ? "a" : "b").repeat(64),
+          status: "active" as const,
+          updatedAt: now - 2 * 24 * 60 * 60 * 1_000,
+          userId,
+        };
+        await reserveQuotaForInsert(ctx, userId, "identity", subject);
+        await ctx.db.insert("authSubjects", subject);
+        await ctx.db.insert("maintenanceState", {
+          key: "retention",
+          nextCategory: "abandoned_identities",
+          updatedAt: now,
+        });
+        return userId;
+      });
+      const before = await runtime.run(async (ctx) => ({
+        identityCapacity: await ctx.db.query("accountDeletionIdentityReservations")
+          .collect(),
+        jobCapacity: await ctx.db.query("accountDeletionJobReservations").collect(),
+        service: await ctx.db.query("storageUsageService").unique(),
+        usage: await ctx.db.query("storageUsageByUser")
+          .withIndex("by_user_and_category", (builder) => builder.eq("userId", userId))
+          .collect(),
+      }));
+      expect(await runtime.mutation(cleanupExpired, { limit: 1 }))
+        .toMatchObject({ abandonedIdentities: 0, processed: 0 });
+      expect(await runtime.run(async (ctx) => ({
+        identityCapacity: await ctx.db.query("accountDeletionIdentityReservations")
+          .collect(),
+        jobCapacity: await ctx.db.query("accountDeletionJobReservations").collect(),
+        service: await ctx.db.query("storageUsageService").unique(),
+        usage: await ctx.db.query("storageUsageByUser")
+          .withIndex("by_user_and_category", (builder) => builder.eq("userId", userId))
+          .collect(),
+      }))).toEqual(before);
+      expect(await runtime.mutation(cleanupExpired, { limit: 200 }))
+        .toMatchObject({ abandonedIdentities: reserved ? 4 : 2 });
+      expect(await runtime.run(async (ctx) => ({
+        identityCapacity: await ctx.db.query("accountDeletionIdentityReservations")
+          .collect(),
+        jobCapacity: await ctx.db.query("accountDeletionJobReservations").collect(),
+        service: await ctx.db.query("storageUsageService").unique(),
+        subjects: await ctx.db.query("authSubjects").collect(),
+        usage: await ctx.db.query("storageUsageByUser").collect(),
+        users: await ctx.db.query("users").collect(),
+      }))).toMatchObject({
+        identityCapacity: [],
+        jobCapacity: [],
+        service: { identities: 0, userLogicalBytes: 0, userRecords: 0 },
+        subjects: [],
+        usage: [],
+        users: [],
+      });
+    }
+  });
+
+  test("atomically erases the committed OTP user/account gap after bounded inactivity", async () => {
+    jest.useFakeTimers();
+    const createdAt = 1_800_000_000_000;
+    jest.setSystemTime(createdAt);
+    try {
+      const runtime = convexTest(schema, modules);
+      await runtime.mutation(genesisQuota, {});
+      const email = "interrupted-account@example.com";
+      const emailDigest = await digestForEmail(email);
+      const fixture = await runtime.run(async (ctx) => {
+        const subject = {
+          admittedBy: "open" as const,
+          authEpoch: 1,
+          createdAt,
+          emailDigest,
+          status: "active" as const,
+          updatedAt: createdAt,
+        };
+        await reserveServiceQuotaForInsert(ctx, subject);
+        const subjectId = await ctx.db.insert("authSubjects", subject);
+        const userId = await ctx.db.insert("users", { email });
+        await initializeUserQuotaAuthority(ctx, userId);
+        const user = await ctx.db.get(userId);
+        if (user === null) throw new Error("missing interrupted user");
+        await reserveQuotaForStoredIdentity(ctx, userId, user);
+        await createAccountDeletionCapacityForNewUser(ctx, userId);
+        const account = {
+          provider: "hra-control-plane-otp-v1",
+          providerAccountId: email,
+          userId,
+        };
+        await reserveQuotaForInsert(ctx, userId, "identity", account);
+        const accountId = await ctx.db.insert("authAccounts", account);
+        await ctx.db.insert("maintenanceState", {
+          key: "retention",
+          nextCategory: "orphaned_auth_users",
+          updatedAt: createdAt,
+        });
+        return { accountId, subjectId, userId };
+      });
+      jest.setSystemTime(createdAt + cloudRetentionMs.abandonedIdentity + 1);
+      await runtime.run(async (ctx) => {
+        const subject = await ctx.db.get(fixture.subjectId);
+        if (subject === null) throw new Error("missing retry subject");
+        const patch = { updatedAt: Date.now() };
+        await adjustServiceQuotaForPatch(ctx, subject, patch);
+        await ctx.db.patch(subject._id, patch);
+      });
+      expect(await runtime.mutation(cleanupExpired, { limit: 200 })).toMatchObject({
+        abandonedIdentities: 0,
+        orphanedAuthUsers: 0,
+        processed: 0,
+      });
+      expect(await runtime.run(async (ctx) => await ctx.db.get(fixture.userId))).not.toBeNull();
+      await runtime.run(async (ctx) => {
+        const [state, subject] = await Promise.all([
+          ctx.db.query("maintenanceState").unique(),
+          ctx.db.get(fixture.subjectId),
+        ]);
+        if (state === null || subject === null) throw new Error("missing retry fixture");
+        const patch = { updatedAt: createdAt };
+        await adjustServiceQuotaForPatch(ctx, subject, patch);
+        await ctx.db.patch(subject._id, patch);
+        await ctx.db.patch(state._id, { nextCategory: "orphaned_auth_users" });
+      });
+      const before = await runtime.run(async (ctx) => ({
+        account: await ctx.db.get(fixture.accountId),
+        identityCapacity: await ctx.db.query("accountDeletionIdentityReservations")
+          .withIndex("by_user", (builder) => builder.eq("userId", fixture.userId))
+          .unique(),
+        jobCapacity: await ctx.db.query("accountDeletionJobReservations")
+          .withIndex("by_user", (builder) => builder.eq("userId", fixture.userId))
+          .unique(),
+        subject: await ctx.db.get(fixture.subjectId),
+        user: await ctx.db.get(fixture.userId),
+      }));
+      expect(await runtime.mutation(cleanupExpired, { limit: 4 })).toMatchObject({
+        abandonedIdentities: 1,
+        orphanedAuthUsers: 0,
+        processed: 1,
+      });
+      const afterLowLimit = await runtime.run(async (ctx) => ({
+        account: await ctx.db.get(fixture.accountId),
+        identityCapacity: await ctx.db.query("accountDeletionIdentityReservations")
+          .withIndex("by_user", (builder) => builder.eq("userId", fixture.userId))
+          .unique(),
+        jobCapacity: await ctx.db.query("accountDeletionJobReservations")
+          .withIndex("by_user", (builder) => builder.eq("userId", fixture.userId))
+          .unique(),
+        subject: await ctx.db.get(fixture.subjectId),
+        user: await ctx.db.get(fixture.userId),
+      }));
+      expect(afterLowLimit).toMatchObject({
+        account: before.account,
+        identityCapacity: before.identityCapacity,
+        jobCapacity: before.jobCapacity,
+        subject: null,
+        user: before.user,
+      });
+      await runtime.run(async (ctx) => {
+        const state = await ctx.db.query("maintenanceState").unique();
+        if (state === null) throw new Error("missing maintenance state");
+        await ctx.db.patch(state._id, { nextCategory: "orphaned_auth_users" });
+      });
+      expect(await runtime.mutation(cleanupExpired, { limit: 200 })).toMatchObject({
+        orphanedAuthUsers: 4,
+        processed: 4,
+      });
+      expect(await runtime.run(async (ctx) => ({
+        accounts: await ctx.db.query("authAccounts").collect(),
+        identityCapacity: await ctx.db.query("accountDeletionIdentityReservations").collect(),
+        jobCapacity: await ctx.db.query("accountDeletionJobReservations").collect(),
+        service: await ctx.db.query("storageUsageService").unique(),
+        subjects: await ctx.db.query("authSubjects").collect(),
+        usage: await ctx.db.query("storageUsageByUser").collect(),
+        users: await ctx.db.query("users").collect(),
+      }))).toMatchObject({
+        accounts: [],
+        identityCapacity: [],
+        jobCapacity: [],
+        service: {
+          identities: 0,
+          logicalBytes: 0,
+          records: 0,
+          userLogicalBytes: 0,
+          userRecords: 0,
+        },
+        subjects: [],
+        usage: [],
+        users: [],
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("skips fresh partial OTP capacity before deep validation and fails closed once old", async () => {
+    jest.useFakeTimers();
+    const createdAt = 1_800_050_000_000;
+    jest.setSystemTime(createdAt);
+    try {
+      const runtime = convexTest(schema, modules);
+      await runtime.mutation(genesisQuota, {});
+      const email = "partial-capacity-interrupted-account@example.com";
+      const userId = await runtime.run(async (ctx) => {
+        const userId = await ctx.db.insert("users", { email });
+        await initializeUserQuotaAuthority(ctx, userId);
+        const user = await ctx.db.get(userId);
+        if (user === null) throw new Error("missing partial-capacity interrupted user");
+        await reserveQuotaForStoredIdentity(ctx, userId, user);
+        await createAccountDeletionCapacityForNewUser(ctx, userId);
+        const account = {
+          provider: "hra-control-plane-otp-v1",
+          providerAccountId: email,
+          userId,
+        };
+        await reserveQuotaForInsert(ctx, userId, "identity", account);
+        await ctx.db.insert("authAccounts", account);
+        const identityCapacity = await ctx.db.query("accountDeletionIdentityReservations")
+          .withIndex("by_user", (builder) => builder.eq("userId", userId))
+          .unique();
+        if (identityCapacity === null) throw new Error("missing capacity corruption fixture");
+        await ctx.db.delete(identityCapacity._id);
+        await ctx.db.insert("maintenanceState", {
+          key: "retention",
+          nextCategory: "orphaned_auth_users",
+          updatedAt: createdAt,
+        });
+        return userId;
+      });
+      jest.setSystemTime(createdAt + cloudRetentionMs.abandonedIdentity);
+      expect(await runtime.mutation(cleanupExpired, { limit: 200 })).toMatchObject({
+        orphanedAuthUsers: 0,
+      });
+      expect(await runtime.run(async (ctx) => await ctx.db.get(userId))).not.toBeNull();
+      jest.setSystemTime(createdAt + cloudRetentionMs.abandonedIdentity + 1);
+      await runtime.run(async (ctx) => {
+        const state = await ctx.db.query("maintenanceState").unique();
+        if (state === null) throw new Error("missing partial-capacity maintenance state");
+        await ctx.db.patch(state._id, { nextCategory: "orphaned_auth_users" });
+      });
+      await expect(runtime.mutation(cleanupExpired, { limit: 200 }))
+        .rejects.toThrow("AUTHORITY_REDUCTION_CAPACITY_CORRUPT");
+      expect(await runtime.run(async (ctx) => await ctx.db.get(userId))).not.toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("preserves a fresh retry and retires a bound pre-challenge identity only when stale", async () => {
+    jest.useFakeTimers();
+    const createdAt = 1_800_100_000_000;
+    jest.setSystemTime(createdAt);
+    try {
+      const runtime = convexTest(schema, modules);
+      await runtime.mutation(genesisQuota, {});
+      const email = "bound-before-challenge@example.com";
+      const emailDigest = await digestForEmail(email);
+      const fixture = await runtime.run(async (ctx) => {
+        const userId = await ctx.db.insert("users", { email });
+        await initializeUserQuotaAuthority(ctx, userId);
+        const user = await ctx.db.get(userId);
+        if (user === null) throw new Error("missing bound user");
+        await reserveQuotaForStoredIdentity(ctx, userId, user);
+        await createAccountDeletionCapacityForNewUser(ctx, userId);
+        const account = {
+          provider: "hra-control-plane-otp-v1",
+          providerAccountId: email,
+          userId,
+        };
+        await reserveQuotaForInsert(ctx, userId, "identity", account);
+        const accountId = await ctx.db.insert("authAccounts", account);
+        const subject = {
+          admittedBy: "open" as const,
+          authEpoch: 1,
+          createdAt,
+          emailDigest,
+          status: "active" as const,
+          updatedAt: createdAt,
+          userId,
+        };
+        await reserveQuotaForInsert(ctx, userId, "identity", subject);
+        const subjectId = await ctx.db.insert("authSubjects", subject);
+        await ctx.db.insert("maintenanceState", {
+          key: "retention",
+          nextCategory: "abandoned_identities",
+          updatedAt: createdAt,
+        });
+        return { accountId, subjectId, userId };
+      });
+      jest.setSystemTime(createdAt + cloudRetentionMs.abandonedIdentity - 1);
+      expect(await runtime.mutation(cleanupExpired, { limit: 200 })).toMatchObject({
+        abandonedIdentities: 0,
+      });
+      expect(await runtime.run(async (ctx) => await ctx.db.get(fixture.userId))).not.toBeNull();
+      jest.setSystemTime(createdAt + cloudRetentionMs.abandonedIdentity + 1);
+      await runtime.run(async (ctx) => {
+        const state = await ctx.db.query("maintenanceState").unique();
+        if (state === null) throw new Error("missing maintenance state");
+        await ctx.db.patch(state._id, { nextCategory: "abandoned_identities" });
+      });
+      expect(await runtime.mutation(cleanupExpired, { limit: 200 })).toMatchObject({
+        abandonedIdentities: 1,
+      });
+      expect(await runtime.run(async (ctx) => await ctx.db.get(fixture.accountId))).toBeNull();
+      expect(await runtime.run(async (ctx) => await ctx.db.get(fixture.subjectId))).not.toBeNull();
+      await runtime.run(async (ctx) => {
+        const state = await ctx.db.query("maintenanceState").unique();
+        if (state === null) throw new Error("missing maintenance state");
+        await ctx.db.patch(state._id, { nextCategory: "abandoned_identities" });
+      });
+      expect(await runtime.mutation(cleanupExpired, { limit: 200 })).toMatchObject({
+        abandonedIdentities: 4,
+      });
+      expect(await runtime.run(async (ctx) => ({
+        capacities: (await ctx.db.query("accountDeletionIdentityReservations").collect()).length
+          + (await ctx.db.query("accountDeletionJobReservations").collect()).length,
+        subjects: (await ctx.db.query("authSubjects").collect()).length,
+        usage: (await ctx.db.query("storageUsageByUser").collect()).length,
+        users: (await ctx.db.query("users").collect()).length,
+      }))).toEqual({ capacities: 0, subjects: 0, usage: 0, users: 0 });
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test("materializes a legacy usage cursor before deleting its final source row", async () => {
@@ -315,6 +678,7 @@ describe("bounded cloud retention", () => {
         const user = await ctx.db.get(userId);
         if (user === null) throw new Error("missing verification race user");
         await reserveQuotaForStoredIdentity(ctx, userId, user);
+        await createAccountDeletionCapacityForNewUser(ctx, userId);
         const account = {
           provider: "hra-control-plane-otp-v1",
           providerAccountId: `${first}@example.com`,
@@ -376,10 +740,16 @@ describe("bounded cloud retention", () => {
 
       const observed = await runtime.run(async (ctx) => {
         await requireHardQuotaAuthority(ctx);
-        const [account, challenge, invite, subject, user] = await Promise.all([
+        const [account, challenge, identityCapacity, invite, jobCapacity, subject, user] = await Promise.all([
           ctx.db.get(fixture.accountId),
           ctx.db.get(fixture.challengeId),
+          ctx.db.query("accountDeletionIdentityReservations")
+            .withIndex("by_user", (builder) => builder.eq("userId", fixture.userId))
+            .unique(),
           ctx.db.get(fixture.inviteId),
+          ctx.db.query("accountDeletionJobReservations")
+            .withIndex("by_user", (builder) => builder.eq("userId", fixture.userId))
+            .unique(),
           ctx.db.get(fixture.subjectId),
           ctx.db.get(fixture.userId),
         ]);
@@ -396,15 +766,28 @@ describe("bounded cloud retention", () => {
           ));
           return logicalDocumentBytes(document as Readonly<Record<string, Value>>);
         };
-        const expectedIdentityBytes = account === null || subject === null || user === null
+        const job = await ctx.db.query("storageUsageByUser")
+          .withIndex("by_user_and_category", (query) =>
+            query.eq("userId", fixture.userId).eq("category", "job"))
+          .unique();
+        const expectedIdentityBytes = account === null
+          || identityCapacity === null
+          || subject === null
+          || user === null
           ? -1
-          : chargedDocument(account) + chargedDocument(subject) + chargedDocument(user);
+          : chargedDocument(account)
+            + logicalDocumentBytes(identityCapacity)
+            + chargedDocument(subject)
+            + chargedDocument(user);
         return {
           account,
           challenge,
           expectedIdentityBytes,
           identity,
+          identityCapacity,
           invite,
+          job,
+          jobCapacity,
           service,
           subject,
           user,
@@ -416,19 +799,25 @@ describe("bounded cloud retention", () => {
       expect(observed.subject).toMatchObject({ status: "active", userId: fixture.userId });
       expect(observed.subject?.verifiedAt).toBeNumber();
       expect(observed.user?.emailVerificationTime).toBe(observed.subject?.verifiedAt);
+      expect(observed.identityCapacity).toMatchObject({ category: "identity" });
+      expect(observed.jobCapacity).toMatchObject({ category: "job" });
       expect(observed.identity).toMatchObject({
         logicalBytes: observed.expectedIdentityBytes,
-        records: 3,
+        records: 4,
+      });
+      expect(observed.job).toMatchObject({
+        logicalBytes: logicalDocumentBytes(observed.jobCapacity ?? {}),
+        records: 1,
       });
       expect(observed.service).toMatchObject({
         identities: 1,
         serviceRecords: 1,
-        userRecords: 3,
+        userRecords: 5,
       });
     }
   });
 
-  test("expires no-effect pending commands and deletes only old terminal evidence", async () => {
+  test("expires no-effect pending commands and deletes only acknowledged terminal evidence", async () => {
     const runtime = convexTest(schema, modules);
     await runtime.mutation(genesisQuota, {});
     const now = Date.now();
@@ -491,6 +880,7 @@ describe("bounded cloud retention", () => {
       const pending = {
         ...base,
         deadline: now - 1,
+        lifecycleCapacityVersion: commandLifecycleCapacityVersion,
         nonterminal: true,
         publicId: "018bcfe5-6800-7000-8000-000000000002",
         state: "pending",
@@ -498,6 +888,7 @@ describe("bounded cloud retention", () => {
       } as const;
       await reserveNonterminalCommandQuotaForInsert(ctx, userId, pending);
       const pendingId = await ctx.db.insert("sessionCommands", pending);
+      await reserveCommandLifecycleForInsert(ctx, "session", pending);
       const oldTerminal = {
         ...base,
         deadline: now - 1,
@@ -534,6 +925,40 @@ describe("bounded cloud retention", () => {
       const unacknowledgedTerminalId = await ctx.db.insert(
         "sessionCommands",
         unacknowledgedTerminal,
+      );
+      const unacknowledgedResultTerminal = {
+        ...base,
+        deadline: now - 1,
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000a",
+        nonterminal: false,
+        publicId: "018bcfe5-6800-7000-8000-00000000000b",
+        result: {
+          algorithm: "A256GCM" as const,
+          ciphertext: "Q".repeat(32),
+          keyVersion: 1,
+          nonce: "Q".repeat(16),
+        },
+        resultCode: "APPLIED",
+        resultDigest: "a".repeat(64),
+        state: "applied",
+        updatedAt: now - 60 * 24 * 60 * 60 * 1_000,
+      } as const;
+      await reserveQuotaForInsert(ctx, userId, "command", unacknowledgedResultTerminal);
+      const unacknowledgedResultTerminalId = await ctx.db.insert(
+        "sessionCommands",
+        unacknowledgedResultTerminal,
+      );
+      const legacyUnmarkedResultTerminal = {
+        ...unacknowledgedResultTerminal,
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000c",
+        publicId: "018bcfe5-6800-7000-8000-00000000000d",
+        requestDigest: "b".repeat(64),
+        resultDigest: "c".repeat(64),
+      } as const;
+      await reserveQuotaForInsert(ctx, userId, "command", legacyUnmarkedResultTerminal);
+      const legacyUnmarkedResultTerminalId = await ctx.db.insert(
+        "sessionCommands",
+        legacyUnmarkedResultTerminal,
       );
       const expiredLoginResult = {
         createdAt: now - 10 * 60 * 1_000,
@@ -592,10 +1017,12 @@ describe("bounded cloud retention", () => {
       return {
         expiredLoginResultId,
         legacyExpiredLoginResultId,
+        legacyUnmarkedResultTerminalId,
         oldSecurityId,
         oldTerminalId,
         pendingId,
         recentTerminalId,
+        unacknowledgedResultTerminalId,
         unacknowledgedTerminalId,
         userId,
       };
@@ -606,7 +1033,7 @@ describe("bounded cloud retention", () => {
       deviceCommandLoginResults: 2,
       expiredPendingCommands: 1,
       securityEvents: 1,
-      terminalCommands: 1,
+      terminalCommands: 4,
     });
     expect(await runtime.run(async (ctx) => {
       const loginResult = await ctx.db.get(ids.expiredLoginResultId);
@@ -626,7 +1053,13 @@ describe("bounded cloud retention", () => {
         pending: await ctx.db.get(ids.pendingId),
         loginResult: projectLoginResult(loginResult),
         legacyLoginResult: projectLoginResult(legacyLoginResult),
+        legacyUnmarkedResultTerminal: await ctx.db.get(
+          ids.legacyUnmarkedResultTerminalId,
+        ),
         recentTerminal: await ctx.db.get(ids.recentTerminalId),
+        unacknowledgedResultTerminal: await ctx.db.get(
+          ids.unacknowledgedResultTerminalId,
+        ),
         unacknowledgedTerminal: await ctx.db.get(ids.unacknowledgedTerminalId),
       };
     })).toMatchObject({
@@ -647,24 +1080,29 @@ describe("bounded cloud retention", () => {
         resultSingleUse: true,
         state: "applied",
       },
+      legacyUnmarkedResultTerminal: { result: expect.any(Object), state: "applied" },
       recentTerminal: { state: "applied" },
+      unacknowledgedResultTerminal: { result: expect.any(Object), state: "applied" },
       unacknowledgedTerminal: { state: "applied" },
     });
     expect(await runtime.run(async (ctx) => {
       const expiredPending = await ctx.db.get(ids.pendingId);
-      const oldTerminal = await ctx.db.get(ids.unacknowledgedTerminalId);
+      const resultTerminal = await ctx.db.get(ids.unacknowledgedResultTerminalId);
       return {
         expiredPendingAcknowledged: expiredPending !== null
           && "requesterAcknowledgedAt" in expiredPending,
         expiredPendingHasCleanup: expiredPending !== null
           && "terminalCleanupAfter" in expiredPending,
-        oldTerminalAcknowledged: oldTerminal !== null
-          && "requesterAcknowledgedAt" in oldTerminal,
+        resultTerminalAcknowledged: resultTerminal !== null
+          && "requesterAcknowledgedAt" in resultTerminal,
+        resultTerminalHasCleanup: resultTerminal !== null
+          && "terminalCleanupAfter" in resultTerminal,
       };
     })).toEqual({
       expiredPendingAcknowledged: false,
       expiredPendingHasCleanup: false,
-      oldTerminalAcknowledged: false,
+      resultTerminalAcknowledged: false,
+      resultTerminalHasCleanup: false,
     });
     const accounting = async () => await runtime.run(async (ctx) => {
       const [sessionCommands, deviceCommands, quota, service] = await Promise.all([
@@ -698,7 +1136,7 @@ describe("bounded cloud retention", () => {
     expect(await accounting()).toEqual(afterFirstSweep);
   });
 
-  test("drains every legacy terminal device state within budget at the hard quota ceiling", async () => {
+  test("drains only cleanup-authorized terminal device states at the hard quota ceiling", async () => {
     const runtime = convexTest(schema, modules);
     await runtime.mutation(genesisQuota, {});
     const now = Date.now();
@@ -749,17 +1187,19 @@ describe("bounded cloud retention", () => {
           publicId: `018bcfe5-6800-7000-8000-0000000004${ordinal}`,
           requestDigest: ordinal.repeat(64),
           requestingDeviceId: deviceId,
+          requesterAcknowledgedAt: now - 31 * 24 * 60 * 60 * 1_000,
           state,
           targetDeviceId: deviceId,
+          terminalCleanupAfter: now - 1,
           updatedAt: now - 60 * 24 * 60 * 60 * 1_000,
           userId,
         };
         await reserveQuotaForInsert(ctx, userId, "command", command);
         oldIds.push(await ctx.db.insert("deviceCommands", command));
       }
-      const youngCommand = {
-        createdAt: now - 24 * 60 * 60 * 1_000,
-        deadline: now - 1,
+      const unacknowledgedCommand = {
+        createdAt: now - 60 * 24 * 60 * 60 * 1_000,
+        deadline: now - 59 * 24 * 60 * 60 * 1_000,
         idempotencyKey: "018bcfe5-6800-7000-8000-00000000036",
         kind: "usage_refresh" as const,
         nonterminal: false,
@@ -769,14 +1209,14 @@ describe("bounded cloud retention", () => {
         requestingDeviceId: deviceId,
         state: "expired" as const,
         targetDeviceId: deviceId,
-        updatedAt: now - 24 * 60 * 60 * 1_000,
+        updatedAt: now - 60 * 24 * 60 * 60 * 1_000,
         userId,
       };
-      await reserveQuotaForInsert(ctx, userId, "command", youngCommand);
-      const youngId = await ctx.db.insert("deviceCommands", youngCommand);
+      await reserveQuotaForInsert(ctx, userId, "command", unacknowledgedCommand);
+      const unacknowledgedId = await ctx.db.insert("deviceCommands", unacknowledgedCommand);
 
-      // Leave one byte of quota headroom. Any repair that first adds hosted
-      // acknowledgement metadata would fail; direct deletion must still run.
+      // Leave one byte of quota headroom. Cleanup must delete already-authorized
+      // rows directly without patching or inferring acknowledgement from age.
       const categoryRows = await ctx.db.query("storageUsageByUser")
         .withIndex("by_user_and_category", (builder) => builder.eq("userId", userId))
         .collect();
@@ -800,7 +1240,7 @@ describe("bounded cloud retention", () => {
         userLogicalBytes: service.userLogicalBytes + fillerBytes,
         userRecords: service.userRecords + 1,
       });
-      return { oldIds, userId, youngId };
+      return { oldIds, unacknowledgedId, userId };
     });
 
     const accounting = async () => await runtime.run(async (ctx) => {
@@ -843,8 +1283,8 @@ describe("bounded cloud retention", () => {
     );
 
     expect(await runtime.mutation(cleanupExpired, { limit: 3 })).toMatchObject({
-      processed: 2,
-      terminalDeviceCommands: 2,
+      processed: 3,
+      terminalDeviceCommands: 3,
     });
     const afterSecond = await accounting();
     expect(afterSecond.commandBytes).toBe(afterSecond.expectedBytes);
@@ -852,7 +1292,7 @@ describe("bounded cloud retention", () => {
     expect((afterFirst.commandBytes ?? 0) - (afterSecond.commandBytes ?? 0)).toBe(
       (afterFirst.serviceUserBytes ?? 0) - (afterSecond.serviceUserBytes ?? 0),
     );
-    expect(afterSecond.ids).toEqual([String(fixture.youngId)]);
+    expect(afterSecond.ids).toEqual([String(fixture.unacknowledgedId)]);
     expect(fixture.oldIds.every((id) => !afterSecond.ids.includes(String(id)))).toBe(true);
   });
 
@@ -1109,6 +1549,7 @@ describe("bounded cloud retention", () => {
       };
       const pendingCommand = {
         ...commandBase,
+        lifecycleCapacityVersion: commandLifecycleCapacityVersion,
         nonterminal: true,
         publicId: "018bcfe5-6800-7000-8000-000000000104",
         state: "pending",
@@ -1116,6 +1557,7 @@ describe("bounded cloud retention", () => {
       } as const;
       await reserveNonterminalCommandQuotaForInsert(ctx, userId, pendingCommand);
       await ctx.db.insert("sessionCommands", pendingCommand);
+      await reserveCommandLifecycleForInsert(ctx, "session", pendingCommand);
       const terminalCommand = {
         ...commandBase,
         idempotencyKey: "018bcfe5-6800-7000-8000-000000000105",
@@ -1148,6 +1590,7 @@ describe("bounded cloud retention", () => {
       const pendingDeviceCommand = {
         ...deviceCommandBase,
         idempotencyKey: "018bcfe5-6800-7000-8000-000000000108",
+        lifecycleCapacityVersion: commandLifecycleCapacityVersion,
         nonterminal: true,
         publicId: "018bcfe5-6800-7000-8000-000000000109",
         requesterAcknowledgedAt: now - 100_000,
@@ -1156,6 +1599,7 @@ describe("bounded cloud retention", () => {
       } as const;
       await reserveNonterminalCommandQuotaForInsert(ctx, userId, pendingDeviceCommand);
       await ctx.db.insert("deviceCommands", pendingDeviceCommand);
+      await reserveCommandLifecycleForInsert(ctx, "device", pendingDeviceCommand);
       const terminalDeviceCommand = {
         ...deviceCommandBase,
         idempotencyKey: "018bcfe5-6800-7000-8000-00000000010a",
@@ -1261,7 +1705,7 @@ describe("bounded cloud retention", () => {
       terminalDeviceCommands: 1,
       usageSnapshots: 1,
       processed: 18,
-      visitedCategories: 21,
+      visitedCategories: 22,
     });
     expect(await runtime.run(async (ctx) => {
       const row = (await ctx.db.query("deviceCommands").collect())
@@ -1335,6 +1779,7 @@ describe("bounded cloud retention", () => {
         { records: 1, resource: "codex_account" },
         { records: 1, resource: "device" },
         { records: 0, resource: "live_chunk" },
+        { records: 0, resource: "memory_space" },
         { records: 0, resource: "nonterminal_command" },
         { records: 0, resource: "session_chunk" },
         { records: 1, resource: "session_head" },

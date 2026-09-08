@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
-import { decryptBytes, randomKeyBytes } from "./crypto";
+import { decryptBytes, encryptBytes, randomKeyBytes } from "./crypto";
 import {
   cloudPayloadAad,
+  activeRemoteDerivedCodexSelection,
+  activeRemotePresetSelection,
   decryptDeviceCommand,
   decryptDeviceCommandResult,
   decryptDeviceRegistry,
+  decryptMemorySummary,
   decryptNotificationEmail,
   decryptNotificationHours,
   decryptUsageProjection,
@@ -14,15 +17,18 @@ import {
   encryptDeviceCommand,
   encryptDeviceCommandResult,
   encryptDeviceRegistry,
+  encryptMemorySummary,
   encryptNotificationEmail,
   encryptNotificationHours,
   encryptUsageProjection,
   encryptRemoteCommand,
   isRelayedLoginUserCode,
   isRelayedLoginUrl,
+  memorySummaryFitsEncryptedEnvelope,
   parseDeviceCommandPayload,
   parseDeviceCommandResultPayload,
   parseDeviceRegistryPayload,
+  parseMemorySummaryPayload,
   parseRemoteCommandPayload,
   parseSessionMetadataPayload,
   type DeviceRegistryPayload,
@@ -75,30 +81,77 @@ describe("closed encrypted payloads", () => {
   });
 
   test("admits every provider-specific preset in model and default-preset commands", () => {
-    for (const preset of ["high", "fable-max", "astra"] as const) {
-      expect(parseRemoteCommandPayload({ kind: "set_model", preset }))
-        .toEqual({ kind: "set_model", preset });
-      expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset }))
-        .toEqual({ kind: "set_default_preset", preset });
+    for (const preset of ["low", "high", "ultra", "fable-max"] as const) {
+      const selection = activeRemotePresetSelection(preset);
+      expect(parseRemoteCommandPayload({ kind: "set_model", ...selection }))
+        .toEqual({ kind: "set_model", ...selection });
+      expect(parseRemoteCommandPayload({ kind: "set_default_preset", ...selection }))
+        .toEqual({ kind: "set_default_preset", ...selection });
     }
     expect(parseRemoteCommandPayload({ kind: "set_model", preset: "fable" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_model", preset: "astra" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset: "astra" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_model", preset: "ultra" })).toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_model",
+      preset: "ultra",
+      presetContract: 2,
+    })).toBeNull();
   });
 
   test("admits a provider switch with an optional preset and refuses anything else", () => {
     expect(parseRemoteCommandPayload({ kind: "set_provider", provider: "claude" }))
       .toEqual({ kind: "set_provider", provider: "claude" });
-    expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "fable-max", provider: "claude" }))
-      .toEqual({ kind: "set_provider", preset: "fable-max", provider: "claude" });
+    const derivedCodex = activeRemoteDerivedCodexSelection();
+    expect(derivedCodex).toEqual({ presetContract: 1, provider: "codex" });
+    expect(parseRemoteCommandPayload({ kind: "set_provider", ...derivedCodex }))
+      .toEqual({ kind: "set_provider", ...derivedCodex });
+    expect(parseRemoteCommandPayload({ kind: "set_provider", provider: "codex" }))
+      .toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_provider",
+      presetContract: 2,
+      provider: "codex",
+    })).toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_provider",
+      presetContract: 1,
+      provider: "claude",
+    })).toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_provider",
+      ...activeRemotePresetSelection("fable-max"),
+      provider: "claude",
+    })).toEqual({
+      kind: "set_provider",
+      preset: "fable-max",
+      provider: "claude",
+    });
+    expect(parseRemoteCommandPayload({
+      kind: "set_provider",
+      ...activeRemotePresetSelection("high"),
+      provider: "codex",
+    })).toEqual({ kind: "set_provider", preset: "high", presetContract: 1, provider: "codex" });
     expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "astra", provider: "devin" }))
-      .toEqual({ kind: "set_provider", preset: "astra", provider: "devin" });
-    expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "high", provider: "codex" }))
-      .toEqual({ kind: "set_provider", preset: "high", provider: "codex" });
+      .toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_provider", provider: "devin" })).toBeNull();
     for (const mismatch of [
       { kind: "set_provider", preset: "astra", provider: "codex" },
       { kind: "set_provider", preset: "fable-max", provider: "devin" },
-      { kind: "set_provider", preset: "ultra", provider: "claude" },
+      { kind: "set_provider", preset: "ultra", presetContract: 1, provider: "claude" },
     ]) expect(parseRemoteCommandPayload(mismatch)).toBeNull();
     expect(parseRemoteCommandPayload({ kind: "set_provider", provider: "gemini" })).toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_provider",
+      preset: "high",
+      provider: "codex",
+    })).toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_provider",
+      preset: "high",
+      presetContract: 2,
+      provider: "codex",
+    })).toBeNull();
     expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "fable", provider: "claude" }))
       .toBeNull();
     // A remote caller never picks the account: account selection is
@@ -125,6 +178,15 @@ describe("closed encrypted payloads", () => {
       .toBeNull();
   });
 
+  test("accepts only the closed historical retirement marker without dropping legacy metadata", () => {
+    const retired = { archived: true, name: "Past work", note: null, retiredProvider: "devin" as const };
+    expect(parseSessionMetadataPayload(retired)).toEqual(retired);
+    expect(parseSessionMetadataPayload({ ...retired, retiredProvider: "codex" })).toBeNull();
+    expect(parseSessionMetadataPayload({ ...retired, retiredProvider: true })).toBeNull();
+    expect(parseSessionMetadataPayload({ name: "Past work", note: null }))
+      .toEqual({ name: "Past work", note: null });
+  });
+
   test("remote commands round trip only under their entity authority", async () => {
     const key = randomKeyBytes();
     const authority = {
@@ -137,8 +199,9 @@ describe("closed encrypted payloads", () => {
     const existingEnvelope = await encryptRemoteCommand(existingPayload, key, authority);
     expect(await decryptRemoteCommand(existingEnvelope, key, authority)).toEqual(existingPayload);
     const devinPayload = { kind: "set_provider", preset: "astra", provider: "devin" } as const;
-    const envelope = await encryptRemoteCommand(devinPayload, key, authority);
-    expect(await decryptRemoteCommand(envelope, key, authority)).toEqual(devinPayload);
+    // A valid envelope written by the former client must fail after decryption.
+    const envelope = await encryptBytes(new TextEncoder().encode(JSON.stringify(devinPayload)), key, 1, cloudPayloadAad(authority));
+    await expectPromiseToReject(decryptRemoteCommand(envelope, key, authority));
     await expectPromiseToReject(decryptRemoteCommand(envelope, key, {
       ...authority,
       entityPublicId: "command_87654321",
@@ -333,7 +396,10 @@ describe("remote decision payloads", () => {
       value: "ultra",
     });
     try {
-      const parsed = parseRemoteCommandPayload({ kind: "set_provider", provider: "codex" });
+      const parsed = parseRemoteCommandPayload({
+        kind: "set_provider",
+        ...activeRemoteDerivedCodexSelection(),
+      });
       expect(parsed).not.toBeNull();
       expect(parsed && Object.hasOwn(parsed, "preset")).toBe(false);
       expect(parsed && "preset" in parsed ? parsed.preset : undefined).toBeUndefined();
@@ -349,8 +415,18 @@ describe("settings command payloads", () => {
       .toEqual({ kind: "set_approval_mode", mode: "auto:workspace", scope: "session" });
     expect(parseRemoteCommandPayload({ kind: "set_show_thinking", enabled: true, scope: "default" }))
       .toEqual({ enabled: true, kind: "set_show_thinking", scope: "default" });
+    expect(parseRemoteCommandPayload({
+      kind: "set_default_preset",
+      preset: "ultra",
+      presetContract: 1,
+    })).toEqual({ kind: "set_default_preset", preset: "ultra", presetContract: 1 });
     expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset: "ultra" }))
-      .toEqual({ kind: "set_default_preset", preset: "ultra" });
+      .toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "set_default_preset",
+      preset: "ultra",
+      presetContract: 2,
+    })).toBeNull();
     expect(parseRemoteCommandPayload({ kind: "archive_session", archived: true }))
       .toEqual({ archived: true, kind: "archive_session" });
     expect(parseRemoteCommandPayload({ kind: "rename_session", name: "Nightly review" }))
@@ -641,11 +717,247 @@ describe("device registry payloads", () => {
   });
 });
 
+describe("memory summary payloads", () => {
+  const digest = (scalar: string) => scalar.repeat(64);
+  const summary = {
+    coverage: { peerActions: "complete", peerPolicies: "complete", spaces: "complete" },
+    observedAt: 1_700_000_000_000,
+    peerActions: [{
+      actor: { label: "Planner", ref: digest("a") },
+      createdAt: 1_699_999_998_000,
+      delivery: "steer",
+      state: "applied",
+      target: { label: "Builder", ref: digest("b") },
+      updatedAt: 1_699_999_999_000,
+    }],
+    peerPolicies: [{
+      mode: "coordinate",
+      projectLabel: "HRA",
+      session: { label: "Planner", ref: digest("a") },
+      updatedAt: 1_699_999_997_000,
+    }],
+    spaces: [{
+      bindingDigest: digest("c"),
+      canonicalSpaceId: `hra:project:space-${"d".repeat(32)}`,
+      enrollment: "attached",
+      head: { digest: digest("e"), operationSha256: digest("f"), sequence: 7 },
+      lastExchangeAt: 1_699_999_999_500,
+      projectLabel: "HRA",
+      recentRecords: [{
+        key: "release-policy",
+        kind: "memory_page",
+        updatedAt: 1_699_999_996_000,
+      }],
+      recordCount: 4,
+      remoteHead: { digest: digest("e"), operationSha256: digest("f"), sequence: 7 },
+      syncStatus: "settled",
+    }],
+    version: 1,
+  } as const;
+  const authority = {
+    entityPublicId: "device_12345678",
+    keyVersion: 2,
+    kind: "memory_summary",
+    userPublicId: "user_12345678",
+  } as const;
+
+  test("round-trips under an authority distinct from the byte-strict device registry", async () => {
+    const parsed = parseMemorySummaryPayload(summary);
+    expect(parsed).toEqual(summary);
+    const key = randomKeyBytes();
+    const envelope = await encryptMemorySummary(summary, key, authority);
+    expect(JSON.stringify(envelope)).not.toContain("release-policy");
+    expect(JSON.stringify(envelope)).not.toContain("Planner");
+    expect(await decryptMemorySummary(envelope, key, authority)).toEqual(summary);
+    await expectPromiseToReject(decryptMemorySummary(envelope, key, {
+      ...authority,
+      kind: "device_registry",
+    }));
+    await expectPromiseToReject(decryptMemorySummary(envelope, key, {
+      ...authority,
+      entityPublicId: "device_87654321",
+    }));
+
+    const registry = registryFixture();
+    expect(JSON.stringify(parseDeviceRegistryPayload(registry))).toBe(JSON.stringify(registry));
+    expect(parseDeviceRegistryPayload({ ...registry, memorySummary: summary })).toBeNull();
+  });
+
+  test("refuses local identifiers, paths, bodies, reasons, ambiguous roles, and incoherent heads", () => {
+    const space = summary.spaces[0];
+    const action = summary.peerActions[0];
+    expect(space).toBeDefined();
+    expect(action).toBeDefined();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      coverage: { ...summary.coverage, spaces: "unknown" },
+    })).toBeNull();
+    const withoutCoverage = { ...summary } as Record<string, unknown>;
+    delete withoutCoverage.coverage;
+    expect(parseMemorySummaryPayload(withoutCoverage)).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, projectId: "proj_local" }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, projectLabel: ["", "Users", "operator", "private"].join("/") }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, recentRecords: [{ ...space.recentRecords[0], body: "secret" }] }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      peerActions: [{ ...action, reason: "because" }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      peerActions: [{ ...action, target: action.actor }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        head: { ...space.head, operationSha256: null },
+      }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        enrollment: "not_enrolled",
+        remoteHead: space.remoteHead,
+        syncStatus: "local_only",
+      }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, recordCount: 0 }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, recordCount: null }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        enrollment: "unavailable",
+        recentRecords: [],
+        recordCount: null,
+        syncStatus: "error",
+      }],
+    })).not.toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        enrollment: "detached",
+        remoteHead: space.remoteHead,
+        syncStatus: "local_only",
+      }],
+    })).not.toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, lastExchangeAt: summary.observedAt + 1 }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      peerPolicies: [{ ...summary.peerPolicies[0], updatedAt: summary.observedAt + 1 }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      peerActions: [{ ...action, updatedAt: summary.observedAt + 1 }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        remoteHead: { ...space.remoteHead, digest: digest("9") },
+      }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, syncStatus: "local_only" }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        enrollment: "not_enrolled",
+        head: { digest: space.head.digest, operationSha256: null, sequence: -0 },
+        lastExchangeAt: null,
+        recentRecords: [],
+        recordCount: 0,
+        remoteHead: null,
+        syncStatus: "local_only",
+      }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        enrollment: "unavailable",
+        recentRecords: [],
+        recordCount: -0,
+        syncStatus: "error",
+      }],
+    })).toBeNull();
+  });
+
+  test("refuses an oversized valid summary before encryption", async () => {
+    const oversized = {
+      ...summary,
+      peerActions: [],
+      peerPolicies: Array.from({ length: 200 }, (_, index) => ({
+        mode: "coordinate" as const,
+        projectLabel: "P".repeat(200),
+        session: {
+          label: "S".repeat(200),
+          ref: index.toString(16).padStart(64, "0"),
+        },
+        updatedAt: summary.observedAt,
+      })),
+      spaces: [],
+    };
+    expect(parseMemorySummaryPayload(oversized)).not.toBeNull();
+    expect(memorySummaryFitsEncryptedEnvelope(oversized)).toBe(false);
+    await expectPromiseToReject(encryptMemorySummary(oversized, randomKeyBytes(), authority));
+  });
+
+  test("enforces collection bounds and snapshots foreign values without getters", () => {
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      peerActions: Array.from({ length: 51 }, () => summary.peerActions[0]),
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      peerPolicies: Array.from({ length: 201 }, (_, index) => ({
+        ...summary.peerPolicies[0],
+        session: { label: `Session ${index}`, ref: index.toString(16).padStart(64, "0") },
+      })),
+    })).toBeNull();
+    const foreign = { ...summary } as Record<string, unknown>;
+    let getterCalls = 0;
+    Object.defineProperty(foreign, "spaces", {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return summary.spaces;
+      },
+    });
+    expect(parseMemorySummaryPayload(foreign)).toBeNull();
+    expect(getterCalls).toBe(0);
+  });
+});
+
 describe("device command payloads", () => {
   const sessionStart = {
     accountPublicId: "account_primary",
     kind: "session_start",
     preset: "ultra",
+    presetContract: 1,
     projectPublicId: "project_alpha",
     prompt: "continue the migration",
     provider: "codex",
@@ -654,15 +966,28 @@ describe("device command payloads", () => {
   test("accepts each kind in its exact shape", () => {
     expect(parseDeviceCommandPayload(sessionStart)).toEqual(sessionStart);
     expect(parseDeviceCommandPayload({
-      ...sessionStart,
+      accountPublicId: sessionStart.accountPublicId,
+      kind: sessionStart.kind,
       preset: "fable-max",
+      projectPublicId: sessionStart.projectPublicId,
+      prompt: sessionStart.prompt,
       provider: "claude",
-    })).toEqual({ ...sessionStart, preset: "fable-max", provider: "claude" });
+    })).toEqual({
+      accountPublicId: sessionStart.accountPublicId,
+      kind: sessionStart.kind,
+      preset: "fable-max",
+      projectPublicId: sessionStart.projectPublicId,
+      prompt: sessionStart.prompt,
+      provider: "claude",
+    });
     expect(parseDeviceCommandPayload({
-      ...sessionStart,
+      accountPublicId: sessionStart.accountPublicId,
+      kind: sessionStart.kind,
       preset: "astra",
+      projectPublicId: sessionStart.projectPublicId,
+      prompt: sessionStart.prompt,
       provider: "devin",
-    })).toEqual({ ...sessionStart, preset: "astra", provider: "devin" });
+    })).toBeNull();
     expect(parseDeviceCommandPayload({
       accountPublicId: "account_primary",
       kind: "account_login_start",
@@ -696,6 +1021,25 @@ describe("device command payloads", () => {
 
   test("refuses an extra key, a wrong scalar, and a session command kind", () => {
     expect(parseDeviceCommandPayload({ ...sessionStart, extra: 1 })).toBeNull();
+    expect(parseDeviceCommandPayload({
+      accountPublicId: sessionStart.accountPublicId,
+      kind: sessionStart.kind,
+      preset: sessionStart.preset,
+      projectPublicId: sessionStart.projectPublicId,
+      prompt: sessionStart.prompt,
+      provider: sessionStart.provider,
+    })).toBeNull();
+    expect(parseDeviceCommandPayload({
+      ...sessionStart,
+      presetContract: undefined,
+    })).toBeNull();
+    expect(parseDeviceCommandPayload({ ...sessionStart, presetContract: 2 })).toBeNull();
+    expect(parseDeviceCommandPayload({
+      ...sessionStart,
+      preset: "fable-max",
+      presetContract: 2,
+      provider: "claude",
+    })).toBeNull();
     expect(parseDeviceCommandPayload({ ...sessionStart, preset: "fable-max" })).toBeNull();
     expect(parseDeviceCommandPayload({ ...sessionStart, preset: "astra" })).toBeNull();
     expect(parseDeviceCommandPayload({ ...sessionStart, provider: "devin" })).toBeNull();
@@ -886,8 +1230,10 @@ describe("device command payloads", () => {
     } as const;
     const resultAuthority = { ...commandAuthority, kind: "device_command_result" } as const;
     const devinSessionStart = { ...sessionStart, preset: "astra", provider: "devin" } as const;
-    const envelope = await encryptDeviceCommand(devinSessionStart, key, commandAuthority);
-    expect(await decryptDeviceCommand(envelope, key, commandAuthority)).toEqual(devinSessionStart);
+    const legacyEnvelope = await encryptBytes(new TextEncoder().encode(JSON.stringify(devinSessionStart)), key, 1, cloudPayloadAad(commandAuthority));
+    await expectPromiseToReject(decryptDeviceCommand(legacyEnvelope, key, commandAuthority));
+    const envelope = await encryptDeviceCommand(sessionStart, key, commandAuthority);
+    expect(await decryptDeviceCommand(envelope, key, commandAuthority)).toEqual(sessionStart);
     // The two authorities are separate: a command envelope never decrypts as a
     // result, so a relayed login handoff cannot be produced by replaying a request.
     await expectPromiseToReject(decryptDeviceCommandResult(envelope, key, resultAuthority));

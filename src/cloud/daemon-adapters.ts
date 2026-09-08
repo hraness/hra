@@ -49,10 +49,13 @@ import {
   deviceRegistryLimits,
   isRelayedLoginUserCode,
   isRelayedLoginUrl,
+  parseDeviceCommandPayload,
+  parseRemoteCommandPayload,
   type DeviceCommandLoginStatus,
   type DeviceCommandPayload,
   type DeviceRegistryAccount,
   type DeviceRegistryPayload,
+  type MemorySummaryPayload,
   type DeviceRegistryScheduledTask,
   type RemoteCommandPayload,
 } from "./payloads";
@@ -131,6 +134,7 @@ import {
   type CompactRemoteInteractionPolicy,
   type CompactAttachment,
   type CompactMessageActor,
+  type CompactMessageActorKind,
   type CompactSessionEvent,
   type GitAction,
   type ModelPreset,
@@ -188,6 +192,7 @@ type LocalExecuteRemote = (
 type CompactSessionEventBody =
   | Readonly<{
       actor?: CompactMessageActor;
+      actorKind?: CompactMessageActorKind;
       attachments?: readonly CompactAttachment[];
       kind: "user_message" | "assistant_message";
       text: string;
@@ -643,7 +648,7 @@ function providerAccountCanReadExistingSession(
 ): boolean {
   return readiness === "signed_in"
     || (
-      (authority.provider === "claude" || authority.provider === "devin")
+      authority.provider === "claude"
       && readiness === "unverified"
       && authority.routingProvenance === "explicit"
     );
@@ -666,6 +671,7 @@ export function deviceRegistryAccountAddress(input:
   | Readonly<{ kind: "local"; profileId: string; provider: Provider }>
   | Readonly<{ kind: "public"; publicId: string }>): DeviceRegistryAccountAddress | null {
   if (input.kind === "local") {
+    if (input.provider === "devin") return null;
     const profileId = profileIdSchema.safeParse(input.profileId);
     if (!profileId.success) return null;
     const publicId = input.provider === "codex"
@@ -1040,6 +1046,7 @@ function parseRecoveryObservedInteractionIds(value: unknown): readonly string[] 
 }
 
 function terminalSessionState(session: SessionRecord): "active" | "idle" | "terminal" | null {
+  if (session.provider === "devin") return "terminal";
   if (session.state === "active") return "active";
   if (session.state === "idle") return "idle";
   if (session.state === "terminal") return "terminal";
@@ -1050,9 +1057,8 @@ function terminalSessionState(session: SessionRecord): "active" | "idle" | "term
  * Every provider session remains subordinate to its exact durable provider
  * account authority. Managed Claude sessions also use the accepted platform
  * boundary, while an adopted session can use its exact active personal-runtime
- * binding. Devin has no personal-home route and is admitted only through its
- * native managed-session authority. A detaching or detached binding never
- * reopens provider authority.
+ * binding. Devin is retired and has no provider authority. A detaching or
+ * detached binding never reopens provider authority.
  */
 function profileAllowsEstablishedSession(
   store: StateStore,
@@ -1070,7 +1076,7 @@ function profileAllowsEstablishedSession(
   switch (session.provider) {
     case "codex": return true;
     case "claude": return platform === "linux" || usesPersonalRuntime;
-    case "devin": return true;
+    case "devin": return false;
   }
 }
 
@@ -1094,6 +1100,9 @@ function compactSessionEventBody(event: CompactSessionEvent): CompactSessionEven
     return {
       ...(event.kind === "user_message" && event.actor !== undefined
         ? { actor: event.actor }
+        : {}),
+      ...(event.kind === "user_message" && event.actorKind !== undefined
+        ? { actorKind: event.actorKind }
         : {}),
       ...(event.kind === "user_message" && event.attachments !== undefined
         ? { attachments: event.attachments }
@@ -2411,11 +2420,16 @@ function completedProjectionTurns(
     const text = scheduledTaskSource
       ? scheduledTaskPromptProjectionMarker
       : boundedText(message.text, 64_000);
-    // A user message HRA authored on the human's behalf is labelled so the web
-    // grid can tell an autoresponse from something the human actually typed.
-    const autorespondAuthored = message.role === "user"
-      && message.clientId !== undefined
-      && store.isAutorespondMessageSource(session.id, message.clientId);
+    // Resolve authorship from the one storage-owned source classifier. The
+    // legacy actor stays `autorespond` for every non-owner host message so the
+    // released v0.5 reader accepts it. New readers refine the label through an
+    // additive actorKind key that old readers ignore.
+    const messageActor = message.role === "user" && message.clientId !== undefined
+      ? store.sessionMessageActorForSource(session.id, message.clientId)
+      : null;
+    const actorKind = messageActor === "automation" || messageActor === "peer_session" || messageActor === "provider_switch"
+      ? messageActor
+      : null;
     // The manifest is local custody, keyed by the client message id the turn
     // was dispatched under. It names each file and its size; the bytes never
     // leave this machine.
@@ -2423,7 +2437,8 @@ function completedProjectionTurns(
       ? store.messageAttachmentManifest(session.id, message.clientId)
       : [];
     messages.push({
-      ...(autorespondAuthored ? { actor: "autorespond" as const } : {}),
+      ...(messageActor === null || messageActor === "human" ? {} : { actor: "autorespond" }),
+      ...(actorKind === null ? {} : { actorKind }),
       ...(manifest.length === 0 ? {} : { attachments: manifest }),
       kind: message.role === "user" ? "user_message" : "assistant_message",
       text,
@@ -2592,6 +2607,11 @@ export type StateBackedCloudDaemonAdapterOptions = Readonly<{
   liveThinking?: boolean;
   /** Display name for this machine in the device registry (default: the host name). */
   machineLabel?: string;
+  /** Optional at construction because memory is composed after cloud. */
+  memorySummarySource?: (input: Readonly<{
+    devicePublicId: string;
+    signal: AbortSignal;
+  }>) => Promise<MemorySummaryPayload>;
   now?: () => number;
   platform?: NodeJS.Platform;
   paths: StatePaths;
@@ -2644,13 +2664,13 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     observedAt: number;
     signedIn: boolean | null;
   }>();
-  readonly #accountObservationTasks = new Map<"claude" | "devin", {
+  readonly #accountObservationTasks = new Map<"claude", {
     controller: AbortController;
     key: string;
     task: Promise<void>;
   }>();
-  readonly #accountObservationCursors = new Map<"claude" | "devin", ProfileId>();
-  readonly #accountObservationCleanupFailures = new Set<"claude" | "devin">();
+  readonly #accountObservationCursors = new Map<"claude", ProfileId>();
+  readonly #accountObservationCleanupFailures = new Set<"claude">();
   #accountObservationsClosed = false;
   #closeTask: Promise<void> | null = null;
   #cache: CloudProjectionCache | null;
@@ -2672,6 +2692,12 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   readonly #liveThinking: boolean;
   readonly #gatewayKeyCustody: CloudGatewayKeyCustody;
   readonly #machineLabel: string;
+  readMemorySummary?: (
+    input: Readonly<{
+      devicePublicId: string;
+      signal: AbortSignal;
+    }>,
+  ) => Promise<MemorySummaryPayload>;
   readonly #registryNow: () => number;
   readonly #platform: NodeJS.Platform;
 
@@ -2680,6 +2706,15 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     this.#platform = options.platform ?? process.platform;
     this.#registryNow = options.now ?? Date.now;
     this.#machineLabel = registryLabel(options.machineLabel ?? hostname(), "This machine");
+    if (options.memorySummarySource !== undefined) {
+      this.readMemorySummary = async (input) => {
+        if (input.signal.aborted) throw input.signal.reason;
+        const summary = await options.memorySummarySource?.(input);
+        if (summary === undefined) throw new Error("Memory summary source is unavailable.");
+        throwIfAborted(input.signal);
+        return summary;
+      };
+    }
     // Without an injected custody the adapter reports no key and refuses to
     // store one: the CLI hands in the daemon's generational secret custody so
     // the key the hosted command stores is the key the responder reads.
@@ -3255,11 +3290,12 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         // Provider-unbound legacy sessions remain locally readable from the
         // compact cache but cannot trigger a fresh provider read.
       }
+      const retired = session.provider === "devin";
       // Detach retires provider authority before it archives the local row. The
       // archived head is the cloud tombstone for a session that was projected
       // before detach, so it must remain publishable without reopening that
       // retired provider authority.
-      let includeHead = canReadProvider || detachedArchiveHead;
+      let includeHead = canReadProvider || detachedArchiveHead || retired;
       if (cache !== null) {
         if (!canReadProvider) {
           try {
@@ -3369,6 +3405,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
           // unarchived session's metadata keeps its pre-archive bytes and
           // does not force a metadata update on every existing session.
           ...(session.archivedAt === undefined ? {} : { archived: true }),
+          ...(retired ? { retiredProvider: "devin" as const } : {}),
           name: boundedName(session.title),
           note: boundedNote(session.note),
         },
@@ -3478,7 +3515,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
    */
   #startAccountObservation(
     profile: ProfileRecord,
-    provider: "claude" | "devin",
+    provider: "claude",
     signal: AbortSignal,
   ): boolean {
     const readProjection = this.#readProviderAccountProjectionForCloud;
@@ -3561,10 +3598,10 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       .filter((profile) => profile.state !== "removed")
       .slice(0, deviceRegistryLimits.accounts);
     const accounts: DeviceRegistryAccount[] = [];
-    const providers: readonly ("claude" | "devin")[] =
+    const providers: readonly "claude"[] =
       this.#readProviderAccountProjectionForCloud === undefined
         ? []
-        : ["claude", "devin"];
+        : ["claude"];
     const currentKeys = new Set(profiles.flatMap((profile) =>
       providers.map((provider) => `${provider}_${profile.id}`)));
     for (const key of this.#accountObservations.keys()) {
@@ -3580,7 +3617,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     // profile retains Codex's historical raw id and every sibling-provider row
     // whose runtime proves an auth state; the 100-row protocol cap never leaves
     // a selected profile with only Codex because an earlier provider tier filled
-    // the array. At most two slots remain unused when the next complete group
+    // the array. At most one slot remains unused when the next complete group
     // would cross the bound.
     for (const profile of profiles) {
       if (profile.state === "removed") continue;
@@ -3728,6 +3765,28 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     input: Readonly<{ signal: AbortSignal }>,
   ): Promise<CloudDeviceRegistryProjection> {
     return await this.#buildDeviceRegistryProjection(input);
+  }
+
+  /**
+   * The CLI composes cloud before the Oh coordinator. Bind exactly once after
+   * both exist; the bridge does not start cycling until daemon composition is
+   * complete, so no partially initialized summary can be published.
+   */
+  bindMemorySummarySource(
+    source: (input: Readonly<{
+      devicePublicId: string;
+      signal: AbortSignal;
+    }>) => Promise<MemorySummaryPayload>,
+  ): void {
+    if (this.readMemorySummary !== undefined) {
+      throw new Error("Memory summary source is already bound.");
+    }
+    this.readMemorySummary = async (input) => {
+      if (input.signal.aborted) throw input.signal.reason;
+      const summary = await source(input);
+      throwIfAborted(input.signal);
+      return summary;
+    };
   }
 
   async readAttentionNotificationSnapshot(input: Readonly<{
@@ -3922,7 +3981,19 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     signal: AbortSignal;
   }>): Promise<CloudCommandExecutionResult> {
     if (input.signal.aborted) throw input.signal.reason;
+    // Reject stale provider selections even for an already-decoded command.
+    // Other kinds retain their existing, more specific refusal codes below.
+    if (
+      (input.payload.kind === "set_provider" || input.payload.kind === "set_model"
+        || input.payload.kind === "set_default_preset")
+      && parseRemoteCommandPayload(input.payload) === null
+    ) {
+      return { code: "COMMAND_PAYLOAD_INVALID", state: "failed" };
+    }
     try {
+      if (this.#store.requireSession(input.sessionPublicId).provider === "devin") {
+        return { code: "PROVIDER_RETIRED", state: "failed" };
+      }
       const context = (() => {
         try {
           const session = this.#store.requireSession(input.sessionPublicId);
@@ -3994,7 +4065,12 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
             command = { kind: "session.stop", session: session.id, idempotencyKey: input.idempotencyKey };
             break;
           case "set_model":
-            command = { kind: "session.preset", session: session.id, preset: input.payload.preset, idempotencyKey: input.idempotencyKey };
+            command = {
+              kind: "session.preset",
+              session: session.id,
+              preset: input.payload.preset,
+              idempotencyKey: input.idempotencyKey,
+            };
             break;
           // A provider switch is a provider effect, not a setting: it ends one
           // provider thread and starts another. It therefore runs on the
@@ -4004,7 +4080,10 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
               kind: "session.switch",
               session: session.id,
               provider: input.payload.provider,
-              ...(input.payload.preset === undefined ? {} : { preset: input.payload.preset }),
+              ...("preset" in input.payload ? { preset: input.payload.preset } : {}),
+              ...("presetContract" in input.payload
+                ? { presetContract: input.payload.presetContract }
+                : {}),
               idempotencyKey: input.idempotencyKey,
             };
             break;
@@ -4120,6 +4199,9 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     const policy = this.#store.readDeviceCommandPolicy();
     if (!policy.deviceCommandsAllowed) {
       return { code: "DEVICE_COMMANDS_DENIED", state: "failed" };
+    }
+    if (parseDeviceCommandPayload(input.payload) === null) {
+      return { code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", state: "failed" };
     }
     if (
       (input.payload.kind === "account_login_start"
@@ -4257,6 +4339,9 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         idempotencyKey: startKey,
         kind: "session.start",
         preset: payload.preset,
+        ...("presetContract" in payload
+          ? { presetContract: payload.presetContract }
+          : {}),
         project: payload.projectPublicId,
         provider: payload.provider,
       }, { signal });
@@ -4742,7 +4827,9 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
   }
 
   async sync(signal: AbortSignal): Promise<unknown> {
-    const daemon = await this.#bridge.cycle(signal);
+    const daemon = await this.#bridge.cycle(signal, {
+      forceDeviceRegistryPublication: true,
+    });
     const value = await this.#control.sync(signal);
     if (
       !isRecord(value)
@@ -4768,6 +4855,7 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
     return {
       control,
       daemon: {
+        commandRequestVersion: daemon.commandRequestVersion,
         commandsApplied: daemon.commandsApplied,
         commandsUnsettled: daemon.commandsUnsettled,
         errors: daemon.errors.slice(0, 32),

@@ -12,17 +12,20 @@ import type { KeyEnvelopeEntry } from "../data/wire";
 import {
   browserDeviceLabel,
   commandEnqueueDigestPurpose,
+  deviceCommandEnqueueDigestPurpose,
+  deviceEnqueueRequest,
+  deviceEnqueueRequestDigest,
   deviceLabelAad,
   deviceRegisterDigestPurpose,
   encryptDeviceLabel,
   enqueueRequest,
   enqueueRequestDigest,
-  isDeviceClassValidatorRejection,
   randomBindNonce,
   randomOpaqueId,
   registrationIntent,
   registrationRequestDigest,
   selectKeyEnvelope,
+  submitBrowserDeviceRegistration,
 } from "./registration";
 
 const userPublicId = "user_0123456789abcdef";
@@ -156,6 +159,7 @@ describe("registration digest", () => {
 });
 
 describe("enqueue digest", () => {
+  const requestingDevicePublicId = "device_requester_01234567";
   const request = enqueueRequest({
     deadline: 1_700_000_000_000,
     expectedTargetDevicePublicId: devicePublicId,
@@ -165,7 +169,7 @@ describe("enqueue digest", () => {
     sessionPublicId: "session_0123456789abcdef",
   });
 
-  test("serializes in the daemon's key order", () => {
+  test("serializes the wire fields in the daemon's key order", () => {
     expect(Object.keys(request)).toEqual([
       "deadline",
       "expectedTargetDevicePublicId",
@@ -181,9 +185,17 @@ describe("enqueue digest", () => {
     const expected = await hmacSha256Hex(
       key,
       commandEnqueueDigestPurpose,
-      JSON.stringify(request),
+      JSON.stringify({
+        deadline: request.deadline,
+        expectedTargetDevicePublicId: request.expectedTargetDevicePublicId,
+        kind: request.kind,
+        payload: request.payload,
+        publicId: request.publicId,
+        requestingDevicePublicId,
+        sessionPublicId: request.sessionPublicId,
+      }),
     );
-    expect(await enqueueRequestDigest(key, request)).toBe(expected);
+    expect(await enqueueRequestDigest(key, request, requestingDevicePublicId)).toBe(expected);
   });
 
   test("binds the expected custodian device", async () => {
@@ -192,8 +204,45 @@ describe("enqueue digest", () => {
       ...request,
       expectedTargetDevicePublicId: "device_ffffffffffffffff",
     });
-    expect(await enqueueRequestDigest(key, moved))
-      .not.toBe(await enqueueRequestDigest(key, request));
+    expect(await enqueueRequestDigest(key, moved, requestingDevicePublicId))
+      .not.toBe(await enqueueRequestDigest(key, request, requestingDevicePublicId));
+  });
+
+  test("binds the requesting device", async () => {
+    const key = randomKeyBytes();
+    expect(await enqueueRequestDigest(key, request, "device_other_requester"))
+      .not.toBe(await enqueueRequestDigest(key, request, requestingDevicePublicId));
+  });
+});
+
+describe("device enqueue digest", () => {
+  const requestingDevicePublicId = "device_requester_01234567";
+  const request = deviceEnqueueRequest({
+    deadline: 1_700_000_000_000,
+    expectedTargetDevicePublicId: devicePublicId,
+    kind: "usage_refresh",
+    payload: envelope,
+    publicId: "01931f2a-7c00-7000-8000-000000000003",
+  });
+
+  test("binds the server-projected requesting device in canonical key order", async () => {
+    const key = randomKeyBytes();
+    const expected = await hmacSha256Hex(
+      key,
+      deviceCommandEnqueueDigestPurpose,
+      JSON.stringify({
+        deadline: request.deadline,
+        expectedTargetDevicePublicId: request.expectedTargetDevicePublicId,
+        kind: request.kind,
+        payload: request.payload,
+        publicId: request.publicId,
+        requestingDevicePublicId,
+      }),
+    );
+    expect(await deviceEnqueueRequestDigest(key, request, requestingDevicePublicId))
+      .toBe(expected);
+    expect(await deviceEnqueueRequestDigest(key, request, "device_other_requester"))
+      .not.toBe(expected);
   });
 });
 
@@ -235,15 +284,34 @@ describe("identifiers", () => {
   });
 });
 
-describe("isDeviceClassValidatorRejection", () => {
-  test("recognises an argument validator rejection naming the field", () => {
-    expect(isDeviceClassValidatorRejection(new Error(
+describe("browser registration submission", () => {
+  test("fails closed instead of retrying classless against an older validator", async () => {
+    const intent = registrationIntent({
+      encryptedLabel: envelope,
+      idempotencyKey: "01931f2a-7c00-7000-8000-000000000003",
+      keyVersion,
+      publicId: devicePublicId,
+      signingPublicKey: "signing",
+      wrappingPublicKey: "wrapping",
+    });
+    const requests: unknown[] = [];
+    const rejection = new Error(
       "ArgumentValidationError: Object contains extra field `deviceClass` that is not in the validator.",
-    ))).toBe(true);
-  });
+    );
 
-  test("does not swallow a handler failure", () => {
-    expect(isDeviceClassValidatorRejection(new Error("Cloud authority is not current."))).toBe(false);
-    expect(isDeviceClassValidatorRejection(new Error("deviceClass is revoked"))).toBe(false);
+    await expect(submitBrowserDeviceRegistration({
+      intent,
+      mutate: async (request) => {
+        requests.push(request);
+        throw rejection;
+      },
+      requestDigest: "a".repeat(64),
+    })).rejects.toBe(rejection);
+
+    expect(requests).toEqual([{
+      ...intent,
+      deviceClass: "browser",
+      requestDigest: "a".repeat(64),
+    }]);
   });
 });

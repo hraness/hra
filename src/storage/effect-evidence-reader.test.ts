@@ -49,8 +49,8 @@ test("a failed historical decoder never falls through to timestamp or actor acce
   for (const format of formats) {
     const timestamp = decodeMutationEvidence({ format, json: markedStopJson });
     const actor = decodeMutationEvidence({ format, json: actorJson });
-    expect(timestamp.kind).toBe(format === "canonical41_v1" || format === "canonical43_v1" ? "parsed" : "opaque");
-    expect(actor.kind).toBe(format === "canonical43_v1" ? "parsed" : "opaque");
+    expect(timestamp.kind).toBe(format === "canonical41_v1" || format === "canonical43_v1" || format === "canonical49_v1" || format === "canonical_sol43_v1" ? "parsed" : "opaque");
+    expect(actor.kind).toBe(format === "canonical43_v1" || format === "canonical49_v1" ? "parsed" : "opaque");
     if (timestamp.kind === "parsed") expect(timestamp.canonicalJson).toBe(markedStopJson);
     if (actor.kind === "parsed") expect(actor.canonicalJson).toBe(actorJson);
   }
@@ -131,7 +131,7 @@ test("duplicate-key interpretation is explicitly JavaScript canonical evidence, 
   for (const format of formats) {
     expect(decodeMutationEvidence({ format, json: nullLast })).toEqual({ kind: "opaque", reason: "invalid_shape" });
     const result = decodeMutationEvidence({ format, json: markerLast });
-    if (format === "canonical41_v1" || format === "canonical43_v1") {
+    if (format === "canonical41_v1" || format === "canonical43_v1" || format === "canonical49_v1" || format === "canonical_sol43_v1") {
       expect(result.kind).toBe("parsed");
       if (result.kind !== "parsed") throw new Error("Expected last-key-wins timestamp interpretation.");
       expect(result.canonicalJson).toBe(markedStopJson);

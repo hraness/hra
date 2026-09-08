@@ -5,6 +5,10 @@ import { convexTest } from "convex-test";
 
 import { USAGE_POLL_MIN_INTERVAL_MS } from "../src/daemon/usage-poller";
 import {
+  identityInviteLifetimeMs,
+  invitePublicIdFromCapabilityDigest,
+} from "../src/cloud/inviteAuthority";
+import {
   parseUsageEncryptedEnvelope,
   USAGE_CLOUD_ENVELOPE_MAX_CIPHERTEXT_CHARACTERS,
 } from "../src/cloud/usage";
@@ -13,7 +17,14 @@ import {
   USAGE_LOCAL_RETAIN_BYTES,
   USAGE_LOCAL_SNAPSHOT_MAX_BYTES,
 } from "../src/storage/state-store";
-import { CLOUD_USAGE_SNAPSHOT_RETENTION_MS } from "./lifecyclePolicy";
+import {
+  CLOUD_USAGE_SNAPSHOT_RETENTION_MS,
+  HOSTED_TABLE_LIFECYCLE,
+} from "./lifecyclePolicy";
+import {
+  createAccountDeletionCapacityForNewUser,
+  createDeviceRevocationCapacityForNewDevice,
+} from "./authorityReductionCapacity";
 import schema from "./schema";
 import { modules } from "./test.setup";
 import {
@@ -30,6 +41,7 @@ import {
   adjustQuotaForPatch,
   adjustServiceQuotaForPatch,
   finalizeUserQuotaAuthorityForDelete,
+  hostedBootstrapStatus as hostedBootstrapStatusQuery,
   initializeAccountUsageQuotaAuthority,
   initializeUserQuotaAuthority,
   logicalDocumentBytes,
@@ -49,6 +61,7 @@ import {
   reserveSessionHeadQuotaForInsert,
 } from "./quota";
 import type { QuotaCategory } from "./quota";
+import { durableJobCapacityReservation } from "./validators";
 
 type Args = Readonly<Record<string, Value>>;
 type PresenceResponse = Readonly<{ online: boolean; sequence: number | null }>;
@@ -58,13 +71,25 @@ const genesisHardAuthority = makeFunctionReference<
   Record<string, never>,
   Readonly<{ enforcement: "hard" }>
 >("quota:genesisHardAuthority");
+const genesisHostedAuthority = makeFunctionReference<"mutation", Readonly<{
+  capabilityDigest: string;
+  lifetimeMs: number;
+  publicId: string;
+}>, unknown>("quota:genesisHostedAuthority");
+const hostedBootstrapStatus = makeFunctionReference<"query", Record<string, never>, Readonly<{
+  occupiedTableCount: number;
+  serviceControlCount: 0 | 1 | 2;
+  state: "accepted" | "inconsistent" | "ready" | "uninitialized";
+}>>("quota:hostedBootstrapStatus");
 const connect = makeFunctionReference<"mutation", Args, PresenceResponse>("presence:connect");
 const heartbeat = makeFunctionReference<"mutation", Args, PresenceResponse>("presence:heartbeat");
 const auditDirectTablePage = makeFunctionReference<"query", Args, Readonly<{
+  category: QuotaCategory;
   continueCursor: string;
   isDone: boolean;
   logicalBytes: number;
   records: number;
+  table: string;
 }>>("quota:auditDirectTablePage");
 
 const envelope = {
@@ -144,6 +169,84 @@ async function quotaWorld() {
 
 type QuotaRuntime = Awaited<ReturnType<typeof quotaWorld>>["testRuntime"];
 
+async function hostedBootstrapWorld(): Promise<QuotaRuntime> {
+  const runtime = convexTest(schema, modules);
+  const capabilityDigest = "6".repeat(64);
+  expect(await runtime.mutation(genesisHostedAuthority, {
+    capabilityDigest,
+    lifetimeMs: identityInviteLifetimeMs,
+    publicId: invitePublicIdFromCapabilityDigest(capabilityDigest),
+  })).toMatchObject({ enforcement: "hard", replay: false });
+  return runtime;
+}
+
+async function insertOrphanMemoryRow(
+  runtime: QuotaRuntime,
+  table: "memorySpaces" | "memoryOperations",
+): Promise<void> {
+  await runtime.run(async (ctx) => {
+    const now = Date.now();
+    const userId = await ctx.db.insert("users", {});
+    const memoryEnvelope = {
+      algorithm: "A256GCM" as const,
+      ciphertext: "A".repeat(22),
+      keyVersion: 1,
+      nonce: "B".repeat(16),
+    };
+    const memorySpaceId = await ctx.db.insert("memorySpaces", {
+      bindingPolicy: "one_project_one_space",
+      createdAt: now,
+      encryptedDescriptor: memoryEnvelope,
+      genesisHeadProof: memoryEnvelope,
+      genesisToken: "0".repeat(64),
+      identityContract: 2,
+      keyVersion: 1,
+      publicId: `memory_${"A".repeat(32)}`,
+      revision: 1,
+      updatedAt: now,
+      userId,
+      wrappedSpaceKey: memoryEnvelope,
+    });
+    if (table === "memoryOperations") {
+      const sourceDeviceId = await ctx.db.insert("devices", {
+        authEpoch: 1,
+        createdAt: now,
+        credentialGeneration: 1,
+        deviceClass: "daemon",
+        encryptedLabel: memoryEnvelope,
+        keyVersion: 1,
+        publicId: "device_bootstrap_memory",
+        revision: 1,
+        signingPublicKey: "fixture",
+        status: "active",
+        updatedAt: now,
+        userId,
+        wrappingPublicKey: "fixture",
+      });
+      await ctx.db.insert("memoryOperations", {
+        adoptionProof: null,
+        baseRevision: 1,
+        createdAt: now,
+        genesisToken: "0".repeat(64),
+        headToken: "1".repeat(64),
+        keyVersion: 1,
+        memorySpaceId,
+        operation: memoryEnvelope,
+        priorToken: "0".repeat(64),
+        sequence: 1,
+        sourceDeviceId,
+        terminalHeadProof: memoryEnvelope,
+        userId,
+      });
+      await ctx.db.delete(memorySpaceId);
+      await ctx.db.delete(sourceDeviceId);
+    }
+    // Model inconsistent stored state without inventing IDs or bypassing the
+    // schema. Only the chosen memory table remains occupied by this fixture.
+    await ctx.db.delete(userId);
+  });
+}
+
 async function categoryUsageFor(
   testRuntime: QuotaRuntime,
   userId: Id<"users">,
@@ -168,6 +271,133 @@ async function userResourceFor(
         .eq("resource", resource))
       .unique());
 }
+
+describe("hosted bootstrap status table coverage", () => {
+  test("reports a genuinely empty deployment as uninitialized", async () => {
+    const runtime = convexTest(schema, modules);
+    expect(await runtime.query(hostedBootstrapStatus, {})).toEqual({
+      occupiedTableCount: 0,
+      serviceControlCount: 0,
+      state: "uninitialized",
+    });
+  });
+
+  test("reports the genuine clean hosted-bootstrap frame as ready", async () => {
+    const runtime = await hostedBootstrapWorld();
+    expect(await runtime.query(hostedBootstrapStatus, {})).toEqual({
+      occupiedTableCount: 3,
+      serviceControlCount: 1,
+      state: "ready",
+    });
+  });
+
+  for (const table of ["memorySpaces", "memoryOperations"] as const) {
+    test(`rejects ${table} as the sole orphan table`, async () => {
+      const runtime = convexTest(schema, modules);
+      await insertOrphanMemoryRow(runtime, table);
+      expect(await runtime.run(async (ctx) => await ctx.db.query(table).collect()))
+        .toHaveLength(1);
+      expect(await runtime.query(hostedBootstrapStatus, {})).toEqual({
+        occupiedTableCount: 1,
+        serviceControlCount: 0,
+        state: "inconsistent",
+      });
+    });
+
+    test(`rejects unaccounted ${table} after genuine hosted bootstrap`, async () => {
+      const runtime = await hostedBootstrapWorld();
+      expect(await runtime.query(hostedBootstrapStatus, {})).toEqual({
+        occupiedTableCount: 3,
+        serviceControlCount: 1,
+        state: "ready",
+      });
+      await insertOrphanMemoryRow(runtime, table);
+      expect(await runtime.query(hostedBootstrapStatus, {})).toEqual({
+        occupiedTableCount: 4,
+        serviceControlCount: 1,
+        state: "inconsistent",
+      });
+    });
+
+    test(`counts multiple ${table} rows as one occupied table`, async () => {
+      const runtime = convexTest(schema, modules);
+      await insertOrphanMemoryRow(runtime, table);
+      await insertOrphanMemoryRow(runtime, table);
+      expect(await runtime.run(async (ctx) => await ctx.db.query(table).collect()))
+        .toHaveLength(2);
+      expect(await runtime.query(hostedBootstrapStatus, {})).toEqual({
+        occupiedTableCount: 1,
+        serviceControlCount: 0,
+        state: "inconsistent",
+      });
+    });
+  }
+
+  test("counts both orphan memory tables independently", async () => {
+    const runtime = convexTest(schema, modules);
+    await insertOrphanMemoryRow(runtime, "memorySpaces");
+    await insertOrphanMemoryRow(runtime, "memoryOperations");
+    expect(await runtime.query(hostedBootstrapStatus, {})).toEqual({
+      occupiedTableCount: 2,
+      serviceControlCount: 0,
+      state: "inconsistent",
+    });
+  });
+
+  test("rejects both unaccounted memory tables after genuine hosted bootstrap", async () => {
+    const runtime = await hostedBootstrapWorld();
+    await insertOrphanMemoryRow(runtime, "memorySpaces");
+    await insertOrphanMemoryRow(runtime, "memoryOperations");
+    expect(await runtime.query(hostedBootstrapStatus, {})).toEqual({
+      occupiedTableCount: 5,
+      serviceControlCount: 1,
+      state: "inconsistent",
+    });
+  });
+
+  test("reads and counts every lifecycle table through bounded actual queries", async () => {
+    const runtime = convexTest(schema, modules);
+    const reads: Array<Readonly<{ limit: number; table: string }>> = [];
+    const countedTables = new Set<string>();
+    const status = await runtime.query(async (ctx) => {
+      const originalQuery = ctx.db.query.bind(ctx.db);
+      const query: typeof ctx.db.query = (table) => {
+        const initializer = originalQuery(table);
+        const originalTake = initializer.take.bind(initializer);
+        initializer.take = async (limit) => {
+          reads.push({ limit, table });
+          const rows = await originalTake(limit);
+          return new Proxy(rows, {
+            get(target, property, receiver) {
+              if (property === "length") countedTables.add(table);
+              const value: unknown = Reflect.get(target, property, receiver);
+              return value;
+            },
+          });
+        };
+        return initializer;
+      };
+      // The registered runtime exposes this handler, but its public declaration
+      // omits internal members. Keep this test-only access checked and unknown.
+      const handler: unknown = Reflect.get(hostedBootstrapStatusQuery, "_handler");
+      if (typeof handler !== "function") throw new Error("Missing bootstrap status test handler.");
+      const result: unknown = await Reflect.apply(handler, undefined, [
+        { ...ctx, db: { ...ctx.db, query } },
+        {},
+      ]);
+      return result;
+    });
+    const expectedTables = Object.keys(HOSTED_TABLE_LIFECYCLE).sort();
+    expect(status).toEqual({
+      occupiedTableCount: 0,
+      serviceControlCount: 0,
+      state: "uninitialized",
+    });
+    expect(reads.map((read) => read.table).sort()).toEqual(expectedTables);
+    expect(reads.map((read) => read.limit)).toEqual(expectedTables.map(() => 2));
+    expect([...countedTables].sort()).toEqual(expectedTables);
+  });
+});
 
 describe("hosted quota authority", () => {
   test("uses Convex UTF-8 canonicalization and deterministic system overhead", () => {
@@ -955,5 +1185,96 @@ describe("hosted quota authority", () => {
     expect(first).toMatchObject({ isDone: false, records: 2 });
     expect(second).toMatchObject({ isDone: true, records: 1 });
     expect(await categoryUsageFor(world.testRuntime, world.userId, "security")).toEqual(before);
+  });
+
+  test("shadow audit reconciles every physical authority-reduction reservation", async () => {
+    const world = await quotaWorld();
+    await world.testRuntime.run(async (ctx) => {
+      await createAccountDeletionCapacityForNewUser(ctx, world.userId);
+      await createDeviceRevocationCapacityForNewDevice(
+        ctx,
+        world.userId,
+        world.deviceId,
+      );
+    });
+    const expected = {
+      accountDeletionIdentityReservations: "identity",
+      accountDeletionJobReservations: "job",
+      deviceRevocationDeviceReservations: "device",
+      deviceRevocationJobReservations: "job",
+      deviceRevocationReceiptReservations: "receipt",
+      deviceRevocationSecurityReservations: "security",
+    } as const;
+    for (const [table, category] of Object.entries(expected)) {
+      const audit = await world.testRuntime.query(auditDirectTablePage, {
+        paginationOpts: { cursor: null, numItems: 1 },
+        table,
+        userId: world.userId,
+      });
+      expect(audit).toMatchObject({ category, isDone: true, records: 1, table });
+      expect(audit.logicalBytes).toBeGreaterThan(2_048);
+    }
+  });
+
+  test("shadow audit reconciles capacity-backed durable jobs as job-category rows", async () => {
+    const world = await quotaWorld();
+    const documents = await world.testRuntime.run(async (ctx) => {
+      const subject = await ctx.db.query("authSubjects")
+        .withIndex("by_user", (builder) => builder.eq("userId", world.userId))
+        .unique();
+      if (subject === null) throw new Error("missing job audit subject");
+      const accountDeletion = {
+        capacityReservation: durableJobCapacityReservation,
+        category: "commands_and_leases" as const,
+        createdAt: 1,
+        publicId: "job_audit_account",
+        state: "pending" as const,
+        statusCapabilityDigest: "a".repeat(64),
+        subjectId: subject._id,
+        updatedAt: 1,
+        userId: world.userId,
+      };
+      const deviceRevocation = {
+        capacityReservation: durableJobCapacityReservation,
+        category: "sessions" as const,
+        createdAt: 1,
+        deviceId: world.deviceId,
+        publicId: "job_audit_device",
+        state: "pending" as const,
+        updatedAt: 1,
+        userId: world.userId,
+      };
+      await reserveQuotaForInsert(ctx, world.userId, "job", accountDeletion);
+      await ctx.db.insert("accountDeletionJobs", accountDeletion);
+      await reserveQuotaForInsert(ctx, world.userId, "job", deviceRevocation);
+      await ctx.db.insert("deviceRevocationJobs", deviceRevocation);
+      return { accountDeletion, deviceRevocation };
+    });
+    const before = await categoryUsageFor(world.testRuntime, world.userId, "job");
+    const accountAudit = await world.testRuntime.query(auditDirectTablePage, {
+      paginationOpts: { cursor: null, numItems: 1 },
+      table: "accountDeletionJobs",
+      userId: world.userId,
+    });
+    const revocationAudit = await world.testRuntime.query(auditDirectTablePage, {
+      paginationOpts: { cursor: null, numItems: 1 },
+      table: "deviceRevocationJobs",
+      userId: world.userId,
+    });
+    expect(accountAudit).toMatchObject({
+      category: "job",
+      isDone: true,
+      logicalBytes: logicalDocumentBytes(documents.accountDeletion),
+      records: 1,
+      table: "accountDeletionJobs",
+    });
+    expect(revocationAudit).toMatchObject({
+      category: "job",
+      isDone: true,
+      logicalBytes: logicalDocumentBytes(documents.deviceRevocation),
+      records: 1,
+      table: "deviceRevocationJobs",
+    });
+    expect(await categoryUsageFor(world.testRuntime, world.userId, "job")).toEqual(before);
   });
 });

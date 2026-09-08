@@ -28,6 +28,10 @@ import { publicInteractionSchema, type PublicInteraction } from "../src/domain/i
 import { sessionEventPageSchema, type SessionEvent } from "../src/domain/session-events";
 import { safeLiveAcceptanceCommandDigest } from "../src/codex/protocol";
 import {
+  projectMemoryHeadRefSchema,
+  type ProjectMemoryHeadRef,
+} from "../src/storage/state-store";
+import {
   loadProtectedOutputNativeOpenAtLibrary,
   protectedOutputOpenAtLibrariesForPlatform,
   type ProtectedOutputNativeOpenAtLibrary,
@@ -39,6 +43,15 @@ import {
   type LiveAcceptanceDeviceName,
   type LiveAcceptanceRun,
 } from "./live-acceptance";
+import {
+  liveAcceptanceMemoryFaultStatusSchema,
+  type LiveAcceptanceMemoryFaultStatus,
+} from "./live-acceptance-memory-fault";
+import {
+  liveMemoryErasureObservationSchema,
+  liveMemoryQuotaObservationSchema,
+  type LiveAcceptanceMemoryReadback,
+} from "./live-acceptance-memory-readback";
 
 const operatorInputFd = 0;
 const operatorOutputFd = 1;
@@ -53,6 +66,7 @@ const defaultPollIntervalMs = 1_000;
 // The 120-second bound covers the 70-second maximum normal cadence, two
 // serialized 15-second provider reads, and a 20-second local scheduling margin.
 const autonomousUsageProofDeadlineMs = 120_000;
+const memoryFaultDeadlineMs = 60_000;
 const commandProofContent = "hra-live-tool-progress";
 const expectedPermissionName = "network";
 const expectedQuestionId = "acceptance_choice";
@@ -139,6 +153,8 @@ type ScenarioRun = Pick<
 type ScenarioTiming = Readonly<{
   accountLoginDeadlineMs?: number;
   autonomousUsageProofDeadlineMs?: number;
+  memoryFaultDeadlineMs?: number;
+  memoryReadback?: LiveAcceptanceMemoryReadback;
   now?: () => number;
   pollIntervalMs?: number;
   prepareCommandProof?: (projectDirectory: string) => CommandProof;
@@ -147,27 +163,6 @@ type ScenarioTiming = Readonly<{
   signal?: AbortSignal;
   sleep?: (milliseconds: number) => Promise<void>;
   turnDeadlineMs?: number;
-}>;
-
-export type LiveAcceptanceEvidence = Readonly<{
-  accountIds: readonly [string, string];
-  cloudTargetDigest: string;
-  completedAt: number;
-  devicePublicIds: readonly [string, string];
-  eventKinds: Readonly<Record<string, readonly string[]>>;
-  markerDigests: readonly [string, string, string];
-  packageVersion: string;
-  pluginLifecycleEffectsRejected: readonly ["auth", "disable", "enable", "install"];
-  pluginInstallRejected: true;
-  presence: readonly ["online", "offline", "online"];
-  providerIdentitiesDistinct: true;
-  remoteCommand: Readonly<{ resultCode: "APPLIED"; state: "applied" }>;
-  runId: string;
-  sessionIds: readonly [string, string];
-  sourceRevision: string;
-  startedAt: number;
-  status: "passed";
-  version: 1;
 }>;
 
 export type LiveAcceptanceScenarioAttestation = Readonly<{
@@ -190,8 +185,9 @@ const scenarioAttestationSchema = z.object({
 const evidenceDigestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 const evidenceIdSchema = z.string().min(1).max(200);
 const evidenceTimestampSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const evidenceCountSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 
-const liveAcceptanceEvidenceSchema: z.ZodType<LiveAcceptanceEvidence> = z.object({
+const commonLiveAcceptanceEvidenceShape = {
   accountIds: z.tuple([evidenceIdSchema, evidenceIdSchema]),
   cloudTargetDigest: evidenceDigestSchema,
   completedAt: evidenceTimestampSchema,
@@ -220,8 +216,109 @@ const liveAcceptanceEvidenceSchema: z.ZodType<LiveAcceptanceEvidence> = z.object
   sourceRevision: z.string().regex(/^[a-f0-9]{40}$/u),
   startedAt: evidenceTimestampSchema,
   status: z.literal("passed"),
-  version: z.literal(1),
+} as const;
+
+const liveAcceptanceMemoryHistoricalReconciliationEvidenceSchema = z.object({
+  candidateBindingDigest: evidenceDigestSchema,
+  candidateHead: projectMemoryHeadRefSchema,
+  candidateHeadObservedByPeer: z.literal(true),
+  droppedGeneration: evidenceCountSchema.positive(),
+  exactHistoricalOperation: z.literal(true),
+  historical: z.object({
+    afterSequence: evidenceCountSchema,
+    firstOperationSha256: evidenceDigestSchema,
+    generation: evidenceCountSchema.positive(),
+    terminalSequence: evidenceCountSchema.positive(),
+  }).strict(),
+  hostedSpaceIdSha256: evidenceDigestSchema,
+  noRepeatPush: z.literal(true),
+  publicRecoverySettled: z.literal(true),
+  pushDispatchCount: z.literal(1),
+  recoveredHead: projectMemoryHeadRefSchema,
+  sameGenerationRefusalCount: evidenceCountSchema.positive(),
+  sequence: evidenceCountSchema.positive(),
+  structuredRequestSha256: evidenceDigestSchema,
+  wireOperationSha256: evidenceDigestSchema,
 }).strict().superRefine((evidence, context) => {
+  if (
+    evidence.sequence !== 1
+    || evidence.candidateHead.sequence !== evidence.sequence
+    || evidence.historical.afterSequence !== evidence.sequence - 1
+    || evidence.historical.firstOperationSha256 !== evidence.wireOperationSha256
+    || evidence.historical.generation <= evidence.droppedGeneration
+    || evidence.historical.terminalSequence !== evidence.sequence + 1
+    || evidence.recoveredHead.sequence !== evidence.historical.terminalSequence
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Canonical-memory response-drop evidence is incoherent.",
+    });
+  }
+});
+
+const liveAcceptanceMemoryDivergenceEvidenceSchema = z.object({
+  commonHead: projectMemoryHeadRefSchema,
+  diagnosticCode: z.literal("REMOTE_MEMORY_EQUAL_SEQUENCE_CONFLICT"),
+  divergentSequence: evidenceCountSchema.positive(),
+  loserHead: projectMemoryHeadRefSchema,
+  loserPagePreserved: z.literal(true),
+  loserStickyConflict: z.literal(true),
+  sameSequenceDistinctHeads: z.literal(true),
+  winnerHead: projectMemoryHeadRefSchema,
+  winnerPreserved: z.literal(true),
+}).strict().superRefine((evidence, context) => {
+  if (
+    evidence.divergentSequence !== evidence.commonHead.sequence + 1
+    || evidence.loserHead.sequence !== evidence.divergentSequence
+    || evidence.winnerHead.sequence !== evidence.divergentSequence
+    || evidence.loserHead.headDigest === evidence.winnerHead.headDigest
+    || evidence.loserHead.operationSha256 === evidence.winnerHead.operationSha256
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Canonical-memory divergence evidence is incoherent.",
+    });
+  }
+});
+
+const liveAcceptanceMemoryEvidenceSchema = z.object({
+  divergence: liveAcceptanceMemoryDivergenceEvidenceSchema,
+  erasure: liveMemoryErasureObservationSchema,
+  historicalReconciliation: liveAcceptanceMemoryHistoricalReconciliationEvidenceSchema,
+  quota: liveMemoryQuotaObservationSchema,
+  secondaryProviderIdentityMatched: z.literal(true),
+}).strict().superRefine((evidence, context) => {
+  if (
+    evidence.divergence.commonHead.sequence
+      !== evidence.historicalReconciliation.historical.terminalSequence
+    || evidence.divergence.commonHead.headDigest
+      !== evidence.historicalReconciliation.recoveredHead.headDigest
+    || evidence.divergence.commonHead.operationSha256
+      !== evidence.historicalReconciliation.recoveredHead.operationSha256
+    || evidence.quota.operationRecords !== evidence.divergence.divergentSequence
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Canonical-memory release evidence is incoherent.",
+    });
+  }
+});
+
+const liveAcceptanceEvidenceV1Schema = z.object({
+  ...commonLiveAcceptanceEvidenceShape,
+  version: z.literal(1),
+}).strict();
+
+const liveAcceptanceEvidenceV2Schema = z.object({
+  ...commonLiveAcceptanceEvidenceShape,
+  memory: liveAcceptanceMemoryEvidenceSchema,
+  version: z.literal(2),
+}).strict();
+
+export const liveAcceptanceEvidenceSchema = z.union([
+  liveAcceptanceEvidenceV1Schema,
+  liveAcceptanceEvidenceV2Schema,
+]).superRefine((evidence, context) => {
   const distinctPairs = [
     evidence.accountIds,
     evidence.devicePublicIds,
@@ -234,6 +331,17 @@ const liveAcceptanceEvidenceSchema: z.ZodType<LiveAcceptanceEvidence> = z.object
     || evidence.sessionIds.some((sessionId) => !(sessionId in evidence.eventKinds))
   ) context.addIssue({ code: "custom", message: "Live acceptance evidence is incoherent." });
 });
+
+export type LiveAcceptanceEvidence = z.infer<typeof liveAcceptanceEvidenceSchema>;
+export type LiveAcceptanceEvidenceV2 = z.infer<typeof liveAcceptanceEvidenceV2Schema>;
+
+export const parseCurrentLiveAcceptanceEvidence = (
+  input: unknown,
+): LiveAcceptanceEvidenceV2 => {
+  const evidence = liveAcceptanceEvidenceSchema.parse(input);
+  if (evidence.version !== 2) throw new ScenarioFailure("live_evidence_version_obsolete");
+  return evidence;
+};
 
 class ScenarioFailure extends Error {
   constructor(readonly code: string) {
@@ -872,9 +980,21 @@ const cancellableDevice = (
   device: LiveAcceptanceDevice,
   signal: AbortSignal,
 ): LiveAcceptanceDevice => ({
+  armCanonicalMemoryResponseDrop: async (input) => await abortable(
+    async () => await device.armCanonicalMemoryResponseDrop(input),
+    signal,
+  ),
+  canonicalMemoryResponseDropStatus: async () => await abortable(
+    async () => await device.canonicalMemoryResponseDropStatus(),
+    signal,
+  ),
   device: device.device,
   execute: async (argv, options) => await abortable(
     async () => await device.execute(argv, options),
+    signal,
+  ),
+  finalizeCanonicalMemoryResponseDrop: async (input) => await abortable(
+    async () => await device.finalizeCanonicalMemoryResponseDrop(input),
     signal,
   ),
   projectDirectory: device.projectDirectory,
@@ -923,7 +1043,11 @@ const executeJson = async (
   const expectedCommand = argv[0] === "interaction"
     && ["answer", "decide", "grant", "submit"].includes(argv[1] ?? "")
     ? "interaction.resolve"
-    : `${argv[0] ?? ""}.${argv[1] ?? ""}`;
+    : argv[0] === "memory" && argv[1] === "hosted"
+      ? `memory.hosted.${argv[2] ?? ""}`
+      : argv[0] === "memory" && ["get", "list", "search"].includes(argv[1] ?? "")
+        ? "memory.query"
+      : `${argv[0] ?? ""}.${argv[1] ?? ""}`;
   if (envelope.command !== expectedCommand) {
     throw new ScenarioFailure("cli_command_mismatch");
   }
@@ -933,7 +1057,10 @@ const executeJson = async (
 const executeJsonFailure = async (
   device: LiveAcceptanceDevice,
   argv: readonly string[],
-  expected: Readonly<{ code: "INVALID_INPUT" | "UNAVAILABLE"; exitCode?: number }>,
+  expected: Readonly<{
+    code: "INTERNAL" | "INVALID_INPUT" | "UNAVAILABLE";
+    exitCode?: number;
+  }>,
 ): Promise<void> => {
   if (!argv.includes("--json")) throw new ScenarioFailure("json_flag_missing");
   const result = await device.execute(argv);
@@ -1098,6 +1225,7 @@ const deviceListScenarioSchema = z.object({
   currentDevicePublicId: z.string().min(1).max(200),
   devices: z.array(z.object({
     current: z.boolean(),
+    fingerprint: z.string().regex(/^[0-9a-f]{4}(?:-[0-9a-f]{4}){7}$/u),
     online: z.boolean(),
     publicId: z.string().min(1).max(200),
     status: z.enum(["pending", "active", "revoked"]),
@@ -1943,13 +2071,819 @@ const assertDeviceAListAuthority = (
   return deviceBRow;
 };
 
+const publicMemoryHeadSchema = z.object({
+  digest: evidenceDigestSchema,
+  operationSha256: evidenceDigestSchema.nullable(),
+  sequence: evidenceCountSchema,
+}).strict().refine(
+  (head) => (head.sequence === 0) === (head.operationSha256 === null),
+  "A public memory head has no operation only at sequence zero.",
+);
+
+const hostedRemoteObservationSchema = z.object({
+  genesisToken: evidenceDigestSchema,
+  head: projectMemoryHeadRefSchema,
+  headProofDigest: evidenceDigestSchema,
+  headToken: evidenceDigestSchema,
+  keyVersion: evidenceCountSchema.positive(),
+  revision: evidenceCountSchema.positive(),
+}).strict();
+
+const hostedAttachmentSchema = z.object({
+  accountBindingDigest: evidenceDigestSchema,
+  canonicalBindingDigest: evidenceDigestSchema,
+  generation: evidenceCountSchema.positive(),
+  projectId: evidenceIdSchema,
+  remote: hostedRemoteObservationSchema,
+  remoteSpaceId: z.string().min(1).max(200),
+  revision: evidenceCountSchema.positive(),
+  state: z.enum(["attached", "conflict", "detached", "error"]),
+}).passthrough();
+
+const hostedCreateResultSchema = z.object({
+  attachment: hostedAttachmentSchema,
+  canonicalSpaceId: z.string().min(1).max(200),
+  hostedSpaceId: z.string().regex(/^memory_[A-Za-z0-9_-]{32}$/u),
+  projectId: evidenceIdSchema,
+  replay: z.literal(false),
+}).passthrough();
+
+const hostedAttachmentResultSchema = z.object({
+  attachment: hostedAttachmentSchema,
+  projectId: evidenceIdSchema,
+}).passthrough();
+
+const hostedSyncResultSchema = z.object({
+  attached: z.literal(true),
+  complete: z.literal(true),
+  localHead: projectMemoryHeadRefSchema,
+  operations: evidenceCountSchema,
+  projectId: evidenceIdSchema,
+  remoteHead: projectMemoryHeadRefSchema,
+  state: z.literal("converged"),
+}).strict();
+
+const memoryRememberResultSchema = z.object({
+  ok: z.literal(true),
+  page: z.object({
+    key: z.string().min(1).max(200),
+    operationSha256: evidenceDigestSchema,
+    recordSha256: evidenceDigestSchema,
+  }).strict(),
+  receiptSha256: evidenceDigestSchema,
+  replay: z.literal(false),
+  submission: z.object({
+    id: evidenceIdSchema,
+    kind: z.literal("remember"),
+    state: z.literal("applied"),
+  }).strict(),
+  version: z.literal(1),
+  workingHead: publicMemoryHeadSchema,
+}).passthrough();
+
+const memoryShareResultSchema = z.object({
+  canonicalHead: publicMemoryHeadSchema,
+  ok: z.literal(true),
+  receiptSha256: evidenceDigestSchema,
+  replay: z.literal(false),
+  share: z.object({
+    key: z.string().min(1).max(200),
+    nominationSha256: evidenceDigestSchema,
+    operationSha256: evidenceDigestSchema,
+    recordSha256: evidenceDigestSchema,
+    status: z.literal("adopted"),
+  }).strict(),
+  submission: z.object({
+    id: evidenceIdSchema,
+    kind: z.literal("share"),
+    state: z.literal("applied"),
+  }).strict(),
+  version: z.literal(1),
+}).passthrough();
+
+const memoryStatusSchema = z.object({
+  canonical: z.object({
+    diagnosticCode: z.string().min(1).max(200).nullable(),
+    expectedHead: publicMemoryHeadSchema,
+    frozen: z.boolean(),
+    initialized: z.boolean(),
+    lastExchangeHead: publicMemoryHeadSchema.nullable(),
+    physicalState: z.string().min(1).max(64),
+    syncState: z.string().min(1).max(64),
+  }).passthrough(),
+  ok: z.literal(true),
+  projectId: evidenceIdSchema,
+  sessionId: evidenceIdSchema,
+  unsettledSubmission: z.unknown().nullable(),
+  version: z.literal(1),
+}).passthrough();
+
+const memoryGetResultSchema = z.object({
+  canonical: z.object({
+    diagnosticCode: z.string().min(1).max(200).nullable(),
+    frozen: z.boolean(),
+    included: z.boolean(),
+    syncState: z.string().min(1).max(64).nullable(),
+  }).strict(),
+  canonicalHead: publicMemoryHeadSchema.nullable(),
+  continuation: z.null(),
+  mode: z.literal("get"),
+  ok: z.literal(true),
+  page: z.object({
+    completeness: z.literal("complete"),
+    hasMore: z.literal(false),
+    returnedRows: evidenceCountSchema,
+    totalRows: evidenceCountSchema,
+  }).passthrough(),
+  rows: z.array(z.object({
+    bodyChunk: z.string().max(64 * 1024),
+    chunkCount: z.literal(1),
+    chunkIndex: z.literal(0),
+    key: z.string().min(1).max(200),
+    lane: z.enum(["canonical", "working"]),
+    recordSha256: evidenceDigestSchema,
+  }).passthrough()).min(1).max(2),
+  scope: z.enum(["composite", "working"]),
+  version: z.literal(1),
+}).passthrough();
+
+const sameMemoryHead = (
+  left: ProjectMemoryHeadRef,
+  right: ProjectMemoryHeadRef,
+): boolean => left.sequence === right.sequence
+  && left.operationSha256 === right.operationSha256
+  && left.headDigest === right.headDigest;
+
+const internalMemoryHead = (
+  head: z.infer<typeof publicMemoryHeadSchema>,
+): ProjectMemoryHeadRef => projectMemoryHeadRefSchema.parse({
+  headDigest: head.digest,
+  operationSha256: head.operationSha256,
+  sequence: head.sequence,
+});
+
+const assertHostedAttachment = (
+  attachment: z.infer<typeof hostedAttachmentSchema>,
+  expected: Readonly<{
+    generation?: number;
+    hostedSpaceId: string;
+    projectId: string;
+    state: "attached" | "conflict" | "detached" | "error";
+  }>,
+): void => {
+  if (
+    attachment.projectId !== expected.projectId
+    || attachment.remoteSpaceId !== expected.hostedSpaceId
+    || attachment.state !== expected.state
+    || (expected.generation !== undefined && attachment.generation !== expected.generation)
+  ) throw new ScenarioFailure("memory_hosted_attachment_changed");
+};
+
+const assertConvergedMemorySync = (
+  value: unknown,
+  projectId: string,
+  expectedHead: ProjectMemoryHeadRef,
+): void => {
+  const sync = hostedSyncResultSchema.parse(value);
+  if (
+    sync.projectId !== projectId
+    || !sameMemoryHead(sync.localHead, expectedHead)
+    || !sameMemoryHead(sync.remoteHead, expectedHead)
+  ) throw new ScenarioFailure("memory_hosted_sync_not_converged");
+};
+
+const assertSettledMemoryStatus = (
+  value: unknown,
+  sessionId: string,
+  projectId: string,
+  expectedHead: ProjectMemoryHeadRef,
+): void => {
+  const status = memoryStatusSchema.parse(value);
+  const expectedPublicHead = internalMemoryHead(status.canonical.expectedHead);
+  const lastExchangeHead = status.canonical.lastExchangeHead === null
+    ? null
+    : internalMemoryHead(status.canonical.lastExchangeHead);
+  if (
+    status.sessionId !== sessionId
+    || status.projectId !== projectId
+    || !status.canonical.initialized
+    || status.canonical.physicalState !== "initialized"
+    || status.canonical.syncState !== "settled"
+    || status.canonical.frozen
+    || status.canonical.diagnosticCode !== null
+    || !sameMemoryHead(expectedPublicHead, expectedHead)
+    || lastExchangeHead === null
+    || !sameMemoryHead(lastExchangeHead, expectedHead)
+    || status.unsettledSubmission !== null
+  ) throw new ScenarioFailure("memory_public_status_not_settled");
+};
+
+const assertMemoryPage = (
+  value: unknown,
+  expected: Readonly<{
+    body: string;
+    canonicalHead: ProjectMemoryHeadRef | null;
+    key: string;
+    lane?: "canonical" | "working";
+    recordSha256: string;
+    scope: "composite" | "working";
+  }>,
+): void => {
+  const result = memoryGetResultSchema.parse(value);
+  const canonicalHead = result.canonicalHead === null
+    ? null
+    : internalMemoryHead(result.canonicalHead);
+  const matches = result.rows.filter((row) =>
+    row.key === expected.key
+    && row.recordSha256 === expected.recordSha256
+    && row.bodyChunk === expected.body
+    && (expected.lane === undefined || row.lane === expected.lane));
+  if (
+    result.scope !== expected.scope
+    || result.page.returnedRows !== result.rows.length
+    || result.page.totalRows !== result.rows.length
+    || matches.length !== 1
+    || (expected.canonicalHead === null) !== (canonicalHead === null)
+    || (
+      expected.canonicalHead !== null
+      && canonicalHead !== null
+      && !sameMemoryHead(canonicalHead, expected.canonicalHead)
+    )
+    || (expected.scope === "composite"
+      && (!result.canonical.included || result.canonical.frozen))
+    || (expected.scope === "working"
+      && (result.canonical.included || result.canonicalHead !== null))
+  ) throw new ScenarioFailure("memory_page_not_proven");
+};
+
+type MemoryPageProof = Readonly<{
+  body: string;
+  head: ProjectMemoryHeadRef;
+  key: string;
+  recordSha256: string;
+}>;
+
+const rememberAndShareMemoryPage = async (
+  device: LiveAcceptanceDevice,
+  sessionId: string,
+  label: string,
+): Promise<MemoryPageProof> => {
+  const key = `acceptance.${label}.${randomUUID()}`;
+  const title = `Acceptance ${label}`;
+  const summary = `Bounded live acceptance proof for ${label}.`;
+  const body = `Exact nonsecret live acceptance memory body for ${label} ${randomUUID()}.`;
+  const remembered = memoryRememberResultSchema.parse(await executeJson(device, [
+    "memory",
+    "remember",
+    sessionId,
+    key,
+    "--title",
+    title,
+    "--summary",
+    summary,
+    "--idempotency-key",
+    randomUUID(),
+    "--json",
+    "--",
+    body,
+  ]));
+  if (
+    remembered.page.key !== key
+    || remembered.page.operationSha256 !== remembered.workingHead.operationSha256
+  ) throw new ScenarioFailure("memory_remember_receipt_invalid");
+  const shared = memoryShareResultSchema.parse(await executeJson(device, [
+    "memory",
+    "share",
+    sessionId,
+    key,
+    "--reason",
+    `Live acceptance ${label}.`,
+    "--idempotency-key",
+    randomUUID(),
+    "--json",
+  ]));
+  const head = internalMemoryHead(shared.canonicalHead);
+  if (
+    shared.share.key !== key
+    || shared.share.recordSha256 !== remembered.page.recordSha256
+    || shared.share.operationSha256 !== head.operationSha256
+  ) throw new ScenarioFailure("memory_share_receipt_invalid");
+  return {
+    body,
+    head,
+    key,
+    recordSha256: remembered.page.recordSha256,
+  };
+};
+
+const pollMemoryFaultPhase = async (
+  device: LiveAcceptanceDevice,
+  phase: "dropped_blocking" | "historical_proved",
+  timing: Readonly<{
+    deadlineMs: number;
+    now: () => number;
+    pollIntervalMs: number;
+    signal: AbortSignal;
+    sleep: (milliseconds: number) => Promise<void>;
+  }>,
+): Promise<LiveAcceptanceMemoryFaultStatus> => await pollUntil({
+  deadlineMs: timing.deadlineMs,
+  now: timing.now,
+  operation: async () => {
+    const status = liveAcceptanceMemoryFaultStatusSchema.parse(
+      await device.canonicalMemoryResponseDropStatus(),
+    );
+    if (status.phase === "failed" || status.phase === "closed" || status.phase === "unavailable") {
+      throw new ScenarioFailure("memory_fault_controller_failed");
+    }
+    return status.phase === phase ? status : null;
+  },
+  pollIntervalMs: timing.pollIntervalMs,
+  signal: timing.signal,
+  sleep: timing.sleep,
+});
+
+const sameDropProof = (
+  left: NonNullable<LiveAcceptanceMemoryFaultStatus["proof"]>,
+  right: NonNullable<LiveAcceptanceMemoryFaultStatus["proof"]>,
+): boolean => left.candidateBindingDigest === right.candidateBindingDigest
+  && sameMemoryHead(left.candidateHead, right.candidateHead)
+  && left.droppedGeneration === right.droppedGeneration
+  && left.hostedSpaceIdSha256 === right.hostedSpaceIdSha256
+  && left.sequence === right.sequence
+  && left.structuredRequestSha256 === right.structuredRequestSha256
+  && left.wireOperationSha256 === right.wireOperationSha256;
+
+type MemoryBeforeCleanupEvidence = Omit<
+  z.infer<typeof liveAcceptanceMemoryEvidenceSchema>,
+  "erasure"
+>;
+
+const proveCanonicalMemoryRelease = async (input: Readonly<{
+  deviceA: LiveAcceptanceDevice;
+  deviceB: LiveAcceptanceDevice;
+  faultDeadlineMs: number;
+  memoryReadback: LiveAcceptanceMemoryReadback;
+  memorySessionB: string;
+  now: () => number;
+  operator: LiveAcceptanceScenarioOperator;
+  pollIntervalMs: number;
+  projectA: string;
+  projectB: string;
+  sessionA: string;
+  signal: AbortSignal;
+  sleep: (milliseconds: number) => Promise<void>;
+}>): Promise<MemoryBeforeCleanupEvidence> => {
+  await input.operator.progress("canonical_memory_baseline");
+  const created = hostedCreateResultSchema.parse(await executeJson(input.deviceA, [
+    "memory",
+    "hosted",
+    "create",
+    input.projectA,
+    "--idempotency-key",
+    randomUUID(),
+    "--json",
+  ]));
+  if (
+    created.projectId !== input.projectA
+    || created.attachment.remote.head.sequence !== 0
+  ) throw new ScenarioFailure("memory_hosted_create_invalid");
+  assertHostedAttachment(created.attachment, {
+    hostedSpaceId: created.hostedSpaceId,
+    projectId: input.projectA,
+    state: "attached",
+  });
+
+  const attachedB = hostedAttachmentResultSchema.parse(await executeJson(input.deviceB, [
+    "memory",
+    "hosted",
+    "attach",
+    input.projectB,
+    created.hostedSpaceId,
+    "--json",
+  ]));
+  if (
+    attachedB.projectId !== input.projectB
+    || attachedB.attachment.canonicalBindingDigest
+      !== created.attachment.canonicalBindingDigest
+    || JSON.stringify(attachedB.attachment.remote)
+      !== JSON.stringify(created.attachment.remote)
+  ) throw new ScenarioFailure("memory_hosted_peer_attachment_invalid");
+  assertHostedAttachment(attachedB.attachment, {
+    hostedSpaceId: created.hostedSpaceId,
+    projectId: input.projectB,
+    state: "attached",
+  });
+
+  const detachedA = hostedAttachmentResultSchema.parse(await executeJson(input.deviceA, [
+    "memory",
+    "hosted",
+    "detach",
+    input.projectA,
+    "--generation",
+    String(created.attachment.generation),
+    "--json",
+  ]));
+  assertHostedAttachment(detachedA.attachment, {
+    generation: created.attachment.generation + 1,
+    hostedSpaceId: created.hostedSpaceId,
+    projectId: input.projectA,
+    state: "detached",
+  });
+  if (
+    JSON.stringify(detachedA.attachment.remote)
+      !== JSON.stringify(created.attachment.remote)
+  ) throw new ScenarioFailure("memory_hosted_detach_observation_changed");
+
+  await input.operator.progress("canonical_memory_response_drop");
+  const candidate = await rememberAndShareMemoryPage(
+    input.deviceA,
+    input.sessionA,
+    "response-drop-candidate",
+  );
+  if (candidate.head.sequence !== detachedA.attachment.remote.head.sequence + 1) {
+    throw new ScenarioFailure("memory_candidate_not_exact_successor");
+  }
+  const armed = liveAcceptanceMemoryFaultStatusSchema.parse(
+    await input.deviceA.armCanonicalMemoryResponseDrop({
+      candidateHead: candidate.head,
+      hostedSpaceId: created.hostedSpaceId,
+      remote: {
+        genesisToken: detachedA.attachment.remote.genesisToken,
+        head: detachedA.attachment.remote.head,
+        headToken: detachedA.attachment.remote.headToken,
+        keyVersion: detachedA.attachment.remote.keyVersion,
+        revision: detachedA.attachment.remote.revision,
+      },
+    }),
+  );
+  if (armed.phase !== "armed" || armed.currentGeneration === null) {
+    throw new ScenarioFailure("memory_fault_not_armed");
+  }
+  await executeJsonFailure(input.deviceA, [
+    "memory",
+    "hosted",
+    "attach",
+    input.projectA,
+    created.hostedSpaceId,
+    "--json",
+  ], { code: "INTERNAL", exitCode: 1 });
+  const initiallyDropped = await pollMemoryFaultPhase(input.deviceA, "dropped_blocking", {
+    deadlineMs: input.faultDeadlineMs,
+    now: input.now,
+    pollIntervalMs: input.pollIntervalMs,
+    signal: input.signal,
+    sleep: input.sleep,
+  });
+  if (
+    initiallyDropped.proof === undefined
+    || !sameMemoryHead(initiallyDropped.proof.candidateHead, candidate.head)
+    || initiallyDropped.proof.hostedSpaceIdSha256 !== sha256(created.hostedSpaceId)
+    || initiallyDropped.proof.sequence !== candidate.head.sequence
+  ) throw new ScenarioFailure("memory_drop_proof_invalid");
+
+  await executeJsonFailure(input.deviceA, [
+    "memory",
+    "hosted",
+    "sync",
+    input.projectA,
+    "--json",
+  ], { code: "INTERNAL", exitCode: 1 });
+  const dropped = await pollMemoryFaultPhase(input.deviceA, "dropped_blocking", {
+    deadlineMs: input.faultDeadlineMs,
+    now: input.now,
+    pollIntervalMs: input.pollIntervalMs,
+    signal: input.signal,
+    sleep: input.sleep,
+  });
+  if (
+    dropped.proof === undefined
+    || !sameDropProof(initiallyDropped.proof, dropped.proof)
+    || dropped.proof.sameGenerationRefusalCount
+      <= initiallyDropped.proof.sameGenerationRefusalCount
+  ) throw new ScenarioFailure("memory_same_generation_not_blocked");
+  await input.deviceA.suspend();
+
+  await input.operator.progress("canonical_memory_peer_recovery");
+  assertConvergedMemorySync(await executeJson(input.deviceB, [
+    "memory",
+    "hosted",
+    "sync",
+    input.projectB,
+    "--json",
+  ]), input.projectB, candidate.head);
+  assertSettledMemoryStatus(await executeJson(input.deviceB, [
+    "memory",
+    "status",
+    input.memorySessionB,
+    "--json",
+  ]), input.memorySessionB, input.projectB, candidate.head);
+  assertMemoryPage(await executeJson(input.deviceB, [
+    "memory",
+    "get",
+    input.memorySessionB,
+    candidate.key,
+    "--json",
+  ]), {
+    body: candidate.body,
+    canonicalHead: candidate.head,
+    key: candidate.key,
+    lane: "canonical",
+    recordSha256: candidate.recordSha256,
+    scope: "composite",
+  });
+
+  const later = await rememberAndShareMemoryPage(
+    input.deviceB,
+    input.memorySessionB,
+    "post-drop-terminal",
+  );
+  if (later.head.sequence !== candidate.head.sequence + 1) {
+    throw new ScenarioFailure("memory_later_head_invalid");
+  }
+  assertConvergedMemorySync(await executeJson(input.deviceB, [
+    "memory",
+    "hosted",
+    "sync",
+    input.projectB,
+    "--json",
+  ]), input.projectB, later.head);
+  assertSettledMemoryStatus(await executeJson(input.deviceB, [
+    "memory",
+    "status",
+    input.memorySessionB,
+    "--json",
+  ]), input.memorySessionB, input.projectB, later.head);
+
+  await input.deviceA.resume();
+  const historical = await pollMemoryFaultPhase(input.deviceA, "historical_proved", {
+    deadlineMs: input.faultDeadlineMs,
+    now: input.now,
+    pollIntervalMs: input.pollIntervalMs,
+    signal: input.signal,
+    sleep: input.sleep,
+  });
+  if (
+    historical.proof === undefined
+    || historical.historical === undefined
+    || !sameDropProof(dropped.proof, historical.proof)
+    || historical.historical.afterSequence !== candidate.head.sequence - 1
+    || historical.historical.firstOperationSha256
+      !== historical.proof.wireOperationSha256
+    || historical.historical.generation <= historical.proof.droppedGeneration
+    || historical.historical.terminalSequence !== later.head.sequence
+  ) throw new ScenarioFailure("memory_historical_reconciliation_invalid");
+  assertConvergedMemorySync(await executeJson(input.deviceA, [
+    "memory",
+    "hosted",
+    "sync",
+    input.projectA,
+    "--json",
+  ]), input.projectA, later.head);
+  assertSettledMemoryStatus(await executeJson(input.deviceA, [
+    "memory",
+    "status",
+    input.sessionA,
+    "--json",
+  ]), input.sessionA, input.projectA, later.head);
+  assertMemoryPage(await executeJson(input.deviceA, [
+    "memory",
+    "get",
+    input.sessionA,
+    candidate.key,
+    "--json",
+  ]), {
+    body: candidate.body,
+    canonicalHead: later.head,
+    key: candidate.key,
+    lane: "canonical",
+    recordSha256: candidate.recordSha256,
+    scope: "composite",
+  });
+  const finalized = liveAcceptanceMemoryFaultStatusSchema.parse(
+    await input.deviceA.finalizeCanonicalMemoryResponseDrop({
+      candidateBindingDigest: historical.proof.candidateBindingDigest,
+      laterTerminalSequence: later.head.sequence,
+    }),
+  );
+  if (
+    finalized.phase !== "finalized"
+    || finalized.proof === undefined
+    || finalized.historical === undefined
+    || !sameDropProof(historical.proof, finalized.proof)
+    || JSON.stringify(finalized.historical) !== JSON.stringify(historical.historical)
+  ) throw new ScenarioFailure("memory_fault_finalize_invalid");
+
+  await input.operator.progress("canonical_memory_divergence");
+  const currentA = hostedAttachmentResultSchema.parse(await executeJson(input.deviceA, [
+    "memory",
+    "hosted",
+    "attach",
+    input.projectA,
+    created.hostedSpaceId,
+    "--json",
+  ]));
+  const currentB = hostedAttachmentResultSchema.parse(await executeJson(input.deviceB, [
+    "memory",
+    "hosted",
+    "attach",
+    input.projectB,
+    created.hostedSpaceId,
+    "--json",
+  ]));
+  for (const [current, projectId] of [
+    [currentA, input.projectA],
+    [currentB, input.projectB],
+  ] as const) {
+    assertHostedAttachment(current.attachment, {
+      hostedSpaceId: created.hostedSpaceId,
+      projectId,
+      state: "attached",
+    });
+    if (!sameMemoryHead(current.attachment.remote.head, later.head)) {
+      throw new ScenarioFailure("memory_attachment_not_at_common_head");
+    }
+  }
+  const [detachedWinnerValue, detachedLoserValue] = await Promise.all([
+    executeJson(input.deviceA, [
+      "memory",
+      "hosted",
+      "detach",
+      input.projectA,
+      "--generation",
+      String(currentA.attachment.generation),
+      "--json",
+    ]),
+    executeJson(input.deviceB, [
+      "memory",
+      "hosted",
+      "detach",
+      input.projectB,
+      "--generation",
+      String(currentB.attachment.generation),
+      "--json",
+    ]),
+  ]);
+  const detachedWinner = hostedAttachmentResultSchema.parse(detachedWinnerValue);
+  const detachedLoser = hostedAttachmentResultSchema.parse(detachedLoserValue);
+  assertHostedAttachment(detachedWinner.attachment, {
+    generation: currentA.attachment.generation + 1,
+    hostedSpaceId: created.hostedSpaceId,
+    projectId: input.projectA,
+    state: "detached",
+  });
+  assertHostedAttachment(detachedLoser.attachment, {
+    generation: currentB.attachment.generation + 1,
+    hostedSpaceId: created.hostedSpaceId,
+    projectId: input.projectB,
+    state: "detached",
+  });
+  const [winner, loser] = await Promise.all([
+    rememberAndShareMemoryPage(input.deviceA, input.sessionA, "divergence-winner"),
+    rememberAndShareMemoryPage(input.deviceB, input.memorySessionB, "divergence-loser"),
+  ]);
+  if (
+    winner.head.sequence !== later.head.sequence + 1
+    || loser.head.sequence !== winner.head.sequence
+    || sameMemoryHead(winner.head, loser.head)
+    || winner.head.operationSha256 === loser.head.operationSha256
+  ) throw new ScenarioFailure("memory_equal_sequence_divergence_invalid");
+
+  const winnerAttached = hostedAttachmentResultSchema.parse(await executeJson(input.deviceA, [
+    "memory",
+    "hosted",
+    "attach",
+    input.projectA,
+    created.hostedSpaceId,
+    "--json",
+  ]));
+  assertHostedAttachment(winnerAttached.attachment, {
+    generation: detachedWinner.attachment.generation + 1,
+    hostedSpaceId: created.hostedSpaceId,
+    projectId: input.projectA,
+    state: "attached",
+  });
+  if (!sameMemoryHead(winnerAttached.attachment.remote.head, winner.head)) {
+    throw new ScenarioFailure("memory_divergence_winner_not_published");
+  }
+  await executeJsonFailure(input.deviceB, [
+    "memory",
+    "hosted",
+    "attach",
+    input.projectB,
+    created.hostedSpaceId,
+    "--json",
+  ], { code: "INTERNAL", exitCode: 1 });
+
+  const loserStatus = memoryStatusSchema.parse(await executeJson(input.deviceB, [
+    "memory",
+    "status",
+    input.memorySessionB,
+    "--json",
+  ]));
+  if (
+    loserStatus.sessionId !== input.memorySessionB
+    || loserStatus.projectId !== input.projectB
+    || loserStatus.canonical.syncState !== "conflict"
+    || !loserStatus.canonical.frozen
+    || loserStatus.canonical.diagnosticCode !== "REMOTE_MEMORY_EQUAL_SEQUENCE_CONFLICT"
+    || !sameMemoryHead(internalMemoryHead(loserStatus.canonical.expectedHead), loser.head)
+    || loserStatus.unsettledSubmission !== null
+  ) throw new ScenarioFailure("memory_divergence_conflict_not_sticky");
+  assertMemoryPage(await executeJson(input.deviceB, [
+    "memory",
+    "get",
+    input.memorySessionB,
+    loser.key,
+    "--working-only",
+    "--json",
+  ]), {
+    body: loser.body,
+    canonicalHead: null,
+    key: loser.key,
+    lane: "working",
+    recordSha256: loser.recordSha256,
+    scope: "working",
+  });
+
+  assertConvergedMemorySync(await executeJson(input.deviceA, [
+    "memory",
+    "hosted",
+    "sync",
+    input.projectA,
+    "--json",
+  ]), input.projectA, winner.head);
+  assertSettledMemoryStatus(await executeJson(input.deviceA, [
+    "memory",
+    "status",
+    input.sessionA,
+    "--json",
+  ]), input.sessionA, input.projectA, winner.head);
+  assertMemoryPage(await executeJson(input.deviceA, [
+    "memory",
+    "get",
+    input.sessionA,
+    winner.key,
+    "--json",
+  ]), {
+    body: winner.body,
+    canonicalHead: winner.head,
+    key: winner.key,
+    lane: "canonical",
+    recordSha256: winner.recordSha256,
+    scope: "composite",
+  });
+  const quota = liveMemoryQuotaObservationSchema.parse(await abortable(
+    async () => await input.memoryReadback.observePopulated(
+      winner.head.sequence,
+      input.signal,
+    ),
+    input.signal,
+  ));
+
+  return {
+    divergence: {
+      commonHead: later.head,
+      diagnosticCode: "REMOTE_MEMORY_EQUAL_SEQUENCE_CONFLICT",
+      divergentSequence: winner.head.sequence,
+      loserHead: loser.head,
+      loserPagePreserved: true,
+      loserStickyConflict: true,
+      sameSequenceDistinctHeads: true,
+      winnerHead: winner.head,
+      winnerPreserved: true,
+    },
+    historicalReconciliation: {
+      candidateBindingDigest: historical.proof.candidateBindingDigest,
+      candidateHead: candidate.head,
+      candidateHeadObservedByPeer: true,
+      droppedGeneration: historical.proof.droppedGeneration,
+      exactHistoricalOperation: true,
+      historical: historical.historical,
+      hostedSpaceIdSha256: historical.proof.hostedSpaceIdSha256,
+      noRepeatPush: true,
+      publicRecoverySettled: true,
+      pushDispatchCount: historical.proof.pushDispatchCount,
+      recoveredHead: later.head,
+      sameGenerationRefusalCount: historical.proof.sameGenerationRefusalCount,
+      sequence: historical.proof.sequence,
+      structuredRequestSha256: historical.proof.structuredRequestSha256,
+      wireOperationSha256: historical.proof.wireOperationSha256,
+    },
+    quota,
+    secondaryProviderIdentityMatched: true,
+  };
+};
+
 export async function runLiveAcceptanceScenario(
   run: ScenarioRun,
   operator: LiveAcceptanceScenarioOperator,
   attestationInput: LiveAcceptanceScenarioAttestation,
   timing: ScenarioTiming = {},
-): Promise<LiveAcceptanceEvidence> {
+): Promise<LiveAcceptanceEvidenceV2> {
   const attestation = scenarioAttestationSchema.parse(attestationInput);
+  const memoryReadback = timing.memoryReadback;
+  if (memoryReadback === undefined) throw new ScenarioFailure("memory_readback_required");
   const now = timing.now ?? Date.now;
   const sleep = timing.sleep ?? (async (milliseconds: number) => { await Bun.sleep(milliseconds); });
   const prepareCommandProof = timing.prepareCommandProof ?? createCommandProof;
@@ -1961,7 +2895,7 @@ export async function runLiveAcceptanceScenario(
   const deviceB = cancellableDevice(run.device("b"), signal);
 
   await operator.progress("projects");
-  const [projectA] = await Promise.all([addProject(deviceA), addProject(deviceB)]);
+  const [projectA, projectB] = await Promise.all([addProject(deviceA), addProject(deviceB)]);
 
   await operator.progress("device_a_auth");
   const identityA = await protectedAuth(
@@ -2063,11 +2997,12 @@ export async function runLiveAcceptanceScenario(
     deviceA,
     ["device", "list", "--json"],
   ));
-  if (assertDeviceAListAuthority(
+  const pendingDeviceB = assertDeviceAListAuthority(
     listedPending,
     pairA.device.publicId,
     deviceBPublicId,
-  ).status !== "pending") {
+  );
+  if (pendingDeviceB.status !== "pending") {
     throw new ScenarioFailure("device_b_pending_not_visible");
   }
   await executeJsonFailure(deviceB, ["sync", "now", "--json"], { code: "UNAVAILABLE" });
@@ -2087,7 +3022,14 @@ export async function runLiveAcceptanceScenario(
   await operator.progress("device_b_approval");
   const approved = record(await executeJson(
     deviceA,
-    ["device", "approve", deviceBPublicId, "--json"],
+    [
+      "device",
+      "approve",
+      deviceBPublicId,
+      "--fingerprint",
+      pendingDeviceB.fingerprint,
+      "--json",
+    ],
   ), "device_approve");
   const approvedDevice = record(approved.device, "approved_device");
   if (approvedDevice.publicId !== deviceBPublicId || approvedDevice.status !== "active") {
@@ -2097,10 +3039,36 @@ export async function runLiveAcceptanceScenario(
   if (!activePairB.paired || activePairB.device.publicId !== deviceBPublicId || activePairB.device.status !== "active") {
     throw new ScenarioFailure("device_b_pairing_failed");
   }
+  await abortable(
+    async () => await memoryReadback.bindDevices(
+      [pairA.device.publicId, deviceBPublicId],
+      signal,
+    ),
+    signal,
+  );
+
+  await operator.progress("device_b_codex_account");
+  const accountBOnDeviceB = await addAccount(deviceB, "Acceptance Secondary Memory");
+  const signedInBOnDeviceB = await loginAccount({
+    accountId: accountBOnDeviceB,
+    accountLabel: "Acceptance Secondary Memory",
+    deadlineMs: timing.accountLoginDeadlineMs ?? accountLoginDeadlineMs,
+    device: deviceB,
+    now,
+    operator,
+    pollIntervalMs,
+    signal,
+    sleep,
+  });
+  if (
+    signedInBOnDeviceB.providerEmail.trim().toLowerCase()
+      !== providerEmailB.trim().toLowerCase()
+  ) throw new ScenarioFailure("memory_secondary_provider_identity_changed");
 
   await operator.progress("sessions_and_interactions");
   const sessionA = await startSession(deviceA, accountA, projectA);
   const sessionB = await startSession(deviceA, accountB, projectA);
+  const memorySessionB = await startSession(deviceB, accountBOnDeviceB, projectB);
   const commandProofA = prepareCommandProof(deviceA.projectDirectory);
   const commandProofB = prepareCommandProof(deviceA.projectDirectory);
   const markerA = `hra-live-user-input-${randomUUID()}`;
@@ -2335,6 +3303,22 @@ export async function runLiveAcceptanceScenario(
     sleep,
   });
 
+  const memoryBeforeCleanup = await proveCanonicalMemoryRelease({
+    deviceA,
+    deviceB,
+    faultDeadlineMs: timing.memoryFaultDeadlineMs ?? memoryFaultDeadlineMs,
+    memoryReadback,
+    memorySessionB,
+    now,
+    operator,
+    pollIntervalMs,
+    projectA,
+    projectB,
+    sessionA,
+    signal,
+    sleep,
+  });
+
   await operator.progress("presence_and_revocation");
   const onlineBefore = deviceListScenarioSchema.parse(await executeJson(
     deviceA,
@@ -2420,7 +3404,11 @@ export async function runLiveAcceptanceScenario(
 
   await operator.progress("cleanup");
   await run.cleanup({ signal });
-  return liveAcceptanceEvidenceSchema.parse({
+  const erasure = liveMemoryErasureObservationSchema.parse(await abortable(
+    async () => await memoryReadback.observeErased(signal),
+    signal,
+  ));
+  return parseCurrentLiveAcceptanceEvidence({
     accountIds: [accountA, accountB],
     cloudTargetDigest: attestation.cloudTargetDigest,
     completedAt: now(),
@@ -2430,6 +3418,7 @@ export async function runLiveAcceptanceScenario(
       [sessionB]: sessionEvidenceB.eventKinds,
     },
     markerDigests: [sha256(markerA), sha256(markerB), sha256(remoteMarker)],
+    memory: { ...memoryBeforeCleanup, erasure },
     packageVersion: attestation.packageVersion,
     pluginLifecycleEffectsRejected: ["auth", "disable", "enable", "install"],
     pluginInstallRejected: true,
@@ -2441,7 +3430,7 @@ export async function runLiveAcceptanceScenario(
     sourceRevision: attestation.sourceRevision,
     startedAt,
     status: "passed",
-    version: 1,
+    version: 2,
   });
 }
 

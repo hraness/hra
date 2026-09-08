@@ -36,10 +36,17 @@ import {
 } from "../domain/notification-hours-contract";
 import { isModelPreset, type ModelPreset } from "./projection";
 import {
+  activePresetBinding,
   presetProviders,
   providerSchema,
+  sharedActiveCodexPresetContract,
+  supportedPresetSchema,
+  supportedProviderSchema,
   type AdoptableProvider,
+  type PresetContract,
   type Provider,
+  type SupportedPreset,
+  type SupportedProvider,
 } from "../domain/presets";
 import {
   parseUsageEncryptedEnvelope,
@@ -60,6 +67,11 @@ function isInteractionId(value: unknown): value is string {
 
 const isProvider = (value: unknown): value is Provider =>
   providerSchema.safeParse(value).success;
+
+const isSupportedProvider = (value: unknown): value is SupportedProvider =>
+  supportedProviderSchema.safeParse(value).success;
+const isSupportedPreset = (value: unknown): value is SupportedPreset =>
+  supportedPresetSchema.safeParse(value).success;
 
 function isRemoteInteractionAnswerMap(
   value: unknown,
@@ -219,18 +231,68 @@ function parseRemoteAttachments(value: unknown): readonly RemoteAttachment[] | n
   return parsed;
 }
 
+/**
+ * Exact active interpretation of a preset alias at a remote write boundary.
+ *
+ * Browser, CLI, and daemon deployments do not roll atomically. Requiring this
+ * frozen token for the rebound Codex aliases means an old client cannot
+ * silently select their new meaning, while an old daemon rejects the additive
+ * key before effects. Stable aliases retain their existing token-free shape.
+ */
+export type ActiveRemotePresetSelection = Readonly<{
+  preset: "high" | "ultra";
+  presetContract: PresetContract;
+}> | Readonly<{
+  preset: Exclude<SupportedPreset, "high" | "ultra">;
+}>;
+
+export function activeRemotePresetSelection(
+  preset: SupportedPreset,
+): ActiveRemotePresetSelection {
+  return preset === "high" || preset === "ultra"
+    ? { preset, presetContract: activePresetBinding(preset).contract }
+    : { preset };
+}
+
+/**
+ * Contract fence for a provider switch that lets the daemon derive a Codex
+ * preset from the source tier. The client does not know whether that tier is
+ * High or Ultra, so those mutable aliases must share one active contract.
+ */
+export type ActiveRemoteDerivedCodexSelection = Readonly<{
+  presetContract: PresetContract;
+  provider: "codex";
+}>;
+
+export function activeRemoteDerivedCodexSelection(): ActiveRemoteDerivedCodexSelection {
+  return { presetContract: sharedActiveCodexPresetContract(), provider: "codex" };
+}
+
+function parseActiveRemotePresetSelection(
+  value: Readonly<Record<string, unknown>>,
+): ActiveRemotePresetSelection | null {
+  if (!isSupportedPreset(value.preset)) return null;
+  const selection = activeRemotePresetSelection(value.preset);
+  return "presetContract" in selection
+    && value.presetContract !== selection.presetContract
+    ? null
+    : selection;
+}
+
 export type RemoteCommandPayload =
   | Readonly<{ kind: "send" | "queue" | "steer" | "send_or_steer"; message: string }>
   | RemoteMessagePayload
   | Readonly<{ kind: "stop" }>
-  | Readonly<{ kind: "set_model"; preset: ModelPreset }>
+  | (Readonly<{ kind: "set_model" }> & ActiveRemotePresetSelection)
   /**
    * Move one session to another provider. The preset is optional: omitted, the
    * custodian keeps the session's tier when the target provider has one. The
    * account is deliberately absent — choosing an account is user-directed and
    * stays on the machine that holds the credentials.
    */
-  | Readonly<{ kind: "set_provider"; preset?: ModelPreset; provider: Provider }>
+  | Readonly<{ kind: "set_provider"; provider: Exclude<SupportedProvider, "codex"> }>
+  | (Readonly<{ kind: "set_provider" }> & ActiveRemoteDerivedCodexSelection)
+  | (Readonly<{ kind: "set_provider"; provider: SupportedProvider }> & ActiveRemotePresetSelection)
   | Readonly<{ enabled: boolean; kind: "set_fast" }>
   | ResolveInteractionDecisionPayload
   | ResolveInteractionAnswersPayload
@@ -240,7 +302,7 @@ export type RemoteCommandPayload =
       scope: "session" | "default";
     }>
   | Readonly<{ enabled: boolean; kind: "set_show_thinking"; scope: "session" | "default" }>
-  | Readonly<{ kind: "set_default_preset"; preset: ModelPreset }>
+  | (Readonly<{ kind: "set_default_preset" }> & ActiveRemotePresetSelection)
   | Readonly<{ archived: boolean; kind: "archive_session" }>
   | Readonly<{ kind: "rename_session"; name: string | null }>
   | Readonly<{ key: string; kind: "set_gateway_key" }>;
@@ -256,14 +318,13 @@ export type RemoteCommandPayload =
  * question without widening the current UI's authority.
  */
 export type DeviceCommandPayload =
-  | Readonly<{
+  | (Readonly<{
       accountPublicId: string;
       kind: "session_start";
-      preset: ModelPreset;
       projectPublicId: string;
       prompt: string;
-      provider: Provider;
-    }>
+      provider: SupportedProvider;
+    }> & ActiveRemotePresetSelection)
   | Readonly<{
       accountPublicId: string;
       /** Absent identifies a legacy requester that the current daemon refuses. */
@@ -343,21 +404,22 @@ export function isRelayedLoginUserCode(value: unknown): value is string {
 
 export function parseDeviceCommandPayload(value: unknown): DeviceCommandPayload | null {
   if (!isRecord(value)) return null;
+  const presetSelection = parseActiveRemotePresetSelection(value);
   if (
     value.kind === "session_start"
+    && presetSelection !== null
     && hasExactKeys(value, [
       "accountPublicId",
       "kind",
-      "preset",
+      ...Object.keys(presetSelection),
       "projectPublicId",
       "prompt",
       "provider",
     ])
     && isOpaqueIdentifier(value.accountPublicId)
     && isOpaqueIdentifier(value.projectPublicId)
-    && isModelPreset(value.preset)
-    && isProvider(value.provider)
-    && presetProviders[value.preset] === value.provider
+    && isSupportedProvider(value.provider)
+    && presetProviders[presetSelection.preset] === value.provider
     && typeof value.prompt === "string"
     && value.prompt.length >= 1
     && value.prompt.length <= deviceCommandLimits.promptCharacters
@@ -367,7 +429,7 @@ export function parseDeviceCommandPayload(value: unknown): DeviceCommandPayload 
     return {
       accountPublicId: value.accountPublicId,
       kind: value.kind,
-      preset: value.preset,
+      ...presetSelection,
       projectPublicId: value.projectPublicId,
       prompt: value.prompt,
       provider: value.provider,
@@ -499,6 +561,7 @@ export function parseDeviceCommandResultPayload(
 
 export type SessionMetadataPayload = Readonly<{
   archived?: boolean;
+  retiredProvider?: "devin";
   name: string | null;
   note: string | null;
 }>;
@@ -567,6 +630,84 @@ export type DeviceRegistryPayload = Readonly<{
   version: 1;
 }>;
 
+export type MemorySummaryHead = Readonly<{
+  digest: string;
+  operationSha256: string | null;
+  sequence: number;
+}>;
+
+export type MemorySummaryRecentRecord = Readonly<{
+  /** Memory pages are the only record kind admitted by the stable host facade. */
+  kind: "memory_page";
+  key: string;
+  updatedAt: number;
+}>;
+
+export type MemorySummarySpace = Readonly<{
+  bindingDigest: string;
+  canonicalSpaceId: string;
+  enrollment: "attached" | "detached" | "not_enrolled" | "unavailable";
+  head: MemorySummaryHead;
+  lastExchangeAt: number | null;
+  projectLabel: string;
+  recentRecords: readonly MemorySummaryRecentRecord[];
+  /** Null means the exact canonical snapshot could not be verified locally. */
+  recordCount: number | null;
+  remoteHead: MemorySummaryHead | null;
+  syncStatus: "conflict" | "error" | "local_only" | "settled" | "syncing";
+}>;
+
+export type MemorySummaryPeerIdentity = Readonly<{
+  /** Device-scoped digest; never a local HRA session id. */
+  ref: string;
+  label: string;
+}>;
+
+export type MemorySummaryPeerPolicy = Readonly<{
+  mode: "coordinate" | "inspect" | "off";
+  projectLabel: string;
+  session: MemorySummaryPeerIdentity;
+  updatedAt: number;
+}>;
+
+export type MemorySummaryPeerAction = Readonly<{
+  actor: MemorySummaryPeerIdentity;
+  createdAt: number;
+  delivery: "queue" | "send" | "steer";
+  state: "ambiguous" | "applied" | "cancelled" | "effect_started" | "failed" | "prepared" | "queued";
+  target: MemorySummaryPeerIdentity;
+  updatedAt: number;
+}>;
+
+export type MemorySummaryCoverage = Readonly<{
+  /** `bounded` means a deterministic prefix hit its count or encrypted-envelope budget. */
+  peerActions: "bounded" | "complete";
+  peerPolicies: "bounded" | "complete";
+  spaces: "bounded" | "complete";
+}>;
+
+/**
+ * Read-only supervision for one publishing daemon. This payload has its own
+ * AAD kind and envelope so the byte-strict DeviceRegistryPayload v1 contract
+ * never acquires an optional memory field. It intentionally carries neither
+ * page bodies nor raw local project/session identifiers.
+ */
+export type MemorySummaryPayload = Readonly<{
+  coverage: MemorySummaryCoverage;
+  observedAt: number;
+  peerActions: readonly MemorySummaryPeerAction[];
+  peerPolicies: readonly MemorySummaryPeerPolicy[];
+  spaces: readonly MemorySummarySpace[];
+  version: 1;
+}>;
+
+export const memorySummaryLimits = Object.freeze({
+  peerActions: 50,
+  peerPolicies: 200,
+  recentRecordsPerSpace: 32,
+  spaces: 100,
+} as const);
+
 export const deviceRegistryLimits = Object.freeze({
   accounts: 100,
   cadenceCharacters: 512,
@@ -585,6 +726,7 @@ export type CloudPayloadAuthority = Readonly<{
     | "device_command"
     | "device_command_result"
     | "device_registry"
+    | "memory_summary"
     | "notification_email"
     | "notification_hours"
     | "session_metadata"
@@ -594,6 +736,7 @@ export type CloudPayloadAuthority = Readonly<{
 
 function parseRemoteCommandPayloadUnchecked(value: unknown): RemoteCommandPayload | null {
   if (!isRecord(value)) return null;
+  const presetSelection = parseActiveRemotePresetSelection(value);
   if (
     (value.kind === "send" || value.kind === "queue" || value.kind === "steer"
       || value.kind === "send_or_steer")
@@ -618,23 +761,35 @@ function parseRemoteCommandPayloadUnchecked(value: unknown): RemoteCommandPayloa
   if (value.kind === "stop" && hasExactKeys(value, ["kind"])) return { kind: value.kind };
   if (
     value.kind === "set_model"
-    && hasExactKeys(value, ["kind", "preset"])
-    && isModelPreset(value.preset)
-  ) return { kind: value.kind, preset: value.preset };
+    && presetSelection !== null
+    && hasExactKeys(value, ["kind", ...Object.keys(presetSelection)])
+  ) return { kind: value.kind, ...presetSelection };
   if (
     value.kind === "set_provider"
-    && isProvider(value.provider)
-    && (
-      (hasExactKeys(value, ["kind", "provider"]) && value.preset === undefined)
-      || (hasExactKeys(value, ["kind", "preset", "provider"]) && isModelPreset(value.preset))
-    )
+    && isSupportedProvider(value.provider)
   ) {
-    if (isModelPreset(value.preset)) {
-      return presetProviders[value.preset] === value.provider
-        ? { kind: value.kind, preset: value.preset, provider: value.provider }
+    if (
+      presetSelection !== null
+      && hasExactKeys(value, ["kind", ...Object.keys(presetSelection), "provider"])
+    ) {
+      return presetProviders[presetSelection.preset] === value.provider
+        ? {
+            kind: value.kind,
+            ...presetSelection,
+             provider: value.provider,
+           }
         : null;
     }
-    return { kind: value.kind, provider: value.provider };
+    if (value.provider === "codex") {
+      const derivedSelection = activeRemoteDerivedCodexSelection();
+      return hasExactKeys(value, ["kind", "presetContract", "provider"])
+        && value.presetContract === derivedSelection.presetContract
+        ? { kind: value.kind, ...derivedSelection }
+        : null;
+    }
+    return hasExactKeys(value, ["kind", "provider"])
+      ? { kind: value.kind, provider: value.provider }
+      : null;
   }
   if (
     value.kind === "set_fast"
@@ -687,9 +842,9 @@ function parseRemoteCommandPayloadUnchecked(value: unknown): RemoteCommandPayloa
   ) return { enabled: value.enabled, kind: value.kind, scope: value.scope };
   if (
     value.kind === "set_default_preset"
-    && hasExactKeys(value, ["kind", "preset"])
-    && isModelPreset(value.preset)
-  ) return { kind: value.kind, preset: value.preset };
+    && presetSelection !== null
+    && hasExactKeys(value, ["kind", ...Object.keys(presetSelection)])
+  ) return { kind: value.kind, ...presetSelection };
   if (
     value.kind === "archive_session"
     && hasExactKeys(value, ["archived", "kind"])
@@ -761,9 +916,11 @@ export function parseSessionMetadataPayload(value: unknown): SessionMetadataPayl
   // `archived` is an additive optional key: a payload written before session
   // archive existed still parses, and an absent key means "not archived".
   const archived = Object.hasOwn(value, "archived");
+  const retiredProvider = Object.hasOwn(value, "retiredProvider");
   if (
-    !hasExactKeys(value, archived ? ["archived", "name", "note"] : ["name", "note"])
+    !hasExactKeys(value, ["name", "note", ...(archived ? ["archived"] : []), ...(retiredProvider ? ["retiredProvider"] : [])])
     || (archived && typeof value.archived !== "boolean")
+    || (retiredProvider && value.retiredProvider !== "devin")
   ) return null;
   if (
     value.name !== null
@@ -782,6 +939,7 @@ export function parseSessionMetadataPayload(value: unknown): SessionMetadataPayl
   ) return null;
   return {
     ...(archived ? { archived: value.archived as boolean } : {}),
+    ...(retiredProvider ? { retiredProvider: "devin" as const } : {}),
     name: value.name,
     note: value.note,
   };
@@ -986,6 +1144,254 @@ export function parseDeviceRegistryPayload(value: unknown): DeviceRegistryPayloa
   return snapshot.ok ? parseDeviceRegistryPayloadUnchecked(snapshot.value) : null;
 }
 
+const portableMemorySpacePattern = /^hra:project:space-[a-f0-9]{32}$/u;
+
+function parseMemorySummaryHead(value: unknown): MemorySummaryHead | null {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ["digest", "operationSha256", "sequence"])
+    || typeof value.digest !== "string"
+    || !/^[a-f0-9]{64}$/u.test(value.digest)
+    || (value.operationSha256 !== null
+      && (typeof value.operationSha256 !== "string"
+        || !/^[a-f0-9]{64}$/u.test(value.operationSha256)))
+    || !Number.isSafeInteger(value.sequence)
+    || (value.sequence as number) < 0
+    || Object.is(value.sequence, -0)
+    || ((value.sequence as number) === 0) !== (value.operationSha256 === null)
+  ) return null;
+  return {
+    digest: value.digest,
+    operationSha256: value.operationSha256,
+    sequence: value.sequence as number,
+  };
+}
+
+function parseMemorySummaryPeerIdentity(value: unknown): MemorySummaryPeerIdentity | null {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ["label", "ref"])
+    || !isRegistryLabel(value.label)
+    || typeof value.ref !== "string"
+    || !/^[a-f0-9]{64}$/u.test(value.ref)
+  ) return null;
+  return { label: value.label, ref: value.ref };
+}
+
+function parseMemorySummaryPayloadUnchecked(value: unknown): MemorySummaryPayload | null {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, [
+      "coverage",
+      "observedAt",
+      "peerActions",
+      "peerPolicies",
+      "spaces",
+      "version",
+    ])
+    || value.version !== 1
+    || !isRegistryTimestamp(value.observedAt)
+    || !isRecord(value.coverage)
+    || !hasExactKeys(value.coverage, ["peerActions", "peerPolicies", "spaces"])
+    || (value.coverage.peerActions !== "bounded" && value.coverage.peerActions !== "complete")
+    || (value.coverage.peerPolicies !== "bounded" && value.coverage.peerPolicies !== "complete")
+    || (value.coverage.spaces !== "bounded" && value.coverage.spaces !== "complete")
+    || !Array.isArray(value.spaces)
+    || value.spaces.length > memorySummaryLimits.spaces
+    || !Array.isArray(value.peerPolicies)
+    || value.peerPolicies.length > memorySummaryLimits.peerPolicies
+    || !Array.isArray(value.peerActions)
+    || value.peerActions.length > memorySummaryLimits.peerActions
+  ) return null;
+
+  const spaces: MemorySummarySpace[] = [];
+  const spaceIds = new Set<string>();
+  for (const entry of value.spaces) {
+    if (
+      !isRecord(entry)
+      || !hasExactKeys(entry, [
+        "bindingDigest",
+        "canonicalSpaceId",
+        "enrollment",
+        "head",
+        "lastExchangeAt",
+        "projectLabel",
+        "recentRecords",
+        "recordCount",
+        "remoteHead",
+        "syncStatus",
+      ])
+      || typeof entry.bindingDigest !== "string"
+      || !/^[a-f0-9]{64}$/u.test(entry.bindingDigest)
+      || typeof entry.canonicalSpaceId !== "string"
+      || !portableMemorySpacePattern.test(entry.canonicalSpaceId)
+      || (entry.enrollment !== "attached"
+        && entry.enrollment !== "detached"
+        && entry.enrollment !== "not_enrolled"
+        && entry.enrollment !== "unavailable")
+      || !isRegistryLabel(entry.projectLabel)
+      || (entry.recordCount !== null && (
+        !Number.isSafeInteger(entry.recordCount)
+        || (entry.recordCount as number) < 0
+        || Object.is(entry.recordCount, -0)
+      ))
+      || (entry.lastExchangeAt !== null && !isRegistryTimestamp(entry.lastExchangeAt))
+      || (entry.lastExchangeAt !== null && entry.lastExchangeAt > value.observedAt)
+      || (entry.syncStatus !== "conflict"
+        && entry.syncStatus !== "error"
+        && entry.syncStatus !== "local_only"
+        && entry.syncStatus !== "settled"
+        && entry.syncStatus !== "syncing")
+      || !Array.isArray(entry.recentRecords)
+      || entry.recentRecords.length > memorySummaryLimits.recentRecordsPerSpace
+      || spaceIds.has(entry.canonicalSpaceId)
+    ) return null;
+    const head = parseMemorySummaryHead(entry.head);
+    const remoteHead = entry.remoteHead === null ? null : parseMemorySummaryHead(entry.remoteHead);
+    if (head === null || (entry.remoteHead !== null && remoteHead === null)) return null;
+    if (
+      entry.enrollment === "not_enrolled"
+      && (entry.syncStatus !== "local_only" || remoteHead !== null || entry.lastExchangeAt !== null)
+    ) return null;
+    if (
+      entry.syncStatus === "local_only"
+      && entry.enrollment !== "not_enrolled"
+      && entry.enrollment !== "detached"
+    ) return null;
+    if (entry.enrollment === "attached" && remoteHead === null) return null;
+    if (
+      entry.recordCount === null
+      && (entry.enrollment !== "unavailable" || entry.recentRecords.length !== 0)
+    ) return null;
+    if (
+      entry.syncStatus === "settled"
+      && (remoteHead === null
+        || remoteHead.sequence !== head.sequence
+        || remoteHead.operationSha256 !== head.operationSha256
+        || remoteHead.digest !== head.digest)
+    ) return null;
+    const recentRecords: MemorySummaryRecentRecord[] = [];
+    const recordKeys = new Set<string>();
+    for (const record of entry.recentRecords) {
+      if (
+        !isRecord(record)
+        || !hasExactKeys(record, ["key", "kind", "updatedAt"])
+        || record.kind !== "memory_page"
+        || !isRegistryLabel(record.key, 512)
+        || !isRegistryTimestamp(record.updatedAt)
+        || record.updatedAt > value.observedAt
+        || recordKeys.has(record.key)
+      ) return null;
+      recordKeys.add(record.key);
+      recentRecords.push({ key: record.key, kind: record.kind, updatedAt: record.updatedAt });
+    }
+    if (entry.recordCount !== null && (entry.recordCount as number) < recentRecords.length) {
+      return null;
+    }
+    spaceIds.add(entry.canonicalSpaceId);
+    spaces.push({
+      bindingDigest: entry.bindingDigest,
+      canonicalSpaceId: entry.canonicalSpaceId,
+      enrollment: entry.enrollment,
+      head,
+      lastExchangeAt: entry.lastExchangeAt,
+      projectLabel: entry.projectLabel,
+      recentRecords,
+      recordCount: entry.recordCount as number | null,
+      remoteHead,
+      syncStatus: entry.syncStatus,
+    });
+  }
+
+  const peerPolicies: MemorySummaryPeerPolicy[] = [];
+  const policyRefs = new Set<string>();
+  for (const entry of value.peerPolicies) {
+    if (
+      !isRecord(entry)
+      || !hasExactKeys(entry, ["mode", "projectLabel", "session", "updatedAt"])
+      || (entry.mode !== "coordinate" && entry.mode !== "inspect" && entry.mode !== "off")
+      || !isRegistryLabel(entry.projectLabel)
+      || !isRegistryTimestamp(entry.updatedAt)
+      || entry.updatedAt > value.observedAt
+    ) return null;
+    const session = parseMemorySummaryPeerIdentity(entry.session);
+    if (session === null || policyRefs.has(session.ref)) return null;
+    policyRefs.add(session.ref);
+    peerPolicies.push({
+      mode: entry.mode,
+      projectLabel: entry.projectLabel,
+      session,
+      updatedAt: entry.updatedAt,
+    });
+  }
+
+  const peerActions: MemorySummaryPeerAction[] = [];
+  for (const entry of value.peerActions) {
+    if (
+      !isRecord(entry)
+      || !hasExactKeys(entry, ["actor", "createdAt", "delivery", "state", "target", "updatedAt"])
+      || (entry.delivery !== "queue" && entry.delivery !== "send" && entry.delivery !== "steer")
+      || (entry.state !== "ambiguous"
+        && entry.state !== "applied"
+        && entry.state !== "cancelled"
+        && entry.state !== "effect_started"
+        && entry.state !== "failed"
+        && entry.state !== "prepared"
+        && entry.state !== "queued")
+      || !isRegistryTimestamp(entry.createdAt)
+      || !isRegistryTimestamp(entry.updatedAt)
+      || entry.updatedAt < entry.createdAt
+      || entry.updatedAt > value.observedAt
+    ) return null;
+    const actor = parseMemorySummaryPeerIdentity(entry.actor);
+    const target = parseMemorySummaryPeerIdentity(entry.target);
+    if (actor === null || target === null || actor.ref === target.ref) return null;
+    peerActions.push({
+      actor,
+      createdAt: entry.createdAt,
+      delivery: entry.delivery,
+      state: entry.state,
+      target,
+      updatedAt: entry.updatedAt,
+    });
+  }
+
+  return {
+    coverage: {
+      peerActions: value.coverage.peerActions,
+      peerPolicies: value.coverage.peerPolicies,
+      spaces: value.coverage.spaces,
+    },
+    observedAt: value.observedAt,
+    peerActions,
+    peerPolicies,
+    spaces,
+    version: 1,
+  };
+}
+
+/** Parse one immutable accessor-free snapshot of an untrusted memory summary. */
+export function parseMemorySummaryPayload(value: unknown): MemorySummaryPayload | null {
+  const snapshot = snapshotForeignJson(value);
+  return snapshot.ok ? parseMemorySummaryPayloadUnchecked(snapshot.value) : null;
+}
+
+/**
+ * Preflight the separate summary before spending an account-key nonce. The
+ * conservative plaintext bound is the same AES-GCM plus unpadded-base64
+ * bound enforced after encryption.
+ */
+export function memorySummaryFitsEncryptedEnvelope(value: unknown): boolean {
+  const parsed = parseMemorySummaryPayload(value);
+  if (parsed === null) return false;
+  try {
+    const bytes = new TextEncoder().encode(JSON.stringify(parsed)).byteLength;
+    return bytes <= Math.floor(cloudLimits.memorySummaryCiphertextCharacters * 3 / 4) - 16;
+  } catch {
+    return false;
+  }
+}
+
 export function cloudPayloadAad(authority: CloudPayloadAuthority): Uint8Array {
   if (
     !isOpaqueIdentifier(authority.entityPublicId)
@@ -1025,6 +1431,30 @@ async function decryptJson(
   return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext)) as unknown;
 }
 
+export type AuthenticatedPayloadInspection<T> =
+  | Readonly<{ kind: "invalid" }>
+  | Readonly<{ kind: "valid"; payload: T }>;
+
+async function inspectAuthenticatedJson<T>(
+  envelope: EncryptedEnvelope,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+  parse: (value: unknown) => T | null,
+): Promise<AuthenticatedPayloadInspection<T>> {
+  if (envelope.keyVersion !== authority.keyVersion) throw new Error("Cloud payload key mismatch.");
+  // Authentication failures intentionally escape. Only bytes authenticated by
+  // the account key may be classified as a deterministic semantic rejection.
+  const plaintext = await decryptBytes(envelope, key, cloudPayloadAad(authority));
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext)) as unknown;
+  } catch {
+    return { kind: "invalid" };
+  }
+  const parsed = parse(value);
+  return parsed === null ? { kind: "invalid" } : { kind: "valid", payload: parsed };
+}
+
 export async function encryptRemoteCommand(
   payload: RemoteCommandPayload,
   key: Uint8Array,
@@ -1042,10 +1472,18 @@ export async function decryptRemoteCommand(
   key: Uint8Array,
   authority: CloudPayloadAuthority,
 ): Promise<RemoteCommandPayload> {
+  const inspected = await inspectRemoteCommand(envelope, key, authority);
+  if (inspected.kind === "invalid") throw new Error("Invalid remote command payload.");
+  return inspected.payload;
+}
+
+export async function inspectRemoteCommand(
+  envelope: EncryptedEnvelope,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<AuthenticatedPayloadInspection<RemoteCommandPayload>> {
   if (authority.kind !== "command") throw new Error("Invalid remote command authority.");
-  const parsed = parseRemoteCommandPayload(await decryptJson(envelope, key, authority));
-  if (parsed === null) throw new Error("Invalid remote command payload.");
-  return parsed;
+  return await inspectAuthenticatedJson(envelope, key, authority, parseRemoteCommandPayload);
 }
 
 export async function encryptDeviceCommand(
@@ -1064,10 +1502,18 @@ export async function decryptDeviceCommand(
   key: Uint8Array,
   authority: CloudPayloadAuthority,
 ): Promise<DeviceCommandPayload> {
+  const inspected = await inspectDeviceCommand(envelope, key, authority);
+  if (inspected.kind === "invalid") throw new Error("Invalid device command payload.");
+  return inspected.payload;
+}
+
+export async function inspectDeviceCommand(
+  envelope: EncryptedEnvelope,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<AuthenticatedPayloadInspection<DeviceCommandPayload>> {
   if (authority.kind !== "device_command") throw new Error("Invalid device command authority.");
-  const parsed = parseDeviceCommandPayload(await decryptJson(envelope, key, authority));
-  if (parsed === null) throw new Error("Invalid device command payload.");
-  return parsed;
+  return await inspectAuthenticatedJson(envelope, key, authority, parseDeviceCommandPayload);
 }
 
 export async function encryptDeviceCommandResult(
@@ -1141,6 +1587,36 @@ export async function decryptDeviceRegistry(
   if (authority.kind !== "device_registry") throw new Error("Invalid device registry authority.");
   const parsed = parseDeviceRegistryPayload(await decryptJson(envelope, key, authority));
   if (parsed === null) throw new Error("Invalid device registry payload.");
+  return parsed;
+}
+
+export async function encryptMemorySummary(
+  payload: MemorySummaryPayload,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<EncryptedEnvelope> {
+  const parsed = parseMemorySummaryPayload(payload);
+  if (authority.kind !== "memory_summary" || parsed === null) {
+    throw new Error("Invalid memory summary payload.");
+  }
+  if (!memorySummaryFitsEncryptedEnvelope(parsed)) {
+    throw new Error("Encrypted memory summary exceeds its closed envelope bound.");
+  }
+  const envelope = await encryptJson(parsed, key, authority);
+  if (envelope.ciphertext.length > cloudLimits.memorySummaryCiphertextCharacters) {
+    throw new Error("Encrypted memory summary exceeds its closed envelope bound.");
+  }
+  return envelope;
+}
+
+export async function decryptMemorySummary(
+  envelope: EncryptedEnvelope,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<MemorySummaryPayload> {
+  if (authority.kind !== "memory_summary") throw new Error("Invalid memory summary authority.");
+  const parsed = parseMemorySummaryPayload(await decryptJson(envelope, key, authority));
+  if (parsed === null) throw new Error("Invalid memory summary payload.");
   return parsed;
 }
 

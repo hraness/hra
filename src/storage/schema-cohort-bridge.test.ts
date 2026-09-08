@@ -45,11 +45,16 @@ test("an authentic private48 checkpoint bridges once without rewriting immutable
   const now = 1_900_000_001_000;
   const store = new StateStore(paths, { now: () => now });
   cleanup.push(async () => { store.close(); });
-  expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+  expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
   expect(snapshots(database)).toEqual(old);
   expect(database.query("SELECT version,applied_at FROM migrations WHERE version>=40 ORDER BY version").all())
-    .toEqual([{ version: 40, applied_at: now }, ...privateTask48Fixture.migrations
-      .filter((row) => row.version >= 40).map((row) => ({ version: row.version + 1, applied_at: row.applied_at }))]);
+    .toEqual([
+      ...Array.from({ length: 11 }, (_, index) => ({ version: index + 40, applied_at: now })),
+      // Private usage slots 40–48 retain their original times at joined slots 51–59.
+      ...privateTask48Fixture.migrations.filter((row) => row.version >= 40)
+        .map((row) => ({ version: row.version + 11, applied_at: row.applied_at })),
+      { version: 60, applied_at: now },
+    ]);
   expect(database.query("SELECT message,state FROM queue_entries WHERE id=?").get(privateTask48Fixture.queueId))
     .toEqual({ message: "Private sealed queue remains pending.", state: "pending" });
   const reopened = new StateStore(paths, { readonly: true });
@@ -201,9 +206,11 @@ test("authentic private48 usage preserves exact authority across the bridge whil
   const now = 40_000;
   const expectedLedger = [
     ...archived.migrations.filter((row) => row.version < 40),
-    { version: 40, applied_at: now },
+    ...Array.from({ length: 11 }, (_, index) => ({ version: index + 40, applied_at: now })),
+    // Only the nine proved private usage slots move; their timestamps do not.
     ...archived.migrations.filter((row) => row.version >= 40)
-      .map((row) => ({ version: row.version + 1, applied_at: row.applied_at })),
+      .map((row) => ({ version: row.version + 11, applied_at: row.applied_at })),
+    { version: 60, applied_at: now },
   ];
   const assertExact = (store: StateStore) => {
     expect(store.requireProviderAccountAuthority(archived.profileId, "codex")).toEqual(archived.authority);
@@ -217,7 +224,7 @@ test("authentic private48 usage preserves exact authority across the bridge whil
   };
   const migrated = new StateStore(paths, { now: () => now });
   cleanup.push(async () => { migrated.close(); });
-  expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+  expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
   assertExact(migrated);
   migrated.recordUsage(archived.profileId, 1, 10_000, archived.first, archived.authority);
   migrated.recordUsagePollFailure(archived.profileId, archived.fingerprint, 2, 20_000, archived.authority);

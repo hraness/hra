@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { canonical40QueuesDatabaseBytes, canonical40QueuesFixture } from "../../scripts/fixtures/canonical40-queues";
+import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
 import { StateStore, type StoredMessageAttachment } from "./state-store";
 
@@ -37,7 +38,9 @@ async function fixture() {
   databases.push(database);
   database.exec("PRAGMA foreign_keys=ON");
   const input = { sessionId: session.id, message: "original private body", profileGeneration: authority.processGeneration,
-    providerAuthority: authority, idempotencyKey: randomUUID(), attachments: [attachment] };
+    providerAuthority: authority, idempotencyKey: randomUUID(),
+    attachments: [{ digest: attachment.digest, name: attachment.name, mediaType: attachment.mediaType, byteLength: attachment.byteLength }],
+    storedAttachments: [attachment] };
   const enqueue = (request: typeof input = input) => {
     const reservation = store.reserveAttachmentIngress({ kind: "session.queue", sessionId: request.sessionId,
       idempotencyKey: request.idempotencyKey, message: request.message, providerAuthority: request.providerAuthority,
@@ -129,9 +132,10 @@ describe("queue attachment durable integrity", () => {
   });
   test("new invalid Unicode is refused with no request or attachment writes", async () => {
     const f = await fixture();
-    for (const input of [{ ...f.input, message: "bad\ud800" }, { ...f.input, attachments: [{ ...attachment, name: "bad\ud800.txt" }] }]) {
-      expect(() => f.store.enqueueIdempotent(input)).toThrow("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
-    }
+    expect(() => f.store.enqueueIdempotent({ ...f.input, message: "bad\ud800" })).toThrow("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+    expect(() => f.store.enqueueIdempotent({ ...f.input, attachments: [{ digest: attachment.digest,
+      byteLength: attachment.byteLength, mediaType: attachment.mediaType, name: "bad\ud800.txt" }] }))
+      .toThrow("An attachment name must be a single-line file name");
     expect(f.database.query("SELECT * FROM queue_entries").all()).toEqual([]);
     expect(f.database.query("SELECT * FROM queue_attachment_identities").all()).toEqual([]);
     expect(f.database.query("SELECT * FROM message_attachments").all()).toEqual([]);
@@ -151,7 +155,7 @@ describe("queue attachment durable integrity", () => {
       request: { title: "wrong owner" }, idempotencyKey: f.input.idempotencyKey })).toThrow();
     f.close(); expect(() => f.reopen()).toThrow("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
   });
-  test("an anchor-only queue schema is not mistaken for a legacy namespace before current-cohort repair", async () => {
+  test("an anchor-only queue schema is refused without current-cohort repair", async () => {
     const f = await fixture(); f.enqueue();
     // Keep the genuine current cohort and every surviving marker/anchor. An
     // absent owned table is corruption, not permission to repair a legacy DB.
@@ -159,9 +163,14 @@ describe("queue attachment durable integrity", () => {
     const before = f.database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").all();
     expect(() => f.store.prepareMutation({ kind: "session.rename", authorityId: f.session.id, authorityGeneration: f.authority.processGeneration,
       request: {}, idempotencyKey: f.input.idempotencyKey })).toThrow();
-    f.close(); expect(() => f.reopen()).toThrow("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
-    expect(f.database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").all()).toEqual(before);
-    expect(f.database.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+    f.close();
+    // Dropping the table also deletes its independently audited retired-provider
+    // guard. Both open modes must refuse that first schema boundary unchanged.
+    for (const readonly of [false, true]) {
+      expect(() => { f.reopen(readonly); }).toThrow("RETIRED_PROVIDER_ADMISSION_SCHEMA_INVALID");
+      expect(f.database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").all()).toEqual(before);
+    }
+    expect(f.database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
   });
   test("a retained format marker prevents public manifest repair after both seals disappear", async () => {
     const f = await fixture(); const queue = f.enqueue();
@@ -216,13 +225,16 @@ describe("queue attachment durable integrity", () => {
   });
   test.each(["dispatching", "ambiguous"] as const)("retains %s attachments beyond the display cap", async (state) => {
     const f = await fixture(); const queued = f.enqueue();
+    const binding = f.store.requireSessionPresetRequirement(f.session.id);
     const evidence = f.store.beginQueueEffect({ queueId: queued.id, sessionId: f.session.id, profileGeneration: f.authority.processGeneration, providerAuthority: f.authority,
+      providerConnectionId: "48000000-0000-4000-8000-000000000003",
       evidence: { kind: "queue.dispatch", queueId: queued.id, sessionId: f.session.id, providerThreadId: "queue-integrity", profileGeneration: f.authority.processGeneration,
         baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null }, clientMessageId: queued.id,
-        messageDigest: createHash("sha256").update(f.input.message).digest("hex"), runtimeProfile: {
-          profileId: f.profile.id, processGeneration: f.profile.processGeneration, observedAt: 2_000, preset: "high", model: "gpt-6-astra", reasoningEffort: "max",
+        messageDigest: createHash("sha256").update(f.input.message).digest("hex"), runtimeProfile: effectiveRuntimeProfileSchema.parse({
+          profileId: f.profile.id, processGeneration: f.profile.processGeneration, observedAt: 2_000,
+          preset: binding.preset, model: binding.requirement.model, reasoningEffort: binding.requirement.effort,
           serviceTier: null, fast: false, approvalPolicy: "on-request", reviewMode: "auto_review", permissionProfile: ":workspace", computerUse: true, pluginCapability: true, enabledApps: [],
-        } } });
+        }) } });
     if (state === "ambiguous") f.store.markQueueEffectAmbiguous(queued.id, evidence.digest);
     for (let index = 0; index < 201; index++) f.store.recordMessageAttachments({ sessionId: f.session.id, sourceId: `display_${String(index)}`, attachments: [attachment] });
     expect(f.store.requireQueue(queued.id).state).toBe(state);
@@ -256,13 +268,16 @@ describe("queue attachment durable integrity", () => {
     expect(f.store.queueAttachmentManifest(queue.id)).toEqual([]);
     expect(f.database.query("SELECT kind,state FROM mutation_attempts WHERE kind='session.queue'").all()).toEqual([{ kind: "session.queue", state: "applied" }]);
     expect(f.database.query("SELECT queue_id FROM queue_attachment_identity_anchors").all()).toEqual([{ queue_id: queue.id }]);
+    const binding = f.store.requireSessionPresetRequirement(f.session.id);
     const started = f.store.beginQueueEffect({ queueId: queue.id, sessionId: f.session.id, profileGeneration: f.authority.processGeneration, providerAuthority: f.authority,
+      providerConnectionId: "48000000-0000-4000-8000-000000000003",
       evidence: { kind: "queue.dispatch", queueId: queue.id, sessionId: f.session.id, providerThreadId: "queue-integrity", profileGeneration: f.authority.processGeneration,
         baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null }, clientMessageId: queue.id,
-        messageDigest: createHash("sha256").update(queue.message).digest("hex"), runtimeProfile: {
-          profileId: f.profile.id, processGeneration: f.profile.processGeneration, observedAt: 2_000, preset: "high", model: "gpt-6-astra", reasoningEffort: "max",
+        messageDigest: createHash("sha256").update(queue.message).digest("hex"), runtimeProfile: effectiveRuntimeProfileSchema.parse({
+          profileId: f.profile.id, processGeneration: f.profile.processGeneration, observedAt: 2_000,
+          preset: binding.preset, model: binding.requirement.model, reasoningEffort: binding.requirement.effort,
           serviceTier: null, fast: false, approvalPolicy: "on-request", reviewMode: "auto_review", permissionProfile: ":workspace", computerUse: true, pluginCapability: true, enabledApps: [],
-        } } });
+        }) } });
     expect(started.queueId).toBe(queue.id);
     expect(f.store.requireQueue(queue.id).state).toBe("dispatching");
   });

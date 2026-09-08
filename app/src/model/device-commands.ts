@@ -1,10 +1,11 @@
 import {
+  activeRemotePresetSelection,
   deviceCommandLoginResultLifetimeMs,
   deviceCommandLimits,
   parseDeviceCommandPayload,
   type DeviceCommandPayload,
   type DeviceCommandResultPayload,
-  type ModelPreset,
+  type SupportedPreset,
   type NotificationHoursUpdate,
 } from "../hra/cloud";
 import type { MachineView } from "./settings-view";
@@ -17,16 +18,16 @@ import type { MachineView } from "./settings-view";
  * that adds or drops a field fails here rather than at the machine.
  */
 
-export type PresetChoice = ModelPreset;
+export type PresetChoice = SupportedPreset;
 
-/** The UI default the plan names: Astra Ultra. */
+/** The stable Codex Ultra alias; the target daemon owns its exact active binding. */
 export const defaultSessionStartPreset: PresetChoice = "ultra";
 
-export type SessionStartProvider = "codex" | "claude" | "devin";
+export type SessionStartProvider = "codex" | "claude";
 
 export const defaultSessionStartPresetForProvider = (
   provider: SessionStartProvider,
-): PresetChoice => provider === "claude" ? "fable-max" : provider === "devin" ? "astra" : "ultra";
+): PresetChoice => provider === "claude" ? "fable-max" : "ultra";
 
 export type SessionStartTarget = Readonly<{
   accountLabel: string;
@@ -43,7 +44,7 @@ export type SessionStartTarget = Readonly<{
 export function sessionStartTargetLabel(target: SessionStartTarget): string {
   const provider = target.provider === "claude"
     ? "Claude Code (Linux machine only)"
-    : target.provider === "devin" ? "Devin" : "Codex";
+    : "Codex";
   return `${target.accountLabel} — ${target.machineLabel} — ${provider}`;
 }
 
@@ -79,7 +80,7 @@ export function sessionStartCommand(input: Readonly<{
   return build({
     accountPublicId: input.accountPublicId,
     kind: "session_start",
-    preset: input.preset,
+    ...activeRemotePresetSelection(input.preset),
     projectPublicId: input.projectPublicId,
     prompt,
     provider: input.provider,
@@ -227,6 +228,7 @@ export function sessionStartTargets(
     if (!machine.deviceCommandsAllowed) continue;
     if (machine.projects.length === 0) continue;
     for (const account of machine.accounts) {
+      if (account.provider === "devin") continue;
       if (account.status !== "signed_in") continue;
       targets.push({
         accountLabel: account.label,
@@ -290,6 +292,8 @@ export function deviceCommandNotice(command: Readonly<{
     case "effect_started":
       return { text: "Running on the machine…", tone: "pending" };
     case "applied":
+      if (command.kind === "account_login_start") return { text: "Login started.", tone: "settled" };
+      if (command.kind === "account_login_status") return { text: "Status checked.", tone: "settled" };
       return command.kind === "session_start"
         ? { text: "Started. The new session appears here shortly.", tone: "settled" }
         : { text: "Done.", tone: "settled" };

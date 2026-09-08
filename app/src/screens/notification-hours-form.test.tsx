@@ -82,7 +82,7 @@ const machine: MachineView = {
   accountLinkingAllowed: false,
   accounts: [],
   attentionEmailEnabled: false,
-  daemonVersion: "0.6.0",
+  daemonVersion: "0.6.1",
   defaultApprovalMode: "auto:all",
   defaultPreset: "ultra",
   deviceCommandsAllowed: true,
@@ -90,6 +90,8 @@ const machine: MachineView = {
   deviceStatus: "active",
   heartbeatAt: 1_760_000_000_000,
   label: "Studio",
+  memorySummary: null,
+  memorySummaryFreshness: "unsupported",
   notificationHours: {
     endMinute: 1_020,
     revision: 4,

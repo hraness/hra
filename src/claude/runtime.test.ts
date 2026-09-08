@@ -13,6 +13,7 @@ import {
   CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
   type ClaudeNativeFallbackCapability,
 } from "./pin";
+import { HRA_SESSION_PREAMBLE } from "../domain/hra-preamble";
 import { presetRequirements } from "../domain/presets";
 import {
   buildPinnedClaudeRuntimeArgv,
@@ -20,6 +21,7 @@ import {
   locateClaudeExecutable,
   resolvePinnedClaudeRuntime,
   spawnClaudeVersionProbe,
+  withClaudeHostToolRuntime,
   type ClaudeVersionProbeProcess,
 } from "./runtime";
 
@@ -72,8 +74,11 @@ describe("pinned Claude runtime", () => {
       CLAUDE_PIN_MODEL,
       "--effort",
       CLAUDE_PIN_EFFORT,
+      "--system-prompt-snapshot",
+      "on",
     ]);
     // "max without ultracode".
+    expect(runtime.argv).not.toContain("--append-system-prompt");
     expect(runtime.argv).not.toContain("ultracode");
     expect(runtime.argv).not.toContain("--dangerously-skip-permissions");
   });
@@ -98,6 +103,8 @@ describe("pinned Claude runtime", () => {
       CLAUDE_PIN_MODEL,
       "--effort",
       CLAUDE_PIN_EFFORT,
+      "--system-prompt-snapshot",
+      "on",
     ]);
 
     expect(buildPinnedClaudeRuntimeArgv({
@@ -124,6 +131,8 @@ describe("pinned Claude runtime", () => {
       CLAUDE_PIN_FALLBACK_MODEL,
       "--effort",
       CLAUDE_PIN_EFFORT,
+      "--system-prompt-snapshot",
+      "on",
     ]);
   });
 
@@ -164,6 +173,50 @@ describe("pinned Claude runtime", () => {
         status: "unavailable",
       } as unknown as ClaudeNativeFallbackCapability,
     })).toThrow("reviewed reason");
+  });
+
+  test("adds exactly one private MCP configuration under strict isolation", async () => {
+    const { configDir, path } = await fakeExecutable();
+    const runtime = await resolvePinnedClaudeRuntime({
+      configDir,
+      executablePath: path,
+      probeVersion: async () => CLAUDE_PIN,
+    });
+    const mcpConfigPath = join(configDir, "private-session", "mcp.json");
+    const bound = withClaudeHostToolRuntime(runtime, { mcpConfigPath });
+    expect(bound.argv.slice(-3)).toEqual([
+      "--mcp-config",
+      mcpConfigPath,
+      "--strict-mcp-config",
+    ]);
+    expect(bound.argv.filter((argument) => argument === "--append-system-prompt")).toHaveLength(1);
+    expect(bound.argv[bound.argv.indexOf("--append-system-prompt") + 1])
+      .toBe(HRA_SESSION_PREAMBLE.text);
+    expect(bound.argv.filter((argument) => argument === "--system-prompt-snapshot")).toHaveLength(1);
+    expect(() => withClaudeHostToolRuntime(bound, { mcpConfigPath })).toThrow(ClaudeError);
+    expect(() => withClaudeHostToolRuntime(runtime, { mcpConfigPath: "relative/mcp.json" }))
+      .toThrow("must be absolute");
+  });
+
+  test("threads cancellation through runtime resolution and checks it after the probe", async () => {
+    const { configDir, path } = await fakeExecutable();
+    const controller = new AbortController();
+    const cancellation = new Error("version resolution canceled");
+    const failure = await resolvePinnedClaudeRuntime({
+      configDir,
+      executablePath: path,
+      probeVersion: async (input) => {
+        expect(input.signal).toBe(controller.signal);
+        controller.abort(cancellation);
+        return CLAUDE_PIN;
+      },
+      signal: controller.signal,
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBe(cancellation);
   });
 
   test("refuses an unpinned build instead of parsing it hopefully", async () => {

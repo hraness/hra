@@ -19,6 +19,7 @@ const captures = [
   { name: "retired-provider retained authority", bytes: combined49RetiredDatabaseBytes, identity: combined49RetiredFixture },
 ] as const;
 const recordedAt = 1_900_000_000_000;
+const migratedAt = recordedAt + 1_000;
 const launchTableName = "session_claude_process_launch_intents";
 const hash = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 const schemaObject = z.object({ type: z.string(), name: z.string(), tbl_name: z.string(), sql: z.string().nullable() }).strict();
@@ -54,7 +55,19 @@ const snapshot = (database: Database) => {
   );
   expect(tables.length).toBeLessThanOrEqual(512);
   const rows: Record<string, z.infer<typeof rowSchema>[]> = {};
+  const columns: Record<string, string[]> = {};
+  const cells: Record<string, z.infer<typeof rowSchema>[]> = {};
   for (const { name } of tables) {
+    const names = z.object({ name: z.string().regex(/^[a-z][a-z0-9_]*$/u) }).array().parse(
+      database.query(`PRAGMA table_info("${name}")`).all(),
+    ).map((column) => column.name);
+    columns[name] = names;
+    const projection = names.map((column) => `json_array(typeof("${column}"),
+      CASE WHEN typeof("${column}") IN ('text','blob') THEN hex(CAST("${column}" AS BLOB))
+      ELSE "${column}" END) AS "${column}"`).join(",");
+    cells[name] = rowSchema.array().parse(database.query(`SELECT ${projection} FROM "${name}" LIMIT 4097`).all())
+      .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+    expect(cells[name].length).toBeLessThanOrEqual(4096);
     // Fresh prepared statements avoid stale SELECT * metadata after ALTER.
     const statement = database.prepare(`SELECT * FROM "${name}" LIMIT 4097`);
     try {
@@ -71,6 +84,8 @@ const snapshot = (database: Database) => {
     schema: schemaObject.array().parse(database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()),
     foreignKeys: database.query("PRAGMA foreign_key_check").all(),
     rows,
+    columns,
+    cells,
   };
   expect(Buffer.byteLength(JSON.stringify(value), "utf8")).toBeLessThanOrEqual(16 * 1024 * 1024);
   expect(value.foreignKeys).toEqual([]);
@@ -85,6 +100,45 @@ const inspect = (path: string) => {
   } finally {
     database.close(false);
   }
+};
+
+const assertMigratedHistory = (original: ReturnType<typeof snapshot>, migrated: ReturnType<typeof snapshot>): void => {
+  expect(migrated.version).toEqual({ user_version: 60 });
+  const ledger = z.object({ version: z.number(), applied_at: z.number() }).strict().array().parse(original.ledger);
+  expect(migrated.ledger).toEqual([
+    ...ledger.filter((row) => row.version <= 40),
+    ...Array.from({ length: 10 }, (_, index) => ({ version: index + 41, applied_at: migratedAt })),
+    ...ledger.filter((row) => row.version >= 41).map((row) => ({ ...row, version: row.version + 10 })),
+    { version: 60, applied_at: migratedAt },
+  ]);
+  for (const [table, names] of Object.entries(original.columns)) {
+    for (const name of names) expect(migrated.columns[table]).toContain(name);
+    if (table === "migrations" || table === "session_autorespond_counters") continue;
+    const actual = migrated.cells[table];
+    if (actual === undefined) throw new Error(`Missing migrated fixture table: ${table}`);
+    const expected = original.cells[table];
+    if (expected === undefined) throw new Error(`Missing original fixture table: ${table}`);
+    // Adding columns cannot authorize changes to any observed original cell,
+    // including the exact UTF-8 bytes of retained JSON/digest preimages.
+    expect(actual.map((row) => Object.fromEntries(names.map((name) => [name, row[name]])))
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))).toEqual(expected);
+  }
+  const counters = new Map(z.object({ session_id: z.string(), consecutive_count: z.number(), updated_at: z.number() })
+    .strict().array().parse(original.rows.session_autorespond_counters).map((row) => [row.session_id, row] as const));
+  for (const session of rowSchema.array().parse(original.rows.sessions)) {
+    const id = z.string().parse(session.id);
+    const previous = counters.get(id);
+    // Canonical44's frozen conservative floor is the sole old-row metadata
+    // exception; do not turn it into permission to ignore this whole table.
+    counters.set(id, { session_id: id, consecutive_count: Math.max(previous?.consecutive_count ?? 0, 3),
+      updated_at: Math.max(previous?.updated_at ?? 0, migratedAt) });
+  }
+  expect(migrated.rows.session_autorespond_counters).toEqual([...counters.values()]
+    .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
+  // This compatibility variant must remain nullable; the join must not
+  // silently replace its admitted historical declaration with current DDL.
+  expect(migrated.schema.find((object) => object.name === launchTableName))
+    .toEqual(original.schema.find((object) => object.name === launchTableName));
 };
 
 const withNullableLaunchFixture = async (
@@ -165,18 +219,31 @@ const withNullableLaunchFixture = async (
 
 for (const capture of captures) {
   for (const firstReadonly of [true, false]) {
-    test(`synthetic nullable-launch DDL preserves ${capture.name} through full ${firstReadonly ? "RO/RW" : "RW/RO"} current49 opens`, async () => {
+    test(`synthetic nullable-launch DDL preserves ${capture.name} through 49-to-60 migration and ${firstReadonly ? "RO/RW" : "RW/RO"} reopens`, async () => {
       await withNullableLaunchFixture(capture, false, async (paths, expected) => {
+        const originalBytes = hash(await readFile(paths.database));
+        expect(() => new StateStore(paths, { readonly: true }))
+          .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:49:60");
+        expect(inspect(paths.database)).toEqual(expected);
+        expect(hash(await readFile(paths.database))).toBe(originalBytes);
+        const upgrading = new StateStore(paths, { now: () => migratedAt, resolveMachineTimeZone: () => "UTC" });
+        let migrated: ReturnType<typeof snapshot>;
+        try {
+          expect(upgrading.listClaudeProcessLaunchIntents()).toEqual([]);
+          migrated = inspect(paths.database);
+          assertMigratedHistory(expected, migrated);
+        } finally { upgrading.close(); }
+        expect(inspect(paths.database)).toEqual(migrated);
         for (const readonly of [firstReadonly, !firstReadonly]) {
           const beforeBytes = hash(await readFile(paths.database));
-          const store = new StateStore(paths, { readonly, now: () => recordedAt, resolveMachineTimeZone: () => "UTC" });
+          const store = new StateStore(paths, { readonly, now: () => migratedAt + 1, resolveMachineTimeZone: () => "UTC" });
           try {
             expect(store.listClaudeProcessLaunchIntents()).toEqual([]);
-            expect(inspect(paths.database)).toEqual(expected);
+            expect(inspect(paths.database)).toEqual(migrated);
           } finally {
             store.close();
           }
-          expect(inspect(paths.database)).toEqual(expected);
+          expect(inspect(paths.database)).toEqual(migrated);
           if (readonly) expect(hash(await readFile(paths.database))).toBe(beforeBytes);
         }
       });
@@ -184,12 +251,12 @@ for (const capture of captures) {
   }
 }
 
-test("nullable launch DDL does not admit an unproved NULL-key/NULL-marker row through either current49 open", async () => {
+test("nullable launch DDL keeps RO migration refusal distinct from the RW unproved NULL-key/NULL-marker row refusal", async () => {
   await withNullableLaunchFixture(captures[0], true, async (paths, expected) => {
     for (const readonly of [true, false]) {
       const beforeBytes = hash(await readFile(paths.database));
       expect(() => new StateStore(paths, { readonly, now: () => recordedAt, resolveMachineTimeZone: () => "UTC" }))
-        .toThrow("CLAUDE_PROCESS_CUSTODY_CORRUPT");
+        .toThrow(readonly ? "STATE_SCHEMA_MIGRATION_REQUIRED:49:60" : "CLAUDE_PROCESS_CUSTODY_CORRUPT");
       expect(inspect(paths.database)).toEqual(expected);
       expect(hash(await readFile(paths.database))).toBe(beforeBytes);
     }

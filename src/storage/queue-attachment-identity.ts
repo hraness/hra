@@ -7,6 +7,7 @@ import { isAttachmentImageMediaType, type AttachmentReference } from "../domain/
 import { providerAccountAuthoritySchema } from "../domain/provider-accounts";
 import { attemptIdSchema, queueIdSchema, sessionIdSchema, unixMillisecondsSchema, utf8Bytes } from "../domain/values";
 import { normalizeSchemaSql } from "./schema-cohort";
+import { schemaSqlBeforeJoinedTranscriptColumns, type UsageSchemaColumnMode } from "./joined-transcript-columns";
 
 export const QUEUE_ATTACHMENT_FORMAT = "atomic_attachments_v1";
 export const QUEUE_ATTACHMENT_PENDING_SOURCE_CAP = 200;
@@ -171,7 +172,7 @@ export function applyQueueAttachmentSchema(database: Database): void {
   }
   for (const object of QUEUE_ATTACHMENT_SCHEMA_OBJECTS) database.exec(object.sql);
 }
-export function assertQueueAttachmentSchema(database: Database): void {
+export function assertQueueAttachmentSchema(database: Database, mode: UsageSchemaColumnMode = "historical"): void {
   const column = database.query("SELECT type,\"notnull\" AS required,dflt_value FROM pragma_table_info('queue_entries') WHERE name='enqueue_identity_format'").get() as
     { type: string; required: number; dflt_value: string | null } | null;
   if (column?.type !== "TEXT" || column.required !== 0 || column.dflt_value !== null) return corrupt();
@@ -179,21 +180,21 @@ export function assertQueueAttachmentSchema(database: Database): void {
   if (identityColumn?.type !== "TEXT" || identityColumn.required !== 0 || identityColumn.dflt_value !== null) return corrupt();
   const parent = database.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='queue_entries'").get() as { sql: string } | null;
   if (parent === null || /\/\*|--/u.test(parent.sql)) return corrupt();
-  const parentSql = normalizeSchemaSql(parent.sql);
+  const parentSql = schemaSqlBeforeJoinedTranscriptColumns(database, "queue_entries", parent.sql, mode);
   // These owned columns are the complete appended tail in the admitted schema.
   // A future queue-column migration must extend this exact audit, not match
   // declaration text that could occur within an unrelated quoted identifier.
   const suffix = normalizeSchemaSql(`, enqueue_identity_format TEXT CHECK(enqueue_identity_format IS NULL OR enqueue_identity_format='${QUEUE_ATTACHMENT_FORMAT}'),
     enqueue_identity_attempt_id TEXT REFERENCES queue_attachment_identities(attempt_id) DEFERRABLE INITIALLY DEFERRED
     CHECK((enqueue_identity_format IS NULL AND enqueue_identity_attempt_id IS NULL) OR (enqueue_identity_format IS '${QUEUE_ATTACHMENT_FORMAT}' AND enqueue_identity_attempt_id IS NOT NULL))) STRICT`);
-  if (!parentSql.endsWith(suffix)) return corrupt();
+  if (parentSql === null || !parentSql.endsWith(suffix)) return corrupt();
   for (const object of QUEUE_ATTACHMENT_SCHEMA_OBJECTS) {
     const row = database.query("SELECT type,tbl_name,sql FROM sqlite_master WHERE name=?").get(object.name) as { type: string; tbl_name: string; sql: string } | null;
     if (row === null || row.type !== object.type || row.tbl_name !== object.table || normalizeSchemaSql(row.sql) !== normalizeSchemaSql(object.sql)) return corrupt();
   }
 }
 export function readQueueAttachmentIdentity(database: Database, queueIdInput: string): QueueAttachmentIdentity | null {
-  assertQueueAttachmentSchema(database);
+  assertQueueAttachmentSchema(database, "joined");
   const queueId = queueIdSchema.parse(queueIdInput);
   const row = database.query("SELECT * FROM queue_attachment_identities WHERE queue_id=?").get(queueId) as Record<string, unknown> | null;
   const anchor = database.query("SELECT * FROM queue_attachment_identity_anchors WHERE queue_id=?").get(queueId) as Record<string, unknown> | null;
@@ -237,7 +238,7 @@ export function assertQueueAttachmentMutationIntegrity(database: Database, looku
   if (version < 47
     && database.query("SELECT 1 FROM sqlite_master WHERE name LIKE 'queue_attachment_%' LIMIT 1").get() === null
     && database.query("SELECT 1 FROM pragma_table_info('queue_entries') WHERE name IN ('enqueue_identity_format','enqueue_identity_attempt_id')").get() === null) return;
-  assertQueueAttachmentSchema(database);
+  assertQueueAttachmentSchema(database, "joined");
   const byKey = "idempotencyKey" in lookup;
   const value = byKey ? lookup.idempotencyKey : lookup.attemptId;
   const rows = database.query(`SELECT queue_id FROM queue_attachment_identities WHERE ${byKey ? "original_key" : "attempt_id"}=?
@@ -309,8 +310,8 @@ export function insertQueueAttachmentIdentity(database: Database, input: QueueAt
   readVerifiedQueueAttachmentManifest(database, identity.queueId);
 }
 
-export function auditQueueAttachmentIdentities(database: Database): void {
-  assertQueueAttachmentSchema(database);
+export function auditQueueAttachmentIdentities(database: Database, mode: UsageSchemaColumnMode = "joined"): void {
+  assertQueueAttachmentSchema(database, mode);
   if (database.query(`SELECT 1 FROM queue_attachment_quarantines event LEFT JOIN queue_entries queue ON queue.id=event.queue_id
     LEFT JOIN queue_attachment_quarantines original ON original.queue_id=event.queue_id AND original.ordinal=1
     WHERE queue.id IS NULL OR queue.session_id!=event.session_id OR original.queue_id IS NULL

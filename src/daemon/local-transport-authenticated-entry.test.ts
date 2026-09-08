@@ -9,7 +9,7 @@ import { commandResponseSchema, LOCAL_COMMAND_REQUEST_VERSION } from "../domain/
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import { StateStore } from "../storage/state-store";
 import { LocalDaemonServer } from "./local-transport";
-import type { ClaudeRuntimePort, CloudControlPort, CodexRuntimePort, DevinRuntimePort } from "./ports";
+import type { ClaudeRuntimePort, CloudControlPort, CodexRuntimePort } from "./ports";
 import { HraService } from "./service";
 
 const rawRequest = async (socketPath: string, envelope: unknown) => await new Promise<unknown>((resolve, reject) => {
@@ -50,7 +50,6 @@ test("only an authenticated local frame can invoke the retained service composit
   const port = (name: string): unknown => new Proxy({}, {
     get: (_target, property) => {
       if (property === "close") return async () => { closed.push(name); };
-      if (name === "devin" && property === "closeCustody") return undefined;
       forbidden.push(`${name}.${String(property)}`);
       throw new Error("A transport-only fixture accessed a provider operation.");
     },
@@ -61,7 +60,7 @@ test("only an authenticated local frame can invoke the retained service composit
     store = new StateStore(paths, { resolveMachineTimeZone: () => "UTC" });
     const activeComposition = HraService.createLocalComposition({ store, paths,
       codex: port("codex") as CodexRuntimePort, claude: port("claude") as ClaudeRuntimePort,
-      devin: port("devin") as DevinRuntimePort, cloud: port("cloud") as CloudControlPort,
+      cloud: port("cloud") as CloudControlPort,
       daemonAuthority: { assertCurrent: async () => undefined, close: () => undefined }, requestStop: () => undefined });
     composition = activeComposition;
     let handlerCalls = 0;
@@ -108,7 +107,7 @@ test("only an authenticated local frame can invoke the retained service composit
       finally { store?.close(); await rm(root, { recursive: true, force: true }); }
     }
   }
-  expect(closed.toSorted()).toEqual(["claude", "codex", "devin"]);
+  expect(closed.toSorted()).toEqual(["claude", "codex"]);
   expect(forbidden).toEqual([]);
 });
 

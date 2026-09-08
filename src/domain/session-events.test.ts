@@ -226,6 +226,23 @@ describe("session events", () => {
     })).toThrow();
   });
 
+  test("retains peer-session authorship without accepting caller-defined actors", () => {
+    expect(sessionEventBodySchema.parse({
+      type: "user_message",
+      turnId: null,
+      actor: "peer_session",
+      text: "Untrusted coordination from another HRA session.",
+      omittedCharacters: 0,
+    })).toMatchObject({ actor: "peer_session" });
+    expect(() => sessionEventBodySchema.parse({
+      type: "user_message",
+      turnId: null,
+      actor: "owner",
+      text: "Forged authority.",
+      omittedCharacters: 0,
+    })).toThrow();
+  });
+
   test("keeps all public envelopes bounded and session-account fenced", () => {
     const parsed = sessionEventSchema.parse({
       version: 1,

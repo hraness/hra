@@ -32,6 +32,32 @@ const events = [
   },
 ] as const;
 
+/**
+ * The released v0.5.0 reader accepted only the two legacy actor values and
+ * ignored a bounded number of additive keys. Keep this narrow copy beside the
+ * compatibility assertion so a future wire change cannot silently rely on a
+ * reader that users have not deployed yet.
+ */
+function releasedV050AcceptsCompactUserMessage(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Readonly<Record<string, unknown>>;
+  let keys: readonly (string | symbol)[];
+  try {
+    keys = Reflect.ownKeys(record);
+  } catch {
+    return false;
+  }
+  return keys.length <= 4 + 12
+    && ["kind", "sequence", "text", "turnId"].every((key) => Object.hasOwn(record, key))
+    && record.kind === "user_message"
+    && Number.isSafeInteger(record.sequence)
+    && (record.sequence as number) >= 1
+    && typeof record.text === "string"
+    && record.text.length <= 64_000
+    && typeof record.turnId === "string"
+    && (record.actor === undefined || record.actor === "human" || record.actor === "autorespond");
+}
+
 describe("encrypted session projections", () => {
   test("allows only project-relative bounded file names", () => {
     expect(isProjectRelativePath("src/example.ts")).toBe(true);
@@ -577,9 +603,8 @@ describe("encrypted session projections", () => {
     }])).toBeNull();
   });
 
-  test("versions the user_message actor and mixes old and new chunk shapes", () => {
+  test("keeps non-owner actor detail additive for the released v0.5 reader", () => {
     const humanMessage = { kind: "user_message", sequence: 1, text: "fix it", turnId: "turn_12345678" } as const;
-    // An old (v1) chunk carries no actor at all.
     expect(parseCompactSessionEvents([humanMessage])).toEqual([humanMessage]);
     const autorespondMessage = {
       actor: "autorespond",
@@ -589,21 +614,83 @@ describe("encrypted session projections", () => {
       turnId: "turn_12345678",
     } as const;
     expect(parseCompactSessionEvents([autorespondMessage])).toEqual([autorespondMessage]);
+    const peerMessage = {
+      ...humanMessage,
+      actor: "autorespond",
+      actorKind: "peer_session",
+    } as const;
+    expect(parseCompactSessionEvents([peerMessage])).toEqual([peerMessage]);
+    const providerSwitchMessage = {
+      ...humanMessage,
+      actor: "autorespond",
+      actorKind: "provider_switch",
+    } as const;
+    expect(parseCompactSessionEvents([providerSwitchMessage])).toEqual([providerSwitchMessage]);
+    const automationMessage = {
+      ...humanMessage,
+      actor: "autorespond",
+      actorKind: "automation",
+    } as const;
+    expect(parseCompactSessionEvents([automationMessage])).toEqual([automationMessage]);
+
+    // This is a compatibility assertion against the frozen v0.5 actor rule,
+    // not merely a round trip through the current parser. Its unknown-key
+    // slack ignores actorKind while the legacy actor remains recognizable.
+    expect(releasedV050AcceptsCompactUserMessage(peerMessage)).toBe(true);
+    expect(releasedV050AcceptsCompactUserMessage(providerSwitchMessage)).toBe(true);
+    expect(releasedV050AcceptsCompactUserMessage(automationMessage)).toBe(true);
+    expect(parseCompactSessionEvents([{ ...automationMessage, actor: "automation" }])).toBeNull();
+    expect(parseCompactSessionEvents([{ ...humanMessage, actorKind: "automation" }])).toBeNull();
+    expect(releasedV050AcceptsCompactUserMessage({
+      ...humanMessage,
+      actor: "peer_session",
+    })).toBe(false);
+
+    expect(parseCompactSessionEvents([{
+      ...humanMessage,
+      actor: "autorespond",
+      actorKind: "future_host_actor",
+    }])).toEqual([{
+      ...humanMessage,
+      actor: "autorespond",
+      actorKind: "unknown",
+    }]);
+    for (const actorKind of [null, 1, "", "PeerSession", "peer session", "x".repeat(65)]) {
+      expect(parseCompactSessionEvents([{
+        ...humanMessage,
+        actor: "autorespond",
+        actorKind,
+      }])).toBeNull();
+    }
+    expect(parseCompactSessionEvents([{ ...humanMessage, actorKind: "peer_session" }])).toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...humanMessage,
+      actor: "human",
+      actorKind: "peer_session",
+    }])).toBeNull();
     expect(parseCompactSessionEvents([{ ...humanMessage, actor: "robot" }])).toBeNull();
-    // assistant_message never carries actor; an unknown extra key on it is a
-    // forward-compatible addition and is silently dropped.
+
     const assistantWithFutureField = {
       ...events[1],
       confidence: 0.9,
     };
     expect(parseCompactSessionEvents([assistantWithFutureField])).toEqual([events[1]]);
-    // Mixed-version decode: one old-shape chunk (no actor) followed by one
-    // new-shape chunk (an unknown extra key), decoded together as one page.
     const mixed = [
       humanMessage,
-      { ...events[1], sequence: 2, hypotheticalFutureField: true },
+      { ...peerMessage, sequence: 2 },
+      {
+        ...providerSwitchMessage,
+        actorKind: "future_host_actor",
+        sequence: 3,
+      },
+      { ...events[1], sequence: 4, hypotheticalFutureField: true },
     ];
-    expect(parseCompactSessionEvents(mixed)).toEqual([humanMessage, { ...events[1], sequence: 2 }]);
+    expect(parseCompactSessionEvents(mixed)).toEqual([
+      humanMessage,
+      { ...peerMessage, sequence: 2 },
+      { ...providerSwitchMessage, actorKind: "unknown", sequence: 3 },
+      { ...events[1], sequence: 4 },
+    ]);
   });
 
   test("round trips only under the full session authority tuple", async () => {

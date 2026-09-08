@@ -16,14 +16,22 @@ import { z } from "zod";
 import { snapshotForeignJson } from "../domain/guards";
 import { assertCombined49AdoptionSchema } from "./combined49-adoption-schema";
 import {
-  mutationEffectEvidence49Schema as mutationEffectEvidenceSchema,
-  queueEffectEvidence49Schema as queueEffectEvidenceSchema,
-} from "./effect-evidence-codecs";
+  joinedMutationEffectEvidenceSchema,
+  joinedQueueEffectEvidenceSchema,
+} from "./joined-effect-evidence-codecs";
+import {
+  insertJoinedMutationEffectEvidence,
+  insertJoinedQueueEffectEvidence,
+  applyEffectEvidenceProvenance,
+  assertEffectEvidenceProvenanceSchema,
+  auditEffectEvidenceProvenance,
+  readMutationEffectEvidenceProvenance,
+  readQueueEffectEvidenceProvenance,
+} from "./effect-evidence-provenance";
 import {
   assertSchemaCohortObjects,
   assertSchemaCohortMigrationTail,
   schemaCohortObjects,
-  relocatePrivateTaskMigrationTail,
   normalizeSchemaSql as normalizeSqlStructure,
 } from "./schema-cohort";
 import {
@@ -42,20 +50,53 @@ import {
 const sessionSwitchAdoptionObjectNames = schemaCohortObjects(
   SESSION_SWITCH_ADOPTION_TABLES, SESSION_SWITCH_ADOPTION_GUARDS,
 ).map((object) => object.name);
+import {
+  autorespondAfterHoursPolicySchema,
+  selectAutorespondAfterHoursTier,
+  type AutorespondAfterHoursPolicy,
+  type AutorespondAfterHoursSelection,
+} from "../domain/autorespond-after-hours";
+import { decideProtocolAutorespondAuthority } from "../domain/autorespond-protocol-policy";
+import {
+  AUTORESPOND_CONSECUTIVE_LIMIT,
+  AUTORESPOND_HOUR_MS,
+  AUTORESPOND_DAY_MS,
+  AUTORESPOND_RESERVATIONS_PER_SESSION_CAP,
+  type AutorespondBudgetReservationInput,
+  type AutorespondBudgetReservationResult,
+} from "../domain/autorespond-budget";
 
 import {
   containsUnsafeTerminalScalar,
   redactAbsolutePaths,
 } from "../domain/text-safety";
 import {
+  factsMemoryHeadSchema,
+  type FactsMemoryHead,
+} from "../domain/facts-memory";
+import {
+  deriveProjectMemoryCanonicalIdentity,
+  legacyProjectMemorySpaceId,
+  PROJECT_MEMORY_EMPTY_HEAD,
+  projectMemoryCanonicalSpaceIdSchema,
+  projectMemoryIdentityContractSchema,
+  type ProjectMemoryIdentityContract,
+} from "../domain/project-memory";
+import { canonicalMemoryCiphertextLimits } from "../domain/canonical-memory-sync";
+import {
+  attachmentByteLengthSchema,
   attachmentDigestSchema,
   attachmentMediaTypeSchema,
   attachmentNameSchema,
+  attachmentReferenceListSchema,
+  legacyAttachmentReferenceListSchema,
 } from "../domain/attachment-schemas";
 import {
   ATTACHMENT_MAX_BYTES,
   ATTACHMENT_MAX_COUNT,
   isAttachmentImageMediaType,
+  isAttachmentName,
+  projectLegacyAttachmentReferences,
   type AttachmentManifestEntry,
   type AttachmentMediaType,
   type AttachmentReference,
@@ -98,20 +139,27 @@ import {
   type SessionLocalObservationSnapshot,
 } from "../domain/observation";
 import {
+  activePresetBinding,
   assertPresetSupportedByProvider,
-  currentPresetContract,
+  assertSupportedProvider,
+  isSupportedProvider,
+  isReboundCodexPreset,
   legacyPresetContract,
   presetForProviderTier,
   presetContractSchema,
-  presetRequirementForContract,
+  presetRequirementForContractV1,
   presetSchema,
   presetTiers,
   presetsForProvider,
   presetTierSchema,
   adoptableProviderSchema,
+  providerSwitchRequiresPresetContract,
   providerSchema,
+  sharedActiveCodexPresetContract,
+  supportedPresetSchema,
   type AdoptableProvider,
   type Preset,
+  type PresetContract,
   type PresetRequirement,
   type Provider,
 } from "../domain/presets";
@@ -138,7 +186,6 @@ import {
   type ProviderAccountListResult,
 } from "../domain/provider-account-list";
 import {
-  effectiveDevinRuntimeProfileSchema,
   isCodexRuntimeProfile,
   isDevinRuntimeProfile,
   reviewedRuntimeProfileProvider,
@@ -201,17 +248,60 @@ import {
   SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
   sessionEventBodySchema,
   sessionEventGapReasonSchema,
+  sessionMessageActorSchema,
   sessionEventSchema,
   type SessionEvent,
   type SessionEventBody,
   type SessionEventGapReason,
+  type SessionMessageActor,
 } from "../domain/session-events";
 import { TRANSCRIPT_SEED_MAX_CHARACTERS } from "../domain/transcript";
 import { SESSION_CONVERSATION_AUTOMATION_CAPABILITY } from "../domain/session-tasks";
+import {
+  sessionSwitchRawRequestSchema,
+  sessionSwitchRawRequestV1Schema,
+  type SessionSwitchRawRequest,
+} from "../domain/session-switch-request";
+export type { SessionSwitchRawRequest } from "../domain/session-switch-request";
+import {
+  insertSessionSwitchExecutionContext,
+  readSessionSwitchExecutionContext,
+  applySessionSwitchExecutionContexts,
+  assertSessionSwitchExecutionContextSchema,
+  auditSessionSwitchExecutionContexts,
+  sessionSwitchExecutionHostCapabilitiesSchema,
+  type SessionSwitchExecutionHostCapabilities,
+} from "./session-switch-execution-context";
+import { backfillSessionUserMessageFinalizations } from "./session-user-message-backfill";
+import { applyJoinedQueueTranscriptGuard, assertJoinedQueueTranscriptGuard } from "./joined-queue-transcript-guard";
+import { applyPeerSessionCancellationSchema, assertPeerSessionCancellationSchema,
+  insertPeerSessionCancellation, parsePeerSessionCancellationReceipt,
+  PEER_SESSION_CANCELLATION_KIND, readPeerSessionCancellation } from "./peer-session-cancellation";
+import { readHistoricalRuntimeProfileAuthorityRows } from "./historical-runtime-profile-authority";
+import {
+  applyJoinedEvidenceGuards,
+  auditJoinedEvidenceGuards,
+  JOINED_EVIDENCE_PREDECESSOR_GUARDS,
+} from "./joined-evidence-guards";
+import {
+  applyProviderLoginBindingTransitions,
+  assertProviderLoginBindingTransitionSchema,
+  assertProviderLoginCancellationBinding,
+  auditProviderLoginBindingTransitions,
+  prepareProviderLoginBindingTransition,
+  PROVIDER_LOGIN_BINDING_PREDECESSOR_GUARDS,
+  readProviderLoginBindingAuthority,
+} from "./provider-login-binding-transitions";
+import {
+  applyRetiredProviderAdmissionGuards,
+  auditRetiredProviderAdmissionGuards,
+  RETIRED_PROVIDER_ADMISSION_GUARDS,
+} from "./retired-provider-admission";
+import type { HistoricalEffectEvidenceFormat } from "./effect-evidence-reader";
 import { SESSION_SWITCH_BLOCKING_PREDICATE, SESSION_SWITCH_FENCE_SOURCE } from "./session-switch-fence";
 import { AttachmentBlobStore, ATTACHMENT_BLOB_SWEEP_GRACE_MS, parseAttachmentCleanupCandidate,
   type AttachmentCleanupCandidate, type AttachmentCleanupPort } from "./attachment-store";
-import { AttachmentCustodyError, applyAttachmentCustodySchema, auditAttachmentCustody, assertAttachmentCustodySchema, assertAttachmentDaemon, attachmentDaemonSchema,
+import { AttachmentCustodyError, applyAttachmentCustodySchema, applyJoinedAttachmentTerminalGuard, auditAttachmentCustody, assertAttachmentCustodySchema, assertAttachmentDaemon, attachmentDaemonSchema,
   assertLiveAttachmentClosure, attachmentInputProof, attachmentMutationProtectedSql, attachmentReferencesDigest,
   bindAttachmentParent, hasUnknownAttachmentCustody, hasAttachmentCustodyArtifacts, initialEmptyAttachmentInput, insertEmptyAttachmentInput,
   parseAttachmentInput, readAttachmentParent, readAttachmentSet, reconcileAttachmentTerminals, reconcileLiveAttachmentTerminals, releaseAttachmentSet,
@@ -232,6 +322,7 @@ import { appendSessionSendOutcome, applySessionSendOwnerSchema, assertLegacyMuta
   requireSessionSendOwner, sessionSendEvidenceDigest, sessionSendOwnedSql, sessionSendUnclaimedSql,
   SessionSendOwnershipError, type OwnedDirectSendOutcomeInput, type SessionSendOwnerHistory,
 } from "./session-send-owner";
+import { workPreparedEffectSchema } from "../domain/work";
 import {
   digestTranscriptSeed,
   sessionProviderSwitchDurableReceiptSchema,
@@ -256,12 +347,14 @@ import {
   attemptIdSchema,
   canonicalLabelKey,
   createAttemptId,
+  createPeerActionId,
   createProfileId,
   createProjectId,
   createQueueId,
   createSessionId,
   labelSchema,
   noteSchema,
+  peerActionIdSchema,
   profileIdSchema,
   projectIdSchema,
   queueIdSchema,
@@ -271,6 +364,7 @@ import {
   unixMillisecondsSchema,
   utf8Bytes,
   type AttemptId,
+  type PeerActionId,
   type ProfileId,
   type ProjectId,
   type QueueId,
@@ -278,14 +372,29 @@ import {
 } from "../domain/values";
 import { resolveUsableCanonicalProjectDirectory } from "./project-directory";
 import {
+  assertLegacyCanonicalProfileRows,
+  assertLegacyCanonicalProfileStorageAbsent,
+  assertLegacyCanonicalProfileStorageSchema,
+  deriveLegacySessionProfileKey,
+  LEGACY_CANONICAL_PROFILE_BACKFILL_SQL,
+  LEGACY_CANONICAL_PROFILE_COLUMNS_SQL,
+  LEGACY_CANONICAL_PROFILE_GUARDS_SQL,
+} from "./canonical-profile-storage";
+import {
   WORK_SCHEMA_SQL,
   WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL,
+  WORK_PROJECT_AUTHORITY_SCHEMA_SQL,
   WorkStore,
+  assertLegacyVersion42WorkSchema,
   assertProviderVersion39WorkSchema,
+  assertProviderVersion40WorkSchema,
   assertReadonlyWorkSchema,
   assertWorkSchema,
   assertWorkSignalProviderAuthorities,
   backfillLegacyWorkSignalProviderAuthorities,
+  assertWorkProjectAuthoritySchema,
+  installCanonicalVersion40WorkSchema,
+  installCanonicalVersion42WorkSchema,
   type WorkCapabilityIssuer,
   type WorkCapabilityVerifier,
   type WorkCursorEncoder,
@@ -299,6 +408,7 @@ import {
   SESSION_TASK_SCHEMA_SQL,
   SessionTaskStore,
   assertSessionTaskSchema,
+  type SessionTaskExecutionAuthority,
 } from "./session-task-store";
 import {
   assertCanonicalAdoption40SessionTaskSchema,
@@ -336,9 +446,9 @@ const codexProviderAccountAuthorityKeyForEmail = (email: string): string =>
 const profileStateAllowsProviderSessionAuthority = (
   provider: Provider,
   state: ProfileRecord["state"],
-): boolean => provider === "claude" || provider === "devin"
+): boolean => provider === "claude"
   ? state === "signed_in" || state === "signed_out"
-  : state === "signed_in";
+  : provider === "codex" && state === "signed_in";
 const sessionAdoptionProviderThreadIdSchema = z.string().min(1).max(200);
 const sessionAdoptionProviderProjectRootSchema = z.string().min(1).refine(
   // Personal provider homes are supported on Darwin/Linux; keep the runtime
@@ -535,6 +645,8 @@ const sessionRowSchema = z.object({
   // multi-provider presets, so `provider` plus this tier names the preset.
   preset: presetTierSchema,
   preset_contract: presetContractSchema,
+  // Canonical identity is proved against this row's own historical tuple.
+  canonical_profile_key: z.unknown(),
   fast_enabled: z.union([z.literal(0), z.literal(1)]),
   state: sessionStateSchema,
   active_turn_id: z.string().nullable(),
@@ -870,6 +982,9 @@ const restartInteractionSessionStateReasons: ReadonlySet<string> = new Set([
   "autorespond_consecutive_limit",
   "autorespond_hourly_budget",
   "autorespond_daily_budget",
+  "autorespond_policy_changed",
+  "autorespond_history_unavailable",
+  "autorespond_source_already_reserved",
   "autorespond_resolution_refused",
   "autorespond_failed",
 ]);
@@ -881,7 +996,7 @@ const restartInteractionSessionStateReasons: ReadonlySet<string> = new Set([
  * family, which names exactly which positive-gate clause refused the turn.
  */
 export const autorespondEvidenceOutcomeSchema = z.union([
-  z.enum(["accepted", "refused", "sent", "verbatim_mismatch", "responder_failed"]),
+  z.enum(["accepted", "refused", "unknown", "sent", "verbatim_mismatch", "responder_failed"]),
   z.string().regex(/^gate_failed:[a-z_]{1,48}$/u),
 ]);
 
@@ -1074,6 +1189,20 @@ export type ProviderRuntimeAccountRevocationRecord = Readonly<{
   completedAt: number | null;
 }>;
 
+export type PeerSessionDirectoryRecord = Readonly<{
+  id: SessionId;
+  title: string;
+  provider: Provider;
+  preset: Preset;
+  state: SessionRecord["state"];
+  active: boolean;
+  revision: number;
+  policy: PeerSessionPolicyMode;
+  policyRevision: number;
+  createdAt: number;
+  updatedAt: number;
+}>;
+
 export type SessionRuntimeProfileRecord = {
   sessionId: SessionId;
   revision: number;
@@ -1091,6 +1220,8 @@ export type SessionEventStreamPosition = {
 
 export type SessionEventList = SessionEventStreamPosition & {
   gapReason: SessionEventGapReason | null;
+  /** Persistent evidence that some prefix of this stream was pruned. */
+  retentionGapReason: SessionEventGapReason | null;
   events: readonly SessionEvent[];
 };
 
@@ -1142,13 +1273,6 @@ type SessionSwitchReconciliationFromPhase = z.infer<
   typeof sessionSwitchReconciliationFromPhaseSchema
 >;
 
-export type SessionSwitchRawRequest = Readonly<{
-  session: string;
-  provider: Provider;
-  account: string | null;
-  preset: Preset | null;
-}>;
-
 export type SessionSwitchTranscriptPin = Readonly<{
   streamEpoch: string;
   floorSequence: number;
@@ -1189,6 +1313,7 @@ export type SessionSwitchRecord = Readonly<{
   targetPreset: Preset;
   sourcePresetContract: z.infer<typeof presetContractSchema>;
   targetPresetContract: z.infer<typeof presetContractSchema>;
+  targetHostCapabilities?: SessionSwitchExecutionHostCapabilities;
   sourceRuntimeProfileRevision: number;
   sourceRuntimeProfileDigest: string;
   sourceRuntimeProfileSourceKind: z.infer<typeof runtimeProfileSourceKindSchema>;
@@ -1577,9 +1702,1913 @@ export type QueueRecord = {
   id: QueueId;
   sessionId: SessionId;
   message: string;
+  messageActor: SessionMessageActor;
+  peerActionId?: PeerActionId;
   state: QueueState;
   createdAt: number;
   updatedAt: number;
+};
+
+export const PEER_SESSION_HOP_LIMIT = 8;
+export const PEER_SESSION_HOURLY_ACTION_LIMIT = 120;
+export const PEER_SESSION_PROJECT_HOURLY_ACTION_LIMIT = 120;
+export const PEER_SESSION_HOURLY_DISTINCT_TARGET_LIMIT = 16;
+export const PEER_SESSION_RATE_WINDOW_MS = 60 * 60 * 1_000;
+export const CONTROL_PLANE_RECONCILIATION_BATCH_LIMIT = 100;
+/** Full replay and causal evidence is retained for at least seven days. */
+export const PEER_SESSION_ACTION_RETAIN_AGE_MS = 7 * 24 * 60 * 60_000;
+export const PEER_SESSION_PARENT_FAN_IN_LIMIT = 32;
+export const PEER_SESSION_CAUSAL_VISIT_LIMIT = 64;
+export const PEER_SESSION_CAUSAL_ROOT_LIMIT = 64;
+export const PEER_SESSION_TURN_ORIGIN_LIMIT = 32;
+export const PEER_SESSION_INBOUND_QUEUE_COUNT_LIMIT = 64;
+export const PEER_SESSION_INBOUND_QUEUE_BYTES_LIMIT = 1_048_576;
+export const PEER_SESSION_RETAINED_ACTION_LIMIT = 25_000;
+/**
+ * Direct-delivery tombstones are only needed until the corresponding durable
+ * message event source exists (or the mutation is known not to have applied).
+ * The same project bound as the peer action ledger makes a missing projection
+ * fail closed without introducing an unbounded second ledger.
+ */
+export const PEER_SESSION_DIRECT_MESSAGE_SOURCE_LIMIT = PEER_SESSION_RETAINED_ACTION_LIMIT;
+export const MEMORY_SUBMISSION_RETAINED_PROJECT_LIMIT = 10_000;
+/** Exact replay and local attestation evidence is retained for at least 30 days. */
+export const MEMORY_SUBMISSION_RETAIN_AGE_MS = 30 * 24 * 60 * 60_000;
+export const CANONICAL_MEMORY_SYNC_RETAINED_PROJECT_LIMIT = 10_000;
+/** Settled hosted-sync replay evidence is retained for at least 30 days. */
+export const CANONICAL_MEMORY_SYNC_RETAIN_AGE_MS = 30 * 24 * 60 * 60_000;
+export const MEMORY_PAGE_ATTESTATION_AUTHORITY_LIMIT = 8_192;
+
+export const peerSessionPolicyModeSchema = z.enum(["off", "inspect", "coordinate"]);
+export const peerSessionDeliverySchema = z.enum(["send", "queue", "steer"]);
+export const peerSessionActionStateSchema = z.enum([
+  "prepared",
+  "queued",
+  "effect_started",
+  "applied",
+  "failed",
+  "ambiguous",
+  "cancelled",
+]);
+
+export type PeerSessionPolicyMode = z.infer<typeof peerSessionPolicyModeSchema>;
+export type PeerSessionDelivery = z.infer<typeof peerSessionDeliverySchema>;
+export type PeerSessionActionState = z.infer<typeof peerSessionActionStateSchema>;
+
+export type PeerSessionPolicyRecord = Readonly<{
+  sessionId: SessionId;
+  mode: PeerSessionPolicyMode;
+  revision: number;
+  createdAt: number;
+  updatedAt: number;
+}>;
+
+export type PeerSessionActionRecord = Readonly<{
+  id: PeerActionId;
+  idempotencyKey: string;
+  actorSessionId: SessionId;
+  actorTurnDigest: string;
+  projectId: ProjectId;
+  actorPolicyRevision: number;
+  targetSessionId: SessionId;
+  targetExpectedRevision: number;
+  targetPolicyRevision: number;
+  delivery: PeerSessionDelivery;
+  requestDigest: string;
+  messageDigest: string;
+  reasonDigest: string;
+  state: PeerSessionActionState;
+  hop: number;
+  targetTurnDigest?: string;
+  resultDigest?: string;
+  parentActionIds: readonly PeerActionId[];
+  visitedSessionIds: readonly SessionId[];
+  rootActionIds: readonly PeerActionId[];
+  createdAt: number;
+  updatedAt: number;
+}>;
+
+export type PeerSessionActionAdmission = Readonly<{
+  action: PeerSessionActionRecord;
+  queue?: QueueRecord;
+  replay: boolean;
+}>;
+
+export type PeerSessionDirectMessageSourceRecord = Readonly<{
+  actionId: PeerActionId;
+  idempotencyKey: string;
+  actorSessionId: SessionId;
+  actorTurnDigest: string;
+  projectId: ProjectId;
+  targetSessionId: SessionId;
+  targetExpectedRevision: number;
+  delivery: Exclude<PeerSessionDelivery, "queue">;
+  requestDigest: string;
+  messageDigest: string;
+  reasonDigest: string;
+  createdAt: number;
+}>;
+
+export type SessionMessageEventSourceRecord = Readonly<{
+  sourceId: string;
+  sourceKind: "mutation" | "queue";
+  sessionId: SessionId;
+  actor: SessionMessageActor;
+  bodyDigest: string;
+  streamEpoch: string;
+  eventSequence: number;
+  createdAt: number;
+}>;
+
+export type SessionUserMessageEventAppendResult = Readonly<{
+  event: SessionEvent;
+  appended: boolean;
+}>;
+
+export type SessionEffectResolutionResult = SessionRecord & Readonly<{
+  messageEvent?: SessionUserMessageEventAppendResult;
+}>;
+
+export const projectMemorySyncStateSchema = z.enum([
+  "local_only",
+  "settled",
+  "conflict",
+  "error",
+]);
+export const projectMemoryPhysicalStateSchema = z.enum([
+  "reserved",
+  "initialized",
+  "rejected",
+]);
+export const memorySubmissionKindSchema = z.enum(["remember", "share"]);
+export const memorySubmissionStateSchema = z.enum([
+  "prepared",
+  "effect_started",
+  "applied",
+  "failed",
+  "ambiguous",
+  "cancelled",
+]);
+
+const memorySubmissionIdSchema = z.string().regex(/^memsub_[0-9a-f]{32}$/u);
+const memoryDiagnosticCodeSchema = z.string().regex(/^[A-Z][A-Z0-9_]{0,79}$/u);
+const canonicalMemoryHostedCreateIntentIdSchema = z.string()
+  .regex(/^cmcreate_[0-9a-f]{32}$/u);
+const canonicalMemorySyncIntentIdSchema = z.string().regex(/^cmsync_[0-9a-f]{32}$/u);
+const canonicalMemoryHostedSpaceIdSchema = z.string().regex(/^memory_[A-Za-z0-9_-]{32}$/u);
+const canonicalMemoryDigestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
+const canonicalMemoryHeadTokenSchema = canonicalMemoryDigestSchema;
+const canonicalMemoryEnvelopeBase64UrlSchema = z.string().regex(/^[A-Za-z0-9_-]+$/u);
+
+export const canonicalMemoryHostedAttachmentStateSchema = z.enum([
+  "attached",
+  "detached",
+  "conflict",
+  "error",
+]);
+export const canonicalMemoryHostedCreateIntentStateSchema = z.enum([
+  "allocating",
+  "key_staged",
+  "prepared",
+  "effect_started",
+  "winner_observed",
+  "settled",
+  "conflict",
+  "error",
+]);
+export const canonicalMemorySyncDirectionSchema = z.enum(["pull", "push"]);
+export const canonicalMemorySyncIntentStateSchema = z.enum([
+  "prepared",
+  "effect_started",
+  "response_observed",
+  "settled",
+  "conflict",
+  "error",
+]);
+
+export type CanonicalMemoryHostedAttachmentState = z.infer<
+  typeof canonicalMemoryHostedAttachmentStateSchema
+>;
+export type CanonicalMemoryHostedCreateIntentState = z.infer<
+  typeof canonicalMemoryHostedCreateIntentStateSchema
+>;
+export type CanonicalMemorySyncDirection = z.infer<
+  typeof canonicalMemorySyncDirectionSchema
+>;
+export type CanonicalMemorySyncIntentState = z.infer<
+  typeof canonicalMemorySyncIntentStateSchema
+>;
+
+export type CanonicalMemoryEncryptedEnvelope = Readonly<{
+  algorithm: "A256GCM";
+  ciphertext: string;
+  keyVersion: number;
+  nonce: string;
+}>;
+
+export type CanonicalMemoryHostedCreateRequest = Readonly<{
+  bindingPolicy: "one_project_one_space";
+  encryptedDescriptor: CanonicalMemoryEncryptedEnvelope;
+  genesisHeadProof: CanonicalMemoryEncryptedEnvelope;
+  genesisToken: string;
+  identityContract: 2;
+  keyVersion: number;
+  spaceId: string;
+  wrappedSpaceKey: CanonicalMemoryEncryptedEnvelope;
+}>;
+
+export type CanonicalMemoryHostedCreateWinner = CanonicalMemoryHostedCreateRequest & Readonly<{
+  replay: boolean;
+  revision: number;
+}>;
+
+export type CanonicalMemoryHostedCreateIntentRecord = Readonly<{
+  accountBindingDigest: string;
+  authorityHead: ProjectMemoryHeadRef;
+  authorityRevision: number;
+  canonicalBindingDigest: string;
+  createdAt: number;
+  diagnosticCode?: string;
+  effectStartedAt?: number;
+  id: string;
+  idempotencyKey: string;
+  keyVersion?: number;
+  projectId: ProjectId;
+  remoteSpaceId: string;
+  request?: CanonicalMemoryHostedCreateRequest;
+  requestDigest?: string;
+  settledAt?: number;
+  state: CanonicalMemoryHostedCreateIntentState;
+  updatedAt: number;
+  winnerDigest?: string;
+  winnerObservedAt?: number;
+  winnerReplay?: boolean;
+  winnerRevision?: number;
+  wrappedSpaceKey?: CanonicalMemoryEncryptedEnvelope;
+}>;
+
+export type CanonicalMemoryHostedCreateAllocation = Readonly<{
+  record: CanonicalMemoryHostedCreateIntentRecord;
+  replay: boolean;
+}>;
+
+export type CanonicalMemoryHostedRemoteObservation = Readonly<{
+  genesisToken: string;
+  head: ProjectMemoryHeadRef;
+  headProofDigest: string;
+  headToken: string;
+  keyVersion: number;
+  revision: number;
+}>;
+
+export type CanonicalMemoryHostedAttachmentRecord = Readonly<{
+  accountBindingDigest: string;
+  canonicalBindingDigest: string;
+  createdAt: number;
+  diagnosticCode?: string;
+  generation: number;
+  projectId: ProjectId;
+  remote: CanonicalMemoryHostedRemoteObservation;
+  remoteSpaceId: string;
+  revision: number;
+  state: CanonicalMemoryHostedAttachmentState;
+  updatedAt: number;
+}>;
+
+export type CanonicalMemorySyncOperation = Readonly<{
+  adoptionProof: CanonicalMemoryEncryptedEnvelope | null;
+  genesisToken: string;
+  headToken: string;
+  operation: CanonicalMemoryEncryptedEnvelope;
+  priorToken: string;
+  sequence: number;
+  terminalHeadProof: CanonicalMemoryEncryptedEnvelope;
+}>;
+
+export type CanonicalMemorySyncSpoolOperation = CanonicalMemorySyncOperation & Readonly<{
+  operationDigest: string;
+}>;
+
+export type CanonicalMemorySyncIntentRecord = Readonly<{
+  attachmentGeneration: number;
+  attachmentRevision: number;
+  authorityRevision: number;
+  canonicalBindingDigest: string;
+  createdAt: number;
+  diagnosticCode?: string;
+  direction: CanonicalMemorySyncDirection;
+  effectStartedAt?: number;
+  id: string;
+  idempotencyKey: string;
+  localHead: ProjectMemoryHeadRef;
+  localHeadToken: string;
+  projectId: ProjectId;
+  remoteObservation: CanonicalMemoryHostedRemoteObservation;
+  requestDigest: string;
+  requestOperation?: CanonicalMemorySyncSpoolOperation;
+  responseDigest?: string;
+  responseObservation?: CanonicalMemoryHostedRemoteObservation;
+  responseOperation?: CanonicalMemorySyncSpoolOperation;
+  responseObservedAt?: number;
+  resultHead?: ProjectMemoryHeadRef;
+  settledAt?: number;
+  state: CanonicalMemorySyncIntentState;
+  updatedAt: number;
+}>;
+
+export type CanonicalMemorySyncPreparation = Readonly<{
+  record: CanonicalMemorySyncIntentRecord;
+  replay: boolean;
+}>;
+
+/**
+ * Durable, ID-free provenance admitted for one canonical Oh operation.
+ *
+ * The local project id is only the control-plane lookup key; every field that
+ * crosses devices is portable and is independently bound to the canonical
+ * space, exact operation, record, key, content, and source receipt.
+ */
+export type CanonicalMemoryPortableAdoptionProof = Readonly<{
+  bindingDigest: string;
+  canonicalSpaceId: string;
+  contentDigest: string;
+  keyDigest: string;
+  operationSha256: string;
+  recordSha256: string;
+  sequence: number;
+  sourceReceiptSha256: string;
+}>;
+
+export type CanonicalMemoryPortableAdoptionProofRecord =
+  CanonicalMemoryPortableAdoptionProof & Readonly<{
+    createdAt: number;
+    projectId: ProjectId;
+  }>;
+
+export type ProjectMemorySyncState = z.infer<typeof projectMemorySyncStateSchema>;
+export type ProjectMemoryPhysicalState = z.infer<typeof projectMemoryPhysicalStateSchema>;
+export type MemorySubmissionKind = z.infer<typeof memorySubmissionKindSchema>;
+export type MemorySubmissionState = z.infer<typeof memorySubmissionStateSchema>;
+
+export const projectMemoryHeadRefSchema = z.object({
+  sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  operationSha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  headDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+}).strict().refine(
+  (head) => (head.sequence === 0) === (head.operationSha256 === null),
+  "A memory head has no operation only at sequence zero.",
+).refine(
+  (head) => head.sequence !== 0
+    || head.headDigest === PROJECT_MEMORY_EMPTY_HEAD.headDigest,
+  "The empty memory head has one exact digest.",
+);
+
+export type ProjectMemoryHeadRef = z.infer<typeof projectMemoryHeadRefSchema>;
+
+export const memorySubmissionOutcomeCodeSchema = z.enum([
+  "remember_committed",
+  "remember_not_applied",
+  "share_adopted",
+  "share_already_present",
+  "share_conflict",
+  "share_not_applied",
+  "share_too_large",
+]);
+export type MemorySubmissionOutcomeCode = z.infer<typeof memorySubmissionOutcomeCodeSchema>;
+
+export type MemorySubmissionConflictEvidence = Readonly<{
+  actualHead: ProjectMemoryHeadRef;
+  canonicalRecordSha256: string | null;
+  nominatedRecordSha256: string;
+}>;
+
+export type ProjectMemoryAuthorityRecord = Readonly<{
+  projectId: ProjectId;
+  identityContract: ProjectMemoryIdentityContract;
+  canonicalSpaceId: string;
+  physicalState: ProjectMemoryPhysicalState;
+  initializedAt?: number;
+  authorityDigest: string;
+  bindingDigest: string;
+  head: ProjectMemoryHeadRef;
+  revision: number;
+  syncState: ProjectMemorySyncState;
+  lastExchangeAt?: number;
+  lastExchangeHead?: ProjectMemoryHeadRef;
+  diagnosticCode?: string;
+  createdAt: number;
+  updatedAt: number;
+}>;
+
+export type MemorySubmissionRecord = Readonly<{
+  id: string;
+  idempotencyKey: string;
+  kind: MemorySubmissionKind;
+  actorSessionId: SessionId;
+  projectId: ProjectId;
+  requestDigest: string;
+  contentDigest: string;
+  keyDigest: string;
+  workingBindingDigest: string;
+  workingEpoch: number;
+  /** Working head for remember; canonical project head for share. */
+  expectedHead: ProjectMemoryHeadRef;
+  effectRecordSha256?: string;
+  attestationSha256?: string;
+  operationId?: string;
+  /** Exact nominated working head. Present only for share submissions. */
+  sourceHead?: ProjectMemoryHeadRef;
+  nominationSha256?: string;
+  resultHead?: ProjectMemoryHeadRef;
+  receiptDigest?: string;
+  outcomeCode?: MemorySubmissionOutcomeCode;
+  conflict?: MemorySubmissionConflictEvidence;
+  state: MemorySubmissionState;
+  createdAt: number;
+  updatedAt: number;
+}>;
+
+/**
+ * Compact host-attestation evidence retained for as long as an active working
+ * or canonical page references it. This is intentionally independent of the
+ * finite memory-submission replay journal.
+ */
+export type MemoryPageAttestationRecord = Readonly<{
+  attestationSha256: string;
+  submissionId: string;
+  idempotencyKey: string;
+  actorSessionId: SessionId;
+  projectId: ProjectId;
+  requestDigest: string;
+  contentDigest: string;
+  keyDigest: string;
+  workingBindingDigest: string;
+  workingEpoch: number;
+  effectRecordSha256: string;
+  createdAt: number;
+}>;
+
+export type MemoryPageAttestationLane = "working" | "canonical";
+
+export type MemoryWorkingAttestationHeadRecord = Readonly<{
+  authorityDigest: string;
+  head: ProjectMemoryHeadRef;
+  origin: "create" | "fork";
+  forkChildHead?: ProjectMemoryHeadRef;
+  forkParentAuthorityDigest?: string;
+  forkParentHead?: ProjectMemoryHeadRef;
+  createdAt: number;
+  updatedAt: number;
+}>;
+
+export type MemoryWorkingAttestationForkRecord = Readonly<{
+  childAuthorityDigest: string;
+  childSessionId: SessionId;
+  parentAuthorityDigest: string;
+  parentHead: ProjectMemoryHeadRef;
+  createdAt: number;
+  updatedAt: number;
+}>;
+
+export type MemorySubmissionPreparation = Readonly<{
+  record: MemorySubmissionRecord;
+  replay: boolean;
+}>;
+
+export type ControlPlaneReconciliationCursor = Readonly<{
+  createdAt: number;
+  id: string;
+}>;
+
+export type ControlPlaneReconciliationPage<T> = Readonly<{
+  records: readonly T[];
+  nextCursor?: ControlPlaneReconciliationCursor;
+}>;
+
+export type SessionHostCapabilityBindingRecord = Readonly<{
+  sessionId: SessionId;
+  preambleVersion: number;
+  preambleDigest: string;
+  manifestVersion: number;
+  manifestDigest: string;
+  recordedAt: number;
+}>;
+
+const peerSessionPolicyRowSchema = z.object({
+  session_id: sessionIdSchema,
+  mode: peerSessionPolicyModeSchema,
+  revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const peerSessionActionRowSchema = z.object({
+  id: peerActionIdSchema,
+  idempotency_key: z.string().uuid(),
+  actor_session_id: sessionIdSchema,
+  actor_turn_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  project_id: projectIdSchema,
+  actor_policy_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  target_session_id: sessionIdSchema,
+  target_expected_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  target_policy_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  delivery: peerSessionDeliverySchema,
+  request_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  message_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  reason_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  state: peerSessionActionStateSchema,
+  hop: z.number().int().min(1).max(PEER_SESSION_HOP_LIMIT),
+  target_turn_digest: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  result_digest: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const peerSessionDirectMessageSourceRowSchema = z.object({
+  action_id: peerActionIdSchema,
+  idempotency_key: z.string().uuid(),
+  actor_session_id: sessionIdSchema,
+  actor_turn_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  project_id: projectIdSchema,
+  target_session_id: sessionIdSchema,
+  target_expected_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  delivery: z.enum(["send", "steer"]),
+  request_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  message_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  reason_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  created_at: unixMillisecondsSchema,
+}).strict();
+
+const sessionMessageEventSourceRowSchema = z.object({
+  source_id: z.union([attemptIdSchema, queueIdSchema]),
+  source_kind: z.enum(["mutation", "queue"]),
+  session_id: sessionIdSchema,
+  actor: sessionMessageActorSchema,
+  body_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  stream_epoch: z.string().uuid(),
+  event_sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  created_at: unixMillisecondsSchema,
+}).strict();
+
+const mapSessionMessageEventSource = (
+  value: unknown,
+): SessionMessageEventSourceRecord => {
+  const row = sessionMessageEventSourceRowSchema.parse(value);
+  return {
+    sourceId: row.source_id,
+    sourceKind: row.source_kind,
+    sessionId: row.session_id,
+    actor: row.actor,
+    bodyDigest: row.body_digest,
+    streamEpoch: row.stream_epoch,
+    eventSequence: row.event_sequence,
+    createdAt: row.created_at,
+  };
+};
+
+const projectMemoryAuthorityRowSchema = z.object({
+  project_id: projectIdSchema,
+  identity_contract: projectMemoryIdentityContractSchema,
+  canonical_space_id: projectMemoryCanonicalSpaceIdSchema,
+  physical_state: projectMemoryPhysicalStateSchema,
+  initialized_at: unixMillisecondsSchema.nullable(),
+  authority_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  binding_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  head_operation_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  head_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  sync_state: projectMemorySyncStateSchema,
+  last_exchange_at: unixMillisecondsSchema.nullable(),
+  last_exchange_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  last_exchange_operation_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  last_exchange_head_digest: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  diagnostic_code: memoryDiagnosticCodeSchema.nullable(),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+const legacyProjectMemoryAuthorityRowSchema = projectMemoryAuthorityRowSchema.omit({
+  canonical_space_id: true,
+  identity_contract: true,
+  initialized_at: true,
+  physical_state: true,
+});
+
+const canonicalMemoryHostedCreateIntentRowSchema = z.object({
+  id: canonicalMemoryHostedCreateIntentIdSchema,
+  idempotency_key: z.string().uuid(),
+  project_id: projectIdSchema,
+  state: canonicalMemoryHostedCreateIntentStateSchema,
+  authority_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  canonical_binding_digest: canonicalMemoryDigestSchema,
+  authority_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  authority_head_operation_sha256: canonicalMemoryDigestSchema.nullable(),
+  authority_head_digest: canonicalMemoryDigestSchema,
+  account_binding_digest: canonicalMemoryDigestSchema,
+  remote_space_id: canonicalMemoryHostedSpaceIdSchema,
+  space_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  wrapped_key_algorithm: z.literal("A256GCM").nullable(),
+  wrapped_key_ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(canonicalMemoryCiphertextLimits.terminalHeadProof).nullable(),
+  wrapped_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  wrapped_key_nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16).nullable(),
+  descriptor_algorithm: z.literal("A256GCM").nullable(),
+  descriptor_ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(canonicalMemoryCiphertextLimits.terminalHeadProof).nullable(),
+  descriptor_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  descriptor_nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16).nullable(),
+  genesis_proof_algorithm: z.literal("A256GCM").nullable(),
+  genesis_proof_ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(canonicalMemoryCiphertextLimits.terminalHeadProof).nullable(),
+  genesis_proof_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  genesis_proof_nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16).nullable(),
+  genesis_token: canonicalMemoryHeadTokenSchema.nullable(),
+  request_digest: canonicalMemoryDigestSchema.nullable(),
+  effect_started_at: unixMillisecondsSchema.nullable(),
+  winner_digest: canonicalMemoryDigestSchema.nullable(),
+  winner_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  winner_replay: z.union([z.literal(0), z.literal(1)]).nullable(),
+  winner_observed_at: unixMillisecondsSchema.nullable(),
+  settled_at: unixMillisecondsSchema.nullable(),
+  diagnostic_code: memoryDiagnosticCodeSchema.nullable(),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const canonicalMemoryHostedAttachmentRowSchema = z.object({
+  project_id: projectIdSchema,
+  remote_space_id: canonicalMemoryHostedSpaceIdSchema,
+  account_binding_digest: canonicalMemoryDigestSchema,
+  canonical_binding_digest: canonicalMemoryDigestSchema,
+  generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  state: canonicalMemoryHostedAttachmentStateSchema,
+  genesis_token: canonicalMemoryHeadTokenSchema,
+  remote_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  remote_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  remote_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  remote_head_operation_sha256: canonicalMemoryDigestSchema.nullable(),
+  remote_head_digest: canonicalMemoryDigestSchema,
+  remote_head_token: canonicalMemoryHeadTokenSchema,
+  remote_head_proof_digest: canonicalMemoryDigestSchema,
+  diagnostic_code: memoryDiagnosticCodeSchema.nullable(),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const canonicalMemorySyncIntentRowSchema = z.object({
+  id: canonicalMemorySyncIntentIdSchema,
+  idempotency_key: z.string().uuid(),
+  project_id: projectIdSchema,
+  direction: canonicalMemorySyncDirectionSchema,
+  state: canonicalMemorySyncIntentStateSchema,
+  attachment_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  attachment_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  authority_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  canonical_binding_digest: canonicalMemoryDigestSchema,
+  local_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  local_head_operation_sha256: canonicalMemoryDigestSchema.nullable(),
+  local_head_digest: canonicalMemoryDigestSchema,
+  local_head_token: canonicalMemoryHeadTokenSchema,
+  remote_genesis_token: canonicalMemoryHeadTokenSchema,
+  remote_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  remote_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  remote_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  remote_head_operation_sha256: canonicalMemoryDigestSchema.nullable(),
+  remote_head_digest: canonicalMemoryDigestSchema,
+  remote_head_token: canonicalMemoryHeadTokenSchema,
+  remote_head_proof_digest: canonicalMemoryDigestSchema,
+  request_digest: canonicalMemoryDigestSchema,
+  effect_started_at: unixMillisecondsSchema.nullable(),
+  response_digest: canonicalMemoryDigestSchema.nullable(),
+  response_genesis_token: canonicalMemoryHeadTokenSchema.nullable(),
+  response_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  response_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  response_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  response_head_operation_sha256: canonicalMemoryDigestSchema.nullable(),
+  response_head_digest: canonicalMemoryDigestSchema.nullable(),
+  response_head_token: canonicalMemoryHeadTokenSchema.nullable(),
+  response_head_proof_digest: canonicalMemoryDigestSchema.nullable(),
+  response_observed_at: unixMillisecondsSchema.nullable(),
+  result_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  result_head_operation_sha256: canonicalMemoryDigestSchema.nullable(),
+  result_head_digest: canonicalMemoryDigestSchema.nullable(),
+  settled_at: unixMillisecondsSchema.nullable(),
+  diagnostic_code: memoryDiagnosticCodeSchema.nullable(),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const canonicalMemorySyncSpoolRowSchema = z.object({
+  intent_id: canonicalMemorySyncIntentIdSchema,
+  phase: z.enum(["request", "response"]),
+  genesis_token: canonicalMemoryHeadTokenSchema,
+  prior_token: canonicalMemoryHeadTokenSchema,
+  head_token: canonicalMemoryHeadTokenSchema,
+  sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  adoption_proof_algorithm: z.literal("A256GCM").nullable(),
+  adoption_proof_ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(canonicalMemoryCiphertextLimits.adoptionProof).nullable(),
+  adoption_proof_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+    .nullable(),
+  adoption_proof_nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16).nullable(),
+  operation_algorithm: z.literal("A256GCM"),
+  operation_ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(canonicalMemoryCiphertextLimits.operation),
+  operation_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  operation_nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16),
+  proof_algorithm: z.literal("A256GCM"),
+  proof_ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(canonicalMemoryCiphertextLimits.terminalHeadProof),
+  proof_key_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  proof_nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16),
+  operation_digest: canonicalMemoryDigestSchema,
+  created_at: unixMillisecondsSchema,
+}).strict();
+
+const canonicalMemoryPortableAdoptionProofRowSchema = z.object({
+  project_id: projectIdSchema,
+  canonical_space_id: projectMemoryCanonicalSpaceIdSchema,
+  canonical_binding_digest: canonicalMemoryDigestSchema,
+  sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  operation_sha256: canonicalMemoryDigestSchema,
+  record_sha256: canonicalMemoryDigestSchema,
+  key_digest: canonicalMemoryDigestSchema,
+  content_digest: canonicalMemoryDigestSchema,
+  source_receipt_sha256: canonicalMemoryDigestSchema,
+  created_at: unixMillisecondsSchema,
+}).strict();
+
+const memorySubmissionRowSchema = z.object({
+  id: memorySubmissionIdSchema,
+  idempotency_key: z.string().uuid(),
+  kind: memorySubmissionKindSchema,
+  actor_session_id: sessionIdSchema,
+  project_id: projectIdSchema,
+  request_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  content_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  key_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  working_binding_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  working_epoch: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  effect_record_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  attestation_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  operation_id: z.string().min(1).max(128).nullable(),
+  source_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  source_head_operation_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  source_head_digest: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  nomination_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  expected_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  expected_head_operation_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  expected_head_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  result_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  result_head_operation_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  result_head_digest: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  receipt_digest: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  outcome_code: memorySubmissionOutcomeCodeSchema.nullable(),
+  conflict_actual_head_sequence: z.number().int().nonnegative()
+    .max(Number.MAX_SAFE_INTEGER).nullable(),
+  conflict_actual_head_operation_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  conflict_actual_head_digest: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  conflict_canonical_record_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  conflict_nominated_record_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  state: memorySubmissionStateSchema,
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const memoryPageAttestationRowSchema = z.object({
+  attestation_sha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  submission_id: memorySubmissionIdSchema,
+  idempotency_key: z.string().uuid(),
+  actor_session_id: sessionIdSchema,
+  project_id: projectIdSchema,
+  request_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  content_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  key_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  working_binding_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  working_epoch: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  effect_record_sha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  created_at: unixMillisecondsSchema,
+}).strict();
+
+const mapMemoryPageAttestation = (value: unknown): MemoryPageAttestationRecord => {
+  const row = memoryPageAttestationRowSchema.parse(value);
+  return {
+    attestationSha256: row.attestation_sha256,
+    submissionId: row.submission_id,
+    idempotencyKey: row.idempotency_key,
+    actorSessionId: row.actor_session_id,
+    projectId: row.project_id,
+    requestDigest: row.request_digest,
+    contentDigest: row.content_digest,
+    keyDigest: row.key_digest,
+    workingBindingDigest: row.working_binding_digest,
+    workingEpoch: row.working_epoch,
+    effectRecordSha256: row.effect_record_sha256,
+    createdAt: row.created_at,
+  };
+};
+
+const memoryWorkingAttestationHeadRowSchema = z.object({
+  authority_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  head_operation_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  head_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  origin: z.enum(["create", "fork"]),
+  fork_child_head_sequence: z.number().int().nonnegative()
+    .max(Number.MAX_SAFE_INTEGER).nullable(),
+  fork_child_head_operation_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  fork_child_head_digest: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  fork_parent_authority_digest: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  fork_parent_head_sequence: z.number().int().nonnegative()
+    .max(Number.MAX_SAFE_INTEGER).nullable(),
+  fork_parent_head_operation_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  fork_parent_head_digest: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const mapMemoryWorkingAttestationHead = (
+  value: unknown,
+): MemoryWorkingAttestationHeadRecord => {
+  const row = memoryWorkingAttestationHeadRowSchema.parse(value);
+  const head = projectMemoryHeadRefSchema.parse({
+    sequence: row.head_sequence,
+    operationSha256: row.head_operation_sha256,
+    headDigest: row.head_digest,
+  });
+  const parentParts = [
+    row.fork_parent_authority_digest,
+    row.fork_parent_head_sequence,
+    row.fork_parent_head_digest,
+  ];
+  const childParts = [row.fork_child_head_sequence, row.fork_child_head_digest];
+  const hasForkChild = childParts.every((part) => part !== null);
+  const hasParent = parentParts.every((part) => part !== null);
+  if (
+    (!hasParent && parentParts.some((part) => part !== null))
+    || (!hasForkChild && childParts.some((part) => part !== null))
+    || (row.fork_child_head_sequence === null
+      && row.fork_child_head_operation_sha256 !== null)
+    || (row.fork_parent_head_sequence === null
+      && row.fork_parent_head_operation_sha256 !== null)
+    || (row.origin === "fork") !== (hasParent && hasForkChild)
+  ) throw new Error("MEMORY_WORKING_ATTESTATION_HEAD_INVALID");
+  const forkChildHead = hasForkChild
+    ? projectMemoryHeadRefSchema.parse({
+        sequence: row.fork_child_head_sequence,
+        operationSha256: row.fork_child_head_operation_sha256,
+        headDigest: row.fork_child_head_digest,
+      })
+    : undefined;
+  const forkParentHead = hasParent
+    ? projectMemoryHeadRefSchema.parse({
+        sequence: row.fork_parent_head_sequence,
+        operationSha256: row.fork_parent_head_operation_sha256,
+        headDigest: row.fork_parent_head_digest,
+      })
+    : undefined;
+  return {
+    authorityDigest: row.authority_digest,
+    head,
+    origin: row.origin,
+    ...(forkChildHead === undefined ? {} : { forkChildHead }),
+    ...(row.fork_parent_authority_digest === null
+      ? {}
+      : { forkParentAuthorityDigest: row.fork_parent_authority_digest }),
+    ...(forkParentHead === undefined ? {} : { forkParentHead }),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+};
+
+const memoryWorkingAttestationForkRowSchema = z.object({
+  child_authority_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  child_session_id: sessionIdSchema,
+  parent_authority_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  parent_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  parent_head_operation_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  parent_head_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const mapMemoryWorkingAttestationFork = (
+  value: unknown,
+): MemoryWorkingAttestationForkRecord => {
+  const row = memoryWorkingAttestationForkRowSchema.parse(value);
+  return {
+    childAuthorityDigest: row.child_authority_digest,
+    childSessionId: row.child_session_id,
+    parentAuthorityDigest: row.parent_authority_digest,
+    parentHead: projectMemoryHeadRefSchema.parse({
+      sequence: row.parent_head_sequence,
+      operationSha256: row.parent_head_operation_sha256,
+      headDigest: row.parent_head_digest,
+    }),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+};
+
+const memorySubmissionOutcomeShapeIsValid = (input: Readonly<{
+  expectedHead: ProjectMemoryHeadRef;
+  kind: MemorySubmissionKind;
+  outcomeCode?: MemorySubmissionOutcomeCode;
+  resultHead?: ProjectMemoryHeadRef;
+  state: MemorySubmissionState;
+}>): boolean => {
+  if (input.state === "applied") {
+    if (input.resultHead === undefined) return false;
+    if (input.kind === "remember") {
+      return input.outcomeCode === "remember_committed"
+        && input.resultHead.sequence === input.expectedHead.sequence + 1;
+    }
+    if (input.outcomeCode === "share_adopted") {
+      return input.resultHead.sequence === input.expectedHead.sequence + 1;
+    }
+    return input.outcomeCode === "share_already_present"
+      && input.resultHead.sequence === input.expectedHead.sequence
+      && input.resultHead.operationSha256 === input.expectedHead.operationSha256
+      && input.resultHead.headDigest === input.expectedHead.headDigest;
+  }
+  if (input.state === "failed") {
+    return input.resultHead === undefined && (input.kind === "remember"
+      ? input.outcomeCode === "remember_not_applied"
+      : input.outcomeCode === "share_conflict"
+        || input.outcomeCode === "share_not_applied"
+        || input.outcomeCode === "share_too_large");
+  }
+  return input.resultHead === undefined && input.outcomeCode === undefined;
+};
+
+const sessionHostCapabilityBindingRowSchema = z.object({
+  session_id: sessionIdSchema,
+  preamble_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  preamble_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  manifest_version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  manifest_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  recorded_at: unixMillisecondsSchema,
+}).strict();
+
+const mapPeerSessionPolicy = (value: unknown): PeerSessionPolicyRecord => {
+  const row = peerSessionPolicyRowSchema.parse(value);
+  return {
+    sessionId: row.session_id,
+    mode: row.mode,
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+};
+
+const mapProjectMemoryAuthority = (value: unknown): ProjectMemoryAuthorityRecord => {
+  const row = projectMemoryAuthorityRowSchema.parse(value);
+  const identity = deriveProjectMemoryCanonicalIdentity({
+    canonicalSpaceId: row.canonical_space_id,
+    identityContract: row.identity_contract,
+    projectId: row.project_id,
+  });
+  if (
+    identity.authorityDigest !== row.authority_digest
+    || identity.bindingDigest !== row.binding_digest
+  ) throw new Error("PROJECT_MEMORY_AUTHORITY_IDENTITY_INVALID");
+  const head = projectMemoryHeadRefSchema.parse({
+    sequence: row.head_sequence,
+    operationSha256: row.head_operation_sha256,
+    headDigest: row.head_digest,
+  });
+  const exchangeFields = [
+    row.last_exchange_at,
+    row.last_exchange_sequence,
+    row.last_exchange_head_digest,
+  ];
+  const hasExchange = exchangeFields.every((field) => field !== null);
+  if (
+    (row.physical_state === "initialized") !== (row.initialized_at !== null)
+    || (row.physical_state === "reserved" && (
+      head.sequence !== PROJECT_MEMORY_EMPTY_HEAD.sequence
+      || head.operationSha256 !== PROJECT_MEMORY_EMPTY_HEAD.operationSha256
+      || head.headDigest !== PROJECT_MEMORY_EMPTY_HEAD.headDigest
+      || hasExchange
+    ))
+    || (row.physical_state === "rejected" && (
+      head.sequence !== PROJECT_MEMORY_EMPTY_HEAD.sequence
+      || head.operationSha256 !== PROJECT_MEMORY_EMPTY_HEAD.operationSha256
+      || head.headDigest !== PROJECT_MEMORY_EMPTY_HEAD.headDigest
+      || row.sync_state !== "error"
+      || row.diagnostic_code === null
+      || hasExchange
+    ))
+    || (!hasExchange && exchangeFields.some((field) => field !== null))
+    || (row.last_exchange_sequence === null && row.last_exchange_operation_sha256 !== null)
+    || (row.last_exchange_sequence === 0 && row.last_exchange_operation_sha256 !== null)
+    || (row.last_exchange_sequence !== null
+      && row.last_exchange_sequence > 0
+      && row.last_exchange_operation_sha256 === null)
+    || ((row.sync_state === "conflict" || row.sync_state === "error")
+      !== (row.diagnostic_code !== null))
+    || ((row.sync_state === "settled") && !hasExchange)
+  ) throw new Error("PROJECT_MEMORY_AUTHORITY_INVALID");
+  const lastExchangeHead = !hasExchange
+    ? undefined
+    : projectMemoryHeadRefSchema.parse({
+        sequence: row.last_exchange_sequence,
+        operationSha256: row.last_exchange_operation_sha256,
+        headDigest: row.last_exchange_head_digest,
+      });
+  if (
+    row.sync_state === "settled"
+    && JSON.stringify(lastExchangeHead) !== JSON.stringify(head)
+  ) throw new Error("PROJECT_MEMORY_AUTHORITY_INVALID");
+  return {
+    projectId: row.project_id,
+    identityContract: row.identity_contract,
+    canonicalSpaceId: row.canonical_space_id,
+    physicalState: row.physical_state,
+    ...(row.initialized_at === null ? {} : { initializedAt: row.initialized_at }),
+    authorityDigest: row.authority_digest,
+    bindingDigest: row.binding_digest,
+    head,
+    revision: row.revision,
+    syncState: row.sync_state,
+    ...(row.last_exchange_at === null ? {} : { lastExchangeAt: row.last_exchange_at }),
+    ...(lastExchangeHead === undefined ? {} : { lastExchangeHead }),
+    ...(row.diagnostic_code === null ? {} : { diagnosticCode: row.diagnostic_code }),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+};
+
+const parseCanonicalMemoryEncryptedEnvelope = (
+  value: unknown,
+  maximumCiphertextCharacters: number,
+): CanonicalMemoryEncryptedEnvelope => z.object({
+  algorithm: z.literal("A256GCM"),
+  ciphertext: canonicalMemoryEnvelopeBase64UrlSchema
+    .min(22).max(maximumCiphertextCharacters),
+  keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  nonce: canonicalMemoryEnvelopeBase64UrlSchema.length(16),
+}).strict().parse(value);
+
+const sameCanonicalMemoryEncryptedEnvelope = (
+  left: CanonicalMemoryEncryptedEnvelope,
+  right: CanonicalMemoryEncryptedEnvelope,
+): boolean => left.ciphertext === right.ciphertext
+  && left.keyVersion === right.keyVersion
+  && left.nonce === right.nonce;
+
+const parseCanonicalMemoryHostedCreateRequest = (
+  value: CanonicalMemoryHostedCreateRequest,
+): CanonicalMemoryHostedCreateRequest => {
+  const parsed = z.object({
+    bindingPolicy: z.literal("one_project_one_space"),
+    encryptedDescriptor: z.unknown(),
+    genesisHeadProof: z.unknown(),
+    genesisToken: canonicalMemoryHeadTokenSchema,
+    identityContract: z.literal(2),
+    keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    spaceId: canonicalMemoryHostedSpaceIdSchema,
+    wrappedSpaceKey: z.unknown(),
+  }).strict().parse(value);
+  const encryptedDescriptor = parseCanonicalMemoryEncryptedEnvelope(
+    parsed.encryptedDescriptor,
+    canonicalMemoryCiphertextLimits.terminalHeadProof,
+  );
+  const genesisHeadProof = parseCanonicalMemoryEncryptedEnvelope(
+    parsed.genesisHeadProof,
+    canonicalMemoryCiphertextLimits.terminalHeadProof,
+  );
+  const wrappedSpaceKey = parseCanonicalMemoryEncryptedEnvelope(
+    parsed.wrappedSpaceKey,
+    canonicalMemoryCiphertextLimits.terminalHeadProof,
+  );
+  if (
+    encryptedDescriptor.keyVersion !== parsed.keyVersion
+    || genesisHeadProof.keyVersion !== parsed.keyVersion
+  ) throw new TypeError("CANONICAL_MEMORY_HOSTED_CREATE_REQUEST_INVALID");
+  return {
+    bindingPolicy: parsed.bindingPolicy,
+    encryptedDescriptor,
+    genesisHeadProof,
+    genesisToken: parsed.genesisToken,
+    identityContract: parsed.identityContract,
+    keyVersion: parsed.keyVersion,
+    spaceId: parsed.spaceId,
+    wrappedSpaceKey,
+  };
+};
+
+const parseCanonicalMemoryHostedCreateWinner = (
+  value: CanonicalMemoryHostedCreateWinner,
+): CanonicalMemoryHostedCreateWinner => {
+  const parsed = z.object({
+    bindingPolicy: z.literal("one_project_one_space"),
+    encryptedDescriptor: z.unknown(),
+    genesisHeadProof: z.unknown(),
+    genesisToken: canonicalMemoryHeadTokenSchema,
+    identityContract: z.literal(2),
+    keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    replay: z.boolean(),
+    revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    spaceId: canonicalMemoryHostedSpaceIdSchema,
+    wrappedSpaceKey: z.unknown(),
+  }).strict().parse(value);
+  const request = parseCanonicalMemoryHostedCreateRequest({
+    bindingPolicy: parsed.bindingPolicy,
+    encryptedDescriptor: parsed.encryptedDescriptor as CanonicalMemoryEncryptedEnvelope,
+    genesisHeadProof: parsed.genesisHeadProof as CanonicalMemoryEncryptedEnvelope,
+    genesisToken: parsed.genesisToken,
+    identityContract: parsed.identityContract,
+    keyVersion: parsed.keyVersion,
+    spaceId: parsed.spaceId,
+    wrappedSpaceKey: parsed.wrappedSpaceKey as CanonicalMemoryEncryptedEnvelope,
+  });
+  return { ...request, replay: parsed.replay, revision: parsed.revision };
+};
+
+const canonicalMemoryHostedCreateRequestDigest = (
+  request: CanonicalMemoryHostedCreateRequest,
+): string => digestJson({
+  contract: "hra.canonical-memory.hosted-create-request.v1",
+  request,
+});
+
+const canonicalMemoryHostedCreateWinnerDigest = (
+  request: CanonicalMemoryHostedCreateRequest,
+  revision: number,
+  replay: boolean,
+): string => digestJson({
+  contract: "hra.canonical-memory.hosted-create-winner.v1",
+  replay,
+  request,
+  revision,
+});
+
+const canonicalMemoryHostedHeadProofDigest = (
+  envelope: CanonicalMemoryEncryptedEnvelope,
+): string => digestJson({
+  contract: "hra.canonical-memory.encrypted-head-proof.v1",
+  envelope,
+});
+
+const mapCanonicalMemoryHostedCreateIntent = (
+  value: unknown,
+): CanonicalMemoryHostedCreateIntentRecord => {
+  const row = canonicalMemoryHostedCreateIntentRowSchema.parse(value);
+  const authorityHead = projectMemoryHeadRefSchema.parse({
+    sequence: row.authority_head_sequence,
+    operationSha256: row.authority_head_operation_sha256,
+    headDigest: row.authority_head_digest,
+  });
+  const wrappedParts = [
+    row.space_key_version,
+    row.wrapped_key_algorithm,
+    row.wrapped_key_ciphertext,
+    row.wrapped_key_version,
+    row.wrapped_key_nonce,
+  ];
+  const hasWrappedKey = wrappedParts.every((part) => part !== null);
+  if (!hasWrappedKey && wrappedParts.some((part) => part !== null)) {
+    throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_INVALID");
+  }
+  const wrappedSpaceKey = !hasWrappedKey
+    ? undefined
+    : parseCanonicalMemoryEncryptedEnvelope({
+        algorithm: row.wrapped_key_algorithm,
+        ciphertext: row.wrapped_key_ciphertext,
+        keyVersion: row.wrapped_key_version,
+        nonce: row.wrapped_key_nonce,
+      }, canonicalMemoryCiphertextLimits.terminalHeadProof);
+  const preparedParts = [
+    row.descriptor_algorithm,
+    row.descriptor_ciphertext,
+    row.descriptor_key_version,
+    row.descriptor_nonce,
+    row.genesis_proof_algorithm,
+    row.genesis_proof_ciphertext,
+    row.genesis_proof_key_version,
+    row.genesis_proof_nonce,
+    row.genesis_token,
+    row.request_digest,
+  ];
+  const hasPreparedRequest = preparedParts.every((part) => part !== null);
+  if (!hasPreparedRequest && preparedParts.some((part) => part !== null)) {
+    throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_INVALID");
+  }
+  const request = !hasPreparedRequest || wrappedSpaceKey === undefined
+    ? undefined
+    : parseCanonicalMemoryHostedCreateRequest({
+        bindingPolicy: "one_project_one_space",
+        encryptedDescriptor: {
+          algorithm: row.descriptor_algorithm as "A256GCM",
+          ciphertext: row.descriptor_ciphertext as string,
+          keyVersion: row.descriptor_key_version as number,
+          nonce: row.descriptor_nonce as string,
+        },
+        genesisHeadProof: {
+          algorithm: row.genesis_proof_algorithm as "A256GCM",
+          ciphertext: row.genesis_proof_ciphertext as string,
+          keyVersion: row.genesis_proof_key_version as number,
+          nonce: row.genesis_proof_nonce as string,
+        },
+        genesisToken: row.genesis_token as string,
+        identityContract: 2,
+        keyVersion: row.space_key_version as number,
+        spaceId: row.remote_space_id,
+        wrappedSpaceKey,
+      });
+  if (
+    hasPreparedRequest !== (request !== undefined)
+    || (request !== undefined
+      && row.request_digest !== canonicalMemoryHostedCreateRequestDigest(request))
+  ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_INVALID");
+  const winnerParts = [
+    row.winner_digest,
+    row.winner_revision,
+    row.winner_replay,
+    row.winner_observed_at,
+  ];
+  const hasWinner = winnerParts.every((part) => part !== null);
+  if (
+    (!hasWinner && winnerParts.some((part) => part !== null))
+    || (hasWinner && (
+      request === undefined
+      || row.effect_started_at === null
+      || row.winner_digest !== canonicalMemoryHostedCreateWinnerDigest(
+        request,
+        row.winner_revision as number,
+        row.winner_replay === 1,
+      )
+    ))
+  ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_INVALID");
+  const isTerminalFailure = row.state === "conflict" || row.state === "error";
+  if (
+    (row.state === "allocating" && (hasWrappedKey || request !== undefined
+      || row.effect_started_at !== null || hasWinner))
+    || (row.state === "key_staged" && (!hasWrappedKey || request !== undefined
+      || row.effect_started_at !== null || hasWinner))
+    || (row.state === "prepared" && (request === undefined
+      || row.effect_started_at !== null || hasWinner))
+    || (row.state === "effect_started" && (request === undefined
+      || row.effect_started_at === null || hasWinner))
+    || (row.state === "winner_observed" && !hasWinner)
+    || (row.state === "settled" && !hasWinner)
+    || (isTerminalFailure && row.diagnostic_code === null)
+    || (!isTerminalFailure && row.diagnostic_code !== null)
+    || ((row.state === "settled" || isTerminalFailure) !== (row.settled_at !== null))
+  ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_INVALID");
+  return {
+    accountBindingDigest: row.account_binding_digest,
+    authorityHead,
+    authorityRevision: row.authority_revision,
+    canonicalBindingDigest: row.canonical_binding_digest,
+    createdAt: row.created_at,
+    ...(row.diagnostic_code === null ? {} : { diagnosticCode: row.diagnostic_code }),
+    ...(row.effect_started_at === null ? {} : { effectStartedAt: row.effect_started_at }),
+    id: row.id,
+    idempotencyKey: row.idempotency_key,
+    ...(row.space_key_version === null ? {} : { keyVersion: row.space_key_version }),
+    projectId: row.project_id,
+    remoteSpaceId: row.remote_space_id,
+    ...(request === undefined ? {} : { request, requestDigest: row.request_digest as string }),
+    ...(row.settled_at === null ? {} : { settledAt: row.settled_at }),
+    state: row.state,
+    updatedAt: row.updated_at,
+    ...(row.winner_digest === null ? {} : { winnerDigest: row.winner_digest }),
+    ...(row.winner_observed_at === null
+      ? {}
+      : { winnerObservedAt: row.winner_observed_at }),
+    ...(row.winner_replay === null ? {} : { winnerReplay: row.winner_replay === 1 }),
+    ...(row.winner_revision === null ? {} : { winnerRevision: row.winner_revision }),
+    ...(wrappedSpaceKey === undefined ? {} : { wrappedSpaceKey }),
+  };
+};
+
+const parseCanonicalMemorySyncSpoolOperation = (
+  value: CanonicalMemorySyncOperation,
+): CanonicalMemorySyncSpoolOperation => {
+  const parsed = z.object({
+    adoptionProof: z.unknown(),
+    genesisToken: canonicalMemoryHeadTokenSchema,
+    headToken: canonicalMemoryHeadTokenSchema,
+    operation: z.unknown(),
+    priorToken: canonicalMemoryHeadTokenSchema,
+    sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    terminalHeadProof: z.unknown(),
+  }).strict().parse(value);
+  const adoptionProof = parsed.adoptionProof === null
+    ? null
+    : parseCanonicalMemoryEncryptedEnvelope(
+        parsed.adoptionProof,
+        canonicalMemoryCiphertextLimits.adoptionProof,
+      );
+  const operation = parseCanonicalMemoryEncryptedEnvelope(
+    parsed.operation,
+    canonicalMemoryCiphertextLimits.operation,
+  );
+  const terminalHeadProof = parseCanonicalMemoryEncryptedEnvelope(
+    parsed.terminalHeadProof,
+    canonicalMemoryCiphertextLimits.terminalHeadProof,
+  );
+  if (
+    parsed.genesisToken === parsed.headToken
+    || parsed.priorToken === parsed.headToken
+    || (adoptionProof !== null && adoptionProof.keyVersion !== operation.keyVersion)
+    || operation.keyVersion !== terminalHeadProof.keyVersion
+  ) throw new TypeError("CANONICAL_MEMORY_SYNC_SPOOL_INVALID");
+  const normalized = { ...parsed, adoptionProof, operation, terminalHeadProof };
+  return {
+    ...normalized,
+    operationDigest: digestJson({
+      contract: "hra.canonical-memory.operation-envelope.v1",
+      operation: normalized,
+    }),
+  };
+};
+
+const canonicalMemoryWireOperation = (
+  operation: CanonicalMemorySyncSpoolOperation,
+): CanonicalMemorySyncOperation => ({
+  adoptionProof: operation.adoptionProof,
+  genesisToken: operation.genesisToken,
+  headToken: operation.headToken,
+  operation: operation.operation,
+  priorToken: operation.priorToken,
+  sequence: operation.sequence,
+  terminalHeadProof: operation.terminalHeadProof,
+});
+
+const canonicalMemorySpoolOperationWithoutPhase = (
+  operation: CanonicalMemorySyncSpoolOperation & Readonly<{ phase: "request" | "response" }>,
+): CanonicalMemorySyncSpoolOperation => ({
+  ...canonicalMemoryWireOperation(operation),
+  operationDigest: operation.operationDigest,
+});
+
+const mapCanonicalMemoryPortableAdoptionProof = (
+  value: unknown,
+): CanonicalMemoryPortableAdoptionProofRecord => {
+  const row = canonicalMemoryPortableAdoptionProofRowSchema.parse(value);
+  return {
+    bindingDigest: row.canonical_binding_digest,
+    canonicalSpaceId: row.canonical_space_id,
+    contentDigest: row.content_digest,
+    createdAt: row.created_at,
+    keyDigest: row.key_digest,
+    operationSha256: row.operation_sha256,
+    projectId: row.project_id,
+    recordSha256: row.record_sha256,
+    sequence: row.sequence,
+    sourceReceiptSha256: row.source_receipt_sha256,
+  };
+};
+
+const parseCanonicalMemoryPortableAdoptionProof = (
+  value: unknown,
+): CanonicalMemoryPortableAdoptionProof => z.object({
+  bindingDigest: canonicalMemoryDigestSchema,
+  canonicalSpaceId: projectMemoryCanonicalSpaceIdSchema,
+  contentDigest: canonicalMemoryDigestSchema,
+  keyDigest: canonicalMemoryDigestSchema,
+  operationSha256: canonicalMemoryDigestSchema,
+  recordSha256: canonicalMemoryDigestSchema,
+  sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  sourceReceiptSha256: canonicalMemoryDigestSchema,
+}).strict().parse(value);
+
+const sameCanonicalMemorySyncOperation = (
+  left: CanonicalMemorySyncSpoolOperation | undefined,
+  right: CanonicalMemorySyncSpoolOperation | undefined,
+): boolean => left === undefined || right === undefined
+  ? left === right
+  : left.operationDigest === right.operationDigest
+    && JSON.stringify(canonicalMemoryWireOperation(left))
+      === JSON.stringify(canonicalMemoryWireOperation(right));
+
+const canonicalMemorySyncRequestDigest = (input: Readonly<{
+  direction: CanonicalMemorySyncDirection;
+  localHead: ProjectMemoryHeadRef;
+  localHeadToken: string;
+  remote: CanonicalMemoryHostedRemoteObservation;
+  remoteSpaceId: string;
+  requestOperation?: CanonicalMemorySyncSpoolOperation;
+}>): string => input.direction === "push" && input.requestOperation !== undefined
+  ? digestJson({
+      contract: "hra.canonical-memory.push-request.v1",
+      expectedKeyVersion: input.remote.keyVersion,
+      expectedRevision: input.remote.revision,
+      operations: [canonicalMemoryWireOperation(input.requestOperation)],
+      spaceId: input.remoteSpaceId,
+    })
+  : digestJson({
+      afterHeadToken: input.localHeadToken,
+      afterSequence: input.localHead.sequence,
+      contract: "hra.canonical-memory.pull-request.v1",
+      expectedGenesisToken: input.remote.genesisToken,
+      expectedKeyVersion: input.remote.keyVersion,
+      limit: 1,
+      spaceId: input.remoteSpaceId,
+      terminalHeadToken: input.remote.headToken,
+      terminalSequence: input.remote.head.sequence,
+    });
+
+const canonicalMemorySyncResponseDigest = (input: Readonly<{
+  direction: CanonicalMemorySyncDirection;
+  operation?: CanonicalMemorySyncSpoolOperation;
+  remote: CanonicalMemoryHostedRemoteObservation;
+}>): string => digestJson({
+  contract: "hra.canonical-memory.response-observation.v1",
+  direction: input.direction,
+  operation: input.operation === undefined
+    ? null
+    : canonicalMemoryWireOperation(input.operation),
+  remote: input.remote,
+});
+
+const sameProjectMemoryHead = (
+  left: ProjectMemoryHeadRef,
+  right: ProjectMemoryHeadRef,
+): boolean => left.sequence === right.sequence
+  && left.operationSha256 === right.operationSha256
+  && left.headDigest === right.headDigest;
+
+const sameCanonicalMemoryRemoteObservation = (
+  left: CanonicalMemoryHostedRemoteObservation,
+  right: CanonicalMemoryHostedRemoteObservation,
+): boolean => left.genesisToken === right.genesisToken
+  && sameProjectMemoryHead(left.head, right.head)
+  && left.headProofDigest === right.headProofDigest
+  && left.headToken === right.headToken
+  && left.keyVersion === right.keyVersion
+  && left.revision === right.revision;
+
+const parseCanonicalMemoryRemoteObservation = (
+  value: CanonicalMemoryHostedRemoteObservation,
+): CanonicalMemoryHostedRemoteObservation => {
+  const parsed = z.object({
+    genesisToken: canonicalMemoryHeadTokenSchema,
+    head: projectMemoryHeadRefSchema,
+    headProofDigest: canonicalMemoryDigestSchema,
+    headToken: canonicalMemoryHeadTokenSchema,
+    keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  }).strict().parse(value);
+  if (
+    (parsed.head.sequence === 0 && parsed.headToken !== parsed.genesisToken)
+    || (parsed.head.sequence > 0 && parsed.headToken === parsed.genesisToken)
+  ) throw new TypeError("CANONICAL_MEMORY_REMOTE_OBSERVATION_INVALID");
+  return parsed;
+};
+
+const mapCanonicalMemoryHostedAttachment = (
+  value: unknown,
+): CanonicalMemoryHostedAttachmentRecord => {
+  const row = canonicalMemoryHostedAttachmentRowSchema.parse(value);
+  const remote = parseCanonicalMemoryRemoteObservation({
+    genesisToken: row.genesis_token,
+    head: {
+      sequence: row.remote_head_sequence,
+      operationSha256: row.remote_head_operation_sha256,
+      headDigest: row.remote_head_digest,
+    },
+    headProofDigest: row.remote_head_proof_digest,
+    headToken: row.remote_head_token,
+    keyVersion: row.remote_key_version,
+    revision: row.remote_revision,
+  });
+  if (
+    ((row.state === "conflict" || row.state === "error")
+      !== (row.diagnostic_code !== null))
+  ) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_INVALID");
+  return {
+    accountBindingDigest: row.account_binding_digest,
+    canonicalBindingDigest: row.canonical_binding_digest,
+    createdAt: row.created_at,
+    ...(row.diagnostic_code === null ? {} : { diagnosticCode: row.diagnostic_code }),
+    generation: row.generation,
+    projectId: row.project_id,
+    remote,
+    remoteSpaceId: row.remote_space_id,
+    revision: row.revision,
+    state: row.state,
+    updatedAt: row.updated_at,
+  };
+};
+
+const mapCanonicalMemorySyncSpoolOperation = (
+  value: unknown,
+): CanonicalMemorySyncSpoolOperation & Readonly<{ phase: "request" | "response" }> => {
+  const row = canonicalMemorySyncSpoolRowSchema.parse(value);
+  const adoptionProofParts = [
+    row.adoption_proof_algorithm,
+    row.adoption_proof_ciphertext,
+    row.adoption_proof_key_version,
+    row.adoption_proof_nonce,
+  ];
+  const hasAdoptionProof = adoptionProofParts.every((part) => part !== null);
+  if (
+    (!hasAdoptionProof && adoptionProofParts.some((part) => part !== null))
+    || row.genesis_token === row.head_token
+    || row.prior_token === row.head_token
+    || (hasAdoptionProof && row.adoption_proof_key_version !== row.operation_key_version)
+    || row.operation_key_version !== row.proof_key_version
+  ) throw new Error("CANONICAL_MEMORY_SYNC_SPOOL_INVALID");
+  const operation = {
+    phase: row.phase,
+    adoptionProof: !hasAdoptionProof
+      ? null
+      : {
+          algorithm: row.adoption_proof_algorithm as "A256GCM",
+          ciphertext: row.adoption_proof_ciphertext as string,
+          keyVersion: row.adoption_proof_key_version as number,
+          nonce: row.adoption_proof_nonce as string,
+        },
+    genesisToken: row.genesis_token,
+    headToken: row.head_token,
+    operation: {
+      algorithm: row.operation_algorithm,
+      ciphertext: row.operation_ciphertext,
+      keyVersion: row.operation_key_version,
+      nonce: row.operation_nonce,
+    },
+    operationDigest: row.operation_digest,
+    priorToken: row.prior_token,
+    sequence: row.sequence,
+    terminalHeadProof: {
+      algorithm: row.proof_algorithm,
+      ciphertext: row.proof_ciphertext,
+      keyVersion: row.proof_key_version,
+      nonce: row.proof_nonce,
+    },
+  };
+  const wireOperation = canonicalMemoryWireOperation(operation);
+  const { operationDigest } = operation;
+  if (operationDigest !== digestJson({
+    contract: "hra.canonical-memory.operation-envelope.v1",
+    operation: wireOperation,
+  })) throw new Error("CANONICAL_MEMORY_SYNC_SPOOL_INVALID");
+  return operation;
+};
+
+const mapCanonicalMemorySyncIntent = (
+  value: unknown,
+  spoolValues: readonly unknown[],
+  remoteSpaceId: string,
+): CanonicalMemorySyncIntentRecord => {
+  const row = canonicalMemorySyncIntentRowSchema.parse(value);
+  const parsedRemoteSpaceId = canonicalMemoryHostedSpaceIdSchema.parse(remoteSpaceId);
+  const localHead = projectMemoryHeadRefSchema.parse({
+    sequence: row.local_head_sequence,
+    operationSha256: row.local_head_operation_sha256,
+    headDigest: row.local_head_digest,
+  });
+  const remoteObservation = parseCanonicalMemoryRemoteObservation({
+    genesisToken: row.remote_genesis_token,
+    head: {
+      sequence: row.remote_head_sequence,
+      operationSha256: row.remote_head_operation_sha256,
+      headDigest: row.remote_head_digest,
+    },
+    headProofDigest: row.remote_head_proof_digest,
+    headToken: row.remote_head_token,
+    keyVersion: row.remote_key_version,
+    revision: row.remote_revision,
+  });
+  if (
+    (localHead.sequence === 0 && row.local_head_token !== remoteObservation.genesisToken)
+    || (localHead.sequence > 0 && row.local_head_token === remoteObservation.genesisToken)
+  ) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+  const spool = spoolValues.map(mapCanonicalMemorySyncSpoolOperation);
+  const requestSpool = spool.find((operation) => operation.phase === "request");
+  const responseSpool = spool.find((operation) => operation.phase === "response");
+  const requestOperation = requestSpool === undefined
+    ? undefined
+    : canonicalMemorySpoolOperationWithoutPhase(requestSpool);
+  const responseOperation = responseSpool === undefined
+    ? undefined
+    : canonicalMemorySpoolOperationWithoutPhase(responseSpool);
+  if (
+    spool.length !== new Set(spool.map((operation) => operation.phase)).size
+    || (row.direction === "push") !== (requestOperation !== undefined)
+    || (row.direction === "push" && responseOperation !== undefined)
+    || requestOperation?.genesisToken !== undefined
+      && requestOperation.genesisToken !== remoteObservation.genesisToken
+    || (requestOperation !== undefined && (
+      requestOperation.sequence !== remoteObservation.head.sequence + 1
+      || requestOperation.priorToken !== remoteObservation.headToken
+      || requestOperation.operation.keyVersion !== remoteObservation.keyVersion
+      || requestOperation.sequence > localHead.sequence
+      || (requestOperation.sequence === localHead.sequence
+        && requestOperation.headToken !== row.local_head_token)
+    ))
+    || (responseOperation !== undefined && (
+      row.direction !== "pull"
+      || responseOperation.genesisToken !== remoteObservation.genesisToken
+      || responseOperation.sequence !== localHead.sequence + 1
+      || responseOperation.priorToken !== row.local_head_token
+      || responseOperation.operation.keyVersion !== remoteObservation.keyVersion
+      || responseOperation.sequence > remoteObservation.head.sequence
+    ))
+  ) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+
+  const responseCore = [
+    row.response_digest,
+    row.response_genesis_token,
+    row.response_revision,
+    row.response_key_version,
+    row.response_head_sequence,
+    row.response_head_digest,
+    row.response_head_token,
+    row.response_head_proof_digest,
+    row.response_observed_at,
+  ];
+  const hasResponse = responseCore.every((field) => field !== null);
+  if (
+    (!hasResponse && responseCore.some((field) => field !== null))
+    || (row.response_head_sequence === null && row.response_head_operation_sha256 !== null)
+  ) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+  const responseObservation = !hasResponse
+    ? undefined
+    : parseCanonicalMemoryRemoteObservation({
+        genesisToken: canonicalMemoryHeadTokenSchema.parse(row.response_genesis_token),
+        head: {
+          sequence: z.number().int().nonnegative().parse(row.response_head_sequence),
+          operationSha256: row.response_head_operation_sha256,
+          headDigest: canonicalMemoryDigestSchema.parse(row.response_head_digest),
+        },
+        headProofDigest: canonicalMemoryDigestSchema.parse(row.response_head_proof_digest),
+        headToken: canonicalMemoryHeadTokenSchema.parse(row.response_head_token),
+        keyVersion: z.number().int().positive().parse(row.response_key_version),
+        revision: z.number().int().positive().parse(row.response_revision),
+      });
+  if (row.request_digest !== canonicalMemorySyncRequestDigest({
+    direction: row.direction,
+    localHead,
+    localHeadToken: row.local_head_token,
+    remote: remoteObservation,
+    remoteSpaceId: parsedRemoteSpaceId,
+    ...(requestOperation === undefined ? {} : { requestOperation }),
+  })) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+  if (
+    responseObservation !== undefined
+    && row.response_digest !== canonicalMemorySyncResponseDigest({
+      direction: row.direction,
+      remote: responseObservation,
+      ...(responseOperation === undefined ? {} : { operation: responseOperation }),
+    })
+  ) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+  const hasResult = row.result_head_sequence !== null && row.result_head_digest !== null;
+  if (
+    hasResult !== (row.result_head_sequence !== null || row.result_head_digest !== null)
+    || (row.result_head_sequence === null && row.result_head_operation_sha256 !== null)
+  ) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+  const resultHead = !hasResult
+    ? undefined
+    : projectMemoryHeadRefSchema.parse({
+        sequence: row.result_head_sequence,
+        operationSha256: row.result_head_operation_sha256,
+        headDigest: row.result_head_digest,
+      });
+  const responseRequired = row.state === "response_observed" || row.state === "settled";
+  const responseForbidden = row.state === "prepared" || row.state === "effect_started";
+  const terminalState = row.state === "settled"
+    || row.state === "conflict"
+    || row.state === "error";
+  const authorizedPullResult = resultHead !== undefined
+    && row.direction === "pull"
+    && responseOperation !== undefined
+    && responseObservation !== undefined
+    && resultHead.sequence === localHead.sequence + 1
+    && resultHead.sequence === responseOperation.sequence
+    && resultHead.sequence <= responseObservation.head.sequence
+    && (resultHead.sequence !== responseObservation.head.sequence
+      || sameProjectMemoryHead(resultHead, responseObservation.head));
+  const settledWithoutImport = row.state === "settled"
+    && resultHead !== undefined
+    && responseOperation === undefined
+    && sameProjectMemoryHead(resultHead, localHead);
+  if (
+    (row.effect_started_at !== null) !== (row.state !== "prepared")
+    || (responseRequired && !hasResponse)
+    || (responseForbidden && hasResponse)
+    || (row.state === "settled" && resultHead === undefined)
+    || terminalState !== (row.settled_at !== null)
+    || ((row.state === "conflict" || row.state === "error")
+      !== (row.diagnostic_code !== null))
+    || ((row.state === "conflict" || row.state === "error") && row.settled_at === null)
+    || (resultHead !== undefined && !authorizedPullResult && !settledWithoutImport)
+    || ((row.state === "prepared" || row.state === "effect_started")
+      && resultHead !== undefined)
+    || (!hasResponse && responseOperation !== undefined)
+  ) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_INVALID");
+  return {
+    attachmentGeneration: row.attachment_generation,
+    attachmentRevision: row.attachment_revision,
+    authorityRevision: row.authority_revision,
+    canonicalBindingDigest: row.canonical_binding_digest,
+    createdAt: row.created_at,
+    ...(row.diagnostic_code === null ? {} : { diagnosticCode: row.diagnostic_code }),
+    direction: row.direction,
+    ...(row.effect_started_at === null ? {} : { effectStartedAt: row.effect_started_at }),
+    id: row.id,
+    idempotencyKey: row.idempotency_key,
+    localHead,
+    localHeadToken: row.local_head_token,
+    projectId: row.project_id,
+    remoteObservation,
+    requestDigest: row.request_digest,
+    ...(requestOperation === undefined ? {} : { requestOperation }),
+    ...(row.response_digest === null ? {} : { responseDigest: row.response_digest }),
+    ...(responseObservation === undefined ? {} : { responseObservation }),
+    ...(responseOperation === undefined ? {} : { responseOperation }),
+    ...(row.response_observed_at === null
+      ? {}
+      : { responseObservedAt: row.response_observed_at }),
+    ...(resultHead === undefined ? {} : { resultHead }),
+    ...(row.settled_at === null ? {} : { settledAt: row.settled_at }),
+    state: row.state,
+    updatedAt: row.updated_at,
+  };
+};
+
+const mapMemorySubmission = (value: unknown): MemorySubmissionRecord => {
+  const row = memorySubmissionRowSchema.parse(value);
+  const expectedHead = projectMemoryHeadRefSchema.parse({
+    sequence: row.expected_head_sequence,
+    operationSha256: row.expected_head_operation_sha256,
+    headDigest: row.expected_head_digest,
+  });
+  const resultValues = [row.result_head_sequence, row.result_head_digest, row.receipt_digest];
+  const hasResult = resultValues.every((field) => field !== null);
+  if (
+    (!hasResult && resultValues.some((field) => field !== null))
+    || (row.state === "applied") !== hasResult
+    || (row.result_head_sequence === null && row.result_head_operation_sha256 !== null)
+    || (row.result_head_sequence === 0 && row.result_head_operation_sha256 !== null)
+    || (row.result_head_sequence !== null
+      && row.result_head_sequence > 0
+      && row.result_head_operation_sha256 === null)
+  ) throw new Error("MEMORY_SUBMISSION_AUTHORITY_INVALID");
+  const resultHead = !hasResult
+    ? undefined
+    : projectMemoryHeadRefSchema.parse({
+        sequence: row.result_head_sequence,
+        operationSha256: row.result_head_operation_sha256,
+        headDigest: row.result_head_digest,
+      });
+  const sourceValues = [row.source_head_sequence, row.source_head_digest];
+  const hasSource = sourceValues.every((field) => field !== null);
+  if (
+    (!hasSource && sourceValues.some((field) => field !== null))
+    || (row.source_head_sequence === null && row.source_head_operation_sha256 !== null)
+    || (row.source_head_sequence === 0 && row.source_head_operation_sha256 !== null)
+    || (row.source_head_sequence !== null
+      && row.source_head_sequence > 0
+      && row.source_head_operation_sha256 === null)
+  ) throw new Error("MEMORY_SUBMISSION_SOURCE_AUTHORITY_INVALID");
+  const sourceHead = !hasSource
+    ? undefined
+    : projectMemoryHeadRefSchema.parse({
+        sequence: row.source_head_sequence,
+        operationSha256: row.source_head_operation_sha256,
+        headDigest: row.source_head_digest,
+      });
+  const conflictHeadValues = [
+    row.conflict_actual_head_sequence,
+    row.conflict_actual_head_digest,
+    row.conflict_nominated_record_sha256,
+  ];
+  const hasConflict = conflictHeadValues.every((field) => field !== null);
+  if (
+    (!hasConflict && conflictHeadValues.some((field) => field !== null))
+    || (!hasConflict && row.conflict_actual_head_operation_sha256 !== null)
+    || (row.conflict_actual_head_sequence === 0
+      && row.conflict_actual_head_operation_sha256 !== null)
+    || (row.conflict_actual_head_sequence !== null
+      && row.conflict_actual_head_sequence > 0
+      && row.conflict_actual_head_operation_sha256 === null)
+    || (hasConflict !== (row.outcome_code === "share_conflict"))
+  ) throw new Error("MEMORY_SUBMISSION_CONFLICT_EVIDENCE_INVALID");
+  const conflict = !hasConflict
+    ? undefined
+    : {
+        actualHead: projectMemoryHeadRefSchema.parse({
+          sequence: row.conflict_actual_head_sequence,
+          operationSha256: row.conflict_actual_head_operation_sha256,
+          headDigest: row.conflict_actual_head_digest,
+        }),
+        canonicalRecordSha256: row.conflict_canonical_record_sha256,
+        nominatedRecordSha256: row.conflict_nominated_record_sha256
+          ?? (() => { throw new Error("MEMORY_SUBMISSION_CONFLICT_EVIDENCE_INVALID"); })(),
+      };
+  if (!memorySubmissionOutcomeShapeIsValid({
+    expectedHead,
+    kind: row.kind,
+    ...(row.outcome_code === null ? {} : { outcomeCode: row.outcome_code }),
+    ...(resultHead === undefined ? {} : { resultHead }),
+    state: row.state,
+  })) throw new Error("MEMORY_SUBMISSION_OUTCOME_STATE_INVALID");
+  const evidence = [row.effect_record_sha256, row.attestation_sha256, row.operation_id];
+  const hasEvidence = evidence.every((field) => field !== null);
+  if (
+    (!hasEvidence && evidence.some((field) => field !== null))
+    || (row.kind === "remember" && (sourceHead !== undefined || row.nomination_sha256 !== null))
+    || (row.kind === "share"
+      && hasEvidence
+      && (sourceHead === undefined || row.nomination_sha256 === null))
+    || (row.kind === "share"
+      && !hasEvidence
+      && (sourceHead !== undefined || row.nomination_sha256 !== null))
+    || (!hasEvidence && !["prepared", "cancelled"].includes(row.state))
+  ) throw new Error("MEMORY_SUBMISSION_EFFECT_EVIDENCE_INVALID");
+  return {
+    id: row.id,
+    idempotencyKey: row.idempotency_key,
+    kind: row.kind,
+    actorSessionId: row.actor_session_id,
+    projectId: row.project_id,
+    requestDigest: row.request_digest,
+    contentDigest: row.content_digest,
+    keyDigest: row.key_digest,
+    workingBindingDigest: row.working_binding_digest,
+    workingEpoch: row.working_epoch,
+    expectedHead,
+    ...(row.effect_record_sha256 === null
+      ? {}
+      : { effectRecordSha256: row.effect_record_sha256 }),
+    ...(row.attestation_sha256 === null ? {} : { attestationSha256: row.attestation_sha256 }),
+    ...(row.operation_id === null ? {} : { operationId: row.operation_id }),
+    ...(sourceHead === undefined ? {} : { sourceHead }),
+    ...(row.nomination_sha256 === null ? {} : { nominationSha256: row.nomination_sha256 }),
+    ...(resultHead === undefined ? {} : { resultHead }),
+    ...(row.receipt_digest === null ? {} : { receiptDigest: row.receipt_digest }),
+    ...(row.outcome_code === null ? {} : { outcomeCode: row.outcome_code }),
+    ...(conflict === undefined ? {} : { conflict }),
+    state: row.state,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+};
+
+const mapSessionHostCapabilityBinding = (
+  value: unknown,
+): SessionHostCapabilityBindingRecord => {
+  const row = sessionHostCapabilityBindingRowSchema.parse(value);
+  return {
+    sessionId: row.session_id,
+    preambleVersion: row.preamble_version,
+    preambleDigest: row.preamble_digest,
+    manifestVersion: row.manifest_version,
+    manifestDigest: row.manifest_digest,
+    recordedAt: row.recorded_at,
+  };
+};
+
+const queueRecordRowSchema = z.object({
+  id: queueIdSchema,
+  session_id: sessionIdSchema,
+  message: z.string(),
+  message_actor: z.enum(["human", "peer_session"]),
+  peer_action_id: peerActionIdSchema.nullable(),
+  peer_action_resolution_exists: z.union([z.literal(0), z.literal(1)]),
+  state: queueStateSchema,
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const queueRecordColumns = `
+  q.id,q.session_id,q.message,q.message_actor,q.peer_action_id,q.state,q.created_at,q.updated_at,
+  CASE WHEN EXISTS (
+    SELECT 1 FROM queue_effect_resolutions resolution WHERE resolution.queue_id=q.id
+  ) THEN 1 ELSE 0 END AS peer_action_resolution_exists`;
+
+const mapQueueRecord = (value: unknown): QueueRecord => {
+  const row = queueRecordRowSchema.parse(value);
+  const detachedPeerProvenanceAllowed = row.message_actor === "peer_session"
+    && row.peer_action_id === null
+    && (
+      ["applied", "failed", "cancelled"].includes(row.state)
+      || (row.state === "ambiguous" && row.peer_action_resolution_exists === 1)
+    );
+  if (
+    (row.message_actor === "human" && row.peer_action_id !== null)
+    || (row.message_actor === "peer_session"
+      && row.peer_action_id === null
+      && !detachedPeerProvenanceAllowed)
+  ) {
+    throw new Error("QUEUE_PEER_PROVENANCE_INVALID");
+  }
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    message: row.message,
+    messageActor: row.message_actor,
+    ...(row.peer_action_id === null ? {} : { peerActionId: row.peer_action_id }),
+    state: row.state,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 };
 
 export type MutationAttemptRecord = {
@@ -1610,6 +3639,180 @@ export type UnsettledMutationRecord = (MutationAttemptRecord & { format: "legacy
   ownership: SessionSendOwnerHistory;
 }>;
 
+export const sessionUserMessageTranscriptStatusSchema = z.enum([
+  "none",
+  "pending",
+  "finalized",
+  "unavailable",
+  "abandoned",
+]);
+export type SessionUserMessageTranscriptStatus = z.infer<
+  typeof sessionUserMessageTranscriptStatusSchema
+>;
+
+const sessionUserMessageIntentSchema = z.object({
+  version: z.literal(1),
+  accountId: profileIdSchema,
+  providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  providerConnectionId: z.string().uuid().nullable(),
+  actor: sessionMessageActorSchema,
+  text: z.string().max(SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS),
+  omittedCharacters: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  attachments: attachmentReferenceListSchema.optional(),
+}).strict();
+
+const sessionUserMessageActorReceiptSchema = z.object({
+  version: z.literal(1),
+  actor: sessionMessageActorSchema,
+  hadAttachments: z.boolean(),
+}).strict();
+
+const sessionUserMessageSourcePayloadSchema = z.union([
+  sessionUserMessageIntentSchema,
+  sessionUserMessageActorReceiptSchema,
+]);
+
+export type SessionUserMessageIntent = z.infer<typeof sessionUserMessageIntentSchema>;
+
+export type SessionUserMessageSource = Readonly<{
+  status: SessionUserMessageTranscriptStatus;
+  intent?: SessionUserMessageIntent | z.infer<typeof sessionUserMessageActorReceiptSchema>;
+}>;
+
+export type SessionUserMessageIntentInput = Readonly<{
+  accountId: ProfileId;
+  providerGeneration: number;
+  providerConnectionId?: string | null;
+  actor: SessionMessageActor;
+  message: string;
+  attachments?: readonly AttachmentReference[];
+  storedAttachments?: readonly StoredMessageAttachment[];
+}>;
+
+const transcriptControlScalar = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
+
+const sanitizeTranscriptIntentText = (value: string): string => {
+  const redacted = redactCompleteSensitiveText(
+    redactAbsolutePaths(value),
+    "[protected]",
+  );
+  let output = "";
+  for (const scalar of redacted) {
+    output += scalar === "\n"
+      ? scalar
+      : transcriptControlScalar.test(scalar)
+        ? "�"
+        : scalar;
+  }
+  return output;
+};
+
+const canonicalSessionUserMessageIntent = (
+  input: SessionUserMessageIntentInput,
+): Readonly<{ intent: SessionUserMessageIntent; json: string }> => {
+  const message = z.string().min(1).max(262_144).parse(input.message);
+  // Recognize complete secrets before truncating; a boundary-split credential
+  // must never become an unrecognizable plaintext fragment in durable intent.
+  const text = sanitizeTranscriptIntentText(message)
+    .slice(0, SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS);
+  const attachments = input.attachments === undefined || input.attachments.length === 0
+    ? undefined
+    : attachmentReferenceListSchema.parse(input.attachments);
+  const intent = sessionUserMessageIntentSchema.parse({
+    version: 1,
+    accountId: input.accountId,
+    providerGeneration: input.providerGeneration,
+    providerConnectionId: input.providerConnectionId ?? null,
+    actor: input.actor,
+    text,
+    omittedCharacters: message.length - Math.min(
+      message.length,
+      SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
+    ),
+    ...(attachments === undefined ? {} : { attachments }),
+  });
+  const json = JSON.stringify(intent);
+  if (utf8Bytes(json) > SESSION_EVENT_MAX_BYTES) {
+    throw new Error("SESSION_USER_MESSAGE_INTENT_EXCEEDS_BOUND");
+  }
+  return { intent, json };
+};
+
+const sessionUserMessageActorReceiptJson = (input: Readonly<{
+  actor: SessionMessageActor;
+  attachments?: readonly AttachmentReference[];
+}>): string => JSON.stringify(sessionUserMessageActorReceiptSchema.parse({
+  version: 1,
+  actor: input.actor,
+  hadAttachments: (input.attachments?.length ?? 0) > 0,
+}));
+
+type MutationRequestAuthority = Readonly<{
+  kind: string;
+  authorityId: string;
+  authorityGeneration: number;
+  request: unknown;
+}>;
+
+export type SessionStartMutationRequest = Readonly<{
+  projectId: ProjectId;
+  provider: Provider;
+  preset: Preset;
+  presetContract?: PresetContract | undefined;
+  fast: boolean;
+}>;
+
+export const sessionStartMutationRequest = (input: Readonly<{
+  projectId: ProjectId;
+  provider: Provider;
+  preset: Preset;
+  presetContract?: PresetContract | undefined;
+  fast: boolean;
+}>): SessionStartMutationRequest => {
+  return {
+    projectId: input.projectId,
+    provider: input.provider,
+    preset: input.preset,
+    ...(input.presetContract === undefined ? {} : { presetContract: input.presetContract }),
+    fast: input.fast,
+  };
+};
+
+export type SessionProviderSwitchMutationRequest = Readonly<{
+  provider: Provider;
+  preset: Preset;
+  presetContract?: PresetContract | undefined;
+  targetProfileId: ProfileId;
+  seedDigest: string;
+}>;
+
+export const sessionProviderSwitchMutationRequest = (input: Readonly<{
+  provider: Provider;
+  preset: Preset;
+  presetContract?: PresetContract | undefined;
+  targetProfileId: ProfileId;
+  seedDigest: string;
+}>): SessionProviderSwitchMutationRequest => {
+  return {
+    provider: input.provider,
+    preset: input.preset,
+    ...(input.presetContract === undefined
+      ? {}
+      : { presetContract: input.presetContract }),
+    targetProfileId: input.targetProfileId,
+    seedDigest: input.seedDigest,
+  };
+};
+
+export const mutationRequestDigest = (input: MutationRequestAuthority): string =>
+  createHash("sha256")
+    .update(JSON.stringify({
+      kind: input.kind,
+      authorityId: input.authorityId,
+      authorityGeneration: input.authorityGeneration,
+      request: input.request,
+    }))
+    .digest("hex");
 export type PendingLoginAuthority = {
   attemptId: AttemptId;
   idempotencyKey: string;
@@ -1625,12 +3828,12 @@ export type SessionProviderBaseline = {
 };
 
 export type MutationEffectEvidence =
-  | { kind: "session.send"; providerThreadId: string; baseline: SessionProviderBaseline; clientMessageId: string; messageDigest: string; runtimeProfile?: ReviewedRuntimeProfile }
-  | { kind: "session.steer"; providerThreadId: string; baseline: SessionProviderBaseline; activeTurnId: string | null; clientMessageId: string; messageDigest: string }
-  | { kind: "session.stop"; providerThreadId: string; baseline: SessionProviderBaseline; activeTurnId: string | null }
-  | { kind: "session.rename"; providerThreadId: string; baseline: SessionProviderBaseline; requestedName: string }
-  | { kind: "session.start"; projectId: ProjectId; clientMessageId: string | null; messageDigest: string | null; runtimeProfile?: ReviewedRuntimeProfile; conversationAutomationCapability?: typeof SESSION_CONVERSATION_AUTOMATION_CAPABILITY }
-  | { kind: "session.switch"; daemonGeneration?: number | undefined; requestedAccountId: ProfileId | null; requestedPreset: Preset | null; sourceProfileId: ProfileId; sourceProcessGeneration: number; sourceProvider: Provider; sourceProviderThreadId: string; sourcePreset: Preset; targetProfileId: ProfileId; targetProcessGeneration: number; targetProvider: Provider; targetProviderAccountKey?: string | undefined; targetPreset: Preset; transcriptDigest: string; seedDigest: string; seedIncludedRecords: number; seedOmittedRecords: number; runtimeProfile: ReviewedRuntimeProfile }
+  | { kind: "session.send"; providerThreadId: string; baseline: SessionProviderBaseline; clientMessageId: string; messageDigest: string; runtimeProfile?: ReviewedRuntimeProfile | undefined; messageActor?: SessionMessageActor | undefined }
+  | { kind: "session.steer"; providerThreadId: string; baseline: SessionProviderBaseline; activeTurnId: string | null; clientMessageId: string; messageDigest: string; messageActor?: SessionMessageActor | undefined }
+  | { kind: "session.stop"; providerThreadId: string; providerTimestampUnit?: "unix_milliseconds_v1" | undefined; baseline: SessionProviderBaseline; activeTurnId: string | null }
+  | { kind: "session.rename"; providerThreadId: string; providerTimestampUnit?: "unix_milliseconds_v1" | undefined; baseline: SessionProviderBaseline; requestedName: string }
+  | { kind: "session.start"; projectId: ProjectId; clientMessageId: string | null; messageDigest: string | null; presetContract?: PresetContract | undefined; runtimeProfile?: ReviewedRuntimeProfile | undefined; conversationAutomationCapability?: typeof SESSION_CONVERSATION_AUTOMATION_CAPABILITY | undefined }
+  | { kind: "session.switch"; daemonGeneration?: number | undefined; requestedAccountId: ProfileId | null; requestedPreset: Preset | null; sourceProfileId: ProfileId; sourceProcessGeneration: number; sourceProvider: Provider; sourceProviderThreadId: string; sourcePreset: Preset; targetProfileId: ProfileId; targetProcessGeneration: number; targetProvider: Provider; targetProviderAccountKey?: string | undefined; targetHostCapabilities?: SessionProviderSwitchHostCapabilities | undefined; targetPreset: Preset; presetContract?: PresetContract | undefined; transcriptDigest: string; seedDigest: string; seedIncludedRecords: number; seedOmittedRecords: number; seedRetentionGapReason?: SessionEventGapReason | undefined; runtimeProfile: ReviewedRuntimeProfile }
   | { kind: "account.login"; method: "browser" | "device_code" }
   | { kind: "account.claude-login"; provider: "claude"; baselineSignedIn: false }
   | { kind: "account.devin-login"; provider: "devin"; baselineSignedIn: false }
@@ -1650,6 +3853,13 @@ export type MutationResolutionRecord = {
   receipt?: unknown;
   createdAt: number;
 };
+
+export type SessionProviderSwitchHostCapabilities = Readonly<{
+  preambleVersion: number;
+  preambleDigest: string;
+  manifestVersion: number;
+  manifestDigest: string;
+}>;
 
 export type QueueEffectEvidence = {
   kind: "queue.dispatch";
@@ -1671,6 +3881,23 @@ export type QueueEffectEvidenceRecord = {
   resolution?: { kind: "proven_applied" | "abandoned"; evidence: unknown; receipt?: unknown; createdAt: number };
 };
 
+// Stored evidence is interpreted only under its immutable source-selected
+// format. A parsed envelope is still not the action's provider authority.
+const requireMutationEvidenceFromProvenance = (
+  database: Database, attemptId: AttemptId,
+): MutationEffectEvidenceRecord => {
+  const result = readMutationEffectEvidenceProvenance(database, attemptId);
+  if (result.kind !== "parsed") throw new Error("MUTATION_EFFECT_EVIDENCE_UNAVAILABLE");
+  return { attemptId, digest: result.digest, evidence: result.evidence, recordedAt: result.recordedAt };
+};
+const requireQueueEvidenceFromProvenance = (
+  database: Database, queueId: QueueId,
+): Omit<QueueEffectEvidenceRecord, "resolution"> => {
+  const result = readQueueEffectEvidenceProvenance(database, queueId);
+  if (result.kind !== "parsed") throw new Error("QUEUE_EFFECT_EVIDENCE_UNAVAILABLE");
+  return { queueId, digest: result.digest, evidence: result.evidence, recordedAt: result.recordedAt };
+};
+
 const desktopSwitchPhaseSchema = z.enum([
   "prepared",
   "quit_started",
@@ -1690,7 +3917,8 @@ const desktopSwitchStageSchema = z.enum([
   "verified",
   "recovery-required",
 ]);
-const desktopDiagnosticSchema = z.string().regex(/^[A-Z][A-Z0-9_]{0,79}$/u);
+const controlPlaneDiagnosticSchema = z.string().regex(/^[A-Z][A-Z0-9_]{0,79}$/u);
+const desktopDiagnosticSchema = controlPlaneDiagnosticSchema;
 const desktopAccountKeySchema = z
   .string()
   .trim()
@@ -1712,7 +3940,173 @@ const pendingLoginReceiptAuthoritySchema = z.object({
   status: z.literal("pending"),
   loginId: providerLoginIdSchema,
 }).passthrough();
+const mutationEffectEvidenceSchema = joinedMutationEffectEvidenceSchema;
+const safeProviderTimestampSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const timestampResolutionEvidenceSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("session.stop"),
+    providerThreadId: providerThreadIdSchema,
+    providerTimestampUnit: z.literal("unix_milliseconds_v1"),
+    providerUpdatedAt: safeProviderTimestampSchema,
+    activeTurnId: z.string().min(1).max(200),
+    observedStatus: z.enum(["absent", "completed", "interrupted", "failed"]),
+  }).strict(),
+  z.object({
+    kind: z.literal("session.rename"),
+    providerThreadId: providerThreadIdSchema,
+    providerTimestampUnit: z.literal("unix_milliseconds_v1"),
+    providerUpdatedAt: safeProviderTimestampSchema,
+    requestedName: z.string().refine((value) => value === value.trim()).pipe(titleSchema),
+  }).strict(),
+]);
+
+const assertTimestampMutationResolution = (input: {
+  effect: Extract<MutationEffectEvidence, { kind: "session.stop" | "session.rename" }>;
+  resolution: MutationResolutionRecord["kind"];
+  evidence: unknown;
+  receipt: unknown;
+  provider: { providerThreadId: string; title: string; activeTurnId?: string; providerUpdatedAt?: number } | undefined;
+}): void => {
+  if (input.resolution !== "proven_applied") {
+    if (input.receipt !== undefined) throw new Error("MUTATION_RECOVERY_TIMESTAMP_RECEIPT_UNEXPECTED");
+    return;
+  }
+  const { effect, provider } = input;
+  const proof = timestampResolutionEvidenceSchema.safeParse(input.evidence);
+  const baseline = safeProviderTimestampSchema.safeParse(effect.baseline.providerUpdatedAt);
+  if (!proof.success || !baseline.success
+    || effect.providerTimestampUnit !== "unix_milliseconds_v1"
+    || proof.data.kind !== effect.kind
+    || proof.data.providerThreadId !== effect.providerThreadId
+    || proof.data.providerUpdatedAt <= baseline.data
+    || provider?.providerThreadId !== effect.providerThreadId
+    || provider.providerUpdatedAt !== proof.data.providerUpdatedAt) {
+    throw new Error("MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID");
+  }
+  if (effect.kind === "session.stop" && proof.data.kind === "session.stop") {
+    const receipt = z.object({ stopped: z.literal(true), activeTurnId: z.string().min(1).max(200) }).strict().safeParse(input.receipt);
+    if (!receipt.success || effect.activeTurnId === null
+      || effect.activeTurnId !== proof.data.activeTurnId
+      || receipt.data.activeTurnId !== effect.activeTurnId
+      || provider.activeTurnId === effect.activeTurnId) {
+      throw new Error("MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID");
+    }
+  } else if (effect.kind === "session.rename" && proof.data.kind === "session.rename") {
+    const receipt = z.object({ renamed: z.literal(true) }).strict().safeParse(input.receipt);
+    if (!receipt.success || proof.data.requestedName !== effect.requestedName
+      || provider.title !== effect.requestedName) {
+      throw new Error("MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID");
+    }
+  }
+};
+
+const queueEffectEvidenceSchema = joinedQueueEffectEvidenceSchema;
 const mutationResolutionKindSchema = z.enum(["proven_applied", "provider_state_reconciled", "abandoned"]);
+const peerCausalFenceSchema = z.object({
+  version: z.literal(1), providerThreadId: providerThreadIdSchema,
+  activeTurnId: z.string().min(1).max(200).nullable(),
+}).strict();
+function assertPeerCausalFenceNotSupplied(evidence: unknown): void {
+  if (typeof evidence === "object" && evidence !== null && Object.hasOwn(evidence, "peerCausalFence")) {
+    throw new Error("PEER_SESSION_CAUSAL_FENCE_RESERVED");
+  }
+}
+function snapshotPeerCausalResolutionInput(evidence: unknown): unknown {
+  assertPeerCausalFenceNotSupplied(evidence);
+  const snapshot = snapshotForeignJson(evidence);
+  if (!snapshot.ok) throw new Error("PEER_SESSION_CAUSAL_FENCE_EVIDENCE_INVALID");
+  assertPeerCausalFenceNotSupplied(snapshot.value);
+  return snapshot.value;
+}
+function peerCausalResolutionEvidence(evidence: unknown, effectThreadId: string,
+  provider: Readonly<{ providerThreadId: string; status: "active" | "idle" | "terminal"; activeTurnId?: string }>,
+): Readonly<Record<string, unknown>> {
+  if (provider.providerThreadId !== effectThreadId) throw new Error("PEER_SESSION_CAUSAL_FENCE_THREAD_MISMATCH");
+  return { ...z.record(z.string(), z.unknown()).parse(evidence), peerCausalFence: peerCausalFenceSchema.parse({
+    version: 1, providerThreadId: effectThreadId, activeTurnId: provider.status === "active" ? provider.activeTurnId : null,
+  }) };
+}
+function readPeerCausalTranscriptActor(database: Database, table: "mutation_attempts" | "queue_entries", id: string): SessionMessageActor | undefined {
+  const row = z.object({ valid: z.literal(1), unique_actor: z.literal(1),
+    present: z.union([z.literal(0), z.literal(1)]), actor: z.string().max(64).nullable(),
+  }).strict().parse(database.query(`SELECT (transcript_intent_json IS NULL OR json_valid(transcript_intent_json)) AS valid,
+    (SELECT count(*) FROM json_each(doc) WHERE key='actor')<=1 AS unique_actor,
+    json_type(doc,'$.actor') IS NOT NULL AS present,
+    CASE WHEN json_type(doc,'$.actor')='text' AND length(CAST(json_extract(doc,'$.actor') AS BLOB))<=64
+      THEN json_extract(doc,'$.actor') ELSE NULL END AS actor
+    FROM (SELECT transcript_intent_json,CASE WHEN json_valid(transcript_intent_json) THEN transcript_intent_json ELSE '{}' END AS doc
+      FROM ${table} WHERE id=?)`).get(id));
+  return row.present === 0 ? undefined : sessionMessageActorSchema.parse(row.actor);
+}
+const peerCausalCandidateSchema = z.object({
+  resolution_id: z.union([attemptIdSchema, queueIdSchema]),
+  effect_kind: z.enum(["session.send", "session.steer", "queue.dispatch"]),
+  queue_actor: z.enum(["human", "peer_session"]).nullable(),
+  resolution_valid: z.union([z.literal(0), z.literal(1)]),
+  marker_present: z.union([z.literal(0), z.literal(1)]),
+  marker_json: z.string().max(4096).nullable(),
+  marker_keys_unique: z.union([z.literal(0), z.literal(1)]),
+  transcript_valid: z.union([z.literal(0), z.literal(1)]),
+  transcript_actor_present: z.union([z.literal(0), z.literal(1)]),
+  transcript_actor: z.string().max(64).nullable(),
+  transcript_actor_unique: z.union([z.literal(0), z.literal(1)]),
+}).strict();
+// Parent/resolution candidates are selected before any JSON authority filter.
+// JSON1 retains duplicate-key facts; SQL bounds returned strings before JS.
+const peerCausalCandidateProjectionSql = `SELECT resolution_id,effect_kind,queue_actor,
+  json_valid(resolution_json) AS resolution_valid,
+  json_type(resolution_doc,'$.peerCausalFence') IS NOT NULL AS marker_present,
+  CASE WHEN length(CAST(json_quote(json_extract(resolution_doc,'$.peerCausalFence')) AS BLOB))<=4096
+    THEN json_quote(json_extract(resolution_doc,'$.peerCausalFence')) ELSE NULL END AS marker_json,
+  ((SELECT count(*) FROM json_each(resolution_doc) WHERE key='peerCausalFence')=1
+    AND (SELECT count(*) FROM json_each(resolution_doc,'$.peerCausalFence'))=
+      (SELECT count(DISTINCT key) FROM json_each(resolution_doc,'$.peerCausalFence'))) AS marker_keys_unique,
+  (transcript_json IS NULL OR json_valid(transcript_json)) AS transcript_valid,
+  json_type(transcript_doc,'$.actor') IS NOT NULL AS transcript_actor_present,
+  CASE WHEN json_type(transcript_doc,'$.actor')='text'
+      AND length(CAST(json_extract(transcript_doc,'$.actor') AS BLOB))<=64
+    THEN json_extract(transcript_doc,'$.actor') ELSE NULL END AS transcript_actor,
+  (SELECT count(*) FROM json_each(transcript_doc) WHERE key='actor')<=1 AS transcript_actor_unique
+  FROM (SELECT *, CASE WHEN json_valid(resolution_json) THEN resolution_json ELSE '{}' END AS resolution_doc,
+    CASE WHEN json_valid(transcript_json) THEN transcript_json ELSE '{}' END AS transcript_doc FROM candidate)
+  WHERE resolution_id>? ORDER BY resolution_id LIMIT 16`;
+function peerCausalFenceRefusesTurn(candidate: z.infer<typeof peerCausalCandidateSchema>,
+  evidence: MutationEffectEvidence | QueueEffectEvidence, providerThreadId: string, turnId: string,
+): boolean {
+  if (evidence.kind !== candidate.effect_kind) return true;
+  // A proved other thread is unrelated. Opaque/missing evidence never reaches
+  // this branch and cannot disappear merely because its raw JSON says so.
+  if (evidence.providerThreadId !== providerThreadId) return false;
+  if (candidate.resolution_valid !== 1 || candidate.transcript_valid !== 1 || candidate.transcript_actor_unique !== 1) return true;
+  const transcript = candidate.transcript_actor_present === 0 ? undefined
+    : sessionMessageActorSchema.safeParse(candidate.transcript_actor);
+  if (transcript !== undefined && !transcript.success) return true;
+  const transcriptActor = transcript?.data;
+  const effectActor = "messageActor" in evidence ? evidence.messageActor : undefined;
+  if (effectActor !== undefined && transcriptActor !== undefined
+    && (effectActor === "peer_session") !== (transcriptActor === "peer_session")) return true;
+  // The existing queue column is a physical peer/nonpeer category; explicit
+  // automation/autorespond/provider_switch transcript actors are not humanized.
+  if (candidate.queue_actor !== null && ((effectActor !== undefined
+    && (effectActor === "peer_session") !== (candidate.queue_actor === "peer_session"))
+    || (transcriptActor !== undefined
+      && (transcriptActor === "peer_session") !== (candidate.queue_actor === "peer_session")))) return true;
+  const actors = [effectActor, transcriptActor, candidate.queue_actor ?? undefined].filter((actor) => actor !== undefined);
+  if (candidate.marker_present === 0 && actors.length > 0 && actors.every((actor) => actor !== "peer_session")) return false;
+  if (evidence.kind === "session.steer") {
+    const target = z.string().min(1).max(200).safeParse(evidence.activeTurnId);
+    if (target.success && target.data === turnId) return true;
+    // Unlike send/queue, a selected historical steer names its exact target
+    // turn. A different target excludes this particular turn without inferring
+    // an actor or reconstructing an accepted turn from time/newer receipts.
+    if (candidate.marker_present === 0) return !target.success;
+  } else if (candidate.marker_present === 0) return true;
+  if (candidate.marker_json === null || candidate.marker_keys_unique !== 1) return true;
+  try {
+    const marker = peerCausalFenceSchema.safeParse(JSON.parse(candidate.marker_json) as unknown);
+    return !marker.success || marker.data.providerThreadId !== providerThreadId || marker.data.activeTurnId === turnId;
+  } catch { return true; }
+}
 const desktopRecoveryResolutionSchema = z.enum(["resolved_applied", "resolved_not_applied"]);
 const desktopSwitchBeginSchema = z
   .object({
@@ -1732,12 +4126,6 @@ const desktopSwitchBeginSchema = z
 
 const sessionSwitchDiagnosticSchema = z.string().regex(/^[A-Z][A-Z0-9_]{0,79}$/u);
 const sessionSwitchFailureCodeSchema = z.string().regex(/^[A-Z][A-Z0-9_]{0,79}$/u);
-const sessionSwitchRawRequestSchema = z.object({
-  session: z.string().min(1).max(200),
-  provider: providerSchema,
-  account: z.string().min(1).max(200).nullable(),
-  preset: presetSchema.nullable(),
-}).strict();
 const defaultSessionSwitchPreset = (provider: Provider, sourcePreset: Preset): Preset => {
   const supported = presetsForProvider(provider);
   const matchingTier = supported.find(
@@ -1839,7 +4227,12 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 49;
+// Preserve main's v40 adoption, v41 timestamp, v42 Work, and v43 transcript
+// contracts, v44 approval budgets, v45 auth authority, and v46 after-hours
+// policy, v47/v48 memory authority, and the v49 nullable Work project fence.
+// Private candidate only until the exact governed canonical50 join is proved.
+// Canonical1..50 precede the nine frozen usage units51..59 and joined bridge60.
+const currentSchemaVersion = 60;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -1864,6 +4257,7 @@ const safeObservationTitle = (value: string): string => {
   }
   return titleSchema.parse(`${prefix.trimEnd()}${marker}`);
 };
+
 const stateBusyTimeoutMs = 5_000;
 
 // The scrub checkpoint waits inside SQLite's busy handler for readers that
@@ -1985,6 +4379,1111 @@ export const PROVIDER_USAGE_COMPONENT_RETAIN_COUNT = 2_048;
 export const PROVIDER_USAGE_COMPONENT_RETAIN_BYTES = 16 * 1_024 * 1_024;
 const PROVIDER_USAGE_COMPONENT_MAX_BYTES = 256 * 1_024;
 export const USAGE_LOCAL_SNAPSHOT_MAX_BYTES = 262_144;
+
+// Insert-only hardening leaves legacy evidence, digests, and resolutions intact.
+const timestampMutationResolutionGuard = `
+CREATE TRIGGER mutation_resolutions_timestamp_proof_insert
+BEFORE INSERT ON mutation_resolutions
+WHEN (SELECT kind FROM mutation_attempts WHERE id=NEW.attempt_id) IN ('session.stop','session.rename')
+BEGIN
+  SELECT CASE WHEN NEW.resolution_kind<>'proven_applied' AND NEW.receipt_json IS NOT NULL
+    THEN RAISE(ABORT,'MUTATION_RECOVERY_TIMESTAMP_RECEIPT_UNEXPECTED') END;
+  SELECT CASE WHEN NEW.resolution_kind='proven_applied' AND (
+    NOT json_valid(NEW.evidence_json) OR NEW.receipt_json IS NULL OR NOT json_valid(NEW.receipt_json)
+  ) THEN RAISE(ABORT,'MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID') END;
+  SELECT CASE WHEN NEW.resolution_kind='proven_applied' AND NOT EXISTS (
+    SELECT 1 FROM mutation_attempts m
+    JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+    JOIN sessions s ON s.id=m.authority_id
+    WHERE m.id=NEW.attempt_id AND e.kind=m.kind
+      AND json_extract(e.evidence_json,'$.kind')=m.kind
+      AND json_extract(NEW.evidence_json,'$.kind')=m.kind
+      AND json_extract(e.evidence_json,'$.providerThreadId')=s.provider_thread_id
+      AND json_extract(NEW.evidence_json,'$.providerThreadId')=s.provider_thread_id
+      AND json_extract(e.evidence_json,'$.providerTimestampUnit')='unix_milliseconds_v1'
+      AND json_extract(NEW.evidence_json,'$.providerTimestampUnit')='unix_milliseconds_v1'
+      AND json_type(e.evidence_json,'$.baseline.providerUpdatedAt')='integer'
+      AND json_extract(e.evidence_json,'$.baseline.providerUpdatedAt') BETWEEN 0 AND 9007199254740991
+      AND json_type(NEW.evidence_json,'$.providerUpdatedAt')='integer'
+      AND json_extract(NEW.evidence_json,'$.providerUpdatedAt') BETWEEN 0 AND 9007199254740991
+      AND json_extract(NEW.evidence_json,'$.providerUpdatedAt')>json_extract(e.evidence_json,'$.baseline.providerUpdatedAt')
+      AND s.provider_updated_at=json_extract(NEW.evidence_json,'$.providerUpdatedAt')
+      AND (
+        (m.kind='session.stop'
+          AND s.active_turn_id IS NOT json_extract(e.evidence_json,'$.activeTurnId')
+          AND (SELECT count(*) FROM json_each(NEW.evidence_json))=6
+          AND (SELECT count(*) FROM json_each(NEW.receipt_json))=2
+          AND json_type(e.evidence_json,'$.activeTurnId')='text'
+          AND json_extract(NEW.evidence_json,'$.activeTurnId')=json_extract(e.evidence_json,'$.activeTurnId')
+          AND json_extract(NEW.receipt_json,'$.activeTurnId')=json_extract(e.evidence_json,'$.activeTurnId')
+          AND json_extract(NEW.evidence_json,'$.observedStatus') IN ('absent','completed','interrupted','failed')
+          AND json_type(NEW.receipt_json,'$.stopped')='true')
+        OR (m.kind='session.rename'
+          AND s.title=json_extract(e.evidence_json,'$.requestedName')
+          AND (SELECT count(*) FROM json_each(NEW.evidence_json))=5
+          AND (SELECT count(*) FROM json_each(NEW.receipt_json))=1
+          AND json_extract(NEW.evidence_json,'$.requestedName')=json_extract(e.evidence_json,'$.requestedName')
+          AND json_type(NEW.receipt_json,'$.renamed')='true')
+      )
+  ) THEN RAISE(ABORT,'MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID') END;
+END;
+`;
+
+const assertSchemaVersion41TimestampProof = (database: Database): void => {
+  const observed = z.object({ type: z.literal("trigger"), tbl_name: z.literal("mutation_resolutions"), sql: z.string() }).strict().safeParse(
+    database.query("SELECT type,tbl_name,sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'").get(),
+  );
+  // SQLite stores our CREATE statement without its terminal semicolon. Compare
+  // the exact remaining text: normalizing whitespace can change SQL literals.
+  if (!observed.success || observed.data.sql !== timestampMutationResolutionGuard.trim().slice(0, -1)) {
+    throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID");
+  }
+};
+
+const assertSchemaMigrationLedgerTail = (
+  database: Database,
+  expected: readonly number[],
+  errorCode: string,
+): void => {
+  const ledger = z.object({
+    version: z.number().int(),
+    applied_at: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
+  }).strict().array().safeParse(database.query(
+    `SELECT version,applied_at FROM migrations WHERE version>=${String(expected[0])} ORDER BY version LIMIT ${String(expected.length + 1)}`,
+  ).all());
+  if (
+    !ledger.success
+    || ledger.data.length !== expected.length
+    || ledger.data.some((row, index) => row.version !== expected[index])
+  ) throw new Error(errorCode);
+};
+
+const assertSchemaVersion40Authority = (database: Database): void => {
+  assertSchemaMigrationLedgerTail(
+    database,
+    [40],
+    "STATE_SCHEMA_V40_MIGRATION_LEDGER_INVALID",
+  );
+};
+
+const assertSchemaVersion41Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSchemaMigrationLedgerTail(
+    database,
+    [40, 41],
+    "STATE_SCHEMA_V41_MIGRATION_LEDGER_INVALID",
+  );
+};
+
+const assertSchemaVersion42Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSchemaMigrationLedgerTail(
+    database,
+    [40, 41, 42],
+    "STATE_SCHEMA_V42_MIGRATION_LEDGER_INVALID",
+  );
+};
+
+// User-message bodies belong to the bounded transcript ledger, but exact
+// mutation/effect identities outlive that retention window. The source row
+// therefore owns one bounded, already-public intent and its status. This is
+// enough to finish an accepted effect without asking a provider again and does
+// not create an independently growing ledger.
+const schemaVersion43MutationTranscriptFinalizedColumn =
+  "ALTER TABLE mutation_attempts ADD COLUMN transcript_finalized INTEGER NOT NULL DEFAULT 0 "
+  + "CHECK(transcript_finalized IN (0,1))";
+const schemaVersion43QueueTranscriptFinalizedColumn =
+  "ALTER TABLE queue_entries ADD COLUMN transcript_finalized INTEGER NOT NULL DEFAULT 0 "
+  + "CHECK(transcript_finalized IN (0,1))";
+const schemaVersion43MutationTranscriptStatusColumn =
+  "ALTER TABLE mutation_attempts ADD COLUMN transcript_status TEXT NOT NULL DEFAULT 'none' "
+  + "CHECK(transcript_status IN ('none','pending','finalized','unavailable','abandoned'))";
+const schemaVersion43QueueTranscriptStatusColumn =
+  "ALTER TABLE queue_entries ADD COLUMN transcript_status TEXT NOT NULL DEFAULT 'none' "
+  + "CHECK(transcript_status IN ('none','pending','finalized','unavailable','abandoned'))";
+const schemaVersion43MutationTranscriptIntentColumn =
+  `ALTER TABLE mutation_attempts ADD COLUMN transcript_intent_json TEXT
+   CHECK(transcript_intent_json IS NULL OR (
+     json_valid(transcript_intent_json)
+     AND length(CAST(transcript_intent_json AS BLOB))<=${String(SESSION_EVENT_MAX_BYTES)}
+   ))`;
+const schemaVersion43QueueTranscriptIntentColumn =
+  `ALTER TABLE queue_entries ADD COLUMN transcript_intent_json TEXT
+   CHECK(transcript_intent_json IS NULL OR (
+     json_valid(transcript_intent_json)
+     AND length(CAST(transcript_intent_json AS BLOB))<=${String(SESSION_EVENT_MAX_BYTES)}
+   ))`;
+const schemaVersion9SessionEventsAccountAuthorityGuard = `
+CREATE TRIGGER IF NOT EXISTS session_events_account_authority_guard
+BEFORE INSERT ON session_events
+WHEN NOT EXISTS(
+  SELECT 1 FROM sessions s JOIN profiles p ON p.id=s.profile_id
+  WHERE s.id=NEW.session_id
+    AND s.profile_id=NEW.account_id
+    AND p.process_generation=NEW.provider_generation
+)
+BEGIN SELECT RAISE(ABORT, 'session event account authority mismatch'); END;
+`;
+const schemaVersion43SessionEventsAccountAuthorityGuard = `
+CREATE TRIGGER IF NOT EXISTS session_events_account_authority_guard
+BEFORE INSERT ON session_events
+WHEN NOT EXISTS(
+  SELECT 1 FROM sessions s JOIN profiles p ON p.id=s.profile_id
+  WHERE s.id=NEW.session_id
+    AND s.profile_id=NEW.account_id
+    AND (
+      p.process_generation=NEW.provider_generation
+      OR (
+        p.process_generation>NEW.provider_generation
+        AND json_extract(NEW.event_json,'$.body.type')='user_message'
+        AND (
+          EXISTS(
+            SELECT 1 FROM mutation_attempts m
+            WHERE m.authority_id=NEW.session_id
+              AND m.kind IN ('session.send','session.steer')
+              AND m.idempotency_key=json_extract(NEW.event_json,'$.body.sourceId')
+              AND m.state IN ('effect_started','applied','ambiguous')
+              AND m.transcript_status='pending'
+              AND m.transcript_finalized=0
+              AND json_extract(m.transcript_intent_json,'$.accountId')=NEW.account_id
+              AND json_extract(m.transcript_intent_json,'$.providerGeneration')=
+                  NEW.provider_generation
+              AND json_extract(m.transcript_intent_json,'$.providerConnectionId')
+                  IS NEW.provider_connection_id
+              AND json_extract(m.transcript_intent_json,'$.actor')=
+                  json_extract(NEW.event_json,'$.body.actor')
+              AND json_extract(m.transcript_intent_json,'$.text')=
+                  json_extract(NEW.event_json,'$.body.text')
+              AND json_extract(m.transcript_intent_json,'$.omittedCharacters')=
+                  json_extract(NEW.event_json,'$.body.omittedCharacters')
+              AND COALESCE(json_extract(m.transcript_intent_json,'$.attachments'),'[]')=
+                  COALESCE(json_extract(NEW.event_json,'$.body.attachments'),'[]')
+          )
+          OR EXISTS(
+            SELECT 1 FROM queue_entries q
+            WHERE q.session_id=NEW.session_id
+              AND q.id=json_extract(NEW.event_json,'$.body.sourceId')
+              AND q.state IN ('dispatching','applied','ambiguous')
+              AND q.transcript_status='pending'
+              AND q.transcript_finalized=0
+              AND json_extract(q.transcript_intent_json,'$.accountId')=NEW.account_id
+              AND json_extract(q.transcript_intent_json,'$.providerGeneration')=
+                  NEW.provider_generation
+              AND json_extract(q.transcript_intent_json,'$.providerConnectionId')
+                  IS NEW.provider_connection_id
+              AND json_extract(q.transcript_intent_json,'$.actor')=
+                  json_extract(NEW.event_json,'$.body.actor')
+              AND json_extract(q.transcript_intent_json,'$.text')=
+                  json_extract(NEW.event_json,'$.body.text')
+              AND json_extract(q.transcript_intent_json,'$.omittedCharacters')=
+                  json_extract(NEW.event_json,'$.body.omittedCharacters')
+              AND COALESCE(json_extract(q.transcript_intent_json,'$.attachments'),'[]')=
+                  COALESCE(json_extract(NEW.event_json,'$.body.attachments'),'[]')
+          )
+        )
+      )
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'session event account authority mismatch'); END;
+`;
+const schemaVersion43SessionUserMessageFinalizationGuards = `
+CREATE TRIGGER IF NOT EXISTS mutation_transcript_finalization_guard
+BEFORE UPDATE OF transcript_finalized,transcript_status,transcript_intent_json ON mutation_attempts
+WHEN NOT (
+  NEW.kind=OLD.kind
+  AND (
+    (NEW.transcript_finalized=OLD.transcript_finalized
+      AND NEW.transcript_status=OLD.transcript_status
+      AND NEW.transcript_intent_json IS OLD.transcript_intent_json)
+    OR (OLD.kind IN ('session.send','session.steer')
+      AND OLD.transcript_status='none' AND OLD.transcript_finalized=0
+      AND OLD.transcript_intent_json IS NULL
+      AND NEW.transcript_status='pending' AND NEW.transcript_finalized=0
+      AND NEW.transcript_intent_json IS NOT NULL)
+    OR (OLD.kind IN ('session.send','session.steer')
+      AND OLD.transcript_status='pending' AND OLD.transcript_finalized=0
+      AND NEW.transcript_status='finalized' AND NEW.transcript_finalized=1
+      AND json_extract(NEW.transcript_intent_json,'$.version')=1
+      AND json_extract(NEW.transcript_intent_json,'$.actor')=
+          json_extract(OLD.transcript_intent_json,'$.actor')
+      AND json_type(NEW.transcript_intent_json,'$.hadAttachments') IN ('true','false')
+      AND json_extract(NEW.transcript_intent_json,'$.hadAttachments')=
+          (COALESCE(json_array_length(
+            json_extract(OLD.transcript_intent_json,'$.attachments')),0)>0)
+      AND (SELECT count(*) FROM json_each(NEW.transcript_intent_json))=3)
+    OR (OLD.kind IN ('session.send','session.steer')
+      AND OLD.transcript_status='pending' AND OLD.transcript_finalized=0
+      AND NEW.transcript_status='abandoned' AND NEW.transcript_finalized=0
+      AND json_extract(NEW.transcript_intent_json,'$.version')=1
+      AND json_extract(NEW.transcript_intent_json,'$.actor')=
+          json_extract(OLD.transcript_intent_json,'$.actor')
+      AND json_type(NEW.transcript_intent_json,'$.hadAttachments') IN ('true','false')
+      AND json_extract(NEW.transcript_intent_json,'$.hadAttachments')=
+          (COALESCE(json_array_length(
+            json_extract(OLD.transcript_intent_json,'$.attachments')),0)>0)
+      AND (SELECT count(*) FROM json_each(NEW.transcript_intent_json))=3)
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'mutation transcript intent/status transition invalid'); END;
+CREATE TRIGGER IF NOT EXISTS queue_transcript_finalization_guard
+BEFORE UPDATE OF transcript_finalized,transcript_status,transcript_intent_json ON queue_entries
+WHEN NOT (
+  (NEW.transcript_finalized=OLD.transcript_finalized
+    AND NEW.transcript_status=OLD.transcript_status
+    AND NEW.transcript_intent_json IS OLD.transcript_intent_json)
+  OR (OLD.transcript_status='none' AND OLD.transcript_finalized=0
+    AND OLD.transcript_intent_json IS NULL
+    AND NEW.transcript_status='pending' AND NEW.transcript_finalized=0
+    AND NEW.transcript_intent_json IS NOT NULL)
+  OR (OLD.state='pending' AND NEW.state='pending'
+    AND OLD.transcript_status='pending' AND OLD.transcript_finalized=0
+    AND NEW.transcript_status='pending' AND NEW.transcript_finalized=0
+    AND json_extract(NEW.transcript_intent_json,'$.version')=1
+    AND json_extract(NEW.transcript_intent_json,'$.accountId')=(
+      SELECT s.profile_id FROM sessions s WHERE s.id=NEW.session_id)
+    AND json_extract(NEW.transcript_intent_json,'$.providerGeneration')=(
+      SELECT p.process_generation FROM sessions s JOIN profiles p
+      ON p.id=s.profile_id WHERE s.id=NEW.session_id)
+    AND json_type(NEW.transcript_intent_json,'$.providerConnectionId')
+      IN ('null','text')
+    AND json_extract(NEW.transcript_intent_json,'$.actor')=
+        json_extract(OLD.transcript_intent_json,'$.actor')
+    AND json_extract(NEW.transcript_intent_json,'$.text')=
+        json_extract(OLD.transcript_intent_json,'$.text')
+    AND json_extract(NEW.transcript_intent_json,'$.omittedCharacters')=
+        json_extract(OLD.transcript_intent_json,'$.omittedCharacters')
+    AND COALESCE(json_extract(NEW.transcript_intent_json,'$.attachments'),'[]')=
+        COALESCE(json_extract(OLD.transcript_intent_json,'$.attachments'),'[]')
+    AND (SELECT count(*) FROM json_each(NEW.transcript_intent_json)) IN (7,8))
+  OR (OLD.transcript_status='pending' AND OLD.transcript_finalized=0
+    AND NEW.transcript_status='finalized' AND NEW.transcript_finalized=1
+    AND json_extract(NEW.transcript_intent_json,'$.version')=1
+    AND json_extract(NEW.transcript_intent_json,'$.actor')=
+        json_extract(OLD.transcript_intent_json,'$.actor')
+    AND json_type(NEW.transcript_intent_json,'$.hadAttachments') IN ('true','false')
+    AND json_extract(NEW.transcript_intent_json,'$.hadAttachments')=
+        (COALESCE(json_array_length(
+          json_extract(OLD.transcript_intent_json,'$.attachments')),0)>0)
+    AND (SELECT count(*) FROM json_each(NEW.transcript_intent_json))=3)
+  OR (OLD.transcript_status='pending' AND OLD.transcript_finalized=0
+    AND NEW.transcript_status='abandoned' AND NEW.transcript_finalized=0
+    AND json_extract(NEW.transcript_intent_json,'$.version')=1
+    AND json_extract(NEW.transcript_intent_json,'$.actor')=
+        json_extract(OLD.transcript_intent_json,'$.actor')
+    AND json_type(NEW.transcript_intent_json,'$.hadAttachments') IN ('true','false')
+    AND json_extract(NEW.transcript_intent_json,'$.hadAttachments')=
+        (COALESCE(json_array_length(
+          json_extract(OLD.transcript_intent_json,'$.attachments')),0)>0)
+    AND (SELECT count(*) FROM json_each(NEW.transcript_intent_json))=3)
+)
+BEGIN SELECT RAISE(ABORT, 'queue transcript intent/status transition invalid'); END;
+`;
+
+// Every transition from pending to cancelled proves that no provider effect
+// occurred. Settle the already-staged transcript intent and release its blob
+// references at the database boundary so direct cancellation call sites
+// cannot accidentally strand user prose or attachment custody.
+const schemaVersion43QueueCancellationSettlement = `
+CREATE TRIGGER IF NOT EXISTS queue_transcript_cancellation_settlement
+AFTER UPDATE OF state ON queue_entries
+WHEN OLD.state='pending' AND NEW.state='cancelled'
+BEGIN
+  UPDATE queue_entries SET transcript_status='abandoned',
+    transcript_intent_json=json_object(
+      'version',1,
+      'actor',json_extract(transcript_intent_json,'$.actor'),
+      'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+        json_extract(transcript_intent_json,'$.attachments')),0)>0
+        THEN 'true' ELSE 'false' END))
+  WHERE id=NEW.id AND transcript_status='pending';
+  DELETE FROM message_attachments
+  WHERE session_id=NEW.session_id AND source_id=NEW.id;
+END;
+`;
+
+const schemaVersion43FinalizationTriggerSql = (
+  name: "mutation_transcript_finalization_guard" | "queue_transcript_finalization_guard",
+): string => {
+  const marker = `CREATE TRIGGER IF NOT EXISTS ${name}`;
+  const start = schemaVersion43SessionUserMessageFinalizationGuards.indexOf(marker);
+  const end = schemaVersion43SessionUserMessageFinalizationGuards.indexOf("END;", start);
+  if (start < 0 || end < 0) throw new Error("STATE_SCHEMA_V43_DEFINITION_INVALID");
+  return schemaVersion43SessionUserMessageFinalizationGuards.slice(start, end + 4);
+};
+
+const schemaVersion43QueueFinalizationGuardBeforeAuthorityRebind = (): string => {
+  const current = schemaVersion43FinalizationTriggerSql(
+    "queue_transcript_finalization_guard",
+  );
+  const start = current.indexOf("  OR (OLD.state='pending' AND NEW.state='pending'");
+  const end = current.indexOf(
+    "\n  OR (OLD.transcript_status='pending' AND OLD.transcript_finalized=0\n"
+      + "    AND NEW.transcript_status='finalized'",
+    start,
+  );
+  if (start < 0 || end < 0) throw new Error("STATE_SCHEMA_V43_DEFINITION_INVALID");
+  return current.slice(0, start) + current.slice(end);
+};
+
+const upgradeSchemaVersion43QueueTranscriptAuthorityGuard = (
+  database: Database,
+): void => {
+  const observed = z.object({ sql: z.string() }).strict().safeParse(
+    database.query(
+      `SELECT sql FROM sqlite_master
+       WHERE type='trigger' AND name='queue_transcript_finalization_guard'`,
+    ).get(),
+  );
+  if (!observed.success) {
+    throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+  }
+  const actual = normalizedTriggerSql(observed.data.sql);
+  const current = normalizedTriggerSql(schemaVersion43FinalizationTriggerSql(
+    "queue_transcript_finalization_guard",
+  ));
+  if (actual === current) return;
+  if (actual !== normalizedTriggerSql(
+    schemaVersion43QueueFinalizationGuardBeforeAuthorityRebind(),
+  )) throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+  database.exec("DROP TRIGGER queue_transcript_finalization_guard");
+  database.exec(schemaVersion43FinalizationTriggerSql(
+    "queue_transcript_finalization_guard",
+  ));
+};
+
+const normalizedTriggerSql = (sql: string): string => normalizeSqlStructure(
+  sql.replace(/\bIF NOT EXISTS\b/giu, ""),
+);
+
+const schemaVersion43QueueCancellationSettlementState = (
+  database: Database,
+): "exact" | "missing" => {
+  const value = database.query(
+    `SELECT type,sql FROM sqlite_master
+     WHERE name='queue_transcript_cancellation_settlement'`,
+  ).get();
+  if (value === null) return "missing";
+  const observed = z.object({
+    sql: z.string(),
+    type: z.literal("trigger"),
+  }).strict().safeParse(value);
+  if (
+    !observed.success
+    || normalizedTriggerSql(observed.data.sql)
+      !== normalizedTriggerSql(schemaVersion43QueueCancellationSettlement)
+  ) {
+    throw new Error("STATE_SCHEMA_V43_QUEUE_CANCELLATION_GUARD_COLLISION");
+  }
+  return "exact";
+};
+
+const installSchemaVersion43QueueCancellationSettlement = (
+  database: Database,
+): void => {
+  if (schemaVersion43QueueCancellationSettlementState(database) === "missing") {
+    database.exec(schemaVersion43QueueCancellationSettlement);
+  }
+};
+
+/**
+ * A short-lived pre-release v43 build could cancel a queue row before this
+ * database-boundary settlement trigger existed, then install the trigger on a
+ * later open. Repair both missing-trigger and already-reopened databases: fold
+ * pending prose, release every cancelled manifest, and retain scrub authority
+ * before the current authority surface is accepted.
+ */
+const repairSchemaVersion43CancelledQueueSettlements = (
+  database: Database,
+  repairedAt: number,
+): void => {
+  const rows = z.array(z.object({
+    id: queueIdSchema,
+    session_id: sessionIdSchema,
+    transcript_intent_json: z.string().nullable(),
+    transcript_status: sessionUserMessageTranscriptStatusSchema,
+  }).strict()).parse(database.query(
+    `SELECT id,session_id,transcript_status,transcript_intent_json
+     FROM queue_entries WHERE state='cancelled' ORDER BY session_id,id`,
+  ).all());
+  let repaired = false;
+  for (const row of rows) {
+    if (row.transcript_status === "pending") {
+      if (row.transcript_intent_json === null) {
+        throw new Error("STATE_SCHEMA_V43_QUEUE_CANCELLATION_SETTLEMENT_INVALID");
+      }
+      const intent = sessionUserMessageIntentSchema.parse(
+        JSON.parse(row.transcript_intent_json) as unknown,
+      );
+      const changed = database.query(
+        `UPDATE queue_entries
+         SET transcript_status='abandoned',transcript_intent_json=?
+         WHERE id=? AND session_id=? AND state='cancelled'
+           AND transcript_status='pending'`,
+      ).run(
+        sessionUserMessageActorReceiptJson({
+          actor: intent.actor,
+          ...(intent.attachments === undefined
+            ? {}
+            : { attachments: intent.attachments }),
+        }),
+        row.id,
+        row.session_id,
+      );
+      if (changed.changes !== 1) {
+        throw new Error("STATE_SCHEMA_V43_QUEUE_CANCELLATION_SETTLEMENT_CHANGED");
+      }
+      repaired = true;
+    }
+    const released = database.query(
+      "DELETE FROM message_attachments WHERE session_id=? AND source_id=?",
+    ).run(row.session_id, row.id);
+    repaired = released.changes > 0 || repaired;
+  }
+  if (repaired) requireQueueMessageScrub(database, repairedAt, true);
+};
+
+const assertSchemaVersion43QueueCancellationSettlement = (
+  database: Database,
+): void => {
+  try {
+    if (schemaVersion43QueueCancellationSettlementState(database) !== "exact") {
+      throw new Error("missing");
+    }
+  } catch {
+    throw new Error("STATE_SCHEMA_V43_QUEUE_CANCELLATION_GUARD_INVALID");
+  }
+  if (database.query(
+    `SELECT 1 FROM queue_entries q
+     WHERE q.state='cancelled' AND (
+       q.transcript_status='pending'
+       OR EXISTS (
+         SELECT 1 FROM message_attachments a
+         WHERE a.session_id=q.session_id AND a.source_id=q.id
+       )
+     ) LIMIT 1`,
+  ).get() !== null) {
+    throw new Error("STATE_SCHEMA_V43_QUEUE_CANCELLATION_SETTLEMENT_INVALID");
+  }
+};
+
+const installSchemaVersion43SessionEventsAccountAuthorityGuard = (
+  database: Database,
+): void => {
+  const observed = z.object({ sql: z.string() }).strict().safeParse(
+    database.query(
+      "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+    ).get("session_events_account_authority_guard"),
+  );
+  if (!observed.success) {
+    throw new Error("STATE_SCHEMA_V43_SESSION_EVENT_AUTHORITY_GUARD_COLLISION");
+  }
+  const observedSql = normalizedTriggerSql(observed.data.sql);
+  const predecessorSql = normalizedTriggerSql(
+    schemaVersion9SessionEventsAccountAuthorityGuard,
+  );
+  const currentSql = normalizedTriggerSql(
+    schemaVersion43SessionEventsAccountAuthorityGuard,
+  );
+  if (observedSql !== predecessorSql && observedSql !== currentSql) {
+    throw new Error("STATE_SCHEMA_V43_SESSION_EVENT_AUTHORITY_GUARD_COLLISION");
+  }
+  if (observedSql === predecessorSql) {
+    database.exec("DROP TRIGGER session_events_account_authority_guard");
+    database.exec(schemaVersion43SessionEventsAccountAuthorityGuard);
+  }
+};
+
+const removeExactSchemaVersion43FinalizationGuardsForMigration = (
+  database: Database,
+): void => {
+  for (const name of [
+    "mutation_transcript_finalization_guard",
+    "queue_transcript_finalization_guard",
+  ] as const) {
+    const observed = z.object({ sql: z.string() }).strict().safeParse(
+      database.query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").get(name),
+    );
+    if (!observed.success) continue;
+    const expected = schemaVersion43FinalizationTriggerSql(name)
+      .replace(/\bIF NOT EXISTS\b/giu, "");
+    if (
+      normalizeSqlStructure(observed.data.sql.replace(/\bIF NOT EXISTS\b/giu, ""))
+      !== normalizeSqlStructure(expected)
+    ) throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_GUARD_COLLISION");
+    database.exec(`DROP TRIGGER ${name}`);
+  }
+};
+
+const assertSessionUserMessageFinalizationCore = (
+  database: Database,
+  allowQueueGuardBeforeAuthorityRebind = false,
+  queueGuard: "historical" | "joined" = "historical",
+): void => {
+  for (const table of ["mutation_attempts", "queue_entries"] as const) {
+    const column = z.object({
+      dflt_value: z.literal("0"),
+      name: z.literal("transcript_finalized"),
+      notnull: z.literal(1),
+      pk: z.literal(0),
+      type: z.literal("INTEGER"),
+    }).passthrough().safeParse(database.query(
+      `SELECT * FROM pragma_table_info('${table}') WHERE name='transcript_finalized'`,
+    ).get());
+    if (!column.success) {
+      throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+    }
+    if (database.query(
+      `SELECT 1 FROM ${table} WHERE transcript_finalized NOT IN (0,1) LIMIT 1`,
+    ).get() !== null) {
+      throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+    }
+    const statusColumn = z.object({
+      dflt_value: z.literal("'none'"),
+      name: z.literal("transcript_status"),
+      notnull: z.literal(1),
+      pk: z.literal(0),
+      type: z.literal("TEXT"),
+    }).passthrough().safeParse(database.query(
+      `SELECT * FROM pragma_table_info('${table}') WHERE name='transcript_status'`,
+    ).get());
+    const intentColumn = z.object({
+      dflt_value: z.null(),
+      name: z.literal("transcript_intent_json"),
+      notnull: z.literal(0),
+      pk: z.literal(0),
+      type: z.literal("TEXT"),
+    }).passthrough().safeParse(database.query(
+      `SELECT * FROM pragma_table_info('${table}') WHERE name='transcript_intent_json'`,
+    ).get());
+    if (!statusColumn.success || !intentColumn.success || database.query(
+      `SELECT 1 FROM ${table}
+       WHERE transcript_status NOT IN ('none','pending','finalized','unavailable','abandoned')
+          OR transcript_finalized!=(transcript_status='finalized')
+          OR (transcript_intent_json IS NOT NULL AND (
+            NOT json_valid(transcript_intent_json)
+            OR length(CAST(transcript_intent_json AS BLOB))>${String(SESSION_EVENT_MAX_BYTES)}
+          )) LIMIT 1`,
+    ).get() !== null) {
+      throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+    }
+  }
+  for (const name of [
+    "mutation_transcript_finalization_guard",
+    "queue_transcript_finalization_guard",
+  ] as const) {
+    if (queueGuard === "joined" && name === "queue_transcript_finalization_guard") {
+      assertJoinedQueueTranscriptGuard(database, schemaVersion43FinalizationTriggerSql(name));
+      continue;
+    }
+    const observed = z.object({ sql: z.string() }).strict().safeParse(
+      database.query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").get(name),
+    );
+    const expectedSql = schemaVersion43FinalizationTriggerSql(name)
+      .replace(/\bIF NOT EXISTS\b/giu, "");
+    const observedSql = observed.success
+      ? observed.data.sql.replace(/\bIF NOT EXISTS\b/giu, "")
+      : "";
+    const accepted = [normalizeSqlStructure(expectedSql)];
+    if (allowQueueGuardBeforeAuthorityRebind && name === "queue_transcript_finalization_guard") {
+      accepted.push(normalizeSqlStructure(
+        schemaVersion43QueueFinalizationGuardBeforeAuthorityRebind()
+          .replace(/\bIF NOT EXISTS\b/giu, ""),
+      ));
+    }
+    if (!observed.success || !accepted.includes(normalizeSqlStructure(observedSql))) {
+      throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+    }
+  }
+};
+
+const assertSchemaVersion43SessionUserMessageFinalizations = (
+  database: Database,
+  allowQueueGuardBeforeAuthorityRebind = false,
+): void => {
+  assertSessionUserMessageFinalizationCore(database, allowQueueGuardBeforeAuthorityRebind);
+  const accountAuthorityGuard = z.object({ sql: z.string() }).strict().safeParse(
+    database.query(
+      "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+    ).get("session_events_account_authority_guard"),
+  );
+  if (
+    !accountAuthorityGuard.success
+    || normalizedTriggerSql(accountAuthorityGuard.data.sql)
+      !== normalizedTriggerSql(schemaVersion43SessionEventsAccountAuthorityGuard)
+  ) throw new Error("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+};
+
+const assertSchemaVersion43BaseAuthority = (
+  database: Database,
+  allowQueueGuardBeforeAuthorityRebind = false,
+): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSchemaMigrationLedgerTail(
+    database,
+    readUserVersion(database) === 44 ? [40, 41, 42, 43, 44] : [40, 41, 42, 43],
+    "STATE_SCHEMA_V43_MIGRATION_LEDGER_INVALID",
+  );
+  assertSchemaVersion43SessionUserMessageFinalizations(
+    database,
+    allowQueueGuardBeforeAuthorityRebind,
+  );
+};
+
+const assertSchemaVersion43Authority = (database: Database): void => {
+  assertSchemaVersion43BaseAuthority(database);
+  assertSchemaVersion43QueueCancellationSettlement(database);
+};
+
+// Account mutation attempts keep their original generation and effect bytes.
+// Only this append-only, exact +1 chain carries their reconciliation authority
+// through a daemon generation rollover. It never grants another dispatch.
+const schemaVersion45AccountMutationAuthority = `
+CREATE TABLE account_mutation_authority_rebinds (
+  attempt_id TEXT NOT NULL REFERENCES mutation_attempts(id),
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  kind TEXT NOT NULL CHECK(kind IN ('account.login','account.logout','account.login-cancel')),
+  evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*'),
+  from_generation INTEGER NOT NULL CHECK(from_generation>=0 AND from_generation<9007199254740991),
+  to_generation INTEGER NOT NULL CHECK(to_generation=from_generation+1),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at>=0 AND recorded_at<=9007199254740991),
+  PRIMARY KEY(attempt_id,from_generation)
+) STRICT;
+CREATE TRIGGER account_mutation_authority_rebinds_immutable_update
+BEFORE UPDATE ON account_mutation_authority_rebinds
+BEGIN SELECT RAISE(ABORT, 'account mutation authority rebind is immutable'); END;
+CREATE TRIGGER account_mutation_authority_rebinds_immutable_delete
+BEFORE DELETE ON account_mutation_authority_rebinds
+BEGIN SELECT RAISE(ABORT, 'account mutation authority rebind is immutable'); END;
+CREATE TRIGGER account_mutation_authority_rebinds_insert_guard
+BEFORE INSERT ON account_mutation_authority_rebinds
+WHEN NOT EXISTS (
+  SELECT 1 FROM mutation_attempts m
+  JOIN mutation_effect_evidence e ON e.attempt_id=m.id AND e.kind=m.kind
+  JOIN profiles p ON p.id=m.authority_id
+  WHERE m.id=NEW.attempt_id AND m.authority_id=NEW.profile_id
+    AND m.kind=NEW.kind AND e.evidence_digest=NEW.evidence_digest
+    AND m.state IN ('effect_started','ambiguous')
+    AND NOT EXISTS (SELECT 1 FROM mutation_resolutions r WHERE r.attempt_id=m.id)
+    AND p.state!='removed' AND p.process_generation=NEW.from_generation
+    AND (
+      m.authority_generation=NEW.from_generation
+      OR EXISTS (
+        SELECT 1 FROM account_mutation_authority_rebinds a
+        WHERE a.attempt_id=m.id AND a.profile_id=NEW.profile_id
+          AND a.kind=NEW.kind AND a.evidence_digest=NEW.evidence_digest
+          AND a.to_generation=NEW.from_generation
+      )
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'account mutation authority rebind has no exact predecessor'); END;
+`;
+
+const schemaVersion45AccountMutationAuthorityObjects = (() => {
+  const expected = new Database(":memory:");
+  try {
+    expected.exec(schemaVersion45AccountMutationAuthority);
+    return expected.query(
+      "SELECT name,sql,type FROM sqlite_master WHERE tbl_name='account_mutation_authority_rebinds' AND sql IS NOT NULL ORDER BY name",
+    ).all().map((row) => z.object({ name: z.string(), sql: z.string(), type: z.string() }).strict().parse(row));
+  } finally {
+    expected.close(false);
+  }
+})();
+
+const assertSchemaVersion45AccountMutationAuthority = (database: Database): void => {
+  const objects = database.query(
+    "SELECT name,sql,type FROM sqlite_master WHERE tbl_name='account_mutation_authority_rebinds' AND sql IS NOT NULL ORDER BY name",
+  ).all();
+  if (JSON.stringify(objects) !== JSON.stringify(schemaVersion45AccountMutationAuthorityObjects)) {
+    throw new Error("STATE_SCHEMA_V45_ACCOUNT_MUTATION_AUTHORITY_INVALID");
+  }
+};
+
+const assertSchemaVersion45Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSchemaMigrationLedgerTail(database, [40, 41, 42, 43, 44, 45], "STATE_SCHEMA_V45_MIGRATION_LEDGER_INVALID");
+  assertSchemaVersion43SessionUserMessageFinalizations(database);
+  assertSchemaVersion43QueueCancellationSettlement(database);
+  assertSchemaVersion44AutorespondObjects(database);
+  assertSchemaVersion44AutorespondEvidence(database);
+  assertSchemaVersion45AccountMutationAuthority(database);
+};
+
+// Higher protocol limits have independent, default-off consent. A legacy
+// floor of three cannot prove exact consecutive history, even after the v44
+// rolling-window hold expires. Only a newly finalized human source clears it.
+const schemaVersion46AutorespondAfterHours = `
+CREATE TABLE autorespond_after_hours_policy (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  kind TEXT NOT NULL CHECK(kind='autorespond_after_hours'),
+  version INTEGER NOT NULL CHECK(version=1),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+  created_at INTEGER NOT NULL CHECK(created_at BETWEEN 0 AND 9007199254740991),
+  updated_at INTEGER NOT NULL CHECK(updated_at BETWEEN created_at AND 9007199254740991)
+) STRICT;
+CREATE TRIGGER autorespond_after_hours_policy_insert_guard
+BEFORE INSERT ON autorespond_after_hours_policy
+WHEN EXISTS (SELECT 1 FROM autorespond_after_hours_policy)
+  OR NEW.revision!=1 OR NEW.enabled!=0
+BEGIN SELECT RAISE(ABORT, 'autorespond after-hours policy must start disabled'); END;
+CREATE TRIGGER autorespond_after_hours_policy_update_guard
+BEFORE UPDATE ON autorespond_after_hours_policy
+WHEN NEW.singleton!=OLD.singleton OR NEW.kind!=OLD.kind OR NEW.version!=OLD.version
+  OR NEW.created_at!=OLD.created_at OR NEW.revision!=OLD.revision+1
+  OR NEW.updated_at<OLD.updated_at
+BEGIN SELECT RAISE(ABORT, 'autorespond after-hours policy transition is invalid'); END;
+CREATE TRIGGER autorespond_after_hours_policy_delete_guard
+BEFORE DELETE ON autorespond_after_hours_policy
+BEGIN SELECT RAISE(ABORT, 'autorespond after-hours policy cannot be deleted'); END;
+CREATE TABLE autorespond_after_hours_history (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  human_reset_required INTEGER NOT NULL CHECK(human_reset_required IN (0,1)),
+  reset_source_kind TEXT CHECK(reset_source_kind IN ('mutation','queue')),
+  reset_source_id TEXT CHECK(length(reset_source_id) BETWEEN 1 AND 200),
+  CHECK((reset_source_kind IS NULL)=(reset_source_id IS NULL)),
+  CHECK(human_reset_required=0 OR reset_source_kind IS NULL)
+) STRICT;
+CREATE TRIGGER autorespond_after_hours_history_insert_guard
+BEFORE INSERT ON autorespond_after_hours_history
+WHEN EXISTS (SELECT 1 FROM autorespond_after_hours_history WHERE session_id=NEW.session_id)
+  OR NEW.reset_source_kind IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'autorespond after-hours history cannot be replaced'); END;
+CREATE TRIGGER autorespond_after_hours_history_delete_guard
+BEFORE DELETE ON autorespond_after_hours_history
+WHEN EXISTS (SELECT 1 FROM sessions WHERE id=OLD.session_id)
+BEGIN SELECT RAISE(ABORT, 'autorespond after-hours history cannot be deleted'); END;
+CREATE TRIGGER sessions_autorespond_after_hours_history
+AFTER INSERT ON sessions
+BEGIN
+  INSERT INTO autorespond_after_hours_history(session_id,human_reset_required)
+  VALUES (NEW.id,0);
+END;
+CREATE TRIGGER autorespond_after_hours_history_update_guard
+BEFORE UPDATE ON autorespond_after_hours_history
+WHEN NEW.session_id!=OLD.session_id OR OLD.human_reset_required!=1
+  OR NEW.human_reset_required!=0 OR NEW.reset_source_kind IS NULL
+  OR NOT EXISTS (
+    SELECT 1 FROM session_events e JOIN session_event_streams s
+      ON s.session_id=e.session_id AND s.stream_epoch=e.stream_epoch
+    WHERE e.session_id=NEW.session_id AND e.sequence=s.next_sequence
+      AND json_extract(e.event_json,'$.body.type')='user_message'
+      AND json_extract(e.event_json,'$.body.actor')='human'
+      AND json_extract(e.event_json,'$.body.sourceId')=NEW.reset_source_id
+  )
+  OR NOT (
+    (NEW.reset_source_kind='mutation' AND EXISTS (
+      SELECT 1 FROM mutation_attempts m
+      WHERE m.authority_id=NEW.session_id AND m.idempotency_key=NEW.reset_source_id
+        AND m.kind IN ('session.send','session.steer')
+        AND m.transcript_status='finalized'
+        AND json_extract(m.transcript_intent_json,'$.actor')='human'
+    )) OR (NEW.reset_source_kind='queue' AND EXISTS (
+      SELECT 1 FROM queue_entries q
+      WHERE q.session_id=NEW.session_id AND q.id=NEW.reset_source_id
+        AND q.transcript_status='finalized'
+        AND json_extract(q.transcript_intent_json,'$.actor')='human'
+    ))
+  )
+BEGIN SELECT RAISE(ABORT, 'autorespond after-hours history requires exact human finalization'); END;
+`;
+
+const schemaVersion46AutorespondAfterHoursObjects = (() => {
+  const expected = new Database(":memory:");
+  try {
+    expected.exec("CREATE TABLE sessions(id TEXT PRIMARY KEY) STRICT");
+    expected.exec(schemaVersion46AutorespondAfterHours);
+    return expected.query(
+      "SELECT name,sql,type FROM sqlite_master WHERE (tbl_name IN ('autorespond_after_hours_policy','autorespond_after_hours_history') OR name LIKE '%autorespond_after_hours%') AND sql IS NOT NULL ORDER BY name",
+    ).all();
+  } finally { expected.close(false); }
+})();
+
+const assertSchemaVersion46AutorespondAfterHours = (database: Database): void => {
+  const observed = database.query(
+    "SELECT name,sql,type FROM sqlite_master WHERE (tbl_name IN ('autorespond_after_hours_policy','autorespond_after_hours_history') OR name LIKE '%autorespond_after_hours%') AND sql IS NOT NULL ORDER BY name",
+  ).all();
+  if (JSON.stringify(observed) !== JSON.stringify(schemaVersion46AutorespondAfterHoursObjects)) {
+    throw new Error("STATE_SCHEMA_V46_AUTORESPOND_AFTER_HOURS_AUTHORITY_INVALID");
+  }
+  const policies = database.query("SELECT * FROM autorespond_after_hours_policy").all();
+  if (policies.length !== 1) throw new Error("STATE_SCHEMA_V46_AUTORESPOND_AFTER_HOURS_POLICY_INVALID");
+  mapAutorespondAfterHoursPolicy(policies[0]);
+  assertAutorespondBudgetHistoryCoverage(database);
+  if (database.query(`SELECT 1 FROM sessions s
+    LEFT JOIN autorespond_after_hours_history a ON a.session_id=s.id
+    JOIN autorespond_budget_history h ON h.session_id=s.id
+    WHERE a.session_id IS NULL
+      OR typeof(a.human_reset_required)!='integer' OR a.human_reset_required NOT IN (0,1)
+      OR (h.available_at=0 AND (a.human_reset_required!=0 OR a.reset_source_kind IS NOT NULL))
+      OR (h.available_at>0 AND a.human_reset_required=0 AND a.reset_source_kind IS NULL)
+      OR ((a.reset_source_kind IS NULL)!=(a.reset_source_id IS NULL))
+      OR (a.human_reset_required=1 AND a.reset_source_kind IS NOT NULL)
+      OR (a.reset_source_kind IS NOT NULL AND a.reset_source_kind NOT IN ('mutation','queue'))
+      OR (a.reset_source_id IS NOT NULL AND (typeof(a.reset_source_id)!='text' OR length(a.reset_source_id) NOT BETWEEN 1 AND 200))
+    LIMIT 1`).get() !== null
+    || database.query(`SELECT 1 FROM autorespond_after_hours_history a
+      WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id=a.session_id) LIMIT 1`).get() !== null) {
+    throw new Error("STATE_SCHEMA_V46_AUTORESPOND_AFTER_HOURS_HISTORY_INVALID");
+  }
+};
+
+const assertAutorespondBudgetHistoryCoverage = (database: Database): void => {
+  if (database.query(`SELECT 1 FROM sessions s
+    LEFT JOIN autorespond_budget_history h ON h.session_id=s.id
+    WHERE h.session_id IS NULL OR typeof(h.available_at)!='integer'
+      OR h.available_at<0 OR h.available_at>9007199254740991 LIMIT 1`).get() !== null
+    || database.query(`SELECT 1 FROM autorespond_budget_history h
+      WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id=h.session_id) LIMIT 1`).get() !== null) {
+    throw new Error("STATE_SCHEMA_V46_AUTORESPOND_BUDGET_HISTORY_INVALID");
+  }
+};
+
+const assertSchemaVersion46Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSchemaMigrationLedgerTail(database, [40, 41, 42, 43, 44, 45, 46], "STATE_SCHEMA_V46_MIGRATION_LEDGER_INVALID");
+  assertSchemaVersion43SessionUserMessageFinalizations(database);
+  assertSchemaVersion43QueueCancellationSettlement(database);
+  assertSchemaVersion44AutorespondObjects(database);
+  assertSchemaVersion44AutorespondEvidence(database);
+  assertSchemaVersion45AccountMutationAuthority(database);
+  assertSchemaVersion46AutorespondAfterHours(database);
+};
+
+const mapAutorespondAfterHoursPolicy = (row: unknown): AutorespondAfterHoursPolicy => {
+  const parsed = z.object({
+    singleton: z.literal(1), kind: z.literal("autorespond_after_hours"), version: z.literal(1),
+    revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), enabled: z.union([z.literal(0), z.literal(1)]),
+    created_at: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER), updated_at: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
+  }).strict().parse(row);
+  if (parsed.updated_at < parsed.created_at) throw new Error("AUTORESPOND_AFTER_HOURS_POLICY_INVALID");
+  return autorespondAfterHoursPolicySchema.parse({
+    kind: parsed.kind, version: parsed.version, revision: parsed.revision, enabled: parsed.enabled === 1,
+  });
+};
+
+// Display evidence has count retention and cannot prove a rolling budget.
+// Keep content-free admission authority independently, preserving unsettled
+// prose keys until their already-charged transcript is finalized.
+const schemaVersion44AutorespondBudget = `
+CREATE TABLE IF NOT EXISTS autorespond_budget_history (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  available_at INTEGER NOT NULL CHECK(available_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS autorespond_budget_history_immutable
+BEFORE UPDATE ON autorespond_budget_history
+BEGIN SELECT RAISE(ABORT, 'autorespond budget history is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS sessions_autorespond_budget_history
+AFTER INSERT ON sessions
+BEGIN
+  INSERT INTO autorespond_budget_history(session_id,available_at) VALUES (NEW.id,0);
+END;
+CREATE TABLE IF NOT EXISTS autorespond_budget_reservations (
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  source_kind TEXT NOT NULL CHECK(source_kind IN ('protocol','prose')),
+  source_id TEXT NOT NULL CHECK(length(source_id) BETWEEN 1 AND 200),
+  mode TEXT NOT NULL CHECK(mode IN ('auto:all','auto:workspace')),
+  reserved_at INTEGER NOT NULL CHECK(reserved_at BETWEEN 0 AND 9007199254740991),
+  PRIMARY KEY(session_id,source_kind,source_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS autorespond_budget_reservations_window
+  ON autorespond_budget_reservations(session_id,reserved_at);
+CREATE TRIGGER IF NOT EXISTS autorespond_budget_reservations_immutable
+BEFORE UPDATE ON autorespond_budget_reservations
+BEGIN SELECT RAISE(ABORT, 'autorespond budget reservation is immutable'); END;
+`;
+
+const schemaVersion44AutorespondObjects = (() => {
+  const expected = new Database(":memory:");
+  try {
+    expected.exec("CREATE TABLE sessions(id TEXT PRIMARY KEY) STRICT");
+    expected.exec(schemaVersion44AutorespondBudget);
+    return z.array(z.object({ name: z.string(), sql: z.string(), type: z.string() }).strict()).parse(
+      expected.query("SELECT name,sql,type FROM sqlite_master WHERE name LIKE '%autorespond_budget%' AND sql IS NOT NULL ORDER BY name").all(),
+    );
+  } finally {
+    expected.close(false);
+  }
+})();
+
+const assertSchemaVersion44AutorespondObjects = (database: Database): void => {
+  for (const expected of schemaVersion44AutorespondObjects) {
+    const observed = z.object({ sql: z.string(), type: z.string() }).strict().safeParse(
+      database.query("SELECT sql,type FROM sqlite_master WHERE name=?").get(expected.name),
+    );
+    if (!observed.success || observed.data.type !== expected.type
+      || normalizedTriggerSql(observed.data.sql) !== normalizedTriggerSql(expected.sql)) {
+      throw new Error("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_AUTHORITY_INVALID");
+    }
+  }
+};
+
+const assertSchemaVersion44Authority = (database: Database): void => {
+  assertSchemaVersion44AutorespondObjects(database);
+  assertSchemaVersion44AutorespondEvidence(database);
+  assertSchemaMigrationLedgerTail(database, [40, 41, 42, 43, 44], "STATE_SCHEMA_V44_MIGRATION_LEDGER_INVALID");
+};
+
+const schemaVersion43LegacyAttachmentRowSchema = z.object({
+  byte_length: attachmentByteLengthSchema,
+  created_at: unixMillisecondsSchema,
+  digest: attachmentDigestSchema,
+  media_type: attachmentMediaTypeSchema,
+  name: z.string(),
+  position: z.number().int().min(0).max(ATTACHMENT_MAX_COUNT - 1),
+  session_id: sessionIdSchema,
+  source_id: z.string().min(1).max(200),
+}).strict();
+
+/**
+ * v42 accepted presentation names containing Unicode format and separator
+ * scalars. Project only that historical policy delta to a visible safe scalar
+ * in both the byte-free manifest and any still-pending transcript intent. This
+ * preserves unsent messages, effect evidence, user text, and exact blob
+ * custody while ensuring every current read and later replay parses safely.
+ *
+ * This is deliberately idempotent for pre-release v43 databases too: after
+ * the first successful transaction every manifest already has its current
+ * canonical presentation name.
+ */
+const normalizeSchemaVersion43LegacyAttachmentNames = (
+  database: Database,
+): void => {
+  const unsafeSources = new Map<string, { sessionId: SessionId; sourceId: string }>();
+  for (const value of database.query(
+    `SELECT session_id,source_id,position,digest,name,media_type,byte_length,created_at
+     FROM message_attachments
+     ORDER BY session_id,source_id,position`,
+  ).all()) {
+    const row = schemaVersion43LegacyAttachmentRowSchema.parse(value);
+    if (isAttachmentName(row.name)) continue;
+    const key = `${row.session_id}\u0000${row.source_id}`;
+    unsafeSources.set(key, { sessionId: row.session_id, sourceId: row.source_id });
+  }
+  if (unsafeSources.size === 0) return;
+
+  const pendingIntentUpdates: Array<Readonly<{
+    json: string;
+    sessionId: SessionId;
+    sourceId: string;
+    sourceKind: "mutation" | "queue";
+  }>> = [];
+  const normalizedManifests: Array<readonly z.infer<
+    typeof schemaVersion43LegacyAttachmentRowSchema
+  >[]> = [];
+  for (const { sessionId, sourceId } of unsafeSources.values()) {
+    const rows = schemaVersion43LegacyAttachmentRowSchema.array().parse(database.query(
+      `SELECT session_id,source_id,position,digest,name,media_type,byte_length,created_at
+       FROM message_attachments WHERE session_id=? AND source_id=?
+       ORDER BY position`,
+    ).all(sessionId, sourceId));
+    const references = rows.map((row) => ({
+      byteLength: row.byte_length,
+      digest: row.digest,
+      mediaType: row.media_type,
+      name: row.name,
+    }));
+    const projectedReferences = projectLegacyAttachmentReferences(references);
+    if (projectedReferences === null) {
+      throw new Error("STATE_SCHEMA_V43_ATTACHMENT_NAME_INVALID");
+    }
+    attachmentReferenceListSchema.parse(projectedReferences);
+    const normalized = rows.map((row, index) => ({
+      ...row,
+      name: projectedReferences[index]?.name ?? "",
+    }));
+
+    const queue = z.object({
+      transcript_intent_json: z.string().nullable(),
+      transcript_status: sessionUserMessageTranscriptStatusSchema,
+    }).strict().nullable().parse(
+      database.query(
+        `SELECT transcript_status,transcript_intent_json FROM queue_entries
+         WHERE id=? AND session_id=?`,
+      ).get(sourceId, sessionId),
+    );
+    const mutation = z.object({
+      transcript_intent_json: z.string().nullable(),
+      transcript_status: sessionUserMessageTranscriptStatusSchema,
+    }).strict().nullable().parse(database.query(
+      `SELECT transcript_status,transcript_intent_json FROM mutation_attempts
+       WHERE id=? AND authority_id=? AND kind IN ('session.send','session.steer')`,
+    ).get(sourceId, sessionId));
+    if (queue !== null && mutation !== null) {
+      throw new Error("STATE_SCHEMA_V43_ATTACHMENT_SOURCE_AMBIGUOUS");
+    }
+    const source = queue === null
+      ? mutation === null ? null : { ...mutation, sourceKind: "mutation" as const }
+      : { ...queue, sourceKind: "queue" as const };
+    if (source?.transcript_status === "pending") {
+      if (source.transcript_intent_json === null) {
+        throw new Error("STATE_SCHEMA_V43_ATTACHMENT_TRANSCRIPT_INTENT_INVALID");
+      }
+      const raw = z.object({ attachments: z.unknown() }).passthrough().parse(
+        JSON.parse(source.transcript_intent_json) as unknown,
+      );
+      const legacyIntentAttachments = legacyAttachmentReferenceListSchema.safeParse(
+        raw.attachments,
+      );
+      const attachments = legacyIntentAttachments.success
+        ? projectLegacyAttachmentReferences(legacyIntentAttachments.data)
+        : null;
+      if (attachments === null) {
+        throw new Error("STATE_SCHEMA_V43_ATTACHMENT_TRANSCRIPT_INTENT_INVALID");
+      }
+      const intent = sessionUserMessageIntentSchema.parse({ ...raw, attachments });
+      if (JSON.stringify(intent.attachments) !== JSON.stringify(projectedReferences)) {
+        throw new Error("STATE_SCHEMA_V43_ATTACHMENT_TRANSCRIPT_INTENT_MISMATCH");
+      }
+      pendingIntentUpdates.push({
+        json: JSON.stringify(intent),
+        sessionId,
+        sourceId,
+        sourceKind: source.sourceKind,
+      });
+    }
+    normalizedManifests.push(normalized);
+  }
+
+  if (pendingIntentUpdates.length > 0) {
+    removeExactSchemaVersion43FinalizationGuardsForMigration(database);
+    for (const update of pendingIntentUpdates) {
+      const table = update.sourceKind === "queue" ? "queue_entries" : "mutation_attempts";
+      const authorityColumn = update.sourceKind === "queue" ? "session_id" : "authority_id";
+      const changed = database.query(
+        `UPDATE ${table} SET transcript_intent_json=?
+         WHERE id=? AND ${authorityColumn}=? AND transcript_status='pending'`,
+      ).run(update.json, update.sourceId, update.sessionId);
+      if (changed.changes !== 1) {
+        throw new Error("STATE_SCHEMA_V43_ATTACHMENT_TRANSCRIPT_AUTHORITY_CHANGED");
+      }
+    }
+    database.exec(schemaVersion43SessionUserMessageFinalizationGuards);
+  }
+  for (const manifest of normalizedManifests) {
+    const first = manifest[0];
+    if (first === undefined) continue;
+    database.query(
+      "DELETE FROM message_attachments WHERE session_id=? AND source_id=?",
+    ).run(first.session_id, first.source_id);
+    for (const row of manifest) {
+      database.query(
+        `INSERT INTO message_attachments(
+           session_id,source_id,position,digest,name,media_type,byte_length,created_at
+         ) VALUES (?,?,?,?,?,?,?,?)`,
+      ).run(
+        row.session_id,
+        row.source_id,
+        row.position,
+        row.digest,
+        row.name,
+        row.media_type,
+        row.byte_length,
+        row.created_at,
+      );
+    }
+  }
+};
 
 const schemaVersion1 = `
 CREATE TABLE IF NOT EXISTS migrations (
@@ -2354,15 +5853,7 @@ CREATE INDEX IF NOT EXISTS session_events_age
 CREATE TRIGGER IF NOT EXISTS session_events_immutable_update
 BEFORE UPDATE ON session_events
 BEGIN SELECT RAISE(ABORT, 'session event is immutable'); END;
-CREATE TRIGGER IF NOT EXISTS session_events_account_authority_guard
-BEFORE INSERT ON session_events
-WHEN NOT EXISTS(
-  SELECT 1 FROM sessions s JOIN profiles p ON p.id=s.profile_id
-  WHERE s.id=NEW.session_id
-    AND s.profile_id=NEW.account_id
-    AND p.process_generation=NEW.provider_generation
-)
-BEGIN SELECT RAISE(ABORT, 'session event account authority mismatch'); END;
+${schemaVersion9SessionEventsAccountAuthorityGuard}
 CREATE TRIGGER IF NOT EXISTS session_events_accounting_insert
 AFTER INSERT ON session_events
 BEGIN
@@ -3346,6 +6837,46 @@ CREATE TABLE IF NOT EXISTS autorespond_message_sources (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS autorespond_message_sources_recent ON autorespond_message_sources(session_id, created_at DESC);
 `;
+
+const schemaVersion44AutorespondEvidence = schemaVersion31Statements[0]
+  .replace("autorespond_evidence_next", "autorespond_evidence")
+  .replace("'accepted','refused','sent'", "'accepted','refused','unknown','sent'");
+
+const schemaVersion44AutorespondEvidencePredecessor = (() => {
+  const expected = new Database(":memory:");
+  try {
+    expected.exec(schemaVersion31Statements[0]);
+    expected.exec("ALTER TABLE autorespond_evidence_next RENAME TO autorespond_evidence");
+    return z.object({ sql: z.string() }).strict().parse(expected.query(
+      "SELECT sql FROM sqlite_master WHERE name='autorespond_evidence'",
+    ).get()).sql;
+  } finally { expected.close(false); }
+})();
+
+const assertSchemaVersion44AutorespondEvidence = (database: Database): void => {
+  const row = z.object({ sql: z.string() }).strict().safeParse(database.query(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='autorespond_evidence'",
+  ).get());
+  if (!row.success || normalizedTriggerSql(row.data.sql)
+    !== normalizedTriggerSql(schemaVersion44AutorespondEvidence)) {
+    throw new Error("STATE_SCHEMA_V44_AUTORESPOND_EVIDENCE_INVALID");
+  }
+};
+
+const migrateSchemaVersion44AutorespondEvidence = (database: Database): void => {
+  const row = z.object({ sql: z.string() }).strict().parse(database.query(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='autorespond_evidence'",
+  ).get());
+  if (normalizedTriggerSql(row.sql) === normalizedTriggerSql(schemaVersion44AutorespondEvidence)) return;
+  if (normalizedTriggerSql(row.sql) !== normalizedTriggerSql(schemaVersion44AutorespondEvidencePredecessor)) {
+    throw new Error("STATE_SCHEMA_V44_AUTORESPOND_EVIDENCE_PREDECESSOR_INVALID");
+  }
+  database.exec("ALTER TABLE autorespond_evidence RENAME TO autorespond_evidence_v43");
+  database.exec(schemaVersion44AutorespondEvidence);
+  database.exec("INSERT INTO autorespond_evidence SELECT * FROM autorespond_evidence_v43");
+  database.exec("DROP TABLE autorespond_evidence_v43");
+  database.exec(schemaVersion31Objects);
+};
 /** Per-session autorespond-authored message sources kept for projection labelling. */
 export const AUTORESPOND_MESSAGE_SOURCE_PER_SESSION_CAP = 500;
 // Session archive and the settings projection's daemon-level defaults (W2
@@ -6323,7 +9854,38 @@ const schemaVersion42SessionSwitchObjectSql = (
   }
 };
 
-const assertSchemaVersion42SessionSwitch = (database: Database): void => {
+// The frozen journal's contract-2 cell remains a legacy storage shadow. Joined
+// execution reads the resolved contract from the immutable context and plan;
+// no current preset default or unanchored parent field grants rebind authority.
+const joinedSessionSwitchSessionUpdateGuard = (() => {
+  const definition = schemaVersion42SessionSwitchObjects.find((object) =>
+    object.name === "session_switch_session_update_guard");
+  if (definition === undefined) throw new Error("STATE_SCHEMA_V42_DEFINITION_INVALID");
+  const original = schemaVersion42SessionSwitchObjectSql(definition);
+  const predecessor = "AND NEW.preset_contract=switch.target_preset_contract";
+  if (original.split(predecessor).length !== 2) throw new Error("STATE_SCHEMA_V42_DEFINITION_INVALID");
+  return original.replace(predecessor, `AND NEW.preset_contract IS (
+        SELECT context.target_preset_contract FROM session_switch_execution_contexts context
+        JOIN session_switch_execution_context_anchors anchor
+          ON anchor.attempt_id=context.attempt_id AND anchor.context_digest=context.context_digest
+        JOIN session_switch_plan_anchors plan
+          ON plan.attempt_id=context.attempt_id AND plan.plan_digest=context.plan_digest
+          AND plan.recorded_at=context.created_at
+        JOIN session_switch_attempts parent
+          ON parent.attempt_id=context.attempt_id AND parent.journal_sequence=switch.journal_sequence
+        WHERE context.attempt_id=switch.attempt_id AND context.request_digest=switch.request_digest
+          AND context.target_provider_account_id=switch.target_provider_account_id
+          AND context.target_profile_id=switch.target_profile_id AND context.target_provider=switch.target_provider
+          AND context.target_binding_generation=switch.target_binding_generation
+          AND context.target_process_generation=switch.target_process_generation
+          AND context.renderer_version=parent.renderer_version AND context.created_at=parent.created_at
+      )`);
+})();
+
+const assertSchemaVersion42SessionSwitch = (
+  database: Database,
+  format: "historical" | "joined" = "historical",
+): void => {
   const names = schemaVersion42SessionSwitchObjects
     .map((object) => `'${object.name}'`).join(",");
   const rows = database.query(
@@ -6336,7 +9898,8 @@ const assertSchemaVersion42SessionSwitch = (database: Database): void => {
   for (const expected of schemaVersion42SessionSwitchObjects) {
     const observed = rows.find((row) => row.name === expected.name);
     const observedSql = observed?.sql;
-    const expectedSql = schemaVersion42SessionSwitchObjectSql(expected);
+    const expectedSql = format === "joined" && expected.name === "session_switch_session_update_guard"
+      ? joinedSessionSwitchSessionUpdateGuard : schemaVersion42SessionSwitchObjectSql(expected);
     if (
       observed === undefined
       || observed.type !== expected.type
@@ -6344,6 +9907,15 @@ const assertSchemaVersion42SessionSwitch = (database: Database): void => {
       || normalizeSqlStructure(observedSql ?? "") !== normalizeSqlStructure(expectedSql)
     ) throw new Error(`STATE_SCHEMA_V42_STRUCTURE_INVALID:${expected.name}`);
   }
+};
+
+const applyJoinedSessionSwitchSessionUpdateGuard = (database: Database): void => {
+  if (!database.inTransaction) throw new Error("STATE_SCHEMA_JOIN_TRANSACTION_REQUIRED");
+  assertSchemaVersion42SessionSwitch(database, "historical");
+  assertSessionSwitchExecutionContextSchema(database);
+  database.exec("DROP TRIGGER session_switch_session_update_guard");
+  database.exec(joinedSessionSwitchSessionUpdateGuard);
+  assertSchemaVersion42SessionSwitch(database, "joined");
 };
 
 const automaticUsagePolicyMutationKind = "usage.auto.configure";
@@ -6611,31 +10183,11 @@ const applySchemaVersion43AutomaticUsagePolicy = (database: Database, now: numbe
   auditAutomaticUsagePolicyHistory(database);
 };
 
-const devinCloseWriterSchema = z.object({
+const devinCloseWitnessSchema = z.object({
   sessionId: sessionIdSchema,
   providerThreadId: providerThreadIdSchema,
   connectionId: z.string().uuid(),
-  projectRoot: z.string().min(1).max(4096).nullable(),
-  effectiveRuntimeProfile: reviewedRuntimeProfileSchema,
 }).strict();
-const devinCloseWitnessSchema = devinCloseWriterSchema.pick({
-  sessionId: true, providerThreadId: true, connectionId: true,
-});
-export type DevinJoinedCloseWriter = z.infer<typeof devinCloseWriterSchema>;
-const devinCloseCaptureSchema = z.object({
-  closeId: z.string().uuid(),
-  captureDigest: sha256Schema,
-  providerAuthority: devinProviderAccountAuthoritySchema,
-  writers: z.array(devinCloseWitnessSchema).min(1).max(1024),
-}).strict();
-export type DevinJoinedCloseCapture = z.infer<typeof devinCloseCaptureSchema>;
-export type DevinJoinedCloseReceipt = Readonly<{
-  closeId: string;
-  providerAuthority: z.infer<typeof devinProviderAccountAuthoritySchema>;
-  retiredAuthority: z.infer<typeof devinProviderAccountAuthoritySchema>;
-  daemonGeneration: number;
-  bootId: string;
-}>;
 export class DevinJoinedCloseError extends Error {
   constructor(readonly code: "DEVIN_JOINED_CLOSE_CONFLICT" | "DEVIN_JOINED_CLOSE_CORRUPT") {
     super(code);
@@ -6656,7 +10208,6 @@ const devinCloseSnapshotSchema = devinCloseWitnessSchema.extend({
   runtimeDigest: sha256Schema,
   runtimeContractDigest: sha256Schema,
 }).strict();
-type DevinCloseSnapshot = z.infer<typeof devinCloseSnapshotSchema>;
 const devinCloseIntentSchema = z.object({
   close_id: z.string().uuid(),
   provider_account_id: providerAccountIdSchema,
@@ -6688,14 +10239,6 @@ const devinCloseAuthority = (intent: z.infer<typeof devinCloseIntentSchema>) =>
   });
 const devinCloseDigest = (kind: string, value: unknown): string =>
   createHash("sha256").update(`hra:devin-joined-close:${kind}:v1\0`).update(JSON.stringify(value)).digest("hex");
-const devinCloseRuntimeContractDigest = (value: ReviewedRuntimeProfile): string => {
-  const profile = effectiveDevinRuntimeProfileSchema.parse(value);
-  return devinCloseDigest("runtime-contract", {
-    profileId: profile.profileId, preset: profile.preset, model: profile.model,
-    reasoningEffort: profile.reasoningEffort, devinVersion: profile.devinVersion,
-    protocolVersion: profile.protocolVersion, isolatedHome: profile.isolatedHome,
-  });
-};
 const devinCloseTables = [
   { name: "devin_joined_close_intents", sql: `CREATE TABLE IF NOT EXISTS devin_joined_close_intents(
     close_id TEXT PRIMARY KEY CHECK(length(close_id)=36),
@@ -7001,77 +10544,6 @@ const retireMigratedOrphanCodexUsageAuthorities = (
   }
 };
 
-const sqliteTableExists = (database: Database, table: string): boolean => {
-  if (!/^[a-z_]+$/u.test(table)) throw new Error("Unsafe SQLite table identifier.");
-  return database.query(
-    "SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name=?",
-  ).get(table) !== null;
-};
-
-const repairOrphanProviderAuthoritySidecars = (database: Database): void => {
-  if (!sqliteTableExists(database, "provider_accounts")) return;
-  // Some downgrade/security-scrub fixtures delete their parent rows with
-  // foreign_keys disabled. These sidecars are owned by those parents, so
-  // remove only proven orphans before the next whole-database FK scan.
-  database.exec(`
-    DROP TRIGGER IF EXISTS runtime_profile_provider_authorities_immutable_delete;
-    DROP TRIGGER IF EXISTS queue_provider_authorities_immutable_delete;
-    DROP TRIGGER IF EXISTS interaction_provider_authorities_immutable_delete;
-  `);
-  if (
-    sqliteTableExists(database, "runtime_profile_provider_authorities")
-    && sqliteTableExists(database, "session_runtime_profiles")
-  ) database.exec(`
-    DELETE FROM runtime_profile_provider_authorities
-      WHERE NOT EXISTS(
-        SELECT 1 FROM session_runtime_profiles value
-        WHERE value.session_id=runtime_profile_provider_authorities.session_id
-          AND value.revision=runtime_profile_provider_authorities.revision
-      );
-  `);
-  if (
-    sqliteTableExists(database, "queue_provider_authorities")
-    && sqliteTableExists(database, "queue_entries")
-  ) database.exec(`
-    DELETE FROM queue_provider_authorities
-      WHERE NOT EXISTS(
-        SELECT 1 FROM queue_entries value
-        WHERE value.id=queue_provider_authorities.queue_id
-      );
-  `);
-  if (
-    sqliteTableExists(database, "interaction_provider_authorities")
-    && sqliteTableExists(database, "provider_interactions")
-  ) database.exec(`
-    DELETE FROM interaction_provider_authorities
-      WHERE NOT EXISTS(
-        SELECT 1 FROM provider_interactions value
-        WHERE value.public_id=interaction_provider_authorities.public_id
-      );
-  `);
-  if (
-    sqliteTableExists(database, "session_event_provider_authorities")
-    && sqliteTableExists(database, "session_events")
-  ) database.exec(`
-    DELETE FROM session_event_provider_authorities
-      WHERE NOT EXISTS(
-        SELECT 1 FROM session_events value
-        WHERE value.session_id=session_event_provider_authorities.session_id
-          AND value.sequence=session_event_provider_authorities.sequence
-      );
-  `);
-  if (
-    sqliteTableExists(database, "account_rate_limit_reset_provider_authorities")
-    && sqliteTableExists(database, "account_rate_limit_reset_attempts")
-  ) database.exec(`
-    DELETE FROM account_rate_limit_reset_provider_authorities
-      WHERE NOT EXISTS(
-        SELECT 1 FROM account_rate_limit_reset_attempts value
-        WHERE value.idempotency_key=account_rate_limit_reset_provider_authorities.idempotency_key
-      );
-  `);
-};
-
 const providerAccountForProfile = (
   database: Database,
   profileId: ProfileId,
@@ -7264,24 +10736,22 @@ const insertLegacyProviderAuthorityQuarantine = (
   );
 };
 
-const legacyRuntimeProfileAuthority = (
+const legacyParsedRuntimeProfileAuthority = (
   database: Database,
-  profileJson: string,
-): ProviderAccountAuthority | null => {
-  let value: unknown;
-  try {
-    value = JSON.parse(profileJson) as unknown;
-  } catch {
-    return null;
-  }
-  const parsed = reviewedRuntimeProfileSchema.safeParse(value);
-  if (!parsed.success) return null;
-  const provider = reviewedRuntimeProfileProvider(parsed.data);
-  const account = providerAccountForProfile(database, parsed.data.profileId, provider);
-  return authorityFromProviderAccount(account, parsed.data.processGeneration);
+  profile: ReviewedRuntimeProfile,
+): ProviderAccountAuthority => {
+  // Only an admitted original runtime row or a provenance-selected parsed
+  // effect reaches this path. Do not serialize objects into invented raw proof.
+  const provider = reviewedRuntimeProfileProvider(profile);
+  const account = providerAccountForProfile(database, profile.profileId, provider);
+  return authorityFromProviderAccount(account, profile.processGeneration);
 };
 
-const legacyExternalProviderProcessGenerations = (database: Database, provider: "claude" | "devin"): ReadonlyMap<ProfileId, number> => {
+const legacyExternalProviderProcessGenerations = (
+  database: Database,
+  provider: "claude" | "devin",
+  sourceFormat: HistoricalEffectEvidenceFormat,
+): ReadonlyMap<ProfileId, number> => {
   const generations = new Map<ProfileId, number>();
   const record = (value: unknown): void => {
     const parsed = reviewedRuntimeProfileSchema.safeParse(value);
@@ -7291,28 +10761,22 @@ const legacyExternalProviderProcessGenerations = (database: Database, provider: 
       Math.max(generations.get(parsed.data.profileId) ?? 0, parsed.data.processGeneration),
     );
   };
-  for (const row of database.query(
-    "SELECT profile_json FROM session_runtime_profiles",
-  ).all() as { profile_json: string }[]) {
-    try { record(JSON.parse(row.profile_json) as unknown); } catch { /* quarantined later */ }
+  for (const row of readHistoricalRuntimeProfileAuthorityRows(database, sourceFormat)) {
+    if (row.kind === "parsed") record(row.profile);
   }
   for (const row of database.query(
-    "SELECT evidence_json FROM mutation_effect_evidence",
-  ).all() as { evidence_json: string }[]) {
-    try {
-      const evidence = mutationEffectEvidenceSchema.safeParse(JSON.parse(row.evidence_json) as unknown);
-      if (evidence.success && "runtimeProfile" in evidence.data) {
-        record(evidence.data.runtimeProfile);
-      }
-    } catch { /* quarantined later */ }
+    "SELECT attempt_id FROM mutation_effect_evidence ORDER BY attempt_id",
+  ).all() as { attempt_id: string }[]) {
+    const evidence = readMutationEffectEvidenceProvenance(database, row.attempt_id);
+    if (evidence.kind === "parsed" && "runtimeProfile" in evidence.evidence) {
+      record(evidence.evidence.runtimeProfile);
+    }
   }
   for (const row of database.query(
-    "SELECT evidence_json FROM queue_effect_evidence",
-  ).all() as { evidence_json: string }[]) {
-    try {
-      const evidence = queueEffectEvidenceSchema.safeParse(JSON.parse(row.evidence_json) as unknown);
-      if (evidence.success) record(evidence.data.runtimeProfile);
-    } catch { /* quarantined later */ }
+    "SELECT queue_id FROM queue_effect_evidence ORDER BY queue_id",
+  ).all() as { queue_id: string }[]) {
+    const evidence = readQueueEffectEvidenceProvenance(database, row.queue_id);
+    if (evidence.kind === "parsed") record(evidence.evidence.runtimeProfile);
   }
   // Released foreground-login grants used the shared profile generation.
   // Preserve that exact historical provider fence without deriving it from
@@ -7339,7 +10803,12 @@ const legacyExternalProviderProcessGenerations = (database: Database, provider: 
 const backfillSchemaVersion40ProviderAccounts = (
   database: Database,
   migratedAt: number,
+  sourceFormat: HistoricalEffectEvidenceFormat,
 ): void => {
+  // The outer migration must first bind the independently admitted incoming
+  // dialect to every original evidence byte. A missing/changed proof aborts
+  // before the account registry gains any derived authority.
+  auditEffectEvidenceProvenance(database);
   const profiles = database.query(
     `SELECT id,state,process_generation,provider_email,provider_plan,created_at,updated_at
      FROM profiles ORDER BY created_at,id`,
@@ -7353,8 +10822,8 @@ const backfillSchemaVersion40ProviderAccounts = (
     updated_at: unixMillisecondsSchema,
   }).strict().parse(row));
   const externalProcessGenerations = {
-    claude: legacyExternalProviderProcessGenerations(database, "claude"),
-    devin: legacyExternalProviderProcessGenerations(database, "devin"),
+    claude: legacyExternalProviderProcessGenerations(database, "claude", sourceFormat),
+    devin: legacyExternalProviderProcessGenerations(database, "devin", sourceFormat),
   };
 
   let activePosition = 0;
@@ -7425,47 +10894,32 @@ const backfillSchemaVersion40ProviderAccounts = (
     ).run(provider, active?.id ?? null, migratedAt, migratedAt);
   }
 
-  const runtimeRows = database.query(
-    `SELECT session_id,revision,profile_id,process_generation,profile_json,recorded_at
-     FROM session_runtime_profiles ORDER BY session_id,revision`,
-  ).all().map((row) => z.object({
-    session_id: sessionIdSchema,
-    revision: z.number().int().positive(),
-    profile_id: profileIdSchema,
-    process_generation: z.number().int().nonnegative(),
-    profile_json: z.string(),
-    recorded_at: unixMillisecondsSchema,
-  }).strict().parse(row));
-  for (const runtime of runtimeRows) {
-    const authority = legacyRuntimeProfileAuthority(database, runtime.profile_json);
-    if (
-      authority === null
-      || authority.profileId !== runtime.profile_id
-      || authority.processGeneration !== runtime.process_generation
-    ) {
+  for (const runtime of readHistoricalRuntimeProfileAuthorityRows(database, sourceFormat)) {
+    if (runtime.kind === "opaque") {
       insertLegacyProviderAuthorityQuarantine(
         database,
         "runtime_profile",
-        `${runtime.session_id}:${runtime.revision}`,
+        `${runtime.sessionId}:${runtime.revision}`,
         "missing_immutable_runtime_authority",
         migratedAt,
       );
       continue;
     }
+    const authority = legacyParsedRuntimeProfileAuthority(database, runtime.profile);
     database.query(
       `INSERT OR IGNORE INTO runtime_profile_provider_authorities(
          session_id,revision,provider_account_id,profile_id,provider,
          binding_generation,process_generation,provenance,recorded_at
        ) VALUES (?,?,?,?,?,?,?,'legacy_runtime_profile',?)`,
     ).run(
-      runtime.session_id,
+      runtime.sessionId,
       runtime.revision,
       authority.providerAccountId,
       authority.profileId,
       authority.provider,
       authority.bindingGeneration,
       authority.processGeneration,
-      Math.max(runtime.recorded_at, migratedAt),
+      Math.max(runtime.recordedAt, migratedAt),
     );
   }
 
@@ -7510,23 +10964,20 @@ const backfillSchemaVersion40ProviderAccounts = (
         });
     if (authority === null && latestRuntime === null) {
       const start = database.query(
-        `SELECT e.evidence_json FROM session_start_attempts s
+        `SELECT e.attempt_id FROM session_start_attempts s
          JOIN mutation_effect_evidence e ON e.attempt_id=s.attempt_id
          WHERE s.session_id=? ORDER BY e.recorded_at DESC,e.attempt_id DESC LIMIT 1`,
-      ).get(session.id) as { evidence_json: string } | null;
+      ).get(session.id) as { attempt_id: string } | null;
       if (start !== null) {
-        try {
-          const evidence = mutationEffectEvidenceSchema.parse(
-            JSON.parse(start.evidence_json) as unknown,
-          );
+        const selected = readMutationEffectEvidenceProvenance(database, start.attempt_id);
+        if (selected.kind === "parsed") {
+          const evidence = selected.evidence;
           if (evidence.kind === "session.start" && evidence.runtimeProfile !== undefined) {
-            authority = legacyRuntimeProfileAuthority(
+            authority = legacyParsedRuntimeProfileAuthority(
               database,
-              JSON.stringify(evidence.runtimeProfile),
+              evidence.runtimeProfile,
             );
           }
-        } catch {
-          authority = null;
         }
       }
     }
@@ -7564,7 +11015,7 @@ const backfillSchemaVersion40ProviderAccounts = (
 
   const mutationRows = database.query(
     `SELECT m.id,m.kind,m.authority_id,m.authority_generation,m.state,m.result_json,
-            e.evidence_json,r.attempt_id AS resolution_id,
+            e.attempt_id AS effect_attempt_id,r.attempt_id AS resolution_id,
             dr.attempt_id AS desktop_resolution_id
      FROM mutation_attempts m
      LEFT JOIN mutation_effect_evidence e ON e.attempt_id=m.id
@@ -7578,7 +11029,7 @@ const backfillSchemaVersion40ProviderAccounts = (
     authority_generation: z.number().int().nonnegative(),
     state: z.string(),
     result_json: z.string().nullable(),
-    evidence_json: z.string().nullable(),
+    effect_attempt_id: attemptIdSchema.nullable(),
     resolution_id: z.string().nullable(),
     desktop_resolution_id: z.string().nullable(),
   }).strict().parse(row));
@@ -7619,36 +11070,32 @@ const backfillSchemaVersion40ProviderAccounts = (
           const { queueId } = z.object({ queueId: queueIdSchema }).passthrough().parse(
             JSON.parse(mutation.result_json) as unknown,
           );
-          const row = z.object({ evidence_json: z.string() }).strict().nullable().parse(
+          const row = z.object({ queue_id: queueIdSchema }).strict().nullable().parse(
             database.query(
-              "SELECT evidence_json FROM queue_effect_evidence WHERE queue_id=?",
+              "SELECT queue_id FROM queue_effect_evidence WHERE queue_id=?",
             ).get(queueId),
           );
           if (row !== null) {
-            const evidence = queueEffectEvidenceSchema.parse(
-              JSON.parse(row.evidence_json) as unknown,
-            );
-            authority = legacyRuntimeProfileAuthority(
+            const evidence = requireQueueEvidenceFromProvenance(database, row.queue_id).evidence;
+            authority = legacyParsedRuntimeProfileAuthority(
               database,
-              JSON.stringify(evidence.runtimeProfile),
+              evidence.runtimeProfile,
             );
             provenance = "legacy_queue_runtime";
           }
         } catch {
           authority = null;
         }
-      } else if (mutation.evidence_json !== null) {
+      } else if (mutation.effect_attempt_id !== null) {
         try {
-          const evidence = mutationEffectEvidenceSchema.parse(
-            JSON.parse(mutation.evidence_json) as unknown,
-          );
+          const evidence = requireMutationEvidenceFromProvenance(database, mutation.effect_attempt_id).evidence;
           if (
             (evidence.kind === "session.start" || evidence.kind === "session.send")
             && evidence.runtimeProfile !== undefined
           ) {
-            authority = legacyRuntimeProfileAuthority(
+            authority = legacyParsedRuntimeProfileAuthority(
               database,
-              JSON.stringify(evidence.runtimeProfile),
+              evidence.runtimeProfile,
             );
           } else if (
             (evidence.kind === "session.steer" || evidence.kind === "session.stop")
@@ -7707,28 +11154,25 @@ const backfillSchemaVersion40ProviderAccounts = (
   }
 
   const queueRows = database.query(
-    `SELECT q.id,q.state,q.created_at,e.evidence_json,e.recorded_at FROM queue_entries q
+    `SELECT q.id,q.state,q.created_at,e.queue_id AS effect_queue_id,e.recorded_at FROM queue_entries q
      LEFT JOIN queue_effect_evidence e ON e.queue_id=q.id ORDER BY q.enqueue_sequence`,
   ).all().map((row) => z.object({
     id: queueIdSchema,
     state: queueStateSchema,
     created_at: unixMillisecondsSchema,
-    evidence_json: z.string().nullable(),
+    effect_queue_id: queueIdSchema.nullable(),
     recorded_at: unixMillisecondsSchema.nullable(),
   }).strict().parse(row));
   for (const queue of queueRows) {
     let authority: ProviderAccountAuthority | null = null;
-    if (queue.evidence_json !== null) {
-      try {
-        const evidence = queueEffectEvidenceSchema.parse(
-          JSON.parse(queue.evidence_json) as unknown,
-        );
-        authority = legacyRuntimeProfileAuthority(
+    if (queue.effect_queue_id !== null) {
+      const selected = readQueueEffectEvidenceProvenance(database, queue.effect_queue_id);
+      if (selected.kind === "parsed") {
+        const evidence = selected.evidence;
+        authority = legacyParsedRuntimeProfileAuthority(
           database,
-          JSON.stringify(evidence.runtimeProfile),
+          evidence.runtimeProfile,
         );
-      } catch {
-        authority = null;
       }
     }
     if (authority === null) {
@@ -10067,19 +13511,10 @@ const schemaVersion40WorkAuthorityTables = schemaVersion40WorkAuthorityTableName
   .map(schemaVersion40TableSql)
   .join("\n");
 
-const taskWorkAuthorityDependencyTables = schemaCohortObjects(schemaVersion40ProviderAccounts)
-  .filter((object) => object.type === "table"
-    && (object.name === "provider_accounts" || object.name === "session_provider_authorities"))
-  .map((object) => object.sql)
-  .join("\n");
-
 const ensureSchemaVersion40WorkAuthorityDependencies = (database: Database): void => {
   // Create referenced tables before touching profiles: on newer SQLite,
   // ALTER TABLE reparses every trigger and rejects a still-missing relation.
   database.exec(schemaVersion40WorkAuthorityTables);
-  // Combined Work guards also join the exact provider tuple. Create only its
-  // two referenced tables here, without rows, guards or a migration stamp.
-  database.exec(taskWorkAuthorityDependencyTables);
   if (!hasTableColumn(database, "profiles", "codex_account_key")) {
     database.exec(
       `ALTER TABLE profiles ADD COLUMN ${schemaVersion40ProfileCodexAccountKeyColumn}`,
@@ -10381,11 +13816,15 @@ const applySchemaVersion40SessionAdoption = (
     )
   `);
   database.exec(schemaVersion40SessionAccountAuthorityUpdateGuard);
-  // Work's account and route guards reference the adoption authority tables.
-  // Rebuild their merged v40 bodies before quarantine constructs WorkStore;
-  // otherwise a legacy same-name trigger can survive CREATE IF NOT EXISTS.
-  database.exec(WORK_SCHEMA_SQL);
-  assertWorkSchema(database);
+  // Install the frozen canonical predecessor, not evolving runtime guards
+  // that require a later provider-account registry. Canonical v42 owns its
+  // own exact two-guard replacement before the usage overlay is installed.
+  installCanonicalVersion40WorkSchema(database);
+  // The outer admission proved absence before any mutation. The >=40 paths
+  // preapply this companion once; older inputs first acquire its parents here.
+  if (!hasTableColumn(database, "sessions", "canonical_profile_key")) {
+    applySchemaVersion50CanonicalProfiles(database);
+  }
   // Defer quarantine until the combined owner/custody schemas are installed.
   // Its cancellation paths must obey the existing original-send and queue owners.
   ensureVersion40CandidateColumns(database);
@@ -10394,6 +13833,2672 @@ const applySchemaVersion40SessionAdoption = (
 
 /** Maximum unclaimed candidates retained per provider. */
 export const SESSION_ADOPTION_PENDING_CANDIDATE_CAP = 2_000;
+
+/*
+ * Peer sessions, facts-memory authority, attributed messages, and the
+ * provider-switch recovery journal are schema v40. v39 belongs exclusively
+ * to the upstream/main Devin provider-authority migration above.
+ */
+const legacyProjectMemoryAuthoritiesTableSql = `
+CREATE TABLE IF NOT EXISTS project_memory_authorities (
+  project_id TEXT PRIMARY KEY REFERENCES projects(id),
+  authority_digest TEXT NOT NULL CHECK(length(authority_digest) = 64 AND authority_digest NOT GLOB '*[^a-f0-9]*'),
+  binding_digest TEXT NOT NULL CHECK(length(binding_digest) = 64 AND binding_digest NOT GLOB '*[^a-f0-9]*'),
+  head_sequence INTEGER NOT NULL CHECK(head_sequence BETWEEN 0 AND 9007199254740991),
+  head_operation_sha256 TEXT CHECK(head_operation_sha256 IS NULL OR (length(head_operation_sha256) = 64 AND head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  head_digest TEXT NOT NULL CHECK(length(head_digest) = 64 AND head_digest NOT GLOB '*[^a-f0-9]*'),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  sync_state TEXT NOT NULL CHECK(sync_state IN ('local_only','settled','conflict','error')),
+  last_exchange_at INTEGER CHECK(last_exchange_at IS NULL OR last_exchange_at >= 0),
+  last_exchange_sequence INTEGER CHECK(last_exchange_sequence IS NULL OR last_exchange_sequence BETWEEN 0 AND 9007199254740991),
+  last_exchange_operation_sha256 TEXT CHECK(last_exchange_operation_sha256 IS NULL OR (length(last_exchange_operation_sha256) = 64 AND last_exchange_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  last_exchange_head_digest TEXT CHECK(last_exchange_head_digest IS NULL OR (length(last_exchange_head_digest) = 64 AND last_exchange_head_digest NOT GLOB '*[^a-f0-9]*')),
+  diagnostic_code TEXT CHECK(
+    diagnostic_code IS NULL
+    OR (
+      diagnostic_code GLOB '[A-Z]*'
+      AND diagnostic_code NOT GLOB '*[^A-Z0-9_]*'
+      AND length(diagnostic_code) BETWEEN 1 AND 80
+    )
+  ),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+  CHECK((head_sequence = 0) = (head_operation_sha256 IS NULL)),
+  CHECK(
+    (last_exchange_at IS NULL) = (last_exchange_sequence IS NULL)
+    AND (last_exchange_at IS NULL) = (last_exchange_head_digest IS NULL)
+    AND (last_exchange_sequence IS NOT NULL OR last_exchange_operation_sha256 IS NULL)
+    AND (
+      last_exchange_sequence IS NULL
+      OR ((last_exchange_sequence = 0) = (last_exchange_operation_sha256 IS NULL))
+    )
+  ),
+  CHECK((sync_state IN ('conflict','error')) = (diagnostic_code IS NOT NULL)),
+  CHECK(
+    sync_state != 'settled'
+    OR (
+      last_exchange_at IS NOT NULL
+      AND last_exchange_sequence=head_sequence
+      AND last_exchange_operation_sha256 IS head_operation_sha256
+      AND last_exchange_head_digest=head_digest
+    )
+  )
+) STRICT;`;
+
+const schemaVersion40PeerSessions = `
+CREATE TABLE IF NOT EXISTS session_peer_policies (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL CHECK(mode IN ('off','inspect','coordinate')),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= created_at)
+) STRICT;
+CREATE TABLE IF NOT EXISTS peer_session_actions (
+  id TEXT PRIMARY KEY CHECK(id GLOB 'peer_[0-9a-f]*' AND length(id) = 37),
+  idempotency_key TEXT NOT NULL UNIQUE CHECK(length(idempotency_key) BETWEEN 1 AND 64),
+  actor_session_id TEXT NOT NULL REFERENCES sessions(id),
+  actor_turn_digest TEXT NOT NULL CHECK(length(actor_turn_digest) = 64 AND actor_turn_digest NOT GLOB '*[^a-f0-9]*'),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  actor_policy_revision INTEGER NOT NULL CHECK(actor_policy_revision BETWEEN 1 AND 9007199254740991),
+  target_session_id TEXT NOT NULL REFERENCES sessions(id),
+  target_expected_revision INTEGER NOT NULL CHECK(target_expected_revision BETWEEN 1 AND 9007199254740991),
+  target_policy_revision INTEGER NOT NULL CHECK(target_policy_revision BETWEEN 1 AND 9007199254740991),
+  delivery TEXT NOT NULL CHECK(delivery IN ('send','queue','steer')),
+  request_digest TEXT NOT NULL CHECK(length(request_digest) = 64 AND request_digest NOT GLOB '*[^a-f0-9]*'),
+  message_digest TEXT NOT NULL CHECK(length(message_digest) = 64 AND message_digest NOT GLOB '*[^a-f0-9]*'),
+  reason_digest TEXT NOT NULL CHECK(length(reason_digest) = 64 AND reason_digest NOT GLOB '*[^a-f0-9]*'),
+  state TEXT NOT NULL CHECK(state IN ('prepared','queued','effect_started','applied','failed','ambiguous','cancelled')),
+  hop INTEGER NOT NULL CHECK(hop BETWEEN 1 AND ${String(PEER_SESSION_HOP_LIMIT)}),
+  target_turn_digest TEXT CHECK(target_turn_digest IS NULL OR (length(target_turn_digest) = 64 AND target_turn_digest NOT GLOB '*[^a-f0-9]*')),
+  result_digest TEXT CHECK(result_digest IS NULL OR (length(result_digest) = 64 AND result_digest NOT GLOB '*[^a-f0-9]*')),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+  CHECK(actor_session_id != target_session_id),
+  CHECK((state = 'applied') = (target_turn_digest IS NOT NULL))
+) STRICT;
+CREATE INDEX IF NOT EXISTS peer_session_actions_actor_recent
+  ON peer_session_actions(actor_session_id,created_at DESC,id);
+CREATE INDEX IF NOT EXISTS peer_session_actions_actor_target_recent
+  ON peer_session_actions(actor_session_id,target_session_id,created_at DESC,id);
+CREATE INDEX IF NOT EXISTS peer_session_actions_target_recent
+  ON peer_session_actions(target_session_id,created_at DESC,id);
+CREATE INDEX IF NOT EXISTS peer_session_actions_unsettled
+  ON peer_session_actions(created_at,id)
+  WHERE state IN ('prepared','queued','effect_started','ambiguous');
+CREATE INDEX IF NOT EXISTS peer_session_actions_project_rate
+  ON peer_session_actions(project_id,created_at,id);
+CREATE INDEX IF NOT EXISTS peer_session_actions_project_retention
+  ON peer_session_actions(project_id,updated_at,id)
+  WHERE state IN ('applied','failed','cancelled');
+CREATE TABLE IF NOT EXISTS session_message_event_sources (
+  source_id TEXT PRIMARY KEY CHECK(
+    (source_id GLOB 'attempt_[0-9a-f]*' AND length(source_id)=40)
+    OR (source_id GLOB 'queue_[0-9a-f]*' AND length(source_id)=38)
+  ),
+  source_kind TEXT NOT NULL CHECK(source_kind IN ('mutation','queue')),
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  actor TEXT NOT NULL CHECK(actor IN ('human','automation','autorespond','peer_session','provider_switch')),
+  body_digest TEXT NOT NULL CHECK(length(body_digest) = 64 AND body_digest NOT GLOB '*[^a-f0-9]*'),
+  stream_epoch TEXT NOT NULL CHECK(length(stream_epoch) = 36),
+  event_sequence INTEGER NOT NULL CHECK(event_sequence BETWEEN 1 AND 9007199254740991),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  UNIQUE(session_id,event_sequence),
+  FOREIGN KEY(session_id,event_sequence)
+    REFERENCES session_events(session_id,sequence)
+) STRICT;
+CREATE INDEX IF NOT EXISTS session_message_event_sources_session_recent
+  ON session_message_event_sources(session_id,event_sequence DESC);
+DROP TRIGGER IF EXISTS session_message_event_source_insert_guard;
+CREATE TRIGGER session_message_event_source_insert_guard
+BEFORE INSERT ON session_message_event_sources
+WHEN NOT (
+  EXISTS (
+    SELECT 1 FROM session_events event
+    WHERE event.session_id=NEW.session_id
+      AND event.sequence=NEW.event_sequence
+      AND event.stream_epoch=NEW.stream_epoch
+      AND event.recorded_at=NEW.created_at
+      AND json_extract(event.event_json,'$.body.type')='user_message'
+      AND json_extract(event.event_json,'$.body.actor')=NEW.actor
+  )
+  AND (
+    (NEW.source_kind='mutation' AND EXISTS (
+      SELECT 1
+      FROM mutation_attempts mutation
+      JOIN mutation_effect_evidence evidence ON evidence.attempt_id=mutation.id
+      LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=mutation.id
+      WHERE mutation.id=NEW.source_id
+        AND mutation.authority_id=NEW.session_id
+        AND mutation.kind IN ('session.send','session.steer')
+        AND (
+          mutation.state='applied'
+          OR resolution.resolution_kind='proven_applied'
+        )
+        AND COALESCE(
+          json_extract(evidence.evidence_json,'$.messageActor'),
+          CASE
+            WHEN EXISTS (
+              SELECT 1 FROM autorespond_message_sources autorespond
+              WHERE autorespond.session_id=mutation.authority_id
+                AND autorespond.source_id=mutation.id
+            ) THEN 'autorespond'
+            WHEN EXISTS (
+              SELECT 1 FROM peer_session_direct_message_sources peer
+              WHERE peer.idempotency_key=mutation.idempotency_key
+                AND peer.target_session_id=mutation.authority_id
+                AND mutation.kind=('session.' || peer.delivery)
+            ) OR EXISTS (
+              SELECT 1 FROM peer_session_actions action
+              WHERE action.idempotency_key=mutation.idempotency_key
+                AND action.target_session_id=mutation.authority_id
+                AND mutation.kind=('session.' || action.delivery)
+            ) THEN 'peer_session'
+            WHEN EXISTS (
+              SELECT 1 FROM work_prepared_effects work
+              WHERE json_extract(work.instruction_json,'$.nestedMutationKey')=mutation.idempotency_key
+                AND json_extract(work.instruction_json,'$.targetSessionId')=mutation.authority_id
+                AND (
+                  (json_extract(work.instruction_json,'$.kind')='dispatch' AND mutation.kind='session.send')
+                  OR (json_extract(work.instruction_json,'$.kind')='signal'
+                    AND json_extract(work.instruction_json,'$.mode')='steer' AND mutation.kind='session.steer')
+                )
+            ) THEN 'automation'
+            ELSE 'human'
+          END
+        )=NEW.actor
+    ))
+    OR (NEW.source_kind='queue' AND EXISTS (
+      SELECT 1
+      FROM queue_entries queue
+      LEFT JOIN queue_effect_resolutions resolution ON resolution.queue_id=queue.id
+      WHERE queue.id=NEW.source_id
+        AND queue.session_id=NEW.session_id
+        AND (
+          queue.state='applied'
+          OR resolution.resolution_kind='proven_applied'
+        )
+        AND json_extract(queue.transcript_intent_json,'$.actor')=NEW.actor
+        AND (
+          (queue.message_actor='peer_session' AND NEW.actor='peer_session')
+          OR (queue.message_actor='human' AND NEW.actor!='peer_session')
+        )
+    ))
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'invalid session message event source'); END;
+DROP TRIGGER IF EXISTS session_message_event_source_immutable_update;
+CREATE TRIGGER session_message_event_source_immutable_update
+BEFORE UPDATE ON session_message_event_sources
+BEGIN SELECT RAISE(ABORT, 'session message event source is immutable'); END;
+DROP TRIGGER IF EXISTS session_message_event_source_delete_guard;
+CREATE TRIGGER session_message_event_source_delete_guard
+BEFORE DELETE ON session_message_event_sources
+WHEN EXISTS (
+  SELECT 1 FROM session_events event
+  WHERE event.session_id=OLD.session_id AND event.sequence=OLD.event_sequence
+)
+BEGIN SELECT RAISE(ABORT, 'session message event source is immutable while retained'); END;
+DROP TRIGGER IF EXISTS session_message_event_source_event_delete;
+CREATE TRIGGER session_message_event_source_event_delete
+AFTER DELETE ON session_events
+BEGIN
+  DELETE FROM session_message_event_sources
+  WHERE session_id=OLD.session_id AND event_sequence=OLD.sequence;
+END;
+CREATE TABLE IF NOT EXISTS peer_session_direct_message_sources (
+  idempotency_key TEXT PRIMARY KEY CHECK(length(idempotency_key) = 36),
+  action_id TEXT NOT NULL UNIQUE CHECK(action_id GLOB 'peer_[0-9a-f]*' AND length(action_id) = 37),
+  actor_session_id TEXT NOT NULL CHECK(actor_session_id GLOB 'sess_[0-9a-f]*' AND length(actor_session_id) = 37),
+  actor_turn_digest TEXT NOT NULL CHECK(length(actor_turn_digest) = 64 AND actor_turn_digest NOT GLOB '*[^a-f0-9]*'),
+  project_id TEXT NOT NULL CHECK(project_id GLOB 'proj_[0-9a-f]*' AND length(project_id) = 37),
+  target_session_id TEXT NOT NULL CHECK(target_session_id GLOB 'sess_[0-9a-f]*' AND length(target_session_id) = 37),
+  target_expected_revision INTEGER NOT NULL CHECK(target_expected_revision BETWEEN 1 AND 9007199254740991),
+  delivery TEXT NOT NULL CHECK(delivery IN ('send','steer')),
+  request_digest TEXT NOT NULL CHECK(length(request_digest) = 64 AND request_digest NOT GLOB '*[^a-f0-9]*'),
+  message_digest TEXT NOT NULL CHECK(length(message_digest) = 64 AND message_digest NOT GLOB '*[^a-f0-9]*'),
+  reason_digest TEXT NOT NULL CHECK(length(reason_digest) = 64 AND reason_digest NOT GLOB '*[^a-f0-9]*'),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  CHECK(actor_session_id != target_session_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS peer_session_direct_message_sources_project_recent
+  ON peer_session_direct_message_sources(project_id,created_at,idempotency_key);
+CREATE INDEX IF NOT EXISTS peer_session_direct_message_sources_target
+  ON peer_session_direct_message_sources(target_session_id,idempotency_key);
+DROP TRIGGER IF EXISTS peer_session_direct_message_source_insert_guard;
+CREATE TRIGGER peer_session_direct_message_source_insert_guard
+BEFORE INSERT ON peer_session_direct_message_sources
+WHEN NOT EXISTS (
+  SELECT 1 FROM peer_session_actions action
+  WHERE action.id=NEW.action_id
+    AND action.idempotency_key=NEW.idempotency_key
+    AND action.actor_session_id=NEW.actor_session_id
+    AND action.actor_turn_digest=NEW.actor_turn_digest
+    AND action.project_id=NEW.project_id
+    AND action.target_session_id=NEW.target_session_id
+    AND action.target_expected_revision=NEW.target_expected_revision
+    AND action.delivery=NEW.delivery
+    AND action.request_digest=NEW.request_digest
+    AND action.message_digest=NEW.message_digest
+    AND action.reason_digest=NEW.reason_digest
+    AND action.created_at=NEW.created_at
+)
+BEGIN SELECT RAISE(ABORT, 'invalid peer session direct message source'); END;
+DROP TRIGGER IF EXISTS peer_session_direct_message_source_immutable_update;
+CREATE TRIGGER peer_session_direct_message_source_immutable_update
+BEFORE UPDATE ON peer_session_direct_message_sources
+BEGIN SELECT RAISE(ABORT, 'peer session direct message source is immutable'); END;
+DROP TRIGGER IF EXISTS peer_session_direct_message_source_delete_guard;
+CREATE TRIGGER peer_session_direct_message_source_delete_guard
+BEFORE DELETE ON peer_session_direct_message_sources
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM mutation_attempts mutation
+  LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=mutation.id
+  LEFT JOIN mutation_effect_evidence evidence ON evidence.attempt_id=mutation.id
+  LEFT JOIN session_message_event_sources source
+    ON source.source_id=mutation.id
+      AND source.session_id=OLD.target_session_id
+      AND source.actor='peer_session'
+  WHERE mutation.idempotency_key=OLD.idempotency_key
+    AND mutation.authority_id=OLD.target_session_id
+    AND mutation.kind=('session.' || OLD.delivery)
+    AND (
+      source.source_id IS NOT NULL
+      OR json_extract(evidence.evidence_json,'$.messageActor')='peer_session'
+      OR mutation.state IN ('failed','cancelled')
+      OR resolution.resolution_kind='abandoned'
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'peer session direct message source is required'); END;
+DROP TRIGGER IF EXISTS peer_session_direct_message_source_quota;
+CREATE TRIGGER peer_session_direct_message_source_quota
+BEFORE INSERT ON peer_session_direct_message_sources
+WHEN (
+  SELECT COUNT(*) FROM peer_session_direct_message_sources
+  WHERE project_id=NEW.project_id
+)>=${String(PEER_SESSION_DIRECT_MESSAGE_SOURCE_LIMIT)}
+BEGIN SELECT RAISE(ABORT, 'peer session direct message source quota exceeded'); END;
+CREATE TABLE IF NOT EXISTS peer_session_action_parents (
+  action_id TEXT NOT NULL REFERENCES peer_session_actions(id),
+  parent_action_id TEXT NOT NULL REFERENCES peer_session_actions(id),
+  PRIMARY KEY(action_id,parent_action_id),
+  CHECK(action_id != parent_action_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS peer_session_action_parents_parent
+  ON peer_session_action_parents(parent_action_id,action_id);
+CREATE TABLE IF NOT EXISTS peer_session_action_visits (
+  action_id TEXT NOT NULL REFERENCES peer_session_actions(id),
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  PRIMARY KEY(action_id,session_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS peer_session_action_visits_session
+  ON peer_session_action_visits(session_id,action_id);
+CREATE TABLE IF NOT EXISTS peer_session_action_roots (
+  action_id TEXT NOT NULL REFERENCES peer_session_actions(id),
+  root_action_id TEXT NOT NULL REFERENCES peer_session_actions(id),
+  PRIMARY KEY(action_id,root_action_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS peer_session_action_roots_root
+  ON peer_session_action_roots(root_action_id,action_id);
+CREATE TABLE IF NOT EXISTS peer_session_turn_origins (
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  turn_digest TEXT NOT NULL CHECK(length(turn_digest) = 64 AND turn_digest NOT GLOB '*[^a-f0-9]*'),
+  action_id TEXT NOT NULL REFERENCES peer_session_actions(id),
+  PRIMARY KEY(session_id,turn_digest,action_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS peer_session_turn_origins_action
+  ON peer_session_turn_origins(action_id,session_id,turn_digest);
+DROP TRIGGER IF EXISTS session_peer_policy_default;
+CREATE TRIGGER session_peer_policy_default
+AFTER INSERT ON sessions
+BEGIN
+  INSERT INTO session_peer_policies(session_id,mode,revision,created_at,updated_at)
+  VALUES (NEW.id,'coordinate',1,NEW.created_at,NEW.created_at);
+END;
+DROP TRIGGER IF EXISTS session_peer_policy_transition_guard;
+CREATE TRIGGER session_peer_policy_transition_guard
+BEFORE UPDATE ON session_peer_policies
+WHEN NOT (
+  NEW.session_id=OLD.session_id
+  AND NEW.created_at=OLD.created_at
+  AND NEW.revision=OLD.revision+1
+  AND NEW.updated_at>=OLD.updated_at
+  AND NEW.mode IN ('off','inspect','coordinate')
+)
+BEGIN SELECT RAISE(ABORT, 'illegal peer session policy transition'); END;
+DROP TRIGGER IF EXISTS peer_session_action_insert_guard;
+CREATE TRIGGER peer_session_action_insert_guard
+BEFORE INSERT ON peer_session_actions
+WHEN NEW.state NOT IN ('prepared','queued')
+  OR NEW.target_turn_digest IS NOT NULL
+  OR NEW.result_digest IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'illegal peer session action insertion'); END;
+DROP TRIGGER IF EXISTS peer_session_action_transition_guard;
+CREATE TRIGGER peer_session_action_transition_guard
+BEFORE UPDATE ON peer_session_actions
+WHEN NOT (
+  NEW.id=OLD.id
+  AND NEW.idempotency_key=OLD.idempotency_key
+  AND NEW.actor_session_id=OLD.actor_session_id
+  AND NEW.actor_turn_digest=OLD.actor_turn_digest
+  AND NEW.project_id=OLD.project_id
+  AND NEW.actor_policy_revision=OLD.actor_policy_revision
+  AND NEW.target_session_id=OLD.target_session_id
+  AND NEW.target_expected_revision=OLD.target_expected_revision
+  AND NEW.target_policy_revision=OLD.target_policy_revision
+  AND NEW.delivery=OLD.delivery
+  AND NEW.request_digest=OLD.request_digest
+  AND NEW.message_digest=OLD.message_digest
+  AND NEW.reason_digest=OLD.reason_digest
+  AND NEW.hop=OLD.hop
+  AND NEW.created_at=OLD.created_at
+  AND NEW.updated_at>=OLD.updated_at
+  AND (OLD.target_turn_digest IS NULL OR NEW.target_turn_digest IS OLD.target_turn_digest)
+  AND (OLD.result_digest IS NULL OR NEW.result_digest IS OLD.result_digest)
+  AND (
+    NEW.state=OLD.state
+    OR (OLD.state='prepared' AND NEW.state IN ('effect_started','cancelled'))
+    OR (OLD.state='queued' AND NEW.state IN ('effect_started','cancelled','ambiguous'))
+    OR (OLD.state='effect_started' AND NEW.state IN ('applied','failed','ambiguous'))
+    OR (OLD.state='ambiguous' AND NEW.state IN ('applied','failed'))
+    OR (
+      OLD.state IN ('effect_started','ambiguous')
+      AND NEW.state='cancelled'
+      AND NOT EXISTS (
+        SELECT 1 FROM mutation_effect_evidence evidence
+        JOIN mutation_attempts mutation ON mutation.id=evidence.attempt_id
+        WHERE mutation.idempotency_key=OLD.idempotency_key
+      )
+      AND EXISTS (
+        SELECT 1 FROM mutation_attempts mutation
+        WHERE mutation.idempotency_key=OLD.idempotency_key
+          AND mutation.authority_id=OLD.target_session_id
+          AND mutation.kind=('session.' || OLD.delivery)
+          AND mutation.state='cancelled'
+      )
+    )
+  )
+  AND ((NEW.state='applied') = (NEW.target_turn_digest IS NOT NULL))
+  AND (NEW.state IN ('applied','failed','ambiguous','cancelled') OR NEW.result_digest IS NULL)
+)
+BEGIN SELECT RAISE(ABORT, 'illegal peer session action transition'); END;
+DROP TRIGGER IF EXISTS peer_session_action_delete_guard;
+CREATE TRIGGER peer_session_action_delete_guard
+BEFORE DELETE ON peer_session_actions
+WHEN OLD.state NOT IN ('applied','failed','cancelled')
+BEGIN SELECT RAISE(ABORT, 'peer session recovery evidence is immutable'); END;
+DROP TRIGGER IF EXISTS peer_session_action_parent_insert_guard;
+CREATE TRIGGER peer_session_action_parent_insert_guard
+BEFORE INSERT ON peer_session_action_parents
+WHEN NOT EXISTS (
+  SELECT 1 FROM peer_session_actions child
+  JOIN peer_session_actions parent ON parent.id=NEW.parent_action_id
+  WHERE child.id=NEW.action_id
+    AND child.actor_session_id=parent.target_session_id
+    AND child.project_id=parent.project_id
+    AND child.hop>parent.hop
+)
+BEGIN SELECT RAISE(ABORT, 'invalid peer session action parent'); END;
+DROP TRIGGER IF EXISTS peer_session_action_root_insert_guard;
+CREATE TRIGGER peer_session_action_root_insert_guard
+BEFORE INSERT ON peer_session_action_roots
+WHEN NOT EXISTS (
+  SELECT 1 FROM peer_session_actions child
+  JOIN peer_session_actions root ON root.id=NEW.root_action_id
+  WHERE child.id=NEW.action_id
+    AND child.project_id=root.project_id
+    AND root.hop=1
+)
+BEGIN SELECT RAISE(ABORT, 'invalid peer session action root'); END;
+DROP TRIGGER IF EXISTS peer_session_action_turn_origin_insert_guard;
+CREATE TRIGGER peer_session_action_turn_origin_insert_guard
+BEFORE INSERT ON peer_session_turn_origins
+WHEN NOT EXISTS (
+  SELECT 1 FROM peer_session_actions action
+  WHERE action.id=NEW.action_id
+    AND action.target_session_id=NEW.session_id
+    AND action.target_turn_digest=NEW.turn_digest
+    AND action.state='applied'
+)
+BEGIN SELECT RAISE(ABORT, 'invalid peer session turn origin'); END;
+DROP TRIGGER IF EXISTS peer_session_action_parents_immutable_update;
+CREATE TRIGGER peer_session_action_parents_immutable_update
+BEFORE UPDATE ON peer_session_action_parents
+BEGIN SELECT RAISE(ABORT, 'peer session action parents are immutable'); END;
+DROP TRIGGER IF EXISTS peer_session_action_parents_immutable_delete;
+CREATE TRIGGER peer_session_action_parents_immutable_delete
+BEFORE DELETE ON peer_session_action_parents
+WHEN NOT EXISTS (
+  SELECT 1 FROM peer_session_actions action
+  WHERE action.id=OLD.action_id AND action.state IN ('applied','failed','cancelled')
+)
+BEGIN SELECT RAISE(ABORT, 'peer session action parents are immutable until settlement'); END;
+DROP TRIGGER IF EXISTS peer_session_action_visits_immutable_update;
+CREATE TRIGGER peer_session_action_visits_immutable_update
+BEFORE UPDATE ON peer_session_action_visits
+BEGIN SELECT RAISE(ABORT, 'peer session action visits are immutable'); END;
+DROP TRIGGER IF EXISTS peer_session_action_visits_immutable_delete;
+CREATE TRIGGER peer_session_action_visits_immutable_delete
+BEFORE DELETE ON peer_session_action_visits
+WHEN NOT EXISTS (
+  SELECT 1 FROM peer_session_actions action
+  WHERE action.id=OLD.action_id AND action.state IN ('applied','failed','cancelled')
+)
+BEGIN SELECT RAISE(ABORT, 'peer session action visits are immutable until settlement'); END;
+DROP TRIGGER IF EXISTS peer_session_action_roots_immutable_update;
+CREATE TRIGGER peer_session_action_roots_immutable_update
+BEFORE UPDATE ON peer_session_action_roots
+BEGIN SELECT RAISE(ABORT, 'peer session action roots are immutable'); END;
+DROP TRIGGER IF EXISTS peer_session_action_roots_immutable_delete;
+CREATE TRIGGER peer_session_action_roots_immutable_delete
+BEFORE DELETE ON peer_session_action_roots
+WHEN NOT EXISTS (
+  SELECT 1 FROM peer_session_actions action
+  WHERE action.id=OLD.action_id AND action.state IN ('applied','failed','cancelled')
+)
+BEGIN SELECT RAISE(ABORT, 'peer session action roots are immutable until settlement'); END;
+DROP TRIGGER IF EXISTS peer_session_turn_origins_immutable_update;
+CREATE TRIGGER peer_session_turn_origins_immutable_update
+BEFORE UPDATE ON peer_session_turn_origins
+BEGIN SELECT RAISE(ABORT, 'peer session turn origins are immutable'); END;
+DROP TRIGGER IF EXISTS peer_session_turn_origins_immutable_delete;
+CREATE TRIGGER peer_session_turn_origins_immutable_delete
+BEFORE DELETE ON peer_session_turn_origins
+WHEN NOT EXISTS (
+  SELECT 1 FROM peer_session_actions action
+  WHERE action.id=OLD.action_id AND action.state IN ('applied','failed','cancelled')
+)
+BEGIN SELECT RAISE(ABORT, 'peer session turn origins are immutable until settlement'); END;
+CREATE TABLE IF NOT EXISTS session_host_capability_bindings (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  preamble_version INTEGER NOT NULL CHECK(preamble_version BETWEEN 1 AND 9007199254740991),
+  preamble_digest TEXT NOT NULL CHECK(length(preamble_digest) = 64 AND preamble_digest NOT GLOB '*[^a-f0-9]*'),
+  manifest_version INTEGER NOT NULL CHECK(manifest_version BETWEEN 1 AND 9007199254740991),
+  manifest_digest TEXT NOT NULL CHECK(length(manifest_digest) = 64 AND manifest_digest NOT GLOB '*[^a-f0-9]*'),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at >= 0)
+) STRICT;
+DROP TRIGGER IF EXISTS session_host_capability_binding_immutable;
+CREATE TRIGGER session_host_capability_binding_immutable
+BEFORE UPDATE ON session_host_capability_bindings
+BEGIN SELECT RAISE(ABORT, 'session host capability binding is immutable'); END;
+CREATE TABLE IF NOT EXISTS project_memory_authorities (
+  project_id TEXT PRIMARY KEY REFERENCES projects(id),
+  identity_contract INTEGER NOT NULL CHECK(identity_contract IN (1,2)),
+  canonical_space_id TEXT NOT NULL CHECK(
+    (
+      identity_contract=1
+      AND length(canonical_space_id)=76
+      AND canonical_space_id GLOB 'hra:project:*'
+      AND substr(canonical_space_id,13) NOT GLOB '*[^a-f0-9]*'
+    ) OR (
+      identity_contract=2
+      AND length(canonical_space_id)=50
+      AND canonical_space_id GLOB 'hra:project:space-*'
+      AND substr(canonical_space_id,19) NOT GLOB '*[^a-f0-9]*'
+    )
+  ),
+  physical_state TEXT NOT NULL CHECK(physical_state IN ('reserved','initialized','rejected')),
+  initialized_at INTEGER CHECK(initialized_at IS NULL OR initialized_at >= 0),
+  authority_digest TEXT NOT NULL CHECK(length(authority_digest) = 64 AND authority_digest NOT GLOB '*[^a-f0-9]*'),
+  binding_digest TEXT NOT NULL CHECK(length(binding_digest) = 64 AND binding_digest NOT GLOB '*[^a-f0-9]*'),
+  head_sequence INTEGER NOT NULL CHECK(head_sequence BETWEEN 0 AND 9007199254740991),
+  head_operation_sha256 TEXT CHECK(head_operation_sha256 IS NULL OR (length(head_operation_sha256) = 64 AND head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  head_digest TEXT NOT NULL CHECK(length(head_digest) = 64 AND head_digest NOT GLOB '*[^a-f0-9]*'),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  sync_state TEXT NOT NULL CHECK(sync_state IN ('local_only','settled','conflict','error')),
+  last_exchange_at INTEGER CHECK(last_exchange_at IS NULL OR last_exchange_at >= 0),
+  last_exchange_sequence INTEGER CHECK(last_exchange_sequence IS NULL OR last_exchange_sequence BETWEEN 0 AND 9007199254740991),
+  last_exchange_operation_sha256 TEXT CHECK(last_exchange_operation_sha256 IS NULL OR (length(last_exchange_operation_sha256) = 64 AND last_exchange_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  last_exchange_head_digest TEXT CHECK(last_exchange_head_digest IS NULL OR (length(last_exchange_head_digest) = 64 AND last_exchange_head_digest NOT GLOB '*[^a-f0-9]*')),
+  diagnostic_code TEXT CHECK(
+    diagnostic_code IS NULL
+    OR (
+      diagnostic_code GLOB '[A-Z]*'
+      AND diagnostic_code NOT GLOB '*[^A-Z0-9_]*'
+      AND length(diagnostic_code) BETWEEN 1 AND 80
+    )
+  ),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+  CHECK((physical_state='initialized') = (initialized_at IS NOT NULL)),
+  CHECK(initialized_at IS NULL OR (initialized_at >= created_at AND initialized_at <= updated_at)),
+  CHECK((head_sequence = 0) = (head_operation_sha256 IS NULL)),
+  CHECK(head_sequence != 0 OR head_digest = '${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'),
+  CHECK(
+    (last_exchange_at IS NULL) = (last_exchange_sequence IS NULL)
+    AND (last_exchange_at IS NULL) = (last_exchange_head_digest IS NULL)
+    AND (last_exchange_sequence IS NOT NULL OR last_exchange_operation_sha256 IS NULL)
+    AND (
+      last_exchange_sequence IS NULL
+      OR ((last_exchange_sequence = 0) = (last_exchange_operation_sha256 IS NULL))
+    )
+  ),
+  CHECK(
+    last_exchange_sequence IS NULL
+    OR last_exchange_sequence != 0
+    OR last_exchange_head_digest = '${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'
+  ),
+  CHECK((sync_state IN ('conflict','error')) = (diagnostic_code IS NOT NULL)),
+  CHECK(
+    physical_state!='reserved'
+    OR (
+      head_sequence=0
+      AND head_operation_sha256 IS NULL
+      AND head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'
+      AND sync_state='local_only'
+      AND last_exchange_at IS NULL
+      AND last_exchange_sequence IS NULL
+      AND last_exchange_operation_sha256 IS NULL
+      AND last_exchange_head_digest IS NULL
+      AND diagnostic_code IS NULL
+    )
+  ),
+  CHECK(
+    physical_state!='rejected'
+    OR (
+      initialized_at IS NULL
+      AND head_sequence=0
+      AND head_operation_sha256 IS NULL
+      AND head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'
+      AND sync_state='error'
+      AND last_exchange_at IS NULL
+      AND last_exchange_sequence IS NULL
+      AND last_exchange_operation_sha256 IS NULL
+      AND last_exchange_head_digest IS NULL
+      AND diagnostic_code IS NOT NULL
+    )
+  ),
+  CHECK(
+    sync_state != 'settled'
+    OR (
+      last_exchange_at IS NOT NULL
+      AND last_exchange_sequence=head_sequence
+      AND last_exchange_operation_sha256 IS head_operation_sha256
+      AND last_exchange_head_digest=head_digest
+    )
+  )
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS project_memory_authorities_space_unique
+  ON project_memory_authorities(canonical_space_id);
+CREATE TABLE IF NOT EXISTS memory_submissions (
+  id TEXT PRIMARY KEY CHECK(id GLOB 'memsub_[0-9a-f]*' AND length(id) = 39),
+  idempotency_key TEXT NOT NULL UNIQUE CHECK(length(idempotency_key) BETWEEN 1 AND 64),
+  kind TEXT NOT NULL CHECK(kind IN ('remember','share')),
+  actor_session_id TEXT NOT NULL REFERENCES sessions(id),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  request_digest TEXT NOT NULL CHECK(length(request_digest) = 64 AND request_digest NOT GLOB '*[^a-f0-9]*'),
+  content_digest TEXT NOT NULL CHECK(length(content_digest) = 64 AND content_digest NOT GLOB '*[^a-f0-9]*'),
+  key_digest TEXT NOT NULL CHECK(length(key_digest) = 64 AND key_digest NOT GLOB '*[^a-f0-9]*'),
+  working_binding_digest TEXT NOT NULL CHECK(length(working_binding_digest) = 64 AND working_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  working_epoch INTEGER NOT NULL CHECK(working_epoch BETWEEN 1 AND 9007199254740991),
+  effect_record_sha256 TEXT CHECK(effect_record_sha256 IS NULL OR (length(effect_record_sha256) = 64 AND effect_record_sha256 NOT GLOB '*[^a-f0-9]*')),
+  attestation_sha256 TEXT CHECK(attestation_sha256 IS NULL OR (length(attestation_sha256) = 64 AND attestation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  operation_id TEXT CHECK(operation_id IS NULL OR length(operation_id) BETWEEN 1 AND 128),
+  source_head_sequence INTEGER CHECK(source_head_sequence IS NULL OR source_head_sequence BETWEEN 0 AND 9007199254740991),
+  source_head_operation_sha256 TEXT CHECK(source_head_operation_sha256 IS NULL OR (length(source_head_operation_sha256) = 64 AND source_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  source_head_digest TEXT CHECK(source_head_digest IS NULL OR (length(source_head_digest) = 64 AND source_head_digest NOT GLOB '*[^a-f0-9]*')),
+  nomination_sha256 TEXT CHECK(nomination_sha256 IS NULL OR (length(nomination_sha256) = 64 AND nomination_sha256 NOT GLOB '*[^a-f0-9]*')),
+  expected_head_sequence INTEGER NOT NULL CHECK(expected_head_sequence BETWEEN 0 AND 9007199254740991),
+  expected_head_operation_sha256 TEXT CHECK(expected_head_operation_sha256 IS NULL OR (length(expected_head_operation_sha256) = 64 AND expected_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  expected_head_digest TEXT NOT NULL CHECK(length(expected_head_digest) = 64 AND expected_head_digest NOT GLOB '*[^a-f0-9]*'),
+  result_head_sequence INTEGER CHECK(result_head_sequence IS NULL OR result_head_sequence BETWEEN 0 AND 9007199254740991),
+  result_head_operation_sha256 TEXT CHECK(result_head_operation_sha256 IS NULL OR (length(result_head_operation_sha256) = 64 AND result_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  result_head_digest TEXT CHECK(result_head_digest IS NULL OR (length(result_head_digest) = 64 AND result_head_digest NOT GLOB '*[^a-f0-9]*')),
+  receipt_digest TEXT CHECK(receipt_digest IS NULL OR (length(receipt_digest) = 64 AND receipt_digest NOT GLOB '*[^a-f0-9]*')),
+  outcome_code TEXT CHECK(outcome_code IS NULL OR outcome_code IN ('remember_committed','remember_not_applied','share_adopted','share_already_present','share_conflict','share_not_applied','share_too_large')),
+  conflict_actual_head_sequence INTEGER CHECK(conflict_actual_head_sequence IS NULL OR conflict_actual_head_sequence BETWEEN 0 AND 9007199254740991),
+  conflict_actual_head_operation_sha256 TEXT CHECK(conflict_actual_head_operation_sha256 IS NULL OR (length(conflict_actual_head_operation_sha256) = 64 AND conflict_actual_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  conflict_actual_head_digest TEXT CHECK(conflict_actual_head_digest IS NULL OR (length(conflict_actual_head_digest) = 64 AND conflict_actual_head_digest NOT GLOB '*[^a-f0-9]*')),
+  conflict_canonical_record_sha256 TEXT CHECK(conflict_canonical_record_sha256 IS NULL OR (length(conflict_canonical_record_sha256) = 64 AND conflict_canonical_record_sha256 NOT GLOB '*[^a-f0-9]*')),
+  conflict_nominated_record_sha256 TEXT CHECK(conflict_nominated_record_sha256 IS NULL OR (length(conflict_nominated_record_sha256) = 64 AND conflict_nominated_record_sha256 NOT GLOB '*[^a-f0-9]*')),
+  state TEXT NOT NULL CHECK(state IN ('prepared','effect_started','applied','failed','ambiguous','cancelled')),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+  CHECK((expected_head_sequence = 0) = (expected_head_operation_sha256 IS NULL)),
+  CHECK(
+    (
+      effect_record_sha256 IS NULL
+      AND attestation_sha256 IS NULL
+      AND operation_id IS NULL
+      AND source_head_sequence IS NULL
+      AND source_head_operation_sha256 IS NULL
+      AND source_head_digest IS NULL
+      AND nomination_sha256 IS NULL
+    )
+    OR (
+      effect_record_sha256 IS NOT NULL
+      AND attestation_sha256 IS NOT NULL
+      AND operation_id IS NOT NULL
+      AND (
+        (
+          kind='remember'
+          AND source_head_sequence IS NULL
+          AND source_head_operation_sha256 IS NULL
+          AND source_head_digest IS NULL
+          AND nomination_sha256 IS NULL
+        )
+        OR (
+          kind='share'
+          AND source_head_sequence IS NOT NULL
+          AND source_head_digest IS NOT NULL
+          AND nomination_sha256 IS NOT NULL
+          AND ((source_head_sequence=0) = (source_head_operation_sha256 IS NULL))
+        )
+      )
+    )
+  ),
+  CHECK(effect_record_sha256 IS NOT NULL OR state IN ('prepared','cancelled')),
+  CHECK(
+    (result_head_sequence IS NULL) = (result_head_digest IS NULL)
+    AND (result_head_sequence IS NULL) = (receipt_digest IS NULL)
+    AND (result_head_sequence IS NOT NULL OR result_head_operation_sha256 IS NULL)
+    AND (
+      result_head_sequence IS NULL
+      OR ((result_head_sequence = 0) = (result_head_operation_sha256 IS NULL))
+    )
+  ),
+  CHECK((state = 'applied') = (result_head_sequence IS NOT NULL)),
+  CHECK((state IN ('applied','failed')) = (outcome_code IS NOT NULL)),
+  CHECK(
+    (state NOT IN ('applied','failed') AND outcome_code IS NULL)
+    OR (
+      kind='remember'
+      AND (
+        (state='applied' AND outcome_code='remember_committed'
+          AND result_head_sequence=expected_head_sequence+1)
+        OR (state='failed' AND outcome_code='remember_not_applied')
+      )
+    )
+    OR (
+      kind='share'
+      AND (
+        (state='applied' AND outcome_code='share_adopted'
+          AND result_head_sequence=expected_head_sequence+1)
+        OR (state='applied' AND outcome_code='share_already_present'
+          AND result_head_sequence=expected_head_sequence
+          AND result_head_operation_sha256 IS expected_head_operation_sha256
+          AND result_head_digest=expected_head_digest)
+        OR (state='failed' AND outcome_code IN ('share_conflict','share_not_applied','share_too_large'))
+      )
+    )
+  ),
+  CHECK(
+    (
+      conflict_actual_head_sequence IS NULL
+      AND conflict_actual_head_operation_sha256 IS NULL
+      AND conflict_actual_head_digest IS NULL
+      AND conflict_canonical_record_sha256 IS NULL
+      AND conflict_nominated_record_sha256 IS NULL
+    )
+    OR (
+      outcome_code='share_conflict'
+      AND conflict_actual_head_sequence IS NOT NULL
+      AND conflict_actual_head_digest IS NOT NULL
+      AND conflict_nominated_record_sha256 IS NOT NULL
+      AND ((conflict_actual_head_sequence=0) = (conflict_actual_head_operation_sha256 IS NULL))
+    )
+  )
+) STRICT;
+CREATE TABLE IF NOT EXISTS memory_page_attestations (
+  attestation_sha256 TEXT PRIMARY KEY CHECK(length(attestation_sha256) = 64 AND attestation_sha256 NOT GLOB '*[^a-f0-9]*'),
+  submission_id TEXT NOT NULL UNIQUE CHECK(submission_id GLOB 'memsub_[0-9a-f]*' AND length(submission_id) = 39),
+  idempotency_key TEXT NOT NULL CHECK(length(idempotency_key) BETWEEN 1 AND 64),
+  actor_session_id TEXT NOT NULL CHECK(actor_session_id GLOB 'sess_[0-9a-f]*' AND length(actor_session_id) = 37),
+  project_id TEXT NOT NULL CHECK(project_id GLOB 'proj_[0-9a-f]*' AND length(project_id) = 37),
+  request_digest TEXT NOT NULL CHECK(length(request_digest) = 64 AND request_digest NOT GLOB '*[^a-f0-9]*'),
+  content_digest TEXT NOT NULL CHECK(length(content_digest) = 64 AND content_digest NOT GLOB '*[^a-f0-9]*'),
+  key_digest TEXT NOT NULL CHECK(length(key_digest) = 64 AND key_digest NOT GLOB '*[^a-f0-9]*'),
+  working_binding_digest TEXT NOT NULL CHECK(length(working_binding_digest) = 64 AND working_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  working_epoch INTEGER NOT NULL CHECK(working_epoch BETWEEN 1 AND 9007199254740991),
+  effect_record_sha256 TEXT NOT NULL CHECK(length(effect_record_sha256) = 64 AND effect_record_sha256 NOT GLOB '*[^a-f0-9]*'),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS memory_working_attestation_heads (
+  authority_digest TEXT PRIMARY KEY CHECK(length(authority_digest) = 64 AND authority_digest NOT GLOB '*[^a-f0-9]*'),
+  head_sequence INTEGER NOT NULL CHECK(head_sequence BETWEEN 0 AND 9007199254740991),
+  head_operation_sha256 TEXT CHECK(head_operation_sha256 IS NULL OR (length(head_operation_sha256) = 64 AND head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  head_digest TEXT NOT NULL CHECK(length(head_digest) = 64 AND head_digest NOT GLOB '*[^a-f0-9]*'),
+  origin TEXT NOT NULL CHECK(origin IN ('create','fork')),
+  fork_child_head_sequence INTEGER CHECK(fork_child_head_sequence IS NULL OR fork_child_head_sequence BETWEEN 0 AND 9007199254740991),
+  fork_child_head_operation_sha256 TEXT CHECK(fork_child_head_operation_sha256 IS NULL OR (length(fork_child_head_operation_sha256) = 64 AND fork_child_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  fork_child_head_digest TEXT CHECK(fork_child_head_digest IS NULL OR (length(fork_child_head_digest) = 64 AND fork_child_head_digest NOT GLOB '*[^a-f0-9]*')),
+  fork_parent_authority_digest TEXT CHECK(fork_parent_authority_digest IS NULL OR (length(fork_parent_authority_digest) = 64 AND fork_parent_authority_digest NOT GLOB '*[^a-f0-9]*')),
+  fork_parent_head_sequence INTEGER CHECK(fork_parent_head_sequence IS NULL OR fork_parent_head_sequence BETWEEN 0 AND 9007199254740991),
+  fork_parent_head_operation_sha256 TEXT CHECK(fork_parent_head_operation_sha256 IS NULL OR (length(fork_parent_head_operation_sha256) = 64 AND fork_parent_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  fork_parent_head_digest TEXT CHECK(fork_parent_head_digest IS NULL OR (length(fork_parent_head_digest) = 64 AND fork_parent_head_digest NOT GLOB '*[^a-f0-9]*')),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+  CHECK((head_sequence=0) = (head_operation_sha256 IS NULL)),
+  CHECK(
+    (origin='create'
+      AND fork_child_head_sequence IS NULL
+      AND fork_child_head_operation_sha256 IS NULL
+      AND fork_child_head_digest IS NULL
+      AND fork_parent_authority_digest IS NULL
+      AND fork_parent_head_sequence IS NULL
+      AND fork_parent_head_operation_sha256 IS NULL
+      AND fork_parent_head_digest IS NULL)
+    OR
+    (origin='fork'
+      AND fork_child_head_sequence IS NOT NULL
+      AND fork_child_head_digest IS NOT NULL
+      AND ((fork_child_head_sequence=0) = (fork_child_head_operation_sha256 IS NULL))
+      AND fork_parent_authority_digest IS NOT NULL
+      AND fork_parent_authority_digest!=authority_digest
+      AND fork_parent_head_sequence IS NOT NULL
+      AND fork_parent_head_digest IS NOT NULL
+      AND ((fork_parent_head_sequence=0) = (fork_parent_head_operation_sha256 IS NULL)))
+  )
+) STRICT;
+CREATE TABLE IF NOT EXISTS memory_working_attestation_forks (
+  child_authority_digest TEXT PRIMARY KEY CHECK(length(child_authority_digest) = 64 AND child_authority_digest NOT GLOB '*[^a-f0-9]*'),
+  child_session_id TEXT NOT NULL UNIQUE CHECK(child_session_id GLOB 'sess_[0-9a-f]*' AND length(child_session_id) = 37),
+  parent_authority_digest TEXT NOT NULL CHECK(length(parent_authority_digest) = 64 AND parent_authority_digest NOT GLOB '*[^a-f0-9]*'),
+  parent_head_sequence INTEGER NOT NULL CHECK(parent_head_sequence BETWEEN 0 AND 9007199254740991),
+  parent_head_operation_sha256 TEXT CHECK(parent_head_operation_sha256 IS NULL OR (length(parent_head_operation_sha256) = 64 AND parent_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  parent_head_digest TEXT NOT NULL CHECK(length(parent_head_digest) = 64 AND parent_head_digest NOT GLOB '*[^a-f0-9]*'),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+  CHECK(child_authority_digest!=parent_authority_digest),
+  CHECK((parent_head_sequence=0) = (parent_head_operation_sha256 IS NULL))
+) STRICT;
+CREATE TABLE IF NOT EXISTS memory_page_attestation_refs (
+  lane TEXT NOT NULL CHECK(lane IN ('working','canonical')),
+  authority_digest TEXT NOT NULL CHECK(length(authority_digest) = 64 AND authority_digest NOT GLOB '*[^a-f0-9]*'),
+  project_id TEXT NOT NULL CHECK(project_id GLOB 'proj_[0-9a-f]*' AND length(project_id) = 37),
+  key_digest TEXT NOT NULL CHECK(length(key_digest) = 64 AND key_digest NOT GLOB '*[^a-f0-9]*'),
+  attestation_sha256 TEXT NOT NULL REFERENCES memory_page_attestations(attestation_sha256),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+  PRIMARY KEY(lane,authority_digest,key_digest)
+) STRICT;
+CREATE INDEX IF NOT EXISTS memory_submissions_actor_recent
+  ON memory_submissions(actor_session_id,created_at DESC,id);
+CREATE INDEX IF NOT EXISTS memory_submissions_project_recent
+  ON memory_submissions(project_id,created_at DESC,id);
+CREATE INDEX IF NOT EXISTS memory_submissions_unsettled
+  ON memory_submissions(created_at,id)
+  WHERE state IN ('prepared','effect_started','ambiguous');
+CREATE UNIQUE INDEX IF NOT EXISTS memory_submissions_one_unsettled_project
+  ON memory_submissions(project_id)
+  WHERE state IN ('prepared','effect_started','ambiguous');
+CREATE UNIQUE INDEX IF NOT EXISTS memory_submissions_remember_attestation
+  ON memory_submissions(attestation_sha256)
+  WHERE kind='remember' AND attestation_sha256 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS memory_page_attestation_refs_attestation
+  ON memory_page_attestation_refs(attestation_sha256);
+DROP TRIGGER IF EXISTS project_memory_authority_insert_guard;
+CREATE TRIGGER project_memory_authority_insert_guard
+BEFORE INSERT ON project_memory_authorities
+WHEN NEW.revision!=1
+  OR NEW.physical_state!='reserved'
+  OR NEW.initialized_at IS NOT NULL
+  OR NEW.sync_state!='local_only'
+  OR NEW.last_exchange_at IS NOT NULL
+  OR NEW.last_exchange_sequence IS NOT NULL
+  OR NEW.last_exchange_operation_sha256 IS NOT NULL
+  OR NEW.last_exchange_head_digest IS NOT NULL
+  OR NEW.diagnostic_code IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'illegal project memory authority insertion'); END;
+DROP TRIGGER IF EXISTS project_memory_authority_transition_guard;
+CREATE TRIGGER project_memory_authority_transition_guard
+BEFORE UPDATE ON project_memory_authorities
+WHEN NOT (
+  NEW.project_id=OLD.project_id
+  AND NEW.identity_contract=OLD.identity_contract
+  AND NEW.canonical_space_id=OLD.canonical_space_id
+  AND (
+    (
+      OLD.physical_state='reserved'
+      AND NEW.physical_state='initialized'
+      AND NEW.initialized_at IS NOT NULL
+      AND NEW.head_sequence=OLD.head_sequence
+      AND NEW.head_operation_sha256 IS OLD.head_operation_sha256
+      AND NEW.head_digest=OLD.head_digest
+      AND NEW.sync_state=OLD.sync_state
+      AND NEW.last_exchange_at IS OLD.last_exchange_at
+      AND NEW.last_exchange_sequence IS OLD.last_exchange_sequence
+      AND NEW.last_exchange_operation_sha256 IS OLD.last_exchange_operation_sha256
+      AND NEW.last_exchange_head_digest IS OLD.last_exchange_head_digest
+      AND NEW.diagnostic_code IS OLD.diagnostic_code
+    )
+    OR (
+      OLD.physical_state='reserved'
+      AND NEW.physical_state='rejected'
+      AND NEW.initialized_at IS NULL
+      AND NEW.head_sequence=OLD.head_sequence
+      AND NEW.head_operation_sha256 IS OLD.head_operation_sha256
+      AND NEW.head_digest=OLD.head_digest
+      AND NEW.sync_state='error'
+      AND NEW.last_exchange_at IS OLD.last_exchange_at
+      AND NEW.last_exchange_sequence IS OLD.last_exchange_sequence
+      AND NEW.last_exchange_operation_sha256 IS OLD.last_exchange_operation_sha256
+      AND NEW.last_exchange_head_digest IS OLD.last_exchange_head_digest
+      AND NEW.diagnostic_code IS NOT NULL
+    )
+    OR (
+      OLD.physical_state='initialized'
+      AND NEW.physical_state='initialized'
+      AND NEW.initialized_at=OLD.initialized_at
+    )
+  )
+  AND NEW.authority_digest=OLD.authority_digest
+  AND NEW.binding_digest=OLD.binding_digest
+  AND NEW.revision=OLD.revision+1
+  AND NEW.created_at=OLD.created_at
+  AND NEW.updated_at>=OLD.updated_at
+  AND (OLD.sync_state NOT IN ('conflict','error') OR NEW.sync_state=OLD.sync_state)
+  AND NEW.head_sequence>=OLD.head_sequence
+  AND (
+    NEW.head_sequence>OLD.head_sequence
+    OR (
+      NEW.head_operation_sha256 IS OLD.head_operation_sha256
+      AND NEW.head_digest=OLD.head_digest
+    )
+  )
+  AND (
+    NEW.sync_state!='settled'
+    OR (
+      NEW.last_exchange_sequence=NEW.head_sequence
+      AND NEW.last_exchange_operation_sha256 IS NEW.head_operation_sha256
+      AND NEW.last_exchange_head_digest=NEW.head_digest
+    )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'illegal project memory authority transition'); END;
+DROP TRIGGER IF EXISTS memory_submission_insert_guard;
+CREATE TRIGGER memory_submission_insert_guard
+BEFORE INSERT ON memory_submissions
+WHEN NEW.state!='prepared'
+  OR NEW.effect_record_sha256 IS NOT NULL
+  OR NEW.attestation_sha256 IS NOT NULL
+  OR NEW.operation_id IS NOT NULL
+  OR NEW.source_head_sequence IS NOT NULL
+  OR NEW.source_head_operation_sha256 IS NOT NULL
+  OR NEW.source_head_digest IS NOT NULL
+  OR NEW.nomination_sha256 IS NOT NULL
+  OR NEW.result_head_sequence IS NOT NULL
+  OR NEW.result_head_operation_sha256 IS NOT NULL
+  OR NEW.result_head_digest IS NOT NULL
+  OR NEW.receipt_digest IS NOT NULL
+  OR NEW.outcome_code IS NOT NULL
+  OR NEW.conflict_actual_head_sequence IS NOT NULL
+  OR NEW.conflict_actual_head_operation_sha256 IS NOT NULL
+  OR NEW.conflict_actual_head_digest IS NOT NULL
+  OR NEW.conflict_canonical_record_sha256 IS NOT NULL
+  OR NEW.conflict_nominated_record_sha256 IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'illegal memory submission insertion'); END;
+DROP TRIGGER IF EXISTS memory_submission_transition_guard;
+CREATE TRIGGER memory_submission_transition_guard
+BEFORE UPDATE ON memory_submissions
+WHEN NOT (
+  NEW.id=OLD.id
+  AND NEW.idempotency_key=OLD.idempotency_key
+  AND NEW.kind=OLD.kind
+  AND NEW.actor_session_id=OLD.actor_session_id
+  AND NEW.project_id=OLD.project_id
+  AND NEW.request_digest=OLD.request_digest
+  AND NEW.content_digest=OLD.content_digest
+  AND NEW.key_digest=OLD.key_digest
+  AND NEW.working_binding_digest=OLD.working_binding_digest
+  AND NEW.working_epoch=OLD.working_epoch
+  AND (
+    (
+      NEW.effect_record_sha256 IS OLD.effect_record_sha256
+      AND NEW.attestation_sha256 IS OLD.attestation_sha256
+      AND NEW.operation_id IS OLD.operation_id
+      AND NEW.source_head_sequence IS OLD.source_head_sequence
+      AND NEW.source_head_operation_sha256 IS OLD.source_head_operation_sha256
+      AND NEW.source_head_digest IS OLD.source_head_digest
+      AND NEW.nomination_sha256 IS OLD.nomination_sha256
+    )
+    OR (
+      OLD.state='prepared'
+      AND NEW.state='prepared'
+      AND OLD.effect_record_sha256 IS NULL
+      AND OLD.attestation_sha256 IS NULL
+      AND OLD.operation_id IS NULL
+      AND OLD.source_head_sequence IS NULL
+      AND OLD.source_head_operation_sha256 IS NULL
+      AND OLD.source_head_digest IS NULL
+      AND OLD.nomination_sha256 IS NULL
+      AND NEW.effect_record_sha256 IS NOT NULL
+      AND NEW.attestation_sha256 IS NOT NULL
+      AND NEW.operation_id IS NOT NULL
+    )
+  )
+  AND NEW.expected_head_sequence=OLD.expected_head_sequence
+  AND NEW.expected_head_operation_sha256 IS OLD.expected_head_operation_sha256
+  AND NEW.expected_head_digest=OLD.expected_head_digest
+  AND NEW.created_at=OLD.created_at
+  AND NEW.updated_at>=OLD.updated_at
+  AND (OLD.result_head_sequence IS NULL OR NEW.result_head_sequence=OLD.result_head_sequence)
+  AND (OLD.result_head_operation_sha256 IS NULL OR NEW.result_head_operation_sha256 IS OLD.result_head_operation_sha256)
+  AND (OLD.result_head_digest IS NULL OR NEW.result_head_digest IS OLD.result_head_digest)
+  AND (OLD.receipt_digest IS NULL OR NEW.receipt_digest IS OLD.receipt_digest)
+  AND (OLD.outcome_code IS NULL OR NEW.outcome_code=OLD.outcome_code)
+  AND (OLD.conflict_actual_head_sequence IS NULL OR NEW.conflict_actual_head_sequence=OLD.conflict_actual_head_sequence)
+  AND (OLD.conflict_actual_head_operation_sha256 IS NULL OR NEW.conflict_actual_head_operation_sha256 IS OLD.conflict_actual_head_operation_sha256)
+  AND (OLD.conflict_actual_head_digest IS NULL OR NEW.conflict_actual_head_digest=OLD.conflict_actual_head_digest)
+  AND (OLD.conflict_canonical_record_sha256 IS NULL OR NEW.conflict_canonical_record_sha256 IS OLD.conflict_canonical_record_sha256)
+  AND (OLD.conflict_nominated_record_sha256 IS NULL OR NEW.conflict_nominated_record_sha256=OLD.conflict_nominated_record_sha256)
+  AND (
+    NEW.state=OLD.state
+    OR (OLD.state='prepared' AND NEW.state IN ('effect_started','cancelled'))
+    OR (OLD.state='effect_started' AND NEW.state IN ('applied','failed','ambiguous'))
+    OR (OLD.state='ambiguous' AND NEW.state IN ('applied','failed'))
+  )
+  AND ((NEW.state='applied') = (NEW.result_head_sequence IS NOT NULL))
+  AND ((NEW.state IN ('applied','failed')) = (NEW.outcome_code IS NOT NULL))
+  AND (
+    NEW.state!='applied'
+    OR (OLD.kind='remember' AND NEW.outcome_code='remember_committed'
+      AND NEW.result_head_sequence=OLD.expected_head_sequence+1)
+    OR (OLD.kind='share' AND NEW.outcome_code='share_adopted'
+      AND NEW.result_head_sequence=OLD.expected_head_sequence+1)
+    OR (OLD.kind='share' AND NEW.outcome_code='share_already_present'
+      AND NEW.result_head_sequence=OLD.expected_head_sequence
+      AND NEW.result_head_operation_sha256 IS OLD.expected_head_operation_sha256
+      AND NEW.result_head_digest=OLD.expected_head_digest)
+  )
+  AND (
+    NEW.state!='failed'
+    OR (OLD.kind='remember' AND NEW.outcome_code='remember_not_applied')
+    OR (OLD.kind='share' AND NEW.outcome_code IN ('share_conflict','share_not_applied','share_too_large'))
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'illegal memory submission transition'); END;
+DROP TRIGGER IF EXISTS memory_submission_delete_guard;
+CREATE TRIGGER memory_submission_delete_guard
+BEFORE DELETE ON memory_submissions
+WHEN OLD.state IN ('prepared','effect_started','ambiguous')
+BEGIN SELECT RAISE(ABORT, 'memory submissions are immutable'); END;
+DROP TRIGGER IF EXISTS memory_page_attestation_insert_guard;
+CREATE TRIGGER memory_page_attestation_insert_guard
+BEFORE INSERT ON memory_page_attestations
+WHEN NOT EXISTS (
+  SELECT 1 FROM memory_submissions submission
+  WHERE submission.id=NEW.submission_id
+    AND submission.idempotency_key=NEW.idempotency_key
+    AND submission.kind='remember'
+    AND submission.actor_session_id=NEW.actor_session_id
+    AND submission.project_id=NEW.project_id
+    AND submission.request_digest=NEW.request_digest
+    AND submission.content_digest=NEW.content_digest
+    AND submission.key_digest=NEW.key_digest
+    AND submission.working_binding_digest=NEW.working_binding_digest
+    AND submission.working_epoch=NEW.working_epoch
+    AND submission.effect_record_sha256=NEW.effect_record_sha256
+    AND submission.attestation_sha256=NEW.attestation_sha256
+    AND submission.state='applied'
+    AND submission.outcome_code='remember_committed'
+    AND submission.created_at=NEW.created_at
+)
+BEGIN SELECT RAISE(ABORT, 'invalid memory page attestation'); END;
+DROP TRIGGER IF EXISTS memory_page_attestation_update_guard;
+CREATE TRIGGER memory_page_attestation_update_guard
+BEFORE UPDATE ON memory_page_attestations
+BEGIN SELECT RAISE(ABORT, 'memory page attestations are immutable'); END;
+DROP TRIGGER IF EXISTS memory_page_attestation_delete_guard;
+CREATE TRIGGER memory_page_attestation_delete_guard
+BEFORE DELETE ON memory_page_attestations
+WHEN EXISTS (
+  SELECT 1 FROM memory_page_attestation_refs reference
+  WHERE reference.attestation_sha256=OLD.attestation_sha256
+)
+BEGIN SELECT RAISE(ABORT, 'referenced memory page attestation'); END;
+DROP TRIGGER IF EXISTS memory_page_attestation_ref_insert_guard;
+CREATE TRIGGER memory_page_attestation_ref_insert_guard
+BEFORE INSERT ON memory_page_attestation_refs
+WHEN NOT EXISTS (
+  SELECT 1 FROM memory_page_attestations attestation
+  WHERE attestation.attestation_sha256=NEW.attestation_sha256
+    AND attestation.project_id=NEW.project_id
+    AND attestation.key_digest=NEW.key_digest
+) OR (
+  NEW.lane='working'
+  AND NOT EXISTS (
+    SELECT 1 FROM memory_working_attestation_heads head
+    WHERE head.authority_digest=NEW.authority_digest
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM memory_working_attestation_forks fork
+    WHERE fork.child_authority_digest=NEW.authority_digest
+  )
+) OR (
+  NEW.lane='working'
+  AND NOT EXISTS (
+    SELECT 1 FROM memory_page_attestations attestation
+    WHERE attestation.attestation_sha256=NEW.attestation_sha256
+      AND (
+        attestation.working_binding_digest=NEW.authority_digest
+        OR EXISTS (
+          SELECT 1 FROM memory_page_attestation_refs source
+          WHERE source.lane='working'
+            AND source.attestation_sha256=NEW.attestation_sha256
+            AND source.project_id=NEW.project_id
+            AND source.key_digest=NEW.key_digest
+        )
+      )
+  )
+) OR (
+  NEW.lane='canonical'
+  AND NOT EXISTS (
+    SELECT 1 FROM project_memory_authorities authority
+    WHERE authority.project_id=NEW.project_id
+      AND authority.authority_digest=NEW.authority_digest
+  )
+) OR (
+  SELECT COUNT(*) FROM memory_page_attestation_refs reference
+  WHERE reference.lane=NEW.lane
+    AND reference.authority_digest=NEW.authority_digest
+)>=${String(MEMORY_PAGE_ATTESTATION_AUTHORITY_LIMIT)}
+AND NOT EXISTS (
+  SELECT 1 FROM memory_page_attestation_refs current
+  WHERE current.lane=NEW.lane
+    AND current.authority_digest=NEW.authority_digest
+    AND current.key_digest=NEW.key_digest
+)
+BEGIN SELECT RAISE(ABORT, 'invalid memory page attestation reference'); END;
+DROP TRIGGER IF EXISTS memory_page_attestation_ref_update_guard;
+CREATE TRIGGER memory_page_attestation_ref_update_guard
+BEFORE UPDATE ON memory_page_attestation_refs
+WHEN NOT (
+  NEW.lane=OLD.lane
+  AND NEW.authority_digest=OLD.authority_digest
+  AND (NEW.project_id=OLD.project_id OR OLD.lane='working')
+  AND NEW.key_digest=OLD.key_digest
+  AND NEW.updated_at>=OLD.updated_at
+  AND EXISTS (
+    SELECT 1 FROM memory_page_attestations attestation
+    WHERE attestation.attestation_sha256=NEW.attestation_sha256
+      AND attestation.project_id=NEW.project_id
+      AND attestation.key_digest=NEW.key_digest
+  )
+  AND (
+    NEW.lane!='working'
+    OR EXISTS (
+      SELECT 1 FROM memory_working_attestation_heads head
+      WHERE head.authority_digest=NEW.authority_digest
+    )
+    OR EXISTS (
+      SELECT 1 FROM memory_working_attestation_forks fork
+      WHERE fork.child_authority_digest=NEW.authority_digest
+    )
+  )
+  AND (
+    NEW.lane!='working'
+    OR NEW.attestation_sha256=OLD.attestation_sha256
+    OR EXISTS (
+      SELECT 1 FROM memory_page_attestations attestation
+      WHERE attestation.attestation_sha256=NEW.attestation_sha256
+        AND attestation.working_binding_digest=NEW.authority_digest
+    )
+  )
+  AND (
+    NEW.lane!='canonical'
+    OR EXISTS (
+      SELECT 1 FROM project_memory_authorities authority
+      WHERE authority.project_id=NEW.project_id
+        AND authority.authority_digest=NEW.authority_digest
+    )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'invalid memory page attestation reference transition'); END;
+DROP TRIGGER IF EXISTS memory_working_attestation_head_insert_guard;
+CREATE TRIGGER memory_working_attestation_head_insert_guard
+BEFORE INSERT ON memory_working_attestation_heads
+WHEN (
+  NEW.origin='create'
+  AND NOT EXISTS (
+    SELECT 1 FROM memory_submissions submission
+    WHERE submission.kind='remember'
+      AND submission.working_binding_digest=NEW.authority_digest
+      AND submission.state='applied'
+      AND submission.outcome_code='remember_committed'
+      AND submission.result_head_sequence=NEW.head_sequence
+      AND submission.result_head_operation_sha256 IS NEW.head_operation_sha256
+      AND submission.result_head_digest=NEW.head_digest
+  )
+) OR (
+  NEW.origin='fork'
+  AND (
+    NEW.head_sequence!=NEW.fork_child_head_sequence
+    OR NEW.head_operation_sha256 IS NOT NEW.fork_child_head_operation_sha256
+    OR NEW.head_digest!=NEW.fork_child_head_digest
+    OR NOT EXISTS (
+      SELECT 1 FROM memory_working_attestation_forks fork
+      WHERE fork.child_authority_digest=NEW.authority_digest
+        AND fork.parent_authority_digest=NEW.fork_parent_authority_digest
+        AND fork.parent_head_sequence=NEW.fork_parent_head_sequence
+        AND fork.parent_head_operation_sha256 IS NEW.fork_parent_head_operation_sha256
+        AND fork.parent_head_digest=NEW.fork_parent_head_digest
+    )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'invalid memory working attestation head insertion'); END;
+DROP TRIGGER IF EXISTS memory_working_attestation_head_update_guard;
+CREATE TRIGGER memory_working_attestation_head_update_guard
+BEFORE UPDATE ON memory_working_attestation_heads
+WHEN NOT (
+  NEW.authority_digest=OLD.authority_digest
+  AND NEW.origin=OLD.origin
+  AND NEW.fork_child_head_sequence IS OLD.fork_child_head_sequence
+  AND NEW.fork_child_head_operation_sha256 IS OLD.fork_child_head_operation_sha256
+  AND NEW.fork_child_head_digest IS OLD.fork_child_head_digest
+  AND NEW.fork_parent_authority_digest IS OLD.fork_parent_authority_digest
+  AND NEW.fork_parent_head_sequence IS OLD.fork_parent_head_sequence
+  AND NEW.fork_parent_head_operation_sha256 IS OLD.fork_parent_head_operation_sha256
+  AND NEW.fork_parent_head_digest IS OLD.fork_parent_head_digest
+  AND NEW.created_at=OLD.created_at
+  AND NEW.updated_at>=OLD.updated_at
+  AND EXISTS (
+    SELECT 1 FROM memory_submissions submission
+    WHERE submission.kind='remember'
+      AND submission.working_binding_digest=OLD.authority_digest
+      AND submission.state='applied'
+      AND submission.outcome_code='remember_committed'
+      AND submission.expected_head_sequence=OLD.head_sequence
+      AND submission.expected_head_operation_sha256 IS OLD.head_operation_sha256
+      AND submission.expected_head_digest=OLD.head_digest
+      AND submission.result_head_sequence=NEW.head_sequence
+      AND submission.result_head_operation_sha256 IS NEW.head_operation_sha256
+      AND submission.result_head_digest=NEW.head_digest
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'invalid memory working attestation head transition'); END;
+DROP TRIGGER IF EXISTS memory_working_attestation_head_delete_guard;
+CREATE TRIGGER memory_working_attestation_head_delete_guard
+BEFORE DELETE ON memory_working_attestation_heads
+WHEN EXISTS (
+  SELECT 1 FROM memory_page_attestation_refs reference
+  WHERE reference.lane='working' AND reference.authority_digest=OLD.authority_digest
+)
+BEGIN SELECT RAISE(ABORT, 'referenced memory working attestation head'); END;
+DROP TRIGGER IF EXISTS memory_working_attestation_fork_insert_guard;
+CREATE TRIGGER memory_working_attestation_fork_insert_guard
+BEFORE INSERT ON memory_working_attestation_forks
+WHEN EXISTS (
+  SELECT 1 FROM memory_working_attestation_heads child
+  WHERE child.authority_digest=NEW.child_authority_digest
+) OR EXISTS (
+  SELECT 1 FROM memory_page_attestation_refs child
+  WHERE child.lane='working' AND child.authority_digest=NEW.child_authority_digest
+) OR NOT (
+  EXISTS (
+    SELECT 1 FROM memory_working_attestation_heads parent
+    WHERE parent.authority_digest=NEW.parent_authority_digest
+      AND parent.head_sequence=NEW.parent_head_sequence
+      AND parent.head_operation_sha256 IS NEW.parent_head_operation_sha256
+      AND parent.head_digest=NEW.parent_head_digest
+  )
+  OR (
+    NEW.parent_head_sequence=0
+    AND NOT EXISTS (
+      SELECT 1 FROM memory_working_attestation_heads parent
+      WHERE parent.authority_digest=NEW.parent_authority_digest
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM memory_page_attestation_refs reference
+      WHERE reference.lane='working'
+        AND reference.authority_digest=NEW.parent_authority_digest
+    )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'invalid memory working attestation fork insertion'); END;
+DROP TRIGGER IF EXISTS memory_working_attestation_fork_update_guard;
+CREATE TRIGGER memory_working_attestation_fork_update_guard
+BEFORE UPDATE ON memory_working_attestation_forks
+BEGIN SELECT RAISE(ABORT, 'memory working attestation forks are immutable'); END;
+DROP TRIGGER IF EXISTS memory_working_attestation_fork_delete_guard;
+CREATE TRIGGER memory_working_attestation_fork_delete_guard
+BEFORE DELETE ON memory_working_attestation_forks
+WHEN EXISTS (
+  SELECT 1 FROM memory_page_attestation_refs reference
+  WHERE reference.lane='working'
+    AND reference.authority_digest=OLD.child_authority_digest
+) AND NOT EXISTS (
+  SELECT 1 FROM memory_working_attestation_heads child
+  WHERE child.authority_digest=OLD.child_authority_digest
+    AND child.origin='fork'
+    AND child.fork_parent_authority_digest=OLD.parent_authority_digest
+    AND child.fork_parent_head_sequence=OLD.parent_head_sequence
+    AND child.fork_parent_head_operation_sha256 IS OLD.parent_head_operation_sha256
+    AND child.fork_parent_head_digest=OLD.parent_head_digest
+)
+BEGIN SELECT RAISE(ABORT, 'unfinalized memory working attestation fork'); END;
+DROP TRIGGER IF EXISTS project_memory_authority_delete_guard;
+CREATE TRIGGER project_memory_authority_delete_guard
+BEFORE DELETE ON project_memory_authorities
+BEGIN SELECT RAISE(ABORT, 'project memory authority is immutable'); END;
+DROP TRIGGER IF EXISTS session_host_capability_binding_delete_guard;
+CREATE TRIGGER session_host_capability_binding_delete_guard
+BEFORE DELETE ON session_host_capability_bindings
+WHEN NOT EXISTS (
+  SELECT 1 FROM sessions s
+  WHERE s.id=OLD.session_id
+    AND s.state='starting'
+    AND s.provider_thread_id IS NULL
+    AND s.active_turn_id IS NULL
+    AND s.provider_updated_at IS NULL
+) AND NOT EXISTS (
+  SELECT 1 FROM mutation_attempts mutation
+  WHERE mutation.authority_id=OLD.session_id
+    AND mutation.kind='session.switch'
+    AND mutation.state='effect_started'
+    AND EXISTS (
+      SELECT 1 FROM session_provider_switch_targets target
+      WHERE target.attempt_id=mutation.id
+    )
+    AND EXISTS (
+      SELECT 1 FROM session_provider_switch_source_releases released
+      WHERE released.attempt_id=mutation.id
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'session host capability binding is immutable'); END;
+DROP TRIGGER IF EXISTS peer_session_action_retained_quota;
+CREATE TRIGGER peer_session_action_retained_quota
+BEFORE INSERT ON peer_session_actions
+WHEN (
+  SELECT COUNT(*) FROM peer_session_actions WHERE project_id=NEW.project_id
+)>=${String(PEER_SESSION_RETAINED_ACTION_LIMIT)}
+BEGIN SELECT RAISE(ABORT, 'peer session retained action quota exceeded'); END;
+DROP TRIGGER IF EXISTS memory_submission_retained_quota;
+CREATE TRIGGER memory_submission_retained_quota
+BEFORE INSERT ON memory_submissions
+WHEN (
+  SELECT COUNT(*) FROM memory_submissions WHERE project_id=NEW.project_id
+)>=${String(MEMORY_SUBMISSION_RETAINED_PROJECT_LIMIT)}
+BEGIN SELECT RAISE(ABORT, 'memory submission retained quota exceeded'); END;
+DROP TRIGGER IF EXISTS peer_session_action_parent_quota;
+CREATE TRIGGER peer_session_action_parent_quota
+BEFORE INSERT ON peer_session_action_parents
+WHEN (
+  SELECT COUNT(*) FROM peer_session_action_parents WHERE action_id=NEW.action_id
+)>=${String(PEER_SESSION_PARENT_FAN_IN_LIMIT)}
+BEGIN SELECT RAISE(ABORT, 'peer session parent fan-in quota exceeded'); END;
+DROP TRIGGER IF EXISTS peer_session_action_visit_quota;
+CREATE TRIGGER peer_session_action_visit_quota
+BEFORE INSERT ON peer_session_action_visits
+WHEN (
+  SELECT COUNT(*) FROM peer_session_action_visits WHERE action_id=NEW.action_id
+)>=${String(PEER_SESSION_CAUSAL_VISIT_LIMIT)}
+BEGIN SELECT RAISE(ABORT, 'peer session visit quota exceeded'); END;
+DROP TRIGGER IF EXISTS peer_session_action_root_quota;
+CREATE TRIGGER peer_session_action_root_quota
+BEFORE INSERT ON peer_session_action_roots
+WHEN (
+  SELECT COUNT(*) FROM peer_session_action_roots WHERE action_id=NEW.action_id
+)>=${String(PEER_SESSION_CAUSAL_ROOT_LIMIT)}
+BEGIN SELECT RAISE(ABORT, 'peer session root quota exceeded'); END;
+DROP TRIGGER IF EXISTS peer_session_turn_origin_quota;
+CREATE TRIGGER peer_session_turn_origin_quota
+BEFORE INSERT ON peer_session_turn_origins
+WHEN (
+  SELECT COUNT(*) FROM peer_session_turn_origins
+  WHERE session_id=NEW.session_id AND turn_digest=NEW.turn_digest
+)>=${String(PEER_SESSION_TURN_ORIGIN_LIMIT)}
+BEGIN SELECT RAISE(ABORT, 'peer session turn origin quota exceeded'); END;
+`;
+
+const schemaVersion40QueuePeerProvenance = `
+CREATE INDEX IF NOT EXISTS queue_peer_action
+  ON queue_entries(peer_action_id) WHERE peer_action_id IS NOT NULL;
+DROP TRIGGER IF EXISTS queue_peer_provenance_insert_guard;
+CREATE TRIGGER queue_peer_provenance_insert_guard
+BEFORE INSERT ON queue_entries
+WHEN NOT (
+  (NEW.message_actor='human' AND NEW.peer_action_id IS NULL)
+  OR (
+    NEW.message_actor='peer_session'
+    AND NEW.peer_action_id IS NOT NULL
+    AND EXISTS (
+      SELECT 1 FROM peer_session_actions action
+      WHERE action.id=NEW.peer_action_id
+        AND action.target_session_id=NEW.session_id
+        AND action.delivery='queue'
+        AND action.state='queued'
+    )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'invalid queue peer provenance'); END;
+DROP TRIGGER IF EXISTS queue_peer_inbound_quota_guard;
+CREATE TRIGGER queue_peer_inbound_quota_guard
+BEFORE INSERT ON queue_entries
+WHEN NEW.message_actor='peer_session' AND (
+  (
+    SELECT COUNT(*) FROM queue_entries
+    WHERE session_id=NEW.session_id
+      AND message_actor='peer_session'
+      AND state IN ('pending','dispatching','ambiguous')
+  )>=${String(PEER_SESSION_INBOUND_QUEUE_COUNT_LIMIT)}
+  OR (
+    SELECT COALESCE(SUM(length(CAST(message AS BLOB))),0)
+    FROM queue_entries
+    WHERE session_id=NEW.session_id
+      AND message_actor='peer_session'
+      AND state IN ('pending','dispatching','ambiguous')
+  )+length(CAST(NEW.message AS BLOB))>${String(PEER_SESSION_INBOUND_QUEUE_BYTES_LIMIT)}
+)
+BEGIN SELECT RAISE(ABORT, 'peer session inbound queue quota exceeded'); END;
+DROP TRIGGER IF EXISTS queue_peer_provenance_immutable;
+CREATE TRIGGER queue_peer_provenance_immutable
+BEFORE UPDATE OF message_actor,peer_action_id ON queue_entries
+WHEN (
+  NEW.message_actor IS NOT OLD.message_actor
+  OR NEW.peer_action_id IS NOT OLD.peer_action_id
+) AND NOT (
+  OLD.message_actor='peer_session'
+  AND NEW.message_actor='peer_session'
+  AND OLD.peer_action_id IS NOT NULL
+  AND NEW.peer_action_id IS NULL
+  AND NEW.state=OLD.state
+  AND (
+    OLD.state IN ('applied','failed','cancelled')
+    OR (
+      OLD.state='ambiguous'
+      AND EXISTS (
+        SELECT 1 FROM queue_effect_resolutions resolution
+        WHERE resolution.queue_id=OLD.id
+      )
+    )
+  )
+  AND EXISTS (
+    SELECT 1 FROM peer_session_actions action
+    WHERE action.id=OLD.peer_action_id
+      AND action.target_session_id=OLD.session_id
+      AND action.delivery='queue'
+      AND action.state IN ('applied','failed','cancelled')
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'queue peer provenance is immutable'); END;
+DROP TRIGGER IF EXISTS queue_peer_effect_evidence_guard;
+CREATE TRIGGER queue_peer_effect_evidence_guard
+BEFORE UPDATE OF state ON queue_entries
+WHEN OLD.peer_action_id IS NOT NULL
+  AND OLD.state='pending'
+  AND NEW.state='dispatching'
+  AND NOT EXISTS (
+    SELECT 1 FROM queue_effect_evidence evidence
+    JOIN peer_session_actions action ON action.id=OLD.peer_action_id
+    WHERE evidence.queue_id=OLD.id
+      AND action.target_session_id=OLD.session_id
+      AND action.delivery='queue'
+      AND action.state='queued'
+      AND json_extract(evidence.evidence_json,'$.messageDigest')=action.message_digest
+  )
+BEGIN SELECT RAISE(ABORT, 'peer queue effect evidence required'); END;
+DROP TRIGGER IF EXISTS queue_peer_action_transition;
+CREATE TRIGGER queue_peer_action_transition
+AFTER UPDATE OF state ON queue_entries
+WHEN NEW.peer_action_id IS NOT NULL AND NEW.state IS NOT OLD.state
+BEGIN
+  UPDATE peer_session_actions
+  SET state=CASE NEW.state
+    WHEN 'pending' THEN 'queued'
+    WHEN 'dispatching' THEN 'effect_started'
+    WHEN 'applied' THEN 'applied'
+    WHEN 'failed' THEN 'failed'
+    WHEN 'ambiguous' THEN 'ambiguous'
+    WHEN 'cancelled' THEN 'cancelled'
+  END,
+  updated_at=MAX(updated_at,NEW.updated_at)
+  WHERE id=NEW.peer_action_id;
+END;
+`;
+
+
+const projectMemoryAuthoritiesTableSql = (): string => {
+  const marker = "CREATE TABLE IF NOT EXISTS project_memory_authorities";
+  const start = schemaVersion40PeerSessions.indexOf(marker);
+  const end = schemaVersion40PeerSessions.indexOf(") STRICT;", start);
+  if (start < 0 || end < 0) throw new Error("STATE_SCHEMA_V40_DEFINITION_INVALID");
+  return schemaVersion40PeerSessions.slice(start, end + ") STRICT;".length);
+};
+
+const repairLegacyProjectMemoryAuthorities = (database: Database): void => {
+  const observed = database.query(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='project_memory_authorities'",
+  ).get();
+  if (observed === null) return;
+  const hasContract = hasTableColumn(database, "project_memory_authorities", "identity_contract");
+  const hasSpace = hasTableColumn(database, "project_memory_authorities", "canonical_space_id");
+  const hasPhysicalState = hasTableColumn(
+    database,
+    "project_memory_authorities",
+    "physical_state",
+  );
+  const hasInitializedAt = hasTableColumn(
+    database,
+    "project_memory_authorities",
+    "initialized_at",
+  );
+  if (hasContract && hasSpace && hasPhysicalState && hasInitializedAt) return;
+  if (hasContract || hasSpace || hasPhysicalState || hasInitializedAt) {
+    throw new Error("PROJECT_MEMORY_AUTHORITY_MIGRATION_INVALID");
+  }
+  const observedSql = z.object({ sql: z.string() }).strict().parse(observed).sql;
+  if (normalizeSqlStructure(observedSql.replace(/\bIF NOT EXISTS\b/giu, ""))
+    !== normalizeSqlStructure(
+      legacyProjectMemoryAuthoritiesTableSql.replace(/\bIF NOT EXISTS\b/giu, ""),
+    )) throw new Error("PROJECT_MEMORY_AUTHORITY_MIGRATION_INVALID");
+
+  const migrated = (() => {
+    try {
+      const rows = legacyProjectMemoryAuthorityRowSchema.array().parse(
+        database.query("SELECT * FROM project_memory_authorities ORDER BY project_id").all(),
+      );
+      return rows.map((row) => {
+        projectMemoryHeadRefSchema.parse({
+          headDigest: row.head_digest,
+          operationSha256: row.head_operation_sha256,
+          sequence: row.head_sequence,
+        });
+        if (row.last_exchange_sequence !== null) {
+          projectMemoryHeadRefSchema.parse({
+            headDigest: row.last_exchange_head_digest,
+            operationSha256: row.last_exchange_operation_sha256,
+            sequence: row.last_exchange_sequence,
+          });
+        }
+        const identity = deriveProjectMemoryCanonicalIdentity({
+          canonicalSpaceId: legacyProjectMemorySpaceId(row.project_id),
+          identityContract: 1,
+          projectId: row.project_id,
+        });
+        if (
+          identity.authorityDigest !== row.authority_digest
+          || identity.bindingDigest !== row.binding_digest
+        ) throw new Error("PROJECT_MEMORY_AUTHORITY_MIGRATION_INVALID");
+        return { identity, row };
+      });
+    } catch (cause: unknown) {
+      if (
+        cause instanceof Error
+        && cause.message === "PROJECT_MEMORY_AUTHORITY_MIGRATION_INVALID"
+      ) throw cause;
+      throw new Error("PROJECT_MEMORY_AUTHORITY_MIGRATION_INVALID", { cause });
+    }
+  })();
+
+  database.transaction(() => {
+    for (const trigger of [
+      "memory_page_attestation_ref_insert_guard",
+      "memory_page_attestation_ref_update_guard",
+      "project_memory_authority_delete_guard",
+      "project_memory_authority_insert_guard",
+      "project_memory_authority_transition_guard",
+    ]) database.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+    database.exec("DROP TABLE project_memory_authorities");
+    database.exec(projectMemoryAuthoritiesTableSql());
+    const insert = database.query(
+      `INSERT INTO project_memory_authorities(
+         project_id,identity_contract,canonical_space_id,physical_state,initialized_at,
+         authority_digest,binding_digest,
+         head_sequence,head_operation_sha256,head_digest,revision,sync_state,
+         last_exchange_at,last_exchange_sequence,last_exchange_operation_sha256,
+         last_exchange_head_digest,diagnostic_code,created_at,updated_at
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    );
+    for (const { identity, row } of migrated) {
+      insert.run(
+        row.project_id,
+        identity.identityContract,
+        identity.canonicalSpaceId,
+        "initialized",
+        row.created_at,
+        row.authority_digest,
+        row.binding_digest,
+        row.head_sequence,
+        row.head_operation_sha256,
+        row.head_digest,
+        row.revision,
+        row.sync_state,
+        row.last_exchange_at,
+        row.last_exchange_sequence,
+        row.last_exchange_operation_sha256,
+        row.last_exchange_head_digest,
+        row.diagnostic_code,
+        row.created_at,
+        row.updated_at,
+      );
+    }
+  }).immediate();
+};
+
+const applySchemaVersion40PeerSessions = (database: Database): void => {
+  repairLegacyProjectMemoryAuthorities(database);
+  database.exec(schemaVersion40PeerSessions);
+  database.query(
+    `INSERT OR IGNORE INTO peer_session_direct_message_sources(
+       idempotency_key,action_id,actor_session_id,actor_turn_digest,project_id,
+       target_session_id,target_expected_revision,delivery,request_digest,
+       message_digest,reason_digest,created_at
+     )
+     SELECT idempotency_key,id,actor_session_id,actor_turn_digest,project_id,
+            target_session_id,target_expected_revision,delivery,request_digest,
+            message_digest,reason_digest,created_at
+     FROM peer_session_actions
+     WHERE delivery IN ('send','steer')
+     ORDER BY created_at,id`,
+  ).run();
+  if (!hasTableColumn(database, "queue_entries", "message_actor")) {
+    database.exec(
+      "ALTER TABLE queue_entries ADD COLUMN message_actor TEXT NOT NULL DEFAULT 'human' CHECK(message_actor IN ('human','peer_session'))",
+    );
+  }
+  if (!hasTableColumn(database, "queue_entries", "peer_action_id")) {
+    database.exec(
+      "ALTER TABLE queue_entries ADD COLUMN peer_action_id TEXT REFERENCES peer_session_actions(id)",
+    );
+  }
+  database.query(
+    `INSERT OR IGNORE INTO session_peer_policies(
+       session_id,mode,revision,created_at,updated_at
+     )
+     SELECT id,'coordinate',1,created_at,created_at FROM sessions ORDER BY id`,
+  ).run();
+  database.exec(schemaVersion40QueuePeerProvenance);
+};
+
+/*
+ * Hosted canonical memory is an additive control-plane journal. It stores
+ * only opaque routing identifiers, public heads/digests, and already-encrypted
+ * operation envelopes. Portable descriptor/proof plaintext, data keys,
+ * credentials, and project paths never cross this boundary.
+ */
+const schemaVersion41CanonicalMemorySync = `
+CREATE TABLE IF NOT EXISTS project_memory_hosted_attachments (
+  project_id TEXT PRIMARY KEY REFERENCES project_memory_authorities(project_id),
+  remote_space_id TEXT NOT NULL UNIQUE CHECK(
+    length(remote_space_id)=39
+    AND remote_space_id GLOB 'memory_[A-Za-z0-9_-]*'
+    AND remote_space_id NOT GLOB '*[^A-Za-z0-9_-]*'
+  ),
+  account_binding_digest TEXT NOT NULL CHECK(length(account_binding_digest)=64 AND account_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  canonical_binding_digest TEXT NOT NULL CHECK(length(canonical_binding_digest)=64 AND canonical_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 9007199254740991),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  state TEXT NOT NULL CHECK(state IN ('attached','detached','conflict','error')),
+  genesis_token TEXT NOT NULL CHECK(length(genesis_token)=64 AND genesis_token NOT GLOB '*[^a-f0-9]*'),
+  remote_revision INTEGER NOT NULL CHECK(remote_revision BETWEEN 1 AND 9007199254740991),
+  remote_key_version INTEGER NOT NULL CHECK(remote_key_version BETWEEN 1 AND 9007199254740991),
+  remote_head_sequence INTEGER NOT NULL CHECK(remote_head_sequence BETWEEN 0 AND 9007199254740991),
+  remote_head_operation_sha256 TEXT CHECK(remote_head_operation_sha256 IS NULL OR (length(remote_head_operation_sha256)=64 AND remote_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  remote_head_digest TEXT NOT NULL CHECK(length(remote_head_digest)=64 AND remote_head_digest NOT GLOB '*[^a-f0-9]*'),
+  remote_head_token TEXT NOT NULL CHECK(length(remote_head_token)=64 AND remote_head_token NOT GLOB '*[^a-f0-9]*'),
+  remote_head_proof_digest TEXT NOT NULL CHECK(length(remote_head_proof_digest)=64 AND remote_head_proof_digest NOT GLOB '*[^a-f0-9]*'),
+  diagnostic_code TEXT CHECK(diagnostic_code IS NULL OR (
+    diagnostic_code GLOB '[A-Z]*'
+    AND diagnostic_code NOT GLOB '*[^A-Z0-9_]*'
+    AND length(diagnostic_code) BETWEEN 1 AND 80
+  )),
+  created_at INTEGER NOT NULL CHECK(created_at>=0),
+  updated_at INTEGER NOT NULL CHECK(updated_at>=created_at),
+  CHECK((remote_head_sequence=0)=(remote_head_operation_sha256 IS NULL)),
+  CHECK(remote_head_sequence!=0 OR remote_head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'),
+  CHECK((remote_head_sequence=0 AND remote_head_token=genesis_token)
+     OR (remote_head_sequence>0 AND remote_head_token!=genesis_token)),
+  CHECK((state IN ('conflict','error'))=(diagnostic_code IS NOT NULL))
+) STRICT;
+CREATE TABLE IF NOT EXISTS project_memory_hosted_create_intents (
+  id TEXT PRIMARY KEY CHECK(id GLOB 'cmcreate_[0-9a-f]*' AND length(id)=41),
+  idempotency_key TEXT NOT NULL UNIQUE CHECK(length(idempotency_key)=36),
+  project_id TEXT NOT NULL REFERENCES project_memory_authorities(project_id),
+  state TEXT NOT NULL CHECK(state IN (
+    'allocating','key_staged','prepared','effect_started','winner_observed',
+    'settled','conflict','error'
+  )),
+  authority_revision INTEGER NOT NULL CHECK(authority_revision BETWEEN 1 AND 9007199254740991),
+  canonical_binding_digest TEXT NOT NULL CHECK(length(canonical_binding_digest)=64 AND canonical_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  authority_head_sequence INTEGER NOT NULL CHECK(authority_head_sequence BETWEEN 0 AND 9007199254740991),
+  authority_head_operation_sha256 TEXT CHECK(authority_head_operation_sha256 IS NULL OR (length(authority_head_operation_sha256)=64 AND authority_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  authority_head_digest TEXT NOT NULL CHECK(length(authority_head_digest)=64 AND authority_head_digest NOT GLOB '*[^a-f0-9]*'),
+  account_binding_digest TEXT NOT NULL CHECK(length(account_binding_digest)=64 AND account_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  remote_space_id TEXT NOT NULL CHECK(
+    length(remote_space_id)=39
+    AND remote_space_id GLOB 'memory_[A-Za-z0-9_-]*'
+    AND remote_space_id NOT GLOB '*[^A-Za-z0-9_-]*'
+  ),
+  space_key_version INTEGER CHECK(space_key_version IS NULL OR space_key_version BETWEEN 1 AND 9007199254740991),
+  wrapped_key_algorithm TEXT CHECK(wrapped_key_algorithm IS NULL OR wrapped_key_algorithm='A256GCM'),
+  wrapped_key_ciphertext TEXT CHECK(wrapped_key_ciphertext IS NULL OR (
+    length(wrapped_key_ciphertext) BETWEEN 22 AND ${String(canonicalMemoryCiphertextLimits.terminalHeadProof)}
+    AND wrapped_key_ciphertext NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  wrapped_key_version INTEGER CHECK(wrapped_key_version IS NULL OR wrapped_key_version BETWEEN 1 AND 9007199254740991),
+  wrapped_key_nonce TEXT CHECK(wrapped_key_nonce IS NULL OR (
+    length(wrapped_key_nonce)=16 AND wrapped_key_nonce NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  descriptor_algorithm TEXT CHECK(descriptor_algorithm IS NULL OR descriptor_algorithm='A256GCM'),
+  descriptor_ciphertext TEXT CHECK(descriptor_ciphertext IS NULL OR (
+    length(descriptor_ciphertext) BETWEEN 22 AND ${String(canonicalMemoryCiphertextLimits.terminalHeadProof)}
+    AND descriptor_ciphertext NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  descriptor_key_version INTEGER CHECK(descriptor_key_version IS NULL OR descriptor_key_version BETWEEN 1 AND 9007199254740991),
+  descriptor_nonce TEXT CHECK(descriptor_nonce IS NULL OR (
+    length(descriptor_nonce)=16 AND descriptor_nonce NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  genesis_proof_algorithm TEXT CHECK(genesis_proof_algorithm IS NULL OR genesis_proof_algorithm='A256GCM'),
+  genesis_proof_ciphertext TEXT CHECK(genesis_proof_ciphertext IS NULL OR (
+    length(genesis_proof_ciphertext) BETWEEN 22 AND ${String(canonicalMemoryCiphertextLimits.terminalHeadProof)}
+    AND genesis_proof_ciphertext NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  genesis_proof_key_version INTEGER CHECK(genesis_proof_key_version IS NULL OR genesis_proof_key_version BETWEEN 1 AND 9007199254740991),
+  genesis_proof_nonce TEXT CHECK(genesis_proof_nonce IS NULL OR (
+    length(genesis_proof_nonce)=16 AND genesis_proof_nonce NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  genesis_token TEXT CHECK(genesis_token IS NULL OR (length(genesis_token)=64 AND genesis_token NOT GLOB '*[^a-f0-9]*')),
+  request_digest TEXT CHECK(request_digest IS NULL OR (length(request_digest)=64 AND request_digest NOT GLOB '*[^a-f0-9]*')),
+  effect_started_at INTEGER CHECK(effect_started_at IS NULL OR effect_started_at>=created_at),
+  winner_digest TEXT CHECK(winner_digest IS NULL OR (length(winner_digest)=64 AND winner_digest NOT GLOB '*[^a-f0-9]*')),
+  winner_revision INTEGER CHECK(winner_revision IS NULL OR winner_revision BETWEEN 1 AND 9007199254740991),
+  winner_replay INTEGER CHECK(winner_replay IS NULL OR winner_replay IN (0,1)),
+  winner_observed_at INTEGER CHECK(winner_observed_at IS NULL OR (
+    effect_started_at IS NOT NULL AND winner_observed_at>=effect_started_at
+  )),
+  settled_at INTEGER CHECK(settled_at IS NULL OR settled_at>=created_at),
+  diagnostic_code TEXT CHECK(diagnostic_code IS NULL OR (
+    diagnostic_code GLOB '[A-Z]*'
+    AND diagnostic_code NOT GLOB '*[^A-Z0-9_]*'
+    AND length(diagnostic_code) BETWEEN 1 AND 80
+  )),
+  created_at INTEGER NOT NULL CHECK(created_at>=0),
+  updated_at INTEGER NOT NULL CHECK(updated_at>=created_at),
+  CHECK((authority_head_sequence=0)=(authority_head_operation_sha256 IS NULL)),
+  CHECK(authority_head_sequence!=0 OR authority_head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'),
+  CHECK(
+    (space_key_version IS NULL AND wrapped_key_algorithm IS NULL
+      AND wrapped_key_ciphertext IS NULL AND wrapped_key_version IS NULL
+      AND wrapped_key_nonce IS NULL)
+    OR
+    (space_key_version IS NOT NULL AND wrapped_key_algorithm IS NOT NULL
+      AND wrapped_key_ciphertext IS NOT NULL AND wrapped_key_version IS NOT NULL
+      AND wrapped_key_nonce IS NOT NULL)
+  ),
+  CHECK(
+    (descriptor_algorithm IS NULL AND descriptor_ciphertext IS NULL
+      AND descriptor_key_version IS NULL AND descriptor_nonce IS NULL
+      AND genesis_proof_algorithm IS NULL AND genesis_proof_ciphertext IS NULL
+      AND genesis_proof_key_version IS NULL AND genesis_proof_nonce IS NULL
+      AND genesis_token IS NULL AND request_digest IS NULL)
+    OR
+    (space_key_version IS NOT NULL AND descriptor_algorithm IS NOT NULL
+      AND descriptor_ciphertext IS NOT NULL AND descriptor_key_version=space_key_version
+      AND descriptor_nonce IS NOT NULL AND genesis_proof_algorithm IS NOT NULL
+      AND genesis_proof_ciphertext IS NOT NULL
+      AND genesis_proof_key_version=space_key_version
+      AND genesis_proof_nonce IS NOT NULL AND genesis_token IS NOT NULL
+      AND request_digest IS NOT NULL)
+  ),
+  CHECK(
+    (winner_digest IS NULL AND winner_revision IS NULL
+      AND winner_replay IS NULL AND winner_observed_at IS NULL)
+    OR
+    (request_digest IS NOT NULL AND effect_started_at IS NOT NULL
+      AND winner_digest IS NOT NULL AND winner_revision IS NOT NULL
+      AND winner_replay IS NOT NULL AND winner_observed_at IS NOT NULL)
+  ),
+  CHECK(effect_started_at IS NULL OR request_digest IS NOT NULL),
+  CHECK((state IN ('settled','conflict','error'))=(settled_at IS NOT NULL)),
+  CHECK((state IN ('conflict','error'))=(diagnostic_code IS NOT NULL)),
+  CHECK(
+    (state='allocating' AND space_key_version IS NULL)
+    OR (state='key_staged' AND space_key_version IS NOT NULL AND request_digest IS NULL)
+    OR (state='prepared' AND request_digest IS NOT NULL AND effect_started_at IS NULL)
+    OR (state='effect_started' AND effect_started_at IS NOT NULL AND winner_digest IS NULL)
+    OR (state='winner_observed' AND winner_digest IS NOT NULL)
+    OR (state='settled' AND winner_digest IS NOT NULL)
+    OR state IN ('conflict','error')
+  )
+) STRICT;
+CREATE TABLE IF NOT EXISTS project_memory_sync_intents (
+  id TEXT PRIMARY KEY CHECK(id GLOB 'cmsync_[0-9a-f]*' AND length(id)=39),
+  idempotency_key TEXT NOT NULL UNIQUE CHECK(length(idempotency_key)=36),
+  project_id TEXT NOT NULL REFERENCES project_memory_hosted_attachments(project_id),
+  direction TEXT NOT NULL CHECK(direction IN ('pull','push')),
+  state TEXT NOT NULL CHECK(state IN ('prepared','effect_started','response_observed','settled','conflict','error')),
+  attachment_generation INTEGER NOT NULL CHECK(attachment_generation BETWEEN 1 AND 9007199254740991),
+  attachment_revision INTEGER NOT NULL CHECK(attachment_revision BETWEEN 1 AND 9007199254740991),
+  authority_revision INTEGER NOT NULL CHECK(authority_revision BETWEEN 1 AND 9007199254740991),
+  canonical_binding_digest TEXT NOT NULL CHECK(length(canonical_binding_digest)=64 AND canonical_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  local_head_sequence INTEGER NOT NULL CHECK(local_head_sequence BETWEEN 0 AND 9007199254740991),
+  local_head_operation_sha256 TEXT CHECK(local_head_operation_sha256 IS NULL OR (length(local_head_operation_sha256)=64 AND local_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  local_head_digest TEXT NOT NULL CHECK(length(local_head_digest)=64 AND local_head_digest NOT GLOB '*[^a-f0-9]*'),
+  local_head_token TEXT NOT NULL CHECK(length(local_head_token)=64 AND local_head_token NOT GLOB '*[^a-f0-9]*'),
+  remote_genesis_token TEXT NOT NULL CHECK(length(remote_genesis_token)=64 AND remote_genesis_token NOT GLOB '*[^a-f0-9]*'),
+  remote_revision INTEGER NOT NULL CHECK(remote_revision BETWEEN 1 AND 9007199254740991),
+  remote_key_version INTEGER NOT NULL CHECK(remote_key_version BETWEEN 1 AND 9007199254740991),
+  remote_head_sequence INTEGER NOT NULL CHECK(remote_head_sequence BETWEEN 0 AND 9007199254740991),
+  remote_head_operation_sha256 TEXT CHECK(remote_head_operation_sha256 IS NULL OR (length(remote_head_operation_sha256)=64 AND remote_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  remote_head_digest TEXT NOT NULL CHECK(length(remote_head_digest)=64 AND remote_head_digest NOT GLOB '*[^a-f0-9]*'),
+  remote_head_token TEXT NOT NULL CHECK(length(remote_head_token)=64 AND remote_head_token NOT GLOB '*[^a-f0-9]*'),
+  remote_head_proof_digest TEXT NOT NULL CHECK(length(remote_head_proof_digest)=64 AND remote_head_proof_digest NOT GLOB '*[^a-f0-9]*'),
+  request_digest TEXT NOT NULL CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^a-f0-9]*'),
+  effect_started_at INTEGER CHECK(effect_started_at IS NULL OR effect_started_at>=created_at),
+  response_digest TEXT CHECK(response_digest IS NULL OR (length(response_digest)=64 AND response_digest NOT GLOB '*[^a-f0-9]*')),
+  response_genesis_token TEXT CHECK(response_genesis_token IS NULL OR (length(response_genesis_token)=64 AND response_genesis_token NOT GLOB '*[^a-f0-9]*')),
+  response_revision INTEGER CHECK(response_revision IS NULL OR response_revision BETWEEN 1 AND 9007199254740991),
+  response_key_version INTEGER CHECK(response_key_version IS NULL OR response_key_version BETWEEN 1 AND 9007199254740991),
+  response_head_sequence INTEGER CHECK(response_head_sequence IS NULL OR response_head_sequence BETWEEN 0 AND 9007199254740991),
+  response_head_operation_sha256 TEXT CHECK(response_head_operation_sha256 IS NULL OR (length(response_head_operation_sha256)=64 AND response_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  response_head_digest TEXT CHECK(response_head_digest IS NULL OR (length(response_head_digest)=64 AND response_head_digest NOT GLOB '*[^a-f0-9]*')),
+  response_head_token TEXT CHECK(response_head_token IS NULL OR (length(response_head_token)=64 AND response_head_token NOT GLOB '*[^a-f0-9]*')),
+  response_head_proof_digest TEXT CHECK(response_head_proof_digest IS NULL OR (length(response_head_proof_digest)=64 AND response_head_proof_digest NOT GLOB '*[^a-f0-9]*')),
+  response_observed_at INTEGER CHECK(response_observed_at IS NULL OR response_observed_at>=created_at),
+  result_head_sequence INTEGER CHECK(result_head_sequence IS NULL OR result_head_sequence BETWEEN 0 AND 9007199254740991),
+  result_head_operation_sha256 TEXT CHECK(result_head_operation_sha256 IS NULL OR (length(result_head_operation_sha256)=64 AND result_head_operation_sha256 NOT GLOB '*[^a-f0-9]*')),
+  result_head_digest TEXT CHECK(result_head_digest IS NULL OR (length(result_head_digest)=64 AND result_head_digest NOT GLOB '*[^a-f0-9]*')),
+  settled_at INTEGER CHECK(settled_at IS NULL OR settled_at>=created_at),
+  diagnostic_code TEXT CHECK(diagnostic_code IS NULL OR (
+    diagnostic_code GLOB '[A-Z]*'
+    AND diagnostic_code NOT GLOB '*[^A-Z0-9_]*'
+    AND length(diagnostic_code) BETWEEN 1 AND 80
+  )),
+  created_at INTEGER NOT NULL CHECK(created_at>=0),
+  updated_at INTEGER NOT NULL CHECK(updated_at>=created_at),
+  CHECK((local_head_sequence=0)=(local_head_operation_sha256 IS NULL)),
+  CHECK(local_head_sequence!=0 OR local_head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'),
+  CHECK((local_head_sequence=0 AND local_head_token=remote_genesis_token)
+     OR (local_head_sequence>0 AND local_head_token!=remote_genesis_token)),
+  CHECK((remote_head_sequence=0)=(remote_head_operation_sha256 IS NULL)),
+  CHECK(remote_head_sequence!=0 OR remote_head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'),
+  CHECK((remote_head_sequence=0 AND remote_head_token=remote_genesis_token)
+     OR (remote_head_sequence>0 AND remote_head_token!=remote_genesis_token)),
+  CHECK((direction='push' AND local_head_sequence>remote_head_sequence)
+     OR (direction='pull' AND local_head_sequence<=remote_head_sequence)),
+  CHECK(
+    (response_digest IS NULL AND response_genesis_token IS NULL
+      AND response_revision IS NULL AND response_key_version IS NULL
+      AND response_head_sequence IS NULL AND response_head_operation_sha256 IS NULL
+      AND response_head_digest IS NULL AND response_head_token IS NULL
+      AND response_head_proof_digest IS NULL AND response_observed_at IS NULL)
+    OR
+    (response_digest IS NOT NULL AND response_genesis_token IS NOT NULL
+      AND response_revision IS NOT NULL AND response_key_version IS NOT NULL
+      AND response_head_sequence IS NOT NULL AND response_head_digest IS NOT NULL
+      AND response_head_token IS NOT NULL AND response_head_proof_digest IS NOT NULL
+      AND response_observed_at IS NOT NULL
+      AND ((response_head_sequence=0)=(response_head_operation_sha256 IS NULL))
+      AND (response_head_sequence!=0 OR response_head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}')
+      AND ((response_head_sequence=0 AND response_head_token=response_genesis_token)
+        OR (response_head_sequence>0 AND response_head_token!=response_genesis_token)))
+  ),
+  CHECK(
+    (result_head_sequence IS NULL AND result_head_operation_sha256 IS NULL AND result_head_digest IS NULL)
+    OR
+    (result_head_sequence IS NOT NULL AND result_head_digest IS NOT NULL
+      AND ((result_head_sequence=0)=(result_head_operation_sha256 IS NULL))
+      AND (result_head_sequence!=0 OR result_head_digest='${PROJECT_MEMORY_EMPTY_HEAD.headDigest}'))
+  ),
+  CHECK(
+    (state='prepared' AND effect_started_at IS NULL AND response_digest IS NULL
+      AND result_head_sequence IS NULL AND settled_at IS NULL AND diagnostic_code IS NULL)
+    OR
+    (state='effect_started' AND effect_started_at IS NOT NULL AND response_digest IS NULL
+      AND result_head_sequence IS NULL AND settled_at IS NULL AND diagnostic_code IS NULL)
+    OR
+    (state='response_observed' AND effect_started_at IS NOT NULL AND response_digest IS NOT NULL
+      AND (direction='pull' OR result_head_sequence IS NULL)
+      AND settled_at IS NULL AND diagnostic_code IS NULL)
+    OR
+    (state='settled' AND effect_started_at IS NOT NULL AND response_digest IS NOT NULL
+      AND result_head_sequence IS NOT NULL AND settled_at IS NOT NULL AND diagnostic_code IS NULL)
+    OR
+    (state IN ('conflict','error') AND effect_started_at IS NOT NULL
+      AND (direction='pull' OR result_head_sequence IS NULL)
+      AND settled_at IS NOT NULL AND diagnostic_code IS NOT NULL)
+  ),
+  CHECK(effect_started_at IS NULL OR effect_started_at<=updated_at),
+  CHECK(response_observed_at IS NULL OR (response_observed_at>=effect_started_at AND response_observed_at<=updated_at)),
+  CHECK(settled_at IS NULL OR (settled_at>=effect_started_at AND settled_at<=updated_at))
+) STRICT;
+CREATE TABLE IF NOT EXISTS project_memory_sync_spool (
+  intent_id TEXT NOT NULL REFERENCES project_memory_sync_intents(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+  phase TEXT NOT NULL CHECK(phase IN ('request','response')),
+  genesis_token TEXT NOT NULL CHECK(length(genesis_token)=64 AND genesis_token NOT GLOB '*[^a-f0-9]*'),
+  prior_token TEXT NOT NULL CHECK(length(prior_token)=64 AND prior_token NOT GLOB '*[^a-f0-9]*'),
+  head_token TEXT NOT NULL CHECK(length(head_token)=64 AND head_token NOT GLOB '*[^a-f0-9]*'),
+  sequence INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 9007199254740991),
+  adoption_proof_algorithm TEXT CHECK(adoption_proof_algorithm IS NULL OR adoption_proof_algorithm='A256GCM'),
+  adoption_proof_ciphertext TEXT CHECK(adoption_proof_ciphertext IS NULL OR (
+    length(adoption_proof_ciphertext) BETWEEN 22 AND ${String(canonicalMemoryCiphertextLimits.adoptionProof)}
+    AND adoption_proof_ciphertext NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  adoption_proof_key_version INTEGER CHECK(adoption_proof_key_version IS NULL OR adoption_proof_key_version BETWEEN 1 AND 9007199254740991),
+  adoption_proof_nonce TEXT CHECK(adoption_proof_nonce IS NULL OR (
+    length(adoption_proof_nonce)=16 AND adoption_proof_nonce NOT GLOB '*[^A-Za-z0-9_-]*'
+  )),
+  operation_algorithm TEXT NOT NULL CHECK(operation_algorithm='A256GCM'),
+  operation_ciphertext TEXT NOT NULL CHECK(
+    length(operation_ciphertext) BETWEEN 22 AND ${String(canonicalMemoryCiphertextLimits.operation)}
+    AND operation_ciphertext NOT GLOB '*[^A-Za-z0-9_-]*'
+  ),
+  operation_key_version INTEGER NOT NULL CHECK(operation_key_version BETWEEN 1 AND 9007199254740991),
+  operation_nonce TEXT NOT NULL CHECK(length(operation_nonce)=16 AND operation_nonce NOT GLOB '*[^A-Za-z0-9_-]*'),
+  proof_algorithm TEXT NOT NULL CHECK(proof_algorithm='A256GCM'),
+  proof_ciphertext TEXT NOT NULL CHECK(
+    length(proof_ciphertext) BETWEEN 22 AND ${String(canonicalMemoryCiphertextLimits.terminalHeadProof)}
+    AND proof_ciphertext NOT GLOB '*[^A-Za-z0-9_-]*'
+  ),
+  proof_key_version INTEGER NOT NULL CHECK(proof_key_version BETWEEN 1 AND 9007199254740991),
+  proof_nonce TEXT NOT NULL CHECK(length(proof_nonce)=16 AND proof_nonce NOT GLOB '*[^A-Za-z0-9_-]*'),
+  operation_digest TEXT NOT NULL CHECK(length(operation_digest)=64 AND operation_digest NOT GLOB '*[^a-f0-9]*'),
+  created_at INTEGER NOT NULL CHECK(created_at>=0),
+  PRIMARY KEY(intent_id,phase),
+  CHECK(prior_token!=head_token AND genesis_token!=head_token),
+  CHECK(operation_key_version=proof_key_version),
+  CHECK(
+    (adoption_proof_algorithm IS NULL AND adoption_proof_ciphertext IS NULL
+      AND adoption_proof_key_version IS NULL AND adoption_proof_nonce IS NULL)
+    OR
+    (adoption_proof_algorithm IS NOT NULL AND adoption_proof_ciphertext IS NOT NULL
+      AND adoption_proof_key_version IS NOT NULL AND adoption_proof_nonce IS NOT NULL
+      AND adoption_proof_key_version=operation_key_version)
+  )
+) STRICT;
+CREATE TABLE IF NOT EXISTS project_memory_portable_adoption_proofs (
+  project_id TEXT NOT NULL REFERENCES project_memory_authorities(project_id),
+  canonical_space_id TEXT NOT NULL CHECK(
+    length(canonical_space_id)=50
+    AND canonical_space_id GLOB 'hra:project:space-*'
+    AND substr(canonical_space_id,19) NOT GLOB '*[^a-f0-9]*'
+  ),
+  canonical_binding_digest TEXT NOT NULL CHECK(length(canonical_binding_digest)=64 AND canonical_binding_digest NOT GLOB '*[^a-f0-9]*'),
+  sequence INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 9007199254740991),
+  operation_sha256 TEXT NOT NULL CHECK(length(operation_sha256)=64 AND operation_sha256 NOT GLOB '*[^a-f0-9]*'),
+  record_sha256 TEXT NOT NULL CHECK(length(record_sha256)=64 AND record_sha256 NOT GLOB '*[^a-f0-9]*'),
+  key_digest TEXT NOT NULL CHECK(length(key_digest)=64 AND key_digest NOT GLOB '*[^a-f0-9]*'),
+  content_digest TEXT NOT NULL CHECK(length(content_digest)=64 AND content_digest NOT GLOB '*[^a-f0-9]*'),
+  source_receipt_sha256 TEXT NOT NULL CHECK(length(source_receipt_sha256)=64 AND source_receipt_sha256 NOT GLOB '*[^a-f0-9]*'),
+  created_at INTEGER NOT NULL CHECK(created_at>=0),
+  PRIMARY KEY(project_id,operation_sha256),
+  UNIQUE(project_id,sequence)
+) STRICT;
+CREATE INDEX IF NOT EXISTS project_memory_sync_intents_project_recent
+  ON project_memory_sync_intents(project_id,created_at DESC,id);
+CREATE INDEX IF NOT EXISTS project_memory_sync_intents_project_settled
+  ON project_memory_sync_intents(project_id,updated_at,id) WHERE state='settled';
+CREATE UNIQUE INDEX IF NOT EXISTS project_memory_sync_intents_one_unresolved_project
+  ON project_memory_sync_intents(project_id)
+  WHERE state IN ('prepared','effect_started','response_observed');
+CREATE INDEX IF NOT EXISTS project_memory_hosted_create_intents_project_recent
+  ON project_memory_hosted_create_intents(project_id,created_at DESC,id);
+CREATE UNIQUE INDEX IF NOT EXISTS project_memory_hosted_create_intents_remote_space
+  ON project_memory_hosted_create_intents(remote_space_id);
+CREATE UNIQUE INDEX IF NOT EXISTS project_memory_hosted_create_intents_one_unresolved_project
+  ON project_memory_hosted_create_intents(project_id)
+  WHERE state IN ('allocating','key_staged','prepared','effect_started','winner_observed');
+CREATE INDEX IF NOT EXISTS project_memory_portable_adoption_proofs_record
+  ON project_memory_portable_adoption_proofs(
+    project_id,canonical_binding_digest,record_sha256,key_digest,content_digest
+  );
+DROP TRIGGER IF EXISTS project_memory_portable_adoption_proof_insert_guard;
+CREATE TRIGGER project_memory_portable_adoption_proof_insert_guard
+BEFORE INSERT ON project_memory_portable_adoption_proofs
+WHEN NOT EXISTS (
+  SELECT 1 FROM project_memory_authorities authority
+  WHERE authority.project_id=NEW.project_id
+    AND authority.identity_contract=2
+    AND authority.physical_state='initialized'
+    AND authority.canonical_space_id=NEW.canonical_space_id
+    AND authority.binding_digest=NEW.canonical_binding_digest
+    AND authority.head_sequence=NEW.sequence
+    AND authority.head_operation_sha256=NEW.operation_sha256
+)
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory portable adoption proof'); END;
+DROP TRIGGER IF EXISTS project_memory_portable_adoption_proof_update_guard;
+CREATE TRIGGER project_memory_portable_adoption_proof_update_guard
+BEFORE UPDATE ON project_memory_portable_adoption_proofs
+BEGIN SELECT RAISE(ABORT, 'canonical memory portable adoption proof is immutable'); END;
+DROP TRIGGER IF EXISTS project_memory_portable_adoption_proof_delete_guard;
+CREATE TRIGGER project_memory_portable_adoption_proof_delete_guard
+BEFORE DELETE ON project_memory_portable_adoption_proofs
+BEGIN SELECT RAISE(ABORT, 'canonical memory portable adoption proof is permanent'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_create_intent_insert_guard;
+CREATE TRIGGER project_memory_hosted_create_intent_insert_guard
+BEFORE INSERT ON project_memory_hosted_create_intents
+WHEN NEW.state!='allocating'
+  OR NOT EXISTS (
+    SELECT 1 FROM project_memory_authorities authority
+    WHERE authority.project_id=NEW.project_id
+      AND authority.identity_contract=2
+      AND authority.physical_state!='rejected'
+      AND authority.sync_state NOT IN ('conflict','error')
+      AND authority.binding_digest=NEW.canonical_binding_digest
+      AND authority.revision=NEW.authority_revision
+      AND authority.head_sequence=NEW.authority_head_sequence
+      AND authority.head_operation_sha256 IS NEW.authority_head_operation_sha256
+      AND authority.head_digest=NEW.authority_head_digest
+  )
+  OR EXISTS (
+    SELECT 1 FROM project_memory_hosted_attachments attachment
+    WHERE attachment.project_id=NEW.project_id
+  )
+  OR EXISTS (
+    SELECT 1 FROM project_memory_sync_intents intent
+    WHERE intent.project_id=NEW.project_id
+      AND intent.state IN ('prepared','effect_started','response_observed')
+  )
+  OR EXISTS (
+    SELECT 1 FROM memory_submissions submission
+    WHERE submission.project_id=NEW.project_id AND submission.kind='share'
+      AND submission.state IN ('prepared','effect_started','ambiguous')
+  )
+  OR EXISTS (
+    SELECT 1 FROM project_memory_hosted_create_intents create_intent
+    WHERE create_intent.project_id=NEW.project_id
+      AND create_intent.state IN (
+        'allocating','key_staged','prepared','effect_started','winner_observed'
+      )
+  )
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory hosted create intent'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_create_intent_transition_guard;
+CREATE TRIGGER project_memory_hosted_create_intent_transition_guard
+BEFORE UPDATE ON project_memory_hosted_create_intents
+WHEN NOT (
+  NEW.id=OLD.id AND NEW.idempotency_key=OLD.idempotency_key
+  AND NEW.project_id=OLD.project_id
+  AND NEW.authority_revision=OLD.authority_revision
+  AND NEW.canonical_binding_digest=OLD.canonical_binding_digest
+  AND NEW.authority_head_sequence=OLD.authority_head_sequence
+  AND NEW.authority_head_operation_sha256 IS OLD.authority_head_operation_sha256
+  AND NEW.authority_head_digest=OLD.authority_head_digest
+  AND NEW.account_binding_digest=OLD.account_binding_digest
+  AND NEW.remote_space_id=OLD.remote_space_id
+  AND NEW.created_at=OLD.created_at AND NEW.updated_at>=OLD.updated_at
+  AND (
+    (OLD.state='allocating' AND NEW.state='key_staged'
+      AND NEW.space_key_version IS NOT NULL
+      AND NEW.wrapped_key_algorithm IS NOT NULL
+      AND NEW.wrapped_key_ciphertext IS NOT NULL
+      AND NEW.wrapped_key_version IS NOT NULL
+      AND NEW.wrapped_key_nonce IS NOT NULL
+      AND NEW.descriptor_algorithm IS NULL AND NEW.descriptor_ciphertext IS NULL
+      AND NEW.descriptor_key_version IS NULL AND NEW.descriptor_nonce IS NULL
+      AND NEW.genesis_proof_algorithm IS NULL
+      AND NEW.genesis_proof_ciphertext IS NULL
+      AND NEW.genesis_proof_key_version IS NULL
+      AND NEW.genesis_proof_nonce IS NULL AND NEW.genesis_token IS NULL
+      AND NEW.request_digest IS NULL AND NEW.effect_started_at IS NULL
+      AND NEW.winner_digest IS NULL AND NEW.winner_revision IS NULL
+      AND NEW.winner_replay IS NULL AND NEW.winner_observed_at IS NULL
+      AND NEW.settled_at IS NULL AND NEW.diagnostic_code IS NULL)
+    OR
+    (OLD.state='key_staged' AND NEW.state='prepared'
+      AND NEW.space_key_version=OLD.space_key_version
+      AND NEW.wrapped_key_algorithm=OLD.wrapped_key_algorithm
+      AND NEW.wrapped_key_ciphertext=OLD.wrapped_key_ciphertext
+      AND NEW.wrapped_key_version=OLD.wrapped_key_version
+      AND NEW.wrapped_key_nonce=OLD.wrapped_key_nonce
+      AND NEW.descriptor_algorithm IS NOT NULL
+      AND NEW.descriptor_ciphertext IS NOT NULL
+      AND NEW.descriptor_key_version=OLD.space_key_version
+      AND NEW.descriptor_nonce IS NOT NULL
+      AND NEW.genesis_proof_algorithm IS NOT NULL
+      AND NEW.genesis_proof_ciphertext IS NOT NULL
+      AND NEW.genesis_proof_key_version=OLD.space_key_version
+      AND NEW.genesis_proof_nonce IS NOT NULL AND NEW.genesis_token IS NOT NULL
+      AND NEW.request_digest IS NOT NULL AND NEW.effect_started_at IS NULL
+      AND NEW.winner_digest IS NULL AND NEW.winner_revision IS NULL
+      AND NEW.winner_replay IS NULL AND NEW.winner_observed_at IS NULL
+      AND NEW.settled_at IS NULL AND NEW.diagnostic_code IS NULL)
+    OR
+    (OLD.state='prepared' AND NEW.state='effect_started'
+      AND NEW.space_key_version=OLD.space_key_version
+      AND NEW.wrapped_key_algorithm=OLD.wrapped_key_algorithm
+      AND NEW.wrapped_key_ciphertext=OLD.wrapped_key_ciphertext
+      AND NEW.wrapped_key_version=OLD.wrapped_key_version
+      AND NEW.wrapped_key_nonce=OLD.wrapped_key_nonce
+      AND NEW.descriptor_algorithm=OLD.descriptor_algorithm
+      AND NEW.descriptor_ciphertext=OLD.descriptor_ciphertext
+      AND NEW.descriptor_key_version=OLD.descriptor_key_version
+      AND NEW.descriptor_nonce=OLD.descriptor_nonce
+      AND NEW.genesis_proof_algorithm=OLD.genesis_proof_algorithm
+      AND NEW.genesis_proof_ciphertext=OLD.genesis_proof_ciphertext
+      AND NEW.genesis_proof_key_version=OLD.genesis_proof_key_version
+      AND NEW.genesis_proof_nonce=OLD.genesis_proof_nonce
+      AND NEW.genesis_token=OLD.genesis_token
+      AND NEW.request_digest=OLD.request_digest
+      AND NEW.effect_started_at IS NOT NULL
+      AND NEW.winner_digest IS NULL AND NEW.winner_revision IS NULL
+      AND NEW.winner_replay IS NULL AND NEW.winner_observed_at IS NULL
+      AND NEW.settled_at IS NULL AND NEW.diagnostic_code IS NULL)
+    OR
+    (OLD.state='effect_started' AND NEW.state='winner_observed'
+      AND NEW.space_key_version=OLD.space_key_version
+      AND NEW.wrapped_key_algorithm=OLD.wrapped_key_algorithm
+      AND NEW.wrapped_key_ciphertext=OLD.wrapped_key_ciphertext
+      AND NEW.wrapped_key_version=OLD.wrapped_key_version
+      AND NEW.wrapped_key_nonce=OLD.wrapped_key_nonce
+      AND NEW.descriptor_algorithm=OLD.descriptor_algorithm
+      AND NEW.descriptor_ciphertext=OLD.descriptor_ciphertext
+      AND NEW.descriptor_key_version=OLD.descriptor_key_version
+      AND NEW.descriptor_nonce=OLD.descriptor_nonce
+      AND NEW.genesis_proof_algorithm=OLD.genesis_proof_algorithm
+      AND NEW.genesis_proof_ciphertext=OLD.genesis_proof_ciphertext
+      AND NEW.genesis_proof_key_version=OLD.genesis_proof_key_version
+      AND NEW.genesis_proof_nonce=OLD.genesis_proof_nonce
+      AND NEW.genesis_token=OLD.genesis_token
+      AND NEW.request_digest=OLD.request_digest
+      AND NEW.effect_started_at=OLD.effect_started_at
+      AND NEW.winner_digest IS NOT NULL AND NEW.winner_revision IS NOT NULL
+      AND NEW.winner_replay IS NOT NULL AND NEW.winner_observed_at IS NOT NULL
+      AND NEW.settled_at IS NULL AND NEW.diagnostic_code IS NULL)
+    OR
+    (OLD.state='winner_observed' AND NEW.state='settled'
+      AND NEW.space_key_version=OLD.space_key_version
+      AND NEW.wrapped_key_algorithm=OLD.wrapped_key_algorithm
+      AND NEW.wrapped_key_ciphertext=OLD.wrapped_key_ciphertext
+      AND NEW.wrapped_key_version=OLD.wrapped_key_version
+      AND NEW.wrapped_key_nonce=OLD.wrapped_key_nonce
+      AND NEW.descriptor_algorithm=OLD.descriptor_algorithm
+      AND NEW.descriptor_ciphertext=OLD.descriptor_ciphertext
+      AND NEW.descriptor_key_version=OLD.descriptor_key_version
+      AND NEW.descriptor_nonce=OLD.descriptor_nonce
+      AND NEW.genesis_proof_algorithm=OLD.genesis_proof_algorithm
+      AND NEW.genesis_proof_ciphertext=OLD.genesis_proof_ciphertext
+      AND NEW.genesis_proof_key_version=OLD.genesis_proof_key_version
+      AND NEW.genesis_proof_nonce=OLD.genesis_proof_nonce
+      AND NEW.genesis_token=OLD.genesis_token
+      AND NEW.request_digest=OLD.request_digest
+      AND NEW.effect_started_at=OLD.effect_started_at
+      AND NEW.winner_digest=OLD.winner_digest
+      AND NEW.winner_revision=OLD.winner_revision
+      AND NEW.winner_replay=OLD.winner_replay
+      AND NEW.winner_observed_at=OLD.winner_observed_at
+      AND NEW.settled_at IS NOT NULL AND NEW.diagnostic_code IS NULL)
+    OR
+    (OLD.state IN ('allocating','key_staged','prepared','effect_started','winner_observed')
+      AND NEW.state IN ('conflict','error')
+      AND NEW.space_key_version IS OLD.space_key_version
+      AND NEW.wrapped_key_algorithm IS OLD.wrapped_key_algorithm
+      AND NEW.wrapped_key_ciphertext IS OLD.wrapped_key_ciphertext
+      AND NEW.wrapped_key_version IS OLD.wrapped_key_version
+      AND NEW.wrapped_key_nonce IS OLD.wrapped_key_nonce
+      AND NEW.descriptor_algorithm IS OLD.descriptor_algorithm
+      AND NEW.descriptor_ciphertext IS OLD.descriptor_ciphertext
+      AND NEW.descriptor_key_version IS OLD.descriptor_key_version
+      AND NEW.descriptor_nonce IS OLD.descriptor_nonce
+      AND NEW.genesis_proof_algorithm IS OLD.genesis_proof_algorithm
+      AND NEW.genesis_proof_ciphertext IS OLD.genesis_proof_ciphertext
+      AND NEW.genesis_proof_key_version IS OLD.genesis_proof_key_version
+      AND NEW.genesis_proof_nonce IS OLD.genesis_proof_nonce
+      AND NEW.genesis_token IS OLD.genesis_token
+      AND NEW.request_digest IS OLD.request_digest
+      AND NEW.effect_started_at IS OLD.effect_started_at
+      AND NEW.winner_digest IS OLD.winner_digest
+      AND NEW.winner_revision IS OLD.winner_revision
+      AND NEW.winner_replay IS OLD.winner_replay
+      AND NEW.winner_observed_at IS OLD.winner_observed_at
+      AND NEW.settled_at IS NOT NULL AND NEW.diagnostic_code IS NOT NULL)
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory hosted create transition'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_create_intent_delete_guard;
+CREATE TRIGGER project_memory_hosted_create_intent_delete_guard
+BEFORE DELETE ON project_memory_hosted_create_intents
+BEGIN SELECT RAISE(ABORT, 'canonical memory hosted create intent is immutable'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_attachment_insert_guard;
+CREATE TRIGGER project_memory_hosted_attachment_insert_guard
+BEFORE INSERT ON project_memory_hosted_attachments
+WHEN NEW.state!='attached' OR NEW.generation!=1 OR NEW.revision!=1
+  OR NOT EXISTS (
+    SELECT 1 FROM project_memory_authorities authority
+    WHERE authority.project_id=NEW.project_id
+      AND authority.identity_contract=2
+      AND authority.physical_state!='rejected'
+      AND authority.sync_state NOT IN ('conflict','error')
+      AND authority.binding_digest=NEW.canonical_binding_digest
+  )
+  OR EXISTS (
+    SELECT 1 FROM project_memory_hosted_create_intents intent
+    WHERE intent.project_id=NEW.project_id
+      AND intent.state IN ('allocating','key_staged','prepared','effect_started','winner_observed')
+  )
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory hosted attachment'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_attachment_transition_guard;
+CREATE TRIGGER project_memory_hosted_attachment_transition_guard
+BEFORE UPDATE ON project_memory_hosted_attachments
+WHEN NOT (
+  NEW.project_id=OLD.project_id
+  AND NEW.remote_space_id=OLD.remote_space_id
+  AND NEW.account_binding_digest=OLD.account_binding_digest
+  AND NEW.canonical_binding_digest=OLD.canonical_binding_digest
+  AND NEW.created_at=OLD.created_at
+  AND NEW.revision=OLD.revision+1
+  AND NEW.updated_at>=OLD.updated_at
+  AND NEW.genesis_token=OLD.genesis_token
+  AND (
+    (OLD.state='attached' AND NEW.state='detached'
+      AND NEW.generation=OLD.generation+1
+      AND NEW.remote_revision=OLD.remote_revision
+      AND NEW.remote_key_version=OLD.remote_key_version
+      AND NEW.remote_head_sequence=OLD.remote_head_sequence
+      AND NEW.remote_head_operation_sha256 IS OLD.remote_head_operation_sha256
+      AND NEW.remote_head_digest=OLD.remote_head_digest
+      AND NEW.remote_head_token=OLD.remote_head_token
+      AND NEW.remote_head_proof_digest=OLD.remote_head_proof_digest
+      AND NEW.diagnostic_code IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM project_memory_sync_intents intent
+        WHERE intent.project_id=OLD.project_id
+          AND intent.state IN ('prepared','effect_started','response_observed')
+      ))
+    OR
+    (OLD.state='detached' AND NEW.state='attached'
+      AND NEW.generation=OLD.generation+1
+      AND NEW.diagnostic_code IS NULL
+      AND NEW.remote_revision=OLD.remote_revision
+      AND NEW.remote_key_version=OLD.remote_key_version
+      AND NEW.remote_head_sequence>=OLD.remote_head_sequence
+      AND (NEW.remote_head_sequence!=OLD.remote_head_sequence OR (
+        NEW.remote_head_operation_sha256 IS OLD.remote_head_operation_sha256
+        AND NEW.remote_head_digest=OLD.remote_head_digest
+        AND NEW.remote_head_token=OLD.remote_head_token
+        AND NEW.remote_head_proof_digest=OLD.remote_head_proof_digest)))
+    OR
+    (OLD.state='attached' AND NEW.state='attached'
+      AND NEW.generation=OLD.generation
+      AND NEW.diagnostic_code IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM project_memory_sync_intents intent
+        WHERE intent.project_id=OLD.project_id
+          AND intent.state IN ('prepared','effect_started','response_observed')
+      )
+      AND NEW.remote_revision=OLD.remote_revision
+      AND NEW.remote_key_version=OLD.remote_key_version
+      AND NEW.remote_head_sequence>=OLD.remote_head_sequence
+      AND (NEW.remote_head_sequence!=OLD.remote_head_sequence OR (
+        NEW.remote_head_operation_sha256 IS OLD.remote_head_operation_sha256
+        AND NEW.remote_head_digest=OLD.remote_head_digest
+        AND NEW.remote_head_token=OLD.remote_head_token
+        AND NEW.remote_head_proof_digest=OLD.remote_head_proof_digest)))
+    OR
+    (OLD.state='attached' AND NEW.state IN ('conflict','error')
+      AND NEW.generation=OLD.generation
+      AND NEW.remote_revision=OLD.remote_revision
+      AND NEW.remote_key_version=OLD.remote_key_version
+      AND NEW.remote_head_sequence=OLD.remote_head_sequence
+      AND NEW.remote_head_operation_sha256 IS OLD.remote_head_operation_sha256
+      AND NEW.remote_head_digest=OLD.remote_head_digest
+      AND NEW.remote_head_token=OLD.remote_head_token
+      AND NEW.remote_head_proof_digest=OLD.remote_head_proof_digest
+      AND NEW.diagnostic_code IS NOT NULL)
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory hosted attachment transition'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_attachment_delete_guard;
+CREATE TRIGGER project_memory_hosted_attachment_delete_guard
+BEFORE DELETE ON project_memory_hosted_attachments
+BEGIN SELECT RAISE(ABORT, 'canonical memory hosted attachment is permanent'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_spool_insert_guard;
+CREATE TRIGGER project_memory_sync_spool_insert_guard
+BEFORE INSERT ON project_memory_sync_spool
+WHEN EXISTS (SELECT 1 FROM project_memory_sync_intents intent WHERE intent.id=NEW.intent_id)
+  AND NOT EXISTS (
+    SELECT 1 FROM project_memory_sync_intents intent
+    WHERE intent.id=NEW.intent_id
+      AND ((NEW.phase='request' AND intent.direction='push' AND intent.state='prepared')
+        OR (NEW.phase='response' AND intent.direction='pull' AND intent.state='effect_started'))
+  )
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory sync spool insertion'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_spool_update_guard;
+CREATE TRIGGER project_memory_sync_spool_update_guard
+BEFORE UPDATE ON project_memory_sync_spool
+BEGIN SELECT RAISE(ABORT, 'canonical memory sync spool is immutable'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_spool_delete_guard;
+CREATE TRIGGER project_memory_sync_spool_delete_guard
+BEFORE DELETE ON project_memory_sync_spool
+WHEN EXISTS (SELECT 1 FROM project_memory_sync_intents intent WHERE intent.id=OLD.intent_id)
+BEGIN SELECT RAISE(ABORT, 'canonical memory sync spool is immutable'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_intent_insert_guard;
+CREATE TRIGGER project_memory_sync_intent_insert_guard
+BEFORE INSERT ON project_memory_sync_intents
+WHEN NEW.state!='prepared'
+  OR EXISTS (
+    SELECT 1 FROM project_memory_hosted_create_intents create_intent
+    WHERE create_intent.project_id=NEW.project_id
+      AND create_intent.state IN (
+        'allocating','key_staged','prepared','effect_started','winner_observed'
+      )
+  )
+  OR NOT EXISTS (
+    SELECT 1 FROM project_memory_hosted_attachments attachment
+    WHERE attachment.project_id=NEW.project_id
+      AND attachment.state='attached'
+      AND attachment.generation=NEW.attachment_generation
+      AND attachment.revision=NEW.attachment_revision
+      AND attachment.canonical_binding_digest=NEW.canonical_binding_digest
+      AND attachment.genesis_token=NEW.remote_genesis_token
+      AND attachment.remote_revision=NEW.remote_revision
+      AND attachment.remote_key_version=NEW.remote_key_version
+      AND attachment.remote_head_sequence=NEW.remote_head_sequence
+      AND attachment.remote_head_operation_sha256 IS NEW.remote_head_operation_sha256
+      AND attachment.remote_head_digest=NEW.remote_head_digest
+      AND attachment.remote_head_token=NEW.remote_head_token
+      AND attachment.remote_head_proof_digest=NEW.remote_head_proof_digest
+  )
+  OR NOT EXISTS (
+    SELECT 1 FROM project_memory_authorities authority
+    WHERE authority.project_id=NEW.project_id
+      AND authority.physical_state='initialized'
+      AND authority.sync_state NOT IN ('conflict','error')
+      AND authority.binding_digest=NEW.canonical_binding_digest
+      AND authority.revision=NEW.authority_revision
+      AND authority.head_sequence=NEW.local_head_sequence
+      AND authority.head_operation_sha256 IS NEW.local_head_operation_sha256
+      AND authority.head_digest=NEW.local_head_digest
+  )
+  OR EXISTS (
+    SELECT 1 FROM memory_submissions submission
+    WHERE submission.project_id=NEW.project_id AND submission.kind='share'
+      AND submission.state IN ('prepared','effect_started','ambiguous')
+  )
+  OR ((NEW.direction='push') != (
+    SELECT COUNT(*)=1 FROM project_memory_sync_spool spool
+    WHERE spool.intent_id=NEW.id AND spool.phase='request'
+  ))
+  OR EXISTS (SELECT 1 FROM project_memory_sync_spool spool WHERE spool.intent_id=NEW.id AND spool.phase='response')
+  OR (NEW.direction='push' AND NOT EXISTS (
+    SELECT 1 FROM project_memory_sync_spool spool
+    WHERE spool.intent_id=NEW.id AND spool.phase='request'
+      AND spool.genesis_token=NEW.remote_genesis_token
+      AND spool.sequence=NEW.remote_head_sequence+1
+      AND spool.prior_token=NEW.remote_head_token
+      AND spool.operation_key_version=NEW.remote_key_version
+      AND spool.sequence<=NEW.local_head_sequence
+      AND (spool.sequence!=NEW.local_head_sequence OR spool.head_token=NEW.local_head_token)
+  ))
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory sync intent'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_intent_transition_guard;
+CREATE TRIGGER project_memory_sync_intent_transition_guard
+BEFORE UPDATE ON project_memory_sync_intents
+WHEN NOT (
+  NEW.id=OLD.id AND NEW.idempotency_key=OLD.idempotency_key
+  AND NEW.project_id=OLD.project_id AND NEW.direction=OLD.direction
+  AND NEW.attachment_generation=OLD.attachment_generation
+  AND NEW.attachment_revision=OLD.attachment_revision
+  AND NEW.authority_revision=OLD.authority_revision
+  AND NEW.canonical_binding_digest=OLD.canonical_binding_digest
+  AND NEW.local_head_sequence=OLD.local_head_sequence
+  AND NEW.local_head_operation_sha256 IS OLD.local_head_operation_sha256
+  AND NEW.local_head_digest=OLD.local_head_digest
+  AND NEW.local_head_token=OLD.local_head_token
+  AND NEW.remote_genesis_token=OLD.remote_genesis_token
+  AND NEW.remote_revision=OLD.remote_revision
+  AND NEW.remote_key_version=OLD.remote_key_version
+  AND NEW.remote_head_sequence=OLD.remote_head_sequence
+  AND NEW.remote_head_operation_sha256 IS OLD.remote_head_operation_sha256
+  AND NEW.remote_head_digest=OLD.remote_head_digest
+  AND NEW.remote_head_token=OLD.remote_head_token
+  AND NEW.remote_head_proof_digest=OLD.remote_head_proof_digest
+  AND NEW.request_digest=OLD.request_digest AND NEW.created_at=OLD.created_at
+  AND NEW.updated_at>=OLD.updated_at
+  AND (
+    (OLD.state='prepared' AND NEW.state='effect_started'
+      AND NEW.effect_started_at IS NOT NULL)
+    OR
+    (OLD.state='effect_started' AND NEW.state='response_observed'
+      AND NEW.effect_started_at=OLD.effect_started_at
+      AND NEW.result_head_sequence IS NULL
+      AND NEW.result_head_operation_sha256 IS NULL
+      AND NEW.result_head_digest IS NULL
+      AND NEW.response_digest IS NOT NULL
+      AND NEW.response_genesis_token=OLD.remote_genesis_token
+        AND ((OLD.direction='push'
+          AND NEW.response_revision=OLD.remote_revision
+          AND NEW.response_key_version=OLD.remote_key_version
+          AND NEW.response_head_sequence=OLD.remote_head_sequence+1
+          AND NOT EXISTS (SELECT 1 FROM project_memory_sync_spool spool WHERE spool.intent_id=OLD.id AND spool.phase='response'))
+        OR (OLD.direction='pull'
+          AND NEW.response_revision=OLD.remote_revision
+          AND NEW.response_key_version=OLD.remote_key_version
+          AND NEW.response_head_sequence=OLD.remote_head_sequence
+          AND NEW.response_head_operation_sha256 IS OLD.remote_head_operation_sha256
+          AND NEW.response_head_digest=OLD.remote_head_digest
+          AND NEW.response_head_token=OLD.remote_head_token
+          AND NEW.response_head_proof_digest=OLD.remote_head_proof_digest
+          AND ((OLD.remote_head_sequence=OLD.local_head_sequence
+              AND NOT EXISTS (SELECT 1 FROM project_memory_sync_spool spool WHERE spool.intent_id=OLD.id AND spool.phase='response'))
+            OR (OLD.remote_head_sequence>OLD.local_head_sequence
+              AND EXISTS (
+                SELECT 1 FROM project_memory_sync_spool spool
+                WHERE spool.intent_id=OLD.id AND spool.phase='response'
+                  AND spool.genesis_token=OLD.remote_genesis_token
+                  AND spool.prior_token=OLD.local_head_token
+                  AND spool.sequence=OLD.local_head_sequence+1
+                  AND spool.sequence<=OLD.remote_head_sequence
+                  AND spool.operation_key_version=OLD.remote_key_version
+                  AND (spool.sequence!=OLD.remote_head_sequence OR spool.head_token=OLD.remote_head_token)
+              ))))))
+    OR
+    (OLD.state='response_observed' AND NEW.state='response_observed'
+      AND OLD.direction='pull'
+      AND NEW.effect_started_at=OLD.effect_started_at
+      AND NEW.response_digest=OLD.response_digest
+      AND NEW.response_genesis_token=OLD.response_genesis_token
+      AND NEW.response_revision=OLD.response_revision
+      AND NEW.response_key_version=OLD.response_key_version
+      AND NEW.response_head_sequence=OLD.response_head_sequence
+      AND NEW.response_head_operation_sha256 IS OLD.response_head_operation_sha256
+      AND NEW.response_head_digest=OLD.response_head_digest
+      AND NEW.response_head_token=OLD.response_head_token
+      AND NEW.response_head_proof_digest=OLD.response_head_proof_digest
+      AND NEW.response_observed_at=OLD.response_observed_at
+      AND OLD.result_head_sequence IS NULL
+      AND OLD.result_head_operation_sha256 IS NULL
+      AND OLD.result_head_digest IS NULL
+      AND NEW.result_head_sequence=OLD.local_head_sequence+1
+      AND NEW.result_head_sequence<=OLD.response_head_sequence
+      AND NEW.result_head_operation_sha256 IS NOT NULL
+      AND NEW.result_head_digest IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM project_memory_sync_spool spool
+        WHERE spool.intent_id=OLD.id AND spool.phase='response'
+          AND spool.sequence=NEW.result_head_sequence
+      )
+      AND NEW.settled_at IS NULL AND NEW.diagnostic_code IS NULL)
+    OR
+    (OLD.state='response_observed' AND NEW.state='settled'
+      AND NEW.effect_started_at=OLD.effect_started_at
+      AND NEW.response_digest=OLD.response_digest
+      AND NEW.response_genesis_token=OLD.response_genesis_token
+      AND NEW.response_revision=OLD.response_revision
+      AND NEW.response_key_version=OLD.response_key_version
+      AND NEW.response_head_sequence=OLD.response_head_sequence
+      AND NEW.response_head_operation_sha256 IS OLD.response_head_operation_sha256
+      AND NEW.response_head_digest=OLD.response_head_digest
+      AND NEW.response_head_token=OLD.response_head_token
+      AND NEW.response_head_proof_digest=OLD.response_head_proof_digest
+      AND NEW.response_observed_at=OLD.response_observed_at
+      AND NEW.result_head_sequence IS NOT NULL
+      AND (
+        (OLD.direction='push'
+          AND OLD.result_head_sequence IS NULL
+          AND NEW.result_head_sequence=OLD.local_head_sequence
+          AND NEW.result_head_operation_sha256 IS OLD.local_head_operation_sha256
+          AND NEW.result_head_digest=OLD.local_head_digest)
+        OR
+        (OLD.direction='pull' AND NOT EXISTS (
+            SELECT 1 FROM project_memory_sync_spool spool
+            WHERE spool.intent_id=OLD.id AND spool.phase='response'
+          )
+          AND OLD.result_head_sequence IS NULL
+          AND NEW.result_head_sequence=OLD.local_head_sequence
+          AND NEW.result_head_operation_sha256 IS OLD.local_head_operation_sha256
+          AND NEW.result_head_digest=OLD.local_head_digest)
+        OR
+        (OLD.direction='pull' AND EXISTS (
+            SELECT 1 FROM project_memory_sync_spool spool
+            WHERE spool.intent_id=OLD.id AND spool.phase='response'
+          )
+          AND NEW.result_head_sequence=OLD.result_head_sequence
+          AND NEW.result_head_operation_sha256 IS OLD.result_head_operation_sha256
+          AND NEW.result_head_digest=OLD.result_head_digest)
+      )
+      AND NEW.settled_at IS NOT NULL)
+    OR
+    (OLD.state IN ('prepared','effect_started','response_observed')
+      AND NEW.state IN ('conflict','error')
+      AND NEW.effect_started_at IS NOT NULL
+      AND NEW.response_digest IS OLD.response_digest
+      AND NEW.response_genesis_token IS OLD.response_genesis_token
+      AND NEW.response_revision IS OLD.response_revision
+      AND NEW.response_key_version IS OLD.response_key_version
+      AND NEW.response_head_sequence IS OLD.response_head_sequence
+      AND NEW.response_head_operation_sha256 IS OLD.response_head_operation_sha256
+      AND NEW.response_head_digest IS OLD.response_head_digest
+      AND NEW.response_head_token IS OLD.response_head_token
+      AND NEW.response_head_proof_digest IS OLD.response_head_proof_digest
+      AND NEW.response_observed_at IS OLD.response_observed_at
+      AND NEW.result_head_sequence IS OLD.result_head_sequence
+      AND NEW.result_head_operation_sha256 IS OLD.result_head_operation_sha256
+      AND NEW.result_head_digest IS OLD.result_head_digest
+      AND NEW.settled_at IS NOT NULL AND NEW.diagnostic_code IS NOT NULL)
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'invalid canonical memory sync intent transition'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_intent_delete_guard;
+CREATE TRIGGER project_memory_sync_intent_delete_guard
+BEFORE DELETE ON project_memory_sync_intents
+WHEN OLD.state!='settled'
+BEGIN SELECT RAISE(ABORT, 'unsettled canonical memory sync intent is immutable'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_intent_retained_quota;
+CREATE TRIGGER project_memory_sync_intent_retained_quota
+BEFORE INSERT ON project_memory_sync_intents
+WHEN (SELECT COUNT(*) FROM project_memory_sync_intents WHERE project_id=NEW.project_id)>=${String(CANONICAL_MEMORY_SYNC_RETAINED_PROJECT_LIMIT)}
+BEGIN SELECT RAISE(ABORT, 'canonical memory sync retained quota exceeded'); END;
+DROP TRIGGER IF EXISTS project_memory_hosted_create_authority_fence;
+CREATE TRIGGER project_memory_hosted_create_authority_fence
+BEFORE UPDATE ON project_memory_authorities
+WHEN EXISTS (
+  SELECT 1 FROM project_memory_hosted_create_intents intent
+  WHERE intent.project_id=OLD.project_id
+    AND intent.state IN (
+      'allocating','key_staged','prepared','effect_started','winner_observed'
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'canonical memory mutation fenced by hosted create'); END;
+DROP TRIGGER IF EXISTS project_memory_sync_authority_fence;
+CREATE TRIGGER project_memory_sync_authority_fence
+BEFORE UPDATE ON project_memory_authorities
+WHEN EXISTS (
+  SELECT 1 FROM project_memory_sync_intents intent
+  WHERE intent.project_id=OLD.project_id
+    AND intent.state IN ('prepared','effect_started','response_observed')
+)
+BEGIN SELECT RAISE(ABORT, 'canonical memory mutation fenced by hosted sync'); END;
+DROP TRIGGER IF EXISTS canonical_memory_sync_share_fence;
+CREATE TRIGGER canonical_memory_sync_share_fence
+BEFORE INSERT ON memory_submissions
+WHEN NEW.kind='share' AND (
+  EXISTS (
+    SELECT 1 FROM project_memory_authorities authority
+    WHERE authority.project_id=NEW.project_id
+      AND authority.sync_state IN ('conflict','error')
+  )
+  OR EXISTS (
+    SELECT 1 FROM project_memory_hosted_create_intents create_intent
+    WHERE create_intent.project_id=NEW.project_id
+      AND create_intent.state IN (
+        'allocating','key_staged','prepared','effect_started','winner_observed'
+      )
+  )
+  OR EXISTS (
+    SELECT 1 FROM project_memory_hosted_attachments attachment
+    WHERE attachment.project_id=NEW.project_id
+      AND (
+        attachment.state IN ('conflict','error')
+        OR EXISTS (
+          SELECT 1 FROM project_memory_sync_intents intent
+          WHERE intent.project_id=attachment.project_id
+            AND intent.state IN ('prepared','effect_started','response_observed')
+        )
+      )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'canonical memory mutation fenced by hosted sync'); END;
+`;
+
+const applySchemaVersion41CanonicalMemorySync = (database: Database): void => {
+  database.exec(schemaVersion41CanonicalMemorySync);
+};
+
+const schemaVersion41Objects = [
+  { name: "project_memory_hosted_attachments", table: "project_memory_hosted_attachments", type: "table" },
+  { name: "project_memory_hosted_create_intents", table: "project_memory_hosted_create_intents", type: "table" },
+  { name: "project_memory_sync_intents", table: "project_memory_sync_intents", type: "table" },
+  { name: "project_memory_sync_spool", table: "project_memory_sync_spool", type: "table" },
+  { name: "project_memory_portable_adoption_proofs", table: "project_memory_portable_adoption_proofs", type: "table" },
+  { name: "project_memory_hosted_create_intents_project_recent", table: "project_memory_hosted_create_intents", type: "index" },
+  { name: "project_memory_hosted_create_intents_remote_space", table: "project_memory_hosted_create_intents", type: "index" },
+  { name: "project_memory_hosted_create_intents_one_unresolved_project", table: "project_memory_hosted_create_intents", type: "index" },
+  { name: "project_memory_sync_intents_project_recent", table: "project_memory_sync_intents", type: "index" },
+  { name: "project_memory_sync_intents_project_settled", table: "project_memory_sync_intents", type: "index" },
+  { name: "project_memory_sync_intents_one_unresolved_project", table: "project_memory_sync_intents", type: "index" },
+  { name: "project_memory_portable_adoption_proofs_record", table: "project_memory_portable_adoption_proofs", type: "index" },
+  { name: "project_memory_portable_adoption_proof_insert_guard", table: "project_memory_portable_adoption_proofs", type: "trigger" },
+  { name: "project_memory_portable_adoption_proof_update_guard", table: "project_memory_portable_adoption_proofs", type: "trigger" },
+  { name: "project_memory_portable_adoption_proof_delete_guard", table: "project_memory_portable_adoption_proofs", type: "trigger" },
+  { name: "project_memory_hosted_create_intent_insert_guard", table: "project_memory_hosted_create_intents", type: "trigger" },
+  { name: "project_memory_hosted_create_intent_transition_guard", table: "project_memory_hosted_create_intents", type: "trigger" },
+  { name: "project_memory_hosted_create_intent_delete_guard", table: "project_memory_hosted_create_intents", type: "trigger" },
+  { name: "project_memory_hosted_attachment_insert_guard", table: "project_memory_hosted_attachments", type: "trigger" },
+  { name: "project_memory_hosted_attachment_transition_guard", table: "project_memory_hosted_attachments", type: "trigger" },
+  { name: "project_memory_hosted_attachment_delete_guard", table: "project_memory_hosted_attachments", type: "trigger" },
+  { name: "project_memory_sync_spool_insert_guard", table: "project_memory_sync_spool", type: "trigger" },
+  { name: "project_memory_sync_spool_update_guard", table: "project_memory_sync_spool", type: "trigger" },
+  { name: "project_memory_sync_spool_delete_guard", table: "project_memory_sync_spool", type: "trigger" },
+  { name: "project_memory_sync_intent_insert_guard", table: "project_memory_sync_intents", type: "trigger" },
+  { name: "project_memory_sync_intent_transition_guard", table: "project_memory_sync_intents", type: "trigger" },
+  { name: "project_memory_sync_intent_delete_guard", table: "project_memory_sync_intents", type: "trigger" },
+  { name: "project_memory_sync_intent_retained_quota", table: "project_memory_sync_intents", type: "trigger" },
+  { name: "project_memory_hosted_create_authority_fence", table: "project_memory_authorities", type: "trigger" },
+  { name: "project_memory_sync_authority_fence", table: "project_memory_authorities", type: "trigger" },
+  { name: "canonical_memory_sync_share_fence", table: "memory_submissions", type: "trigger" },
+] as const;
+
+const schemaVersion41ObjectSql = (object: (typeof schemaVersion41Objects)[number]): string => {
+  const markers = object.type === "table"
+    ? [`CREATE TABLE IF NOT EXISTS ${object.name}`]
+    : object.type === "index"
+      ? [
+        `CREATE INDEX IF NOT EXISTS ${object.name}`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS ${object.name}`,
+      ]
+      : [`CREATE TRIGGER ${object.name}`];
+  const start = markers.reduce((found, marker) => {
+    const candidate = schemaVersion41CanonicalMemorySync.indexOf(marker);
+    if (candidate < 0) return found;
+    return found < 0 ? candidate : Math.min(found, candidate);
+  }, -1);
+  const terminator = object.type === "table" ? ") STRICT;" : object.type === "index" ? ";" : "END;";
+  const end = schemaVersion41CanonicalMemorySync.indexOf(terminator, start);
+  if (start < 0 || end < 0) throw new Error("STATE_SCHEMA_V41_DEFINITION_INVALID");
+  return schemaVersion41CanonicalMemorySync.slice(start, end + terminator.length);
+};
+
+const schemaVersion40Objects = [
+  { name: "session_peer_policies", table: "session_peer_policies", type: "table", source: schemaVersion40PeerSessions },
+  { name: "peer_session_actions", table: "peer_session_actions", type: "table", source: schemaVersion40PeerSessions },
+  { name: "peer_session_actions_actor_recent", table: "peer_session_actions", type: "index", source: schemaVersion40PeerSessions },
+  { name: "peer_session_actions_actor_target_recent", table: "peer_session_actions", type: "index", source: schemaVersion40PeerSessions },
+  { name: "peer_session_actions_target_recent", table: "peer_session_actions", type: "index", source: schemaVersion40PeerSessions },
+  { name: "peer_session_actions_unsettled", table: "peer_session_actions", type: "index", source: schemaVersion40PeerSessions },
+  { name: "peer_session_actions_project_rate", table: "peer_session_actions", type: "index", source: schemaVersion40PeerSessions },
+  { name: "peer_session_actions_project_retention", table: "peer_session_actions", type: "index", source: schemaVersion40PeerSessions },
+  { name: "session_message_event_sources", table: "session_message_event_sources", type: "table", source: schemaVersion40PeerSessions },
+  { name: "session_message_event_sources_session_recent", table: "session_message_event_sources", type: "index", source: schemaVersion40PeerSessions },
+  { name: "session_message_event_source_insert_guard", table: "session_message_event_sources", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "session_message_event_source_immutable_update", table: "session_message_event_sources", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "session_message_event_source_delete_guard", table: "session_message_event_sources", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "session_message_event_source_event_delete", table: "session_events", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_direct_message_sources", table: "peer_session_direct_message_sources", type: "table", source: schemaVersion40PeerSessions },
+  { name: "peer_session_direct_message_sources_project_recent", table: "peer_session_direct_message_sources", type: "index", source: schemaVersion40PeerSessions },
+  { name: "peer_session_direct_message_sources_target", table: "peer_session_direct_message_sources", type: "index", source: schemaVersion40PeerSessions },
+  { name: "peer_session_direct_message_source_insert_guard", table: "peer_session_direct_message_sources", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_direct_message_source_immutable_update", table: "peer_session_direct_message_sources", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_direct_message_source_delete_guard", table: "peer_session_direct_message_sources", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_direct_message_source_quota", table: "peer_session_direct_message_sources", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_parents", table: "peer_session_action_parents", type: "table", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_parents_parent", table: "peer_session_action_parents", type: "index", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_visits", table: "peer_session_action_visits", type: "table", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_visits_session", table: "peer_session_action_visits", type: "index", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_roots", table: "peer_session_action_roots", type: "table", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_roots_root", table: "peer_session_action_roots", type: "index", source: schemaVersion40PeerSessions },
+  { name: "peer_session_turn_origins", table: "peer_session_turn_origins", type: "table", source: schemaVersion40PeerSessions },
+  { name: "peer_session_turn_origins_action", table: "peer_session_turn_origins", type: "index", source: schemaVersion40PeerSessions },
+  { name: "session_peer_policy_default", table: "sessions", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "session_peer_policy_transition_guard", table: "session_peer_policies", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_insert_guard", table: "peer_session_actions", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_transition_guard", table: "peer_session_actions", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_delete_guard", table: "peer_session_actions", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_parent_insert_guard", table: "peer_session_action_parents", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_root_insert_guard", table: "peer_session_action_roots", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_turn_origin_insert_guard", table: "peer_session_turn_origins", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_parents_immutable_update", table: "peer_session_action_parents", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_parents_immutable_delete", table: "peer_session_action_parents", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_visits_immutable_update", table: "peer_session_action_visits", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_visits_immutable_delete", table: "peer_session_action_visits", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_roots_immutable_update", table: "peer_session_action_roots", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_roots_immutable_delete", table: "peer_session_action_roots", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_turn_origins_immutable_update", table: "peer_session_turn_origins", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_turn_origins_immutable_delete", table: "peer_session_turn_origins", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "session_host_capability_bindings", table: "session_host_capability_bindings", type: "table", source: schemaVersion40PeerSessions },
+  { name: "session_host_capability_binding_immutable", table: "session_host_capability_bindings", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "project_memory_authorities", table: "project_memory_authorities", type: "table", source: schemaVersion40PeerSessions },
+  { name: "project_memory_authorities_space_unique", table: "project_memory_authorities", type: "index", source: schemaVersion40PeerSessions },
+  { name: "memory_submissions", table: "memory_submissions", type: "table", source: schemaVersion40PeerSessions },
+  { name: "memory_page_attestations", table: "memory_page_attestations", type: "table", source: schemaVersion40PeerSessions },
+  { name: "memory_working_attestation_heads", table: "memory_working_attestation_heads", type: "table", source: schemaVersion40PeerSessions },
+  { name: "memory_working_attestation_forks", table: "memory_working_attestation_forks", type: "table", source: schemaVersion40PeerSessions },
+  { name: "memory_page_attestation_refs", table: "memory_page_attestation_refs", type: "table", source: schemaVersion40PeerSessions },
+  { name: "memory_submissions_actor_recent", table: "memory_submissions", type: "index", source: schemaVersion40PeerSessions },
+  { name: "memory_submissions_project_recent", table: "memory_submissions", type: "index", source: schemaVersion40PeerSessions },
+  { name: "memory_submissions_unsettled", table: "memory_submissions", type: "index", source: schemaVersion40PeerSessions },
+  { name: "memory_submissions_one_unsettled_project", table: "memory_submissions", type: "index", source: schemaVersion40PeerSessions },
+  { name: "memory_submissions_remember_attestation", table: "memory_submissions", type: "index", source: schemaVersion40PeerSessions },
+  { name: "memory_page_attestation_refs_attestation", table: "memory_page_attestation_refs", type: "index", source: schemaVersion40PeerSessions },
+  { name: "project_memory_authority_insert_guard", table: "project_memory_authorities", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "project_memory_authority_transition_guard", table: "project_memory_authorities", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_submission_insert_guard", table: "memory_submissions", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_submission_transition_guard", table: "memory_submissions", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_submission_delete_guard", table: "memory_submissions", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_page_attestation_insert_guard", table: "memory_page_attestations", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_page_attestation_update_guard", table: "memory_page_attestations", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_page_attestation_delete_guard", table: "memory_page_attestations", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_page_attestation_ref_insert_guard", table: "memory_page_attestation_refs", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_page_attestation_ref_update_guard", table: "memory_page_attestation_refs", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_working_attestation_head_insert_guard", table: "memory_working_attestation_heads", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_working_attestation_head_update_guard", table: "memory_working_attestation_heads", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_working_attestation_head_delete_guard", table: "memory_working_attestation_heads", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_working_attestation_fork_insert_guard", table: "memory_working_attestation_forks", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_working_attestation_fork_update_guard", table: "memory_working_attestation_forks", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_working_attestation_fork_delete_guard", table: "memory_working_attestation_forks", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "project_memory_authority_delete_guard", table: "project_memory_authorities", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "session_host_capability_binding_delete_guard", table: "session_host_capability_bindings", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_parent_quota", table: "peer_session_action_parents", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_visit_quota", table: "peer_session_action_visits", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_root_quota", table: "peer_session_action_roots", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_turn_origin_quota", table: "peer_session_turn_origins", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "peer_session_action_retained_quota", table: "peer_session_actions", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "memory_submission_retained_quota", table: "memory_submissions", type: "trigger", source: schemaVersion40PeerSessions },
+  { name: "queue_peer_action", table: "queue_entries", type: "index", source: schemaVersion40QueuePeerProvenance },
+  { name: "queue_peer_provenance_insert_guard", table: "queue_entries", type: "trigger", source: schemaVersion40QueuePeerProvenance },
+  { name: "queue_peer_inbound_quota_guard", table: "queue_entries", type: "trigger", source: schemaVersion40QueuePeerProvenance },
+  { name: "queue_peer_provenance_immutable", table: "queue_entries", type: "trigger", source: schemaVersion40QueuePeerProvenance },
+  { name: "queue_peer_effect_evidence_guard", table: "queue_entries", type: "trigger", source: schemaVersion40QueuePeerProvenance },
+  { name: "queue_peer_action_transition", table: "queue_entries", type: "trigger", source: schemaVersion40QueuePeerProvenance },
+] as const;
+
+
+type EmbeddedSchemaObject = Readonly<{
+  name: string;
+  table: string;
+  type: "table" | "index" | "trigger";
+  source: string;
+}>;
+
+const schemaVersion40ObjectSql = (object: EmbeddedSchemaObject): string => {
+  const markers = object.type === "table"
+    ? [`CREATE TABLE IF NOT EXISTS ${object.name}`]
+    : object.type === "index"
+      ? [
+        `CREATE INDEX IF NOT EXISTS ${object.name}`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS ${object.name}`,
+      ]
+      : [`CREATE TRIGGER ${object.name}`];
+  const start = markers.reduce((found, marker) => {
+    const candidate = object.source.indexOf(marker);
+    if (candidate < 0) return found;
+    return found < 0 ? candidate : Math.min(found, candidate);
+  }, -1);
+  const terminator = object.type === "table" ? ") STRICT;" : object.type === "index" ? ";" : "END;";
+  const end = object.source.indexOf(terminator, start);
+  if (start < 0 || end < 0) throw new Error("STATE_SCHEMA_V40_DEFINITION_INVALID");
+  return object.source.slice(start, end + terminator.length);
+};
+
 const applySchemaVersion33DeviceCommands = (database: Database): void => {
   if (!hasTableColumn(database, "daemon_state", "device_commands_allowed")) {
     database.exec(schemaVersion33DeviceCommandsAllowedColumn);
@@ -10895,20 +17000,29 @@ const assertSchemaVersion40ProfileCodexAccountKeys = (database: Database): void 
   ))) throw new Error("STATE_SCHEMA_V39_PROFILE_CODEX_ACCOUNT_KEY_INVALID");
 };
 
-const assertExactSchemaVersion40AdoptionSurface = (database: Database, canonical40 = false): void => {
-  const rows = adoptionFootprintObjects(database);
+const assertExactSchemaVersion40AdoptionSurface = (
+  database: Database,
+  surface: "canonical" | "canonical_with_custody" | "joined" = "joined",
+): void => {
+  const footprint = adoptionFootprintObjects(database);
+  // Only the current bridge adds these independently exact-checked guards to
+  // adoption-owned tables. Historical admission still rejects that footprint.
+  if (surface === "joined") auditRetiredProviderAdmissionGuards(database);
+  const rows = surface === "joined"
+    ? footprint.filter((row) => !RETIRED_PROVIDER_ADMISSION_GUARDS.some((guard) => guard.name === row.name))
+    : footprint;
   const expectedNames = new Set([
     ...schemaVersion40AdoptionObjectNames,
     ...adoptionAwareWorkObjectNames,
-    ...(canonical40 ? [] : CLAUDE_PROCESS_CUSTODY_OBJECT_NAMES),
-    ...(canonical40 ? [] : sessionSwitchAdoptionObjectNames),
+    ...(surface === "canonical" ? [] : CLAUDE_PROCESS_CUSTODY_OBJECT_NAMES),
+    ...(surface === "canonical" ? [] : sessionSwitchAdoptionObjectNames),
   ]);
   assertNoUnexpectedAdoptionFootprintObjects(rows, expectedNames);
   if (
     rows.length !== expectedNames.size
     || rows.some((row) => !expectedNames.has(row.name))
   ) throw new Error("STATE_SCHEMA_V39_ADOPTION_SURFACE_INVALID");
-  assertExactCurrentAdoptionWorkObjects(rows, canonical40);
+  assertExactCurrentAdoptionWorkObjects(rows, surface !== "joined");
   assertSchemaVersion40ProfileCodexAccountKeys(database);
 };
 
@@ -11297,12 +17411,12 @@ const applySchemaVersion37AttentionEmailPolicy = (
 };
 
 // Preset aliases are durable user intent, but their exact model mapping has
-// changed once. Existing and provider-imported rows retain the legacy mapping;
-// HRA-created or explicitly reselected rows are stamped current at their write
-// boundary. `works` is installed by WorkStore in the same database and carries
-// the same contract so a claim cannot reinterpret its route mid-flight.
-// These shipped DDL and audit versions stay literal when new-write defaults
-// change; widening them requires an appended migration and its own audit.
+// changed once. Existing rows retain the contract established by migration or
+// their earlier write. New and explicitly reselected session rows resolve
+// `activePresetBinding` at their write boundary; an active binding may select
+// either frozen contract. `works` is installed by WorkStore in the same
+// database and owns its separate creation-time contract, which claim admission
+// checks against the session without reinterpreting either route mid-flight.
 const schemaVersion38SessionPresetContractColumn =
   "ALTER TABLE sessions ADD COLUMN preset_contract INTEGER NOT NULL DEFAULT 1 "
   + "CHECK(preset_contract IN (1,2))";
@@ -11346,6 +17460,367 @@ const assertSchemaVersion38PresetContracts = (database: Database): void => {
   ).get() !== null) {
     throw new Error("STATE_SCHEMA_V38_WORK_PRESET_CONTRACT_INVALID");
   }
+};
+
+const assertEmbeddedSchemaObjects = (
+  database: Database,
+  objects: readonly EmbeddedSchemaObject[],
+  code: string,
+): void => {
+  const names = objects.map((object) => `'${object.name}'`).join(",");
+  const rows = database.query(
+    `SELECT type,name,tbl_name,sql FROM sqlite_master
+     WHERE name IN (${names}) ORDER BY name`,
+  ).all().map((row) => sqliteSchemaObjectRowSchema.parse(row));
+  if (rows.length !== objects.length) throw new Error(code);
+  for (const expected of objects) {
+    const observed = rows.find((row) => row.name === expected.name);
+    const observedSql = observed?.sql.replace(/\bIF NOT EXISTS\b/giu, "");
+    const expectedSql = schemaVersion40ObjectSql(expected)
+      .replace(/\bIF NOT EXISTS\b/giu, "");
+    if (
+      observed === undefined
+      || observed.type !== expected.type
+      || observed.tbl_name !== expected.table
+      || normalizeSqlStructure(observedSql ?? "") !== normalizeSqlStructure(expectedSql)
+    ) throw new Error(code);
+  }
+};
+
+const assertPeerAndLocalMemoryObjects = (
+  database: Database,
+  objects: readonly EmbeddedSchemaObject[],
+  code: string,
+): void => {
+  assertEmbeddedSchemaObjects(
+    database,
+    objects,
+    code,
+  );
+  const queueColumns = database.query("PRAGMA table_info(queue_entries)").all()
+    .map((row) => z.object({ name: z.string(), notnull: z.number().int(), type: z.string() }).passthrough().parse(row));
+  const actor = queueColumns.find((column) => column.name === "message_actor");
+  const action = queueColumns.find((column) => column.name === "peer_action_id");
+  const queueSql = normalizeSqlStructure(z.object({ sql: z.string() }).strict().parse(
+    database.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='queue_entries'").get(),
+  ).sql);
+  if (
+    actor?.type !== "TEXT"
+    || actor.notnull !== 1
+    || action?.type !== "TEXT"
+    || action.notnull !== 0
+    || /--|\/\*/u.test(queueSql)
+    || !/[,()]\s*message_actor TEXT NOT NULL DEFAULT 'human' CHECK\(message_actor IN \('human','peer_session'\)\)\s*[,)]/u.test(queueSql)
+    || !/[,()]\s*peer_action_id TEXT REFERENCES peer_session_actions\(id\)\s*[,)]/u.test(queueSql)
+  ) throw new Error(code);
+  if (database.query(
+    "SELECT 1 FROM queue_entries WHERE message_actor NOT IN ('human','peer_session') OR message_actor IS NULL LIMIT 1",
+  ).get() !== null) throw new Error(code);
+  try {
+    for (const row of database.query(
+      "SELECT * FROM project_memory_authorities ORDER BY project_id",
+    ).all()) mapProjectMemoryAuthority(row);
+  } catch (cause: unknown) {
+    throw new Error(code, { cause });
+  }
+};
+
+const assertSchemaVersion40Objects = (database: Database): void => {
+  assertPeerAndLocalMemoryObjects(
+    database,
+    schemaVersion40Objects,
+    "STATE_SCHEMA_V40_STRUCTURE_INVALID",
+  );
+};
+
+const assertSchemaVersion41Objects = (database: Database): void => {
+  const names = schemaVersion41Objects.map((object) => `'${object.name}'`).join(",");
+  const rows = database.query(
+    `SELECT type,name,tbl_name,sql FROM sqlite_master
+     WHERE name IN (${names}) ORDER BY name`,
+  ).all().map((row) => sqliteSchemaObjectRowSchema.parse(row));
+  if (rows.length !== schemaVersion41Objects.length) {
+    throw new Error("STATE_SCHEMA_V41_STRUCTURE_INVALID");
+  }
+  for (const expected of schemaVersion41Objects) {
+    const observed = rows.find((row) => row.name === expected.name);
+    const observedSql = observed?.sql.replace(/\bIF NOT EXISTS\b/giu, "");
+    const expectedSql = schemaVersion41ObjectSql(expected)
+      .replace(/\bIF NOT EXISTS\b/giu, "");
+    if (
+      observed === undefined
+      || observed.type !== expected.type
+      || observed.tbl_name !== expected.table
+      || normalizeSqlStructure(observedSql ?? "") !== normalizeSqlStructure(expectedSql)
+    ) throw new Error("STATE_SCHEMA_V41_STRUCTURE_INVALID");
+  }
+  try {
+    for (const row of database.query(
+      "SELECT * FROM project_memory_hosted_create_intents ORDER BY created_at,id",
+    ).all()) {
+      const intent = mapCanonicalMemoryHostedCreateIntent(row);
+      const authorityRow = database.query(
+        "SELECT * FROM project_memory_authorities WHERE project_id=?",
+      ).get(intent.projectId);
+      if (authorityRow === null) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_AUTHORITY_MISSING");
+      }
+      const authority = mapProjectMemoryAuthority(authorityRow);
+      const attachmentRow = database.query(
+        "SELECT * FROM project_memory_hosted_attachments WHERE project_id=?",
+      ).get(intent.projectId);
+      const attachment = attachmentRow === null
+        ? null
+        : mapCanonicalMemoryHostedAttachment(attachmentRow);
+      const unresolved = [
+        "allocating",
+        "key_staged",
+        "prepared",
+        "effect_started",
+        "winner_observed",
+      ].includes(intent.state);
+      if (unresolved) {
+        if (
+          authority.identityContract !== 2
+          || authority.physicalState === "rejected"
+          || authority.syncState === "conflict"
+          || authority.syncState === "error"
+          || authority.bindingDigest !== intent.canonicalBindingDigest
+          || authority.revision !== intent.authorityRevision
+          || !sameProjectMemoryHead(authority.head, intent.authorityHead)
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_AUTHORITY_INVALID");
+      }
+      if (unresolved && attachment !== null) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_ATTACHMENT_INVALID");
+      }
+      if (intent.state === "settled") {
+        if (
+          authority.identityContract !== 2
+          || authority.physicalState === "rejected"
+          || authority.bindingDigest !== intent.canonicalBindingDigest
+          || authority.revision < intent.authorityRevision
+          || attachment === null
+          || intent.request === undefined
+          || intent.winnerRevision === undefined
+          || attachment.remoteSpaceId !== intent.remoteSpaceId
+          || attachment.accountBindingDigest !== intent.accountBindingDigest
+          || attachment.canonicalBindingDigest !== intent.canonicalBindingDigest
+          || attachment.remote.genesisToken !== intent.request.genesisToken
+          || attachment.remote.keyVersion !== intent.request.keyVersion
+          || attachment.remote.revision !== intent.winnerRevision
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_SETTLEMENT_INVALID");
+      } else if (!unresolved) {
+        if (
+          attachment !== null
+          || authority.bindingDigest !== intent.canonicalBindingDigest
+          || !sameProjectMemoryHead(authority.head, intent.authorityHead)
+          || authority.revision !== intent.authorityRevision + 1
+          || authority.syncState !== intent.state
+          || authority.diagnosticCode !== intent.diagnosticCode
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_FAILURE_INVALID");
+      }
+    }
+    for (const row of database.query(
+      "SELECT * FROM project_memory_hosted_attachments ORDER BY project_id",
+    ).all()) mapCanonicalMemoryHostedAttachment(row);
+    for (const row of database.query(
+      "SELECT * FROM project_memory_sync_intents ORDER BY created_at,id",
+    ).all()) {
+      const parsed = canonicalMemorySyncIntentRowSchema.parse(row);
+      const attachment = z.object({
+        remote_space_id: canonicalMemoryHostedSpaceIdSchema,
+      }).strict().parse(database.query(
+        "SELECT remote_space_id FROM project_memory_hosted_attachments WHERE project_id=?",
+      ).get(parsed.project_id));
+      mapCanonicalMemorySyncIntent(row, database.query(
+        "SELECT * FROM project_memory_sync_spool WHERE intent_id=? ORDER BY phase",
+      ).all(parsed.id), attachment.remote_space_id);
+    }
+    for (const row of database.query(
+      "SELECT * FROM project_memory_portable_adoption_proofs ORDER BY project_id,sequence",
+    ).all()) {
+      const proof = mapCanonicalMemoryPortableAdoptionProof(row);
+      const authorityRow = database.query(
+        "SELECT * FROM project_memory_authorities WHERE project_id=?",
+      ).get(proof.projectId);
+      if (authorityRow === null) {
+        throw new Error("CANONICAL_MEMORY_PORTABLE_ADOPTION_PROOF_AUTHORITY_MISSING");
+      }
+      const authority = mapProjectMemoryAuthority(authorityRow);
+      if (
+        authority.identityContract !== 2
+        || authority.physicalState !== "initialized"
+        || authority.canonicalSpaceId !== proof.canonicalSpaceId
+        || authority.bindingDigest !== proof.bindingDigest
+        || authority.head.sequence < proof.sequence
+      ) throw new Error("CANONICAL_MEMORY_PORTABLE_ADOPTION_PROOF_AUTHORITY_INVALID");
+    }
+  } catch (cause: unknown) {
+    throw new Error("STATE_SCHEMA_V41_CANONICAL_MEMORY_SYNC_INVALID", { cause });
+  }
+  if (database.query(
+    `SELECT 1
+     FROM project_memory_sync_intents intent
+     JOIN project_memory_hosted_attachments attachment
+       ON attachment.project_id=intent.project_id
+     LEFT JOIN project_memory_authorities authority
+       ON authority.project_id=intent.project_id
+     WHERE (
+       intent.state IN ('prepared','effect_started','response_observed')
+       AND (
+         attachment.state!='attached'
+         OR attachment.generation!=intent.attachment_generation
+         OR attachment.revision!=intent.attachment_revision
+         OR attachment.canonical_binding_digest!=intent.canonical_binding_digest
+         OR authority.project_id IS NULL
+         OR authority.revision!=intent.authority_revision
+         OR authority.binding_digest!=intent.canonical_binding_digest
+         OR authority.head_sequence!=intent.local_head_sequence
+         OR authority.head_operation_sha256 IS NOT intent.local_head_operation_sha256
+         OR authority.head_digest!=intent.local_head_digest
+       )
+     ) OR (
+       intent.state IN ('conflict','error')
+       AND (attachment.state!=intent.state OR attachment.diagnostic_code!=intent.diagnostic_code)
+     )
+     LIMIT 1`,
+  ).get() !== null) throw new Error("STATE_SCHEMA_V41_CANONICAL_MEMORY_SYNC_INVALID");
+};
+
+// Unreleased memory migrations follow main's immutable v40-v46 sequence.
+// The embedded SQL identifiers remain stable; only forward ledger slots move.
+const applySchemaVersion47PeerSessions = applySchemaVersion40PeerSessions;
+const applySchemaVersion48CanonicalMemorySync = applySchemaVersion41CanonicalMemorySync;
+const assertSchemaVersion47PeerObjects = assertSchemaVersion40Objects;
+const assertSchemaVersion48CanonicalMemoryObjects = assertSchemaVersion41Objects;
+
+const assertSchemaVersionMemoryAuthority = (database: Database, version: 47 | 48): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSchemaMigrationLedgerTail(database, version === 47
+    ? [40, 41, 42, 43, 44, 45, 46, 47]
+    : [40, 41, 42, 43, 44, 45, 46, 47, 48],
+    `STATE_SCHEMA_V${String(version)}_MIGRATION_LEDGER_INVALID`);
+  assertSchemaVersionMemoryObjects(database, version);
+};
+
+const assertSchemaVersionMemoryObjects = (database: Database, version: 47 | 48): void => {
+  assertSchemaVersion43SessionUserMessageFinalizations(database);
+  assertSchemaVersion43QueueCancellationSettlement(database);
+  assertSchemaVersion44AutorespondObjects(database);
+  assertSchemaVersion44AutorespondEvidence(database);
+  assertSchemaVersion45AccountMutationAuthority(database);
+  assertSchemaVersion46AutorespondAfterHours(database);
+  assertSchemaVersion47PeerObjects(database);
+  if (version === 48) assertSchemaVersion48CanonicalMemoryObjects(database);
+};
+
+const assertSchemaVersion49Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSchemaMigrationLedgerTail(database, [40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
+    "STATE_SCHEMA_V49_MIGRATION_LEDGER_INVALID");
+  assertSchemaVersionMemoryObjects(database, 48);
+  assertWorkProjectAuthoritySchema(database);
+};
+
+const assertSchemaVersion50Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSchemaMigrationLedgerTail(database, [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50],
+    "STATE_SCHEMA_V50_MIGRATION_LEDGER_INVALID");
+  assertSchemaVersionMemoryObjects(database, 48);
+  assertWorkProjectAuthoritySchema(database);
+  assertLegacyCanonicalProfileStorageSchema(database);
+};
+
+// Only these exact released guards obstruct a key-only additive backfill.
+// Preserve their observed bodies and every historical revision and timestamp.
+const canonicalProfileBackfillGuards = [
+  { name: "work_routes_no_update", table: "work_routes", sql: `CREATE TRIGGER work_routes_no_update
+BEFORE UPDATE ON work_routes BEGIN SELECT RAISE(ABORT,'WORK_ROUTE_IMMUTABLE'); END` },
+  { name: "work_tasks_no_update", table: "work_tasks", sql: `CREATE TRIGGER work_tasks_no_update
+BEFORE UPDATE ON work_tasks BEGIN SELECT RAISE(ABORT,'WORK_TASK_IMMUTABLE'); END` },
+  { name: "work_attempt_revision_guard", table: "work_attempts", sql: `CREATE TRIGGER work_attempt_revision_guard
+BEFORE UPDATE ON work_attempts
+WHEN NEW.revision != OLD.revision + 1
+BEGIN SELECT RAISE(ABORT,'WORK_ATTEMPT_REVISION'); END` },
+] as const;
+
+const applySchemaVersion50CanonicalProfiles = (database: Database): void => {
+  if (!database.inTransaction) throw new Error("STATE_SCHEMA_V50_TRANSACTION_REQUIRED");
+  assertLegacyCanonicalProfileStorageAbsent(database);
+  const preserved = canonicalProfileBackfillGuards.map((guard) => {
+    const rows = database.query(
+      "SELECT type,name,tbl_name,sql FROM main.sqlite_master WHERE name=? COLLATE NOCASE",
+    ).all(guard.name);
+    const parsed = sqliteSchemaObjectRowSchema.safeParse(rows[0]);
+    if (rows.length !== 1 || !parsed.success || parsed.data.type !== "trigger"
+      || parsed.data.name !== guard.name || parsed.data.tbl_name !== guard.table
+      || normalizeSqlStructure(parsed.data.sql) !== normalizeSqlStructure(guard.sql)) {
+      throw new Error("STATE_SCHEMA_V50_BACKFILL_GUARD_INVALID");
+    }
+    return { name: guard.name, sql: parsed.data.sql };
+  });
+  database.exec(LEGACY_CANONICAL_PROFILE_COLUMNS_SQL);
+  for (const guard of preserved) database.exec(`DROP TRIGGER main.${guard.name}`);
+  database.exec(LEGACY_CANONICAL_PROFILE_BACKFILL_SQL);
+  for (const guard of preserved) database.exec(guard.sql);
+  assertLegacyCanonicalProfileRows(database);
+  database.exec(LEGACY_CANONICAL_PROFILE_GUARDS_SQL);
+  assertLegacyCanonicalProfileStorageSchema(database);
+};
+
+// Retained usage has an all-column switch fence that canonical50 never had.
+// The join permits only the additive key backfill while every original cell
+// stays identical. Keep canonical50 and the original switch guard unchanged.
+const applyRetainedUsageCanonicalProfiles = (database: Database): void => {
+  const fail = (): never => { throw new Error("STATE_SCHEMA_JOIN_PROFILE_BACKFILL_INVALID"); };
+  if (!database.inTransaction) return fail();
+  const name = "session_switch_session_update_guard";
+  if (database.query(`SELECT 1 FROM sqlite_temp_master
+    WHERE name COLLATE NOCASE IN ('sessions',?) OR tbl_name COLLATE NOCASE='sessions' LIMIT 1`).get(name) !== null) return fail();
+  const definition = schemaVersion42SessionSwitchObjects.find((object) => object.name === name);
+  const observed = sqliteSchemaObjectRowSchema.array().max(1).safeParse(database.query(
+    "SELECT type,name,tbl_name,sql FROM main.sqlite_master WHERE name=? COLLATE NOCASE",
+  ).all(name));
+  const original = observed.success ? observed.data[0] : undefined;
+  if (definition === undefined || original === undefined || original.type !== "trigger"
+    || original.name !== name || original.tbl_name !== "sessions"
+    || normalizeSqlStructure(original.sql) !== normalizeSqlStructure(schemaVersion42SessionSwitchObjectSql(definition))) return fail();
+  const columns = z.object({ name: z.string().regex(/^[a-z][a-z0-9_]*$/u), hidden: z.literal(0) })
+    .strict().array().min(1).max(2000).parse(database.query(
+      "SELECT name,hidden FROM pragma_table_xinfo('sessions','main') ORDER BY cid",
+    ).all());
+  const names = columns.map((column) => column.name);
+  if (new Set(names).size !== names.length || !names.includes("id") || names.includes("canonical_profile_key")) return fail();
+  const preserved = names.map((column) => `(typeof(NEW."${column}")=typeof(OLD."${column}")
+    AND NEW."${column}" COLLATE BINARY IS OLD."${column}" COLLATE BINARY)`).join(" AND ");
+  database.transaction(() => {
+    database.exec(`DROP TRIGGER main.${name}`);
+    try {
+      database.exec(`CREATE TRIGGER ${name} BEFORE UPDATE ON sessions WHEN NOT (${preserved})
+        BEGIN SELECT RAISE(ABORT,'STATE_SCHEMA_JOIN_PROFILE_BACKFILL_INVALID'); END;`);
+      applySchemaVersion50CanonicalProfiles(database);
+    } finally {
+      database.exec(`DROP TRIGGER IF EXISTS main.${name}`);
+      database.exec(original.sql);
+    }
+  })();
+};
+
+// This migration-only scan must precede legacy quarantine, which may retire
+// claims. Never normalize contradictory project authority into migration proof.
+const assertSchemaVersion49ProjectPredecessor = (database: Database): void => {
+  if (database.query(
+    "SELECT 1 FROM sqlite_master WHERE name='work_session_project_authority_guard' COLLATE NOCASE LIMIT 1",
+  ).get() !== null) throw new Error("STATE_SCHEMA_V49_WORK_PROJECT_PREDECESSOR_COLLISION");
+  if (database.query(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_attempts'",
+  ).get() !== null && database.query(
+    `SELECT 1 FROM work_attempts AS a
+     LEFT JOIN sessions AS s ON s.id=a.worker_session_id
+     WHERE a.state IN ('claimed','dispatching','running','recovery_required')
+       AND (s.id IS NULL OR s.project_id IS NOT a.project_id)
+     LIMIT 1`,
+  ).get() !== null) throw new Error("STATE_SCHEMA_V49_WORK_PROJECT_AUTHORITY_INVALID");
 };
 
 const assertSchemaVersion24Objects = (database: Database): void => {
@@ -12446,11 +18921,84 @@ const repairMalformedSessionSwitchJournalsBeforeIntegrity = (
         if (bounded?.valid !== 1) throw new Error("SESSION_SWITCH_RECORD_BOUNDS_INVALID");
         mapSessionSwitch(database, database.query(
           `${sessionSwitchSelect} WHERE switch.journal_sequence=?`,
-        ).get(row.journal_sequence));
+        ).get(row.journal_sequence), "historical_v1");
       } catch {
         quarantineMalformedSessionSwitchJournal(database, now, row.journal_sequence);
       }
     }
+  }
+};
+
+// Sequence exclusions are containment authority, never execution authority.
+// The independent adoption capsule and terminal disposition must already be
+// valid; a raw malformed identifier or a legacy_read_only capsule proves none
+// of that. Keep this read in the same transaction as the context apply/audit.
+const readProvedMalformedSessionSwitchJournalSequences = (
+  database: Database,
+  stage: "historical_install" | "current",
+): ReadonlySet<number> => {
+  try {
+    if (!database.inTransaction) throw new Error();
+    z.enum(["historical_install", "current"]).parse(stage);
+    if (stage === "current") assertSessionSwitchExecutionContextSchema(database);
+    assertSchemaVersion42SessionSwitch(database, stage === "current" ? "joined" : "historical");
+    auditSessionSwitchAdoption(database);
+    const count = z.object({ count: z.number().int().nonnegative().safe() }).strict().parse(
+      database.query("SELECT COUNT(*) AS count FROM session_switch_malformed_dispositions").get(),
+    ).count;
+    const sequences = new Set<number>();
+    let after = 0;
+    let seen = 0;
+    while (seen < count) {
+      // LEFT joins preserve missing/contradictory proof as a refused candidate.
+      // Corrupt journal strings never cross this SQL boundary into an ID parser.
+      const rows = z.object({
+        journal_sequence: z.number().int().positive().safe(),
+        mutation_request_key: z.string().uuid(),
+        session_id: sessionIdSchema,
+        from_phase: sessionSwitchPhaseSchema,
+        terminal_phase: z.enum(["cancelled", "reconciliation_required"]),
+        diagnostic_code: z.literal("MALFORMED_SWITCH_RECORD"),
+        evidence_depth: z.number().int().min(0).max(5),
+        recorded_at: unixMillisecondsSchema,
+        proved: z.literal(1),
+      }).strict().array().max(100).parse(database.query(`SELECT d.journal_sequence,
+          CASE WHEN length(CAST(d.mutation_request_key AS BLOB))=36 THEN d.mutation_request_key END AS mutation_request_key,
+          CASE WHEN length(CAST(d.session_id AS BLOB))<=200 THEN d.session_id END AS session_id,
+          CASE WHEN length(CAST(d.from_phase AS BLOB))<=32 THEN d.from_phase END AS from_phase,
+          CASE WHEN length(CAST(d.terminal_phase AS BLOB))<=32 THEN d.terminal_phase END AS terminal_phase,
+          CASE WHEN length(CAST(d.diagnostic_code AS BLOB))<=32 THEN d.diagnostic_code END AS diagnostic_code,
+          d.evidence_depth,d.recorded_at,
+          CASE WHEN p.journal_sequence IS NOT NULL AND p.attempt_id=m.id
+            AND m.kind='session.switch' AND m.authority_id=d.session_id
+            AND proof.kind='exact_v1' THEN 1 ELSE 0 END AS proved
+        FROM session_switch_malformed_dispositions d
+        LEFT JOIN session_switch_attempts p ON p.journal_sequence=d.journal_sequence
+        LEFT JOIN mutation_attempts m ON m.idempotency_key=d.mutation_request_key
+        LEFT JOIN session_switch_adoption_capsules proof ON proof.attempt_id=m.id
+        WHERE d.journal_sequence>? ORDER BY d.journal_sequence LIMIT 100`).all(after));
+      if (rows.length === 0 || seen + rows.length > count) throw new Error();
+      for (const row of rows) {
+        if (row.journal_sequence <= after) throw new Error();
+        after = row.journal_sequence;
+        seen++;
+        // Containment never invalidates or replaces a previously anchored
+        // context. Any full or partial context must still pass the ordinary
+        // context audit. Only proved contextless history may be excluded.
+        const hasContext = stage === "current" && database.query(`
+          SELECT 1 FROM session_switch_execution_contexts c
+            JOIN session_switch_attempts p ON p.attempt_id=c.attempt_id WHERE p.journal_sequence=?
+          UNION ALL SELECT 1 FROM session_switch_execution_context_anchors a
+            JOIN session_switch_attempts p ON p.attempt_id=a.attempt_id WHERE p.journal_sequence=? LIMIT 1
+        `).get(after, after) !== null;
+        if (!hasContext) sequences.add(after);
+      }
+    }
+    if (database.query("SELECT 1 FROM session_switch_malformed_dispositions WHERE journal_sequence>? LIMIT 1")
+      .get(after) !== null) throw new Error();
+    return sequences;
+  } catch {
+    throw new Error("SESSION_SWITCH_MALFORMED_DISPOSITION_UNPROVABLE");
   }
 };
 
@@ -12462,7 +19010,10 @@ const privateTask40RootObjects = schemaCohortObjects(
   schemaVersion40ProviderAccounts, schemaVersion41ProviderUsage, schemaVersion42SessionSwitch,
 ).filter((object) => privateTask40RootNames.has(object.name));
 
-const assertTaskOwnershipCohort = (database: Database): void => {
+const assertTaskOwnershipCohort = (
+  database: Database,
+  format: "private_task48_v1" | "combined49_v1",
+): void => {
   assertSchemaCohortObjects(database, privateTask40RootObjects, "private-task48");
   assertProviderAccountAuthority(database);
   assertWorkSignalProviderAuthorities(database);
@@ -12470,10 +19021,10 @@ const assertTaskOwnershipCohort = (database: Database): void => {
   assertSchemaVersion42SessionSwitch(database);
   auditAutomaticUsagePolicyHistory(database);
   auditDevinJoinedCloses(database);
-  auditSessionSendOwners(database);
+  auditSessionSendOwners(database, { kind: "historical", format });
   auditAutomaticPointerMoves(database);
-  auditQueueAttachmentIdentities(database);
-  auditAttachmentCustody(database);
+  auditQueueAttachmentIdentities(database, "historical");
+  auditAttachmentCustody(database, { kind: "historical", format });
 };
 
 const hasTaskAuthorityFootprint = (database: Database): boolean => database.query(
@@ -12496,7 +19047,7 @@ const hasTaskAuthorityFootprint = (database: Database): boolean => database.quer
 const classifyStateSchemaCohort = (
   database: Database,
   version: number,
-): "legacy" | "canonical40" | "private48" | "combined49" => {
+): "legacy" | "canonical40" | "canonical" | "private48" | "combined49" => {
   if (version < 40) return "legacy";
   assertCanonicalLabelKeys(database);
   assertSchemaVersion24Objects(database);
@@ -12509,11 +19060,15 @@ const classifyStateSchemaCohort = (
     if (hasTaskAuthorityFootprint(database)) throw new Error("STATE_SCHEMA_COHORT_MIXED");
     assertSchemaCohortMigrationTail(database, 40);
     assertSchemaVersion40AdoptionObjects(database);
-    assertExactSchemaVersion40AdoptionSurface(database, true);
+    assertExactSchemaVersion40AdoptionSurface(database, "canonical");
     assertCanonicalAdoption40WorkSchema(database);
     assertCanonicalAdoption40SessionTaskSchema(database);
     return "canonical40";
   }
+  // Canonical 41–49 and the private cohorts overlap numerically. Only the
+  // exact absence of task-owned objects permits the canonical preflight below;
+  // its version-specific ledger, schema and row audits still precede writes.
+  if (version >= 41 && version <= 50 && !hasTaskAuthorityFootprint(database)) return "canonical";
   if (version === 48) {
     if (adoptionFootprintObjects(database).length !== 0
       || hasTableColumn(database, "profiles", "codex_account_key")) {
@@ -12522,12 +19077,12 @@ const classifyStateSchemaCohort = (
     assertSchemaCohortMigrationTail(database, 48);
     assertPrivateTask48WorkSchema(database);
     assertPrivateTask48SessionTaskSchema(database);
-    assertTaskOwnershipCohort(database);
+    assertTaskOwnershipCohort(database, "private_task48_v1");
     return "private48";
   }
   if (version === 49) {
     assertSchemaCohortMigrationTail(database, 49);
-    assertTaskOwnershipCohort(database);
+    assertTaskOwnershipCohort(database, "combined49_v1");
     assertCombined49AdoptionSchema(database);
     assertSchemaVersion40ProfileCodexAccountKeys(database);
     assertCombined49WorkSchema(database);
@@ -12539,72 +19094,235 @@ const classifyStateSchemaCohort = (
   throw new Error(`STATE_SCHEMA_COHORT_UNSUPPORTED:${version}`);
 };
 
+// Select a source family only after its structural and populated authority
+// preflight, never by inspecting document fields or trying another decoder.
+const incomingEffectEvidenceFormat = (
+  cohort: ReturnType<typeof classifyStateSchemaCohort>,
+  version: number,
+): HistoricalEffectEvidenceFormat => {
+  if (cohort === "private48") return "private_task48_v1";
+  if (cohort === "combined49") return "combined49_v1";
+  if (version <= 40) return "canonical40_v1";
+  if (version <= 42) return "canonical41_v1";
+  if (version <= 46) return "canonical_sol43_v1";
+  return "canonical49_v1";
+};
+
+const relocateUsageMigrationLedger = (
+  database: Database,
+  cohort: "private48" | "combined49",
+): void => {
+  if (!database.inTransaction) throw new Error("STATE_SCHEMA_JOIN_TRANSACTION_REQUIRED");
+  const fromStart = cohort === "private48" ? 40 : 41;
+  const last = fromStart + 8;
+  assertSchemaCohortMigrationTail(database, cohort === "private48" ? 48 : 49);
+  // Move only the nine already-proved unpublished usage slots. Keep each
+  // original applied_at and every source record in this immediate transaction.
+  for (let from = last; from >= fromStart; from--) {
+    const changed = database.query("UPDATE migrations SET version=? WHERE version=?")
+      .run(51 + from - fromStart, from);
+    if (changed.changes !== 1) throw new Error("STATE_SCHEMA_JOIN_LEDGER_CONFLICT");
+  }
+};
+
+const peerSessionCancellationPredecessor = (): string => {
+  const guard = schemaVersion40Objects.find((object) =>
+    object.name === "peer_session_direct_message_source_delete_guard");
+  if (guard === undefined) throw new Error("PEER_SESSION_CANCELLATION_SCHEMA_SOURCE_MISSING");
+  return schemaVersion40ObjectSql(guard);
+};
+
+const assertJoinedCanonicalObjects = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSessionUserMessageFinalizationCore(database, false, "joined");
+  assertSchemaVersion43QueueCancellationSettlement(database);
+  assertSchemaVersion44AutorespondObjects(database);
+  assertSchemaVersion44AutorespondEvidence(database);
+  assertSchemaVersion45AccountMutationAuthority(database);
+  assertSchemaVersion46AutorespondAfterHours(database);
+  assertPeerAndLocalMemoryObjects(
+    database,
+    schemaVersion40Objects.filter((object) => object.name !== "peer_session_direct_message_source_delete_guard"),
+    "STATE_SCHEMA_V40_STRUCTURE_INVALID",
+  );
+  assertPeerSessionCancellationSchema(database, peerSessionCancellationPredecessor());
+  assertSchemaVersion48CanonicalMemoryObjects(database);
+  assertWorkProjectAuthoritySchema(database);
+  assertLegacyCanonicalProfileStorageSchema(database);
+};
+
+const joinedProviderRootObjects = privateTask40RootObjects.filter((object) =>
+  ![...JOINED_EVIDENCE_PREDECESSOR_GUARDS, ...PROVIDER_LOGIN_BINDING_PREDECESSOR_GUARDS]
+    .some((guard) => guard.name === object.name));
+
+const assertJoinedStateSchema = (database: Database): void => {
+  assertSchemaMigrationLedgerTail(database,
+    Array.from({ length: 26 }, (_, index) => index + 35), "STATE_SCHEMA_JOIN_LEDGER_INVALID");
+  assertJoinedCanonicalObjects(database);
+  assertSchemaCohortObjects(database, joinedProviderRootObjects, "joined60");
+  assertEffectEvidenceProvenanceSchema(database);
+  assertSessionSwitchExecutionContextSchema(database);
+  assertSchemaVersion42SessionSwitch(database, "joined");
+  auditJoinedEvidenceGuards(database);
+  assertProviderLoginBindingTransitionSchema(database);
+  auditRetiredProviderAdmissionGuards(database);
+};
+
 const migrateWritableDatabase = (
   database: Database,
   now: () => number,
   securityScrubCheckpoint: SecurityScrubCheckpointPolicy = defaultSecurityScrubCheckpointPolicy,
   resolveMachineTimeZone: MachineTimeZoneResolver = defaultMachineTimeZoneResolver,
 ): void => {
-  const securityScrubPending = database.transaction(() => {
-  const initialVersion = readUserVersion(database);
-  if (initialVersion > currentSchemaVersion) {
-    throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
-  }
-  const cohort = classifyStateSchemaCohort(database, initialVersion);
-  if (cohort === "combined49") {
-    auditAttachmentCustody(database);
-    auditQueueAttachmentIdentities(database);
-    auditAutomaticPointerMoves(database);
-    auditSessionSendOwners(database);
-    auditDevinJoinedCloses(database);
-    assertSchemaVersion43AutomaticUsagePolicy(database);
-    assertCanonicalLabelKeys(database);
-    assertSchemaVersion41ProviderUsage(database);
-    assertSchemaVersion42SessionSwitch(database);
-    // A current-version stamp is an assertion boundary, not permission to
-    // reconstruct authority. Prove every provider/adoption execution guard
-    // before the idempotent maintenance tail can touch any schema object.
-    assertCanonicalLabelKeys(database);
-    assertSchemaVersion39ProviderAuthority(database);
-    assertCombined49AdoptionSchema(database);
-    assertSchemaVersion40ProfileCodexAccountKeys(database);
-    assertCombined49WorkSchema(database);
-    assertCombined49SessionTaskSchema(database);
-  }
-  // Both pre-release adoption and notification builds used version 36. Freeze
-  // their identity before any additive pre-application can blur the evidence.
-  const exactLegacyFeatureVersion36 = isExactLegacyFeatureVersion36(
-    database,
-    initialVersion,
-  );
-  const legacySessionAdoption = initialVersion < 40
-    ? classifyLegacySessionAdoptionSchema(database, initialVersion)
-    : "absent";
-  if (initialVersion === 39 && legacySessionAdoption === "absent") {
-    // Provider v39 was the protected-main predecessor to adoption v40. Prove
-    // that complete released surface before any schema or row mutation; a
-    // same-version lookalike must not gain adoption authority through repair.
-    assertLegacyAdoptionMigrationTail(database, 39);
-    assertSchemaVersion35Objects(database);
-    assertCompositeNotificationPolicy(database);
-    assertSchemaVersion38PresetContracts(database);
-    assertSchemaVersion39ProviderAuthority(database);
-    assertProviderVersion39WorkSchema(database);
-    assertSessionTaskSchema(database);
-  }
-
-  // Security migrations may replace secret-bearing legacy records. SQLite must
-  // overwrite superseded cell content instead of leaving it in free pages.
+  // Keep physical scrubbing outside the transaction, but acquire the writer
+  // fence before predecessor reads so admission cannot race a schema writer.
   database.exec("PRAGMA secure_delete = ON");
-    // A stamped provider-account schema owns these immutable execution
-    // fences. Do not recreate missing current-format custody as a migration.
-    let redacted = false;
-    let version = cohort === "private48" ? currentSchemaVersion : initialVersion;
-    if (cohort === "private48") {
-      unixMillisecondsSchema.parse(now());
-      applySchemaVersion40SessionAdoption(database);
+  const securityScrubPending = database.transaction(() => {
+    const initialVersion = readUserVersion(database);
+    if (initialVersion > currentSchemaVersion) {
+      throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
     }
-    repairOrphanProviderAuthoritySidecars(database);
+    if (initialVersion === currentSchemaVersion) {
+      assertJoinedStateSchema(database);
+      auditProviderLoginBindingTransitions(database);
+      assertLegacyCanonicalProfileRows(database);
+      auditEffectEvidenceProvenance(database);
+      assertWorkSignalProviderAuthorities(database);
+      auditAutomaticUsagePolicyHistory(database);
+      auditDevinJoinedCloses(database);
+      auditSessionSendOwners(database);
+      auditAutomaticPointerMoves(database);
+      auditQueueAttachmentIdentities(database);
+      auditAttachmentCustody(database);
+      auditSessionSwitchExecutionContexts(database, {
+        excludedMalformedJournalSequences: readProvedMalformedSessionSwitchJournalSequences(database, "current"),
+      });
+      // Current schema is an assertion boundary, not permission to replay
+      // historical installers, move a ledger or reconstruct missing proof.
+      return hasPendingSecurityScrub(database);
+    }
+    const cohort = classifyStateSchemaCohort(database, initialVersion);
+    if (database.query(`SELECT 1 FROM sqlite_master WHERE
+      name GLOB '*effect_evidence_provenance*' OR name GLOB 'session_switch_execution_*'
+      OR name GLOB 'joined_evidence_*' OR name GLOB 'retired_provider_*'
+      OR name GLOB 'provider_login_binding_*' LIMIT 1`).get() !== null) {
+      throw new Error("STATE_SCHEMA_JOIN_PREDECESSOR_COLLISION");
+    }
+    if (initialVersion < 50) assertLegacyCanonicalProfileStorageAbsent(database);
+    else {
+      assertSchemaVersion50Authority(database);
+      assertLegacyCanonicalProfileRows(database);
+    }
+    if (cohort !== "private48" && cohort !== "combined49") {
+    if (initialVersion < 44 && database.query(
+      "SELECT 1 FROM sqlite_master WHERE name LIKE '%autorespond_budget%' LIMIT 1",
+    ).get() !== null) {
+      throw new Error("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_PREDECESSOR_COLLISION");
+    }
+    if (initialVersion < 46 && database.query(
+      "SELECT 1 FROM sqlite_master WHERE name LIKE '%autorespond_after_hours%' LIMIT 1",
+    ).get() !== null) {
+      throw new Error("STATE_SCHEMA_V46_AUTORESPOND_AFTER_HOURS_PREDECESSOR_COLLISION");
+    }
+    if (initialVersion === 49) {
+      assertSchemaVersion49Authority(database);
+    } else if (initialVersion === 47 || initialVersion === 48) {
+      assertSchemaVersionMemoryAuthority(database, initialVersion);
+    } else if (initialVersion === 46) {
+      assertSchemaVersion46Authority(database);
+    } else if (initialVersion === 45) {
+      assertSchemaVersion45Authority(database);
+    } else if (initialVersion === 44) {
+      assertSchemaVersion43Authority(database);
+      assertSchemaVersion44Authority(database);
+    } else if (initialVersion === 43) {
+      // Pre-release v43 shipped briefly without the queue-cancellation trigger.
+      // Prove every other v43 authority object and reject a colliding object
+      // before the transactional, row-aware repair below is allowed to run.
+      assertSchemaVersion43BaseAuthority(database, true);
+      schemaVersion43QueueCancellationSettlementState(database);
+    }
+    else if (initialVersion === 42) assertSchemaVersion42Authority(database);
+    else if (initialVersion === 41) assertSchemaVersion41Authority(database);
+    else if (initialVersion === 40) assertSchemaVersion40Authority(database);
+    if (
+      initialVersion < 41
+      && database.query("SELECT 1 FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'").get() !== null
+    ) {
+      throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
+    }
+    if (initialVersion >= 42) {
+      // A current-version stamp is an assertion boundary, not permission to
+      // reconstruct authority. Prove every provider/adoption execution guard
+      // before the idempotent maintenance tail can touch any schema object.
+      assertCanonicalLabelKeys(database);
+      assertSchemaVersion35Objects(database);
+      assertSchemaVersion38PresetContracts(database);
+      assertSchemaVersion39ProviderAuthority(database);
+      assertSchemaVersion40AdoptionObjects(database);
+      assertExactSchemaVersion40AdoptionSurface(database, "canonical");
+      if (initialVersion >= 49) {
+        assertLegacyVersion42WorkSchema(database);
+        assertWorkProjectAuthoritySchema(database);
+      }
+      else assertLegacyVersion42WorkSchema(database);
+      assertSessionTaskSchema(database);
+      assertCompositeNotificationPolicy(database);
+    }
+    if (initialVersion === 40 || initialVersion === 41) {
+      // Timestamp v41 retains the released adoption-v40 contract-2 Work guards.
+      // Prove that exact surface before replacing only the reviewed Work guards.
+      assertCanonicalLabelKeys(database);
+      assertSchemaVersion39ProviderAuthority(database);
+      assertSchemaVersion40AdoptionObjects(database);
+      assertExactSchemaVersion40AdoptionSurface(database, "canonical");
+      assertProviderVersion40WorkSchema(database);
+      assertSessionTaskSchema(database);
+    }
+    }
+    // Both pre-release adoption and notification builds used version 36. Freeze
+    // their identity before any additive pre-application can blur the evidence.
+    const exactLegacyFeatureVersion36 = isExactLegacyFeatureVersion36(
+      database,
+      initialVersion,
+    );
+    // Adoption became canonical at v40. Later migrations must not feed that
+    // released surface back through the pre-v40 footprint classifier.
+    const legacySessionAdoption = initialVersion < 40
+      ? classifyLegacySessionAdoptionSchema(database, initialVersion)
+      : "absent";
+    if (initialVersion === 39 && legacySessionAdoption === "absent") {
+      // Provider v39 was the protected-main predecessor to adoption v40. Prove
+      // that complete released surface before any schema or row mutation; a
+      // same-version lookalike must not gain adoption authority through repair.
+      assertLegacyAdoptionMigrationTail(database, 39);
+      assertSchemaVersion35Objects(database);
+      assertCompositeNotificationPolicy(database);
+      assertSchemaVersion38PresetContracts(database);
+      assertSchemaVersion39ProviderAuthority(database);
+      assertProviderVersion39WorkSchema(database);
+      assertSessionTaskSchema(database);
+    }
+    if (cohort === "private48" || cohort === "combined49" || initialVersion < 49) {
+      assertSchemaVersion49ProjectPredecessor(database);
+      // These predecessors already have the complete Work/session parents.
+      if (initialVersion >= 40) database.exec(WORK_PROJECT_AUTHORITY_SCHEMA_SQL);
+    }
+    const retainedUsage = cohort === "private48" || cohort === "combined49";
+    if (retainedUsage) relocateUsageMigrationLedger(database, cohort);
+    if (retainedUsage) applyRetainedUsageCanonicalProfiles(database);
+    else if (initialVersion >= 40 && initialVersion < 50) applySchemaVersion50CanonicalProfiles(database);
+    const evidenceFormat = incomingEffectEvidenceFormat(cohort, initialVersion);
+    if (initialVersion >= 7) applyEffectEvidenceProvenance(database, evidenceFormat);
+    if (cohort === "combined49") {
+      // This admitted cohort already owns the independent adoption capsule.
+      // Restore a provably malformed prepared locator before canonical Work's
+      // complete foreign-key audit; do not weaken that audit or infer a capsule.
+      repairMalformedSessionSwitchJournalsBeforeIntegrity(database, now);
+      readProvedMalformedSessionSwitchJournalSequences(database, "historical_install");
+    }
+    let redacted = false;
+    let version = cohort === "private48" ? 39 : cohort === "combined49" ? 40 : initialVersion;
     // v9-v12 databases may have committed URL-bearing MCP records or their
     // superseded bytes without retaining evidence that WAL truncation finished.
     // Materializing the v13 authority inside this transaction makes the byte
@@ -12645,7 +19363,9 @@ const migrateWritableDatabase = (
     // require those relations and the profile proof column to exist first.
     // This pre-application creates no authority rows or guards; v40 remains
     // responsible for backfill, quarantine, and the canonical trigger set.
-    if (version < 40) ensureSchemaVersion40WorkAuthorityDependencies(database);
+    if (version < 40) {
+      ensureSchemaVersion40WorkAuthorityDependencies(database);
+    }
 
     if (version < 2) {
       // Early development builds accidentally stamped this column as schema v1.
@@ -12730,6 +19450,7 @@ const migrateWritableDatabase = (
     }
 
     if (version < 8) {
+      if (initialVersion < 7) applyEffectEvidenceProvenance(database, evidenceFormat);
       database.exec(schemaVersion8);
       const migratedAt = now();
       backfillExactTurnRuntimeProfiles(database, migratedAt);
@@ -12940,11 +19661,7 @@ const migrateWritableDatabase = (
       // The same transaction records the complete provider-v39 migration
       // below after all earlier ordered migrations have been applied.
       ensureSchemaVersion39SessionProviderColumn(database);
-      database.exec(WORK_SCHEMA_SQL);
-      // Current Work authority triggers depend on the provider-scoped tables
-      // and profile proof added by v39. The whole migration is one transaction,
-      // so validate the complete Work surface after those objects are present
-      // rather than rejecting this temporary v26 waypoint.
+      installCanonicalVersion40WorkSchema(database);
       database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(26, now());
       database.exec("PRAGMA user_version = 26");
       version = 26;
@@ -13012,6 +19729,13 @@ const migrateWritableDatabase = (
 
     if (version < 31) {
       if (!hasTableColumn(database, "autorespond_evidence", "path")) {
+        // A pre-release/current-version object may already contain a trigger
+        // that references the additive message-source table while its schema
+        // stamp and autorespond table have been restored to v30. Recreate the
+        // additive v31 objects before SQLite reparses every trigger during the
+        // table rename; the surrounding migration transaction still rolls the
+        // repair back if the rebuild cannot complete.
+        database.exec(schemaVersion31Objects);
         applySchemaVersion31(database);
       }
       if (!hasTableColumn(database, "autorespond_evidence", "path")) {
@@ -13110,6 +19834,10 @@ const migrateWritableDatabase = (
 
     if (version < 40) {
       const migratedAt = unixMillisecondsSchema.parse(now());
+      // Adoption quarantine constructs WorkStore before the final waypoint.
+      // Preapply only this transaction-owned v49 companion; the frozen Work
+      // replay below cannot remove it, and no intermediate ledger commits.
+      if (initialVersion < 40) database.exec(WORK_PROJECT_AUTHORITY_SCHEMA_SQL);
       applySchemaVersion40SessionAdoption(database);
       database.query(
         "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
@@ -13117,96 +19845,128 @@ const migrateWritableDatabase = (
       database.exec("PRAGMA user_version = 40");
       version = 40;
     }
+
     if (version < 41) {
-      applySchemaVersion40ProviderAccounts(database);
-      const migratedAt = unixMillisecondsSchema.parse(now());
-      backfillSchemaVersion40ProviderAccounts(database, migratedAt);
-      backfillLegacyWorkSignalProviderAuthorities(database, migratedAt);
-      database.exec(WORK_SCHEMA_SQL);
-      assertWorkSchema(database);
-      assertWorkSignalProviderAuthorities(database);
-      assertProviderAccountAuthority(database);
-      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(41, migratedAt);
-      database.exec("PRAGMA user_version = 40");
+      // v40 remains an immutable predecessor. This migration adds one guard;
+      // a colliding same-name object is not silently replaced or trusted.
+      database.exec(timestampMutationResolutionGuard);
+      assertSchemaVersion41TimestampProof(database);
+      database.query("INSERT INTO migrations(version, applied_at) VALUES (?, ?)").run(41, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version = 41");
       version = 41;
     }
+
     if (version < 42) {
-      applySchemaVersion41ProviderUsage(database);
       const migratedAt = unixMillisecondsSchema.parse(now());
-      retireMigratedOrphanCodexUsageAuthorities(database, migratedAt);
-      assertProviderAccountAuthority(database);
-      assertSchemaVersion41ProviderUsage(database);
-      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(42, migratedAt);
-      database.exec("PRAGMA user_version = 41");
+      installCanonicalVersion42WorkSchema(database);
+      database.query(
+        "INSERT INTO migrations(version, applied_at) VALUES (?, ?)",
+      ).run(42, migratedAt);
+      database.exec("PRAGMA user_version = 42");
       version = 42;
     }
+
     if (version < 43) {
-      applySchemaVersion42SessionSwitch(database);
       const migratedAt = unixMillisecondsSchema.parse(now());
-      repairMalformedSessionSwitchJournalsBeforeIntegrity(database, now);
-      assertSchemaVersion42SessionSwitch(database);
-      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(43, migratedAt);
-      database.exec("PRAGMA user_version = 42");
+      if (!hasTableColumn(database, "mutation_attempts", "transcript_finalized")) {
+        database.exec(schemaVersion43MutationTranscriptFinalizedColumn);
+      }
+      if (!hasTableColumn(database, "queue_entries", "transcript_finalized")) {
+        database.exec(schemaVersion43QueueTranscriptFinalizedColumn);
+      }
+      if (!hasTableColumn(database, "mutation_attempts", "transcript_status")) {
+        database.exec(schemaVersion43MutationTranscriptStatusColumn);
+      }
+      if (!hasTableColumn(database, "queue_entries", "transcript_status")) {
+        database.exec(schemaVersion43QueueTranscriptStatusColumn);
+      }
+      if (!hasTableColumn(database, "mutation_attempts", "transcript_intent_json")) {
+        database.exec(schemaVersion43MutationTranscriptIntentColumn);
+      }
+      if (!hasTableColumn(database, "queue_entries", "transcript_intent_json")) {
+        database.exec(schemaVersion43QueueTranscriptIntentColumn);
+      }
+      if (!retainedUsage) installSchemaVersion43SessionEventsAccountAuthorityGuard(database);
+      removeExactSchemaVersion43FinalizationGuardsForMigration(database);
+      backfillSessionUserMessageFinalizations(database, retainedUsage ? "retained_usage" : "canonical");
+      database.exec(schemaVersion43SessionUserMessageFinalizationGuards);
+      installSchemaVersion43QueueCancellationSettlement(database);
+      if (retainedUsage) assertSessionUserMessageFinalizationCore(database);
+      else assertSchemaVersion43SessionUserMessageFinalizations(database);
+      assertSchemaVersion43QueueCancellationSettlement(database);
+      database.query(
+        "INSERT INTO migrations(version, applied_at) VALUES (?, ?)",
+      ).run(43, migratedAt);
+      database.exec("PRAGMA user_version = 43");
       version = 43;
     }
+
     if (version < 44) {
       const migratedAt = unixMillisecondsSchema.parse(now());
-      applySchemaVersion43AutomaticUsagePolicy(database, migratedAt);
-      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(44, migratedAt);
-      database.exec("PRAGMA user_version = 43");
+      migrateSchemaVersion44AutorespondEvidence(database);
+      database.exec(schemaVersion44AutorespondBudget);
+      assertSchemaVersion44AutorespondObjects(database);
+      // A retained display audit cannot establish how many older successes
+      // were evicted. Existing sessions wait one complete budget window;
+      // sessions inserted after this migration receive available_at=0.
+      // Predecessor success could commit before its separate counter bump.
+      // The consecutive horizon is unbounded, so only a human message can
+      // clear this once-only conservative floor, even after the day expires.
+      database.query(
+        `INSERT INTO session_autorespond_counters(session_id,consecutive_count,updated_at)
+         SELECT id,?,? FROM sessions s WHERE NOT EXISTS (
+           SELECT 1 FROM autorespond_budget_history h WHERE h.session_id=s.id
+         )
+         ON CONFLICT(session_id) DO UPDATE SET
+           consecutive_count=MAX(consecutive_count,excluded.consecutive_count),
+           updated_at=MAX(updated_at,excluded.updated_at)`,
+      ).run(AUTORESPOND_CONSECUTIVE_LIMIT, migratedAt);
+      database.query(
+        `INSERT OR IGNORE INTO autorespond_budget_history(session_id,available_at)
+         SELECT id,? FROM sessions`,
+      ).run(unixMillisecondsSchema.parse(migratedAt + AUTORESPOND_DAY_MS));
+      database.query("INSERT INTO migrations(version,applied_at) VALUES (?,?)").run(44, migratedAt);
+      database.exec("PRAGMA user_version = 44");
       version = 44;
     }
+
     if (version < 45) {
-      for (const object of schemaVersion44DevinCloseObjects) database.exec(object.sql);
-      auditDevinJoinedCloses(database);
-      database.query("INSERT INTO migrations(version,applied_at) VALUES(45,?)").run(now());
-      database.exec("PRAGMA user_version=44");
+      database.exec(schemaVersion45AccountMutationAuthority);
+      assertSchemaVersion45AccountMutationAuthority(database);
+      database.query("INSERT INTO migrations(version, applied_at) VALUES (?, ?)")
+        .run(45, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version = 45");
       version = 45;
     }
+
     if (version < 46) {
-      applySessionSendOwnerSchema(database);
-      auditSessionSendOwners(database);
-      database.query("INSERT INTO migrations(version,applied_at) VALUES(46,?)").run(now());
-      database.exec("PRAGMA user_version=45");
+      assertAutorespondBudgetHistoryCoverage(database);
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      database.exec(schemaVersion46AutorespondAfterHours);
+      database.query(`INSERT INTO autorespond_after_hours_policy(
+        singleton,kind,version,revision,enabled,created_at,updated_at
+      ) VALUES (1,'autorespond_after_hours',1,1,0,?,?)`).run(migratedAt, migratedAt);
+      database.query(`INSERT INTO autorespond_after_hours_history(session_id,human_reset_required)
+        SELECT session_id,CASE WHEN available_at>0 THEN 1 ELSE 0 END
+        FROM autorespond_budget_history`).run();
+      assertSchemaVersion46AutorespondAfterHours(database);
+      database.query("INSERT INTO migrations(version,applied_at) VALUES (?,?)").run(46, migratedAt);
+      database.exec("PRAGMA user_version = 46");
       version = 46;
     }
+
     if (version < 47) {
-      applyAutomaticPointerMoveSchema(database);
-      auditAutomaticPointerMoves(database);
-      database.query("INSERT INTO migrations(version,applied_at) VALUES(47,?)").run(now());
-      database.exec("PRAGMA user_version = 46");
+      applySchemaVersion47PeerSessions(database);
+      database.query("INSERT INTO migrations(version, applied_at) VALUES (?, ?)").run(47, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version = 47");
       version = 47;
     }
-    if (version < 48) {
-      applyQueueAttachmentSchema(database);
-      auditQueueAttachmentIdentities(database);
-      database.query(`INSERT INTO queue_attachment_quarantines(queue_id,ordinal,session_id,kind,reason,recorded_at)
-        SELECT id,1,session_id,'quarantined','legacy_identity_unproved',? FROM queue_entries WHERE state='pending' AND enqueue_identity_format IS NULL
-        ON CONFLICT(queue_id,ordinal) DO NOTHING`).run(now());
-      database.query(`UPDATE sessions SET state='recovery_required',revision=revision+1,updated_at=MAX(updated_at,?)
-        WHERE state NOT IN ('terminal','recovery_required') AND EXISTS(SELECT 1 FROM queue_attachment_quarantines quarantine WHERE quarantine.session_id=sessions.id)`)
-        .run(now());
-      database.query("INSERT INTO migrations(version,applied_at) VALUES(48,?)").run(now());
-      database.exec("PRAGMA user_version=47");
-      version = 48;
-    }
-    if (version < 49) {
-      // Partial v48 artifacts are not a legacy empty database. Never recreate
-      // missing custody evidence from a retained marker or child table.
-      if (hasAttachmentCustodyArtifacts(database)) {
-        throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_CORRUPT");
-      }
-      applyAttachmentCustodySchema(database);
-      reconcileAttachmentTerminals(database, now());
-      auditAttachmentCustody(database);
-      database.query("INSERT INTO migrations(version,applied_at) VALUES(49,?)").run(now());
-      database.exec("PRAGMA user_version=48");
-      version = 49;
-    }
 
-    if (cohort !== "combined49") {
-      applyClaudeProcessCustody(database);
-      applySessionSwitchAdoption(database);
+    if (version < 48) {
+      applySchemaVersion48CanonicalMemorySync(database);
+      database.query("INSERT INTO migrations(version, applied_at) VALUES (?, ?)").run(48, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version = 48");
+      version = 48;
     }
 
     // Reapplying additive objects and idempotent authority backfills makes a
@@ -13237,34 +19997,179 @@ const migrateWritableDatabase = (
     assertSchemaVersion24Objects(database);
     ensureSessionEventProjectionVersion(database);
     applySchemaVersion38PresetContracts(database);
-    if (initialVersion < currentSchemaVersion) applySchemaVersion39ProviderAuthority(database);
-    if (initialVersion < currentSchemaVersion) database.exec(WORK_SCHEMA_SQL);
+    if (initialVersion < 40) applySchemaVersion39ProviderAuthority(database);
     assertSchemaVersion38PresetContracts(database);
     assertSchemaVersion39ProviderAuthority(database);
     database.exec(schemaVersion27);
     ensureUsagePollFailureAccountFingerprint(database);
     database.exec(schemaVersion28);
     assertAccountRateLimitResetPolicies(database);
-    database.exec(SESSION_TASK_SCHEMA_SQL);
-    assertSessionTaskSchema(database);
     database.exec(schemaVersion30);
     database.exec(schemaVersion31Objects);
     applySchemaVersion31Archive(database);
     applySchemaVersion33DeviceCommands(database);
     applySchemaVersion34Attachments(database);
+    upgradeSchemaVersion43QueueTranscriptAuthorityGuard(database);
+    // Private queue/attachment inputs are sealed. Canonical presentation repair
+    // cannot rewrite their names or any request/intent/digest preimage.
+    if (!retainedUsage) normalizeSchemaVersion43LegacyAttachmentNames(database);
+    repairSchemaVersion43CancelledQueueSettlements(
+      database,
+      unixMillisecondsSchema.parse(now()),
+    );
+    installSchemaVersion43QueueCancellationSettlement(database);
     applySchemaVersion35ProviderSwitchProgress(database);
     assertSchemaVersion35Objects(database);
     database.exec(schemaVersion36NotificationHours);
     database.exec(schemaVersion37AttentionEmailPolicy);
     assertCompositeNotificationPolicy(database);
-    applySchemaVersion40ProviderAccounts(database);
-    applySchemaVersion41ProviderUsage(database);
-    applySchemaVersion42SessionSwitch(database);
-    repairMalformedSessionSwitchJournalsBeforeIntegrity(database, now);
+    assertSchemaVersion40AdoptionObjects(database, { useExactProviderProcessCustody: cohort === "combined49" });
+    assertSchemaVersion46AutorespondAfterHours(database);
+    // Frozen Work42 has been installed for every predecessor here. Only the
+    // retained combined49 cohort already owns the separate custody footprint.
+    assertExactSchemaVersion40AdoptionSurface(database,
+      cohort === "combined49" ? "canonical_with_custody" : "canonical");
+    applySchemaVersion47PeerSessions(database);
+    applySchemaVersion48CanonicalMemorySync(database);
+    if (version < 49) {
+      if (retainedUsage) assertJoinedCanonicalObjects(database);
+      else assertSchemaVersionMemoryAuthority(database, 48);
+      assertWorkProjectAuthoritySchema(database);
+      database.query("INSERT INTO migrations(version,applied_at) VALUES (?,?)")
+        .run(49, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version=49");
+      version = 49;
+    }
+    if (version < 50) {
+      if (retainedUsage) {
+        assertJoinedCanonicalObjects(database);
+        assertSchemaMigrationLedgerTail(database,
+          [...Array.from({ length: 10 }, (_, index) => index + 40),
+            ...Array.from({ length: 9 }, (_, index) => index + 51)],
+          "STATE_SCHEMA_JOIN_CANONICAL_WAYPOINT_INVALID");
+      } else assertSchemaVersion49Authority(database);
+      assertLegacyCanonicalProfileStorageSchema(database);
+      assertLegacyCanonicalProfileRows(database);
+      database.query("INSERT INTO migrations(version,applied_at) VALUES (?,?)")
+        .run(50, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version=50");
+      version = 50;
+    }
+    if (retainedUsage) {
+      assertSchemaMigrationLedgerTail(database,
+        Array.from({ length: 20 }, (_, index) => index + 40),
+        "STATE_SCHEMA_JOIN_CANONICAL_WAYPOINT_INVALID");
+      version = 59;
+    } else assertSchemaVersion50Authority(database);
+
+    // Usage successor waypoints are inserted here only after the complete
+    // canonical contract. Retained usage cohorts skip their original installers.
+    if (version < 51) {
+      applySchemaVersion40ProviderAccounts(database);
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      backfillSchemaVersion40ProviderAccounts(database, migratedAt, evidenceFormat);
+      backfillLegacyWorkSignalProviderAuthorities(database, migratedAt);
+      database.exec(WORK_SCHEMA_SQL);
+      assertWorkSchema(database);
+      assertWorkSignalProviderAuthorities(database);
+      assertProviderAccountAuthority(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(51, migratedAt);
+      database.exec("PRAGMA user_version=51");
+      version = 51;
+    }
+    if (version < 52) {
+      applySchemaVersion41ProviderUsage(database);
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      retireMigratedOrphanCodexUsageAuthorities(database, migratedAt);
+      assertProviderAccountAuthority(database);
+      assertSchemaVersion41ProviderUsage(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(52, migratedAt);
+      database.exec("PRAGMA user_version=52");
+      version = 52;
+    }
+    if (version < 53) {
+      applySchemaVersion42SessionSwitch(database);
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      repairMalformedSessionSwitchJournalsBeforeIntegrity(database, now);
+      assertSchemaVersion42SessionSwitch(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(53, migratedAt);
+      database.exec("PRAGMA user_version=53");
+      version = 53;
+    }
+    if (version < 54) {
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      applySchemaVersion43AutomaticUsagePolicy(database, migratedAt);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(54, migratedAt);
+      database.exec("PRAGMA user_version=54");
+      version = 54;
+    }
+    if (version < 55) {
+      for (const object of schemaVersion44DevinCloseObjects) database.exec(object.sql);
+      auditDevinJoinedCloses(database);
+      database.query("INSERT INTO migrations(version,applied_at) VALUES(55,?)").run(now());
+      database.exec("PRAGMA user_version=55");
+      version = 55;
+    }
+    if (version < 56) {
+      applySessionSendOwnerSchema(database);
+      auditSessionSendOwners(database);
+      database.query("INSERT INTO migrations(version,applied_at) VALUES(56,?)").run(now());
+      database.exec("PRAGMA user_version=56");
+      version = 56;
+    }
+    if (version < 57) {
+      applyAutomaticPointerMoveSchema(database);
+      auditAutomaticPointerMoves(database);
+      database.query("INSERT INTO migrations(version,applied_at) VALUES(57,?)").run(now());
+      database.exec("PRAGMA user_version=57");
+      version = 57;
+    }
+    if (version < 58) {
+      applyQueueAttachmentSchema(database);
+      auditQueueAttachmentIdentities(database);
+      database.query(`INSERT INTO queue_attachment_quarantines(queue_id,ordinal,session_id,kind,reason,recorded_at)
+        SELECT id,1,session_id,'quarantined','legacy_identity_unproved',? FROM queue_entries WHERE state='pending' AND enqueue_identity_format IS NULL
+        ON CONFLICT(queue_id,ordinal) DO NOTHING`).run(now());
+      database.query(`UPDATE sessions SET state='recovery_required',revision=revision+1,updated_at=MAX(updated_at,?)
+        WHERE state NOT IN ('terminal','recovery_required') AND EXISTS(SELECT 1 FROM queue_attachment_quarantines quarantine WHERE quarantine.session_id=sessions.id)`)
+        .run(now());
+      database.query("INSERT INTO migrations(version,applied_at) VALUES(58,?)").run(now());
+      database.exec("PRAGMA user_version=58");
+      version = 58;
+    }
+    if (version < 59) {
+      // Partial v48 artifacts are not a legacy empty database. Never recreate
+      // missing custody evidence from a retained marker or child table.
+      if (hasAttachmentCustodyArtifacts(database)) {
+        throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_CORRUPT");
+      }
+      applyAttachmentCustodySchema(database);
+      reconcileAttachmentTerminals(database, now(), { kind: "historical", format: evidenceFormat });
+      auditAttachmentCustody(database, { kind: "historical", format: evidenceFormat });
+      database.query("INSERT INTO migrations(version,applied_at) VALUES(59,?)").run(now());
+      database.exec("PRAGMA user_version=59");
+      version = 59;
+    }
+
+    if (cohort !== "combined49") {
+      applyClaudeProcessCustody(database);
+      applySessionSwitchAdoption(database);
+    }
+    database.exec(WORK_SCHEMA_SQL);
+    database.exec(SESSION_TASK_SCHEMA_SQL);
     applyCombinedAdoptionGuards(database);
-    assertSchemaVersion40AdoptionObjects(database, { useExactProviderProcessCustody: true });
-    assertExactSchemaVersion40AdoptionSurface(database);
-    assertWorkSchema(database);
+    repairMalformedSessionSwitchJournalsBeforeIntegrity(database, now);
+    const executionContextExclusions = {
+      excludedMalformedJournalSequences: readProvedMalformedSessionSwitchJournalSequences(database, "historical_install"),
+    };
+    applySessionSwitchExecutionContexts(database, executionContextExclusions);
+    applyJoinedSessionSwitchSessionUpdateGuard(database);
+    applyJoinedEvidenceGuards(database);
+    applyJoinedQueueTranscriptGuard(database, schemaVersion43FinalizationTriggerSql("queue_transcript_finalization_guard"));
+    applyJoinedAttachmentTerminalGuard(database);
+    applyProviderLoginBindingTransitions(database);
+    applyPeerSessionCancellationSchema(database, peerSessionCancellationPredecessor());
+    applyRetiredProviderAdmissionGuards(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -13274,7 +20179,7 @@ const migrateWritableDatabase = (
     assertWorkSignalProviderAuthorities(database);
     assertProviderAccountAuthority(database);
     assertSchemaVersion41ProviderUsage(database);
-    assertSchemaVersion42SessionSwitch(database);
+    assertSchemaVersion42SessionSwitch(database, "joined");
     auditAutomaticUsagePolicyHistory(database);
     auditDevinJoinedCloses(database);
     auditSessionSendOwners(database);
@@ -13286,8 +20191,13 @@ const migrateWritableDatabase = (
     auditClaudeProcessCustody(database);
     auditSessionSwitchAdoption(database);
     assertExactSchemaVersion40AdoptionSurface(database);
-    if (cohort === "private48") relocatePrivateTaskMigrationTail(database, now());
-    database.exec("PRAGMA user_version=49");
+    auditEffectEvidenceProvenance(database);
+    auditSessionSwitchExecutionContexts(database, executionContextExclusions);
+    auditProviderLoginBindingTransitions(database);
+    database.query("INSERT INTO migrations(version,applied_at) VALUES (?,?)")
+      .run(60, unixMillisecondsSchema.parse(now()));
+    database.exec("PRAGMA user_version=60");
+    assertJoinedStateSchema(database);
     return hasPendingSecurityScrub(database);
   }).immediate();
   if (securityScrubPending) completePendingSecurityScrub(database, false, securityScrubCheckpoint);
@@ -13354,8 +20264,22 @@ const mapProject = (row: unknown): ProjectRecord => {
 const legacySessionProviderShadow = (provider: Provider): "codex" | "claude" =>
   provider === "claude" ? "claude" : "codex";
 
-const mapSession = (row: unknown): SessionRecord => {
+const requireCanonicalSessionProfileKey = (provider: unknown, tier: unknown, contract: unknown) => {
+  const key = deriveLegacySessionProfileKey(provider, tier, contract);
+  if (key === null) throw new Error("SESSION_CANONICAL_PROFILE_CORRUPT");
+  return key;
+};
+
+const parseCanonicalSessionRow = (row: unknown): z.infer<typeof sessionRowSchema> => {
   const parsed = sessionRowSchema.parse(row);
+  if (parsed.canonical_profile_key !== requireCanonicalSessionProfileKey(
+    parsed.provider_v39, parsed.preset, parsed.preset_contract,
+  )) throw new Error("SESSION_CANONICAL_PROFILE_CORRUPT");
+  return parsed;
+};
+
+const mapSession = (row: unknown): SessionRecord => {
+  const parsed = parseCanonicalSessionRow(row);
   if (parsed.provider !== legacySessionProviderShadow(parsed.provider_v39)) {
     throw new Error("SESSION_PROVIDER_COMPATIBILITY_SHADOW_MISMATCH");
   }
@@ -13593,11 +20517,11 @@ const presetContractForLegacySwitchRuntimeProfile = (
   profile: ReviewedRuntimeProfile,
   preset: Preset,
 ): z.infer<typeof presetContractSchema> => {
-  const contract2 = presetRequirementForContract(preset, 2);
+  const contract2 = presetRequirementForContractV1(preset, 2);
   if (profile.model === contract2.model && profile.reasoningEffort === contract2.effort) {
     return 2;
   }
-  const contract1 = presetRequirementForContract(preset, 1);
+  const contract1 = presetRequirementForContractV1(preset, 1);
   if (
     profile.model === contract1.model
     && profile.reasoningEffort === contract1.effort
@@ -13657,7 +20581,7 @@ const interactionRowSchema = z.object({
 
 const mapInteraction = (
   row: unknown,
-  providerAuthority: ProviderAccountAuthority | null = null,
+  providerAuthority: ProviderAccountAuthority,
 ): InteractionRecord => {
   const parsed = interactionRowSchema.parse(row);
   const requestId = parsed.request_id_type === "number"
@@ -13674,11 +20598,9 @@ const mapInteraction = (
     authority: {
       profileId: parsed.profile_id,
       processGeneration: parsed.process_generation,
-      ...(providerAuthority === null ? {} : {
-        provider: providerAuthority.provider,
-        providerAccountId: providerAuthority.providerAccountId,
-        bindingGeneration: providerAuthority.bindingGeneration,
-      }),
+      provider: providerAuthority.provider,
+      providerAccountId: providerAuthority.providerAccountId,
+      bindingGeneration: providerAuthority.bindingGeneration,
       connectionId: parsed.connection_id,
       requestId,
       method: parsed.method,
@@ -13707,17 +20629,35 @@ const storedSessionEventEnvelopeSchema = z.object({
   body: z.unknown(),
 }).passthrough();
 
+/**
+ * Earlier event projections admitted Unicode format and separator scalars in
+ * attachment display names. Keep the immutable stored event intact, but
+ * replace exactly that historical policy delta before the current public
+ * schema is applied. Other malformed names still fail closed.
+ */
+const projectLegacyStoredAttachmentNames = (value: unknown): unknown => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const body = value as Readonly<Record<string, unknown>>;
+  if (body.type !== "user_message" || !Array.isArray(body.attachments)) return value;
+  const predecessor = legacyAttachmentReferenceListSchema.safeParse(body.attachments);
+  if (!predecessor.success) return value;
+  const attachments = projectLegacyAttachmentReferences(predecessor.data);
+  if (attachments === null) return value;
+  return { ...body, attachments };
+};
+
 const parseStoredSessionEvent = (
   value: string,
   projectionVersion: 1 | 2,
   projector: PublicProviderIdentifierProjector,
 ): SessionEvent => {
   const stored = storedSessionEventEnvelopeSchema.parse(JSON.parse(value) as unknown);
+  const projectedBody = projectionVersion === 2
+    ? stored.body
+    : projectPublicSessionEventBody(stored.body, projector);
   return sessionEventSchema.parse({
     ...stored,
-    body: projectionVersion === 2
-      ? stored.body
-      : projectPublicSessionEventBody(stored.body, projector),
+    body: projectLegacyStoredAttachmentNames(projectedBody),
   });
 };
 
@@ -15092,11 +22032,23 @@ const assertSessionSwitchSeedAuthorityLineage = (
   ) throw new Error("SESSION_SWITCH_SEED_AUTHORITY_LINEAGE_MISMATCH");
 };
 
-const mapSessionSwitch = (database: Database, value: unknown): SessionSwitchRecord => {
+const mapSessionSwitch = (
+  database: Database,
+  value: unknown,
+  format: "joined" | "historical_v1" = "joined",
+): SessionSwitchRecord => {
   const row = sessionSwitchRowSchema.parse(value);
-  const rawRequest = sessionSwitchRawRequestSchema.parse(
+  const rawRequest: SessionSwitchRawRequest = (format === "historical_v1"
+    ? sessionSwitchRawRequestV1Schema : sessionSwitchRawRequestSchema).parse(
     JSON.parse(row.raw_request_json) as unknown,
   );
+  const executionContext = format === "historical_v1" ? null
+    : readSessionSwitchExecutionContext(database, row.attempt_id);
+  const targetPresetContract = executionContext === null
+    ? row.target_preset_contract : executionContext.targetPresetContract;
+  if (format === "historical_v1" && row.renderer_version !== 1) {
+    throw new Error("SESSION_SWITCH_EXECUTION_CONTEXT_CORRUPT");
+  }
   if (
     JSON.stringify(rawRequest) !== row.raw_request_json
     || digestJson(rawRequest) !== row.request_digest
@@ -15208,7 +22160,7 @@ const mapSessionSwitch = (database: Database, value: unknown): SessionSwitchReco
   assertRuntimeProfileRequirement(
     sourceRuntimeProfile,
     row.source_preset,
-    presetRequirementForContract(row.source_preset, row.source_preset_contract),
+    presetRequirementForContractV1(row.source_preset, row.source_preset_contract),
     "SESSION_SWITCH_SOURCE_PRESET_CONTRACT_MISMATCH",
   );
   const sourceRuntimeAuthority = providerAccountAuthoritySchema.parse({
@@ -15261,7 +22213,7 @@ const mapSessionSwitch = (database: Database, value: unknown): SessionSwitchReco
       sourcePreset: row.source_preset,
       targetPreset: row.target_preset,
       sourcePresetContract: row.source_preset_contract,
-      targetPresetContract: row.target_preset_contract,
+      targetPresetContract,
       sourceRuntimeProfileRevision: row.source_runtime_profile_revision,
       sourceRuntimeProfileDigest: row.source_runtime_profile_digest,
       sourceRuntimeProfileSourceKind: z.enum(runtimeProfileSourceKindSchema.options)
@@ -15308,7 +22260,7 @@ const mapSessionSwitch = (database: Database, value: unknown): SessionSwitchReco
     assertRuntimeProfileRequirement(
       runtimeProfile,
       row.target_preset,
-      presetRequirementForContract(row.target_preset, row.target_preset_contract),
+      presetRequirementForContractV1(row.target_preset, targetPresetContract),
       "SESSION_SWITCH_TARGET_PRESET_CONTRACT_MISMATCH",
     );
     targetStart = {
@@ -15788,7 +22740,9 @@ const mapSessionSwitch = (database: Database, value: unknown): SessionSwitchReco
     sourcePreset: row.source_preset,
     targetPreset: row.target_preset,
     sourcePresetContract: row.source_preset_contract,
-    targetPresetContract: row.target_preset_contract,
+    targetPresetContract,
+    ...(executionContext?.requestFormat === 2
+      ? { targetHostCapabilities: executionContext.targetHostCapabilities } : {}),
     sourceRuntimeProfileRevision: row.source_runtime_profile_revision,
     sourceRuntimeProfileDigest: row.source_runtime_profile_digest,
     sourceRuntimeProfileSourceKind: z.enum(runtimeProfileSourceKindSchema.options)
@@ -15954,6 +22908,7 @@ const parseSessionProviderSwitchReceipt = (
     || receipt.providerThreadId !== targetProviderThreadId
     || receipt.request.accountId !== evidence.requestedAccountId
     || receipt.request.preset !== evidence.requestedPreset
+    || receipt.request.presetContract !== evidence.presetContract
     || receipt.request.provider !== evidence.targetProvider
     || receipt.from.account !== evidence.sourceProfileId
     || receipt.from.preset !== evidence.sourcePreset
@@ -15965,11 +22920,15 @@ const parseSessionProviderSwitchReceipt = (
     || receipt.seed.digest !== evidence.seedDigest
     || receipt.seed.includedRecords !== evidence.seedIncludedRecords
     || receipt.seed.omittedRecords !== evidence.seedOmittedRecords
+    || receipt.seed.retentionGapReason !== evidence.seedRetentionGapReason
     || receipt.seed.status !== seedTurnStatus
     || receipt.turnId !== seedTurnId
   ) throw new Error("SESSION_PROVIDER_SWITCH_RECEIPT_MISMATCH");
   return receipt;
 };
+
+const digestPeerTurnId = (value: string): string =>
+  createHash("sha256").update(value, "utf8").digest("hex");
 
 const parseOptionalPlan = (value: string | undefined): string | undefined => {
   if (value === undefined) return undefined;
@@ -16032,6 +22991,35 @@ export class SessionSwitchStoreError extends Error {
   constructor(readonly code: SessionSwitchStoreErrorCode, cause?: unknown) {
     super(code, cause === undefined ? undefined : { cause });
     this.name = "SessionSwitchStoreError";
+  }
+}
+
+export type PeerSessionRefusalCode =
+  | "PEER_SESSION_SELF_REFUSED"
+  | "PEER_SESSION_CYCLE_REFUSED"
+  | "PEER_SESSION_HOP_LIMIT_REFUSED"
+  | "PEER_SESSION_PROJECT_REFUSED"
+  | "PEER_SESSION_POLICY_REFUSED"
+  | "PEER_SESSION_POLICY_REVISION_CONFLICT"
+  | "PEER_SESSION_REVISION_CONFLICT"
+  | "PEER_SESSION_TARGET_STATE_REFUSED"
+  | "PEER_SESSION_ACTOR_TURN_REFUSED"
+  | "PEER_SESSION_RATE_LIMIT_REFUSED"
+  | "PEER_SESSION_FANOUT_LIMIT_REFUSED"
+  | "PEER_SESSION_PARENT_LIMIT_REFUSED"
+  | "PEER_SESSION_CAUSAL_LIMIT_REFUSED"
+  | "PEER_SESSION_INBOUND_QUEUE_LIMIT_REFUSED"
+  | "PEER_SESSION_RETENTION_LIMIT_REFUSED"
+  | "PEER_SESSION_NESTED_MUTATION_NOT_RESUMABLE"
+  | "PEER_SESSION_CANCELLATION_UNPROVEN"
+  | "PEER_SESSION_CANCELLATION_CONFLICT"
+  | "PEER_SESSION_IDEMPOTENCY_CONFLICT"
+  | "PEER_SESSION_NOT_FOUND";
+
+export class PeerSessionRefusalError extends Error {
+  constructor(readonly code: PeerSessionRefusalCode) {
+    super(code);
+    this.name = "PeerSessionRefusalError";
   }
 }
 
@@ -16106,20 +23094,15 @@ export class StateStore {
         if (version > currentSchemaVersion) throw new Error(`STATE_SCHEMA_NEWER:${version}:${currentSchemaVersion}`);
         if (version < currentSchemaVersion) throw new Error(`STATE_SCHEMA_MIGRATION_REQUIRED:${version}:${currentSchemaVersion}`);
         if (hasPendingSecurityScrub(this.#database)) throw new Error("STATE_SECURITY_SCRUB_REQUIRED");
-        assertSchemaCohortMigrationTail(this.#database, currentSchemaVersion);
-        assertSchemaCohortObjects(this.#database, privateTask40RootObjects, "combined49");
+        assertJoinedStateSchema(this.#database);
       }
       assertSchemaVersion24Objects(this.#database);
       assertSchemaVersion35Objects(this.#database);
       assertSchemaVersion38PresetContracts(this.#database);
       assertSchemaVersion39ProviderAuthority(this.#database);
-      if (this.#readonly) {
-        assertCombined49AdoptionSchema(this.#database);
-        assertSchemaVersion40ProfileCodexAccountKeys(this.#database);
-      } else {
-        assertSchemaVersion40AdoptionObjects(this.#database, { useExactProviderProcessCustody: true });
-        assertExactSchemaVersion40AdoptionSurface(this.#database);
-      }
+      assertSchemaVersion40AdoptionObjects(this.#database, { useExactProviderProcessCustody: true });
+      assertExactSchemaVersion40AdoptionSurface(this.#database);
+      assertJoinedStateSchema(this.#database);
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);
@@ -16130,7 +23113,7 @@ export class StateStore {
       assertSessionTaskSchema(this.#database);
       assertProviderAccountAuthority(this.#database);
       assertSchemaVersion41ProviderUsage(this.#database);
-      assertSchemaVersion42SessionSwitch(this.#database);
+      assertSchemaVersion42SessionSwitch(this.#database, "joined");
       if (this.#readonly) auditAutomaticUsagePolicyHistory(this.#database);
       if (this.#readonly) auditDevinJoinedCloses(this.#database);
       if (this.#readonly) auditAutomaticPointerMoves(this.#database);
@@ -16139,6 +23122,12 @@ export class StateStore {
       if (this.#readonly) auditSessionSendOwners(this.#database);
       auditClaudeProcessCustody(this.#database);
       auditSessionSwitchAdoption(this.#database);
+      if (this.#readonly) this.#database.transaction(() => {
+        auditProviderLoginBindingTransitions(this.#database);
+        auditSessionSwitchExecutionContexts(this.#database, {
+          excludedMalformedJournalSequences: readProvedMalformedSessionSwitchJournalSequences(this.#database, "current"),
+        });
+      }).deferred();
       assertCompositeNotificationPolicy(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
@@ -16169,10 +23158,25 @@ export class StateStore {
     });
   }
 
-  createSessionTaskStore(): SessionTaskStore {
+  createSessionTaskStore(options: Readonly<{
+    isExecutionAuthorityLive?: (authority: SessionTaskExecutionAuthority) => boolean;
+  }> = {}): SessionTaskStore {
     return new SessionTaskStore(this.#database, {
       now: this.#now,
-      enqueue: (sessionId, message) => this.enqueue(sessionId, message),
+      ...options,
+      enqueue: (sessionId, message) => {
+        const authority = baseProviderAccountAuthority(this.requireSessionProviderAuthority(sessionId));
+        const queued = this.enqueueIdempotent({
+          sessionId, message, actor: "automation", providerAuthority: authority,
+          profileGeneration: authority.processGeneration,
+        });
+        // The task callback has a closed receipt contract. Peer provenance
+        // remains on the owning queue; it is not part of this projection.
+        return {
+          id: queued.id, sessionId: queued.sessionId, message: queued.message,
+          state: queued.state, createdAt: queued.createdAt, updatedAt: queued.updatedAt,
+        };
+      },
     });
   }
 
@@ -16189,6 +23193,100 @@ export class StateStore {
       providerThreadIdSchema.parse(providerThreadId),
     );
     return row !== null;
+  }
+
+  /**
+   * Proves that the current automation row descends from an HRA-native start
+   * whose completed receipt and immutable evidence explicitly carried the
+   * automation capability. Managed-home location alone is not capability
+   * evidence: listing can import arbitrary provider-owned threads there. A
+   * completed provider switch is intentionally outside this legacy proof;
+   * the caller must validate the replacement thread's full host binding.
+   */
+  hasNativeConversationAutomationAuthority(
+    sessionId: SessionId,
+    providerThreadId: string,
+  ): boolean {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const parsedProviderThreadId = providerThreadIdSchema.parse(providerThreadId);
+    const authorityRow = this.#database.query(
+      `SELECT s.profile_id
+       FROM session_conversation_automation automation
+       JOIN sessions s ON s.id=automation.session_id
+       JOIN session_provider_account_authorities provider_authority
+         ON provider_authority.session_id=s.id
+        AND provider_authority.provider=s.provider_v39
+       WHERE automation.session_id=? AND automation.provider_thread_id=?
+         AND s.provider_thread_id=automation.provider_thread_id
+         AND s.provider_v39 IN ('codex','claude')
+         AND provider_authority.runtime_scope='managed'`,
+    ).get(parsedSessionId, parsedProviderThreadId);
+    if (authorityRow === null) return false;
+    const authority = z.object({
+      profile_id: profileIdSchema,
+    }).strict().parse(authorityRow);
+    if (!this.sessionAccountAuthorityMatches(parsedSessionId, authority.profile_id)) {
+      return false;
+    }
+
+    const startRows = this.#database.query(
+      `SELECT mutation.id AS attempt_id,mutation.state,mutation.result_json,
+              evidence.evidence_digest,
+              resolution.resolution_kind,resolution.receipt_json
+       FROM session_start_attempts start
+       JOIN mutation_attempts mutation ON mutation.id=start.attempt_id
+       JOIN mutation_effect_evidence evidence ON evidence.attempt_id=mutation.id
+       LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=mutation.id
+       WHERE start.session_id=? AND mutation.kind='session.start'
+       ORDER BY mutation.created_at,mutation.id LIMIT 2`,
+    ).all(parsedSessionId);
+    if (startRows.length !== 1) return false;
+    const start = z.object({
+      attempt_id: attemptIdSchema,
+      state: mutationStateSchema.exclude(["reconciled"]),
+      result_json: z.string().nullable(),
+      evidence_digest: sha256Schema,
+      resolution_kind: mutationResolutionKindSchema.nullable(),
+      receipt_json: z.string().nullable(),
+    }).strict().parse(startRows[0]);
+    const receiptJson = start.state === "applied" && start.resolution_kind === null
+      ? start.result_json
+      : start.resolution_kind === "proven_applied"
+        ? start.receipt_json
+        : null;
+    if (receiptJson === null) return false;
+    try {
+      const receipt = z.object({ sessionId: sessionIdSchema }).passthrough().parse(
+        JSON.parse(receiptJson) as unknown,
+      );
+      const evidence = requireMutationEvidenceFromProvenance(
+        this.#database, start.attempt_id,
+      ).evidence;
+      if (
+        receipt.sessionId !== parsedSessionId
+        || evidence.kind !== "session.start"
+        || digestJson(evidence) !== start.evidence_digest
+      ) return false;
+      if (
+        evidence.conversationAutomationCapability
+        !== SESSION_CONVERSATION_AUTOMATION_CAPABILITY
+      ) return false;
+      const switched = this.#database.query(
+        `SELECT 1
+         FROM mutation_attempts mutation
+         LEFT JOIN mutation_resolutions resolution
+           ON resolution.attempt_id=mutation.id
+         WHERE mutation.authority_id=? AND mutation.kind='session.switch'
+           AND (
+             (mutation.state='applied' AND resolution.attempt_id IS NULL)
+             OR resolution.resolution_kind='proven_applied'
+           )
+         LIMIT 1`,
+      ).get(parsedSessionId);
+      return switched === null;
+    } catch {
+      return false;
+    }
   }
 
   isSessionTaskQueueSource(sessionId: SessionId, queueId: QueueId): boolean {
@@ -16625,6 +23723,7 @@ export class StateStore {
   }>): ProviderAccountRecord {
     const profileId = profileIdSchema.parse(input.profileId);
     const provider = providerSchema.parse(input.provider);
+    assertSupportedProvider(provider);
     const expectedGeneration = z.number().int().positive()
       .max(Number.MAX_SAFE_INTEGER).parse(input.expectedBindingGeneration);
     const readiness = providerAccountReadinessSchema.exclude(["removed"])
@@ -16678,6 +23777,7 @@ export class StateStore {
     providerAccountIds: readonly ProviderAccountId[];
   }>): ProviderAccountState {
     const provider = providerSchema.parse(input.provider);
+    assertSupportedProvider(provider);
     const expectedOrderRevision = z.number().int().positive()
       .max(Number.MAX_SAFE_INTEGER).parse(input.expectedOrderRevision);
     const ids = z.array(providerAccountIdSchema).max(10_000).parse(input.providerAccountIds);
@@ -16725,6 +23825,7 @@ export class StateStore {
     providerAccountId: ProviderAccountId;
   }>): ProviderAccountState {
     const provider = providerSchema.parse(input.provider);
+    assertSupportedProvider(provider);
     const expectedPointerRevision = z.number().int().positive()
       .max(Number.MAX_SAFE_INTEGER).parse(input.expectedPointerRevision);
     const providerAccountId = providerAccountIdSchema.parse(input.providerAccountId);
@@ -16783,29 +23884,34 @@ export class StateStore {
     ).get(parsedProfileId, parsedProvider, parsedProfileId, parsedProvider) !== null) {
       return "unsettled_authority";
     }
-    const providerSwitch = this.#database.query(
-      `SELECT 1 AS present
+    const providerSwitches = this.#database.query(
+      `SELECT m.id AS attempt_id
        FROM mutation_attempts m
-       JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+       LEFT JOIN mutation_effect_evidence e ON e.attempt_id=m.id
        LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
-       WHERE e.kind='session.switch'
+       WHERE (m.kind='session.switch' OR e.kind='session.switch')
          AND m.state IN ('effect_started','ambiguous')
          AND r.attempt_id IS NULL
-         AND (
-           (json_extract(e.evidence_json,'$.sourceProfileId')=?
-             AND json_extract(e.evidence_json,'$.sourceProvider')=?)
-           OR
-           (json_extract(e.evidence_json,'$.targetProfileId')=?
-             AND json_extract(e.evidence_json,'$.targetProvider')=?)
-         )
-       LIMIT 1`,
-    ).get(
-      parsedProfileId,
-      parsedProvider,
-      parsedProfileId,
-      parsedProvider,
-    );
-    if (providerSwitch !== null) return "unsettled_authority";
+         AND (e.attempt_id IS NOT NULL OR NOT EXISTS(
+           SELECT 1 FROM session_switch_attempts dedicated WHERE dedicated.attempt_id=m.id
+         ))
+       ORDER BY m.id`,
+    ).all();
+    for (const raw of providerSwitches) {
+      // The target is not recoverable from an opaque payload. Do not let a
+      // JSON predicate (or a missing projection) make that reservation vanish.
+      try {
+        const selected = z.object({ attempt_id: attemptIdSchema }).strict().parse(raw);
+        const evidence = requireMutationEvidenceFromProvenance(this.#database, selected.attempt_id).evidence;
+        if (evidence.kind !== "session.switch"
+          || (evidence.sourceProfileId === parsedProfileId && evidence.sourceProvider === parsedProvider)
+          || (evidence.targetProfileId === parsedProfileId && evidence.targetProvider === parsedProvider)) {
+          return "unsettled_authority";
+        }
+      } catch {
+        return "unsettled_authority";
+      }
+    }
     const row = z.object({
       reason: z.enum([
         "active_session",
@@ -16889,6 +23995,14 @@ export class StateStore {
     if (this.#hasUnsettledClaudeLoginAuthority(parsedProfileId)) {
       return "unsettled_authority";
     }
+    if (this.#database.query(
+      `SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+       WHERE ${SESSION_SWITCH_BLOCKING_PREDICATE}
+         AND ((switch.source_profile_id=? AND switch.source_provider='claude')
+           OR (switch.target_profile_id=? AND switch.target_provider='claude')) LIMIT 1`,
+    ).get(parsedProfileId, parsedProfileId) !== null) {
+      return "unsettled_authority";
+    }
     const mismatchedPersonalBinding = this.#database.query(
       `SELECT 1 AS present
        FROM session_personal_runtime_bindings b
@@ -16902,44 +24016,52 @@ export class StateStore {
        LIMIT 1`,
     ).get(parsedProfileId);
     if (mismatchedPersonalBinding !== null) return "unsettled_authority";
-    const providerSwitch = this.#database.query(
-      `SELECT 1 AS present
+    const providerSwitches = this.#database.query(
+      `SELECT m.id AS attempt_id,
+         CASE WHEN NOT EXISTS(
+           SELECT 1 FROM session_personal_runtime_bindings b
+           WHERE b.session_id=m.authority_id
+             AND b.provider='claude' AND b.state IN ('active','detaching')
+         ) AND (
+           EXISTS(
+             SELECT 1 FROM session_provider_account_authorities a
+             WHERE a.session_id=m.authority_id AND a.provider='claude'
+               AND a.runtime_scope='managed'
+           ) OR NOT EXISTS(
+             SELECT 1
+             FROM session_personal_runtime_bindings b
+             JOIN sessions s ON s.id=b.session_id
+             WHERE b.session_id=m.authority_id AND b.state='detached'
+               AND b.provider=s.provider_v39
+               AND b.provider_thread_id=s.provider_thread_id
+           )
+         ) THEN 1 ELSE 0 END AS source_blocks_managed
        FROM mutation_attempts m
-       JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+       LEFT JOIN mutation_effect_evidence e ON e.attempt_id=m.id
        LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
-       WHERE e.kind='session.switch'
+       WHERE (m.kind='session.switch' OR e.kind='session.switch')
          AND m.state IN ('effect_started','ambiguous')
          AND r.attempt_id IS NULL
-         AND (
-           (json_extract(e.evidence_json,'$.targetProfileId')=?
-             AND json_extract(e.evidence_json,'$.targetProvider')='claude')
-           OR
-           (json_extract(e.evidence_json,'$.sourceProfileId')=?
-             AND json_extract(e.evidence_json,'$.sourceProvider')='claude'
-             AND NOT EXISTS(
-               SELECT 1 FROM session_personal_runtime_bindings b
-               WHERE b.session_id=m.authority_id
-                 AND b.provider='claude' AND b.state IN ('active','detaching')
-             )
-             AND (
-               EXISTS(
-                 SELECT 1 FROM session_provider_account_authorities a
-                 WHERE a.session_id=m.authority_id AND a.provider='claude'
-                   AND a.runtime_scope='managed'
-               )
-               OR NOT EXISTS(
-                 SELECT 1
-                 FROM session_personal_runtime_bindings b
-                 JOIN sessions s ON s.id=b.session_id
-                 WHERE b.session_id=m.authority_id AND b.state='detached'
-                   AND b.provider=s.provider_v39
-                   AND b.provider_thread_id=s.provider_thread_id
-               )
-             ))
-         )
-       LIMIT 1`,
-    ).get(parsedProfileId, parsedProfileId);
-    if (providerSwitch !== null) return "unsettled_authority";
+         AND (e.attempt_id IS NOT NULL OR NOT EXISTS(
+           SELECT 1 FROM session_switch_attempts dedicated WHERE dedicated.attempt_id=m.id
+         ))
+       ORDER BY m.id`,
+    ).all();
+    for (const raw of providerSwitches) {
+      try {
+        const selected = z.object({
+          attempt_id: attemptIdSchema,
+          source_blocks_managed: z.number().int().min(0).max(1),
+        }).strict().parse(raw);
+        const evidence = requireMutationEvidenceFromProvenance(this.#database, selected.attempt_id).evidence;
+        if (evidence.kind !== "session.switch"
+          || (evidence.targetProfileId === parsedProfileId && evidence.targetProvider === "claude")
+          || (evidence.sourceProfileId === parsedProfileId && evidence.sourceProvider === "claude"
+            && selected.source_blocks_managed === 1)) return "unsettled_authority";
+      } catch {
+        return "unsettled_authority";
+      }
+    }
     return z.object({
       reason: z.enum([
         "active_session",
@@ -17080,6 +24202,7 @@ export class StateStore {
     const provider = providerSchema.parse(input.provider);
     const originGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
       .parse(input.originGeneration);
+    if (provider === "devin") return false;
     const captured = this.readMutationProviderAuthorities(attemptId).filter((item) =>
       item.authority.profileId === profileId && item.authority.provider === provider
       && item.authority.processGeneration === originGeneration
@@ -17116,6 +24239,107 @@ export class StateStore {
       provider,
       current.processGeneration,
     ) !== null;
+  }
+
+  #readAccountMutationRecoveryOrigin(input: Readonly<{
+    attemptId: AttemptId;
+    profileId: ProfileId;
+    originGeneration: number;
+  }>) {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const profileId = profileIdSchema.parse(input.profileId);
+    const originGeneration = z.number().int().nonnegative().safe().parse(input.originGeneration);
+    const authority = z.object({
+      authority_id: profileIdSchema,
+      authority_generation: z.number().int().nonnegative().safe(),
+      kind: z.enum(["account.login", "account.logout", "account.login-cancel"]),
+      evidence_kind: z.enum(["account.login", "account.logout", "account.login-cancel"]),
+      evidence_digest: sha256Schema,
+      request_digest: sha256Schema,
+      process_generation: z.number().int().nonnegative().safe(),
+    }).strict().safeParse(this.#database.query(
+      `SELECT m.authority_id,m.authority_generation,m.kind,e.kind AS evidence_kind,
+         e.evidence_digest,m.request_digest,p.process_generation
+       FROM mutation_attempts m JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+       JOIN profiles p ON p.id=m.authority_id AND p.state!='removed'
+       WHERE m.id=?`,
+    ).get(attemptId));
+    if (!authority.success) return null;
+    const row = authority.data;
+    if (row.authority_id !== profileId || row.authority_generation !== originGeneration
+      || row.kind !== row.evidence_kind) return null;
+    try {
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
+      if (evidence.kind !== row.kind || digestJson(evidence) !== row.evidence_digest) return null;
+      const request = evidence.kind === "account.login"
+        ? { deviceCode: evidence.method === "device_code" }
+        : evidence.kind === "account.login-cancel" ? { loginId: evidence.loginId } : {};
+      if (mutationRequestDigest({
+        kind: row.kind, authorityId: profileId, authorityGeneration: originGeneration, request,
+      }) !== row.request_digest) return null;
+    } catch {
+      return null;
+    }
+    return row;
+  }
+
+  isAccountMutationAuthorityCurrent(input: Readonly<{
+    attemptId: AttemptId;
+    profileId: ProfileId;
+    originGeneration: number;
+  }>): boolean {
+    const row = this.#readAccountMutationRecoveryOrigin(input);
+    if (row === null) return false;
+    if (row.process_generation === input.originGeneration) return true;
+    return this.#database.query(
+      `WITH RECURSIVE authority_chain(generation) AS (
+         VALUES (?)
+         UNION ALL
+         SELECT r.to_generation FROM account_mutation_authority_rebinds r
+         JOIN authority_chain c ON r.from_generation=c.generation
+         WHERE r.attempt_id=? AND r.profile_id=? AND r.kind=? AND r.evidence_digest=?
+       ) SELECT 1 FROM authority_chain WHERE generation=? LIMIT 1`,
+    ).get(input.originGeneration, input.attemptId, input.profileId, row.kind, row.evidence_digest, row.process_generation) !== null;
+  }
+
+  #canQuarantineUnboundAccountMutation(input: Readonly<{
+    attemptId: AttemptId;
+    profileId: ProfileId;
+    originGeneration: number;
+  }>): boolean {
+    const origin = this.#readAccountMutationRecoveryOrigin(input);
+    // Old releases advanced profile generations without an account successor
+    // ledger. Validate those immutable bytes only to preserve a local fence.
+    // This predicate is never a provider-current or resolution authority.
+    return origin !== null && origin.authority_generation < origin.process_generation
+      && this.#database.query("SELECT 1 FROM account_mutation_authority_rebinds WHERE attempt_id=? LIMIT 1")
+        .get(input.attemptId) === null;
+  }
+
+  #recordAccountMutationAuthoritySuccessors(input: Readonly<{
+    fromGeneration: number;
+    now: number;
+    profileId: ProfileId;
+  }>): void {
+    for (const attempt of this.listUnsettledMutations({ authorityId: input.profileId })) {
+      if (attempt.kind !== "account.login" && attempt.kind !== "account.logout" && attempt.kind !== "account.login-cancel") continue;
+      const authority = {
+        attemptId: attempt.id, profileId: input.profileId, originGeneration: attempt.authorityGeneration,
+      };
+      if (attempt.evidence === undefined) throw new Error("ACCOUNT_MUTATION_SUCCESSOR_AUTHORITY_MISMATCH");
+      if (!this.isAccountMutationAuthorityCurrent(authority)) {
+        if (!this.#canQuarantineUnboundAccountMutation(authority)) throw new Error("ACCOUNT_MUTATION_SUCCESSOR_AUTHORITY_MISMATCH");
+        this.#database.query("UPDATE profiles SET state='recovery_required',updated_at=MAX(updated_at,?) WHERE id=? AND process_generation=? AND state!='removed'")
+          .run(input.now, input.profileId, input.fromGeneration);
+        continue;
+      }
+      this.#database.query(
+        `INSERT INTO account_mutation_authority_rebinds(
+           attempt_id,profile_id,kind,evidence_digest,from_generation,to_generation,recorded_at
+         ) VALUES (?,?,?,?,?,?,?)`,
+      ).run(attempt.id, input.profileId, attempt.kind, attempt.evidence.digest,
+        input.fromGeneration, input.fromGeneration + 1, input.now);
+    }
   }
 
   hasNonterminalProviderSession(profileId: ProfileId, provider: Provider): boolean {
@@ -17175,73 +24399,6 @@ export class StateStore {
     sessionId: SessionId;
   }>): boolean {
     return this.canReleaseIdleManagedClaudeSessionForAccountLogin(input);
-  }
-
-  canReleaseIdleDevinSessionForAccountLogin(input: Readonly<{
-    profileId: ProfileId;
-    profileGeneration: number;
-    sessionId: SessionId;
-  }>): boolean {
-    const profileId = profileIdSchema.parse(input.profileId);
-    const profileGeneration = z.number().int().nonnegative()
-      .max(Number.MAX_SAFE_INTEGER).parse(input.profileGeneration);
-    const sessionId = sessionIdSchema.parse(input.sessionId);
-    assertUnsettledSessionSendOwners(this.#database, sessionId);
-    return this.#database.query(
-      `SELECT 1 AS releasable
-       FROM sessions s
-       JOIN profiles p ON p.id=s.profile_id
-       JOIN session_provider_authorities captured ON captured.session_id=s.id
-       JOIN provider_accounts account ON account.id=captured.provider_account_id
-       WHERE s.id=? AND s.profile_id=? AND account.process_generation=?
-         AND captured.provider=s.provider_v39 AND account.provider=s.provider_v39
-         AND captured.profile_id=s.profile_id AND account.profile_id=s.profile_id
-         AND captured.binding_generation=account.binding_generation
-         AND captured.process_generation=account.process_generation
-         AND account.readiness!='removed'
-         AND p.state!='removed'
-         AND s.provider_v39='devin' AND s.provider_thread_id IS NOT NULL
-         AND s.state='idle' AND s.active_turn_id IS NULL
-         AND NOT EXISTS(
-           SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
-           WHERE switch.session_id=s.id AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
-         )
-         AND NOT EXISTS(
-           SELECT 1 FROM mutation_attempts m
-           LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
-           LEFT JOIN session_start_attempts a ON a.attempt_id=m.id
-           WHERE (m.authority_id=s.id OR a.session_id=s.id)
-             AND m.state IN ('prepared','effect_started','ambiguous')
-             AND r.attempt_id IS NULL
-             AND NOT ${sessionSendUnclaimedSql("m")}
-         )
-         AND NOT EXISTS(
-           SELECT 1 FROM queue_entries q
-           LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
-           WHERE q.session_id=s.id
-             AND q.state IN ('pending','dispatching','ambiguous')
-             AND r.queue_id IS NULL
-         )
-         AND NOT EXISTS(
-           SELECT 1 FROM provider_interactions i
-           WHERE i.session_id=s.id
-             AND i.state IN ('pending','response_prepared','response_written')
-         )
-         AND NOT EXISTS(
-           SELECT 1 FROM work_attempts w
-           WHERE w.worker_session_id=s.id
-             AND w.state IN ('claimed','dispatching','running','recovery_required')
-         )
-         AND NOT EXISTS(
-           SELECT 1 FROM work_signals w
-           WHERE w.to_session_id=s.id
-             AND NOT EXISTS(
-               SELECT 1 FROM work_signal_receipts r
-               WHERE r.signal_id=w.id AND r.kind='ack'
-             )
-         )
-       LIMIT 1`,
-    ).get(sessionId, profileId, profileGeneration) !== null;
   }
 
   canReleaseIdleManagedClaudeSessionForAccountLogin(input: Readonly<{
@@ -17347,7 +24504,7 @@ export class StateStore {
     const parsedProfileId = profileIdSchema.parse(profileId);
     const rows = this.#database.query(
       `SELECT m.id,m.kind AS mutation_kind,m.authority_id,m.authority_generation,
-              e.kind AS evidence_kind,e.evidence_json,e.evidence_digest,
+              e.kind AS evidence_kind,e.attempt_id AS evidence_attempt_id,e.evidence_digest,
               a.session_id AS session_start_id
        FROM mutation_attempts m
        LEFT JOIN mutation_effect_evidence e ON e.attempt_id=m.id
@@ -17365,7 +24522,7 @@ export class StateStore {
       authority_id: string;
       authority_generation: number;
       evidence_kind: string | null;
-      evidence_json: string | null;
+      evidence_attempt_id: string | null;
       evidence_digest: string | null;
       session_start_id: string | null;
     }[];
@@ -17390,16 +24547,15 @@ export class StateStore {
       const attemptId = attemptIdSchema.parse(raw.id);
       const mutationKind = z.enum(["session.start", "session.switch"])
         .parse(raw.mutation_kind);
+      const expectedEvidenceKind = mutationKind;
       if (
-        raw.evidence_json === null
+        raw.evidence_attempt_id !== attemptId
         || raw.evidence_digest === null
-        || raw.evidence_kind !== mutationKind
+        || raw.evidence_kind !== expectedEvidenceKind
       ) throw new Error("SESSION_MUTATION_SUCCESSOR_EVIDENCE_MISSING");
-      const evidence = mutationEffectEvidenceSchema.parse(
-        JSON.parse(raw.evidence_json) as unknown,
-      );
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
       if (
-        evidence.kind !== mutationKind
+        evidence.kind !== expectedEvidenceKind
         || digestJson(evidence) !== sha256Schema.parse(raw.evidence_digest)
       ) throw new Error("SESSION_MUTATION_SUCCESSOR_EVIDENCE_MISMATCH");
       const authorityGeneration = z.number().int().nonnegative()
@@ -17484,7 +24640,6 @@ export class StateStore {
       );
       if (inserted.changes !== 1) throw new Error("SESSION_MUTATION_SUCCESSOR_CAS_CONFLICT");
       // Keep the released v35 ledger current for the Codex successor too.
-      {
         const compatibility = this.#database.query(
           `INSERT INTO session_mutation_authority_rebinds(
              attempt_id,profile_id,provider,from_generation,to_generation,recorded_at
@@ -17497,9 +24652,8 @@ export class StateStore {
           input.fromGeneration + 1,
           input.now,
         );
-        if (compatibility.changes !== 1) {
-          throw new Error("SESSION_MUTATION_SUCCESSOR_COMPATIBILITY_CAS_CONFLICT");
-        }
+      if (compatibility.changes !== 1) {
+        throw new Error("SESSION_MUTATION_SUCCESSOR_COMPATIBILITY_CAS_CONFLICT");
       }
     }
   }
@@ -17521,244 +24675,6 @@ export class StateStore {
     return this.requireProfile(profileId);
   }
 
-  #devinCloseBlocked(authority: ProviderAccountAuthority): boolean {
-    return this.#database.query("SELECT 1 FROM provider_accounts WHERE id=? AND readiness IN ('signed_in','unverified')")
-      .get(authority.providerAccountId) === null || this.#database.query(
-      `SELECT 1 FROM provider_accounts WHERE id=? AND ${unsettledForegroundProviderLoginSql}`,
-    ).get(authority.providerAccountId) !== null || this.#database.query(
-      `SELECT 1 FROM mutation_attempts m JOIN mutation_provider_authorities a ON a.attempt_id=m.id
-       LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
-       WHERE m.kind='session.switch' AND m.state IN ('prepared','effect_started','ambiguous')
-         AND r.attempt_id IS NULL AND a.provider_account_id=? AND a.binding_generation=?
-       LIMIT 1`,
-    ).get(authority.providerAccountId, authority.bindingGeneration) !== null;
-  }
-
-  #devinRuntimeAuthorityReachesSession(sessionId: SessionId, runtimeAuthority: ProviderAccountAuthority, captured: SessionProviderAuthority): boolean {
-    if (sameProviderAccountAuthority(runtimeAuthority, captured)) return true;
-    if (runtimeAuthority.provider !== "devin" || runtimeAuthority.providerAccountId !== captured.providerAccountId
-      || runtimeAuthority.bindingGeneration !== captured.bindingGeneration || runtimeAuthority.profileId !== captured.profileId) return false;
-    let generation = runtimeAuthority.processGeneration;
-    for (let index = 0; index < 256 && generation < captured.processGeneration; index += 1) {
-      const rows = this.#database.query(`SELECT * FROM session_provider_authority_successors
-        WHERE session_id=? AND from_provider='devin' AND from_provider_account_id=? AND from_binding_generation=?
-          AND from_process_generation=? ORDER BY from_authority_revision LIMIT 2`)
-        .all(sessionId, captured.providerAccountId, captured.bindingGeneration, generation);
-      if (rows.length !== 1) return false;
-      const edge = sessionProviderAuthoritySuccessorRowSchema.parse(rows[0]);
-      if (edge.transition_kind !== "provider_restart" || edge.to_provider !== "devin"
-        || edge.to_provider_account_id !== captured.providerAccountId || edge.to_binding_generation !== captured.bindingGeneration
-        || edge.to_process_generation <= generation || edge.to_authority_revision > captured.authorityRevision) return false;
-      const proof = readDevinJoinedClose(this.#database, edge.transition_id);
-      if (proof.consumed === null || !proof.members.some((member) => member.sessionId === sessionId && member.authorityRevision === edge.from_authority_revision)) return false;
-      generation = edge.to_process_generation;
-    }
-    return generation === captured.processGeneration;
-  }
-
-  #devinCloseSnapshot(
-    witness: z.infer<typeof devinCloseWitnessSchema>,
-    authority: ProviderAccountAuthority,
-  ): DevinCloseSnapshot | null {
-    const session = this.requireSession(witness.sessionId);
-    const captured = this.requireCapturedSessionProviderAuthority(session.id);
-    if (session.state !== "idle" || session.activeTurnId !== undefined || session.provider !== "devin"
-      || session.providerThreadId !== witness.providerThreadId
-      || !sameProviderAccountAuthority(captured, authority)
-      || this.sessionSwitchAdmissionBlocked({ sessionId: session.id, providerThreadId: witness.providerThreadId, providerAuthority: authority }).blocked) return null;
-    if (this.#database.query(
-      `SELECT 1 FROM mutation_attempts m LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
-       WHERE m.authority_id=? AND m.state IN ('prepared','effect_started','ambiguous') AND r.attempt_id IS NULL
-         AND NOT ${sessionSendUnclaimedSql("m")} LIMIT 1`,
-    ).get(session.id) !== null || this.#database.query(
-      "SELECT 1 FROM queue_entries WHERE session_id=? AND state IN ('dispatching','ambiguous') LIMIT 1",
-    ).get(session.id) !== null || this.#database.query(
-      `SELECT 1 FROM provider_interactions i LEFT JOIN interaction_provider_authorities a ON a.public_id=i.public_id
-       WHERE i.state IN ('pending','response_prepared','response_written') AND (i.session_id=? OR (
-         i.session_id IS NULL AND i.thread_id=? AND a.provider_account_id=? AND a.binding_generation=? AND a.process_generation=?
-       )) LIMIT 1`,
-    ).get(session.id, witness.providerThreadId, authority.providerAccountId, authority.bindingGeneration, authority.processGeneration) !== null) return null;
-    const runtime = this.latestSessionRuntimeProfile(session.id);
-    if (runtime === null || reviewedRuntimeProfileProvider(runtime.profile) !== "devin"
-      || !this.#devinRuntimeAuthorityReachesSession(session.id, this.#requireRuntimeProfileProviderAuthority(runtime), captured)) return null;
-    const project = session.projectId === undefined ? null : this.requireProject(session.projectId);
-    return devinCloseSnapshotSchema.parse({
-      ...witness,
-      sessionRevision: session.revision,
-      authorityRevision: captured.authorityRevision,
-      routingProvenance: captured.routingProvenance,
-      appliedPointerRevision: captured.appliedPointerRevision,
-      projectId: session.projectId ?? null,
-      projectRootDigest: project === null ? null : devinCloseDigest("project", project.rootPath),
-      preset: session.preset,
-      presetContract: this.requireSessionPresetContract(session.id),
-      fastEnabled: session.fastEnabled,
-      runtimeRevision: runtime.revision,
-      runtimeDigest: digestJson(runtime.profile),
-      runtimeContractDigest: devinCloseRuntimeContractDigest(runtime.profile),
-    });
-  }
-
-  prepareDevinJoinedClose(input: Readonly<{
-    daemonGeneration: number;
-    bootId: string;
-    providerAuthority: ProviderAccountAuthority;
-    writers: readonly DevinJoinedCloseWriter[];
-  }>): DevinJoinedCloseCapture | null {
-    const authority = devinProviderAccountAuthoritySchema.parse(input.providerAuthority);
-    const daemonGeneration = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER - 1).parse(input.daemonGeneration);
-    const bootId = z.string().min(1).max(200).parse(input.bootId);
-    const writers = z.array(devinCloseWriterSchema).max(1024).parse(input.writers);
-    if (new Set(writers.map((writer) => writer.sessionId)).size !== writers.length
-      || new Set(writers.map((writer) => writer.connectionId)).size !== writers.length
-      || new Set(writers.map((writer) => writer.providerThreadId)).size !== writers.length) {
-      throw new DevinJoinedCloseError("DEVIN_JOINED_CLOSE_CONFLICT");
-    }
-    return this.#database.transaction(() => {
-      assertSchemaVersion44DevinClose(this.#database);
-      this.assertProviderAccountAuthorityCurrent(authority);
-      if (this.#devinCloseBlocked(authority)) return null;
-      const members: DevinCloseSnapshot[] = [];
-      for (const writer of writers) {
-        const snapshot = this.#devinCloseSnapshot(devinCloseWitnessSchema.parse({
-          sessionId: writer.sessionId, providerThreadId: writer.providerThreadId, connectionId: writer.connectionId,
-        }), authority);
-        if (snapshot === null) continue;
-        const nativeProjectDigest = writer.projectRoot === null ? null : devinCloseDigest("project", writer.projectRoot);
-        if (snapshot.runtimeContractDigest !== devinCloseRuntimeContractDigest(writer.effectiveRuntimeProfile)
-          || writer.effectiveRuntimeProfile.processGeneration !== authority.processGeneration
-          || snapshot.projectRootDigest !== nativeProjectDigest) continue;
-        members.push(snapshot);
-      }
-      if (members.length === 0) return null;
-      members.sort((left, right) => left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0);
-      const intent = devinCloseIntentSchema.parse({
-        close_id: randomUUID(), provider_account_id: authority.providerAccountId, profile_id: authority.profileId,
-        binding_generation: authority.bindingGeneration, process_generation: authority.processGeneration,
-        daemon_generation: daemonGeneration, boot_id: bootId,
-        member_count: members.length, member_digest: devinCloseDigest("members", members), recorded_at: this.#now(),
-      });
-      this.#database.query(`INSERT INTO devin_joined_close_intents(
-        close_id,provider_account_id,profile_id,binding_generation,process_generation,daemon_generation,
-        boot_id,member_count,member_digest,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
-        intent.close_id, intent.provider_account_id, intent.profile_id, intent.binding_generation,
-        intent.process_generation, intent.daemon_generation, intent.boot_id, intent.member_count, intent.member_digest, intent.recorded_at,
-      );
-      for (const member of members) this.#database.query(
-        "INSERT INTO devin_joined_close_snapshots(close_id,session_id,snapshot_json) VALUES(?,?,?)",
-      ).run(intent.close_id, member.sessionId, JSON.stringify(member));
-      const captureDigest = devinCloseDigest("intent", intent);
-      this.#database.query("INSERT INTO devin_joined_close_anchors(close_id,kind,digest) VALUES(?,'intent',?)")
-        .run(intent.close_id, captureDigest);
-      readDevinJoinedClose(this.#database, intent.close_id);
-      return { closeId: intent.close_id, captureDigest, providerAuthority: authority,
-        writers: members.map(({ sessionId, providerThreadId, connectionId }) => ({ sessionId, providerThreadId, connectionId })) };
-    }).immediate();
-  }
-
-  recordDevinJoinedClose(input: Readonly<{
-    capture: DevinJoinedCloseCapture;
-    joinedWriters: readonly Readonly<{ providerAuthority: ProviderAccountAuthority; providerThreadId: string; connectionId: string }>[];
-  }>): DevinJoinedCloseReceipt {
-    const capture = devinCloseCaptureSchema.parse(input.capture);
-    const joinedWriters = z.array(z.object({
-      providerAuthority: devinProviderAccountAuthoritySchema, providerThreadId: providerThreadIdSchema, connectionId: z.string().uuid(),
-    }).strict()).min(1).max(1024).parse(input.joinedWriters);
-    return this.#database.transaction(() => {
-      assertSchemaVersion44DevinClose(this.#database);
-      const record = readDevinJoinedClose(this.#database, capture.closeId);
-      const expectedWriters = record.members.map(({ sessionId, providerThreadId, connectionId }) => ({ sessionId, providerThreadId, connectionId }));
-      if (capture.captureDigest !== record.captureDigest || !sameProviderAccountAuthority(capture.providerAuthority, record.authority)
-        || JSON.stringify(capture.writers) !== JSON.stringify(expectedWriters)
-        || joinedWriters.length !== record.members.length
-        || new Set(joinedWriters.map((writer) => writer.connectionId)).size !== joinedWriters.length
-        || joinedWriters.some((writer) => !sameProviderAccountAuthority(writer.providerAuthority, record.authority)
-          || !record.members.some((member) => member.connectionId === writer.connectionId && member.providerThreadId === writer.providerThreadId))) {
-        throw new DevinJoinedCloseError("DEVIN_JOINED_CLOSE_CONFLICT");
-      }
-      const receipt: DevinJoinedCloseReceipt = {
-        closeId: capture.closeId, providerAuthority: record.authority,
-        retiredAuthority: { ...record.authority, processGeneration: record.authority.processGeneration + 1 },
-        daemonGeneration: record.intent.daemon_generation, bootId: record.intent.boot_id,
-      };
-      if (record.joined !== null) return receipt;
-      this.assertProviderAccountAuthorityCurrent(record.authority);
-      if (this.#devinCloseBlocked(record.authority)) throw new DevinJoinedCloseError("DEVIN_JOINED_CLOSE_CONFLICT");
-      for (const member of record.members) {
-        const current = this.#devinCloseSnapshot({ sessionId: member.sessionId, providerThreadId: member.providerThreadId, connectionId: member.connectionId }, record.authority);
-        if (JSON.stringify(current) !== JSON.stringify(member)) throw new DevinJoinedCloseError("DEVIN_JOINED_CLOSE_CONFLICT");
-      }
-      const joined = { close_id: capture.closeId, retired_process_generation: receipt.retiredAuthority.processGeneration, recorded_at: unixMillisecondsSchema.parse(this.#now()) };
-      this.#database.query("INSERT INTO devin_joined_close_receipts(close_id,retired_process_generation,recorded_at) VALUES(?,?,?)")
-        .run(joined.close_id, joined.retired_process_generation, joined.recorded_at);
-      this.#database.query("INSERT INTO devin_joined_close_anchors(close_id,kind,digest) VALUES(?,'joined',?)")
-        .run(capture.closeId, devinCloseDigest("joined", { captureDigest: record.captureDigest, joined }));
-      const changed = this.#database.query(`UPDATE provider_accounts SET process_generation=process_generation+1,updated_at=MAX(updated_at,?)
-        WHERE id=? AND provider='devin' AND binding_generation=? AND process_generation=? AND NOT ${unsettledForegroundProviderLoginSql}`)
-        .run(joined.recorded_at, record.authority.providerAccountId, record.authority.bindingGeneration, record.authority.processGeneration);
-      if (changed.changes !== 1) throw new DevinJoinedCloseError("DEVIN_JOINED_CLOSE_CONFLICT");
-      readDevinJoinedClose(this.#database, capture.closeId);
-      return receipt;
-    }).immediate();
-  }
-
-  #consumeDevinJoinedCloses(previousGeneration: number, previousBootId: string | null, bootId: string, now: number): void {
-    let afterId = "";
-    for (;;) {
-      const rows = this.#database.query(`SELECT i.close_id FROM devin_joined_close_intents i
-        JOIN devin_joined_close_receipts r ON r.close_id=i.close_id
-        LEFT JOIN devin_joined_close_consumptions c ON c.close_id=i.close_id
-        WHERE i.daemon_generation=? AND i.boot_id=? AND c.close_id IS NULL AND i.close_id>?
-        ORDER BY i.close_id LIMIT 100`).all(previousGeneration, previousBootId, afterId)
-        .map((row) => z.object({ close_id: z.string().uuid() }).strict().parse(row));
-      if (rows.length === 0) break;
-      for (const row of rows) {
-        afterId = row.close_id;
-        const record = readDevinJoinedClose(this.#database, row.close_id);
-        const account = this.requireProviderAccountById(record.authority.providerAccountId);
-        if (account.provider !== "devin" || account.readiness === "removed"
-          || account.bindingGeneration !== record.authority.bindingGeneration
-          || account.processGeneration !== record.authority.processGeneration + 2
-          || this.#devinCloseBlocked(record.authority)) continue;
-        if (record.members.some((member) => JSON.stringify(this.#devinCloseSnapshot({
-          sessionId: member.sessionId, providerThreadId: member.providerThreadId, connectionId: member.connectionId,
-        }, record.authority)) !== JSON.stringify(member))) continue;
-        const consumed = { close_id: row.close_id, daemon_generation: previousGeneration + 1, boot_id: bootId,
-          process_generation: account.processGeneration, recorded_at: now };
-        this.#database.query(`INSERT INTO devin_joined_close_consumptions(close_id,daemon_generation,boot_id,process_generation,recorded_at)
-          VALUES(?,?,?,?,?)`).run(consumed.close_id, consumed.daemon_generation, consumed.boot_id, consumed.process_generation, consumed.recorded_at);
-        this.#database.query("INSERT INTO devin_joined_close_anchors(close_id,kind,digest) VALUES(?,'consumed',?)")
-          .run(row.close_id, devinCloseDigest("consumed", { captureDigest: record.captureDigest, joined: record.joined, consumed }));
-        for (const member of record.members) {
-          insertSessionProviderAuthoritySuccessor(this.#database, {
-            sessionId: member.sessionId, targetAuthority: { ...record.authority, processGeneration: account.processGeneration },
-            targetRoutingProvenance: member.routingProvenance, targetAppliedPointerRevision: member.appliedPointerRevision,
-            transitionKind: "provider_restart", transitionId: row.close_id, recordedAt: now,
-          });
-          const changed = this.#database.query(`UPDATE session_provider_authorities SET process_generation=?,authority_revision=authority_revision+1
-            WHERE session_id=? AND authority_revision=? AND process_generation=? AND binding_generation=? AND provider_account_id=?`)
-            .run(account.processGeneration, member.sessionId, member.authorityRevision, record.authority.processGeneration,
-              record.authority.bindingGeneration, record.authority.providerAccountId);
-          if (changed.changes !== 1) throw new DevinJoinedCloseError("DEVIN_JOINED_CLOSE_CONFLICT");
-        }
-        readDevinJoinedClose(this.#database, row.close_id);
-      }
-    }
-    // No immutable joined writer proof means no native load authority. A later
-    // empty-manager close cannot renew a consumed receipt for these sessions.
-    this.#database.query(`UPDATE sessions SET state='recovery_required',active_turn_id=NULL,revision=revision+1,updated_at=MAX(updated_at,?)
-      WHERE provider_v39='devin' AND state NOT IN ('terminal','recovery_required')
-        AND NOT EXISTS(SELECT 1 FROM devin_joined_close_consumptions c
-          JOIN devin_joined_close_intents i ON i.close_id=c.close_id
-          JOIN devin_joined_close_snapshots m ON m.close_id=c.close_id AND m.session_id=sessions.id
-          JOIN session_provider_authorities s ON s.session_id=m.session_id
-          WHERE c.daemon_generation=? AND c.boot_id=? AND s.provider='devin'
-            AND s.provider_account_id=i.provider_account_id AND s.binding_generation=i.binding_generation
-            AND s.process_generation=c.process_generation
-            AND s.authority_revision=json_extract(m.snapshot_json,'$.authorityRevision')+1)
-        AND NOT EXISTS(SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch WHERE switch.session_id=sessions.id AND ${SESSION_SWITCH_BLOCKING_PREDICATE})`)
-      .run(now, previousGeneration + 1, bootId);
-  }
 
   advanceProviderAccountProcessGeneration(input: Readonly<{
     profileId: ProfileId;
@@ -17767,6 +24683,7 @@ export class StateStore {
   }>): ProviderAccountAuthority {
     const profileId = profileIdSchema.parse(input.profileId);
     const provider = providerSchema.parse(input.provider);
+    assertSupportedProvider(provider);
     const expected = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER - 1)
       .parse(input.expectedProcessGeneration);
     if (provider === "codex") {
@@ -17855,17 +24772,20 @@ export class StateStore {
           profileId: current.id,
         });
       }
-      const activeLogin = this.#database.query(`SELECT attempt_id,process_generation
+      this.#recordAccountMutationAuthoritySuccessors({ profileId, fromGeneration: expectedGeneration, now });
+      const activeLogin = this.#database.query(`SELECT attempt_id,process_generation,login_id
                                                 FROM provider_login_authorities
                                                 WHERE profile_id=? AND state='active'`).all(profileId) as {
         attempt_id: string;
         process_generation: number;
+        login_id: string;
       }[];
       if (activeLogin.length > 1) throw new Error("LOGIN_GENERATION_AUTHORITY_AMBIGUOUS");
       if (activeLogin.length === 1) {
         if (
-          current.state !== "login_pending"
-          || activeLogin[0]?.process_generation !== expectedGeneration
+          activeLogin[0]?.process_generation !== expectedGeneration
+          || readProviderLoginBindingAuthority(this.#database, profileId, expectedGeneration)?.attemptId
+            !== activeLogin[0].attempt_id
         ) throw new Error("LOGIN_GENERATION_AUTHORITY_MISMATCH");
         this.#advancePendingLoginProcessAuthority(
           profileId,
@@ -17874,7 +24794,11 @@ export class StateStore {
           now,
         );
       }
-      const state = profileStateSchema.exclude(["removed"]).parse(current.state);
+      const retainedState = this.requireProfileById(profileId).state;
+      if (retainedState === "removed") throw new Error("Profile generation authority changed.");
+      const state = retainedState === "login_pending" && activeLogin.length === 0
+        ? "recovery_required"
+        : retainedState;
       const affectedWorkIds = workStore?.prepareProfileAuthorityChange(
         profileId,
         expectedGeneration,
@@ -18037,8 +24961,8 @@ export class StateStore {
        SET readiness=?,binding_generation=binding_generation+?,
            readiness_observed_at=?,provider_email=?,provider_plan=?,
            updated_at=MAX(updated_at,?)
-       WHERE id=? AND binding_generation=? AND readiness!='removed'`,
-    ).run(
+       WHERE id=? AND binding_generation=? AND readiness!='removed' RETURNING id`,
+    ).get(
       input.readiness,
       authorityChanged ? 1 : 0,
       input.observedAt,
@@ -18048,7 +24972,9 @@ export class StateStore {
       account.id,
       account.binding_generation,
     );
-    if (changed.changes !== 1) throw new Error("PROVIDER_ACCOUNT_AUTHORITY_STALE");
+    if (z.object({ id: providerAccountIdSchema }).strict().nullable().parse(changed)?.id !== account.id) {
+      throw new Error("PROVIDER_ACCOUNT_AUTHORITY_STALE");
+    }
   }
 
   #setProfileState(
@@ -18251,6 +25177,25 @@ export class StateStore {
     if (attempt === null || (attempt.state !== "effect_started" && attempt.state !== "ambiguous")) {
       throw new Error("MUTATION_RECOVERY_PROVIDER_AUTHORITY_MISMATCH");
     }
+    // A matching provider binding is necessary but never substitutes for the
+    // immutable account-effect successor chain introduced by canonical v45.
+    if (!this.isAccountMutationAuthorityCurrent({
+      attemptId: attempt.id,
+      profileId: current.profileId,
+      originGeneration: attempt.authorityGeneration,
+    })) throw new Error("ACCOUNT_MUTATION_RECOVERY_AUTHORITY_MISMATCH");
+    if (attempt.kind === "account.login-cancel") {
+      if (attempt.providerAuthorityQuarantine !== undefined) {
+        throw new Error("MUTATION_RECOVERY_PROVIDER_AUTHORITY_MISMATCH");
+      }
+      // The dedicated reader preserves the original cancellation tuple and
+      // separately proves the pending login's current binding. Its only import
+      // baseline exception is the explicitly selected canonical Sol43/v45
+      // representation; generic login/logout recovery does not inherit it.
+      assertProviderLoginCancellationBinding(this.#database, current.profileId,
+        current.processGeneration, attempt.id);
+      return attempt;
+    }
     const original = (value: MutationAttemptRecord) => {
       const evidence = value.evidence?.evidence;
       const authorities = this.readMutationProviderAuthorities(value.id);
@@ -18305,43 +25250,6 @@ export class StateStore {
         && profile.state !== (captured.evidence.baselineSignedIn ? "signed_in" : "signed_out"))) {
       throw new Error("MUTATION_RECOVERY_PROVIDER_AUTHORITY_MISMATCH");
     }
-    if (captured.evidence.kind === "account.login-cancel") {
-      // Cancellation borrows no process lineage of its own. Its immutable
-      // loginId must identify the actual pending login and that login's chain.
-      const rows = this.#database.query(`SELECT a.attempt_id,a.process_generation,m.idempotency_key,
-          c.provider_account_id,c.profile_id,c.provider,c.binding_generation,c.process_generation AS origin_generation
-        FROM provider_login_authorities a JOIN mutation_attempts m ON m.id=a.attempt_id
-        LEFT JOIN account_scoped_provider_authorities c ON c.scope_kind='provider_login' AND c.scope_id=a.attempt_id
-        WHERE a.profile_id=? AND a.login_id=? AND a.state='active' LIMIT 2`)
-        .all(current.profileId, captured.evidence.loginId);
-      if (rows.length !== 1) throw new Error("MUTATION_RECOVERY_PROVIDER_AUTHORITY_MISMATCH");
-      const pending = z.object({ attempt_id: attemptIdSchema, process_generation: positiveGenerationSchema,
-        idempotency_key: z.string().uuid(), provider_account_id: providerAccountIdSchema,
-        profile_id: profileIdSchema, provider: z.literal("codex"), binding_generation: positiveGenerationSchema,
-        origin_generation: positiveGenerationSchema }).strict().parse(rows[0]);
-      const login = this.readMutation(pending.idempotency_key);
-      if (login === null || login.state !== "applied" || login.kind !== "account.login") {
-        throw new Error("MUTATION_RECOVERY_PROVIDER_AUTHORITY_MISMATCH");
-      }
-      const loginOriginal = original(login);
-      const receipt = pendingLoginReceiptAuthoritySchema.strict().parse(login.result);
-      const reached = this.#database.query(`WITH RECURSIVE chain(generation) AS (
-          VALUES (?) UNION SELECT successor.to_generation FROM session_mutation_authority_rebinds_v39 successor
-          JOIN chain ON successor.from_generation=chain.generation
-          WHERE successor.attempt_id=? AND successor.profile_id=? AND successor.provider='codex'
-        ) SELECT generation FROM chain WHERE generation IN (?,?)`).all(pending.origin_generation,
-        pending.attempt_id, current.profileId, captured.authority.processGeneration, current.processGeneration)
-        .map((row) => z.object({ generation: positiveGenerationSchema }).strict().parse(row).generation);
-      if (receipt.loginId !== captured.evidence.loginId || pending.attempt_id !== login.id
-        || pending.process_generation !== current.processGeneration
-        || pending.provider_account_id !== captured.authority.providerAccountId || pending.profile_id !== current.profileId
-        || pending.binding_generation !== captured.authority.bindingGeneration
-        || pending.origin_generation !== loginOriginal.authority.processGeneration
-        || !sameProviderAccountBinding(loginOriginal.authority, captured.authority)
-        || !reached.includes(captured.authority.processGeneration) || !reached.includes(current.processGeneration)) {
-        throw new Error("MUTATION_RECOVERY_PROVIDER_AUTHORITY_MISMATCH");
-      }
-    }
     return attempt;
   }
 
@@ -18373,7 +25281,8 @@ export class StateStore {
         this.#database.query(
           `SELECT COUNT(*) AS count FROM mutation_attempts m
            LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
-           WHERE m.authority_id=? AND m.authority_generation=?
+           WHERE m.authority_id=? AND (m.authority_generation=?
+             OR m.kind IN ('account.login','account.logout','account.login-cancel'))
              AND m.kind NOT IN ('account.claude-login','account.devin-login')
              AND m.state IN ('effect_started','ambiguous')
              AND r.attempt_id IS NULL`,
@@ -18389,8 +25298,17 @@ export class StateStore {
       if (generic.count !== 0 || resets.count !== 0) {
         throw new Error("PROFILE_RECOVERY_AUTHORITY_UNSETTLED");
       }
-      const state = provider.signedIn ? "signed_in" : "signed_out";
+      const pendingLogin = readProviderLoginBindingAuthority(this.#database, profileId, expectedGeneration);
+      const state = provider.signedIn ? "signed_in" : pendingLogin === null ? "signed_out" : "login_pending";
       const now = unixMillisecondsSchema.parse(this.#now());
+      if (state === "login_pending") {
+        if (pendingLogin?.pendingCancellationId === null || pendingLogin === null) {
+          throw new Error("PROVIDER_LOGIN_BINDING_PROOF_INVALID");
+        }
+        prepareProviderLoginBindingTransition(this.#database, { profileId,
+          cancellationAttemptId: pendingLogin.pendingCancellationId,
+          cause: "cancellation_reconciled_pending", recordedAt: now });
+      }
       const providerEmail = provider.signedIn ? provider.email ?? null : null;
       const changed = this.#database.query(
         `UPDATE profiles SET state=?,provider_email=?,codex_account_key=?,provider_plan=?,updated_at=?
@@ -18420,8 +25338,8 @@ export class StateStore {
          SET readiness=?,binding_generation=binding_generation+?,
              readiness_observed_at=?,provider_email=?,provider_plan=?,
              updated_at=MAX(updated_at,?)
-         WHERE id=? AND binding_generation=? AND readiness!='removed'`,
-      ).run(
+         WHERE id=? AND binding_generation=? AND readiness!='removed' RETURNING id`,
+      ).get(
         state,
         bindingAuthorityChanged ? 1 : 0,
         now,
@@ -18431,10 +25349,10 @@ export class StateStore {
         providerAccount.id,
         providerAccount.binding_generation,
       );
-      if (bindingChanged.changes !== 1) {
+      if (z.object({ id: providerAccountIdSchema }).strict().nullable().parse(bindingChanged)?.id !== providerAccount.id) {
         throw new Error("PROVIDER_ACCOUNT_AUTHORITY_STALE");
       }
-      this.#database.query(
+      if (state !== "login_pending") this.#database.query(
         `UPDATE provider_login_authorities
          SET state='settled',settlement=?,updated_at=?
          WHERE profile_id=? AND process_generation=? AND state='active'`,
@@ -18638,9 +25556,11 @@ export class StateStore {
     const now = this.#now();
     const title = input.title === undefined ? "Untitled session" : titleSchema.parse(input.title);
     const provider = providerSchema.parse(input.provider ?? "codex");
-    const preset = presetSchema.parse(input.preset);
+    assertSupportedProvider(provider);
+    const preset = supportedPresetSchema.parse(input.preset);
     const routing = sessionRoutingProvenanceSchema.parse(input.routing ?? "explicit");
     assertPresetSupportedByProvider(provider, preset);
+    const presetBinding = activePresetBinding(preset);
     const create = this.#database.transaction(() => {
       const state = this.readProviderAccountState(provider);
       const account = routing === "managed"
@@ -18667,7 +25587,7 @@ export class StateStore {
       if (routing === "managed" && appliedPointerRevision !== state.pointerRevision) {
         throw new Error("PROVIDER_ACTIVE_ACCOUNT_CONFLICT");
       }
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id, account.profileId, input.projectId ?? null, title, legacySessionProviderShadow(provider), provider, presetTiers[preset], currentPresetContract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,canonical_profile_key,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id, account.profileId, input.projectId ?? null, title, legacySessionProviderShadow(provider), provider, presetTiers[preset], presetBinding.contract, requireCanonicalSessionProfileKey(provider, presetTiers[preset], presetBinding.contract), input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       // This preparatory row has no provider-account observation yet. Clear the
       // legacy profile-derived hint in the same transaction so a later plain
       // bindSession cannot launder it into provider authority. Provider import
@@ -18756,9 +25676,9 @@ export class StateStore {
         "UPDATE sessions SET archived_at=? WHERE id=?",
       ).run(archived ? now : null, parsedSessionId);
       if (result.changes !== 1) throw new SelectionError("NOT_FOUND");
+      return this.requireSession(parsedSessionId);
     });
-    write.immediate();
-    return this.requireSession(parsedSessionId);
+    return write.immediate();
   }
 
   readNotificationHours(): NotificationHoursPolicy {
@@ -18956,7 +25876,7 @@ export class StateStore {
   }
 
   setDefaultPreset(preset: Preset): void {
-    const parsed = presetSchema.parse(preset);
+    const parsed = supportedPresetSchema.parse(preset);
     const result = this.#database.query("UPDATE daemon_state SET default_preset=? WHERE singleton=1").run(presetTiers[parsed]);
     if (result.changes !== 1) throw new Error("DAEMON_STATE_MISSING");
   }
@@ -18966,8 +25886,11 @@ export class StateStore {
     after: Readonly<{ createdAt: number; sessionId: SessionId }> | null;
     excludedProvider?: Provider;
     includeArchived?: boolean;
+    /** Include retired local history in this read projection, never current authority. */
+    includeRetiredHistory?: boolean;
     limit: number;
     requireCurrentAccountAuthority?: boolean;
+    provider?: Provider;
   }>): Readonly<{
     sessions: readonly SessionRecord[];
     nextPosition: Readonly<{ createdAt: number; sessionId: SessionId }> | null;
@@ -18983,9 +25906,12 @@ export class StateStore {
     const excludedProvider = input.excludedProvider === undefined
       ? null
       : providerSchema.parse(input.excludedProvider);
+    const provider = input.provider === undefined
+      ? null
+      : providerSchema.parse(input.provider);
     const archiveClause = input.includeArchived === true ? "" : " AND s.archived_at IS NULL";
     const accountAuthorityClause = input.requireCurrentAccountAuthority === true
-      ? ` AND EXISTS (
+      ? ` AND ((s.provider_v39 IN ('codex','claude') AND EXISTS (
            SELECT 1
            FROM profiles p
            LEFT JOIN session_provider_account_authorities pa
@@ -19028,18 +25954,29 @@ export class StateStore {
                  ))
                OR (s.provider_v39='devin' AND p.state IN ('signed_in','signed_out'))
              )
-         )`
+         ))${input.includeRetiredHistory === true ? " OR s.provider_v39='devin'" : ""})`
       : "";
     const rows = (after === null
       ? this.#database.query(
         `SELECT s.* FROM sessions s
-         WHERE s.profile_id=? AND (? IS NULL OR s.provider_v39!=?)${archiveClause}${accountAuthorityClause}
+         WHERE s.profile_id=?
+           AND (? IS NULL OR s.provider_v39!=?)
+           AND (? IS NULL OR s.provider_v39=?)${archiveClause}${accountAuthorityClause}
          ORDER BY s.created_at DESC,s.id ASC
          LIMIT ?`,
-      ).all(profileId, excludedProvider, excludedProvider, limit + 1)
+      ).all(
+        profileId,
+        excludedProvider,
+        excludedProvider,
+        provider,
+        provider,
+        limit + 1,
+      )
       : this.#database.query(
         `SELECT s.* FROM sessions s
-         WHERE s.profile_id=? AND (? IS NULL OR s.provider_v39!=?)${archiveClause}${accountAuthorityClause}
+         WHERE s.profile_id=?
+           AND (? IS NULL OR s.provider_v39!=?)
+           AND (? IS NULL OR s.provider_v39=?)${archiveClause}${accountAuthorityClause}
            AND (s.created_at < ? OR (s.created_at = ? AND s.id > ?))
          ORDER BY s.created_at DESC,s.id ASC
          LIMIT ?`,
@@ -19047,12 +25984,120 @@ export class StateStore {
         profileId,
         excludedProvider,
         excludedProvider,
+        provider,
+        provider,
         after.createdAt,
         after.createdAt,
         after.sessionId,
         limit + 1,
       ))
       .map(mapSession);
+    const sessions = rows.slice(0, limit);
+    const last = sessions.at(-1);
+    return {
+      sessions,
+      nextPosition: rows.length > limit && last !== undefined
+        ? { createdAt: last.createdAt, sessionId: last.id }
+        : null,
+    };
+  }
+
+  /**
+   * Stable local page for a model session's same-project peer directory.
+   * The actor is excluded and targets whose effective policy is off are not
+   * disclosed. Creation order keeps a target's ordinary state changes from
+   * moving it between pages.
+   */
+  listPeerProjectSessionPage(input: Readonly<{
+    actorSessionId: SessionId;
+    actorTurnId: string;
+    after: Readonly<{ createdAt: number; sessionId: SessionId }> | null;
+    limit: number;
+  }>): Readonly<{
+    sessions: readonly PeerSessionDirectoryRecord[];
+    nextPosition: Readonly<{ createdAt: number; sessionId: SessionId }> | null;
+  }> {
+    const actorSessionId = sessionIdSchema.parse(input.actorSessionId);
+    const actorTurnId = z.string().min(1).max(200).parse(input.actorTurnId);
+    const limit = z.number().int().min(1).max(50).parse(input.limit);
+    const after = input.after === null
+      ? null
+      : {
+          createdAt: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER)
+            .parse(input.after.createdAt),
+          sessionId: sessionIdSchema.parse(input.after.sessionId),
+        };
+    const actor = this.#requireLivePeerSession(
+      actorSessionId,
+      "PEER_SESSION_ACTOR_TURN_REFUSED",
+    );
+    if (
+      actor.state !== "active"
+      || actor.activeTurnId !== actorTurnId
+      || actor.projectId === undefined
+    ) throw new PeerSessionRefusalError("PEER_SESSION_ACTOR_TURN_REFUSED");
+    const actorPolicy = this.requirePeerSessionPolicy(actorSessionId);
+    if (actorPolicy.mode === "off") {
+      throw new PeerSessionRefusalError("PEER_SESSION_POLICY_REFUSED");
+    }
+    const directoryRowSchema = z.object({
+      id: sessionIdSchema,
+      title: titleSchema,
+      provider: providerSchema,
+      preset: presetTierSchema,
+      state: sessionStateSchema,
+      active: z.union([z.literal(0), z.literal(1)]),
+      revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      policy: peerSessionPolicyModeSchema,
+      policy_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      created_at: unixMillisecondsSchema,
+      updated_at: unixMillisecondsSchema,
+    }).strict();
+    const selection = `SELECT sessions.id,sessions.title,sessions.provider_v39 AS provider,sessions.preset,
+      sessions.state,(sessions.active_turn_id IS NOT NULL) AS active,
+      sessions.revision,policy.mode AS policy,policy.revision AS policy_revision,
+      sessions.created_at,sessions.updated_at
+      FROM sessions JOIN session_peer_policies policy ON policy.session_id=sessions.id`;
+    const rows = (after === null
+      ? this.#database.query(
+        `${selection}
+         WHERE sessions.project_id=? AND sessions.id<>? AND sessions.archived_at IS NULL
+           AND sessions.provider_v39 IN ('codex','claude')
+           AND policy.mode<>'off'
+         ORDER BY sessions.created_at DESC,sessions.id ASC
+         LIMIT ?`,
+      ).all(actor.projectId, actorSessionId, limit + 1)
+      : this.#database.query(
+        `${selection}
+         WHERE sessions.project_id=? AND sessions.id<>? AND sessions.archived_at IS NULL
+           AND sessions.provider_v39 IN ('codex','claude')
+           AND policy.mode<>'off'
+           AND (sessions.created_at < ? OR (sessions.created_at = ? AND sessions.id > ?))
+         ORDER BY sessions.created_at DESC,sessions.id ASC
+         LIMIT ?`,
+      ).all(
+        actor.projectId,
+        actorSessionId,
+        after.createdAt,
+        after.createdAt,
+        after.sessionId,
+        limit + 1,
+      )).map((row) => {
+        const parsed = directoryRowSchema.parse(row);
+        return {
+          id: parsed.id,
+          title: parsed.title,
+          provider: parsed.provider,
+          preset: presetForProviderTier(parsed.provider, parsed.preset),
+          state: parsed.state,
+          active: parsed.active === 1,
+          revision: parsed.revision,
+          policy: parsed.policy,
+          policyRevision: parsed.policy_revision,
+          createdAt: parsed.created_at,
+          updatedAt: parsed.updated_at,
+        } satisfies PeerSessionDirectoryRecord;
+      });
     const sessions = rows.slice(0, limit);
     const last = sessions.at(-1);
     return {
@@ -19227,6 +26272,7 @@ export class StateStore {
     sourceAuthority: ProviderAccountAuthority;
     targetAuthority: ProviderAccountAuthority;
     targetAccountKey: string;
+    targetHostCapabilities: SessionSwitchExecutionHostCapabilities;
     expectedSessionRevision: number;
     expectedAuthorityRevision: number;
     sourcePreset: Preset;
@@ -19237,7 +26283,7 @@ export class StateStore {
     transcript: SessionSwitchTranscriptPin;
   }>): Readonly<{ status: "prepared" | "replayed"; switch: SessionSwitchRecord }> {
     const idempotencyKey = z.string().uuid().parse(input.idempotencyKey);
-    const rawRequest = sessionSwitchRawRequestSchema.parse(input.rawRequest);
+    const rawRequest: SessionSwitchRawRequest = sessionSwitchRawRequestSchema.parse(input.rawRequest);
     const rawRequestJson = JSON.stringify(rawRequest);
     const requestDigest = digestJson(rawRequest);
     const sessionId = sessionIdSchema.parse(input.sessionId);
@@ -19253,9 +26299,7 @@ export class StateStore {
     const sourcePreset = presetSchema.parse(input.sourcePreset);
     const targetPreset = presetSchema.parse(input.targetPreset);
     const sourcePresetContract = presetContractSchema.parse(input.sourcePresetContract);
-    const targetPresetContract = z.literal(currentPresetContract).parse(input.targetPresetContract);
-    assertPresetSupportedByProvider(sourceAuthority.provider, sourcePreset);
-    assertPresetSupportedByProvider(targetAuthority.provider, targetPreset);
+    const targetPresetContract = presetContractSchema.parse(input.targetPresetContract);
     const sourceRuntimeProfileRevision = positiveGenerationSchema.parse(
       input.sourceRuntimeProfileRevision,
     );
@@ -19280,6 +26324,9 @@ export class StateStore {
         || existing.targetPresetContract !== targetPresetContract
         || existing.sourceRuntimeProfileRevision !== sourceRuntimeProfileRevision
         || JSON.stringify(existing.transcript) !== JSON.stringify(transcript)
+        || (existing.rawRequest.version === 2
+          && JSON.stringify(existing.targetHostCapabilities)
+            !== JSON.stringify(sessionSwitchExecutionHostCapabilitiesSchema.parse(input.targetHostCapabilities)))
       ) throw new SessionSwitchStoreError("IDEMPOTENCY_CONFLICT");
       const adoption = readSessionSwitchAdoption(this.#database, existing.attemptId);
       if (adoption !== null && adoption.targetAccountKey !== targetAccountKey) {
@@ -19288,11 +26335,25 @@ export class StateStore {
       return { status: "replayed", switch: existing };
     }
 
+    // Old requests can only replay their committed plan. New plans record the
+    // caller's contract choice and the exact host capabilities before IO.
+    const targetHostCapabilities = sessionSwitchExecutionHostCapabilitiesSchema.parse(input.targetHostCapabilities);
+    assertSupportedProvider(sourceAuthority.provider);
+    assertSupportedProvider(targetAuthority.provider);
+    assertPresetSupportedByProvider(sourceAuthority.provider, sourcePreset);
+    assertPresetSupportedByProvider(targetAuthority.provider, targetPreset);
+    if (rawRequest.version !== 2 || transcript.rendererVersion !== 2
+      || targetPresetContract !== activePresetBinding(targetPreset).contract
+      || (rawRequest.presetContract !== null && rawRequest.presetContract !== targetPresetContract)) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+    }
+
     let attemptId: AttemptId | undefined;
     const prepare = this.#database.transaction(() => {
       const session = mapSession(this.#database.query(
         "SELECT * FROM sessions WHERE id=?",
       ).get(sessionId));
+      this.#assertSessionSwitchHostCapabilitiesCompatible(sessionId, targetHostCapabilities);
       let requestedSessionId: SessionId;
       let requestedTargetProfileId: ProfileId;
       try {
@@ -19493,6 +26554,23 @@ export class StateStore {
         },
         targetAccountKey,
       });
+      const planDigest = sessionSwitchPlanDigest({
+        attemptId, requestKey: idempotencyKey, requestDigest, rawRequest, sessionId,
+        sourceAuthority, targetAuthority,
+        originalSessionRevision: expectedSessionRevision,
+        originalAuthorityRevision: expectedAuthorityRevision,
+        sourceProviderThreadId: session.providerThreadId,
+        sourcePreset, targetPreset, sourcePresetContract, targetPresetContract,
+        sourceRuntimeProfileRevision, sourceRuntimeProfileDigest,
+        sourceRuntimeProfileSourceKind: runtimeRecord.sourceKind,
+        sourceRuntimeProfileSourceId: runtimeRecord.sourceId,
+        sourceRuntimeProfileRecordedAt: runtimeRecord.recordedAt,
+        transcript, createdAt: now,
+      });
+      insertSessionSwitchExecutionContext(this.#database, {
+        attemptId, requestFormat: 2, requestDigest, planDigest, targetAuthority,
+        createdAt: now, rendererVersion: 2, targetPresetContract, targetHostCapabilities,
+      });
       this.#database.query(
         `INSERT INTO session_switch_attempts(
            attempt_id,request_key,request_digest,raw_request_json,session_id,phase,
@@ -19532,7 +26610,7 @@ export class StateStore {
         sourcePreset,
         targetPreset,
         sourcePresetContract,
-        targetPresetContract,
+        2, // Frozen legacy storage shadow; the context seals the actual contract.
         sourceRuntimeProfileRevision,
         sourceRuntimeProfileDigest,
         transcript.streamEpoch,
@@ -19556,29 +26634,7 @@ export class StateStore {
       ).run(
         attemptId,
         session.providerThreadId,
-        sessionSwitchPlanDigest({
-          attemptId,
-          requestKey: idempotencyKey,
-          requestDigest,
-          rawRequest,
-          sessionId,
-          sourceAuthority,
-          targetAuthority,
-          originalSessionRevision: expectedSessionRevision,
-          originalAuthorityRevision: expectedAuthorityRevision,
-          sourceProviderThreadId: session.providerThreadId,
-          sourcePreset,
-          targetPreset,
-          sourcePresetContract,
-          targetPresetContract,
-          sourceRuntimeProfileRevision,
-          sourceRuntimeProfileDigest,
-          sourceRuntimeProfileSourceKind: runtimeRecord.sourceKind,
-          sourceRuntimeProfileSourceId: runtimeRecord.sourceId,
-          sourceRuntimeProfileRecordedAt: runtimeRecord.recordedAt,
-          transcript,
-          createdAt: now,
-        }),
+        planDigest,
         now,
       );
     });
@@ -19728,6 +26784,11 @@ export class StateStore {
     const cas = parseSessionSwitchCas(input);
     const begin = this.#database.transaction(() => {
       const record = this.#requireSessionSwitchCas(cas, "prepared");
+      assertSupportedProvider(record.sourceAuthority.provider);
+      assertSupportedProvider(record.targetAuthority.provider);
+      if (record.targetPresetContract !== activePresetBinding(record.targetPreset).contract) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+      }
       this.#assertSessionSwitchSourceCurrent(record);
       this.#assertSessionSwitchTargetCurrent(record);
       this.#transitionSessionSwitch(record, "prepared", "target_starting", null);
@@ -19750,6 +26811,15 @@ export class StateStore {
       throw error;
     }
     return this.requireSessionSwitch(cas.attemptId);
+  }
+
+  assertSessionSwitchTargetStartCurrent(input: SessionSwitchCas): void {
+    const cas = parseSessionSwitchCas(input);
+    this.#database.transaction(() => {
+      const record = this.#requireSessionSwitchCas(cas, "target_starting");
+      this.#assertSessionSwitchSourceCurrent(record);
+      this.#assertSessionSwitchTargetCurrent(record);
+    }).deferred();
   }
 
   completeSessionSwitchTargetStart(input: SessionSwitchCas & Readonly<{
@@ -19786,7 +26856,7 @@ export class StateStore {
       assertRuntimeProfileRequirement(
         runtimeProfile,
         record.targetPreset,
-        presetRequirementForContract(record.targetPreset, record.targetPresetContract),
+        presetRequirementForContractV1(record.targetPreset, record.targetPresetContract),
         "SESSION_SWITCH_TARGET_PRESET_CONTRACT_MISMATCH",
       );
       const now = unixMillisecondsSchema.parse(this.#now());
@@ -20092,7 +27162,7 @@ export class StateStore {
       }
       const bound = this.#database.query(
         `UPDATE sessions
-         SET profile_id=?,provider=?,provider_v39=?,preset=?,preset_contract=?,provider_thread_id=?,state=?,active_turn_id=?,
+         SET profile_id=?,provider=?,provider_v39=?,preset=?,preset_contract=?,canonical_profile_key=?,provider_thread_id=?,state=?,active_turn_id=?,
              provider_updated_at=?,revision=revision+1,updated_at=MAX(updated_at,?)
          WHERE id=? AND revision=? AND profile_id=? AND provider_v39=? AND preset=?
            AND provider_thread_id=? AND state NOT IN ('terminal','recovery_required')
@@ -20103,6 +27173,9 @@ export class StateStore {
         record.targetAuthority.provider,
         presetTiers[record.targetPreset],
         record.targetPresetContract,
+        requireCanonicalSessionProfileKey(
+          record.targetAuthority.provider, presetTiers[record.targetPreset], record.targetPresetContract,
+        ),
         record.targetStart.providerThreadId,
         record.targetStart.state,
         record.targetStart.activeTurnId,
@@ -20165,6 +27238,20 @@ export class StateStore {
         `UPDATE session_conversation_automation SET provider_thread_id=?
          WHERE session_id=?`,
       ).run(record.targetStart.providerThreadId, record.sessionId);
+      // Host capabilities belong to the logical session and remain immutable
+      // when the target uses the same sealed contract. Only an unbound source
+      // gains the target's exact contract; historical V1 never inherits one.
+      this.#assertSessionSwitchHostCapabilitiesCompatible(record.sessionId, record.targetHostCapabilities);
+      if (record.targetHostCapabilities !== undefined
+        && this.readSessionHostCapabilityBinding(record.sessionId) === null) {
+        const capabilities = record.targetHostCapabilities;
+        this.#database.query(`INSERT INTO session_host_capability_bindings(
+          session_id,preamble_version,preamble_digest,manifest_version,manifest_digest,recorded_at
+        ) VALUES (?,?,?,?,?,?)`).run(
+          record.sessionId, capabilities.preambleVersion, capabilities.preambleDigest,
+          capabilities.manifestVersion, capabilities.manifestDigest, now,
+        );
+      }
       const runtime = this.#insertSessionRuntimeProfile({
         sessionId: record.sessionId,
         sourceKind: "session_start",
@@ -21305,7 +28392,22 @@ export class StateStore {
     return record;
   }
 
+  #assertSessionSwitchHostCapabilitiesCompatible(
+    sessionId: SessionId,
+    target: SessionSwitchExecutionHostCapabilities | undefined,
+  ): void {
+    const existing = this.readSessionHostCapabilityBinding(sessionId);
+    if (existing !== null && (target === undefined
+      || existing.preambleVersion !== target.preambleVersion
+      || existing.preambleDigest !== target.preambleDigest
+      || existing.manifestVersion !== target.manifestVersion
+      || existing.manifestDigest !== target.manifestDigest)) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+    }
+  }
+
   #assertSessionSwitchSourceCurrent(record: SessionSwitchRecord): void {
+    this.#assertSessionSwitchHostCapabilitiesCompatible(record.sessionId, record.targetHostCapabilities);
     const adoption = readSessionSwitchAdoption(this.#database, record.attemptId);
     if (adoption === null) throw new Error("SESSION_SWITCH_ADOPTION_UNPROVED");
     const scope = this.readSessionProviderAccountAuthority(record.sessionId);
@@ -21578,11 +28680,11 @@ export class StateStore {
     preset: Preset;
     requirement: PresetRequirement;
   }> {
-    const parsed = sessionRowSchema.parse(
+    const parsed = parseCanonicalSessionRow(
       this.#database.query("SELECT * FROM sessions WHERE id=?").get(sessionIdSchema.parse(sessionId)),
     );
     const preset = presetForProviderTier(parsed.provider_v39, parsed.preset);
-    const requirement = presetRequirementForContract(preset, parsed.preset_contract);
+    const requirement = presetRequirementForContractV1(preset, parsed.preset_contract);
     return {
       contract: parsed.preset_contract,
       preset,
@@ -21654,6 +28756,7 @@ export class StateStore {
        LEFT JOIN session_provider_account_authorities pa
          ON pa.session_id=s.id AND pa.provider=s.provider_v39
        WHERE s.id=? AND s.profile_id=?
+         AND s.provider_v39 IN ('codex','claude')
          AND NOT EXISTS(
            SELECT 1 FROM provider_runtime_account_revocations r
            WHERE r.profile_id=s.profile_id
@@ -22679,14 +29782,6 @@ export class StateStore {
       claudeProcessIdentity: claudeProcessIdentitySchema.optional(),
     }).strict().parse(input);
     assertPresetSupportedByProvider(parsed.provider, parsed.preset);
-    const currentRequirement = presetRequirementForContract(
-      parsed.preset,
-      currentPresetContract,
-    );
-    if (
-      parsed.requirement.model !== currentRequirement.model
-      || parsed.requirement.effort !== currentRequirement.effort
-    ) throw new Error("SESSION_ADOPTION_PRESET_REQUIREMENT_MISMATCH");
     if ((parsed.provider === "claude") !== (parsed.claudeProcessIdentity !== undefined)) {
       throw new Error("SESSION_ADOPTION_CLAUDE_PROCESS_AUTHORITY_REQUIRED");
     }
@@ -22827,6 +29922,20 @@ export class StateStore {
         if (collisions.length > 0) throw new Error("SESSION_ADOPTION_SESSION_COLLISION");
       }
 
+      const activeBinding = activePresetBinding(parsed.preset);
+      const preservedBinding = priorBinding?.state === "active"
+        ? this.#requireSessionPresetBinding(priorBinding.sessionId)
+        : undefined;
+      if (preservedBinding !== undefined && preservedBinding.preset !== parsed.preset) {
+        throw new Error("SESSION_ADOPTION_PRESET_REQUIREMENT_MISMATCH");
+      }
+      const adoptionContract = preservedBinding?.contract ?? activeBinding.contract;
+      const adoptionRequirement = preservedBinding?.requirement ?? activeBinding.requirement;
+      if (
+        parsed.requirement.model !== adoptionRequirement.model
+        || parsed.requirement.effort !== adoptionRequirement.effort
+      ) throw new Error("SESSION_ADOPTION_PRESET_REQUIREMENT_MISMATCH");
+
       const requestedProjectId = parsed.projectId ?? candidate.projectId ?? undefined;
       const projectId = requestedProjectId !== undefined
         && this.#database.query("SELECT 1 FROM projects WHERE id=?").get(requestedProjectId) !== null
@@ -22843,7 +29952,7 @@ export class StateStore {
         ...(projectId === undefined ? {} : { projectId }),
         title: candidate.title,
         preset: parsed.preset,
-        presetContract: currentPresetContract,
+        presetContract: adoptionContract,
         fastEnabled: parsed.fastEnabled,
         state: candidate.providerState,
         ...(candidate.activeTurnId === null ? {} : { activeTurnId: candidate.activeTurnId }),
@@ -22860,18 +29969,19 @@ export class StateStore {
         priorBinding?.state !== "active"
         && (
           session.preset !== parsed.preset
-          || this.#requireSessionPresetBinding(session.id).contract !== currentPresetContract
+          || this.#requireSessionPresetBinding(session.id).contract !== adoptionContract
           || session.fastEnabled !== parsed.fastEnabled
         )
       ) {
         const updated = this.#database.query(
           `UPDATE sessions
-           SET preset=?,preset_contract=?,fast_enabled=?,revision=revision+1,
+           SET preset=?,preset_contract=?,canonical_profile_key=?,fast_enabled=?,revision=revision+1,
              updated_at=MAX(updated_at,?)
            WHERE id=? AND revision=?`,
         ).run(
           presetTiers[parsed.preset],
-          currentPresetContract,
+          adoptionContract,
+          requireCanonicalSessionProfileKey(parsed.provider, presetTiers[parsed.preset], adoptionContract),
           parsed.fastEnabled ? 1 : 0,
           now,
           session.id,
@@ -22881,6 +29991,13 @@ export class StateStore {
         session = this.requireSession(session.id);
       }
       this.#assertSessionRuntimeProfileContract(session.id, parsed.runtimeProfile);
+
+      // A personal session resumed from provider-owned history has no proof
+      // that HRA's host-tool preamble or manifest reached that thread. Never
+      // mint or inherit a capability binding while adopting it.
+      if (this.readSessionHostCapabilityBinding(session.id) !== null) {
+        throw new Error("SESSION_ADOPTION_HOST_CAPABILITY_BINDING_CONFLICT");
+      }
 
       if (priorBinding === null) {
         this.#database.query(
@@ -22910,19 +30027,6 @@ export class StateStore {
          WHERE provider=? AND provider_thread_id=?`,
       ).run(now, parsed.provider, parsed.providerThreadId);
       this.#database.query("UPDATE sessions SET archived_at=NULL WHERE id=?").run(session.id);
-      this.#database.query(
-        `INSERT INTO session_conversation_automation(
-           session_id,provider_thread_id,enabled_at
-         ) VALUES (?,?,?)
-         ON CONFLICT(session_id) DO NOTHING`,
-      ).run(session.id, parsed.providerThreadId, now);
-      const automation = this.#database.query(
-        `SELECT 1 FROM session_conversation_automation
-         WHERE session_id=? AND provider_thread_id=?`,
-      ).get(session.id, parsed.providerThreadId);
-      if (automation === null) {
-        throw new Error("SESSION_ADOPTION_CONVERSATION_AUTOMATION_BINDING_CONFLICT");
-      }
       if (parsed.claudeProcessIdentity !== undefined) {
         this.#bindClaudeProcessAuthorityLocked({
           sessionId: session.id,
@@ -22950,7 +30054,10 @@ export class StateStore {
         `SELECT * FROM session_adoption_candidates
          WHERE provider=? AND provider_thread_id=?`,
       ).get(parsed.provider, parsed.providerThreadId);
-      if (binding === null || adoptedCandidateRow === null) {
+      if (
+        binding === null
+        || adoptedCandidateRow === null
+      ) {
         throw new Error("SESSION_ADOPTION_COMMIT_INCOMPLETE");
       }
       return {
@@ -23093,8 +30200,8 @@ export class StateStore {
           && exactClaudeSessionAuthority;
 
         const startRows = this.#database.query(
-          `SELECT m.authority_id,m.authority_generation,
-                  e.evidence_json,e.evidence_digest
+          `SELECT m.id AS attempt_id,m.authority_id,m.authority_generation,
+                  e.evidence_digest
            FROM session_start_attempts sa
            JOIN mutation_attempts m ON m.id=sa.attempt_id
            JOIN mutation_effect_evidence e ON e.attempt_id=m.id
@@ -23105,18 +30212,18 @@ export class StateStore {
         ).all(parsed.sessionId);
         const startAuthority = startRows.length === 1
           ? z.object({
+              attempt_id: attemptIdSchema,
               authority_id: profileIdSchema,
               authority_generation: z.number().int().nonnegative().safe(),
-              evidence_json: z.string(),
               evidence_digest: sha256Schema,
             }).strict().parse(startRows[0])
           : null;
         const startEvidence = (() => {
           if (startAuthority === null) return null;
           try {
-            const evidence = mutationEffectEvidenceSchema.parse(
-              JSON.parse(startAuthority.evidence_json) as unknown,
-            );
+            const evidence = requireMutationEvidenceFromProvenance(
+              this.#database, startAuthority.attempt_id,
+            ).evidence;
             return evidence.kind === "session.start"
               && digestJson(evidence) === startAuthority.evidence_digest
               ? evidence
@@ -23155,7 +30262,7 @@ export class StateStore {
 
         const switchRows = this.#database.query(
           `SELECT m.id AS attempt_id,m.authority_generation,
-                  e.evidence_json,e.evidence_digest,
+                  e.evidence_digest,
                   t.provider_thread_id AS target_provider_thread_id,
                   EXISTS(
                     SELECT 1 FROM session_provider_switch_target_releases tr
@@ -23173,7 +30280,6 @@ export class StateStore {
           ? z.object({
               attempt_id: attemptIdSchema,
               authority_generation: z.number().int().nonnegative().safe(),
-              evidence_json: z.string(),
               evidence_digest: sha256Schema,
               target_provider_thread_id: providerThreadIdSchema.nullable(),
               target_released: z.number().int().min(0).max(1),
@@ -23182,9 +30288,9 @@ export class StateStore {
         const switchEvidence = (() => {
           if (switchAuthority === null) return null;
           try {
-            const evidence = mutationEffectEvidenceSchema.parse(
-              JSON.parse(switchAuthority.evidence_json) as unknown,
-            );
+            const evidence = requireMutationEvidenceFromProvenance(
+              this.#database, switchAuthority.attempt_id,
+            ).evidence;
             return evidence.kind === "session.switch"
               && digestJson(evidence) === switchAuthority.evidence_digest
               ? evidence
@@ -24923,6 +32029,11 @@ export class StateStore {
         now,
         profileId: parsed.profileId,
       });
+      this.#recordAccountMutationAuthoritySuccessors({
+        fromGeneration: parsed.expectedGeneration,
+        now,
+        profileId: parsed.profileId,
+      });
       const profile = this.#database.query(
         `UPDATE profiles
          SET process_generation=process_generation+1,
@@ -25402,13 +32513,12 @@ export class StateStore {
       const row = z.object({
         state: z.enum(["effect_started", "ambiguous"]),
         session_id: sessionIdSchema,
-        evidence_json: z.string(),
-      }).strict().parse(this.#database.query(`SELECT m.state,s.session_id,e.evidence_json
+      }).strict().parse(this.#database.query(`SELECT m.state,s.session_id
                                               FROM mutation_attempts m
                                               JOIN session_start_attempts s ON s.attempt_id=m.id
                                               JOIN mutation_effect_evidence e ON e.attempt_id=m.id
                                               WHERE m.id=? AND m.kind='session.start'`).get(attemptId));
-      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
       const primary = this.readMutationProviderAuthorities(attemptId)
         .find((candidate) => candidate.role === "primary");
       if (
@@ -25482,31 +32592,49 @@ export class StateStore {
   completeSessionTurnEffect(input: {
     attemptId: AttemptId;
     sessionId: SessionId;
+    accountId: ProfileId;
+    providerGeneration: number;
+    providerConnectionId: string | null;
     expectedSessionRevision: number;
     applyResponseState: boolean;
     providerAuthority: ProviderAccountAuthority;
     turnId: string;
     turnStatus: "completed" | "interrupted" | "failed" | "inProgress";
     runtimeProfile: ReviewedRuntimeProfile;
+    message: string;
     receipt: unknown;
-  }): void {
+  }): SessionUserMessageEventAppendResult {
     const attemptId = attemptIdSchema.parse(input.attemptId);
     assertLegacyMutationOwnership(this.#database, { attemptId });
     const sessionId = sessionIdSchema.parse(input.sessionId);
     const providerAuthority = providerAccountAuthoritySchema.parse(input.providerAuthority);
+    const accountId = profileIdSchema.parse(input.accountId);
+    const providerGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.providerGeneration);
+    const providerConnectionId = z.string().uuid().nullable().parse(input.providerConnectionId);
+    const message = z.string().min(1).max(262_144).parse(input.message);
     const profile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
     const now = this.#now();
     const transaction = this.#database.transaction(() => {
-      const row = z.object({ authority_id: sessionIdSchema, evidence_json: z.string() }).strict().parse(
-        this.#database.query(`SELECT m.authority_id,e.evidence_json FROM mutation_attempts m
+      const row = z.object({
+        authority_id: sessionIdSchema,
+        profile_id: profileIdSchema,
+        process_generation: z.number().int().nonnegative(),
+      }).strict().parse(
+        this.#database.query(`SELECT m.authority_id,s.profile_id,authority.process_generation
+                              FROM mutation_attempts m
                               JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+                              JOIN sessions s ON s.id=m.authority_id
+                              JOIN session_provider_authorities authority ON authority.session_id=s.id
                               WHERE m.id=? AND m.kind='session.send' AND m.state='effect_started'`).get(attemptId),
       );
-      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
       const primary = this.readMutationProviderAuthorities(attemptId)
         .find((candidate) => candidate.role === "primary");
       if (
         row.authority_id !== sessionId
+        || row.profile_id !== accountId
+        || row.process_generation !== providerGeneration
         || evidence.kind !== "session.send"
         || evidence.runtimeProfile === undefined
         || JSON.stringify(evidence.runtimeProfile) !== JSON.stringify(profile)
@@ -25514,7 +32642,11 @@ export class StateStore {
       if (
         primary === undefined
         || !sameProviderAccountAuthority(primary.authority, providerAuthority)
+        || !sameProviderAccountAuthority(providerAuthority, this.requireCapturedSessionProviderAuthority(sessionId))
+        || providerAuthority.profileId !== accountId
+        || providerAuthority.processGeneration !== providerGeneration
       ) throw new Error("SESSION_TURN_PROVIDER_AUTHORITY_MISMATCH");
+      this.assertProviderAccountAuthorityCurrent(providerAuthority);
       this.#bindSessionTurnRuntimeProfile({
         sessionId,
         sourceKind: "turn_start",
@@ -25538,8 +32670,98 @@ export class StateStore {
       const applied = this.#database.query("UPDATE mutation_attempts SET state='applied',result_json=?,updated_at=? WHERE id=? AND state='effect_started'").run(JSON.stringify(input.receipt), now, attemptId);
       if (applied.changes !== 1) throw new Error("SESSION_TURN_RECEIPT_CAS_CONFLICT");
       settleAttachmentParent(this.#database, attemptId, now);
+      const appended = this.#appendSessionUserMessageEventOnceInTransaction({
+        sourceId: attemptId,
+        sessionId,
+        accountId,
+        providerGeneration,
+        providerConnectionId,
+        turnId: z.string().min(1).max(200).parse(input.turnId),
+        message,
+        recordedAt: now,
+      });
+      if (evidence.messageActor === "human") {
+        this.#database.query(
+          `UPDATE session_autorespond_counters
+           SET consecutive_count=0,updated_at=? WHERE session_id=?`,
+        ).run(now, sessionId);
+      }
+      return appended;
     });
-    transaction.immediate();
+    return transaction.immediate();
+  }
+
+  completeSessionSteerEffect(input: Readonly<{
+    attemptId: AttemptId;
+    sessionId: SessionId;
+    accountId: ProfileId;
+    providerGeneration: number;
+    providerAuthority: ProviderAccountAuthority;
+    providerConnectionId: string | null;
+    turnId: string;
+    message: string;
+    receipt: unknown;
+  }>): SessionUserMessageEventAppendResult {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const accountId = profileIdSchema.parse(input.accountId);
+    const providerAuthority = providerAccountAuthoritySchema.parse(input.providerAuthority);
+    const providerGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.providerGeneration);
+    const providerConnectionId = z.string().uuid().nullable().parse(input.providerConnectionId);
+    const turnId = z.string().min(1).max(200).parse(input.turnId);
+    const message = z.string().min(1).max(262_144).parse(input.message);
+    const now = unixMillisecondsSchema.parse(this.#now());
+    const complete = this.#database.transaction(() => {
+      const row = z.object({
+        authority_id: sessionIdSchema,
+        profile_id: profileIdSchema,
+        process_generation: z.number().int().nonnegative(),
+      }).strict().parse(this.#database.query(
+        `SELECT mutation.authority_id,
+                session.profile_id,authority.process_generation
+         FROM mutation_attempts mutation
+         JOIN mutation_effect_evidence evidence ON evidence.attempt_id=mutation.id
+         JOIN sessions session ON session.id=mutation.authority_id
+         JOIN session_provider_authorities authority ON authority.session_id=session.id
+         WHERE mutation.id=? AND mutation.kind='session.steer'
+           AND mutation.state='effect_started'`,
+      ).get(attemptId));
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
+      if (
+        row.authority_id !== sessionId
+        || row.profile_id !== accountId
+        || row.process_generation !== providerGeneration
+        || evidence.kind !== "session.steer"
+        || evidence.activeTurnId !== turnId
+      ) throw new Error("SESSION_STEER_EFFECT_EVIDENCE_MISMATCH");
+      const primary = this.readMutationProviderAuthorities(attemptId)
+        .find((candidate) => candidate.role === "primary");
+      if (primary === undefined
+        || !sameProviderAccountAuthority(primary.authority, providerAuthority)
+        || !sameProviderAccountAuthority(providerAuthority, this.requireCapturedSessionProviderAuthority(sessionId))
+        || providerAuthority.profileId !== accountId
+        || providerAuthority.processGeneration !== providerGeneration) {
+        throw new Error("SESSION_STEER_PROVIDER_AUTHORITY_MISMATCH");
+      }
+      this.assertProviderAccountAuthorityCurrent(providerAuthority);
+      const applied = this.#database.query(
+        `UPDATE mutation_attempts SET state='applied',result_json=?,updated_at=?
+         WHERE id=? AND state='effect_started'`,
+      ).run(JSON.stringify(input.receipt), now, attemptId);
+      if (applied.changes !== 1) throw new Error("SESSION_STEER_RECEIPT_CAS_CONFLICT");
+      return this.#appendSessionUserMessageEventOnceInTransaction({
+        sourceId: attemptId,
+        sessionId,
+        accountId,
+        providerGeneration,
+        providerConnectionId,
+        turnId,
+        message,
+        recordedAt: now,
+      });
+    });
+    return complete.immediate();
   }
 
   latestSessionRuntimeProfile(sessionId: SessionId): SessionRuntimeProfileRecord | null {
@@ -25579,11 +32801,8 @@ export class StateStore {
       providerAccountKey: providerAccountAuthorityKeySchema.optional(),
       conversationAutomationEnabled: z.boolean().optional(),
     }).strict().parse(input);
-    if (parsed.provider === "devin") {
-      if (parsed.providerAccountKey !== undefined) {
-        throw new Error("SESSION_IMPORT_DEVIN_ACCOUNT_KEY_FORBIDDEN");
-      }
-    } else if (
+    assertSupportedProvider(parsed.provider);
+    if (
       parsed.providerAccountKey === undefined
       || !providerAccountAuthorityKeyMatchesProvider(
         parsed.provider,
@@ -25602,9 +32821,7 @@ export class StateStore {
         ...(parsed.projectId === undefined ? {} : { projectId: parsed.projectId }),
         title: parsed.title,
         preset: parsed.preset,
-        presetContract: parsed.provider === "devin"
-          ? currentPresetContract
-          : legacyPresetContract,
+        presetContract: legacyPresetContract,
         fastEnabled: parsed.fastEnabled,
         state: parsed.state,
         ...(parsed.activeTurnId === undefined ? {} : { activeTurnId: parsed.activeTurnId }),
@@ -25673,9 +32890,9 @@ export class StateStore {
       this.#database.query(
         `INSERT INTO sessions(
            id,profile_id,project_id,provider_thread_id,title,provider,provider_v39,preset,
-           preset_contract,fast_enabled,state,active_turn_id,provider_updated_at,
+           preset_contract,canonical_profile_key,fast_enabled,state,active_turn_id,provider_updated_at,
            revision,created_at,updated_at
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
       ).run(
         id,
         input.profileId,
@@ -25686,6 +32903,7 @@ export class StateStore {
         input.provider,
         presetTiers[input.preset],
         input.presetContract,
+        requireCanonicalSessionProfileKey(input.provider, presetTiers[input.preset], input.presetContract),
         input.fastEnabled ? 1 : 0,
         input.state,
         input.activeTurnId ?? null,
@@ -25967,6 +33185,7 @@ export class StateStore {
     lastHour: number;
   }> {
     const parsedSessionId = sessionIdSchema.parse(sessionId);
+    unixMillisecondsSchema.parse(now);
     const counter = this.#database.query(
       "SELECT consecutive_count FROM session_autorespond_counters WHERE session_id=?",
     ).get(parsedSessionId);
@@ -25974,19 +33193,195 @@ export class StateStore {
       ? 0
       : z.object({ consecutive_count: z.number().int().nonnegative() }).strict().parse(counter).consecutive_count;
     const count = (since: number): number => {
-      // Both paths spend the same per-session budget: a protocol approval that
-      // was accepted and a prose approval that was actually sent.
+      // Admission spends the budget before the effect can begin. Display
+      // evidence, failures, ambiguity, and later pruning cannot refund it.
       const row = this.#database.query(
-        `SELECT COUNT(*) AS total FROM autorespond_evidence
-         WHERE session_id=? AND outcome IN ('accepted','sent') AND occurred_at>=?`,
+        `SELECT COUNT(*) AS total FROM autorespond_budget_reservations
+         WHERE session_id=? AND reserved_at>=?`,
       ).get(parsedSessionId, since);
       return z.object({ total: z.number().int().nonnegative() }).strict().parse(row).total;
     };
     return {
       consecutive,
-      lastDay: count(now - 24 * 60 * 60 * 1_000),
-      lastHour: count(now - 60 * 60 * 1_000),
+      lastDay: count(now - AUTORESPOND_DAY_MS),
+      lastHour: count(now - AUTORESPOND_HOUR_MS),
     };
+  }
+
+  readAutorespondBudgetHistoryAvailableAt(sessionId: SessionId, now: number = this.#now()): number | null {
+    const row = z.object({ available_at: unixMillisecondsSchema }).strict().parse(
+      this.#database.query("SELECT available_at FROM autorespond_budget_history WHERE session_id=?")
+        .get(sessionIdSchema.parse(sessionId)),
+    );
+    return row.available_at > unixMillisecondsSchema.parse(now) ? row.available_at : null;
+  }
+
+  readAutorespondAfterHoursPolicy(): AutorespondAfterHoursPolicy {
+    const row = this.#database.query("SELECT * FROM autorespond_after_hours_policy WHERE singleton=1").get();
+    if (row === null) throw new Error("AUTORESPOND_AFTER_HOURS_POLICY_MISSING");
+    return mapAutorespondAfterHoursPolicy(row);
+  }
+
+  updateAutorespondAfterHoursPolicy(
+    input: Readonly<{ enabled: boolean; expectedRevision: number }>,
+  ): AutorespondAfterHoursPolicy {
+    const parsed = z.object({
+      enabled: z.boolean(),
+      expectedRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    }).strict().parse(input);
+    const write = this.#database.transaction(() => {
+      const current = this.readAutorespondAfterHoursPolicy();
+      if (current.revision !== parsed.expectedRevision) throw new Error("AUTORESPOND_AFTER_HOURS_POLICY_CONFLICT");
+      if (current.revision >= Number.MAX_SAFE_INTEGER) throw new Error("AUTORESPOND_AFTER_HOURS_REVISION_EXHAUSTED");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const updated = this.#database.query(`UPDATE autorespond_after_hours_policy
+        SET enabled=?,revision=revision+1,updated_at=MAX(updated_at,?)
+        WHERE singleton=1 AND revision=?`).run(parsed.enabled ? 1 : 0, now, parsed.expectedRevision);
+      if (updated.changes !== 1) throw new Error("AUTORESPOND_AFTER_HOURS_POLICY_CONFLICT");
+      return this.readAutorespondAfterHoursPolicy();
+    });
+    return write.immediate();
+  }
+
+  /** Provisional observation only; reservation recomputes authority in its write transaction. */
+  readAutorespondAfterHoursSelection(
+    sessionId: SessionId,
+    sourceKind: "protocol" | "prose",
+    approvalEligibility: "eligible" | "ineligible" | "unknown",
+    now?: number,
+  ): AutorespondAfterHoursSelection {
+    const read = this.#database.transaction(() => {
+      let observedAt: unknown = now;
+      if (observedAt === undefined) {
+        try { observedAt = this.#now(); } catch { observedAt = null; }
+      }
+      return this.#readAutorespondAfterHoursSelectionInTransaction(
+        sessionIdSchema.parse(sessionId), sourceKind, approvalEligibility, observedAt,
+      );
+    });
+    return read.deferred();
+  }
+
+  #readAutorespondAfterHoursSelectionInTransaction(
+    sessionId: SessionId,
+    sourceKind: "protocol" | "prose",
+    approvalEligibility: "eligible" | "ineligible" | "unknown",
+    observedAt: unknown,
+  ): AutorespondAfterHoursSelection {
+    this.requireSession(sessionId);
+    const policy = this.readAutorespondAfterHoursPolicy();
+    const history = z.object({
+      available_at: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
+      human_reset_required: z.union([z.literal(0), z.literal(1)]),
+      reset_source_kind: z.enum(["mutation", "queue"]).nullable(),
+      reset_source_id: z.string().min(1).max(200).nullable(),
+    }).strict().parse(this.#database.query(`SELECT h.available_at,a.human_reset_required,a.reset_source_kind,a.reset_source_id
+      FROM autorespond_budget_history h JOIN autorespond_after_hours_history a ON a.session_id=h.session_id
+      WHERE h.session_id=?`).get(sessionId));
+    if ((history.reset_source_kind === null) !== (history.reset_source_id === null)
+      || (history.human_reset_required === 1 && history.reset_source_kind !== null)
+      || (history.available_at === 0 && (history.human_reset_required !== 0 || history.reset_source_kind !== null))
+      || (history.available_at > 0 && history.human_reset_required === 0 && history.reset_source_kind === null)) {
+      throw new Error("AUTORESPOND_AFTER_HOURS_HISTORY_INVALID");
+    }
+    const validTime = unixMillisecondsSchema.safeParse(observedAt);
+    const historyEligibility = history.human_reset_required === 1 ? "human_reset_required"
+      : (history.available_at === 0 || (validTime.success && history.available_at <= validTime.data))
+        && (!validTime.success || this.#database.query(
+          "SELECT 1 FROM autorespond_budget_reservations WHERE session_id=? AND reserved_at>? LIMIT 1",
+        ).get(sessionId, validTime.data) === null) ? "proven" : "unknown";
+    const input = { sourceKind, approvalEligibility, historyEligibility, policy, observedAt };
+    if (sourceKind === "prose" || !policy.enabled || approvalEligibility !== "eligible" || historyEligibility !== "proven") {
+      return selectAutorespondAfterHoursTier(input);
+    }
+    // A notification schedule is not approval authority. An unavailable or
+    // invalid schedule only prevents elevation; core consent/history errors
+    // above still fail closed, and reservation separately proves its clock.
+    let schedule: NotificationHoursPolicy | null = null;
+    try { schedule = this.readNotificationHours(); } catch { /* baseline only */ }
+    return selectAutorespondAfterHoursTier({ ...input, schedule });
+  }
+
+  reserveAutorespondBudget(input: AutorespondBudgetReservationInput): AutorespondBudgetReservationResult {
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const sourceKind = z.enum(["protocol", "prose"]).parse(input.sourceKind);
+    const sourceId = z.string().min(1).max(200).parse(input.sourceId);
+    if (sourceKind === "protocol") z.string().uuid().parse(sourceId);
+    const expectedMode = approvalModeSchema.parse(input.expectedMode);
+    const reserve = this.#database.transaction((): AutorespondBudgetReservationResult => {
+      this.requireSession(sessionId);
+      const now = unixMillisecondsSchema.max(8_640_000_000_000_000).parse(this.#now());
+      const mode = this.readSessionApprovalMode(sessionId).mode;
+      if (mode === "manual") return { state: "refused", code: "manual_mode" };
+      if (mode !== expectedMode) return { state: "refused", code: "policy_changed" };
+      const existing = this.#database.query(
+        `SELECT mode FROM autorespond_budget_reservations
+         WHERE session_id=? AND source_kind=? AND source_id=?`,
+      ).get(sessionId, sourceKind, sourceId);
+      if (existing !== null) {
+        const originalMode = z.object({ mode: approvalModeSchema }).strict().parse(existing).mode;
+        return originalMode === mode ? { state: "existing" } : { state: "refused", code: "policy_changed" };
+      }
+      const source = sourceKind === "protocol"
+        ? this.#database.query(
+            `SELECT * FROM provider_interactions WHERE public_id=? AND session_id=? AND state='pending'`,
+          ).get(sourceId, sessionId)
+        : this.#database.query(
+            `SELECT 1 FROM mutation_attempts WHERE idempotency_key=? AND authority_id=?
+             AND kind='session.send' AND state='effect_started' AND transcript_status='pending'
+             AND json_extract(transcript_intent_json,'$.actor')='autorespond'`,
+          ).get(sourceId, sessionId);
+      if (source === null) throw new Error("AUTORESPOND_BUDGET_SOURCE_AUTHORITY_INVALID");
+      if (sourceKind === "protocol") {
+        const interaction = this.#mapInteraction(source);
+        const authority = decideProtocolAutorespondAuthority({ display: interaction.display, kind: interaction.kind, mode });
+        if (authority.action !== "accept") return { state: "refused", code: authority.code };
+      }
+      if (this.readAutorespondBudgetHistoryAvailableAt(sessionId, now) !== null) {
+        return { state: "refused", code: "history_unavailable" };
+      }
+      // Every committed prune also inserts a new reservation at this time.
+      // That remaining high-water row detects a clock rewind instead of
+      // silently reopening budget whose older rows were already removed.
+      if (this.#database.query(
+        "SELECT 1 FROM autorespond_budget_reservations WHERE session_id=? AND reserved_at>? LIMIT 1",
+      ).get(sessionId, now) !== null) return { state: "refused", code: "history_unavailable" };
+      const retained = z.object({ total: z.number().int().nonnegative() }).strict().parse(
+        this.#database.query(`SELECT COUNT(*) AS total FROM autorespond_budget_reservations
+          WHERE session_id=? AND (reserved_at>=? OR (source_kind='prose' AND EXISTS (
+            SELECT 1 FROM mutation_attempts m WHERE m.authority_id=session_id
+              AND m.idempotency_key=source_id AND m.kind='session.send' AND m.transcript_status='pending'
+          )))`).get(sessionId, now - AUTORESPOND_DAY_MS),
+      ).total;
+      if (retained >= AUTORESPOND_RESERVATIONS_PER_SESSION_CAP) {
+        return { state: "refused", code: "history_unavailable" };
+      }
+      const budgets = this.readAutorespondBudgets(sessionId, now);
+      const selection = this.#readAutorespondAfterHoursSelectionInTransaction(sessionId, sourceKind, "eligible", now);
+      if (budgets.consecutive >= selection.limits.consecutive) return { state: "refused", code: "consecutive_limit" };
+      if (budgets.lastHour >= selection.limits.lastHour) return { state: "refused", code: "hourly_budget" };
+      if (budgets.lastDay >= selection.limits.lastDay) return { state: "refused", code: "daily_budget" };
+      this.#database.query(
+        `DELETE FROM autorespond_budget_reservations
+         WHERE session_id=? AND reserved_at<? AND NOT (
+           source_kind='prose' AND EXISTS (
+             SELECT 1 FROM mutation_attempts m WHERE m.authority_id=session_id
+               AND m.idempotency_key=source_id AND m.kind='session.send'
+               AND m.transcript_status='pending'
+           )
+         )`,
+      ).run(sessionId, now - AUTORESPOND_DAY_MS);
+      this.#database.query(
+        `INSERT INTO autorespond_budget_reservations(session_id,source_kind,source_id,mode,reserved_at)
+         VALUES (?,?,?,?,?)`,
+      ).run(sessionId, sourceKind, sourceId, mode, now);
+      this.#database.query(
+        `INSERT INTO session_autorespond_counters(session_id,consecutive_count,updated_at) VALUES (?,1,?)
+         ON CONFLICT(session_id) DO UPDATE SET consecutive_count=consecutive_count+1,updated_at=excluded.updated_at`,
+      ).run(sessionId, now);
+      return { state: "reserved" };
+    });
+    return reserve.immediate();
   }
 
   bumpAutorespondCounter(sessionId: SessionId): number {
@@ -26047,7 +33442,7 @@ export class StateStore {
     kind: "command_approval" | "file_change_approval" | "permission_approval";
     latencyMs: number;
     mode: ApprovalMode;
-    outcome: "accepted" | "refused";
+    outcome: "accepted" | "refused" | "unknown";
     sessionId: SessionId;
     subagent: boolean;
   }): void {
@@ -26184,6 +33579,7 @@ export class StateStore {
    */
   reserveAttachmentIngress(input: AttachmentIngressInput): ({ kind: "empty" } | ({ kind: "reserved" } & AttachmentReservation)) {
     const parsed = parseAttachmentInput(input);
+    assertSupportedProvider(parsed.providerAuthority.provider);
     return this.#database.transaction(() => {
       assertAttachmentDaemon(this.#database, parsed);
       this.assertProviderAccountAuthorityCurrent(parsed.providerAuthority);
@@ -26206,7 +33602,7 @@ export class StateStore {
     const candidate = parseAttachmentCleanupCandidate(input.candidate);
     return this.#database.transaction(() => {
       assertAttachmentDaemon(this.#database, input);
-      assertAttachmentCustodySchema(this.#database);
+      assertAttachmentCustodySchema(this.#database, "joined");
       reconcileLiveAttachmentTerminals(this.#database, this.#now());
       const live = assertLiveAttachmentClosure(this.#database);
       if (hasUnknownAttachmentCustody(this.#database)) return { kind: "retained" as const, reason: "unknown_input" as const };
@@ -26255,6 +33651,7 @@ export class StateStore {
         return { attempt: { id: existing.id, state: existing.state, replay: true, ...(existing.result === undefined ? {} : { result: existing.result }) },
           custody: parent.custody === null ? { kind: "empty" as const } : { kind: "mutation_owned" as const, custodyId: parent.custody.origin.id, custodyDigest: parent.custody.digest } };
       }
+      assertSupportedProvider(parsed.providerAuthority.provider);
       assertAttachmentDaemon(this.#database, parsed);
       this.assertProviderAccountAuthorityCurrent(parsed.providerAuthority);
       if (!sameProviderAccountAuthority(parsed.providerAuthority, this.requireSessionProviderAuthority(sessionIdSchema.parse(parsed.sessionId)))) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_AUTHORITY_CHANGED");
@@ -26319,70 +33716,110 @@ export class StateStore {
   }
 
   #recordMessageAttachments(input: Parameters<StateStore["recordMessageAttachments"]>[0]): void {
-    const parsedSessionId = sessionIdSchema.parse(input.sessionId);
-    const parsedSourceId = z.string().min(1).max(200).parse(input.sourceId);
-    const parsed = storedMessageAttachmentListSchema.parse(input.attachments);
-    const references = parseQueueAttachmentReferences(parsed.map(({ byteLength, digest, mediaType, name }) => ({ byteLength, digest, mediaType, name })));
-    if (parsed.some((entry) => entry.canonicalMediaType !== (isAttachmentImageMediaType(entry.mediaType) ? entry.mediaType : "text/plain"))) {
-      throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
-    }
-    const now = this.#now();
-    const write = this.#database.transaction(() => {
-      const sealed = this.#database.query("SELECT queue_id FROM queue_attachment_identities WHERE queue_id=? UNION SELECT queue_id FROM queue_attachment_identity_anchors WHERE queue_id=? LIMIT 1")
-        .get(parsedSourceId, parsedSourceId);
-      if (sealed !== null) {
-        const identity = readQueueAttachmentIdentity(this.#database, parsedSourceId);
-        if (identity === null || identity.sessionId !== parsedSessionId || identity.attachmentCount !== references.length
-          || identity.manifestDigest !== queueAttachmentManifestDigest(references)) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
-        return;
+    this.#database.transaction(() => {
+      this.#recordMessageAttachmentsInTransaction(
+        sessionIdSchema.parse(input.sessionId), input.sourceId, input.attachments, this.#now(),
+      );
+    }).immediate();
+  }
+
+  #recordMessageAttachmentsInTransaction(
+    sessionId: SessionId,
+    sourceId: string,
+    attachments: readonly StoredMessageAttachment[],
+    recordedAt: number,
+  ): void {
+    sessionIdSchema.parse(sessionId);
+    z.string().min(1).max(200).parse(sourceId);
+    unixMillisecondsSchema.parse(recordedAt);
+    const parsed = storedMessageAttachmentListSchema.parse(attachments);
+    const references = parseQueueAttachmentReferences(parsed.map(
+      ({ byteLength, digest, mediaType, name }) => ({ byteLength, digest, mediaType, name }),
+    ));
+    if (parsed.some((entry) => entry.canonicalMediaType !== (
+      isAttachmentImageMediaType(entry.mediaType) ? entry.mediaType : "text/plain"
+    ))) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+    // Transcript finalization and ordinary admission use the same custody
+    // boundary. Neither can replace a sealed queue's original manifest.
+    const sealed = this.#database.query(
+      "SELECT queue_id FROM queue_attachment_identities WHERE queue_id=? UNION SELECT queue_id FROM queue_attachment_identity_anchors WHERE queue_id=? LIMIT 1",
+    ).get(sourceId, sourceId);
+    if (sealed !== null) {
+      const identity = readQueueAttachmentIdentity(this.#database, sourceId);
+      if (identity === null || identity.sessionId !== sessionId
+        || identity.attachmentCount !== references.length
+        || identity.manifestDigest !== queueAttachmentManifestDigest(references)) {
+        throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
       }
-      const legacyQueue = this.#database.query("SELECT 1 FROM queue_entries WHERE id=? AND enqueue_identity_format IS NULL").get(parsedSourceId);
-      if (legacyQueue !== null) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
-      if (parsed.length === 0) return;
-      for (const [position, attachment] of parsed.entries()) {
-        this.#database.query(
-          `INSERT INTO attachments(digest,media_type,byte_length,created_at,reference_count)
-           VALUES (?,?,?,?,0)
-           ON CONFLICT(digest) DO NOTHING`,
-        ).run(
-          attachment.digest,
-          attachment.canonicalMediaType,
-          attachment.byteLength,
-          now,
-        );
-        const custody = this.#database.query("SELECT media_type,byte_length FROM attachments WHERE digest=?").get(attachment.digest) as { media_type: string; byte_length: number };
-        if (custody.media_type !== attachment.canonicalMediaType || custody.byte_length !== attachment.byteLength) {
-          throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
-        }
-        this.#database.query(
-          `INSERT INTO message_attachments(session_id,source_id,position,digest,name,media_type,byte_length,created_at)
-           VALUES (?,?,?,?,?,?,?,?)
-           ON CONFLICT(session_id,source_id,position) DO NOTHING`,
-        ).run(
-          parsedSessionId,
-          parsedSourceId,
-          position,
-          attachment.digest,
-          attachment.name,
-          attachment.mediaType,
-          attachment.byteLength,
-          now,
-        );
+      return;
+    }
+    if (this.#database.query(
+      "SELECT 1 FROM queue_entries WHERE id=? AND enqueue_identity_format IS NULL",
+    ).get(sourceId) !== null) {
+      throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
+    }
+    for (const [position, attachment] of parsed.entries()) {
+      this.#database.query(
+        `INSERT INTO attachments(digest,media_type,byte_length,created_at,reference_count)
+         VALUES (?,?,?,?,0)
+         ON CONFLICT(digest) DO NOTHING`,
+      ).run(
+        attachment.digest, attachment.canonicalMediaType, attachment.byteLength, recordedAt,
+      );
+      const custody = attachmentCustodyRowSchema.parse(this.#database.query(
+        `SELECT digest,media_type,byte_length,reference_count
+         FROM attachments WHERE digest=?`,
+      ).get(attachment.digest));
+      if (custody.media_type !== attachment.canonicalMediaType
+        || custody.byte_length !== attachment.byteLength) {
+        throw new Error("ATTACHMENT_CUSTODY_IDENTITY_CONFLICT");
       }
       this.#database.query(
-        `DELETE FROM message_attachments WHERE session_id=?
-         AND NOT ${attachmentMutationProtectedSql("message_attachments.source_id")}
-         AND NOT EXISTS(SELECT 1 FROM queue_entries queue WHERE queue.id=message_attachments.source_id
-           AND queue.session_id=message_attachments.session_id AND ${queueAttachmentsProtectedSql("queue")})
+        `INSERT INTO message_attachments(session_id,source_id,position,digest,name,media_type,byte_length,created_at)
+         VALUES (?,?,?,?,?,?,?,?)
+         ON CONFLICT(session_id,source_id,position) DO NOTHING`,
+      ).run(
+        sessionId, sourceId, position, attachment.digest, attachment.name,
+        attachment.mediaType, attachment.byteLength, recordedAt,
+      );
+      const linked = messageAttachmentRowSchema.parse(this.#database.query(
+        `SELECT digest,name,media_type,byte_length FROM message_attachments
+         WHERE session_id=? AND source_id=? AND position=?`,
+      ).get(sessionId, sourceId, position));
+      if (linked.digest !== attachment.digest || linked.name !== attachment.name
+        || linked.media_type !== attachment.mediaType || linked.byte_length !== attachment.byteLength) {
+        throw new Error("MESSAGE_ATTACHMENT_IDENTITY_CONFLICT");
+      }
+    }
+    const linkedCount = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+      this.#database.query(
+        "SELECT count(*) AS count FROM message_attachments WHERE session_id=? AND source_id=?",
+      ).get(sessionId, sourceId),
+    ).count;
+    if (linkedCount !== parsed.length) throw new Error("MESSAGE_ATTACHMENT_COUNT_CONFLICT");
+    if (parsed.length === 0) return;
+    const protectedSource = (alias: "message_attachments" | "linked"): string => `(
+      ${attachmentMutationProtectedSql(`${alias}.source_id`)}
+      OR EXISTS(SELECT 1 FROM queue_entries q
+        WHERE q.session_id=${alias}.session_id AND q.id=${alias}.source_id
+          AND (${queueAttachmentsProtectedSql("q")} OR q.transcript_status='pending'))
+      OR EXISTS(SELECT 1 FROM mutation_attempts m
+        WHERE m.authority_id=${alias}.session_id
+          AND (m.id=${alias}.source_id OR m.idempotency_key=${alias}.source_id)
+          AND m.kind IN ('session.send','session.steer') AND m.transcript_status='pending')
+    )`;
+    this.#database.query(
+      `DELETE FROM message_attachments
+       WHERE session_id=? AND NOT ${protectedSource("message_attachments")}
          AND source_id NOT IN (
            SELECT source_id FROM (
-             SELECT source_id, MAX(created_at) AS recent FROM message_attachments
-             WHERE session_id=? AND NOT ${attachmentMutationProtectedSql("message_attachments.source_id")} AND NOT EXISTS(SELECT 1 FROM queue_entries queue WHERE queue.id=message_attachments.source_id
-               AND queue.session_id=message_attachments.session_id AND ${queueAttachmentsProtectedSql("queue")})
-             GROUP BY source_id ORDER BY recent DESC, source_id DESC LIMIT ?))`,
-      ).run(parsedSessionId, parsedSessionId, MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP);
-    });
-    write.immediate();
+             SELECT linked.source_id,MAX(linked.created_at) AS recent
+             FROM message_attachments linked
+             WHERE linked.session_id=? AND NOT ${protectedSource("linked")}
+             GROUP BY linked.source_id ORDER BY recent DESC,linked.source_id DESC LIMIT ?
+           )
+         )`,
+    ).run(sessionId, sessionId, MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP);
   }
 
   /** The bounded, byte-free manifest for one dispatched message. */
@@ -26405,6 +33842,387 @@ export class StateStore {
         name: parsed.name,
       };
     });
+  }
+
+  #stageSessionUserMessageIntentInTransaction(input: Readonly<{
+    sessionId: SessionId;
+    sourceKind: "mutation" | "queue";
+    sourceId: string;
+    intent: SessionUserMessageIntentInput;
+  }>): void {
+    const prepared = canonicalSessionUserMessageIntent(input.intent);
+    const storedAttachments = storedMessageAttachmentListSchema.parse(
+      input.intent.storedAttachments ?? [],
+    );
+    const storedReferences = storedAttachments.map((attachment) => ({
+      byteLength: attachment.byteLength,
+      digest: attachment.digest,
+      mediaType: attachment.mediaType,
+      name: attachment.name,
+    }));
+    if (JSON.stringify(storedReferences) !== JSON.stringify(prepared.intent.attachments ?? [])) {
+      throw new Error("SESSION_USER_MESSAGE_ATTACHMENT_INTENT_MISMATCH");
+    }
+    const source = input.sourceKind === "mutation"
+      ? z.object({
+          id: attemptIdSchema,
+          authority_id: sessionIdSchema,
+          kind: z.enum(["session.send", "session.steer"]),
+          transcript_status: sessionUserMessageTranscriptStatusSchema,
+          transcript_intent_json: z.string().nullable(),
+        }).strict().parse(this.#database.query(
+          `SELECT id,authority_id,kind,transcript_status,transcript_intent_json
+           FROM mutation_attempts WHERE id=?`,
+        ).get(attemptIdSchema.parse(input.sourceId)))
+      : z.object({
+          id: queueIdSchema,
+          session_id: sessionIdSchema,
+          transcript_status: sessionUserMessageTranscriptStatusSchema,
+          transcript_intent_json: z.string().nullable(),
+        }).strict().parse(this.#database.query(
+          `SELECT id,session_id,transcript_status,transcript_intent_json
+           FROM queue_entries WHERE id=?`,
+        ).get(queueIdSchema.parse(input.sourceId)));
+    const sourceSessionId = "authority_id" in source
+      ? source.authority_id
+      : source.session_id;
+    if (
+      sourceSessionId !== input.sessionId
+      || source.transcript_status !== "none"
+      || source.transcript_intent_json !== null
+    ) throw new Error("SESSION_USER_MESSAGE_INTENT_AUTHORITY_INVALID");
+    const changed = input.sourceKind === "mutation"
+      ? this.#database.query(
+          `UPDATE mutation_attempts
+           SET transcript_status='pending',transcript_intent_json=?
+           WHERE id=? AND authority_id=? AND transcript_status='none'
+             AND transcript_intent_json IS NULL`,
+        ).run(prepared.json, source.id, input.sessionId)
+      : this.#database.query(
+          `UPDATE queue_entries
+           SET transcript_status='pending',transcript_intent_json=?
+           WHERE id=? AND session_id=? AND transcript_status='none'
+             AND transcript_intent_json IS NULL`,
+        ).run(prepared.json, source.id, input.sessionId);
+    if (changed.changes !== 1) {
+      throw new Error("SESSION_USER_MESSAGE_INTENT_AUTHORITY_INVALID");
+    }
+    this.#recordMessageAttachmentsInTransaction(
+      input.sessionId,
+      source.id,
+      storedAttachments,
+      this.#now(),
+    );
+  }
+
+  readSessionUserMessageSource(
+    sessionId: SessionId,
+    sourceKind: "mutation" | "queue",
+    sourceId: string,
+  ): SessionUserMessageSource {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const parsedSourceId = z.string().min(1).max(200).parse(sourceId);
+    const row = sourceKind === "mutation"
+      ? this.#database.query(
+          `SELECT transcript_status,transcript_intent_json
+           FROM mutation_attempts
+           WHERE authority_id=? AND idempotency_key=?
+             AND kind IN ('session.send','session.steer')`,
+        ).get(parsedSessionId, parsedSourceId)
+      : this.#database.query(
+          `SELECT transcript_status,transcript_intent_json
+           FROM queue_entries WHERE session_id=? AND id=?`,
+        ).get(parsedSessionId, parsedSourceId);
+    if (row === null) throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+    const parsed = z.object({
+      transcript_status: sessionUserMessageTranscriptStatusSchema,
+      transcript_intent_json: z.string().nullable(),
+    }).strict().parse(row);
+    const intent = parsed.transcript_intent_json === null
+      ? undefined
+      : sessionUserMessageSourcePayloadSchema.parse(
+          JSON.parse(parsed.transcript_intent_json) as unknown,
+        );
+    if (
+      parsed.transcript_status === "pending"
+      && (intent === undefined || !("text" in intent))
+    ) {
+      throw new Error("SESSION_USER_MESSAGE_INTENT_MISSING");
+    }
+    return {
+      status: parsed.transcript_status,
+      ...(intent === undefined ? {} : { intent }),
+    };
+  }
+
+  hasPendingSessionUserMessageFinalization(sessionId: SessionId): boolean {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    return this.#database.query(
+      `SELECT 1 FROM mutation_attempts
+       WHERE authority_id=? AND kind IN ('session.send','session.steer')
+         AND transcript_status='pending'
+         AND state IN ('effect_started','applied','ambiguous')
+       UNION ALL
+       SELECT 1 FROM queue_entries
+       WHERE session_id=? AND transcript_status='pending'
+         AND state IN ('dispatching','applied','ambiguous')
+       LIMIT 1`,
+    ).get(parsedSessionId, parsedSessionId) !== null;
+  }
+
+  #finalizeSessionUserMessageSourceInTransaction(input: Readonly<{
+    sessionId: SessionId;
+    sourceKind: "mutation" | "queue";
+    sourceId: string;
+    turnId: string;
+    recordedAt: number;
+  }>): SessionEvent | null {
+    const row = input.sourceKind === "mutation"
+      ? this.#database.query(
+          `SELECT transcript_status,transcript_intent_json
+           FROM mutation_attempts
+           WHERE authority_id=? AND id=?
+             AND kind IN ('session.send','session.steer')`,
+        ).get(input.sessionId, attemptIdSchema.parse(input.sourceId))
+      : this.#database.query(
+          `SELECT transcript_status,transcript_intent_json
+           FROM queue_entries WHERE session_id=? AND id=?`,
+        ).get(input.sessionId, queueIdSchema.parse(input.sourceId));
+    if (row === null) throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+    const parsed = z.object({
+      transcript_status: sessionUserMessageTranscriptStatusSchema,
+      transcript_intent_json: z.string().nullable(),
+    }).strict().parse(row);
+    const source: SessionUserMessageSource = {
+      status: parsed.transcript_status,
+      ...(parsed.transcript_intent_json === null
+        ? {}
+        : {
+            intent: sessionUserMessageSourcePayloadSchema.parse(
+              JSON.parse(parsed.transcript_intent_json) as unknown,
+            ),
+          }),
+    };
+    if (source.status === "finalized") return null;
+    if (
+      source.status !== "pending"
+      || source.intent === undefined
+      || !("text" in source.intent)
+    ) {
+      throw new Error(`SESSION_USER_MESSAGE_SOURCE_${source.status.toUpperCase()}`);
+    }
+    // The public intent contains only the legacy scalar tuple. Recover its
+    // full authority from the immutable source, never from today's account.
+    // A settled source can outlive a Codex process restart, but cannot inherit
+    // a different account binding, native thread, or provider-switch lineage.
+    let providerAuthority: ProviderAccountAuthority;
+    let providerThreadId: string;
+    let runtimeProfile: ReviewedRuntimeProfile | undefined;
+    let runtimeSourceKind: "turn_start" | "queue_start" | undefined;
+    if (input.sourceKind === "mutation") {
+      const attemptId = attemptIdSchema.parse(input.sourceId);
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
+      if (evidence.kind !== "session.send" && evidence.kind !== "session.steer") {
+        throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+      }
+      const authorities = this.readMutationProviderAuthorities(attemptId);
+      const primary = authorities.find((item) => item.role === "primary");
+      if (authorities.length !== 1 || primary === undefined
+        || evidence.clientMessageId !== attemptId
+        || this.sessionMessageActorForSource(input.sessionId, attemptId) !== source.intent.actor) {
+        throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+      }
+      providerAuthority = primary.authority;
+      providerThreadId = evidence.providerThreadId;
+      const receipt = z.object({ receipt_json: z.string().min(2).max(262_144) }).strict().parse(
+        this.#database.query(
+          `SELECT CASE WHEN resolution.resolution_kind='proven_applied'
+                    THEN resolution.receipt_json ELSE mutation.result_json END AS receipt_json
+           FROM mutation_attempts mutation
+           LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=mutation.id
+           WHERE mutation.id=? AND mutation.authority_id=?
+             AND (mutation.state='applied' OR resolution.resolution_kind='proven_applied')`,
+        ).get(attemptId, input.sessionId),
+      );
+      const receiptValue: unknown = JSON.parse(receipt.receipt_json);
+      const receiptTurn = evidence.kind === "session.send"
+        ? z.object({ turnId: providerThreadIdSchema }).passthrough().parse(receiptValue).turnId
+        : z.object({ activeTurnId: providerThreadIdSchema }).passthrough().parse(receiptValue).activeTurnId;
+      if (receiptTurn !== input.turnId
+        || (evidence.kind === "session.steer" && evidence.activeTurnId !== input.turnId)) {
+        throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+      }
+      if (evidence.kind === "session.send") {
+        runtimeProfile = evidence.runtimeProfile;
+        runtimeSourceKind = "turn_start";
+      }
+    } else {
+      const queueId = queueIdSchema.parse(input.sourceId);
+      const authority = this.readQueueProviderAuthority(queueId);
+      if (authority === null
+        || this.sessionMessageActorForSource(input.sessionId, queueId) !== source.intent.actor) {
+        throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+      }
+      // Absence is not an admitted historical format. Without an independently
+      // retained dispatch proof, a queue row cannot author a new transcript.
+      const evidence = requireQueueEvidenceFromProvenance(this.#database, queueId).evidence;
+      if (evidence.sessionId !== input.sessionId
+        || evidence.queueId !== queueId || evidence.clientMessageId !== queueId
+        || evidence.profileGeneration !== authority.processGeneration
+        || evidence.runtimeProfile.profileId !== authority.profileId
+        || reviewedRuntimeProfileProvider(evidence.runtimeProfile) !== authority.provider) {
+        throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+      }
+      providerAuthority = authority;
+      providerThreadId = evidence.providerThreadId;
+      runtimeProfile = evidence.runtimeProfile;
+      runtimeSourceKind = "queue_start";
+      const settlement = z.object({
+        state: queueStateSchema,
+        resolution_kind: z.enum(["proven_applied", "abandoned"]).nullable(),
+        receipt_json: z.string().min(2).max(262_144).nullable(),
+      }).strict().parse(this.#database.query(
+        `SELECT queue.state,resolution.resolution_kind,resolution.receipt_json
+         FROM queue_entries queue
+         LEFT JOIN queue_effect_resolutions resolution ON resolution.queue_id=queue.id
+         WHERE queue.id=? AND queue.session_id=?`,
+      ).get(queueId, input.sessionId));
+      if (settlement.state !== "applied" && settlement.resolution_kind !== "proven_applied") {
+        throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+      }
+      if (settlement.resolution_kind === "proven_applied") {
+        const receiptValue: unknown = JSON.parse(z.string().parse(settlement.receipt_json));
+        if (z.object({ turnId: providerThreadIdSchema }).passthrough().parse(receiptValue).turnId !== input.turnId) {
+          throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+        }
+      }
+    }
+    if (providerAuthority.profileId !== source.intent.accountId
+      || providerAuthority.processGeneration !== source.intent.providerGeneration) {
+      throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+    }
+    const session = this.requireSession(input.sessionId);
+    if (session.profileId !== providerAuthority.profileId
+      || session.provider !== providerAuthority.provider
+      || session.providerThreadId !== providerThreadId) {
+      throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+    }
+    if (runtimeSourceKind !== undefined) {
+      if (runtimeProfile === undefined) throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+      const turn = mapSessionTurnRuntimeProfile(this.#database.query(
+        "SELECT * FROM session_turn_runtime_profiles WHERE session_id=? AND turn_id=?",
+      ).get(input.sessionId, input.turnId));
+      const runtime = this.#mapSessionRuntimeProfileWithAuthority(this.#database.query(
+        "SELECT * FROM session_runtime_profiles WHERE session_id=? AND source_kind=? AND source_id=?",
+      ).get(input.sessionId, runtimeSourceKind, input.sourceId));
+      if (turn.sourceKind !== runtimeSourceKind || turn.sourceId !== input.sourceId
+        || JSON.stringify(turn.profile) !== JSON.stringify(runtimeProfile)
+        || JSON.stringify(runtime.profile) !== JSON.stringify(runtimeProfile)
+        || !sameProviderAccountAuthority(this.#requireRuntimeProfileProviderAuthority(runtime), providerAuthority)) {
+        throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+      }
+    }
+    const eventSourceId = input.sourceKind === "mutation"
+      ? z.object({ idempotency_key: z.string().min(1).max(200) }).strict().parse(
+          this.#database.query(
+            `SELECT idempotency_key FROM mutation_attempts
+             WHERE authority_id=? AND id=?`,
+          ).get(input.sessionId, attemptIdSchema.parse(input.sourceId)),
+        ).idempotency_key
+      : queueIdSchema.parse(input.sourceId);
+    const body = sessionEventBodySchema.parse(projectPublicSessionEventBody({
+      type: "user_message",
+      turnId: input.turnId,
+      sourceId: eventSourceId,
+      actor: source.intent.actor,
+      text: source.intent.text,
+      omittedCharacters: source.intent.omittedCharacters,
+      ...(source.intent.attachments === undefined
+        ? {}
+        : { attachments: source.intent.attachments }),
+    }, this.#publicProviderIdentifierProjector));
+    const event = this.#appendSessionEventUnderCapturedAuthorityInTransaction({
+      sessionId: input.sessionId,
+      accountId: source.intent.accountId,
+      providerGeneration: source.intent.providerGeneration,
+      providerAuthority,
+      providerConnectionId: source.intent.providerConnectionId,
+      body,
+      recordedAt: input.recordedAt,
+      userMessageSourceKind: input.sourceKind,
+      settledSourceThreadId: providerThreadId,
+    });
+    this.#database.query(
+      `INSERT INTO session_message_event_sources(
+         source_id,source_kind,session_id,actor,body_digest,stream_epoch,event_sequence,created_at
+       ) VALUES (?,?,?,?,?,?,?,?)`,
+    ).run(input.sourceId, input.sourceKind, input.sessionId, source.intent.actor,
+      digestJson(event.body), event.streamEpoch, event.sequence, input.recordedAt);
+    return event;
+  }
+
+  /** Finish a settled source using only its durable receipt and public intent. */
+  finalizeSessionUserMessageSource(input: Readonly<{
+    sessionId: SessionId;
+    sourceKind: "mutation" | "queue";
+    sourceId: string;
+    turnId: string;
+  }>): SessionEvent | null {
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const sourceId = z.string().min(1).max(200).parse(input.sourceId);
+    const turnId = z.string().min(1).max(200).parse(input.turnId);
+    const finalize = this.#database.transaction(() => {
+      // The settlement proof and append share one immediate write snapshot, so
+      // recovery cannot invalidate the proof between the check and the write.
+      const settled = input.sourceKind === "mutation"
+        ? this.#database.query(
+            `SELECT m.id FROM mutation_attempts m
+             LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+             WHERE m.authority_id=? AND m.idempotency_key=?
+               AND (m.state='applied' OR r.resolution_kind='proven_applied')`,
+          ).get(sessionId, sourceId)
+        : this.#database.query(
+            `SELECT q.id FROM queue_entries q
+             LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
+             WHERE q.session_id=? AND q.id=?
+               AND (q.state='applied' OR r.resolution_kind='proven_applied')`,
+          ).get(sessionId, sourceId);
+      if (settled === null) throw new Error("SESSION_USER_MESSAGE_SOURCE_NOT_SETTLED");
+      const sourceRowId = input.sourceKind === "mutation"
+        ? z.object({ id: attemptIdSchema }).strict().parse(settled).id
+        : z.object({ id: queueIdSchema }).strict().parse(settled).id;
+      return this.#finalizeSessionUserMessageSourceInTransaction({
+        sessionId,
+        sourceKind: input.sourceKind,
+        sourceId: sourceRowId,
+        turnId,
+        recordedAt: unixMillisecondsSchema.parse(this.#now()),
+      });
+    });
+    return finalize.immediate();
+  }
+
+  /** Whether this HRA operation already finalized its neutral user message. */
+  hasSessionUserMessageSource(
+    sessionId: SessionId,
+    sourceKind: "mutation" | "queue",
+    sourceId: string,
+  ): boolean {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const parsedSourceId = z.string().min(1).max(200).safeParse(sourceId);
+    if (!parsedSourceId.success) return false;
+    return sourceKind === "mutation"
+      ? this.#database.query(
+          `SELECT 1 FROM mutation_attempts
+           WHERE authority_id=? AND idempotency_key=?
+             AND kind IN ('session.send','session.steer')
+             AND transcript_status='finalized' AND transcript_finalized=1`,
+        ).get(parsedSessionId, parsedSourceId.data) !== null
+      : this.#database.query(
+          `SELECT 1 FROM queue_entries
+           WHERE session_id=? AND id=?
+             AND transcript_status='finalized' AND transcript_finalized=1`,
+        ).get(parsedSessionId, parsedSourceId.data) !== null;
   }
 
   /** The canonical media type a stored digest was admitted under, if any. */
@@ -26496,16 +34314,16 @@ export class StateStore {
 
   /*
    * `accepted` counts the autoresponses that actually reached the provider on
-   * either path; `refused` counts every other recorded attempt, including the
-   * bounded `gate_failed:<reason>` family.
+   * either path; `unknown` keeps indeterminate effects separate and `refused`
+   * counts other attempts, including the bounded `gate_failed:<reason>` family.
    */
-  countAutorespondEvidence(input: { sessionId?: SessionId } = {}): Readonly<{ accepted: number; refused: number }> {
+  countAutorespondEvidence(input: { sessionId?: SessionId } = {}): Readonly<{ accepted: number; refused: number; unknown: number }> {
     const rows = input.sessionId === undefined
       ? this.#database.query("SELECT outcome, COUNT(*) AS total FROM autorespond_evidence GROUP BY outcome").all()
       : this.#database.query(
           "SELECT outcome, COUNT(*) AS total FROM autorespond_evidence WHERE session_id=? GROUP BY outcome",
         ).all(sessionIdSchema.parse(input.sessionId));
-    const counts = { accepted: 0, refused: 0 };
+    const counts = { accepted: 0, refused: 0, unknown: 0 };
     for (const row of rows) {
       const parsed = z.object({
         outcome: autorespondEvidenceOutcomeSchema,
@@ -26513,6 +34331,8 @@ export class StateStore {
       }).strict().parse(row);
       if (parsed.outcome === "accepted" || parsed.outcome === "sent") {
         counts.accepted += parsed.total;
+      } else if (parsed.outcome === "unknown") {
+        counts.unknown += parsed.total;
       } else {
         counts.refused += parsed.total;
       }
@@ -26526,15 +34346,40 @@ export class StateStore {
 
   bindSession(input: { sessionId: SessionId; expectedRevision: number; providerThreadId: string; state: "active" | "idle"; activeTurnId?: string; providerUpdatedAt?: number }): SessionRecord {
     const now = this.#now();
-    const result = this.#database.query("UPDATE sessions SET provider_thread_id=?,state=?,active_turn_id=?,provider_updated_at=?,revision=revision+1,updated_at=? WHERE id=? AND revision=? AND state='starting'").run(input.providerThreadId, input.state, input.activeTurnId ?? null, input.providerUpdatedAt ?? null, now, input.sessionId, input.expectedRevision);
-    if (result.changes !== 1) throw new Error("Session authority changed before the provider binding committed.");
-    return this.requireSession(input.sessionId);
+    const bind = this.#database.transaction(() => {
+      const result = this.#database.query("UPDATE sessions SET provider_thread_id=?,state=?,active_turn_id=?,provider_updated_at=?,revision=revision+1,updated_at=? WHERE id=? AND revision=? AND state='starting'").run(input.providerThreadId, input.state, input.activeTurnId ?? null, input.providerUpdatedAt ?? null, now, input.sessionId, input.expectedRevision);
+      if (result.changes !== 1) throw new Error("Session authority changed before the provider binding committed.");
+      return this.requireSession(input.sessionId);
+    });
+    return bind.immediate();
   }
 
   deleteUnboundStartingSession(sessionId: SessionId, expectedRevision: number): boolean {
     const parsedSessionId = sessionIdSchema.parse(sessionId);
     const parsedRevision = z.number().int().positive().parse(expectedRevision);
     const remove = this.#database.transaction(() => {
+      const removable = this.#database
+        .query(
+          `SELECT id FROM sessions
+           WHERE id=?
+             AND revision=?
+             AND state='starting'
+             AND provider_thread_id IS NULL
+             AND active_turn_id IS NULL
+             AND provider_updated_at IS NULL
+             AND NOT EXISTS(SELECT 1 FROM queue_entries WHERE session_id=sessions.id)
+             AND NOT EXISTS(SELECT 1 FROM turn_summaries WHERE session_id=sessions.id)`,
+        )
+        .get(parsedSessionId, parsedRevision);
+      if (removable === null) return false;
+      // Remove the immutable capability child while its exact, never-started
+      // parent is still visible to the narrow deletion guard. Relying on the
+      // parent DELETE cascade would run the child trigger after the parent row
+      // is no longer visible and incorrectly quarantine a determinate
+      // pre-provider rejection.
+      this.#database.query(
+        "DELETE FROM session_host_capability_bindings WHERE session_id=?",
+      ).run(parsedSessionId);
       const deleted = this.#database
         .query(
           `DELETE FROM sessions
@@ -26549,39 +34394,66 @@ export class StateStore {
            RETURNING id`,
         )
         .get(parsedSessionId, parsedRevision);
-      return deleted !== null;
+      if (deleted === null) throw new Error("SESSION_START_PLACEHOLDER_DELETE_CONFLICT");
+      return true;
     });
     return remove.immediate();
   }
 
   updateSessionMetadata(input: { sessionId: SessionId; expectedRevision: number; title?: string; note?: string; preset?: Preset; fastEnabled?: boolean; projectId?: ProjectId | null }): SessionRecord {
-    const current = this.requireSession(input.sessionId);
-    const currentPresetBinding = this.#requireSessionPresetBinding(current.id);
-    if (current.revision !== input.expectedRevision) throw new Error("Session metadata revision conflict.");
-    // An unsettled provider effect owns the exact runtime profile it reviewed.
-    // Keep that recovery evidence admissible by refusing any route
-    // reinterpretation until recovery has settled it or explicit abandonment
-    // has terminalized the session.
-    if (input.preset !== undefined && current.state === "recovery_required") {
-      throw new Error("SESSION_PRESET_RECOVERY_REQUIRED");
-    }
-    const title = input.title === undefined ? current.title : titleSchema.parse(input.title);
-    const note = input.note === undefined ? current.note : noteSchema.parse(input.note);
-    const preset = input.preset === undefined ? current.preset : presetSchema.parse(input.preset);
-    // A preset the session's provider cannot run is refused, never ignored.
-    assertPresetSupportedByProvider(current.provider, preset);
-    const fast = input.fastEnabled === undefined ? current.fastEnabled : input.fastEnabled;
-    const project = input.projectId === undefined ? current.projectId ?? null : input.projectId;
-    // Naming the preset is an explicit opt-in to the current mapping, even
-    // when the alias itself did not change. Unrelated metadata preserves the
-    // durable interpretation admitted for this session.
-    const presetContract = input.preset === undefined
-      ? currentPresetBinding.contract
-      : currentPresetContract;
-    const now = this.#now();
-    const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,preset_contract=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], presetContract, fast ? 1 : 0, project, now, current.id, current.revision);
-    if (result.changes !== 1) throw new Error("Session metadata revision conflict.");
-    return this.requireSession(current.id);
+    const update = this.#database.transaction(() => {
+      const current = this.requireSession(input.sessionId);
+      if (input.preset !== undefined || input.fastEnabled !== undefined || input.projectId !== undefined) {
+        assertSupportedProvider(current.provider);
+      }
+      const currentPresetBinding = this.#requireSessionPresetBinding(current.id);
+      if (current.revision !== input.expectedRevision) throw new Error("Session metadata revision conflict.");
+      // An unsettled provider effect owns the exact runtime profile it reviewed.
+      // Keep that recovery evidence admissible by refusing any route
+      // reinterpretation until recovery has settled it or explicit abandonment
+      // has terminalized the session.
+      if (input.preset !== undefined && current.state === "recovery_required") {
+        throw new Error("SESSION_PRESET_RECOVERY_REQUIRED");
+      }
+      const currentProjectId = current.projectId ?? null;
+      const requestedProjectId = input.projectId === undefined
+        ? currentProjectId
+        : input.projectId;
+      if (
+        requestedProjectId !== currentProjectId
+        && (current.state !== "idle" || current.activeTurnId !== undefined)
+      ) throw new Error("SESSION_PROJECT_REQUIRES_IDLE");
+      const title = input.title === undefined ? current.title : titleSchema.parse(input.title);
+      const note = input.note === undefined ? current.note : noteSchema.parse(input.note);
+      const preset = input.preset === undefined ? current.preset : supportedPresetSchema.parse(input.preset);
+      // A preset the session's provider cannot run is refused, never ignored.
+      assertPresetSupportedByProvider(current.provider, preset);
+      const fast = input.fastEnabled === undefined ? current.fastEnabled : input.fastEnabled;
+      const project = requestedProjectId;
+      // Naming the preset is an explicit opt-in to the active binding, even
+      // when the alias itself did not change. Unrelated metadata preserves the
+      // durable interpretation admitted for this session.
+      const presetContract = input.preset === undefined
+        ? currentPresetBinding.contract
+        : activePresetBinding(preset).contract;
+      // The released Work trigger uses != for this nullable column. Fence the
+      // semantic write with null-safe comparison without rewriting that frozen
+      // schema. The immediate transaction excludes a concurrent Work claim.
+      if (project !== currentProjectId && this.#database.query(
+        `SELECT 1 FROM work_attempts
+         WHERE worker_session_id=?
+           AND state IN ('claimed','dispatching','running','recovery_required')
+           AND project_id IS NOT ?
+         LIMIT 1`,
+      ).get(current.id, project) !== null) {
+        throw new Error("WORK_SESSION_ATTEMPT_AUTHORITY");
+      }
+      const now = this.#now();
+      const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,preset_contract=?,canonical_profile_key=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], presetContract, requireCanonicalSessionProfileKey(current.provider, presetTiers[preset], presetContract), fast ? 1 : 0, project, now, current.id, current.revision);
+      if (result.changes !== 1) throw new Error("Session metadata revision conflict.");
+      return this.requireSession(current.id);
+    });
+    return update.immediate();
   }
 
   /**
@@ -26617,6 +34489,12 @@ export class StateStore {
     providerAccountKey?: string;
     claudeProcessIdentity?: ClaudeProcessIdentity;
     seedTurnId: string;
+    hostCapabilities?: Readonly<{
+      preambleVersion: number;
+      preambleDigest: string;
+      manifestVersion: number;
+      manifestDigest: string;
+    }>;
     receipt: unknown;
   }): SessionRecord {
     const attemptId = attemptIdSchema.parse(input.attemptId);
@@ -26626,17 +34504,14 @@ export class StateStore {
     const providerAuthority = providerAccountAuthoritySchema.parse(input.providerAuthority);
     const expectedTargetProfileGeneration = z.number().int().nonnegative()
       .parse(input.expectedTargetProfileGeneration);
-    const preset = presetSchema.parse(input.preset);
+    assertSupportedProvider(provider);
+    const preset = supportedPresetSchema.parse(input.preset);
     assertPresetSupportedByProvider(provider, preset);
     const runtimeProfile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
     const providerAccountKey = input.providerAccountKey === undefined
       ? undefined
       : providerAccountAuthorityKeySchema.parse(input.providerAccountKey);
-    if (provider === "devin") {
-      if (providerAccountKey !== undefined) {
-        throw new Error("SESSION_PROVIDER_SWITCH_DEVIN_ACCOUNT_KEY_FORBIDDEN");
-      }
-    } else if (
+    if (
       providerAccountKey === undefined
       || !providerAccountAuthorityKeyMatchesProvider(provider, providerAccountKey)
     ) {
@@ -26662,8 +34537,20 @@ export class StateStore {
     const targetPresetContract = presetContractForLegacySwitchRuntimeProfile(runtimeProfile, preset);
     const providerThreadId = providerThreadIdSchema.parse(input.providerThreadId);
     const seedTurnId = providerThreadIdSchema.parse(input.seedTurnId);
+    if (input.hostCapabilities === undefined) {
+      throw new Error("SESSION_PROVIDER_SWITCH_HOST_CAPABILITY_MISMATCH");
+    }
+    const hostCapabilities = {
+      preambleVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+        .parse(input.hostCapabilities.preambleVersion),
+      preambleDigest: sha256Schema.parse(input.hostCapabilities.preambleDigest),
+      manifestVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+        .parse(input.hostCapabilities.manifestVersion),
+      manifestDigest: sha256Schema.parse(input.hostCapabilities.manifestDigest),
+    };
     const now = this.#now();
     const transaction = this.#database.transaction(() => {
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
       const targetProfileAuthority = mapProfile(
         this.#database.query("SELECT * FROM profiles WHERE id=?").get(profileId),
       );
@@ -26675,6 +34562,7 @@ export class StateStore {
         throw new Error("SESSION_PROVIDER_SWITCH_TARGET_AUTHORITY_CHANGED");
       }
       const sourceSession = this.requireSession(sessionId);
+      assertSupportedProvider(sourceSession.provider);
       const sourceProviderAuthority = this.readSessionProviderAccountAuthority(sessionId);
       const expectedSessionRevision = z.number().int().positive().parse(
         input.expectedSessionRevision,
@@ -26684,11 +34572,8 @@ export class StateStore {
         || sourceSession.state === "recovery_required"
         || sourceSession.state === "terminal"
       ) throw new Error("SESSION_PROVIDER_SWITCH_CAS_CONFLICT");
-      if (
-        sourceSession.provider === "devin"
-          ? sourceProviderAuthority !== null
-          : sourceProviderAuthority === null
-            || sourceProviderAuthority.provider !== sourceSession.provider
+      if (sourceProviderAuthority === null
+        || sourceProviderAuthority.provider !== sourceSession.provider
       ) throw new Error("SESSION_PROVIDER_SWITCH_SOURCE_ACCOUNT_AUTHORITY_MISSING");
       const personalBindingRow = this.#database.query(
         `SELECT * FROM session_personal_runtime_bindings
@@ -26726,19 +34611,16 @@ export class StateStore {
           throw new Error("SESSION_PROVIDER_SWITCH_PERSONAL_CANDIDATE_MISSING");
         }
       }
-      if (sourceSession.provider !== "devin") {
-        const retiredProviderAuthority = this.#database.query(
-          "DELETE FROM session_provider_account_authorities WHERE session_id=?",
-        ).run(sessionId);
-        if (retiredProviderAuthority.changes !== 1) {
-          throw new Error("SESSION_PROVIDER_SWITCH_SOURCE_ACCOUNT_AUTHORITY_CONFLICT");
-        }
+      const retiredProviderAuthority = this.#database.query(
+        "DELETE FROM session_provider_account_authorities WHERE session_id=?",
+      ).run(sessionId);
+      if (retiredProviderAuthority.changes !== 1) {
+        throw new Error("SESSION_PROVIDER_SWITCH_SOURCE_ACCOUNT_AUTHORITY_CONFLICT");
       }
       const authority = z.object({
         authority_id: sessionIdSchema,
         authority_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
         state: z.literal("effect_started"),
-        evidence_json: z.string(),
         target_provider_thread_id: providerThreadIdSchema,
         seed_client_message_id: attemptIdSchema,
         seed_text: z.string().min(1).max(24_576),
@@ -26748,7 +34630,7 @@ export class StateStore {
         source_released: z.number().int().min(0).max(1),
         target_released: z.number().int().min(0).max(1),
       }).strict().parse(this.#database.query(
-        `SELECT m.authority_id,m.authority_generation,m.state,e.evidence_json,
+        `SELECT m.authority_id,m.authority_generation,m.state,
                 t.provider_thread_id AS target_provider_thread_id,
                 i.client_message_id AS seed_client_message_id,
                 i.seed_text,
@@ -26765,9 +34647,6 @@ export class StateStore {
          LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
          WHERE m.id=? AND m.kind='session.switch' AND r.attempt_id IS NULL`,
       ).get(attemptId));
-      const evidence = mutationEffectEvidenceSchema.parse(
-        JSON.parse(authority.evidence_json) as unknown,
-      );
       const seedRuntimeProfile = reviewedRuntimeProfileSchema.parse(
         JSON.parse(authority.seed_runtime_profile_json) as unknown,
       );
@@ -26780,6 +34659,7 @@ export class StateStore {
         || evidence.targetProfileId !== profileId
         || evidence.targetProvider !== provider
         || evidence.targetProviderAccountKey !== providerAccountKey
+        || JSON.stringify(evidence.targetHostCapabilities) !== JSON.stringify(hostCapabilities)
         || evidence.targetPreset !== preset
         || authority.target_provider_thread_id !== providerThreadId
         || sessionProviderSwitchTargetAliasesSource(evidence, providerThreadId)
@@ -26838,7 +34718,7 @@ export class StateStore {
       // caller can observe the intermediate idle row.
       const bound = this.#database.query(
         `UPDATE sessions
-         SET provider=?,provider_v39=?,profile_id=?,preset=?,preset_contract=?,provider_thread_id=?,state=?,active_turn_id=?,
+         SET provider=?,provider_v39=?,profile_id=?,preset=?,preset_contract=?,canonical_profile_key=?,provider_thread_id=?,state=?,active_turn_id=?,
              provider_updated_at=?,revision=revision+1,updated_at=?
          WHERE id=? AND revision=? AND profile_id=? AND provider_v39=?
            AND provider_thread_id=? AND state NOT IN ('recovery_required','terminal')
@@ -26849,6 +34729,7 @@ export class StateStore {
         profileId,
         presetTiers[preset],
         targetPresetContract,
+        requireCanonicalSessionProfileKey(provider, presetTiers[preset], targetPresetContract),
         providerThreadId,
         "idle",
         null,
@@ -26881,14 +34762,12 @@ export class StateStore {
       if (authorityChanged.changes !== 1) {
         throw new Error("SESSION_PROVIDER_SWITCH_AUTHORITY_MISSING");
       }
-      if (provider !== "devin" && providerAccountKey !== undefined) {
-        this.#bindSessionProviderAccountAuthorityLocked({
-          sessionId,
-          provider,
-          runtimeScope: "managed",
-          accountKey: providerAccountKey,
-        }, now);
-      }
+      this.#bindSessionProviderAccountAuthorityLocked({
+        sessionId,
+        provider,
+        runtimeScope: "managed",
+        accountKey: providerAccountKey,
+      }, now);
       let expectedReboundRevision = expectedSessionRevision + 1;
       if (input.state === "active") {
         const activated = this.#database.query(
@@ -26934,6 +34813,22 @@ export class StateStore {
         `UPDATE session_conversation_automation
          SET provider_thread_id=? WHERE session_id=?`,
       ).run(providerThreadId, sessionId);
+      this.#database.query(
+        "DELETE FROM session_host_capability_bindings WHERE session_id=?",
+      ).run(sessionId);
+      this.#database.query(
+        `INSERT INTO session_host_capability_bindings(
+           session_id,preamble_version,preamble_digest,manifest_version,
+           manifest_digest,recorded_at
+         ) VALUES (?,?,?,?,?,?)`,
+      ).run(
+        sessionId,
+        hostCapabilities.preambleVersion,
+        hostCapabilities.preambleDigest,
+        hostCapabilities.manifestVersion,
+        hostCapabilities.manifestDigest,
+        now,
+      );
       this.#insertSessionRuntimeProfile(
         {
           sessionId,
@@ -26964,6 +34859,9 @@ export class StateStore {
           transcriptDigest: evidence.transcriptDigest,
           seedDigest: evidence.seedDigest,
           seedOmittedRecords: evidence.seedOmittedRecords,
+          ...(evidence.seedRetentionGapReason === undefined
+            ? {}
+            : { seedRetentionGapReason: evidence.seedRetentionGapReason }),
         },
         providerConnectionId: null,
         providerGeneration: providerAuthority.processGeneration,
@@ -27006,9 +34904,12 @@ export class StateStore {
 
   setSessionTurnState(input: { sessionId: SessionId; expectedRevision: number; state: "active" | "idle" | "terminal" | "recovery_required"; activeTurnId?: string }): SessionRecord {
     const now = this.#now();
-    const result = this.#database.query("UPDATE sessions SET state=?,active_turn_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(input.state, input.activeTurnId ?? null, now, input.sessionId, input.expectedRevision);
-    if (result.changes !== 1) throw new Error("Session state revision conflict.");
-    return this.requireSession(input.sessionId);
+    const update = this.#database.transaction(() => {
+      const result = this.#database.query("UPDATE sessions SET state=?,active_turn_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(input.state, input.activeTurnId ?? null, now, input.sessionId, input.expectedRevision);
+      if (result.changes !== 1) throw new Error("Session state revision conflict.");
+      return this.requireSession(input.sessionId);
+    });
+    return update.immediate();
   }
 
   reconcileSessionFromProvider(input: { sessionId: SessionId; state?: "active" | "idle" | "terminal" | "recovery_required"; activeTurnId?: string | null; title?: string }): SessionRecord {
@@ -27060,31 +34961,13 @@ export class StateStore {
     });
   }
 
-  terminalizeIdleDevinSessionForAccountLogin(input: Readonly<{
-    accountId: ProfileId;
-    providerConnectionId: string | null;
-    providerGeneration: number;
-    providerAuthority: ProviderAccountAuthority;
-    sessionId: SessionId;
-  }>): Readonly<{
-    changed: boolean;
-    event?: SessionEvent;
-    interactions: readonly InteractionRecord[];
-    session: SessionRecord;
-  }> {
-    return this.#terminalizeProviderSession({
-      ...input,
-      source: "devin_account_login",
-    });
-  }
-
   #terminalizeProviderSession(input: Readonly<{
     accountId: ProfileId;
     providerConnectionId: string | null;
     providerGeneration: number;
     providerAuthority: ProviderAccountAuthority;
     sessionId: SessionId;
-    source: "provider_thread_deleted" | "provider_transport_lost" | "claude_account_login" | "devin_account_login";
+    source: "provider_thread_deleted" | "provider_transport_lost" | "claude_account_login";
   }>): Readonly<{
     changed: boolean;
     event?: SessionEvent;
@@ -27119,21 +35002,13 @@ export class StateStore {
       }).blocked) {
         throw new Error("SESSION_SWITCH_STORAGE_FENCED");
       }
-      if (input.source === "claude_account_login" || input.source === "devin_account_login") {
-        const provider = input.source === "claude_account_login" ? "claude" : "devin";
-        const releasable = provider === "claude"
-          ? this.canReleaseIdleManagedClaudeSessionForAccountLogin.bind(this)
-          : this.canReleaseIdleDevinSessionForAccountLogin.bind(this);
-        if (!releasable({
+      if (input.source === "claude_account_login") {
+        if (!this.canReleaseIdleManagedClaudeSessionForAccountLogin({
           profileId: accountId,
           profileGeneration: providerGeneration,
           sessionId: current.id,
         })) {
-          throw new Error(
-            provider === "claude"
-              ? "CLAUDE_LOGIN_SESSION_NOT_QUIESCENT"
-              : "DEVIN_LOGIN_SESSION_NOT_QUIESCENT",
-          );
+          throw new Error("CLAUDE_LOGIN_SESSION_NOT_QUIESCENT");
         }
       }
       // Loss of the source transport does not dispose an independently
@@ -27188,9 +35063,7 @@ export class StateStore {
       this.#database.query(
         "UPDATE queue_entries SET state='ambiguous',updated_at=? WHERE session_id=? AND state='dispatching'",
       ).run(now, current.id);
-      const providerDeletionEvidence = JSON.stringify({
-        source: input.source,
-      });
+      const terminalizationEvidence = JSON.stringify({ source: input.source });
       this.#database.query(
         `INSERT OR IGNORE INTO queue_effect_resolutions(
            queue_id,resolution_kind,evidence_json,receipt_json,created_at
@@ -27199,8 +35072,16 @@ export class StateStore {
          FROM queue_entries q
          JOIN queue_effect_evidence e ON e.queue_id=q.id
          LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
-         WHERE q.session_id=? AND q.state='ambiguous' AND r.queue_id IS NULL`,
-      ).run(providerDeletionEvidence, now, current.id);
+       WHERE q.session_id=? AND q.state='ambiguous' AND r.queue_id IS NULL`,
+      ).run(terminalizationEvidence, now, current.id);
+      this.#database.query(
+        `UPDATE peer_session_actions
+         SET state='failed',result_digest=?,updated_at=MAX(updated_at,?)
+         WHERE state='ambiguous' AND id IN (
+           SELECT peer_action_id FROM queue_entries
+           WHERE session_id=? AND peer_action_id IS NOT NULL
+         )`,
+      ).run(digestJson({ source: input.source }), now, current.id);
       this.#database.query(
         `UPDATE mutation_attempts
          SET state='cancelled',updated_at=?
@@ -27224,8 +35105,47 @@ export class StateStore {
            AND m.state IN ('effect_started','ambiguous')
            AND NOT ${sessionSendOwnedSql("m.id", "m.idempotency_key", "m.request_format")}
            AND r.attempt_id IS NULL`,
-      ).run(providerDeletionEvidence, now, current.id, current.id);
+      ).run(terminalizationEvidence, now, current.id, current.id);
       this.#retireOwnedSessionSends(now, "provider_outcome_unknown", current.id);
+      // Provider deletion and managed-Claude account release are definitive:
+      // no source in this session can still produce a transcript event. Fold
+      // every staged intent to its bounded actor receipt in the same
+      // transaction as operation settlement, then release attachment custody.
+      // Otherwise a terminal source remains permanently "pending" and its
+      // manifest is exempt from the normal bounded-retention pruning path.
+      this.#database.query(
+        `UPDATE queue_entries SET transcript_status='abandoned',
+           transcript_intent_json=json_object(
+             'version',1,
+             'actor',json_extract(transcript_intent_json,'$.actor'),
+             'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+               json_extract(transcript_intent_json,'$.attachments')),0)>0
+               THEN 'true' ELSE 'false' END))
+         WHERE session_id=? AND transcript_status='pending'`,
+      ).run(current.id);
+      this.#database.query(
+        `UPDATE mutation_attempts SET transcript_status='abandoned',
+           transcript_intent_json=json_object(
+             'version',1,
+             'actor',json_extract(transcript_intent_json,'$.actor'),
+             'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+               json_extract(transcript_intent_json,'$.attachments')),0)>0
+               THEN 'true' ELSE 'false' END))
+         WHERE authority_id=? AND kind IN ('session.send','session.steer')
+           AND transcript_status='pending'`,
+      ).run(current.id);
+      const releasedAttachments = this.#database.query(
+        `DELETE FROM message_attachments WHERE session_id=?
+         AND NOT ${attachmentMutationProtectedSql("message_attachments.source_id")}
+         AND NOT EXISTS(SELECT 1 FROM queue_entries queue WHERE queue.id=message_attachments.source_id
+           AND queue.session_id=message_attachments.session_id AND ${queueAttachmentsProtectedSql("queue")})`,
+      ).run(current.id);
+      if (releasedAttachments.changes > 0) {
+        // Secure deletion has already been enabled for this connection. The
+        // durable scrub authority additionally forces the superseded WAL
+        // frames out before this terminalization reports success.
+        requireQueueMessageScrub(this.#database, now, false);
+      }
       this.#database.query(
         `UPDATE session_tasks
          SET status='paused',revision=revision+1,next_due_at=NULL,
@@ -27266,14 +35186,17 @@ export class StateStore {
   quarantineSession(sessionId: SessionId): SessionRecord {
     const parsedSessionId = sessionIdSchema.parse(sessionId);
     const now = this.#now();
-    this.#database
-      .query(
-        `UPDATE sessions
-         SET state='recovery_required',active_turn_id=NULL,revision=revision+1,updated_at=?
-         WHERE id=? AND state NOT IN ('recovery_required','terminal')`,
-      )
-      .run(now, parsedSessionId);
-    return this.requireSession(parsedSessionId);
+    const quarantine = this.#database.transaction(() => {
+      this.#database
+        .query(
+          `UPDATE sessions
+           SET state='recovery_required',active_turn_id=NULL,revision=revision+1,updated_at=?
+           WHERE id=? AND state NOT IN ('recovery_required','terminal')`,
+        )
+        .run(now, parsedSessionId);
+      return this.requireSession(parsedSessionId);
+    });
+    return quarantine.immediate();
   }
 
   hasUnsettledLegacyProviderAuthorityQuarantineForSession(
@@ -27423,12 +35346,16 @@ export class StateStore {
       expectedRevision: number;
       resolution: "abandoned";
     }): SessionRecord {
-    completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const sessionId = sessionIdSchema.parse(input.sessionId);
+    if (input.resolution === "provider_state_reconciled") {
+      assertSupportedProvider(this.requireSession(sessionId).provider);
+    }
+    completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const expectedRevision = z.number().int().positive().parse(input.expectedRevision);
     const now = this.#now();
     const resolveRecovery = this.#database.transaction(() => {
       const session = mapSession(this.#database.query("SELECT * FROM sessions WHERE id=?").get(sessionId));
+      if (input.resolution === "provider_state_reconciled") assertSupportedProvider(session.provider);
       if (session.state !== "recovery_required" || session.revision !== expectedRevision) {
         throw new Error("SESSION_STATUS_RECOVERY_CAS_CONFLICT");
       }
@@ -27496,7 +35423,4630 @@ export class StateStore {
     return this.requireSession(sessionId);
   }
 
-  #enqueuePrepared(sessionId: SessionId, message: string, attemptId: AttemptId): QueueRecord {
+  readSessionHostCapabilityBinding(
+    sessionId: SessionId,
+  ): SessionHostCapabilityBindingRecord | null {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const row = this.#database.query(
+      "SELECT * FROM session_host_capability_bindings WHERE session_id=?",
+    ).get(parsedSessionId);
+    return row === null ? null : mapSessionHostCapabilityBinding(row);
+  }
+
+  requireSessionHostCapabilityBinding(
+    sessionId: SessionId,
+  ): SessionHostCapabilityBindingRecord {
+    const binding = this.readSessionHostCapabilityBinding(sessionId);
+    if (binding === null) throw new Error("SESSION_HOST_CAPABILITY_BINDING_MISSING");
+    return binding;
+  }
+
+  bindSessionHostCapabilities(input: Readonly<{
+    sessionId: SessionId;
+    preambleVersion: number;
+    preambleDigest: string;
+    manifestVersion: number;
+    manifestDigest: string;
+  }>): SessionHostCapabilityBindingRecord {
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const preambleVersion = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.preambleVersion);
+    const preambleDigest = sha256Schema.parse(input.preambleDigest);
+    const manifestVersion = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.manifestVersion);
+    const manifestDigest = sha256Schema.parse(input.manifestDigest);
+    const bind = this.#database.transaction(() => {
+      const existing = this.readSessionHostCapabilityBinding(sessionId);
+      if (existing !== null) {
+        if (
+          existing.preambleVersion !== preambleVersion
+          || existing.preambleDigest !== preambleDigest
+          || existing.manifestVersion !== manifestVersion
+          || existing.manifestDigest !== manifestDigest
+        ) throw new Error("SESSION_HOST_CAPABILITY_BINDING_CONFLICT");
+        return;
+      }
+      const session = this.#requirePeerSession(sessionId);
+      if (
+        session.state !== "idle"
+        || session.activeTurnId !== undefined
+        || session.providerThreadId === undefined
+      ) {
+        throw new Error("SESSION_HOST_CAPABILITY_ADOPTION_MID_TURN");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      this.#database.query(
+        `INSERT INTO session_host_capability_bindings(
+           session_id,preamble_version,preamble_digest,manifest_version,
+           manifest_digest,recorded_at
+         ) VALUES (?,?,?,?,?,?)`,
+      ).run(
+        sessionId,
+        preambleVersion,
+        preambleDigest,
+        manifestVersion,
+        manifestDigest,
+        now,
+      );
+    });
+    bind.immediate();
+    return this.requireSessionHostCapabilityBinding(sessionId);
+  }
+
+  reserveProjectMemoryAuthority(input: Readonly<{
+    projectId: ProjectId;
+    identityContract: ProjectMemoryIdentityContract;
+    canonicalSpaceId: string;
+    head: ProjectMemoryHeadRef;
+  }>): ProjectMemoryAuthorityRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    let identity: ReturnType<typeof deriveProjectMemoryCanonicalIdentity>;
+    let head: ProjectMemoryHeadRef;
+    try {
+      identity = deriveProjectMemoryCanonicalIdentity({
+        canonicalSpaceId: input.canonicalSpaceId,
+        identityContract: input.identityContract,
+        projectId,
+      });
+      head = projectMemoryHeadRefSchema.parse(input.head);
+    } catch (cause: unknown) {
+      throw new TypeError("PROJECT_MEMORY_AUTHORITY_RESERVATION_INVALID", { cause });
+    }
+    if (identity.identityContract !== 2) {
+      throw new TypeError("PROJECT_MEMORY_AUTHORITY_RESERVATION_INVALID");
+    }
+    return this.#reserveProjectMemoryAuthority(projectId, identity, head);
+  }
+
+  reserveLegacyProjectMemoryAuthorityForRecovery(
+    projectIdValue: ProjectId,
+  ): ProjectMemoryAuthorityRecord {
+    const projectId = projectIdSchema.parse(projectIdValue);
+    const identity = deriveProjectMemoryCanonicalIdentity({
+      canonicalSpaceId: legacyProjectMemorySpaceId(projectId),
+      identityContract: 1,
+      projectId,
+    });
+    return this.#reserveProjectMemoryAuthority(
+      projectId,
+      identity,
+      PROJECT_MEMORY_EMPTY_HEAD,
+    );
+  }
+
+  #reserveProjectMemoryAuthority(
+    projectId: ProjectId,
+    identity: ReturnType<typeof deriveProjectMemoryCanonicalIdentity>,
+    head: ProjectMemoryHeadRef,
+  ): ProjectMemoryAuthorityRecord {
+    if (
+      head.sequence !== PROJECT_MEMORY_EMPTY_HEAD.sequence
+      || head.operationSha256 !== PROJECT_MEMORY_EMPTY_HEAD.operationSha256
+      || head.headDigest !== PROJECT_MEMORY_EMPTY_HEAD.headDigest
+    ) throw new TypeError("PROJECT_MEMORY_AUTHORITY_RESERVATION_INVALID");
+    const reserve = this.#database.transaction(() => {
+      if (this.#database.query("SELECT 1 FROM projects WHERE id=?").get(projectId) === null) {
+        throw new SelectionError("NOT_FOUND");
+      }
+      const existing = this.readProjectMemoryAuthority(projectId);
+      // Concurrent first-open callers may generate different portable ids.
+      // The immediate transaction elects one winner; every loser adopts the
+      // already durable identity before any physical Oh store is opened.
+      if (existing !== null) return;
+      const now = unixMillisecondsSchema.parse(this.#now());
+      this.#database.query(
+        `INSERT INTO project_memory_authorities(
+           project_id,identity_contract,canonical_space_id,physical_state,initialized_at,
+           authority_digest,binding_digest,head_sequence,
+           head_operation_sha256,head_digest,revision,sync_state,
+           last_exchange_at,last_exchange_sequence,last_exchange_operation_sha256,
+           last_exchange_head_digest,diagnostic_code,created_at,updated_at
+         ) VALUES (?,?,?,'reserved',NULL,?,?,?,?,?,1,'local_only',NULL,NULL,NULL,NULL,NULL,?,?)`,
+      ).run(
+        projectId,
+        identity.identityContract,
+        identity.canonicalSpaceId,
+        identity.authorityDigest,
+        identity.bindingDigest,
+        head.sequence,
+        head.operationSha256,
+        head.headDigest,
+        now,
+        now,
+      );
+    });
+    reserve.immediate();
+    const authority = this.readProjectMemoryAuthority(projectId);
+    if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+    return authority;
+  }
+
+  markProjectMemoryAuthorityInitialized(input: Readonly<{
+    projectId: ProjectId;
+    expectedRevision: number;
+    expectedHead: ProjectMemoryHeadRef;
+  }>): ProjectMemoryAuthorityRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const expectedRevision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedRevision);
+    const expectedHead = projectMemoryHeadRefSchema.parse(input.expectedHead);
+    const initialize = this.#database.transaction(() => {
+      const current = this.readProjectMemoryAuthority(projectId);
+      if (current === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (current.physicalState === "initialized") {
+        if (JSON.stringify(current.head) !== JSON.stringify(expectedHead)) {
+          throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+        }
+        return;
+      }
+      if (current.revision !== expectedRevision) {
+        throw new Error("PROJECT_MEMORY_REVISION_CONFLICT");
+      }
+      if (JSON.stringify(current.head) !== JSON.stringify(expectedHead)) {
+        throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const initializedAt = Math.max(current.updatedAt, now);
+      const changed = this.#database.query(
+        `UPDATE project_memory_authorities
+         SET physical_state='initialized',initialized_at=?,revision=revision+1,
+             updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND revision=? AND physical_state='reserved'
+           AND head_sequence=? AND head_operation_sha256 IS ? AND head_digest=?`,
+      ).run(
+        initializedAt,
+        initializedAt,
+        projectId,
+        expectedRevision,
+        expectedHead.sequence,
+        expectedHead.operationSha256,
+        expectedHead.headDigest,
+      );
+      if (changed.changes !== 1) throw new Error("PROJECT_MEMORY_REVISION_CONFLICT");
+    });
+    initialize.immediate();
+    const authority = this.readProjectMemoryAuthority(projectId);
+    if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+    return authority;
+  }
+
+  rejectReservedProjectMemoryAuthority(input: Readonly<{
+    diagnosticCode: string;
+    expectedHead: ProjectMemoryHeadRef;
+    expectedRevision: number;
+    projectId: ProjectId;
+  }>): ProjectMemoryAuthorityRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const expectedRevision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedRevision);
+    const expectedHead = projectMemoryHeadRefSchema.parse(input.expectedHead);
+    const diagnosticCode = memoryDiagnosticCodeSchema.parse(input.diagnosticCode);
+    const reject = this.#database.transaction(() => {
+      const current = this.readProjectMemoryAuthority(projectId);
+      if (current === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (current.physicalState === "rejected") {
+        if (
+          current.diagnosticCode !== diagnosticCode
+          || JSON.stringify(current.head) !== JSON.stringify(expectedHead)
+        ) throw new Error("PROJECT_MEMORY_AUTHORITY_REJECTION_CONFLICT");
+        return;
+      }
+      if (current.physicalState !== "reserved") {
+        throw new Error("PROJECT_MEMORY_AUTHORITY_ALREADY_INITIALIZED");
+      }
+      if (current.revision !== expectedRevision) {
+        throw new Error("PROJECT_MEMORY_REVISION_CONFLICT");
+      }
+      if (JSON.stringify(current.head) !== JSON.stringify(expectedHead)) {
+        throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+      }
+      const now = Math.max(current.updatedAt, unixMillisecondsSchema.parse(this.#now()));
+      const changed = this.#database.query(
+        `UPDATE project_memory_authorities
+         SET physical_state='rejected',sync_state='error',diagnostic_code=?,
+             revision=revision+1,updated_at=?
+         WHERE project_id=? AND revision=? AND physical_state='reserved'
+           AND head_sequence=? AND head_operation_sha256 IS ? AND head_digest=?`,
+      ).run(
+        diagnosticCode,
+        now,
+        projectId,
+        expectedRevision,
+        expectedHead.sequence,
+        expectedHead.operationSha256,
+        expectedHead.headDigest,
+      );
+      if (changed.changes !== 1) throw new Error("PROJECT_MEMORY_REVISION_CONFLICT");
+    });
+    reject.immediate();
+    const authority = this.readProjectMemoryAuthority(projectId);
+    if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+    return authority;
+  }
+
+  readProjectMemoryAuthority(projectId: ProjectId): ProjectMemoryAuthorityRecord | null {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    const row = this.#database.query("SELECT * FROM project_memory_authorities WHERE project_id=?")
+      .get(parsedProjectId);
+    return row === null ? null : mapProjectMemoryAuthority(row);
+  }
+
+  readCanonicalMemoryPortableAdoptionProof(input: Readonly<{
+    operationSha256: string;
+    projectId: ProjectId;
+    sequence: number;
+  }>): CanonicalMemoryPortableAdoptionProofRecord | null {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const sequence = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.sequence);
+    const operationSha256 = canonicalMemoryDigestSchema.parse(input.operationSha256);
+    const row = this.#database.query(
+      `SELECT * FROM project_memory_portable_adoption_proofs
+       WHERE project_id=? AND sequence=? AND operation_sha256=?`,
+    ).get(projectId, sequence, operationSha256);
+    return row === null ? null : mapCanonicalMemoryPortableAdoptionProof(row);
+  }
+
+  isCanonicalMemoryPortableAdoptionProofReferenced(input: Readonly<{
+    bindingDigest: string;
+    contentDigest?: string;
+    keyDigest: string;
+    projectId: ProjectId;
+    recordSha256: string;
+  }>): boolean {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const bindingDigest = canonicalMemoryDigestSchema.parse(input.bindingDigest);
+    const recordSha256 = canonicalMemoryDigestSchema.parse(input.recordSha256);
+    const keyDigest = canonicalMemoryDigestSchema.parse(input.keyDigest);
+    const contentDigest = input.contentDigest === undefined
+      ? undefined
+      : canonicalMemoryDigestSchema.parse(input.contentDigest);
+    return this.#database.query(
+      `SELECT 1 FROM project_memory_portable_adoption_proofs
+       WHERE project_id=? AND canonical_binding_digest=? AND record_sha256=?
+         AND key_digest=? ${contentDigest === undefined ? "" : "AND content_digest=?"}
+       LIMIT 1`,
+    ).get(
+      projectId,
+      bindingDigest,
+      recordSha256,
+      keyDigest,
+      ...(contentDigest === undefined ? [] : [contentDigest]),
+    ) !== null;
+  }
+
+  compareAndSwapProjectMemoryHead(input: Readonly<{
+    projectId: ProjectId;
+    expectedRevision: number;
+    expectedHead: ProjectMemoryHeadRef;
+    nextHead: ProjectMemoryHeadRef;
+  }>): ProjectMemoryAuthorityRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const expectedRevision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedRevision);
+    const expectedHead = projectMemoryHeadRefSchema.parse(input.expectedHead);
+    const nextHead = projectMemoryHeadRefSchema.parse(input.nextHead);
+    const advance = this.#database.transaction(() => {
+      const current = this.readProjectMemoryAuthority(projectId);
+      if (current === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (current.physicalState !== "initialized") {
+        throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+      }
+      if (current.revision !== expectedRevision) {
+        throw new Error("PROJECT_MEMORY_REVISION_CONFLICT");
+      }
+      if (JSON.stringify(current.head) !== JSON.stringify(expectedHead)) {
+        throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+      }
+      if (JSON.stringify(current.head) === JSON.stringify(nextHead)) return;
+      if (nextHead.sequence <= current.head.sequence) {
+        throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_authorities
+         SET head_sequence=?,head_operation_sha256=?,head_digest=?,
+             revision=revision+1,
+             sync_state=CASE WHEN sync_state IN ('conflict','error')
+               THEN sync_state ELSE 'local_only' END,
+             diagnostic_code=CASE WHEN sync_state IN ('conflict','error')
+               THEN diagnostic_code ELSE NULL END,
+             updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND revision=? AND head_sequence=?
+           AND head_operation_sha256 IS ? AND head_digest=?`,
+      ).run(
+        nextHead.sequence,
+        nextHead.operationSha256,
+        nextHead.headDigest,
+        now,
+        projectId,
+        expectedRevision,
+        expectedHead.sequence,
+        expectedHead.operationSha256,
+        expectedHead.headDigest,
+      );
+      if (changed.changes !== 1) throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+    });
+    advance.immediate();
+    const authority = this.readProjectMemoryAuthority(projectId);
+    if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+    return authority;
+  }
+
+  recordProjectMemorySyncObservation(input: Readonly<{
+    projectId: ProjectId;
+    expectedRevision: number;
+    expectedHead: ProjectMemoryHeadRef;
+    state: ProjectMemorySyncState;
+    exchangeHead?: ProjectMemoryHeadRef;
+    diagnosticCode?: string;
+  }>): ProjectMemoryAuthorityRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const expectedRevision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedRevision);
+    const expectedHead = projectMemoryHeadRefSchema.parse(input.expectedHead);
+    const state = projectMemorySyncStateSchema.parse(input.state);
+    const exchangeHead = input.exchangeHead === undefined
+      ? undefined
+      : projectMemoryHeadRefSchema.parse(input.exchangeHead);
+    const diagnosticCode = input.diagnosticCode === undefined
+      ? undefined
+      : memoryDiagnosticCodeSchema.parse(input.diagnosticCode);
+    if (
+      (state === "settled" && (
+        exchangeHead === undefined
+        || JSON.stringify(exchangeHead) !== JSON.stringify(expectedHead)
+        || diagnosticCode !== undefined
+      ))
+      || (state === "conflict" && (exchangeHead === undefined || diagnosticCode === undefined))
+      || (state === "error" && diagnosticCode === undefined)
+      || (state === "local_only" && (exchangeHead !== undefined || diagnosticCode !== undefined))
+    ) throw new TypeError("PROJECT_MEMORY_SYNC_OBSERVATION_INVALID");
+    const observe = this.#database.transaction(() => {
+      const current = this.readProjectMemoryAuthority(projectId);
+      if (current === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (current.physicalState !== "initialized") {
+        throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+      }
+      if (current.revision !== expectedRevision) {
+        throw new Error("PROJECT_MEMORY_REVISION_CONFLICT");
+      }
+      if (JSON.stringify(current.head) !== JSON.stringify(expectedHead)) {
+        throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+      }
+      if (
+        (current.syncState === "conflict" || current.syncState === "error")
+        && state !== current.syncState
+      ) {
+        throw new Error("PROJECT_MEMORY_SYNC_FROZEN");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const lastExchangeAt = exchangeHead === undefined ? current.lastExchangeAt ?? null : now;
+      const lastExchangeHead = exchangeHead ?? current.lastExchangeHead;
+      const changed = this.#database.query(
+        `UPDATE project_memory_authorities
+         SET revision=revision+1,sync_state=?,last_exchange_at=?,
+             last_exchange_sequence=?,last_exchange_operation_sha256=?,
+             last_exchange_head_digest=?,diagnostic_code=?,updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND revision=? AND head_sequence=?
+           AND head_operation_sha256 IS ? AND head_digest=?`,
+      ).run(
+        state,
+        lastExchangeAt,
+        lastExchangeHead?.sequence ?? null,
+        lastExchangeHead?.operationSha256 ?? null,
+        lastExchangeHead?.headDigest ?? null,
+        diagnosticCode ?? null,
+        now,
+        projectId,
+        expectedRevision,
+        expectedHead.sequence,
+        expectedHead.operationSha256,
+        expectedHead.headDigest,
+      );
+      if (changed.changes !== 1) throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+    });
+    observe.immediate();
+    const authority = this.readProjectMemoryAuthority(projectId);
+    if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+    return authority;
+  }
+
+  readCanonicalMemoryHostedCreateIntent(
+    intentId: string,
+  ): CanonicalMemoryHostedCreateIntentRecord | null {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(intentId);
+    const row = this.#database.query(
+      "SELECT * FROM project_memory_hosted_create_intents WHERE id=?",
+    ).get(id);
+    return row === null ? null : mapCanonicalMemoryHostedCreateIntent(row);
+  }
+
+  readUnresolvedCanonicalMemoryHostedCreateIntent(
+    projectId: ProjectId,
+  ): CanonicalMemoryHostedCreateIntentRecord | null {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    const row = this.#database.query(
+      `SELECT id FROM project_memory_hosted_create_intents
+       WHERE project_id=? AND state IN (
+         'allocating','key_staged','prepared','effect_started','winner_observed'
+       )`,
+    ).get(parsedProjectId);
+    if (row === null) return null;
+    return this.readCanonicalMemoryHostedCreateIntent(
+      z.object({ id: canonicalMemoryHostedCreateIntentIdSchema }).strict().parse(row).id,
+    );
+  }
+
+  #assertCanonicalMemoryHostedCreatePinsCurrent(
+    intent: CanonicalMemoryHostedCreateIntentRecord,
+  ): void {
+    const authority = this.readProjectMemoryAuthority(intent.projectId);
+    if (
+      authority === null
+      || authority.identityContract !== 2
+      || authority.physicalState === "rejected"
+      || authority.syncState === "conflict"
+      || authority.syncState === "error"
+      || authority.revision !== intent.authorityRevision
+      || authority.bindingDigest !== intent.canonicalBindingDigest
+      || !sameProjectMemoryHead(authority.head, intent.authorityHead)
+    ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_AUTHORITY_CONFLICT");
+    if (this.readCanonicalMemoryHostedAttachment(intent.projectId) !== null) {
+      throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_ATTACHMENT_CONFLICT");
+    }
+    if (this.readUnresolvedCanonicalMemorySyncIntent(intent.projectId) !== null) {
+      throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+    }
+  }
+
+  allocateCanonicalMemoryHostedCreate(input: Readonly<{
+    accountBindingDigest: string;
+    idempotencyKey: string;
+    projectId: ProjectId;
+    remoteSpaceId: string;
+  }>): CanonicalMemoryHostedCreateAllocation {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const accountBindingDigest = canonicalMemoryDigestSchema.parse(input.accountBindingDigest);
+    const idempotencyKey = z.string().uuid().parse(input.idempotencyKey);
+    const remoteSpaceId = canonicalMemoryHostedSpaceIdSchema.parse(input.remoteSpaceId);
+    let id: string | undefined;
+    let replay = false;
+    const allocate = this.#database.transaction(() => {
+      const existingRow = this.#database.query(
+        "SELECT id FROM project_memory_hosted_create_intents WHERE idempotency_key=?",
+      ).get(idempotencyKey);
+      if (existingRow !== null) {
+        const existing = this.readCanonicalMemoryHostedCreateIntent(
+          z.object({ id: canonicalMemoryHostedCreateIntentIdSchema }).strict()
+            .parse(existingRow).id,
+        );
+        if (
+          existing === null
+          || existing.projectId !== projectId
+          || existing.accountBindingDigest !== accountBindingDigest
+          || existing.remoteSpaceId !== remoteSpaceId
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_IDEMPOTENCY_CONFLICT");
+        id = existing.id;
+        replay = true;
+        return;
+      }
+      if (this.#database.query("SELECT 1 FROM projects WHERE id=?").get(projectId) === null) {
+        throw new SelectionError("NOT_FOUND");
+      }
+      const authority = this.readProjectMemoryAuthority(projectId);
+      if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (authority.identityContract !== 2 || authority.physicalState === "rejected") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_IDENTITY_MISMATCH");
+      }
+      if (authority.syncState === "conflict" || authority.syncState === "error") {
+        throw new Error("PROJECT_MEMORY_SYNC_FROZEN");
+      }
+      if (this.readCanonicalMemoryHostedAttachment(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_ALREADY_EXISTS");
+      }
+      if (this.readUnresolvedCanonicalMemoryHostedCreateIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_RECOVERY_REQUIRED");
+      }
+      if (this.readUnresolvedCanonicalMemorySyncIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+      }
+      if (this.#database.query(
+        `SELECT 1 FROM memory_submissions
+         WHERE project_id=? AND kind='share'
+           AND state IN ('prepared','effect_started','ambiguous') LIMIT 1`,
+      ).get(projectId) !== null) throw new Error("MEMORY_RECOVERY_REQUIRED");
+      if (this.#database.query(
+        "SELECT 1 FROM project_memory_hosted_create_intents WHERE remote_space_id=?",
+      ).get(remoteSpaceId) !== null) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_ROUTE_CONFLICT");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      id = `cmcreate_${randomUUID().replaceAll("-", "")}`;
+      this.#database.query(
+        `INSERT INTO project_memory_hosted_create_intents(
+           id,idempotency_key,project_id,state,authority_revision,
+           canonical_binding_digest,authority_head_sequence,
+           authority_head_operation_sha256,authority_head_digest,
+           account_binding_digest,remote_space_id,space_key_version,
+           wrapped_key_algorithm,wrapped_key_ciphertext,wrapped_key_version,
+           wrapped_key_nonce,descriptor_algorithm,descriptor_ciphertext,
+           descriptor_key_version,descriptor_nonce,genesis_proof_algorithm,
+           genesis_proof_ciphertext,genesis_proof_key_version,genesis_proof_nonce,
+           genesis_token,request_digest,effect_started_at,winner_digest,
+           winner_revision,winner_replay,winner_observed_at,settled_at,
+           diagnostic_code,created_at,updated_at
+         ) VALUES (?,?,?,'allocating',?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,NULL,
+           NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+           NULL,NULL,NULL,?,?)`,
+      ).run(
+        id,
+        idempotencyKey,
+        projectId,
+        authority.revision,
+        authority.bindingDigest,
+        authority.head.sequence,
+        authority.head.operationSha256,
+        authority.head.headDigest,
+        accountBindingDigest,
+        remoteSpaceId,
+        now,
+        now,
+      );
+    });
+    allocate.immediate();
+    if (id === undefined) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_ALLOCATION_FAILED");
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    return { record, replay };
+  }
+
+  stageCanonicalMemoryHostedCreateKey(input: Readonly<{
+    intentId: string;
+    keyVersion: number;
+    wrappedSpaceKey: CanonicalMemoryEncryptedEnvelope;
+  }>): CanonicalMemoryHostedCreateIntentRecord {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(input.intentId);
+    const keyVersion = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.keyVersion);
+    const wrappedSpaceKey = parseCanonicalMemoryEncryptedEnvelope(
+      input.wrappedSpaceKey,
+      canonicalMemoryCiphertextLimits.terminalHeadProof,
+    );
+    const stage = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedCreateIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+      if (current.wrappedSpaceKey !== undefined || current.keyVersion !== undefined) {
+        if (
+          current.keyVersion !== keyVersion
+          || current.wrappedSpaceKey === undefined
+          || !sameCanonicalMemoryEncryptedEnvelope(current.wrappedSpaceKey, wrappedSpaceKey)
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_KEY_CONFLICT");
+        return;
+      }
+      if (current.state !== "allocating") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_FROZEN");
+      }
+      this.#assertCanonicalMemoryHostedCreatePinsCurrent(current);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_create_intents
+         SET state='key_staged',space_key_version=?,wrapped_key_algorithm=?,
+             wrapped_key_ciphertext=?,wrapped_key_version=?,wrapped_key_nonce=?,
+             updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='allocating'`,
+      ).run(
+        keyVersion,
+        wrappedSpaceKey.algorithm,
+        wrappedSpaceKey.ciphertext,
+        wrappedSpaceKey.keyVersion,
+        wrappedSpaceKey.nonce,
+        now,
+        id,
+      );
+      if (changed.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+    });
+    stage.immediate();
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    return record;
+  }
+
+  prepareCanonicalMemoryHostedCreate(input: Readonly<{
+    intentId: string;
+    request: CanonicalMemoryHostedCreateRequest;
+  }>): CanonicalMemoryHostedCreateIntentRecord {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(input.intentId);
+    const request = parseCanonicalMemoryHostedCreateRequest(input.request);
+    const requestDigest = canonicalMemoryHostedCreateRequestDigest(request);
+    const prepare = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedCreateIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+      if (current.request !== undefined) {
+        if (
+          current.requestDigest !== requestDigest
+          || JSON.stringify(current.request) !== JSON.stringify(request)
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_REQUEST_CONFLICT");
+        return;
+      }
+      if (
+        current.state !== "key_staged"
+        || current.keyVersion === undefined
+        || current.wrappedSpaceKey === undefined
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      this.#assertCanonicalMemoryHostedCreatePinsCurrent(current);
+      if (
+        request.spaceId !== current.remoteSpaceId
+        || request.keyVersion !== current.keyVersion
+        || !sameCanonicalMemoryEncryptedEnvelope(
+          request.wrappedSpaceKey,
+          current.wrappedSpaceKey,
+        )
+      ) throw new TypeError("CANONICAL_MEMORY_HOSTED_CREATE_REQUEST_INVALID");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_create_intents
+         SET state='prepared',descriptor_algorithm=?,descriptor_ciphertext=?,
+             descriptor_key_version=?,descriptor_nonce=?,genesis_proof_algorithm=?,
+             genesis_proof_ciphertext=?,genesis_proof_key_version=?,
+             genesis_proof_nonce=?,genesis_token=?,request_digest=?,
+             updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='key_staged'`,
+      ).run(
+        request.encryptedDescriptor.algorithm,
+        request.encryptedDescriptor.ciphertext,
+        request.encryptedDescriptor.keyVersion,
+        request.encryptedDescriptor.nonce,
+        request.genesisHeadProof.algorithm,
+        request.genesisHeadProof.ciphertext,
+        request.genesisHeadProof.keyVersion,
+        request.genesisHeadProof.nonce,
+        request.genesisToken,
+        requestDigest,
+        now,
+        id,
+      );
+      if (changed.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+    });
+    prepare.immediate();
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    return record;
+  }
+
+  markCanonicalMemoryHostedCreateEffectStarted(
+    intentId: string,
+  ): CanonicalMemoryHostedCreateIntentRecord {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(intentId);
+    const mark = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedCreateIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+      if (["effect_started", "winner_observed", "settled"].includes(current.state)) return;
+      if (current.state !== "prepared") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_FROZEN");
+      }
+      this.#assertCanonicalMemoryHostedCreatePinsCurrent(current);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_create_intents
+         SET state='effect_started',effect_started_at=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='prepared'`,
+      ).run(now, now, id);
+      if (changed.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+    });
+    mark.immediate();
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    return record;
+  }
+
+  recordCanonicalMemoryHostedCreateWinner(input: Readonly<{
+    intentId: string;
+    winner: CanonicalMemoryHostedCreateWinner;
+  }>): CanonicalMemoryHostedCreateIntentRecord {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(input.intentId);
+    const winner = parseCanonicalMemoryHostedCreateWinner(input.winner);
+    const winnerRequest = parseCanonicalMemoryHostedCreateRequest({
+      bindingPolicy: winner.bindingPolicy,
+      encryptedDescriptor: winner.encryptedDescriptor,
+      genesisHeadProof: winner.genesisHeadProof,
+      genesisToken: winner.genesisToken,
+      identityContract: winner.identityContract,
+      keyVersion: winner.keyVersion,
+      spaceId: winner.spaceId,
+      wrappedSpaceKey: winner.wrappedSpaceKey,
+    });
+    const winnerDigest = canonicalMemoryHostedCreateWinnerDigest(
+      winnerRequest,
+      winner.revision,
+      winner.replay,
+    );
+    const observe = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedCreateIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+      if (current.state === "winner_observed" || current.state === "settled") {
+        if (
+          current.winnerDigest !== winnerDigest
+          || current.winnerRevision !== winner.revision
+          || current.winnerReplay !== winner.replay
+        ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_WINNER_CONFLICT");
+        return;
+      }
+      if (current.state !== "effect_started" || current.request === undefined) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+      this.#assertCanonicalMemoryHostedCreatePinsCurrent(current);
+      if (
+        current.requestDigest !== canonicalMemoryHostedCreateRequestDigest(winnerRequest)
+        || JSON.stringify(current.request) !== JSON.stringify(winnerRequest)
+      ) throw new TypeError("CANONICAL_MEMORY_HOSTED_CREATE_WINNER_INVALID");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_create_intents
+         SET state='winner_observed',winner_digest=?,winner_revision=?,
+             winner_replay=?,winner_observed_at=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='effect_started'`,
+      ).run(winnerDigest, winner.revision, winner.replay ? 1 : 0, now, now, id);
+      if (changed.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+    });
+    observe.immediate();
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    return record;
+  }
+
+  settleCanonicalMemoryHostedCreate(
+    intentId: string,
+  ): CanonicalMemoryHostedCreateIntentRecord {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(intentId);
+    const settle = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedCreateIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+      if (current.state === "settled") return;
+      if (
+        current.state !== "winner_observed"
+        || current.request === undefined
+        || current.winnerRevision === undefined
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      this.#assertCanonicalMemoryHostedCreatePinsCurrent(current);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const intentChanged = this.#database.query(
+        `UPDATE project_memory_hosted_create_intents
+         SET state='settled',settled_at=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='winner_observed'`,
+      ).run(now, now, id);
+      if (intentChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+      const attachmentChanged = this.#database.query(
+        `INSERT INTO project_memory_hosted_attachments(
+           project_id,remote_space_id,account_binding_digest,canonical_binding_digest,
+           generation,revision,state,genesis_token,remote_revision,remote_key_version,
+           remote_head_sequence,remote_head_operation_sha256,remote_head_digest,
+           remote_head_token,remote_head_proof_digest,diagnostic_code,created_at,updated_at
+         ) VALUES (?,?,?,?,1,1,'attached',?,?,?,0,NULL,?,?,?,NULL,?,?)`,
+      ).run(
+        current.projectId,
+        current.remoteSpaceId,
+        current.accountBindingDigest,
+        current.canonicalBindingDigest,
+        current.request.genesisToken,
+        current.winnerRevision,
+        current.request.keyVersion,
+        PROJECT_MEMORY_EMPTY_HEAD.headDigest,
+        current.request.genesisToken,
+        canonicalMemoryHostedHeadProofDigest(current.request.genesisHeadProof),
+        now,
+        now,
+      );
+      if (attachmentChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_ATTACHMENT_CONFLICT");
+      }
+    });
+    settle.immediate();
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    if (record.state !== "settled") {
+      throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_SETTLEMENT_FAILED");
+    }
+    return record;
+  }
+
+  failCanonicalMemoryHostedCreate(input: Readonly<{
+    diagnosticCode: string;
+    intentId: string;
+    state: "conflict" | "error";
+  }>): CanonicalMemoryHostedCreateIntentRecord {
+    const id = canonicalMemoryHostedCreateIntentIdSchema.parse(input.intentId);
+    const state = z.enum(["conflict", "error"]).parse(input.state);
+    const diagnosticCode = memoryDiagnosticCodeSchema.parse(input.diagnosticCode);
+    const fail = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedCreateIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+      if (current.state === "conflict" || current.state === "error") {
+        if (current.state !== state || current.diagnosticCode !== diagnosticCode) {
+          throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_FAILURE_CONFLICT");
+        }
+        return;
+      }
+      if (current.state === "settled") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_ALREADY_SETTLED");
+      }
+      this.#assertCanonicalMemoryHostedCreatePinsCurrent(current);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const intentChanged = this.#database.query(
+        `UPDATE project_memory_hosted_create_intents
+         SET state=?,settled_at=?,diagnostic_code=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state IN (
+           'allocating','key_staged','prepared','effect_started','winner_observed'
+         )`,
+      ).run(state, now, diagnosticCode, now, id);
+      if (intentChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_STATE_CONFLICT");
+      }
+      const authorityChanged = this.#database.query(
+        `UPDATE project_memory_authorities
+         SET sync_state=?,diagnostic_code=?,revision=revision+1,
+             updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND revision=? AND binding_digest=?
+           AND head_sequence=? AND head_operation_sha256 IS ? AND head_digest=?`,
+      ).run(
+        state,
+        diagnosticCode,
+        now,
+        current.projectId,
+        current.authorityRevision,
+        current.canonicalBindingDigest,
+        current.authorityHead.sequence,
+        current.authorityHead.operationSha256,
+        current.authorityHead.headDigest,
+      );
+      if (authorityChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_AUTHORITY_CONFLICT");
+      }
+    });
+    fail.immediate();
+    const record = this.readCanonicalMemoryHostedCreateIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_INTENT_MISSING");
+    return record;
+  }
+
+  readCanonicalMemoryHostedAttachment(
+    projectId: ProjectId,
+  ): CanonicalMemoryHostedAttachmentRecord | null {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    const row = this.#database.query(
+      "SELECT * FROM project_memory_hosted_attachments WHERE project_id=?",
+    ).get(parsedProjectId);
+    return row === null ? null : mapCanonicalMemoryHostedAttachment(row);
+  }
+
+  attachCanonicalMemoryHostedSpace(input: Readonly<{
+    accountBindingDigest: string;
+    canonicalSpaceId: string;
+    projectId: ProjectId;
+    remote: CanonicalMemoryHostedRemoteObservation;
+    remoteSpaceId: string;
+  }>): CanonicalMemoryHostedAttachmentRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const accountBindingDigest = canonicalMemoryDigestSchema.parse(input.accountBindingDigest);
+    const remoteSpaceId = canonicalMemoryHostedSpaceIdSchema.parse(input.remoteSpaceId);
+    const remote = parseCanonicalMemoryRemoteObservation(input.remote);
+    let identity: ReturnType<typeof deriveProjectMemoryCanonicalIdentity>;
+    try {
+      identity = deriveProjectMemoryCanonicalIdentity({
+        canonicalSpaceId: input.canonicalSpaceId,
+        identityContract: 2,
+        projectId,
+      });
+    } catch (cause: unknown) {
+      throw new TypeError("CANONICAL_MEMORY_HOSTED_ATTACHMENT_INVALID", { cause });
+    }
+    const attach = this.#database.transaction(() => {
+      if (this.#database.query("SELECT 1 FROM projects WHERE id=?").get(projectId) === null) {
+        throw new SelectionError("NOT_FOUND");
+      }
+      if (this.readUnresolvedCanonicalMemoryHostedCreateIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_CREATE_RECOVERY_REQUIRED");
+      }
+      let authority = this.readProjectMemoryAuthority(projectId);
+      if (authority === null) {
+        const now = unixMillisecondsSchema.parse(this.#now());
+        this.#database.query(
+          `INSERT INTO project_memory_authorities(
+             project_id,identity_contract,canonical_space_id,physical_state,initialized_at,
+             authority_digest,binding_digest,head_sequence,head_operation_sha256,
+             head_digest,revision,sync_state,last_exchange_at,last_exchange_sequence,
+             last_exchange_operation_sha256,last_exchange_head_digest,diagnostic_code,
+             created_at,updated_at
+           ) VALUES (?,?,?,'reserved',NULL,?,?,?,?,?,1,'local_only',NULL,NULL,NULL,NULL,NULL,?,?)`,
+        ).run(
+          projectId,
+          identity.identityContract,
+          identity.canonicalSpaceId,
+          identity.authorityDigest,
+          identity.bindingDigest,
+          PROJECT_MEMORY_EMPTY_HEAD.sequence,
+          PROJECT_MEMORY_EMPTY_HEAD.operationSha256,
+          PROJECT_MEMORY_EMPTY_HEAD.headDigest,
+          now,
+          now,
+        );
+        authority = this.readProjectMemoryAuthority(projectId);
+      }
+      if (
+        authority === null
+        || authority.identityContract !== 2
+        || authority.canonicalSpaceId !== identity.canonicalSpaceId
+        || authority.bindingDigest !== identity.bindingDigest
+        || authority.physicalState === "rejected"
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_IDENTITY_MISMATCH");
+      if (authority.syncState === "conflict" || authority.syncState === "error") {
+        throw new Error("PROJECT_MEMORY_SYNC_FROZEN");
+      }
+      const existing = this.readCanonicalMemoryHostedAttachment(projectId);
+      if (existing === null) {
+        const now = unixMillisecondsSchema.parse(this.#now());
+        this.#database.query(
+          `INSERT INTO project_memory_hosted_attachments(
+             project_id,remote_space_id,account_binding_digest,canonical_binding_digest,
+             generation,revision,state,genesis_token,remote_revision,remote_key_version,
+             remote_head_sequence,remote_head_operation_sha256,remote_head_digest,
+             remote_head_token,remote_head_proof_digest,diagnostic_code,created_at,updated_at
+           ) VALUES (?,?,?,?,1,1,'attached',?,?,?,?,?,?,?,?,NULL,?,?)`,
+        ).run(
+          projectId,
+          remoteSpaceId,
+          accountBindingDigest,
+          identity.bindingDigest,
+          remote.genesisToken,
+          remote.revision,
+          remote.keyVersion,
+          remote.head.sequence,
+          remote.head.operationSha256,
+          remote.head.headDigest,
+          remote.headToken,
+          remote.headProofDigest,
+          now,
+          now,
+        );
+        return;
+      }
+      if (
+        existing.remoteSpaceId !== remoteSpaceId
+        || existing.accountBindingDigest !== accountBindingDigest
+        || existing.canonicalBindingDigest !== identity.bindingDigest
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_REBIND_REFUSED");
+      if (existing.state === "conflict" || existing.state === "error") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_FROZEN");
+      }
+      if (existing.state === "attached") {
+        if (!sameCanonicalMemoryRemoteObservation(existing.remote, remote)) {
+          throw new Error("CANONICAL_MEMORY_HOSTED_OBSERVATION_CONFLICT");
+        }
+        return;
+      }
+      if (
+        remote.genesisToken !== existing.remote.genesisToken
+        || remote.revision !== existing.remote.revision
+        || remote.keyVersion !== existing.remote.keyVersion
+        || remote.head.sequence < existing.remote.head.sequence
+        || (remote.head.sequence === existing.remote.head.sequence
+          && !sameCanonicalMemoryRemoteObservation(existing.remote, remote))
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_OBSERVATION_CONFLICT");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_attachments
+         SET state='attached',generation=generation+1,revision=revision+1,
+             remote_revision=?,remote_key_version=?,remote_head_sequence=?,
+             remote_head_operation_sha256=?,remote_head_digest=?,remote_head_token=?,
+             remote_head_proof_digest=?,updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND state='detached' AND generation=? AND revision=?`,
+      ).run(
+        remote.revision,
+        remote.keyVersion,
+        remote.head.sequence,
+        remote.head.operationSha256,
+        remote.head.headDigest,
+        remote.headToken,
+        remote.headProofDigest,
+        now,
+        projectId,
+        existing.generation,
+        existing.revision,
+      );
+      if (changed.changes !== 1) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_CONFLICT");
+    });
+    attach.immediate();
+    const attached = this.readCanonicalMemoryHostedAttachment(projectId);
+    if (attached === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+    return attached;
+  }
+
+  recordCanonicalMemoryHostedObservation(input: Readonly<{
+    expectedGeneration: number;
+    expectedRevision: number;
+    projectId: ProjectId;
+    remote: CanonicalMemoryHostedRemoteObservation;
+  }>): CanonicalMemoryHostedAttachmentRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const expectedGeneration = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedGeneration);
+    const expectedRevision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedRevision);
+    const remote = parseCanonicalMemoryRemoteObservation(input.remote);
+    let stickyRefusal: string | undefined;
+    const observe = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedAttachment(projectId);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+      if (current.state !== "attached") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_NOT_ACTIVE");
+      }
+      if (
+        current.generation !== expectedGeneration
+        || current.revision !== expectedRevision
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_OBSERVATION_CONFLICT");
+      const authority = this.readProjectMemoryAuthority(projectId);
+      if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (authority.physicalState !== "initialized") {
+        throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+      }
+      if (authority.syncState === "conflict" || authority.syncState === "error") {
+        throw new Error("PROJECT_MEMORY_SYNC_FROZEN");
+      }
+      if (this.readUnresolvedCanonicalMemorySyncIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+      }
+      if (sameCanonicalMemoryRemoteObservation(current.remote, remote)) return;
+      const configurationMismatch =
+        remote.genesisToken !== current.remote.genesisToken
+        || remote.revision !== current.remote.revision
+        || remote.keyVersion !== current.remote.keyVersion;
+      if (configurationMismatch || remote.head.sequence <= current.remote.head.sequence) {
+        stickyRefusal = "CANONICAL_MEMORY_HOSTED_OBSERVATION_CONFLICT";
+        this.#freezeCanonicalMemoryHostedState({
+          attachment: current,
+          authority,
+          diagnosticCode: configurationMismatch
+            ? "REMOTE_MEMORY_CONFIGURATION_CONFLICT"
+            : "REMOTE_MEMORY_HEAD_CONFLICT",
+          observedHead: remote.head,
+          now: unixMillisecondsSchema.parse(this.#now()),
+        });
+        return;
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_attachments
+         SET revision=revision+1,remote_revision=?,remote_key_version=?,
+             remote_head_sequence=?,remote_head_operation_sha256=?,remote_head_digest=?,
+             remote_head_token=?,remote_head_proof_digest=?,updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND state='attached' AND generation=? AND revision=?`,
+      ).run(
+        remote.revision,
+        remote.keyVersion,
+        remote.head.sequence,
+        remote.head.operationSha256,
+        remote.head.headDigest,
+        remote.headToken,
+        remote.headProofDigest,
+        now,
+        projectId,
+        expectedGeneration,
+        expectedRevision,
+      );
+      if (changed.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_OBSERVATION_CONFLICT");
+      }
+    });
+    observe.immediate();
+    if (stickyRefusal !== undefined) throw new Error(stickyRefusal);
+    const observed = this.readCanonicalMemoryHostedAttachment(projectId);
+    if (observed === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+    return observed;
+  }
+
+  /**
+   * Permanently freeze an attached hosted-memory binding when no sync intent
+   * exists to own the failure (for example, a deleted space or an invalid
+   * encrypted configuration discovered before an operation was prepared).
+   */
+  failCanonicalMemoryHostedAttachment(input: Readonly<{
+    diagnosticCode: string;
+    expectedGeneration: number;
+    expectedRevision: number;
+    observedHead?: ProjectMemoryHeadRef;
+    projectId: ProjectId;
+    state: "conflict" | "error";
+  }>): CanonicalMemoryHostedAttachmentRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const expectedGeneration = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedGeneration);
+    const expectedRevision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedRevision);
+    const state = z.enum(["conflict", "error"]).parse(input.state);
+    const diagnosticCode = memoryDiagnosticCodeSchema.parse(input.diagnosticCode);
+    const observedHead = input.observedHead === undefined
+      ? undefined
+      : projectMemoryHeadRefSchema.parse(input.observedHead);
+    const fail = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedAttachment(projectId);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+      if (current.state !== "attached") {
+        if (
+          current.state === state
+          && current.diagnosticCode === diagnosticCode
+          && current.generation === expectedGeneration
+          && current.revision === expectedRevision + 1
+        ) return;
+        throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_FROZEN");
+      }
+      if (
+        current.generation !== expectedGeneration
+        || current.revision !== expectedRevision
+      ) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_CONFLICT");
+      if (this.readUnresolvedCanonicalMemorySyncIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+      }
+      const authority = this.readProjectMemoryAuthority(projectId);
+      if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (authority.physicalState !== "initialized") {
+        throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+      }
+      if (authority.syncState === "conflict" || authority.syncState === "error") {
+        throw new Error("PROJECT_MEMORY_SYNC_FROZEN");
+      }
+      this.#freezeCanonicalMemoryHostedState({
+        attachment: current,
+        authority,
+        diagnosticCode,
+        observedHead: observedHead ?? current.remote.head,
+        now: unixMillisecondsSchema.parse(this.#now()),
+        state,
+      });
+    });
+    fail.immediate();
+    const failed = this.readCanonicalMemoryHostedAttachment(projectId);
+    if (failed === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+    return failed;
+  }
+
+  detachCanonicalMemoryHostedSpace(input: Readonly<{
+    expectedGeneration: number;
+    projectId: ProjectId;
+  }>): CanonicalMemoryHostedAttachmentRecord {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const expectedGeneration = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedGeneration);
+    const detach = this.#database.transaction(() => {
+      const current = this.readCanonicalMemoryHostedAttachment(projectId);
+      if (current === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+      if (current.state === "conflict" || current.state === "error") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_FROZEN");
+      }
+      if (current.state === "detached") {
+        if (current.generation !== expectedGeneration) {
+          throw new Error("CANONICAL_MEMORY_HOSTED_GENERATION_CONFLICT");
+        }
+        return;
+      }
+      if (current.generation !== expectedGeneration) {
+        throw new Error("CANONICAL_MEMORY_HOSTED_GENERATION_CONFLICT");
+      }
+      if (this.readUnresolvedCanonicalMemorySyncIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_hosted_attachments
+         SET state='detached',generation=generation+1,revision=revision+1,
+             updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND state='attached' AND generation=? AND revision=?`,
+      ).run(now, projectId, current.generation, current.revision);
+      if (changed.changes !== 1) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_CONFLICT");
+    });
+    detach.immediate();
+    const detached = this.readCanonicalMemoryHostedAttachment(projectId);
+    if (detached === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+    return detached;
+  }
+
+  readCanonicalMemorySyncIntent(intentId: string): CanonicalMemorySyncIntentRecord | null {
+    const id = canonicalMemorySyncIntentIdSchema.parse(intentId);
+    const row = this.#database.query(
+      "SELECT * FROM project_memory_sync_intents WHERE id=?",
+    ).get(id);
+    if (row === null) return null;
+    const projectId = canonicalMemorySyncIntentRowSchema.parse(row).project_id;
+    const attachment = z.object({
+      remote_space_id: canonicalMemoryHostedSpaceIdSchema,
+    }).strict().parse(this.#database.query(
+      "SELECT remote_space_id FROM project_memory_hosted_attachments WHERE project_id=?",
+    ).get(projectId));
+    return mapCanonicalMemorySyncIntent(row, this.#database.query(
+      "SELECT * FROM project_memory_sync_spool WHERE intent_id=? ORDER BY phase",
+    ).all(id), attachment.remote_space_id);
+  }
+
+  readUnresolvedCanonicalMemorySyncIntent(
+    projectId: ProjectId,
+  ): CanonicalMemorySyncIntentRecord | null {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    const row = this.#database.query(
+      `SELECT id FROM project_memory_sync_intents
+       WHERE project_id=? AND state IN ('prepared','effect_started','response_observed')`,
+    ).get(parsedProjectId);
+    if (row === null) return null;
+    return this.readCanonicalMemorySyncIntent(
+      z.object({ id: canonicalMemorySyncIntentIdSchema }).strict().parse(row).id,
+    );
+  }
+
+  isCanonicalMemoryMutationFenced(projectId: ProjectId): boolean {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    return this.#database.query(
+      `SELECT 1
+       WHERE EXISTS (
+         SELECT 1 FROM project_memory_authorities authority
+         WHERE authority.project_id=? AND authority.sync_state IN ('conflict','error')
+       ) OR EXISTS (
+         SELECT 1 FROM project_memory_hosted_create_intents create_intent
+         WHERE create_intent.project_id=?
+           AND create_intent.state IN (
+             'allocating','key_staged','prepared','effect_started','winner_observed'
+           )
+       ) OR EXISTS (
+         SELECT 1 FROM project_memory_hosted_attachments attachment
+         WHERE attachment.project_id=?
+           AND (
+             attachment.state IN ('conflict','error')
+             OR EXISTS (
+               SELECT 1 FROM project_memory_sync_intents intent
+               WHERE intent.project_id=attachment.project_id
+                 AND intent.state IN ('prepared','effect_started','response_observed')
+             )
+           )
+       )
+       LIMIT 1`,
+    ).get(parsedProjectId, parsedProjectId, parsedProjectId) !== null;
+  }
+
+  isCanonicalMemoryPhysicalHeadAuthorized(input: Readonly<{
+    canonicalBindingDigest: string;
+    controlHead: ProjectMemoryHeadRef;
+    observedHead: ProjectMemoryHeadRef;
+    projectId: ProjectId;
+  }>): boolean {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const canonicalBindingDigest = canonicalMemoryDigestSchema.parse(
+      input.canonicalBindingDigest,
+    );
+    const controlHead = projectMemoryHeadRefSchema.parse(input.controlHead);
+    const observedHead = projectMemoryHeadRefSchema.parse(input.observedHead);
+    let authorized = false;
+    const classify = this.#database.transaction(() => {
+      const authority = this.readProjectMemoryAuthority(projectId);
+      if (
+        authority === null
+        || authority.physicalState !== "initialized"
+        || authority.syncState === "conflict"
+        || authority.syncState === "error"
+        || authority.bindingDigest !== canonicalBindingDigest
+      ) return;
+      // If settlement committed before this snapshot began, the current
+      // control head is authoritative even when the caller captured an older
+      // control head before opening the physical Oh authority.
+      if (sameProjectMemoryHead(authority.head, observedHead)) {
+        authorized = true;
+        return;
+      }
+      if (!sameProjectMemoryHead(authority.head, controlHead)) return;
+      const attachment = this.readCanonicalMemoryHostedAttachment(projectId);
+      const intent = this.readUnresolvedCanonicalMemorySyncIntent(projectId);
+      if (
+        attachment === null
+        || attachment.state !== "attached"
+        || intent === null
+        || intent.state !== "response_observed"
+        || intent.direction !== "pull"
+        || intent.responseObservation === undefined
+        || intent.responseOperation === undefined
+        || intent.resultHead === undefined
+        || attachment.canonicalBindingDigest !== canonicalBindingDigest
+        || intent.canonicalBindingDigest !== canonicalBindingDigest
+        || intent.attachmentGeneration !== attachment.generation
+        || intent.attachmentRevision !== attachment.revision
+        || intent.authorityRevision !== authority.revision
+        || !sameProjectMemoryHead(intent.localHead, controlHead)
+        || !sameProjectMemoryHead(intent.resultHead, observedHead)
+        || !sameCanonicalMemoryRemoteObservation(
+          intent.remoteObservation,
+          attachment.remote,
+        )
+        || !sameCanonicalMemoryRemoteObservation(
+          intent.responseObservation,
+          attachment.remote,
+        )
+        || intent.responseOperation.genesisToken !== attachment.remote.genesisToken
+        || intent.responseOperation.priorToken !== intent.localHeadToken
+        || intent.responseOperation.operation.keyVersion !== attachment.remote.keyVersion
+        || intent.responseOperation.sequence !== controlHead.sequence + 1
+        || intent.resultHead.sequence !== intent.responseOperation.sequence
+        || intent.resultHead.sequence > attachment.remote.head.sequence
+        || (intent.resultHead.sequence === attachment.remote.head.sequence && (
+          intent.responseOperation.headToken !== attachment.remote.headToken
+          || !sameProjectMemoryHead(intent.resultHead, attachment.remote.head)
+        ))
+      ) return;
+      authorized = true;
+    });
+    classify.deferred();
+    return authorized;
+  }
+
+  #insertCanonicalMemorySyncSpoolOperation(
+    intentId: string,
+    phase: "request" | "response",
+    operation: CanonicalMemorySyncSpoolOperation,
+    createdAt: number,
+  ): void {
+    this.#database.query(
+      `INSERT INTO project_memory_sync_spool(
+         intent_id,phase,genesis_token,prior_token,head_token,sequence,
+         adoption_proof_algorithm,adoption_proof_ciphertext,
+         adoption_proof_key_version,adoption_proof_nonce,
+         operation_algorithm,operation_ciphertext,operation_key_version,
+         operation_nonce,proof_algorithm,proof_ciphertext,proof_key_version,
+         proof_nonce,operation_digest,created_at
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      intentId,
+      phase,
+      operation.genesisToken,
+      operation.priorToken,
+      operation.headToken,
+      operation.sequence,
+      operation.adoptionProof?.algorithm ?? null,
+      operation.adoptionProof?.ciphertext ?? null,
+      operation.adoptionProof?.keyVersion ?? null,
+      operation.adoptionProof?.nonce ?? null,
+      operation.operation.algorithm,
+      operation.operation.ciphertext,
+      operation.operation.keyVersion,
+      operation.operation.nonce,
+      operation.terminalHeadProof.algorithm,
+      operation.terminalHeadProof.ciphertext,
+      operation.terminalHeadProof.keyVersion,
+      operation.terminalHeadProof.nonce,
+      operation.operationDigest,
+      createdAt,
+    );
+  }
+
+  #assertCanonicalMemorySyncPinsCurrent(intent: CanonicalMemorySyncIntentRecord): void {
+    const attachment = this.readCanonicalMemoryHostedAttachment(intent.projectId);
+    if (
+      attachment === null
+      || attachment.state !== "attached"
+      || attachment.generation !== intent.attachmentGeneration
+      || attachment.revision !== intent.attachmentRevision
+      || attachment.canonicalBindingDigest !== intent.canonicalBindingDigest
+      || !sameCanonicalMemoryRemoteObservation(
+        attachment.remote,
+        intent.remoteObservation,
+      )
+    ) throw new Error("CANONICAL_MEMORY_SYNC_ATTACHMENT_CONFLICT");
+    const authority = this.readProjectMemoryAuthority(intent.projectId);
+    if (
+      authority === null
+      || authority.physicalState !== "initialized"
+      || authority.syncState === "conflict"
+      || authority.syncState === "error"
+      || authority.revision !== intent.authorityRevision
+      || authority.bindingDigest !== intent.canonicalBindingDigest
+      || !sameProjectMemoryHead(authority.head, intent.localHead)
+    ) throw new Error("CANONICAL_MEMORY_SYNC_AUTHORITY_CONFLICT");
+  }
+
+  #freezeCanonicalMemoryHostedState(input: Readonly<{
+    attachment: CanonicalMemoryHostedAttachmentRecord;
+    authority: ProjectMemoryAuthorityRecord;
+    diagnosticCode: string;
+    observedHead: ProjectMemoryHeadRef;
+    now: number;
+    state?: "conflict" | "error";
+  }>): void {
+    const diagnosticCode = memoryDiagnosticCodeSchema.parse(input.diagnosticCode);
+    const observedHead = projectMemoryHeadRefSchema.parse(input.observedHead);
+    const state = z.enum(["conflict", "error"]).parse(input.state ?? "conflict");
+    const attachmentChanged = this.#database.query(
+      `UPDATE project_memory_hosted_attachments
+       SET state=?,revision=revision+1,diagnostic_code=?,updated_at=MAX(updated_at,?)
+       WHERE project_id=? AND state='attached' AND generation=? AND revision=?`,
+    ).run(
+      state,
+      diagnosticCode,
+      input.now,
+      input.attachment.projectId,
+      input.attachment.generation,
+      input.attachment.revision,
+    );
+    if (attachmentChanged.changes !== 1) {
+      throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_CONFLICT");
+    }
+    const authorityChanged = this.#database.query(
+      `UPDATE project_memory_authorities
+       SET sync_state=?,last_exchange_at=?,last_exchange_sequence=?,
+           last_exchange_operation_sha256=?,last_exchange_head_digest=?,diagnostic_code=?,
+           revision=revision+1,updated_at=MAX(updated_at,?)
+       WHERE project_id=? AND physical_state='initialized' AND revision=?
+         AND head_sequence=? AND head_operation_sha256 IS ? AND head_digest=?`,
+    ).run(
+      state,
+      input.now,
+      observedHead.sequence,
+      observedHead.operationSha256,
+      observedHead.headDigest,
+      diagnosticCode,
+      input.now,
+      input.authority.projectId,
+      input.authority.revision,
+      input.authority.head.sequence,
+      input.authority.head.operationSha256,
+      input.authority.head.headDigest,
+    );
+    if (authorityChanged.changes !== 1) {
+      throw new Error("CANONICAL_MEMORY_SYNC_AUTHORITY_CONFLICT");
+    }
+  }
+
+  prepareCanonicalMemorySync(input: Readonly<{
+    direction: CanonicalMemorySyncDirection;
+    idempotencyKey: string;
+    localHeadToken: string;
+    projectId: ProjectId;
+    requestOperation?: CanonicalMemorySyncOperation;
+  }>): CanonicalMemorySyncPreparation {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const direction = canonicalMemorySyncDirectionSchema.parse(input.direction);
+    const idempotencyKey = z.string().uuid().parse(input.idempotencyKey);
+    const localHeadToken = canonicalMemoryHeadTokenSchema.parse(input.localHeadToken);
+    const requestOperation = input.requestOperation === undefined
+      ? undefined
+      : parseCanonicalMemorySyncSpoolOperation(input.requestOperation);
+    if ((direction === "push") !== (requestOperation !== undefined)) {
+      throw new TypeError("CANONICAL_MEMORY_SYNC_REQUEST_SPOOL_MISMATCH");
+    }
+    let id: string | undefined;
+    let replay = false;
+    let stickyRefusal: string | undefined;
+    const prepare = this.#database.transaction(() => {
+      const existingRow = this.#database.query(
+        "SELECT id FROM project_memory_sync_intents WHERE idempotency_key=?",
+      ).get(idempotencyKey);
+      if (existingRow !== null) {
+        const existing = this.readCanonicalMemorySyncIntent(
+          z.object({ id: canonicalMemorySyncIntentIdSchema }).strict().parse(existingRow).id,
+        );
+        if (
+          existing === null
+          || existing.projectId !== projectId
+          || existing.direction !== direction
+          || existing.localHeadToken !== localHeadToken
+          || !sameCanonicalMemorySyncOperation(existing.requestOperation, requestOperation)
+        ) throw new Error("CANONICAL_MEMORY_SYNC_IDEMPOTENCY_CONFLICT");
+        id = existing.id;
+        replay = true;
+        return;
+      }
+      const attachment = this.readCanonicalMemoryHostedAttachment(projectId);
+      if (attachment === null) throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_MISSING");
+      if (attachment.state !== "attached") {
+        throw new Error("CANONICAL_MEMORY_HOSTED_ATTACHMENT_NOT_ACTIVE");
+      }
+      const authority = this.readProjectMemoryAuthority(projectId);
+      if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+      if (authority.physicalState !== "initialized") {
+        throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+      }
+      if (authority.syncState === "conflict" || authority.syncState === "error") {
+        throw new Error("PROJECT_MEMORY_SYNC_FROZEN");
+      }
+      if (this.readUnresolvedCanonicalMemorySyncIntent(projectId) !== null) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+      }
+      if (this.#database.query(
+        `SELECT 1 FROM memory_submissions
+         WHERE project_id=? AND kind='share'
+           AND state IN ('prepared','effect_started','ambiguous') LIMIT 1`,
+      ).get(projectId) !== null) throw new Error("MEMORY_RECOVERY_REQUIRED");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      if (
+        direction === "pull"
+        && authority.head.sequence === attachment.remote.head.sequence
+        && (
+          !sameProjectMemoryHead(authority.head, attachment.remote.head)
+          || localHeadToken !== attachment.remote.headToken
+        )
+      ) {
+        stickyRefusal = "CANONICAL_MEMORY_SYNC_EQUAL_SEQUENCE_CONFLICT";
+        this.#freezeCanonicalMemoryHostedState({
+          attachment,
+          authority,
+          diagnosticCode: "REMOTE_MEMORY_EQUAL_SEQUENCE_CONFLICT",
+          observedHead: attachment.remote.head,
+          now,
+        });
+        return;
+      }
+      const requestDigest = canonicalMemorySyncRequestDigest({
+        direction,
+        localHead: authority.head,
+        localHeadToken,
+        remote: attachment.remote,
+        remoteSpaceId: attachment.remoteSpaceId,
+        ...(requestOperation === undefined ? {} : { requestOperation }),
+      });
+      if (now >= CANONICAL_MEMORY_SYNC_RETAIN_AGE_MS) {
+        this.#database.query(
+          `DELETE FROM project_memory_sync_intents
+           WHERE project_id=? AND state='settled' AND updated_at<=?`,
+        ).run(projectId, now - CANONICAL_MEMORY_SYNC_RETAIN_AGE_MS);
+      }
+      const retained = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+        this.#database.query(
+          "SELECT COUNT(*) AS count FROM project_memory_sync_intents WHERE project_id=?",
+        ).get(projectId),
+      );
+      if (retained.count >= CANONICAL_MEMORY_SYNC_RETAINED_PROJECT_LIMIT) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RETAINED_QUOTA_EXCEEDED");
+      }
+      id = `cmsync_${randomUUID().replaceAll("-", "")}`;
+      if (requestOperation !== undefined) {
+        this.#insertCanonicalMemorySyncSpoolOperation(id, "request", requestOperation, now);
+      }
+      this.#database.query(
+        `INSERT INTO project_memory_sync_intents(
+           id,idempotency_key,project_id,direction,state,attachment_generation,
+           attachment_revision,authority_revision,canonical_binding_digest,
+           local_head_sequence,local_head_operation_sha256,local_head_digest,
+           local_head_token,remote_genesis_token,remote_revision,remote_key_version,
+           remote_head_sequence,remote_head_operation_sha256,remote_head_digest,
+           remote_head_token,remote_head_proof_digest,request_digest,effect_started_at,
+           response_digest,response_genesis_token,response_revision,response_key_version,
+           response_head_sequence,response_head_operation_sha256,response_head_digest,
+           response_head_token,response_head_proof_digest,response_observed_at,
+           result_head_sequence,result_head_operation_sha256,result_head_digest,
+           settled_at,diagnostic_code,created_at,updated_at
+         ) VALUES (?,?,?,?,'prepared',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,
+           NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?,?)`,
+      ).run(
+        id,
+        idempotencyKey,
+        projectId,
+        direction,
+        attachment.generation,
+        attachment.revision,
+        authority.revision,
+        authority.bindingDigest,
+        authority.head.sequence,
+        authority.head.operationSha256,
+        authority.head.headDigest,
+        localHeadToken,
+        attachment.remote.genesisToken,
+        attachment.remote.revision,
+        attachment.remote.keyVersion,
+        attachment.remote.head.sequence,
+        attachment.remote.head.operationSha256,
+        attachment.remote.head.headDigest,
+        attachment.remote.headToken,
+        attachment.remote.headProofDigest,
+        requestDigest,
+        now,
+        now,
+      );
+    });
+    prepare.immediate();
+    if (stickyRefusal !== undefined) throw new Error(stickyRefusal);
+    if (id === undefined) throw new Error("CANONICAL_MEMORY_SYNC_PREPARATION_FAILED");
+    const record = this.readCanonicalMemorySyncIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+    return { record, replay };
+  }
+
+  markCanonicalMemorySyncEffectStarted(intentId: string): CanonicalMemorySyncIntentRecord {
+    const id = canonicalMemorySyncIntentIdSchema.parse(intentId);
+    const mark = this.#database.transaction(() => {
+      const current = this.readCanonicalMemorySyncIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+      if (current.state !== "prepared") {
+        if (["effect_started", "response_observed", "settled"].includes(current.state)) return;
+        throw new Error("CANONICAL_MEMORY_SYNC_INTENT_FROZEN");
+      }
+      this.#assertCanonicalMemorySyncPinsCurrent(current);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_sync_intents
+         SET state='effect_started',effect_started_at=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='prepared'`,
+      ).run(now, now, id);
+      if (changed.changes !== 1) throw new Error("CANONICAL_MEMORY_SYNC_STATE_CONFLICT");
+    });
+    mark.immediate();
+    const record = this.readCanonicalMemorySyncIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+    return record;
+  }
+
+  recordCanonicalMemorySyncResponse(input: Readonly<{
+    intentId: string;
+    operation?: CanonicalMemorySyncOperation;
+    remote: CanonicalMemoryHostedRemoteObservation;
+  }>): CanonicalMemorySyncIntentRecord {
+    const id = canonicalMemorySyncIntentIdSchema.parse(input.intentId);
+    const remote = parseCanonicalMemoryRemoteObservation(input.remote);
+    const operation = input.operation === undefined
+      ? undefined
+      : parseCanonicalMemorySyncSpoolOperation(input.operation);
+    const observe = this.#database.transaction(() => {
+      const current = this.readCanonicalMemorySyncIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+      const responseDigest = canonicalMemorySyncResponseDigest({
+        direction: current.direction,
+        remote,
+        ...(operation === undefined ? {} : { operation }),
+      });
+      if (current.state === "response_observed" || current.state === "settled") {
+        if (
+          current.responseDigest !== responseDigest
+          || current.responseObservation === undefined
+          || !sameCanonicalMemoryRemoteObservation(current.responseObservation, remote)
+          || !sameCanonicalMemorySyncOperation(current.responseOperation, operation)
+        ) throw new Error("CANONICAL_MEMORY_SYNC_RESPONSE_CONFLICT");
+        return;
+      }
+      if (current.state !== "effect_started") {
+        throw new Error("CANONICAL_MEMORY_SYNC_STATE_CONFLICT");
+      }
+      this.#assertCanonicalMemorySyncPinsCurrent(current);
+      if (current.direction === "push") {
+        if (
+          operation !== undefined
+          || current.requestOperation === undefined
+          || remote.genesisToken !== current.remoteObservation.genesisToken
+          || remote.revision !== current.remoteObservation.revision
+          || remote.keyVersion !== current.remoteObservation.keyVersion
+          || remote.head.sequence !== current.remoteObservation.head.sequence + 1
+          || remote.headToken !== current.requestOperation.headToken
+        ) throw new TypeError("CANONICAL_MEMORY_SYNC_RESPONSE_INVALID");
+      } else if (
+        !sameCanonicalMemoryRemoteObservation(remote, current.remoteObservation)
+        || ((remote.head.sequence === current.localHead.sequence) !== (operation === undefined))
+        || (operation !== undefined && (
+          operation.genesisToken !== remote.genesisToken
+          || operation.priorToken !== current.localHeadToken
+          || operation.sequence !== current.localHead.sequence + 1
+          || operation.sequence > remote.head.sequence
+          || operation.operation.keyVersion !== remote.keyVersion
+          || (operation.sequence === remote.head.sequence
+            && operation.headToken !== remote.headToken)
+        ))
+      ) throw new TypeError("CANONICAL_MEMORY_SYNC_RESPONSE_INVALID");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      if (operation !== undefined) {
+        this.#insertCanonicalMemorySyncSpoolOperation(id, "response", operation, now);
+      }
+      const changed = this.#database.query(
+        `UPDATE project_memory_sync_intents
+         SET state='response_observed',response_digest=?,response_genesis_token=?,
+             response_revision=?,response_key_version=?,response_head_sequence=?,
+             response_head_operation_sha256=?,response_head_digest=?,response_head_token=?,
+             response_head_proof_digest=?,response_observed_at=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='effect_started'`,
+      ).run(
+        responseDigest,
+        remote.genesisToken,
+        remote.revision,
+        remote.keyVersion,
+        remote.head.sequence,
+        remote.head.operationSha256,
+        remote.head.headDigest,
+        remote.headToken,
+        remote.headProofDigest,
+        now,
+        now,
+        id,
+      );
+      if (changed.changes !== 1) throw new Error("CANONICAL_MEMORY_SYNC_STATE_CONFLICT");
+    });
+    observe.immediate();
+    const record = this.readCanonicalMemorySyncIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+    return record;
+  }
+
+  authorizeCanonicalMemoryPullResult(input: Readonly<{
+    intentId: string;
+    resultHead: ProjectMemoryHeadRef;
+  }>): CanonicalMemorySyncIntentRecord {
+    const id = canonicalMemorySyncIntentIdSchema.parse(input.intentId);
+    const resultHead = projectMemoryHeadRefSchema.parse(input.resultHead);
+    const authorize = this.#database.transaction(() => {
+      const current = this.readCanonicalMemorySyncIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+      if (current.resultHead !== undefined) {
+        if (!sameProjectMemoryHead(current.resultHead, resultHead)) {
+          throw new Error("CANONICAL_MEMORY_SYNC_RESULT_AUTHORIZATION_CONFLICT");
+        }
+        return;
+      }
+      if (
+        current.state !== "response_observed"
+        || current.direction !== "pull"
+        || current.responseObservation === undefined
+        || current.responseOperation === undefined
+      ) throw new Error("CANONICAL_MEMORY_SYNC_RESULT_NOT_AUTHORIZABLE");
+      this.#assertCanonicalMemorySyncPinsCurrent(current);
+      if (
+        resultHead.sequence !== current.localHead.sequence + 1
+        || resultHead.sequence !== current.responseOperation.sequence
+        || resultHead.sequence > current.responseObservation.head.sequence
+        || (resultHead.sequence === current.responseObservation.head.sequence
+          && !sameProjectMemoryHead(resultHead, current.responseObservation.head))
+      ) throw new TypeError("CANONICAL_MEMORY_SYNC_RESULT_INVALID");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE project_memory_sync_intents
+         SET result_head_sequence=?,result_head_operation_sha256=?,result_head_digest=?,
+             updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='response_observed' AND direction='pull'
+           AND result_head_sequence IS NULL AND result_head_operation_sha256 IS NULL
+           AND result_head_digest IS NULL`,
+      ).run(
+        resultHead.sequence,
+        resultHead.operationSha256,
+        resultHead.headDigest,
+        now,
+        id,
+      );
+      if (changed.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_SYNC_RESULT_AUTHORIZATION_CONFLICT");
+      }
+    });
+    authorize.immediate();
+    const record = this.readCanonicalMemorySyncIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+    return record;
+  }
+
+  settleCanonicalMemorySync(input: Readonly<{
+    intentId: string;
+    latestRemote?: CanonicalMemoryHostedRemoteObservation;
+    portableAdoptionProof?: CanonicalMemoryPortableAdoptionProof;
+    resultHead: ProjectMemoryHeadRef;
+  }>): CanonicalMemorySyncIntentRecord {
+    const id = canonicalMemorySyncIntentIdSchema.parse(input.intentId);
+    const resultHead = projectMemoryHeadRefSchema.parse(input.resultHead);
+    const latestRemote = input.latestRemote === undefined
+      ? undefined
+      : parseCanonicalMemoryRemoteObservation(input.latestRemote);
+    const portableAdoptionProof = input.portableAdoptionProof === undefined
+      ? undefined
+      : parseCanonicalMemoryPortableAdoptionProof(input.portableAdoptionProof);
+    const settle = this.#database.transaction(() => {
+      const current = this.readCanonicalMemorySyncIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+      if (current.state === "settled") {
+        if (current.resultHead === undefined || !sameProjectMemoryHead(current.resultHead, resultHead)) {
+          throw new Error("CANONICAL_MEMORY_SYNC_SETTLEMENT_CONFLICT");
+        }
+        if (latestRemote !== undefined) {
+          const attachment = this.readCanonicalMemoryHostedAttachment(current.projectId);
+          if (
+            attachment === null
+            || !sameCanonicalMemoryRemoteObservation(attachment.remote, latestRemote)
+          ) throw new Error("CANONICAL_MEMORY_SYNC_SETTLEMENT_CONFLICT");
+        }
+        if (portableAdoptionProof !== undefined) {
+          const admitted = this.readCanonicalMemoryPortableAdoptionProof({
+            operationSha256: portableAdoptionProof.operationSha256,
+            projectId: current.projectId,
+            sequence: portableAdoptionProof.sequence,
+          });
+          if (
+            admitted === null
+            || admitted.bindingDigest !== portableAdoptionProof.bindingDigest
+            || admitted.canonicalSpaceId !== portableAdoptionProof.canonicalSpaceId
+            || admitted.contentDigest !== portableAdoptionProof.contentDigest
+            || admitted.keyDigest !== portableAdoptionProof.keyDigest
+            || admitted.recordSha256 !== portableAdoptionProof.recordSha256
+            || admitted.sourceReceiptSha256 !== portableAdoptionProof.sourceReceiptSha256
+          ) throw new Error("CANONICAL_MEMORY_PORTABLE_ADOPTION_PROOF_CONFLICT");
+        }
+        return;
+      }
+      if (current.state !== "response_observed" || current.responseObservation === undefined) {
+        throw new Error("CANONICAL_MEMORY_SYNC_STATE_CONFLICT");
+      }
+      this.#assertCanonicalMemorySyncPinsCurrent(current);
+      const response = current.responseObservation;
+      const settlementRemote = latestRemote ?? response;
+      if (
+        settlementRemote.genesisToken !== response.genesisToken
+        || settlementRemote.revision !== response.revision
+        || settlementRemote.keyVersion !== response.keyVersion
+        || settlementRemote.head.sequence < response.head.sequence
+        || (settlementRemote.head.sequence === response.head.sequence
+          && !sameCanonicalMemoryRemoteObservation(settlementRemote, response))
+        || (settlementRemote.head.sequence > response.head.sequence
+          && current.direction !== "push")
+      ) throw new TypeError("CANONICAL_MEMORY_SYNC_SETTLEMENT_REMOTE_INVALID");
+      const exchangeHead = current.direction === "push"
+        ? settlementRemote.head
+        : resultHead;
+      if (
+        (current.direction === "push" && !sameProjectMemoryHead(resultHead, current.localHead))
+        || (current.direction === "pull" && current.responseOperation === undefined
+          && !sameProjectMemoryHead(resultHead, current.localHead))
+        || (current.direction === "pull" && current.responseOperation !== undefined
+          && (current.resultHead === undefined
+            || !sameProjectMemoryHead(resultHead, current.resultHead)))
+        || (resultHead.sequence === current.responseObservation.head.sequence
+          && !sameProjectMemoryHead(resultHead, current.responseObservation.head))
+      ) throw new TypeError("CANONICAL_MEMORY_SYNC_SETTLEMENT_INVALID");
+      if (
+        portableAdoptionProof !== undefined
+        && (
+          current.direction !== "pull"
+          || current.responseOperation === undefined
+          || portableAdoptionProof.bindingDigest !== current.canonicalBindingDigest
+          || portableAdoptionProof.sequence !== resultHead.sequence
+          || portableAdoptionProof.operationSha256 !== resultHead.operationSha256
+        )
+      ) throw new TypeError("CANONICAL_MEMORY_PORTABLE_ADOPTION_PROOF_INVALID");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const intentChanged = this.#database.query(
+        `UPDATE project_memory_sync_intents
+         SET state='settled',result_head_sequence=?,result_head_operation_sha256=?,
+             result_head_digest=?,settled_at=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='response_observed'`,
+      ).run(
+        resultHead.sequence,
+        resultHead.operationSha256,
+        resultHead.headDigest,
+        now,
+        now,
+        id,
+      );
+      if (intentChanged.changes !== 1) throw new Error("CANONICAL_MEMORY_SYNC_STATE_CONFLICT");
+      const attachmentChanged = this.#database.query(
+        `UPDATE project_memory_hosted_attachments
+         SET revision=revision+1,remote_revision=?,remote_key_version=?,
+             remote_head_sequence=?,remote_head_operation_sha256=?,remote_head_digest=?,
+             remote_head_token=?,remote_head_proof_digest=?,updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND state='attached' AND generation=? AND revision=?`,
+      ).run(
+        settlementRemote.revision,
+        settlementRemote.keyVersion,
+        settlementRemote.head.sequence,
+        settlementRemote.head.operationSha256,
+        settlementRemote.head.headDigest,
+        settlementRemote.headToken,
+        settlementRemote.headProofDigest,
+        now,
+        current.projectId,
+        current.attachmentGeneration,
+        current.attachmentRevision,
+      );
+      if (attachmentChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_SYNC_ATTACHMENT_CONFLICT");
+      }
+      const converged = sameProjectMemoryHead(resultHead, settlementRemote.head);
+      const authorityChanged = this.#database.query(
+        `UPDATE project_memory_authorities
+         SET head_sequence=?,head_operation_sha256=?,head_digest=?,revision=revision+1,
+             sync_state=?,last_exchange_at=?,last_exchange_sequence=?,
+             last_exchange_operation_sha256=?,last_exchange_head_digest=?,
+             diagnostic_code=NULL,updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND revision=? AND binding_digest=?
+           AND head_sequence=? AND head_operation_sha256 IS ? AND head_digest=?`,
+      ).run(
+        resultHead.sequence,
+        resultHead.operationSha256,
+        resultHead.headDigest,
+        converged ? "settled" : "local_only",
+        now,
+        exchangeHead.sequence,
+        exchangeHead.operationSha256,
+        exchangeHead.headDigest,
+        now,
+        current.projectId,
+        current.authorityRevision,
+        current.canonicalBindingDigest,
+        current.localHead.sequence,
+        current.localHead.operationSha256,
+        current.localHead.headDigest,
+      );
+      if (authorityChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_SYNC_AUTHORITY_CONFLICT");
+      }
+      if (portableAdoptionProof !== undefined) {
+        this.#insertCanonicalMemoryPortableAdoptionProof({
+          createdAt: now,
+          projectId: current.projectId,
+          proof: portableAdoptionProof,
+        });
+      }
+    });
+    settle.immediate();
+    const record = this.readCanonicalMemorySyncIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+    return record;
+  }
+
+  failCanonicalMemorySync(input: Readonly<{
+    diagnosticCode: string;
+    intentId: string;
+    state: "conflict" | "error";
+  }>): CanonicalMemorySyncIntentRecord {
+    const id = canonicalMemorySyncIntentIdSchema.parse(input.intentId);
+    const state = z.enum(["conflict", "error"]).parse(input.state);
+    const diagnosticCode = memoryDiagnosticCodeSchema.parse(input.diagnosticCode);
+    const fail = this.#database.transaction(() => {
+      const current = this.readCanonicalMemorySyncIntent(id);
+      if (current === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+      if (current.state === "conflict" || current.state === "error") {
+        if (current.state !== state || current.diagnosticCode !== diagnosticCode) {
+          throw new Error("CANONICAL_MEMORY_SYNC_FAILURE_CONFLICT");
+        }
+        return;
+      }
+      if (current.state === "settled") throw new Error("CANONICAL_MEMORY_SYNC_ALREADY_SETTLED");
+      this.#assertCanonicalMemorySyncPinsCurrent(current);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const effectStartedAt = current.effectStartedAt ?? now;
+      const intentChanged = this.#database.query(
+        `UPDATE project_memory_sync_intents
+         SET state=?,effect_started_at=?,settled_at=?,diagnostic_code=?,
+             updated_at=MAX(updated_at,?)
+         WHERE id=? AND state IN ('prepared','effect_started','response_observed')`,
+      ).run(state, effectStartedAt, now, diagnosticCode, now, id);
+      if (intentChanged.changes !== 1) throw new Error("CANONICAL_MEMORY_SYNC_STATE_CONFLICT");
+      const attachmentChanged = this.#database.query(
+        `UPDATE project_memory_hosted_attachments
+         SET state=?,revision=revision+1,diagnostic_code=?,updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND state='attached' AND generation=? AND revision=?`,
+      ).run(
+        state,
+        diagnosticCode,
+        now,
+        current.projectId,
+        current.attachmentGeneration,
+        current.attachmentRevision,
+      );
+      if (attachmentChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_SYNC_ATTACHMENT_CONFLICT");
+      }
+      const authorityChanged = this.#database.query(
+        `UPDATE project_memory_authorities
+         SET sync_state=?,diagnostic_code=?,revision=revision+1,updated_at=MAX(updated_at,?)
+         WHERE project_id=? AND revision=? AND binding_digest=?
+           AND head_sequence=? AND head_operation_sha256 IS ? AND head_digest=?`,
+      ).run(
+        state,
+        diagnosticCode,
+        now,
+        current.projectId,
+        current.authorityRevision,
+        current.canonicalBindingDigest,
+        current.localHead.sequence,
+        current.localHead.operationSha256,
+        current.localHead.headDigest,
+      );
+      if (authorityChanged.changes !== 1) {
+        throw new Error("CANONICAL_MEMORY_SYNC_AUTHORITY_CONFLICT");
+      }
+    });
+    fail.immediate();
+    const record = this.readCanonicalMemorySyncIntent(id);
+    if (record === null) throw new Error("CANONICAL_MEMORY_SYNC_INTENT_MISSING");
+    return record;
+  }
+
+  prepareMemorySubmission(input: Readonly<{
+    actorSessionId: SessionId;
+    projectId: ProjectId;
+    kind: MemorySubmissionKind;
+    requestDigest: string;
+    contentDigest: string;
+    keyDigest: string;
+    workingBindingDigest: string;
+    workingEpoch: number;
+    expectedHead: ProjectMemoryHeadRef;
+    idempotencyKey: string;
+  }>): MemorySubmissionPreparation {
+    const actorSessionId = sessionIdSchema.parse(input.actorSessionId);
+    const projectId = projectIdSchema.parse(input.projectId);
+    const kind = memorySubmissionKindSchema.parse(input.kind);
+    const requestDigest = sha256Schema.parse(input.requestDigest);
+    const contentDigest = sha256Schema.parse(input.contentDigest);
+    const keyDigest = sha256Schema.parse(input.keyDigest);
+    const workingBindingDigest = sha256Schema.parse(input.workingBindingDigest);
+    const workingEpoch = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.workingEpoch);
+    const expectedHead = projectMemoryHeadRefSchema.parse(input.expectedHead);
+    const idempotencyKey = z.string().uuid().parse(input.idempotencyKey);
+    let submissionId: string | undefined;
+    let replay = false;
+    const prepare = this.#database.transaction(() => {
+      const actor = this.#requirePeerSession(actorSessionId);
+      if (actor.state === "terminal") {
+        throw new Error("MEMORY_SUBMISSION_ACTOR_TERMINAL");
+      }
+      if (actor.state === "recovery_required") {
+        throw new Error("MEMORY_SUBMISSION_ACTOR_RECOVERY_REQUIRED");
+      }
+      if (actor.projectId !== projectId) {
+        throw new Error("MEMORY_SUBMISSION_PROJECT_REFUSED");
+      }
+      const existingRow = this.#database.query(
+        "SELECT * FROM memory_submissions WHERE idempotency_key=?",
+      ).get(idempotencyKey);
+      if (existingRow !== null) {
+        const existing = mapMemorySubmission(existingRow);
+        if (
+          existing.actorSessionId !== actorSessionId
+          || existing.projectId !== projectId
+          || existing.kind !== kind
+          || existing.requestDigest !== requestDigest
+          || existing.contentDigest !== contentDigest
+          || existing.keyDigest !== keyDigest
+          || existing.workingBindingDigest !== workingBindingDigest
+          || existing.workingEpoch !== workingEpoch
+          || JSON.stringify(existing.expectedHead) !== JSON.stringify(expectedHead)
+        ) throw new Error("MEMORY_SUBMISSION_IDEMPOTENCY_CONFLICT");
+        if (["prepared", "effect_started", "ambiguous"].includes(existing.state)) {
+          if (kind === "share") {
+            const authority = this.readProjectMemoryAuthority(projectId);
+            if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+            if (authority.physicalState !== "initialized") {
+              throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+            }
+            if (JSON.stringify(authority.head) !== JSON.stringify(expectedHead)) {
+              throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+            }
+          }
+        }
+        submissionId = existing.id;
+        replay = true;
+        return;
+      }
+      if (kind === "share") {
+        if (this.isCanonicalMemoryMutationFenced(projectId)) {
+          throw new Error("CANONICAL_MEMORY_SYNC_RECOVERY_REQUIRED");
+        }
+        const authority = this.readProjectMemoryAuthority(projectId);
+        if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+        if (authority.physicalState !== "initialized") {
+          throw new Error("PROJECT_MEMORY_AUTHORITY_NOT_INITIALIZED");
+        }
+        if (JSON.stringify(authority.head) !== JSON.stringify(expectedHead)) {
+          throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+        }
+      }
+      if (this.readUnsettledMemorySubmissionForProject(projectId) !== null) {
+        throw new Error("MEMORY_RECOVERY_REQUIRED");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      if (now >= MEMORY_SUBMISSION_RETAIN_AGE_MS) {
+        this.#database.query(
+          `DELETE FROM memory_submissions
+           WHERE project_id=? AND state IN ('applied','failed','cancelled')
+             AND updated_at<=?`,
+        ).run(projectId, now - MEMORY_SUBMISSION_RETAIN_AGE_MS);
+      }
+      const retained = z.object({ total: z.number().int().nonnegative() }).strict().parse(
+        this.#database.query(
+          "SELECT COUNT(*) AS total FROM memory_submissions WHERE project_id=?",
+        ).get(projectId),
+      );
+      if (retained.total >= MEMORY_SUBMISSION_RETAINED_PROJECT_LIMIT) {
+        throw new Error("MEMORY_SUBMISSION_RETENTION_LIMIT");
+      }
+      const id = memorySubmissionIdSchema.parse(
+        `memsub_${randomUUID().replaceAll("-", "")}`,
+      );
+      submissionId = id;
+      this.#database.query(
+         `INSERT INTO memory_submissions(
+           id,idempotency_key,kind,actor_session_id,project_id,request_digest,
+           content_digest,key_digest,working_binding_digest,working_epoch,
+           effect_record_sha256,attestation_sha256,operation_id,
+           source_head_sequence,source_head_operation_sha256,source_head_digest,nomination_sha256,
+           expected_head_sequence,
+           expected_head_operation_sha256,expected_head_digest,
+           result_head_sequence,result_head_operation_sha256,result_head_digest,
+           receipt_digest,outcome_code,
+           conflict_actual_head_sequence,conflict_actual_head_operation_sha256,
+           conflict_actual_head_digest,conflict_canonical_record_sha256,
+           conflict_nominated_record_sha256,state,created_at,updated_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?,?,?,
+           NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'prepared',?,?)`,
+      ).run(
+        id,
+        idempotencyKey,
+        kind,
+        actorSessionId,
+        projectId,
+        requestDigest,
+        contentDigest,
+        keyDigest,
+        workingBindingDigest,
+        workingEpoch,
+        expectedHead.sequence,
+        expectedHead.operationSha256,
+        expectedHead.headDigest,
+        now,
+        now,
+      );
+    });
+    prepare.immediate();
+    if (submissionId === undefined) throw new Error("MEMORY_SUBMISSION_PREPARATION_LOST");
+    return { record: this.requireMemorySubmission(submissionId), replay };
+  }
+
+  requireMemorySubmission(submissionId: string): MemorySubmissionRecord {
+    const id = memorySubmissionIdSchema.parse(submissionId);
+    const row = this.#database.query("SELECT * FROM memory_submissions WHERE id=?").get(id);
+    if (row === null) throw new SelectionError("NOT_FOUND");
+    return mapMemorySubmission(row);
+  }
+
+  readMemorySubmissionByIdempotencyKey(idempotencyKey: string): MemorySubmissionRecord | null {
+    const key = z.string().uuid().parse(idempotencyKey);
+    const row = this.#database.query("SELECT * FROM memory_submissions WHERE idempotency_key=?")
+      .get(key);
+    return row === null ? null : mapMemorySubmission(row);
+  }
+
+  /** Checks retained rows only; it does not establish unpruned historical uniqueness. */
+  isSoleMemorySubmissionForSession(sessionId: SessionId, submissionId: string): boolean {
+    const actorId = sessionIdSchema.parse(sessionId);
+    const expectedId = memorySubmissionIdSchema.parse(submissionId);
+    const rows = z.array(z.object({ id: memorySubmissionIdSchema }).strict()).max(2).parse(
+      this.#database.query(
+        "SELECT id FROM memory_submissions WHERE actor_session_id=? LIMIT 2",
+      ).all(actorId),
+    );
+    return rows.length === 1 && rows[0]?.id === expectedId;
+  }
+
+  bindMemorySubmissionEffect(input: Readonly<{
+    submissionId: string;
+    effectRecordSha256: string;
+    attestationSha256: string;
+    operationId: string;
+    sourceHead?: ProjectMemoryHeadRef;
+    nominationSha256?: string;
+  }>): MemorySubmissionRecord {
+    const id = memorySubmissionIdSchema.parse(input.submissionId);
+    const effectRecordSha256 = sha256Schema.parse(input.effectRecordSha256);
+    const attestationSha256 = sha256Schema.parse(input.attestationSha256);
+    const operationId = z.string().min(1).max(128).parse(input.operationId);
+    const sourceHead = input.sourceHead === undefined
+      ? undefined
+      : projectMemoryHeadRefSchema.parse(input.sourceHead);
+    const nominationSha256 = input.nominationSha256 === undefined
+      ? undefined
+      : sha256Schema.parse(input.nominationSha256);
+    const bind = this.#database.transaction(() => {
+      const current = this.requireMemorySubmission(id);
+      const expectedShareEvidence = current.kind === "share";
+      if (expectedShareEvidence !== (sourceHead !== undefined && nominationSha256 !== undefined)) {
+        throw new TypeError("MEMORY_SUBMISSION_EFFECT_KIND_MISMATCH");
+      }
+      if (current.effectRecordSha256 !== undefined) {
+        if (
+          current.effectRecordSha256 !== effectRecordSha256
+          || current.attestationSha256 !== attestationSha256
+          || current.operationId !== operationId
+          || JSON.stringify(current.sourceHead) !== JSON.stringify(sourceHead)
+          || current.nominationSha256 !== nominationSha256
+        ) throw new Error("MEMORY_SUBMISSION_EFFECT_CONFLICT");
+        return;
+      }
+      if (current.state !== "prepared") throw new Error("MEMORY_SUBMISSION_STATE_CONFLICT");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE memory_submissions
+         SET effect_record_sha256=?,attestation_sha256=?,operation_id=?,
+             source_head_sequence=?,source_head_operation_sha256=?,source_head_digest=?,
+             nomination_sha256=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='prepared' AND effect_record_sha256 IS NULL
+           AND attestation_sha256 IS NULL AND operation_id IS NULL
+           AND source_head_sequence IS NULL AND source_head_operation_sha256 IS NULL
+           AND source_head_digest IS NULL AND nomination_sha256 IS NULL`,
+      ).run(
+        effectRecordSha256,
+        attestationSha256,
+        operationId,
+        sourceHead?.sequence ?? null,
+        sourceHead?.operationSha256 ?? null,
+        sourceHead?.headDigest ?? null,
+        nominationSha256 ?? null,
+        now,
+        id,
+      );
+      if (changed.changes !== 1) throw new Error("MEMORY_SUBMISSION_EFFECT_CONFLICT");
+    });
+    bind.immediate();
+    return this.requireMemorySubmission(id);
+  }
+
+  readUnsettledMemorySubmissionForProject(projectId: ProjectId): MemorySubmissionRecord | null {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    const row = this.#database.query(
+      `SELECT * FROM memory_submissions
+       WHERE project_id=? AND state IN ('prepared','effect_started','ambiguous')
+       ORDER BY created_at,id LIMIT 1`,
+    ).get(parsedProjectId);
+    return row === null ? null : mapMemorySubmission(row);
+  }
+
+  findMemoryPageAttestation(attestationSha256: string): MemoryPageAttestationRecord | null {
+    const digest = sha256Schema.parse(attestationSha256);
+    const row = this.#database.query(
+      "SELECT * FROM memory_page_attestations WHERE attestation_sha256=?",
+    ).get(digest);
+    return row === null ? null : mapMemoryPageAttestation(row);
+  }
+
+  isMemoryPageAttestationReferenced(input: Readonly<{
+    attestationSha256: string;
+    authorityDigest: string;
+    keyDigest: string;
+    lane: MemoryPageAttestationLane;
+    projectId: ProjectId;
+  }>): boolean {
+    const attestationSha256 = sha256Schema.parse(input.attestationSha256);
+    const authorityDigest = sha256Schema.parse(input.authorityDigest);
+    const keyDigest = sha256Schema.parse(input.keyDigest);
+    const lane = z.enum(["working", "canonical"]).parse(input.lane);
+    const projectId = projectIdSchema.parse(input.projectId);
+    return this.#database.query(
+      `SELECT 1 FROM memory_page_attestation_refs
+       WHERE lane=? AND authority_digest=? AND project_id=? AND key_digest=?
+         AND attestation_sha256=? LIMIT 1`,
+    ).get(lane, authorityDigest, projectId, keyDigest, attestationSha256) !== null;
+  }
+
+  readMemoryWorkingAttestationHead(
+    authorityDigestValue: string,
+  ): MemoryWorkingAttestationHeadRecord | null {
+    const authorityDigest = sha256Schema.parse(authorityDigestValue);
+    const row = this.#database.query(
+      "SELECT * FROM memory_working_attestation_heads WHERE authority_digest=?",
+    ).get(authorityDigest);
+    return row === null ? null : mapMemoryWorkingAttestationHead(row);
+  }
+
+  readMemoryWorkingAttestationFork(
+    childBindingDigestValue: string,
+  ): MemoryWorkingAttestationForkRecord | null {
+    const childBindingDigest = sha256Schema.parse(childBindingDigestValue);
+    const row = this.#database.query(
+      "SELECT * FROM memory_working_attestation_forks WHERE child_authority_digest=?",
+    ).get(childBindingDigest);
+    return row === null ? null : mapMemoryWorkingAttestationFork(row);
+  }
+
+  hasMemoryWorkingAttestationForkFromParent(parentBindingDigestValue: string): boolean {
+    const parentBindingDigest = sha256Schema.parse(parentBindingDigestValue);
+    return this.#database.query(
+      `SELECT 1 FROM memory_working_attestation_forks
+       WHERE parent_authority_digest=? LIMIT 1`,
+    ).get(parentBindingDigest) !== null;
+  }
+
+  listMemoryWorkingAttestationForks(
+    limitValue: number,
+    afterChildSessionIdValue?: string,
+  ): readonly MemoryWorkingAttestationForkRecord[] {
+    const limit = z.number().int().min(1).max(100).parse(limitValue);
+    const afterChildSessionId = afterChildSessionIdValue === undefined
+      ? undefined
+      : sessionIdSchema.parse(afterChildSessionIdValue);
+    return (afterChildSessionId === undefined
+      ? this.#database.query(
+          `SELECT * FROM memory_working_attestation_forks
+           ORDER BY child_session_id LIMIT ?`,
+        ).all(limit)
+      : this.#database.query(
+          `SELECT * FROM memory_working_attestation_forks
+           WHERE child_session_id>? ORDER BY child_session_id LIMIT ?`,
+        ).all(afterChildSessionId, limit))
+      .map(mapMemoryWorkingAttestationFork);
+  }
+
+  reserveMemoryWorkingPageAttestationFork(input: Readonly<{
+    childBindingDigest: string;
+    childSessionId: SessionId;
+    parentBindingDigest: string;
+    parentHead: FactsMemoryHead;
+  }>): Readonly<{ references: number; state: "finalized" | "reserved" }> {
+    const childBindingDigest = sha256Schema.parse(input.childBindingDigest);
+    const childSessionId = sessionIdSchema.parse(input.childSessionId);
+    const parentBindingDigest = sha256Schema.parse(input.parentBindingDigest);
+    const parentHeadValue = factsMemoryHeadSchema.parse(input.parentHead);
+    const parentHead = projectMemoryHeadRefSchema.parse({
+      sequence: parentHeadValue.sequence,
+      operationSha256: parentHeadValue.operationSha256,
+      headDigest: parentHeadValue.digest,
+    });
+    if (childBindingDigest === parentBindingDigest) {
+      throw new TypeError("MEMORY_PAGE_ATTESTATION_SELF_CLONE");
+    }
+    let changes = 0;
+    let state: "finalized" | "reserved" | undefined;
+    const reserve = this.#database.transaction(() => {
+      const existingChild = this.readMemoryWorkingAttestationHead(childBindingDigest);
+      if (existingChild !== null) {
+        if (
+          existingChild.origin !== "fork"
+          || existingChild.forkParentAuthorityDigest !== parentBindingDigest
+          || JSON.stringify(existingChild.forkParentHead) !== JSON.stringify(parentHead)
+        ) throw new Error("MEMORY_PAGE_ATTESTATION_CLONE_CONFLICT");
+        state = "finalized";
+        return;
+      }
+      const existingFork = this.readMemoryWorkingAttestationFork(childBindingDigest);
+      if (existingFork !== null) {
+        if (
+          existingFork.childSessionId !== childSessionId
+          ||
+          existingFork.parentAuthorityDigest !== parentBindingDigest
+          || JSON.stringify(existingFork.parentHead) !== JSON.stringify(parentHead)
+        ) throw new Error("MEMORY_PAGE_ATTESTATION_CLONE_CONFLICT");
+        state = "reserved";
+        return;
+      }
+      if (this.#database.query(
+        `SELECT 1 FROM memory_page_attestation_refs
+         WHERE lane='working' AND authority_digest=? LIMIT 1`,
+      ).get(childBindingDigest) !== null) {
+        throw new Error("MEMORY_PAGE_ATTESTATION_CLONE_CONFLICT");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      this.#database.query(
+        `INSERT INTO memory_working_attestation_forks(
+           child_authority_digest,child_session_id,parent_authority_digest,parent_head_sequence,
+           parent_head_operation_sha256,parent_head_digest,created_at,updated_at
+         ) VALUES (?,?,?,?,?,?,?,?)`,
+      ).run(
+        childBindingDigest,
+        childSessionId,
+        parentBindingDigest,
+        parentHead.sequence,
+        parentHead.operationSha256,
+        parentHead.headDigest,
+        now,
+        now,
+      );
+      const result = this.#database.query(
+        `INSERT INTO memory_page_attestation_refs(
+           lane,authority_digest,project_id,key_digest,attestation_sha256,updated_at
+         )
+         SELECT 'working',?,project_id,key_digest,attestation_sha256,?
+         FROM memory_page_attestation_refs source
+         WHERE source.lane='working' AND source.authority_digest=?`,
+      ).run(childBindingDigest, now, parentBindingDigest);
+      changes = result.changes;
+      state = "reserved";
+    });
+    reserve.immediate();
+    if (state === undefined) throw new Error("MEMORY_PAGE_ATTESTATION_FORK_STATE_LOST");
+    return { references: changes, state };
+  }
+
+  finalizeMemoryWorkingPageAttestationFork(input: Readonly<{
+    childBindingDigest: string;
+    childHead: FactsMemoryHead;
+    parentBindingDigest: string;
+    parentHead: FactsMemoryHead;
+  }>): number {
+    const childBindingDigest = sha256Schema.parse(input.childBindingDigest);
+    const parentBindingDigest = sha256Schema.parse(input.parentBindingDigest);
+    const childHeadValue = factsMemoryHeadSchema.parse(input.childHead);
+    const parentHeadValue = factsMemoryHeadSchema.parse(input.parentHead);
+    const childHead = projectMemoryHeadRefSchema.parse({
+      sequence: childHeadValue.sequence,
+      operationSha256: childHeadValue.operationSha256,
+      headDigest: childHeadValue.digest,
+    });
+    const parentHead = projectMemoryHeadRefSchema.parse({
+      sequence: parentHeadValue.sequence,
+      operationSha256: parentHeadValue.operationSha256,
+      headDigest: parentHeadValue.digest,
+    });
+    const finalize = this.#database.transaction(() => {
+      const existingChild = this.readMemoryWorkingAttestationHead(childBindingDigest);
+      if (existingChild !== null) {
+        if (
+          existingChild.origin !== "fork"
+          || existingChild.forkParentAuthorityDigest !== parentBindingDigest
+          || JSON.stringify(existingChild.forkParentHead) !== JSON.stringify(parentHead)
+          || JSON.stringify(existingChild.forkChildHead) !== JSON.stringify(childHead)
+        ) throw new Error("MEMORY_PAGE_ATTESTATION_CLONE_CONFLICT");
+        return;
+      }
+      const fork = this.readMemoryWorkingAttestationFork(childBindingDigest);
+      if (
+        fork === null
+        || fork.parentAuthorityDigest !== parentBindingDigest
+        || JSON.stringify(fork.parentHead) !== JSON.stringify(parentHead)
+      ) throw new Error("MEMORY_PAGE_ATTESTATION_FORK_NOT_RESERVED");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      this.#database.query(
+        `INSERT INTO memory_working_attestation_heads(
+           authority_digest,head_sequence,head_operation_sha256,head_digest,origin,
+           fork_child_head_sequence,fork_child_head_operation_sha256,fork_child_head_digest,
+           fork_parent_authority_digest,fork_parent_head_sequence,
+           fork_parent_head_operation_sha256,fork_parent_head_digest,created_at,updated_at
+         ) VALUES (?,?,?,?,'fork',?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        childBindingDigest,
+        childHead.sequence,
+        childHead.operationSha256,
+        childHead.headDigest,
+        childHead.sequence,
+        childHead.operationSha256,
+        childHead.headDigest,
+        parentBindingDigest,
+        parentHead.sequence,
+        parentHead.operationSha256,
+        parentHead.headDigest,
+        now,
+        now,
+      );
+      const deleted = this.#database.query(
+        "DELETE FROM memory_working_attestation_forks WHERE child_authority_digest=?",
+      ).run(childBindingDigest);
+      if (deleted.changes !== 1) throw new Error("MEMORY_PAGE_ATTESTATION_FORK_CONFLICT");
+    });
+    finalize.immediate();
+    return 0;
+  }
+
+  purgeMemoryWorkingPageAttestations(input: Readonly<{
+    bindingDigest: string;
+  }>): number {
+    const bindingDigest = sha256Schema.parse(input.bindingDigest);
+    let changes = 0;
+    const purge = this.#database.transaction(() => {
+      const result = this.#database.query(
+        `DELETE FROM memory_page_attestation_refs
+         WHERE lane='working' AND authority_digest=?`,
+      ).run(bindingDigest);
+      changes = result.changes;
+      this.#database.query(
+        "DELETE FROM memory_working_attestation_heads WHERE authority_digest=?",
+      ).run(bindingDigest);
+      this.#database.query(
+        "DELETE FROM memory_working_attestation_forks WHERE child_authority_digest=?",
+      ).run(bindingDigest);
+      this.#deleteOrphanedMemoryPageAttestations();
+    });
+    purge.immediate();
+    return changes;
+  }
+
+  #upsertMemoryPageAttestationReference(input: Readonly<{
+    attestationSha256: string;
+    authorityDigest: string;
+    keyDigest: string;
+    lane: MemoryPageAttestationLane;
+    now: number;
+    projectId: ProjectId;
+  }>): void {
+    const changed = this.#database.query(
+      `UPDATE memory_page_attestation_refs
+       SET project_id=?,attestation_sha256=?,updated_at=MAX(updated_at,?)
+       WHERE lane=? AND authority_digest=? AND key_digest=?`,
+    ).run(
+      input.projectId,
+      input.attestationSha256,
+      input.now,
+      input.lane,
+      input.authorityDigest,
+      input.keyDigest,
+    );
+    if (changed.changes === 1) return;
+    this.#database.query(
+      `INSERT INTO memory_page_attestation_refs(
+         lane,authority_digest,project_id,key_digest,attestation_sha256,updated_at
+       ) VALUES (?,?,?,?,?,?)`,
+    ).run(
+      input.lane,
+      input.authorityDigest,
+      input.projectId,
+      input.keyDigest,
+      input.attestationSha256,
+      input.now,
+    );
+  }
+
+  #insertCanonicalMemoryPortableAdoptionProof(input: Readonly<{
+    createdAt: number;
+    projectId: ProjectId;
+    proof: CanonicalMemoryPortableAdoptionProof;
+  }>): void {
+    const projectId = projectIdSchema.parse(input.projectId);
+    const createdAt = unixMillisecondsSchema.parse(input.createdAt);
+    const proof = parseCanonicalMemoryPortableAdoptionProof(input.proof);
+    const authority = this.readProjectMemoryAuthority(projectId);
+    if (
+      authority === null
+      || authority.identityContract !== 2
+      || authority.physicalState !== "initialized"
+      || authority.canonicalSpaceId !== proof.canonicalSpaceId
+      || authority.bindingDigest !== proof.bindingDigest
+      || authority.head.sequence !== proof.sequence
+      || authority.head.operationSha256 !== proof.operationSha256
+    ) throw new Error("CANONICAL_MEMORY_PORTABLE_ADOPTION_PROOF_AUTHORITY_INVALID");
+    this.#database.query(
+      `INSERT OR IGNORE INTO project_memory_portable_adoption_proofs(
+         project_id,canonical_space_id,canonical_binding_digest,sequence,
+         operation_sha256,record_sha256,key_digest,content_digest,
+         source_receipt_sha256,created_at
+       ) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      projectId,
+      proof.canonicalSpaceId,
+      proof.bindingDigest,
+      proof.sequence,
+      proof.operationSha256,
+      proof.recordSha256,
+      proof.keyDigest,
+      proof.contentDigest,
+      proof.sourceReceiptSha256,
+      createdAt,
+    );
+    const admitted = this.readCanonicalMemoryPortableAdoptionProof({
+      operationSha256: proof.operationSha256,
+      projectId,
+      sequence: proof.sequence,
+    });
+    if (
+      admitted === null
+      || admitted.bindingDigest !== proof.bindingDigest
+      || admitted.canonicalSpaceId !== proof.canonicalSpaceId
+      || admitted.contentDigest !== proof.contentDigest
+      || admitted.keyDigest !== proof.keyDigest
+      || admitted.recordSha256 !== proof.recordSha256
+      || admitted.sourceReceiptSha256 !== proof.sourceReceiptSha256
+    ) throw new Error("CANONICAL_MEMORY_PORTABLE_ADOPTION_PROOF_CONFLICT");
+  }
+
+  #deleteOrphanedMemoryPageAttestations(projectId?: ProjectId): void {
+    this.#database.query(
+      `DELETE FROM memory_page_attestations
+       WHERE ${projectId === undefined ? "" : "project_id=? AND "}NOT EXISTS (
+         SELECT 1 FROM memory_page_attestation_refs reference
+         WHERE reference.attestation_sha256=memory_page_attestations.attestation_sha256
+       )`,
+    ).run(...(projectId === undefined ? [] : [projectId]));
+  }
+
+  readUnsettledMemorySubmissionForSession(sessionId: SessionId): MemorySubmissionRecord | null {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const row = this.#database.query(
+      `SELECT * FROM memory_submissions
+       WHERE actor_session_id=? AND state IN ('prepared','effect_started','ambiguous')
+       ORDER BY created_at,id LIMIT 1`,
+    ).get(parsedSessionId);
+    return row === null ? null : mapMemorySubmission(row);
+  }
+
+  listUnsettledMemorySubmissions(limit: number): readonly MemorySubmissionRecord[] {
+    return this.listUnsettledMemorySubmissionsPage({ limit }).records;
+  }
+
+  listUnsettledMemorySubmissionsPage(input: Readonly<{
+    limit: number;
+    after?: ControlPlaneReconciliationCursor;
+  }>): ControlPlaneReconciliationPage<MemorySubmissionRecord> {
+    const boundedLimit = z.number().int().min(1).max(CONTROL_PLANE_RECONCILIATION_BATCH_LIMIT)
+      .parse(input.limit);
+    const after = input.after === undefined
+      ? undefined
+      : z.object({
+          createdAt: unixMillisecondsSchema,
+          id: memorySubmissionIdSchema,
+        }).strict().parse(input.after);
+    const records = (after === undefined
+      ? this.#database.query(
+          `SELECT * FROM memory_submissions
+           WHERE state IN ('prepared','effect_started','ambiguous')
+           ORDER BY created_at,id LIMIT ?`,
+        ).all(boundedLimit)
+      : this.#database.query(
+          `SELECT * FROM memory_submissions
+           WHERE state IN ('prepared','effect_started','ambiguous')
+             AND (created_at>? OR (created_at=? AND id>?))
+           ORDER BY created_at,id LIMIT ?`,
+        ).all(after.createdAt, after.createdAt, after.id, boundedLimit))
+      .map(mapMemorySubmission);
+    const last = records.at(-1);
+    return {
+      records,
+      ...(last === undefined || records.length < boundedLimit
+        ? {}
+        : { nextCursor: { createdAt: last.createdAt, id: last.id } }),
+    };
+  }
+
+  beginMemorySubmission(
+    submissionId: string,
+    expectedIdempotencyKey?: string,
+  ): MemorySubmissionRecord {
+    const id = memorySubmissionIdSchema.parse(submissionId);
+    const expectedKey = expectedIdempotencyKey === undefined
+      ? undefined
+      : z.string().uuid().parse(expectedIdempotencyKey);
+    const begin = this.#database.transaction(() => {
+      const current = this.requireMemorySubmission(id);
+      if (
+        current.effectRecordSha256 === undefined
+        || current.attestationSha256 === undefined
+        || current.operationId === undefined
+      ) throw new Error("MEMORY_SUBMISSION_EFFECT_UNBOUND");
+      const actor = this.#requirePeerSession(current.actorSessionId);
+      if (actor.state === "terminal") {
+        throw new Error("MEMORY_SUBMISSION_ACTOR_TERMINAL");
+      }
+      if (actor.state === "recovery_required") {
+        throw new Error("MEMORY_SUBMISSION_ACTOR_RECOVERY_REQUIRED");
+      }
+      if (actor.projectId !== current.projectId) {
+        throw new Error("MEMORY_SUBMISSION_PROJECT_REFUSED");
+      }
+      if (current.kind === "share") {
+        const authority = this.readProjectMemoryAuthority(current.projectId);
+        if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+        if (JSON.stringify(authority.head) !== JSON.stringify(current.expectedHead)) {
+          throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+        }
+      }
+      if (current.state === "effect_started") return;
+      if (current.state === "ambiguous") {
+        if (expectedKey === undefined || current.idempotencyKey !== expectedKey) {
+          throw new Error("MEMORY_SUBMISSION_IDEMPOTENCY_CONFLICT");
+        }
+        return;
+      }
+      if (current.state !== "prepared") throw new Error("MEMORY_SUBMISSION_STATE_CONFLICT");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE memory_submissions SET state='effect_started',updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='prepared'`,
+      ).run(now, id);
+      if (changed.changes !== 1) throw new Error("MEMORY_SUBMISSION_STATE_CONFLICT");
+    });
+    begin.immediate();
+    return this.requireMemorySubmission(id);
+  }
+
+  cancelPreparedMemorySubmission(submissionId: string): MemorySubmissionRecord {
+    const id = memorySubmissionIdSchema.parse(submissionId);
+    const cancel = this.#database.transaction(() => {
+      const current = this.requireMemorySubmission(id);
+      if (current.state === "cancelled") return;
+      if (current.state !== "prepared") throw new Error("MEMORY_SUBMISSION_STATE_CONFLICT");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE memory_submissions SET state='cancelled',updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='prepared'`,
+      ).run(now, id);
+      if (changed.changes !== 1) throw new Error("MEMORY_SUBMISSION_STATE_CONFLICT");
+    });
+    cancel.immediate();
+    return this.requireMemorySubmission(id);
+  }
+
+  settleMemorySubmission(input: Readonly<{
+    submissionId: string;
+    expectedState: "effect_started" | "ambiguous";
+    state: "applied" | "failed" | "ambiguous";
+    resultHead?: ProjectMemoryHeadRef;
+    receiptDigest?: string;
+    outcomeCode?: MemorySubmissionOutcomeCode;
+    conflict?: MemorySubmissionConflictEvidence;
+  }>): MemorySubmissionRecord {
+    const id = memorySubmissionIdSchema.parse(input.submissionId);
+    const expectedState = z.enum(["effect_started", "ambiguous"]).parse(input.expectedState);
+    const state = z.enum(["applied", "failed", "ambiguous"]).parse(input.state);
+    const resultHead = input.resultHead === undefined
+      ? undefined
+      : projectMemoryHeadRefSchema.parse(input.resultHead);
+    const receiptDigest = input.receiptDigest === undefined
+      ? undefined
+      : sha256Schema.parse(input.receiptDigest);
+    const outcomeCode = input.outcomeCode === undefined
+      ? undefined
+      : memorySubmissionOutcomeCodeSchema.parse(input.outcomeCode);
+    const conflict = input.conflict === undefined
+      ? undefined
+      : {
+          actualHead: projectMemoryHeadRefSchema.parse(input.conflict.actualHead),
+          canonicalRecordSha256: input.conflict.canonicalRecordSha256 === null
+            ? null
+            : sha256Schema.parse(input.conflict.canonicalRecordSha256),
+          nominatedRecordSha256: sha256Schema.parse(input.conflict.nominatedRecordSha256),
+        };
+    if ((state === "applied") !== (resultHead !== undefined && receiptDigest !== undefined)) {
+      throw new TypeError("MEMORY_SUBMISSION_RESULT_MISMATCH");
+    }
+    if (["applied", "failed"].includes(state) !== (outcomeCode !== undefined)) {
+      throw new TypeError("MEMORY_SUBMISSION_OUTCOME_MISMATCH");
+    }
+    if ((outcomeCode === "share_conflict") !== (conflict !== undefined)) {
+      throw new TypeError("MEMORY_SUBMISSION_CONFLICT_MISMATCH");
+    }
+    const settle = this.#database.transaction(() => {
+      const current = this.requireMemorySubmission(id);
+      if (!memorySubmissionOutcomeShapeIsValid({
+        expectedHead: current.expectedHead,
+        kind: current.kind,
+        ...(outcomeCode === undefined ? {} : { outcomeCode }),
+        ...(resultHead === undefined ? {} : { resultHead }),
+        state,
+      })) throw new TypeError("MEMORY_SUBMISSION_OUTCOME_STATE_MISMATCH");
+      if (
+        current.state === state
+        && JSON.stringify(current.resultHead) === JSON.stringify(resultHead)
+        && current.receiptDigest === receiptDigest
+        && current.outcomeCode === outcomeCode
+        && JSON.stringify(current.conflict) === JSON.stringify(conflict)
+      ) return;
+      const now = unixMillisecondsSchema.parse(this.#now());
+      if (state === "applied" && resultHead !== undefined) {
+        if (current.kind === "remember") {
+          if (
+            resultHead.sequence < current.expectedHead.sequence
+            || (resultHead.sequence === current.expectedHead.sequence
+              && JSON.stringify(resultHead) !== JSON.stringify(current.expectedHead))
+          ) throw new Error("MEMORY_SUBMISSION_REMEMBER_HEAD_ROLLBACK");
+        } else if (outcomeCode === "share_adopted") {
+          const authority = this.readProjectMemoryAuthority(current.projectId);
+          if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+          if (JSON.stringify(authority.head) !== JSON.stringify(current.expectedHead)) {
+            throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+          }
+          if (
+            resultHead.sequence < authority.head.sequence
+            || (resultHead.sequence === authority.head.sequence
+              && JSON.stringify(resultHead) !== JSON.stringify(authority.head))
+          ) throw new Error("MEMORY_SUBMISSION_SHARE_HEAD_ROLLBACK");
+          const authorityChanged = this.#database.query(
+            `UPDATE project_memory_authorities
+             SET head_sequence=?,head_operation_sha256=?,head_digest=?,
+                 revision=revision+1,
+                 sync_state=CASE WHEN sync_state IN ('conflict','error')
+                   THEN sync_state ELSE 'local_only' END,
+                 diagnostic_code=CASE WHEN sync_state IN ('conflict','error')
+                   THEN diagnostic_code ELSE NULL END,
+                 updated_at=MAX(updated_at,?)
+             WHERE project_id=? AND revision=? AND head_sequence=?
+               AND head_operation_sha256 IS ? AND head_digest=?`,
+          ).run(
+            resultHead.sequence,
+            resultHead.operationSha256,
+            resultHead.headDigest,
+            now,
+            current.projectId,
+            authority.revision,
+            authority.head.sequence,
+            authority.head.operationSha256,
+            authority.head.headDigest,
+          );
+          if (authorityChanged.changes !== 1) throw new Error("PROJECT_MEMORY_HEAD_CONFLICT");
+        } else if (outcomeCode !== "share_already_present") {
+          throw new TypeError("MEMORY_SUBMISSION_OUTCOME_STATE_MISMATCH");
+        }
+      }
+      const changed = this.#database.query(
+        `UPDATE memory_submissions
+         SET state=?,result_head_sequence=?,result_head_operation_sha256=?,
+             result_head_digest=?,receipt_digest=?,outcome_code=?,
+             conflict_actual_head_sequence=?,conflict_actual_head_operation_sha256=?,
+             conflict_actual_head_digest=?,conflict_canonical_record_sha256=?,
+             conflict_nominated_record_sha256=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state=?`,
+      ).run(
+        state,
+        resultHead?.sequence ?? null,
+        resultHead?.operationSha256 ?? null,
+        resultHead?.headDigest ?? null,
+        receiptDigest ?? null,
+        outcomeCode ?? null,
+        conflict?.actualHead.sequence ?? null,
+        conflict?.actualHead.operationSha256 ?? null,
+        conflict?.actualHead.headDigest ?? null,
+        conflict?.canonicalRecordSha256 ?? null,
+        conflict?.nominatedRecordSha256 ?? null,
+        now,
+        id,
+        expectedState,
+      );
+      if (changed.changes !== 1) throw new Error("MEMORY_SUBMISSION_STATE_CONFLICT");
+      if (state === "applied") {
+        if (
+          current.effectRecordSha256 === undefined
+          || current.attestationSha256 === undefined
+        ) throw new Error("MEMORY_SUBMISSION_EFFECT_UNBOUND");
+        if (current.kind === "remember") {
+          this.#database.query(
+            `INSERT OR IGNORE INTO memory_page_attestations(
+               attestation_sha256,submission_id,idempotency_key,actor_session_id,
+               project_id,request_digest,content_digest,key_digest,
+               working_binding_digest,working_epoch,effect_record_sha256,created_at
+             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+          ).run(
+            current.attestationSha256,
+            current.id,
+            current.idempotencyKey,
+            current.actorSessionId,
+            current.projectId,
+            current.requestDigest,
+            current.contentDigest,
+            current.keyDigest,
+            current.workingBindingDigest,
+            current.workingEpoch,
+            current.effectRecordSha256,
+            current.createdAt,
+          );
+          const attestation = this.findMemoryPageAttestation(current.attestationSha256);
+          if (
+            attestation === null
+            || attestation.submissionId !== current.id
+            || attestation.idempotencyKey !== current.idempotencyKey
+            || attestation.actorSessionId !== current.actorSessionId
+            || attestation.projectId !== current.projectId
+            || attestation.requestDigest !== current.requestDigest
+            || attestation.contentDigest !== current.contentDigest
+            || attestation.keyDigest !== current.keyDigest
+            || attestation.workingBindingDigest !== current.workingBindingDigest
+            || attestation.workingEpoch !== current.workingEpoch
+            || attestation.effectRecordSha256 !== current.effectRecordSha256
+            || attestation.createdAt !== current.createdAt
+          ) throw new Error("MEMORY_PAGE_ATTESTATION_CONFLICT");
+          if (resultHead === undefined) {
+            throw new Error("MEMORY_SUBMISSION_RESULT_MISMATCH");
+          }
+          this.#advanceMemoryWorkingAttestationHead({
+            authorityDigest: current.workingBindingDigest,
+            expectedHead: current.expectedHead,
+            nextHead: resultHead,
+            now,
+          });
+          this.#upsertMemoryPageAttestationReference({
+            attestationSha256: current.attestationSha256,
+            authorityDigest: current.workingBindingDigest,
+            keyDigest: current.keyDigest,
+            lane: "working",
+            now,
+            projectId: current.projectId,
+          });
+        } else {
+          const source = this.findMemoryPageAttestation(current.attestationSha256);
+          if (
+            source === null
+            || source.projectId !== current.projectId
+            || source.keyDigest !== current.keyDigest
+            || source.effectRecordSha256 !== current.effectRecordSha256
+          ) throw new Error("MEMORY_SHARE_ATTESTATION_INVALID");
+          const authority = this.readProjectMemoryAuthority(current.projectId);
+          if (authority === null) throw new Error("PROJECT_MEMORY_AUTHORITY_MISSING");
+          this.#upsertMemoryPageAttestationReference({
+            attestationSha256: current.attestationSha256,
+            authorityDigest: authority.authorityDigest,
+            keyDigest: current.keyDigest,
+            lane: "canonical",
+            now,
+            projectId: current.projectId,
+          });
+          if (outcomeCode === "share_adopted" && authority.identityContract === 2) {
+            if (
+              resultHead === undefined
+              || resultHead.operationSha256 === null
+              || receiptDigest === undefined
+            ) throw new Error("MEMORY_SUBMISSION_RESULT_MISMATCH");
+            this.#insertCanonicalMemoryPortableAdoptionProof({
+              createdAt: now,
+              projectId: current.projectId,
+              proof: {
+                bindingDigest: authority.bindingDigest,
+                canonicalSpaceId: authority.canonicalSpaceId,
+                contentDigest: source.contentDigest,
+                keyDigest: current.keyDigest,
+                operationSha256: resultHead.operationSha256,
+                recordSha256: current.effectRecordSha256,
+                sequence: resultHead.sequence,
+                sourceReceiptSha256: receiptDigest,
+              },
+            });
+          }
+        }
+        this.#deleteOrphanedMemoryPageAttestations();
+      }
+    });
+    settle.immediate();
+    return this.requireMemorySubmission(id);
+  }
+
+  requirePeerSessionPolicy(sessionId: SessionId): PeerSessionPolicyRecord {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const row = this.#database.query(
+      "SELECT session_id,mode,revision,created_at,updated_at FROM session_peer_policies WHERE session_id=?",
+    ).get(parsedSessionId);
+    if (row === null) throw new PeerSessionRefusalError("PEER_SESSION_NOT_FOUND");
+    return mapPeerSessionPolicy(row);
+  }
+
+  listPeerSessionPolicies(limitValue = 200): readonly PeerSessionPolicyRecord[] {
+    const limit = z.number().int().min(1).max(200).parse(limitValue);
+    return this.#database.query(
+      `SELECT session_id,mode,revision,created_at,updated_at
+       FROM session_peer_policies ORDER BY updated_at DESC,session_id LIMIT ?`,
+    ).all(limit).map(mapPeerSessionPolicy);
+  }
+
+  countPeerSessionPolicies(): number {
+    const row = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+      this.#database.query("SELECT COUNT(*) AS count FROM session_peer_policies").get(),
+    );
+    return row.count;
+  }
+
+  listRecentPeerSessionActions(limitValue = 50): readonly PeerSessionActionRecord[] {
+    const limit = z.number().int().min(1).max(50).parse(limitValue);
+    return this.#database.query(
+      `SELECT * FROM peer_session_actions ORDER BY updated_at DESC,id LIMIT ?`,
+    ).all(limit).map((row) => this.#mapPeerSessionAction(row));
+  }
+
+  setPeerSessionPolicy(input: Readonly<{
+    sessionId: SessionId;
+    expectedRevision: number;
+    mode: PeerSessionPolicyMode;
+  }>): PeerSessionPolicyRecord {
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const expectedRevision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedRevision);
+    const mode = peerSessionPolicyModeSchema.parse(input.mode);
+    const set = this.#database.transaction(() => {
+      this.#requirePeerSession(sessionId, "PEER_SESSION_TARGET_STATE_REFUSED");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE session_peer_policies
+         SET mode=?,revision=revision+1,updated_at=MAX(updated_at,?)
+         WHERE session_id=? AND revision=?`,
+      ).run(mode, now, sessionId, expectedRevision);
+      if (changed.changes !== 1) {
+        if (this.#database.query("SELECT 1 FROM session_peer_policies WHERE session_id=?").get(sessionId) === null) {
+          throw new PeerSessionRefusalError("PEER_SESSION_NOT_FOUND");
+        }
+        throw new PeerSessionRefusalError("PEER_SESSION_POLICY_REVISION_CONFLICT");
+      }
+      return this.requirePeerSessionPolicy(sessionId);
+    });
+    return set.immediate();
+  }
+
+  #requirePeerSession(
+    sessionId: SessionId,
+    retiredProviderCode?: PeerSessionRefusalCode,
+  ): SessionRecord {
+    if (retiredProviderCode !== undefined) {
+      const row = this.#database.query(
+        "SELECT provider_v39 AS provider FROM sessions WHERE id=?",
+      ).get(sessionId);
+      if (row === null) {
+        throw new PeerSessionRefusalError("PEER_SESSION_NOT_FOUND");
+      }
+      const provider = z.object({ provider: providerSchema }).strict().parse(row).provider;
+      if (!isSupportedProvider(provider)) {
+        throw new PeerSessionRefusalError(retiredProviderCode);
+      }
+    }
+    try {
+      return this.requireSession(sessionId);
+    } catch (error: unknown) {
+      if (error instanceof SelectionError) {
+        throw new PeerSessionRefusalError("PEER_SESSION_NOT_FOUND");
+      }
+      throw error;
+    }
+  }
+
+  #requireLivePeerSession(
+    sessionId: SessionId,
+    retiredProviderCode: "PEER_SESSION_ACTOR_TURN_REFUSED" | "PEER_SESSION_TARGET_STATE_REFUSED",
+  ): SessionRecord {
+    const session = this.#requirePeerSession(sessionId, retiredProviderCode);
+    this.assertProviderAccountAuthorityCurrent(
+      baseProviderAccountAuthority(this.requireSessionProviderAuthority(session.id)),
+    );
+    return session;
+  }
+
+  assertPeerSessionInspection(input: Readonly<{
+    actorSessionId: SessionId;
+    actorTurnId: string;
+    targetSessionId: SessionId;
+    expectedTargetRevision: number;
+  }>): SessionRecord {
+    const actorSessionId = sessionIdSchema.parse(input.actorSessionId);
+    const targetSessionId = sessionIdSchema.parse(input.targetSessionId);
+    const actorTurnId = z.string().min(1).max(200).parse(input.actorTurnId);
+    const expectedTargetRevision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedTargetRevision);
+    if (actorSessionId === targetSessionId) {
+      throw new PeerSessionRefusalError("PEER_SESSION_SELF_REFUSED");
+    }
+    const actor = this.#requireLivePeerSession(
+      actorSessionId,
+      "PEER_SESSION_ACTOR_TURN_REFUSED",
+    );
+    const target = this.#requirePeerSession(
+      targetSessionId,
+      "PEER_SESSION_TARGET_STATE_REFUSED",
+    );
+    if (
+      actor.projectId === undefined
+      || target.projectId === undefined
+      || actor.projectId !== target.projectId
+    ) throw new PeerSessionRefusalError("PEER_SESSION_PROJECT_REFUSED");
+    const actorPolicy = this.requirePeerSessionPolicy(actorSessionId);
+    const targetPolicy = this.requirePeerSessionPolicy(targetSessionId);
+    if (actorPolicy.mode === "off" || targetPolicy.mode === "off") {
+      throw new PeerSessionRefusalError("PEER_SESSION_POLICY_REFUSED");
+    }
+    if (actor.state !== "active" || actor.activeTurnId !== actorTurnId) {
+      throw new PeerSessionRefusalError("PEER_SESSION_ACTOR_TURN_REFUSED");
+    }
+    if (target.revision !== expectedTargetRevision) {
+      throw new PeerSessionRefusalError("PEER_SESSION_REVISION_CONFLICT");
+    }
+    return target;
+  }
+
+  #assertPeerSessionTurnOriginCapacity(targetSessionId: SessionId, turnId: string): void {
+    const { total } = z.object({ total: z.number().int().nonnegative().safe() }).strict().parse(
+      this.#database.query("SELECT count(*) AS total FROM peer_session_turn_origins WHERE session_id=? AND turn_digest=?")
+        .get(targetSessionId, digestPeerTurnId(turnId)),
+    );
+    if (total >= PEER_SESSION_TURN_ORIGIN_LIMIT) throw new PeerSessionRefusalError("PEER_SESSION_CAUSAL_LIMIT_REFUSED");
+  }
+
+  #assertPeerSessionTurnCausalCompleteness(actor: SessionRecord, turnId: string): void {
+    // Live full provider binding remains independently checked by admission.
+    // Both callers hold an immediate transaction. This is a bounded result/page
+    // contract, not a constant-work claim for an arbitrarily long history.
+    if (actor.providerThreadId === undefined) return;
+    const sources = [
+      { kind: "mutation", sql: `WITH candidate AS (
+        SELECT CASE WHEN length(CAST(resolution.attempt_id AS BLOB))<=80 THEN resolution.attempt_id ELSE NULL END AS resolution_id,
+          mutation.kind AS effect_kind,NULL AS queue_actor,resolution.evidence_json AS resolution_json,
+          mutation.transcript_intent_json AS transcript_json
+        FROM mutation_attempts mutation
+        JOIN mutation_resolutions resolution ON resolution.attempt_id=mutation.id
+        LEFT JOIN mutation_effect_evidence evidence ON evidence.attempt_id=mutation.id
+        WHERE mutation.authority_id=? AND mutation.kind IN ('session.send','session.steer')
+          AND resolution.resolution_kind='abandoned')` },
+      { kind: "queue", sql: `WITH candidate AS (
+        SELECT CASE WHEN length(CAST(resolution.queue_id AS BLOB))<=80 THEN resolution.queue_id ELSE NULL END AS resolution_id,
+          'queue.dispatch' AS effect_kind,
+          CASE WHEN length(CAST(queue.message_actor AS BLOB))<=64 THEN queue.message_actor ELSE NULL END AS queue_actor,
+          resolution.evidence_json AS resolution_json,queue.transcript_intent_json AS transcript_json
+        FROM queue_entries queue
+        JOIN queue_effect_resolutions resolution ON resolution.queue_id=queue.id
+        LEFT JOIN queue_effect_evidence evidence ON evidence.queue_id=queue.id
+        WHERE queue.session_id=? AND resolution.resolution_kind='abandoned')` },
+    ] as const;
+    for (const source of sources) {
+      const { total } = z.object({ total: z.number().int().nonnegative().safe() }).strict().parse(
+        this.#database.query(`${source.sql} SELECT count(*) AS total FROM candidate`).get(actor.id),
+      );
+      let after = "";
+      let seen = 0;
+      while (seen < total) {
+        const page = this.#database.query(`${source.sql} ${peerCausalCandidateProjectionSql}`).all(actor.id, after)
+          .map((row) => peerCausalCandidateSchema.parse(row));
+        if (page.length === 0 || seen + page.length > total) throw new Error("PEER_SESSION_CAUSAL_FENCE_CURSOR_INVALID");
+        for (const candidate of page) {
+          let evidence: MutationEffectEvidence | QueueEffectEvidence;
+          try {
+            evidence = source.kind === "mutation"
+              ? requireMutationEvidenceFromProvenance(this.#database, attemptIdSchema.parse(candidate.resolution_id)).evidence
+              : requireQueueEvidenceFromProvenance(this.#database, queueIdSchema.parse(candidate.resolution_id)).evidence;
+          } catch {
+            throw new PeerSessionRefusalError("PEER_SESSION_ACTOR_TURN_REFUSED");
+          }
+          if ((source.kind === "queue" && candidate.queue_actor === null)
+            || peerCausalFenceRefusesTurn(candidate, evidence, actor.providerThreadId, turnId)) {
+            throw new PeerSessionRefusalError("PEER_SESSION_ACTOR_TURN_REFUSED");
+          }
+          if (candidate.resolution_id <= after) throw new Error("PEER_SESSION_CAUSAL_FENCE_CURSOR_INVALID");
+          after = candidate.resolution_id;
+          seen += 1;
+        }
+      }
+    }
+  }
+
+  #assertPeerSessionActionAuthority(
+    action: PeerSessionActionRecord,
+    phase: "admission_replay" | "direct_begin" | "queued_begin",
+  ): void {
+    const target = this.#requireLivePeerSession(
+      action.targetSessionId,
+      "PEER_SESSION_TARGET_STATE_REFUSED",
+    );
+    const targetPolicy = this.requirePeerSessionPolicy(action.targetSessionId);
+    if (target.projectId !== action.projectId) {
+      throw new PeerSessionRefusalError("PEER_SESSION_PROJECT_REFUSED");
+    }
+    if (
+      targetPolicy.mode !== "coordinate"
+      || targetPolicy.revision !== action.targetPolicyRevision
+    ) throw new PeerSessionRefusalError("PEER_SESSION_POLICY_REVISION_CONFLICT");
+    const actor = this.#requirePeerSession(
+      action.actorSessionId,
+      "PEER_SESSION_ACTOR_TURN_REFUSED",
+    );
+    const actorPolicy = this.requirePeerSessionPolicy(action.actorSessionId);
+    if (actor.projectId !== action.projectId) {
+      throw new PeerSessionRefusalError("PEER_SESSION_PROJECT_REFUSED");
+    }
+    if (
+      actorPolicy.mode !== "coordinate"
+      || actorPolicy.revision !== action.actorPolicyRevision
+    ) throw new PeerSessionRefusalError("PEER_SESSION_POLICY_REVISION_CONFLICT");
+    if (phase === "queued_begin") {
+      if (target.state !== "idle") {
+        throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+      }
+      return;
+    }
+    // Queued delivery retains its original peer policy contract even after
+    // the actor turn/process ends. Direct execution still needs its live tuple.
+    this.assertProviderAccountAuthorityCurrent(
+      baseProviderAccountAuthority(this.requireSessionProviderAuthority(actor.id)),
+    );
+    if (
+      actor.state !== "active"
+      || actor.activeTurnId === undefined
+      || digestPeerTurnId(actor.activeTurnId) !== action.actorTurnDigest
+    ) throw new PeerSessionRefusalError("PEER_SESSION_ACTOR_TURN_REFUSED");
+    if (phase === "direct_begin") this.#assertPeerSessionTurnCausalCompleteness(actor, actor.activeTurnId);
+    if (target.revision !== action.targetExpectedRevision) {
+      throw new PeerSessionRefusalError("PEER_SESSION_REVISION_CONFLICT");
+    }
+    const targetStateAllowed = action.delivery === "send"
+      ? target.state === "idle"
+      : action.delivery === "steer"
+        ? target.state === "active" && target.activeTurnId !== undefined
+        : target.state !== "terminal" && target.state !== "recovery_required";
+    if (!targetStateAllowed) {
+      throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+    }
+    if (phase === "direct_begin" && action.delivery === "steer" && target.activeTurnId !== undefined) {
+      this.#assertPeerSessionTurnOriginCapacity(target.id, target.activeTurnId);
+    }
+  }
+
+  #prunePeerSessionActionHistory(projectId: ProjectId, now: number): number {
+    const retained = z.object({ total: z.number().int().nonnegative() }).strict().parse(
+      this.#database.query(
+        "SELECT COUNT(*) AS total FROM peer_session_actions WHERE project_id=?",
+      ).get(projectId),
+    );
+    if (retained.total > PEER_SESSION_RETAINED_ACTION_LIMIT) {
+      throw new PeerSessionRefusalError("PEER_SESSION_RETENTION_LIMIT_REFUSED");
+    }
+
+    const cutoff = Math.max(0, now - PEER_SESSION_ACTION_RETAIN_AGE_MS);
+    this.#database.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS hra_peer_prune_protected (
+        id TEXT PRIMARY KEY
+      ) STRICT;
+      CREATE TEMP TABLE IF NOT EXISTS hra_peer_prune_candidates (
+        id TEXT PRIMARY KEY
+      ) STRICT;
+      DELETE FROM hra_peer_prune_protected;
+      DELETE FROM hra_peer_prune_candidates;
+    `);
+
+    this.#database.query(
+      `INSERT OR IGNORE INTO hra_peer_prune_protected(id)
+       SELECT action.id
+       FROM peer_session_actions action
+       WHERE action.project_id=? AND (
+         action.updated_at>=?
+         OR action.state IN ('prepared','queued','effect_started','ambiguous')
+         OR EXISTS (
+           SELECT 1
+           FROM mutation_attempts mutation
+           LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=mutation.id
+           WHERE mutation.idempotency_key=action.idempotency_key
+             AND (
+               mutation.state IN ('prepared','effect_started')
+               OR (mutation.state='ambiguous' AND resolution.attempt_id IS NULL)
+             )
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM queue_entries queue
+           LEFT JOIN queue_effect_resolutions resolution ON resolution.queue_id=queue.id
+           WHERE queue.peer_action_id=action.id
+             AND (
+               queue.state IN ('pending','dispatching')
+               OR (queue.state='ambiguous' AND resolution.queue_id IS NULL)
+             )
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM sessions session
+           WHERE session.id IN (action.actor_session_id,action.target_session_id)
+             AND session.state='recovery_required'
+         )
+       )`,
+    ).run(projectId, cutoff);
+
+    const activeRows = this.#database.query(
+      `SELECT action.id,action.actor_turn_digest,actor.active_turn_id AS actor_active_turn_id,
+              action.target_turn_digest,target.active_turn_id AS target_active_turn_id
+       FROM peer_session_actions action
+       JOIN sessions actor ON actor.id=action.actor_session_id
+       JOIN sessions target ON target.id=action.target_session_id
+       WHERE action.project_id=?
+         AND (
+           (actor.state='active' AND actor.active_turn_id IS NOT NULL)
+           OR (target.state='active' AND target.active_turn_id IS NOT NULL)
+         )
+       ORDER BY action.id
+       LIMIT ?`,
+    ).all(projectId, PEER_SESSION_RETAINED_ACTION_LIMIT + 1).map((value) => z.object({
+      id: peerActionIdSchema,
+      actor_turn_digest: sha256Schema,
+      actor_active_turn_id: z.string().min(1).max(200).nullable(),
+      target_turn_digest: sha256Schema.nullable(),
+      target_active_turn_id: z.string().min(1).max(200).nullable(),
+    }).strict().parse(value));
+    if (activeRows.length > PEER_SESSION_RETAINED_ACTION_LIMIT) {
+      throw new PeerSessionRefusalError("PEER_SESSION_RETENTION_LIMIT_REFUSED");
+    }
+    const protect = this.#database.query(
+      "INSERT OR IGNORE INTO hra_peer_prune_protected(id) VALUES (?)",
+    );
+    for (const row of activeRows) {
+      const actorTurnActive = row.actor_active_turn_id !== null
+        && digestPeerTurnId(row.actor_active_turn_id) === row.actor_turn_digest;
+      const targetTurnActive = row.target_active_turn_id !== null
+        && row.target_turn_digest !== null
+        && digestPeerTurnId(row.target_active_turn_id) === row.target_turn_digest;
+      if (actorTurnActive || targetTurnActive) protect.run(row.id);
+    }
+
+    let converged = false;
+    for (let depth = 0; depth <= PEER_SESSION_HOP_LIMIT; depth += 1) {
+      const parents = this.#database.query(
+        `INSERT OR IGNORE INTO hra_peer_prune_protected(id)
+         SELECT relation.parent_action_id
+         FROM peer_session_action_parents relation
+         JOIN hra_peer_prune_protected protected ON protected.id=relation.action_id
+         JOIN peer_session_actions parent ON parent.id=relation.parent_action_id
+         WHERE parent.project_id=?`,
+      ).run(projectId);
+      const roots = this.#database.query(
+        `INSERT OR IGNORE INTO hra_peer_prune_protected(id)
+         SELECT relation.root_action_id
+         FROM peer_session_action_roots relation
+         JOIN hra_peer_prune_protected protected ON protected.id=relation.action_id
+         JOIN peer_session_actions root ON root.id=relation.root_action_id
+         WHERE root.project_id=?`,
+      ).run(projectId);
+      if (parents.changes === 0 && roots.changes === 0) {
+        converged = true;
+        break;
+      }
+    }
+    if (!converged) {
+      const missingAncestor = this.#database.query(
+        `SELECT 1
+         FROM hra_peer_prune_protected protected
+         LEFT JOIN peer_session_action_parents parent ON parent.action_id=protected.id
+         LEFT JOIN hra_peer_prune_protected protected_parent
+           ON protected_parent.id=parent.parent_action_id
+         LEFT JOIN peer_session_action_roots root ON root.action_id=protected.id
+         LEFT JOIN hra_peer_prune_protected protected_root
+           ON protected_root.id=root.root_action_id
+         WHERE (parent.parent_action_id IS NOT NULL AND protected_parent.id IS NULL)
+            OR (root.root_action_id IS NOT NULL AND protected_root.id IS NULL)
+         LIMIT 1`,
+      ).get();
+      if (missingAncestor !== null) throw new Error("PEER_SESSION_CAUSAL_AUTHORITY_INVALID");
+    }
+
+    this.#database.query(
+      `INSERT INTO hra_peer_prune_candidates(id)
+       SELECT action.id
+       FROM peer_session_actions action
+       LEFT JOIN hra_peer_prune_protected protected ON protected.id=action.id
+       WHERE action.project_id=?
+         AND action.state IN ('applied','failed','cancelled')
+         AND action.updated_at<?
+         AND protected.id IS NULL`,
+    ).run(projectId, cutoff);
+    const candidates = z.object({ total: z.number().int().nonnegative() }).strict().parse(
+      this.#database.query("SELECT COUNT(*) AS total FROM hra_peer_prune_candidates").get(),
+    );
+    if (candidates.total === 0) {
+      this.#database.exec("DELETE FROM hra_peer_prune_protected;");
+      this.#prunePeerSessionDirectMessageSources(projectId);
+      return 0;
+    }
+
+    const retainedDependency = this.#database.query(
+      `SELECT 1
+       FROM peer_session_action_parents relation
+       JOIN hra_peer_prune_candidates parent ON parent.id=relation.parent_action_id
+       LEFT JOIN hra_peer_prune_candidates child ON child.id=relation.action_id
+       WHERE child.id IS NULL
+       UNION ALL
+       SELECT 1
+       FROM peer_session_action_roots relation
+       JOIN hra_peer_prune_candidates root ON root.id=relation.root_action_id
+       LEFT JOIN hra_peer_prune_candidates child ON child.id=relation.action_id
+       WHERE child.id IS NULL
+       LIMIT 1`,
+    ).get();
+    if (retainedDependency !== null) throw new Error("PEER_SESSION_CAUSAL_AUTHORITY_INVALID");
+
+    const ineligibleQueue = this.#database.query(
+      `SELECT 1
+       FROM queue_entries queue
+       JOIN hra_peer_prune_candidates candidate ON candidate.id=queue.peer_action_id
+       LEFT JOIN queue_effect_resolutions resolution ON resolution.queue_id=queue.id
+       WHERE queue.message_actor!='peer_session'
+          OR NOT (
+            queue.state IN ('applied','failed','cancelled')
+            OR (queue.state='ambiguous' AND resolution.queue_id IS NOT NULL)
+          )
+       LIMIT 1`,
+    ).get();
+    if (ineligibleQueue !== null) throw new Error("PEER_SESSION_CAUSAL_AUTHORITY_INVALID");
+
+    this.#database.query(
+      `UPDATE queue_entries
+       SET peer_action_id=NULL
+       WHERE peer_action_id IN (SELECT id FROM hra_peer_prune_candidates)`,
+    ).run();
+    this.#database.query(
+      `DELETE FROM peer_session_action_parents
+       WHERE action_id IN (SELECT id FROM hra_peer_prune_candidates)`,
+    ).run();
+    this.#database.query(
+      `DELETE FROM peer_session_action_visits
+       WHERE action_id IN (SELECT id FROM hra_peer_prune_candidates)`,
+    ).run();
+    this.#database.query(
+      `DELETE FROM peer_session_action_roots
+       WHERE action_id IN (SELECT id FROM hra_peer_prune_candidates)`,
+    ).run();
+    this.#database.query(
+      `DELETE FROM peer_session_turn_origins
+       WHERE action_id IN (SELECT id FROM hra_peer_prune_candidates)`,
+    ).run();
+    const deleted = this.#database.query(
+      `DELETE FROM peer_session_actions
+       WHERE id IN (SELECT id FROM hra_peer_prune_candidates)`,
+    ).run();
+    if (deleted.changes !== candidates.total) {
+      throw new Error("PEER_SESSION_CAUSAL_AUTHORITY_INVALID");
+    }
+    this.#database.exec(`
+      DELETE FROM hra_peer_prune_candidates;
+      DELETE FROM hra_peer_prune_protected;
+    `);
+    this.#prunePeerSessionDirectMessageSources(projectId);
+    return deleted.changes;
+  }
+
+  #prunePeerSessionDirectMessageSources(projectId: ProjectId): number {
+    const cancelledSources = z.object({ idempotency_key: z.string().uuid() }).strict().array().parse(
+      this.#database.query(`SELECT source.idempotency_key FROM peer_session_direct_message_sources source
+        JOIN mutation_attempts mutation ON mutation.idempotency_key=source.idempotency_key
+        WHERE source.project_id=? AND mutation.kind=? ORDER BY source.idempotency_key LIMIT ?`)
+        .all(projectId, PEER_SESSION_CANCELLATION_KIND, PEER_SESSION_DIRECT_MESSAGE_SOURCE_LIMIT + 1),
+    );
+    if (cancelledSources.length > PEER_SESSION_DIRECT_MESSAGE_SOURCE_LIMIT) {
+      throw new PeerSessionRefusalError("PEER_SESSION_RETENTION_LIMIT_REFUSED");
+    }
+    const cancelledKeys = cancelledSources.map(({ idempotency_key }) => {
+      if (readPeerSessionCancellation(this.#database, idempotency_key) === null) {
+        throw new PeerSessionRefusalError("PEER_SESSION_CANCELLATION_UNPROVEN");
+      }
+      return idempotency_key;
+    });
+    const rows = this.#database.query(
+      `SELECT source.idempotency_key,mutation.id AS attempt_id,mutation.kind,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM session_message_event_sources event_source
+                WHERE event_source.source_id=mutation.id
+                  AND event_source.session_id=source.target_session_id
+                  AND event_source.actor='peer_session'
+              ) OR mutation.state IN ('failed','cancelled')
+                OR resolution.resolution_kind='abandoned'
+              THEN 1 ELSE 0 END AS independent_cleanup,
+              json_extract(proof.projection_json,'$.messageActor') AS projected_actor
+       FROM peer_session_direct_message_sources source
+       JOIN mutation_attempts mutation
+         ON mutation.idempotency_key=source.idempotency_key
+           AND mutation.authority_id=source.target_session_id
+           AND mutation.kind=('session.' || source.delivery)
+       LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=mutation.id
+       LEFT JOIN mutation_effect_evidence_provenance proof ON proof.attempt_id=mutation.id
+       WHERE source.project_id=?
+       ORDER BY source.idempotency_key LIMIT ?`,
+    ).all(projectId, PEER_SESSION_DIRECT_MESSAGE_SOURCE_LIMIT + 1);
+    if (rows.length > PEER_SESSION_DIRECT_MESSAGE_SOURCE_LIMIT) {
+      throw new PeerSessionRefusalError("PEER_SESSION_RETENTION_LIMIT_REFUSED");
+    }
+    const keys: string[] = [...cancelledKeys];
+    for (const raw of rows) {
+      const row = z.object({
+        idempotency_key: z.string().uuid(),
+        attempt_id: attemptIdSchema,
+        kind: z.enum(["session.send", "session.steer"]),
+        independent_cleanup: z.number().int().min(0).max(1),
+        projected_actor: sessionMessageActorSchema.nullable(),
+      }).strict().parse(raw);
+      if (row.independent_cleanup === 1) {
+        keys.push(row.idempotency_key);
+        continue;
+      }
+      // Opaque historical evidence cannot replace the retained causal source.
+      // An independently retained event or terminal disposition still can.
+      if (row.projected_actor !== "peer_session") continue;
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, row.attempt_id).evidence;
+      if (evidence.kind === row.kind
+        && evidence.messageActor === "peer_session") keys.push(row.idempotency_key);
+    }
+    let deleted = 0;
+    for (const key of keys) {
+      deleted += this.#database.query(
+        `DELETE FROM peer_session_direct_message_sources
+         WHERE project_id=? AND idempotency_key=?`,
+      ).run(projectId, key).changes;
+    }
+    return deleted;
+  }
+
+  #mapPeerSessionDirectMessageSource(
+    value: unknown,
+  ): PeerSessionDirectMessageSourceRecord {
+    const row = peerSessionDirectMessageSourceRowSchema.parse(value);
+    return {
+      actionId: row.action_id,
+      idempotencyKey: row.idempotency_key,
+      actorSessionId: row.actor_session_id,
+      actorTurnDigest: row.actor_turn_digest,
+      projectId: row.project_id,
+      targetSessionId: row.target_session_id,
+      targetExpectedRevision: row.target_expected_revision,
+      delivery: row.delivery,
+      requestDigest: row.request_digest,
+      messageDigest: row.message_digest,
+      reasonDigest: row.reason_digest,
+      createdAt: row.created_at,
+    };
+  }
+
+  #mapPeerSessionAction(value: unknown): PeerSessionActionRecord {
+    const row = peerSessionActionRowSchema.parse(value);
+    const readIds = (table: "peer_session_action_parents" | "peer_session_action_visits" | "peer_session_action_roots", column: "parent_action_id" | "session_id" | "root_action_id") =>
+      this.#database.query(
+        `SELECT ${column} AS id FROM ${table} WHERE action_id=? ORDER BY ${column} LIMIT ?`,
+      ).all(
+        row.id,
+        table === "peer_session_action_parents"
+          ? PEER_SESSION_PARENT_FAN_IN_LIMIT + 1
+          : table === "peer_session_action_visits"
+            ? PEER_SESSION_CAUSAL_VISIT_LIMIT + 1
+            : PEER_SESSION_CAUSAL_ROOT_LIMIT + 1,
+      ).map((entry) => z.object({ id: z.string() }).strict().parse(entry).id);
+    const parentActionIds = readIds(
+      "peer_session_action_parents",
+      "parent_action_id",
+    ).map((id) => peerActionIdSchema.parse(id));
+    const visitedSessionIds = readIds(
+      "peer_session_action_visits",
+      "session_id",
+    ).map((id) => sessionIdSchema.parse(id));
+    const rootActionIds = readIds(
+      "peer_session_action_roots",
+      "root_action_id",
+    ).map((id) => peerActionIdSchema.parse(id));
+    if (
+      parentActionIds.length > PEER_SESSION_PARENT_FAN_IN_LIMIT
+      || visitedSessionIds.length > PEER_SESSION_CAUSAL_VISIT_LIMIT
+      || rootActionIds.length > PEER_SESSION_CAUSAL_ROOT_LIMIT
+      || !visitedSessionIds.includes(row.actor_session_id)
+      || !visitedSessionIds.includes(row.target_session_id)
+      || rootActionIds.length === 0
+      || (parentActionIds.length === 0
+        && (rootActionIds.length !== 1 || rootActionIds[0] !== row.id || row.hop !== 1))
+    ) throw new Error("PEER_SESSION_CAUSAL_AUTHORITY_INVALID");
+    if (parentActionIds.length > 0) {
+      const parentRows = this.#database.query(
+        `SELECT id,hop,project_id FROM peer_session_actions
+         WHERE id IN (${parentActionIds.map(() => "?").join(",")}) ORDER BY id`,
+      ).all(...parentActionIds).map((entry) => z.object({
+        id: peerActionIdSchema,
+        hop: z.number().int().min(1).max(PEER_SESSION_HOP_LIMIT),
+        project_id: projectIdSchema,
+      }).strict().parse(entry));
+      if (
+        parentRows.length !== parentActionIds.length
+        || parentRows.some((parent) => parent.project_id !== row.project_id)
+        || row.hop !== Math.max(...parentRows.map((parent) => parent.hop)) + 1
+      ) throw new Error("PEER_SESSION_CAUSAL_AUTHORITY_INVALID");
+    }
+    const rootRows = this.#database.query(
+      `SELECT id,hop,project_id FROM peer_session_actions
+       WHERE id IN (${rootActionIds.map(() => "?").join(",")}) ORDER BY id`,
+    ).all(...rootActionIds).map((entry) => z.object({
+      id: peerActionIdSchema,
+      hop: z.literal(1),
+      project_id: projectIdSchema,
+    }).strict().parse(entry));
+    if (
+      rootRows.length !== rootActionIds.length
+      || rootRows.some((root) => root.project_id !== row.project_id)
+    ) throw new Error("PEER_SESSION_CAUSAL_AUTHORITY_INVALID");
+    return {
+      id: row.id,
+      idempotencyKey: row.idempotency_key,
+      actorSessionId: row.actor_session_id,
+      actorTurnDigest: row.actor_turn_digest,
+      projectId: row.project_id,
+      actorPolicyRevision: row.actor_policy_revision,
+      targetSessionId: row.target_session_id,
+      targetExpectedRevision: row.target_expected_revision,
+      targetPolicyRevision: row.target_policy_revision,
+      delivery: row.delivery,
+      requestDigest: row.request_digest,
+      messageDigest: row.message_digest,
+      reasonDigest: row.reason_digest,
+      state: row.state,
+      hop: row.hop,
+      ...(row.target_turn_digest === null ? {} : { targetTurnDigest: row.target_turn_digest }),
+      ...(row.result_digest === null ? {} : { resultDigest: row.result_digest }),
+      parentActionIds,
+      visitedSessionIds,
+      rootActionIds,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  requirePeerSessionAction(actionId: PeerActionId): PeerSessionActionRecord {
+    const parsedActionId = peerActionIdSchema.parse(actionId);
+    const row = this.#database.query("SELECT * FROM peer_session_actions WHERE id=?")
+      .get(parsedActionId);
+    if (row === null) throw new PeerSessionRefusalError("PEER_SESSION_NOT_FOUND");
+    return this.#mapPeerSessionAction(row);
+  }
+
+  readPeerSessionActionByIdempotencyKey(idempotencyKey: string): PeerSessionActionRecord | null {
+    const parsedKey = z.string().uuid().parse(idempotencyKey);
+    const row = this.#database.query("SELECT * FROM peer_session_actions WHERE idempotency_key=?")
+      .get(parsedKey);
+    return row === null ? null : this.#mapPeerSessionAction(row);
+  }
+
+  readPeerSessionDirectMessageSource(
+    idempotencyKey: string,
+  ): PeerSessionDirectMessageSourceRecord | null {
+    const parsedKey = z.string().uuid().parse(idempotencyKey);
+    const row = this.#database.query(
+      "SELECT * FROM peer_session_direct_message_sources WHERE idempotency_key=?",
+    ).get(parsedKey);
+    return row === null ? null : this.#mapPeerSessionDirectMessageSource(row);
+  }
+
+  listUnsettledPeerSessionActions(limit: number): readonly PeerSessionActionRecord[] {
+    return this.listUnsettledPeerSessionActionsPage({ limit }).records;
+  }
+
+  listUnsettledPeerSessionActionsPage(input: Readonly<{
+    limit: number;
+    after?: ControlPlaneReconciliationCursor;
+  }>): ControlPlaneReconciliationPage<PeerSessionActionRecord> {
+    const boundedLimit = z.number().int().min(1).max(CONTROL_PLANE_RECONCILIATION_BATCH_LIMIT)
+      .parse(input.limit);
+    const after = input.after === undefined
+      ? undefined
+      : z.object({
+          createdAt: unixMillisecondsSchema,
+          id: peerActionIdSchema,
+        }).strict().parse(input.after);
+    const records = (after === undefined
+      ? this.#database.query(
+          `SELECT * FROM peer_session_actions
+           WHERE state IN ('prepared','queued','effect_started','ambiguous')
+           ORDER BY created_at,id LIMIT ?`,
+        ).all(boundedLimit)
+      : this.#database.query(
+          `SELECT * FROM peer_session_actions
+           WHERE state IN ('prepared','queued','effect_started','ambiguous')
+             AND (created_at>? OR (created_at=? AND id>?))
+           ORDER BY created_at,id LIMIT ?`,
+        ).all(after.createdAt, after.createdAt, after.id, boundedLimit))
+      .map((row) => this.#mapPeerSessionAction(row));
+    const last = records.at(-1);
+    return {
+      records,
+      ...(last === undefined || records.length < boundedLimit
+        ? {}
+        : { nextCursor: { createdAt: last.createdAt, id: last.id } }),
+    };
+  }
+
+  readPeerSessionMutationJoin(idempotencyKey: string): Readonly<{
+    action: PeerSessionActionRecord | null;
+    attempt: MutationAttemptRecord;
+  }> | null {
+    const key = z.string().uuid().parse(idempotencyKey);
+    const action = this.readPeerSessionActionByIdempotencyKey(key);
+    const attempt = this.readMutation(key);
+    if (action === null && attempt === null) return null;
+    if (attempt?.kind === PEER_SESSION_CANCELLATION_KIND) {
+      if (readPeerSessionCancellation(this.#database, key) === null) {
+        throw new PeerSessionRefusalError("PEER_SESSION_CANCELLATION_UNPROVEN");
+      }
+      return { action, attempt };
+    }
+    if (action === null && attempt !== null) {
+      const retainedPeerSource = (
+        (attempt.kind === "session.send" || attempt.kind === "session.steer")
+        && (
+          (attempt.evidence?.evidence.kind === attempt.kind
+            && attempt.evidence.evidence.messageActor === "peer_session")
+          || this.#database.query(
+            `SELECT 1 FROM peer_session_direct_message_sources source
+             WHERE source.idempotency_key=?
+               AND source.target_session_id=?
+               AND ?=('session.' || source.delivery) LIMIT 1`,
+          ).get(
+            attempt.idempotencyKey,
+            attempt.authorityId,
+            attempt.kind,
+          ) !== null
+          || this.#database.query(
+            `SELECT 1 FROM session_message_event_sources source
+             WHERE source.source_id=? AND source.session_id=?
+               AND source.actor='peer_session' LIMIT 1`,
+          ).get(attempt.id, attempt.authorityId) !== null
+        )
+      );
+      if (retainedPeerSource) return { action: null, attempt };
+    }
+    if (action === null || attempt === null) {
+      throw new Error("PEER_SESSION_MUTATION_JOIN_INCOMPLETE");
+    }
+    if (
+      action.delivery === "queue"
+      || attempt.authorityId !== action.targetSessionId
+      || attempt.idempotencyKey !== action.idempotencyKey
+      || attempt.kind !== `session.${action.delivery}`
+    ) throw new Error("PEER_SESSION_MUTATION_JOIN_INVALID");
+    const joinedEvidence = attempt.evidence?.evidence;
+    if (joinedEvidence === undefined) {
+      if (action.state === "cancelled" && attempt.state === "cancelled") {
+        return { action, attempt };
+      }
+      const source = this.readPeerSessionDirectMessageSource(key);
+      if (
+        source === null
+        || source.actionId !== action.id
+        || source.targetSessionId !== action.targetSessionId
+        || source.delivery !== action.delivery
+        || source.messageDigest !== action.messageDigest
+        || ["effect_started", "ambiguous", "applied", "reconciled"].includes(attempt.state)
+      ) throw new Error("PEER_SESSION_MUTATION_JOIN_INVALID");
+    } else if (
+      (joinedEvidence.kind !== "session.send" && joinedEvidence.kind !== "session.steer")
+      || joinedEvidence.kind !== attempt.kind
+      || joinedEvidence.messageActor !== "peer_session"
+      || joinedEvidence.messageDigest !== action.messageDigest
+    ) throw new Error("PEER_SESSION_MUTATION_JOIN_INVALID");
+    return { action, attempt };
+  }
+
+  #isWorkSessionMessageSource(input: Readonly<{
+    idempotencyKey: string;
+    sessionId: SessionId;
+    kind: "session.send" | "session.steer";
+    profileGeneration?: number;
+  }>): boolean {
+    const rows = this.#database.query(
+      `SELECT instruction_json,instruction_digest,work_id,subject_id,effect_kind
+       FROM work_prepared_effects
+       WHERE json_extract(instruction_json,'$.nestedMutationKey')=? LIMIT 2`,
+    ).all(input.idempotencyKey);
+    if (rows.length === 0) return false;
+    if (rows.length !== 1) throw new Error("SESSION_MESSAGE_ACTOR_AMBIGUOUS");
+    const row = z.object({
+      instruction_json: z.string(),
+      instruction_digest: sha256Schema,
+      work_id: z.string(),
+      subject_id: z.string(),
+      effect_kind: z.enum(["attempt_dispatch", "signal_send"]),
+    }).strict().parse(rows[0]);
+    const effect = workPreparedEffectSchema.parse(JSON.parse(row.instruction_json) as unknown);
+    if (
+      createHash("sha256").update(row.instruction_json).digest("hex") !== row.instruction_digest
+      || effect.workId !== row.work_id
+      || (effect.kind === "dispatch" ? effect.attemptId : effect.signalId) !== row.subject_id
+      || (effect.kind === "dispatch" ? "attempt_dispatch" : "signal_send") !== row.effect_kind
+      || effect.nestedMutationKey !== input.idempotencyKey
+      || effect.targetSessionId !== input.sessionId
+      || (effect.kind === "dispatch" ? input.kind !== "session.send"
+        : effect.mode !== "steer" || input.kind !== "session.steer")
+      || (input.profileGeneration !== undefined && effect.accountGeneration !== input.profileGeneration)
+    ) throw new Error("SESSION_WORK_MESSAGE_AUTHORITY_INVALID");
+    return true;
+  }
+
+  sessionMessageActorForSource(
+    sessionId: SessionId,
+    sourceId: string,
+  ): SessionMessageActor | null {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const parsedSourceId = z.string().min(1).max(200).safeParse(sourceId);
+    if (!parsedSourceId.success) return null;
+    const retained = z.object({ actor: sessionMessageActorSchema }).strict().nullable().parse(
+      this.#database.query(
+        `SELECT actor FROM session_message_event_sources
+         WHERE session_id=? AND source_id=?`,
+      ).get(parsedSessionId, parsedSourceId.data),
+    );
+    if (retained !== null) return retained.actor;
+    if (queueIdSchema.safeParse(parsedSourceId.data).success) {
+      const queued = z.object({ message_actor: z.enum(["human", "peer_session"]) })
+        .strict().nullable().parse(this.#database.query(
+          `SELECT message_actor FROM queue_entries WHERE id=? AND session_id=?`,
+        ).get(parsedSourceId.data, parsedSessionId));
+      return queued === null ? null : this.queueMessageActor(queueIdSchema.parse(parsedSourceId.data));
+    }
+    if (!attemptIdSchema.safeParse(parsedSourceId.data).success) return null;
+    const mutation = z.object({
+      evidence_attempt_id: attemptIdSchema.nullable(),
+      idempotency_key: z.string(),
+      kind: z.string(),
+    }).strict().nullable().parse(this.#database.query(
+      `SELECT mutation.idempotency_key,mutation.kind,evidence.attempt_id AS evidence_attempt_id
+       FROM mutation_attempts mutation
+       LEFT JOIN mutation_effect_evidence evidence ON evidence.attempt_id=mutation.id
+       WHERE mutation.id=? AND mutation.authority_id=?`,
+    ).get(parsedSourceId.data, parsedSessionId));
+    if (
+      mutation === null
+      || (mutation.kind !== "session.send" && mutation.kind !== "session.steer")
+    ) return null;
+    if (mutation.evidence_attempt_id !== null) {
+      const evidence = requireMutationEvidenceFromProvenance(
+        this.#database, mutation.evidence_attempt_id,
+      ).evidence;
+      if (evidence.kind === "session.send" || evidence.kind === "session.steer") {
+        if (evidence.messageActor !== undefined) return evidence.messageActor;
+      }
+    }
+    if (this.isAutorespondMessageSource(parsedSessionId, parsedSourceId.data)) {
+      return "autorespond";
+    }
+    if (this.isPeerSessionMessageSource(parsedSessionId, parsedSourceId.data)) {
+      return "peer_session";
+    }
+    if (this.#isWorkSessionMessageSource({
+      idempotencyKey: mutation.idempotency_key,
+      sessionId: parsedSessionId,
+      kind: mutation.kind,
+    })) return "automation";
+    return "human";
+  }
+
+  isPeerSessionMessageSource(sessionId: SessionId, sourceId: string): boolean {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const parsedSourceId = z.string().min(1).max(200).parse(sourceId);
+    if (queueIdSchema.safeParse(parsedSourceId).success) {
+      return this.#database.query(
+        `SELECT 1 FROM queue_entries q
+         WHERE q.id=? AND q.session_id=? AND q.message_actor='peer_session' LIMIT 1`,
+      ).get(parsedSourceId, parsedSessionId) !== null;
+    }
+    if (attemptIdSchema.safeParse(parsedSourceId).success) {
+      const retained = this.#database.query(
+        `SELECT 1 FROM mutation_attempts attempt
+         WHERE attempt.id=? AND attempt.authority_id=?
+           AND attempt.kind IN ('session.send','session.steer')
+           AND (
+             EXISTS (
+               SELECT 1 FROM session_message_event_sources source
+               WHERE source.source_id=attempt.id
+                 AND source.session_id=? AND source.actor='peer_session'
+             )
+             OR EXISTS (
+               SELECT 1 FROM peer_session_direct_message_sources source
+               WHERE source.idempotency_key=attempt.idempotency_key
+                 AND source.target_session_id=?
+                 AND attempt.kind=('session.' || source.delivery)
+             )
+             OR EXISTS (
+               SELECT 1 FROM peer_session_actions action
+               WHERE action.idempotency_key=attempt.idempotency_key
+                 AND action.target_session_id=?
+                 AND action.delivery IN ('send','steer')
+                 AND attempt.kind=('session.' || action.delivery)
+             )
+           ) LIMIT 1`,
+      ).get(
+        parsedSourceId,
+        parsedSessionId,
+        parsedSessionId,
+        parsedSessionId,
+        parsedSessionId,
+      ) !== null;
+      if (retained) return true;
+      const selected = z.object({
+        attempt_id: attemptIdSchema,
+        kind: z.enum(["session.send", "session.steer"]),
+      }).strict().nullable().parse(this.#database.query(
+        `SELECT attempt.id AS attempt_id,attempt.kind
+         FROM mutation_attempts attempt
+         JOIN mutation_effect_evidence evidence ON evidence.attempt_id=attempt.id
+         WHERE attempt.id=? AND attempt.authority_id=?
+           AND attempt.kind IN ('session.send','session.steer')`,
+      ).get(parsedSourceId, parsedSessionId));
+      if (selected === null) return false;
+      const evidence = requireMutationEvidenceFromProvenance(
+        this.#database, selected.attempt_id,
+      ).evidence;
+      return evidence.kind === selected.kind
+        && evidence.messageActor === "peer_session";
+    }
+    return false;
+  }
+
+  recoverStartedControlPlaneEffects(): Readonly<{
+    peerActionIds: readonly PeerActionId[];
+    memorySubmissionIds: readonly string[];
+  }> {
+    const peerActionIds: PeerActionId[] = [];
+    const memorySubmissionIds: string[] = [];
+    const recover = this.#database.transaction(() => {
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const peers = this.#database.query(
+        `UPDATE peer_session_actions
+         SET state='ambiguous',updated_at=MAX(updated_at,?)
+         WHERE state='effect_started' AND delivery IN ('send','steer')
+         RETURNING id`,
+      ).all(now);
+      for (const row of peers) {
+        peerActionIds.push(z.object({ id: peerActionIdSchema }).strict().parse(row).id);
+      }
+      const submissions = this.#database.query(
+        `UPDATE memory_submissions
+         SET state='ambiguous',updated_at=MAX(updated_at,?)
+         WHERE state='effect_started'
+         RETURNING id`,
+      ).all(now);
+      for (const row of submissions) {
+        memorySubmissionIds.push(z.object({ id: memorySubmissionIdSchema }).strict().parse(row).id);
+      }
+    });
+    recover.immediate();
+    return {
+      peerActionIds: peerActionIds.sort(),
+      memorySubmissionIds: memorySubmissionIds.sort(),
+    };
+  }
+
+  readPeerSessionTurnOrigins(input: Readonly<{
+    sessionId: SessionId;
+    turnId: string;
+  }>): readonly PeerSessionActionRecord[] {
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const turnDigest = digestPeerTurnId(z.string().min(1).max(200).parse(input.turnId));
+    const rows = this.#database.query(
+      `SELECT action.* FROM peer_session_turn_origins origin
+       JOIN peer_session_actions action ON action.id=origin.action_id
+       WHERE origin.session_id=? AND origin.turn_digest=? ORDER BY action.id LIMIT ?`,
+    ).all(
+      sessionId,
+      turnDigest,
+      PEER_SESSION_TURN_ORIGIN_LIMIT + 1,
+    ).map((row) => this.#mapPeerSessionAction(row));
+    if (rows.length > PEER_SESSION_TURN_ORIGIN_LIMIT) {
+      throw new Error("PEER_SESSION_CAUSAL_AUTHORITY_INVALID");
+    }
+    return rows;
+  }
+
+  admitPeerSessionAction(input: Readonly<{
+    actorSessionId: SessionId;
+    actorTurnId: string;
+    targetSessionId: SessionId;
+    expectedTargetRevision: number;
+    delivery: PeerSessionDelivery;
+    requestDigest: string;
+    messageDigest: string;
+    reasonDigest: string;
+    idempotencyKey: string;
+    message?: string;
+  }>): PeerSessionActionAdmission {
+    const actorSessionId = sessionIdSchema.parse(input.actorSessionId);
+    const actorTurnId = z.string().min(1).max(200).parse(input.actorTurnId);
+    const actorTurnDigest = digestPeerTurnId(actorTurnId);
+    const targetSessionId = sessionIdSchema.parse(input.targetSessionId);
+    const expectedTargetRevision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.expectedTargetRevision);
+    const delivery = peerSessionDeliverySchema.parse(input.delivery);
+    const requestDigest = sha256Schema.parse(input.requestDigest);
+    const messageDigest = sha256Schema.parse(input.messageDigest);
+    const reasonDigest = sha256Schema.parse(input.reasonDigest);
+    const idempotencyKey = z.string().uuid().parse(input.idempotencyKey);
+    const message = input.message === undefined
+      ? undefined
+      : z.string().min(1).max(262_144).parse(input.message);
+    if (
+      (delivery === "queue") !== (message !== undefined)
+      || (message !== undefined
+        && createHash("sha256").update(message, "utf8").digest("hex") !== messageDigest)
+    ) throw new TypeError("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
+
+    let actionId: PeerActionId | undefined;
+    let queueId: QueueId | undefined;
+    let replay = false;
+    const admit = this.#database.transaction(() => {
+      const existingRow = this.#database.query(
+        "SELECT * FROM peer_session_actions WHERE idempotency_key=?",
+      ).get(idempotencyKey);
+      if (existingRow !== null) {
+        const existing = this.#mapPeerSessionAction(existingRow);
+        if (
+          existing.actorSessionId !== actorSessionId
+          || existing.actorTurnDigest !== actorTurnDigest
+          || existing.targetSessionId !== targetSessionId
+          || existing.targetExpectedRevision !== expectedTargetRevision
+          || existing.delivery !== delivery
+          || existing.requestDigest !== requestDigest
+          || existing.messageDigest !== messageDigest
+          || existing.reasonDigest !== reasonDigest
+        ) throw new PeerSessionRefusalError("PEER_SESSION_IDEMPOTENCY_CONFLICT");
+        if (["prepared", "queued", "effect_started", "ambiguous"].includes(existing.state)) {
+          this.#assertPeerSessionActionAuthority(existing, "admission_replay");
+        }
+        actionId = existing.id;
+        replay = true;
+        if (delivery === "queue") {
+          const queueRow = z.object({ id: queueIdSchema }).strict().parse(
+            this.#database.query("SELECT id FROM queue_entries WHERE peer_action_id=?")
+              .get(existing.id),
+          );
+          queueId = queueRow.id;
+        }
+        return;
+      }
+      // A compacted direct action deliberately leaves either its direct-source
+      // tombstone or its globally unique nested mutation behind. Never turn a
+      // retention boundary into permission to reuse the old peer key.
+      if (
+        this.#database.query(
+          "SELECT 1 FROM peer_session_direct_message_sources WHERE idempotency_key=?",
+        ).get(idempotencyKey) !== null
+        || this.#database.query(
+          "SELECT 1 FROM mutation_attempts WHERE idempotency_key=?",
+        ).get(idempotencyKey) !== null
+      ) throw new PeerSessionRefusalError("PEER_SESSION_IDEMPOTENCY_CONFLICT");
+      if (actorSessionId === targetSessionId) {
+        throw new PeerSessionRefusalError("PEER_SESSION_SELF_REFUSED");
+      }
+      const actor = this.#requirePeerSession(
+        actorSessionId,
+        "PEER_SESSION_ACTOR_TURN_REFUSED",
+      );
+      const target = this.#requirePeerSession(
+        targetSessionId,
+        "PEER_SESSION_TARGET_STATE_REFUSED",
+      );
+      this.assertProviderAccountAuthorityCurrent(
+        baseProviderAccountAuthority(this.requireSessionProviderAuthority(actor.id)),
+      );
+      const targetAuthority = this.requireSessionProviderAuthority(target.id);
+      this.assertProviderAccountAuthorityCurrent(baseProviderAccountAuthority(targetAuthority));
+      if (
+        actor.projectId === undefined
+        || target.projectId === undefined
+        || actor.projectId !== target.projectId
+      ) throw new PeerSessionRefusalError("PEER_SESSION_PROJECT_REFUSED");
+      const actorPolicy = this.requirePeerSessionPolicy(actorSessionId);
+      const targetPolicy = this.requirePeerSessionPolicy(targetSessionId);
+      if (actorPolicy.mode !== "coordinate" || targetPolicy.mode !== "coordinate") {
+        throw new PeerSessionRefusalError("PEER_SESSION_POLICY_REFUSED");
+      }
+      if (actor.state !== "active" || actor.activeTurnId !== actorTurnId) {
+        throw new PeerSessionRefusalError("PEER_SESSION_ACTOR_TURN_REFUSED");
+      }
+      this.#assertPeerSessionTurnCausalCompleteness(actor, actorTurnId);
+      if (target.revision !== expectedTargetRevision) {
+        throw new PeerSessionRefusalError("PEER_SESSION_REVISION_CONFLICT");
+      }
+      const targetStateAllowed = delivery === "send"
+        ? target.state === "idle"
+        : delivery === "steer"
+          ? target.state === "active" && target.activeTurnId !== undefined
+          : target.state !== "terminal" && target.state !== "recovery_required";
+      if (!targetStateAllowed) {
+        throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+      }
+
+      if (delivery === "steer" && target.activeTurnId !== undefined) {
+        this.#assertPeerSessionTurnOriginCapacity(target.id, target.activeTurnId);
+      }
+
+      const now = unixMillisecondsSchema.parse(this.#now());
+      this.#prunePeerSessionActionHistory(actor.projectId, now);
+      const retained = z.object({ total: z.number().int().nonnegative() }).strict().parse(
+        this.#database.query(
+          "SELECT COUNT(*) AS total FROM peer_session_actions WHERE project_id=?",
+        ).get(actor.projectId),
+      );
+      if (retained.total >= PEER_SESSION_RETAINED_ACTION_LIMIT) {
+        throw new PeerSessionRefusalError("PEER_SESSION_RETENTION_LIMIT_REFUSED");
+      }
+      if (delivery !== "queue") {
+        const retainedSources = z.object({ total: z.number().int().nonnegative() })
+          .strict().parse(this.#database.query(
+            `SELECT COUNT(*) AS total FROM peer_session_direct_message_sources
+             WHERE project_id=?`,
+          ).get(actor.projectId));
+        if (retainedSources.total >= PEER_SESSION_DIRECT_MESSAGE_SOURCE_LIMIT) {
+          throw new PeerSessionRefusalError("PEER_SESSION_RETENTION_LIMIT_REFUSED");
+        }
+      }
+      if (delivery === "queue" && message !== undefined) {
+        const inbound = z.object({
+          bytes: z.number().int().nonnegative(),
+          total: z.number().int().nonnegative(),
+        }).strict().parse(this.#database.query(
+          `SELECT COUNT(*) AS total,
+                  COALESCE(SUM(length(CAST(message AS BLOB))),0) AS bytes
+           FROM queue_entries
+           WHERE session_id=? AND message_actor='peer_session'
+             AND state IN ('pending','dispatching','ambiguous')`,
+        ).get(targetSessionId));
+        if (
+          inbound.total >= PEER_SESSION_INBOUND_QUEUE_COUNT_LIMIT
+          || inbound.bytes + utf8Bytes(message) > PEER_SESSION_INBOUND_QUEUE_BYTES_LIMIT
+        ) throw new PeerSessionRefusalError("PEER_SESSION_INBOUND_QUEUE_LIMIT_REFUSED");
+      }
+
+      const parentRows = this.#database.query(
+        `SELECT action.id,action.hop FROM peer_session_turn_origins origin
+         JOIN peer_session_actions action ON action.id=origin.action_id
+         WHERE origin.session_id=? AND origin.turn_digest=? AND action.project_id=?
+         ORDER BY action.id LIMIT ?`,
+      ).all(
+        actorSessionId,
+        actorTurnDigest,
+        actor.projectId,
+        PEER_SESSION_PARENT_FAN_IN_LIMIT + 1,
+      ).map((row) => z.object({
+        id: peerActionIdSchema,
+        hop: z.number().int().min(1).max(PEER_SESSION_HOP_LIMIT),
+      }).strict().parse(row));
+      if (parentRows.length > PEER_SESSION_PARENT_FAN_IN_LIMIT) {
+        throw new PeerSessionRefusalError("PEER_SESSION_PARENT_LIMIT_REFUSED");
+      }
+      const parentActionIds = parentRows.map((parent) => parent.id);
+      const inheritedVisits = new Set<SessionId>();
+      const rootActionIds = new Set<PeerActionId>();
+      for (const parent of parentRows) {
+        const visits = this.#database.query(
+          "SELECT session_id FROM peer_session_action_visits WHERE action_id=? ORDER BY session_id LIMIT ?",
+        ).all(parent.id, PEER_SESSION_CAUSAL_VISIT_LIMIT + 1);
+        if (visits.length > PEER_SESSION_CAUSAL_VISIT_LIMIT) {
+          throw new PeerSessionRefusalError("PEER_SESSION_CAUSAL_LIMIT_REFUSED");
+        }
+        for (const value of visits) {
+          inheritedVisits.add(z.object({ session_id: sessionIdSchema }).strict().parse(value).session_id);
+          if (inheritedVisits.size > PEER_SESSION_CAUSAL_VISIT_LIMIT) {
+            throw new PeerSessionRefusalError("PEER_SESSION_CAUSAL_LIMIT_REFUSED");
+          }
+        }
+        const roots = this.#database.query(
+          "SELECT root_action_id FROM peer_session_action_roots WHERE action_id=? ORDER BY root_action_id LIMIT ?",
+        ).all(parent.id, PEER_SESSION_CAUSAL_ROOT_LIMIT + 1);
+        if (roots.length > PEER_SESSION_CAUSAL_ROOT_LIMIT) {
+          throw new PeerSessionRefusalError("PEER_SESSION_CAUSAL_LIMIT_REFUSED");
+        }
+        for (const value of roots) {
+          rootActionIds.add(z.object({ root_action_id: peerActionIdSchema }).strict().parse(value).root_action_id);
+          if (rootActionIds.size > PEER_SESSION_CAUSAL_ROOT_LIMIT) {
+            throw new PeerSessionRefusalError("PEER_SESSION_CAUSAL_LIMIT_REFUSED");
+          }
+        }
+      }
+      if (inheritedVisits.has(targetSessionId)) {
+        throw new PeerSessionRefusalError("PEER_SESSION_CYCLE_REFUSED");
+      }
+      const hop = parentRows.length === 0
+        ? 1
+        : Math.max(...parentRows.map((parent) => parent.hop)) + 1;
+      if (hop > PEER_SESSION_HOP_LIMIT) {
+        throw new PeerSessionRefusalError("PEER_SESSION_HOP_LIMIT_REFUSED");
+      }
+
+      const cutoff = Math.max(0, now - PEER_SESSION_RATE_WINDOW_MS);
+      const projectUsage = z.object({ total: z.number().int().nonnegative() }).strict().parse(
+        this.#database.query(
+          "SELECT COUNT(*) AS total FROM peer_session_actions WHERE project_id=? AND created_at>=?",
+        ).get(actor.projectId, cutoff),
+      );
+      if (projectUsage.total >= PEER_SESSION_PROJECT_HOURLY_ACTION_LIMIT) {
+        throw new PeerSessionRefusalError("PEER_SESSION_RATE_LIMIT_REFUSED");
+      }
+      const usage = z.object({ total: z.number().int().nonnegative() }).strict().parse(
+        this.#database.query(
+          "SELECT COUNT(*) AS total FROM peer_session_actions WHERE actor_session_id=? AND created_at>=?",
+        ).get(actorSessionId, cutoff),
+      );
+      if (usage.total >= PEER_SESSION_HOURLY_ACTION_LIMIT) {
+        throw new PeerSessionRefusalError("PEER_SESSION_RATE_LIMIT_REFUSED");
+      }
+      const priorTarget = this.#database.query(
+        `SELECT 1 FROM peer_session_actions
+         WHERE actor_session_id=? AND target_session_id=? AND created_at>=? LIMIT 1`,
+      ).get(actorSessionId, targetSessionId, cutoff);
+      if (priorTarget === null) {
+        const fanout = z.object({ total: z.number().int().nonnegative() }).strict().parse(
+          this.#database.query(
+            `SELECT COUNT(DISTINCT target_session_id) AS total
+             FROM peer_session_actions WHERE actor_session_id=? AND created_at>=?`,
+          ).get(actorSessionId, cutoff),
+        );
+        if (fanout.total >= PEER_SESSION_HOURLY_DISTINCT_TARGET_LIMIT) {
+          throw new PeerSessionRefusalError("PEER_SESSION_FANOUT_LIMIT_REFUSED");
+        }
+      }
+
+      const id = createPeerActionId();
+      actionId = id;
+      const state: PeerSessionActionState = delivery === "queue" ? "queued" : "prepared";
+      this.#database.query(
+        `INSERT INTO peer_session_actions(
+           id,idempotency_key,actor_session_id,actor_turn_digest,project_id,
+           actor_policy_revision,target_session_id,target_expected_revision,
+           target_policy_revision,delivery,request_digest,message_digest,reason_digest,
+           state,hop,target_turn_digest,result_digest,created_at,updated_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        id,
+        idempotencyKey,
+        actorSessionId,
+        actorTurnDigest,
+        actor.projectId,
+        actorPolicy.revision,
+        targetSessionId,
+        expectedTargetRevision,
+        targetPolicy.revision,
+        delivery,
+        requestDigest,
+        messageDigest,
+        reasonDigest,
+        state,
+        hop,
+        null,
+        null,
+        now,
+        now,
+      );
+      if (delivery !== "queue") {
+        this.#database.query(
+          `INSERT INTO peer_session_direct_message_sources(
+             idempotency_key,action_id,actor_session_id,actor_turn_digest,project_id,
+             target_session_id,target_expected_revision,delivery,request_digest,
+             message_digest,reason_digest,created_at
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ).run(
+          idempotencyKey,
+          id,
+          actorSessionId,
+          actorTurnDigest,
+          actor.projectId,
+          targetSessionId,
+          expectedTargetRevision,
+          delivery,
+          requestDigest,
+          messageDigest,
+          reasonDigest,
+          now,
+        );
+      }
+      for (const parentId of parentActionIds) {
+        this.#database.query(
+          "INSERT INTO peer_session_action_parents(action_id,parent_action_id) VALUES (?,?)",
+        ).run(id, parentId);
+      }
+      const visited = new Set<SessionId>(inheritedVisits);
+      visited.add(actorSessionId);
+      visited.add(targetSessionId);
+      if (visited.size > PEER_SESSION_CAUSAL_VISIT_LIMIT) {
+        throw new PeerSessionRefusalError("PEER_SESSION_CAUSAL_LIMIT_REFUSED");
+      }
+      for (const sessionId of [...visited].sort()) {
+        this.#database.query(
+          "INSERT INTO peer_session_action_visits(action_id,session_id) VALUES (?,?)",
+        ).run(id, sessionId);
+      }
+      if (parentRows.length === 0) rootActionIds.add(id);
+      if (rootActionIds.size === 0) throw new Error("PEER_SESSION_CAUSAL_AUTHORITY_INVALID");
+      for (const rootId of [...rootActionIds].sort()) {
+        this.#database.query(
+          "INSERT INTO peer_session_action_roots(action_id,root_action_id) VALUES (?,?)",
+        ).run(id, rootId);
+      }
+      if (delivery === "queue" && message !== undefined) {
+        // The action, causal graph, original key, exact target tuple and empty
+        // attachment seal commit together. Historical peer queues are replayed
+        // above without manufacturing this newer nested receipt.
+        queueId = this.#enqueueIdempotentWithResult({
+          sessionId: targetSessionId,
+          message,
+          actor: "peer_session",
+          profileGeneration: targetAuthority.processGeneration,
+          providerAuthority: baseProviderAccountAuthority(targetAuthority),
+          idempotencyKey,
+          attachments: [],
+          storedAttachments: [],
+        }, id).queued.id;
+      }
+    });
+    admit.immediate();
+    if (actionId === undefined) throw new Error("PEER_SESSION_ADMISSION_LOST");
+    return {
+      action: this.requirePeerSessionAction(actionId),
+      ...(queueId === undefined ? {} : { queue: this.requireQueue(queueId) }),
+      replay,
+    };
+  }
+
+  beginPeerSessionActionEffect(actionId: PeerActionId): PeerSessionActionRecord {
+    const id = peerActionIdSchema.parse(actionId);
+    const begin = this.#database.transaction(() => {
+      const current = this.requirePeerSessionAction(id);
+      if (current.delivery === "queue") {
+        throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+      }
+      this.#assertPeerSessionActionAuthority(current, "direct_begin");
+      if (current.state === "effect_started" || current.state === "ambiguous") {
+        const nested = z.object({
+          authority_id: sessionIdSchema,
+          evidence_attempt_id: attemptIdSchema.nullable(),
+          idempotency_key: z.string().uuid(),
+          kind: z.string(),
+          state: mutationStateSchema,
+        }).strict().nullable().parse(this.#database.query(
+          `SELECT attempt.authority_id,attempt.idempotency_key,attempt.kind,attempt.state,
+                  evidence.attempt_id AS evidence_attempt_id
+           FROM mutation_attempts attempt
+           LEFT JOIN mutation_effect_evidence evidence ON evidence.attempt_id=attempt.id
+           WHERE attempt.idempotency_key=?`,
+        ).get(current.idempotencyKey));
+        if (
+          nested === null
+          || nested.idempotency_key !== current.idempotencyKey
+          || nested.authority_id !== current.targetSessionId
+          || nested.kind !== `session.${current.delivery}`
+          || nested.state !== "prepared"
+          || nested.evidence_attempt_id !== null
+        ) {
+          throw new PeerSessionRefusalError("PEER_SESSION_NESTED_MUTATION_NOT_RESUMABLE");
+        }
+        return;
+      }
+      if (current.state !== "prepared") {
+        throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE peer_session_actions SET state='effect_started',updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='prepared' AND delivery IN ('send','steer')`,
+      ).run(now, id);
+      if (changed.changes !== 1) {
+        throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+      }
+    });
+    begin.immediate();
+    return this.requirePeerSessionAction(id);
+  }
+
+  /**
+   * Cancel a direct peer action only when durable state proves no provider
+   * effect could have started. The peer action and its absent-or-prepared
+   * nested mutation become terminal in one transaction, which makes restart
+   * recovery finite even if target revision or actor-turn authority changed.
+   */
+  cancelUnstartedPeerSessionDirectAction(input: Readonly<{
+    actionId: PeerActionId;
+    diagnosticCode: string;
+  }>): PeerSessionActionRecord {
+    const actionId = peerActionIdSchema.parse(input.actionId);
+    const diagnostic = controlPlaneDiagnosticSchema.parse(input.diagnosticCode);
+    const cancel = this.#database.transaction(() => {
+      const action = this.requirePeerSessionAction(actionId);
+      if (action.delivery === "queue") {
+        throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+      }
+      const result = {
+        code: diagnostic,
+        peerActionId: action.id,
+        providerEffectStarted: false,
+      } as const;
+      const resultJson = JSON.stringify(result);
+      let resultDigest = digestJson(result);
+      const existing = z.object({
+        id: attemptIdSchema,
+        authority_id: sessionIdSchema,
+        authority_generation: z.number().int().nonnegative(),
+        idempotency_key: z.string().uuid(),
+        kind: z.string(),
+        request_digest: sha256Schema,
+        state: mutationStateSchema.exclude(["reconciled"]),
+        result_json: z.string().nullable(),
+        evidence_attempt_id: attemptIdSchema.nullable(),
+        resolution_attempt_id: attemptIdSchema.nullable(),
+      }).strict().nullable().parse(this.#database.query(
+        `SELECT mutation.id,mutation.authority_id,mutation.authority_generation,
+                mutation.idempotency_key,mutation.kind,mutation.request_digest,
+                mutation.state,mutation.result_json,
+                evidence.attempt_id AS evidence_attempt_id,
+                resolution.attempt_id AS resolution_attempt_id
+         FROM mutation_attempts mutation
+         LEFT JOIN mutation_effect_evidence evidence ON evidence.attempt_id=mutation.id
+         LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=mutation.id
+         WHERE mutation.idempotency_key=?`,
+      ).get(action.idempotencyKey));
+      if (action.state === "cancelled") {
+        if (existing?.kind === PEER_SESSION_CANCELLATION_KIND) {
+          const receipt = readPeerSessionCancellation(this.#database, action.idempotencyKey);
+          if (receipt === null || receipt.code !== diagnostic) {
+            throw new PeerSessionRefusalError("PEER_SESSION_CANCELLATION_CONFLICT");
+          }
+          return;
+        }
+        if (
+          action.resultDigest !== resultDigest
+          || existing === null
+          || existing.authority_id !== action.targetSessionId
+          || existing.kind !== `session.${action.delivery}`
+          || existing.state !== "cancelled"
+          || (existing.result_json !== resultJson && existing.result_json !== null)
+          || existing.evidence_attempt_id !== null
+          || existing.resolution_attempt_id !== null
+        ) throw new PeerSessionRefusalError("PEER_SESSION_CANCELLATION_CONFLICT");
+        return;
+      }
+      if (!["prepared", "effect_started", "ambiguous"].includes(action.state)) {
+        throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+      }
+      const source = this.#database.query(
+        `SELECT 1 FROM peer_session_direct_message_sources
+         WHERE action_id=? AND idempotency_key=? AND target_session_id=?
+           AND delivery=? AND request_digest=? AND message_digest=?`,
+      ).get(
+        action.id,
+        action.idempotencyKey,
+        action.targetSessionId,
+        action.delivery,
+        action.requestDigest,
+        action.messageDigest,
+      );
+      if (source === null) {
+        throw new PeerSessionRefusalError("PEER_SESSION_CANCELLATION_UNPROVEN");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      let attemptId: AttemptId;
+      if (existing === null) {
+        attemptId = createAttemptId();
+        const receipt = parsePeerSessionCancellationReceipt({
+          version: 1, peerActionId: action.id, idempotencyKey: action.idempotencyKey,
+          actorSessionId: action.actorSessionId, actorTurnDigest: action.actorTurnDigest,
+          projectId: action.projectId, targetSessionId: action.targetSessionId,
+          targetExpectedRevision: action.targetExpectedRevision, delivery: action.delivery,
+          requestDigest: action.requestDigest, messageDigest: action.messageDigest,
+          reasonDigest: action.reasonDigest, code: diagnostic, providerEffectStarted: false,
+        });
+        insertPeerSessionCancellation(this.#database, { attemptId, receipt, recordedAt: now });
+        resultDigest = digestJson(receipt);
+      } else {
+        if (
+          existing.authority_id !== action.targetSessionId
+          || existing.idempotency_key !== action.idempotencyKey
+          || existing.kind !== `session.${action.delivery}`
+          || existing.state !== "prepared"
+          || existing.result_json !== null
+          || existing.evidence_attempt_id !== null
+          || existing.resolution_attempt_id !== null
+        ) throw new PeerSessionRefusalError("PEER_SESSION_CANCELLATION_UNPROVEN");
+        attemptId = existing.id;
+        // This is an actual retained input, not the absent-input tombstone.
+        // Keep its custody and original kind; NULL is the existing independent
+        // no-effect cancellation preimage, while the peer ledger owns the code.
+        readAttachmentParent(this.#database, attemptId);
+        const mutation = this.#database.query(
+          `UPDATE mutation_attempts SET state='cancelled',result_json=NULL,updated_at=MAX(updated_at,?)
+           WHERE id=? AND state='prepared'`,
+        ).run(now, attemptId);
+        if (mutation.changes !== 1) throw new PeerSessionRefusalError("PEER_SESSION_CANCELLATION_CONFLICT");
+        this.#database.query(`UPDATE mutation_attempts SET transcript_status='abandoned',
+          transcript_intent_json=json_object('version',1,'actor',json_extract(transcript_intent_json,'$.actor'),
+            'hadAttachments',json(CASE WHEN COALESCE(json_array_length(transcript_intent_json,'$.attachments'),0)>0
+              THEN 'true' ELSE 'false' END)) WHERE id=? AND transcript_status='pending'`).run(attemptId);
+        settleAttachmentParent(this.#database, attemptId, now);
+        this.#database.query("DELETE FROM message_attachments WHERE session_id=? AND source_id=?")
+          .run(action.targetSessionId, attemptId);
+      }
+      const peer = this.#database.query(
+        `UPDATE peer_session_actions
+         SET state='cancelled',result_digest=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state=?`,
+      ).run(resultDigest, now, action.id, action.state);
+      if (peer.changes !== 1) {
+        throw new PeerSessionRefusalError("PEER_SESSION_CANCELLATION_CONFLICT");
+      }
+      const removed = this.#database.query(
+        `DELETE FROM peer_session_direct_message_sources
+         WHERE action_id=? AND idempotency_key=?`,
+      ).run(action.id, action.idempotencyKey);
+      if (removed.changes !== 1) {
+        throw new PeerSessionRefusalError("PEER_SESSION_CANCELLATION_CONFLICT");
+      }
+      if (existing === null && readPeerSessionCancellation(this.#database, action.idempotencyKey) === null) {
+        throw new PeerSessionRefusalError("PEER_SESSION_CANCELLATION_UNPROVEN");
+      }
+    });
+    cancel.immediate();
+    return this.requirePeerSessionAction(actionId);
+  }
+
+  settlePeerSessionAction(input: Readonly<{
+    actionId: PeerActionId;
+    expectedState: "effect_started" | "ambiguous";
+    state: "applied" | "failed" | "ambiguous";
+    targetTurnId?: string;
+    resultDigest?: string;
+  }>): PeerSessionActionRecord {
+    const actionId = peerActionIdSchema.parse(input.actionId);
+    const expectedState = z.enum(["effect_started", "ambiguous"]).parse(input.expectedState);
+    const state = z.enum(["applied", "failed", "ambiguous"]).parse(input.state);
+    const targetTurnDigest = input.targetTurnId === undefined
+      ? null
+      : digestPeerTurnId(z.string().min(1).max(200).parse(input.targetTurnId));
+    const requestedResultDigest = input.resultDigest === undefined
+      ? undefined
+      : sha256Schema.parse(input.resultDigest);
+    if ((state === "applied") !== (targetTurnDigest !== null)) {
+      throw new TypeError("PEER_SESSION_TARGET_TURN_MISMATCH");
+    }
+    const settle = this.#database.transaction(() => {
+      const current = this.requirePeerSessionAction(actionId);
+      if (current.delivery === "queue") {
+        throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+      }
+      const resultDigest = requestedResultDigest ?? current.resultDigest ?? null;
+      if (
+        current.state === state
+        && (current.targetTurnDigest ?? null) === targetTurnDigest
+        && (current.resultDigest ?? null) === resultDigest
+      ) return;
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE peer_session_actions
+         SET state=?,target_turn_digest=?,result_digest=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state=?`,
+      ).run(state, targetTurnDigest, resultDigest, now, actionId, expectedState);
+      if (changed.changes !== 1) {
+        throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+      }
+      if (state === "applied" && targetTurnDigest !== null) {
+        this.#database.query(
+          `INSERT INTO peer_session_turn_origins(session_id,turn_digest,action_id)
+           SELECT target_session_id,?,id FROM peer_session_actions WHERE id=?`,
+        ).run(targetTurnDigest, actionId);
+      }
+    });
+    settle.immediate();
+    return this.requirePeerSessionAction(actionId);
+  }
+
+  attachPeerSessionActionToTurn(input: Readonly<{
+    actionId: PeerActionId;
+    targetSessionId: SessionId;
+    turnId: string;
+  }>): PeerSessionActionRecord {
+    const actionId = peerActionIdSchema.parse(input.actionId);
+    const targetSessionId = sessionIdSchema.parse(input.targetSessionId);
+    const turnDigest = digestPeerTurnId(z.string().min(1).max(200).parse(input.turnId));
+    const action = this.requirePeerSessionAction(actionId);
+    if (
+      action.state !== "applied"
+      || action.targetSessionId !== targetSessionId
+      || action.targetTurnDigest !== turnDigest
+    ) throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+    // BEFORE INSERT quota guards also run for INSERT OR IGNORE. Exact replay
+    // already owns this origin and must not consume a thirty-third slot.
+    if (this.#database.query("SELECT 1 FROM peer_session_turn_origins WHERE session_id=? AND turn_digest=? AND action_id=?")
+      .get(targetSessionId, turnDigest, actionId) !== null) return action;
+    this.#database.query(
+      `INSERT OR IGNORE INTO peer_session_turn_origins(session_id,turn_digest,action_id)
+       VALUES (?,?,?)`,
+    ).run(targetSessionId, turnDigest, actionId);
+    return this.requirePeerSessionAction(actionId);
+  }
+
+  #enqueuePrepared(
+    sessionId: SessionId,
+    message: string,
+    attemptId: AttemptId,
+    provenance: Readonly<{
+      messageActor: "human" | "peer_session";
+      peerActionId?: PeerActionId;
+    }> = { messageActor: "human" },
+  ): QueueRecord {
+    assertSupportedProvider(this.requireSession(sessionId).provider);
     const id = createQueueId();
     const now = this.#now();
     const sequenceRow = this.#database.query(
@@ -27509,7 +40059,24 @@ export class StateStore {
     const enqueueSequence = z.object({
       enqueue_sequence: z.number().int().positive().safe(),
     }).strict().parse(sequenceRow).enqueue_sequence;
-    this.#database.query("INSERT INTO queue_entries(id,session_id,message,state,enqueue_sequence,created_at,updated_at,enqueue_identity_format,enqueue_identity_attempt_id) VALUES (?,?,?,?,?,?,?,?,?)").run(id, sessionId, message, "pending", enqueueSequence, now, now, QUEUE_ATTACHMENT_FORMAT, attemptId);
+    this.#database.query(
+      `INSERT INTO queue_entries(
+         id,session_id,message,message_actor,peer_action_id,state,
+         enqueue_sequence,created_at,updated_at,enqueue_identity_format,enqueue_identity_attempt_id
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      id,
+      sessionId,
+      message,
+      provenance.messageActor,
+      provenance.peerActionId ?? null,
+      "pending",
+      enqueueSequence,
+      now,
+      now,
+      QUEUE_ATTACHMENT_FORMAT,
+      attemptId,
+    );
     const providerAuthority = baseProviderAccountAuthority(
       this.requireSessionProviderAuthority(sessionId),
     );
@@ -27522,7 +40089,16 @@ export class StateStore {
       "queue_prepare",
       now,
     );
-    return { id, sessionId, message, state: "pending", createdAt: now, updatedAt: now };
+    return {
+      id,
+      sessionId,
+      message,
+      messageActor: provenance.messageActor,
+      ...(provenance.peerActionId === undefined ? {} : { peerActionId: provenance.peerActionId }),
+      state: "pending",
+      createdAt: now,
+      updatedAt: now,
+    };
   }
 
   enqueue(sessionId: SessionId, message: string): QueueRecord {
@@ -27537,7 +40113,10 @@ export class StateStore {
     message: string;
     idempotencyKey?: string;
     providerAuthority: ProviderAccountAuthority;
-    attachments?: readonly StoredMessageAttachment[];
+    actor?: SessionMessageActor;
+    providerConnectionId?: string | null;
+    attachments?: readonly AttachmentReference[];
+    storedAttachments?: readonly StoredMessageAttachment[];
     attachmentReservation?: AttachmentReservation & AttachmentDaemon;
   }): QueueRecord {
     return this.enqueueIdempotentWithResult(input).queued;
@@ -27548,11 +40127,13 @@ export class StateStore {
     message: string;
     idempotencyKey: string;
     attachments?: readonly AttachmentReference[];
+    actor?: SessionMessageActor;
   }): { queued: QueueRecord; verification: "sealed" | "legacy_unverified" } | null {
     const sessionId = sessionIdSchema.parse(input.sessionId);
     const message = z.string().min(1).max(262_144).parse(input.message);
     const key = z.string().uuid().parse(input.idempotencyKey);
     const references = parseQueueAttachmentReferences(input.attachments ?? []);
+    const actor = input.actor === undefined ? undefined : sessionMessageActorSchema.parse(input.actor);
     return this.#database.transaction(() => {
       const attempt = this.readMutation(key);
       if (attempt === null) return null;
@@ -27560,7 +40141,7 @@ export class StateStore {
         || (attempt.state !== "applied" && attempt.state !== "reconciled")) {
         throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
       }
-      const result = z.object({ queueId: queueIdSchema }).strict().safeParse(attempt.result);
+      const result = z.object({ queueId: queueIdSchema, actor: sessionMessageActorSchema.optional() }).strict().safeParse(attempt.result);
       if (!result.success) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
       const identity = readQueueAttachmentIdentity(this.#database, result.data.queueId);
       if (identity === null && references.length !== 0) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
@@ -27573,6 +40154,10 @@ export class StateStore {
       ))) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
       const queued = this.requireQueue(result.data.queueId);
       if (queued.sessionId !== sessionId) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
+      if (actor !== undefined && (this.queueMessageActor(queued.id) !== actor
+        || (result.data.actor !== undefined && result.data.actor !== actor))) {
+        throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+      }
       return { queued, verification: identity === null ? "legacy_unverified" as const : "sealed" as const };
     })();
   }
@@ -27583,20 +40168,45 @@ export class StateStore {
     message: string;
     idempotencyKey?: string;
     providerAuthority: ProviderAccountAuthority;
-    attachments?: readonly StoredMessageAttachment[];
+    actor?: SessionMessageActor;
+    providerConnectionId?: string | null;
+    attachments?: readonly AttachmentReference[];
+    storedAttachments?: readonly StoredMessageAttachment[];
     attachmentReservation?: AttachmentReservation & AttachmentDaemon;
   }): { queued: QueueRecord; replayed: boolean; verification: "sealed" | "legacy_unverified" } {
+    return this.#enqueueIdempotentWithResult(input);
+  }
+
+  #enqueueIdempotentWithResult(
+    input: Parameters<StateStore["enqueueIdempotentWithResult"]>[0],
+    peerActionId?: PeerActionId,
+  ): { queued: QueueRecord; replayed: boolean; verification: "sealed" | "legacy_unverified" } {
     const parsedSessionId = sessionIdSchema.parse(input.sessionId);
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
     const parsedMessage = z.string().min(1).max(262_144).parse(input.message);
     if (utf8Bytes(parsedMessage) > 262_144) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
-    const attachments = storedMessageAttachmentListSchema.parse(input.attachments ?? []);
-    const references = parseQueueAttachmentReferences(attachments.map(({ digest, name, mediaType, byteLength }) => ({ digest, name, mediaType, byteLength })));
+    const actor = sessionMessageActorSchema.parse(input.actor ?? "human");
+    const providerConnectionId = z.string().uuid().nullable().parse(input.providerConnectionId ?? null);
+    const references = parseQueueAttachmentReferences(input.attachments ?? []);
+    const attachments = storedMessageAttachmentListSchema.parse(input.storedAttachments ?? []);
+    if ((actor === "peer_session") !== (peerActionId !== undefined)) {
+      throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+    }
     if (!parsedMessage.isWellFormed() || references.some((reference) => !reference.name.isWellFormed())) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
     const idempotencyKey = z.string().uuid().parse(input.idempotencyKey ?? randomUUID());
     const providerAuthority = providerAccountAuthoritySchema.parse(input.providerAuthority);
     return this.#database.transaction(() => {
-    const replay = this.readQueueEnqueueReplay({ sessionId: parsedSessionId, message: parsedMessage, idempotencyKey, attachments: references });
+    const replay = this.readQueueEnqueueReplay({ sessionId: parsedSessionId, message: parsedMessage, idempotencyKey, attachments: references, actor });
+    if (peerActionId !== undefined) {
+      const peer = this.requirePeerSessionAction(peerActionId);
+      if (peer.delivery !== "queue" || peer.state !== "queued"
+        || peer.targetSessionId !== parsedSessionId || peer.idempotencyKey !== idempotencyKey
+        || peer.messageDigest !== createHash("sha256").update(parsedMessage, "utf8").digest("hex")
+        || references.length !== 0 || attachments.length !== 0
+        || (replay !== null && replay.queued.peerActionId !== peerActionId)) {
+        throw new PeerSessionRefusalError("PEER_SESSION_IDEMPOTENCY_CONFLICT");
+      }
+    }
     const transfer = (queueId: string): void => {
       if (input.attachmentReservation !== undefined) transferAttachmentQueue(this.#database, input.attachmentReservation, input.attachmentReservation,
         { kind: "session.queue", sessionId: parsedSessionId, idempotencyKey, message: parsedMessage, attachments: references,
@@ -27647,8 +40257,22 @@ export class StateStore {
       if (authority.session_state === "recovery_required" || authority.session_state === "terminal") {
         throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       }
-      const queued = this.#enqueuePrepared(parsedSessionId, parsedMessage, attempt.id);
-      this.#recordMessageAttachments({ sessionId: parsedSessionId, sourceId: queued.id, attachments });
+      const queued = this.#enqueuePrepared(parsedSessionId, parsedMessage, attempt.id,
+        peerActionId === undefined ? { messageActor: "human" } : { messageActor: "peer_session", peerActionId });
+      this.#stageSessionUserMessageIntentInTransaction({
+        sessionId: parsedSessionId,
+        sourceKind: "queue",
+        sourceId: queued.id,
+        intent: {
+          accountId: providerAuthority.profileId,
+          providerGeneration: parsedGeneration,
+          providerConnectionId,
+          actor,
+          message: parsedMessage,
+          ...(references.length === 0 ? {} : { attachments: references }),
+          storedAttachments: attachments,
+        },
+      });
       if (this.#database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'").run(this.#now(), attempt.id).changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       if (this.#database.query("UPDATE mutation_attempts SET state='applied',result_json=?,updated_at=? WHERE id=? AND state='effect_started'").run(JSON.stringify({ queueId: queued.id }), this.#now(), attempt.id).changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       insertQueueAttachmentIdentity(this.#database, {
@@ -27737,76 +40361,93 @@ export class StateStore {
     return this.requireSession(sessionId);
   }
 
+  /** The durable source class admitted with a task occurrence or queue mutation. */
+  queueMessageActor(id: QueueId): SessionMessageActor {
+    const queueId = queueIdSchema.parse(id);
+    const source = this.#database.query(
+      "SELECT transcript_intent_json,message_actor FROM queue_entries WHERE id=?",
+    ).get(queueId);
+    if (source !== null) {
+      const row = z.object({
+        transcript_intent_json: z.string().nullable(),
+        message_actor: z.enum(["human", "peer_session"]),
+      }).strict().parse(source);
+      const intentJson = row.transcript_intent_json;
+      if (intentJson !== null) {
+        const actor = sessionUserMessageSourcePayloadSchema.parse(JSON.parse(intentJson) as unknown).actor;
+        if ((row.message_actor === "peer_session") !== (actor === "peer_session")) {
+          throw new Error("QUEUE_PEER_PROVENANCE_INVALID");
+        }
+        return actor;
+      }
+      if (row.message_actor === "peer_session") return "peer_session";
+    }
+    if (this.#database.query(
+      "SELECT 1 FROM session_task_occurrences WHERE queue_id=?",
+    ).get(queueId) !== null) return "automation";
+    const row = this.#database.query(
+      `SELECT json_extract(m.result_json,'$.actor') AS actor,
+              EXISTS(
+                SELECT 1 FROM work_prepared_effects w
+                WHERE json_extract(w.instruction_json,'$.nestedMutationKey')=m.idempotency_key
+              ) AS work_source
+       FROM mutation_attempts m
+       WHERE m.kind='session.queue'
+         AND m.state='applied'
+         AND json_extract(m.result_json,'$.queueId')=?
+       ORDER BY m.created_at,m.id LIMIT 1`,
+    ).get(queueId);
+    if (row === null) return "human";
+    const parsed = z.object({
+      actor: sessionMessageActorSchema.nullable(),
+      work_source: z.union([z.literal(0), z.literal(1)]),
+    }).strict().parse(row);
+    return parsed.actor ?? (parsed.work_source === 1 ? "automation" : "human");
+  }
+
   listQueue(sessionId: SessionId): readonly QueueRecord[] {
-    const rows = this.#database.query("SELECT id,session_id,message,state,created_at,updated_at FROM queue_entries WHERE session_id=? ORDER BY enqueue_sequence").all(sessionId);
-    return rows.map((row) => {
-      const parsed = z.object({ id: queueIdSchema, session_id: sessionIdSchema, message: z.string(), state: queueStateSchema, created_at: unixMillisecondsSchema, updated_at: unixMillisecondsSchema }).strict().parse(row);
-      return { id: parsed.id, sessionId: parsed.session_id, message: parsed.message, state: parsed.state, createdAt: parsed.created_at, updatedAt: parsed.updated_at };
-    });
+    return this.#database.query(
+      `SELECT ${queueRecordColumns}
+       FROM queue_entries q WHERE q.session_id=? ORDER BY q.enqueue_sequence`,
+    ).all(sessionId).map(mapQueueRecord);
   }
 
   requireQueue(id: QueueId): QueueRecord {
-    const row = this.#database.query("SELECT id,session_id,message,state,created_at,updated_at FROM queue_entries WHERE id=?").get(id);
+    const row = this.#database.query(
+      `SELECT ${queueRecordColumns}
+       FROM queue_entries q WHERE q.id=?`,
+    ).get(id);
     if (row === null) throw new SelectionError("NOT_FOUND");
-    const parsed = z.object({ id: queueIdSchema, session_id: sessionIdSchema, message: z.string(), state: queueStateSchema, created_at: unixMillisecondsSchema, updated_at: unixMillisecondsSchema }).strict().parse(row);
-    return { id: parsed.id, sessionId: parsed.session_id, message: parsed.message, state: parsed.state, createdAt: parsed.created_at, updatedAt: parsed.updated_at };
+    return mapQueueRecord(row);
   }
 
   nextPendingQueue(sessionId: SessionId): QueueRecord | null {
     const parsedSessionId = sessionIdSchema.parse(sessionId);
     const row = this.#database.query(
-      `SELECT value.id,value.session_id,value.message,value.state,
-              value.created_at,value.updated_at,q.scope_id AS quarantined
-       FROM queue_entries value
-       LEFT JOIN legacy_provider_authority_quarantines q
-         ON q.scope_kind='queue' AND q.scope_id=value.id
-       WHERE value.session_id=? AND value.state='pending'
-         AND NOT EXISTS(
-           SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
-           WHERE switch.session_id=value.session_id
-    AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
-         )
-       ORDER BY enqueue_sequence LIMIT 1`,
+      `SELECT ${queueRecordColumns}
+       FROM queue_entries q
+       WHERE q.session_id=? AND q.state='pending'
+         AND NOT EXISTS(SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+           WHERE switch.session_id=q.session_id AND ${SESSION_SWITCH_BLOCKING_PREDICATE})
+       ORDER BY q.enqueue_sequence LIMIT 1`,
     ).get(parsedSessionId);
     if (row === null) return null;
-    const parsed = z.object({
-      id: queueIdSchema,
-      session_id: sessionIdSchema,
-      message: z.string(),
-      state: z.literal("pending"),
-      created_at: unixMillisecondsSchema,
-      updated_at: unixMillisecondsSchema,
-      quarantined: z.string().nullable(),
-    }).strict().parse(row);
-    // Preserve FIFO: an unproved legacy head entry blocks later entries, but
-    // it can never be upgraded from the session's mutable current binding and
-    // dispatched to a provider.
-    if (parsed.quarantined !== null) return null;
-    return {
-      id: parsed.id,
-      sessionId: parsed.session_id,
-      message: parsed.message,
-      state: parsed.state,
-      createdAt: parsed.created_at,
-      updatedAt: parsed.updated_at,
-    };
+    const parsed = mapQueueRecord(row);
+    if (parsed.state !== "pending") throw new Error("QUEUE_PENDING_READ_INVALID");
+    if (this.readLegacyProviderAuthorityQuarantine("queue", parsed.id) !== null) return null;
+    return parsed;
   }
 
   listRecoverableQueue(): readonly QueueRecord[] {
     const rows = this.#database
-      .query(`SELECT id,session_id,message,state,created_at,updated_at
-              FROM queue_entries value WHERE state IN ('pending','dispatching')
-                AND NOT EXISTS(
-                  SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
-                  WHERE switch.session_id=value.session_id
-    AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
-                )
-              ORDER BY enqueue_sequence`)
+      .query(`SELECT ${queueRecordColumns}
+              FROM queue_entries q
+              WHERE q.state IN ('pending','dispatching')
+                AND NOT EXISTS(SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+                  WHERE switch.session_id=q.session_id AND ${SESSION_SWITCH_BLOCKING_PREDICATE})
+              ORDER BY q.enqueue_sequence`)
       .all();
-    return rows.map((row) => {
-      const parsed = z.object({ id: queueIdSchema, session_id: sessionIdSchema, message: z.string(), state: queueStateSchema, created_at: unixMillisecondsSchema, updated_at: unixMillisecondsSchema }).strict().parse(row);
-      return { id: parsed.id, sessionId: parsed.session_id, message: parsed.message, state: parsed.state, createdAt: parsed.created_at, updatedAt: parsed.updated_at };
-    });
+    return rows.map(mapQueueRecord);
   }
 
   transitionQueue(id: QueueId, from: QueueState, to: QueueState): boolean {
@@ -27816,11 +40457,35 @@ export class StateStore {
     if (!canTransitionQueue(parsedFrom, parsedTo)) {
       throw new Error(`Illegal queue transition: ${parsedFrom} -> ${parsedTo}`);
     }
+    if (parsedFrom === "pending" && parsedTo === "dispatching") {
+      const provenance = this.#database.query(
+        "SELECT peer_action_id FROM queue_entries WHERE id=?",
+      ).get(id) as { peer_action_id: string | null } | null;
+      if (provenance?.peer_action_id !== null && provenance?.peer_action_id !== undefined) {
+        throw new Error("PEER_QUEUE_EFFECT_EVIDENCE_REQUIRED");
+      }
+    }
     const now = this.#now();
     const changed = z.object({ id: queueIdSchema }).strict().nullable().parse(
-      this.#database.query(
-        "UPDATE queue_entries SET state=?,updated_at=? WHERE id=? AND state=? RETURNING id",
-      ).get(parsedTo, now, id, parsedFrom),
+      parsedTo === "failed" || parsedTo === "cancelled"
+        ? this.#database.query(
+            `UPDATE queue_entries
+             SET state=?,updated_at=?,
+                 transcript_status=CASE WHEN transcript_status='pending'
+                   THEN 'abandoned' ELSE transcript_status END,
+                 transcript_intent_json=CASE WHEN transcript_status='pending'
+                   THEN json_object(
+                     'version',1,
+                     'actor',json_extract(transcript_intent_json,'$.actor'),
+                     'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+                       json_extract(transcript_intent_json,'$.attachments')),0)>0
+                       THEN 'true' ELSE 'false' END))
+                   ELSE transcript_intent_json END
+             WHERE id=? AND state=? RETURNING id`,
+          ).get(parsedTo, now, id, parsedFrom)
+        : this.#database.query(
+            "UPDATE queue_entries SET state=?,updated_at=? WHERE id=? AND state=? RETURNING id",
+          ).get(parsedTo, now, id, parsedFrom),
     );
     if (changed !== null && (parsedTo === "applied" || parsedTo === "failed" || parsedTo === "cancelled")) {
       completePendingSecurityScrub(this.#database, true, this.#securityScrubCheckpoint);
@@ -27828,11 +40493,79 @@ export class StateStore {
     return changed !== null;
   }
 
+  /**
+   * Retire a queued peer message whose durable admission authority has been
+   * permanently revoked before any provider effect evidence was recorded.
+   *
+   * A peer queue is intentionally allowed to outlive the actor turn that
+   * admitted it, but not a policy revision, a project move, or a terminal
+   * target. Keeping such an entry pending would make it the permanent
+   * head-of-line item for the target session and would retain inbound quota
+   * forever. The queue transition trigger settles the linked peer action in
+   * the same transaction.
+   */
+  cancelRevokedPendingPeerQueue(queueId: QueueId): QueueRecord | null {
+    completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
+    const id = queueIdSchema.parse(queueId);
+    const cancel = this.#database.transaction((): boolean => {
+      const queue = this.requireQueue(id);
+      if (
+        queue.state !== "pending"
+        || queue.messageActor !== "peer_session"
+        || queue.peerActionId === undefined
+      ) return false;
+      const action = this.requirePeerSessionAction(queue.peerActionId);
+      if (
+        action.delivery !== "queue"
+        || action.targetSessionId !== queue.sessionId
+        || action.state !== "queued"
+      ) throw new Error("QUEUE_PEER_ACTION_AUTHORITY_CHANGED");
+      const actor = this.#requirePeerSession(action.actorSessionId);
+      const target = this.#requirePeerSession(action.targetSessionId);
+      const actorPolicy = this.requirePeerSessionPolicy(action.actorSessionId);
+      const targetPolicy = this.requirePeerSessionPolicy(action.targetSessionId);
+      const permanentlyRevoked = actor.projectId !== action.projectId
+        || target.projectId !== action.projectId
+        || !isSupportedProvider(actor.provider)
+        || !isSupportedProvider(target.provider)
+        || actorPolicy.mode !== "coordinate"
+        || actorPolicy.revision !== action.actorPolicyRevision
+        || targetPolicy.mode !== "coordinate"
+        || targetPolicy.revision !== action.targetPolicyRevision
+        || target.state === "terminal";
+      if (!permanentlyRevoked) return false;
+      const changed = z.object({ id: queueIdSchema }).strict().nullable().parse(
+        this.#database.query(
+        `UPDATE queue_entries
+         SET state='cancelled',updated_at=?
+         WHERE id=? AND state='pending' AND peer_action_id=?
+           AND NOT EXISTS(
+             SELECT 1 FROM queue_effect_evidence evidence
+             WHERE evidence.queue_id=?
+           )
+         RETURNING id`,
+        ).get(this.#now(), id, action.id, id),
+      );
+      if (changed === null) {
+        throw new Error("QUEUE_PEER_CANCELLATION_CONFLICT");
+      }
+      if (this.requirePeerSessionAction(action.id).state !== "cancelled") {
+        throw new Error("QUEUE_PEER_CANCELLATION_CONFLICT");
+      }
+      return true;
+    });
+    const cancelled = cancel.immediate();
+    if (!cancelled) return null;
+    completePendingSecurityScrub(this.#database, true, this.#securityScrubCheckpoint);
+    return this.requireQueue(id);
+  }
+
   beginQueueEffect(input: {
     queueId: QueueId;
     sessionId: SessionId;
     profileGeneration: number;
     providerAuthority: ProviderAccountAuthority;
+    providerConnectionId: string;
     evidence: QueueEffectEvidence;
   }): QueueEffectEvidenceRecord {
     const queueId = queueIdSchema.parse(input.queueId);
@@ -27842,11 +40575,13 @@ export class StateStore {
     if (providerAuthority.processGeneration !== generation) {
       throw new Error("QUEUE_PROVIDER_AUTHORITY_MISMATCH");
     }
+    const providerConnectionId = z.string().uuid().parse(
+      input.providerConnectionId,
+    );
     const evidence = queueEffectEvidenceSchema.parse(input.evidence);
     if (evidence.queueId !== queueId || evidence.sessionId !== sessionId || evidence.profileGeneration !== generation) {
       throw new Error("QUEUE_EFFECT_REQUEST_MISMATCH");
     }
-    const canonical = JSON.stringify(evidence);
     const digest = digestJson(evidence);
     const now = this.#now();
     const begin = this.#database.transaction(() => {
@@ -27854,14 +40589,19 @@ export class StateStore {
       if (this.readLegacyProviderAuthorityQuarantine("queue", queueId) !== null) {
         throw new Error("QUEUE_PROVIDER_AUTHORITY_QUARANTINED");
       }
+      assertSupportedProvider(this.requireSession(sessionId).provider);
       const authority = z.object({
         queue_state: z.literal("pending"),
         queue_session_id: sessionIdSchema,
         queue_message: z.string().min(1).max(262_144),
+        transcript_intent_json: z.string().nullable(),
+        transcript_status: sessionUserMessageTranscriptStatusSchema,
         profile_id: profileIdSchema,
         provider_thread_id: providerThreadIdSchema,
         session_state: z.literal("idle"),
+        peer_action_id: peerActionIdSchema.nullable(),
       }).strict().parse(this.#database.query(`SELECT q.state AS queue_state,q.session_id AS queue_session_id,q.message AS queue_message,
+                                                     q.peer_action_id,q.transcript_status,q.transcript_intent_json,
                                                      s.profile_id,s.provider_thread_id,s.state AS session_state
                                               FROM queue_entries q
                                               JOIN sessions s ON s.id=q.session_id
@@ -27891,7 +40631,103 @@ export class StateStore {
       // rather than against the session's mutable binding. Keep both writes
       // in this transaction so neither can survive without the other.
       this.#assertSessionRuntimeProfileContract(sessionId, evidence.runtimeProfile);
-      this.#database.query("INSERT INTO queue_effect_evidence(queue_id,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?)").run(queueId, canonical, digest, now);
+      if (authority.peer_action_id !== null) {
+        const action = this.requirePeerSessionAction(authority.peer_action_id);
+        this.#assertPeerSessionActionAuthority(action, "queued_begin");
+        if (
+          action.state !== "queued"
+          || action.targetSessionId !== sessionId
+          || action.delivery !== "queue"
+          || action.messageDigest !== evidence.messageDigest
+        ) throw new Error("QUEUE_PEER_ACTION_AUTHORITY_CHANGED");
+      }
+      if (authority.transcript_status === "none") {
+        const storedAttachments = this.#database.query(
+          `SELECT ma.byte_length,ma.digest,ma.media_type,ma.name,
+                  a.media_type AS canonical_media_type
+           FROM message_attachments ma
+           JOIN attachments a ON a.digest=ma.digest
+           WHERE ma.session_id=? AND ma.source_id=? ORDER BY ma.position`,
+        ).all(sessionId, queueId).map((value) => {
+          const row = z.object({
+            byte_length: z.number().int().positive(),
+            canonical_media_type: attachmentMediaTypeSchema,
+            digest: attachmentDigestSchema,
+            media_type: attachmentMediaTypeSchema,
+            name: attachmentNameSchema,
+          }).strict().parse(value);
+          return storedMessageAttachmentSchema.parse({
+            byteLength: row.byte_length,
+            canonicalMediaType: row.canonical_media_type,
+            digest: row.digest,
+            mediaType: row.media_type,
+            name: row.name,
+          });
+        });
+        this.#stageSessionUserMessageIntentInTransaction({
+          sessionId,
+          sourceKind: "queue",
+          sourceId: queueId,
+          intent: {
+            accountId: authority.profile_id,
+            providerGeneration: generation,
+            providerConnectionId,
+            actor: this.queueMessageActor(queueId),
+            message: authority.queue_message,
+            ...(storedAttachments.length === 0
+              ? {}
+              : {
+                  attachments: storedAttachments.map((attachment) => ({
+                    byteLength: attachment.byteLength,
+                    digest: attachment.digest,
+                    mediaType: attachment.mediaType,
+                    name: attachment.name,
+                  })),
+                  storedAttachments,
+                }),
+          },
+        });
+      } else if (authority.transcript_status === "pending") {
+        if (authority.transcript_intent_json === null) {
+          throw new Error("QUEUE_EFFECT_TRANSCRIPT_AUTHORITY_CHANGED");
+        }
+        const prior = sessionUserMessageIntentSchema.parse(
+          JSON.parse(authority.transcript_intent_json) as unknown,
+        );
+        const rebound = canonicalSessionUserMessageIntent({
+          accountId: authority.profile_id,
+          providerGeneration: generation,
+          providerConnectionId,
+          actor: prior.actor,
+          message: authority.queue_message,
+          ...(prior.attachments === undefined
+            ? {}
+            : { attachments: prior.attachments }),
+        });
+        if (
+          prior.actor !== rebound.intent.actor
+          || prior.text !== rebound.intent.text
+          || prior.omittedCharacters !== rebound.intent.omittedCharacters
+          || JSON.stringify(prior.attachments ?? [])
+            !== JSON.stringify(rebound.intent.attachments ?? [])
+        ) throw new Error("QUEUE_EFFECT_TRANSCRIPT_AUTHORITY_CHANGED");
+        const reboundIntent = this.#database.query(
+          `UPDATE queue_entries SET transcript_intent_json=?
+           WHERE id=? AND session_id=? AND state='pending'
+             AND transcript_status='pending' AND transcript_intent_json=?`,
+        ).run(
+          rebound.json,
+          queueId,
+          sessionId,
+          authority.transcript_intent_json,
+        );
+        if (reboundIntent.changes !== 1) {
+          throw new Error("QUEUE_EFFECT_TRANSCRIPT_AUTHORITY_CHANGED");
+        }
+      } else {
+        throw new Error("QUEUE_EFFECT_TRANSCRIPT_AUTHORITY_CHANGED");
+      }
+      insertJoinedQueueEffectEvidence(this.#database, { queueId, evidence, recordedAt: now });
       insertProviderAuthorityEvidence(
         this.#database,
         "queue_provider_authorities",
@@ -27900,21 +40736,34 @@ export class StateStore {
         "queue_runtime",
         now,
       );
-      const changed = this.#database.query("UPDATE queue_entries SET state='dispatching',updated_at=? WHERE id=? AND state='pending'").run(now, queueId);
-      if (changed.changes !== 1) throw new Error("QUEUE_EFFECT_AUTHORITY_CHANGED");
+      const changed = z.object({ id: queueIdSchema }).strict().nullable().parse(
+        this.#database.query(
+          "UPDATE queue_entries SET state='dispatching',updated_at=? WHERE id=? AND state='pending' RETURNING id",
+        ).get(now, queueId),
+      );
+      if (changed === null) throw new Error("QUEUE_EFFECT_AUTHORITY_CHANGED");
     });
     begin.immediate();
     return { queueId, digest, evidence, recordedAt: now };
   }
 
   readQueueEffect(queueId: QueueId): QueueEffectEvidenceRecord | null {
+    return this.#database.inTransaction ? this.#readQueueEffectInTransaction(queueId)
+      : this.#database.transaction(() => this.#readQueueEffectInTransaction(queueId)).deferred();
+  }
+
+  #readQueueEffectInTransaction(queueId: QueueId): QueueEffectEvidenceRecord | null {
     const parsedQueueId = queueIdSchema.parse(queueId);
     const row = this.#database.query(`SELECT e.evidence_json,e.evidence_digest,e.recorded_at,
                                              r.resolution_kind,r.evidence_json AS resolution_evidence_json,
-                                             r.receipt_json,r.created_at AS resolution_created_at
-                                      FROM queue_effect_evidence e
+                                             r.receipt_json,r.created_at AS resolution_created_at,
+                                             q.message,q.message_actor,q.peer_action_id,
+                                             action.message_digest AS action_message_digest
+                                      FROM queue_entries q
+                                      JOIN queue_effect_evidence e ON e.queue_id=q.id
                                       LEFT JOIN queue_effect_resolutions r ON r.queue_id=e.queue_id
-                                      WHERE e.queue_id=?`).get(parsedQueueId) as {
+                                      LEFT JOIN peer_session_actions action ON action.id=q.peer_action_id
+                                      WHERE q.id=?`).get(parsedQueueId) as {
       evidence_json: string;
       evidence_digest: string;
       recorded_at: number;
@@ -27922,16 +40771,35 @@ export class StateStore {
       resolution_evidence_json: string | null;
       receipt_json: string | null;
       resolution_created_at: number | null;
+      message: string;
+      message_actor: "human" | "peer_session";
+      peer_action_id: string | null;
+      action_message_digest: string | null;
     } | null;
     if (row === null) return null;
-    const evidence = queueEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
-    const digest = sha256Schema.parse(row.evidence_digest);
-    if (evidence.queueId !== parsedQueueId || digestJson(evidence) !== digest) throw new Error("QUEUE_EFFECT_EVIDENCE_MISMATCH");
+    const proved = requireQueueEvidenceFromProvenance(this.#database, parsedQueueId);
+    const { evidence, digest } = proved;
+    if (
+      evidence.queueId !== parsedQueueId
+      || digestJson(evidence) !== digest
+      || (
+        row.message !== settledQueueMessage
+        && createHash("sha256").update(row.message, "utf8").digest("hex")
+          !== evidence.messageDigest
+      )
+      || (
+        row.peer_action_id !== null
+        && (
+          row.message_actor !== "peer_session"
+          || row.action_message_digest !== evidence.messageDigest
+        )
+      )
+    ) throw new Error("QUEUE_EFFECT_EVIDENCE_MISMATCH");
     return {
       queueId: parsedQueueId,
       digest,
       evidence,
-      recordedAt: unixMillisecondsSchema.parse(row.recorded_at),
+      recordedAt: proved.recordedAt,
       ...(row.resolution_kind === null ? {} : {
         resolution: {
           kind: row.resolution_kind,
@@ -27975,9 +40843,9 @@ export class StateStore {
     const recovered: QueueId[] = [];
     const unresolved: QueueId[] = [];
     const recover = this.#database.transaction(() => {
-      const rows = this.#database.query("SELECT id,session_id FROM queue_entries WHERE state='dispatching' ORDER BY enqueue_sequence").all();
+      const rows = this.#database.query("SELECT id,session_id,message FROM queue_entries WHERE state='dispatching' ORDER BY enqueue_sequence").all();
       for (const row of rows) {
-        const parsed = z.object({ id: queueIdSchema, session_id: sessionIdSchema }).strict().parse(row);
+        const parsed = z.object({ id: queueIdSchema, session_id: sessionIdSchema, message: z.string() }).strict().parse(row);
         if (this.readLegacyProviderAuthorityQuarantine("queue", parsed.id) !== null) {
           const now = this.#now();
           const queueChanged = this.#database.query(
@@ -28004,7 +40872,9 @@ export class StateStore {
         }
         let sessionProviderAuthority: SessionProviderAuthority;
         try {
-          sessionProviderAuthority = this.requireSessionProviderAuthority(parsed.session_id);
+          sessionProviderAuthority = providerAuthority.provider === "devin"
+            ? this.requireCapturedSessionProviderAuthority(parsed.session_id)
+            : this.requireSessionProviderAuthority(parsed.session_id);
         } catch {
           unresolved.push(parsed.id);
           continue;
@@ -28013,7 +40883,8 @@ export class StateStore {
           this.#database.query("SELECT provider_thread_id FROM sessions WHERE id=?").get(parsed.session_id),
         );
         if (
-          binding.provider_thread_id !== record.evidence.providerThreadId
+          createHash("sha256").update(parsed.message).digest("hex") !== record.evidence.messageDigest
+          || binding.provider_thread_id !== record.evidence.providerThreadId
           || record.evidence.profileGeneration !== providerAuthority.processGeneration
           || !sameProviderAccountBinding(providerAuthority, sessionProviderAuthority)
         ) {
@@ -28021,10 +40892,16 @@ export class StateStore {
           continue;
         }
         const now = this.#now();
-        const queueChanged = this.#database.query("UPDATE queue_entries SET state='ambiguous',updated_at=? WHERE id=? AND state='dispatching'").run(now, parsed.id);
-        if (queueChanged.changes !== 1) throw new Error("QUEUE_RECOVERY_CAS_CONFLICT");
+        const queueChanged = z.object({ id: queueIdSchema }).strict().nullable().parse(
+          this.#database.query(
+            "UPDATE queue_entries SET state='ambiguous',updated_at=? WHERE id=? AND state='dispatching' RETURNING id",
+          ).get(now, parsed.id),
+        );
+        if (queueChanged === null) throw new Error("QUEUE_RECOVERY_CAS_CONFLICT");
         this.#database.query(`UPDATE sessions SET state='recovery_required',active_turn_id=NULL,revision=revision+1,updated_at=?
                               WHERE id=? AND state NOT IN ('recovery_required','terminal')`).run(now, parsed.session_id);
+        // Every authority mismatch exits above. Recovery only quarantines the
+        // proved effect; it never dispatches it or revives retired authority.
         recovered.push(parsed.id);
       }
     });
@@ -28034,6 +40911,9 @@ export class StateStore {
 
   completeQueueEffect(input: {
     queueId: QueueId;
+    accountId: ProfileId;
+    providerGeneration: number;
+    providerConnectionId: string | null;
     expectedEvidenceDigest: string;
     expectedSessionRevision: number;
     applyResponseState: boolean;
@@ -28041,28 +40921,64 @@ export class StateStore {
     turnId: string;
     turnStatus: "completed" | "interrupted" | "failed" | "inProgress";
     runtimeProfile: ReviewedRuntimeProfile;
+    message: string;
     receipt: unknown;
-  }): void {
+  }): SessionUserMessageEventAppendResult {
     completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const queueId = queueIdSchema.parse(input.queueId);
+    const accountId = profileIdSchema.parse(input.accountId);
+    const providerGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.providerGeneration);
+    const providerConnectionId = z.string().uuid().nullable().parse(input.providerConnectionId);
+    const message = z.string().min(1).max(262_144).parse(input.message);
     const evidenceDigest = sha256Schema.parse(input.expectedEvidenceDigest);
     const providerAuthority = providerAccountAuthoritySchema.parse(input.providerAuthority);
     const profile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
     const now = this.#now();
     const complete = this.#database.transaction(() => {
-      const row = z.object({ session_id: sessionIdSchema, state: z.literal("dispatching"), evidence_json: z.string(), evidence_digest: sha256Schema }).strict().parse(
-        this.#database.query(`SELECT q.session_id,q.state,e.evidence_json,e.evidence_digest
-                              FROM queue_entries q JOIN queue_effect_evidence e ON e.queue_id=q.id WHERE q.id=?`).get(queueId),
+      const row = z.object({
+        session_id: sessionIdSchema,
+        state: z.literal("dispatching"),
+        peer_action_id: peerActionIdSchema.nullable(),
+        evidence_json: z.string(),
+        evidence_digest: sha256Schema,
+        message: z.string().min(1).max(262_144),
+        profile_id: profileIdSchema,
+        process_generation: z.number().int().nonnegative(),
+      }).strict().parse(
+        this.#database.query(`SELECT q.session_id,q.state,q.peer_action_id,q.message,
+                                     e.evidence_json,e.evidence_digest,
+                                     s.profile_id,captured.process_generation
+                              FROM queue_entries q
+                              JOIN queue_effect_evidence e ON e.queue_id=q.id
+                              JOIN sessions s ON s.id=q.session_id
+                              JOIN session_provider_authorities captured ON captured.session_id=s.id
+                              WHERE q.id=?`).get(queueId),
       );
-      const evidence = queueEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
-      if (row.evidence_digest !== evidenceDigest || digestJson(evidence) !== evidenceDigest || JSON.stringify(evidence.runtimeProfile) !== JSON.stringify(profile)) {
+      const evidence = requireQueueEvidenceFromProvenance(this.#database, queueId).evidence;
+      if (
+        row.evidence_digest !== evidenceDigest
+        || digestJson(evidence) !== evidenceDigest
+        || JSON.stringify(evidence.runtimeProfile) !== JSON.stringify(profile)
+        || evidence.runtimeProfile.profileId !== row.profile_id
+        || row.profile_id !== accountId
+        || row.process_generation !== providerGeneration
+        || row.message !== message
+        || createHash("sha256").update(row.message, "utf8").digest("hex")
+          !== evidence.messageDigest
+      ) {
         throw new Error("QUEUE_EFFECT_EVIDENCE_MISMATCH");
       }
       const frozenAuthority = this.readQueueProviderAuthority(queueId);
       if (
         frozenAuthority === null
         || !sameProviderAccountAuthority(frozenAuthority, providerAuthority)
+        || !sameProviderAccountAuthority(providerAuthority,
+          this.requireCapturedSessionProviderAuthority(row.session_id))
+        || providerAuthority.profileId !== accountId
+        || providerAuthority.processGeneration !== providerGeneration
       ) throw new Error("QUEUE_PROVIDER_AUTHORITY_MISMATCH");
+      this.assertProviderAccountAuthorityCurrent(providerAuthority);
       this.#bindSessionTurnRuntimeProfile({
         sessionId: row.session_id,
         sourceKind: "queue_start",
@@ -28071,12 +40987,36 @@ export class StateStore {
         profile,
         providerAuthority,
       }, now);
+      const targetTurnId = z.string().min(1).max(200).parse(input.turnId);
+      const targetTurnDigest = digestPeerTurnId(targetTurnId);
+      if (row.peer_action_id !== null) {
+        const actionChanged = this.#database.query(
+          `UPDATE peer_session_actions
+           SET state='applied',target_turn_digest=?,result_digest=?,updated_at=MAX(updated_at,?)
+           WHERE id=? AND target_session_id=? AND delivery='queue'
+             AND message_digest=? AND state='effect_started'`,
+        ).run(
+          targetTurnDigest,
+          digestJson(input.receipt),
+          now,
+          row.peer_action_id,
+          row.session_id,
+          evidence.messageDigest,
+        );
+        if (actionChanged.changes !== 1) throw new Error("QUEUE_PEER_ACTION_CAS_CONFLICT");
+      }
       const queueChanged = z.object({ id: queueIdSchema }).strict().nullable().parse(
         this.#database.query(
           "UPDATE queue_entries SET state='applied',updated_at=? WHERE id=? AND state='dispatching' RETURNING id",
         ).get(now, queueId),
       );
       if (queueChanged === null) throw new Error("QUEUE_EFFECT_CAS_CONFLICT");
+      if (row.peer_action_id !== null) {
+        this.#database.query(
+          `INSERT INTO peer_session_turn_origins(session_id,turn_digest,action_id)
+           VALUES (?,?,?)`,
+        ).run(row.session_id, targetTurnDigest, row.peer_action_id);
+      }
       const nextState = input.turnStatus === "inProgress" ? "active" : "idle";
       if (input.applyResponseState) {
         const sessionChanged = this.#database.query(`UPDATE sessions SET state=?,active_turn_id=?,revision=revision+1,updated_at=?
@@ -28089,9 +41029,72 @@ export class StateStore {
         );
         if (sessionChanged.changes !== 1) throw new Error("QUEUE_EFFECT_SESSION_CAS_CONFLICT");
       }
+      return this.#appendQueueUserMessageEventOnceInTransaction({
+        sourceId: queueId,
+        sessionId: row.session_id,
+        accountId,
+        providerGeneration,
+        providerConnectionId,
+        turnId: targetTurnId,
+        message,
+        recordedAt: now,
+      });
     });
-    complete.immediate();
+    const appended = complete.immediate();
     completePendingSecurityScrub(this.#database, true, this.#securityScrubCheckpoint);
+    return appended;
+  }
+
+  #advanceMemoryWorkingAttestationHead(input: Readonly<{
+    authorityDigest: string;
+    expectedHead: ProjectMemoryHeadRef;
+    nextHead: ProjectMemoryHeadRef;
+    now: number;
+  }>): void {
+    const current = this.readMemoryWorkingAttestationHead(input.authorityDigest);
+    if (current === null) {
+      if (input.expectedHead.sequence !== 0 || this.#database.query(
+        `SELECT 1 FROM memory_page_attestation_refs
+         WHERE lane='working' AND authority_digest=? LIMIT 1`,
+      ).get(input.authorityDigest) !== null) {
+        throw new Error("MEMORY_WORKING_ATTESTATION_HEAD_CONFLICT");
+      }
+      this.#database.query(
+        `INSERT INTO memory_working_attestation_heads(
+           authority_digest,head_sequence,head_operation_sha256,head_digest,origin,
+           fork_child_head_sequence,fork_child_head_operation_sha256,fork_child_head_digest,
+           fork_parent_authority_digest,fork_parent_head_sequence,
+           fork_parent_head_operation_sha256,fork_parent_head_digest,created_at,updated_at
+         ) VALUES (?,?,?,?,'create',NULL,NULL,NULL,NULL,NULL,NULL,NULL,?,?)`,
+      ).run(
+        input.authorityDigest,
+        input.nextHead.sequence,
+        input.nextHead.operationSha256,
+        input.nextHead.headDigest,
+        input.now,
+        input.now,
+      );
+      return;
+    }
+    if (JSON.stringify(current.head) !== JSON.stringify(input.expectedHead)) {
+      throw new Error("MEMORY_WORKING_ATTESTATION_HEAD_CONFLICT");
+    }
+    const changed = this.#database.query(
+      `UPDATE memory_working_attestation_heads
+       SET head_sequence=?,head_operation_sha256=?,head_digest=?,updated_at=MAX(updated_at,?)
+       WHERE authority_digest=? AND head_sequence=?
+         AND head_operation_sha256 IS ? AND head_digest=?`,
+    ).run(
+      input.nextHead.sequence,
+      input.nextHead.operationSha256,
+      input.nextHead.headDigest,
+      input.now,
+      input.authorityDigest,
+      input.expectedHead.sequence,
+      input.expectedHead.operationSha256,
+      input.expectedHead.headDigest,
+    );
+    if (changed.changes !== 1) throw new Error("MEMORY_WORKING_ATTESTATION_HEAD_CONFLICT");
   }
 
   failQueueEffect(queueId: QueueId): boolean {
@@ -28101,23 +41104,24 @@ export class StateStore {
   markQueueEffectAmbiguous(queueId: QueueId, expectedEvidenceDigest: string): SessionRecord {
     const parsedQueueId = queueIdSchema.parse(queueId);
     const digest = sha256Schema.parse(expectedEvidenceDigest);
-    let sessionId: SessionId | undefined;
     const mark = this.#database.transaction(() => {
       const row = z.object({ session_id: sessionIdSchema, state: z.literal("dispatching"), evidence_digest: sha256Schema }).strict().parse(
         this.#database.query(`SELECT q.session_id,q.state,e.evidence_digest FROM queue_entries q
                               JOIN queue_effect_evidence e ON e.queue_id=q.id WHERE q.id=?`).get(parsedQueueId),
       );
       if (row.evidence_digest !== digest) throw new Error("QUEUE_EFFECT_EVIDENCE_MISMATCH");
-      sessionId = row.session_id;
       const now = this.#now();
-      const changed = this.#database.query("UPDATE queue_entries SET state='ambiguous',updated_at=? WHERE id=? AND state='dispatching'").run(now, parsedQueueId);
-      if (changed.changes !== 1) throw new Error("QUEUE_EFFECT_CAS_CONFLICT");
+      const changed = z.object({ id: queueIdSchema }).strict().nullable().parse(
+        this.#database.query(
+          "UPDATE queue_entries SET state='ambiguous',updated_at=? WHERE id=? AND state='dispatching' RETURNING id",
+        ).get(now, parsedQueueId),
+      );
+      if (changed === null) throw new Error("QUEUE_EFFECT_CAS_CONFLICT");
       this.#database.query(`UPDATE sessions SET state='recovery_required',active_turn_id=NULL,revision=revision+1,updated_at=?
                             WHERE id=? AND state NOT IN ('recovery_required','terminal')`).run(now, row.session_id);
+      return this.requireSession(row.session_id);
     });
-    mark.immediate();
-    if (sessionId === undefined) throw new Error("Queue ambiguity lost its session authority.");
-    return this.requireSession(sessionId);
+    return mark.immediate();
   }
 
   resolveQueueEffect(input: {
@@ -28127,23 +41131,41 @@ export class StateStore {
     resolutionEvidence: unknown;
     receipt?: unknown;
     provider: { providerThreadId: string; title: string; status: "active" | "idle" | "terminal"; activeTurnId?: string; providerUpdatedAt?: number };
-  }): SessionRecord {
+  }): SessionEffectResolutionResult {
+    const requestedResolutionEvidence = snapshotPeerCausalResolutionInput(input.resolutionEvidence);
     completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const queueId = queueIdSchema.parse(input.queueId);
     const expectedDigest = sha256Schema.parse(input.expectedEvidenceDigest);
     const now = this.#now();
     let sessionId: SessionId | undefined;
+    let messageEvent: SessionUserMessageEventAppendResult | undefined;
     const resolve = this.#database.transaction(() => {
-      const row = z.object({ session_id: sessionIdSchema, state: z.literal("ambiguous"), evidence_json: z.string(), evidence_digest: sha256Schema }).strict().parse(
-        this.#database.query(`SELECT q.session_id,q.state,e.evidence_json,e.evidence_digest
+      const row = z.object({
+        session_id: sessionIdSchema,
+        state: z.literal("ambiguous"),
+        peer_action_id: peerActionIdSchema.nullable(),
+        message_actor: z.enum(["human", "peer_session"]),
+        message: z.string().min(1).max(262_144),
+        evidence_json: z.string(),
+        evidence_digest: sha256Schema,
+      }).strict().parse(
+        this.#database.query(`SELECT q.session_id,q.state,q.peer_action_id,q.message_actor,q.message,e.evidence_json,e.evidence_digest
                               FROM queue_entries q JOIN queue_effect_evidence e ON e.queue_id=q.id
                               LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
                               WHERE q.id=? AND r.queue_id IS NULL`).get(queueId),
       );
-      const evidence = queueEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
-      if (row.evidence_digest !== expectedDigest || digestJson(evidence) !== expectedDigest) throw new Error("QUEUE_RECOVERY_EVIDENCE_MISMATCH");
+      const evidence = requireQueueEvidenceFromProvenance(this.#database, queueId).evidence;
+      const session = mapSession(
+        this.#database.query("SELECT * FROM sessions WHERE id=?").get(row.session_id),
+      );
+      if (
+        row.evidence_digest !== expectedDigest
+        || digestJson(evidence) !== expectedDigest
+        || session.profileId !== evidence.runtimeProfile.profileId
+        || createHash("sha256").update(row.message, "utf8").digest("hex")
+          !== evidence.messageDigest
+      ) throw new Error("QUEUE_RECOVERY_EVIDENCE_MISMATCH");
       sessionId = row.session_id;
-      const session = mapSession(this.#database.query("SELECT * FROM sessions WHERE id=?").get(row.session_id));
       const providerAuthority = this.readQueueProviderAuthority(queueId);
       let captured: SessionProviderAuthority;
       try {
@@ -28162,6 +41184,14 @@ export class StateStore {
       if (session.providerThreadId !== input.provider.providerThreadId || evidence.providerThreadId !== input.provider.providerThreadId) {
         throw new Error("QUEUE_RECOVERY_THREAD_MISMATCH");
       }
+      const transcriptActor = readPeerCausalTranscriptActor(this.#database, "queue_entries", queueId);
+      if (transcriptActor !== undefined && (transcriptActor === "peer_session") !== (row.message_actor === "peer_session")) {
+        throw new Error("QUEUE_RECOVERY_EVIDENCE_MISMATCH");
+      }
+      const resolutionEvidence = input.resolution === "abandoned" && row.message_actor === "peer_session"
+        ? peerCausalResolutionEvidence(requestedResolutionEvidence, evidence.providerThreadId, input.provider)
+        : requestedResolutionEvidence;
+      const resolutionJson = JSON.stringify(resolutionEvidence);
       const changed = this.#database.query(`UPDATE sessions SET title=?,state=?,active_turn_id=?,provider_updated_at=?,revision=revision+1,updated_at=?
                                             WHERE id=? AND revision=? AND state='recovery_required'`).run(
         titleSchema.parse(input.provider.title),
@@ -28184,22 +41214,92 @@ export class StateStore {
           providerAuthority,
           allowHistoricalProviderAuthority: true,
         }, now);
+        if (row.peer_action_id !== null) {
+          const targetTurnDigest = digestPeerTurnId(recoveredTurn.turnId);
+          const actionChanged = this.#database.query(
+            `UPDATE peer_session_actions
+             SET state='applied',target_turn_digest=?,result_digest=?,updated_at=MAX(updated_at,?)
+             WHERE id=? AND target_session_id=? AND delivery='queue'
+               AND message_digest=? AND state='ambiguous'`,
+          ).run(
+            targetTurnDigest,
+            digestJson(input.receipt),
+            now,
+            row.peer_action_id,
+            row.session_id,
+            evidence.messageDigest,
+          );
+          if (actionChanged.changes !== 1) throw new Error("QUEUE_PEER_ACTION_CAS_CONFLICT");
+          this.#database.query(
+            `INSERT INTO peer_session_turn_origins(session_id,turn_digest,action_id)
+             VALUES (?,?,?)`,
+          ).run(row.session_id, targetTurnDigest, row.peer_action_id);
+        }
+      } else {
+        if (row.peer_action_id !== null) {
+        const actionChanged = this.#database.query(
+          `UPDATE peer_session_actions
+           SET state='failed',result_digest=?,updated_at=MAX(updated_at,?)
+           WHERE id=? AND target_session_id=? AND delivery='queue'
+             AND message_digest=? AND state='ambiguous'`,
+        ).run(
+          digestJson(resolutionEvidence),
+          now,
+          row.peer_action_id,
+          row.session_id,
+          evidence.messageDigest,
+        );
+        if (actionChanged.changes !== 1) throw new Error("QUEUE_PEER_ACTION_CAS_CONFLICT");
+        }
+        this.#database.query(
+          `UPDATE queue_entries SET transcript_status='abandoned',
+             transcript_intent_json=json_object(
+               'version',1,
+               'actor',json_extract(transcript_intent_json,'$.actor'),
+               'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+                 json_extract(transcript_intent_json,'$.attachments')),0)>0
+                 THEN 'true' ELSE 'false' END))
+           WHERE id=? AND transcript_status='pending'`,
+        ).run(queueId);
       }
       this.#database.query("INSERT INTO queue_effect_resolutions(queue_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)").run(
         queueId,
         input.resolution,
-        JSON.stringify(input.resolutionEvidence),
+        resolutionJson,
         input.receipt === undefined ? null : JSON.stringify(input.receipt),
         now,
       );
+      if (input.resolution === "proven_applied") {
+        const recoveredTurn = z.object({ turnId: z.string().min(1).max(200) })
+          .passthrough().parse(input.receipt);
+        const currentProfile = this.requireProfileById(session.profileId);
+        messageEvent = this.#appendQueueUserMessageEventOnceInTransaction({
+          sourceId: queueId,
+          sessionId: row.session_id,
+          accountId: session.profileId,
+          providerGeneration: currentProfile.processGeneration,
+          providerConnectionId: null,
+          turnId: recoveredTurn.turnId,
+          message: row.message,
+          recordedAt: now,
+        });
+      }
     });
     resolve.immediate();
     completePendingSecurityScrub(this.#database, true, this.#securityScrubCheckpoint);
     if (sessionId === undefined) throw new Error("Queue recovery lost its session authority.");
-    return this.requireSession(sessionId);
+    return {
+      ...this.requireSession(sessionId),
+      ...(messageEvent === undefined ? {} : { messageEvent }),
+    };
   }
 
   readMutation(idempotencyKey: string): MutationAttemptRecord | null {
+    return this.#database.inTransaction ? this.#readMutationInTransaction(idempotencyKey)
+      : this.#database.transaction(() => this.#readMutationInTransaction(idempotencyKey)).deferred();
+  }
+
+  #readMutationInTransaction(idempotencyKey: string): MutationAttemptRecord | null {
     const key = z.string().uuid().parse(idempotencyKey);
     assertLegacyMutationOwnership(this.#database, { idempotencyKey: key });
     if (this.#database.query(
@@ -28258,18 +41358,11 @@ export class StateStore {
     const originalState = mutationStateSchema.exclude(["reconciled"]).parse(row.state);
     let evidence: MutationEffectEvidenceRecord | undefined;
     if (row.evidence_json !== null) {
-      const parsedEvidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown) as MutationEffectEvidence;
-      const parsedDigest = sha256Schema.parse(row.evidence_digest);
-      if (digestJson(parsedEvidence) !== parsedDigest) throw new Error("MUTATION_EFFECT_EVIDENCE_DIGEST_MISMATCH");
-      if (row.evidence_kind !== row.kind || parsedEvidence.kind !== row.kind) {
+      const proved = requireMutationEvidenceFromProvenance(this.#database, attemptIdSchema.parse(row.id));
+      if (row.evidence_kind !== row.kind || proved.evidence.kind !== row.kind) {
         throw new Error("MUTATION_EFFECT_EVIDENCE_KIND_MISMATCH");
       }
-      evidence = {
-        attemptId: attemptIdSchema.parse(row.id),
-        digest: parsedDigest,
-        evidence: parsedEvidence,
-        recordedAt: unixMillisecondsSchema.parse(row.recorded_at),
-      };
+      evidence = proved;
     }
     const resolution = row.resolution_kind === null
       ? undefined
@@ -28521,54 +41614,14 @@ export class StateStore {
 
   readPendingLoginAuthority(profileId: ProfileId, processGeneration: number): PendingLoginAuthority | null {
     const parsedProfileId = profileIdSchema.parse(profileId);
-    const parsedGeneration = z.number().int().nonnegative().parse(processGeneration);
-    const rows = this.#database.query(`SELECT a.attempt_id,m.idempotency_key,a.login_id,
-                                              c.provider_account_id,c.binding_generation,
-                                              c.process_generation AS origin_generation
-                                       FROM provider_login_authorities a
-                                       JOIN mutation_attempts m ON m.id=a.attempt_id
-                                       LEFT JOIN account_scoped_provider_authorities c
-                                         ON c.scope_kind='provider_login'
-                                        AND c.scope_id=a.attempt_id
-                                        AND c.profile_id=a.profile_id
-                                       WHERE a.profile_id=? AND a.process_generation=? AND a.state='active'
-                                       ORDER BY a.recorded_at,a.attempt_id`).all(parsedProfileId, parsedGeneration) as {
-      attempt_id: string;
-      idempotency_key: string;
-      login_id: string;
-      provider_account_id: ProviderAccountId;
-      binding_generation: number;
-      origin_generation: number;
-    }[];
-    const pending = rows.map((row) => {
-      const origin = z.number().int().nonnegative().parse(row.origin_generation);
-      const reached = this.#database.query(
-        `WITH RECURSIVE chain(generation) AS (
-           VALUES (?)
-           UNION ALL
-           SELECT successor.to_generation FROM session_mutation_authority_rebinds_v39 successor
-           JOIN chain ON successor.from_generation=chain.generation
-           WHERE successor.attempt_id=? AND successor.profile_id=? AND successor.provider='codex'
-         ) SELECT 1 FROM chain WHERE generation=? LIMIT 1`,
-      ).get(origin, row.attempt_id, parsedProfileId, parsedGeneration);
-      if (reached === null) throw new Error("LOGIN_RESTART_AUTHORITY_MISMATCH");
-      this.assertProviderAccountAuthorityCurrent({
-        providerAccountId: providerAccountIdSchema.parse(row.provider_account_id),
-        profileId: parsedProfileId,
-        provider: "codex",
-        bindingGeneration: z.number().int().positive().parse(row.binding_generation),
-        processGeneration: parsedGeneration,
-      });
-      return ({
-        attemptId: attemptIdSchema.parse(row.attempt_id),
-        idempotencyKey: z.string().uuid().parse(row.idempotency_key),
-        profileId: parsedProfileId,
-        processGeneration: parsedGeneration,
-        loginId: providerLoginIdSchema.parse(row.login_id),
-      } satisfies PendingLoginAuthority);
-    });
-    if (pending.length > 1) throw new Error("LOGIN_CANCEL_AUTHORITY_AMBIGUOUS");
-    return pending[0] ?? null;
+    const parsedGeneration = z.number().int().nonnegative().safe().parse(processGeneration);
+    return this.#database.transaction(() => {
+      const pending = readProviderLoginBindingAuthority(this.#database, parsedProfileId, parsedGeneration);
+      return pending === null ? null : {
+        attemptId: pending.attemptId, idempotencyKey: pending.idempotencyKey,
+        profileId: parsedProfileId, processGeneration: parsedGeneration, loginId: pending.loginId,
+      } satisfies PendingLoginAuthority;
+    })();
   }
 
   #advancePendingLoginProcessAuthority(
@@ -28792,6 +41845,61 @@ export class StateStore {
     return settle.immediate();
   }
 
+  completeLoginCancelMutation(input: {
+    attemptId: AttemptId;
+    profileId: ProfileId;
+    processGeneration: number;
+    receipt: {
+      loginId: string;
+      providerStatus: "canceled" | "not_found";
+      provider: { signedIn: boolean; email?: string; plan?: string };
+    };
+  }): ProfileRecord {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const profileId = profileIdSchema.parse(input.profileId);
+    const processGeneration = z.number().int().nonnegative().safe().parse(input.processGeneration);
+    const receipt = z.object({
+      loginId: providerLoginIdSchema,
+      providerStatus: z.enum(["canceled", "not_found"]),
+      provider: z.object({ signedIn: z.boolean(), email: z.string().max(1_024).optional(), plan: z.string().max(128).optional() }).strict(),
+    }).strict().parse(input.receipt);
+    const complete = this.#database.transaction(() => {
+      const row = z.object({
+        authority_id: profileIdSchema,
+        authority_generation: z.number().int().nonnegative().safe(),
+        state: z.literal("effect_started"),
+        evidence_json: z.string(),
+      }).strict().parse(this.#database.query(
+        `SELECT m.authority_id,m.authority_generation,m.state,e.evidence_json
+         FROM mutation_attempts m JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+         WHERE m.id=? AND m.kind='account.login-cancel' AND e.kind=m.kind
+           AND NOT EXISTS (SELECT 1 FROM mutation_resolutions r WHERE r.attempt_id=m.id)`,
+      ).get(attemptId));
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
+      if (row.authority_id !== profileId || row.authority_generation !== processGeneration
+        || evidence.kind !== "account.login-cancel" || evidence.loginId !== receipt.loginId
+        || !this.isAccountMutationAuthorityCurrent({ attemptId, profileId, originGeneration: processGeneration })) {
+        throw new Error("LOGIN_CANCEL_MUTATION_AUTHORITY_MISMATCH");
+      }
+      this.settlePendingLogin({
+        profileId,
+        processGeneration,
+        loginId: receipt.loginId,
+        providerStatus: receipt.providerStatus,
+        provider: {
+          signedIn: receipt.provider.signedIn,
+          ...(receipt.provider.email === undefined ? {} : { email: receipt.provider.email }),
+          ...(receipt.provider.plan === undefined ? {} : { plan: receipt.provider.plan }),
+        },
+      });
+      if (!this.transitionMutation(attemptId, "effect_started", "applied", receipt)) {
+        throw new Error("LOGIN_CANCEL_MUTATION_CAS_CONFLICT");
+      }
+    });
+    complete.immediate();
+    return this.requireProfileById(profileId);
+  }
+
   /**
    * Records the effect evidence for an `account.login-cancel` attempt and moves
    * it to `effect_started` in one transaction, bound to the exact pending login
@@ -28817,8 +41925,6 @@ export class StateStore {
       kind: "account.login-cancel",
       loginId: input.loginId,
     } satisfies MutationEffectEvidence) as Extract<MutationEffectEvidence, { kind: "account.login-cancel" }>;
-    const canonical = JSON.stringify(evidence);
-    const digest = createHash("sha256").update(canonical).digest("hex");
     const now = this.#now();
     const begin = this.#database.transaction(() => {
       const row = z.object({
@@ -28846,7 +41952,7 @@ export class StateStore {
         authority: providerAuthority,
         provenance: "account_login_cancel",
       }, now);
-      this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
+      insertJoinedMutationEffectEvidence(this.#database, { attemptId: parsedAttemptId, evidence, recordedAt: now });
       const changed = this.#database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'").run(now, parsedAttemptId);
       if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
     });
@@ -28892,9 +41998,7 @@ export class StateStore {
                               WHERE m.id=? AND r.attempt_id IS NULL`).get(parsedAttemptId),
       );
       if (row.state !== expectedState) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
-      const evidence = mutationEffectEvidenceSchema.parse(
-        JSON.parse(row.evidence_json) as unknown,
-      );
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, parsedAttemptId).evidence;
       const providerAuthorities = this.readMutationProviderAuthorities(parsedAttemptId);
       const primary = providerAuthorities.find((value) => value.role === "primary");
       if (
@@ -28909,6 +42013,9 @@ export class StateStore {
         || primary.authority.provider !== "codex"
         || primary.authority.processGeneration !== row.authority_generation
       ) throw new Error("MUTATION_RECOVERY_PROVIDER_AUTHORITY_MISMATCH");
+      if (!this.isAccountMutationAuthorityCurrent({
+        attemptId: parsedAttemptId, profileId: row.authority_id, originGeneration: row.authority_generation,
+      })) throw new Error("ACCOUNT_MUTATION_RECOVERY_AUTHORITY_MISMATCH");
       const inserted = this.#database.query("INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)").run(
         parsedAttemptId,
         "provider_state_reconciled",
@@ -29221,6 +42328,7 @@ export class StateStore {
       }
       if (existing.kind === "legacy") throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
       const session = this.requireSession(request.session);
+      assertSupportedProvider(session.provider);
       const captured = this.requireCapturedSessionProviderAuthority(session.id);
       if (session.providerThreadId === undefined || session.state === "terminal") throw new SessionSendOwnershipError("SESSION_SEND_SOURCE_CHANGED");
       const daemon = { daemonGeneration: parsed.daemonGeneration, bootId: parsed.bootId };
@@ -29288,6 +42396,7 @@ export class StateStore {
       }
       if (existing.kind === "legacy") throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
       const session = this.requireSession(request.session);
+      assertSupportedProvider(session.provider);
       const captured = this.requireCapturedSessionProviderAuthority(session.id);
       if (session.providerThreadId === undefined || session.state === "terminal") throw new SessionSendOwnershipError("SESSION_SEND_SOURCE_CHANGED");
       assertUnsettledSessionSendOwners(this.#database, session.id);
@@ -29329,6 +42438,7 @@ export class StateStore {
   }>): SessionSendOwnerHistory & { dispatchGranted: true } {
     const fingerprint = sessionSendRequestFingerprintSchema.parse(input.requestFingerprint);
     const executionAuthority = providerAccountAuthoritySchema.parse(input.executionAuthority);
+    assertSupportedProvider(executionAuthority.provider);
     const evidence = ownedDirectSendEvidenceSchema.parse(input.evidence);
     const suppliedAttachments = input.attachments;
     const parsedAttachments = storedMessageAttachmentListSchema.safeParse(
@@ -29476,11 +42586,33 @@ export class StateStore {
   }
 
   #prepareMutation(input: Parameters<StateStore["prepareMutation"]>[0], attachmentInput?: InitialAttachmentInput): { id: AttemptId; state: MutationState; replay: boolean; result?: unknown } {
+    if (input.kind === PEER_SESSION_CANCELLATION_KIND) throw new Error("PEER_SESSION_CANCELLATION_CLOSED_API_REQUIRED");
     if (input.kind === automaticUsagePolicyMutationKind) throw new Error("AUTOMATIC_USAGE_POLICY_CLOSED_API_REQUIRED");
     if (input.kind === AUTOMATIC_POINTER_MOVE_KIND) throw new AutomaticPointerMoveStoreError("AUTOMATIC_POINTER_MOVE_CLOSED_API_REQUIRED");
     const idempotencyKey = input.idempotencyKey ?? randomUUID();
-    const canonical = JSON.stringify({ kind: input.kind, authorityId: input.authorityId, authorityGeneration: input.authorityGeneration, request: input.request });
-    const digest = createHash("sha256").update(canonical).digest("hex");
+    const directPeerSource = z.object({
+      target_session_id: sessionIdSchema,
+      delivery: z.enum(["send", "steer"]),
+      message_digest: sha256Schema,
+    }).strict().nullable().parse(this.#database.query(
+      `SELECT target_session_id,delivery,message_digest
+       FROM peer_session_direct_message_sources WHERE idempotency_key=?`,
+    ).get(idempotencyKey));
+    if (directPeerSource !== null) {
+      if (
+        input.authorityId !== directPeerSource.target_session_id
+        || input.kind !== `session.${directPeerSource.delivery}`
+      ) throw new Error("PEER_SESSION_MUTATION_JOIN_INVALID");
+      const peerRequest = z.object({
+        message: z.string().min(1).max(262_144),
+      }).passthrough().safeParse(input.request);
+      if (
+        !peerRequest.success
+        || createHash("sha256").update(peerRequest.data.message, "utf8").digest("hex")
+          !== directPeerSource.message_digest
+      ) throw new Error("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
+    }
+    const digest = mutationRequestDigest(input);
     const providerAuthorities = this.#parseProviderAuthorityEvidence(input.providerAuthorities);
     const existing = this.readMutation(idempotencyKey);
     if (existing !== null) {
@@ -29499,6 +42631,7 @@ export class StateStore {
       }
       return { id: existing.id, state: existing.state, replay: true, ...(existing.result === undefined ? {} : { result: existing.result }) };
     }
+    if (input.kind === "account.devin-login") assertSupportedProvider("devin");
     let id: AttemptId | undefined;
     const prepare = this.#database.transaction(() => {
       const ownedSession = sessionIdSchema.safeParse(input.authorityId);
@@ -29524,7 +42657,8 @@ export class StateStore {
         .query(`SELECT 1 FROM mutation_attempts m
                 LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
                 LEFT JOIN desktop_switch_resolutions dr ON dr.attempt_id=m.id
-                WHERE m.authority_id=? AND m.authority_generation=?
+                WHERE m.authority_id=? AND (m.authority_generation=?
+                    OR m.kind IN ('account.login','account.logout','account.login-cancel'))
                   AND m.state IN ('effect_started','ambiguous') AND r.attempt_id IS NULL AND dr.attempt_id IS NULL
                   AND (? IS NULL
                     OR NOT EXISTS(SELECT 1 FROM mutation_provider_authorities a WHERE a.attempt_id=m.id)
@@ -29558,6 +42692,10 @@ export class StateStore {
     providerAuthorities: readonly ProviderAuthorityEvidence[];
   }>): boolean {
     const attemptId = attemptIdSchema.parse(input.attemptId);
+    if (this.#database.query("SELECT 1 FROM mutation_attempts WHERE id=? AND kind=?")
+      .get(attemptId, PEER_SESSION_CANCELLATION_KIND) !== null) {
+      throw new Error("PEER_SESSION_CANCELLATION_CLOSED_API_REQUIRED");
+    }
     assertLegacyMutationOwnership(this.#database, { attemptId });
     if (this.#database.query("SELECT 1 FROM mutation_attempts WHERE id=? AND attachment_input_format IS NOT NULL").get(attemptId) !== null) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
     if (this.#database.query("SELECT 1 FROM mutation_attempts WHERE id=? AND kind='session.queue'").get(attemptId) !== null) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
@@ -29592,8 +42730,19 @@ export class StateStore {
       }
       const now = this.#now();
       const resultJson = result === undefined ? null : JSON.stringify(result);
+      const abandonTranscript = to === "failed" || to === "cancelled";
       const update = this.#database.query(
-        `UPDATE mutation_attempts SET state=?,result_json=?,updated_at=?
+        `UPDATE mutation_attempts SET state=?,result_json=?,updated_at=?,
+               transcript_status=CASE WHEN ?=1 AND transcript_status='pending'
+                 THEN 'abandoned' ELSE transcript_status END,
+               transcript_intent_json=CASE WHEN ?=1 AND transcript_status='pending'
+                 THEN json_object(
+                   'version',1,
+                   'actor',json_extract(transcript_intent_json,'$.actor'),
+                   'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+                     json_extract(transcript_intent_json,'$.attachments')),0)>0
+                     THEN 'true' ELSE 'false' END))
+                 ELSE transcript_intent_json END
          WHERE id=? AND state=?
            AND NOT EXISTS(
              SELECT 1 FROM session_switch_attempts switch
@@ -29602,31 +42751,117 @@ export class StateStore {
            AND NOT EXISTS(
              SELECT 1 FROM session_switch_malformed_dispositions malformed
              WHERE malformed.mutation_request_key=mutation_attempts.idempotency_key
-           )`,
-      ).run(to, resultJson, now, attemptId, from);
-      if (update.changes === 1) settleAttachmentParent(this.#database, attemptId, now);
-      return update.changes === 1;
+           ) RETURNING id`,
+      ).get(to, resultJson, now, abandonTranscript ? 1 : 0, abandonTranscript ? 1 : 0, attemptId, from);
+      if (update === null) return false;
+      if (z.object({ id: attemptIdSchema }).strict().parse(update).id !== attemptId) {
+        throw new Error("MUTATION_TRANSITION_CAS_CONFLICT");
+      }
+      settleAttachmentParent(this.#database, attemptId, now);
+      return true;
     });
     return transition.immediate();
   }
 
-  beginSessionMutationEffect(input: {
+  beginSessionMutationEffect(input: Readonly<{
     attemptId: AttemptId;
     sessionId: SessionId;
     profileGeneration: number;
     providerAuthority: ProviderAccountAuthority;
-    evidence: Extract<MutationEffectEvidence, { kind: "session.send" | "session.steer" | "session.stop" | "session.rename" }>;
     attachments?: readonly StoredMessageAttachment[];
     custody?: { custodyId: string; custodyDigest: string };
     daemonGeneration?: number;
     bootId?: string;
-  }): MutationEffectEvidenceRecord {
+  }> & (
+    | Readonly<{
+        evidence: Extract<MutationEffectEvidence, { kind: "session.send" | "session.steer" }>;
+        message: string;
+        transcript: SessionUserMessageIntentInput & Readonly<{ providerConnectionId: string }>;
+      }>
+    | Readonly<{
+        evidence: Extract<MutationEffectEvidence, { kind: "session.stop" | "session.rename" }>;
+        message?: never;
+        transcript?: never;
+      }>
+  )): MutationEffectEvidenceRecord {
     const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
     assertLegacyMutationOwnership(this.#database, { attemptId: parsedAttemptId });
     const parsedSessionId = sessionIdSchema.parse(input.sessionId);
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
     const providerAuthority = providerAccountAuthoritySchema.parse(input.providerAuthority);
-    const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
+    const suppliedAttachments = input.attachments;
+    const attachments = suppliedAttachments === undefined ? undefined : storedMessageAttachmentListSchema.parse(suppliedAttachments);
+    const parsedEvidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
+    let evidence = parsedEvidence;
+    let sourceIdempotencyKey: string | undefined;
+    let peerAuthored = false;
+    if (parsedEvidence.kind === "session.send" || parsedEvidence.kind === "session.steer") {
+      const message = z.string().min(1).max(262_144).parse(input.message);
+      if (createHash("sha256").update(message, "utf8").digest("hex") !== parsedEvidence.messageDigest) {
+        throw new Error("SESSION_MESSAGE_DIGEST_MISMATCH");
+      }
+      // Retained native mutation keys predate the public UUID admission contract.
+      // Preserve their bounded source identity when deriving transcript authorship.
+      const source = z.object({ idempotency_key: z.string().min(1).max(200) }).strict().parse(
+        this.#database.query(
+          "SELECT idempotency_key FROM mutation_attempts WHERE id=?",
+        ).get(parsedAttemptId),
+      );
+      sourceIdempotencyKey = source.idempotency_key;
+      const peerSource = z.object({
+        target_session_id: sessionIdSchema,
+        delivery: z.enum(["send", "steer"]),
+        message_digest: sha256Schema,
+      }).strict().nullable().parse(
+        this.#database.query(
+          `SELECT target_session_id,delivery,message_digest
+           FROM peer_session_direct_message_sources
+           WHERE idempotency_key=? LIMIT 1`,
+        ).get(source.idempotency_key),
+      );
+      if (
+        peerSource !== null && (
+          peerSource.target_session_id !== parsedSessionId
+          || peerSource.delivery !== (parsedEvidence.kind === "session.send" ? "send" : "steer")
+        )
+      ) throw new Error("PEER_SESSION_MUTATION_JOIN_INVALID");
+      if (peerSource !== null && peerSource.message_digest !== parsedEvidence.messageDigest) {
+        throw new Error("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
+      }
+      peerAuthored = peerSource !== null;
+      const autorespondAuthored = this.#database.query(
+        `SELECT 1 FROM autorespond_message_sources
+         WHERE session_id=? AND source_id=? LIMIT 1`,
+      ).get(parsedSessionId, parsedAttemptId) !== null;
+      const workAuthored = this.#isWorkSessionMessageSource({
+        idempotencyKey: source.idempotency_key,
+        sessionId: parsedSessionId,
+        kind: parsedEvidence.kind,
+        profileGeneration: parsedGeneration,
+      });
+      if (Number(peerAuthored) + Number(autorespondAuthored) + Number(workAuthored) > 1) {
+        throw new Error("SESSION_MESSAGE_ACTOR_AMBIGUOUS");
+      }
+      const messageActor: SessionMessageActor = peerAuthored
+        ? "peer_session"
+        : autorespondAuthored
+          ? "autorespond"
+          : workAuthored
+            ? "automation"
+            : "human";
+      if (
+        parsedEvidence.messageActor !== undefined
+        && parsedEvidence.messageActor !== messageActor
+      ) throw new Error("SESSION_MESSAGE_ACTOR_MISMATCH");
+      evidence = {
+        ...parsedEvidence,
+        messageActor,
+      };
+    }
+    if ((evidence.kind === "session.stop" || evidence.kind === "session.rename")
+      && evidence.providerTimestampUnit !== undefined) {
+      safeProviderTimestampSchema.parse(evidence.baseline.providerUpdatedAt);
+    }
     const canonical = JSON.stringify(evidence);
     const digest = createHash("sha256").update(canonical).digest("hex");
     const now = this.#now();
@@ -29638,6 +42873,7 @@ export class StateStore {
       }).blocked) {
         throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
       }
+      assertSupportedProvider(this.requireSession(parsedSessionId).provider);
       const authority = z.object({
         kind: z.string(),
         authority_id: sessionIdSchema,
@@ -29656,6 +42892,8 @@ export class StateStore {
         || authority.authority_id !== parsedSessionId
         || authority.authority_generation !== parsedGeneration
         || authority.provider_thread_id !== evidence.providerThreadId
+        || ((evidence.kind === "session.send" || evidence.kind === "session.steer")
+          && evidence.clientMessageId !== parsedAttemptId)
         || (evidence.kind === "session.send" && evidence.runtimeProfile !== undefined && (
           evidence.runtimeProfile.profileId !== authority.profile_id
           || evidence.runtimeProfile.processGeneration !== parsedGeneration
@@ -29678,24 +42916,100 @@ export class StateStore {
       if (evidence.kind === "session.send" && evidence.runtimeProfile !== undefined) {
         this.#assertSessionRuntimeProfileContract(parsedSessionId, evidence.runtimeProfile);
       }
+      let provedAttachmentDigest: string | undefined;
       if (evidence.kind === "session.send" || evidence.kind === "session.steer") {
         const parent = readAttachmentParent(this.#database, parsedAttemptId);
         if (parent.format !== null) {
           if (input.daemonGeneration === undefined || input.bootId === undefined) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_AUTHORITY_CHANGED");
           assertAttachmentDaemon(this.#database, { daemonGeneration: input.daemonGeneration, bootId: input.bootId });
-          if (input.attachments === undefined || parent.proof === null) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
-          const refs = input.attachments.map(({ digest, name, mediaType, byteLength }) => ({ digest, name, mediaType, byteLength }));
+          if (attachments === undefined || parent.proof === null) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
+          const refs = attachments.map(({ digest, name, mediaType, byteLength }) => ({ digest, name, mediaType, byteLength }));
           if (attachmentReferencesDigest(refs) !== parent.proof.referenceDigest || evidence.messageDigest !== parent.proof.messageDigest
             || evidence.clientMessageId !== parsedAttemptId) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
           if (parent.custody !== null) {
             if (input.custody?.custodyId !== parent.custody.origin.id || input.custody.custodyDigest !== parent.custody.digest || parent.custody.releasedBy !== null) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
             assertAttachmentDaemon(this.#database, parent.custody.origin);
           }
-          this.#recordMessageAttachments({ sessionId: parsedSessionId, sourceId: parsedAttemptId, attachments: input.attachments });
-          if (attachmentReferencesDigest(this.messageAttachmentManifest(parsedSessionId, parsedAttemptId)) !== parent.proof.referenceDigest) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_CORRUPT");
+          provedAttachmentDigest = parent.proof.referenceDigest;
         }
       }
-      this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
+      if (peerAuthored) {
+        if (evidence.kind !== "session.send" && evidence.kind !== "session.steer") {
+          throw new Error("PEER_SESSION_MUTATION_JOIN_INVALID");
+        }
+        const peerAction = this.readPeerSessionActionByIdempotencyKey(
+          sourceIdempotencyKey
+            ?? (() => { throw new Error("PEER_SESSION_MUTATION_JOIN_INVALID"); })(),
+        );
+        if (
+          peerAction === null
+          || peerAction.targetSessionId !== parsedSessionId
+          || peerAction.delivery !== (evidence.kind === "session.send" ? "send" : "steer")
+          || peerAction.messageDigest !== evidence.messageDigest
+          || !["prepared", "effect_started", "ambiguous"].includes(peerAction.state)
+        ) throw new Error("PEER_SESSION_MUTATION_JOIN_INVALID");
+        this.#assertPeerSessionActionAuthority(peerAction, "direct_begin");
+        if (peerAction.state === "prepared") {
+          const peerChanged = this.#database.query(
+            `UPDATE peer_session_actions
+             SET state='effect_started',updated_at=MAX(updated_at,?)
+             WHERE id=? AND state='prepared'`,
+          ).run(now, peerAction.id);
+          if (peerChanged.changes !== 1) {
+            throw new Error("PEER_SESSION_MUTATION_JOIN_INVALID");
+          }
+        }
+      }
+      if (evidence.kind === "session.send" || evidence.kind === "session.steer") {
+        if (input.transcript === undefined) {
+          throw new Error("SESSION_USER_MESSAGE_INTENT_REQUIRED");
+        }
+        if (
+          input.transcript.accountId !== authority.profile_id
+          || input.transcript.providerGeneration !== parsedGeneration
+          || input.transcript.actor !== evidence.messageActor
+          || input.transcript.message !== input.message
+        ) throw new Error("SESSION_USER_MESSAGE_INTENT_AUTHORITY_CHANGED");
+        z.string().uuid().parse(input.transcript.providerConnectionId);
+        let intent = input.transcript;
+        if (provedAttachmentDigest !== undefined) {
+          if (attachments === undefined) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
+          const references = attachments.map(({ byteLength, digest, mediaType, name }) => ({ byteLength, digest, mediaType, name }));
+          if ((intent.attachments !== undefined && attachmentReferencesDigest(intent.attachments) !== provedAttachmentDigest)
+            || (intent.storedAttachments !== undefined
+              && JSON.stringify(storedMessageAttachmentListSchema.parse(intent.storedAttachments)) !== JSON.stringify(attachments))) {
+            throw new Error("SESSION_USER_MESSAGE_ATTACHMENT_INTENT_MISMATCH");
+          }
+          // The original custody proof owns this ordered manifest. Optional
+          // transcript copies may agree with it, but may neither replace it
+          // nor turn omitted duplicate metadata into an empty manifest.
+          intent = { ...intent, attachments: references, storedAttachments: attachments };
+        }
+        this.#stageSessionUserMessageIntentInTransaction({
+          sessionId: parsedSessionId,
+          sourceKind: "mutation",
+          sourceId: parsedAttemptId,
+          intent,
+        });
+        if (provedAttachmentDigest !== undefined
+          && attachmentReferencesDigest(this.messageAttachmentManifest(parsedSessionId, parsedAttemptId)) !== provedAttachmentDigest) {
+          throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_CORRUPT");
+        }
+      } else if (input.transcript !== undefined) {
+        throw new Error("SESSION_USER_MESSAGE_INTENT_UNEXPECTED");
+      }
+      insertJoinedMutationEffectEvidence(this.#database, { attemptId: parsedAttemptId, evidence, recordedAt: now });
+      if (
+        (evidence.kind === "session.send" || evidence.kind === "session.steer")
+        && evidence.messageActor === "peer_session"
+      ) {
+        this.#database.query(
+          `DELETE FROM peer_session_direct_message_sources
+           WHERE idempotency_key=(
+             SELECT idempotency_key FROM mutation_attempts WHERE id=?
+           )`,
+        ).run(parsedAttemptId);
+      }
       const changed = this.#database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'").run(now, parsedAttemptId);
       if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
     });
@@ -29722,14 +43036,21 @@ export class StateStore {
     appliedPointerRevision?: number;
     providerAccountKey?: string;
     evidence: Extract<MutationEffectEvidence, { kind: "session.start" }>;
+    hostCapabilities?: Readonly<{
+      preambleVersion: number;
+      preambleDigest: string;
+      manifestVersion: number;
+      manifestDigest: string;
+    }>;
   }): SessionRecord {
     const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
     assertLegacyMutationOwnership(this.#database, { attemptId: parsedAttemptId });
     const parsedProfileId = profileIdSchema.parse(input.profileId);
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
     const parsedProjectId = projectIdSchema.parse(input.projectId);
-    const parsedPreset = presetSchema.parse(input.preset);
+    const parsedPreset = supportedPresetSchema.parse(input.preset);
     const parsedProvider = providerSchema.parse(input.provider);
+    assertSupportedProvider(parsedProvider);
     const providerAuthority = providerAccountAuthoritySchema.parse(input.providerAuthority);
     if (
       providerAuthority.profileId !== parsedProfileId
@@ -29740,11 +43061,7 @@ export class StateStore {
     const providerAccountKey = input.providerAccountKey === undefined
       ? undefined
       : providerAccountAuthorityKeySchema.parse(input.providerAccountKey);
-    if (parsedProvider === "devin") {
-      if (providerAccountKey !== undefined) {
-        throw new Error("SESSION_START_DEVIN_ACCOUNT_KEY_FORBIDDEN");
-      }
-    } else if (
+    if (
       providerAccountKey === undefined
       || !providerAccountAuthorityKeyMatchesProvider(parsedProvider, providerAccountKey)
     ) {
@@ -29764,14 +43081,43 @@ export class StateStore {
     if (parsedProvider !== "codex" && providerAuthentication === undefined) {
       throw new Error("SESSION_START_PROVIDER_AUTHENTICATION_REQUIRED");
     }
+    const hostCapabilities = input.hostCapabilities === undefined
+      ? undefined
+      : {
+          preambleVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+            .parse(input.hostCapabilities.preambleVersion),
+          preambleDigest: sha256Schema.parse(input.hostCapabilities.preambleDigest),
+          manifestVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+            .parse(input.hostCapabilities.manifestVersion),
+          manifestDigest: sha256Schema.parse(input.hostCapabilities.manifestDigest),
+        };
     assertPresetSupportedByProvider(parsedProvider, parsedPreset);
+    const presetBinding = activePresetBinding(parsedPreset);
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
-    if (evidence.projectId !== parsedProjectId) throw new Error("MUTATION_EFFECT_REQUEST_MISMATCH");
+    const expectedPresetContract = isReboundCodexPreset(parsedPreset)
+      ? presetBinding.contract
+      : undefined;
+    const expectedRequestDigest = mutationRequestDigest({
+      kind: "session.start",
+      authorityId: parsedProfileId,
+      authorityGeneration: parsedGeneration,
+      request: sessionStartMutationRequest({
+        projectId: parsedProjectId,
+        provider: parsedProvider,
+        preset: parsedPreset,
+        presetContract: evidence.presetContract,
+        fast: input.fastEnabled,
+      }),
+    });
+    if (
+      evidence.projectId !== parsedProjectId
+      || evidence.presetContract !== expectedPresetContract
+    ) throw new Error("MUTATION_EFFECT_REQUEST_MISMATCH");
     if (evidence.runtimeProfile !== undefined) {
       assertRuntimeProfileRequirement(
         evidence.runtimeProfile,
         parsedPreset,
-        presetRequirementForContract(parsedPreset, currentPresetContract),
+        presetBinding.requirement,
         "MUTATION_EFFECT_RUNTIME_PROFILE_PRESET_CONTRACT_MISMATCH",
       );
     }
@@ -29786,18 +43132,17 @@ export class StateStore {
         : input.fastEnabled)
       || reviewedRuntimeProfileProvider(evidence.runtimeProfile) !== parsedProvider
     )) throw new Error("MUTATION_EFFECT_RUNTIME_PROFILE_MISMATCH");
-    const canonical = JSON.stringify(evidence);
-    const digest = createHash("sha256").update(canonical).digest("hex");
     const sessionId = createSessionId();
     const now = this.#now();
     const begin = this.#database.transaction(() => {
-      const authority = z.object({ kind: z.literal("session.start"), authority_id: profileIdSchema, authority_generation: z.number().int().nonnegative(), state: z.literal("prepared"), process_generation: z.number().int().nonnegative(), profile_state: profileStateSchema, provider_email: z.string().nullable() }).strict().parse(
-        this.#database.query(`SELECT m.kind,m.authority_id,m.authority_generation,m.state,p.process_generation,p.state AS profile_state,p.provider_email
+      const authority = z.object({ kind: z.literal("session.start"), authority_id: profileIdSchema, authority_generation: z.number().int().nonnegative(), request_digest: sha256Schema, state: z.literal("prepared"), process_generation: z.number().int().nonnegative(), profile_state: profileStateSchema, provider_email: z.string().nullable() }).strict().parse(
+        this.#database.query(`SELECT m.kind,m.authority_id,m.authority_generation,m.request_digest,m.state,p.process_generation,p.state AS profile_state,p.provider_email
                               FROM mutation_attempts m JOIN profiles p ON p.id=m.authority_id WHERE m.id=?`).get(parsedAttemptId),
       );
       if (
         authority.authority_id !== parsedProfileId
         || authority.authority_generation !== parsedGeneration
+        || authority.request_digest !== expectedRequestDigest
         || (parsedProvider === "codex" && authority.process_generation !== parsedGeneration)
         || authority.profile_state === "removed"
         || (parsedProvider === "codex" && authority.profile_state !== "signed_in")
@@ -29823,7 +43168,7 @@ export class StateStore {
         authority: providerAuthority,
         provenance: "session_start",
       }, now);
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", legacySessionProviderShadow(parsedProvider), parsedProvider, presetTiers[parsedPreset], currentPresetContract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,canonical_profile_key,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", legacySessionProviderShadow(parsedProvider), parsedProvider, presetTiers[parsedPreset], presetBinding.contract, requireCanonicalSessionProfileKey(parsedProvider, presetTiers[parsedPreset], presetBinding.contract), input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(sessionId, now);
       this.#database.query(
         `INSERT INTO session_provider_authorities(
@@ -29841,19 +43186,32 @@ export class StateStore {
         appliedPointerRevision,
         now,
       );
-      if (parsedProvider !== "devin") {
-        this.#bindSessionProviderAccountAuthorityLocked({
-          sessionId,
-          provider: parsedProvider,
-          runtimeScope: "managed",
-          accountKey: providerAccountKey as string,
-        }, now);
-      }
+      this.#bindSessionProviderAccountAuthorityLocked({
+        sessionId,
+        provider: parsedProvider,
+        runtimeScope: "managed",
+        accountKey: providerAccountKey,
+      }, now);
       if (!this.sessionAccountAuthorityMatches(sessionId, parsedProfileId)) {
         throw new Error("SESSION_START_ACCOUNT_AUTHORITY_MISMATCH");
       }
+      if (hostCapabilities !== undefined) {
+        this.#database.query(
+          `INSERT INTO session_host_capability_bindings(
+             session_id,preamble_version,preamble_digest,manifest_version,
+             manifest_digest,recorded_at
+           ) VALUES (?,?,?,?,?,?)`,
+        ).run(
+          sessionId,
+          hostCapabilities.preambleVersion,
+          hostCapabilities.preambleDigest,
+          hostCapabilities.manifestVersion,
+          hostCapabilities.manifestDigest,
+          now,
+        );
+      }
       this.#database.query("INSERT INTO session_start_attempts(attempt_id,session_id,created_at) VALUES (?,?,?)").run(parsedAttemptId, sessionId, now);
-      this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
+      insertJoinedMutationEffectEvidence(this.#database, { attemptId: parsedAttemptId, evidence, recordedAt: now });
       const changed = this.#database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'").run(now, parsedAttemptId);
       if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
     });
@@ -29902,11 +43260,10 @@ export class StateStore {
     const attemptId = attemptIdSchema.parse(input.attemptId);
     const sessionId = sessionIdSchema.parse(input.sessionId);
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
-    if (evidence.targetProvider === "devin") {
-      if (evidence.targetProviderAccountKey !== undefined) {
-        throw new Error("SESSION_PROVIDER_SWITCH_DEVIN_ACCOUNT_KEY_FORBIDDEN");
-      }
-    } else if (
+    assertSupportedProvider(evidence.sourceProvider);
+    assertSupportedProvider(evidence.targetProvider);
+    const targetProvider = evidence.targetProvider;
+    if (
       evidence.targetProviderAccountKey === undefined
       || !providerAccountAuthorityKeyMatchesProvider(
         evidence.targetProvider,
@@ -29914,6 +43271,19 @@ export class StateStore {
       )
     ) {
       throw new Error("SESSION_PROVIDER_SWITCH_TARGET_ACCOUNT_AUTHORITY_REQUIRED");
+    }
+    if (evidence.targetHostCapabilities === undefined) {
+      throw new Error("SESSION_PROVIDER_SWITCH_HOST_CAPABILITY_MISMATCH");
+    }
+    const targetPresetBinding = activePresetBinding(evidence.targetPreset);
+    const expectedPresetContract = providerSwitchRequiresPresetContract(
+      evidence.targetProvider,
+      evidence.requestedPreset ?? undefined,
+    )
+      ? sharedActiveCodexPresetContract()
+      : undefined;
+    if (evidence.presetContract !== expectedPresetContract) {
+      throw new Error("SESSION_PROVIDER_SWITCH_PRESET_CONTRACT_MISMATCH");
     }
     const providerAuthentication = input.providerAuthentication === undefined
       ? undefined
@@ -29927,7 +43297,7 @@ export class StateStore {
     assertRuntimeProfileRequirement(
       evidence.runtimeProfile,
       evidence.targetPreset,
-      presetRequirementForContract(evidence.targetPreset, currentPresetContract),
+      targetPresetBinding.requirement,
       "SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_PRESET_CONTRACT_MISMATCH",
     );
     if (
@@ -29941,15 +43311,28 @@ export class StateStore {
     if (evidence.targetProvider !== "codex" && providerAuthentication === undefined) {
       throw new Error("SESSION_PROVIDER_SWITCH_AUTHENTICATION_REQUIRED");
     }
-    const canonical = JSON.stringify(evidence);
     const digest = digestJson(evidence);
+    const expectedRequestDigest = mutationRequestDigest({
+      kind: "session.switch",
+      authorityId: sessionId,
+      authorityGeneration: evidence.targetProcessGeneration,
+      request: sessionProviderSwitchMutationRequest({
+        provider: evidence.targetProvider,
+        preset: evidence.targetPreset,
+        presetContract: evidence.presetContract,
+        targetProfileId: evidence.targetProfileId,
+        seedDigest: evidence.seedDigest,
+      }),
+    });
     const now = this.#now();
     const record = this.#database.transaction(() => {
+      assertSupportedProvider(this.requireSession(sessionId).provider);
       const authority = z.object({
         daemon_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
         kind: z.literal("session.switch"),
         authority_id: sessionIdSchema,
         authority_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        request_digest: sha256Schema,
         mutation_state: z.literal("prepared"),
         source_profile_id: profileIdSchema,
         source_process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -29963,7 +43346,7 @@ export class StateStore {
         target_provider_email: z.string().nullable(),
       }).strict().parse(this.#database.query(
         `SELECT (SELECT generation FROM daemon_state WHERE singleton=1) AS daemon_generation,
-                m.kind,m.authority_id,m.authority_generation,m.state AS mutation_state,
+                m.kind,m.authority_id,m.authority_generation,m.request_digest,m.state AS mutation_state,
                 s.profile_id AS source_profile_id,source_account.process_generation AS source_process_generation,
                 s.provider_v39 AS source_provider,s.provider_thread_id AS source_provider_thread_id,
                 s.preset AS source_preset,s.state AS session_state,
@@ -29983,6 +43366,7 @@ export class StateStore {
         || authority.daemon_generation !== evidence.daemonGeneration
         || authority.authority_id !== sessionId
         || authority.authority_generation !== evidence.targetProcessGeneration
+        || authority.request_digest !== expectedRequestDigest
         || authority.source_profile_id !== evidence.sourceProfileId
         || authority.source_process_generation !== evidence.sourceProcessGeneration
         || authority.source_provider !== evidence.sourceProvider
@@ -30007,13 +43391,11 @@ export class StateStore {
           )
         )
       ) throw new Error("SESSION_PROVIDER_SWITCH_AUTHORITY_CHANGED");
-      const targetRevocation = evidence.targetProvider === "devin"
-        ? null
-        : this.readProviderRuntimeAccountRevocation({
-            profileId: evidence.targetProfileId,
-            provider: evidence.targetProvider,
-            runtimeScope: "managed",
-          });
+      const targetRevocation = this.readProviderRuntimeAccountRevocation({
+        profileId: evidence.targetProfileId,
+        provider: targetProvider,
+        runtimeScope: "managed",
+      });
       if (
         targetRevocation !== null
         && (
@@ -30038,9 +43420,7 @@ export class StateStore {
         providerAuthority: authorities.source,
         providerThreadId: evidence.sourceProviderThreadId,
       }).blocked) throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
-      this.#database.query(
-        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)",
-      ).run(attemptId, evidence.kind, canonical, digest, now);
+      insertJoinedMutationEffectEvidence(this.#database, { attemptId: attemptId, evidence, recordedAt: now });
       const changed = this.#database.query(
         "UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'",
       ).run(now, attemptId);
@@ -30073,7 +43453,7 @@ export class StateStore {
          LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
          WHERE m.id=? AND r.attempt_id IS NULL`,
       ).get(attemptId));
-      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
       if (
         row.authority_id !== sessionId
         || evidence.kind !== "session.switch"
@@ -30130,7 +43510,7 @@ export class StateStore {
          LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
          WHERE m.id=? AND r.attempt_id IS NULL`,
       ).get(attemptId));
-      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
       if (
         row.authority_id !== sessionId
         || row.target_provider_thread_id !== providerThreadId
@@ -30201,7 +43581,7 @@ export class StateStore {
          LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
          WHERE m.id=? AND r.attempt_id IS NULL`,
       ).get(attemptId));
-      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
       if (
         row.authority_id !== sessionId
         || row.target_provider_thread_id !== providerThreadId
@@ -30268,9 +43648,7 @@ export class StateStore {
          LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
          WHERE m.id=? AND r.attempt_id IS NULL`,
       ).get(attemptId));
-      const evidence = mutationEffectEvidenceSchema.parse(
-        JSON.parse(row.evidence_json) as unknown,
-      );
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
       if (
         row.authority_id !== sessionId
         || evidence.kind !== "session.switch"
@@ -30337,9 +43715,7 @@ export class StateStore {
          LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
          WHERE m.id=? AND r.attempt_id IS NULL`,
       ).get(attemptId));
-      const evidence = mutationEffectEvidenceSchema.parse(
-        JSON.parse(row.evidence_json) as unknown,
-      );
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
       const targetAccountAuthorityMatches = evidence.kind === "session.switch"
         && (evidence.targetProvider === "devin"
           ? providerAccountKey === undefined
@@ -30432,9 +43808,7 @@ export class StateStore {
       || (row.seed_turn_id !== null && row.client_message_id === null)
       || (row.seed_turn_id === null) !== (row.seed_turn_status === null)
     ) throw new Error("SESSION_PROVIDER_SWITCH_SEED_PROGRESS_CORRUPT");
-    const evidence = mutationEffectEvidenceSchema.parse(
-      JSON.parse(row.evidence_json) as unknown,
-    );
+    const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptIdSchema.parse(attemptId)).evidence;
     if (evidence.kind !== "session.switch") {
       throw new Error("SESSION_PROVIDER_SWITCH_SEED_PROGRESS_CORRUPT");
     }
@@ -30501,9 +43875,7 @@ export class StateStore {
          JOIN mutation_effect_evidence e ON e.attempt_id=m.id
          WHERE m.id=?`,
       ).get(attemptId));
-      const evidence = mutationEffectEvidenceSchema.parse(
-        JSON.parse(authority.evidence_json) as unknown,
-      );
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
       if (
         authority.session_id !== sessionId
         || authority.profile_id !== runtimeProfile.profileId
@@ -30551,9 +43923,9 @@ export class StateStore {
         providerAuthority: primary,
         allowHistoricalProviderAuthority: true,
       }, now);
+      return this.requireSession(sessionId);
     });
-    bind.immediate();
-    return this.requireSession(sessionId);
+    return bind.immediate();
   }
 
   bindSessionProviderSwitchRecoveryTarget(input: {
@@ -30595,9 +43967,7 @@ export class StateStore {
          LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
          WHERE m.id=? AND r.attempt_id IS NULL`,
       ).get(attemptId));
-      const evidence = mutationEffectEvidenceSchema.parse(
-        JSON.parse(authority.evidence_json) as unknown,
-      );
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, attemptId).evidence;
       const targetAccountAuthorityMatches = evidence.kind === "session.switch"
         && (evidence.targetProvider === "devin"
           ? providerAccountKey === undefined
@@ -30808,7 +44178,7 @@ export class StateStore {
       });
       const changed = this.#database.query(
         `UPDATE sessions
-         SET provider=?,provider_v39=?,profile_id=?,preset=?,preset_contract=?,provider_thread_id=?,title=?,
+         SET provider=?,provider_v39=?,profile_id=?,preset=?,preset_contract=?,canonical_profile_key=?,provider_thread_id=?,title=?,
              state='recovery_required',active_turn_id=NULL,provider_updated_at=?,
              revision=revision+1,updated_at=?
          WHERE id=? AND revision=? AND state!='terminal' RETURNING id`,
@@ -30818,6 +44188,7 @@ export class StateStore {
         evidence.targetProfileId,
         presetTiers[evidence.targetPreset],
         targetPresetContract,
+        requireCanonicalSessionProfileKey(evidence.targetProvider, presetTiers[evidence.targetPreset], targetPresetContract),
         authority.target_provider_thread_id,
         titleSchema.parse(input.title),
         input.providerUpdatedAt ?? null,
@@ -31080,8 +44451,6 @@ export class StateStore {
         ? {}
         : { providerRetirements: input.providerRetirements }),
     });
-    const canonical = JSON.stringify(evidence);
-    const digest = createHash("sha256").update(canonical).digest("hex");
     const now = this.#now();
     const begin = this.#database.transaction(() => {
       const row = z.object({ kind: z.string(), authority_id: profileIdSchema, authority_generation: z.number().int().nonnegative(), state: z.literal("prepared"), process_generation: z.number().int().nonnegative(), profile_state: profileStateSchema }).strict().parse(
@@ -31201,7 +44570,7 @@ export class StateStore {
           }
         }
       }
-      this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
+      insertJoinedMutationEffectEvidence(this.#database, { attemptId: parsedAttemptId, evidence, recordedAt: now });
       const changed = this.#database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'").run(now, parsedAttemptId);
       if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       return {
@@ -31272,9 +44641,7 @@ export class StateStore {
         || row.profile_state === "removed"
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       this.#assertProviderLoginAuthority(parsedAttemptId, parsedProfileId, parsedGeneration, "claude", true);
-      this.#database.query(
-        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)",
-      ).run(parsedAttemptId, evidence.kind, canonical, digest, now);
+      insertJoinedMutationEffectEvidence(this.#database, { attemptId: parsedAttemptId, evidence, recordedAt: now });
       const changed = this.#database.query(
         "UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'",
       ).run(now, parsedAttemptId);
@@ -31364,7 +44731,7 @@ export class StateStore {
          LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
          WHERE m.idempotency_key=?`,
       ).get(parsed.idempotencyKey));
-      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, parsed.attemptId).evidence;
       if (
         row.id !== parsed.attemptId
         || row.authority_id !== parsed.profileId
@@ -31474,7 +44841,7 @@ export class StateStore {
          LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
          WHERE m.idempotency_key=?`,
       ).get(parsed.idempotencyKey));
-      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, parsed.attemptId).evidence;
       if (
         row.id !== parsed.attemptId
         || row.authority_id !== parsed.profileId
@@ -31512,193 +44879,6 @@ export class StateStore {
       if (inserted.changes !== 1) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
     });
     abandon.immediate();
-    return result;
-  }
-
-  /**
-   * Durably consumes the one-time permission to launch Devin's foreground
-   * login inside the profile's isolated provider home. The generic mutation
-   * attempt remains the provider-specific fence and no credential is read.
-   */
-  beginDevinLoginMutationEffect(input: {
-    attemptId: AttemptId;
-    profileId: ProfileId;
-    profileGeneration: number;
-    evidence: Extract<MutationEffectEvidence, { kind: "account.devin-login" }>;
-  }): MutationEffectEvidenceRecord {
-    const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
-    const parsedProfileId = profileIdSchema.parse(input.profileId);
-    const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
-    const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
-    const canonical = JSON.stringify(evidence);
-    const digest = createHash("sha256").update(canonical).digest("hex");
-    const now = this.#now();
-    const begin = this.#database.transaction(() => {
-      const row = z.object({
-        kind: z.literal("account.devin-login"),
-        authority_id: profileIdSchema,
-        authority_generation: z.number().int().nonnegative(),
-        state: z.literal("prepared"),
-        process_generation: z.number().int().nonnegative(),
-        profile_state: profileStateSchema,
-      }).strict().parse(this.#database.query(
-        `SELECT m.kind,m.authority_id,m.authority_generation,m.state,
-                account.process_generation,p.state AS profile_state
-         FROM mutation_attempts m JOIN profiles p ON p.id=m.authority_id
-         JOIN provider_accounts account ON account.profile_id=p.id AND account.provider='devin'
-         WHERE m.id=?`,
-      ).get(parsedAttemptId));
-      if (
-        row.authority_id !== parsedProfileId
-        || row.authority_generation !== parsedGeneration
-        || row.process_generation !== parsedGeneration
-        || row.profile_state === "removed"
-      ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-      this.#assertProviderLoginAuthority(parsedAttemptId, parsedProfileId, parsedGeneration, "devin", true);
-      this.#database.query(
-        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)",
-      ).run(parsedAttemptId, evidence.kind, canonical, digest, now);
-      const changed = this.#database.query(
-        "UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'",
-      ).run(now, parsedAttemptId);
-      if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-    });
-    begin.immediate();
-    return { attemptId: parsedAttemptId, digest, evidence, recordedAt: now };
-  }
-
-  settleDevinLoginMutation(input: {
-    attemptId: AttemptId;
-    idempotencyKey: string;
-    profileId: ProfileId;
-    profileGeneration: number;
-    signedIn: boolean;
-    outcome:
-      | Readonly<{ state: "joined"; exitCode: number; interruptedBy: "SIGINT" | "SIGTERM" | null }>
-      | Readonly<{ state: "not_started"; reason: "spawn_failed" }>
-      | Readonly<{ state: "not_started"; reason: "preflight_stale" }>
-      | Readonly<{ state: "not_started"; reason: "interrupted_before_spawn"; interruptedBy: "SIGINT" | "SIGTERM" }>;
-  }): Readonly<{
-    accountId: ProfileId;
-    attemptId: AttemptId;
-    idempotencyKey: string;
-    providerGeneration: number;
-    signedIn: boolean;
-    outcome:
-      | Readonly<{ state: "joined"; exitCode: number; interruptedBy: "SIGINT" | "SIGTERM" | null }>
-      | Readonly<{ state: "not_started"; reason: "spawn_failed" }>
-      | Readonly<{ state: "not_started"; reason: "preflight_stale" }>
-      | Readonly<{ state: "not_started"; reason: "interrupted_before_spawn"; interruptedBy: "SIGINT" | "SIGTERM" }>;
-  }> {
-    const parsed = z.object({
-      attemptId: attemptIdSchema,
-      idempotencyKey: z.string().uuid(),
-      profileId: profileIdSchema,
-      profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-      signedIn: z.boolean(),
-      outcome: z.union([
-        z.object({
-          state: z.literal("joined"),
-          exitCode: z.number().int().nonnegative().max(255),
-          interruptedBy: z.enum(["SIGINT", "SIGTERM"]).nullable(),
-        }).strict(),
-        z.object({ state: z.literal("not_started"), reason: z.literal("spawn_failed") }).strict(),
-        z.object({ state: z.literal("not_started"), reason: z.literal("preflight_stale") }).strict(),
-        z.object({
-          state: z.literal("not_started"),
-          reason: z.literal("interrupted_before_spawn"),
-          interruptedBy: z.enum(["SIGINT", "SIGTERM"]),
-        }).strict(),
-      ]),
-    }).strict().parse(input);
-    if (parsed.outcome.state === "not_started" && parsed.signedIn) {
-      throw new Error("DEVIN_LOGIN_NO_EFFECT_STATUS_CONFLICT");
-    }
-    const result = {
-      accountId: parsed.profileId,
-      attemptId: parsed.attemptId,
-      idempotencyKey: parsed.idempotencyKey,
-      providerGeneration: parsed.profileGeneration,
-      signedIn: parsed.signedIn,
-      outcome: parsed.outcome,
-    } as const;
-    const now = this.#now();
-    const settle = this.#database.transaction(() => {
-      const row = z.object({
-        id: attemptIdSchema,
-        idempotency_key: z.string().uuid(),
-        kind: z.literal("account.devin-login"),
-        authority_id: profileIdSchema,
-        authority_generation: z.number().int().nonnegative(),
-        state: z.enum(["effect_started", "applied", "failed", "ambiguous"]),
-        result_json: z.string().nullable(),
-        profile_state: profileStateSchema,
-        evidence_json: z.string(),
-        evidence_digest: sha256Schema,
-        resolution_kind: mutationResolutionKindSchema.nullable(),
-        receipt_json: z.string().nullable(),
-      }).strict().parse(this.#database.query(
-        `SELECT m.id,m.idempotency_key,m.kind,m.authority_id,m.authority_generation,
-                m.state,m.result_json,p.state AS profile_state,e.evidence_json,e.evidence_digest,
-                r.resolution_kind,r.receipt_json
-         FROM mutation_attempts m
-         JOIN profiles p ON p.id=m.authority_id
-         JOIN mutation_effect_evidence e ON e.attempt_id=m.id
-         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
-         WHERE m.idempotency_key=?`,
-      ).get(parsed.idempotencyKey));
-      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
-      if (
-        row.id !== parsed.attemptId
-        || row.authority_id !== parsed.profileId
-        || row.authority_generation !== parsed.profileGeneration
-        || row.profile_state === "removed"
-        || evidence.kind !== "account.devin-login"
-        || digestJson(evidence) !== row.evidence_digest
-      ) throw new Error("DEVIN_LOGIN_AUTHORITY_MISMATCH");
-      this.#assertProviderLoginAuthority(parsed.attemptId, parsed.profileId, parsed.profileGeneration, "devin", false);
-      if (row.resolution_kind !== null) {
-        const prior = row.receipt_json === null ? null : JSON.parse(row.receipt_json) as unknown;
-        if (
-          row.resolution_kind === "abandoned"
-          || JSON.stringify(prior) !== JSON.stringify(result)
-        ) throw new Error("DEVIN_LOGIN_TERMINAL_OUTCOME_CONFLICT");
-        return;
-      }
-      if (row.state === "applied" || row.state === "failed") {
-        const prior = row.result_json === null ? null : JSON.parse(row.result_json) as unknown;
-        if (JSON.stringify(prior) !== JSON.stringify(result)) {
-          throw new Error("DEVIN_LOGIN_TERMINAL_OUTCOME_CONFLICT");
-        }
-        return;
-      }
-      if (parsed.outcome.state === "joined") {
-        this.#assertProviderLoginAuthority(parsed.attemptId, parsed.profileId, parsed.profileGeneration, "devin", true);
-      }
-      if (row.state === "ambiguous") {
-        const inserted = this.#database.query(
-          "INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)",
-        ).run(
-          parsed.attemptId,
-          parsed.signedIn ? "proven_applied" : "provider_state_reconciled",
-          JSON.stringify({
-            source: "account.devin-login.complete",
-            signedIn: parsed.signedIn,
-            outcome: parsed.outcome,
-          }),
-          JSON.stringify(result),
-          now,
-        );
-        if (inserted.changes !== 1) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
-        return;
-      }
-      const target = parsed.signedIn ? "applied" : "failed";
-      const changed = this.#database.query(
-        "UPDATE mutation_attempts SET state=?,result_json=?,updated_at=? WHERE id=? AND state='effect_started'",
-      ).run(target, JSON.stringify(result), now, parsed.attemptId);
-      if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-    });
-    settle.immediate();
     return result;
   }
 
@@ -31757,7 +44937,7 @@ export class StateStore {
          LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
          WHERE m.idempotency_key=?`,
       ).get(parsed.idempotencyKey));
-      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, parsed.attemptId).evidence;
       if (
         row.id !== parsed.attemptId
         || row.authority_id !== parsed.profileId
@@ -31856,17 +45036,20 @@ export class StateStore {
     resolution: MutationResolutionRecord["kind"];
     resolutionEvidence: unknown;
     receipt?: unknown;
+    message?: string;
     provider?: { providerThreadId: string; title: string; status: "active" | "idle" | "terminal"; activeTurnId?: string; providerUpdatedAt?: number };
     acknowledgeProviderStateUnknown?: boolean;
-  }): SessionRecord {
+  }): SessionEffectResolutionResult {
+    const requestedResolutionEvidence = snapshotPeerCausalResolutionInput(input.resolutionEvidence);
     const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
     assertLegacyMutationOwnership(this.#database, { attemptId: parsedAttemptId });
     const expectedDigest = sha256Schema.parse(input.expectedEvidenceDigest);
     const resolution = mutationResolutionKindSchema.parse(input.resolution);
-    const resolutionJson = JSON.stringify(input.resolutionEvidence);
+    let resolutionJson = JSON.stringify(requestedResolutionEvidence);
     let receiptJson = input.receipt === undefined ? null : JSON.stringify(input.receipt);
     const now = this.#now();
     let resolvedSessionId: SessionId | undefined;
+    let messageEvent: SessionUserMessageEventAppendResult | undefined;
     const resolveAttempt = this.#database.transaction(() => {
       const row = z.object({
         authority_id: z.string(),
@@ -31885,9 +45068,18 @@ export class StateStore {
       if (row.state !== input.expectedOriginalState || row.evidence_digest !== expectedDigest) {
         throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
       }
-      const effectEvidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown) as MutationEffectEvidence;
+      const effectEvidence = requireMutationEvidenceFromProvenance(this.#database, parsedAttemptId).evidence;
       if (effectEvidence.kind !== row.kind || digestJson(effectEvidence) !== row.evidence_digest) {
         throw new Error("MUTATION_RECOVERY_EVIDENCE_MISMATCH");
+      }
+      if (effectEvidence.kind === "session.stop" || effectEvidence.kind === "session.rename") {
+        assertTimestampMutationResolution({
+          effect: effectEvidence,
+          resolution,
+          evidence: requestedResolutionEvidence,
+          receipt: input.receipt,
+          provider: input.provider,
+        });
       }
       if (effectEvidence.kind === "session.switch") {
         if (resolution === "proven_applied" && input.receipt === undefined) {
@@ -31901,6 +45093,15 @@ export class StateStore {
       const sessionId = row.session_start_id ?? sessionIdSchema.parse(row.authority_id);
       resolvedSessionId = sessionId;
       const session = mapSession(this.#database.query("SELECT * FROM sessions WHERE id=?").get(sessionId));
+      if (resolution === "abandoned" && (effectEvidence.kind === "session.send" || effectEvidence.kind === "session.steer")) {
+        const transcriptActor = readPeerCausalTranscriptActor(this.#database, "mutation_attempts", parsedAttemptId);
+        const peerOrUnknown = effectEvidence.messageActor === "peer_session" || transcriptActor === "peer_session"
+          || (effectEvidence.messageActor === undefined && transcriptActor === undefined);
+        if (peerOrUnknown) {
+          if (input.provider === undefined) throw new Error("MUTATION_RECOVERY_PROVIDER_PROJECTION_REQUIRED");
+          resolutionJson = JSON.stringify(peerCausalResolutionEvidence(requestedResolutionEvidence, effectEvidence.providerThreadId, input.provider));
+        }
+      }
       const providerAuthorities = this.readMutationProviderAuthorities(parsedAttemptId);
       const primary = providerAuthorities.find((value) => value.role === "primary");
       let captured: SessionProviderAuthority;
@@ -32073,6 +45274,22 @@ export class StateStore {
           }, now);
         }
       }
+      if (effectEvidence.kind === "session.send" || effectEvidence.kind === "session.steer") {
+        if (resolution === "abandoned") {
+          this.#database.query(
+            `UPDATE mutation_attempts SET transcript_status='abandoned',
+               transcript_intent_json=json_object(
+                 'version',1,
+                 'actor',json_extract(transcript_intent_json,'$.actor'),
+                 'hadAttachments',json(CASE WHEN COALESCE(json_array_length(
+                   json_extract(transcript_intent_json,'$.attachments')),0)>0
+                   THEN 'true' ELSE 'false' END))
+             WHERE id=? AND transcript_status='pending'`,
+          ).run(parsedAttemptId);
+        } else if (resolution !== "proven_applied") {
+          throw new Error("SESSION_USER_MESSAGE_RECOVERY_RESOLUTION_INVALID");
+        }
+      }
       if (
         resolution === "proven_applied"
         && effectEvidence.kind === "session.start"
@@ -32165,6 +45382,9 @@ export class StateStore {
             transcriptDigest: effectEvidence.transcriptDigest,
             seedDigest: effectEvidence.seedDigest,
             seedOmittedRecords: effectEvidence.seedOmittedRecords,
+            ...(effectEvidence.seedRetentionGapReason === undefined
+              ? {}
+              : { seedRetentionGapReason: effectEvidence.seedRetentionGapReason }),
           },
           providerConnectionId: null,
           providerGeneration: targetAuthority.processGeneration,
@@ -32196,10 +45416,56 @@ export class StateStore {
       const inserted = this.#database.query("INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, resolution, resolutionJson, receiptJson, now);
       if (inserted.changes !== 1) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
       settleAttachmentParent(this.#database, parsedAttemptId, now);
+      if (
+        resolution === "proven_applied"
+        && (effectEvidence.kind === "session.send" || effectEvidence.kind === "session.steer")
+      ) {
+        const recoveredTurn = effectEvidence.kind === "session.send"
+          ? z.object({ turnId: z.string().min(1).max(200) }).passthrough().parse(input.receipt).turnId
+          : z.object({ activeTurnId: z.string().min(1).max(200) }).passthrough().parse(input.receipt).activeTurnId;
+        const resolvedSession = this.requireSession(sessionId);
+        const resolvedProfile = this.requireProfileById(resolvedSession.profileId);
+        if (input.message === undefined) {
+          const source = this.#database.query(
+            "SELECT transcript_status FROM mutation_attempts WHERE id=? AND authority_id=?",
+          ).get(parsedAttemptId, sessionId);
+          if (z.object({ transcript_status: sessionUserMessageTranscriptStatusSchema }).strict()
+            .parse(source).transcript_status === "pending") {
+            const event = this.#finalizeSessionUserMessageSourceInTransaction({
+              sourceId: parsedAttemptId,
+              sourceKind: "mutation",
+              sessionId,
+              turnId: recoveredTurn,
+              recordedAt: now,
+            });
+            if (event !== null) messageEvent = { event, appended: true };
+          }
+        } else {
+          messageEvent = this.#appendSessionUserMessageEventOnceInTransaction({
+            sourceId: parsedAttemptId,
+            sessionId,
+            accountId: resolvedSession.profileId,
+            providerGeneration: resolvedProfile.processGeneration,
+            providerConnectionId: null,
+            turnId: recoveredTurn,
+            message: z.string().min(1).max(262_144).parse(input.message),
+            recordedAt: now,
+          });
+        }
+        if (messageEvent?.appended === true && effectEvidence.kind === "session.send" && effectEvidence.messageActor === "human") {
+          this.#database.query(
+            `UPDATE session_autorespond_counters
+             SET consecutive_count=0,updated_at=? WHERE session_id=?`,
+          ).run(now, sessionId);
+        }
+      }
     });
     resolveAttempt.immediate();
     if (resolvedSessionId === undefined) throw new Error("Mutation recovery lost its session binding.");
-    return this.requireSession(resolvedSessionId);
+    return {
+      ...this.requireSession(resolvedSessionId),
+      ...(messageEvent === undefined ? {} : { messageEvent }),
+    };
   }
 
   /**
@@ -32317,9 +45583,7 @@ export class StateStore {
                               WHERE m.id=? AND r.attempt_id IS NULL`).get(parsedAttemptId),
       );
       if (row.state !== input.expectedOriginalState || row.evidence_digest !== expectedDigest) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
-      const evidence = mutationEffectEvidenceSchema.parse(
-        JSON.parse(row.evidence_json) as unknown,
-      );
+      const evidence = requireMutationEvidenceFromProvenance(this.#database, parsedAttemptId).evidence;
       const providerAuthorities = this.readMutationProviderAuthorities(parsedAttemptId);
       const primary = providerAuthorities.find((value) => value.role === "primary");
       if (
@@ -32334,6 +45598,9 @@ export class StateStore {
         || primary.authority.processGeneration !== row.authority_generation
       ) throw new Error("MUTATION_RECOVERY_PROVIDER_AUTHORITY_MISMATCH");
       profileId = row.authority_id;
+      if (!this.isAccountMutationAuthorityCurrent({
+        attemptId: parsedAttemptId, profileId, originGeneration: row.authority_generation,
+      })) throw new Error("ACCOUNT_MUTATION_RECOVERY_AUTHORITY_MISMATCH");
       const providerEmail = provider.signedIn ? provider.email ?? null : null;
       const changed = this.#database.query(`UPDATE profiles SET state=?,provider_email=?,codex_account_key=?,provider_plan=?,updated_at=?
                                             WHERE id=? AND process_generation=? AND state='recovery_required'`).run(
@@ -32372,6 +45639,13 @@ export class StateStore {
   } {
     const recover = this.#database.transaction(() => {
       auditSessionSendOwners(this.#database);
+      // This local predicate authorizes only quarantine of retired evidence.
+      // It is deliberately not a provider-current proof: no successor or
+      // executable authority is granted when a historical generation is old.
+      const canQuarantineRetiredAuthority = (profileId: ProfileId, generation: number): boolean =>
+        this.#database.query(
+          "SELECT 1 FROM profiles WHERE id=? AND state!='removed' AND process_generation>=?",
+        ).get(profileId, generation) !== null;
       const rows = this.#database
         .query(`SELECT m.id,m.kind,m.authority_id,m.authority_generation,e.kind AS evidence_kind,e.evidence_json,e.evidence_digest,s.session_id AS session_start_id
                 FROM mutation_attempts m
@@ -32482,9 +45756,13 @@ export class StateStore {
         let effectEvidence: MutationEffectEvidence | undefined;
         if (kind !== "desktop.switch") {
           try {
-            if (raw.evidence_kind !== kind || raw.evidence_json === null) throw new Error("missing effect evidence");
-            effectEvidence = mutationEffectEvidenceSchema.parse(JSON.parse(raw.evidence_json) as unknown) as MutationEffectEvidence;
-            if (effectEvidence.kind !== kind || digestJson(effectEvidence) !== sha256Schema.parse(raw.evidence_digest)) throw new Error("effect evidence mismatch");
+            const evidenceKindMatches = raw.evidence_kind === kind;
+            if (!evidenceKindMatches || raw.evidence_json === null) throw new Error("missing effect evidence");
+            effectEvidence = requireMutationEvidenceFromProvenance(this.#database, id).evidence;
+            if (
+              effectEvidence.kind !== raw.evidence_kind
+              || digestJson(effectEvidence) !== sha256Schema.parse(raw.evidence_digest)
+            ) throw new Error("effect evidence mismatch");
           } catch {
             unresolved.push({ id, kind, authorityId });
             continue;
@@ -32578,11 +45856,21 @@ export class StateStore {
             && primary.authority.processGeneration === authorityGeneration
           ) {
             const profile = this.#database
-              .query("SELECT state FROM profiles WHERE id=?")
-              .get(parsedProfile.data) as { state: string } | null;
-            if (profile !== null) {
+              .query("SELECT state,process_generation FROM profiles WHERE id=?")
+              .get(parsedProfile.data) as { state: string; process_generation: number } | null;
+            if (profile !== null && (this.isAccountMutationAuthorityCurrent({
+              attemptId: id, profileId: parsedProfile.data, originGeneration: authorityGeneration,
+            }) || this.#canQuarantineUnboundAccountMutation({
+              attemptId: id, profileId: parsedProfile.data, originGeneration: authorityGeneration,
+            }))) {
               if (profile.state !== "removed" && profile.state !== "recovery_required") {
                 const recoveryAt = this.#now();
+                if (kind === "account.login-cancel") {
+                  prepareProviderLoginBindingTransition(this.#database, {
+                    profileId: parsedProfile.data, cancellationAttemptId: id,
+                    cause: "cancellation_quarantined", recordedAt: recoveryAt,
+                  });
+                }
                 const changed = this.#database
                   .query("UPDATE profiles SET state='recovery_required',updated_at=? WHERE id=? AND state NOT IN ('removed','recovery_required')")
                   .run(recoveryAt, parsedProfile.data);
@@ -32631,6 +45919,15 @@ export class StateStore {
               && captured !== null
               && sameProviderAccountBinding(primary.authority, captured)
               && runtimeAuthorityMatches
+              && (primary.authority.provider === "devin"
+                ? effectEvidence.runtimeProfile !== undefined
+                  && isDevinRuntimeProfile(effectEvidence.runtimeProfile)
+                  && this.requireSession(parsedSession.data).projectId === effectEvidence.projectId
+                  && canQuarantineRetiredAuthority(parsedProfile.data, authorityGeneration)
+                : this.isSessionMutationProviderAuthorityCurrent({
+                    attemptId: id, profileId: parsedProfile.data,
+                    provider: primary.authority.provider, originGeneration: authorityGeneration,
+                  }))
             ) {
               if (binding.state !== "terminal" && binding.state !== "recovery_required") {
                 this.#database.query("UPDATE sessions SET state='recovery_required',active_turn_id=NULL,revision=revision+1,updated_at=? WHERE id=?").run(this.#now(), parsedSession.data);
@@ -32659,23 +45956,36 @@ export class StateStore {
               && session.profileId === effectEvidence.targetProfileId
               && session.provider === effectEvidence.targetProvider
               && session.providerThreadId === target.provider_thread_id;
+            const hasRetiredProvider = effectEvidence.sourceProvider === "devin"
+              || effectEvidence.targetProvider === "devin";
+            const retiredRuntimeProfileMatches = !hasRetiredProvider || (
+              reviewedRuntimeProfileProvider(effectEvidence.runtimeProfile) === effectEvidence.targetProvider
+              && effectEvidence.runtimeProfile.profileId === effectEvidence.targetProfileId
+              && effectEvidence.runtimeProfile.processGeneration === effectEvidence.targetProcessGeneration
+              && effectEvidence.runtimeProfile.preset === effectEvidence.targetPreset
+            );
             if (
-              !(target !== null && sessionProviderSwitchTargetAliasesSource(
+              retiredRuntimeProfileMatches
+              && !(target !== null && sessionProviderSwitchTargetAliasesSource(
                 effectEvidence,
                 target.provider_thread_id,
               ))
-              && this.isSessionMutationProviderAuthorityCurrent({
+              && (effectEvidence.sourceProvider === "devin"
+                ? canQuarantineRetiredAuthority(effectEvidence.sourceProfileId, effectEvidence.sourceProcessGeneration)
+                : this.isSessionMutationProviderAuthorityCurrent({
                 attemptId: id,
                 profileId: effectEvidence.sourceProfileId,
                 provider: effectEvidence.sourceProvider,
                 originGeneration: effectEvidence.sourceProcessGeneration,
-              })
-              && this.isSessionMutationProviderAuthorityCurrent({
+              }))
+              && (effectEvidence.targetProvider === "devin"
+                ? canQuarantineRetiredAuthority(effectEvidence.targetProfileId, effectEvidence.targetProcessGeneration)
+                : this.isSessionMutationProviderAuthorityCurrent({
                 attemptId: id,
                 profileId: effectEvidence.targetProfileId,
                 provider: effectEvidence.targetProvider,
                 originGeneration: effectEvidence.targetProcessGeneration,
-              })
+              }))
               && authorityGeneration === effectEvidence.targetProcessGeneration
               && (sourceBinding || targetBinding)
             ) {
@@ -32698,10 +46008,18 @@ export class StateStore {
           unresolved.push({ id, kind, authorityId });
           continue;
         }
-        if (kind !== "desktop.switch" && !this.transitionMutation(id, "effect_started", "ambiguous", { code: "DAEMON_RESTART" })) {
+        const retiredSessionSwitchRecovered = kind === "session.switch"
+          && effectEvidence?.kind === "session.switch"
+          && (effectEvidence.sourceProvider === "devin"
+            || effectEvidence.targetProvider === "devin");
+        if (
+          kind !== "desktop.switch"
+          && (kind !== "session.switch" || retiredSessionSwitchRecovered)
+          && !this.transitionMutation(id, "effect_started", "ambiguous", { code: "DAEMON_RESTART" })
+        ) {
           throw new Error("Mutation changed during restart recovery.");
         }
-        recovered.push(id);
+        if (kind !== "session.switch" || retiredSessionSwitchRecovered) recovered.push(id);
       }
       return { recovered, unresolved };
     });
@@ -34290,6 +47608,9 @@ export class StateStore {
     providerConnectionId: string | null;
     body: SessionEventBody;
     recordedAt: number;
+    userMessageSourceKind?: "mutation" | "queue";
+    /** Only the private, source-validated settled-message finalizer sets this. */
+    settledSourceThreadId?: string;
   }>): SessionEvent {
     const authority = z.object({
       profile_id: profileIdSchema,
@@ -34305,8 +47626,68 @@ export class StateStore {
     const capturedProviderAuthority = baseProviderAccountAuthority(
       this.requireCapturedSessionProviderAuthority(input.sessionId),
     );
+    let provenance = "session_event";
     if (!sameProviderAccountAuthority(providerAuthority, capturedProviderAuthority)) {
-      throw new Error("SESSION_EVENT_PROVIDER_AUTHORITY_CHANGED");
+      if (input.settledSourceThreadId === undefined
+        || input.userMessageSourceKind === undefined
+        || input.body.type !== "user_message" || input.body.sourceId === undefined
+        || providerAuthority.provider !== "codex"
+        || !sameProviderAccountBinding(providerAuthority, capturedProviderAuthority)
+        || providerAuthority.processGeneration >= capturedProviderAuthority.processGeneration) {
+        throw new Error("SESSION_EVENT_PROVIDER_AUTHORITY_CHANGED");
+      }
+      const session = this.requireSession(input.sessionId);
+      const captured = this.requireCapturedSessionProviderAuthority(input.sessionId);
+      if (session.providerThreadId !== input.settledSourceThreadId
+        || !sameProviderAccountAuthority(capturedProviderAuthority, this.requireProviderAccountAuthority(
+          providerAuthority.profileId, providerAuthority.provider,
+        ))) throw new Error("SESSION_EVENT_PROVIDER_AUTHORITY_CHANGED");
+      // The restart writer captures the exact old-authority gap before moving
+      // this immutable ledger. It admits one crash step, or two steps after a
+      // graceful disconnect. Follow every retained edge; arithmetic alone is
+      // not proof, and a switch-away-and-back cannot stand in for a restart.
+      // Bounded pages avoid retaining lifetime history. Revisions strictly
+      // decrease under the caller's transaction, so this never chases inserts.
+      let revision = captured.authorityRevision;
+      let generation = captured.processGeneration;
+      while (generation > providerAuthority.processGeneration) {
+        const page = this.#database.query(
+          `SELECT * FROM session_provider_authority_successors
+           WHERE session_id=? AND from_authority_revision<?
+           ORDER BY from_authority_revision DESC LIMIT 100`,
+        ).all(input.sessionId, revision);
+        if (page.length === 0) throw new Error("SESSION_EVENT_PROVIDER_AUTHORITY_CHANGED");
+        for (const value of page) {
+          const edge = sessionProviderAuthoritySuccessorRowSchema.parse(value);
+          const step = edge.to_process_generation - edge.from_process_generation;
+          if (edge.to_authority_revision !== revision
+            || edge.from_authority_revision !== revision - 1
+            || edge.transition_kind !== "provider_restart"
+            || edge.from_provider_account_id !== providerAuthority.providerAccountId
+            || edge.to_provider_account_id !== providerAuthority.providerAccountId
+            || edge.from_profile_id !== providerAuthority.profileId
+            || edge.to_profile_id !== providerAuthority.profileId
+            || edge.from_provider !== providerAuthority.provider
+            || edge.to_provider !== providerAuthority.provider
+            || edge.from_binding_generation !== providerAuthority.bindingGeneration
+            || edge.to_binding_generation !== providerAuthority.bindingGeneration
+            || edge.to_process_generation !== generation
+            || (step !== 1 && step !== 2)
+            || edge.from_routing_provenance !== captured.routingProvenance
+            || edge.to_routing_provenance !== captured.routingProvenance
+            || edge.from_applied_pointer_revision !== captured.appliedPointerRevision
+            || edge.to_applied_pointer_revision !== captured.appliedPointerRevision) {
+            throw new Error("SESSION_EVENT_PROVIDER_AUTHORITY_CHANGED");
+          }
+          generation = edge.from_process_generation;
+          revision = edge.from_authority_revision;
+          if (generation <= providerAuthority.processGeneration) break;
+        }
+      }
+      if (generation !== providerAuthority.processGeneration) {
+        throw new Error("SESSION_EVENT_PROVIDER_AUTHORITY_CHANGED");
+      }
+      provenance = "settled_source";
     }
     this.#ensureSessionEventStream(input.sessionId);
     const stream = z.object({
@@ -34353,9 +47734,78 @@ export class StateStore {
       "session_event_provider_authorities",
       [input.sessionId, stream.next_sequence],
       baseProviderAccountAuthority(providerAuthority),
-      "session_event",
+      provenance,
       input.recordedAt,
     );
+    if (input.userMessageSourceKind !== undefined) {
+      if (input.body.type !== "user_message" || input.body.sourceId === undefined) {
+        throw new Error("SESSION_USER_MESSAGE_SOURCE_FINALIZATION_INVALID");
+      }
+      const finalized = input.userMessageSourceKind === "mutation"
+        ? this.#database.query(
+            `UPDATE mutation_attempts
+             SET transcript_finalized=1,transcript_status='finalized',
+                 transcript_intent_json=?
+             WHERE authority_id=? AND idempotency_key=?
+               AND kind IN ('session.send','session.steer')
+               AND transcript_finalized=0 AND transcript_status='pending'`,
+          ).run(
+            sessionUserMessageActorReceiptJson({
+              actor: input.body.actor,
+              ...(input.body.attachments === undefined
+                ? {}
+                : { attachments: input.body.attachments }),
+            }),
+            input.sessionId,
+            input.body.sourceId,
+          )
+        : this.#database.query(
+            `UPDATE queue_entries
+             SET transcript_finalized=1,transcript_status='finalized',
+                 transcript_intent_json=?
+             WHERE session_id=? AND id=?
+               AND transcript_finalized=0 AND transcript_status='pending'`,
+          ).run(
+            sessionUserMessageActorReceiptJson({
+              actor: input.body.actor,
+              ...(input.body.attachments === undefined
+                ? {}
+                : { attachments: input.body.attachments }),
+            }),
+            input.sessionId,
+            input.body.sourceId,
+          );
+      if (finalized.changes !== 1) {
+        throw new Error("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+      }
+      // Human prose resets consecutive admission. Current autorespond prose
+      // already reserved its spend before dispatch; only historical unreserved
+      // sources spend on their first finalization. The event/source transaction
+      // keeps exact replay neutral and failed finalization fully retryable.
+      if (input.body.actor === "human") {
+        this.#database.query(`UPDATE autorespond_after_hours_history
+          SET human_reset_required=0,reset_source_kind=?,reset_source_id=?
+          WHERE session_id=? AND human_reset_required=1`).run(
+          input.userMessageSourceKind, input.body.sourceId, input.sessionId,
+        );
+        this.#database.query(
+          `UPDATE session_autorespond_counters
+           SET consecutive_count=0,updated_at=? WHERE session_id=?`,
+        ).run(input.recordedAt, input.sessionId);
+      } else if (input.body.actor === "autorespond" && this.#database.query(
+        `SELECT 1 FROM autorespond_budget_reservations
+         WHERE session_id=? AND source_kind='prose' AND source_id=?`,
+      ).get(input.sessionId, input.body.sourceId) === null) {
+        this.#database.query(
+          `INSERT INTO session_autorespond_counters(
+             session_id,consecutive_count,updated_at
+           ) VALUES (?,1,?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             consecutive_count=consecutive_count+1,
+             updated_at=excluded.updated_at`,
+        ).run(input.sessionId, input.recordedAt);
+      }
+    }
     const advanced = this.#database.query(
       `UPDATE session_event_streams
        SET next_sequence=?,observed_through_sequence=?,updated_at=MAX(updated_at,?)
@@ -34407,6 +47857,7 @@ export class StateStore {
     providerAuthority: ProviderAccountAuthority;
     providerConnectionId: string | null;
     body: SessionEventBody;
+    userMessageSourceKind?: "mutation" | "queue";
   }): SessionEvent {
     const parsed = {
       sessionId: sessionIdSchema.parse(input.sessionId),
@@ -34417,11 +47868,205 @@ export class StateStore {
       providerConnectionId: z.string().uuid().nullable().parse(input.providerConnectionId),
       body: sessionEventBodySchema.parse(input.body),
       recordedAt: unixMillisecondsSchema.parse(this.#now()),
+      ...(input.userMessageSourceKind === undefined
+        ? {}
+        : { userMessageSourceKind: input.userMessageSourceKind }),
     };
     const append = this.#database.transaction(
       () => this.#appendSessionEventInTransaction(parsed),
     );
     return append.immediate();
+  }
+
+  readSessionMessageEventSource(
+    sessionId: SessionId,
+    sourceId: string,
+  ): SessionMessageEventSourceRecord | null {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const parsedSourceId = z.union([attemptIdSchema, queueIdSchema]).parse(sourceId);
+    const row = this.#database.query(
+      `SELECT * FROM session_message_event_sources
+       WHERE session_id=? AND source_id=?`,
+    ).get(parsedSessionId, parsedSourceId);
+    return row === null ? null : mapSessionMessageEventSource(row);
+  }
+
+  /**
+   * Append the durable projection of an applied send/steer once.
+   *
+   * The immutable source marker and event are committed in the same immediate
+   * transaction. The caller supplies the original message, never an actor or
+   * projected body: those are derived from immutable effect evidence. A retry
+   * returns the original retained event. Event retention removes its source
+   * marker in the same delete statement, so the dedupe index shares the exact
+   * event-stream bounds. Durable v43 finalized status outlives that marker and
+   * refuses reappend after pruning; the retained marker is not sole authority.
+   */
+  appendSessionUserMessageEventOnce(input: Readonly<{
+    sourceId: AttemptId;
+    sessionId: SessionId;
+    accountId: ProfileId;
+    providerGeneration: number;
+    providerConnectionId: string | null;
+    turnId: string;
+    message: string;
+  }>): SessionUserMessageEventAppendResult {
+    const parsed = {
+      sourceId: attemptIdSchema.parse(input.sourceId),
+      sessionId: sessionIdSchema.parse(input.sessionId),
+      accountId: profileIdSchema.parse(input.accountId),
+      providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+        .parse(input.providerGeneration),
+      providerConnectionId: z.string().uuid().nullable().parse(input.providerConnectionId),
+      turnId: z.string().min(1).max(200).parse(input.turnId),
+      message: z.string().min(1).max(262_144).parse(input.message),
+      recordedAt: unixMillisecondsSchema.parse(this.#now()),
+    };
+    const append = this.#database.transaction(() =>
+      this.#appendSessionUserMessageEventOnceInTransaction(parsed)
+    );
+    return append.immediate();
+  }
+
+  #appendSessionUserMessageEventOnceInTransaction(input: Readonly<{
+    sourceId: AttemptId;
+    sessionId: SessionId;
+    accountId: ProfileId;
+    providerGeneration: number;
+    providerConnectionId: string | null;
+    turnId: string;
+    message: string;
+    recordedAt: number;
+  }>): SessionUserMessageEventAppendResult {
+    const source = z.object({
+      authority_id: sessionIdSchema,
+      kind: z.enum(["session.send", "session.steer"]),
+      state: mutationStateSchema.exclude(["reconciled"]),
+      evidence_json: z.string(),
+      resolution_kind: mutationResolutionKindSchema.nullable(),
+    }).strict().nullable().parse(this.#database.query(
+      `SELECT mutation.authority_id,mutation.kind,mutation.state,
+              evidence.evidence_json,resolution.resolution_kind
+       FROM mutation_attempts mutation
+       JOIN mutation_effect_evidence evidence ON evidence.attempt_id=mutation.id
+       LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=mutation.id
+       WHERE mutation.id=?`,
+    ).get(input.sourceId));
+    if (source === null || source.authority_id !== input.sessionId) {
+      throw new Error("SESSION_MESSAGE_EVENT_SOURCE_INVALID");
+    }
+    const sourceEvidence = requireMutationEvidenceFromProvenance(this.#database, input.sourceId).evidence;
+    if (
+      (source.state !== "applied" && source.resolution_kind !== "proven_applied")
+      || (sourceEvidence.kind !== "session.send" && sourceEvidence.kind !== "session.steer")
+      || sourceEvidence.kind !== source.kind
+      || sourceEvidence.clientMessageId !== input.sourceId
+    ) throw new Error("SESSION_MESSAGE_EVENT_SOURCE_INVALID");
+    const message = z.string().min(1).max(262_144).parse(input.message);
+    if (createHash("sha256").update(message, "utf8").digest("hex") !== sourceEvidence.messageDigest) {
+      throw new Error("SESSION_MESSAGE_DIGEST_MISMATCH");
+    }
+    return this.#appendUserMessageEventSourceInTransaction({
+      ...input,
+      actor: this.sessionMessageActorForSource(input.sessionId, input.sourceId) ?? "human",
+      message,
+      sourceKind: "mutation",
+    });
+  }
+
+  #appendQueueUserMessageEventOnceInTransaction(input: Readonly<{
+    sourceId: QueueId;
+    sessionId: SessionId;
+    accountId: ProfileId;
+    providerGeneration: number;
+    providerConnectionId: string | null;
+    turnId: string;
+    message: string;
+    recordedAt: number;
+  }>): SessionUserMessageEventAppendResult {
+    const source = z.object({
+      session_id: sessionIdSchema,
+      state: queueStateSchema,
+      message: z.string().min(1).max(262_144),
+      message_actor: z.enum(["human", "peer_session"]),
+      evidence_json: z.string(),
+      resolution_kind: z.enum(["proven_applied", "abandoned"]).nullable(),
+    }).strict().nullable().parse(this.#database.query(
+      `SELECT queue.session_id,queue.state,queue.message,queue.message_actor,
+              evidence.evidence_json,resolution.resolution_kind
+       FROM queue_entries queue
+       JOIN queue_effect_evidence evidence ON evidence.queue_id=queue.id
+       LEFT JOIN queue_effect_resolutions resolution ON resolution.queue_id=queue.id
+       WHERE queue.id=?`,
+    ).get(input.sourceId));
+    if (
+      source === null
+      || source.session_id !== input.sessionId
+      || (source.state !== "applied" && source.resolution_kind !== "proven_applied")
+    ) throw new Error("SESSION_MESSAGE_EVENT_SOURCE_INVALID");
+    const evidence = requireQueueEvidenceFromProvenance(this.#database, input.sourceId).evidence;
+    if (
+      evidence.queueId !== input.sourceId
+      || evidence.sessionId !== input.sessionId
+      || evidence.clientMessageId !== input.sourceId
+      || createHash("sha256").update(input.message, "utf8").digest("hex")
+        !== evidence.messageDigest
+      || (source.message !== input.message && source.message !== settledQueueMessage)
+    ) throw new Error("SESSION_MESSAGE_DIGEST_MISMATCH");
+    return this.#appendUserMessageEventSourceInTransaction({
+      ...input,
+      actor: this.queueMessageActor(input.sourceId),
+      message: input.message,
+      sourceKind: "queue",
+    });
+  }
+
+  #appendUserMessageEventSourceInTransaction(input: Readonly<{
+    sourceId: string;
+    sourceKind: "mutation" | "queue";
+    sessionId: SessionId;
+    accountId: ProfileId;
+    providerGeneration: number;
+    providerConnectionId: string | null;
+    turnId: string;
+    actor: SessionMessageActor;
+    message: string;
+    recordedAt: number;
+  }>): SessionUserMessageEventAppendResult {
+    const expected = canonicalSessionUserMessageIntent(input).intent;
+    const expectedTurn = sessionEventBodySchema.parse(projectPublicSessionEventBody(
+      { type: "turn_started", turnId: input.turnId },
+      this.#publicProviderIdentifierProjector,
+    ));
+    if (expectedTurn.type !== "turn_started") throw new Error("SESSION_MESSAGE_EVENT_BODY_INVALID");
+    const existing = this.readSessionMessageEventSource(input.sessionId, input.sourceId);
+    if (existing !== null) {
+      if (existing.sourceKind !== input.sourceKind || existing.actor !== input.actor) {
+        throw new Error("SESSION_MESSAGE_EVENT_SOURCE_CONFLICT");
+      }
+      const stored = z.object({ event_json: z.string(), projection_version: z.union([z.literal(1), z.literal(2)]) })
+        .strict().nullable().parse(this.#database.query(
+          "SELECT event_json,projection_version FROM session_events WHERE session_id=? AND stream_epoch=? AND sequence=?",
+        ).get(existing.sessionId, existing.streamEpoch, existing.eventSequence));
+      if (stored === null) throw new Error("SESSION_MESSAGE_EVENT_SOURCE_ORPHANED");
+      const event = parseStoredSessionEvent(stored.event_json, stored.projection_version, this.#publicProviderIdentifierProjector);
+      if (event.body.type !== "user_message" || digestJson(event.body) !== existing.bodyDigest
+        || event.body.actor !== input.actor || event.body.turnId !== expectedTurn.turnId
+        || event.body.text !== expected.text || event.body.omittedCharacters !== expected.omittedCharacters) {
+        throw new Error("SESSION_MESSAGE_EVENT_SOURCE_CONFLICT");
+      }
+      return { event, appended: false };
+    }
+    // Durable v43 source status owns finalization beyond transcript retention.
+    // A missing retained marker never authorizes replay of a finalized source.
+    const event = this.#finalizeSessionUserMessageSourceInTransaction(input);
+    if (event === null) throw new Error("SESSION_USER_MESSAGE_SOURCE_FINALIZED");
+    if (event.body.type !== "user_message" || event.body.actor !== input.actor
+      || event.body.turnId !== expectedTurn.turnId || event.body.text !== expected.text
+      || event.body.omittedCharacters !== expected.omittedCharacters) {
+      throw new Error("SESSION_MESSAGE_EVENT_SOURCE_CONFLICT");
+    }
+    return { event, appended: true };
   }
 
   #ensureInteractionStateEventInTransaction(
@@ -34677,10 +48322,65 @@ export class StateStore {
       return {
         ...mapSessionEventStreamPosition(stream),
         gapReason: fellBehind ? stream.retention_gap_reason ?? "stream_restored" : null,
+        retentionGapReason: stream.retention_gap_reason === null
+          ? null
+          : sessionEventGapReasonSchema.parse(stream.retention_gap_reason),
         events,
       };
     });
     return maintenanceNow !== undefined && !this.#readonly ? read.immediate() : read();
+  }
+
+  /**
+   * Read every retained event that can affect a neutral transcript. This is a
+   * bounded tail/export path: the event ledger itself is capped by count and
+   * bytes, and operational-only rows are filtered in SQLite before parsing.
+   */
+  listRetainedTranscriptEvents(sessionId: SessionId): Readonly<{
+    events: readonly SessionEvent[];
+    gapReason: SessionEventGapReason | null;
+  }> {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const maintenanceNow = this.#readonly ? undefined : this.#now();
+    const read = this.#database.transaction(() => {
+      this.#ensureSessionEventStream(parsedSessionId);
+      if (maintenanceNow !== undefined && !this.#readonly) {
+        this.#applySessionEventRetention(parsedSessionId, maintenanceNow);
+      }
+      const stream = this.#readSessionEventStream(parsedSessionId);
+      const rows = this.#database.query(
+        `SELECT event_json,projection_version FROM session_events
+         WHERE session_id=?
+           AND json_extract(event_json,'$.body.type') IN (
+             'user_message','assistant_delta','reasoning_summary_delta',
+             'item_started','item_completed','provider_switched',
+             'turn_started','turn_completed','gap','connection'
+           )
+         ORDER BY sequence`,
+      ).all(parsedSessionId);
+      const events = rows.map((row) => {
+        const parsed = z.object({
+          event_json: z.string(),
+          projection_version: z.union([z.literal(1), z.literal(2)]),
+        }).strict().parse(row);
+        const event = parseStoredSessionEvent(
+          parsed.event_json,
+          parsed.projection_version,
+          this.#publicProviderIdentifierProjector,
+        );
+        if (event.sessionId !== parsedSessionId || event.streamEpoch !== stream.stream_epoch) {
+          throw new Error("SESSION_EVENT_STORED_AUTHORITY_MISMATCH");
+        }
+        return event;
+      });
+      return {
+        events,
+        gapReason: stream.retention_gap_reason === null
+          ? null
+          : sessionEventGapReasonSchema.parse(stream.retention_gap_reason),
+      };
+    });
+    return maintenanceNow === undefined || this.#readonly ? read() : read.immediate();
   }
 
   #requireInteractionRow(publicId: string): z.infer<typeof interactionRowSchema> {
@@ -37260,23 +50960,27 @@ export class StateStore {
       const activeLoginAuthorities = this.#database.query(`SELECT a.attempt_id,a.profile_id,
                                                                   a.process_generation
                                                           FROM provider_login_authorities a
-                                                          JOIN profiles p ON p.id=a.profile_id
                                                           WHERE a.state='active'
-                                                            AND p.state='login_pending'
-                                                            AND p.process_generation=a.process_generation
                                                           ORDER BY a.recorded_at,a.attempt_id`).all() as {
         attempt_id: string;
         profile_id: string;
         process_generation: number;
       }[];
-      const invalidLoginAuthority = this.#database.query(`SELECT a.attempt_id
-                                                          FROM provider_login_authorities a
-                                                          LEFT JOIN profiles p ON p.id=a.profile_id
-                                                          WHERE a.state='active'
-                                                            AND (p.id IS NULL OR p.state!='login_pending' OR p.process_generation!=a.process_generation)
-                                                          LIMIT 1`).get();
-      if (invalidLoginAuthority !== null) {
-        throw new Error("LOGIN_RESTART_AUTHORITY_MISMATCH");
+      for (const sessionId of affectedInteractionSessions) {
+        this.#repairRestartInteractionSessionStateInTransaction(sessionId, now);
+      }
+      for (const raw of activeLoginAuthorities) {
+        const active = z.object({
+          attempt_id: attemptIdSchema,
+          profile_id: profileIdSchema,
+          process_generation: z.number().int().nonnegative().safe(),
+        }).strict().parse(raw);
+        const profile = this.requireProfileById(active.profile_id);
+        if (profile.processGeneration !== active.process_generation
+          || readProviderLoginBindingAuthority(this.#database, active.profile_id, active.process_generation)?.attemptId
+            !== active.attempt_id) {
+          throw new Error("LOGIN_RESTART_AUTHORITY_MISMATCH");
+        }
       }
       // An interrupted legacy switch involving Claude remains indeterminate.
       // Preserve its source for recovery before retiring effect authority.
@@ -37351,6 +51055,11 @@ export class StateStore {
         this.#repairRestartInteractionSessionStateInTransaction(sessionId, now);
       }
       for (const profile of this.listProfiles()) {
+        this.#recordAccountMutationAuthoritySuccessors({
+          fromGeneration: profile.processGeneration,
+          now,
+          profileId: profile.id,
+        });
         if (this.#sessionMutationAuthorityTuplesForProfile(profile.id).length === 0) continue;
         this.#recordSessionMutationAuthoritySuccessors({
           fromGeneration: profile.processGeneration,
@@ -37628,14 +51337,13 @@ export class StateStore {
       this.#database.query(
         `UPDATE provider_accounts
          SET process_generation=process_generation+1,updated_at=MAX(updated_at,?)
-         WHERE provider IN ('claude','devin') AND readiness!='removed'
+         WHERE provider='claude' AND readiness!='removed'
            AND (process_generation>0 OR EXISTS(
              SELECT 1 FROM session_provider_authorities captured
              WHERE captured.provider_account_id=provider_accounts.id
            )) AND NOT ${unsettledForegroundProviderLoginSql}`,
       ).run(now);
       this.#resumeReleasedClaudeSessions(now);
-      this.#consumeDevinJoinedCloses(current.generation, current.boot_id, bootId, now);
       this.#database.query(`UPDATE queue_entries SET state='cancelled',updated_at=MAX(updated_at,?)
         WHERE state='pending' AND NOT EXISTS(SELECT 1 FROM queue_attachment_quarantines quarantine WHERE quarantine.queue_id=queue_entries.id AND quarantine.ordinal=1) AND EXISTS(
           SELECT 1 FROM queue_provider_authorities q JOIN provider_accounts a ON a.id=q.provider_account_id

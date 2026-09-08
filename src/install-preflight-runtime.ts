@@ -28,16 +28,48 @@ import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } fr
 export const HRA_INSTALL_BUN_VERSION = "1.3.14";
 export const HRA_INSTALL_PACKAGE_NAME = "@hraness/hra";
 const HRA_LEGACY_INSTALL_PACKAGE_NAME = "hra";
-export const HRA_INSTALL_PACKAGE_VERSION = "0.6.0";
-export const HRA_INSTALL_CLI_SHA256 = "e49adeed010c22fe22bb24306b95af708480939958bf4ac1e0f1d55c23ddd40a";
-export const HRA_INSTALL_NORMALIZER_SHA256 = "521a6dbf0f1867ee3d168474880f9dab58e696ecb8eb78c7c3bd7ca4a06e7d61";
-export const HRA_INSTALL_ARCHIVE_URL = "https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz";
-export const HRA_INSTALL_ARCHIVE_NAME = "hraness-hra-0.6.0.tgz";
-export const HRA_INSTALL_RELEASE_API_URL = "https://api.github.com/repos/hraness/hra/releases/tags/v0.6.0";
-export const HRA_INSTALL_RELEASE_TAG = "v0.6.0";
+export const HRA_INSTALL_PACKAGE_VERSION = "0.7.0";
+export const HRA_INSTALL_CLI_SHA256 = "597a8ef13b7bce5ca361039e25690337a92996c9c31adb2bbff882a9afbd1d20";
+export const HRA_INSTALL_NORMALIZER_SHA256 = "73f2132fe682619ddcd98faacadef8e98f2cdc0849c0d69c3788cf7837103f9a";
+export const HRA_INSTALL_ARCHIVE_URL = "https://github.com/hraness/hra/releases/download/v0.7.0/hraness-hra-0.7.0.tgz";
+export const HRA_INSTALL_ARCHIVE_NAME = "hraness-hra-0.7.0.tgz";
+export const HRA_INSTALL_RELEASE_API_URL = "https://api.github.com/repos/hraness/hra/releases/tags/v0.7.0";
+export const HRA_INSTALL_RELEASE_TAG = "v0.7.0";
 export const HRA_INSTALL_REPOSITORY_API_URL = "https://api.github.com/repos/hraness/hra";
 export const HRA_INSTALL_REPOSITORY_ID = 1_343_008_607;
 export const HRA_INSTALL_SUCCESS = "hra-install-safe";
+export const HRA_INSTALL_RUNTIME_INJECTION_ENVIRONMENT_NAMES = [
+  "BUN_OPTIONS",
+  "NODE_OPTIONS",
+  "LD_AUDIT",
+  "LD_LIBRARY_PATH",
+  "LD_ORIGIN_PATH",
+  "LD_PRELOAD",
+  "DYLD_FALLBACK_FRAMEWORK_PATH",
+  "DYLD_FALLBACK_LIBRARY_PATH",
+  "DYLD_FRAMEWORK_PATH",
+  "DYLD_IMAGE_SUFFIX",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "DYLD_ROOT_PATH",
+  "DYLD_VERSIONED_FRAMEWORK_PATH",
+  "DYLD_VERSIONED_LIBRARY_PATH",
+] as const;
+
+export const sanitizeHraInstallChildEnvironment = (
+  environment: Readonly<NodeJS.ProcessEnv>,
+): NodeJS.ProcessEnv => {
+  const sanitized: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(environment)) {
+    if (
+      value !== undefined
+      && !HRA_INSTALL_RUNTIME_INJECTION_ENVIRONMENT_NAMES.includes(
+        name as (typeof HRA_INSTALL_RUNTIME_INJECTION_ENVIRONMENT_NAMES)[number],
+      )
+    ) sanitized[name] = value;
+  }
+  return sanitized;
+};
 
 const authorityDocumentMaximumBytes = 64 * 1024;
 const archiveMaximumBytes = 64 * 1024 * 1024;
@@ -498,6 +530,7 @@ const { createHash, randomUUID } = await import("node:crypto");
 const { constants } = await import("node:fs");
 const { lstat, open } = await import("node:fs/promises");
 const { dlopen } = await import("bun:ffi");
+const runtimeInjectionEnvironmentNames = ${JSON.stringify(HRA_INSTALL_RUNTIME_INJECTION_ENVIRONMENT_NAMES)};
 
 const [
   busyPath,
@@ -651,7 +684,7 @@ if (testMode === "normal") {
     heldArchiveIdentity = verifiedArchive.identity;
     archiveSnapshot = verifiedArchive.snapshot;
     if (archiveSnapshot === undefined) throw new Error("The private HRA archive snapshot is unavailable.");
-    const route = "/" + randomUUID() + "/hraness-hra-0.6.0.tgz";
+    const route = "/" + randomUUID() + "/" + ${JSON.stringify(HRA_INSTALL_ARCHIVE_NAME)};
     let requests = 0;
     archiveServer = Bun.serve({
       hostname: "127.0.0.1",
@@ -690,20 +723,30 @@ if (testMode === "normal") {
 const stagingArguments = testMode === "normal"
   ? [
     process.execPath,
+    "--no-env-file",
+    "--config=/dev/null",
     "add",
     "--global",
     "--backend=copyfile",
     "--ignore-scripts",
     archiveUrl,
   ]
-  : [process.execPath, "-e", "await new Promise(() => {});"];
+  : [
+    process.execPath,
+    "--no-env-file",
+    "--config=/dev/null",
+    "-e",
+    "await new Promise(() => {});",
+  ];
 const inheritedNoProxy = process.env.NO_PROXY ?? process.env.no_proxy ?? "";
 const forcedNoProxy = "127.0.0.1,localhost,::1"
   + (inheritedNoProxy.length > 0 && inheritedNoProxy.length <= 4096 ? "," + inheritedNoProxy : "");
+const stagingEnvironment = { ...process.env };
+for (const name of runtimeInjectionEnvironmentNames) delete stagingEnvironment[name];
 const staging = Bun.spawn(stagingArguments, {
   detached: true,
   env: {
-    ...process.env,
+    ...stagingEnvironment,
     NO_PROXY: forcedNoProxy,
     no_proxy: forcedNoProxy,
   },
@@ -1183,7 +1226,32 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 const sha256 = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 const sha256Pattern = /^[0-9a-f]{64}$/u;
-const semverPattern = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(?:\.(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
+const semverCorePattern = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
+const semverIdentifierPattern = /^[0-9A-Za-z-]+$/u;
+const semverNumericIdentifierPattern = /^[0-9]+$/u;
+const validSemverIdentifiers = (value: string, allowNumericLeadingZeroes: boolean): boolean =>
+  value.split(".").every((identifier) => semverIdentifierPattern.test(identifier)
+    && (allowNumericLeadingZeroes
+      || identifier.length === 1
+      || !identifier.startsWith("0")
+      || !semverNumericIdentifierPattern.test(identifier)));
+
+// Keep each identifier independent: overlapping alphabetic matches inside a
+// repeated prerelease group can backtrack exponentially, even below 128 chars.
+// These delimiter splits and unambiguous character scans are linear in input.
+export const isHraInstallReceiptVersion = (value: string): boolean => {
+  if (value.length > 128) return false;
+  const buildSeparator = value.indexOf("+");
+  const withoutBuild = buildSeparator === -1 ? value : value.slice(0, buildSeparator);
+  if (buildSeparator !== -1 && !validSemverIdentifiers(value.slice(buildSeparator + 1), true)) {
+    return false;
+  }
+  const prereleaseSeparator = withoutBuild.indexOf("-");
+  const core = prereleaseSeparator === -1 ? withoutBuild : withoutBuild.slice(0, prereleaseSeparator);
+  return semverCorePattern.test(core)
+    && (prereleaseSeparator === -1
+      || validSemverIdentifiers(withoutBuild.slice(prereleaseSeparator + 1), false));
+};
 const positiveSafeInteger = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 
@@ -1656,6 +1724,7 @@ const parseArchiveIdentityFields = (
 };
 
 const parseIntent = (value: unknown): InstallIntent => {
+  const recoveryMessage = "The durable HRA install intent is invalid or belongs to another release. Do not edit or delete it; rerun the exact originating release installer or stop for manual review.";
   if (
     !isRecord(value)
     || !hasExactKeys(value, intentKeys)
@@ -1677,15 +1746,22 @@ const parseIntent = (value: unknown): InstallIntent => {
     || typeof value.stagingRoot !== "string"
     || typeof value.versionRoot !== "string"
     || value.version !== 2
-  ) throw new InstallPreflightError("The durable HRA install intent is invalid.");
-  const archiveIdentity = parseArchiveIdentityFields(value, "durable HRA install intent");
-  if (
-    (archiveIdentity.archiveSource === "official" && value.archive !== HRA_INSTALL_ARCHIVE_URL)
-    || (
-      archiveIdentity.archiveSource === "local"
-      && (!isAbsolute(value.archive) || resolve(value.archive) !== value.archive)
-    )
-  ) throw new InstallPreflightError("The durable HRA install intent archive path does not match its source class.");
+  ) {
+    throw new InstallPreflightError(recoveryMessage);
+  }
+  let archiveIdentity: HraInstallArchiveIdentity;
+  try {
+    archiveIdentity = parseArchiveIdentityFields(value, "durable HRA install intent");
+    if (
+      (archiveIdentity.archiveSource === "official" && value.archive !== HRA_INSTALL_ARCHIVE_URL)
+      || (
+        archiveIdentity.archiveSource === "local"
+        && (!isAbsolute(value.archive) || resolve(value.archive) !== value.archive)
+      )
+    ) throw new InstallPreflightError(recoveryMessage);
+  } catch {
+    throw new InstallPreflightError(recoveryMessage);
+  }
   return {
     archive: value.archive,
     ...archiveIdentity,
@@ -1722,7 +1798,7 @@ const parseReceipt = (value: unknown): CompleteReceipt => {
       && value.packageName !== HRA_LEGACY_INSTALL_PACKAGE_NAME)
     || typeof value.packageVersion !== "string"
     || value.packageVersion.length > 128
-    || !semverPattern.test(value.packageVersion)
+    || !isHraInstallReceiptVersion(value.packageVersion)
     || typeof value.totalBytes !== "number"
     || !Number.isSafeInteger(value.totalBytes)
     || value.totalBytes < 1
@@ -2103,6 +2179,8 @@ const emptyHeldQuarantine = async (
 ): Promise<void> => {
   const child = Bun.spawn([
     process.execPath,
+    "--no-env-file",
+    "--config=/dev/null",
     "-e",
     anchoredDirectoryEmptySource,
     "--",
@@ -3261,6 +3339,8 @@ const installIntoStage = async (input: Readonly<{
       + 2_000;
     const child = Bun.spawn([
       process.execPath,
+      "--no-env-file",
+      "--config=/dev/null",
       "-e",
       installStageWorkerSource,
       "--",
@@ -3275,7 +3355,7 @@ const installIntoStage = async (input: Readonly<{
       cwd: input.intent.stagingRoot,
       detached: true,
       env: {
-        ...process.env,
+        ...sanitizeHraInstallChildEnvironment(process.env),
         BUN_INSTALL: input.intent.stagingRoot,
         BUN_INSTALL_BIN: join(input.intent.stagingRoot, "bin"),
         BUN_INSTALL_GLOBAL_DIR: join(input.intent.stagingRoot, "install", "global"),
@@ -3390,6 +3470,8 @@ const installIntoStage = async (input: Readonly<{
       throw new InstallPreflightError("Bun staging recorded an invalid isolated HRA archive URL.");
     }
     const stagedArchivePort = Number.parseInt(stagedArchiveUrl.port, 10);
+    const stagedArchivePath = /^\/(?<nonce>[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/(?<name>[^/]+)$/u
+      .exec(stagedArchiveUrl.pathname);
     if (
       stagedArchiveUrl.protocol !== "http:"
       || stagedArchiveUrl.hostname !== "127.0.0.1"
@@ -3400,7 +3482,8 @@ const installIntoStage = async (input: Readonly<{
       || stagedArchivePort > 65_535
       || stagedArchiveUrl.search !== ""
       || stagedArchiveUrl.hash !== ""
-      || !/^\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/hraness-hra-0\.6\.0\.tgz$/u.test(stagedArchiveUrl.pathname)
+      || stagedArchivePath?.groups?.nonce === undefined
+      || stagedArchivePath.groups.name !== HRA_INSTALL_ARCHIVE_NAME
     ) throw new InstallPreflightError("Bun staging left its descriptor-bound loopback archive authority.");
     await unlinkHeldChild(stageCustody, globalInstallRoot, "bun.lock", { missing: true });
     await stageCustody.assertAll();

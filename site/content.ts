@@ -1,6 +1,5 @@
 import packageJson from "../package.json";
 import { CLAUDE_PIN } from "../src/claude/pin";
-import { DEVIN_PIN } from "../src/devin/pin";
 import { buildHraGlobalInstallCommand } from "../src/install-preflight";
 
 export type EndpointAvailability = "beta-not-yet-live" | "live" | "release-ready";
@@ -17,10 +16,17 @@ export type InlineContent =
   | { readonly kind: "link"; readonly href: string; readonly label: string }
   | { readonly kind: "text"; readonly value: string };
 
+export interface OrderedListItem {
+  readonly afterCommands?: readonly InlineContent[];
+  readonly commands?: readonly string[];
+  readonly content: readonly InlineContent[];
+}
+
 export type ContentBlock =
   | { readonly kind: "commands"; readonly commands: readonly string[] }
   | { readonly kind: "list"; readonly items: readonly (readonly InlineContent[])[] }
   | { readonly kind: "notice"; readonly label: string; readonly content: readonly InlineContent[] }
+  | { readonly kind: "ordered-list"; readonly items: readonly OrderedListItem[] }
   | { readonly kind: "paragraph"; readonly content: readonly InlineContent[] }
   | { readonly kind: "subheading"; readonly text: string };
 
@@ -106,6 +112,8 @@ export interface PublicContent {
   readonly badges: readonly Badge[];
   /** Qualified source-and-release positioning for package metadata, discovery, and llms.txt. */
   readonly description: string;
+  /** Operational prerequisite for every current-daemon initialization or start example. */
+  readonly daemonRolloutNotice: string;
   readonly doctorCommand: string;
   readonly endpoints: PublicEndpoints;
   readonly installCommand: string;
@@ -134,9 +142,9 @@ export interface PublicContent {
     readonly url: string;
   };
   readonly productName: string;
-  /** Provider order stated the same way everywhere. */
+  /** Provider availability and its main capability limit, stated the same way everywhere. */
   readonly providerRoadmap: string;
-  /** The exact immutable CLI release installed by the public command. */
+  /** The exact CLI release named by the command; availability is stated separately. */
   readonly releaseVersion: string;
   readonly sections: readonly ContentSection[];
   readonly siteUrl: string;
@@ -158,6 +166,10 @@ const paragraph = (...content: readonly InlineContent[]): ContentBlock => ({
 });
 const list = (...items: readonly (readonly InlineContent[])[]): ContentBlock => ({
   kind: "list",
+  items,
+});
+const orderedList = (...items: readonly OrderedListItem[]): ContentBlock => ({
+  kind: "ordered-list",
   items,
 });
 
@@ -200,31 +212,34 @@ const links = {
 
 const privacyBlocks: readonly ContentBlock[] = [
   paragraph(
-    text("Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code configuration and credentials, Devin configuration and credentials, and local execution continue to work without it. HRA identity is separate from every provider account."),
+    text("Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code configuration and credentials, and local execution continue to work without it. HRA identity is separate from every provider account."),
   ),
   { kind: "subheading", text: "Encrypted before upload" },
   list(
-    [text("User messages and final assistant display text.")],
+    [text("User messages and final assistant display text. This includes peer-session messages and their supplied reasons when HRA records them as transcript messages.")],
     [text("Session names, notes, queued messages, and steering input.")],
-    [text("Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not projected. For managed profiles, HRA validates one bounded Claude Code authentication-status response transiently, reduces it to signedIn, and never retains, returns, projects, or uploads the identity or usage fields. Personal-home Claude adoption transiently reads bounded account, email, and organization identity metadata and retains only a one-way local authority key. Raw Claude identity fields and that private authority key are never publicly returned, projected, or uploaded; HRA never opens or parses a Claude credential file. Devin account identity and allowance are not projected. HRA reports only local signed-in readiness and records provider-supplied session context and cost facts in the neutral session stream.")],
-    [text("Codex and Claude Code personal-session adoption status: whether discovery is enabled and bounded pending, adopted, and fenced counts. Candidate identities and records are never included. Devin has no personal-home adoption surface.")],
+    [text("Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not projected. For managed profiles, HRA validates one bounded Claude Code authentication-status response transiently, reduces it to signedIn, and never retains, returns, projects, or uploads the identity or usage fields. Personal-home Claude adoption transiently reads bounded account, email, and organization identity metadata and retains only a one-way local authority key. Raw Claude identity fields and that private authority key are never publicly returned, projected, or uploaded; HRA never opens or parses a Claude credential file.")],
+    [text("Codex and Claude Code personal-session adoption status: whether discovery is enabled and bounded pending, adopted, and fenced counts. Candidate identities and records are never included.")],
     [text("Turn timing, observed model and tier, and provider usage summaries.")],
     [text("Bounded observed file and Git metadata, without unbounded filesystem paths.")],
     [text("Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.")],
     [text("Remote-command input and results that fit the closed command protocol.")],
+    [text("Canonical Oh operations, including their page records and provenance, terminal-head proofs, portable adoption proofs, and hosted-space descriptors for projects the owner explicitly enrolls in hosted memory.")],
+    [text("A bounded read-only memory summary containing portable space and project labels, exact head and sync metadata, record counts and recent record keys, effective peer policies, and content-free recent peer-action state. Authenticated coverage markers distinguish complete from bounded selections. This summary excludes page bodies, peer message text, action reasons, raw local project or session IDs, paths, and Oh operation bytes.")],
     [text("For an explicitly requested Codex web login, the provider HTTPS verification URL and separate one-time user code. HRA encrypts both to the account key before upload, lets only the requesting browser read them once, and deletes the hosted handoff on that read or after five minutes.")],
   ),
   { kind: "subheading", text: "Never uploaded" },
   list(
-    [text("Codex, Claude Code, or Devin credentials; provider profile or configuration files; plugin credentials; OAuth access or refresh tokens; authorization codes; PKCE verifiers; provider cookies; or the private device code.")],
-    [text("Raw Codex app-server, Claude Code stream, or Devin ACP requests or responses.")],
+    [text("Codex or Claude Code credentials; provider profile or configuration files; plugin credentials; OAuth access or refresh tokens; authorization codes; PKCE verifiers; provider cookies; or the private device code.")],
+    [text("Raw Codex app-server or Claude Code stream requests or responses.")],
     [text("Personal-home adoption candidate identities or records, personal-runtime bindings, process identities, schedule-source metadata, provider-home provenance, provider-account authority hashes, or the automation id, firing time, and instructions from an exact Codex Desktop heartbeat envelope. Such an envelope is replaced with generic protected text before session content is projected.")],
     [text("Raw reasoning, hidden chain of thought, or approval secrets.")],
     [text("Provider-internal login and request IDs, permission values, MCP field contracts, protected answers, or response digests.")],
     [text("Environment variables, arbitrary command output, or unbounded filesystem paths.")],
+    [text("Working-memory Oh records and database bytes; canonical operations or page bodies outside their encrypted operation envelopes; and local Oh database paths.")],
   ),
   paragraph(
-    text("The sync service necessarily sees the verified HRA email address, device identifiers, record types, revisions, ciphertext sizes, timestamps, and execution-lease or command lifecycle metadata. It cannot decrypt session content without a paired device key. Email access alone does not recover that key."),
+    text("The sync service necessarily sees the verified HRA email address, device identifiers, opaque hosted-space identifiers, record types, revisions and key versions, ciphertext sizes, timestamps, execution-lease or command lifecycle metadata, and canonical-memory sequences plus keyed head tokens. It cannot decrypt session or memory content without a paired device key. Email access alone does not recover that key."),
   ),
   paragraph(
     text("A browser device holds the account key and decrypted projection only in that tab's memory by default. HRA does not programmatically write decrypted provider or session text to the clipboard, but browser extensions, accessibility APIs, screenshots, and explicit user selection can observe rendered text."),
@@ -245,7 +260,7 @@ const privacyBlocks: readonly ContentBlock[] = [
     text("Compact-projection recovery is append-only. It preserves every older encrypted cloud chunk, opens a new stream epoch, and keeps the acknowledged unsynced interval visible as a recovery gap until authenticated account deletion."),
   ),
   paragraph(
-    text("Codex activity remains subject to OpenAI's service and privacy terms. Claude Code activity remains subject to Anthropic's service and privacy terms. Devin activity remains subject to Cognition's service and privacy terms."),
+    text("Codex activity remains subject to OpenAI's service and privacy terms. Claude Code activity remains subject to Anthropic's service and privacy terms."),
   ),
   {
     kind: "notice",
@@ -264,20 +279,21 @@ export const siteDocumentPaths: readonly string[] = [
 export const publicReleaseState: "live" | "release-ready" | "staged" = "release-ready";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
-  "https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz",
+  "https://github.com/hraness/hra/releases/download/v0.7.0/hraness-hra-0.7.0.tgz",
 );
 
 const productName = "HRA";
-const tagline = "Control plane for Codex, Claude Code, and Devin";
-const providerRoadmap = "Codex, Claude Code, and Devin.";
-const releaseVersion = "0.6.0";
+const tagline = "Control plane for Codex and Claude Code";
+const providerRoadmap = "Codex and Claude Code, side by side.";
+const releaseVersion = "0.7.0";
+const admittedReleaseVersion = "0.6.3";
+const daemonRolloutNotice = `Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the admitted v${admittedReleaseVersion} daemon or candidate v${releaseVersion} daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability, candidate readiness, and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.`;
 
 /** Public runtime pins come from their authoritative source modules. */
 export const publicPins = {
   bun: packageJson.engines.bun,
   claude: CLAUDE_PIN,
   codex: packageJson.dependencies["@openai/codex"],
-  devin: DEVIN_PIN,
 } as const;
 
 const shieldsLabel = (value: string): string =>
@@ -321,11 +337,6 @@ const badges: readonly Badge[] = [
     href: "https://github.com/hraness/hra/blob/main/docs/providers/claude.md",
     image: staticBadge("runtime", `Claude Code ${publicPins.claude}`, "6f42c1"),
   },
-  {
-    alt: `runtime: Devin CLI ${publicPins.devin}`,
-    href: "https://github.com/hraness/hra/blob/main/docs/providers/devin.md",
-    image: staticBadge("runtime", `Devin CLI ${publicPins.devin}`, "5936b4"),
-  },
 ];
 
 export const publicContent: PublicContent = {
@@ -333,16 +344,17 @@ export const publicContent: PublicContent = {
   tagline,
   providerRoadmap,
   releaseVersion,
-  thesis: `${productName} runs Codex, Claude Code, and Devin sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.`,
-  description: `${tagline} in current source; v${releaseVersion} is release-ready. Run provider sessions side by side through one durable CLI.`,
-  statusLine: `Status: public beta. The local CLI v${releaseVersion} is release-ready; current source runs Codex and Devin on macOS and Linux and Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}.`,
+  thesis: `${productName} runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.`,
+  description: `${tagline}. Local CLI v${releaseVersion} is a release candidate; v${admittedReleaseVersion} is the admitted artifact, while daemon and hosted command-writer rollout remains blocked on capacity.`,
+  daemonRolloutNotice,
+  statusLine: `Status: public beta. Local CLI v${releaseVersion} is a release candidate, while v${admittedReleaseVersion} is the fully admitted public artifact. Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}. Current daemon and hosted command-writer rollout remains blocked on capacity.`,
   badges,
   maintainer: {
     name: "Hraness",
     url: links.hraness,
   },
   socialCard: {
-    alt: `${productName} · Codex + Claude Code + Devin · v${releaseVersion} release-ready · hra.sh`,
+    alt: `${productName} · v${releaseVersion} release candidate · v${admittedReleaseVersion} admitted · daemon rollout blocked on capacity · hra.sh`,
     height: 630,
     path: "/social-card.png",
     width: 1200,
@@ -361,13 +373,13 @@ export const publicContent: PublicContent = {
   links,
   hero: {
     eyebrow: tagline,
-    heading: "One terminal for every Codex, Claude Code, and Devin session",
+    heading: "One terminal for every Codex and Claude Code session",
     summary: "HRA keeps sessions alive behind a local daemon, isolates each account, and lets you or your agent direct any of them from a shell or JSON. Sync between machines is optional and encrypted.",
-    example: "Ask your agent to start a Codex session on your work account, then hand the next turn to Claude Code without losing the conversation.",
-    boundary: `Codex and Devin on macOS and Linux · Claude Code on Linux · local v${releaseVersion} release-ready · hosted sync live (${hostedBetaLabel})`,
+    example: "After the rollout prerequisite below is satisfied, ask your agent to start a Codex session on your work account, then hand the next turn to Claude Code without losing the conversation.",
+    boundary: `Local v${releaseVersion} release candidate · v${admittedReleaseVersion} artifacts admitted · current daemon and hosted command-writer rollout blocked on capacity · Codex on macOS and Linux · Claude Code on Linux · hosted sync live (${hostedBetaLabel})`,
     primaryAction: {
       href: "#install-command",
-      label: "Install HRA",
+      label: "View release prerequisites",
     },
     secondaryAction: {
       href: "#how-it-works",
@@ -392,7 +404,7 @@ export const publicContent: PublicContent = {
       {
         label: "Start",
         command: "hra session start personal --provider codex --json",
-        detail: "Create an Astra Ultra Codex session under the account profile you name.",
+        detail: "Create a Sol Ultra Codex session under the account profile you name.",
       },
       {
         label: "Inspect",
@@ -402,7 +414,7 @@ export const publicContent: PublicContent = {
       {
         label: "Switch",
         command: "hra session switch <session-id> --provider claude --preset fable-max",
-        detail: "Move the next turns to your signed-in Claude Code profile. The HRA conversation stays intact.",
+        detail: "Move the next turns to your signed-in Claude Code profile. The bounded retained HRA conversation record remains available, with any retention gap stated explicitly.",
       },
       {
         label: "Direct",
@@ -414,12 +426,12 @@ export const publicContent: PublicContent = {
       {
         label: "Accounts",
         value: "Isolated profiles",
-        detail: "Codex uses its own CODEX_HOME, Claude Code its own CLAUDE_CONFIG_DIR, and Devin its own HOME and XDG roots per profile.",
+        detail: "Codex uses its own CODEX_HOME per profile; Claude Code uses its own CLAUDE_CONFIG_DIR.",
       },
       {
         label: "Sessions",
-        value: "Live and durable",
-        detail: "The local daemon keeps running after a terminal exits.",
+        value: "Live, locally recorded",
+        detail: "The daemon keeps sessions alive after a terminal exits and stores their provider-neutral transcript.",
       },
       {
         label: "Interfaces",
@@ -436,7 +448,7 @@ export const publicContent: PublicContent = {
   trust: [
     {
       label: "Your provider credentials stay with the provider",
-      detail: "HRA launches managed Codex, Claude Code, and Devin sessions inside isolated profiles. Opted-in Codex and Claude Code personal-session adoption uses existing provider credentials without copying or parsing them. HRA never reads, copies, or forwards a Claude or Devin credential.",
+      detail: "HRA launches managed Codex and Claude Code sessions inside isolated profiles. Opted-in Codex and Claude Code personal-session adoption uses existing provider credentials without copying or parsing them. HRA never reads, copies, or forwards a Claude credential.",
     },
     {
       label: "Local by default",
@@ -454,11 +466,11 @@ export const publicContent: PublicContent = {
   questions: [
     {
       question: "Does HRA need an account?",
-      answer: [text("No. Install the CLI, add a Codex profile, or sign into Claude Code or Devin inside its isolated profile and start a session. An HRA cloud identity is only needed for optional sync between machines.")],
+      answer: [text("No. An HRA cloud identity is only needed for optional sync between machines. Once the current-daemon rollout prerequisite is satisfied, add a Codex profile or sign into Claude Code inside its isolated directory and start a session.")],
     },
     {
-      question: "What does the release candidate include?",
-      answer: [text(`The v${releaseVersion} local CLI release candidate runs Codex on macOS and Linux and Claude Code on Linux. It becomes public only after immutable GitHub and npm release admission. Hosted sync is live as an ${hostedBetaLabel}.`)],
+      question: "What is live, and what is still blocked?",
+      answer: [text(`The v${admittedReleaseVersion} local CLI artifacts passed immutable GitHub and npm release admission. The v${releaseVersion} candidate does not become public until its own exact admission. Both support Codex on macOS and Linux and Claude Code on Linux. Hosted sync is live as an ${hostedBetaLabel}, but current daemon and hosted command-writer rollout remains blocked on capacity. The candidate install command becomes usable only after immutable GitHub and npm release admission; wait for the documented rollout prerequisite before initialization or daemon startup.`)],
     },
     {
       question: "Does HRA use my API keys or provider subscription?",
@@ -491,18 +503,21 @@ export const publicContent: PublicContent = {
   introduction: [
     {
       kind: "notice",
-      label: `Immutable local CLI release candidate; hosted sync live as an ${hostedBetaLabel}`,
+      label: `Local v${releaseVersion} candidate; v${admittedReleaseVersion} artifacts admitted; hosted sync live as an ${hostedBetaLabel}`,
       content: [
-        text("The exact install command below works once GitHub exposes the immutable "),
+        text("Use the exact install command below only after immutable GitHub and npm release admission for "),
         code(`v${releaseVersion}`),
-        text(" GitHub Release and its verified archive. The website and optional hosted sync are live; the candidate becomes public only after exact admission."),
+        text(". The "),
+        link(`v${admittedReleaseVersion} artifacts`, `https://github.com/hraness/hra/releases/tag/v${admittedReleaseVersion}`),
+        text(" passed immutable GitHub and npm release admission. The website and optional hosted sync are live; candidate readiness and prior artifact admission do not authorize current-daemon startup or hosted command writers."),
       ],
     },
+    { kind: "notice", label: "Current daemon rollout blocked", content: [text(daemonRolloutNotice)] },
     paragraph(
-      text("HRA is one Bun CLI plus a local daemon. It isolates Codex, Claude Code, and Devin profiles, gives all three providers one compact session interface, and optionally syncs encrypted provider-neutral projections and commands across your enrolled machines."),
+      text("HRA is one Bun CLI plus a local daemon. It isolates Codex and Claude Code profiles, gives both providers one compact session interface, and optionally syncs encrypted provider-neutral projections and commands across your enrolled machines."),
     ),
     paragraph(
-      text("HRA is short for harness: the control plane that keeps Codex, Claude Code, and Devin sessions working together, and "),
+      text("HRA is short for harness: the control plane that keeps Codex and Claude Code sessions working together, and "),
       link("hraness.com", links.hraness),
       text(" explains the parent brand. The Hraness organization maintains HRA and publishes it under the MIT license."),
     ),
@@ -522,7 +537,7 @@ export const publicContent: PublicContent = {
       heading: "Install and update",
       blocks: [
         paragraph(
-          text(`HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms. Devin effects also run on both platforms when the separately installed Devin CLI reports exactly ${publicPins.devin}. Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install one reviewed immutable tag, then verify the binary before initialization:`),
+          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. After this candidate passes immutable release admission, install its reviewed tag, then verify the binary before initialization:"),
         ),
         {
           kind: "commands",
@@ -534,22 +549,131 @@ export const publicContent: PublicContent = {
           ],
         },
         paragraph(
-          text("The single install command streams the exact v0.6.0 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.6.0 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation recovers or removes only the proven private stage. Existing trustedDependencies remain unchanged."),
+          text("After artifact admission, the single install command removes ambient Bun, Node, and native-library injection variables before either download or Bun startup, disables Bun dotenv loading, and selects /dev/null as the only Bun configuration. Curl and the loader independently cap the streamed preflight at 512 KiB, and the loader refuses an overrun before transpilation or installation. It then verifies and executes the exact v0.7.0 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.7.0 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The detached staging worker and its Bun package-install child repeat the runtime neutralization while retaining the configured registry, proxy, and certificate trust inputs needed for dependency resolution. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation of that exact release's installer recovers or removes only the proven private stage; another release's installer refuses the durable intent. The invoking shell, PATH-selected pinned Bun binary, configured package registry and transport trust, operating system, and same-UID account remain trust boundaries. Existing trustedDependencies remain unchanged."),
         ),
+        { kind: "subheading", text: "Update runbook" },
         paragraph(
-          text("Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.6.0. For a future update, replace the tagged preflight and release archive references together with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:"),
+          text("Use this sequence to replace an installed release. Resolve every uncertain local mutation that depends on old alias or prepared authority before starting the current daemon, and preserve remote-command evidence for the fail-closed reconciliation below. Replace the tagged preflight URL, release archive URL, expected preflight digest, and expected version together with one exact reviewed immutable tag. Never install a moving branch on a release machine, and never run an older daemon against this state root after the current daemon has started."),
         ),
-        {
-          kind: "commands",
-          commands: [
-            "hra daemon stop",
-            "hra daemon status --json",
-            betaInstallCommand,
-            "hra --version",
-            "hra doctor --offline",
-            "hra daemon start",
-          ],
-        },
+        orderedList(
+          {
+            content: [
+              text("Settle any durable installer intent left by an interrupted installation. An installer refuses "),
+              code("$BUN_INSTALL/install/hra/install-intent.json"),
+              text(" when the intent is invalid or belongs to another release. Do not edit or delete that file or its staging or version directories. Rerun the exact immutable install command from the originating release's trusted README or release notes and require the exact "),
+              code("hra-install-safe"),
+              text(" success output. If that installer refuses the intent, stop for manual review; after success, restart this runbook with the current release. Establish the originating tag independently; never execute a URL or command copied only from the intent, and stop for manual review if the tag is uncertain. This recovers only local installer state. It is not authorization to retry, rerun, or mutate that release's GitHub Actions workflow, tag, GitHub Release, or npm publication."),
+            ],
+          },
+          {
+            content: [
+              text("Resolve keyed local mutations under the installed release. For a Codex High or Ultra "),
+              code("session start"),
+              text(", or a source-sensitive provider switch that explicitly or implicitly selects either alias, replay the exact idempotency key using the originating release's own syntax and source evidence. Resolve an affected Work mutation by replaying its exact request document. A v42 attachment-bearing send or steer should likewise be replayed under v42 before updating whenever that release remains usable; retain the exact original message, attachment path and basename, and explicit key if migration has already occurred and the narrow v43 bridge below is required. Continue only when exact replay under the originating release, or that release's documented kind-specific recovery, reaches a terminal settlement. Otherwise the update remains blocked. If that release has no explicit source-contract flag, use only its exact syntax; do not invent an unsupported option or infer an old alias meaning from the new release."),
+            ],
+          },
+          {
+            content: [
+              text("Resolve any uncertain "),
+              code("session preset"),
+              text(" under the installed release. This command has no idempotency key, so repeat it if necessary and inspect the session before updating."),
+            ],
+          },
+          {
+            content: [
+              text("Block the update on any remaining prepared or indeterminate local mutation. HRA exposes no general command to cancel a prepared session start or provider switch, and "),
+              code("session abandon"),
+              text(" applies only to an existing recovery-required session. Retain the originating release and state root until exact replay or its documented recovery reaches a terminal settlement. Do not generate a fresh key or edit SQLite as a workaround."),
+            ],
+          },
+          {
+            content: [
+              text("Reconcile every uncertain CLI session-command enqueue by repeating the exact remote request with its exact idempotency key. Let HRA's durable local outbox reconcile the response, retain every returned session-command ID, and inspect each one with "),
+              code("hra remote command <uuidv7>"),
+              text(". For a browser or device command, retain the current tab's returned command handle and public ID, then inspect it through the app or the corresponding hosted query. The app does not expose its internal idempotency key and must not synthesize a resend. Never edit or delete the local command journal, local outbox, tab state, or hosted row to force progress."),
+            ],
+          },
+          {
+            content: [text("Stop the daemon and prove that it released authority:")],
+            commands: [
+              "hra daemon stop --json",
+              "hra daemon status --json",
+            ],
+            afterCommands: [
+              text("Require the stop command itself to exit zero; its recovery path is the authority-release proof. Treat a status response containing "),
+              code("data.running: false"),
+              text(" only as a secondary no-listener confirmation. Status alone does not prove authority release. Stop on any stop or recovery error."),
+            ],
+          },
+          {
+            content: [
+              text("Only after v0.7.0 completes immutable GitHub and npm release admission, install that exact release, then verify the installed version and offline health:"),
+            ],
+            commands: [
+              betaInstallCommand,
+              "hra --version",
+              "hra doctor --offline",
+            ],
+            afterCommands: [
+              text("Require the exact expected version. Before the first current-daemon start, doctor must either succeed or report only the exact pending state-schema migration that names the old and current schema versions. Any other diagnostic stops the update."),
+            ],
+          },
+          {
+            content: [
+              text("Before starting any current daemon, require the hosted operator to deploy the additive candidate from this release's exact reviewed source, then run the source- and runtime-bound command-capacity status and repair workflow in "),
+              code("docs/hosted-sync.md"),
+              text(". Accept only its protected two-pass zero-debt capacity evidence together with the exact .activated receipt produced after hosted activation and readback for that candidate and numeric target. The capacity evidence alone is not readiness. The hosted activation tuple opens the exact-runtime gate; the later local .activated publication proves the readback and is required before declaring writers ready, but does not itself open that gate. A hard-full legacy owner, partial capacity set, unreserved command debt, unsafe cleanup shape, interrupted intent, candidate swap, concurrent debt, missing activation, or failed readback blocks the update. The Vercel app may auto-deploy earlier, but that UI is not command readiness or effect authority and its commands should receive expected pre-insertion refusals while the runtime gate is closed."),
+            ],
+          },
+          {
+            content: [
+              text("Start the current daemon. This is the no-downgrade boundary: after this command begins, never launch an older daemon against the same state root. Prove post-migration health before syncing, then inspect every retained CLI session-command ID:"),
+            ],
+            commands: [
+              "hra daemon start",
+              "hra doctor --offline",
+              "hra sync now --json",
+              "hra sync status",
+              "hra remote command <uuidv7>",
+            ],
+            afterCommands: [
+              text("Require the post-start doctor command to succeed before sync. If migration retained a v42 send or steer that stopped after preparation but before its attachment manifest or provider effect, replay it now with the same command kind, session, message, original attachment path and basename, and explicit idempotency key. The current CLI admits an earlier-policy-only basename only on this keyed local replay, and the daemon requires the original durable request digest before resolving the blob or contacting a provider. Any missing or changed field fails without a new mutation; fresh sends, steers, queued messages, and hosted payloads remain on the current name rule. For every intended target, require the sync-now response to contain "),
+              code("data.online: true"),
+              text(" and "),
+              code("data.errorCount: 0"),
+              text(", and "),
+              code("data.commandRequestVersion: 2"),
+              text("; a pending device identity or failed registry publication leaves the last field null, and the command exits zero even when its bounded diagnostics report a registry-publication failure. There is no per-target writer switch. Finish all intended target proofs before deploying marker-emitting writer clients globally, or accept and monitor the expected pre-insertion refusals on ungated or mismatched targets. Old clients and targets whose markers are both absent remain compatible. Sync status reports projection recovery, not the command outbox. Use retained CLI session-command IDs for remote-command inspection; inspect browser and device commands through the app or corresponding hosted query."),
+            ],
+          },
+          {
+            content: [
+              text("Classify legacy remote commitments from both the local journal and hosted row before retrying. The current daemon never executes a legacy request commitment. An already-hosted terminal row takes precedence: it confirms the hosted result and permits local retirement without replaying a local outcome. Otherwise, if the hosted row remains nonterminal and either side records "),
+              code("effect_started"),
+              text(", close it result-less as "),
+              code("ambiguous"),
+              text(". A legacy local terminal outcome over any hosted nonterminal row is unauthenticated evidence: discard that outcome and close result-less as "),
+              code("LOCAL_EFFECT_RECOVERY_REQUIRED"),
+              text(" ambiguous. A fresh or local-prepared legacy request over hosted "),
+              code("pending"),
+              text(" or "),
+              code("prepared"),
+              text(" row closes as "),
+              code("failed"),
+              text(" with "),
+              code("LEGACY_REQUEST_COMMITMENT_BEFORE_EFFECT"),
+              text(". Retry only a failed-before-effect request, only after its initiating client is also current, and use a fresh idempotency key. Retain the new command ID. Never automatically retry an ambiguous command. Each daemon privately publishes its command-request version before processing commands. A fresh request is inserted only when its marker exactly matches the target's last stored registry marker and the hosted runtime's capacity activation tuple exactly matches its compiled release attestation. A marker or activation mismatch is rejected before the command, quota charge, or security event is written. A stale matching target marker can exist during an upgrade or downgrade window, but a candidate redeploy invalidates the hosted activation, and the executor checks stop a mismatched binary before prepare or provider effect while recovery paths classify retained rows conservatively. Exact same-key replay remains available across a later target or runtime change, but changing versions under one key conflicts. A registry-publication failure skips both command queues for that cycle, and every marker-2 command also requires current target and hosted activation markers before a new prepare or effect start. The hosted tuple, not the local receipt publication, opens the runtime gate. Accept the protected capacity evidence and its .activated readback receipt from the prerequisite above before declaring writers ready. Require one "),
+              code("hra sync now --json"),
+              text(" result with "),
+              code("data.online: true"),
+              text(" and "),
+              code("data.errorCount: 0"),
+              text(", and "),
+              code("data.commandRequestVersion: 2"),
+              text(", before treating marker-emitting writers as globally available. The Vercel app can auto-deploy from main earlier; that UI is not readiness, and its commands should receive expected pre-insertion refusals until capacity activation and target-marker proof exist. No all-daemons pause or account-wide legacy drain is required."),
+            ],
+          },
+        ),
         {
           kind: "notice",
           label: "v0.5 upgrade quarantine",
@@ -573,13 +697,15 @@ export const publicContent: PublicContent = {
           code("hra account logout <profile>"),
           text(" for every Codex profile. HRA does not sign Claude Code out; use Claude Code's own authentication flow inside every isolated "),
           code("CLAUDE_CONFIG_DIR"),
-          text(" whose credential should be removed. Stop the daemon, require a successful "),
+          text(" whose credential should be removed. Stop the daemon and require "),
+          code("hra daemon stop --json"),
+          text(" itself to exit zero as the authority-release proof. A successful "),
           code("hra daemon status --json"),
           text(" result whose "),
           code("data.running"),
           text(" is "),
           code("false"),
-          text(" before touching local data."),
+          text(" is only an optional no-listener confirmation before touching local data."),
         ),
         {
           kind: "commands",
@@ -588,7 +714,7 @@ export const publicContent: PublicContent = {
             "hra auth status",
             "hra account list",
             "hra account logout <profile>",
-            "hra daemon stop",
+            "hra daemon stop --json",
             "hra daemon status --json",
           ],
         },
@@ -600,7 +726,7 @@ export const publicContent: PublicContent = {
             code("$HOME/Library/Application Support/HRA Control Plane v1"),
             text(" on macOS and "),
             code("$HOME/.local/state/hra-control-plane-v1"),
-            text(" on Linux. After every prerequisite above, a human who explicitly accepts permanent loss of all local provider profiles, Codex credential stores, Claude Code configuration directories, Devin HOME and XDG directories, sessions, ledgers, encryption keys, device credentials, and recovery evidence may move only the exact platform directory to Trash. Claude Code may also own credentials outside that directory, including provider-managed system credential storage; sign out through Claude Code before deletion. Do not move or remove the state directory's parent. Inspect the trashed directory before emptying Trash."),
+            text(" on Linux. After every prerequisite above, a human who explicitly accepts permanent loss of all local provider profiles, Codex credential stores, Claude Code configuration directories, sessions, ledgers, encryption keys, device credentials, and recovery evidence may move only the exact platform directory to Trash. Claude Code may also own credentials outside that directory, including provider-managed system credential storage; sign out through Claude Code before deletion. Do not move or remove the state directory's parent. Inspect the trashed directory before emptying Trash."),
           ],
         },
         paragraph(
@@ -612,12 +738,12 @@ export const publicContent: PublicContent = {
       id: "first-account",
       heading: "First account",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         {
           kind: "commands",
           commands: [
             "hra account add personal",
             "hra account login personal --provider codex --device-code",
-            "hra account login personal --provider devin",
             "hra account usage personal --refresh",
             "hra account usage-history personal --limit 50 --json",
           ],
@@ -637,28 +763,6 @@ export const publicContent: PublicContent = {
           text(" launches a realpath-resolved Claude Code executable only after its exact self-reported version matches HRA's pin, in the foreground inside that profile's isolated "),
           code("CLAUDE_CONFIG_DIR"),
           text(". Claude owns its prompts and browser handoff. HRA gives it the terminal, joins the exact child, and reports only whether Claude says it is signed in; HRA never opens or copies a Claude credential. Claude exposes no HRA device-code, handoff-file, or web-linking protocol. New Claude effects are refused on macOS pending authenticated isolated-Keychain and detached-read acceptance."),
-        ),
-        paragraph(
-          code("hra account login personal --provider devin"),
-          text(` requires a foreground terminal and the exact separately installed Devin CLI ${publicPins.devin}. HRA launches `),
-          code("devin auth login"),
-          text(" with five distinct private profile directories for "),
-          code("HOME"),
-          text(", "),
-          code("XDG_CONFIG_HOME"),
-          text(", "),
-          code("XDG_DATA_HOME"),
-          text(", "),
-          code("XDG_CACHE_HOME"),
-          text(", and "),
-          code("XDG_STATE_HOME"),
-          text(". Add "),
-          code("--manual-token-flow"),
-          text(" to request Devin's own "),
-          code("--force-manual-token-flow"),
-          text(" login path. Devin owns every credential in that boundary. HRA never opens, parses, copies, or uploads it and reports only whether "),
-          code("devin auth status"),
-          text(" says the isolated profile is signed in. Devin exposes no HRA device-code, handoff-file, JSON, or web-linking login path."),
         ),
         paragraph(
           text("For a Codex login, JSON and noninteractive callers must create an empty mode-0600 file under a canonical current-user-owned mode-0700 directory, then pass its absolute canonical path:"),
@@ -685,11 +789,6 @@ export const publicContent: PublicContent = {
           text(" retains the one-child fence even if Claude reports signed in. After confirming that original child has exited, use the exact attempt, generation, and idempotency key in the reported acknowledged "),
           code("hra account login-cancel"),
           text(" command to release only the local fence. That recovery does not stop Claude or read, change, or delete a credential."),
-        ),
-        paragraph(
-          text("Devin foreground login uses the same one-child recovery fence. If its parent or daemon fails after launch, "),
-          code("hra account show personal --provider devin"),
-          text(" returns the exact acknowledged cancellation command. Confirm that the original child has exited before running it. Recovery releases only HRA's local fence and does not stop Devin or read, change, or delete its credential."),
         ),
         paragraph(
           code("hra account list --provider codex"),
@@ -729,21 +828,10 @@ export const publicContent: PublicContent = {
           text(" reports the most recent local reset attempt with its source weekly-window boundary and suppresses a prior identity's snapshot after an account change. Credit IDs, descriptions, private keys, and account fingerprints never enter that reset status or its cloud projection."),
         ),
         paragraph(
-          text("Devin ACP session usage reports current context occupancy and capacity, plus cumulative provider cost only when Devin supplies it. HRA records those facts without interpreting them as an account allowance, remaining balance, billing settlement, or reset window. Devin ACP and "),
-          code("devin auth status"),
-          text(" expose no documented machine-readable account allowance or reset operation, so "),
-          code("hra account show personal --provider devin"),
-          text(" reports allowance "),
-          code("unknown"),
-          text(" with source "),
-          code("devin_acp"),
-          text(". HRA never submits Devin's human-facing usage commands as hidden turns and never applies a Codex reset credit to Devin."),
-        ),
-        paragraph(
           text("Automatic account movement is not exposed yet. The adopted provider-usage boundary permits only a managed Codex session to follow a durable account decision after reset handling and fresh exact source and target reads. Explicit sessions and work tasks stay pinned to the account you selected. Claude and Devin accounts never rotate automatically, and HRA never replays a failed or ambiguous turn under another account."),
         ),
         paragraph(
-          text("HRA cloud identity is separate from every provider account. Use the email-code flow below only after a hosted or self-managed Convex deployment has been configured."),
+          text("HRA cloud identity is separate from every Codex or Claude Code account. Use the email-code flow below only after a hosted or self-managed Convex deployment has been configured."),
         ),
       ],
     },
@@ -751,8 +839,9 @@ export const publicContent: PublicContent = {
       id: "first-session",
       heading: "First session",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         paragraph(
-          text("Complete initialization and the first provider login before this walkthrough. Account login remains a dedicated one-shot command, and the session-start command returns the new session ID."),
+          text("Only after the rollout prerequisite is satisfied, complete initialization and the first provider login before this walkthrough. Account login remains a dedicated one-shot command, and the session-start command returns the new session ID."),
         ),
         { kind: "subheading", text: "Human terminal" },
         paragraph(
@@ -791,28 +880,25 @@ export const publicContent: PublicContent = {
         paragraph(
           text("If the event stream reports a blocking interaction, read its exact ID and revision, inspect the live authority through the protected path, and resolve only the interaction kind you received. Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form. The protected interaction commands and input documents are defined below."),
         ),
-        { kind: "subheading", text: "Claude Code, Devin, and provider switching" },
         paragraph(
-          text("Start directly with Claude Code or Devin by selecting its provider and reviewed preset, or move an idle session among providers. A switch preserves HRA's provider-neutral conversation record but starts a fresh provider-native runtime; it refuses an active turn, an unsettled provider effect, an unsigned target profile, or a preset that belongs to another provider. If a Claude controller is no longer available, HRA can recover the exact conversation with "),
+          text("Devin support has been removed because its supported CLI integration cannot provide verified remaining account quota and reset times. Existing Devin history is read-only and provider-owned credentials are preserved. "),
+          link("Retired-provider compatibility and local login-fence cleanup", "https://github.com/hraness/hra/blob/main/docs/providers/devin.md"),
+          text(" remain documented; no new Devin login or session can start."),
+        ),
+        { kind: "subheading", text: "Claude Code and provider switching" },
+        paragraph(
+          text("Start directly with Claude Code by selecting its provider and reviewed preset, or move an idle session between providers. A switch seeds a fresh provider-native runtime from the latest retained tail of HRA's provider-neutral conversation record; it does not move a provider-native thread. From the point the v0.6 daemon begins recording a session, that record covers accepted direct, queued, Work and scheduled automation, autorespond, and provider-switch handoff messages with actor provenance. It does not backfill provider history from before a personal-home session was admitted or user turns from before a v0.5 installation was upgraded, and those origin gaps do not set the current retention-gap field. Attachments are represented only by byte-free manifests containing bounded names, media types, sizes, and digests. Retention is capped at 50,000 events, 64 MiB, and seven days; when pruning has occurred, switch seeds and exports state the retention reason and leave the unavailable older count unknown. A switch refuses an active turn, an unsettled provider effect, an unsigned target profile, or a preset that belongs to another provider. If a Claude controller is no longer available, HRA can recover the exact conversation with "),
           code("--resume"),
-          text(" only after prior-process exit or an already-completed exact process release is proven. Ambiguous custody stays fenced in recovery without launching another process. Devin uses exact ACP v1 session loading after restart only when its initialization advertised that capability."),
+          text(" only after prior-process exit or an already-completed exact process release is proven. Ambiguous custody stays fenced in recovery without launching another process."),
         ),
         {
           kind: "commands",
           commands: [
             "hra session start personal --provider claude --preset fable-max --json",
-            "hra session start personal --provider devin --preset astra --json",
             "hra session switch <session-id> --provider claude --preset fable-max",
             "hra session export <session-id> --format json",
           ],
         },
-        paragraph(
-          text("ACP v1 has no in-turn steer method, so "),
-          code("hra session steer"),
-          text(" refuses an active Devin turn. Use "),
-          code("hra session queue"),
-          text(" to send the message after the current prompt completes, or stop the turn before sending another message. HRA never sends concurrent prompts to one Devin session."),
-        ),
         { kind: "subheading", text: "Scheduled work in the same conversation" },
         paragraph(
           text("Attach a recurring whole-minute interval to an existing session with "),
@@ -840,16 +926,13 @@ export const publicContent: PublicContent = {
           kind: "notice",
           label: "Local release boundary",
           content: [
-            text("These commands are part of the immutable "),
+            text("These source commands are part of the "),
             code(`v${releaseVersion}`),
-            text(" local CLI release candidate and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol."),
+            text(" local CLI candidate. Its install command becomes usable only after immutable GitHub and npm release admission. Hosted sync is not required for this local protocol; the current-daemon rollout prerequisite still applies before startup."),
           ],
         },
         paragraph(
-          text("The frozen source contract defines a narrow local coordination kernel for agents operating several already-existing provider sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex, Claude Code, and Devin still own their provider-native execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine."),
-        ),
-        paragraph(
-          text("A Devin session can participate in Work coordination records and provider-neutral signal delivery, but it cannot own or execute a Work attempt. Work attempt routes remain Codex-only."),
+          text("The versioned source contract defines a narrow local coordination kernel for agents operating several already-existing provider sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex and Claude Code still own their provider-native execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine."),
         ),
         {
           kind: "commands",
@@ -870,16 +953,25 @@ export const publicContent: PublicContent = {
           code("work watch"),
           text(" emits resumable JSON Lines. "),
           code("work apply"),
-          text(" is the only mutation entry point. It reads one strict "),
+          text(" is the only mutation entry point. It reads one strict version 1 or version 2 request from nonterminal standard input or an explicit file descriptor. Both versions contain "),
           code("{protocol,version,requestId,operation}"),
-          text(" request from nonterminal standard input or an explicit file descriptor. The nested operation carries its UUIDv7 "),
+          text(", and the nested operation carries its UUIDv7 "),
           code("idempotencyKey"),
-          text("; success and failure echo the request ID, and work capabilities are never accepted as argv fields. Same-key replay preserves the durable decision, stable identities, and capabilities without adding a mutation, event, or revision, while mutable public records and the work revision are reprojected from current state. It is not a byte-identical response promise. A retained release tombstone is the exact stored-result exception. "),
+          text(". A version 2 "),
+          code("work.create"),
+          text(" that declares a High or Ultra route, or "),
+          code("task.addBatch"),
+          text(" that adds a High or Ultra task, also carries the caller-authored top-level "),
+          code("presetContract"),
+          text("; version 2 forbids that field on stable operations. Success and failure echo the admitted request ID and version, and work capabilities are never accepted as argv fields. The request version and any authored preset contract are part of changed-intent detection. Same-key replay of the exact request preserves the durable decision, stable identities, and capabilities without adding a mutation, event, or revision, while mutable public records and the work revision are reprojected from current state. It is not a byte-identical response promise. A retained release tombstone is the exact stored-result exception. "),
           code("work protocol"),
-          text(" is queryable by operation, type, or topic. It returns exact field contracts, value syntax, capability semantics, operation kinds, hard bounds, and the closed recovery and process-exit guidance for failures."),
+          text(" is queryable by operation, type, or topic. It returns both accepted apply envelopes, exact field contracts, value syntax, capability semantics, operation kinds, hard bounds, and the closed recovery and process-exit guidance for failures."),
         ),
         paragraph(
           text("Each task carries an exact account ID, project ID, preset, and Fast setting. HRA never chooses another subscription from quota, availability, usage, or incidental ordering. A provider limit blocks or fails that attempt. It does not rotate the task to another account. Explicit tasks on separate accounts may run in parallel."),
+        ),
+        paragraph(
+          text("Each Work also freezes the meaning of its High and Ultra routes when it is created. A fresh affected version 2 request must name the current contract 1 Sol meaning. A fresh affected version 1 request is refused because that format does not identify whether its author meant Sol or Astra; stable version 1 requests remain admissible. An existing contract 2 Work whose coordinator and participating session authorities remain supported keeps Astra for already-declared tasks and remains readable, claimable, reviewable, and settleable. A Work associated with a retired Devin session remains readable but is fenced from mutation and execution. Current tooling does not append a new High or Ultra task to a historical contract 2 Work because the alias now means Sol; create a new Work for a new Sol task graph. Low has the same exact Luna Max meaning under both contracts and remains compatible. Exact same-key replay of an already-applied version 1 or version 2 mutation returns its historical result without adding a task or provider effect. Reusing that key with another version or contract is a conflict, not a request to reinterpret the historical operation."),
         ),
         paragraph(
           text("Readiness is derived from the open work state, time bounds, accepted dependency submissions, and absence of a live or ambiguous attempt. A final assistant message is not completion. The worker submits a bounded structured result and evidence; declared independent reviews and HRA-owned completion gates must accept the exact submission revision."),
@@ -940,6 +1032,7 @@ export const publicContent: PublicContent = {
       id: "cloud-sign-in-and-device-pairing",
       heading: "Cloud sign-in and device pairing",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         paragraph(
           text(`The hosted endpoint is live as an ${hostedBetaLabel}. An unset `),
           code("HRA_CONVEX_URL"),
@@ -977,9 +1070,7 @@ export const publicContent: PublicContent = {
           code("CODEX_HOME"),
           text(". Claude Code receives that profile's isolated "),
           code("CLAUDE_CONFIG_DIR"),
-          text("; HRA treats the whole directory as Claude's authentication boundary and never reads, copies, or forwards its credentials. Devin receives distinct private "),
-          code("HOME"),
-          text(" and four XDG roots; HRA passes those paths to the CLI but never opens, copies, or forwards Devin's credential. Explicitly adopted Codex and Claude Code personal sessions use credentials already owned by the user's personal provider home without copying or parsing them. Provider-managed credential storage remains owned by the provider runtime."),
+          text("; HRA treats the whole directory as Claude's authentication boundary and never reads, copies, or forwards its credentials. Explicitly adopted Codex and Claude Code personal sessions use credentials already owned by the user's personal provider home without copying or parsing them. Provider-managed credential storage remains owned by the provider runtime."),
         ),
         paragraph(
           text("After successful email verification, the daemon automatically registers the current installation before it reads cloud data. The first registered device becomes active and creates the client-side encryption key. A later verified installation is registered as pending and may report presence, but it has no synchronized data, execution, or key authority."),
@@ -1050,15 +1141,13 @@ export const publicContent: PublicContent = {
             code("CODEX_HOME"),
             text(" for Codex and "),
             code("CLAUDE_CONFIG_DIR"),
-            text(" for Claude Code, plus distinct private "),
-            code("HOME"),
-            text(" and XDG roots for Devin. Each provider owns its authentication state; HRA never copies or parses provider credentials."),
+            text(" for Claude Code. Each provider owns its authentication state; HRA never copies or parses provider credentials."),
           ],
           [
-            text("Usage with provenance: account identity, quota, rate-limit, and token snapshots include their provider source time and freshness. A bounded source-ordered 24-hour ledger supports safe human and JSON pagination without returning raw provider payloads."),
+            text("Codex usage with provenance: account identity, quota, rate-limit, and token snapshots include their provider source time and freshness. A bounded source-ordered 24-hour ledger supports safe human and JSON pagination without returning raw provider payloads."),
           ],
           [
-            text("Compact sessions: list sessions, read user and final assistant messages, inspect elapsed time plus bounded observed file and Git actions, then open one turn for full provider-visible detail."),
+            text("Compact sessions: list sessions, read provider-neutral user and final assistant messages, and inspect elapsed time plus bounded observed file and Git actions. Protected full-turn inspection remains Codex-only."),
           ],
           [
             text("Personal-home adoption: opt in to discover recent Codex and Claude Code sessions, plus older Codex threads targeted by present Desktop heartbeat automations, then admit them after bounded account, project, liveness, and exact-resume checks. Active and paused automation records both count until deletion or retargeting. HRA locally parses a bounded automation record but ignores and retains no prompt or working-directory field, keeps later records reachable across daemon restarts, and replaces Desktop's exact fired heartbeat envelope with generic protected text before projection. Account-filtered session lists include admitted rows, which use the same provider-supported public commands, autorespond policy, and approval authority as every HRA session. Provider-specific limits are identical for native and adopted sessions, and provider APIs do not supply a global lease against every later external resume. Read "),
@@ -1066,10 +1155,24 @@ export const publicContent: PublicContent = {
             text("."),
           ],
           [
-            text("Durable controls: send, queue, steer, and stop through either provider; rename Codex sessions; and keep one editable note per session. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing."),
+            text("Durable controls: send, queue, stop, and keep one editable note per session. Codex and Claude Code can steer an active turn. Provider-native rename remains Codex-only. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing."),
           ],
           [
             text("Named projects: a project is a canonical directory that may contain several repositories. Changing it affects future turns only."),
+          ],
+          [
+            text("Stable working and shared project memory: a project-bound session writes to its expiring working lane, reads that lane together with durable project memory, and shares one attested page only through conflict-checked adoption. Bound Codex and Claude Code models use closed HRA tools. Owners use "),
+            code("hra memory status|list|get|search|explain|remember|share"),
+            text(" and explicitly enroll canonical project memory through "),
+            code("hra memory hosted list|create|attach|detach|sync"),
+            text(". Existing personal adoptions and legacy sessions without a proved HRA tool binding use the owner memory CLI; adoption does not silently install model tools or replace their conversation. Hosted memory is opt-in and does not upload the working lane. See "),
+            link("working and project memory", "https://github.com/hraness/hra/blob/main/docs/facts-memory.md"),
+            text(" for the authority, quota, and recovery boundaries."),
+          ],
+          [
+            text("Attributed peer coordination: each session owns a revocable "),
+            code("off|inspect|coordinate"),
+            text(" policy. Bound Codex and Claude Code tools can list, inspect, and message only bounded same-project peers; every action retains actor and lineage without granting session administration or approval authority. Retired sessions cannot participate."),
           ],
           [
             text("Agent work coordination: the frozen beta contract specifies bounded local task graphs, fenced attempts, structured submissions, independent reviews, signals, and a resumable work event stream for exact existing sessions."),
@@ -1078,12 +1181,32 @@ export const publicContent: PublicContent = {
             text("Optional encrypted sync: paired devices share a bounded session projection and submit commands to the one machine holding the execution lease."),
           ],
         ),
+        { kind: "subheading", text: "Peer coordination boundary" },
+        paragraph(
+          text("Peer coordination is separate from Work. It creates no Work, task, attempt, review, or signal membership. The actor and target must be distinct current sessions in the same project. Inspection requires neither policy to be "),
+          code("off"),
+          text("; messaging requires both exact current policy revisions to remain "),
+          code("coordinate"),
+          text(". Changing either policy revokes stale inspection and mutation authority."),
+        ),
+        paragraph(
+          code("send"),
+          text(" starts a new turn only for an idle target. "),
+          code("queue"),
+          text(" records bounded untrusted input for later delivery and works for an active target. "),
+          code("steer"),
+          text(" addresses one exact active turn and is supported by Codex and Claude Code. Peer input cannot resolve approvals, answer protected questions, administer a session, or inherit an identity."),
+        ),
+        paragraph(
+          text("HRA refuses self-addressing, stale target revisions, causal cycles, and a ninth hop. It admits at most 120 new peer actions per actor and per project in a rolling hour, at most 16 distinct targets per actor in that hour, and at most 64 unsettled inbound queue entries or 1 MiB of their text per target. Complete replay and causal evidence remains for at least seven days. Protected recovery ancestry is never pruned to make room, and the 25,000-action project cap fails closed when protected rows consume it."),
+        ),
       ],
     },
     {
       id: "terminal-and-agent-interfaces",
       heading: "Terminal and agent interfaces",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         paragraph(
           text("Run "),
           code("hra"),
@@ -1110,7 +1233,7 @@ export const publicContent: PublicContent = {
           code("hra session status <session> --json"),
           text(" returns status version 2. HRA produces one typed provider-observation result, attempting the bound provider's reviewed observation path only when the current local state makes one applicable, then reads the session, event cut, interactions, and queue from one local SQLite transaction. Codex supports a native app-server observation read. Claude Code uses its live provider-neutral projection while the exact controller is present. If that controller is absent, HRA may establish "),
           code("--resume"),
-          text(" for the exact conversation only after prior-process exit or an already-completed exact process release is proven; ambiguous custody fails closed as recovery required. Devin status also uses HRA's live provider-neutral projection and reloads an exact native session only when its ACP initialization advertised that capability. Execution, attention, provider, and queue remain separate axes, so a headline state cannot hide a recovery condition, pending interaction, response in flight, or queued work. Pending and response-in-flight counts are exact. The result includes at most 10 bounded safe summaries for pending interactions and excludes the session note and private provider thread binding. Every provider turn and item identifier becomes a secret-keyed opaque public alias before status, event, or interaction output. Public observation schemas accept only that exact alias form. The same local installation key keeps aliases coherent across surfaces and daemon restarts without making low-entropy provider IDs guessable from public output. If an existing installation loses that key, HRA refuses to replace it and directs the operator to restore the original local secret."),
+          text(" for the exact conversation only after prior-process exit or an already-completed exact process release is proven; ambiguous custody fails closed as recovery required. Retired Devin sessions use local history only and cannot execute. Execution, attention, provider, and queue remain separate axes, so a headline state cannot hide a recovery condition, pending interaction, response in flight, or queued work. Pending and response-in-flight counts are exact. The result includes at most 10 bounded safe summaries for pending interactions and excludes the session note and private provider thread binding. Every provider turn and item identifier becomes a secret-keyed opaque public alias before status, event, or interaction output. Public observation schemas accept only that exact alias form. The same local installation key keeps aliases coherent across surfaces and daemon restarts without making low-entropy provider IDs guessable from public output. If an existing installation loses that key, HRA refuses to replace it and directs the operator to restore the original local secret."),
         ),
         paragraph(
           code("hra session state <session> --json"),
@@ -1131,9 +1254,32 @@ export const publicContent: PublicContent = {
           code("--session <session>"),
           text(" to override one session and "),
           code("default"),
-          text(" to clear the override. Questions and MCP forms are never answered automatically. A session stops autoresponding after three consecutive answers without a human message, ten in an hour, or forty in a day, and "),
-          code("hra autorespond status"),
-          text(" shows the counters and the last twenty evidence rows. Notification hours do not change these eligibility rules or budgets."),
+          text(" to clear the override. Questions and MCP forms are never answered automatically. The baseline limits are three consecutive answers without a human message, ten in an hour, and forty in a day. "),
+          code("hra autorespond status --session <session>"),
+          text(" shows the shared counters and the last twenty evidence rows. Only an actual human-authored message resets the consecutive counter; peer messages, Work and scheduled automation, autorespond, and provider-switch handoff messages do not. Notification consent never enables automatic approvals."),
+        ),
+        paragraph(
+          text("After-hours protocol budgets were admitted in v0.6.3. They use a separate local opt-in, disabled on new and upgraded installations. The v0.7.0 candidate retains this policy without enabling it. After the applicable artifact admission and daemon rollout gates are satisfied, "),
+          code("hra autorespond-after-hours status"),
+          text(" reports that policy and its revision. To opt in explicitly, use "),
+          code("hra autorespond-after-hours enable --revision <revision>"),
+          text("; use "),
+          code("hra autorespond-after-hours disable --revision <revision>"),
+          text(" to turn it off. Outside the configured notification hours, otherwise eligible protocol approvals with complete budget history may use six consecutive, twenty rolling-hour, and eighty rolling-day reservations. Inside hours or without eligible evidence, the baseline applies. Prose always stays at three, ten, and forty. Both paths spend the same counters. Policy changes and schedule boundaries never reset or refund them, and no approval category gains authority."),
+        ),
+        paragraph(
+          text("Each automatic approval reserves its budget before provider dispatch. Reservations survive uncertain results, daemon restarts, and pruning of the display log; a reserved attempt can remain charged even if a later step proves unsent. The final storage transaction checks current consent, source eligibility, and shared accounting before charging. Higher limits additionally require one coherent current schedule and proven history; an unreadable schedule selects the baseline, while invalid consent or accounting refuses admission. Upgrading an existing session to local schema 44 pauses automatic approvals for 24 hours because older retained logs cannot prove its complete budget history, and requires a new human message to reopen its consecutive budget. You can send that message during the hold. The schema-46 after-hours migration also requires a newly finalized human message for every pre-44 session before its higher tier can apply, even if the old hold expired or a human reset occurred before that migration. "),
+          code("hra autorespond status --session <session>"),
+          text(" reports the hold's end and the consecutive counter. Manual approvals remain available."),
+        ),
+        paragraph(
+          text("Configuring a gateway key explicitly enables the separate prose-approval path. After strict local gates establish that a completed final assistant message asks only for consent, HRA sends at most its final 4,000 characters plus session-state and approval-reason metadata to Vercel AI Gateway model "),
+          code("openai/gpt-5-nano"),
+          text(". It makes one request with a 10-second deadline and no retry. The model cannot create arbitrary text that HRA will send: the daemon emits either "),
+          code("The human has approved. Proceed accordingly."),
+          text(" or a byte-exact substring already present in the assistant message. Immediately before dispatch, HRA checks current consent, the exact completed question, pending interactions, and shared budget again. A newer question or changed authority cancels the stale reply. A timeout, refusal, or other failure leaves the turn for the human. "),
+          code("hra autorespond gateway clear"),
+          text(" disables this prose path."),
         ),
         paragraph(
           text("For snapshot-to-stream continuity, start selected-session monitoring at the atomic status cursor. "),
@@ -1210,27 +1356,33 @@ export const publicContent: PublicContent = {
       id: "presets-and-permissions",
       heading: "Presets and permissions",
       blocks: [
+        { kind: "notice", label: "Conditional walkthrough", content: [text(daemonRolloutNotice)] },
         paragraph(
-          text("HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; "),
+          text("HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. For Codex, that refresh includes model, reasoning effort, Fast service tier, permission profile, computer-use capability, and accessible apps. For Claude, HRA admits only the pinned Fable profile and reviewed host-tool boundary. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; "),
           code("hra session show"),
-          text(` displays it with the provider-neutral transcript. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof, and stream formats. Devin profiles include exact CLI ${publicPins.devin}, ACP v1, model `),
-          code("gpt-6-astra"),
-          text(", provider-default reasoning, and isolated-home proof. Each provider remains authoritative for its native permissions, tools, and hidden runtime state."),
+          text(" displays the bound provider's history and recorded public profile. Read the provider-neutral HRA record with "),
+          code("hra session export"),
+          text(" or the transcript endpoint. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code public profiles include the pinned CLI, model, reasoning effort, default permission mode, and stream formats. HRA privately reviews the exact config-home authority for every Claude effect but omits that custody identity and legacy isolation marker from "),
+          code("session show"),
+          text("; managed and adopted personal-home sessions therefore share one non-identifying public shape. Each provider remains authoritative for its native permissions, tools, and hidden runtime state."),
         ),
         list(
           [code("low"), text(": Codex Luna Max, currently "), code("gpt-5.6-luna"), text(" with "), code("max"), text(" reasoning.")],
-          [code("high"), text(": Codex Astra Max, currently "), code("gpt-6-astra"), text(" with "), code("max"), text(" reasoning.")],
-          [code("ultra"), text(": Codex Astra Ultra, currently "), code("gpt-6-astra"), text(" with "), code("ultra"), text(" reasoning.")],
+          [code("high"), text(": Codex Sol Max, currently "), code("gpt-5.6-sol"), text(" with "), code("max"), text(" reasoning.")],
+          [code("ultra"), text(": Codex Sol Ultra, currently "), code("gpt-5.6-sol"), text(" with "), code("ultra"), text(" reasoning.")],
           [code("fable-max"), text(": Claude Code Fable, currently "), code("claude-fable-5-1"), text(" with "), code("max"), text(" reasoning.")],
-          [code("astra"), text(": Devin GPT-6 Astra, exactly "), code("gpt-6-astra"), text(" with provider-default reasoning. It is the default preset for Devin.")],
-          [code("fast on|off"), text(": a Codex-only, explicit per-turn Fast or Standard overlay. Claude Code and Devin refuse Fast instead of ignoring it. A prior Fast value cannot leak into the next turn.")],
+          [code("fast on|off"), text(": a Codex-only, explicit per-turn Fast or Standard overlay. Claude Code refuses Fast instead of ignoring it. A prior Fast value cannot leak into the next turn.")],
         ),
         paragraph(
-          text("New HRA-created Codex sessions and every explicit preset selection use the current mapping above. Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping for "),
+          text("New HRA-created Codex sessions that use "),
           code("high"),
-          text(" and "),
+          text(" or "),
           code("ultra"),
-          text(" until a preset is explicitly selected; metadata edits, restart recovery, and queued work do not reinterpret an established session."),
+          text(", and explicit selections of either preset, use the Sol mapping above. The "),
+          code("low"),
+          text(" and "),
+          code("fable-max"),
+          text(" bindings are unchanged. Codex sessions already bound to historical contract 2 keep their exact Astra model and effort until a preset is explicitly selected; unrelated metadata edits, restart recovery, and queued work do not reinterpret an established session."),
         ),
         paragraph(
           code("hra init"),
@@ -1242,9 +1394,7 @@ export const publicContent: PublicContent = {
           code("auto_review"),
           text(" path, the exact advertised "),
           code(":workspace"),
-          text(" permission profile, and the selected project as the runtime workspace root. Codex remains authoritative for the profile's effective sandbox, network policy, computer use, plugins, and protected turn inspection. Claude Code runs in its default interactive permission mode under the selected project and maps supported tool-use requests into HRA interactions. Devin runs the exact "),
-          code("devin acp --model gpt-6-astra"),
-          text(" process and maps its offered permission choices into HRA interactions. Neither provider exposes Codex's permission-profile, app, plugin, or protected turn-inspection surfaces."),
+          text(" permission profile, and the selected project as the runtime workspace root. Codex remains authoritative for the profile's effective sandbox, network policy, computer use, plugins, and protected turn inspection. Claude Code runs in its default interactive permission mode under the selected project and maps supported tool-use requests into HRA interactions; it does not expose Codex's permission-profile, app, plugin, or protected turn-inspection surfaces."),
         ),
       ],
     },
@@ -1296,7 +1446,7 @@ export const publicContent: PublicContent = {
       heading: "Sessions across machines",
       blocks: [
         paragraph(
-          text("The machine that created a provider session remains its only executor in v1. It must be online with its HRA daemon running and must hold the current execution lease before a remote command can affect Codex, Claude Code, or Devin. Other paired machines never execute that provider session through one of their own local provider profiles."),
+          text("The machine that created a provider session remains its only executor in v1. It must be online with its HRA daemon running and must hold the current execution lease before a remote command can affect Codex or Claude Code. Other paired machines never execute that provider session through one of their own local provider profiles."),
         ),
         paragraph(
           text("Paired machines can read the encrypted projection and submit bounded send, queue, steer, stop, preset, provider-switch, and Codex Fast commands. The origin daemon claims each command by lease generation and idempotency key. Commands remain pending within their deadline while the origin machine is offline; another machine cannot take over or become a second provider writer."),
@@ -1318,8 +1468,8 @@ export const publicContent: PublicContent = {
             "hra remote send <cloud-session> <message>",
             "hra remote queue|steer <cloud-session> <message>",
             "hra remote stop <cloud-session>",
-            "hra remote preset <cloud-session> <low|high|ultra|fable-max|astra>",
-            "hra remote provider <cloud-session> <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>]",
+            "hra remote preset <cloud-session> <low|high|ultra|fable-max>",
+            "hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
             "hra remote fast <cloud-session> <on|off>",
             "hra remote allow|deny <device-commands|account-linking>",
             "hra remote policy",
@@ -1397,14 +1547,15 @@ export const publicContent: PublicContent = {
             "hra device approve <device-id-or-prefix> --fingerprint <value> [--idempotency-key <uuidv7>] [--json]",
             "hra device revoke <device-id-or-prefix> [--idempotency-key <uuidv7>] [--json]",
             "hra account add <label>",
-            "hra account login <profile> [--provider <codex|claude|devin>] [--device-code|--manual-token-flow] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]",
+            "hra account login <profile> [--provider <codex|claude>] [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]",
             "hra account login-cancel <profile> [--provider codex]",
             "hra account login-cancel <profile> --provider claude --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited",
             "hra account login-cancel <profile> --provider devin --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited",
             "hra account logout <profile>",
             "hra account list",
             "hra account list [--provider <codex|claude>] [--json]",
-            "hra account show <profile> [--provider <codex|claude|devin>]",
+            "hra account show <profile> [--provider <codex|claude>]",
+            "hra account show <profile> --provider devin  (retired local history and cleanup only)",
             "hra account usage [profile] [--refresh]",
             "hra account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]",
             "hra account switch <profile>",
@@ -1424,7 +1575,19 @@ export const publicContent: PublicContent = {
             "hra session watch <session> [--cursor <cursor>] [--jsonl]",
             "hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
             "hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]",
-            "hra session start <account> [--project <project>] [--provider <codex|claude|devin>] [--preset <low|high|ultra|fable-max|astra>] [--fast]",
+            "hra memory status <session> [--json]",
+            "hra memory list <session> [--working-only] [--continuation <token>] [--json]",
+            "hra memory get <session> <key> [--working-only] [--continuation <token>] [--json]",
+            "hra memory search <session> [--working-only] [--continuation <token>] <text> [--json]",
+            "hra memory explain <session> <query-id> <row> [--json]",
+            "hra memory remember <session> <key> --title <title> --summary <summary> [--language <tag>] [--idempotency-key <uuid>] [--json] -- <body>",
+            "hra memory share <session> <key> --reason <reason> [--idempotency-key <uuid>] [--json]",
+            "hra memory hosted list [--json]",
+            "hra memory hosted create <project> [--idempotency-key <uuid>] [--json]",
+            "hra memory hosted attach <project> <hosted-space-id> [--json]",
+            "hra memory hosted detach <project> --generation <n> [--json]",
+            "hra memory hosted sync <project> [--json]",
+            "hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast] [--idempotency-key <uuid> [--preset-contract <1|2>]]",
             "hra session send|queue|steer <session> [--attach <path>]... <message>",
             "hra session stop|recover|abandon <session>",
             "hra session rename <session> <name>",
@@ -1432,11 +1595,15 @@ export const publicContent: PublicContent = {
             "hra session note get|edit|clear <session>",
             "hra session note set <session> <note>",
             "hra session state <session> [--json]",
-            "hra session preset <session> <low|high|ultra|fable-max|astra>",
-            "hra session switch <session> --provider <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>] [--account <account>]",
+            "hra session peer-policy get <session> [--json]",
+            "hra session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]",
+            "hra session preset <session> <low|high|ultra|fable-max>",
+            "hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>] [--idempotency-key <uuid> [--preset-contract <1|2>]]",
             "hra session export <session> [--format <trajectory|json>] [--out <path>]",
             "hra session fast <session> <on|off>",
             "hra session project <session> <project>",
+            "hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]",
+            "hra session export <session> [--format <trajectory|json>] [--out <path>]",
             "hra session task list <session>",
             "hra session task show <session> <task-id>",
             "hra session task create <session> --name <name> --every-minutes <15..10080> [--paused] [--idempotency-key <uuid>] -- <prompt>",
@@ -1458,6 +1625,8 @@ export const publicContent: PublicContent = {
             "hra autorespond on|workspace|off|default|status [--session <session>] [--json]",
             "hra autorespond gateway set [--from-fd <fd>] [--json]",
             "hra autorespond gateway clear [--json]",
+            "hra autorespond-after-hours status [--json]",
+            "hra autorespond-after-hours enable|disable --revision <n> [--json]",
             "hra remote list [--limit <1..100>]",
             "hra remote show <cloud-session>",
             "hra remote command <uuidv7>",
@@ -1465,8 +1634,8 @@ export const publicContent: PublicContent = {
             "hra remote send --or-steer <cloud-session> <message>",
             "hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <decline>",
             "hra remote stop <cloud-session>",
-            "hra remote preset <cloud-session> <low|high|ultra|fable-max|astra>",
-            "hra remote provider <cloud-session> <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>]",
+            "hra remote preset <cloud-session> <low|high|ultra|fable-max>",
+            "hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
             "hra remote fast <cloud-session> <on|off>",
             "hra remote allow|deny <device-commands|account-linking>",
             "hra remote policy",
@@ -1483,7 +1652,24 @@ export const publicContent: PublicContent = {
           code("--idempotency-key <uuid>"),
           text(" to reuse one after a lost response. If a local mutation response is uncertain, HRA returns the generated key and the exact replay arguments without repeating the command payload. Put those arguments before any "),
           code("--"),
-          text(" delimiter when rerunning the otherwise unchanged command. session recover accepts only exact, kind-specific provider proof. session abandon never retries or deletes provider state and releases only the local recovery authority. Remote mutations require a current UUIDv7 when this option is supplied. With "),
+          text(" delimiter when rerunning the otherwise unchanged command. A source-sensitive Codex "),
+          code("session start"),
+          text(" or provider-switch replay includes both "),
+          code("--idempotency-key"),
+          text(" and its immutable "),
+          code("--preset-contract"),
+          text("; do not omit or change either after an update. The preset-contract option is a source-binding field that requires an explicit idempotency key and is rejected for stable requests. With an existing key, a source-matched applied request replays its result and an effect-started request remains recovery-required. With a key that has no stored row, only this build's active source contract may authorize the one fresh effect; the field cannot select a retired route."),
+        ),
+        paragraph(
+          text("An older session-start release did not print the source contract, so its exact historical alias meaning must be supplied explicitly when replaying its key. For a v0.5.0 Codex start that omitted the then-default preset, preserve every other original option and add "),
+          code("--preset high --preset-contract 1"),
+          text("; v0.5.0 High and Ultra both meant Sol. Use "),
+          code("--preset-contract 2"),
+          text(" only for an untagged Astra-era request whose original runtime evidence actually meant Astra. Neither selector can resume a contractless prepared row. Contract 2 cannot authorize a fresh effect under the current Sol binding; contract 1 can authorize the exact Sol request when the key has no stored row, just as a newly generated key can. If the originating meaning cannot be proved, use the retained old release rather than guessing. A contractless prepared row has no supported cancellation or retirement command. It must reach a terminal settlement through exact replay under the originating release, or the update remains blocked. Do not use a fresh key or "),
+          code("session abandon"),
+          text(" as a workaround; that command applies only to an existing recovery-required session and never cancels prepared start or switch authority. "),
+          code("session preset"),
+          text(" has no idempotency-key replay; resolve and inspect it before updating. session recover accepts only exact, kind-specific provider proof. session abandon never retries or deletes provider state and releases only the local recovery authority. Remote mutations require a current UUIDv7 when this option is supplied. With "),
           code("--json"),
           text(", stdout contains one versioned object; diagnostics stay on stderr."),
         ),
@@ -1495,7 +1681,7 @@ export const publicContent: PublicContent = {
           code('{"permissions":["<requested-name>"]}'),
           text(" and a question response reads "),
           code('{"answers":{"<question-id>":{"answers":["<answer>"]}}}'),
-          text(" through protected input. Those permission-name and question-answer document shapes are Codex-specific. The live Codex adapter rehydrates selected permission names to their exact private provider values immediately before the response write; those values never enter display, storage, logs, or sync. Claude Code tool-use requests and Devin ACP permission requests map to HRA's provider-neutral interaction kinds and accept only the response choices that exact callback offers."),
+          text(" through protected input. Those permission-name and question-answer document shapes are Codex-specific. The live Codex adapter rehydrates selected permission names to their exact private provider values immediately before the response write; those values never enter display, storage, logs, or sync. Claude Code tool-use requests map to HRA's provider-neutral interaction kinds and accept only the response choices that exact callback offers."),
         ),
         paragraph(
           text("Every admitted callback carries a local deadline anchored when the provider delivered it. HRA caps the pending interval at 30 minutes and honors a shorter valid provider interval, including an immediate zero interval. At the deadline it writes one provider-neutral timeout error through the same write-ahead ledger, never invents an answer or grant, and quarantines the provider generation if the write may have escaped. "),
@@ -1515,7 +1701,7 @@ export const publicContent: PublicContent = {
         paragraph(
           text("The beta does not expose destructive local profile or project deletion. "),
           code("account logout"),
-          text(" asks Codex app-server to remove that profile's Codex login while HRA preserves its local session history. HRA does not implement Claude Code or Devin sign-out; use each provider's own authentication flow inside its isolated profile."),
+          text(" asks Codex app-server to remove that profile's Codex login while HRA preserves its local session history. HRA does not implement Claude Code sign-out; use Claude Code's own authentication flow inside the isolated profile."),
         ),
       ],
     },
@@ -1524,7 +1710,7 @@ export const publicContent: PublicContent = {
       heading: "Authority boundaries",
       blocks: [
         paragraph(
-          text("Codex app-server, Claude Code, and Devin ACP remain authoritative for their provider-native authentication, sessions, execution, tools, approvals, models, and hidden runtime state. Codex additionally owns its plugin, account allowance, reset, and native transcript surfaces. HRA owns isolated profiles, the durable provider-neutral conversation record and commands, process generations, local projections, optional encrypted sync, and recovery records. The frozen work contract assigns local coordination records to HRA rather than any provider runtime."),
+          text("Codex app-server and Claude Code remain authoritative for their provider-native authentication, sessions, execution, tools, approvals, models, and hidden runtime state; Codex additionally owns its plugin, usage, and native transcript surfaces. HRA owns isolated profiles, the durable provider-neutral conversation record and commands, process generations, local projections, optional encrypted sync, and recovery records. The frozen work contract assigns local coordination records to HRA rather than either provider runtime."),
         ),
         paragraph(
           text("Cloud service availability is not required for local provider authentication, local execution, local work coordination, local recovery, or reading local sessions. Provider accounts remain independent subscriptions. HRA does not pool quota or replay a limited turn under another account or provider. The separately adopted provider-usage contract permits bounded managed Codex movement only under fresh local authority; explicit sessions, work tasks, Claude accounts, and cross-machine execution remain outside that boundary. SQLite remains the local work execution authority; Turso is deferred and non-authoritative."),
@@ -1563,6 +1749,9 @@ const renderMarkdownInline = (content: readonly InlineContent[]): string =>
     })
     .join("");
 
+const indentMarkdownBlock = (value: string, indentation: string): string =>
+  value.split("\n").map((line) => `${indentation}${line}`).join("\n");
+
 const renderMarkdownBlock = (block: ContentBlock, headingLevel: number): string => {
   switch (block.kind) {
     case "commands":
@@ -1571,6 +1760,23 @@ const renderMarkdownBlock = (block: ContentBlock, headingLevel: number): string 
       return block.items.map((item) => `- ${renderMarkdownInline(item)}`).join("\n");
     case "notice":
       return `> **${block.label}.** ${renderMarkdownInline(block.content)}`;
+    case "ordered-list": {
+      return block.items.map((item, index) => {
+        const marker = `${(index + 1).toString()}. `;
+        const indentation = " ".repeat(marker.length);
+        const parts = [`${marker}${renderMarkdownInline(item.content)}`];
+        if (item.commands !== undefined) {
+          parts.push(indentMarkdownBlock(
+            `\`\`\`text\n${item.commands.join("\n")}\n\`\`\``,
+            indentation,
+          ));
+        }
+        if (item.afterCommands !== undefined) {
+          parts.push(indentMarkdownBlock(renderMarkdownInline(item.afterCommands), indentation));
+        }
+        return parts.join("\n\n");
+      }).join("\n\n");
+    }
     case "paragraph":
       return renderMarkdownInline(block.content);
     case "subheading":
@@ -1600,6 +1806,8 @@ export const renderReadmeMarkdown = (content: PublicContent = publicContent): st
     content.statusLine,
     `\`\`\`sh\n${content.installCommand}\n\`\`\``,
     `\`\`\`sh\n${content.doctorCommand}\n\`\`\``,
+    `> ${content.daemonRolloutNotice}`,
+    "After the rollout prerequisite is satisfied, initialize:",
     `\`\`\`sh\n${content.initCommand}\n\`\`\``,
     `## ${content.hero.heading}\n\n${content.hero.summary}\n\n${content.hero.boundary}`,
     `### ${content.hero.proofLabel}\n\n${content.hero.steps.map((step, index) => `${index + 1}. **${step.label}:** \`${step.command}\`. ${step.detail}`).join("\n")}`,
@@ -1631,9 +1839,10 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     content.thesis,
     content.statusLine,
     "",
-    `Install after the v${content.releaseVersion} beta tag is live: ${content.installCommand}`,
-    `Initialize: ${content.initCommand}`,
+    `Only after immutable GitHub and npm release admission, install v${content.releaseVersion}: ${content.installCommand}`,
     `Verify local prerequisites without cloud access: ${content.doctorCommand}`,
+    content.daemonRolloutNotice,
+    `Initialize only after the rollout prerequisite is satisfied: ${content.initCommand}`,
     "",
     `Repository: ${content.links.github}`,
     `Documentation: ${content.links.documentation}`,

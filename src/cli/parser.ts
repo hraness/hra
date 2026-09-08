@@ -10,11 +10,15 @@ import {
   adoptableProviderSchema,
   DEFAULT_PROVIDER,
   defaultPresetForProvider,
-  presetSchema,
-  providerSchema,
+  isReboundCodexPreset,
+  providerSwitchRequiresPresetContract,
+  sharedActiveCodexPresetContract,
   type AdoptableProvider,
-  type Preset,
-  type Provider,
+  supportedPresetSchema,
+  supportedProviderSchema,
+  type PresetContract,
+  type SupportedPreset,
+  type SupportedProvider,
 } from "../domain/presets";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "../domain/usage-metrics";
 import { usageProviderSchema } from "../domain/provider-usage";
@@ -93,6 +97,7 @@ export type SessionAttachmentCliInvocation = Readonly<{
   }>;
   json: boolean;
   kind: "session.attach";
+  legacyAttachmentReplay: boolean;
 }>;
 
 export type SessionEventFollowCliInvocation = Readonly<{
@@ -108,10 +113,9 @@ export type SessionEventWatchCliInvocation = Readonly<{
 }>;
 
 /**
- * `hra session export` reads the provider-neutral transcript in bounded pages
- * and writes one document. It is a client-side flow over the paged
- * `session.transcript` command rather than one round trip, so the whole
- * conversation never has to fit in a single local response.
+ * `hra session export` reads the provider-neutral transcript's latest bounded
+ * retained tail in one local command and writes one document. Older retained
+ * records omitted by that tail remain represented by its exact omission count.
  */
 export type SessionExportCliInvocation = Readonly<{
   format: "trajectory" | "json";
@@ -151,14 +155,6 @@ export type ClaudeAccountAuthCliInvocation = Readonly<{
   replayCommand: string;
 }>;
 
-/** Devin owns the foreground interaction; the daemon owns its durable attempt. */
-export type DevinAccountAuthCliInvocation = Readonly<{
-  command: Extract<LocalCommand, { kind: "account.devin-login.prepare" }>;
-  json: boolean;
-  kind: "account.devin-login";
-  replayCommand: string;
-}>;
-
 export type InteractionResolveCommand = Extract<LocalCommand, { kind: "interaction.resolve" }>;
 
 export type CliInvocation =
@@ -174,7 +170,6 @@ export type CliInvocation =
   | ProtectedInteractionInspectCliInvocation
   | AccountLoginCliInvocation
   | ClaudeAccountAuthCliInvocation
-  | DevinAccountAuthCliInvocation
   | SessionAttachmentCliInvocation
   | SessionEventFollowCliInvocation
   | SessionEventWatchCliInvocation
@@ -210,11 +205,11 @@ export type RemoteCliCommand =
       session: string;
     }>
   | Readonly<{ kind: "remote.stop"; session: string }>
-  | Readonly<{ kind: "remote.preset"; preset: Preset; session: string }>
+  | Readonly<{ kind: "remote.preset"; preset: SupportedPreset; session: string }>
   | Readonly<{
       kind: "remote.provider";
-      preset?: Preset;
-      provider: Provider;
+      preset?: SupportedPreset;
+      provider: SupportedProvider;
       session: string;
     }>
   | Readonly<{ enabled: boolean; kind: "remote.fast"; session: string }>;
@@ -241,7 +236,8 @@ Usage:
   hra plugin list <account> [--project <project>] [--refresh]
   hra plugin show <account> <plugin> [--project <project>] [--refresh]
   hra project add|list|use
-  hra session list|show|status|watch|start|send|queue|steer|stop
+  hra memory status|list|get|search|explain|remember|share|hosted
+  hra session list|show|status|watch|start|send|queue|steer|stop|peer-policy
   hra session adoption status [--provider codex|claude]
   hra session adoption enable <account> --provider codex|claude
   hra session adoption disable --provider codex|claude
@@ -253,6 +249,7 @@ Usage:
   hra session rename|recover|abandon|archive|unarchive|note|preset|fast|project
   hra notification-hours status|set
   hra notification-email status|enable|disable
+  hra autorespond-after-hours status|enable|disable
   hra work protocol|apply|snapshot|task|poll|events|watch
   hra interaction list|show|inspect|decide|grant|answer|submit
   hra remote list|show|command|send|queue|steer|stop|resolve|preset|fast|allow|deny|policy
@@ -274,17 +271,17 @@ Interactive:
 
 Mutation safety:
   --idempotency-key <uuid>  Reuse after a lost response; changed reuse fails closed.
+  --preset-contract <1|2>   Replay a source-sensitive Codex session start or provider switch.
 
 Platform:
-  Codex and Devin provider commands run on macOS and Linux. Claude login, status,
+  Codex provider commands run on macOS and Linux. Claude login, status,
   sessions, and provider switches require Linux; macOS refuses before launching Claude.
 
 Recommended profiles:
   low         Luna Max        (codex)
-  high        Astra Max       (codex)
-  ultra       Astra Ultra     (codex)
+  high        Sol Max         (codex)
+  ultra       Sol Ultra       (codex)
   fable-max   Claude Fable    (claude)
-  astra       GPT-6 Astra     (devin)
 
 Run \`hra <group> --help\` or \`hra help <group> [<command>]\` for command examples.`;
 
@@ -348,13 +345,15 @@ Examples:
 
 Usage:
   hra account add <label>
-  hra account login <profile> [--provider <codex|claude|devin>] [--device-code|--manual-token-flow] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
+  hra account login <profile> [--provider <codex|claude>] [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
   hra account login-cancel <profile> [--provider codex]
   hra account login-cancel <profile> --provider claude --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
   hra account login-cancel <profile> --provider devin --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
+    Retired-provider cleanup only; does not launch, stop, or authenticate Devin.
   hra account logout <profile>
   hra account list [--provider <codex|claude>] [--json]
-  hra account show <profile> [--provider <codex|claude|devin>]
+  hra account show <profile> [--provider <codex|claude>]
+  hra account show <profile> --provider devin  (retired local history and cleanup only)
   hra account usage [profile] [--refresh]
   hra account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]
   hra account switch <profile>
@@ -367,14 +366,13 @@ Provider listing:
   Without --provider, account list keeps the existing profile listing.
 
 Platform:
-  Codex and Devin account commands run on macOS and Linux. Claude login and status
+  Codex account commands run on macOS and Linux. Claude login and status
   require Linux; macOS refuses before launching Claude.
 
 Examples:
   hra account add personal
   hra account login personal --device-code --handoff-file /private/path/login.json
   hra account login personal --provider claude
-  hra account login personal --provider devin --manual-token-flow
   hra account list --provider codex
   hra account list --provider claude --json
   hra account show personal --provider claude
@@ -426,6 +424,61 @@ Examples:
   hra notification-email status
   hra notification-email enable --revision 1
   hra notification-email disable --revision 2`,
+  memory: `HRA memory
+
+Memory is selected by an HRA session. Reads combine that session's working
+lane with its current project's shared canonical lane by default. Add
+--working-only to read the session lane without opening canonical custody.
+Writes never accept a store path, authority, head, rule, or purge capability.
+
+Usage:
+  hra memory status <session> [--json]
+  hra memory list <session> [--working-only] [--continuation <token>] [--json]
+  hra memory get <session> <key> [--working-only] [--continuation <token>] [--json]
+  hra memory search <session> [--working-only] [--continuation <token>] <text> [--json]
+  hra memory explain <session> <query-id> <row> [--json]
+  hra memory remember <session> <key> --title <title> --summary <summary> [--language <tag>] [--idempotency-key <uuid>] [--json] -- <body>
+  hra memory share <session> <key> --reason <reason> [--idempotency-key <uuid>] [--json]
+  hra memory hosted list [--json]
+  hra memory hosted create <project> [--idempotency-key <uuid>] [--json]
+  hra memory hosted attach <project> <hosted-space-id> [--json]
+  hra memory hosted detach <project> --generation <n> [--json]
+  hra memory hosted sync <project> [--json]
+
+The remember command changes only the selected session's expiring working lane.
+The share command explicitly nominates its exact attested working page for
+conflict-checked adoption into the current project's canonical lane. Reuse the
+printed idempotency key after a lost mutation response.
+
+Examples:
+  hra memory status my-session
+  hra memory list my-session --json
+  hra memory get my-session architecture.boundary
+  hra memory search my-session -- "authority boundary"
+  hra memory explain my-session memq_0123456789abcdef0123456789abcdef 0
+  hra memory remember my-session preferences.review --title "Review style" --summary "Prefer adversarial review." -- "Challenge implementation plans before execution."
+  hra memory share my-session preferences.review --reason "Reusable project convention"
+  hra memory hosted create jungle
+  hra memory hosted list`,
+  "autorespond-after-hours": `HRA after-hours automatic approval budgets
+
+Usage:
+  hra autorespond-after-hours status [--json]
+  hra autorespond-after-hours enable|disable --revision <n> [--json]
+
+This machine-local setting is separate consent from notification email and
+notification hours. When enabled, eligible protocol approvals outside notification
+hours may use limits of 6 consecutive, 20 per hour, and 80 per day with proven
+history. Otherwise the limits are 3 consecutive, 10 per hour, and 40 per day.
+Prose always keeps 3/10/40. Existing approval categories and session approval
+modes still apply. Policy changes never reset counters or refund reservations.
+
+Examples:
+  hra autorespond-after-hours status
+  Only if you choose to consent, use the revision returned by status:
+  hra autorespond-after-hours enable --revision <current-revision>
+  To withdraw consent, use the revision returned by status:
+  hra autorespond-after-hours disable --revision <current-revision>`,
   session: `HRA session
 Session tasks always return to the selected conversation. They never create a standalone task or a new conversation.
 
@@ -434,13 +487,15 @@ Usage:
   hra session show <session> [--detail]
   hra session status <session> [--json]
   hra session state <session> [--json]
+  hra session peer-policy get <session> [--json]
+  hra session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]
   hra autorespond on|workspace|off|default|status [--session <session>] [--json]
   hra autorespond gateway set [--from-fd <fd>] [--json]
   hra autorespond gateway clear [--json]
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
-  hra session start <account> [--project <project>] [--provider <codex|claude|devin>] [--preset <low|high|ultra|fable-max|astra>] [--fast]
+  hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast] [--idempotency-key <uuid> [--preset-contract <1|2>]]
   hra session send|queue|steer <session> [--attach <path>]... <message>
   hra session stop|recover|abandon <session>
   hra session archive|unarchive <session>
@@ -451,8 +506,8 @@ Usage:
   hra session rename <session> <name>
   hra session note get|edit|clear <session>
   hra session note set <session> <note>
-  hra session preset <session> <low|high|ultra|fable-max|astra>
-  hra session switch <session> --provider <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>] [--account <account>]
+  hra session preset <session> <low|high|ultra|fable-max>
+  hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>] [--idempotency-key <uuid> [--preset-contract <1|2>]]
   hra session export <session> [--format <trajectory|json>] [--out <path>]
   hra session fast <session> <on|off>
   hra session project <session> <project>
@@ -467,7 +522,6 @@ Examples:
   hra session start personal --provider claude --preset fable-max
   hra session adoption enable personal --provider codex
   hra session discover --provider codex
-  hra session start personal --provider devin --preset astra
   hra session switch my-session --provider claude
   hra session export my-session --format trajectory --out ./trajectory.json
   hra session watch my-session
@@ -475,6 +529,8 @@ Examples:
   hra session events my-session --wait-ms 30000 --jsonl
   hra session send my-session -- "run --help exactly"
   hra session send my-session --attach diagram.png --attach notes.md "what changed here?"
+  hra session peer-policy get my-session
+  hra session peer-policy set my-session inspect --revision 1
   hra session task create my-session --name daily-review --every-minutes 1440 -- "review the release queue"`,
   work: `HRA work
 
@@ -523,8 +579,8 @@ Usage:
   hra remote send|queue|steer <cloud-session> <message>
   hra remote stop <cloud-session>
   hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <decline>
-  hra remote preset <cloud-session> <low|high|ultra|fable-max|astra>
-  hra remote provider <cloud-session> <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>]
+  hra remote preset <cloud-session> <low|high|ultra|fable-max>
+  hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]
   hra remote fast <cloud-session> <on|off>
   hra remote allow|deny <device-commands|account-linking>
   hra remote policy
@@ -638,7 +694,7 @@ const outputModeCommandArguments = (argv: readonly string[]): readonly string[] 
   for (let index = 0; index < regular.length; index += 1) {
     const value = regular[index];
     if (value === undefined) continue;
-    if (value === "--idempotency-key") {
+    if (value === "--idempotency-key" || value === "--preset-contract") {
       index += 1;
       continue;
     }
@@ -692,9 +748,13 @@ const idempotentCommandKinds = new Set<LocalCommand["kind"]>([
   "session.steer",
   "session.stop",
   "session.rename",
+  "session.switch",
   "session.task.create",
   "session.task.edit",
   "session.task.delete",
+  "memory.remember",
+  "memory.share",
+  "memory.hosted.create",
   "device.approve",
   "device.revoke",
 ]);
@@ -772,11 +832,11 @@ const repeatedOption = (cursor: Cursor, name: string, limit: number): readonly s
   }
 };
 
-const selectedProvider = (value: string | undefined): Provider => {
+const selectedProvider = (value: string | undefined): SupportedProvider => {
   if (value === undefined) throw new CliUsageError("Missing value for --provider.");
-  const parsed = providerSchema.safeParse(value);
+  const parsed = supportedProviderSchema.safeParse(value);
   if (!parsed.success) {
-    throw new CliUsageError(`Provider must be one of: ${providerSchema.options.map((entry) => `\`${entry}\``).join(", ")}.`);
+    throw new CliUsageError(`Provider must be one of: ${supportedProviderSchema.options.map((entry) => `\`${entry}\``).join(", ")}.`);
   }
   return parsed.data;
 };
@@ -792,12 +852,20 @@ const selectedAdoptableProvider = (value: string | undefined): AdoptableProvider
   return parsed.data;
 };
 
-const selectedPreset = (value: string): Preset => {
-  const parsed = presetSchema.safeParse(value);
+const selectedPreset = (value: string): SupportedPreset => {
+  const parsed = supportedPresetSchema.safeParse(value);
   if (!parsed.success) {
-    throw new CliUsageError(`Preset must be one of: ${presetSchema.options.map((entry) => `\`${entry}\``).join(", ")}.`);
+    throw new CliUsageError(`Preset must be one of: ${supportedPresetSchema.options.map((entry) => `\`${entry}\``).join(", ")}.`);
   }
   return parsed.data;
+};
+
+const selectedPresetContract = (value: string | undefined): PresetContract | undefined => {
+  if (value === undefined) return undefined;
+  if (value !== "1" && value !== "2") {
+    throw new CliUsageError("--preset-contract must be exactly `1` or `2`.");
+  }
+  return Number(value) as PresetContract;
 };
 
 const boundedDecimal = (
@@ -995,18 +1063,6 @@ export const claudeAccountLoginAbandonCommand = (
   "--acknowledge-child-exited",
 ].join(" ");
 
-export const devinAccountLoginCommand = (
-  account: string,
-  manualTokenFlow: boolean,
-  idempotencyKey?: string,
-): string => [
-  "hra account login",
-  shellArgument(account),
-  "--provider devin",
-  ...(manualTokenFlow ? ["--manual-token-flow"] : []),
-  ...(idempotencyKey === undefined ? [] : ["--idempotency-key", idempotencyKey]),
-].join(" ");
-
 export const devinAccountLoginAbandonCommand = (
   account: string,
   attemptId: string,
@@ -1112,7 +1168,7 @@ const parseAccount = (
   cursor: Cursor,
   idempotencyKey: string | undefined,
   json: boolean,
-): LocalCommand | AccountLoginCliInvocation | ClaudeAccountAuthCliInvocation | DevinAccountAuthCliInvocation => {
+): LocalCommand | AccountLoginCliInvocation | ClaudeAccountAuthCliInvocation => {
   const action = take(cursor, "account action");
   switch (action) {
     case "list": {
@@ -1124,7 +1180,9 @@ const parseAccount = (
     }
     case "add": { const label = remainder(cursor, "account label"); return command({ kind: "account.add", label }); }
     case "show": {
-      const provider = selectedProvider(option(cursor, "--provider") ?? "codex");
+      const requestedProvider = option(cursor, "--provider") ?? "codex";
+      // Retired-provider inspection exposes local history and pending cleanup only.
+      const provider = requestedProvider === "devin" ? "devin" : selectedProvider(requestedProvider);
       const account = take(cursor, "account");
       finish(cursor);
       if (provider !== "codex") {
@@ -1137,7 +1195,6 @@ const parseAccount = (
     }
     case "login": {
       const deviceCode = flag(cursor, "--device-code");
-      const manualTokenFlow = flag(cursor, "--manual-token-flow");
       const handoffFile = option(cursor, "--handoff-file");
       const provider = selectedProvider(option(cursor, "--provider") ?? "codex");
       const account = take(cursor, "account");
@@ -1145,9 +1202,6 @@ const parseAccount = (
       if (provider === "claude") {
         if (deviceCode) {
           throw new CliUsageError("Claude Code does not expose a device-code login. Run the foreground Claude login without --device-code.");
-        }
-        if (manualTokenFlow) {
-          throw new CliUsageError("--manual-token-flow is available only for Devin login.");
         }
         if (handoffFile !== undefined) {
           throw new CliUsageError("Claude login is a foreground terminal flow and does not accept --handoff-file.");
@@ -1166,36 +1220,6 @@ const parseAccount = (
           kind: "account.claude-login",
           replayCommand: claudeAccountLoginCommand(parsed.account, parsed.idempotencyKey),
         };
-      }
-      if (provider === "devin") {
-        if (deviceCode) {
-          throw new CliUsageError("Devin CLI does not expose a device-code login. Use --manual-token-flow for its headless token handoff.");
-        }
-        if (handoffFile !== undefined) {
-          throw new CliUsageError("Devin login is a foreground terminal flow and does not accept --handoff-file.");
-        }
-        const parsed = command({
-          kind: "account.devin-login.prepare",
-          account,
-          idempotencyKey: idempotencyKey ?? randomUUID(),
-          manualTokenFlow,
-        });
-        if (parsed.kind !== "account.devin-login.prepare") {
-          throw new CliUsageError("Devin account login command is invalid.");
-        }
-        return {
-          command: parsed,
-          json,
-          kind: "account.devin-login",
-          replayCommand: devinAccountLoginCommand(
-            parsed.account,
-            parsed.manualTokenFlow,
-            parsed.idempotencyKey,
-          ),
-        };
-      }
-      if (manualTokenFlow) {
-        throw new CliUsageError("--manual-token-flow is available only for Devin login.");
       }
       if (handoffFile !== undefined && (!isAbsolute(handoffFile) || resolve(handoffFile) !== handoffFile)) {
         throw new CliUsageError("--handoff-file must be an absolute normalized path to an existing protected file.");
@@ -1223,7 +1247,9 @@ const parseAccount = (
       };
     }
     case "login-cancel": {
-      const provider = selectedProvider(option(cursor, "--provider") ?? "codex");
+      const requestedProvider = option(cursor, "--provider") ?? "codex";
+      // The sole retired-provider mutation acknowledges an existing child has exited.
+      const provider = requestedProvider === "devin" ? "devin" : selectedProvider(requestedProvider);
       if (provider !== "codex") {
         const acknowledgeChildExited = flag(cursor, "--acknowledge-child-exited");
         const attemptId = option(cursor, "--attempt-id");
@@ -1331,6 +1357,165 @@ const parseProject = (cursor: Cursor, cwd: string): LocalCommand => {
   }
 };
 
+const parseMemory = (
+  cursor: Cursor,
+  idempotencyKey: string | undefined,
+): LocalCommand => {
+  const action = take(cursor, "memory action");
+  const continuation = option(cursor, "--continuation");
+  const workingOnly = flag(cursor, "--working-only");
+  if (action === "hosted") {
+    if (continuation !== undefined || workingOnly) {
+      throw new CliUsageError("Memory hosted commands do not accept query continuation or working-only scope.");
+    }
+    const hostedAction = take(cursor, "hosted memory action");
+    if (hostedAction === "list") {
+      finish(cursor);
+      return { kind: "memory.hosted.list" };
+    }
+    if (hostedAction === "create") {
+      const project = take(cursor, "project");
+      finish(cursor);
+      return command({
+        kind: "memory.hosted.create",
+        project,
+        idempotencyKey: idempotencyKey ?? randomUUID(),
+      });
+    }
+    if (hostedAction === "attach") {
+      const project = take(cursor, "project");
+      const hostedSpaceId = take(cursor, "hosted memory space ID");
+      finish(cursor);
+      return command({ kind: "memory.hosted.attach", project, hostedSpaceId });
+    }
+    if (hostedAction === "detach") {
+      const generation = option(cursor, "--generation");
+      const project = take(cursor, "project");
+      finish(cursor);
+      if (generation === undefined) {
+        throw new CliUsageError("Memory hosted detach requires --generation <n>.");
+      }
+      return command({
+        kind: "memory.hosted.detach",
+        project,
+        expectedGeneration: boundedDecimal(
+          generation,
+          "hosted memory attachment generation",
+          1,
+          Number.MAX_SAFE_INTEGER,
+        ),
+      });
+    }
+    if (hostedAction === "sync") {
+      const project = take(cursor, "project");
+      finish(cursor);
+      return { kind: "memory.hosted.sync", project };
+    }
+    throw new CliUsageError(
+      "Unknown hosted memory action. Run `hra memory --help` for supported actions.",
+    );
+  }
+  if (action === "status") {
+    if (continuation !== undefined) {
+      throw new CliUsageError("--continuation is not supported by memory status.");
+    }
+    if (workingOnly) throw new CliUsageError("--working-only is supported only by memory list, get, and search.");
+    const session = take(cursor, "session");
+    finish(cursor);
+    return { kind: "memory.status", session };
+  }
+  if (action === "list") {
+    const session = take(cursor, "session");
+    finish(cursor);
+    return command({
+      kind: "memory.query",
+      session,
+      value: {
+        mode: "list",
+        ...(workingOnly ? { scope: "working" as const } : {}),
+        ...(continuation === undefined ? {} : { continuation }),
+      },
+    });
+  }
+  if (action === "get") {
+    const session = take(cursor, "session");
+    const key = take(cursor, "memory key");
+    finish(cursor);
+    return command({
+      kind: "memory.query",
+      session,
+      value: {
+        mode: "get",
+        key,
+        ...(workingOnly ? { scope: "working" as const } : {}),
+        ...(continuation === undefined ? {} : { continuation }),
+      },
+    });
+  }
+  if (action === "search") {
+    const session = take(cursor, "session");
+    return command({
+      kind: "memory.query",
+      session,
+      value: {
+        mode: "search",
+        text: remainder(cursor, "search text"),
+        ...(workingOnly ? { scope: "working" as const } : {}),
+        ...(continuation === undefined ? {} : { continuation }),
+      },
+    });
+  }
+  if (continuation !== undefined) {
+    throw new CliUsageError(`--continuation is not supported by memory ${action}.`);
+  }
+  if (workingOnly) {
+    throw new CliUsageError("--working-only is supported only by memory list, get, and search.");
+  }
+  if (action === "explain") {
+    const session = take(cursor, "session");
+    const queryId = take(cursor, "memory query ID");
+    const row = boundedDecimal(take(cursor, "memory row"), "memory row", 0, 255);
+    finish(cursor);
+    return command({ kind: "memory.explain", session, value: { queryId, row } });
+  }
+  if (action === "remember") {
+    const title = option(cursor, "--title");
+    const summary = option(cursor, "--summary");
+    const language = option(cursor, "--language");
+    const session = take(cursor, "session");
+    const key = take(cursor, "memory key");
+    if (title === undefined) throw new CliUsageError("Memory remember requires --title <title>.");
+    if (summary === undefined) throw new CliUsageError("Memory remember requires --summary <summary>.");
+    const body = remainder(cursor, "memory body");
+    return command({
+      kind: "memory.remember",
+      session,
+      idempotencyKey: idempotencyKey ?? randomUUID(),
+      value: {
+        body,
+        key,
+        ...(language === undefined ? {} : { language }),
+        summary,
+        title,
+      },
+    });
+  }
+  if (action === "share") {
+    const reason = option(cursor, "--reason");
+    const session = take(cursor, "session");
+    const key = take(cursor, "memory key");
+    finish(cursor);
+    if (reason === undefined) throw new CliUsageError("Memory share requires --reason <reason>.");
+    return command({
+      kind: "memory.share",
+      session,
+      idempotencyKey: idempotencyKey ?? randomUUID(),
+      value: { key, reason },
+    });
+  }
+  throw new CliUsageError("Unknown memory action. Run `hra memory --help` for supported actions.");
+};
+
 const parseSessionNote = (cursor: Cursor): LocalCommand => {
   const action = take(cursor, "note action");
   const session = take(cursor, "session");
@@ -1341,6 +1526,42 @@ const parseSessionNote = (cursor: Cursor): LocalCommand => {
     case "clear": finish(cursor); return { kind: "session.note.clear", session };
     default: throw new CliUsageError("Unknown note action. Run `hra session --help` for supported actions.");
   }
+};
+
+const parseSessionPeerPolicy = (cursor: Cursor): LocalCommand => {
+  const action = take(cursor, "peer policy action");
+  if (action === "get") {
+    const revision = option(cursor, "--revision");
+    const session = take(cursor, "session");
+    finish(cursor);
+    if (revision !== undefined) {
+      throw new CliUsageError("--revision is supported only by session peer-policy set.");
+    }
+    return { kind: "session.peer-policy.get", session };
+  }
+  if (action === "set") {
+    const expectedRevision = boundedDecimal(
+      option(cursor, "--revision"),
+      "Session peer policy --revision",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const session = take(cursor, "session");
+    const mode = take(cursor, "peer policy mode");
+    finish(cursor);
+    if (mode !== "off" && mode !== "inspect" && mode !== "coordinate") {
+      throw new CliUsageError("Peer policy mode must be `off`, `inspect`, or `coordinate`.");
+    }
+    return command({
+      expectedRevision,
+      kind: "session.peer-policy.set",
+      mode,
+      session,
+    });
+  }
+  throw new CliUsageError(
+    "Unknown peer policy action. Run `hra session peer-policy --help` for supported actions.",
+  );
 };
 
 const parseSessionTask = (
@@ -1438,6 +1659,7 @@ const parseSession = (
   cursor: Cursor,
   jsonl: boolean,
   idempotencyKey: string | undefined,
+  presetContract: PresetContract | undefined,
   jsonRequested: boolean,
 ):
   | LocalCommand
@@ -1458,6 +1680,7 @@ const parseSession = (
     case "show": { const detail = flag(cursor, "--detail"); const session = take(cursor, "session"); finish(cursor); return { kind: "session.show", session, detail }; }
     case "status": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.status", session }; }
     case "state": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.state", session }; }
+    case "peer-policy": return parseSessionPeerPolicy(cursor);
     case "events": {
       const followFlag = flag(cursor, "--follow");
       const follow = followFlag || jsonl;
@@ -1512,11 +1735,36 @@ const parseSession = (
     case "start": {
       const project = option(cursor, "--project");
       const provider = selectedProvider(option(cursor, "--provider") ?? DEFAULT_PROVIDER);
-      const preset = option(cursor, "--preset") ?? defaultPresetForProvider(provider);
+      const presetOption = option(cursor, "--preset");
+      const preset = presetOption === undefined
+        ? defaultPresetForProvider(provider)
+        : selectedPreset(presetOption);
       const fast = flag(cursor, "--fast");
       const account = take(cursor, "account");
       finish(cursor);
-      return command({ kind: "session.start", account, project, provider, preset, fast });
+      if (!isReboundCodexPreset(preset)) {
+        if (presetContract !== undefined) {
+          throw new CliUsageError("--preset-contract is supported only for Codex High or Ultra session starts.");
+        }
+        return command({ kind: "session.start", account, project, provider, preset, fast });
+      }
+      if (idempotencyKey !== undefined && presetContract === undefined) {
+        throw new CliUsageError(
+          "Replaying a Codex High or Ultra session start with --idempotency-key also requires --preset-contract.",
+        );
+      }
+      if (idempotencyKey === undefined && presetContract !== undefined) {
+        throw new CliUsageError("--preset-contract requires an explicit --idempotency-key.");
+      }
+      return command({
+        kind: "session.start",
+        account,
+        project,
+        provider,
+        preset,
+        fast,
+        presetContract: presetContract ?? sharedActiveCodexPresetContract(),
+      });
     }
     case "send":
     case "queue":
@@ -1536,7 +1784,12 @@ const parseSession = (
         && parsed.kind !== "session.queue"
         && parsed.kind !== "session.steer"
       ) throw new CliUsageError("Session message command is invalid.");
-      return { attach, command: parsed, kind: "session.attach" };
+      return {
+        attach,
+        command: parsed,
+        kind: "session.attach",
+        legacyAttachmentReplay: idempotencyKey !== undefined && action !== "queue",
+      };
     }
     case "stop": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.stop", session }; }
     case "rename": { const session = take(cursor, "session"); return command({ kind: "session.rename", session, name: remainder(cursor, "name") }); }
@@ -1580,7 +1833,7 @@ const parseSession = (
     case "recover": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.recover", session }; }
     case "abandon": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.abandon", session }; }
     case "note": return parseSessionNote(cursor);
-    case "preset": { const session = take(cursor, "session"); const preset = take(cursor, "preset"); finish(cursor); return command({ kind: "session.preset", session, preset }); }
+    case "preset": { const session = take(cursor, "session"); const preset = selectedPreset(take(cursor, "preset")); finish(cursor); return command({ kind: "session.preset", session, preset }); }
     case "export": {
       const format = option(cursor, "--format") ?? "trajectory";
       const out = option(cursor, "--out");
@@ -1607,11 +1860,35 @@ const parseSession = (
       const session = take(cursor, "session");
       finish(cursor);
       const selected = selectedProvider(provider);
+      const selectedModelPreset = preset === undefined ? undefined : selectedPreset(preset);
+      if (!providerSwitchRequiresPresetContract(selected, selectedModelPreset)) {
+        if (presetContract !== undefined) {
+          throw new CliUsageError(
+            "--preset-contract is supported only for a source-sensitive Codex provider switch.",
+          );
+        }
+        return command({
+          kind: "session.switch",
+          session,
+          provider: selected,
+          ...(selectedModelPreset === undefined ? {} : { preset: selectedModelPreset }),
+          ...(account === undefined ? {} : { account }),
+        });
+      }
+      if (idempotencyKey !== undefined && presetContract === undefined) {
+        throw new CliUsageError(
+          "Replaying a source-sensitive Codex provider switch with --idempotency-key also requires --preset-contract.",
+        );
+      }
+      if (idempotencyKey === undefined && presetContract !== undefined) {
+        throw new CliUsageError("--preset-contract requires an explicit --idempotency-key.");
+      }
       return command({
         kind: "session.switch",
         session,
         provider: selected,
-        ...(preset === undefined ? {} : { preset }),
+        ...(selectedModelPreset === undefined ? {} : { preset: selectedModelPreset }),
+        presetContract: presetContract ?? sharedActiveCodexPresetContract(),
         ...(account === undefined ? {} : { account }),
       });
     }
@@ -2024,6 +2301,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     throw new CliUsageError("--json and --jsonl are mutually exclusive output modes.");
   }
   const idempotencyKey = option(cursor, "--idempotency-key");
+  const presetContract = selectedPresetContract(option(cursor, "--preset-contract"));
   const helpFlag = flag(cursor, "--help") || flag(cursor, "-h");
   const helpAlias = !helpFlag && cursor.values[0] === "help";
   if (helpFlag || helpAlias || (cursor.values.length === 0 && literalTail.length === 0)) {
@@ -2038,6 +2316,15 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   if (flag(cursor, "--version") || flag(cursor, "-v")) { finish(cursor); return { json, kind: "version" }; }
   cursor.values.push(...literalTail);
   const group = take(cursor, "command");
+  if (
+    presetContract !== undefined
+    && (
+      group !== "session"
+      || (cursor.values[0] !== "start" && cursor.values[0] !== "switch")
+    )
+  ) {
+    throw new CliUsageError("--preset-contract is supported only by session start or switch.");
+  }
   if (jsonl && group !== "session" && group !== "work") {
     throw new CliUsageError(
       "--jsonl is supported only by `hra session events` and `hra session watch`, or by `hra work events` and `hra work watch`.",
@@ -2221,6 +2508,42 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       json,
     };
   }
+  if (group === "autorespond-after-hours") {
+    if (idempotencyKey !== undefined) {
+      throw new CliUsageError("--idempotency-key is not supported by autorespond-after-hours commands.");
+    }
+    const action = take(cursor, "autorespond-after-hours action");
+    if (action === "status") {
+      finish(cursor);
+      return {
+        kind: "command",
+        command: { kind: "autorespond-after-hours.status" },
+        json,
+      };
+    }
+    if (action !== "enable" && action !== "disable") {
+      throw new CliUsageError(
+        "Unknown autorespond-after-hours action. Use `status`, `enable`, or `disable`.",
+      );
+    }
+    const expectedRevision = boundedDecimal(
+      option(cursor, "--revision"),
+      "Autorespond-after-hours --revision",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    finish(cursor);
+    return {
+      kind: "command",
+      command: {
+        expectedRevision,
+        kind: action === "enable"
+          ? "autorespond-after-hours.enable"
+          : "autorespond-after-hours.disable",
+      },
+      json,
+    };
+  }
   if (group === "notification-email") {
     if (idempotencyKey !== undefined) {
       throw new CliUsageError("--idempotency-key is not supported by notification-email commands.");
@@ -2259,19 +2582,20 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   }
   let parsed: LocalCommand;
   let sessionAttach: readonly string[] = [];
+  let legacyAttachmentReplay = false;
   if (group === "account") {
     const account = parseAccount(cursor, idempotencyKey, json);
     if (
       account.kind === "account.login-handoff"
       || account.kind === "account.claude-login"
-      || account.kind === "account.devin-login"
     ) return account;
     parsed = account;
   }
   else if (group === "plugin") parsed = parsePlugin(cursor);
   else if (group === "project") parsed = parseProject(cursor, cwd);
+  else if (group === "memory") parsed = parseMemory(cursor, idempotencyKey);
   else if (group === "session") {
-    const sessionCommand = parseSession(cursor, jsonl, idempotencyKey, json);
+    const sessionCommand = parseSession(cursor, jsonl, idempotencyKey, presetContract, json);
     if (sessionCommand.kind === "session.export") {
       if (idempotencyKey !== undefined) {
         throw new CliUsageError("--idempotency-key is not supported by session.export.");
@@ -2304,6 +2628,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     }
     if (sessionCommand.kind === "session.attach") {
       sessionAttach = sessionCommand.attach;
+      legacyAttachmentReplay = sessionCommand.legacyAttachmentReplay;
       parsed = sessionCommand.command;
     } else {
       parsed = sessionCommand;
@@ -2468,10 +2793,11 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     }
   }
   else throw new CliUsageError("Unknown command. Run `hra --help` for supported commands.");
-  if (idempotencyKey !== undefined && !idempotentCommandKinds.has(parsed.kind)) {
+  const supportsIdempotency = idempotentCommandKinds.has(parsed.kind);
+  if (idempotencyKey !== undefined && !supportsIdempotency) {
     throw new CliUsageError(`--idempotency-key is not supported by ${parsed.kind}.`);
   }
-  if (idempotentCommandKinds.has(parsed.kind)) {
+  if (supportsIdempotency) {
     const generated = "idempotencyKey" in parsed && typeof parsed.idempotencyKey === "string"
       ? parsed.idempotencyKey
       : randomUUID();
@@ -2483,7 +2809,13 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       && parsed.kind !== "session.queue"
       && parsed.kind !== "session.steer"
     ) throw new CliUsageError("Only session send, queue, and steer accept --attach.");
-    return { attach: sessionAttach, command: parsed, json, kind: "session.attach" };
+    return {
+      attach: sessionAttach,
+      command: parsed,
+      json,
+      kind: "session.attach",
+      legacyAttachmentReplay,
+    };
   }
   return { kind: "command", command: parsed, json };
 }

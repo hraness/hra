@@ -58,7 +58,7 @@ type ActiveItem = Readonly<{
   turnId: string;
 }>;
 
-const publicControlScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const publicControlScalar = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
 const providerToolLabelMaximumUtf8Bytes = 256;
 const textEncoder = new TextEncoder();
 
@@ -266,6 +266,14 @@ const sanitizeCompleteBody = (
       ...body,
       turnId: body.turnId === null ? null : publicId(body.turnId),
       text: safe(body.text),
+      ...(body.attachments === undefined
+        ? {}
+        : {
+            attachments: body.attachments.map((attachment) => ({
+              ...attachment,
+              name: safeInline(attachment.name),
+            })),
+          }),
     };
     case "provider_switched": return body;
     case "tool_progress": return {
@@ -563,6 +571,17 @@ export class SessionEventStreamRedactor {
       && sameProviderAuthority(item.providerAuthority, write.providerAuthority)
       && item.providerGeneration === write.providerGeneration);
     this.#quarantinedAuthorities.delete(this.#custodyKey(write));
+    return this.#drainAuthority(write);
+  }
+
+  /**
+   * Finish buffered text before a locally-authored message is appended outside
+   * this reducer. Unlike an interruption boundary, this preserves active-item
+   * custody so later provider deltas for the same item remain admissible.
+   */
+  flushSession(write: Omit<SessionEventWrite, "body">): readonly SessionEventWrite[] {
+    this.#assertWriteAuthority(write);
+    this.#finish((stream) => sameProviderCustody(write, stream), false);
     return this.#drainAuthority(write);
   }
 

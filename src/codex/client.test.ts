@@ -5,10 +5,12 @@ import { CodexAppServerClient, type CodexAppServerClientOptions } from "./client
 import { CodexError } from "./errors.ts";
 import type { CodexProcess } from "./process.ts";
 import {
+  HRA_HOST_DYNAMIC_TOOLS,
   HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
   type CodexAuthority,
   type CodexFact,
   type FencedCodexValue,
+  type HraHostToolCall,
 } from "./protocol.ts";
 
 const CONNECTION_ID = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
@@ -1259,7 +1261,7 @@ describe("CodexAppServerClient", () => {
   test("accepts the pinned desktop user agent and rejects protocol version drift", async () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const pinned = createClient({
-      process: successfulFake(codexHome, "Codex Desktop/0.153.2 (Mac OS 26.5; arm64) dumb (hra; 0.6.0)"),
+      process: successfulFake(codexHome, "Codex Desktop/0.153.2 (Mac OS 26.5; arm64) dumb (hra; 0.6.1)"),
       authority: codexAuthority(1),
       expectedCodexHome: codexHome,
       isAuthorityCurrent: () => true,
@@ -1355,6 +1357,16 @@ describe("CodexAppServerClient", () => {
       process: successfulFake(codexHome),
       onConversationAutomationToolResponseWritten: () => undefined,
     })).toThrow("conversation automation requires paired call and response-written callbacks");
+    expect(() => createClient({
+      ...base,
+      process: successfulFake(codexHome),
+      onHraHostToolCall: async () => ({ scope: "session" }),
+    })).toThrow("HRA host tools require paired call and response-written callbacks");
+    expect(() => createClient({
+      ...base,
+      process: successfulFake(codexHome),
+      onHraHostToolResponseWritten: () => undefined,
+    })).toThrow("HRA host tools require paired call and response-written callbacks");
   });
 
   test("routes the exact conversation automation tool and wakes only after the response write", async () => {
@@ -1420,6 +1432,288 @@ describe("CodexAppServerClient", () => {
     expect(calls[1]?.requestDigest).toBe(calls[0]?.requestDigest);
     expect(process.writes.filter((frame) =>
       (frame as { id?: unknown }).id === "tool-request")).toHaveLength(2);
+    await client.close();
+  });
+
+  test("routes every admitted dynamic tool through the generic HRA callback", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const calls: unknown[] = [];
+    const written: unknown[] = [];
+    const client = createClient({
+      process,
+      authority: codexAuthority(7),
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onHraHostToolCall: async (call) => {
+        calls.push(call);
+        return { accepted: true, tool: call.tool };
+      },
+      onHraHostToolResponseWritten: (call) => {
+        written.push(call);
+      },
+    });
+    await client.initialize();
+    process.respond({
+      id: "peer-tool",
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-2",
+        namespace: "hra",
+        tool: "session_message",
+        arguments: {
+          sessionId: `sess_${"a".repeat(32)}`,
+          expectedRevision: 2,
+          delivery: "queue",
+          message: "Please verify the plan.",
+          reason: "Independent review",
+        },
+      },
+    });
+    await waitFor(() => written.length === 1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      tool: "session_message",
+      input: {
+        expectedRevision: 2,
+        delivery: "queue",
+        message: "Please verify the plan.",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    expect(process.writes.at(-1)).toEqual({
+      id: "peer-tool",
+      result: {
+        contentItems: [{
+          type: "inputText",
+          text: "{\"accepted\":true,\"tool\":\"session_message\"}",
+        }],
+        success: true,
+      },
+    });
+    await client.close();
+  });
+
+  test("fences exact live host calls before queued terminal facts and preserves unrelated threads", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const handlerGate = deferred<undefined>();
+    const completionGate = deferred<undefined>();
+    const calls: HraHostToolCall[] = [];
+    const liveAtAdmission: boolean[] = [];
+    const written: HraHostToolCall[] = [];
+    let completionObserverEntered = false;
+    let markerObserved = false;
+    const client = createClient({
+      process,
+      authority: codexAuthority(7),
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onHraHostToolCall: async (call) => {
+        calls.push(call);
+        liveAtAdmission.push(client.hasLiveHraHostToolCall(call));
+        await handlerGate.promise;
+        return { accepted: true };
+      },
+      onHraHostToolResponseWritten: (call) => { written.push(call); },
+      onFact: async ({ value }) => {
+        if (value.type === "turnCompleted" && value.threadId === "thread-1") {
+          completionObserverEntered = true;
+          await completionGate.promise;
+        }
+        if (value.type === "threadNameUpdated" && value.name === "receive-fence-marker") {
+          markerObserved = true;
+        }
+      },
+    });
+    await client.initialize();
+    const rawTurn = (id: string, status: "completed" | "inProgress") => ({
+      completedAt: status === "completed" ? 2 : null,
+      durationMs: status === "completed" ? 1 : null,
+      id,
+      items: [],
+      startedAt: 1,
+      status,
+    });
+    process.respond({
+      method: "turn/started",
+      params: { threadId: "thread-1", turn: rawTurn("turn-1", "inProgress") },
+    });
+    process.respond({
+      method: "turn/started",
+      params: { threadId: "thread-2", turn: rawTurn("turn-2", "inProgress") },
+    });
+    process.respond({
+      id: "tool-thread-1",
+      method: "item/tool/call",
+      params: conversationAutomationParams(),
+    });
+    process.respond({
+      id: "tool-thread-2",
+      method: "item/tool/call",
+      params: {
+        ...conversationAutomationParams(),
+        callId: "call-2",
+        threadId: "thread-2",
+        turnId: "turn-2",
+      },
+    });
+    await waitFor(() => calls.length === 2);
+    const first = calls[0];
+    const second = calls[1];
+    if (first === undefined || second === undefined) throw new Error("Missing host-tool calls.");
+    expect(liveAtAdmission).toEqual([true, true]);
+    expect(client.hasLiveHraHostToolCall(first)).toBe(true);
+    expect(client.hasLiveHraHostToolCall(second)).toBe(true);
+    for (const changedAuthority of [
+      { ...first.authority, bindingGeneration: first.authority.bindingGeneration + 1 },
+      { ...first.authority, providerAccountId: `acct_${"f".repeat(32)}` },
+      { ...first.authority, provider: "claude" as const },
+    ]) {
+      expect(client.hasLiveHraHostToolCall({ ...first, authority: changedAuthority })).toBe(false);
+    }
+    expect(client.hasLiveHraHostToolCall({
+      ...first,
+      requestDigest: "f".repeat(64),
+    })).toBe(false);
+
+    process.respond({
+      method: "turn/completed",
+      params: { threadId: "thread-1", turn: rawTurn("turn-1", "completed") },
+    });
+    await waitFor(() => completionObserverEntered);
+    expect(client.hasLiveHraHostToolCall(first)).toBe(false);
+    expect(client.hasLiveHraHostToolCall(second)).toBe(true);
+    completionGate.resolve(undefined);
+
+    process.respond({
+      id: "tool-after-completion",
+      method: "item/tool/call",
+      params: { ...conversationAutomationParams(), callId: "call-after-completion" },
+    });
+    process.respond({
+      method: "thread/name/updated",
+      params: { threadId: "thread-2", name: "receive-fence-marker" },
+    });
+    await waitFor(() => markerObserved);
+    expect(calls).toHaveLength(2);
+
+    handlerGate.resolve(undefined);
+    await waitFor(() => written.length === 1);
+    expect(written).toEqual([second]);
+    expect(process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === "tool-thread-1")).toBe(false);
+    expect(process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === "tool-after-completion")).toBe(false);
+    expect(process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === "tool-thread-2")).toBe(true);
+    await client.close();
+  });
+
+  test("does not let an invalidated callback consume a same-identity replacement", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const oldHandlerGate = deferred<undefined>();
+    const replacementHandlerGate = deferred<undefined>();
+    const calls: HraHostToolCall[] = [];
+    const client = createClient({
+      process,
+      authority: codexAuthority(7),
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onHraHostToolCall: async (call) => {
+        calls.push(call);
+        if (call.requestId.type !== "string") throw new Error("Expected a string request id.");
+        await (call.requestId.value === "old-request"
+          ? oldHandlerGate.promise
+          : replacementHandlerGate.promise);
+        return { accepted: true };
+      },
+      onHraHostToolResponseWritten: () => undefined,
+    });
+    await client.initialize();
+    const params = conversationAutomationParams();
+    process.respond({ id: "old-request", method: "item/tool/call", params });
+    await waitFor(() => calls.length === 1);
+    process.respond({
+      method: "serverRequest/resolved",
+      params: { requestId: "old-request", threadId: "thread-1" },
+    });
+    process.respond({ id: "replacement-request", method: "item/tool/call", params });
+    await waitFor(() => calls.length === 2);
+    const replacement = calls[1];
+    if (replacement === undefined) throw new Error("Missing replacement host-tool call.");
+    expect(replacement.requestId).toEqual({ type: "string", value: "replacement-request" });
+    expect(client.hasLiveHraHostToolCall(replacement)).toBe(true);
+
+    oldHandlerGate.resolve(undefined);
+    for (let index = 0; index < 4; index += 1) await Promise.resolve();
+    expect(client.hasLiveHraHostToolCall(replacement)).toBe(true);
+    expect(process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === "old-request")).toBe(false);
+
+    replacementHandlerGate.resolve(undefined);
+    await waitFor(() => process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === "replacement-request"));
+    await client.close();
+    expect(calls).toHaveLength(2);
+    expect(process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === "old-request")).toBe(false);
+  });
+
+  test("does not report a response written when an account barrier refuses its frame", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const handlerGate = deferred<undefined>();
+    let accountAuthoritySignaled = false;
+    let call: HraHostToolCall | undefined;
+    let postWriteCalls = 0;
+    const client = createClient({
+      process,
+      authority: codexAuthority(7),
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onAccountAuthoritySignal: () => {
+        accountAuthoritySignaled = true;
+        return Promise.reject(new Error("injected account refresh rejection"));
+      },
+      onHraHostToolCall: async (input) => {
+        call = input;
+        await handlerGate.promise;
+        return { accepted: true };
+      },
+      onHraHostToolResponseWritten: () => { postWriteCalls += 1; },
+    });
+    await client.initialize();
+    process.respond({
+      id: "barrier-refused-response",
+      method: "item/tool/call",
+      params: conversationAutomationParams(),
+    });
+    await waitFor(() => call !== undefined);
+    if (call === undefined) throw new Error("Missing HRA host-tool call.");
+    const retainedCall = call;
+    expect(client.hasLiveHraHostToolCall(retainedCall)).toBe(true);
+
+    process.respond({
+      method: "account/updated",
+      params: { authMode: "chatgpt", planType: "pro" },
+    });
+    await waitFor(() => accountAuthoritySignaled);
+    handlerGate.resolve(undefined);
+    await waitFor(() => !client.hasLiveHraHostToolCall(retainedCall));
+
+    expect(client.state).toBe("ready");
+    expect(postWriteCalls).toBe(0);
+    expect(process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === "barrier-refused-response")).toBe(false);
     await client.close();
   });
 
@@ -2815,6 +3109,39 @@ describe("CodexAppServerClient", () => {
     await client.close();
   });
 
+  test("account status reads honor caller cancellation and tolerate the late provider response", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const requested = deferred<unknown>();
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
+      } else if (message.method === "account/read") {
+        requested.resolve(message.id);
+      }
+    });
+    const client = createClient({
+      process,
+      authority: codexAuthority(1),
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+    const controller = new AbortController();
+    const reason = new Error("account status caller departed");
+    const result = client.accountRead(false, controller.signal).catch((error: unknown) => error);
+    try {
+      const requestId = await requested.promise;
+      controller.abort(reason);
+      expect(await Promise.race([result, Bun.sleep(200).then(() => "still-pending")])).toBe(reason);
+      process.respond({ id: requestId, result: { account: null, requiresOpenaiAuth: true } });
+      await Bun.sleep(2);
+      expect(client.state).toBe("ready");
+    } finally {
+      await client.close();
+      await result;
+    }
+  });
+
   test("caller abort cancels the current page, prevents continuations, and tolerates its late response", async () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     let modelPage = 0;
@@ -3591,7 +3918,7 @@ describe("CodexAppServerClient", () => {
     await client.close();
   });
 
-  test("binds the exact named workspace profile and validates the effective thread response", async () => {
+  test.each(["current", "historical_v1"] as const)("binds the exact workspace and %s host contract", async (hostCapabilities) => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const thread = {
       id: "thread-1",
@@ -3616,7 +3943,7 @@ describe("CodexAppServerClient", () => {
           result: {
             thread,
             cwd: "/workspace/project",
-            model: "gpt-6-astra",
+            model: "gpt-5.6-sol",
             modelProvider: "openai",
             reasoningEffort: "max",
             serviceTier: "default",
@@ -3635,21 +3962,34 @@ describe("CodexAppServerClient", () => {
       expectedCodexHome: codexHome,
       experimentalApi: true,
       isAuthorityCurrent: () => true,
-      onConversationAutomationToolCall: async () => ({ scope: "conversation" }),
-      onConversationAutomationToolResponseWritten: () => undefined,
+      onHraHostToolCall: async () => ({ scope: "conversation" }),
+      onHraHostToolResponseWritten: () => undefined,
     });
     await client.initialize();
-    const result = await client.startThread({
+    const request = {
       cwd: "/workspace/project",
-      preset: { alias: "high", model: "gpt-6-astra", effort: "max", serviceTier: null, fast: false },
+      ...(hostCapabilities === "historical_v1"
+        ? { hostCapabilities }
+        : { developerInstructions: "Static HRA preamble." }),
+      preset: { alias: "high", model: "gpt-5.6-sol", effort: "max", serviceTier: null, fast: false },
       policy: { review: "auto_review", permissionProfile: ":workspace", writableRoots: ["/workspace/project"] },
-    });
+    } as const;
+    for (const invalid of [
+      { ...request, hostCapabilities: "disabled" },
+      { ...request, hostCapabilities: "historical_v1", developerInstructions: "Do not upgrade historical authority." },
+      { ...request, hostCapabilities: "historical_v1", developerInstructions: undefined },
+    ]) {
+      await expect(client.startThread(invalid as unknown as Parameters<CodexAppServerClient["startThread"]>[0]))
+        .rejects.toMatchObject({ code: "INVALID_INPUT" });
+    }
+    expect(process.writes.filter((frame) => (frame as { method?: unknown }).method === "thread/start")).toEqual([]);
+    const result = await client.startThread(request);
     expect(result.value.activePermissionProfile?.id).toBe(":workspace");
     expect(process.writes.at(-1)).toEqual({
       id: 3,
       method: "thread/start",
       params: {
-        model: "gpt-6-astra",
+        model: "gpt-5.6-sol",
         serviceTier: null,
         cwd: "/workspace/project",
         permissions: ":workspace",
@@ -3657,9 +3997,11 @@ describe("CodexAppServerClient", () => {
         approvalPolicy: "on-request",
         approvalsReviewer: "auto_review",
         config: { model_reasoning_effort: "max" },
+        ...(hostCapabilities === "historical_v1" ? {} : { developerInstructions: "Static HRA preamble." }),
         ephemeral: false,
         historyMode: "paginated",
-        dynamicTools: HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
+        dynamicTools: hostCapabilities === "historical_v1"
+          ? HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS : HRA_HOST_DYNAMIC_TOOLS,
       },
     });
     await client.close();
@@ -3674,7 +4016,7 @@ describe("CodexAppServerClient", () => {
         target.respond({ id: message.id, result: {
           thread: { id: "thread-unsafe", sessionId: "thread-unsafe", preview: "", ephemeral: false, historyMode: "paginated", modelProvider: "openai", createdAt: 1, updatedAt: 1, status: { type: "idle" }, cwd: "/workspace/project", name: null, turns: [] },
           cwd: "/workspace/project",
-          model: "gpt-6-astra",
+          model: "gpt-5.6-sol",
           modelProvider: "openai",
           reasoningEffort: "max",
           serviceTier: "default",
@@ -3698,7 +4040,8 @@ describe("CodexAppServerClient", () => {
     await client.initialize();
     await expect(client.startThread({
       cwd: "/workspace/project",
-      preset: { alias: "high", model: "gpt-6-astra", effort: "max", serviceTier: null, fast: false },
+      developerInstructions: "Static HRA preamble.",
+      preset: { alias: "high", model: "gpt-5.6-sol", effort: "max", serviceTier: null, fast: false },
       policy: { review: "auto_review", permissionProfile: ":workspace", writableRoots: ["/workspace/project"] },
     })).rejects.toMatchObject({ code: "INDETERMINATE_EFFECT", operation: "thread/start" });
     await client.close();
@@ -3749,9 +4092,18 @@ describe("CodexAppServerClient", () => {
       onConversationAutomationToolResponseWritten: () => undefined,
     });
     await client.initialize();
-    await client.resumeThread("thread-legacy");
+    await client.resumeThread("thread-legacy", "Static HRA preamble.");
     expect(process.writes.at(-1)).toEqual({
       id: 3,
+      method: "thread/resume",
+      params: {
+        threadId: "thread-legacy",
+        developerInstructions: "Static HRA preamble.",
+      },
+    });
+    await client.resumeThread("thread-legacy");
+    expect(process.writes.at(-1)).toEqual({
+      id: 4,
       method: "thread/resume",
       params: { threadId: "thread-legacy" },
     });
@@ -3820,6 +4172,7 @@ describe("CodexAppServerClient", () => {
     await client.resumeThreadWithPolicy({
       threadId: "thread-adopted",
       cwd: "/workspace/project",
+      developerInstructions: "Keep this adopted thread within its reviewed policy.",
       preset: {
         alias: "high",
         model: "gpt-5.6-sol",
@@ -3983,4 +4336,41 @@ describe("CodexAppServerClient", () => {
     expect(client.state).toBe("closed");
     expect(process.signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM"]);
   });
+});
+
+test("closed Codex scope stops late stderr diagnostics without reporting normal interruption as failure", async () => {
+  const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+  const diagnostics: string[] = [];
+  const process = new FakeProcess((message, target) => {
+    if (message.method === "initialize") {
+      target.respond({ id: message.id, result: {
+        userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos",
+      } });
+    }
+  }, { ignoreTerm: true, leaveStreamsOpenAfterKill: true });
+  const client = createClient({
+    process,
+    authority: codexAuthority(1),
+    expectedCodexHome: codexHome,
+    isAuthorityCurrent: () => true,
+    onSafeDiagnostic: message => { diagnostics.push(message); },
+    shutdownTermGraceMs: 5,
+    shutdownSettlementMs: 5,
+  });
+  try {
+    await client.initialize();
+    process.stderrQueue.push("before");
+    await waitFor(() => diagnostics.includes("Codex wrote 6 bytes to stderr"));
+    await client.close();
+    expect(client.state).toBe("closed");
+    const completedDiagnostics = [...diagnostics];
+    process.stderrQueue.push("late");
+    await Bun.sleep(5);
+    expect(diagnostics).toEqual(completedDiagnostics);
+    expect(diagnostics).not.toContain("Codex stderr closed unexpectedly");
+  } finally {
+    process.stdoutQueue.close();
+    process.stderrQueue.close();
+    await client.close();
+  }
 });

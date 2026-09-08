@@ -28,7 +28,7 @@ import {
   useReadDeviceCommandResult,
   useSubmitDeviceCommand,
 } from "../data/device-commands";
-import { useDevices, useServerClock, type DeviceView } from "../data/devices";
+import { useDevices, type DeviceView } from "../data/devices";
 import { useDeviceRegistries } from "../data/registry";
 import { useSessionHeads } from "../data/session-heads";
 import { pageSize } from "../env";
@@ -36,6 +36,7 @@ import {
   type CommandState,
   type DeviceCommandResultPayload,
   type RemoteCommandPayload,
+  type SupportedPreset,
 } from "../hra/cloud";
 import { formatRelativeTime, formatUtcDay } from "../model/relative-time";
 import {
@@ -65,7 +66,6 @@ import {
   showThinkingCommand,
   unarchiveSessionCommand,
   type ApprovalMode,
-  type PresetChoice,
 } from "../model/settings-commands";
 import {
   accountBrowserLoginAllowed,
@@ -74,6 +74,9 @@ import {
   allScheduledTasks,
   attentionEmailPresentation,
   commandTargetForMachine,
+  hostedMemorySpaces,
+  hostedPeerActions,
+  hostedPeerPolicies,
   machineLabelsByDevice,
   personalSessionAdoptionCommand,
   shortSessionId,
@@ -449,7 +452,7 @@ function MachineCard({
 
       <SettingsRow
         control={(
-          <ChoiceGroup<PresetChoice>
+          <ChoiceGroup<SupportedPreset>
             disabled={disabled}
             label={`Default preset on ${machine.label}`}
             onSelect={(preset) => { send(defaultPresetCommand(preset)); }}
@@ -457,7 +460,7 @@ function MachineCard({
               label: presetLabels[preset],
               value: preset,
             }))}
-            value={machine.defaultPreset}
+            value={machine.defaultPreset === "astra" ? null : machine.defaultPreset}
           />
         )}
         description="The model preset new sessions start with."
@@ -518,11 +521,171 @@ function MachineCard({
   );
 }
 
+const shortDigest = (value: string): string => value.slice(0, 12);
+
+export function MemorySupervision({ machines, now, ready }: Readonly<{
+  machines: readonly MachineView[];
+  now: number;
+  ready: boolean;
+}>) {
+  if (!ready) return null;
+  const spaces = hostedMemorySpaces(machines);
+  const policies = hostedPeerPolicies(machines);
+  const actions = hostedPeerActions(machines);
+  const unavailable = machines.filter((machine) => machine.memorySummaryFreshness !== "current");
+  const bounded = machines.flatMap((machine) => {
+    if (machine.memorySummaryFreshness !== "current" || machine.memorySummary === null) return [];
+    const categories = [
+      machine.memorySummary.coverage.spaces === "bounded" ? "spaces" : null,
+      machine.memorySummary.coverage.peerPolicies === "bounded" ? "peer policies" : null,
+      machine.memorySummary.coverage.peerActions === "bounded" ? "peer actions" : null,
+    ].filter((category): category is string => category !== null);
+    return categories.length === 0 ? [] : [{ categories, machine }];
+  });
+  return (
+    <SettingsSection
+      description="Read-only encrypted observations from each daemon: up to 100 spaces, 200 peer policies, 50 recently updated peer actions, and 32 recent record keys per space. This bounded view is not an audit log, and HRA never chooses a winning head here."
+      title="Memory and peer activity"
+    >
+      {machines.length === 0 ? <SettingsCard><EmptyRow>No daemon summaries are available.</EmptyRow></SettingsCard> : null}
+      {unavailable.length === 0 ? null : (
+        <SettingsCard>
+          {unavailable.map((machine) => (
+            <SettingsRow
+              control={(
+                <Badge tone={machine.memorySummaryFreshness === "unreadable" ? "danger" : "attention"}>
+                  {machine.memorySummaryFreshness}
+                </Badge>
+              )}
+              description={machine.memorySummaryFreshness === "stale"
+                ? `Last observation ${formatRelativeTime(machine.memorySummary?.observedAt ?? machine.updatedAt, now)}; excluded from agreement.`
+                : machine.memorySummaryFreshness === "unreadable"
+                  ? "The separate encrypted summary could not be verified."
+                  : machine.memorySummaryFreshness === "inactive"
+                    ? "The publishing device authority is not active; its prior summary is excluded."
+                  : "No verified summary is available; this daemon may not support it or may be unable to publish it."}
+              key={machine.devicePublicId}
+              title={`Memory summary on ${machine.label}`}
+            />
+          ))}
+        </SettingsCard>
+      )}
+
+      {bounded.length === 0 ? null : (
+        <SettingsCard>
+          {bounded.map(({ categories, machine }) => (
+            <SettingsRow
+              control={<Badge tone="attention">bounded</Badge>}
+              description={`This daemon reached a projection bound for ${categories.join(", ")}; additional items may exist.`}
+              key={machine.devicePublicId}
+              title={`Summary coverage on ${machine.label}`}
+            />
+          ))}
+        </SettingsCard>
+      )}
+
+      {spaces.length === 0 ? (
+        <SettingsCard><EmptyRow>No portable shared-memory space has been observed.</EmptyRow></SettingsCard>
+      ) : spaces.map((group) => (
+        <SettingsCard key={group.canonicalSpaceId}>
+          <SettingsRow
+            control={(
+              <Badge tone={group.agreement === "agreed"
+                ? "accent"
+                : group.agreement === "disagreed" ? "danger" : "neutral"}
+              >
+                {group.agreement === "agreed"
+                  ? "heads agree"
+                  : group.agreement === "disagreed" ? "heads disagree" : "insufficient evidence"}
+              </Badge>
+            )}
+            description={`Portable space ${shortDigest(group.canonicalSpaceId.slice("hra:project:".length))}; ${group.projectLabels.join(", ") || "project label unavailable"}.`}
+            title="Shared memory"
+          />
+          {group.observations.map((observation) => {
+            const space = observation.space;
+            if (space === null) {
+              return (
+                <SettingsRow
+                  control={<Badge tone="attention">{observation.freshness}</Badge>}
+                  description={observation.freshness === "missing"
+                    ? "This current daemon did not report enrollment in this portable space."
+                    : observation.freshness === "bounded"
+                      ? "This daemon published a capped space list, so absence does not prove non-enrollment."
+                      : "No trustworthy observation is available from this daemon."}
+                  key={observation.devicePublicId}
+                  title={observation.machineLabel}
+                />
+              );
+            }
+            return (
+              <SettingsRow
+                control={(
+                  <>
+                    <Badge tone={observation.freshness === "current" ? "accent" : "attention"}>
+                      {observation.freshness}
+                    </Badge>
+                    <Badge tone={space.syncStatus === "conflict" || space.syncStatus === "error"
+                      ? "danger"
+                      : space.syncStatus === "syncing" ? "attention" : "neutral"}
+                    >
+                      {space.syncStatus}
+                    </Badge>
+                  </>
+                )}
+                description={`Exact head ${space.head.sequence}:${shortDigest(space.head.digest)}, ${space.recordCount === null ? "record count unavailable" : `${space.recordCount} record${space.recordCount === 1 ? "" : "s"}${space.recordCount > space.recentRecords.length ? ` (showing ${space.recentRecords.length} newest key${space.recentRecords.length === 1 ? "" : "s"})` : ""}`}; enrollment ${space.enrollment}; last exchange ${space.lastExchangeAt === null ? "never" : formatRelativeTime(space.lastExchangeAt, now)}.`}
+                key={observation.devicePublicId}
+                title={observation.machineLabel}
+              >
+                {space.recentRecords.length === 0 ? null : (
+                  <ul aria-label={`Recent memory records on ${observation.machineLabel}`} className="flex flex-col gap-1 text-xs text-ink-muted">
+                    {space.recentRecords.map((record) => (
+                      <li key={record.key}>
+                        <span className="font-mono">{record.key}</span>
+                        {` · memory page · ${formatRelativeTime(record.updatedAt, now)}`}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </SettingsRow>
+            );
+          })}
+        </SettingsCard>
+      ))}
+
+      <SettingsCard>
+        {policies.length === 0 ? <EmptyRow>No peer policy appears in the current bounded view.</EmptyRow> : null}
+        {policies.map((policy) => (
+          <SettingsRow
+            control={<Badge tone={policy.mode === "coordinate" ? "accent" : "neutral"}>{policy.mode}</Badge>}
+            description={`${policy.machineLabel} · ${policy.projectLabel} · session ref ${shortDigest(policy.session.ref)} · ${formatRelativeTime(policy.updatedAt, now)}`}
+            key={`${policy.devicePublicId}:${policy.session.ref}`}
+            title={policy.session.label}
+          />
+        ))}
+      </SettingsCard>
+
+      <SettingsCard>
+        {actions.length === 0 ? <EmptyRow>No mutating peer action appears in the current bounded view.</EmptyRow> : null}
+        {actions.map((action, index) => (
+          <SettingsRow
+            control={<Badge tone={action.state === "failed" || action.state === "ambiguous" ? "danger" : "neutral"}>{action.state}</Badge>}
+            description={`${action.machineLabel} · ${action.delivery} · ${formatRelativeTime(action.updatedAt, now)}. Messages and reasons are not uploaded.`}
+            key={`${action.devicePublicId}:${action.createdAt}:${action.actor.ref}:${action.target.ref}:${index}`}
+            title={`Actor ${action.actor.label} (${shortDigest(action.actor.ref)}) → target ${action.target.label} (${shortDigest(action.target.ref)})`}
+          />
+        ))}
+      </SettingsCard>
+    </SettingsSection>
+  );
+}
+
 function ArchivedSessionRow({
   now,
   session,
 }: Readonly<{ now: number; session: ArchivedSessionView }>) {
   const command = useSettingsCommand();
+  const retired = session.retiredProvider === "devin";
   const day = formatUtcDay(session.updatedAt);
   const machine = session.machineLabel ?? shortSessionId(session.executionDevicePublicId);
 
@@ -530,8 +693,9 @@ function ArchivedSessionRow({
     <SettingsRow
       control={(
         <Button
-          disabled={command.busy}
+          disabled={command.busy || retired}
           onClick={() => {
+            if (retired) return;
             command.run({
               payload: unarchiveSessionCommand(),
               target: {
@@ -549,6 +713,7 @@ function ArchivedSessionRow({
       description={`${machine}, last updated ${formatRelativeTime(session.updatedAt, now)}${day === null ? "" : ` on ${day}`}`}
       title={session.title}
     >
+      {retired ? <p className="text-xs text-ink-muted">Devin retired · read-only</p> : null}
       <Notice>{command.notice}</Notice>
     </SettingsRow>
   );
@@ -558,18 +723,20 @@ function ArchivedSessionRow({
 export function AccountBrowserLoginControls({
   account,
   busy,
+  handoffAvailable = false,
   onStart,
   onStatus,
 }: Readonly<{
   account: AccountRowView;
   busy: boolean;
+  handoffAvailable?: boolean;
   onStart: () => void;
   onStatus: () => void;
 }>) {
   if (!accountBrowserLoginAllowed(account)) return null;
   return (
     <div className="flex flex-wrap items-center gap-2">
-      {account.status === "signed_out" ? (
+      {account.status === "signed_out" && !handoffAvailable ? (
         <Button
           disabled={busy}
           onClick={onStart}
@@ -601,7 +768,7 @@ export function AccountBrowserLoginControls({
  * their shared ciphertext on the first read. Poll names this row's account and
  * returns only its status and a bounded local instruction.
  */
-function AccountRow({
+export function AccountRow({
   account,
   now,
   serverClockReady,
@@ -611,7 +778,10 @@ function AccountRow({
   const readResult = useReadDeviceCommandResult();
   const [relay, setRelay] = useState<AccountLoginRelayResult | null>(null);
   const [status, setStatus] = useState<string | null>(null);
-  const [consumeRetryCommand, setConsumeRetryCommand] = useState<string | null>(null);
+  const [consumeRetry, setConsumeRetry] = useState<Readonly<{
+    commandPublicId: string;
+    expiresAt: number;
+  }> | null>(null);
   const [consumeAttempt, setConsumeAttempt] = useState(0);
   const [loginAction, setLoginAction] = useState<AccountLoginActionState>(
     initialAccountLoginActionState,
@@ -624,6 +794,7 @@ function AccountRow({
   const localLoginCommand = account.provider === "codex"
     ? `hra account login ${account.publicId}`
     : `hra account login ${account.publicId} --provider ${account.provider}`;
+  const lostHandoffInstruction = `Check status first. If a login is still pending and you cannot finish it, run \`hra account login-cancel ${account.publicId}\` on ${account.machineLabel} before linking again.`;
   const busy = loginAction.phase !== "idle";
 
   const updateLoginAction = useCallback((next: AccountLoginActionState) => {
@@ -674,9 +845,9 @@ function AccountRow({
     // Fence by public id only after hosted time is ready, before the mutation,
     // so neither clock skew nor a relay-driven render can lose the one read.
     consumedCommand.current = command.publicId;
-    setConsumeRetryCommand(null);
+    setConsumeRetry(null);
     if (admission.status === "expired_or_invalid") {
-      setStatus("This login handoff expired. Start a new login.");
+      setStatus(`This browser's login handoff expired. ${lostHandoffInstruction}`);
       releaseLoginHandoff(command.publicId);
       return;
     }
@@ -687,7 +858,7 @@ function AccountRow({
       .then((result) => {
         if (!mounted.current || activeCommand.current !== command.publicId) return;
         if (result === null) {
-          setStatus("No login handoff was available. It expired, was already read, or requires an HRA update on the machine. Start a new login after checking the machine.");
+          setStatus(`No login handoff was available. It expired, was already read, or requires an HRA update on the machine. ${lostHandoffInstruction}`);
           releaseLoginHandoff(command.publicId);
           return;
         }
@@ -706,20 +877,20 @@ function AccountRow({
         if (failure instanceof DeviceCommandConsumePrecommitError) {
           // The hosted transaction definitely aborted, so retain custody of
           // this exact handoff and let the reader explicitly retry it.
-          setConsumeRetryCommand(command.publicId);
+          setConsumeRetry({ commandPublicId: command.publicId, expiresAt: admission.expiresAt });
           setStatus(failure.message);
           return;
         }
         if (failure instanceof DeviceCommandConsumedResultUnreadableError) {
           setStatus(
-            "The one-time login handoff was consumed but could not be read. Unlock this browser again, check the machine, then start a new login.",
+            `The one-time login handoff was consumed but could not be read. Unlock this browser again. ${lostHandoffInstruction}`,
           );
         } else {
           setStatus("The machine returned an incompatible login handoff. Update HRA on the machine before trying again.");
         }
         releaseLoginHandoff(command.publicId);
       });
-  }, [command, consumeAttempt, consumeResult, now, releaseLoginHandoff, serverClockReady]);
+  }, [command, consumeAttempt, consumeResult, lostHandoffInstruction, now, releaseLoginHandoff, serverClockReady]);
 
   // Failed, cancelled, ambiguous, and hosted-expired starts have no relay to
   // consume. An applied result consumed by another tab also releases the row,
@@ -734,23 +905,37 @@ function AccountRow({
       if (command.resultSingleUse && !command.resultConsumed) return;
       if (consumedCommand.current === command.publicId) return;
       setStatus(command.resultSingleUse
-        ? "No login handoff was available. It expired or was already read. Start a new login after checking the machine."
+        ? `No login handoff was available. It expired or was already read. ${lostHandoffInstruction}`
         : "The machine returned a legacy login handoff. Update HRA on the machine before trying again.");
     }
     releaseLoginHandoff(command.publicId);
-  }, [command, releaseLoginHandoff]);
+  }, [command, lostHandoffInstruction, releaseLoginHandoff]);
 
-  // The provider code is short lived. Server-corrected `now` handles clock
-  // skew, while the timer removes it from memory at the deadline between ticks.
+  // A registry read may lag the handoff, so signed-out alone cannot erase it.
+  // Positive sign-in or recovery evidence does close this browser's handoff.
   useEffect(() => {
-    if (relay === null) return;
+    if (account.status === "signed_in" || account.status === "recovery_required") {
+      setRelay(null);
+    }
+  }, [account.status, relay]);
+
+  // Server-corrected `now` handles clock skew. At the deadline, erase a read
+  // handoff or release a rejected read without requiring another consumption.
+  useEffect(() => {
+    const expiresAt = relay?.expiresAt ?? consumeRetry?.expiresAt;
+    if (expiresAt === undefined) return;
     const maximumBrowserTimerMs = 2_147_483_647;
-    const delay = Math.min(Math.max(0, relay.expiresAt - now), maximumBrowserTimerMs);
+    const delay = Math.min(Math.max(0, expiresAt - now), maximumBrowserTimerMs);
     const timer = setTimeout(() => {
       setRelay((current) => current === relay ? null : current);
+      if (consumeRetry !== null) {
+        setConsumeRetry(null);
+        releaseLoginHandoff(consumeRetry.commandPublicId);
+      }
+      setStatus(`This browser's login handoff expired. ${lostHandoffInstruction}`);
     }, delay);
     return () => { clearTimeout(timer); };
-  }, [now, relay]);
+  }, [consumeRetry, lostHandoffInstruction, now, relay, releaseLoginHandoff]);
 
   useEffect(() => {
     if (
@@ -769,6 +954,7 @@ function AccountRow({
           setStatus("The machine returned an incompatible login status. Update HRA on the machine before trying again.");
           return;
         }
+        if (result.status !== "pending") setRelay(null);
         setStatus(result.instruction);
       })
       .catch(() => {
@@ -787,8 +973,10 @@ function AccountRow({
     // one-time handoff: the action gate above holds that command through read.
     activeCommand.current = null;
     setCommandHandle(null);
-    setConsumeRetryCommand(null);
-    setRelay(null);
+    setConsumeRetry(null);
+    // A status read must preserve the code already consumed by this browser.
+    // It cannot be fetched again from the hosted single-use result.
+    if (payload.kind === "account_login_start") setRelay(null);
     setStatus(null);
     void submitDeviceCommand({ payload, targetDevicePublicId: account.targetDevicePublicId })
       .then((publicId) => {
@@ -830,10 +1018,13 @@ function AccountRow({
       description={account.machineLabel}
       title={account.label}
     >
-      {accountBrowserLoginAllowed(account) ? (
+      {account.provider === "devin" ? (
+        <p className="text-xs text-ink-muted">Devin support is retired. This historical account is read-only.</p>
+      ) : accountBrowserLoginAllowed(account) ? (
         <AccountBrowserLoginControls
           account={account}
           busy={busy}
+          handoffAvailable={relay !== null && relay.expiresAt > now}
           onStart={() => { run(accountLoginStartCommand(account.publicId)); }}
           onStatus={() => { run(accountLoginStatusCommand(account.publicId)); }}
         />
@@ -844,11 +1035,6 @@ function AccountRow({
             <p className="text-xs text-ink-muted">
               Run this on its Linux custodian. Claude linking is not available in the browser,
               and macOS refuses before provider launch.
-            </p>
-          ) : account.provider === "devin" ? (
-            <p className="text-xs text-ink-muted">
-              Devin owns this foreground sign-in. Browser linking is not available; run the
-              command on the custodian machine, or add --manual-token-flow for a headless shell.
             </p>
           ) : null}
         </>
@@ -867,11 +1053,11 @@ function AccountRow({
           {observation.protocolWarning}
         </p>
       )}
-      {consumeRetryCommand === command?.publicId ? (
+      {consumeRetry !== null && consumeRetry.commandPublicId === command?.publicId ? (
         <Button
           onClick={() => {
             consumedCommand.current = null;
-            setConsumeRetryCommand(null);
+            setConsumeRetry(null);
             setStatus(null);
             setConsumeAttempt((attempt) => attempt + 1);
           }}
@@ -930,8 +1116,9 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
   const { signOut } = useAuthActions();
   const registries = useDeviceRegistries();
   const { devices, loading: devicesLoading } = useDevices();
-  const serverClock = useServerClock();
-  const now = serverClock.now;
+  // Readiness and `now` must come from one hosted-clock instance. Otherwise
+  // one hook can be ready while another still exposes its local-time fallback.
+  const now = registries.now;
   const { heads, isLoading: headsLoading, loadMore, status } = useSessionHeads(pageSize);
 
   const labels = useMemo(
@@ -979,6 +1166,12 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
             />
           ))}
         </SettingsSection>
+
+        <MemorySupervision
+          machines={registries.machines}
+          now={now}
+          ready={registries.memorySummaryReady}
+        />
 
         <SettingsSection
           description="Archived sessions stay readable and can be brought back."
@@ -1046,7 +1239,7 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
                 account={account}
                 key={`${account.targetDevicePublicId}:${account.provider}:${account.publicId}`}
                 now={now}
-                serverClockReady={serverClock.ready}
+                serverClockReady={registries.memorySummaryReady}
               />
             ))}
             <SettingsRow
@@ -1056,7 +1249,7 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
               <CommandHint>hra remote allow account-linking</CommandHint>
             </SettingsRow>
             <SettingsRow
-              description="Codex, Claude, and Devin sign in on the machine that owns their isolated provider home."
+              description="Codex and Claude sign in on the machine that owns their isolated provider home."
               title="Link an account from the machine"
             >
               <CommandHint>hra account login &lt;profile&gt; [--provider &lt;provider&gt;]</CommandHint>

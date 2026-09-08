@@ -71,7 +71,7 @@ async function fixture(kind: InputKind) {
     if (kind === "original_send") return store.prepareOwnedSessionSendWithCustody({ request, reservation, ...daemon });
     if (kind === "session.steer") return store.prepareSessionInputMutation({ ...genericInput, kind, reservation });
     return store.enqueueIdempotentWithResult({ sessionId: session.id, profileGeneration: authority.processGeneration,
-      providerAuthority: authority, message: genericInput.message, idempotencyKey, attachments: [attachment],
+      providerAuthority: authority, message: genericInput.message, idempotencyKey, attachments: [reference], storedAttachments: [attachment],
       attachmentReservation: { ...reservation, ...daemon } });
   };
   const snapshot = () => {

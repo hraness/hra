@@ -50,6 +50,7 @@ async function fixture() {
     cleanupSession: async () => { throw new Error("Unexpected memory cleanup."); },
     ensureSession: async () => { throw new Error("Unexpected memory creation."); },
     forkSession: async () => { throw new Error("Unexpected memory fork."); },
+    readSession: () => { throw new Error("Unexpected memory read."); },
     resumeSession: async () => { throw new Error("Unexpected memory resume."); },
     transferSessionOwner: async () => { throw new Error("Unexpected memory transfer."); },
     sweepExpired: async (time) => {

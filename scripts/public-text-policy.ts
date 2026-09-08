@@ -19,6 +19,8 @@ const allowedPublicScopes = new Set([
   "vitejs",
 ]);
 const allowedPublicScopedPackages = new Set([
+  "@anthropic-ai/claude-code",
+  "@anthropic-ai/claude-code-darwin-arm64",
   "@hraness/atet",
   "@hraness/design-kit",
   "@hraness/hra",
@@ -47,6 +49,12 @@ const absoluteUserPaths = [
 ] as const;
 const scopedPackage = /@([a-z0-9][a-z0-9-]*)\/[a-z0-9][a-z0-9._-]*/gu;
 const gitTagReferencePackageShape = ["@refs", "tags"].join("/");
+// A public certificate subject is not an npm scope. Match the complete reviewed
+// identity, including its boundaries, rather than admitting numeric scopes.
+const npmEnvironmentSubject = "repo:hraness@307125679/hra@1343008607:environment:npm-release";
+const subjectPackageOffset = npmEnvironmentSubject.indexOf("@");
+const isSubjectDelimiter = (character: string | undefined): boolean =>
+  character === undefined || /^[\t\r\n "'`()[\]{},;]$/u.test(character);
 
 export class PublicTextPolicyError extends Error {
   constructor(
@@ -66,11 +74,21 @@ export function assertPublicText(value: string, label: string): void {
     const packageName = match[0];
     const matchEnd = match.index + packageName.length;
     const isGitTagReference = packageName === gitTagReferencePackageShape && value[matchEnd] === "/";
+    const subjectStart = match.index - subjectPackageOffset;
+    const subjectEnd = subjectStart + npmEnvironmentSubject.length;
+    const isNpmEnvironmentSubject = subjectStart >= 0
+      && value.slice(subjectStart, subjectEnd) === npmEnvironmentSubject
+      && isSubjectDelimiter(value[subjectStart - 1])
+      && (
+        isSubjectDelimiter(value[subjectEnd])
+        || (value[subjectEnd] === "." && isSubjectDelimiter(value[subjectEnd + 1]))
+      );
     if (
       scope !== undefined
       && !allowedPublicScopes.has(scope)
       && !allowedPublicScopedPackages.has(packageName)
       && !isGitTagReference
+      && !isNpmEnvironmentSubject
     ) {
       throw new PublicTextPolicyError("PRIVATE_SCOPE", label);
     }
@@ -110,6 +128,9 @@ const excludedDirectories = new Set([".git", "dist", "node_modules"]);
  */
 const publicCopyFile = /^(?:[A-Z_]+\.md|package\.json|site\/.+|docs\/.+\.md|\.github\/ISSUE_TEMPLATE\/.+)$/u;
 const textFile = /(?:^|\/)(?:CODEOWNERS|LICENSE|\.bun-version|\.editorconfig|\.gitattributes|\.gitignore)$|\.(?:css|html|json|lock|md|mjs|svg|toml|ts|tsx|txt|xml|yaml|yml|zig)$/u;
+// This synthetic logical dump is a reviewed migration input, not a general
+// database-file exception. It still passes every public sensitive-text check.
+const releasedStateSql = "scripts/fixtures/released-state/v0.5.0/control-plane.sql";
 const editorialWebp = /^site\/images\/editorial\/[a-z0-9]+(?:-[a-z0-9]+)*(?:-384|-768)?\.webp$/u;
 const webpChunkTypes = new Set(["VP8 ", "VP8L", "VP8X"]);
 
@@ -142,7 +163,7 @@ export async function assertPublicTree(root: string): Promise<void> {
         await assertAuthoritySupervisorArtifactPublicFile(root, label);
       } else if (entry.isFile() && editorialWebp.test(label)) {
         await assertEditorialWebp(child, label);
-      } else if (entry.isFile() && textFile.test(child)) {
+      } else if (entry.isFile() && (textFile.test(child) || label === releasedStateSql)) {
         const value = await readFile(child, "utf8");
         if (entry.name === "bun.lock") assertPublicSensitiveText(value, label);
         else assertPublicText(value, label);

@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { closeSync, openSync, writeFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
 
+import packageMetadata from "../package.json";
+
 import {
   admitExactDaemonStop,
   daemonRunProcessArguments,
@@ -41,10 +43,6 @@ import {
   type ClaudeLoginSignal,
   type ClaudeLoginSignalSource,
 } from "./claude/index";
-import {
-  DEVIN_PIN,
-  DEVIN_PIN_MODEL,
-} from "./devin/index";
 import { ShellTerminalCoordinator } from "./cli/shell-terminal";
 import {
   CloudDaemonJournalRecoveryBlocker,
@@ -102,13 +100,6 @@ const cliClaudeRuntime = {
   executablePath: "/test/claude",
   model: CLAUDE_PIN_MODEL,
   version: CLAUDE_PIN,
-} as const;
-
-const cliDevinRuntime = {
-  argv: ["/test/devin", "acp", "--model", DEVIN_PIN_MODEL] as const,
-  executablePath: "/test/devin",
-  model: DEVIN_PIN_MODEL,
-  version: DEVIN_PIN,
 } as const;
 
 class CliClaudeLoginSignalSource implements ClaudeLoginSignalSource {
@@ -650,7 +641,7 @@ describe("CLI entry point", () => {
         probeAuthStatus: (input) => {
           expect(input.configDir).toBe(configDir);
           expect(input.configHome).toBe("isolated");
-          return Promise.resolve({ loggedIn: true });
+          return Promise.resolve({ loggedIn: true, authentication: "claude_ai" });
         },
       });
       expect(account).toMatchObject({
@@ -983,6 +974,81 @@ describe("CLI entry point", () => {
       expect(rendered.error.message).toContain("before reading local status");
       expect(rendered.error.message).not.toContain("starting the daemon");
       expect(captured.read().stderr).toBe("");
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("exports a transcript only to a new private file and never overwrites it", async () => {
+    const runRoot = await realpath(await mkdtemp(join(tmpdir(), "hra-transcript-export-")));
+    const outputPath = join(runRoot, "transcript.json");
+    const sessionId = `sess_${"e".repeat(32)}`;
+    const transcript = {
+      version: 1 as const,
+      sessionId,
+      provider: "codex" as const,
+      records: [{
+        sequence: 1,
+        throughSequence: 1,
+        recordedAt: 1_700_000_000_000,
+        kind: "user" as const,
+        actor: "human" as const,
+        turnId: null,
+        text: "private transcript body",
+        omittedCharacters: 0,
+      }],
+      throughSequence: 1,
+      nextSequence: null,
+      omittedRecords: 0,
+      omittedCharacters: 0,
+      digest: "a".repeat(64),
+    };
+    const callDaemon = (command: LocalCommand): Promise<CommandResponse> => {
+      expect(command).toMatchObject({
+        kind: "session.transcript",
+        limit: 500,
+        session: sessionId,
+        tail: true,
+      });
+      return Promise.resolve({
+        ok: true,
+        version: 1,
+        requestId: crypto.randomUUID(),
+        data: transcript,
+      });
+    };
+    try {
+      const first = capture();
+      expect(await main([
+        "session",
+        "export",
+        sessionId,
+        "--format",
+        "json",
+        "--out",
+        outputPath,
+      ], first.output, { callDaemon })).toBe(0);
+      expect(first.read().stdout).toBe("");
+      expect(first.read().stderr).toBe("Wrote 1 transcript records.\n");
+      expect((await lstat(outputPath)).mode & 0o777).toBe(0o600);
+      expect(JSON.parse(await readFile(outputPath, "utf8"))).toEqual(transcript);
+
+      const before = await readFile(outputPath, "utf8");
+      const second = capture();
+      expect(await main([
+        "session",
+        "export",
+        sessionId,
+        "--format",
+        "json",
+        "--out",
+        outputPath,
+      ], second.output, { callDaemon })).toBe(1);
+      expect(second.read().stdout).toBe("");
+      expect(second.read().stderr).toBe(
+        "hra: HRA failed before a safe command response was available.\n",
+      );
+      expect(await readFile(outputPath, "utf8")).toBe(before);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -2069,7 +2135,7 @@ describe("CLI entry point", () => {
         ok: true,
         version: 1,
         command: "version",
-        data: { version: "0.6.0" },
+        data: { version: packageMetadata.version },
       });
       expect(version.read().stderr).toBe("");
     }
@@ -2768,7 +2834,7 @@ describe("CLI entry point", () => {
   test("version is sourced from package metadata", async () => {
     const captured = capture();
     expect(await main(["--version"], captured.output)).toBe(0);
-    expect(captured.read()).toEqual({ stdout: "hra 0.6.0\n", stderr: "" });
+    expect(captured.read()).toEqual({ stdout: `hra ${packageMetadata.version}\n`, stderr: "" });
   });
 
   test("completes protected interaction input outside argv and never renders its value", async () => {
@@ -3564,25 +3630,35 @@ describe("CLI entry point", () => {
       ["account", "logout", "personal", "--json"],
       ["account", "switch", "personal", "--json"],
       ["session", "start", "personal", "--json"],
+      ["session", "start", "personal", "--provider", "claude", "--json"],
       ["session", "send", "session-1", privatePayload, "--json"],
       ["session", "queue", "session-1", privatePayload, "--json"],
       ["session", "steer", "session-1", privatePayload, "--json"],
       ["session", "stop", "session-1", "--json"],
       ["session", "rename", "session-1", privatePayload, "--json"],
+      ["session", "switch", "session-1", "--provider", "codex", "--preset", "high", "--json"],
       ["session", "task", "create", "session-1", "--name", "review", "--every-minutes", "15", "--json", "--", privatePayload],
       ["session", "task", "edit", "session-1", `stask_${"1".repeat(32)}`, "--revision", "1", "--json", "--", privatePayload],
       ["session", "task", "delete", "session-1", `stask_${"1".repeat(32)}`, "--revision", "1", "--json"],
+      ["memory", "remember", "session-1", "preferences.review", "--title", "Review style", "--summary", "Private summary", "--json", "--", privatePayload],
+      ["memory", "share", "session-1", "preferences.review", "--reason", privatePayload, "--json"],
+      ["memory", "hosted", "create", privatePayload, "--json"],
     ] as const;
 
     for (const argv of commands) {
       const captured = capture();
       let generatedKey = "";
+      let authoredPresetContract: 1 | 2 | undefined;
       expect(await main(argv, captured.output, {
         callDaemon: (command) => {
           generatedKey = "idempotencyKey" in command
             && typeof command.idempotencyKey === "string"
             ? command.idempotencyKey
             : "";
+          authoredPresetContract = command.kind === "session.start"
+            || command.kind === "session.switch"
+            ? command.presetContract
+            : undefined;
           throw new LocalDaemonIndeterminateError("mutation response lost");
         },
       })).toBe(7);
@@ -3605,7 +3681,13 @@ describe("CLI entry point", () => {
           code: "RECOVERY_REQUIRED",
           details: {
             idempotencyKey: generatedKey,
-            replayArguments: ["--idempotency-key", generatedKey],
+            replayArguments: [
+              "--idempotency-key",
+              generatedKey,
+              ...(authoredPresetContract === undefined
+                ? []
+                : ["--preset-contract", String(authoredPresetContract)]),
+            ],
             replayPlacement: "before_double_dash",
             sameKeyReplay: true,
           },
@@ -3728,133 +3810,32 @@ describe("CLI entry point", () => {
     }
   });
 
-  test("runs Devin's pinned foreground login in all five isolated directories", async () => {
-    const { installation, runRoot } = await upgradeFixture("devin-account-login");
-    const accountId = `acct_${"d".repeat(32)}` as const;
-    const attemptId = `attempt_${"e".repeat(32)}` as const;
-    const idempotencyKey = "00000000-0000-4000-8000-000000000321";
-    const calls: LocalCommand[] = [];
-    let preflights = 0;
-    let loginDirectories: Readonly<{
-      home: string;
-      configHome: string;
-      dataHome: string;
-      cacheHome: string;
-      stateHome: string;
-    }> | undefined;
-    const captured = capture();
+  test("rejects retired Devin commands before daemon calls or credential-directory changes", async () => {
+    const { installation, runRoot } = await upgradeFixture("retired-provider");
+    const credentialDirectory = join(installation.paths.profiles, `acct_${"d".repeat(32)}`, "devin-home");
+    const credentialSentinel = join(credentialDirectory, "provider-owned-sentinel");
+    let daemonCalls = 0;
     try {
-      expect(await main([
-        "account",
-        "login",
-        "Personal",
-        "--provider",
-        "devin",
-        "--manual-token-flow",
-        "--idempotency-key",
-        idempotencyKey,
-      ], captured.output, {
-        installation,
-        interactive: true,
-        isTerminalDescriptor: () => true,
-        callDaemon: async (command) => {
-          calls.push(command);
-          if (command.kind === "account.show") {
-            return {
-              data: {
-                account: { id: accountId, label: "Personal" },
-                authentication: { provider: "devin", signedIn: false },
-                nextCommand: `hra account login ${accountId} --provider devin`,
-                providerGeneration: 7,
-                usage: {
-                  allowance: "unknown",
-                  reason: "Devin exposes no account allowance or reset window.",
-                  source: "devin_acp",
-                },
-              },
-              ok: true as const,
-              requestId: crypto.randomUUID(),
-              version: 1 as const,
-            };
-          }
-          if (command.kind === "account.devin-login.prepare") {
-            return {
-              data: {
-                account: { id: accountId, label: "Personal" },
-                authentication: { provider: "devin", signedIn: false },
-                login: {
-                  status: "launch_granted",
-                  attemptId,
-                  idempotencyKey,
-                  providerGeneration: 7,
-                },
-              },
-              ok: true as const,
-              requestId: crypto.randomUUID(),
-              version: 1 as const,
-            };
-          }
-          if (command.kind !== "account.devin-login.complete") throw new Error("Unexpected command.");
-          return {
-            data: {
-              account: { id: accountId, label: "Personal" },
-              authentication: { provider: "devin", signedIn: true },
-              login: {
-                status: "signed_in",
-                attemptId,
-                idempotencyKey,
-                providerGeneration: 7,
-              },
-            },
-            ok: true as const,
-            requestId: crypto.randomUUID(),
-            version: 1 as const,
-          };
-        },
-        runDevinForegroundLogin: async ({ directories, manualTokenFlow, stdio }) => {
-          loginDirectories = directories;
-          expect(manualTokenFlow).toBe(true);
-          expect(stdio).toEqual({ stderr: 2, stdin: 0, stdout: 1 });
-          return { state: "joined", exitCode: 0, interruptedBy: null };
-        },
-        resolveDevinRuntime: async () => {
-          preflights += 1;
-          return cliDevinRuntime;
-        },
-      })).toBe(0);
-      expect(calls).toEqual([
-        { account: "Personal", kind: "account.show", provider: "devin" },
-        {
-          account: "Personal",
-          idempotencyKey,
-          kind: "account.devin-login.prepare",
-          manualTokenFlow: true,
-        },
-        {
-          account: accountId,
-          attemptId,
-          idempotencyKey,
-          kind: "account.devin-login.complete",
-          outcome: { state: "joined", exitCode: 0, interruptedBy: null },
-          providerGeneration: 7,
-        },
-      ]);
-      expect(loginDirectories).toEqual({
-        home: join(installation.paths.profiles, accountId, "devin-home"),
-        configHome: join(installation.paths.profiles, accountId, "devin-config"),
-        dataHome: join(installation.paths.profiles, accountId, "devin-data"),
-        cacheHome: join(installation.paths.profiles, accountId, "devin-cache"),
-        stateHome: join(installation.paths.profiles, accountId, "devin-state"),
-      });
-      expect(preflights).toBe(2);
-      if (loginDirectories === undefined) throw new Error("Devin login did not receive directories.");
-      for (const directory of Object.values(loginDirectories)) {
-        expect((await lstat(directory)).mode & 0o077).toBe(0);
+      await mkdir(credentialDirectory, { recursive: true, mode: 0o700 });
+      await writeFile(credentialSentinel, "untouched", { mode: 0o600 });
+      for (const argv of [
+        ["account", "login", "personal", "--provider", "devin"],
+        ["session", "start", "personal", "--provider", "devin"],
+        ["session", "switch", "s", "--provider", "devin"],
+        ["remote", "provider", "s", "devin"],
+      ]) {
+        const captured = capture();
+        expect(await main([...argv, "--json"], captured.output, {
+          installation,
+          callDaemon: async () => { daemonCalls += 1; throw new Error("No daemon call is permitted."); },
+        })).toBe(2);
+        expect(JSON.parse(captured.read().stdout)).toMatchObject({
+          ok: false, version: 1, error: { code: "INVALID_INPUT" },
+        });
+        expect(captured.read().stderr).toBe("");
       }
-      expect(captured.read()).toEqual({
-        stderr: "",
-        stdout: "Devin is signed in for Personal.\n",
-      });
+      expect(daemonCalls).toBe(0);
+      expect(await readFile(credentialSentinel, "utf8")).toBe("untouched");
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -4425,8 +4406,8 @@ describe("CLI entry point", () => {
     }
   });
 
-  test("completes a typed spawn failure and preserves exact recovery on completion failure", async () => {
-    for (const mode of ["spawn", "timeout", "protocol"] as const) {
+  test("completes a typed spawn failure and preserves exact recovery on unproved exit or completion failure", async () => {
+    for (const mode of ["spawn", "timeout", "protocol", "unjoined"] as const) {
       const completionFailure = mode !== "spawn";
       const { installation, runRoot } = await upgradeFixture(`claude-complete-${mode}`);
       const digit = mode === "spawn" ? "6" : mode === "timeout" ? "5" : "9";
@@ -4447,9 +4428,12 @@ describe("CLI entry point", () => {
           interactive: true,
           isTerminalDescriptor: () => true,
           resolveClaudeRuntime: async () => cliClaudeRuntime,
-          runClaudeForegroundLogin: async () => completionFailure
-            ? { state: "joined", exitCode: 0, interruptedBy: null }
-            : { state: "not_started", reason: "spawn_failed" },
+          runClaudeForegroundLogin: async () => {
+            if (mode === "unjoined") throw new ClaudeError("TIMEOUT", "Native child exit remains unproved.");
+            return completionFailure
+              ? { state: "joined", exitCode: 0, interruptedBy: null }
+              : { state: "not_started", reason: "spawn_failed" };
+          },
           callDaemon: async (command) => {
             commands.push(command);
             if (command.kind === "account.show") return {
@@ -4494,12 +4478,17 @@ describe("CLI entry point", () => {
             };
           },
         });
-        expect(commands.at(-1)).toMatchObject({
-          kind: "account.claude-login.complete",
-          outcome: completionFailure
-            ? { state: "joined", exitCode: 0, interruptedBy: null }
-            : { state: "not_started", reason: "spawn_failed" },
-        });
+        if (mode === "unjoined") {
+          expect(commands.map((command) => command.kind)).toEqual(["account.show", "account.claude-login.prepare"]);
+          expect(captured.read().stdout).not.toContain("is signed in");
+        } else {
+          expect(commands.at(-1)).toMatchObject({
+            kind: "account.claude-login.complete",
+            outcome: completionFailure
+              ? { state: "joined", exitCode: 0, interruptedBy: null }
+              : { state: "not_started", reason: "spawn_failed" },
+          });
+        }
         if (completionFailure) {
           expect(exit).toBe(7);
           expect(JSON.stringify(captured.read())).toContain(attemptId);
@@ -6328,6 +6317,35 @@ describe("CLI entry point", () => {
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
+  });
+
+  test("rejects the canonical-memory fault decorator outside live acceptance before effects", async () => {
+    const installation = createProductionInstallation();
+    let decorated = false;
+    await expect(runDaemon(installation, {
+      liveAcceptanceCanonicalMemoryTransportDecorator: (transport) => {
+        decorated = true;
+        return transport;
+      },
+    })).rejects.toThrow("restricted to live acceptance");
+    expect(decorated).toBeFalse();
+  });
+
+  test("rejects the Claude proof collector outside live acceptance before effects", async () => {
+    const installation = createProductionInstallation();
+    let invoked = false;
+    await expect(runDaemon(installation, {
+      liveAcceptanceClaudeProof: {
+        beginDaemonGeneration: () => { invoked = true; },
+        closeDaemonGeneration: () => { invoked = true; },
+        handleManagedHostToolCall: async () => {
+          invoked = true;
+          return {};
+        },
+        handleManagedHostToolResponseWritten: () => { invoked = true; },
+      },
+    })).rejects.toThrow("Daemon acceptance hooks are restricted to live acceptance.");
+    expect(invoked).toBeFalse();
   });
 
   test("delivers an abort during early daemon boot before transport exists", async () => {

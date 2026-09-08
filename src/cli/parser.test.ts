@@ -9,7 +9,6 @@ import {
   claudeAccountLoginCommand,
   completeProtectedAuthLogin,
   devinAccountLoginAbandonCommand,
-  devinAccountLoginCommand,
   deviceMutationReplayCommand,
   completeProtectedInteraction,
   helpGroupNames,
@@ -153,56 +152,27 @@ describe("CLI parser", () => {
     ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
   });
 
-  test("keeps Devin login and status in its provider-owned foreground flow", () => {
-    const generated = parseCli(["account", "login", "personal", "--provider", "devin"]);
-    expect(generated).toMatchObject({
-      command: {
-        account: "personal",
-        kind: "account.devin-login.prepare",
-        manualTokenFlow: false,
-      },
-      json: false,
-      kind: "account.devin-login",
-    });
-    if (generated.kind !== "account.devin-login") throw new Error("expected Devin login");
-    expect(generated.command.idempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
-    expect(generated.replayCommand).toBe(devinAccountLoginCommand(
-      "personal",
-      false,
-      generated.command.idempotencyKey,
-    ));
-
-    const key = "00000000-0000-4000-8000-000000000102";
-    expect(parseCli([
-      "account", "login", "personal", "--provider", "devin",
-      "--manual-token-flow", "--idempotency-key", key, "--json",
-    ])).toEqual({
-      command: {
-        account: "personal",
-        idempotencyKey: key,
-        kind: "account.devin-login.prepare",
-        manualTokenFlow: true,
-      },
-      json: true,
-      kind: "account.devin-login",
-      replayCommand: `hra account login personal --provider devin --manual-token-flow --idempotency-key ${key}`,
-    });
+  test("retires Devin login while preserving exact local history and cleanup commands", () => {
     expect(parseCli(["account", "show", "personal", "--provider", "devin", "--json"]))
       .toEqual({
         command: { account: "personal", kind: "account.show", provider: "devin" },
         json: true,
         kind: "command",
       });
-
     for (const argv of [
+      ["account", "login", "personal", "--provider", "devin"],
+      ["account", "login", "personal", "--provider", "devin", "--manual-token-flow"],
       ["account", "login", "personal", "--provider", "devin", "--device-code"],
       ["account", "login", "personal", "--provider", "devin", "--handoff-file", "/private/login.json"],
       ["account", "login", "personal", "--provider", "codex", "--manual-token-flow"],
+      ["account", "login", "personal", "--provider", "claude", "--manual-token-flow"],
+      ["account", "login-cancel", "personal", "--provider", "devin"],
     ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
 
+    const key = "00000000-0000-4000-8000-000000000102";
     const attemptId = `attempt_${"b".repeat(32)}`;
-    const abandon = devinAccountLoginAbandonCommand("personal", attemptId, key, 8);
-    expect(parseCli(abandon.split(" ").slice(1))).toEqual({
+    const argv = devinAccountLoginAbandonCommand("personal", attemptId, key, 8).split(" ").slice(1);
+    expect(parseCli(argv)).toEqual({
       command: {
         acknowledgeChildExited: true,
         account: "personal",
@@ -214,6 +184,28 @@ describe("CLI parser", () => {
       json: false,
       kind: "command",
     });
+    for (const required of ["--attempt-id", "--provider-generation", "--idempotency-key"]) {
+      const incomplete = [...argv];
+      incomplete.splice(incomplete.indexOf(required), 2);
+      expect(() => parseCli(incomplete)).toThrow(CliUsageError);
+    }
+    expect(() => parseCli(argv.filter((value) => value !== "--acknowledge-child-exited")))
+      .toThrow(CliUsageError);
+  });
+
+  test("rejects the retired provider and preset at every active CLI selection boundary", () => {
+    for (const argv of [
+      ["session", "start", "personal", "--provider", "devin"],
+      ["session", "switch", "s", "--provider", "devin"],
+      ["remote", "provider", "s", "devin"],
+    ]) expect(() => parseCli(argv)).toThrow("Provider must be one of: `codex`, `claude`.");
+    for (const argv of [
+      ["session", "start", "personal", "--preset", "astra"],
+      ["session", "switch", "s", "--provider", "codex", "--preset", "astra"],
+      ["session", "preset", "s", "astra"],
+      ["remote", "preset", "s", "astra"],
+      ["remote", "provider", "s", "codex", "--preset", "astra"],
+    ]) expect(() => parseCli(argv)).toThrow("Preset must be one of: `low`, `high`, `ultra`, `fable-max`.");
   });
 
   test("parses exact pending-login cancellation without accepting provider authority on argv", () => {
@@ -279,6 +271,151 @@ describe("CLI parser", () => {
     expect(parseCli(["session", "send", "session", "hello", "from", "the", "CLI"])).toMatchObject({ command: { message: "hello from the CLI" } });
   });
 
+  test("parses the closed owner memory surface and generates replayable mutation keys", () => {
+    const continuation = "memc_0123456789abcdef0123456789abcdef";
+    expect(parseCli(["memory", "status", "release"])).toEqual({
+      command: { kind: "memory.status", session: "release" },
+      json: false,
+      kind: "command",
+    });
+    expect(parseCli(["memory", "list", "release", "--continuation", continuation, "--json"]))
+      .toEqual({
+        command: {
+          kind: "memory.query",
+          session: "release",
+          value: { continuation, mode: "list" },
+        },
+        json: true,
+        kind: "command",
+      });
+    expect(parseCli(["memory", "get", "release", "architecture.boundary"]))
+      .toMatchObject({
+        command: {
+          kind: "memory.query",
+          session: "release",
+          value: { key: "architecture.boundary", mode: "get" },
+        },
+      });
+    expect(parseCli([
+      "memory", "get", "release", "architecture.boundary", "--working-only",
+    ])).toMatchObject({
+      command: {
+        kind: "memory.query",
+        session: "release",
+        value: { key: "architecture.boundary", mode: "get", scope: "working" },
+      },
+    });
+    expect(parseCli(["memory", "search", "release", "--", "--authority", "boundary"]))
+      .toMatchObject({
+        command: {
+          kind: "memory.query",
+          session: "release",
+          value: { mode: "search", text: "--authority boundary" },
+        },
+      });
+    expect(parseCli([
+      "memory", "explain", "release", `memq_${"1".repeat(32)}`, "3",
+    ])).toMatchObject({
+      command: {
+        kind: "memory.explain",
+        session: "release",
+        value: { queryId: `memq_${"1".repeat(32)}`, row: 3 },
+      },
+    });
+
+    const remembered = parseCli([
+      "memory", "remember", "release", "preferences.review",
+      "--title", "Review style",
+      "--summary", "Prefer adversarial review.",
+      "--language", "en",
+      "--", "Challenge", "plans", "before", "execution.",
+    ]);
+    expect(remembered).toMatchObject({
+      command: {
+        kind: "memory.remember",
+        session: "release",
+        value: {
+          body: "Challenge plans before execution.",
+          key: "preferences.review",
+          language: "en",
+          summary: "Prefer adversarial review.",
+          title: "Review style",
+        },
+      },
+    });
+    if (remembered.kind !== "command" || remembered.command.kind !== "memory.remember") return;
+    expect(remembered.command.idempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
+
+    const shareKey = "00000000-0000-4000-8000-000000000501";
+    expect(parseCli([
+      "memory", "share", "release", "preferences.review",
+      "--reason", "Reusable project convention",
+      "--idempotency-key", shareKey,
+    ])).toEqual({
+      command: {
+        kind: "memory.share",
+        session: "release",
+        idempotencyKey: shareKey,
+        value: { key: "preferences.review", reason: "Reusable project convention" },
+      },
+      json: false,
+      kind: "command",
+    });
+  });
+
+  test("rejects widened or incoherent owner memory arguments before daemon admission", () => {
+    for (const argv of [
+      ["memory", "status", "release", "--continuation", "token"],
+      ["memory", "status", "release", "--working-only"],
+      ["memory", "get", "release", "Not A Key"],
+      ["memory", "search", "release"],
+      ["memory", "explain", "release", "query", "0"],
+      ["memory", "explain", "release", `memq_${"1".repeat(32)}`, "256"],
+      ["memory", "remember", "release", "preferences.review", "--summary", "summary", "body"],
+      ["memory", "remember", "release", "preferences.review", "--title", "title", "body"],
+      ["memory", "share", "release", "preferences.review"],
+      ["memory", "share", "release", "preferences.review", "--working-only", "--reason", "x"],
+      ["memory", "list", "release", "--idempotency-key", "00000000-0000-4000-8000-000000000502"],
+      ["memory", "purge", "release"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+  });
+
+  test("parses the explicit owner-only hosted memory lifecycle", () => {
+    const key = "00000000-0000-4000-8000-000000000503";
+    const space = `memory_${"A".repeat(32)}`;
+    expect(parseCli(["memory", "hosted", "list", "--json"])).toEqual({
+      command: { kind: "memory.hosted.list" },
+      json: true,
+      kind: "command",
+    });
+    expect(parseCli([
+      "memory", "hosted", "create", "jungle", "--idempotency-key", key,
+    ])).toEqual({
+      command: { idempotencyKey: key, kind: "memory.hosted.create", project: "jungle" },
+      json: false,
+      kind: "command",
+    });
+    expect(parseCli(["memory", "hosted", "attach", "jungle", space]))
+      .toMatchObject({ command: { hostedSpaceId: space, kind: "memory.hosted.attach" } });
+    expect(parseCli(["memory", "hosted", "detach", "jungle", "--generation", "7"]))
+      .toMatchObject({
+        command: {
+          expectedGeneration: 7,
+          kind: "memory.hosted.detach",
+          project: "jungle",
+        },
+      });
+    expect(parseCli(["memory", "hosted", "sync", "jungle"]))
+      .toMatchObject({ command: { kind: "memory.hosted.sync", project: "jungle" } });
+    for (const argv of [
+      ["memory", "hosted", "attach", "jungle", "memory_invalid"],
+      ["memory", "hosted", "detach", "jungle"],
+      ["memory", "hosted", "detach", "jungle", "--generation", "0"],
+      ["memory", "hosted", "list", "--working-only"],
+      ["memory", "hosted", "purge", "jungle"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+  });
+
   test("collects repeated --attach paths and leaves the message untouched", () => {
     // No `--attach` means the exact command the parser always produced.
     expect(parseCli(["session", "send", "s", "hello"])).toMatchObject({
@@ -318,6 +455,26 @@ describe("CLI parser", () => {
     expect(parsed.kind).toBe("session.attach");
     if (parsed.kind !== "session.attach") return;
     expect(typeof parsed.command.idempotencyKey).toBe("string");
+    expect(parsed.legacyAttachmentReplay).toBe(false);
+
+    const key = "00000000-0000-4000-8000-000000000209";
+    for (const action of ["send", "steer"] as const) {
+      const replay = parseCli([
+        "session", action, "s", "--attach", "a.png", "hello",
+        "--idempotency-key", key,
+      ]);
+      expect(replay).toMatchObject({
+        kind: "session.attach",
+        legacyAttachmentReplay: true,
+      });
+    }
+    expect(parseCli([
+      "session", "queue", "s", "--attach", "a.png", "hello",
+      "--idempotency-key", key,
+    ])).toMatchObject({
+      kind: "session.attach",
+      legacyAttachmentReplay: false,
+    });
   });
 
   test("chooses a session provider and its default preset", () => {
@@ -332,36 +489,154 @@ describe("CLI parser", () => {
     });
     expect(parseCli(["session", "start", "work", "--provider", "claude", "--preset", "fable-max"]))
       .toMatchObject({ command: { preset: "fable-max", provider: "claude" } });
-    expect(parseCli(["session", "start", "work", "--provider", "devin"]))
-      .toMatchObject({ command: { kind: "session.start", preset: "astra", provider: "devin" } });
     expect(() => parseCli(["session", "start", "work", "--provider", "gemini"]))
-      .toThrow("Provider must be one of: `codex`, `claude`, `devin`.");
+      .toThrow("Provider must be one of: `codex`, `claude`.");
     // The preset union is widened; the provider mismatch is refused by the
     // daemon, not by argument parsing.
     expect(parseCli(["session", "preset", "s", "fable-max"]))
       .toMatchObject({ command: { kind: "session.preset", preset: "fable-max" } });
+    expect(() => parseCli([
+      "session", "preset", "s", "high",
+      "--idempotency-key", "00000000-0000-4000-8000-000000000207",
+    ])).toThrow("--idempotency-key is not supported by session.preset");
     expect(parseCli(["remote", "preset", "s", "fable-max"]))
       .toMatchObject({ command: { kind: "remote.preset", preset: "fable-max" } });
-    expect(parseCli(["remote", "preset", "s", "astra"]))
-      .toMatchObject({ command: { kind: "remote.preset", preset: "astra" } });
     expect(() => parseCli(["remote", "preset", "s", "fable"]))
-      .toThrow("Preset must be one of: `low`, `high`, `ultra`, `fable-max`, `astra`.");
+      .toThrow("Preset must be one of: `low`, `high`, `ultra`, `fable-max`.");
+  });
+
+  test("authors and preserves the immutable source contract for rebound session starts", () => {
+    const generated = parseCli(["session", "start", "work", "--preset", "high"]);
+    expect(generated).toMatchObject({
+      kind: "command",
+      command: {
+        kind: "session.start",
+        preset: "high",
+        presetContract: 1,
+      },
+    });
+    if (generated.kind !== "command" || generated.command.kind !== "session.start") {
+      throw new Error("Expected a generated session start command.");
+    }
+    expect(generated.command.idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+
+    const idempotencyKey = "00000000-0000-4000-8000-000000000204";
+    expect(parseCli([
+      "--preset-contract", "2",
+      "session", "start", "work", "--preset", "ultra",
+      "--idempotency-key", idempotencyKey,
+    ])).toMatchObject({
+      kind: "command",
+      command: {
+        idempotencyKey,
+        kind: "session.start",
+        preset: "ultra",
+        presetContract: 2,
+      },
+    });
+    expect(() => parseCli([
+      "session", "start", "work", "--preset", "high",
+      "--idempotency-key", idempotencyKey,
+    ])).toThrow("also requires --preset-contract");
+    expect(() => parseCli([
+      "session", "start", "work", "--preset", "high", "--preset-contract", "2",
+    ])).toThrow("requires an explicit --idempotency-key");
+  });
+
+  test("keeps stable starts byte-compatible and rejects source contracts elsewhere", () => {
+    const idempotencyKey = "00000000-0000-4000-8000-000000000205";
+    const stable = parseCli([
+      "session", "start", "work", "--provider", "claude",
+      "--idempotency-key", idempotencyKey,
+    ]);
+    if (stable.kind !== "command") throw new Error("Expected a stable session start command.");
+    const priorByteShape = {
+      kind: "session.start",
+      account: "work",
+      provider: "claude",
+      preset: "fable-max",
+      fast: false,
+      idempotencyKey,
+    };
+    expect(JSON.stringify(stable.command)).toBe(JSON.stringify(priorByteShape));
+    for (const argv of [
+      ["session", "start", "work", "--provider", "claude", "--preset-contract", "1", "--idempotency-key", idempotencyKey],
+      ["session", "status", "session", "--preset-contract", "1"],
+      ["status", "--preset-contract", "1"],
+      ["session", "start", "work", "--preset-contract", "3", "--idempotency-key", idempotencyKey],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
   });
 
   test("parses a provider switch, an export, and the remote provider command", () => {
-    expect(parseCli(["session", "switch", "s", "--provider", "claude"]))
+    const stableSwitch = parseCli(["session", "switch", "s", "--provider", "claude"]);
+    expect(stableSwitch)
       .toMatchObject({ command: { kind: "session.switch", provider: "claude", session: "s" } });
-    expect(parseCli([
+    if (
+      stableSwitch.kind !== "command"
+      || stableSwitch.command.kind !== "session.switch"
+    ) throw new Error("Expected a stable provider switch.");
+    expect(stableSwitch.command.idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+    const reboundSwitch = parseCli([
       "session", "switch", "s", "--provider", "codex", "--preset", "ultra", "--account", "work",
-    ])).toMatchObject({
-      command: { account: "work", kind: "session.switch", preset: "ultra", provider: "codex" },
+    ]);
+    expect(reboundSwitch).toMatchObject({
+      command: {
+        account: "work",
+        kind: "session.switch",
+        preset: "ultra",
+        presetContract: 1,
+        provider: "codex",
+      },
     });
+    if (
+      reboundSwitch.kind !== "command"
+      || reboundSwitch.command.kind !== "session.switch"
+    ) throw new Error("Expected a rebound provider switch.");
+    expect(reboundSwitch.command.idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+    expect(parseCli(["session", "switch", "s", "--provider", "codex"]))
+      .toMatchObject({ command: { presetContract: 1, provider: "codex" } });
+    const switchReplayKey = "00000000-0000-4000-8000-000000000206";
+    expect(parseCli([
+      "session", "switch", "s", "--provider", "codex", "--preset", "high",
+      "--idempotency-key", switchReplayKey, "--preset-contract", "2",
+    ])).toMatchObject({
+      command: {
+        idempotencyKey: switchReplayKey,
+        preset: "high",
+        presetContract: 2,
+        provider: "codex",
+      },
+    });
+    expect(() => parseCli([
+      "session", "switch", "s", "--provider", "codex", "--preset", "high",
+      "--idempotency-key", switchReplayKey,
+    ])).toThrow("also requires --preset-contract");
+    expect(() => parseCli([
+      "session", "switch", "s", "--provider", "codex", "--preset-contract", "2",
+    ])).toThrow("requires an explicit --idempotency-key");
+    expect(parseCli([
+      "session", "switch", "s", "--provider", "claude",
+      "--idempotency-key", switchReplayKey,
+    ])).toMatchObject({
+      command: {
+        idempotencyKey: switchReplayKey,
+        provider: "claude",
+      },
+    });
+    expect(() => parseCli([
+      "session", "switch", "s", "--provider", "claude",
+      "--idempotency-key", switchReplayKey, "--preset-contract", "1",
+    ])).toThrow("supported only for a source-sensitive Codex provider switch");
     expect(() => parseCli(["session", "switch", "s"]))
       .toThrow("Missing value for --provider.");
     expect(() => parseCli(["session", "switch", "s", "--provider", "gemini"]))
-      .toThrow("Provider must be one of: `codex`, `claude`, `devin`.");
-    expect(parseCli(["session", "switch", "s", "--provider", "devin", "--preset", "astra"]))
-      .toMatchObject({ command: { kind: "session.switch", preset: "astra", provider: "devin" } });
+      .toThrow("Provider must be one of: `codex`, `claude`.");
 
     expect(parseCli(["session", "export", "s"]))
       .toMatchObject({ format: "trajectory", kind: "session.export", session: "s" });
@@ -374,10 +649,8 @@ describe("CLI parser", () => {
       .toMatchObject({ command: { kind: "remote.provider", provider: "claude", session: "s" } });
     expect(parseCli(["remote", "provider", "s", "claude", "--preset", "fable-max"]))
       .toMatchObject({ command: { kind: "remote.provider", preset: "fable-max" } });
-    expect(parseCli(["remote", "provider", "s", "devin"]))
-      .toMatchObject({ command: { kind: "remote.provider", provider: "devin", session: "s" } });
     expect(() => parseCli(["remote", "provider", "s", "gemini"]))
-      .toThrow("Provider must be one of: `codex`, `claude`, `devin`.");
+      .toThrow("Provider must be one of: `codex`, `claude`.");
   });
 
   test("parses conversation-bound session task reads with exact task IDs", () => {
@@ -1171,6 +1444,48 @@ describe("CLI parser", () => {
       .toThrow(CliUsageError);
   });
 
+  test("parses exact peer-policy reads and compare-and-set updates", () => {
+    expect(parseCli(["session", "peer-policy", "get", "release", "--json"]))
+      .toEqual({
+        command: { kind: "session.peer-policy.get", session: "release" },
+        json: true,
+        kind: "command",
+      });
+    expect(parseCli([
+      "session",
+      "peer-policy",
+      "set",
+      "release",
+      "inspect",
+      "--revision",
+      "7",
+    ])).toEqual({
+      command: {
+        expectedRevision: 7,
+        kind: "session.peer-policy.set",
+        mode: "inspect",
+        session: "release",
+      },
+      json: false,
+      kind: "command",
+    });
+
+    for (const argv of [
+      ["session", "peer-policy", "set", "release", "off"],
+      ["session", "peer-policy", "set", "release", "on", "--revision", "1"],
+      ["session", "peer-policy", "set", "release", "coordinate", "--revision", "0"],
+      ["session", "peer-policy", "get", "release", "--revision", "1"],
+      ["session", "peer-policy", "get", "release", "extra"],
+      ["session", "peer-policy", "replace", "release"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+
+    expect(resolveUsage("session", "peer-policy").usage).toContain([
+      "Usage:",
+      "  hra session peer-policy get <session> [--json]",
+      "  hra session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]",
+    ].join("\n"));
+  });
+
   test("parses bounded session status, event pages, follow mode, and interactions", () => {
     const eventCursor = `hra1.Y3Vyc29yLXYx.${"A".repeat(43)}`;
     expect(parseCli(["session", "status", "release"])).toEqual({
@@ -1735,8 +2050,12 @@ describe("CLI help", () => {
     expect(usage).not.toMatch(/[\u2018\u2019\u201c\u201d]/u);
     expect(usage).toContain("  hra help [<group> [<command>]]\n");
     expect(usage).toContain("Run `hra <group> --help` or `hra help <group> [<command>]` for command examples.");
-    expect(usage).toContain("Codex and Devin provider commands run on macOS and Linux");
+    expect(usage).toContain("Codex provider commands run on macOS and Linux");
     expect(usage).toContain("Claude login, status,\n  sessions, and provider switches require Linux");
+    expect(usage).toContain("high        Sol Max         (codex)");
+    expect(usage).toContain("ultra       Sol Ultra       (codex)");
+    expect(usage).not.toContain("Astra Max       (codex)");
+    expect(usage).not.toContain("Astra Ultra     (codex)");
     for (const group of helpGroupNames) expect(usage).toContain(`hra ${group}`);
   });
 
@@ -1946,6 +2265,70 @@ describe("notification-email parsing", () => {
       kind: "notification-email.status",
       revision: 1,
     }).success).toBe(false);
+  });
+});
+
+describe("autorespond-after-hours parsing", () => {
+  test("parses local status and exact revision-bound consent updates", () => {
+    for (const json of [false, true]) {
+      const output = json ? ["--json"] : [];
+      expect(parseCli(["autorespond-after-hours", "status", ...output])).toEqual({
+        command: { kind: "autorespond-after-hours.status" }, kind: "command", json,
+      });
+      for (const action of ["enable", "disable"] as const) {
+        for (const expectedRevision of [1, 7, Number.MAX_SAFE_INTEGER]) {
+          expect(parseCli(["autorespond-after-hours", action, "--revision", String(expectedRevision), ...output]))
+            .toEqual({ command: { kind: `autorespond-after-hours.${action}`, expectedRevision }, kind: "command", json });
+        }
+      }
+    }
+  });
+
+  test("rejects missing, noncanonical, and unsafe revisions", () => {
+    for (const action of ["enable", "disable"]) {
+      expect(() => parseCli(["autorespond-after-hours", action])).toThrow(CliUsageError);
+      for (const revision of ["0", "-1", "1.5", "01", "+1", "1e2", " 1", "Infinity", "NaN", "9007199254740992"]) {
+        expect(() => parseCli(["autorespond-after-hours", action, "--revision", revision])).toThrow(CliUsageError);
+      }
+    }
+  });
+
+  test("rejects extra authority, unknown flags, duplicate options, and remote variants", () => {
+    for (const argv of [
+      ["autorespond-after-hours"],
+      ["autorespond-after-hours", "replace", "--revision", "1"],
+      ["autorespond-after-hours", "status", "--revision", "1"],
+      ["autorespond-after-hours", "status", "extra"],
+      ["autorespond-after-hours", "status", "--jsonl"],
+      ["autorespond-after-hours", "enable", "--revision", "1", "--revision", "1"],
+      ["autorespond-after-hours", "disable", "--revision", "1", "extra"],
+      ["autorespond-after-hours", "enable", "--revision", "1", "--enabled", "true"],
+      ["autorespond-after-hours", "enable", "--revision", "1", "--session", "sess_example"],
+      ["autorespond-after-hours", "enable", "--revision", "1", "--preset-contract", "2"],
+      ["remote", "autorespond-after-hours", "enable", "--revision", "1"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+    for (const action of ["status", "enable", "disable"]) {
+      expect(() => parseCli([
+        "autorespond-after-hours", action,
+        ...(action === "status" ? [] : ["--revision", "1"]),
+        "--idempotency-key", "00000000-0000-4000-8000-000000000204",
+      ])).toThrow("not supported");
+    }
+  });
+
+  test("documents separate consent and conditional examples without widening approvals", () => {
+    const help = usageForGroup("autorespond-after-hours");
+    expect(helpGroupNames).toContain("autorespond-after-hours");
+    expect(help).toContain("enable|disable --revision <n>");
+    expect(help).toContain("separate consent from notification email");
+    expect(help).toContain("6 consecutive, 20 per hour, and 80 per day");
+    expect(help).toContain("3 consecutive, 10 per hour, and 40 per day");
+    expect(help).toContain("Prose always keeps 3/10/40");
+    expect(help).toContain("Existing approval categories and session approval");
+    expect(help).toContain("never reset counters or refund reservations");
+    expect(help).toContain("Only if you choose to consent");
+    expect(help).toContain("enable --revision <current-revision>");
+    expect(help).not.toMatch(/enable --revision \d/u);
   });
 });
 

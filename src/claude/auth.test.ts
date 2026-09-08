@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
+import fc from "fast-check";
+
+import { readClaudeAccountProjection } from "./account";
 import {
   parseClaudeAuthStatus,
+  readClaudeAuthenticationObservation,
   readClaudeAuthStatus,
   runClaudeForegroundLogin,
   type ClaudeAuthStatusProcess,
@@ -214,6 +218,111 @@ describe("Claude authentication status", () => {
       signal: new AbortController().signal,
     })).rejects.toMatchObject({ code: "PROTOCOL_LIMIT" });
     expect(process.terminated).toBe(true);
+  });
+
+  test("keeps personal-home status and runtime admission in canonical default-home mode", async () => {
+    let launch: Parameters<NonNullable<Parameters<typeof readClaudeAuthStatus>[0]["processFactory"]>>[0] | undefined;
+    const result = await readClaudeAuthStatus({
+      configDir: CONFIG_DIR,
+      configHome: "personal",
+      environment: {
+        CLAUDE_CONFIG_DIR: "/must-not-cross",
+        HOME: "/Users/test",
+        PATH: "/usr/bin:/bin",
+      },
+      processFactory: (input) => {
+        launch = input;
+        return completedStatusProcess(statusDocument(), 1);
+      },
+      resolveRuntime: async (options) => {
+        expect(options.configHome).toBe("personal");
+        return runtime;
+      },
+      signal: new AbortController().signal,
+    });
+    expect(result).toEqual({ signedIn: false });
+    expect(launch?.environment).toEqual({
+      HOME: "/Users/test",
+      NO_COLOR: "1",
+      PATH: "/usr/bin:/bin",
+    });
+  });
+
+  test("joins the status child when cancellation arrives during spawn", async () => {
+    const controller = new AbortController();
+    const child = new HangingStatusProcess();
+    await expect(readClaudeAuthStatus({
+      configDir: CONFIG_DIR,
+      processFactory: () => {
+        controller.abort();
+        return child;
+      },
+      runtime,
+      signal: controller.signal,
+    })).rejects.toMatchObject({ code: "PROCESS_EXITED" });
+    expect(child.terminated).toBe(true);
+  });
+
+  test("retains only closed authentication-mode evidence and grants OAuth identity only for claude.ai", async () => {
+    for (const [authMethod, authentication] of [["claude.ai", "claude_ai"], ["api_key", "other"]] as const) {
+      const input = {
+        configDir: CONFIG_DIR,
+        processFactory: () => completedStatusProcess(statusDocument({
+          loggedIn: true,
+          authMethod,
+          email: "must-not-cross@example.test",
+          orgId: "must-not-cross",
+        }), 0),
+        runtime,
+        signal: new AbortController().signal,
+      };
+      expect(await readClaudeAuthenticationObservation(input)).toEqual({
+        signedIn: true,
+        authentication,
+      });
+      expect(await readClaudeAuthStatus(input)).toEqual({ signedIn: true });
+    }
+  });
+
+  test("unreviewed authentication methods never inherit cached OAuth identity", async () => {
+    const otherAuthMethod = fc.array(
+      fc.integer({ min: 0, max: 64 }).map((index) =>
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-".charAt(index)),
+      { minLength: 1, maxLength: 64 },
+    ).map((characters) => characters.join(""))
+      .filter((method) => method !== "claude.ai" && method !== "none");
+    await fc.assert(fc.asyncProperty(otherAuthMethod, fc.uuid(), fc.uuid(), async (
+      authMethod,
+      accountUuid,
+      organizationUuid,
+    ) => {
+      const status = await readClaudeAuthenticationObservation({
+        configDir: CONFIG_DIR,
+        configHome: "personal",
+        processFactory: () => completedStatusProcess(statusDocument({ loggedIn: true, authMethod }), 0),
+        runtime,
+        signal: new AbortController().signal,
+      });
+      expect(status).toEqual({ signedIn: true, authentication: "other" });
+      const projection = await readClaudeAccountProjection({
+        configDir: CONFIG_DIR,
+        configHome: "personal",
+        runtime,
+        signal: new AbortController().signal,
+        readMetadata: async () => ({
+          oauthAccount: {
+            accountUuid,
+            organizationUuid,
+            emailAddress: `${accountUuid}@example.test`,
+          },
+        }),
+        probeAuthStatus: async () => ({
+          loggedIn: status.signedIn,
+          authentication: status.authentication,
+        }),
+      });
+      expect(projection).toEqual({ signedIn: true });
+    }), { numRuns: 200, seed: 20_260_907 });
   });
 
   test("terminates and joins on deadline and caller abort", async () => {
@@ -434,5 +543,45 @@ describe("Claude foreground login", () => {
       stdio: { stdin: 0, stdout: 1, stderr: 2 },
     })).rejects.toMatchObject({ code: "PROCESS_EXITED" });
     expect(forced).toBe(true);
+  });
+
+  test("bounds the post-interruption join without claiming an unproven exit", async () => {
+    const controller = new AbortController();
+    let releaseExit!: (code: number) => void;
+    let forced = false;
+    const pending = runClaudeForegroundLogin({
+      configDir: CONFIG_DIR,
+      processFactory: () => ({
+        exited: new Promise<number>((resolve) => { releaseExit = resolve; }),
+        forceTerminate: () => { forced = true; },
+        sendSignal: () => undefined,
+      }),
+      runtime,
+      signal: controller.signal,
+      signalGraceMs: 1,
+      forceJoinDeadlineMs: 1,
+      signalSource: new FakeSignalSource(),
+      stdio: { stdin: 0, stdout: 1, stderr: 2 },
+    });
+    const observed = pending.then(
+      (result) => ({ kind: "completed" as const, result }),
+      (error: unknown) => ({ kind: "failed" as const, error }),
+    );
+    controller.abort();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const outcome = await Promise.race([
+        observed,
+        new Promise<{ kind: "unbounded" }>((resolve) => {
+          timer = setTimeout(() => resolve({ kind: "unbounded" }), 250);
+        }),
+      ]);
+      expect(forced).toBe(true);
+      expect(outcome).toMatchObject({ kind: "failed", error: { code: "TIMEOUT" } });
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      releaseExit(137);
+      await observed;
+    }
   });
 });

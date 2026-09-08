@@ -4,6 +4,8 @@ import fc from "fast-check";
 
 import {
   WORK_ACTIVE_LIMIT,
+  WORK_APPLY_REQUEST_LEGACY_VERSION,
+  WORK_APPLY_REQUEST_VERSION,
   WORK_CRITERIA_LIMIT,
   WORK_EFFECT_RESOLUTION_LIMIT,
   WORK_EVENT_PAGE_LIMIT,
@@ -20,7 +22,9 @@ import {
   WORK_OPERATION_BATCH_LIMIT,
   WORK_OPERATION_CONTRACTS,
   WORK_PLAN_TASK_LIMIT,
+  WORK_PROTOCOL,
   WORK_PROTOCOL_DESCRIPTION,
+  WORK_PROTOCOL_DESCRIPTION_VERSION,
   WORK_RETAINED_LIMIT,
   WORK_SIGNAL_MAX_BYTES,
   WORK_TASK_DETAIL_MAX_BYTES,
@@ -822,15 +826,96 @@ describe("agent-first operation documents", () => {
       .toEqual(new Set(workOperationKindSchema.options));
     expect(workProtocolDescriptionSchema.parse(WORK_PROTOCOL_DESCRIPTION).operations)
       .toEqual(workOperationKindSchema.options);
+    expect(WORK_PROTOCOL_DESCRIPTION.version).toBe(WORK_PROTOCOL_DESCRIPTION_VERSION);
+    expect(WORK_PROTOCOL_DESCRIPTION.wire.acceptedApplyRequestVersions).toEqual([
+      WORK_APPLY_REQUEST_LEGACY_VERSION,
+      WORK_APPLY_REQUEST_VERSION,
+    ]);
+    expect(WORK_PROTOCOL_DESCRIPTION.wire.applyRequestCompatibility).toEqual({
+      v1: "exact_historical_replay_or_fresh_stable_operation",
+      v2: "exact_historical_replay_or_fresh_active_source",
+      presetContract: "required_iff_create_routes_or_added_tasks_select_high_or_ultra",
+    });
     expect(WORK_PROTOCOL_DESCRIPTION.contracts.map((contract) => contract.kind))
       .toEqual(workOperationKindSchema.options);
     expect(WORK_OPERATION_CONTRACTS).toEqual(WORK_PROTOCOL_DESCRIPTION.contracts);
     expect(workProtocolRequestSchema.safeParse({
       protocol: "hra-work-local-v1",
-      version: 1,
+      version: WORK_APPLY_REQUEST_LEGACY_VERSION,
       requestId: streamEpoch,
       operation: operations[0],
     }).success).toBe(true);
+  });
+
+  test.each(["astra", "fable-max"] as const)(
+    "rejects %s at both Work authoring boundaries",
+    (preset) => {
+      const create = operations[0];
+      const addBatch = operations[1];
+
+      expect(workOperationSchema.safeParse({
+        ...create,
+        routes: create.routes.map((route) => ({ ...route, preset })),
+        tasks: create.tasks.map((task) => ({ ...task, preset })),
+      }).success).toBe(false);
+      expect(workOperationSchema.safeParse({
+        ...addBatch,
+        tasks: addBatch.tasks.map((task) => ({ ...task, preset })),
+      }).success).toBe(false);
+    },
+  );
+
+  test("keeps v1 exact while v2 binds High and Ultra source contracts", () => {
+    const stableOperation = operations[0];
+    const reboundOperation = {
+      ...stableOperation,
+      routes: [{ ...stableOperation.routes[0], preset: "high" as const }],
+      tasks: [{ ...stableOperation.tasks[0], preset: "high" as const }],
+    };
+    const base = { protocol: WORK_PROTOCOL, requestId: streamEpoch } as const;
+
+    expect(workProtocolRequestSchema.safeParse({
+      ...base,
+      version: WORK_APPLY_REQUEST_LEGACY_VERSION,
+      operation: reboundOperation,
+    }).success).toBe(true);
+    expect(workProtocolRequestSchema.safeParse({
+      ...base,
+      version: WORK_APPLY_REQUEST_LEGACY_VERSION,
+      presetContract: 1,
+      operation: reboundOperation,
+    }).success).toBe(false);
+
+    expect(workProtocolRequestSchema.safeParse({
+      ...base,
+      version: WORK_APPLY_REQUEST_VERSION,
+      operation: stableOperation,
+    }).success).toBe(true);
+    expect(workProtocolRequestSchema.safeParse({
+      ...base,
+      version: WORK_APPLY_REQUEST_VERSION,
+      presetContract: 1,
+      operation: stableOperation,
+    }).success).toBe(false);
+    for (const presetContract of [1, 2] as const) {
+      expect(workProtocolRequestSchema.safeParse({
+        ...base,
+        version: WORK_APPLY_REQUEST_VERSION,
+        presetContract,
+        operation: reboundOperation,
+      }).success).toBe(true);
+    }
+    expect(workProtocolRequestSchema.safeParse({
+      ...base,
+      version: WORK_APPLY_REQUEST_VERSION,
+      operation: reboundOperation,
+    }).success).toBe(false);
+    expect(workProtocolRequestSchema.safeParse({
+      ...base,
+      version: WORK_APPLY_REQUEST_VERSION,
+      operation: stableOperation,
+      extra: true,
+    }).success).toBe(false);
   });
 
   test("requires in-document idempotency, entity revisions, and exact attempt authority", () => {

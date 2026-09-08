@@ -222,7 +222,7 @@ body {
   font-size: 1rem;
 }
 
-.reference :where(h2, h3, p, ul, pre, .notice) {
+.reference :where(h2, h3, p, ul, ol, pre, .notice) {
   max-width: 72ch;
 }
 
@@ -403,7 +403,7 @@ pre code {
   margin-block: 2rem 0.5rem;
 }
 
-.narrow-page :where(p, ul, pre, .notice) {
+.narrow-page :where(p, ul, ol, pre, .notice) {
   max-width: 72ch;
 }
 

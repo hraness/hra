@@ -26,12 +26,18 @@ const presenceCurrentName = "presence:current" satisfies CloudQuery;
 const listKeyEnvelopesName = "devices:listKeyEnvelopes" satisfies CloudQuery;
 const commandGetName = "commands:get" satisfies CloudQuery;
 const commandListForSessionName = "commands:listForSession" satisfies CloudQuery;
+const commandListUnacknowledgedName = "commands:listUnacknowledgedForRequester" satisfies CloudQuery;
 const deviceCommandGetName = "deviceCommands:get" satisfies CloudQuery;
+const deviceCommandListUnacknowledgedName =
+  "deviceCommands:listUnacknowledgedForRequester" satisfies CloudQuery;
 
 const registerName = "devices:register" satisfies CloudMutation;
 const beginBindName = "devices:beginBind" satisfies CloudMutation;
 const enqueueName = "commands:enqueue" satisfies CloudMutation;
+const acknowledgeCommandReceiptName = "commands:acknowledgeReceipt" satisfies CloudMutation;
 const enqueueDeviceCommandName = "deviceCommands:enqueue" satisfies CloudMutation;
+const acknowledgeDeviceCommandReceiptName =
+  "deviceCommands:acknowledgeReceipt" satisfies CloudMutation;
 const consumeDeviceCommandResultName = "deviceCommands:consumeResult" satisfies CloudMutation;
 const presenceConnectName = "presence:connect" satisfies CloudMutation;
 const presenceHeartbeatName = "presence:heartbeat" satisfies CloudMutation;
@@ -47,7 +53,7 @@ export type WirePresenceArgs = Readonly<{
 }>;
 
 export type WireRegisterArgs = Readonly<{
-  deviceClass?: "browser";
+  deviceClass: "browser";
   encryptedLabel: WireEncryptedEnvelope;
   idempotencyKey: string;
   keyVersion: number;
@@ -59,22 +65,32 @@ export type WireRegisterArgs = Readonly<{
 
 export type WireEnqueueArgs = Readonly<{
   deadline: number;
+  expectedRequestingDevicePublicId: string;
   expectedTargetDevicePublicId: string;
   idempotencyKey: string;
   kind: string;
   payload: WireEncryptedEnvelope;
   publicId: string;
+  requestCommitmentVersion: 2;
   requestDigest: string;
   sessionPublicId: string;
 }>;
 
 export type WireDeviceEnqueueArgs = Readonly<{
   deadline: number;
+  expectedRequestingDevicePublicId: string;
   expectedTargetDevicePublicId: string;
   idempotencyKey: string;
   kind: string;
   payload: WireEncryptedEnvelope;
   publicId: string;
+  requestCommitmentVersion: 2;
+  requestDigest: string;
+}>;
+
+export type WireCommandReceiptProofArgs = Readonly<{
+  commandPublicId: string;
+  idempotencyKey: string;
   requestDigest: string;
 }>;
 
@@ -126,8 +142,20 @@ export const commandListForSession = makeFunctionReference<
   unknown
 >(commandListForSessionName);
 
+export const commandListUnacknowledged = makeFunctionReference<
+  "query",
+  { limit: number },
+  unknown
+>(commandListUnacknowledgedName);
+
 export const deviceCommandGet =
   makeFunctionReference<"query", { commandPublicId: string }, unknown>(deviceCommandGetName);
+
+export const deviceCommandListUnacknowledged = makeFunctionReference<
+  "query",
+  { limit: number },
+  unknown
+>(deviceCommandListUnacknowledgedName);
 
 export const registerDevice =
   makeFunctionReference<"mutation", WireRegisterArgs, unknown>(registerName);
@@ -141,8 +169,20 @@ export const beginBind = makeFunctionReference<
 export const enqueueCommand =
   makeFunctionReference<"mutation", WireEnqueueArgs, unknown>(enqueueName);
 
+export const acknowledgeCommandReceipt = makeFunctionReference<
+  "mutation",
+  WireCommandReceiptProofArgs,
+  unknown
+>(acknowledgeCommandReceiptName);
+
 export const enqueueDeviceCommand =
   makeFunctionReference<"mutation", WireDeviceEnqueueArgs, unknown>(enqueueDeviceCommandName);
+
+export const acknowledgeDeviceCommandReceipt = makeFunctionReference<
+  "mutation",
+  WireCommandReceiptProofArgs,
+  unknown
+>(acknowledgeDeviceCommandReceiptName);
 
 /** Exchanges a single-use device command result exactly once. */
 export const consumeDeviceCommandResult = makeFunctionReference<

@@ -16,6 +16,7 @@ import { StateStore } from "./state-store";
 const sourceRevision = "0ae317793d5ff694b4d333effe25f85f7e7f1491";
 const sourceTree = "8d66385130378febb9be4358dc40fe84de4d0591";
 const recordedAt = 1_900_000_000_000;
+const migratedAt = recordedAt + 1_000;
 const rowSchema = z.record(z.string(), z.unknown());
 type Row = z.infer<typeof rowSchema>;
 const hash = (value: string | Uint8Array): string => createHash("sha256").update(value).digest("hex");
@@ -30,7 +31,21 @@ const snapshot = (path: string) => {
     );
     expect(tables.length).toBeLessThanOrEqual(512);
     const rows: Record<string, Row[]> = {};
+    const columns: Record<string, string[]> = {};
+    const cells: Record<string, Row[]> = {};
     for (const { name } of tables) {
+      const names = z.array(z.object({ name: z.string().regex(/^[A-Za-z0-9_]+$/) })).parse(
+        database.query(`PRAGMA table_info("${name}")`).all(),
+      ).map((column) => column.name);
+      columns[name] = names;
+      // Compare SQLite storage classes and raw TEXT/BLOB bytes, not merely
+      // strings returned by the driver's UTF-8 decoder.
+      const projection = names.map((column) => `json_array(typeof("${column}"),
+        CASE WHEN typeof("${column}") IN ('text','blob') THEN hex(CAST("${column}" AS BLOB))
+        ELSE "${column}" END) AS "${column}"`).join(",");
+      cells[name] = z.array(rowSchema).parse(database.query(`SELECT ${projection} FROM "${name}" LIMIT 4097`).all())
+        .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+      expect(cells[name].length).toBeLessThanOrEqual(4096);
       const statement = database.prepare(`SELECT * FROM "${name}" LIMIT 4097`);
       try {
         const values = z.array(rowSchema).parse(statement.all());
@@ -45,6 +60,8 @@ const snapshot = (path: string) => {
       schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all(),
       ledger: database.query("SELECT version,applied_at FROM migrations ORDER BY version").all(),
       rows,
+      columns,
+      cells,
       foreignKeys: database.query("PRAGMA foreign_key_check").all(),
       inspectionChanges: database.query("SELECT total_changes() AS count").get(),
     };
@@ -68,6 +85,46 @@ const exactRow = (value: Snapshot, table: string, key: string, expected: string 
   const row = matches[0];
   if (row === undefined) throw new Error(`Missing captured fixture row: ${table}`);
   return row;
+};
+
+const assertMigratedHistory = (original: Snapshot, migrated: Snapshot): void => {
+  expect(migrated.version).toEqual({ user_version: 60 });
+  const ledger = z.array(z.object({ version: z.number(), applied_at: z.number() }).strict()).parse(original.ledger);
+  expect(migrated.ledger).toEqual([
+    ...ledger.filter((row) => row.version <= 40),
+    ...Array.from({ length: 10 }, (_, index) => ({ version: index + 41, applied_at: migratedAt })),
+    ...ledger.filter((row) => row.version >= 41).map((row) => ({ ...row, version: row.version + 10 })),
+    { version: 60, applied_at: migratedAt },
+  ]);
+  for (const [table, names] of Object.entries(original.columns)) {
+    for (const name of names) expect(migrated.columns[table]).toContain(name);
+    if (table === "migrations" || table === "session_autorespond_counters") continue;
+    let actual = migrated.cells[table];
+    if (actual === undefined) throw new Error(`Missing migrated fixture table: ${table}`);
+    const expected = original.cells[table];
+    if (expected === undefined) throw new Error(`Missing original fixture table: ${table}`);
+    if (table === "sqlite_sequence") {
+      // New tables may allocate their own sequences; every old sequence stays.
+      const retainedNames = new Set(original.cells[table]?.map((row) => row.name));
+      actual = actual.filter((row) => retainedNames.has(row.name));
+    }
+    expect(actual.map((row) => Object.fromEntries(names.map((name) => [name, row[name]])))
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))).toEqual(expected);
+  }
+  // Canonical44 deliberately installs a conservative autorespond floor. Pin
+  // this exact metadata change instead of exempting all old counter contents.
+  const counters = new Map(tableRows(original, "session_autorespond_counters").map((row) => {
+    const value = z.object({ session_id: z.string(), consecutive_count: z.number(), updated_at: z.number() }).strict().parse(row);
+    return [value.session_id, value] as const;
+  }));
+  for (const session of tableRows(original, "sessions")) {
+    const id = z.string().parse(session.id);
+    const previous = counters.get(id);
+    counters.set(id, { session_id: id, consecutive_count: Math.max(previous?.consecutive_count ?? 0, 3),
+      updated_at: Math.max(previous?.updated_at ?? 0, migratedAt) });
+  }
+  expect(tableRows(migrated, "session_autorespond_counters")).toEqual([...counters.values()]
+    .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
 };
 
 type FixtureIdentity = Readonly<{
@@ -112,19 +169,32 @@ const preserveHistory = async (
     expect(original.version).toEqual({ user_version: 49 });
     expect(original.ledger).toEqual(Array.from({ length: 49 }, (_, index) => ({ version: index + 1, applied_at: recordedAt })));
     expect(exactRow(original, "notification_hours", "singleton", 1).time_zone).toBe("UTC");
+    const originalBytes = hash(await readFile(paths.database));
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:49:60");
+    expectCapturedEqual(snapshot(paths.database), original);
+    expect(hash(await readFile(paths.database))).toBe(originalBytes);
+    const upgrading = new StateStore(paths, { now: () => migratedAt, resolveMachineTimeZone: () => "UTC" });
+    let migrated: Snapshot;
+    try {
+      migrated = snapshot(paths.database);
+      assertMigratedHistory(original, migrated);
+      assertHistory(upgrading, original);
+    } finally { upgrading.close(); }
+    expectCapturedEqual(snapshot(paths.database), migrated);
     // Opening a store is deliberately not a daemon boot, provider observation,
     // attachment read, or native process join. In particular it cannot consume
     // the retired fixture's unused synthetic joined-close receipt.
     for (const readonly of [true, false, false, true]) {
       const beforeBytes = hash(await readFile(paths.database));
-      const store = new StateStore(paths, { readonly, now: () => recordedAt, resolveMachineTimeZone: () => "UTC" });
+      const store = new StateStore(paths, { readonly, now: () => migratedAt + 1, resolveMachineTimeZone: () => "UTC" });
       try {
         assertHistory(store, original);
-        expectCapturedEqual(snapshot(paths.database), original);
+        expectCapturedEqual(snapshot(paths.database), migrated);
       } finally {
         store.close();
       }
-      expectCapturedEqual(snapshot(paths.database), original);
+      expectCapturedEqual(snapshot(paths.database), migrated);
       if (readonly) expect(hash(await readFile(paths.database))).toBe(beforeBytes);
     }
   } finally {
@@ -240,7 +310,9 @@ test("authentic combined49 preserves Devin owner and login history plus unused s
     expectCapturedEqual(store.requireCapturedSessionProviderAuthority(archived.owner.session.id), archived.owner.capturedAuthority);
     expectCapturedEqual(store.requireSessionProviderAuthority(archived.owner.session.id), archived.owner.capturedAuthority);
     expectCapturedEqual(exactRow(captured, "mutation_attempts", "id", archived.owner.history.owner.attemptId), archived.owner.originalParentMutationRow);
-    expectCapturedEqual(store.requireQueue(archived.queue.result.queued.id), archived.queue.result.queued);
+    expectCapturedEqual(store.requireQueue(archived.queue.result.queued.id), {
+      ...archived.queue.result.queued, messageActor: "human",
+    });
     expectCapturedEqual(store.queueAttachmentManifest(archived.queue.result.queued.id), [archived.attachment.reference]);
     assertPinnedParent(captured, archived.owner.history.owner.attemptId, archived.queue.result.queued.id, archived.attachment.reference.digest);
     expectCapturedEqual(store.readMutation(archived.login.idempotencyKey), archived.login.originalMutation);

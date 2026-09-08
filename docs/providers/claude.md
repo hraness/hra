@@ -1,6 +1,6 @@
 # Claude provider notes
 
-Status: the notes below are the W1 spike that the W3-C adapter was built from. The adapter now exists in `src/claude/` (pin, runtime discovery, process, protocol, delta assembler, client) with `src/daemon/claude-runtime-adapter.ts` implementing `ClaudeRuntimePort`. Every mapped shape below is covered by a fixture-driven test in `src/claude/`; nothing shells out to `claude` in tests. On Linux, the daemon starts a managed Claude session end to end and the local CLI has a deterministic foreground sign-in and bounded status path. New managed Claude provider effects are refused on macOS until authenticated testing proves that an isolated `CLAUDE_CONFIG_DIR` has isolated Keychain custody and that a detached daemon can read it without a prompt. Separately, opt-in personal-home discovery can adopt a session only after exact pinned registry and process evidence proves that its prior controller is no longer live. Real authenticated managed-profile acceptance against the exact pin remains pending because the available host has Claude Code 2.1.261 while HRA admits only 2.1.260. There is no Claude account-linking flow in the web app. See [Adopt sessions from personal provider homes](../session-adoption.md).
+Status: the notes below are the W1 spike that the W3-C adapter was built from. The adapter now exists in `src/claude/` (pin, runtime discovery, process, protocol, delta assembler, client) with `src/daemon/claude-runtime-adapter.ts` implementing `ClaudeRuntimePort`. Every mapped shape below is covered by a fixture-driven test in `src/claude/`; nothing shells out to `claude` in tests. On Linux, the daemon starts a managed Claude session end to end and the local CLI has a deterministic foreground sign-in and bounded status path. New managed Claude provider effects are refused on macOS until authenticated testing proves that an isolated `CLAUDE_CONFIG_DIR` has isolated Keychain custody and that a detached daemon can read it without a prompt. Separately, opt-in personal-home discovery can adopt a session only after exact pinned registry and process evidence proves that its prior controller is no longer live. Real authenticated managed-profile acceptance against the exact pin remains pending. A retained macOS executable reported exact Claude Code 2.1.260 on 2026-09-07, so runtime availability no longer blocks the macOS qualification; neither executable discovery, that version probe, nor the deterministic tests prove credential isolation. There is no Claude account-linking flow in the web app. See [Adopt sessions from personal provider homes](../session-adoption.md).
 
 ## Account isolation, sign-in, and status
 
@@ -16,7 +16,11 @@ This is a Linux-only foreground, TTY-only command. It refuses `--json`, resolves
 
 Claude has no HRA device-code, handoff-file, web-linking, or ordinary background cancellation flow. Do not pass `--device-code` or `--handoff-file`. Before launching Claude, HRA durably consumes a one-child grant. Another login cannot start under that grant. When the profile is signed out, preparation may locally release and terminalize only Claude sessions that are quiescent and idle under the same profile. That release stops HRA's local runtime hold but does not delete the provider thread. An active turn, queued work, a pending interaction, recovery, or any other unsettled provider authority refuses login without releasing the session. New Claude provider effects are likewise refused while a login grant is unsettled.
 
-Normally the foreground parent joins Claude and completes the grant immediately. If that parent or the daemon fails after launch, credential presence cannot prove that the child exited, so status keeps the exact recovery fence even when Claude reports signed in. A same-key retry identifies the attempt but never launches a second child. After first confirming the original Claude child has exited, the operator may release only that exact local fence with the acknowledged recovery command reported by status:
+Each Claude child is process-local, but the durable HRA session can resume in a later daemon. HRA records the exact child identity and will launch `claude --resume` only after it proves the prior process is no longer live. The replacement child is durably claimed and observed before its provisioned HRA host-tool binding becomes callable. Unknown or still-live process custody fails closed.
+
+A shared profile-generation change cannot strand that process custody. Active, recovery-required, or otherwise unsettled Claude authority refuses an explicit Codex login. Quiescent exact children are joined and their private bindings revoked before the durable generation advances; their HRA sessions remain resumable rather than being terminalized. After the commit, the isolated runtime bindings are rekeyed to the new generation. A spontaneous Codex disconnect does not rotate the generation while a Claude controller or launch intent is retained. If a post-commit runtime rebind fails, HRA closes the daemon instead of continuing with split authority.
+
+Normally the foreground parent joins Claude and completes the grant immediately. If that parent or the daemon fails after launch, or forced cleanup cannot prove the child's exit within its deadline, credential presence cannot prove that the child exited, so status keeps the exact recovery fence even when Claude reports signed in. The cleanup deadline starts only after interruption; an ordinary interactive login has no arbitrary completion timeout. A same-key retry identifies the attempt but never launches a second child. After first confirming the original Claude child has exited, the operator may release only that exact local fence with the acknowledged recovery command reported by status:
 
 ```sh
 hra account login-cancel <profile> --provider claude \
@@ -36,7 +40,11 @@ hra account show <profile> --provider claude
 
 The status path runs the same version-admitted executable path with `auth status --json` inside the isolated home. HRA bounds the command's deadline and output, validates its exit code and response together, transiently validates the complete status document, discards its identity and usage fields, and projects only whether Claude reports the account as signed in. `--json` is supported for this status command. HRA does not open or parse any Claude credential file. When a launch is unresolved, status returns the exact same-key, completion-status, and acknowledged-abandon guidance without requiring a provider status probe and without treating credential presence as process-exit proof. This recovery-only read remains available when the provider probe cannot run.
 
+This readiness rule applies to session operations and scheduled conversation tasks. `hra work` remains Codex-only because its frozen execution route does not carry a provider. `hra session list --account` emits locally owned Claude sessions before entering Codex's separate provider-list cursor, so account filtering remains provider-neutral even though Claude has no provider-side listing. Fast mode is a Codex service tier and is refused for Claude starts, toggles, and provider switches instead of being silently ignored.
+
 Account selection stays user-directed, and HRA never rotates a Claude account automatically. Claude profiles default to a per-account cap of two concurrent sessions; swarm-scale traffic may be judged non-ordinary by the provider, and users raise the cap knowingly.
+
+Personal account status uses the same bounded, joined status process as managed login status, while leaving `CLAUDE_CONFIG_DIR` unset for Claude's canonical personal home. A coherent signed-out exit is a signed-out observation, not a process fault. Cached OAuth metadata confers identity only when the current status proves Claude subscription authentication; another signed-in authentication mode cannot inherit that cached account identity.
 
 Personal-home adoption is a separate local, opt-in boundary. Discovery reads a bounded allowlist of scalar live-session registry fields and accepts only records naming the exact Claude Code pin. It never runs a discovery prompt or reads the registry key, socket, credential, or transcript. A complete bounded registry snapshot plus a matching PID domain, PID, and host process-start token are required to classify a process as live. A previously captured PID absent from the process table, or a captured PID whose start token now differs, is not live; a registry record missing an exact PID identity and any incomplete, conflicting, or unreadable evidence remain unknown. HRA privately retains that bounded tuple for re-probes if a registry row disappears. The `ps lstart` token has one-second wall-clock granularity, so a rare alias conservatively retains custody rather than authorizing adoption. This is a bounded liveness inference, not a provider-wide lease against another process resuming later. A recent session must also report a registered HRA project. The resumed runtime independently proves the installed pin and exact personal Claude account; the HRA profile's separate Codex account may remain signed out. Once resumed, it has the same stdin, autorespond, and approval authority as a Claude session HRA started. Account revocation and recovery also use the same provider- and runtime-scoped contract. Controller provenance remains private and does not add a session badge or require detach solely for login, logout, or provider-account replacement.
 
@@ -57,7 +65,7 @@ Pending, requires the owner to sign in interactively inside two distinct isolate
 - Whether each sign-in stores a distinct directory-keyed Keychain item or a file inside its own profile home.
 - Whether each detached process with no window server session reads only its own identity without a prompt.
 
-The unauthenticated probe above does not establish either fact. The available host currently has Claude Code 2.1.261, while HRA pins and admits 2.1.260, so it cannot supply release acceptance for this exact tree. HRA never stores a `setup-token` or any other credential under any outcome.
+The unauthenticated probe above does not establish either fact. On 2026-09-07, a retained macOS executable reported exact Claude Code 2.1.260 without replacing the active installation. This removes the earlier runtime-availability blocker, not the authenticated qualification or full live-acceptance requirements. Acceptance must use HRA's exact Claude Code pin; a different version or executable discovery alone is insufficient. HRA never stores a `setup-token` or any other credential under any outcome.
 
 ## Stream-json contract (captured 2026-09-03)
 
@@ -67,15 +75,55 @@ Spike for the "Providers, models" and Claude Code (W3) sections in [HRA Web v1](
 
 Relevant flags, verbatim from `claude --help` on `2.1.260`:
 
+- `--append-system-prompt <prompt>` appends a host-supplied prompt to Claude's default system prompt. Passing an append normally disables the built-in prompt snapshot, so HRA also passes `--system-prompt-snapshot on`: the rendered prompt (including the append) is then recorded and reused verbatim. On resume, an existing record wins over a different launch-time append until compaction. HRA may therefore admit one static preamble without an opening user-message impersonation. The complete relevant help paragraph is retained in the pinned fixture rather than reduced to the flag's first line.
+- `--mcp-config <configs...>` loads explicit MCP server configuration, and `--strict-mcp-config` ignores every other MCP configuration source. These exact flags are the narrow provider-native seam for HRA host tools.
 - `--effort <level>` - "Effort level for the current session (low, medium, high, xhigh, max)". This is the flag list of common values, not the full legal set: `ultracode` is a real, separate `reasoningEffort` value returned by the protocol's model listing for reasoning-capable models (see below) and is not shown in `--help`; "max without ultracode" means passing `--effort max` specifically.
 - `--model <model>` - "Model for the current session. Provide an alias for the latest model (e.g. 'fable', 'opus', or 'sonnet') or a model's full name (e.g. 'claude-fable-5')." The help text's own example (`claude-fable-5`) is already one version behind what this machine accepts (see below).
 - `--fallback-model <model>` - "Enable automatic fallback to specified model(s) when the default model is overloaded or not available." It accepts an ordered comma-separated list and works only with `--print`. The flag's presence proves only an argv surface. It does not prove that a particular fallback model and effort combination is accepted for an authenticated account.
 - `--output-format <format>` - "(only works with --print): 'text' (default), 'json' (single result), or 'stream-json' (realtime streaming)".
+
 - `--input-format <format>` - "(only works with --print): 'text' (default), or 'stream-json' (realtime streaming input)".
 - `--resume [value]` / `-r` - "Resume a conversation by session ID, or open interactive picker with optional search term".
 - `--permission-mode <mode>` - "Permission mode to use for the session (choices: 'acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan')".
 - `--dangerously-skip-permissions` - "Bypass all permission checks. Recommended only for sandboxes with no internet access." (Distinct from `--allow-dangerously-skip-permissions`, which only makes the bypass available as an option without enabling it by default.)
 - `CLAUDE_CONFIG_DIR`: not a `--help` flag, it is an environment variable read by the bundled runtime; strings found in the installed CLI bundle confirm it must be an absolute path (the process errors with "... is not an absolute path" otherwise), that it selects the whole config/session/credential home (matching this doc's existing Keychain-probe notes), and that the runtime specifically checks whether a spawned child's `CLAUDE_CONFIG_DIR` matches its parent's for transcript-mirroring purposes, i.e. isolation is a first-class, load-bearing concept in the runtime, not an incidental side effect of the env var.
+
+### Session-bound HRA host tools
+
+The pinned CLI initializes a stdio MCP server with protocol revision
+`2025-11-25`, then sends `notifications/initialized` and `tools/list`; the exact
+request frames are in `claude-fixtures/mcp-handshake-2.1.260.jsonl.txt`. HRA's
+bridge admits only that pinned client/version and exposes exactly the eight
+entries in the shared `hra.host-tools.v1` manifest. Each model-visible tool
+schema has `additionalProperties: false`; account, project, provider-thread,
+process-generation, clock, and storage authority are never model arguments.
+
+New HRA-created Claude threads receive the HRA preamble and host tools together. Existing personal adoptions and legacy sessions without that durable capability resume with HRA host tools disabled: a saved provider prompt snapshot can ignore a later append, so an MCP configuration alone cannot prove that the combined capability was installed. Their owner-facing memory CLI and ordinary session controls remain available.
+
+Each tool-bound Claude process receives a unique MCP config and binding file in a private
+mode-0700 directory. Both files are mode 0600. The config contains only the
+stdio command and binding-file path; the binding file contains a random
+per-session capability and local callback-socket path beneath the same
+validated private root. Provisioning leaves the binding inactive so the config
+can exist before process spawn; the daemon explicitly activates it only after
+the provider-thread commit. The daemon keeps the capability digest mapped to
+the provider thread and profile generation, and it invalidates that mapping
+before deleting the files on session end, provider switch, or daemon shutdown.
+No daemon-wide bearer or raw HTTP endpoint is given to Claude.
+
+Request replay bodies are retained in a bounded live ledger and reclaimed only
+after the MCP response-written lifecycle completes. Compact session-lifetime
+request-ID and callback call-ID tombstones continue to fence old replays after
+the 256 live bodies are reclaimed. Each session-lifetime ledger retains at
+most 4,096 distinct IDs: known IDs remain exact replays, while a new ID fails
+closed once that ledger's lifetime bound is exhausted. A reclaimed ID can
+never cause the host mutation to execute again.
+
+This is an application attribution boundary, not an OS sandbox. Another
+hostile process running under the same Unix uid can inspect that user's memory
+and private files and is therefore inside HRA's local trust base. The binding
+prevents a model call from choosing another actor; it does not claim isolation
+from same-uid malware.
 
 ### Fable model id and reasoning efforts
 

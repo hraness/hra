@@ -295,6 +295,14 @@ describe("subagentChips", () => {
 });
 
 describe("resolveComposerTarget", () => {
+  test("never steers a retired selection or silently redirects it to another session", () => {
+    const retired = card("retired", { lastActivityAt: 100, retiredProvider: "devin" });
+    const live = card("live", { lastActivityAt: 10 });
+    expect(resolveComposerTarget([retired, live], "retired")).toBeNull();
+    expect(resolveComposerTarget([retired, live], "live")?.publicId).toBe("live");
+    expect(resolveComposerTarget([retired, live], null)?.publicId).toBe("live");
+    expect(resolveComposerTarget([retired], null)).toBeNull();
+  });
   const summaries = [
     card("idle-selected", { lastActivityAt: 1, state: "done" }),
     card("busy-selected", { lastActivityAt: 2, state: "working" }),

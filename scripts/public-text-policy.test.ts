@@ -82,6 +82,21 @@ describe("public text policy", () => {
       .toThrow(PublicTextPolicyError);
   });
 
+  test("allows only the reviewed public Claude capture packages", () => {
+    for (const packageName of [
+      "@anthropic-ai/claude-code",
+      "@anthropic-ai/claude-code-darwin-arm64",
+    ]) {
+      expect(() => assertPublicText(`${packageName}@2.1.260`, "public capture package"))
+        .not.toThrow();
+      expect(() => assertPublicText(`${packageName}-unreviewed`, "unreviewed capture package"))
+        .toThrow(PublicTextPolicyError);
+    }
+    const unreviewed = ["@anthropic-ai", ["claude-code", "linux-x64"].join("-")].join("/");
+    expect(() => assertPublicText(unreviewed, "unreviewed native package"))
+      .toThrow(PublicTextPolicyError);
+  });
+
   test("distinguishes annotated Git tag references from package scopes", () => {
     expect(() => assertPublicText(
       "https://github.com/hraness/hra@refs/tags/v0.1.1",
@@ -91,6 +106,49 @@ describe("public text policy", () => {
       .toThrow(PublicTextPolicyError);
     expect(() => assertPublicText(["@refs", "private", "v0.1.1"].join("/"), "unreviewed reference"))
       .toThrow(PublicTextPolicyError);
+  });
+
+  test("distinguishes the exact public npm certificate subject from numeric package scopes", () => {
+    const subject = "repo:hraness@307125679/hra@1343008607:environment:npm-release";
+    expect(() => assertPublicText(subject, "certificate subject")).not.toThrow();
+    expect(() => assertPublicText(`Subject: \`${subject}\`.`, "quoted certificate subject")).not.toThrow();
+    for (const value of [
+      ["@307125679", "hra"].join("/"),
+      subject.replace("npm-release", "unreviewed"),
+      subject.replace("1343008607", "1343008608"),
+      `private-${subject}`,
+      `${subject}/unreviewed`,
+      `${subject}-unreviewed`,
+      `π${subject}`,
+      `${subject}１`,
+      `１${subject}`,
+      `${subject}π`,
+      `${subject}\u0301`,
+      `${subject}\u200b`,
+      `${subject}.\u200b`,
+      `${subject}.π`,
+      `${subject}..`,
+      `π${subject}.`,
+    ]) expect(() => assertPublicText(value, "unreviewed identity")).toThrow(PublicTextPolicyError);
+  });
+
+  test("admits only the exact reviewed Fulcio repository subject", () => {
+    const subject = "repo:hraness@307125679/hra@1343008607:environment:npm-release";
+    const numericPackageShape = ["@307125679", "hra"].join("/");
+    expect(() => assertPublicText(`OID .24 contains ${subject}.`, "provenance record"))
+      .not.toThrow();
+    for (const value of [
+      numericPackageShape,
+      subject.replace(":environment:npm-release", ":environment:other"),
+      subject.replace("@307125679", "@1"),
+      subject.replace("@1343008607", "@1"),
+      `${subject}/private`,
+      `${subject}.private`,
+      `x${subject}`,
+    ]) {
+      expect(() => assertPublicText(value, "unreviewed provenance subject"))
+        .toThrow(PublicTextPolicyError);
+    }
   });
 
   test("scans SVG and TOML text and rejects unreviewed file types", async () => {
@@ -128,6 +186,34 @@ describe("public text policy", () => {
       await expect(assertPublicTree(root)).resolves.toBeUndefined();
       await writeFile(join(root, ".github", "UNREVIEWED"), "ordinary text\n", "utf8");
       await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "UNREVIEWED_FILE_TYPE" });
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("scans the reviewed released-state SQL fixture without admitting arbitrary SQL files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-sql-"));
+    const fixture = join(root, "scripts/fixtures/released-state/v0.5.0/control-plane.sql");
+    try {
+      await mkdir(dirname(fixture), { recursive: true });
+      await writeFile(fixture, "CREATE TABLE fixture (id TEXT);\n", "utf8");
+      await expect(assertPublicTree(root)).resolves.toBeUndefined();
+      const secret = ["github", "pat"].join("_") + "_" + "abcdefghijklmnopqrstuvwxyz123456";
+      await writeFile(fixture, `INSERT INTO fixture VALUES ('${secret}');\n`, "utf8");
+      await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "SECRET_SHAPE" });
+      const privatePackage = `@${["private", "scope"].join("-")}/example`;
+      await writeFile(fixture, `-- ${privatePackage}\n`, "utf8");
+      await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "PRIVATE_SCOPE" });
+      const privatePath = ["", "Users", "example", "state"].join("/");
+      await writeFile(fixture, `-- ${privatePath}\n`, "utf8");
+      await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "ABSOLUTE_USER_PATH" });
+      await unlink(fixture);
+      for (const path of ["unreviewed.sql", "scripts/fixtures/released-state/v0.5.0/unreviewed.sql"]) {
+        const unreviewed = join(root, path);
+        await writeFile(unreviewed, "CREATE TABLE fixture (id TEXT);\n", "utf8");
+        await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "UNREVIEWED_FILE_TYPE" });
+        await unlink(unreviewed);
+      }
     } finally {
       await rm(root, { force: true, recursive: true });
     }

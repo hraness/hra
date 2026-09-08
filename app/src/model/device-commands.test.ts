@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { parseDeviceCommandPayload, parseDeviceRegistryPayload } from "../hra/cloud";
+import {
+  parseDeviceCommandPayload,
+  parseDeviceRegistryPayload,
+  type DeviceCommandPayload,
+} from "../hra/cloud";
 import {
   accountLoginStartCommand,
   accountLoginStatusCommand,
@@ -28,9 +32,9 @@ import { toMachineView, type MachineView } from "./settings-view";
  * The daemon's own parser is the oracle. A builder that adds or drops a field,
  * or that lets a filesystem path through, fails here rather than at the machine.
  */
-function accepted(payload: unknown): unknown {
+function accepted(payload: unknown): DeviceCommandPayload {
   const parsed = parseDeviceCommandPayload(payload);
-  expect(parsed).not.toBeNull();
+  if (parsed === null) throw new Error("expected an accepted device command fixture");
   return parsed;
 }
 
@@ -83,11 +87,10 @@ function machine(overrides: Partial<Readonly<{
 }
 
 describe("device command builders", () => {
-  test("the composer default is Astra Ultra", () => {
+  test("the composer sends the stable Codex Ultra alias", () => {
     expect(defaultSessionStartPreset).toBe("ultra");
     expect(defaultSessionStartPresetForProvider("codex")).toBe("ultra");
     expect(defaultSessionStartPresetForProvider("claude")).toBe("fable-max");
-    expect(defaultSessionStartPresetForProvider("devin")).toBe("astra");
   });
 
   test("builds a session start that the daemon parser accepts", () => {
@@ -101,6 +104,7 @@ describe("device command builders", () => {
       accountPublicId: "acct_primary0001",
       kind: "session_start",
       preset: "ultra",
+      presetContract: 1,
       projectPublicId: "proj_alpha000001",
       prompt: "continue the migration",
       provider: "codex",
@@ -111,30 +115,39 @@ describe("device command builders", () => {
     const providerPresets = [
       ["codex", "high"],
       ["claude", "fable-max"],
-      ["devin", "astra"],
     ] as const;
     for (const [provider, preset] of providerPresets) {
-      expect(accepted(sessionStartCommand({
+      const command = accepted(sessionStartCommand({
         accountPublicId: `acct_${provider}00001`,
         preset,
         projectPublicId: "proj_alpha000001",
         prompt: "continue",
         provider,
-      }))).toMatchObject({ kind: "session_start", preset, provider });
+      }));
+      expect(command).toMatchObject({
+        kind: "session_start",
+        preset,
+        provider,
+      });
+      expect(Object.hasOwn(command, "presetContract")).toBe(provider === "codex");
     }
 
     for (const [provider, preset] of [
       ["codex", "astra"],
       ["claude", "ultra"],
       ["devin", "fable-max"],
+      ["devin", "astra"],
     ] as const) {
-      expect(() => sessionStartCommand({
+      const stale = {
         accountPublicId: `acct_${provider}00001`,
         preset,
         projectPublicId: "proj_alpha000001",
         prompt: "continue",
         provider,
-      })).toThrow("The device command payload is not valid.");
+      };
+      expect(() => sessionStartCommand(
+        stale as unknown as Parameters<typeof sessionStartCommand>[0],
+      )).toThrow("The device command payload is not valid.");
     }
   });
 
@@ -366,14 +379,12 @@ describe("session start targets", () => {
     expect(sessionStartTargetLabel(codex)).toBe("Work — Studio — Codex");
     expect(sessionStartTargetHint(codex)).not.toContain("Linux custodian");
 
-    const devin = sessionStartTargets([machine({
+    const retiredTargets = sessionStartTargets([machine({
       accounts: [
         { label: "Build", provider: "devin", publicId: "acct_devin000001", status: "signed_in" },
       ],
-    })])[0];
-    if (devin === undefined) throw new Error("expected Devin target");
-    expect(sessionStartTargetLabel(devin)).toBe("Build — Studio — Devin");
-    expect(sessionStartTargetHint(devin)).not.toContain("Linux custodian");
+    })]);
+    expect(retiredTargets).toEqual([]);
   });
 });
 

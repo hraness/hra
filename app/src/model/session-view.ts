@@ -46,6 +46,7 @@ export const sessionStateTone: Readonly<Record<SessionStateValue, SessionTone>> 
  */
 export type SessionCardSummary = Readonly<{
   archived: boolean;
+  retiredProvider?: "devin";
   attention: boolean;
   lastActivityAt: number;
   /**
@@ -208,7 +209,11 @@ export function resolveComposerTarget(
   summaries: readonly SessionCardSummary[],
   selectedPublicId: string | null,
 ): SessionCardSummary | null {
-  const visible = summaries.filter((summary) => !summary.archived);
+  // A deliberate retired selection must not redirect a message to a sibling.
+  if (summaries.some((summary) =>
+    summary.publicId === selectedPublicId && summary.retiredProvider !== undefined)) return null;
+  const visible = summaries.filter((summary) =>
+    !summary.archived && summary.retiredProvider === undefined);
   const selected = selectedPublicId === null
     ? undefined
     : visible.find((summary) => summary.publicId === selectedPublicId);

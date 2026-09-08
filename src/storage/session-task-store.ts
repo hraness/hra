@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { z } from "zod";
 
+import { isSupportedProvider, providerSchema } from "../domain/presets";
 import {
   SESSION_TASK_LIMIT,
   sessionTaskDeleteResultSchema,
@@ -27,6 +28,7 @@ import {
   createSessionTaskId,
   MESSAGE_MAX_BYTES,
   positiveRevisionSchema,
+  profileIdSchema,
   queueIdSchema,
   sessionIdSchema,
   sessionTaskIdSchema,
@@ -476,10 +478,21 @@ AND (
 )`;
 
 const dueCandidateRowSchema = taskRowSchema.extend({
+  process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  profile_id: profileIdSchema,
   project_root: z.string().min(1),
+  provider: providerSchema,
+  provider_thread_id: z.string().min(1),
 });
 
 const eligibleDueTaskRowSchema = dueCandidateRowSchema.extend({
+  profile_state: z.enum([
+    "signed_out",
+    "login_pending",
+    "signed_in",
+    "recovery_required",
+    "removed",
+  ]),
   session_state: z.enum(["starting", "active", "idle"]),
   provider_thread_id: z.string().min(1),
 });
@@ -518,6 +531,14 @@ export type SessionTaskMaterialization = Readonly<{
   queue: SessionTaskQueueRecord;
 }>;
 
+export type SessionTaskExecutionAuthority = Readonly<{
+  processGeneration: number;
+  profileId: z.infer<typeof profileIdSchema>;
+  provider: z.infer<typeof providerSchema>;
+  providerThreadId: string;
+  sessionId: SessionId;
+}>;
+
 export type SessionTaskStoreErrorCode =
   | "DAEMON_AUTHORITY_CHANGED"
   | "ENQUEUE_INVALID"
@@ -526,6 +547,7 @@ export type SessionTaskStoreErrorCode =
   | "IDEMPOTENCY_REPLAY_SUPERSEDED"
   | "NO_CHANGES"
   | "NOT_FOUND"
+  | "PROVIDER_RETIRED"
   | "RECEIPT_CAPACITY_EXHAUSTED"
   | "REVISION_CONFLICT"
   | "SCHEDULE_OVERFLOW"
@@ -637,18 +659,25 @@ export class SessionTaskStore {
   readonly #now: () => number;
   readonly #resolveProjectDirectory: (root: string) => Promise<string | null>;
   readonly #enqueue: SessionTaskEnqueue | undefined;
+  readonly #isExecutionAuthorityLive: (authority: SessionTaskExecutionAuthority) => boolean;
   #dueScanCursor: Readonly<{ nextDueAt: number; taskId: SessionTaskId }> | null = null;
 
   constructor(database: Database, options: Readonly<{
     now?: () => number;
     resolveProjectDirectory?: (root: string) => Promise<string | null>;
     enqueue?: SessionTaskEnqueue;
+    isExecutionAuthorityLive?: (authority: SessionTaskExecutionAuthority) => boolean;
   }> = {}) {
     this.#database = database;
     this.#now = options.now ?? Date.now;
     this.#resolveProjectDirectory = options.resolveProjectDirectory
       ?? resolveUsableCanonicalProjectDirectory;
     this.#enqueue = options.enqueue;
+    // Codex owns a durable reconnect path outside this store. Every other
+    // provider needs a positive, process-local proof from the runtime layer;
+    // a persisted thread id alone is never execution authority.
+    this.#isExecutionAuthorityLive = options.isExecutionAuthorityLive
+      ?? ((authority) => authority.provider === "codex");
     this.#database.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
     assertSessionTaskSchema(this.#database);
   }
@@ -670,6 +699,13 @@ export class SessionTaskStore {
     const row = this.#taskRow(sessionId, taskId);
     if (row === null) throw new SessionTaskStoreError("NOT_FOUND");
     return mapTask(row);
+  }
+
+  #assertSupportedSession(sessionId: SessionId): void {
+    const row = this.#database.query("SELECT provider_v39 FROM sessions WHERE id=?").get(sessionId);
+    if (row === null) throw new SessionTaskStoreError("SESSION_NOT_FOUND");
+    const { provider_v39: provider } = z.object({ provider_v39: providerSchema }).strict().parse(row);
+    if (!isSupportedProvider(provider)) throw new SessionTaskStoreError("PROVIDER_RETIRED");
   }
 
   #receipt(input: Readonly<{
@@ -1015,9 +1051,7 @@ export class SessionTaskStore {
         result = this.#replayTask(replay);
         return;
       }
-      if (this.#database.query("SELECT 1 FROM sessions WHERE id=?").get(sessionId) === null) {
-        throw new SessionTaskStoreError("SESSION_NOT_FOUND");
-      }
+      this.#assertSupportedSession(sessionId);
       const now = this.#nowTimestamp();
       const nextDueAt = status === "active" ? addInterval(now, minutes) : null;
       this.#database.query(
@@ -1094,6 +1128,7 @@ export class SessionTaskStore {
       const prompt = patch.prompt ?? current.prompt;
       const minutes = patch.minutes ?? current.schedule.minutes;
       const status = patch.status ?? current.status;
+      if (status === "active") this.#assertSupportedSession(sessionId);
       const changed = name !== current.name
         || prompt !== current.prompt
         || minutes !== current.schedule.minutes
@@ -1233,6 +1268,7 @@ export class SessionTaskStore {
        WHERE t.deleted_at IS NULL
          AND t.status='active'
          AND s.provider_thread_id IS NOT NULL
+         AND s.provider_v39 IN ('codex','claude')
          AND s.state NOT IN ('terminal','recovery_required')
          ${currentSessionTaskAuthorityPredicate}
          AND NOT EXISTS(
@@ -1286,7 +1322,9 @@ export class SessionTaskStore {
     const candidates = this.#database.query(
       `SELECT
          t.id,t.session_id,t.name,t.prompt,t.schedule_kind,t.interval_minutes,t.status,
-         t.revision,t.next_due_at,t.created_at,t.updated_at,t.deleted_at,p.root_path AS project_root
+         t.revision,t.next_due_at,t.created_at,t.updated_at,t.deleted_at,
+         p.root_path AS project_root,a.id AS profile_id,exact_account.process_generation,
+         s.provider_v39 AS provider,s.provider_thread_id
        FROM session_tasks t
        JOIN sessions s ON s.id=t.session_id
        ${currentSessionTaskAuthorityJoins}
@@ -1295,6 +1333,7 @@ export class SessionTaskStore {
          AND t.status='active'
          AND t.next_due_at<=?
          AND s.provider_thread_id IS NOT NULL
+         AND s.provider_v39 IN ('codex','claude')
          AND s.state NOT IN ('terminal','recovery_required')
          ${currentSessionTaskAuthorityPredicate}
          AND NOT EXISTS(
@@ -1337,6 +1376,20 @@ export class SessionTaskStore {
         taskId: candidate.id,
       };
       this.#dueScanCursor = candidateCursor;
+      let executionAuthorityLive: boolean;
+      try {
+        executionAuthorityLive = this.#isExecutionAuthorityLive({
+          processGeneration: candidate.process_generation,
+          profileId: candidate.profile_id,
+          provider: candidate.provider,
+          providerThreadId: candidate.provider_thread_id,
+          sessionId: candidate.session_id,
+        });
+      } catch (error: unknown) {
+        if (this.#dueScanCursor === candidateCursor) this.#dueScanCursor = previousCursor;
+        throw error;
+      }
+      if (!executionAuthorityLive) continue;
       let canonicalProject: string | null;
       try {
         canonicalProject = await this.#resolveProjectDirectory(candidate.project_root);
@@ -1361,7 +1414,8 @@ export class SessionTaskStore {
           `SELECT
              t.id,t.session_id,t.name,t.prompt,t.schedule_kind,t.interval_minutes,t.status,
              t.revision,t.next_due_at,t.created_at,t.updated_at,t.deleted_at,
-             p.root_path AS project_root,s.state AS session_state,
+             p.root_path AS project_root,a.state AS profile_state,s.state AS session_state,
+             a.id AS profile_id,exact_account.process_generation,s.provider_v39 AS provider,
              s.provider_thread_id
            FROM session_tasks t
            JOIN sessions s ON s.id=t.session_id
@@ -1373,6 +1427,7 @@ export class SessionTaskStore {
              AND t.status='active'
              AND t.next_due_at<=?
              AND s.provider_thread_id IS NOT NULL
+             AND s.provider_v39 IN ('codex','claude')
              AND s.state NOT IN ('terminal','recovery_required')
              ${currentSessionTaskAuthorityPredicate}
              AND NOT EXISTS(
@@ -1394,6 +1449,13 @@ export class SessionTaskStore {
           || authoritative.next_due_at !== candidate.next_due_at
           || authoritative.project_root !== canonicalProject
         ) return;
+        if (!this.#isExecutionAuthorityLive({
+          processGeneration: authoritative.process_generation,
+          profileId: authoritative.profile_id,
+          provider: authoritative.provider,
+          providerThreadId: authoritative.provider_thread_id,
+          sessionId: authoritative.session_id,
+        })) return;
         const scheduledFor = authoritative.next_due_at;
         if (scheduledFor === null) return;
         const { coalescedIntervals, nextDueAt } = nextSlotAfter(

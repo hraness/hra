@@ -251,9 +251,9 @@ const array = (value: unknown, label: string, max: number): readonly unknown[] =
   return value;
 };
 
-const unsafeTerminalScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const unsafeTerminalScalar = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
 const sensitiveProviderTextHint =
-  /(?:auth|cookie|token|key|pass|secret|otp|invite|code|Bearer|Basic|sk[_-]|re[_-]|gh[pousr]|github_pat|xox|AKIA|eyJ|PRIVATE KEY|[\p{Cc}\p{Cf}\p{Cs}\p{M}])/iu;
+  /(?:auth|cookie|token|key|pass|secret|otp|invite|code|Bearer|Basic|sk[_-]|re[_-]|gh[pousr]|github_pat|xox|AKIA|eyJ|PRIVATE KEY|[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{M}])/iu;
 const uncPathHint = /\\\\[^\\/\s]/u;
 
 /**

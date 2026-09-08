@@ -7,6 +7,8 @@ import {
   mutationEvidenceCanonical40Schema,
   mutationEvidenceCanonical41Schema,
   mutationEvidenceCanonical43Schema,
+  mutationEvidenceCanonical49Schema,
+  mutationEvidenceCanonicalSol43Schema,
   mutationEvidencePrivate48Schema,
   queueEvidenceCanonicalSchema,
   queueEvidencePrivate48Schema,
@@ -19,6 +21,8 @@ export const historicalEffectEvidenceFormatSchema = z.enum([
   "canonical40_v1",
   "canonical41_v1",
   "canonical43_v1",
+  "canonical49_v1",
+  "canonical_sol43_v1",
   "private_task48_v1",
   "combined49_v1",
 ]);
@@ -34,6 +38,8 @@ export type HistoricalMutationEvidence =
   | z.infer<typeof mutationEvidenceCanonical40Schema>
   | z.infer<typeof mutationEvidenceCanonical41Schema>
   | z.infer<typeof mutationEvidenceCanonical43Schema>
+  | z.infer<typeof mutationEvidenceCanonical49Schema>
+  | z.infer<typeof mutationEvidenceCanonicalSol43Schema>
   | z.infer<typeof mutationEvidencePrivate48Schema>;
 export type HistoricalQueueEvidence =
   | z.infer<typeof queueEffectEvidence49Schema>
@@ -57,6 +63,8 @@ const mutationCodec = (format: HistoricalEffectEvidenceFormat): z.ZodType<Histor
     case "canonical40_v1": return mutationEvidenceCanonical40Schema;
     case "canonical41_v1": return mutationEvidenceCanonical41Schema;
     case "canonical43_v1": return mutationEvidenceCanonical43Schema;
+    case "canonical49_v1": return mutationEvidenceCanonical49Schema;
+    case "canonical_sol43_v1": return mutationEvidenceCanonicalSol43Schema;
     case "private_task48_v1": return mutationEvidencePrivate48Schema;
     case "combined49_v1": return mutationEffectEvidence49Schema;
   }
@@ -65,7 +73,9 @@ const queueCodec = (format: HistoricalEffectEvidenceFormat): z.ZodType<Historica
   switch (format) {
     case "canonical40_v1":
     case "canonical41_v1":
-    case "canonical43_v1": return queueEvidenceCanonicalSchema;
+    case "canonical43_v1":
+    case "canonical_sol43_v1":
+    case "canonical49_v1": return queueEvidenceCanonicalSchema;
     case "private_task48_v1": return queueEvidencePrivate48Schema;
     case "combined49_v1": return queueEffectEvidence49Schema;
   }

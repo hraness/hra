@@ -7,6 +7,7 @@
  * enter this bundle. Keeping the deep relative paths in one file makes the
  * boundary reviewable and keeps the eslint layering rule enforceable.
  */
+export { type SupportedPreset, type SupportedProvider } from "../../../src/domain/presets";
 export {
   canonicalDevicePublicKeyJson,
   decodeBase64Url,
@@ -37,6 +38,7 @@ export {
   isBase64Url,
   isCommandKind,
   isDeviceCommandKind,
+  isDigest,
   isFiniteTimestamp,
   isOpaqueIdentifier,
   isRecord,
@@ -72,6 +74,7 @@ export {
   type CompactRemoteInteractionQuestion,
   type CompactRemoteInteractionReasonCode,
   type CompactMessageActor,
+  type CompactMessageActorKind,
   type CompactSessionEvent,
   type DetailSessionEvent,
   type GitAction,
@@ -81,24 +84,30 @@ export {
 } from "../../../src/cloud/projection";
 
 export {
+  activeRemoteDerivedCodexSelection,
+  activeRemotePresetSelection,
   cloudPayloadAad,
   decryptDeviceCommandResult,
   decryptDeviceRegistry,
+  decryptMemorySummary,
   decryptNotificationEmail,
   decryptNotificationHours,
   decryptSessionMetadata,
   deviceCommandLoginResultLifetimeMs,
   deviceCommandLimits,
   deviceRegistryLimits,
+  memorySummaryLimits,
   encryptDeviceCommand,
   encryptRemoteCommand,
   encryptNotificationHours,
   parseDeviceCommandPayload,
   parseDeviceCommandResultPayload,
   parseDeviceRegistryPayload,
+  parseMemorySummaryPayload,
   parseRemoteCommandPayload,
   remoteInteractionAnswersFitCommandEnvelope,
   type CloudPayloadAuthority,
+  type ActiveRemotePresetSelection,
   type DeviceCommandPayload,
   type DeviceCommandResultPayload,
   type DeviceRegistryAccount,
@@ -107,6 +116,14 @@ export {
   type DeviceRegistryScheduledTask,
   type DeviceRegistrySessionAdoption,
   type DeviceRegistrySessionAdoptionStatus,
+  type MemorySummaryCoverage,
+  type MemorySummaryHead,
+  type MemorySummaryPayload,
+  type MemorySummaryPeerAction,
+  type MemorySummaryPeerIdentity,
+  type MemorySummaryPeerPolicy,
+  type MemorySummaryRecentRecord,
+  type MemorySummarySpace,
   type RemoteCommandPayload,
   type SessionMetadataPayload,
 } from "../../../src/cloud/payloads";

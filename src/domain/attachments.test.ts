@@ -16,6 +16,9 @@ import {
   canonicalAttachmentMediaType,
   formatAttachmentSize,
   isAttachmentName,
+  isLegacyAttachmentName,
+  projectLegacyAttachmentName,
+  projectLegacyAttachmentReferences,
   sniffAttachmentBytes,
   type PreparedAttachment,
 } from "./attachments";
@@ -113,7 +116,7 @@ describe("attachment admission", () => {
 });
 
 describe("attachment names and media types", () => {
-  test("refuses a path, a traversal, and a control character", () => {
+  test("refuses paths and every unsafe control or line-separator class", () => {
     expect(isAttachmentName("diagram.png")).toBe(true);
     expect(isAttachmentName("a b.png")).toBe(true);
     expect(isAttachmentName("../etc/passwd")).toBe(false);
@@ -122,8 +125,72 @@ describe("attachment names and media types", () => {
     expect(isAttachmentName("..")).toBe(false);
     expect(isAttachmentName(".")).toBe(false);
     expect(isAttachmentName("")).toBe(false);
-    expect(isAttachmentName(`bell${String.fromCodePoint(0x07)}.png`)).toBe(false);
+    for (const unsafe of [
+      String.fromCodePoint(0x07), // Cc: ASCII bell
+      String.fromCodePoint(0x85), // Cc: next line
+      String.fromCodePoint(0x202e), // Cf: right-to-left override
+      "\ud800", // Cs: lone high surrogate
+      String.fromCodePoint(0x2028), // Zl: line separator
+      String.fromCodePoint(0x2029), // Zp: paragraph separator
+    ]) {
+      expect(isAttachmentName(`report${unsafe}fdp.exe`)).toBe(false);
+      expect(attachmentNameSchema.safeParse(`report${unsafe}fdp.exe`).success).toBe(false);
+    }
+    expect(isAttachmentName("ملفّ.txt")).toBe(true);
     expect(attachmentNameSchema.safeParse("x".repeat(256)).success).toBe(false);
+  });
+
+  test("projects only names accepted by the predecessor attachment policy", () => {
+    const predecessorOnly = [
+      String.fromCodePoint(0x85),
+      String.fromCodePoint(0x202e),
+      "\ud800",
+      String.fromCodePoint(0x2028),
+      String.fromCodePoint(0x2029),
+    ];
+    for (const scalar of predecessorOnly) {
+      const name = `report${scalar}notes.txt`;
+      expect(isLegacyAttachmentName(name)).toBe(true);
+      expect(isAttachmentName(name)).toBe(false);
+      expect(projectLegacyAttachmentName(name)).toBe("report�notes.txt");
+    }
+    expect(projectLegacyAttachmentName(`report${String.fromCodePoint(0x07)}notes.txt`))
+      .toBeNull();
+    expect(projectLegacyAttachmentName("../notes.txt")).toBeNull();
+    const boundary = `${"a".repeat(253)}${String.fromCodePoint(0x85)}`;
+    expect(isLegacyAttachmentName(boundary)).toBe(true);
+    expect(projectLegacyAttachmentName(boundary)).toBe(`${"a".repeat(253)}_`);
+  });
+
+  test("projects predecessor manifest collisions without collapsing positions", () => {
+    const digest = "a".repeat(64);
+    const reference = (name: string) => ({
+      byteLength: 1,
+      digest,
+      mediaType: "text/plain" as const,
+      name,
+    });
+    const projected = projectLegacyAttachmentReferences([
+      reference(`same${String.fromCodePoint(0x2028)}name.txt`),
+      reference(`same${String.fromCodePoint(0x2029)}name.txt`),
+      reference("same�name.txt"),
+    ]);
+    expect(projected).not.toBeNull();
+    expect(attachmentReferenceListSchema.safeParse(projected).success).toBe(true);
+    expect(projected?.map(({ name }) => name)).toEqual([
+      "same�name~1.txt",
+      "same�name~2.txt",
+      "same�name.txt",
+    ]);
+
+    const boundaryBase = `${"a".repeat(253)}_`;
+    const boundary = projectLegacyAttachmentReferences([
+      reference(`${"a".repeat(253)}${String.fromCodePoint(0x85)}`),
+      reference(boundaryBase),
+    ]);
+    expect(attachmentReferenceListSchema.safeParse(boundary).success).toBe(true);
+    expect(boundary?.[0]?.name).toBe(`${"a".repeat(253)}~1`);
+    expect(boundary?.[1]?.name).toBe(boundaryBase);
   });
 
   test("maps reviewed extensions and refuses everything else", () => {

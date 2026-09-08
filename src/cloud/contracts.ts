@@ -26,6 +26,7 @@ export const cloudLimits = Object.freeze({
   deviceLabelCiphertextCharacters: 2_048,
   identifierCharacters: 96,
   metadataCiphertextCharacters: 16_384,
+  memorySummaryCiphertextCharacters: 65_536,
   notificationEmailCiphertextCharacters: 2_048,
   notificationHoursCiphertextCharacters: 4_096,
   pageSize: 100,

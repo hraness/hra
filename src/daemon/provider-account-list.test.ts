@@ -8,7 +8,7 @@ import { join } from "node:path";
 import type { ProviderAccountListResult } from "../domain/provider-account-list";
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import { ProviderAccountListingError, StateStore } from "../storage/state-store";
-import type { ClaudeRuntimePort, CloudControlPort, CodexRuntimePort, DevinRuntimePort } from "./ports";
+import type { ClaudeRuntimePort, CloudControlPort, CodexRuntimePort } from "./ports";
 import { CommandFailure, HraService } from "./service";
 
 const roots: string[] = [];
@@ -45,7 +45,7 @@ async function fixture() {
   let authorityChecks = 0;
   const service = new HraService({ store, paths,
     codex: forbiddenPort("codex") as CodexRuntimePort, claude: forbiddenPort("claude") as ClaudeRuntimePort,
-    devin: forbiddenPort("devin") as DevinRuntimePort, cloud: forbiddenPort("cloud") as CloudControlPort,
+    cloud: forbiddenPort("cloud") as CloudControlPort,
     daemonAuthority: { assertCurrent: async () => { authorityChecks += 1; }, close: () => {} },
     now: () => now, requestStop: () => { calls.push("requestStop"); } });
   const snapshot = () => {

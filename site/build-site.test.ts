@@ -133,7 +133,8 @@ describe("static-site build", () => {
     expect(builtStyles).toContain(".hraness-marketing-interface-grid");
     expect(builtStyles).toContain(".syntax-code");
     expect(builtStyles).toContain(".syntax-token--command");
-    expect(builtStyles).toContain(".hraness-site-footer {");
+    expect(builtStyles).toContain("--hraness-site-footer-social-target");
+    expect(builtStyles).not.toContain('@import "./dist/stylex.css"');
 
     expect((await readFile(
       join(root, "dist/site/fonts/nebula-sans/NebulaSans-Bold.woff2"),

@@ -22,6 +22,14 @@ afterEach(async () => {
 
 type CleanupHook = (...args: Parameters<AttachmentCleanupPort["unlinkCleanupCandidateSync"]>) => void;
 
+function databaseSnapshot(database: Database) {
+  return {
+    schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
+    tables: database.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all()
+      .map(({ name }) => ({ name, rows: database.query(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all() })),
+  };
+}
+
 async function fixture(hook?: CleanupHook, legacyKind?: "session.send" | "session.steer") {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-attachment-reservations-")));
   roots.push(home);
@@ -108,6 +116,10 @@ async function fixture(hook?: CleanupHook, legacyKind?: "session.send" | "sessio
   const beginInput = (prepared: ReturnType<typeof prepare>, attachments: readonly StoredMessageAttachment[]) => ({
     attemptId: prepared.attempt.id, sessionId: session.id, profileGeneration: authority.processGeneration,
     providerAuthority: authority, ...daemon, attachments,
+    message: "The exact human request.",
+    transcript: { accountId: authority.profileId, providerGeneration: authority.processGeneration,
+      providerConnectionId: "48000000-0000-4000-8000-000000000001", actor: "human" as const,
+      message: "The exact human request." },
     ...(prepared.custody.kind === "empty" ? {} : { custody: {
       custodyId: prepared.custody.custodyId, custodyDigest: prepared.custody.custodyDigest,
     } }),
@@ -342,20 +354,19 @@ describe("attachment reservations across storage and filesystem custody", () => 
     const redundant = value.reserve([blob.attachment], key, value.other);
     const replay = value.prepare([blob.attachment], key, redundant, value.other);
     if (replay.custody.kind !== "mutation_owned") throw new Error("Expected the original mutation hold");
-    const beginInput = {
-      attemptId: replay.attempt.id, sessionId: value.session.id,
-      ...value.daemon,
-      profileGeneration: value.authority.processGeneration, providerAuthority: value.authority,
-      custody: { custodyId: replay.custody.custodyId, custodyDigest: replay.custody.custodyDigest },
-      attachments: [blob.attachment],
-      evidence: { kind: "session.send" as const, providerThreadId: "attachment-reservation-thread",
-        baseline: { providerUpdatedAt: null, activeTurnId: null, status: "idle" as const },
-        clientMessageId: replay.attempt.id,
-        messageDigest: createHash("sha256").update("The exact human request.").digest("hex") },
-    };
+    const beginInput = value.beginInput(replay, [blob.attachment]);
+    // A second metadata INSERT, even with identical ON CONFLICT input, is not
+    // needed: the one atomic transcript stage must own the manifest write.
+    value.database.exec(`CREATE TRIGGER test_attachment_manifest_single_write BEFORE INSERT ON message_attachments
+      WHEN EXISTS(SELECT 1 FROM message_attachments WHERE session_id=NEW.session_id AND source_id=NEW.source_id AND position=NEW.position)
+      BEGIN SELECT RAISE(ABORT, 'duplicate attachment manifest staging'); END`);
     value.database.exec(`CREATE TRIGGER test_attachment_native_evidence_failure BEFORE INSERT ON mutation_effect_evidence
       BEGIN SELECT RAISE(ABORT, 'injected attachment native evidence failure'); END`);
-    expect(() => value.other.beginSessionMutationEffect(beginInput)).toThrow("injected attachment native evidence failure");
+    const before = databaseSnapshot(value.database);
+    // The provenance writer deliberately sanitizes the injected SQL error;
+    // full rollback plus the successful sibling below pin its causal effect.
+    expect(() => value.other.beginSessionMutationEffect(beginInput)).toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+    expect(databaseSnapshot(value.database)).toEqual(before);
     expect(value.store.readMutation(key)?.state).toBe("prepared");
     expect(value.store.messageAttachmentManifest(value.session.id, original.attempt.id)).toEqual([]);
     expect(value.cleanup(blob.candidate).kind).toBe("retained");
@@ -366,12 +377,48 @@ describe("attachment reservations across storage and filesystem custody", () => 
       { digest: blob.attachment.digest, name: blob.attachment.name,
         mediaType: blob.attachment.mediaType, byteLength: blob.attachment.byteLength },
     ]);
+    expect(value.store.readSessionUserMessageSource(value.session.id, "mutation", key)).toMatchObject({
+      status: "pending", intent: { actor: "human", attachments: [{ digest: blob.attachment.digest,
+        name: blob.attachment.name, mediaType: blob.attachment.mediaType, byteLength: blob.attachment.byteLength }] },
+    });
     expect(() => value.store.beginSessionMutationEffect(beginInput)).toThrow();
     expect(value.database.query("SELECT attempt_id FROM mutation_effect_evidence WHERE attempt_id=?")
       .all(original.attempt.id)).toHaveLength(1);
     expect(value.release(reservation).reason).toBe("mutation_owned");
     expect(value.cleanup(blob.candidate).kind).toBe("retained");
   });
+
+  test.each(["reference omission", "reference order", "reference name", "stored omission", "stored name", "stored canonical type"] as const)(
+    "explicit transcript %s cannot replace the original ordered custody manifest",
+    async (mismatch) => {
+      const value = await fixture();
+      const first = await value.put("First immutable attachment.", "first.txt");
+      const second = await value.put("Second immutable attachment.", "second.txt");
+      const attachments = [first.attachment, second.attachment];
+      const key = randomUUID();
+      const reservation = value.reserve(attachments, key);
+      const prepared = value.prepare(attachments, key, reservation);
+      const references = attachments.map(({ byteLength, digest, mediaType, name }) => ({ byteLength, digest, mediaType, name }));
+      const supplied = value.beginInput(prepared, attachments);
+      const transcript = {
+        ...supplied.transcript,
+        attachments: mismatch === "reference omission" ? [] : mismatch === "reference order" ? [...references].reverse()
+          : mismatch === "reference name" ? references.map((entry) => ({ ...entry, name: "changed.txt" })) : references,
+        storedAttachments: mismatch === "stored omission" ? [] : mismatch === "stored name"
+          ? attachments.map((entry) => ({ ...entry, name: "changed.txt" })) : mismatch === "stored canonical type"
+            ? attachments.map((entry) => ({ ...entry, canonicalMediaType: "text/markdown" as const })) : attachments,
+      };
+      const before = databaseSnapshot(value.database);
+      expect(() => value.store.beginSessionMutationEffect({ ...supplied, transcript }))
+        .toThrow("SESSION_USER_MESSAGE_ATTACHMENT_INTENT_MISMATCH");
+      expect(databaseSnapshot(value.database)).toEqual(before);
+      expect(value.store.readMutation(key)?.state).toBe("prepared");
+      expect(value.store.messageAttachmentManifest(value.session.id, prepared.attempt.id)).toEqual([]);
+      // The same original request remains usable after the refused mismatch.
+      value.store.beginSessionMutationEffect({ ...supplied, transcript: { ...supplied.transcript, attachments: references, storedAttachments: attachments } });
+      expect(value.store.readSessionUserMessageSource(value.session.id, "mutation", key)).toMatchObject({ status: "pending", intent: { attachments: references } });
+    },
+  );
 
   test("queue manifest failure rolls back transfer while the caller's reservation remains live", async () => {
     const value = await fixture();
@@ -381,7 +428,9 @@ describe("attachment reservations across storage and filesystem custody", () => 
     const enqueue = () => value.store.enqueueIdempotentWithResult({
       sessionId: value.session.id, profileGeneration: value.authority.processGeneration,
       providerAuthority: value.authority, message: "The exact human request.", idempotencyKey: key,
-      attachments: [blob.attachment], attachmentReservation: { ...reservation, ...value.daemon },
+      attachments: [{ digest: blob.attachment.digest, name: blob.attachment.name,
+        mediaType: blob.attachment.mediaType, byteLength: blob.attachment.byteLength }],
+      storedAttachments: [blob.attachment], attachmentReservation: { ...reservation, ...value.daemon },
     });
     const sequence = value.database.query("SELECT * FROM queue_sequence_authority").get();
     value.database.exec(`CREATE TRIGGER test_reservation_manifest_failure BEFORE INSERT ON message_attachments
@@ -410,7 +459,9 @@ describe("attachment reservations across storage and filesystem custody", () => 
     const enqueue = (reservation: typeof first, store = value.store) => store.enqueueIdempotentWithResult({
       sessionId: value.session.id, profileGeneration: value.authority.processGeneration,
       providerAuthority: value.authority, message: "The exact human request.", idempotencyKey: key,
-      attachments: [blob.attachment], attachmentReservation: { ...reservation, ...value.daemon },
+      attachments: [{ digest: blob.attachment.digest, name: blob.attachment.name,
+        mediaType: blob.attachment.mediaType, byteLength: blob.attachment.byteLength }],
+      storedAttachments: [blob.attachment], attachmentReservation: { ...reservation, ...value.daemon },
     });
     const original = enqueue(first);
     const redundant = value.reserve([blob.attachment], key, value.other, "session.queue");

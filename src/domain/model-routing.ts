@@ -3,6 +3,8 @@ import { z } from "zod";
 import {
   defaultPresetForProvider,
   isPresetSupportedByProvider,
+  isSupportedPreset,
+  isSupportedProvider,
   presetSchema,
   providerSchema,
 } from "./presets";
@@ -45,10 +47,10 @@ export const effectiveModelRouteSchema = z
       });
     }
 
-    if (route.provider === "claude" && route.fast) {
+    if (route.provider !== "codex" && route.fast) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "Claude routes cannot enable Fast mode.",
+        message: "Only Codex routes can enable Fast mode.",
         path: ["fast"],
       });
     }
@@ -107,6 +109,28 @@ export const modelRoutingInputSchema = z
         code: z.ZodIssueCode.custom,
         message: "Existing selections are valid only for established sessions.",
         path: ["selection"],
+      });
+    }
+
+    if (
+      input.boundary === "new"
+      && !isSupportedProvider(input.effective.provider)
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "New routes must use a supported provider.",
+        path: ["effective", "provider"],
+      });
+    }
+
+    if (
+      input.boundary === "new"
+      && !isSupportedPreset(input.effective.preset)
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "New routes must use a supported preset.",
+        path: ["effective", "preset"],
       });
     }
 
@@ -246,6 +270,20 @@ export const modelRoutingDecisionSchema = z
   })
   .strict()
   .superRefine((value, context) => {
+    if (
+      value.rule !== "preserve_established_route"
+      && (
+        !isSupportedProvider(value.effective.provider)
+        || !isSupportedPreset(value.effective.preset)
+      )
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Only established-session decisions may retain a historical route.",
+        path: ["effective"],
+      });
+    }
+
     if (value.reason !== REASONS[value.rule]) {
       context.addIssue({
         code: z.ZodIssueCode.custom,

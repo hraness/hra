@@ -163,7 +163,9 @@ export type SessionLocalObservationSnapshot = z.infer<
 >;
 
 const providerObservationBase = {
-  source: z.literal("codex_app_server"),
+  // `codex_app_server` remains accepted for persisted/wire compatibility;
+  // isolated providers identify the runtime boundary that produced the read.
+  source: z.enum(["codex_app_server", "claude_runtime", "devin_acp"]),
   basis: z.enum(["local_state", "provider_read"]),
   profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   observedAt: unixMillisecondsSchema,
@@ -187,6 +189,7 @@ export const providerObservationSchema = z.discriminatedUnion("state", [
       "account_signed_out",
       "authority_retired",
       "provider_platform_unavailable",
+      "provider_retired",
       "resume_unavailable",
     ]),
   }).strict(),

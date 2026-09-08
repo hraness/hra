@@ -51,7 +51,7 @@ async function fixture() {
   const admit = (attachments: readonly StoredMessageAttachment[] | undefined, idempotencyKey: string = randomUUID()) => {
     const input = { sessionId: session.id, profileGeneration: authority.processGeneration,
       providerAuthority: authority, message: "The exact queued human request.", idempotencyKey,
-      ...(attachments === undefined ? {} : { attachments }) };
+      ...(attachments === undefined ? {} : { attachments: manifest(attachments), storedAttachments: attachments }) };
     const references = manifest(attachments ?? []);
     const previous = store.readQueueEnqueueReplay({ idempotencyKey, sessionId: session.id,
       message: input.message, attachments: references });

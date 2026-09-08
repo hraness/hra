@@ -6,16 +6,22 @@
  * `auto:workspace` remains fail-closed until adapters can attest exact private
  * authority against a bound project root. File changes, questions, and MCP
  * forms are never answered here. Every action is bounded by a consecutive
- * counter that only a human message resets plus hourly and daily budgets. The
- * decision is pure; the controller applies it through the daemon's ordinary
+ * counter that only a human message resets plus hourly and daily budgets.
+ * A separate default-off consent may select higher protocol limits outside
+ * notification hours. The decision is pure; the controller applies it through the daemon's ordinary
  * resolve path and records evidence.
  */
 
 import type { ApprovalMode, InteractionDisplay, InteractionKind } from "../domain/interactions";
+import type { AutorespondAfterHoursSelection } from "../domain/autorespond-after-hours";
+import { decideProtocolAutorespondAuthority } from "../domain/autorespond-protocol-policy";
+import {
+  AUTORESPOND_CONSECUTIVE_LIMIT,
+  AUTORESPOND_HOURLY_BUDGET,
+  AUTORESPOND_DAILY_BUDGET,
+} from "../domain/autorespond-budget";
 
-export const AUTORESPOND_CONSECUTIVE_LIMIT = 3;
-export const AUTORESPOND_HOURLY_BUDGET = 10;
-export const AUTORESPOND_DAILY_BUDGET = 40;
+export { AUTORESPOND_CONSECUTIVE_LIMIT, AUTORESPOND_HOURLY_BUDGET, AUTORESPOND_DAILY_BUDGET };
 
 export type AutorespondBudgets = Readonly<{
   consecutive: number;
@@ -36,24 +42,6 @@ export type AutorespondEscalation =
   | "hourly_budget"
   | "daily_budget";
 
-/*
- * Bounded evidence label only. Command approvals carry a provider command
- * class and permission approvals carry their requested presentation names;
- * neither label supplies approval authority.
- */
-export function approvalClassOf(display: InteractionDisplay): string {
-  switch (display.kind) {
-    case "command_approval": return `command:${display.commandClass}`.slice(0, 256);
-    case "file_change_approval": return "file_change";
-    case "permission_approval": {
-      const names = display.requested.map((permission) => permission.name).join(",");
-      return `permission:${names.length === 0 ? "unknown" : names}`.slice(0, 256);
-    }
-    case "user_input": return "user_input";
-    case "mcp_elicitation": return "mcp_elicitation";
-  }
-}
-
 export function permissionNamesOf(display: InteractionDisplay): string[] {
   return display.kind === "permission_approval"
     ? display.requested.map((permission) => permission.name)
@@ -65,45 +53,23 @@ export function decideAutorespond(input: Readonly<{
   display: InteractionDisplay;
   kind: InteractionKind;
   mode: ApprovalMode;
+  selection?: AutorespondAfterHoursSelection;
 }>): AutorespondDecision {
-  const approvalClass = approvalClassOf(input.display);
-  if (input.mode === "manual") return { action: "escalate", code: "manual_mode", approvalClass };
-  if (
-    input.kind !== "command_approval"
-    && input.kind !== "file_change_approval"
-    && input.kind !== "permission_approval"
-  ) return { action: "escalate", code: "not_an_approval", approvalClass };
-  if (input.display.kind !== input.kind) return { action: "escalate", code: "not_an_approval", approvalClass };
-  // The pinned provider callback does not expose exact affected paths. Keep
-  // the interaction pending for an informed local decline instead of trying
-  // an acceptance that the live resolution verifier will refuse.
-  if (input.display.kind === "file_change_approval") {
-    return { action: "escalate", code: "protected_authority_required", approvalClass };
-  }
-  if (input.display.kind === "command_approval" && input.mode === "auto:workspace") {
-    return { action: "escalate", code: "protected_authority_required", approvalClass };
-  }
-  if (input.display.kind === "permission_approval") {
-    if (input.display.requested.length === 0) {
-      return { action: "escalate", code: "decision_unavailable", approvalClass };
-    }
-    // Requested category names are sanitised presentation data, not proof of
-    // the exact paths, tool input, or environment the grant authorises. Until
-    // provider adapters return a bound workspace-local attestation, the
-    // workspace mode must fail closed for every permission grant.
-    if (input.mode === "auto:workspace") {
-      return { action: "escalate", code: "protected_authority_required", approvalClass };
-    }
-  } else if (!input.display.availableDecisions.includes("once")) {
-    return { action: "escalate", code: "decision_unavailable", approvalClass };
-  }
-  if (input.budgets.consecutive >= AUTORESPOND_CONSECUTIVE_LIMIT) {
+  const authority = decideProtocolAutorespondAuthority(input);
+  if (authority.action === "escalate") return authority;
+  const { approvalClass } = authority;
+  const limits = input.selection?.limits ?? {
+    consecutive: AUTORESPOND_CONSECUTIVE_LIMIT,
+    lastHour: AUTORESPOND_HOURLY_BUDGET,
+    lastDay: AUTORESPOND_DAILY_BUDGET,
+  };
+  if (input.budgets.consecutive >= limits.consecutive) {
     return { action: "escalate", code: "consecutive_limit", approvalClass };
   }
-  if (input.budgets.lastHour >= AUTORESPOND_HOURLY_BUDGET) {
+  if (input.budgets.lastHour >= limits.lastHour) {
     return { action: "escalate", code: "hourly_budget", approvalClass };
   }
-  if (input.budgets.lastDay >= AUTORESPOND_DAILY_BUDGET) {
+  if (input.budgets.lastDay >= limits.lastDay) {
     return { action: "escalate", code: "daily_budget", approvalClass };
   }
   return { action: "accept", decision: "once", approvalClass };
@@ -111,7 +77,7 @@ export function decideAutorespond(input: Readonly<{
 
 /*
  * Prose path (W2). A prose approval has no provider interaction, so the
- * decision is the positive gate plus the same budgets as the protocol path:
+ * decision is the positive gate plus the baseline budgets:
  * at most one autoresponse per turn, a consecutive counter that only a
  * human-authored send resets, and the hourly and daily caps. The gate itself
  * (cues, message length, gateway key, pending interactions) is evaluated by
@@ -128,6 +94,10 @@ export type ProseAutorespondGateFailure =
   | "message_too_long"
   | "not_an_approval_cue"
   | "pending_interaction"
+  | "policy_changed"
+  | "source_changed"
+  | "source_already_reserved"
+  | "history_unavailable"
   | "verbatim_literal_missing";
 
 export const PROSE_AUTORESPOND_MAX_MESSAGE_CHARACTERS = 4_000;

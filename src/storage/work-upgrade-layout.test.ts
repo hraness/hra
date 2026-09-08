@@ -43,19 +43,35 @@ test("retains the exact Work table layout produced by a canonical30 upgrade", as
     ).all().map((row) => ({ ...row, sql: normalizeSchemaSql(row.sql) }));
     const expected = tables(reference);
     const changed = tables(actual).filter((row) => expected.find((value) => value.name === row.name)?.sql !== row.sql);
-    expect(changed.map((row) => row.name)).toEqual(["works"]);
+    expect(changed.map((row) => row.name)).toEqual(["work_attempts", "work_routes", "work_tasks", "works"]);
     const originalWorks = canonical30WorkFixture.workObjects.find((row) => row.name === "works");
     if (originalWorks === undefined) throw new Error("Missing archived canonical30 Work table.");
     const expectedUpgrade = new Database(":memory:");
     try {
-      expectedUpgrade.exec(originalWorks.sql);
+      // Start from archived table declarations, not the current writer. The
+      // canonical30 works ALTER layout and canonical50 companion columns are
+      // the only allowed differences from the captured combined49 Work tables.
+      for (const row of reference.query<{ name: string; sql: string }, []>(
+        "SELECT name,sql FROM sqlite_master WHERE type='table' AND (name='works' OR name GLOB 'work_*') ORDER BY name",
+      ).all()) expectedUpgrade.exec(row.name === "works" ? originalWorks.sql : row.sql);
       expectedUpgrade.exec("ALTER TABLE works ADD COLUMN preset_contract INTEGER NOT NULL DEFAULT 1 CHECK(preset_contract IN (1,2))");
-      expect(changed).toEqual(tables(expectedUpgrade));
+      for (const table of ["work_routes", "work_tasks", "work_attempts"]) {
+        expectedUpgrade.exec(`ALTER TABLE ${table} ADD COLUMN canonical_profile_key TEXT`);
+      }
+      // Compare the complete table inventory too: a removed or extra table
+      // must not disappear behind a comparison of only changed declarations.
+      expect(tables(actual)).toEqual(tables(expectedUpgrade));
     } finally { expectedUpgrade.close(); }
+    for (const table of ["sessions", "work_routes", "work_tasks", "work_attempts"]) {
+      expect(actual.query(`SELECT name,type,"notnull",dflt_value,pk FROM pragma_table_info('${table}')
+        WHERE name='canonical_profile_key'`).all()).toEqual([
+        { name: "canonical_profile_key", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+      ]);
+    }
     expect(actual.query("SELECT version,applied_at FROM migrations WHERE version<=30 ORDER BY version").all())
       .toEqual([...canonical30WorkFixture.migrations]);
     const before = snapshot(actual);
-    expect(before.version).toEqual({ user_version: 49 });
+    expect(before.version).toEqual({ user_version: 60 });
     expect(before.foreignKeys).toEqual([]);
     store.close();
     store = undefined;

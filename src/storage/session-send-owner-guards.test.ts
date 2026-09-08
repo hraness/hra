@@ -131,9 +131,14 @@ describe("original send generic guards", () => {
       expect(() => value.store.beginSessionMutationEffect({
         attemptId, sessionId: value.session.id, profileGeneration: value.authority.processGeneration,
         providerAuthority: value.authority, evidence: value.evidence,
+        message: value.request.message,
+        transcript: { accountId: value.authority.profileId, providerGeneration: value.authority.processGeneration,
+          providerConnectionId: "48000000-0000-4000-8000-000000000004", actor: "human", message: value.request.message },
       })).toThrow(rejected);
       expect(() => value.store.completeSessionTurnEffect({
         attemptId, sessionId: value.session.id, expectedSessionRevision: value.session.revision,
+        accountId: value.authority.profileId, providerGeneration: value.authority.processGeneration,
+        providerConnectionId: "48000000-0000-4000-8000-000000000004", message: value.request.message,
         applyResponseState: true, providerAuthority: value.authority,
         turnId: value.receipt.turnId, turnStatus: value.receipt.status,
         runtimeProfile: value.runtimeProfile, receipt: value.receipt,

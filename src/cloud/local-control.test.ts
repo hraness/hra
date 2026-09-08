@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
-import type { CloudTransport } from "./client";
+import { USER_RESOURCE_QUOTAS } from "../../convex/quota";
+import type { AccessTokenProvider, CloudArgs, CloudTransport } from "./client";
+import { canonicalMemoryGcmMessageBudgetPerDevice } from "./canonical-memory-crypto";
+import { CanonicalMemoryTransportError } from "./canonical-memory-transport";
 import {
   isRecord,
   parseAccountKeyStatus,
@@ -17,7 +20,9 @@ import {
   gcmMessageBudgetCheckpointInterval,
   gcmMessageBudgetKey,
   gcmMessageBudgetPerKey,
+  hmacSha256Hex,
   KeyRotationRequiredError,
+  processGcmMessageBudget,
 } from "./crypto";
 import {
   cloudDeploymentAuthorityFromEnvironment,
@@ -25,6 +30,7 @@ import {
 } from "./identity-custody";
 import {
   AccountKeyLossPreconditionError,
+  CanonicalMemoryCloudAuthorityError,
   createLocalCloudControlFromEnvironment,
   createCloudUuidV7,
   deploymentFencedCloudTransport,
@@ -51,6 +57,17 @@ const testDeploymentAuthority = {
   generation: 0,
   scopeCustodySlot: (slot: string) => slot,
 };
+
+function deferred<T>(): Readonly<{
+  promise: Promise<T>;
+  resolve(value: T): void;
+}> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((innerResolve) => {
+    resolve = innerResolve;
+  });
+  return { promise, resolve };
+}
 
 function deviceMutationKey(now = fixedNow): string {
   return createCloudUuidV7(now);
@@ -121,10 +138,14 @@ class FakeCloud {
   snapshots = new Map<string, unknown[]>();
   readonly commands = new Map<string, Readonly<{
     payload: EncryptedEnvelope;
+    requestCommitmentVersion?: 2;
     requestDigest: string;
+    requestingDevicePublicId: string;
     response: Readonly<{
       publicId: string;
+      requestCommitmentVersion?: 2;
       replay: boolean;
+      requestingDevicePublicId?: string;
       sessionPublicId: string;
       state: "pending";
       targetDevicePublicId: string;
@@ -149,6 +170,7 @@ class FakeCloud {
   readonly registrationAttempts: Readonly<Record<string, unknown>>[] = [];
   failNextApproveAfterEffect = false;
   failNextApproveBeforeEffect = false;
+  expandNextEnqueueResponse = false;
   failNextEnqueueAfterEffect = false;
   failNextEnqueueBeforeEffect = false;
   failNextAckAfterEffect = false;
@@ -388,7 +410,10 @@ class FakeCloud {
           if (
             typeof args.idempotencyKey !== "string"
             || typeof args.publicId !== "string"
+            || args.requestCommitmentVersion !== 2
             || typeof args.requestDigest !== "string"
+            || typeof args.expectedRequestingDevicePublicId !== "string"
+            || args.expectedRequestingDevicePublicId !== boundDevice
             || typeof args.sessionPublicId !== "string"
             || typeof args.expectedTargetDevicePublicId !== "string"
             || typeof args.kind !== "string"
@@ -405,15 +430,20 @@ class FakeCloud {
             !isRecord(head)
             || head.executionDevicePublicId !== args.expectedTargetDevicePublicId
           ) throw new Error("command target changed");
-          const scope = `${boundDevice ?? "none"}:${args.sessionPublicId}:${args.kind}:${args.idempotencyKey}`;
+          const scope = `${boundDevice}:${args.sessionPublicId}:${args.kind}:${args.idempotencyKey}`;
           const existing = this.commands.get(scope);
           if (existing !== undefined) {
-            if (existing.requestDigest !== args.requestDigest) throw new Error("IDEMPOTENCY_CONFLICT");
+            if (
+              existing.requestDigest !== args.requestDigest
+              || existing.requestCommitmentVersion !== args.requestCommitmentVersion
+            ) throw new Error("IDEMPOTENCY_CONFLICT");
             return { ...existing.response, replay: true };
           }
           const response = {
             publicId: args.publicId,
+            requestCommitmentVersion: 2 as const,
             replay: false,
+            requestingDevicePublicId: boundDevice,
             sessionPublicId: args.sessionPublicId,
             state: "pending" as const,
             targetDevicePublicId: args.expectedTargetDevicePublicId,
@@ -421,12 +451,22 @@ class FakeCloud {
           this.lastEnqueue = args as Readonly<Record<string, unknown>>;
           this.commands.set(scope, {
             payload: args.payload as EncryptedEnvelope,
+            requestCommitmentVersion: 2,
             requestDigest: args.requestDigest,
+            requestingDevicePublicId: boundDevice,
             response,
           });
           if (this.failNextEnqueueAfterEffect) {
             this.failNextEnqueueAfterEffect = false;
             throw new Error("lost command enqueue response");
+          }
+          if (this.expandNextEnqueueResponse) {
+            this.expandNextEnqueueResponse = false;
+            return {
+              ...response,
+              idempotencyKey: args.idempotencyKey,
+              requestDigest: args.requestDigest,
+            };
           }
           return response;
         }
@@ -441,6 +481,7 @@ class FakeCloud {
           if (
             command === undefined
             || command[1].requestDigest !== args.requestDigest
+            || command[1].requestingDevicePublicId !== boundDevice
             || !command[0].endsWith(`:${args.idempotencyKey}`)
           ) throw new Error("invalid command acknowledgement authority");
           this.acknowledgementAttempts += 1;
@@ -560,9 +601,19 @@ class FakeCloud {
           const limit = typeof args.limit === "number" ? args.limit : 0;
           return chunks.slice(Math.max(0, chunks.length - limit));
         }
-        if (name === "commands:get") {
-          const command = [...this.commands.values()].find((candidate) =>
+        if (name === "commands:get" || name === "commands:getForOutboxRecovery") {
+          const commandEntry = [...this.commands.entries()].find(([, candidate]) =>
             candidate.response.publicId === args.commandPublicId);
+          if (
+            name === "commands:getForOutboxRecovery"
+            && commandEntry !== undefined
+            && (
+              typeof args.idempotencyKey !== "string"
+              || !commandEntry[0].endsWith(`:${args.idempotencyKey}`)
+              || commandEntry[1].requestDigest !== args.requestDigest
+            )
+          ) throw new Error("Cloud authority is not current.");
+          const command = commandEntry?.[1];
           return command === undefined
             ? null
             : {
@@ -571,7 +622,11 @@ class FakeCloud {
                 kind: "set_fast",
                 payload: command.payload,
                 publicId: command.response.publicId,
+                ...(command.requestCommitmentVersion === undefined
+                  ? {}
+                  : { requestCommitmentVersion: command.requestCommitmentVersion }),
                 requestDigest: command.requestDigest,
+                requestingDevicePublicId: command.requestingDevicePublicId,
                 ...(this.commandResultCodes.has(command.response.publicId)
                   ? { resultCode: this.commandResultCodes.get(command.response.publicId) }
                   : {}),
@@ -608,6 +663,97 @@ function control(
     transport: cloud.connect(),
   });
 }
+
+type MemoryTransportHarness = {
+  readonly calls: Array<Readonly<{
+    args: CloudArgs;
+    kind: "mutation" | "query";
+    name: string;
+  }>>;
+  mutation: null | ((name: string, args: CloudArgs) => unknown);
+  query: null | ((name: string, args: CloudArgs) => unknown);
+};
+
+function withMemoryTransport(
+  transport: CloudTransport,
+  harness: MemoryTransportHarness,
+  onSignOut?: () => void,
+): CloudTransport {
+  return {
+    action: async (name, args) => {
+      if (name === "auth:signOut") onSignOut?.();
+      return await transport.action(name, args);
+    },
+    mutation: async (name, args) => {
+      if (!name.startsWith("memorySync:")) return await transport.mutation(name, args);
+      harness.calls.push({ args, kind: "mutation", name });
+      if (harness.mutation === null) throw new Error("Unexpected memory mutation.");
+      return await harness.mutation(name, args);
+    },
+    query: async (name, args) => {
+      if (!name.startsWith("memorySync:")) return await transport.query(name, args);
+      harness.calls.push({ args, kind: "query", name });
+      if (harness.query === null) throw new Error("Unexpected memory query.");
+      return await harness.query(name, args);
+    },
+  };
+}
+
+function replaceAccountKey(
+  custody: MemoryCustody,
+  update: Readonly<{ key?: string; provisional?: boolean }>,
+): void {
+  const current = custody.values.get("cloud-account-key");
+  if (current === undefined) throw new Error("missing account key fixture");
+  const decoded: unknown = JSON.parse(current.value) as unknown;
+  if (!isRecord(decoded)) throw new Error("invalid account key fixture");
+  custody.values.set("cloud-account-key", {
+    generation: current.generation + 1,
+    value: JSON.stringify({
+      ...decoded,
+      ...(update.key === undefined ? {} : { key: update.key }),
+      ...(update.provisional === undefined ? {} : { provisional: update.provisional }),
+    }),
+  });
+}
+
+const canonicalMemoryHostedSpaceId = `memory_${"A".repeat(32)}`;
+const canonicalMemoryGenesisToken = "0".repeat(64);
+
+function canonicalMemoryEnvelope(fill: string) {
+  return {
+    algorithm: "A256GCM" as const,
+    ciphertext: fill.repeat(22),
+    keyVersion: 1,
+    nonce: "N".repeat(16),
+  };
+}
+
+const canonicalMemoryCreateRequest = {
+  bindingPolicy: "one_project_one_space" as const,
+  encryptedDescriptor: canonicalMemoryEnvelope("D"),
+  genesisHeadProof: canonicalMemoryEnvelope("H"),
+  genesisToken: canonicalMemoryGenesisToken,
+  identityContract: 2 as const,
+  keyVersion: 1,
+  spaceId: canonicalMemoryHostedSpaceId,
+  wrappedSpaceKey: canonicalMemoryEnvelope("K"),
+};
+
+const canonicalMemoryPushRequest = {
+  expectedKeyVersion: 1,
+  expectedRevision: 1,
+  operations: [{
+    adoptionProof: null,
+    genesisToken: canonicalMemoryGenesisToken,
+    headToken: "1".repeat(64),
+    operation: canonicalMemoryEnvelope("O"),
+    priorToken: canonicalMemoryGenesisToken,
+    sequence: 1,
+    terminalHeadProof: canonicalMemoryEnvelope("P"),
+  }] as const,
+  spaceId: canonicalMemoryHostedSpaceId,
+};
 
 type QueryInterceptor = Readonly<{
   afterQuery: (
@@ -685,6 +831,45 @@ function accountKey(custody: MemoryCustody): Uint8Array {
     throw new Error("invalid account key fixture");
   }
   return decodeBase64Url(decoded.key);
+}
+
+async function rewritePendingCommandOutbox(
+  custody: MemoryCustody,
+  mode: "legacy" | Readonly<{ requestingDevicePublicId: string }>,
+): Promise<Readonly<Record<string, unknown>>> {
+  const observation = custody.values.get("cloud-command-outbox");
+  if (observation === undefined) throw new Error("missing command outbox fixture");
+  const decoded: unknown = JSON.parse(observation.value) as unknown;
+  if (!isRecord(decoded)) throw new Error("invalid command outbox fixture");
+  const request = {
+    deadline: decoded.deadline,
+    expectedTargetDevicePublicId: decoded.targetDevicePublicId,
+    kind: decoded.kind,
+    payload: decoded.envelope,
+    publicId: decoded.commandPublicId,
+    ...(mode === "legacy" ? {} : {
+      requestingDevicePublicId: mode.requestingDevicePublicId,
+    }),
+    sessionPublicId: decoded.sessionPublicId,
+  };
+  const rewritten: Record<string, unknown> = {
+    ...decoded,
+    requestDigest: await hmacSha256Hex(
+      accountKey(custody),
+      "command-enqueue",
+      JSON.stringify(request),
+    ),
+    ...(mode === "legacy"
+      ? { version: 2 }
+      : { requestingDevicePublicId: mode.requestingDevicePublicId, version: 3 }),
+  };
+  if (mode === "legacy") delete rewritten.requestingDevicePublicId;
+  delete rewritten.requestCommitmentVersion;
+  custody.values.set("cloud-command-outbox", {
+    generation: observation.generation,
+    value: JSON.stringify(rewritten),
+  });
+  return rewritten;
 }
 
 function accountKeyIsProvisional(custody: MemoryCustody): boolean {
@@ -1405,6 +1590,656 @@ describe("local cloud control", () => {
     await expect(transport.query("account:current", {}))
       .rejects.toThrow("Cloud deployment authority is not current.");
     expect(transportCalls).toBe(1);
+  });
+
+  test("snapshots only a fresh active account key and keeps account binding opaque and stable", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const harness: MemoryTransportHarness = { calls: [], mutation: null, query: null };
+    const adapter = new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      gcmMessageBudget: new GcmMessageBudget(),
+      now: () => fixedNow,
+      secretCustody: custody,
+      transport: withMemoryTransport(cloud.connect(), harness),
+    });
+    await authenticate(adapter);
+    await adapter.ensureDeviceRegistered(signal);
+    harness.query = (name, args) => {
+      expect(name).toBe("memorySync:list");
+      expect(args).toEqual({ limit: 100 });
+      return [];
+    };
+
+    const expectedKey = accountKey(custody);
+    const first = await adapter.snapshotCanonicalMemoryAuthority(signal);
+    const second = await adapter.snapshotCanonicalMemoryAuthority(signal);
+    expect(first.accountBindingDigest).toMatch(/^[a-f0-9]{64}$/u);
+    expect(second.accountBindingDigest).toBe(first.accountBindingDigest);
+    expect(first.accountKey.keyVersion).toBe(1);
+    expect(first.accountKey.bytes).toEqual(expectedKey);
+    expect(JSON.stringify(first)).not.toContain(userPublicId);
+    expect(JSON.stringify(first)).not.toContain(encodeBase64Url(expectedKey));
+    expect(JSON.stringify(first)).not.toContain("bytes");
+    expect(custody.values.has("cloud-gcm-message-budget")).toBe(true);
+    await expect(first.transport.list()).resolves.toEqual([]);
+    expect(harness.calls).toHaveLength(1);
+
+    first.accountKey.bytes.fill(7);
+    expect(accountKey(custody)).toEqual(expectedKey);
+    await expect(first.assertCurrent()).rejects
+      .toBeInstanceOf(CanonicalMemoryCloudAuthorityError);
+    first.dispose();
+    expect([...first.accountKey.bytes]).toEqual(Array.from({ length: 32 }, () => 0));
+    await expect(first.transport.list()).rejects.toMatchObject({
+      category: "transport",
+      effect: "none",
+    });
+    expect(harness.calls).toHaveLength(1);
+    second.dispose();
+    expect([...second.accountKey.bytes]).toEqual(Array.from({ length: 32 }, () => 0));
+  });
+
+  test("couples canonical encryption to its exact persisted and injected per-device budget", async () => {
+    expect(canonicalMemoryGcmMessageBudgetPerDevice)
+      .toBe(Math.floor((gcmMessageBudgetPerKey - 1) / USER_RESOURCE_QUOTAS.device));
+    expect(canonicalMemoryGcmMessageBudgetPerDevice * USER_RESOURCE_QUOTAS.device)
+      .toBeLessThan(gcmMessageBudgetPerKey);
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const transport = cloud.connect();
+    const process = (budget: GcmMessageBudget): LocalCloudControl => new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      gcmMessageBudget: budget,
+      now: () => fixedNow,
+      secretCustody: custody,
+      transport,
+    });
+    const firstBudget = new GcmMessageBudget();
+    const first = process(firstBudget);
+    await authenticate(first);
+    await first.ensureDeviceRegistered(signal);
+    const firstAuthority = await first.snapshotCanonicalMemoryAuthority(signal);
+    const spaceKey = new Uint8Array(32).fill(73);
+    const spaceBudgetKey = await gcmMessageBudgetKey(spaceKey, 4);
+    const request = {
+      bytes: spaceKey,
+      keyVersion: 4,
+      usage: { hostedSpaceId: canonicalMemoryHostedSpaceId, kind: "space" as const },
+    };
+    const slot = "cloud-gcm-message-budget";
+    const interval = gcmMessageBudgetCheckpointInterval;
+
+    const processBefore = processGcmMessageBudget.observe(spaceBudgetKey);
+    const handle = await firstAuthority.openEncryptionKey(request);
+    const persisted = custody.values.get(slot);
+    const persistedValue = JSON.parse(persisted?.value ?? "null") as {
+      keys?: Array<{
+        keyVersion?: unknown;
+        maximumMessages?: unknown;
+        messages?: unknown;
+        ownerAccountBindingDigest?: unknown;
+        rawFingerprint?: unknown;
+        state?: unknown;
+        usageScope?: unknown;
+      }>;
+    };
+    const persistedSpace = persistedValue.keys?.find((entry) =>
+      entry.rawFingerprint === spaceBudgetKey.fingerprint);
+    expect(persistedSpace?.keyVersion).toBe(4);
+    expect(persistedSpace?.maximumMessages).toBe(canonicalMemoryGcmMessageBudgetPerDevice);
+    expect(persistedSpace?.messages).toBe(2 * interval);
+    expect(persistedSpace?.ownerAccountBindingDigest).toBe(firstAuthority.accountBindingDigest);
+    expect(persistedSpace?.state).toBe("active");
+    expect(persistedSpace?.usageScope).toBe(`space:${canonicalMemoryHostedSpaceId}`);
+    await handle.encrypt(new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6]));
+    expect(firstBudget.observe(spaceBudgetKey)).toBe(1);
+    expect(processGcmMessageBudget.observe(spaceBudgetKey)).toBe(processBefore);
+    expect(custody.values.get(slot)?.generation).toBe(persisted?.generation);
+    handle.dispose();
+    await expect(handle.encrypt(new Uint8Array([1]), new Uint8Array([2])))
+      .rejects.toBeInstanceOf(CanonicalMemoryCloudAuthorityError);
+    firstAuthority.dispose();
+
+    const restartedBudget = new GcmMessageBudget();
+    const restarted = process(restartedBudget);
+    const restartedAuthority = await restarted.snapshotCanonicalMemoryAuthority(signal);
+    const restartedHandle = await restartedAuthority.openEncryptionKey(request);
+    expect(restartedBudget.observe(spaceBudgetKey)).toBe(2 * interval);
+    await restartedHandle.encrypt(new Uint8Array([7]), new Uint8Array([8]));
+    expect(restartedBudget.observe(spaceBudgetKey)).toBe(2 * interval + 1);
+    const restoredValue = JSON.parse(custody.values.get(slot)?.value ?? "null") as {
+      keys?: Array<{ messages?: unknown; rawFingerprint?: unknown }>;
+    };
+    expect(restoredValue.keys?.find((entry) =>
+      entry.rawFingerprint === spaceBudgetKey.fingerprint)?.messages).toBe(4 * interval);
+    restartedHandle.dispose();
+    restartedAuthority.dispose();
+
+    const current = custody.values.get(slot);
+    if (current === undefined || !Array.isArray(restoredValue.keys)) {
+      throw new Error("missing GCM budget fixture");
+    }
+    custody.values.set(slot, {
+      generation: current.generation + 1,
+      value: JSON.stringify({
+        keys: restoredValue.keys.map((entry) => entry.rawFingerprint === spaceBudgetKey.fingerprint
+          ? { ...entry, messages: canonicalMemoryGcmMessageBudgetPerDevice }
+          : entry),
+        legacyKeys: [],
+        version: 2,
+      }),
+    });
+    const exhausted = process(new GcmMessageBudget());
+    const exhaustedAuthority = await exhausted.snapshotCanonicalMemoryAuthority(signal);
+    const refusal = await exhaustedAuthority.openEncryptionKey(request)
+      .catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(KeyRotationRequiredError);
+    expect(refusal).toMatchObject({ code: "KEY_ROTATION_REQUIRED", keyVersion: 4 });
+    exhaustedAuthority.dispose();
+    const afterDisposeGeneration = custody.values.get(slot)?.generation;
+    await expect(exhaustedAuthority.openEncryptionKey(request))
+      .rejects.toBeInstanceOf(CanonicalMemoryCloudAuthorityError);
+    expect(custody.values.get(slot)?.generation).toBe(afterDisposeGeneration);
+  });
+
+  test("binds canonical keys to owner, scope, and version and refuses budget widening", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const transport = cloud.connect();
+    const process = (budget: GcmMessageBudget): LocalCloudControl => new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      gcmMessageBudget: budget,
+      now: () => fixedNow,
+      secretCustody: custody,
+      transport,
+    });
+    const first = process(new GcmMessageBudget());
+    await authenticate(first);
+    await first.ensureDeviceRegistered(signal);
+    const authority = await first.snapshotCanonicalMemoryAuthority(signal);
+    const slot = "cloud-gcm-message-budget";
+    const spaceKey = new Uint8Array(32).fill(74);
+    const request = {
+      bytes: spaceKey,
+      keyVersion: 4,
+      usage: { hostedSpaceId: canonicalMemoryHostedSpaceId, kind: "space" as const },
+    };
+    const handle = await authority.openEncryptionKey(request);
+    handle.dispose();
+
+    await expect(authority.openEncryptionKey({ ...request, keyVersion: 5 }))
+      .rejects.toMatchObject({ reason: "relabel" });
+    await expect(authority.openEncryptionKey({
+      ...request,
+      usage: { hostedSpaceId: `memory_${"B".repeat(32)}`, kind: "space" },
+    })).rejects.toMatchObject({ reason: "cross_owner_or_scope" });
+
+    const current = custody.values.get(slot);
+    if (current === undefined) throw new Error("missing GCM budget fixture");
+    const original = JSON.parse(current.value) as {
+      keys: Array<Record<string, unknown>>;
+      legacyKeys: unknown[];
+      version: 2;
+    };
+    const rawFingerprint = (await gcmMessageBudgetKey(spaceKey, 4)).fingerprint;
+    const target = original.keys.find((entry) => entry.rawFingerprint === rawFingerprint);
+    if (target === undefined) throw new Error("missing bound GCM budget fixture");
+    const generation = current.generation + 1;
+    custody.values.set(slot, {
+      generation,
+      value: JSON.stringify({
+        ...original,
+        keys: original.keys.map((entry) => entry === target
+          ? { ...entry, maximumMessages: 2 * gcmMessageBudgetCheckpointInterval }
+          : entry),
+      }),
+    });
+    await expect(authority.openEncryptionKey(request))
+      .rejects.toMatchObject({ reason: "widening" });
+
+    custody.values.set(slot, {
+      generation: generation + 1,
+      value: JSON.stringify({
+        ...original,
+        keys: original.keys.map((entry) => entry === target
+          ? { ...entry, ownerAccountBindingDigest: "f".repeat(64) }
+          : entry),
+      }),
+    });
+    await expect(authority.openEncryptionKey(request))
+      .rejects.toMatchObject({ reason: "cross_owner_or_scope" });
+    authority.dispose();
+  });
+
+  test("refuses live key retirement and permanently refuses a retired key", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const transport = cloud.connect();
+    const process = (): LocalCloudControl => new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      gcmMessageBudget: new GcmMessageBudget(),
+      now: () => fixedNow,
+      secretCustody: custody,
+      transport,
+    });
+    const adapter = process();
+    await authenticate(adapter);
+    await adapter.ensureDeviceRegistered(signal);
+    const authority = await adapter.snapshotCanonicalMemoryAuthority(signal);
+    const request = {
+      bytes: new Uint8Array(32).fill(75),
+      keyVersion: 2,
+      usage: { hostedSpaceId: canonicalMemoryHostedSpaceId, kind: "space" as const },
+    };
+    const handle = await authority.openEncryptionKey(request);
+    const concurrentAuthority = await process().snapshotCanonicalMemoryAuthority(signal);
+    await expect(concurrentAuthority.retireEncryptionKey(request))
+      .rejects.toMatchObject({ reason: "live" });
+    handle.dispose();
+    await expect(concurrentAuthority.retireEncryptionKey(request)).resolves.toBeUndefined();
+    await expect(concurrentAuthority.retireEncryptionKey(request)).resolves.toBeUndefined();
+    await expect(concurrentAuthority.openEncryptionKey(request))
+      .rejects.toMatchObject({ reason: "retired" });
+    concurrentAuthority.dispose();
+    authority.dispose();
+  });
+
+  test("migrates one exact legacy key without permitting a version relabel", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const adapter = new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      gcmMessageBudget: new GcmMessageBudget(),
+      now: () => fixedNow,
+      secretCustody: custody,
+      transport: cloud.connect(),
+    });
+    await authenticate(adapter);
+    await adapter.ensureDeviceRegistered(signal);
+    const spaceKey = new Uint8Array(32).fill(76);
+    const legacyFingerprint = (await hmacSha256Hex(
+      spaceKey,
+      "gcm-message-budget",
+      "4",
+    )).slice(0, 32);
+    custody.values.set("cloud-gcm-message-budget", {
+      generation: 1,
+      value: JSON.stringify({
+        keys: [{
+          fingerprint: legacyFingerprint,
+          keyVersion: 4,
+          messages: gcmMessageBudgetCheckpointInterval,
+        }],
+        version: 1,
+      }),
+    });
+    const authority = await adapter.snapshotCanonicalMemoryAuthority(signal);
+    const request = {
+      bytes: spaceKey,
+      keyVersion: 4,
+      usage: { hostedSpaceId: canonicalMemoryHostedSpaceId, kind: "space" as const },
+    };
+    const handle = await authority.openEncryptionKey(request);
+    const migrated = JSON.parse(custody.values.get("cloud-gcm-message-budget")?.value ?? "null") as {
+      keys?: Array<{ keyVersion?: unknown; rawFingerprint?: unknown; usageScope?: unknown }>;
+      legacyKeys?: unknown[];
+      version?: unknown;
+    };
+    expect(migrated.version).toBe(2);
+    expect(migrated.legacyKeys).toEqual([]);
+    const migratedRawFingerprint = (await gcmMessageBudgetKey(spaceKey, 4)).fingerprint;
+    const migratedSpace = migrated.keys?.find((entry) =>
+      entry.rawFingerprint === migratedRawFingerprint);
+    expect(migratedSpace?.keyVersion).toBe(4);
+    expect(migratedSpace?.usageScope).toBe(`space:${canonicalMemoryHostedSpaceId}`);
+    handle.dispose();
+    await expect(authority.openEncryptionKey({ ...request, keyVersion: 5 }))
+      .rejects.toMatchObject({ reason: "relabel" });
+    authority.dispose();
+  });
+
+  test("bounds GCM custody after the complete 100-space hosted contract", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const process = (): LocalCloudControl => new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      gcmMessageBudget: new GcmMessageBudget(),
+      now: () => fixedNow,
+      secretCustody: custody,
+      transport: cloud.connect(),
+    });
+    const first = process();
+    await authenticate(first);
+    await first.ensureDeviceRegistered(signal);
+    const accountBudget = await gcmMessageBudgetKey(accountKey(custody), 1);
+    const fingerprints: string[] = [];
+    for (let index = 1; fingerprints.length < 127; index += 1) {
+      const candidate = index.toString(16).padStart(32, "0");
+      if (candidate !== accountBudget.fingerprint) fingerprints.push(candidate);
+    }
+    const slot = "cloud-gcm-message-budget";
+    custody.values.set(slot, {
+      generation: 1,
+      value: JSON.stringify({
+        keys: fingerprints.map((fingerprint) => ({
+          fingerprint,
+          keyVersion: 1,
+          messages: 1,
+        })),
+        version: 1,
+      }),
+    });
+
+    // N=128 admits the active account key after enough capacity for all 100
+    // current immutable space keys plus bounded rotation headroom.
+    const authority = await first.snapshotCanonicalMemoryAuthority(signal);
+    const atLimit = custody.values.get(slot);
+    const atLimitValue = JSON.parse(atLimit?.value ?? "null") as {
+      keys?: Array<{ fingerprint?: unknown }>;
+      legacyKeys?: Array<{ fingerprint?: unknown }>;
+    };
+    expect(atLimitValue.keys).toHaveLength(1);
+    expect(atLimitValue.legacyKeys).toHaveLength(127);
+    const generationAtLimit = atLimit?.generation;
+    await expect(authority.openEncryptionKey({
+      bytes: new Uint8Array(32).fill(77),
+      keyVersion: 1,
+      usage: { hostedSpaceId: canonicalMemoryHostedSpaceId, kind: "space" },
+    }))
+      .rejects.toBeInstanceOf(CanonicalMemoryCloudAuthorityError);
+    expect(custody.values.get(slot)?.generation).toBe(generationAtLimit);
+    authority.dispose();
+
+    // N+1 is corrupt custody, not an excuse to discard a historical mark.
+    const used = new Set([
+      ...(atLimitValue.keys?.map((entry) => entry.fingerprint) ?? []),
+      ...(atLimitValue.legacyKeys?.map((entry) => entry.fingerprint) ?? []),
+    ]);
+    let overflowIndex = 129;
+    while (used.has(overflowIndex.toString(16).padStart(32, "0"))) overflowIndex += 1;
+    const overflowFingerprint = overflowIndex.toString(16).padStart(32, "0");
+    custody.values.set(slot, {
+      generation: (generationAtLimit ?? 1) + 1,
+      value: JSON.stringify({
+        keys: atLimitValue.keys ?? [],
+        legacyKeys: [
+          ...(atLimitValue.legacyKeys ?? []),
+          { fingerprint: overflowFingerprint, keyVersion: 1, messages: 1 },
+        ],
+        version: 2,
+      }),
+    });
+    await expect(process().snapshotCanonicalMemoryAuthority(signal))
+      .rejects.toBeInstanceOf(CanonicalMemoryCloudAuthorityError);
+  });
+
+  test("keeps the account binding stable across key custody changes and distinct by account and deployment", async () => {
+    const open = async (
+      cloud: FakeCloud,
+      deploymentUrl: string,
+    ) => {
+      const custody = new MemoryCustody();
+      const authority = {
+        ...testDeploymentAuthority,
+        deploymentUrl,
+      };
+      const adapter = new LocalCloudControl({
+        deploymentAuthority: authority,
+        deploymentUrl,
+        gcmMessageBudget: new GcmMessageBudget(),
+        now: () => fixedNow,
+        secretCustody: custody,
+        transport: cloud.connect(),
+      });
+      await authenticate(adapter);
+      await adapter.ensureDeviceRegistered(signal);
+      return { adapter, custody };
+    };
+
+    const baseline = await open(new FakeCloud(), testDeploymentUrl);
+    const first = await baseline.adapter.snapshotCanonicalMemoryAuthority(signal);
+    replaceAccountKey(baseline.custody, {
+      key: encodeBase64Url(new Uint8Array(32).fill(91)),
+    });
+    const rotated = await baseline.adapter.snapshotCanonicalMemoryAuthority(signal);
+    expect(rotated.accountBindingDigest).toBe(first.accountBindingDigest);
+
+    const otherAccount = await open(new FakeCloud("user_87654321"), testDeploymentUrl);
+    const otherAccountAuthority = await otherAccount.adapter
+      .snapshotCanonicalMemoryAuthority(signal);
+    expect(otherAccountAuthority.accountBindingDigest).not.toBe(first.accountBindingDigest);
+
+    const otherDeployment = await open(
+      new FakeCloud(),
+      "https://alternate.convex.cloud",
+    );
+    const otherDeploymentAuthority = await otherDeployment.adapter
+      .snapshotCanonicalMemoryAuthority(signal);
+    expect(otherDeploymentAuthority.accountBindingDigest).not.toBe(first.accountBindingDigest);
+
+    first.dispose();
+    rotated.dispose();
+    otherAccountAuthority.dispose();
+    otherDeploymentAuthority.dispose();
+  });
+
+  test("fails closed on provisional and in-flight account-key authority changes", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const adapter = control(cloud, custody);
+    await authenticate(adapter);
+    await adapter.ensureDeviceRegistered(signal);
+
+    cloud.keyEnvelopes.clear();
+    replaceAccountKey(custody, { provisional: true });
+    const provisional = await adapter.snapshotCanonicalMemoryAuthority(signal)
+      .catch((error: unknown) => error);
+    expect(provisional).toBeInstanceOf(CanonicalMemoryCloudAuthorityError);
+    expect((provisional as Error).message)
+      .toBe("Canonical memory cloud authority is unavailable.");
+    expect((provisional as Error).message).not.toContain("provisional");
+    expect((provisional as Error).message).not.toContain(userPublicId);
+
+    replaceAccountKey(custody, {
+      key: encodeBase64Url(new Uint8Array(32).fill(37)),
+      provisional: false,
+    });
+    let accountReads = 0;
+    cloud.beforeAccountCurrentReturn = async () => {
+      accountReads += 1;
+      if (accountReads === 3) {
+        replaceAccountKey(custody, {
+          key: encodeBase64Url(new Uint8Array(32).fill(38)),
+        });
+      }
+    };
+    const raced = await adapter.snapshotCanonicalMemoryAuthority(signal)
+      .catch((error: unknown) => error);
+    expect(raced).toBeInstanceOf(CanonicalMemoryCloudAuthorityError);
+    expect((raced as Error).message)
+      .toBe("Canonical memory cloud authority is unavailable.");
+    expect(accountReads).toBe(3);
+  });
+
+  test("fences exact key and device authority before and after every memory call", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const harness: MemoryTransportHarness = {
+      calls: [],
+      mutation: null,
+      query: () => [],
+    };
+    const adapter = new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      gcmMessageBudget: new GcmMessageBudget(),
+      now: () => fixedNow,
+      secretCustody: custody,
+      transport: withMemoryTransport(cloud.connect(), harness),
+    });
+    await authenticate(adapter);
+    await adapter.ensureDeviceRegistered(signal);
+
+    const stale = await adapter.snapshotCanonicalMemoryAuthority(signal);
+    replaceAccountKey(custody, {
+      key: encodeBase64Url(new Uint8Array(32).fill(51)),
+    });
+    for (const request of [
+      async () => await stale.transport.list(),
+      async () => await stale.transport.create(canonicalMemoryCreateRequest),
+      async () => await stale.transport.push(canonicalMemoryPushRequest),
+    ]) {
+      const preflight = await request().catch((error: unknown) => error);
+      expect(preflight).toBeInstanceOf(CanonicalMemoryTransportError);
+      expect(preflight).toMatchObject({ category: "transport", effect: "none" });
+    }
+    expect(harness.calls).toEqual([]);
+
+    const inFlight = await adapter.snapshotCanonicalMemoryAuthority(signal);
+    const stableBinding = inFlight.accountBindingDigest;
+    harness.query = () => {
+      replaceAccountKey(custody, {
+        key: encodeBase64Url(new Uint8Array(32).fill(52)),
+      });
+      return [];
+    };
+    const postflight = await inFlight.transport.list().catch((error: unknown) => error);
+    expect(postflight).toBeInstanceOf(CanonicalMemoryTransportError);
+    expect(postflight).toMatchObject({ category: "transport", effect: "none" });
+    expect(harness.calls).toHaveLength(1);
+
+    harness.query = () => [];
+    const current = await adapter.snapshotCanonicalMemoryAuthority(signal);
+    expect(current.accountBindingDigest).toBe(stableBinding);
+    const device = [...cloud.devices.values()][0];
+    if (device === undefined) throw new Error("missing device fixture");
+    device.status = "revoked";
+    device.revision += 1;
+    const revoked = await current.transport.list().catch((error: unknown) => error);
+    expect(revoked).toBeInstanceOf(CanonicalMemoryTransportError);
+    expect(revoked).toMatchObject({ category: "transport", effect: "none" });
+    expect(harness.calls).toHaveLength(1);
+
+    stale.dispose();
+    inFlight.dispose();
+    current.dispose();
+  });
+
+  test("does not hold the local-control tail during memory I/O and withholds stale mutation responses", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const harness: MemoryTransportHarness = { calls: [], mutation: null, query: null };
+    const mutationStarted = deferred<undefined>();
+    const releaseMutation = deferred<undefined>();
+    const signOutDispatched = deferred<undefined>();
+    const adapter = new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      gcmMessageBudget: new GcmMessageBudget(),
+      now: () => fixedNow,
+      secretCustody: custody,
+      transport: withMemoryTransport(
+        cloud.connect(),
+        harness,
+        () => signOutDispatched.resolve(undefined),
+      ),
+    });
+    await authenticate(adapter);
+    await adapter.ensureDeviceRegistered(signal);
+    const authority = await adapter.snapshotCanonicalMemoryAuthority(signal);
+    harness.mutation = async (name, args) => {
+      expect(name).toBe("memorySync:create");
+      mutationStarted.resolve(undefined);
+      await releaseMutation.promise;
+      return { ...args, replay: false, revision: 1 };
+    };
+
+    const mutation = authority.transport.create(canonicalMemoryCreateRequest);
+    await mutationStarted.promise;
+    const logout = adapter.logout(signal);
+    await signOutDispatched.promise;
+    await logout;
+    releaseMutation.resolve(undefined);
+
+    const result = await mutation.catch((error: unknown) => error);
+    expect(result).toBeInstanceOf(CanonicalMemoryTransportError);
+    expect(result).toMatchObject({ category: "transport", effect: "indeterminate" });
+    expect(harness.calls).toHaveLength(1);
+    expectSignedOutCustody(custody);
+    authority.dispose();
+  });
+
+  test("never rebinds an in-flight canonical memory snapshot to a later login token", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const tokenResolutionStarted = deferred<undefined>();
+    const releaseTokenResolution = deferred<undefined>();
+    const selectedTokens: string[] = [];
+    let remoteRequests = 0;
+    let remoteMutations = 0;
+    const canonicalMemoryTransportFactory = (
+      accessToken: AccessTokenProvider,
+    ): CloudTransport => ({
+      action: async () => { throw new Error("unexpected canonical memory action"); },
+      mutation: async (name, args) => {
+        expect(name).toBe("memorySync:create");
+        tokenResolutionStarted.resolve(undefined);
+        await releaseTokenResolution.promise;
+        const token = await accessToken();
+        if (token !== null) selectedTokens.push(token);
+        remoteRequests += 1;
+        remoteMutations += 1;
+        return { ...args, replay: false, revision: 1 };
+      },
+      query: async () => { throw new Error("unexpected canonical memory query"); },
+    });
+    const adapter = new LocalCloudControl({
+      canonicalMemoryTransportFactory,
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      gcmMessageBudget: new GcmMessageBudget(),
+      now: () => fixedNow,
+      secretCustody: custody,
+      transport: cloud.connect(),
+    });
+    await authenticate(adapter);
+    await adapter.ensureDeviceRegistered(signal);
+    const authority = await adapter.snapshotCanonicalMemoryAuthority(signal);
+
+    const mutation = authority.transport.create(canonicalMemoryCreateRequest);
+    await tokenResolutionStarted.promise;
+    const currentAuth = custody.values.get("cloud-auth");
+    if (currentAuth === undefined) throw new Error("missing authenticated auth fixture");
+    const decoded: unknown = JSON.parse(currentAuth.value) as unknown;
+    if (!isRecord(decoded)) throw new Error("invalid authenticated auth fixture");
+    expect(decoded.token).toBe("t".repeat(64));
+    const laterLoginToken = "b".repeat(64);
+    custody.values.set("cloud-auth", {
+      generation: currentAuth.generation + 1,
+      value: JSON.stringify({
+        ...decoded,
+        email: "other@example.com",
+        refreshToken: "q".repeat(64),
+        token: laterLoginToken,
+      }),
+    });
+    releaseTokenResolution.resolve(undefined);
+
+    const result = await mutation.catch((error: unknown) => error);
+    expect(result).toBeInstanceOf(CanonicalMemoryTransportError);
+    expect(result).toMatchObject({ category: "transport", effect: "indeterminate" });
+    expect(selectedTokens).not.toContain(laterLoginToken);
+    expect(selectedTokens).toEqual([]);
+    expect(remoteRequests).toBe(0);
+    expect(remoteMutations).toBe(0);
+    authority.dispose();
   });
 
   test("keeps OTP tokens in injected custody and preserves device keys on logout", async () => {
@@ -2203,8 +3038,16 @@ describe("local cloud control", () => {
     await first.listDevices(signal);
     const persisted = custody.values.get(slot);
     expect(JSON.parse(persisted?.value ?? "null")).toEqual({
-      keys: [{ fingerprint: budgetKey.fingerprint, keyVersion: 1, messages: 2 * interval }],
-      version: 1,
+      keys: [expect.objectContaining({
+        keyVersion: 1,
+        maximumMessages: canonicalMemoryGcmMessageBudgetPerDevice,
+        messages: 2 * interval,
+        rawFingerprint: budgetKey.fingerprint,
+        state: "active",
+        usageScope: "account_data",
+      })],
+      legacyKeys: [],
+      version: 2,
     });
     await first.listDevices(signal);
     const sameProcess = process(firstBudget);
@@ -2220,8 +3063,16 @@ describe("local cloud control", () => {
     await restarted.listDevices(signal);
     expect(restartedBudget.observe(budgetKey)).toBe(2 * interval);
     expect(JSON.parse(custody.values.get(slot)?.value ?? "null")).toEqual({
-      keys: [{ fingerprint: budgetKey.fingerprint, keyVersion: 1, messages: 4 * interval }],
-      version: 1,
+      keys: [expect.objectContaining({
+        keyVersion: 1,
+        maximumMessages: canonicalMemoryGcmMessageBudgetPerDevice,
+        messages: 4 * interval,
+        rawFingerprint: budgetKey.fingerprint,
+        state: "active",
+        usageScope: "account_data",
+      })],
+      legacyKeys: [],
+      version: 2,
     });
 
     // A spent key is refused before any transport or encryption effect.
@@ -2985,6 +3836,19 @@ describe("local cloud control", () => {
     expect(custody.values.has("cloud-command-outbox")).toBe(false);
     const commandEnvelope = parseEncryptedEnvelope(cloud.lastEnqueue?.payload);
     if (commandEnvelope === null) throw new Error("missing encrypted command fixture");
+    expect(cloud.lastEnqueue?.requestDigest).toBe(await hmacSha256Hex(
+      key,
+      "command-enqueue",
+      JSON.stringify({
+        deadline: request.deadline,
+        expectedTargetDevicePublicId: pair.device.publicId,
+        kind: request.payload.kind,
+        payload: commandEnvelope,
+        publicId: request.commandPublicId,
+        requestingDevicePublicId: pair.device.publicId,
+        sessionPublicId,
+      }),
+    ));
     expect(await decryptRemoteCommand(commandEnvelope, key, {
       entityPublicId: request.commandPublicId,
       keyVersion: commandEnvelope.keyVersion,
@@ -3004,6 +3868,23 @@ describe("local cloud control", () => {
       state: "failed",
       targetDevicePublicId: pair.device.publicId,
     });
+
+    const expandedResponseRequest = {
+      ...request,
+      commandPublicId: "018bcfe5-6800-7000-8000-000000000009",
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000010",
+    };
+    cloud.expandNextEnqueueResponse = true;
+    await expect(adapter.enqueueRemoteCommand(expandedResponseRequest)).rejects.toThrow(
+      "Cloud remote command receipt is invalid",
+    );
+    expect(custody.values.has("cloud-command-outbox")).toBe(true);
+    expect(cloud.acknowledgedCommands.has(expandedResponseRequest.commandPublicId)).toBe(false);
+    expect(await adapter.enqueueRemoteCommand(expandedResponseRequest)).toMatchObject({
+      commandPublicId: expandedResponseRequest.commandPublicId,
+      replay: true,
+    });
+    expect(custody.values.has("cloud-command-outbox")).toBe(false);
 
     const racedRequest = {
       ...request,
@@ -3126,6 +4007,256 @@ describe("local cloud control", () => {
       replay: false,
     });
     expect(cloud.enqueueAttempts).toBe(attemptsBeforeFresh + 1);
+  });
+
+  test("preserves an absent legacy outbox until its delayed old enqueue appears", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const adapter = control(cloud, custody);
+    await authenticate(adapter);
+    const pair = await adapter.pairDevice(signal) as { device: { publicId: string } };
+    const sessionPublicId = "session_legacy_outbox_absent";
+    cloud.heads = [{
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: pair.device.publicId,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    }];
+    const request = {
+      commandPublicId: "018bcfe5-6800-7000-8000-000000000031",
+      deadline: fixedNow + 60_000,
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000032",
+      payload: { kind: "set_fast", enabled: true } as const,
+      selector: { executionDevicePublicId: pair.device.publicId, publicId: sessionPublicId },
+      signal,
+    };
+    cloud.failNextEnqueueBeforeEffect = true;
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      "enqueue unavailable before effect",
+    );
+    const legacy = await rewritePendingCommandOutbox(custody, "legacy");
+    const attempts = cloud.enqueueAttempts;
+
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      "Legacy pending cloud command is absent remotely but may still commit",
+    );
+    expect(cloud.enqueueAttempts).toBe(attempts);
+    expect(custody.values.has("cloud-command-outbox")).toBe(true);
+
+    const envelope = parseEncryptedEnvelope(legacy.envelope);
+    if (envelope === null || typeof legacy.requestDigest !== "string") {
+      throw new Error("missing delayed legacy enqueue fixture");
+    }
+    cloud.commands.set(
+      `${pair.device.publicId}:${sessionPublicId}:set_fast:${request.idempotencyKey}`,
+      {
+        payload: envelope,
+        requestDigest: legacy.requestDigest,
+        requestingDevicePublicId: pair.device.publicId,
+        response: {
+          publicId: request.commandPublicId,
+          replay: false,
+          sessionPublicId,
+          state: "pending",
+          targetDevicePublicId: pair.device.publicId,
+        },
+      },
+    );
+
+    expect(await adapter.enqueueRemoteCommand(request)).toMatchObject({
+      commandPublicId: request.commandPublicId,
+      replay: true,
+    });
+    expect(cloud.enqueueAttempts).toBe(attempts);
+    expect(cloud.acknowledgementAttempts).toBe(1);
+    expect(custody.values.has("cloud-command-outbox")).toBe(false);
+  });
+
+  test("drains a committed legacy outbox without replaying or rebinding its enqueue", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const adapter = control(cloud, custody);
+    await authenticate(adapter);
+    const pair = await adapter.pairDevice(signal) as { device: { publicId: string } };
+    const sessionPublicId = "session_legacy_outbox_remote";
+    cloud.heads = [{
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: pair.device.publicId,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    }];
+    const request = {
+      commandPublicId: "018bcfe5-6800-7000-8000-000000000033",
+      deadline: fixedNow + 60_000,
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000034",
+      payload: { kind: "set_fast", enabled: true } as const,
+      selector: { executionDevicePublicId: pair.device.publicId, publicId: sessionPublicId },
+      signal,
+    };
+    cloud.failNextEnqueueAfterEffect = true;
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      "lost command enqueue response",
+    );
+    const legacy = await rewritePendingCommandOutbox(custody, "legacy");
+    const committed = [...cloud.commands.entries()].find(([, command]) =>
+      command.response.publicId === request.commandPublicId);
+    if (committed === undefined || typeof legacy.requestDigest !== "string") {
+      throw new Error("missing committed legacy command fixture");
+    }
+    const { requestCommitmentVersion: removedCommitmentVersion, ...legacyCommand } = committed[1];
+    if (removedCommitmentVersion !== 2) throw new Error("missing current commitment marker");
+    cloud.commands.set(committed[0], {
+      ...legacyCommand,
+      requestDigest: legacy.requestDigest,
+    });
+    const attempts = cloud.enqueueAttempts;
+
+    expect(await adapter.enqueueRemoteCommand(request)).toMatchObject({ replay: true });
+    expect(cloud.enqueueAttempts).toBe(attempts);
+    expect(custody.values.has("cloud-command-outbox")).toBe(false);
+  });
+
+  test("preserves a rolled-over current outbox until its delayed enqueue appears", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const adapter = control(cloud, custody);
+    await authenticate(adapter);
+    const pair = await adapter.pairDevice(signal) as { device: { publicId: string } };
+    const sessionPublicId = "session_outbox_rollover";
+    cloud.heads = [{
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: pair.device.publicId,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    }];
+    const request = {
+      commandPublicId: "018bcfe5-6800-7000-8000-000000000035",
+      deadline: fixedNow + 60_000,
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000036",
+      payload: { kind: "set_fast", enabled: true } as const,
+      selector: { executionDevicePublicId: pair.device.publicId, publicId: sessionPublicId },
+      signal,
+    };
+    cloud.failNextEnqueueBeforeEffect = true;
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      "enqueue unavailable before effect",
+    );
+    const retiredRequester = "device_retired_requester";
+    const rewritten = await rewritePendingCommandOutbox(custody, {
+      requestingDevicePublicId: retiredRequester,
+    });
+    const attempts = cloud.enqueueAttempts;
+    const acknowledgementAttempts = cloud.acknowledgementAttempts;
+
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      "different requesting device and may still commit",
+    );
+    expect(cloud.enqueueAttempts).toBe(attempts);
+    expect(cloud.acknowledgementAttempts).toBe(acknowledgementAttempts);
+    expect(custody.values.has("cloud-command-outbox")).toBe(true);
+
+    const envelope = parseEncryptedEnvelope(rewritten.envelope);
+    if (envelope === null || typeof rewritten.requestDigest !== "string") {
+      throw new Error("missing delayed rollover enqueue fixture");
+    }
+    cloud.commands.set(
+      `${retiredRequester}:${sessionPublicId}:set_fast:${request.idempotencyKey}`,
+      {
+        payload: envelope,
+        requestDigest: rewritten.requestDigest,
+        requestingDevicePublicId: retiredRequester,
+        response: {
+          publicId: request.commandPublicId,
+          replay: false,
+          sessionPublicId,
+          state: "pending",
+          targetDevicePublicId: pair.device.publicId,
+        },
+      },
+    );
+
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      `Recovered cloud command ${request.commandPublicId}; retry the new command.`,
+    );
+    expect(cloud.enqueueAttempts).toBe(attempts);
+    expect(cloud.acknowledgementAttempts).toBe(acknowledgementAttempts);
+    expect(custody.values.has("cloud-command-outbox")).toBe(false);
+  });
+
+  test("retires a committed old-requester outbox without rebinding or acknowledging it", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const adapter = control(cloud, custody);
+    await authenticate(adapter);
+    const pair = await adapter.pairDevice(signal) as { device: { publicId: string } };
+    const sessionPublicId = "session_committed_outbox_rollover";
+    cloud.heads = [{
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: pair.device.publicId,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    }];
+    const request = {
+      commandPublicId: "018bcfe5-6800-7000-8000-000000000037",
+      deadline: fixedNow + 60_000,
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000038",
+      payload: { kind: "set_fast", enabled: true } as const,
+      selector: { executionDevicePublicId: pair.device.publicId, publicId: sessionPublicId },
+      signal,
+    };
+    cloud.failNextEnqueueAfterEffect = true;
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      "lost command enqueue response",
+    );
+    const retiredRequester = "device_retired_requester";
+    const rewritten = await rewritePendingCommandOutbox(custody, {
+      requestingDevicePublicId: retiredRequester,
+    });
+    const committed = [...cloud.commands.entries()].find(([, command]) =>
+      command.response.publicId === request.commandPublicId);
+    if (committed === undefined || typeof rewritten.requestDigest !== "string") {
+      throw new Error("missing committed rollover command fixture");
+    }
+    const { requestCommitmentVersion: removedCommitmentVersion, ...legacyCommand } = committed[1];
+    if (removedCommitmentVersion !== 2) throw new Error("missing current commitment marker");
+    cloud.commands.set(committed[0], {
+      ...legacyCommand,
+      requestDigest: rewritten.requestDigest,
+      requestingDevicePublicId: retiredRequester,
+    });
+    const enqueueAttempts = cloud.enqueueAttempts;
+    const acknowledgementAttempts = cloud.acknowledgementAttempts;
+
+    await expect(adapter.enqueueRemoteCommand(request)).rejects.toThrow(
+      `Recovered cloud command ${request.commandPublicId}; retry the new command.`,
+    );
+    expect(cloud.enqueueAttempts).toBe(enqueueAttempts);
+    expect(cloud.acknowledgementAttempts).toBe(acknowledgementAttempts);
+    expect(cloud.commands.get(committed[0])).toMatchObject({
+      requestDigest: rewritten.requestDigest,
+      requestingDevicePublicId: retiredRequester,
+    });
+    expect(custody.values.has("cloud-command-outbox")).toBe(false);
   });
 
   test("does not dispatch a durable command after its deadline", async () => {

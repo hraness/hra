@@ -1,6 +1,7 @@
 import { lstat, realpath } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 
+import { HRA_SESSION_PREAMBLE } from "../domain/hra-preamble.ts";
 import { ClaudeError } from "./errors.ts";
 import {
   CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON,
@@ -138,7 +139,14 @@ export function buildPinnedClaudeRuntimeArgv(input: {
     ...fallbackArgument,
     "--effort",
     CLAUDE_PIN_EFFORT,
+    "--system-prompt-snapshot",
+    "on",
   ];
+}
+
+export interface ClaudeHostToolRuntimeOptions {
+  /** Absolute path to the private, session-specific MCP configuration. */
+  readonly mcpConfigPath: string;
 }
 
 // Claude Code currently reports either `x.y.z` or `x.y.z (Claude Code)`, with
@@ -310,6 +318,7 @@ export const spawnClaudeVersionProbe: ClaudeVersionProbe = async (input) => {
   } finally {
     input.signal.removeEventListener("abort", abort);
   }
+  input.signal.throwIfAborted();
   const [output, diagnostic, code] = outcome;
   void diagnostic;
   if (code !== 0) {
@@ -353,6 +362,7 @@ export async function resolvePinnedClaudeRuntime(
   }
   const environment = options.environment ?? process.env;
   const requested = options.executablePath ?? (await locateClaudeExecutable(environment));
+  signal.throwIfAborted();
   if (!isAbsolute(requested)) {
     throw new ClaudeError("INVALID_INPUT", "the Claude Code executable path must be absolute");
   }
@@ -361,7 +371,9 @@ export async function resolvePinnedClaudeRuntime(
       cause: error,
     });
   });
+  signal.throwIfAborted();
   const stat = await lstat(executablePath);
+  signal.throwIfAborted();
   if (!stat.isFile()) {
     throw new ClaudeError("RUNTIME_MISMATCH", "the Claude Code executable is not a regular file");
   }
@@ -397,5 +409,37 @@ export async function resolvePinnedClaudeRuntime(
     model: CLAUDE_PIN_MODEL,
     nativeFallback,
     version: CLAUDE_PIN,
+  };
+}
+
+/**
+ * Adds the bound HRA preamble and session-specific MCP configuration together.
+ * The configuration contains only a stdio bridge command and the path of a
+ * private binding file; the capability itself never appears in argv.
+ */
+export function withClaudeHostToolRuntime(
+  runtime: PinnedClaudeRuntime,
+  options: ClaudeHostToolRuntimeOptions,
+): PinnedClaudeRuntime {
+  if (!isAbsolute(options.mcpConfigPath) || options.mcpConfigPath.includes("\0")) {
+    throw new ClaudeError("INVALID_INPUT", "the Claude MCP configuration path must be absolute");
+  }
+  if (
+    runtime.argv.includes("--mcp-config")
+    || runtime.argv.includes("--strict-mcp-config")
+    || runtime.argv.includes("--append-system-prompt")
+  ) {
+    throw new ClaudeError("INVALID_INPUT", "the Claude runtime already has an MCP configuration");
+  }
+  return {
+    ...runtime,
+    argv: [
+      ...runtime.argv,
+      "--append-system-prompt",
+      HRA_SESSION_PREAMBLE.text,
+      "--mcp-config",
+      options.mcpConfigPath,
+      "--strict-mcp-config",
+    ],
   };
 }

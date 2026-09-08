@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { canonical40QueuesDatabaseBytes, canonical40QueuesFixture } from "../../scripts/fixtures/canonical40-queues";
+import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
 import { ATTACHMENT_CUSTODY_SCHEMA_OBJECTS } from "./attachment-custody";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
 import { StateStore } from "./state-store";
@@ -51,6 +52,8 @@ async function fixture(legacy = false) {
   const attachment = { digest: "c".repeat(64), byteLength: 4, mediaType: "text/plain" as const, name: "file.txt" };
   const input = (refs = [attachment]) => ({ kind: "session.send" as const, sessionId: session.id, idempotencyKey: randomUUID(),
     message: "input", attachments: refs, providerAuthority: authority, ...daemon });
+  const transcript = { accountId: authority.profileId, providerGeneration: authority.processGeneration,
+    providerConnectionId: "48000000-0000-4000-8000-000000000002", actor: "human" as const, message: "input" };
   const reserve = (request = input()) => {
     const result = store.reserveAttachmentIngress(request);
     if (result.kind !== "reserved") throw new Error("Expected attached custody");
@@ -59,7 +62,7 @@ async function fixture(legacy = false) {
   const prepare = () => { const value = reserve(); return { ...value, prepared: store.prepareSessionInputMutation({ ...value.request, reservation: value.reservation }) }; };
   const cleanup = () => store.cleanupAttachmentCandidate({ ...daemon, candidate: { kind: "blob", digest: attachment.digest, canonicalMediaType: "text/plain" } });
   const reopen = (readonly: boolean) => { const reopened = new StateStore(paths, { readonly, now: () => 2_000_000_000_000 }); stores.push(reopened); return reopened; };
-  return { store, paths, db, daemon, session, authority, attachment, input, reserve, prepare, cleanup, calls, reopen, historical };
+  return { store, paths, db, daemon, session, authority, attachment, input, transcript, reserve, prepare, cleanup, calls, reopen, historical };
 }
 function bypassTableGuards(db: Database, table: string, action: () => void): void {
   const guards = db.query("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?").all(table) as { name: string; sql: string }[];
@@ -71,7 +74,7 @@ describe("attachment custody immutable integrity", () => {
     const f = await fixture();
     const request = f.input([]);
     const prepared = f.store.prepareSessionInputMutation(request);
-    expect(f.db.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+    expect(f.db.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
     expect(f.db.query("SELECT COUNT(*) AS n FROM attachment_custody_slots").get()).toEqual({ n: 0 });
     expect(f.cleanup()).toEqual({ kind: "absent" });
     expect(f.reopen(true).readMutation(f.input([]).idempotencyKey)).toBeNull();
@@ -107,6 +110,7 @@ describe("attachment custody immutable integrity", () => {
     const custody = p.prepared.custody;
     if (custody.kind !== "mutation_owned") throw new Error("Expected durable custody");
     f.store.beginSessionMutationEffect({ attemptId: p.prepared.attempt.id, sessionId: f.session.id, profileGeneration: f.authority.processGeneration,
+      message: f.transcript.message, transcript: f.transcript,
       providerAuthority: f.authority, attachments: [{ ...f.attachment, canonicalMediaType: "text/plain" }], custody, ...f.daemon,
       evidence: { kind: "session.send", providerThreadId: "custody-thread", baseline: { status: "idle", activeTurnId: null, providerUpdatedAt: null },
         clientMessageId: p.prepared.attempt.id, messageDigest: createHash("sha256").update("input").digest("hex") } });
@@ -161,10 +165,12 @@ describe("attachment custody immutable integrity", () => {
       mutations: f.db.query("SELECT * FROM mutation_attempts ORDER BY id").all(),
       sessions: f.db.query("SELECT * FROM sessions ORDER BY id").all() });
     const before = snapshot();
-    expect(() => f.reopen(false)).toThrow("ATTACHMENT_CUSTODY_CORRUPT");
-    expect(() => f.reopen(true)).toThrow("ATTACHMENT_CUSTODY_CORRUPT");
+    // Current joined schema admission detects the missing guard footprint
+    // before the later custody row audit; neither path repairs the damage.
+    expect(() => f.reopen(false)).toThrow("RETIRED_PROVIDER_ADMISSION_SCHEMA_INVALID");
+    expect(() => f.reopen(true)).toThrow("RETIRED_PROVIDER_ADMISSION_SCHEMA_INVALID");
     expect(snapshot()).toEqual(before);
-    expect(f.db.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+    expect(f.db.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
   });
 
   test("a missing parent cannot free its live slot or its original global key", async () => {
@@ -200,10 +206,17 @@ describe("attachment custody immutable integrity", () => {
     f.db.query("INSERT INTO attachments(digest,media_type,byte_length,created_at,reference_count) VALUES(?,'text/plain',4,1,0)").run(f.attachment.digest);
     f.db.query("INSERT INTO message_attachments(session_id,source_id,position,digest,name,media_type,byte_length,created_at) VALUES(?,?,0,?,'evil.txt','text/plain',4,1)")
       .run(f.session.id, p.prepared.attempt.id, f.attachment.digest);
+    const snapshot = () => ({ attempts: f.db.query("SELECT * FROM mutation_attempts ORDER BY id").all(),
+      evidence: f.db.query("SELECT * FROM mutation_effect_evidence ORDER BY attempt_id").all(),
+      manifest: f.db.query("SELECT * FROM message_attachments ORDER BY session_id,source_id,position").all(),
+      accounting: f.db.query("SELECT * FROM attachments ORDER BY digest").all() });
+    const before = snapshot();
     expect(() => f.store.beginSessionMutationEffect({ attemptId: p.prepared.attempt.id, sessionId: f.session.id, profileGeneration: f.authority.processGeneration,
+      message: f.transcript.message, transcript: f.transcript,
       providerAuthority: f.authority, attachments, custody, ...f.daemon,
       evidence: { kind: "session.send", providerThreadId: "custody-thread", baseline: { status: "idle", activeTurnId: null, providerUpdatedAt: null },
-        clientMessageId: p.prepared.attempt.id, messageDigest: createHash("sha256").update("input").digest("hex") } })).toThrow("ATTACHMENT_CUSTODY_CORRUPT");
+        clientMessageId: p.prepared.attempt.id, messageDigest: createHash("sha256").update("input").digest("hex") } })).toThrow("MESSAGE_ATTACHMENT_IDENTITY_CONFLICT");
+    expect(snapshot()).toEqual(before);
     expect(f.db.query("SELECT state FROM mutation_attempts WHERE id=?").get(p.prepared.attempt.id)).toEqual({ state: "prepared" });
     expect(f.db.query("SELECT 1 FROM mutation_effect_evidence WHERE attempt_id=?").get(p.prepared.attempt.id)).toBeNull();
   });
@@ -264,6 +277,7 @@ describe("attachment custody immutable integrity", () => {
     const custody = p.prepared.custody;
     if (custody.kind !== "mutation_owned") throw new Error("Expected retained input");
     f.store.beginSessionMutationEffect({ attemptId: p.prepared.attempt.id, sessionId: f.session.id, profileGeneration: f.authority.processGeneration,
+      message: f.transcript.message, transcript: f.transcript,
       providerAuthority: f.authority, attachments: [{ ...f.attachment, canonicalMediaType: "text/plain" }], custody, ...f.daemon,
       evidence: { kind: "session.send", providerThreadId: "custody-thread", baseline: { status: "idle", activeTurnId: null, providerUpdatedAt: null },
         clientMessageId: p.prepared.attempt.id, messageDigest: createHash("sha256").update("input").digest("hex") } });
@@ -284,11 +298,29 @@ describe("attachment custody immutable integrity", () => {
       else {
         const custody = p.prepared.custody;
         if (custody.kind !== "mutation_owned") throw new Error("Expected retained input");
+        const { preset, requirement } = f.store.requireSessionPresetRequirement(f.session.id);
+        const runtimeProfile = effectiveRuntimeProfileSchema.parse({
+          profileId: f.authority.profileId, processGeneration: f.authority.processGeneration, observedAt: f.session.updatedAt,
+          preset, model: requirement.model, reasoningEffort: requirement.effort, serviceTier: null, fast: false,
+          approvalPolicy: "on-request", reviewMode: "auto_review", permissionProfile: ":workspace",
+          computerUse: true, pluginCapability: true, enabledApps: [],
+        });
         f.store.beginSessionMutationEffect({ attemptId: p.prepared.attempt.id, sessionId: f.session.id, profileGeneration: f.authority.processGeneration,
+          message: f.transcript.message, transcript: f.transcript,
           providerAuthority: f.authority, attachments: [{ ...f.attachment, canonicalMediaType: "text/plain" }], custody, ...f.daemon,
           evidence: { kind: "session.send", providerThreadId: "custody-thread", baseline: { status: "idle", activeTurnId: null, providerUpdatedAt: null },
-            clientMessageId: p.prepared.attempt.id, messageDigest: createHash("sha256").update("input").digest("hex") } });
-        f.store.transitionMutation(p.prepared.attempt.id, "effect_started", "applied", { turnId: "accepted-turn", sourceId: p.prepared.attempt.id });
+            clientMessageId: p.prepared.attempt.id, runtimeProfile, messageDigest: createHash("sha256").update("input").digest("hex") } });
+        // An applied flag alone intentionally retains the pending transcript
+        // hold. Real completion proves the turn and finalizes that source.
+        const completed = f.store.completeSessionTurnEffect({
+          attemptId: p.prepared.attempt.id, sessionId: f.session.id, accountId: f.authority.profileId,
+          providerGeneration: f.authority.processGeneration, providerAuthority: f.authority,
+          providerConnectionId: f.transcript.providerConnectionId, expectedSessionRevision: f.session.revision,
+          applyResponseState: true, runtimeProfile, message: f.transcript.message,
+          turnId: "accepted-turn", turnStatus: "completed", receipt: { turnId: "accepted-turn", sourceId: p.prepared.attempt.id },
+        });
+        expect(completed.event.body).toMatchObject({ type: "user_message", actor: "human", attachments: [f.attachment] });
+        expect(f.store.readSessionUserMessageSource(f.session.id, "mutation", p.request.idempotencyKey).status).toBe("finalized");
       }
       const before = f.store.readMutation(p.request.idempotencyKey);
       const bootId = `boot_${randomUUID().replaceAll("-", "")}`;
@@ -345,7 +377,8 @@ describe("attachment custody immutable integrity", () => {
     const f = await fixture();
     const request = { ...f.input(), kind: "session.queue" as const };
     const queueInput = { sessionId: f.session.id, profileGeneration: f.authority.processGeneration, providerAuthority: f.authority,
-      idempotencyKey: request.idempotencyKey, message: request.message, attachments: [{ ...f.attachment, canonicalMediaType: "text/plain" as const }] };
+      idempotencyKey: request.idempotencyKey, message: request.message, attachments: request.attachments,
+      storedAttachments: [{ ...f.attachment, canonicalMediaType: "text/plain" as const }] };
     expect(() => f.store.enqueueIdempotent(queueInput)).toThrow("ATTACHMENT_CUSTODY_UNPROVED");
     expect(f.store.readMutation(request.idempotencyKey)).toBeNull();
     expect(f.db.query("SELECT COUNT(*) AS n FROM queue_entries").get()).toEqual({ n: 0 });
@@ -365,7 +398,8 @@ describe("attachment custody immutable integrity", () => {
     const reserved = f.store.reserveAttachmentIngress(request);
     if (reserved.kind !== "reserved") throw new Error("Expected queue invocation");
     const queue = f.store.enqueueIdempotent({ sessionId: f.session.id, profileGeneration: f.authority.processGeneration, providerAuthority: f.authority,
-      idempotencyKey: request.idempotencyKey, message: request.message, attachments: [{ ...f.attachment, canonicalMediaType: "text/plain" }],
+      idempotencyKey: request.idempotencyKey, message: request.message, attachments: request.attachments,
+      storedAttachments: [{ ...f.attachment, canonicalMediaType: "text/plain" }],
       attachmentReservation: { ...reserved, ...f.daemon } });
     const identity = f.db.query("SELECT * FROM queue_attachment_identities WHERE queue_id=?").get(queue.id) as {
       queue_id: string; attempt_id: string; original_key: string; session_id: string; identity_json: string; identity_digest: string };
@@ -383,7 +417,8 @@ describe("attachment custody immutable integrity", () => {
     if (reserved.kind !== "reserved") throw new Error("Expected queue invocation");
     f.db.exec("CREATE TRIGGER fail_custody_transfer BEFORE INSERT ON attachment_custody_dispositions WHEN NEW.kind='queue_transferred' BEGIN SELECT RAISE(ABORT,'injected transfer failure'); END");
     expect(() => f.store.enqueueIdempotent({ sessionId: f.session.id, profileGeneration: f.authority.processGeneration, providerAuthority: f.authority,
-      idempotencyKey: request.idempotencyKey, message: request.message, attachments: [{ ...f.attachment, canonicalMediaType: "text/plain" }],
+      idempotencyKey: request.idempotencyKey, message: request.message, attachments: request.attachments,
+      storedAttachments: [{ ...f.attachment, canonicalMediaType: "text/plain" }],
       attachmentReservation: { ...reserved, ...f.daemon } })).toThrow("injected transfer failure");
     for (const table of ["queue_entries", "queue_attachment_identities", "queue_attachment_identity_anchors", "message_attachments", "mutation_attempts"])
       expect(f.db.query(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: 0 });

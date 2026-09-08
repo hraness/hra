@@ -9,19 +9,38 @@ import {
   requireDeviceAuthority,
 } from "./authority";
 import { commandTerminalRetentionMs } from "./commands";
-import { ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS } from "./lifecyclePolicy";
+import {
+  abandonDeviceCommandReceiptForRevokedRequester,
+  abandonSessionCommandReceiptForRevokedRequester,
+  terminalizeDeviceCommandWithLifecycleCapacity,
+  terminalizeSessionCommandWithLifecycleCapacity,
+} from "./commandLifecycle";
+import {
+  ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS,
+  type HOSTED_TABLE_LIFECYCLE,
+} from "./lifecyclePolicy";
 import { attentionNotificationQuotaReservations } from "./attentionNotifications";
+import {
+  patchDeviceRevocationJobWithCapacity,
+} from "./jobLifecycleCapacity";
 import {
   adjustCommandQuotaForPatch,
   adjustQuotaForPatch,
+  logicalDocumentBytes,
   releaseQuotaForDelete,
 } from "./quota";
 import {
   internalMutation,
   query,
+  type DataModel,
   type MutationCtx,
   type QueryCtx,
 } from "./server";
+import {
+  commandLifecycleCapacityVersion,
+  commandReceiptCapacityReservation,
+  maximumCommandLifecycleBatch,
+} from "./validators";
 
 const maximumRevocationBatch = 200;
 
@@ -40,6 +59,7 @@ type RevocationCategory = typeof revocationCategoryOrder[number];
 type ReadCtx = Pick<QueryCtx, "db"> | Pick<MutationCtx, "db">;
 
 type CleanupResult = Readonly<{
+  blocked?: boolean;
   processed: number;
 }>;
 
@@ -47,6 +67,74 @@ export const DEVICE_REVOCATION_SCHEMA_GAPS = Object.freeze([] as const);
 export const DEVICE_REVOCATION_RETAINED_SERVICE_TABLES = Object.freeze([
   "attentionNotificationSafetyFaults",
 ] as const);
+
+export const DEVICE_REVOCATION_TABLE_STRATEGY = {
+  users: "not_device_owned",
+  authSessions: "not_device_owned",
+  authAccounts: "not_device_owned",
+  authRefreshTokens: "not_device_owned",
+  authVerificationCodes: "not_device_owned",
+  authVerifiers: "not_device_owned",
+  authRateLimits: "not_device_owned",
+  authSubjects: "not_device_owned",
+  authEmailAttemptEvents: "not_device_owned",
+  authOtpChallenges: "not_device_owned",
+  authInvites: "not_device_owned",
+  devices: "target_row_retained_revoked",
+  accountDeletionIdentityReservations: "not_device_owned",
+  accountDeletionJobReservations: "not_device_owned",
+  deviceRevocationDeviceReservations: "target_revocation_capacity_consumed",
+  deviceRevocationJobReservations: "target_revocation_capacity_consumed",
+  deviceRevocationSecurityReservations: "target_revocation_capacity_consumed",
+  deviceRevocationReceiptReservations: "target_revocation_capacity_consumed",
+  deviceSessions: "target_custody_deleted",
+  deviceBindChallenges: "target_custody_deleted",
+  deviceKeyEnvelopes: "target_custody_deleted",
+  recoveryEnvelopes: "not_device_owned",
+  devicePresence: "target_presence_deleted",
+  deviceRegistries: "target_custody_deleted",
+  memorySpaces: "not_device_owned",
+  memoryOperations: "source_attribution_retained",
+  sessionHeads: "target_sessions_orphaned",
+  sessionChunks: "source_attribution_retained",
+  sessionStreamEpochs: "source_attribution_retained",
+  executionLeases: "target_lease_deleted",
+  sessionCommands: "target_commands_terminalized",
+  deviceCommands: "target_commands_terminalized",
+  commandLifecycleReservations: "target_commands_terminalized",
+  commandTerminalSecurityReservations: "target_commands_terminalized",
+  attentionNotificationOutbox: "target_notifications_suppressed",
+  attentionNotificationSafetyFaults: "service_retained",
+  codexAccounts: "not_device_owned",
+  deviceAccountBindings: "target_binding_deleted",
+  accountUsageSnapshots: "source_attribution_retained",
+  idempotencyReceipts: "source_attribution_retained",
+  securityEvents: "source_attribution_retained",
+  accountDeletionJobs: "not_device_owned",
+  accountDeletionReceipts: "not_device_owned",
+  deviceRevocationJobs: "revocation_job",
+  storageUsageByUser: "not_device_owned",
+  storageUsageService: "service_retained",
+  serviceControl: "service_retained",
+  storageResourceUsageByUser: "not_device_owned",
+  storageResourceUsageByAccount: "not_device_owned",
+  maintenanceState: "service_retained",
+} as const satisfies Readonly<Record<
+  keyof typeof HOSTED_TABLE_LIFECYCLE,
+  | "not_device_owned"
+  | "revocation_job"
+  | "service_retained"
+  | "source_attribution_retained"
+  | "target_binding_deleted"
+  | "target_commands_terminalized"
+  | "target_custody_deleted"
+  | "target_lease_deleted"
+  | "target_notifications_suppressed"
+  | "target_presence_deleted"
+  | "target_row_retained_revoked"
+  | "target_revocation_capacity_consumed"
+  | "target_sessions_orphaned"
+>>;
 
 function rejectRevocation(): never {
   throw new Error("Device revocation status is unavailable.");
@@ -76,35 +164,6 @@ function nextCategory(category: RevocationCategory): RevocationCategory {
 
 function nextUpdateTime(previous: number): number {
   return Math.max(Date.now(), previous + 1);
-}
-
-async function orphanSessions(
-  ctx: MutationCtx,
-  deviceId: Id<"devices">,
-  userId: Id<"users">,
-  limit: number,
-): Promise<CleanupResult> {
-  const active = await ctx.db.query("sessionHeads")
-    .withIndex("by_execution_device_and_state", (builder) => builder
-      .eq("executionDeviceId", deviceId)
-      .eq("state", "active"))
-    .take(limit);
-  const remaining = limit - active.length;
-  const idle = remaining === 0
-    ? []
-    : await ctx.db.query("sessionHeads")
-      .withIndex("by_execution_device_and_state", (builder) => builder
-        .eq("executionDeviceId", deviceId)
-        .eq("state", "idle"))
-      .take(remaining);
-  const sessions = [...active, ...idle];
-  const now = Date.now();
-  for (const session of sessions) {
-    const sessionPatch = { state: "orphaned" as const, updatedAt: now };
-    await adjustQuotaForPatch(ctx, userId, "session", session, sessionPatch);
-    await ctx.db.patch(session._id, sessionPatch);
-  }
-  return { processed: sessions.length };
 }
 
 async function deleteLeases(
@@ -143,21 +202,24 @@ async function terminalizeCommands(
     userId: Id<"users">;
   }>,
 ): Promise<CleanupResult> {
+  const commandLimit = Math.min(input.limit, maximumCommandLifecycleBatch);
   const targeted = await ctx.db.query("sessionCommands")
-    .withIndex("by_target_nonterminal_and_created_at", (builder) => builder
+    .withIndex("by_target_nonterminal_capacity_and_created_at", (builder) => builder
       .eq("targetDeviceId", input.deviceId)
-      .eq("nonterminal", true))
-    .take(input.limit);
-  let remaining = input.limit - targeted.length;
+      .eq("nonterminal", true)
+      .eq("lifecycleCapacityVersion", commandLifecycleCapacityVersion))
+    .take(commandLimit);
+  let remaining = commandLimit - targeted.length;
 
   // A revoked requester can no longer acknowledge or cancel commands that it
   // sent to another device. Include those effects in the revocation drain.
   const requestedCandidates = remaining === 0
     ? []
     : await ctx.db.query("sessionCommands")
-      .withIndex("by_requesting_device_and_nonterminal", (builder) => builder
+      .withIndex("by_requesting_device_nonterminal_capacity_and_created_at", (builder) => builder
         .eq("requestingDeviceId", input.deviceId)
-        .eq("nonterminal", true))
+        .eq("nonterminal", true)
+        .eq("lifecycleCapacityVersion", commandLifecycleCapacityVersion))
       .take(remaining);
   const targetedIds = new Set(targeted.map((command) => String(command._id)));
   const requested = requestedCandidates.filter((command) =>
@@ -170,47 +232,166 @@ async function terminalizeCommands(
   const targetedDevice = remaining === 0
     ? []
     : await ctx.db.query("deviceCommands")
-      .withIndex("by_target_nonterminal_and_created_at", (builder) => builder
+      .withIndex("by_target_nonterminal_capacity_and_created_at", (builder) => builder
         .eq("targetDeviceId", input.deviceId)
-        .eq("nonterminal", true))
+        .eq("nonterminal", true)
+        .eq("lifecycleCapacityVersion", commandLifecycleCapacityVersion))
       .take(remaining);
   remaining -= targetedDevice.length;
   const requestedDeviceCandidates = remaining === 0
     ? []
     : await ctx.db.query("deviceCommands")
-      .withIndex("by_requesting_device_and_nonterminal", (builder) => builder
+      .withIndex("by_requesting_device_nonterminal_capacity_and_created_at", (builder) => builder
         .eq("requestingDeviceId", input.deviceId)
-        .eq("nonterminal", true))
+        .eq("nonterminal", true)
+        .eq("lifecycleCapacityVersion", commandLifecycleCapacityVersion))
       .take(remaining);
   const targetedDeviceIds = new Set(targetedDevice.map((command) => String(command._id)));
   const requestedDevice = requestedDeviceCandidates.filter((command) =>
     !targetedDeviceIds.has(String(command._id)));
   remaining -= requestedDevice.length;
 
-  const records = [...targeted, ...requested, ...targetedDevice, ...requestedDevice];
+  const sessionRecords = [...targeted, ...requested];
+  const deviceRecords = [...targetedDevice, ...requestedDevice];
   const now = Date.now();
-  for (const command of records) {
+  for (const command of sessionRecords) {
     if (command.state === "pending" || command.state === "prepared") {
       const commandPatch = {
         ...revokedCommandTerminalFields(command, now),
         state: "cancelled" as const,
         updatedAt: now,
       };
-      await adjustCommandQuotaForPatch(ctx, input.userId, command, commandPatch);
-      await ctx.db.patch(command._id, commandPatch);
+      await terminalizeSessionCommandWithLifecycleCapacity(ctx, command, commandPatch);
     } else if (command.state === "effect_started") {
       const commandPatch = {
         ...revokedCommandTerminalFields(command, now),
         state: "ambiguous" as const,
         updatedAt: now,
       };
-      await adjustCommandQuotaForPatch(ctx, input.userId, command, commandPatch);
-      await ctx.db.patch(command._id, commandPatch);
+      await terminalizeSessionCommandWithLifecycleCapacity(ctx, command, commandPatch, {
+        actorDeviceId: command.targetDeviceId,
+        createdAt: now,
+        entityId: command.publicId,
+        event: "command_terminal",
+        userId: command.userId,
+      });
     } else {
       rejectRevocation();
     }
   }
-  return { processed: records.length };
+  for (const command of deviceRecords) {
+    if (command.state === "pending" || command.state === "prepared") {
+      const commandPatch = {
+        ...revokedCommandTerminalFields(command, now),
+        state: "cancelled" as const,
+        updatedAt: now,
+      };
+      await terminalizeDeviceCommandWithLifecycleCapacity(ctx, command, commandPatch);
+    } else if (command.state === "effect_started") {
+      const commandPatch = {
+        ...revokedCommandTerminalFields(command, now),
+        state: "ambiguous" as const,
+        updatedAt: now,
+      };
+      await terminalizeDeviceCommandWithLifecycleCapacity(ctx, command, commandPatch, {
+        actorDeviceId: command.targetDeviceId,
+        createdAt: now,
+        entityId: command.publicId,
+        event: "command_terminal",
+        userId: command.userId,
+      });
+    } else {
+      rejectRevocation();
+    }
+  }
+  const terminalSessionCommands = remaining === 0
+    ? []
+    : await ctx.db.query("sessionCommands")
+      .withIndex(
+        "by_requesting_device_nonterminal_acknowledgement_and_cleanup",
+        (builder) => builder
+        .eq("requestingDeviceId", input.deviceId)
+        .eq("nonterminal", false)
+        .eq("requesterAcknowledgedAt", undefined)
+        .eq("terminalCleanupAfter", undefined)
+        .eq("receiptCapacityReservation", commandReceiptCapacityReservation),
+      )
+      .take(remaining);
+  for (const command of terminalSessionCommands) {
+    if (command.nonterminal) rejectRevocation();
+    await abandonSessionCommandReceiptForRevokedRequester(
+      ctx,
+      command,
+      now,
+      now + commandTerminalRetentionMs,
+    );
+  }
+  remaining -= terminalSessionCommands.length;
+  const terminalDeviceCommands = remaining === 0
+    ? []
+    : await ctx.db.query("deviceCommands")
+      .withIndex(
+        "by_requesting_device_nonterminal_acknowledgement_and_cleanup",
+        (builder) => builder
+        .eq("requestingDeviceId", input.deviceId)
+        .eq("nonterminal", false)
+        .eq("requesterAcknowledgedAt", undefined)
+        .eq("terminalCleanupAfter", undefined)
+        .eq("receiptCapacityReservation", commandReceiptCapacityReservation),
+      )
+      .take(remaining);
+  for (const command of terminalDeviceCommands) {
+    if (command.nonterminal) rejectRevocation();
+    await abandonDeviceCommandReceiptForRevokedRequester(
+      ctx,
+      command,
+      now,
+      now + commandTerminalRetentionMs,
+    );
+  }
+  const processed = sessionRecords.length
+    + deviceRecords.length
+    + terminalSessionCommands.length
+    + terminalDeviceCommands.length;
+  if (processed === 0) {
+    // Capacity-backed work is always drained first. Once that work is gone,
+    // keep the job durably parked on this category while any pre-rollout
+    // command remains. Advancing would strand prepared/effect-started work
+    // forever because the revoked target can no longer execute it. The
+    // operator's bounded reserveExisting repair observes the revoked
+    // relationship and terminalizes one such row atomically; the next drain
+    // then either finds another legacy row or advances normally.
+    const legacy = await Promise.all([
+      ctx.db.query("sessionCommands")
+        .withIndex("by_target_nonterminal_capacity_and_created_at", (builder) => builder
+          .eq("targetDeviceId", input.deviceId)
+          .eq("nonterminal", true)
+          .eq("lifecycleCapacityVersion", undefined))
+        .first(),
+      ctx.db.query("sessionCommands")
+        .withIndex("by_requesting_device_nonterminal_capacity_and_created_at", (builder) => builder
+          .eq("requestingDeviceId", input.deviceId)
+          .eq("nonterminal", true)
+          .eq("lifecycleCapacityVersion", undefined))
+        .first(),
+      ctx.db.query("deviceCommands")
+        .withIndex("by_target_nonterminal_capacity_and_created_at", (builder) => builder
+          .eq("targetDeviceId", input.deviceId)
+          .eq("nonterminal", true)
+          .eq("lifecycleCapacityVersion", undefined))
+        .first(),
+      ctx.db.query("deviceCommands")
+        .withIndex("by_requesting_device_nonterminal_capacity_and_created_at", (builder) => builder
+          .eq("requestingDeviceId", input.deviceId)
+          .eq("nonterminal", true)
+          .eq("lifecycleCapacityVersion", undefined))
+        .first(),
+    ]);
+    if (legacy.some((command) => command !== null)) {
+      return { blocked: true, processed: 0 };
+    }
+  }
+  return { processed };
 }
 
 async function suppressAttentionNotifications(
@@ -358,13 +539,19 @@ async function cleanCategory(
   input: Readonly<{
     category: RevocationCategory;
     deviceId: Id<"devices">;
+    job: DataModel["deviceRevocationJobs"]["document"];
     limit: number;
     userId: Id<"users">;
   }>,
 ): Promise<CleanupResult> {
   switch (input.category) {
     case "sessions":
-      return await orphanSessions(ctx, input.deviceId, input.userId, input.limit);
+      // A revoked execution device is durable orphan authority: it cannot
+      // authenticate, acquire a lease, append, or receive a new command.
+      // Public session reads project active/idle stored spellings as orphaned.
+      // Avoiding a write here makes this category exactly non-growing even at
+      // the legal 10k-head + 10k-lease session record ceiling.
+      return { processed: 0 };
     case "leases":
       return await deleteLeases(ctx, input.deviceId, input.userId, input.limit);
     case "commands":
@@ -396,7 +583,7 @@ export const status = query({
       || target.revokedAt === undefined
     ) rejectRevocation();
     return {
-      category: job.category,
+      category: job.state === "complete" ? "complete" : job.category,
       createdAt: job.createdAt,
       jobId: job.publicId,
       state: job.state,
@@ -436,11 +623,60 @@ export const drain = internalMutation({
       || target.revokedAt === undefined
     ) rejectRevocation();
 
+    // Pre-capacity jobs cannot safely grow their persisted category/state at
+    // a hard quota ceiling. Re-scan the bounded remaining suffix on each turn,
+    // mutating only dependent rows and a fixed-width timestamp. Once the
+    // suffix is empty, the shortest schema-valid completed representation is
+    // retained; public status projects its category as complete below.
+    if (job.capacityReservation === undefined) {
+      let legacyCategory = job.category;
+      while (legacyCategory !== "complete") {
+        const result = await cleanCategory(ctx, {
+          category: legacyCategory,
+          deviceId: job.deviceId,
+          job,
+          limit,
+          userId: job.userId,
+        });
+        if (result.processed > 0 || result.blocked === true) {
+          const jobPatch = { updatedAt: nextUpdateTime(job.updatedAt) };
+          await adjustQuotaForPatch(ctx, job.userId, "job", job, jobPatch);
+          await ctx.db.patch(job._id, jobPatch);
+          return {
+            category: legacyCategory,
+            ...(result.blocked === true ? { blocked: true } : {}),
+            jobId: job.publicId,
+            kind: "drained" as const,
+            processed: result.processed,
+            state: job.state,
+          };
+        }
+        legacyCategory = nextCategory(legacyCategory);
+      }
+      const updatedAt = nextUpdateTime(job.updatedAt);
+      const jobPatch = {
+        category: "leases" as const,
+        state: "complete" as const,
+        updatedAt,
+      };
+      if (logicalDocumentBytes({ ...job, ...jobPatch }) > logicalDocumentBytes(job)) {
+        throw new Error("Device revocation capacity is corrupt.");
+      }
+      await adjustQuotaForPatch(ctx, job.userId, "job", job, jobPatch);
+      await ctx.db.patch(job._id, jobPatch);
+      return {
+        category: "complete" as const,
+        jobId: job.publicId,
+        kind: "complete" as const,
+        processed: 0,
+        state: "complete" as const,
+      };
+    }
+
     if (job.category === "complete") {
       const updatedAt = nextUpdateTime(job.updatedAt);
       const jobPatch = { state: "complete" as const, updatedAt };
-      await adjustQuotaForPatch(ctx, job.userId, "job", job, jobPatch);
-      await ctx.db.patch(job._id, jobPatch);
+      await patchDeviceRevocationJobWithCapacity(ctx, job, jobPatch);
       return {
         category: "complete" as const,
         jobId: job.publicId,
@@ -453,16 +689,17 @@ export const drain = internalMutation({
     const result = await cleanCategory(ctx, {
       category: job.category,
       deviceId: job.deviceId,
+      job,
       limit,
       userId: job.userId,
     });
     const updatedAt = nextUpdateTime(job.updatedAt);
-    if (result.processed > 0) {
+    if (result.processed > 0 || result.blocked === true) {
       const jobPatch = { state: "draining" as const, updatedAt };
-      await adjustQuotaForPatch(ctx, job.userId, "job", job, jobPatch);
-      await ctx.db.patch(job._id, jobPatch);
+      await patchDeviceRevocationJobWithCapacity(ctx, job, jobPatch);
       return {
         category: job.category,
+        ...(result.blocked === true ? { blocked: true } : {}),
         jobId: job.publicId,
         kind: "drained" as const,
         processed: result.processed,
@@ -473,8 +710,7 @@ export const drain = internalMutation({
     const category = nextCategory(job.category);
     const state = category === "complete" ? "complete" as const : "draining" as const;
     const jobPatch = { category, state, updatedAt };
-    await adjustQuotaForPatch(ctx, job.userId, "job", job, jobPatch);
-    await ctx.db.patch(job._id, jobPatch);
+    await patchDeviceRevocationJobWithCapacity(ctx, job, jobPatch);
     return {
       category,
       jobId: job.publicId,

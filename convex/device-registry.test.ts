@@ -6,7 +6,9 @@ import { convexTest } from "convex-test";
 import { cloudLimits } from "../src/cloud/contracts";
 import { expectPromiseToReject } from "../src/cloud/testAssertions";
 import {
+  CATEGORY_QUOTAS,
   initializeUserQuotaAuthority,
+  logicalDocumentBytes,
   reserveQuotaForStoredIdentity,
 } from "./quota";
 import schema from "./schema";
@@ -22,6 +24,9 @@ type RegistryRow = Readonly<{
   devicePublicId: string;
   envelope: Readonly<{ ciphertext: string; keyVersion: number }>;
   keyVersion: number;
+  memorySummaryEnvelope?: Readonly<{ ciphertext: string; keyVersion: number }>;
+  memorySummaryRevision?: number;
+  memorySummaryUpdatedAt?: number;
   notificationEmailEnvelope?: Readonly<{ ciphertext: string; keyVersion: number }>;
   notificationHoursEnvelope?: Readonly<{ ciphertext: string; keyVersion: number }>;
   notificationPolicyRevision?: number;
@@ -31,6 +36,9 @@ type RegistryRow = Readonly<{
 
 const updateRegistry = makeFunctionReference<"mutation", Args, RegistryWrite>(
   "devices:updateRegistry",
+);
+const updateMemorySummary = makeFunctionReference<"mutation", Args, RegistryWrite>(
+  "devices:updateMemorySummary",
 );
 const getRegistry = makeFunctionReference<"query", Args, RegistryRow | null>(
   "devices:getRegistry",
@@ -86,6 +94,7 @@ async function registryWorld() {
   const enrollDevice = async (
     label: string,
     userId: Id<"users">,
+    deviceClass: "browser" | "daemon" = "daemon",
   ): Promise<Identity> => await testRuntime.run(async (ctx) => {
     const authSessionId = await ctx.db.insert("authSessions", {
       expirationTime: now + 3_600_000,
@@ -97,6 +106,7 @@ async function registryWorld() {
       authEpoch: 1,
       createdAt: now,
       credentialGeneration: 1,
+      ...(deviceClass === "daemon" ? {} : { deviceClass }),
       encryptedLabel: labelEnvelope,
       keyVersion: 1,
       publicId: devicePublicId,
@@ -127,6 +137,39 @@ async function registryWorld() {
 }
 
 describe("device registry", () => {
+  test("keeps command capability internal and clears it when an old daemon republishes", async () => {
+    const world = await registryWorld();
+    const primary = await world.enrollDevice("command-capability", await world.enrollUser(
+      "command-capability",
+    ));
+    const runtime = world.asDevice(primary);
+
+    await runtime.mutation(updateRegistry, {
+      commandRequestVersion: 2,
+      envelope: envelopeWith("C".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
+    expect(await world.testRuntime.run(async (ctx) =>
+      (await ctx.db.query("deviceRegistries").unique())?.commandRequestVersion)).toBe(2);
+    expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
+      .not.toHaveProperty("commandRequestVersion");
+    const listed = await runtime.query(listRegistries, {});
+    expect(listed[0]).not.toHaveProperty("commandRequestVersion");
+
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("D".repeat(48)),
+      expectedRevision: 1,
+      keyVersion: 1,
+    });
+    const downgraded = await world.testRuntime.run(async (ctx) =>
+      await ctx.db.query("deviceRegistries").unique());
+    expect(downgraded).not.toBeNull();
+    expect(downgraded).not.toHaveProperty("commandRequestVersion");
+    expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
+      .toMatchObject({ revision: 2 });
+  });
+
   test("advances an exact revision chain for the calling device", async () => {
     const world = await registryWorld();
     const primary = await world.enrollDevice("primary", await world.enrollUser("primary"));
@@ -184,6 +227,174 @@ describe("device registry", () => {
     });
     expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
       .not.toHaveProperty("notificationHoursEnvelope");
+  });
+
+  test("keeps memory supervision on an independent revision while core updates preserve it", async () => {
+    const world = await registryWorld();
+    const primary = await world.enrollDevice("memory", await world.enrollUser("memory"));
+    const runtime = world.asDevice(primary);
+    const summary = envelopeWith("S".repeat(48));
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("M".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
+    await runtime.mutation(updateMemorySummary, {
+      envelope: summary,
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
+    expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
+      .toMatchObject({
+        memorySummaryEnvelope: summary,
+        memorySummaryRevision: 1,
+        memorySummaryUpdatedAt: expect.any(Number),
+        revision: 1,
+      });
+    await expectPromiseToReject(
+      runtime.mutation(updateMemorySummary, {
+        envelope: envelopeWith("T".repeat(48)),
+        expectedRevision: 0,
+        keyVersion: 1,
+      }),
+      "MEMORY_SUMMARY_REVISION_CONFLICT",
+    );
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("N".repeat(48)),
+      expectedRevision: 1,
+      keyVersion: 1,
+    });
+    const preserved = await runtime.query(getRegistry, {
+      devicePublicId: primary.devicePublicId,
+    });
+    expect(preserved).toMatchObject({
+      memorySummaryEnvelope: summary,
+      memorySummaryRevision: 1,
+      revision: 2,
+    });
+    await runtime.mutation(updateMemorySummary, {
+      expectedRevision: 1,
+      keyVersion: 1,
+    });
+    const cleared = await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId });
+    expect(cleared).toMatchObject({ memorySummaryRevision: 2, revision: 2 });
+    expect(cleared).not.toHaveProperty("memorySummaryEnvelope");
+  });
+
+  test("charges and releases the memory summary through registry custody quota", async () => {
+    const world = await registryWorld();
+    const primary = await world.enrollDevice("memory-quota", await world.enrollUser("memory-quota"));
+    const runtime = world.asDevice(primary);
+    const accounting = async () => await world.testRuntime.run(async (ctx) => {
+      const registry = await ctx.db.query("deviceRegistries").unique();
+      const quota = await ctx.db.query("storageUsageByUser")
+        .withIndex("by_user_and_category", (builder) => builder
+          .eq("userId", primary.userId)
+          .eq("category", "custody"))
+        .unique();
+      if (registry === null || quota === null) throw new Error("missing registry quota fixture");
+      const document: Record<string, Value | undefined> = {};
+      for (const [key, value] of Object.entries(registry)) {
+        if (key !== "_creationTime" && key !== "_id") document[key] = value;
+      }
+      return { documentBytes: logicalDocumentBytes(document), quotaBytes: quota.logicalBytes };
+    });
+
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("M".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
+    const withoutSummary = await accounting();
+    await runtime.mutation(updateMemorySummary, {
+      envelope: envelopeWith("S".repeat(1_024)),
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
+    const withSummary = await accounting();
+    expect(withSummary.quotaBytes - withoutSummary.quotaBytes)
+      .toBe(withSummary.documentBytes - withoutSummary.documentBytes);
+    expect(withSummary.quotaBytes).toBeGreaterThan(withoutSummary.quotaBytes);
+
+    await runtime.mutation(updateMemorySummary, {
+      expectedRevision: 1,
+      keyVersion: 1,
+    });
+    const cleared = await accounting();
+    expect(cleared.quotaBytes - withSummary.quotaBytes)
+      .toBe(cleared.documentBytes - withSummary.documentBytes);
+    expect(cleared.quotaBytes).toBeLessThan(withSummary.quotaBytes);
+  });
+
+  test("a summary quota refusal leaves the core registry revision independently writable", async () => {
+    const world = await registryWorld();
+    const primary = await world.enrollDevice("summary-refusal", await world.enrollUser("summary-refusal"));
+    const runtime = world.asDevice(primary);
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("M".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
+    await world.testRuntime.run(async (ctx) => {
+      const custody = await ctx.db.query("storageUsageByUser")
+        .withIndex("by_user_and_category", (builder) => builder
+          .eq("userId", primary.userId)
+          .eq("category", "custody"))
+        .unique();
+      const service = await ctx.db.query("storageUsageService")
+        .withIndex("by_key", (builder) => builder.eq("key", "global"))
+        .unique();
+      if (custody === null || service === null) throw new Error("missing quota authority");
+      const targetBytes = CATEGORY_QUOTAS.custody.logicalBytes - 512;
+      const delta = targetBytes - custody.logicalBytes;
+      expect(delta).toBeGreaterThan(0);
+      await ctx.db.patch(custody._id, { logicalBytes: targetBytes });
+      await ctx.db.patch(service._id, {
+        logicalBytes: service.logicalBytes + delta,
+        userLogicalBytes: service.userLogicalBytes + delta,
+      });
+    });
+
+    await expectPromiseToReject(
+      runtime.mutation(updateMemorySummary, {
+        envelope: envelopeWith("S".repeat(1_024)),
+        expectedRevision: 0,
+        keyVersion: 1,
+      }),
+      "QUOTA_EXCEEDED",
+    );
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("N".repeat(48)),
+      expectedRevision: 1,
+      keyVersion: 1,
+    });
+    const stored = await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId });
+    expect(stored).toMatchObject({ revision: 2 });
+    expect(stored).not.toHaveProperty("memorySummaryEnvelope");
+    expect(stored).not.toHaveProperty("memorySummaryRevision");
+  });
+
+  test("keeps memory-summary publication daemon-only while browser devices remain readers", async () => {
+    const world = await registryWorld();
+    const browser = await world.enrollDevice(
+      "summary-browser",
+      await world.enrollUser("summary-browser"),
+      "browser",
+    );
+    const runtime = world.asDevice(browser);
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("B".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
+    await expectPromiseToReject(
+      runtime.mutation(updateMemorySummary, {
+        envelope: envelopeWith("S".repeat(48)),
+        expectedRevision: 0,
+        keyVersion: 1,
+      }),
+      "BROWSER_DEVICE_CANNOT_EXECUTE",
+    );
   });
 
   test("binds email consent and hours to one outer revision and clears consent on downgrade", async () => {
@@ -430,10 +641,25 @@ describe("device registry", () => {
     const world = await registryWorld();
     const primary = await world.enrollDevice("primary", await world.enrollUser("primary"));
     const runtime = world.asDevice(primary);
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("C".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
 
     await expectPromiseToReject(
-      runtime.mutation(updateRegistry, {
-        envelope: envelopeWith("G".repeat(cloudLimits.registryCiphertextCharacters + 1)),
+      runtime.mutation(updateMemorySummary, {
+        envelope: envelopeWith(
+          "S".repeat(cloudLimits.memorySummaryCiphertextCharacters + 1),
+        ),
+        expectedRevision: 0,
+        keyVersion: 1,
+      }),
+      "Cloud authority is not current",
+    );
+    await expectPromiseToReject(
+      runtime.mutation(updateMemorySummary, {
+        envelope: { ...envelopeWith("S".repeat(48)), keyVersion: 2 },
         expectedRevision: 0,
         keyVersion: 1,
       }),
@@ -441,12 +667,21 @@ describe("device registry", () => {
     );
     await expectPromiseToReject(
       runtime.mutation(updateRegistry, {
+        envelope: envelopeWith("G".repeat(cloudLimits.registryCiphertextCharacters + 1)),
+        expectedRevision: 1,
+        keyVersion: 1,
+      }),
+      "Cloud authority is not current",
+    );
+    await expectPromiseToReject(
+      runtime.mutation(updateRegistry, {
         envelope: envelopeWith("C".repeat(48)),
-        expectedRevision: 0,
+        expectedRevision: 1,
         keyVersion: 2,
       }),
       "Cloud authority is not current",
     );
-    expect(await runtime.query(listRegistries, {})).toEqual([]);
+    expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
+      .toMatchObject({ revision: 1 });
   });
 });

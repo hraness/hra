@@ -22,8 +22,6 @@ import {
   accountLoginReplayCommand,
   claudeAccountLoginAbandonCommand,
   claudeAccountLoginCommand,
-  devinAccountLoginAbandonCommand,
-  devinAccountLoginCommand,
   completeProtectedAuthLogin,
   completeProtectedInteraction,
   deviceMutationReplayCommand,
@@ -69,6 +67,8 @@ import {
   containsAbsolutePath,
   createCloudDaemonLifecycle,
   createCloudUuidV7,
+  activeRemoteDerivedCodexSelection,
+  activeRemotePresetSelection,
   cloudDeploymentAuthorityFromEnvironment,
   CloudDeploymentAuthorityError,
   createLocalCloudControlFromEnvironment,
@@ -91,7 +91,9 @@ import {
   type CloudDeploymentAuthority,
   type CloudProjectionRecoveryStatus,
   type CloudSecretCustodyPort,
+  type CanonicalMemoryCloudAuthoritySource,
 } from "./cloud/index";
+import type { CanonicalMemoryTransport } from "./cloud/canonical-memory-transport";
 import {
   allowlistedEnvironment,
   readCodexAutomationAuthority,
@@ -100,33 +102,24 @@ import {
 } from "./codex/index";
 import {
   CLAUDE_PIN,
+  ClaudeHostToolBindingAuthority,
   createClaudeLoginSignalCustody,
   resolvePinnedClaudeRuntime,
   runClaudeForegroundLogin,
+  type ClaudeHostToolPublicResult,
+  type ClaudeHostToolResponseWritten,
   type ClaudeForegroundLoginResult,
   type ClaudeLoginSignalCustody,
   type ClaudeLoginSignalSource,
   type PinnedClaudeRuntime,
   type ResolvePinnedClaudeRuntimeOptions,
 } from "./claude/index";
-import {
-  createDevinLoginSignalCustody,
-  resolvePinnedDevinRuntime,
-  runDevinForegroundLogin,
-  type DevinDirectories,
-  type DevinForegroundLoginResult,
-  type DevinLoginSignalCustody,
-  type DevinLoginSignalSource,
-  type PinnedDevinRuntime,
-  type ResolvePinnedDevinRuntimeOptions,
-} from "./devin/index";
+import type { HraHostToolCall } from "./codex/protocol";
 import { localCommandSchema, type CommandResponse, type LocalCommand } from "./domain/contracts";
-import { adoptableProviderSchema, providerSchema, type Provider } from "./domain/presets";
+import { adoptableProviderSchema, type Provider } from "./domain/presets";
 import {
-  digestTranscriptRecords,
   sessionTranscriptSchema,
   TRANSCRIPT_PAGE_LIMIT,
-  type TranscriptRecord,
 } from "./domain/transcript";
 import { transcriptToTrajectory } from "./domain/trajectory";
 import {
@@ -143,9 +136,10 @@ import {
   sessionIdSchema,
 } from "./domain/values";
 import {
+  WORK_APPLY_REQUEST_LEGACY_VERSION,
+  WORK_APPLY_REQUEST_VERSION,
   WORK_PROTOCOL_REQUEST_MAX_BYTES,
   WORK_PROTOCOL,
-  WORK_PROTOCOL_VERSION,
   workProtocolRequestSchema,
 } from "./domain/work";
 import {
@@ -180,9 +174,12 @@ import {
   waitForDaemonReady,
   type DaemonIdentity,
 } from "./daemon/daemon-startup";
+import {
+  ClaudeHostToolCallbackServer,
+  claudeHostToolCallbackSocketPath,
+} from "./daemon/claude-host-tool-transport";
 import { PinnedClaudeRuntimeManager } from "./daemon/claude-runtime-adapter";
 import { PinnedCodexRuntimeManager } from "./daemon/codex-runtime-adapter";
-import { PinnedDevinRuntimeManager } from "./daemon/devin-runtime-adapter";
 import {
   BoundedPersonalSessionDiscovery,
   createLocalClaudeProcessLivenessProbe,
@@ -190,7 +187,12 @@ import {
   type ClaudeProcessLivenessProbe,
 } from "./daemon/personal-session-discovery";
 import { HraFactsMemoryLifecycle } from "./daemon/facts-memory-lifecycle";
-import { UnavailableCloudControl, type CloudControlPort, type CompactProjectionRecoveryBlocker, type ProfileAuthority } from "./daemon/ports";
+import {
+  UnavailableCloudControl,
+  type CloudControlPort,
+  type CompactProjectionRecoveryBlocker,
+  type ProfileAuthority,
+} from "./daemon/ports";
 import { SessionEventCursorCodec } from "./daemon/session-event-cursor";
 import { CommandFailure, HraService } from "./daemon/service";
 import { AccountUsagePoller } from "./daemon/usage-poller";
@@ -1181,10 +1183,11 @@ const syncDiagnosticMaximumBytes = 768;
 const syncDiagnosticTruncationMarker = " [truncated]";
 const privateKeyHeaderPattern = /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/iu;
 const secretLabelPattern = /(?:\bBearer\b|\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|api[_-]?key|authorization)\b|\b(?:sk|re)_|\beyJ)/iu;
-const unsafeTerminalScalarPattern = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const unsafeTerminalScalarPattern = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
 const underscoreAbsolutePathPattern = /(^|_)((?:file:\/\/+|~\/|[A-Za-z]:[\\/]|\\\\[^\\/\s"'`<>{}[\](),;]+[\\/]|\/(?!\/))[^\s"'`<>{}[\](),;_]*)/giu;
 
 type SyncNowSummary = Readonly<{
+  commandRequestVersion: 2 | null;
   online: boolean;
   commandsApplied: number;
   commandsUnsettled: number;
@@ -1280,18 +1283,6 @@ export type CliMainInput = Readonly<{
   /** Test seam for grant-bound terminal-signal custody. */
   claudeLoginSignalSource?: ClaudeLoginSignalSource;
   resolveClaudeRuntime?: (options: ResolvePinnedClaudeRuntimeOptions) => Promise<PinnedClaudeRuntime>;
-  /** Narrow test seam around Devin's foreground-only authentication command. */
-  runDevinForegroundLogin?: (input: Readonly<{
-    directories: DevinDirectories;
-    manualTokenFlow?: boolean;
-    signal: AbortSignal;
-    signalCustody: DevinLoginSignalCustody;
-    stdio: Readonly<{ stderr: number; stdin: number; stdout: number }>;
-    runtime: PinnedDevinRuntime;
-  }>) => Promise<DevinForegroundLoginResult>;
-  /** Test seam for Devin's grant-bound terminal-signal custody. */
-  devinLoginSignalSource?: DevinLoginSignalSource;
-  resolveDevinRuntime?: (options: ResolvePinnedDevinRuntimeOptions) => Promise<PinnedDevinRuntime>;
   onHumanSessionObserverBootstrap?: (bootstrap: Readonly<{
     interactions: readonly Readonly<{
       id: string;
@@ -1932,6 +1923,9 @@ function parseSyncNowSummary(value: unknown): SyncNowSummary | null {
   const daemon = value.daemon;
   if (
     typeof daemon.online !== "boolean"
+    || (daemon.commandRequestVersion !== undefined
+      && daemon.commandRequestVersion !== 2
+      && daemon.commandRequestVersion !== null)
     || !isSafeNonNegativeInteger(daemon.commandsApplied)
     || !isSafeNonNegativeInteger(daemon.commandsUnsettled)
     || !isSafeNonNegativeInteger(daemon.sessionsUploaded)
@@ -1948,6 +1942,7 @@ function parseSyncNowSummary(value: unknown): SyncNowSummary | null {
     errors.push(sanitizeSyncDiagnostic(diagnostic));
   }
   return {
+    commandRequestVersion: daemon.commandRequestVersion === 2 ? 2 : null,
     online: daemon.online,
     commandsApplied: daemon.commandsApplied,
     commandsUnsettled: daemon.commandsUnsettled,
@@ -1973,6 +1968,7 @@ function renderSyncNowSuccess(data: unknown, json: boolean, output: Output): num
   }
   const rows = [
     `Cloud sync: ${summary.online ? "online" : "offline"}`,
+    `Command request contract: ${summary.commandRequestVersion === 2 ? "version 2 published" : "not published"}`,
     `Uploaded: ${String(summary.sessionsUploaded)} sessions; ${String(summary.usageUploaded)} usage snapshots`,
     `Commands: ${String(summary.commandsApplied)} applied; ${String(summary.commandsUnsettled)} unsettled`,
   ];
@@ -2677,13 +2673,7 @@ async function editSessionNote(
 }
 
 /**
- * The most transcript pages one export reads. An export is bounded twice: by
- * this budget and by the records one page returns.
- */
-const SESSION_EXPORT_PAGE_BUDGET = 20;
-
-/**
- * `hra session export` reads the provider-neutral transcript in bounded pages
+ * `hra session export` reads the provider-neutral retained tail
  * and writes one document: the letta-ai trajectory v1 shape by default, or
  * HRA's own neutral record shape with `--format json`.
  *
@@ -2695,62 +2685,27 @@ async function exportSessionTranscript(
   output: Output,
   callDaemon: (command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>,
 ): Promise<number> {
-  const records: TranscriptRecord[] = [];
-  let sessionId: string | null = null;
-  let after: number | undefined;
-  let omittedRecords = 0;
-  let omittedCharacters = 0;
-  let truncated = false;
-  for (let page = 0; page < SESSION_EXPORT_PAGE_BUDGET; page += 1) {
-    const response = await callDaemon({
-      kind: "session.transcript",
-      session: invocation.session,
-      ...(after === undefined ? {} : { after }),
-      limit: TRANSCRIPT_PAGE_LIMIT,
-    });
-    if (!response.ok) return renderFailure(response.error, invocation.json, output);
-    const parsed = sessionTranscriptSchema.safeParse(response.data);
-    if (!parsed.success) {
-      return renderFailure({
-        code: "INTERNAL",
-        message: "The daemon returned a transcript page HRA could not validate.",
-      }, invocation.json, output);
-    }
-    const transcript = parsed.data;
-    sessionId ??= transcript.sessionId;
-    if (transcript.sessionId !== sessionId) {
-      return renderFailure({
-        code: "CONFLICT",
-        message: "The transcript changed session identity between pages.",
-      }, invocation.json, output);
-    }
-    records.push(...transcript.records);
-    omittedRecords += transcript.omittedRecords;
-    omittedCharacters += transcript.omittedCharacters;
-    if (transcript.nextSequence === null) break;
-    after = transcript.nextSequence - 1;
-    if (page === SESSION_EXPORT_PAGE_BUDGET - 1) truncated = true;
-  }
-  if (sessionId === null) {
+  const response = await callDaemon({
+    kind: "session.transcript",
+    session: invocation.session,
+    limit: TRANSCRIPT_PAGE_LIMIT,
+    tail: true,
+  });
+  if (!response.ok) return renderFailure(response.error, invocation.json, output);
+  const parsed = sessionTranscriptSchema.safeParse(response.data);
+  if (!parsed.success || parsed.data.provider === undefined) {
     return renderFailure({
-      code: "NOT_FOUND",
-      message: "That session has no transcript.",
+      code: "INTERNAL",
+      message: "The daemon returned a transcript tail HRA could not validate.",
     }, invocation.json, output);
   }
-  const transcript = sessionTranscriptSchema.parse({
-    version: 1,
-    sessionId,
-    records: records.slice(0, TRANSCRIPT_PAGE_LIMIT),
-    throughSequence: records[records.length - 1]?.throughSequence ?? null,
-    nextSequence: null,
-    omittedRecords: omittedRecords + Math.max(0, records.length - TRANSCRIPT_PAGE_LIMIT),
-    omittedCharacters,
-    digest: digestTranscriptRecords(records.slice(0, TRANSCRIPT_PAGE_LIMIT)),
-  });
+  const transcript = parsed.data;
+  const provider = transcript.provider;
+  if (provider === undefined) throw new Error("Transcript provider narrowing failed.");
   const document = invocation.format === "trajectory"
     ? transcriptToTrajectory({
       transcript,
-      provider: await exportedSessionProvider(invocation.session, callDaemon),
+      provider,
       createdAt: Date.now(),
     })
     : transcript;
@@ -2758,24 +2713,22 @@ async function exportSessionTranscript(
   if (invocation.out === undefined) {
     output.writeStdout(serialized);
   } else {
-    await writeFile(resolve(invocation.out), serialized, { encoding: "utf8", mode: 0o600 });
-    output.writeStderr(`Wrote ${String(records.length)} transcript records${
-      truncated ? " (truncated at the export bound)" : ""}.\n`);
+    // Transcript text can be sensitive. Create one new private inode and
+    // refuse every existing path (including a symlink) instead of truncating
+    // or inheriting permissions from it.
+    await writeFile(resolve(invocation.out), serialized, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    output.writeStderr(`Wrote ${String(transcript.records.length)} transcript records${
+      transcript.omittedRecords > 0
+        || (transcript.retentionGapReason !== undefined
+          && transcript.retentionGapReason !== null)
+        ? " (older history omitted)"
+        : ""}.\n`);
   }
   return 0;
-}
-
-/** The provider the session runs on now; it labels the trajectory meta record. */
-async function exportedSessionProvider(
-  session: string,
-  callDaemon: (command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>,
-): Promise<Provider> {
-  const response = await callDaemon({ kind: "session.show", session, detail: false });
-  if (!response.ok) return "codex";
-  const parsed = z.object({
-    session: z.object({ provider: providerSchema }).passthrough(),
-  }).passthrough().safeParse(response.data);
-  return parsed.success ? parsed.data.session.provider : "codex";
 }
 
 function remoteFailure(error: unknown, json: boolean, output: Output): number {
@@ -2826,11 +2779,20 @@ function remotePayload(command: RemoteCliCommand): RemoteCommandPayload | null {
     case "remote.queue": return { kind: "queue", message: command.message };
     case "remote.steer": return { kind: "steer", message: command.message };
     case "remote.stop": return { kind: "stop" };
-    case "remote.preset": return { kind: "set_model", preset: command.preset };
+    case "remote.preset": return {
+      kind: "set_model",
+      ...activeRemotePresetSelection(command.preset),
+    };
     case "remote.provider": return {
       kind: "set_provider",
-      provider: command.provider,
-      ...(command.preset === undefined ? {} : { preset: command.preset }),
+      ...(command.preset === undefined
+        ? command.provider === "codex"
+          ? activeRemoteDerivedCodexSelection()
+          : { provider: command.provider }
+        : {
+            ...activeRemotePresetSelection(command.preset),
+            provider: command.provider,
+          }),
     };
     case "remote.fast": return { enabled: command.enabled, kind: "set_fast" };
   }
@@ -3310,12 +3272,37 @@ type DaemonStopLatch = {
 };
 
 export type RunDaemonOptions = Readonly<{
+  liveAcceptanceCanonicalMemoryTransportDecorator?: (
+    transport: CanonicalMemoryTransport,
+  ) => CanonicalMemoryTransport;
+  liveAcceptanceClaudeProof?: LiveAcceptanceClaudeProofPort;
   stopSignal?: AbortSignal;
+}>;
+
+/**
+ * Acceptance-only custody for one managed-Claude host-tool proof. The concrete
+ * collector lives under `scripts/`; production exposes no observer, flag, or
+ * environment switch that can enable this seam.
+ */
+export type LiveAcceptanceClaudeProofPort = Readonly<{
+  beginDaemonGeneration(generation: number): void;
+  handleManagedHostToolCall(input: Readonly<{
+    authority: ProfileAuthority;
+    call: HraHostToolCall;
+    dispatch: () => Promise<ClaudeHostToolPublicResult>;
+  }>): Promise<ClaudeHostToolPublicResult>;
+  handleManagedHostToolResponseWritten(receipt: ClaudeHostToolResponseWritten): void;
+  /** Invalidates this in-process hook; it is not provider or filesystem cleanup proof. */
+  closeDaemonGeneration(generation: number | null): void;
 }>;
 
 async function runDaemonLifecycle(
   installation: HraInstallation,
   stopLatch: DaemonStopLatch,
+  liveAcceptanceCanonicalMemoryTransportDecorator?: (
+    transport: CanonicalMemoryTransport,
+  ) => CanonicalMemoryTransport,
+  liveAcceptanceClaudeProof?: LiveAcceptanceClaudeProofPort,
 ): Promise<number> {
   assertInstallationHome(installation);
   const paths = installation.paths;
@@ -3329,11 +3316,14 @@ async function runDaemonLifecycle(
   let claude: PinnedClaudeRuntimeManager | undefined;
   let personalCodex: PinnedCodexRuntimeManager | undefined;
   let personalClaude: PinnedClaudeRuntimeManager | undefined;
-  let devin: PinnedDevinRuntimeManager | undefined;
+  let claudeHostToolAuthority: ClaudeHostToolBindingAuthority | undefined;
+  let claudeHostToolServer: ClaudeHostToolCallbackServer | undefined;
   let service: HraService | undefined;
   let server: LocalDaemonServer | undefined;
   let cloudAdapter: StateBackedCloudDaemonAdapter | undefined;
   let cloudLifecycle: CloudDaemonLifecycle | undefined;
+  let cloudLifecycleShutdown: Promise<void> | undefined;
+  let canonicalMemoryAuthoritySource: CanonicalMemoryCloudAuthoritySource | undefined;
   let usagePoller: AccountUsagePoller | undefined;
   let usagePollerShutdown: Promise<void> | undefined;
   let adoptionPoller: AccountUsagePoller | undefined;
@@ -3346,13 +3336,20 @@ async function runDaemonLifecycle(
   let resolveStop!: () => void;
   const stopped = new Promise<void>((resolve) => { resolveStop = resolve; });
   let stopRequested = false;
+  const closeCloudLifecycle = (): Promise<void> => {
+    if (cloudLifecycle === undefined) return Promise.resolve();
+    cloudLifecycleShutdown ??= cloudLifecycle.close();
+    return cloudLifecycleShutdown;
+  };
   const requestStop = () => {
     if (stopRequested) return;
     stopRequested = true;
     if (usagePoller !== undefined) usagePollerShutdown ??= usagePoller.close();
     if (adoptionPoller !== undefined) adoptionPollerShutdown ??= adoptionPoller.close();
+    void closeCloudLifecycle().catch(() => undefined);
     if (service !== undefined) serviceShutdown = service.close();
     else daemonAuthority?.close();
+    claudeHostToolServer?.beginShutdown();
     server?.beginShutdown(new Error("Daemon shutdown was requested."));
     resolveStop();
   };
@@ -3365,6 +3362,7 @@ async function runDaemonLifecycle(
   // shutdown path and publish a closed failure receipt instead of letting the
   // runtime print the raw error and exit without one.
   let unhandledRejectionError: Error | undefined;
+  let claudeHostToolTransportError: Error | undefined;
   const onUnhandledRejection = () => {
     unhandledRejectionError ??= new Error("The daemon stopped after an unhandled promise rejection in an owned background task.");
     requestStop();
@@ -3401,11 +3399,52 @@ async function runDaemonLifecycle(
     await releaseProvenDeadClaudeAuthoritiesBeforeDaemonGeneration(activeStore);
     bootId = `boot_${randomUUID().replaceAll("-", "")}`;
     generation = activeStore.nextDaemonGeneration(bootId);
+    liveAcceptanceClaudeProof?.beginDaemonGeneration(generation);
     await daemonLock.publish({ state: "booting", generation, bootId });
     daemonAuthority = new DaemonAuthorityFence(daemonLock, { generation, bootId });
     const activeDaemonAuthority = daemonAuthority;
     checkpointBoot();
     const serviceReference: { current?: HraService } = {};
+    claudeHostToolAuthority = new ClaudeHostToolBindingAuthority();
+    const activeClaudeHostToolAuthority = claudeHostToolAuthority;
+    claudeHostToolServer = await ClaudeHostToolCallbackServer.start({
+      paths,
+      authority: activeClaudeHostToolAuthority,
+      onFatalError: () => {
+        claudeHostToolTransportError ??= new Error(
+          "The daemon stopped after the Claude host-tool callback transport failed.",
+        );
+        requestStop();
+      },
+      handler: {
+        call: async (call) => {
+          const owners = [claude, personalClaude].filter(
+            (runtime): runtime is PinnedClaudeRuntimeManager =>
+              runtime?.ownsSessionHostToolBinding(call) === true,
+          );
+          const owner = owners[0];
+          if (owner === undefined || owners.length !== 1) {
+            throw new Error("The Claude host-tool call has no unique runtime owner.");
+          }
+          return await owner.handleSessionHostToolCall(call);
+        },
+        responseWritten: async (receipt) => {
+          const owners = [claude, personalClaude].filter(
+            (runtime): runtime is PinnedClaudeRuntimeManager =>
+              runtime?.ownsSessionHostToolBinding(receipt) === true,
+          );
+          const owner = owners[0];
+          if (owner === undefined || owners.length !== 1) {
+            throw new Error("The Claude host-tool receipt has no unique runtime owner.");
+          }
+          await owner.handleSessionHostToolResponseWritten(receipt);
+          if (owner === claude) {
+            liveAcceptanceClaudeProof?.handleManagedHostToolResponseWritten(receipt);
+          }
+        },
+      },
+    });
+    const activeClaudeHostToolServer = claudeHostToolServer;
     codex = new PinnedCodexRuntimeManager({
       allowSameGenerationRelaunchAfterProviderDisconnect: true,
       ...(installation.kind === "live_acceptance"
@@ -3421,17 +3460,21 @@ async function runDaemonLifecycle(
         account: async (authority, account) => {
           await serviceReference.current?.observeCodexAccount(authority, account);
         },
-        conversationAutomation: async (authority, call) => {
+        hraHostTool: async (authority, call) => {
           const current = serviceReference.current;
           if (current === undefined) {
-            throw new Error("The HRA service is unavailable during conversation automation.");
+            throw new Error("The HRA service is unavailable during host-tool execution.");
           }
-          return await current.handleConversationAutomationToolCall(authority, call);
+          return await current.handleHraHostToolCall(authority, call, {
+            provider: "codex",
+            source: "managed",
+          });
         },
-        conversationAutomationResponseWritten: (authority, call) => {
-          serviceReference.current?.notifyConversationAutomationToolResponseWritten(
+        hraHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyHraHostToolResponseWritten(
             authority,
             call,
+            { provider: "codex", source: "managed" },
           );
         },
         fact: async (authority, fact) => { await serviceReference.current?.observeCodexFact(authority, fact); },
@@ -3449,9 +3492,42 @@ async function runDaemonLifecycle(
       isCurrent: (authority) =>
         isExactProviderRuntimeAuthorityCurrent(activeStore, "claude", authority),
       observer: {
+        hraHostTool: async (authority, call) => {
+          const current = serviceReference.current;
+          if (current === undefined) {
+            throw new Error("The HRA service is unavailable during host-tool execution.");
+          }
+          if (liveAcceptanceClaudeProof === undefined) {
+            return await current.handleHraHostToolCall(authority, call, {
+              provider: "claude",
+              source: "managed",
+            });
+          }
+          return await liveAcceptanceClaudeProof.handleManagedHostToolCall({
+            authority,
+            call,
+            dispatch: async () => await current.handleHraHostToolCall(
+              authority,
+              call,
+              { provider: "claude", source: "managed" },
+            ),
+          });
+        },
+        hraHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyHraHostToolResponseWritten(
+            authority,
+            call,
+            { provider: "claude", source: "managed" },
+          );
+        },
         fact: async (authority, fact) => {
           await serviceReference.current?.observeClaudeFact(authority, fact);
         },
+      },
+      hostTools: {
+        bindingAuthority: activeClaudeHostToolAuthority,
+        callbackSocketPath: claudeHostToolCallbackSocketPath(paths),
+        privateRoot: paths.runtime,
       },
     });
     const personalHomes = installation.personalProviderHomes;
@@ -3474,18 +3550,21 @@ async function runDaemonLifecycle(
         account: async (authority, account) => {
           await serviceReference.current?.observePersonalCodexAccount(authority, account);
         },
-        conversationAutomation: async (authority, call) => {
+        hraHostTool: async (authority, call) => {
           const current = serviceReference.current;
           if (current === undefined) {
-            throw new Error("The HRA service is unavailable during conversation automation.");
+            throw new Error("The HRA service is unavailable during host-tool execution.");
           }
-          return await current.handleConversationAutomationToolCall(authority, call, "personal");
+          return await current.handleHraHostToolCall(authority, call, {
+            provider: "codex",
+            source: "personal",
+          });
         },
-        conversationAutomationResponseWritten: (authority, call) => {
-          serviceReference.current?.notifyConversationAutomationToolResponseWritten(
+        hraHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyHraHostToolResponseWritten(
             authority,
             call,
-            "personal",
+            { provider: "codex", source: "personal" },
           );
         },
         fact: async (authority, fact) => {
@@ -3499,9 +3578,31 @@ async function runDaemonLifecycle(
       isCurrent: (authority) =>
         isExactProviderRuntimeAuthorityCurrent(activeStore, "claude", authority),
       observer: {
+        hraHostTool: async (authority, call) => {
+          const current = serviceReference.current;
+          if (current === undefined) {
+            throw new Error("The HRA service is unavailable during host-tool execution.");
+          }
+          return await current.handleHraHostToolCall(authority, call, {
+            provider: "claude",
+            source: "personal",
+          });
+        },
+        hraHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyHraHostToolResponseWritten(
+            authority,
+            call,
+            { provider: "claude", source: "personal" },
+          );
+        },
         fact: async (authority, fact) => {
           await serviceReference.current?.observePersonalClaudeFact(authority, fact);
         },
+      },
+      hostTools: {
+        bindingAuthority: activeClaudeHostToolAuthority,
+        callbackSocketPath: claudeHostToolCallbackSocketPath(paths),
+        privateRoot: paths.runtime,
       },
     });
     const activePersonalCodex = personalCodex;
@@ -3565,44 +3666,9 @@ async function runDaemonLifecycle(
       },
       ...personalClaudeDiscovery,
     });
-    // Devin owns its credentials and native sessions. HRA gives the pinned ACP
-    // process a per-account HOME plus all four XDG roots and observes only the
-    // provider-neutral facts emitted by the manager.
-    devin = new PinnedDevinRuntimeManager({
-      directoriesFor: async (authority) => {
-        const owned = await initializeProfilePaths(paths, authority.id);
-        return {
-          home: owned.devinHome,
-          configHome: owned.devinConfigDir,
-          dataHome: owned.devinDataDir,
-          cacheHome: owned.devinCacheDir,
-          stateHome: owned.devinStateDir,
-        };
-      },
-      isCurrent: (authority) =>
-        isExactProviderRuntimeAuthorityCurrent(activeStore, "devin", authority),
-      observer: {
-        fact: async (authority, fact) => {
-          await serviceReference.current?.observeDevinFact(authority, fact);
-        },
-      },
-      projectRootFor: ({ authority, providerThreadId }) => {
-        if (!isExactProviderRuntimeAuthorityCurrent(activeStore, "devin", authority)) {
-          throw new Error("DEVIN_SESSION_AUTHORITY_STALE");
-        }
-        const session = activeStore.findSessionByProviderThread(authority.id, providerThreadId);
-        if (session?.provider !== "devin" || session.projectId === undefined) return undefined;
-        const bound = activeStore.requireSessionProviderAuthority(session.id);
-        if (
-          bound.profileId !== authority.id
-          || bound.provider !== authority.provider
-          || bound.providerAccountId !== authority.providerAccountId
-          || bound.bindingGeneration !== authority.bindingGeneration
-          || bound.processGeneration !== authority.generation
-        ) throw new Error("DEVIN_SESSION_AUTHORITY_STALE");
-        return activeStore.requireProject(session.projectId).rootPath;
-      },
-    });
+    if (activeClaudeHostToolServer.path !== claudeHostToolCallbackSocketPath(paths)) {
+      throw new Error("Claude host-tool callback transport path changed during daemon startup.");
+    }
     const cloudEnvironment = installation.cloudEnvironment;
     const cloudStartup = await resolveDaemonCloudStartup({
       environment: cloudEnvironment,
@@ -3719,6 +3785,24 @@ async function runDaemonLifecycle(
         cloudAdapter = candidateAdapter;
         cloud = candidateCloud;
         cloudLifecycle = candidateLifecycle;
+        canonicalMemoryAuthoritySource = liveAcceptanceCanonicalMemoryTransportDecorator === undefined
+          ? localCloudControl
+          : {
+              snapshotCanonicalMemoryAuthority: async (signal) => {
+                const authority = await localCloudControl.snapshotCanonicalMemoryAuthority(signal);
+                try {
+                  return Object.freeze({
+                    ...authority,
+                    transport: liveAcceptanceCanonicalMemoryTransportDecorator(
+                      authority.transport,
+                    ),
+                  });
+                } catch (error: unknown) {
+                  authority.dispose();
+                  throw error;
+                }
+              },
+            };
         candidateAdapter = undefined;
         candidateBridge = undefined;
       } catch (error: unknown) {
@@ -3750,14 +3834,66 @@ async function runDaemonLifecycle(
     }
     checkpointBoot();
     factsMemoryControl = new FactsMemoryControlStore(paths.factsMemoryControl);
-    const { OhSqliteFactsMemoryEngine } = await import("./storage/oh-facts-memory-engine");
+    const [
+      { OhSqliteFactsMemoryEngine },
+      { HraOhMemoryCoordinator },
+      { HraCanonicalMemorySynchronizer },
+      { HraMemorySummarySource },
+      { ProjectMemorySerialExecutor },
+    ] = await Promise.all([
+      import("./storage/oh-facts-memory-engine"),
+      import("./daemon/memory-coordinator"),
+      import("./cloud/canonical-memory-sync"),
+      import("./cloud/memory-summary-source"),
+      import("./daemon/project-memory-serial"),
+    ]);
+    const memoryEngine = new OhSqliteFactsMemoryEngine({
+      forkAttestations: activeStore,
+    });
     const factsMemory = new HraFactsMemoryLifecycle({
+      attestations: activeStore,
       broker: new LocalFactsMemoryBroker({
-        engine: new OhSqliteFactsMemoryEngine(),
+        engine: memoryEngine,
         root: paths.factsMemorySessions,
       }),
       control: factsMemoryControl,
     });
+    const projectMemorySerial = new ProjectMemorySerialExecutor();
+    const canonicalMemorySync = canonicalMemoryAuthoritySource === undefined
+      ? undefined
+      : new HraCanonicalMemorySynchronizer({
+          authoritySource: canonicalMemoryAuthoritySource,
+          engine: memoryEngine,
+          onBackgroundFailure: () => {
+            serviceReference.current?.recordBackgroundDiagnostic("canonical_memory_sync_failed");
+          },
+          paths,
+          projectSerial: projectMemorySerial,
+          store: activeStore,
+        });
+    const memory = new HraOhMemoryCoordinator({
+      engine: memoryEngine,
+      factsMemory,
+      paths,
+      projectSerial: projectMemorySerial,
+      store: activeStore,
+      ...(canonicalMemorySync === undefined ? {} : { sync: canonicalMemorySync }),
+    });
+    // A configured daemon may legitimately start before its first cloud
+    // identity is selected. Authentication requires a restart into the newly
+    // bound identity, so keep this optional projection absent until that boot
+    // instead of making cloud enrollment or local HRA unavailable.
+    if (cloudAdapter !== undefined && cloudIdentityNamespace !== null) {
+      const memorySummary = new HraMemorySummarySource({
+        engine: memoryEngine,
+        identityNamespace: cloudIdentityNamespace,
+        paths,
+        projectSerial: projectMemorySerial,
+        store: activeStore,
+      });
+      cloudAdapter.bindMemorySummarySource(async ({ devicePublicId, signal }) =>
+        await memorySummary.read({ devicePublicId, signal }));
+    }
     const desktop = process.platform === "darwin" && installation.desktopSwitching
       ? (() => {
           const bundle = new ExactChatGptBundlePort("/Applications/ChatGPT.app");
@@ -3774,7 +3910,6 @@ async function runDaemonLifecycle(
       paths,
       codex,
       claude,
-      devin,
       personalCodex,
       personalClaude,
       personalCodexHome: personalHomes.codexHome,
@@ -3790,6 +3925,9 @@ async function runDaemonLifecycle(
       usageHistoryCursors,
       workCapabilities,
       factsMemory,
+      memory,
+      beforeMemoryClose: closeCloudLifecycle,
+      ...(canonicalMemorySync === undefined ? {} : { canonicalMemorySync }),
       gatewayKeys,
       proseResponder: new AiGatewayProseResponder({
         readKey: async () => await gatewayKeys.read(),
@@ -3869,6 +4007,9 @@ async function runDaemonLifecycle(
     checkpointBoot();
     await daemonLock.publish({ state: "ready", generation, bootId });
     await stopped;
+    if (claudeHostToolTransportError !== undefined) {
+      throw claudeHostToolTransportError;
+    }
     await daemonLock.publish({ state: "stopping", generation, bootId });
   } catch (error: unknown) {
     if (!(error instanceof DaemonBootInterruptedError)) runError = error;
@@ -3879,6 +4020,7 @@ async function runDaemonLifecycle(
     if (adoptionPoller !== undefined) adoptionPollerShutdown ??= adoptionPoller.close();
     if (service !== undefined) serviceShutdown ??= service.close();
     else daemonAuthority?.close();
+    claudeHostToolServer?.beginShutdown();
     server?.beginShutdown(new Error("Daemon lifetime ended."));
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
@@ -3906,17 +4048,9 @@ async function runDaemonLifecycle(
       }
     }
     if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && cloudLifecycle !== undefined) {
-      try { await joinBeforeDeadline("Cloud daemon shutdown", cloudLifecycle.close()); } catch (error: unknown) {
+      try { await joinBeforeDeadline("Cloud daemon shutdown", closeCloudLifecycle()); } catch (error: unknown) {
         if (error instanceof DaemonJoinDeadlineError) runError = error;
         else cleanupErrors.push(error);
-      }
-    }
-    cloudRequestController?.abort(new Error("Cloud daemon transport is closing."));
-    if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && cloudAdapter !== undefined) {
-      try { await joinBeforeDeadline("Cloud account observation shutdown", cloudAdapter.close()); } catch (error: unknown) {
-        runError = error instanceof DaemonJoinDeadlineError
-          ? error
-          : new DaemonAccountObservationJoinError(error);
       }
     }
     if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError)) {
@@ -3925,7 +4059,7 @@ async function runDaemonLifecycle(
         else {
           const runtimes: Readonly<{
             close: () => Promise<void>;
-            provider: "codex" | "claude" | "devin" | "personal_codex" | "personal_claude";
+            provider: "codex" | "claude" | "personal_codex" | "personal_claude";
           }>[] = [];
           if (codex !== undefined) {
             const runtime = codex;
@@ -3934,10 +4068,6 @@ async function runDaemonLifecycle(
           if (claude !== undefined) {
             const runtime = claude;
             runtimes.push({ close: async () => await runtime.close(), provider: "claude" });
-          }
-          if (devin !== undefined) {
-            const runtime = devin;
-            runtimes.push({ close: async () => await runtime.close(), provider: "devin" });
           }
           if (personalCodex !== undefined) {
             const runtime = personalCodex;
@@ -3965,6 +4095,31 @@ async function runDaemonLifecycle(
       } catch (error: unknown) {
         if (error instanceof DaemonJoinDeadlineError) runError = error;
         else cleanupErrors.push(error);
+      }
+    }
+    // The hosted-memory synchronizer is owned by the service/memory
+    // coordinator but uses the cloud authority snapshot. Join it before
+    // aborting or closing that transport so shutdown cannot strand an
+    // indeterminate write or reopen an Oh database after local custody closes.
+    cloudRequestController?.abort(new Error("Cloud daemon transport is closing."));
+    if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && cloudAdapter !== undefined) {
+      try { await joinBeforeDeadline("Cloud account observation shutdown", cloudAdapter.close()); } catch (error: unknown) {
+        runError = error instanceof DaemonJoinDeadlineError
+          ? error
+          : new DaemonAccountObservationJoinError(error);
+      }
+    }
+    if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && claudeHostToolServer !== undefined) {
+      try { await claudeHostToolServer.close(); } catch (error: unknown) { cleanupErrors.push(error); }
+    }
+    if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && claudeHostToolAuthority !== undefined) {
+      try { await claudeHostToolAuthority.close(); } catch (error: unknown) { cleanupErrors.push(error); }
+    }
+    if (liveAcceptanceClaudeProof !== undefined) {
+      try {
+        liveAcceptanceClaudeProof.closeDaemonGeneration(generation ?? null);
+      } catch (error: unknown) {
+        cleanupErrors.push(error);
       }
     }
 
@@ -4009,6 +4164,17 @@ export async function runDaemon(
   installation: HraInstallation = createProductionInstallation(),
   options: RunDaemonOptions = {},
 ): Promise<number> {
+  if (
+    (
+      options.liveAcceptanceCanonicalMemoryTransportDecorator !== undefined
+      || options.liveAcceptanceClaudeProof !== undefined
+    )
+    && installation.kind !== "live_acceptance"
+  ) {
+    throw new Error(
+      "Daemon acceptance hooks are restricted to live acceptance.",
+    );
+  }
   const stopLatch: DaemonStopLatch = { deliver: undefined, requested: false };
   const requestLatchedStop = () => {
     if (stopLatch.requested) return;
@@ -4021,7 +4187,12 @@ export async function runDaemon(
   // event. Check after registration so no stop can be lost around this edge.
   if (stopSignal?.aborted === true) requestLatchedStop();
   try {
-    return await runDaemonLifecycle(installation, stopLatch);
+    return await runDaemonLifecycle(
+      installation,
+      stopLatch,
+      options.liveAcceptanceCanonicalMemoryTransportDecorator,
+      options.liveAcceptanceClaudeProof,
+    );
   } finally {
     stopLatch.deliver = undefined;
     stopSignal?.removeEventListener("abort", requestLatchedStop);
@@ -4329,28 +4500,41 @@ const writeWorkProtocolFailure = (
   requestId: string | null,
   error: WorkAgentProtocolError,
   output: Output,
+  version: typeof WORK_APPLY_REQUEST_LEGACY_VERSION | typeof WORK_APPLY_REQUEST_VERSION = WORK_APPLY_REQUEST_VERSION,
 ): void => {
   output.writeStdout(`${safeJson(workAgentProtocolResponseSchema.parse({
     protocol: WORK_PROTOCOL,
-    version: WORK_PROTOCOL_VERSION,
+    version,
     requestId,
     ok: false,
     error,
   }))}\n`);
 };
 
-const admittedWorkRequestCorrelation = (document: unknown): string | null => {
+const admittedWorkRequestCorrelation = (document: unknown): Readonly<{
+  requestId: string;
+  version: typeof WORK_APPLY_REQUEST_LEGACY_VERSION | typeof WORK_APPLY_REQUEST_VERSION;
+}> | null => {
   if (document === null || typeof document !== "object" || Array.isArray(document)) return null;
   const record = document as Readonly<Record<string, unknown>>;
   const keys = Object.keys(record).sort();
+  const version = record.version;
   if (
-    JSON.stringify(keys) !== JSON.stringify(["operation", "protocol", "requestId", "version"])
+    version !== WORK_APPLY_REQUEST_LEGACY_VERSION
+    && version !== WORK_APPLY_REQUEST_VERSION
+  ) return null;
+  const exactKeys = version === WORK_APPLY_REQUEST_LEGACY_VERSION
+    ? ["operation", "protocol", "requestId", "version"]
+    : record.presetContract === undefined
+      ? ["operation", "protocol", "requestId", "version"]
+      : ["operation", "presetContract", "protocol", "requestId", "version"];
+  if (
+    JSON.stringify(keys) !== JSON.stringify(exactKeys)
     || record.protocol !== WORK_PROTOCOL
-    || record.version !== WORK_PROTOCOL_VERSION
     || typeof record.requestId !== "string"
   ) return null;
   const parsed = z.string().uuid().safeParse(record.requestId);
-  return parsed.success ? parsed.data : null;
+  return parsed.success ? { requestId: parsed.data, version } : null;
 };
 
 async function executeWorkApply(
@@ -4389,18 +4573,27 @@ async function executeWorkApply(
   }
   const request = workProtocolRequestSchema.safeParse(document);
   if (!request.success) {
-    writeWorkProtocolFailure(admittedWorkRequestCorrelation(document), {
+    const correlation = admittedWorkRequestCorrelation(document);
+    writeWorkProtocolFailure(correlation?.requestId ?? null, {
       code: "invalid_request",
       message: "The work request document does not match the strict versioned HRA work protocol.",
       recovery: "none",
       retryable: false,
       exitCode: 2,
-    }, output);
+    }, output, correlation?.version ?? WORK_APPLY_REQUEST_VERSION);
     return 2;
   }
   const command = localCommandSchema.parse({
     kind: "work.apply",
     requestId: request.data.requestId,
+    ...(request.data.version === WORK_APPLY_REQUEST_VERSION
+      ? {
+          requestVersion: request.data.version,
+          ...(request.data.presetContract === undefined
+            ? {}
+            : { presetContract: request.data.presetContract }),
+        }
+      : {}),
     operation: request.data.operation,
   });
   if (command.kind !== "work.apply") throw new CliUsageError("The work operation is invalid.");
@@ -4415,12 +4608,12 @@ async function executeWorkApply(
       recovery: "replay_exact_request",
       retryable: true,
       exitCode: 7,
-    }, output);
+    }, output, request.data.version);
     return 7;
   }
   if (!response.ok) {
     const failure = mapWorkFailure(response.error);
-    writeWorkProtocolFailure(request.data.requestId, failure.error, output);
+    writeWorkProtocolFailure(request.data.requestId, failure.error, output, request.data.version);
     return failure.exitCode;
   }
   try {
@@ -4433,7 +4626,7 @@ async function executeWorkApply(
       recovery: "replay_exact_request",
       retryable: true,
       exitCode: 7,
-    }, output);
+    }, output, request.data.version);
     return 7;
   }
   return 0;
@@ -4852,100 +5045,6 @@ const claudeLoginCompleteResponseSchema = z.object({
   }
 });
 
-const devinAuthenticationSchema = z.object({
-  provider: z.literal("devin"),
-  signedIn: z.boolean(),
-}).strict();
-const devinStatusAuthenticationSchema = z.object({
-  provider: z.literal("devin"),
-  signedIn: z.boolean().nullable(),
-}).strict();
-const devinUsageStatusSchema = z.object({
-  allowance: z.literal("unknown"),
-  reason: z.string().min(1).max(512),
-  source: z.literal("devin_acp"),
-}).strict();
-const devinAccountStatusResponseSchema = z.object({
-  account: claudeLoginAccountSchema,
-  authentication: devinStatusAuthenticationSchema,
-  providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-  nextCommand: z.string().optional(),
-  recovery: claudeLoginRecoverySchema.optional(),
-  usage: devinUsageStatusSchema,
-}).strict().superRefine((value, context) => {
-  if (
-    value.nextCommand !== undefined
-    && value.nextCommand !== devinAccountLoginCommand(value.account.id, false)
-  ) context.addIssue({ code: "custom", path: ["nextCommand"], message: "Devin login next command is not exact." });
-  if (value.authentication.signedIn === null && value.recovery === undefined) {
-    context.addIssue({
-      code: "custom",
-      path: ["authentication", "signedIn"],
-      message: "An unknown Devin authentication status requires exact recovery authority.",
-    });
-  }
-  if (value.recovery === undefined) return;
-  if (value.recovery.statusCommand !== `hra account show ${value.account.id} --provider devin`) {
-    context.addIssue({ code: "custom", path: ["recovery", "statusCommand"], message: "Devin recovery status command is not exact." });
-  }
-  if (value.recovery.sameKeyReplayCommand !== devinAccountLoginCommand(
-    value.account.id,
-    false,
-    value.recovery.idempotencyKey,
-  )) {
-    context.addIssue({ code: "custom", path: ["recovery", "sameKeyReplayCommand"], message: "Devin recovery replay command is not exact." });
-  }
-  if (value.recovery.abandonCommand !== devinAccountLoginAbandonCommand(
-    value.account.id,
-    value.recovery.attemptId,
-    value.recovery.idempotencyKey,
-    value.recovery.providerGeneration,
-  )) {
-    context.addIssue({ code: "custom", path: ["recovery", "abandonCommand"], message: "Devin recovery abandon command is not exact." });
-  }
-});
-const devinLoginPrepareResponseSchema = z.object({
-  account: claudeLoginAccountSchema,
-  authentication: devinAuthenticationSchema,
-  login: z.discriminatedUnion("status", [
-    z.object({ status: z.literal("signed_in") }).strict(),
-    z.object({
-      status: z.literal("launch_granted"),
-      attemptId: attemptIdSchema,
-      idempotencyKey: z.string().uuid(),
-      providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-    }).strict(),
-  ]),
-}).strict().superRefine((value, context) => {
-  const expectedSignedIn = value.login.status === "signed_in";
-  if (value.authentication.signedIn !== expectedSignedIn) {
-    context.addIssue({
-      code: "custom",
-      path: ["authentication", "signedIn"],
-      message: "Devin authentication state does not match the login preparation status.",
-    });
-  }
-});
-const devinLoginCompleteResponseSchema = z.object({
-  account: claudeLoginAccountSchema,
-  authentication: devinAuthenticationSchema,
-  login: z.object({
-    status: z.enum(["signed_in", "signed_out"]),
-    attemptId: attemptIdSchema,
-    idempotencyKey: z.string().uuid(),
-    providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-  }).strict(),
-}).strict().superRefine((value, context) => {
-  const expectedSignedIn = value.login.status === "signed_in";
-  if (value.authentication.signedIn !== expectedSignedIn) {
-    context.addIssue({
-      code: "custom",
-      path: ["authentication", "signedIn"],
-      message: "Devin authentication state does not match the login completion status.",
-    });
-  }
-});
-
 const renderClaudeLoginResult = (
   data: z.infer<typeof claudeLoginPrepareResponseSchema> | z.infer<typeof claudeLoginCompleteResponseSchema>,
   json: boolean,
@@ -4958,20 +5057,6 @@ const renderClaudeLoginResult = (
   output.writeStdout(data.authentication.signedIn
     ? `Claude Code is signed in for ${terminalSafe(data.account.label)}.\n`
     : `Claude Code is signed out for ${terminalSafe(data.account.label)}.\nNext: ${claudeAccountLoginCommand(data.account.id)}\n`);
-};
-
-const renderDevinLoginResult = (
-  data: z.infer<typeof devinLoginPrepareResponseSchema> | z.infer<typeof devinLoginCompleteResponseSchema>,
-  json: boolean,
-  output: Output,
-): void => {
-  if (json) {
-    output.writeStdout(`${safeJson({ command: "account.login", data, ok: true, version: 1 })}\n`);
-    return;
-  }
-  output.writeStdout(data.authentication.signedIn
-    ? `Devin is signed in for ${terminalSafe(data.account.label)}.\n`
-    : `Devin is signed out for ${terminalSafe(data.account.label)}.\nNext: ${devinAccountLoginCommand(data.account.id, false)}\n`);
 };
 
 const claudeLoginRecovery = (
@@ -5011,45 +5096,6 @@ const claudeLoginRecovery = (
     ),
   },
   message: "Claude login may have started, but HRA could not prove its terminal result. The same-key command identifies this attempt and will never relaunch Claude. If its HRA parent is gone, confirm the Claude child exited before using the exact acknowledged local abandon command; abandon does not stop Claude or change or delete credentials.",
-}, json, output);
-
-const devinLoginRecovery = (
-  input: Readonly<{
-    accountId?: string;
-    attemptId?: string;
-    idempotencyKey: string;
-    providerGeneration?: number;
-    replayCommand: string;
-  }>,
-  json: boolean,
-  output: Output,
-): number => renderFailure({
-  code: "RECOVERY_REQUIRED",
-  details: {
-    ...(input.accountId === undefined ? {} : {
-      accountSelector: input.accountId,
-      statusCommand: `hra account show ${input.accountId} --provider devin`,
-    }),
-    ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
-    idempotencyKey: input.idempotencyKey,
-    ...(input.providerGeneration === undefined ? {} : { providerGeneration: input.providerGeneration }),
-    sameKeyReplayCommand: input.replayCommand,
-    ...(
-      input.accountId === undefined
-      || input.attemptId === undefined
-      || input.providerGeneration === undefined
-        ? {}
-        : {
-            abandonCommand: devinAccountLoginAbandonCommand(
-              input.accountId,
-              input.attemptId,
-              input.idempotencyKey,
-              input.providerGeneration,
-            ),
-          }
-    ),
-  },
-  message: "Devin login may have started, but HRA could not prove its terminal result. The same-key command identifies this attempt and will never relaunch Devin. If its HRA parent is gone, confirm the Devin child exited before using the exact acknowledged local abandon command; abandon does not stop Devin or change or delete credentials.",
 }, json, output);
 
 async function executeClaudeAccountAuthentication(
@@ -5307,276 +5353,6 @@ async function executeClaudeAccountAuthentication(
       }, invocation.json, output);
     }
     renderClaudeLoginResult(completed.data, invocation.json, output);
-    return 0;
-  } finally {
-    signalCustody.close();
-  }
-}
-
-async function executeDevinAccountAuthentication(
-  invocation: Extract<CliInvocation, { kind: "account.devin-login" }>,
-  output: Output,
-  input: CliMainInput,
-): Promise<number> {
-  const isTerminalDescriptor = input.isTerminalDescriptor ?? isatty;
-  if (
-    invocation.json
-    || input.interactive !== true
-    || !isTerminalDescriptor(0)
-    || !isTerminalDescriptor(1)
-    || !isTerminalDescriptor(2)
-  ) {
-    return renderFailure({
-      code: "INTERACTION_REQUIRED",
-      details: { nextCommand: invocation.replayCommand },
-      message: "Devin owns this login interaction. Run it in a foreground terminal without --json so its browser or manual-token handoff stays between you and Devin.",
-    }, invocation.json, output);
-  }
-
-  const callDaemon = commandCaller(input);
-  let statusResponse: CommandResponse;
-  try {
-    statusResponse = await callDaemon({
-      kind: "account.show",
-      account: invocation.command.account,
-      provider: "devin",
-    });
-  } catch (error: unknown) {
-    if (!(error instanceof LocalDaemonIndeterminateError)) throw error;
-    return renderFailure({
-      code: "UNAVAILABLE",
-      message: "HRA could not preflight the exact Devin account. No login launch was granted.",
-    }, invocation.json, output);
-  }
-  if (!statusResponse.ok) return renderFailure(statusResponse.error, invocation.json, output);
-  const status = devinAccountStatusResponseSchema.safeParse(statusResponse.data);
-  if (!status.success) {
-    return renderFailure({
-      code: "INTERNAL",
-      message: "The daemon returned an invalid Devin account preflight. No login launch was granted.",
-    }, invocation.json, output);
-  }
-  if (status.data.recovery !== undefined) {
-    return renderFailure({
-      code: "RECOVERY_REQUIRED",
-      details: status.data.recovery,
-      message: status.data.recovery.diagnostic,
-    }, invocation.json, output);
-  }
-
-  const controller = new AbortController();
-  const installation = input.installation ?? createProductionInstallation();
-  await initializeStatePaths(installation.paths);
-  const owned = await initializeProfilePaths(installation.paths, status.data.account.id);
-  const directories: DevinDirectories = {
-    home: owned.devinHome,
-    configHome: owned.devinConfigDir,
-    dataHome: owned.devinDataDir,
-    cacheHome: owned.devinCacheDir,
-    stateHome: owned.devinStateDir,
-  };
-  const resolveDevinRuntime = input.resolveDevinRuntime ?? resolvePinnedDevinRuntime;
-  const runtime = await resolveDevinRuntime({
-    directories,
-    signal: controller.signal,
-  });
-  const preflight: { directories: DevinDirectories; runtime: PinnedDevinRuntime } = {
-    directories,
-    runtime,
-  };
-  const signalCustody = createDevinLoginSignalCustody({
-    signal: controller.signal,
-    ...(input.devinLoginSignalSource === undefined
-      ? {}
-      : { signalSource: input.devinLoginSignalSource }),
-  });
-  try {
-    let preparedResponse: CommandResponse;
-    try {
-      preparedResponse = await callDaemon(invocation.command);
-    } catch (error: unknown) {
-      if (!(error instanceof LocalDaemonIndeterminateError)) throw error;
-      return devinLoginRecovery({
-        idempotencyKey: invocation.command.idempotencyKey,
-        replayCommand: invocation.replayCommand,
-      }, invocation.json, output);
-    }
-    if (!preparedResponse.ok) return renderFailure(preparedResponse.error, invocation.json, output);
-    const prepared = devinLoginPrepareResponseSchema.safeParse(preparedResponse.data);
-    if (
-      !prepared.success
-      || prepared.data.account.id !== status.data.account.id
-      || (
-        prepared.data.login.status === "launch_granted"
-        && prepared.data.login.idempotencyKey !== invocation.command.idempotencyKey
-      )
-    ) {
-      return devinLoginRecovery({
-        idempotencyKey: invocation.command.idempotencyKey,
-        replayCommand: invocation.replayCommand,
-      }, invocation.json, output);
-    }
-    if (prepared.data.login.status === "signed_in") {
-      renderDevinLoginResult(prepared.data, invocation.json, output);
-      return signalCustody.interruptedBy === "SIGINT"
-        ? 130
-        : signalCustody.interruptedBy === "SIGTERM"
-          ? 143
-          : 0;
-    }
-    const grant = prepared.data.login;
-    const exactReplayCommand = devinAccountLoginCommand(
-      prepared.data.account.id,
-      invocation.command.manualTokenFlow,
-      grant.idempotencyKey,
-    );
-    let foreground: DevinForegroundLoginResult | undefined = signalCustody.interruptedBy === null
-      ? undefined
-      : {
-          state: "not_started",
-          reason: "interrupted_before_spawn",
-          interruptedBy: signalCustody.interruptedBy,
-        };
-    try {
-      if (foreground === undefined) {
-        await ensurePrivateDirectory(preflight.directories.home);
-        await ensurePrivateDirectory(preflight.directories.configHome);
-        await ensurePrivateDirectory(preflight.directories.dataHome);
-        await ensurePrivateDirectory(preflight.directories.cacheHome);
-        await ensurePrivateDirectory(preflight.directories.stateHome);
-      }
-    } catch {
-      foreground = signalCustody.interruptedBy === null
-        ? { state: "not_started", reason: "preflight_stale" }
-        : {
-            state: "not_started",
-            reason: "interrupted_before_spawn",
-            interruptedBy: signalCustody.interruptedBy,
-          };
-    }
-    if (foreground === undefined) {
-      try {
-        const revalidated = await resolveDevinRuntime({
-          directories: preflight.directories,
-          executablePath: preflight.runtime.executablePath,
-          signal: controller.signal,
-        });
-        if (
-          revalidated.executablePath !== preflight.runtime.executablePath
-          || JSON.stringify(revalidated.argv) !== JSON.stringify(preflight.runtime.argv)
-        ) throw new Error("Devin runtime identity changed after launch grant.");
-        preflight.runtime = revalidated;
-      } catch {
-        foreground = signalCustody.interruptedBy === null
-          ? { state: "not_started", reason: "preflight_stale" }
-          : {
-              state: "not_started",
-              reason: "interrupted_before_spawn",
-              interruptedBy: signalCustody.interruptedBy,
-            };
-      }
-    }
-    if (foreground === undefined && signalCustody.interruptedBy !== null) {
-      foreground = {
-        state: "not_started",
-        reason: "interrupted_before_spawn",
-        interruptedBy: signalCustody.interruptedBy,
-      };
-    }
-    if (foreground === undefined) {
-      try {
-        foreground = await (input.runDevinForegroundLogin ?? runDevinForegroundLogin)({
-          directories: preflight.directories,
-          ...(invocation.command.manualTokenFlow ? { manualTokenFlow: true } : {}),
-          runtime: preflight.runtime,
-          signal: controller.signal,
-          signalCustody,
-          stdio: { stderr: 2, stdin: 0, stdout: 1 },
-        });
-      } catch {
-        return devinLoginRecovery({
-          accountId: prepared.data.account.id,
-          attemptId: grant.attemptId,
-          idempotencyKey: grant.idempotencyKey,
-          providerGeneration: grant.providerGeneration,
-          replayCommand: exactReplayCommand,
-        }, invocation.json, output);
-      }
-    }
-    const complete = localCommandSchema.parse({
-      kind: "account.devin-login.complete",
-      account: prepared.data.account.id,
-      attemptId: grant.attemptId,
-      idempotencyKey: grant.idempotencyKey,
-      providerGeneration: grant.providerGeneration,
-      outcome: foreground,
-    });
-    let completedResponse: CommandResponse;
-    try {
-      completedResponse = await callDaemon(complete);
-    } catch (error: unknown) {
-      if (!(error instanceof LocalDaemonIndeterminateError)) throw error;
-      return devinLoginRecovery({
-        accountId: prepared.data.account.id,
-        attemptId: grant.attemptId,
-        idempotencyKey: grant.idempotencyKey,
-        providerGeneration: grant.providerGeneration,
-        replayCommand: exactReplayCommand,
-      }, invocation.json, output);
-    }
-    if (!completedResponse.ok) {
-      return devinLoginRecovery({
-        accountId: prepared.data.account.id,
-        attemptId: grant.attemptId,
-        idempotencyKey: grant.idempotencyKey,
-        providerGeneration: grant.providerGeneration,
-        replayCommand: exactReplayCommand,
-      }, invocation.json, output);
-    }
-    const completed = devinLoginCompleteResponseSchema.safeParse(completedResponse.data);
-    if (
-      !completed.success
-      || completed.data.account.id !== prepared.data.account.id
-      || completed.data.login.attemptId !== grant.attemptId
-      || completed.data.login.idempotencyKey !== grant.idempotencyKey
-      || completed.data.login.providerGeneration !== grant.providerGeneration
-    ) {
-      return devinLoginRecovery({
-        accountId: prepared.data.account.id,
-        attemptId: grant.attemptId,
-        idempotencyKey: grant.idempotencyKey,
-        providerGeneration: grant.providerGeneration,
-        replayCommand: exactReplayCommand,
-      }, invocation.json, output);
-    }
-    const interruptedBy = (foreground.state === "joined"
-      ? foreground.interruptedBy
-      : foreground.reason === "interrupted_before_spawn"
-        ? foreground.interruptedBy
-        : null) ?? signalCustody.interruptedBy;
-    if (interruptedBy !== null) {
-      output.writeStderr(completed.data.authentication.signedIn
-        ? "hra: Devin login was interrupted after authentication completed.\n"
-        : "hra: Devin login was canceled; the isolated profile remains signed out.\n");
-      return interruptedBy === "SIGINT" ? 130 : 143;
-    }
-    if (!completed.data.authentication.signedIn) {
-      const nextCommand = devinAccountLoginCommand(
-        completed.data.account.id,
-        invocation.command.manualTokenFlow,
-      );
-      return renderFailure({
-        code: "INTERACTION_REQUIRED",
-        details: {
-          accountSelector: completed.data.account.id,
-          accountState: "signed_out",
-          nextCommand,
-          provider: "devin",
-        },
-        message: "Devin finished without an authenticated session in this account's isolated profile.",
-      }, invocation.json, output);
-    }
-    renderDevinLoginResult(completed.data, invocation.json, output);
     return 0;
   } finally {
     signalCustody.close();
@@ -6479,6 +6255,7 @@ async function executeInvocation(
         blobs,
         invocation.attach,
         input.attachmentCwd ?? process.cwd(),
+        { allowLegacyReplayName: invocation.legacyAttachmentReplay },
       );
     } catch (error: unknown) {
       if (error instanceof AttachmentIngestError) {
@@ -6508,9 +6285,6 @@ async function executeInvocation(
   }
   if (invocation.kind === "account.claude-login") {
     return await executeClaudeAccountAuthentication(invocation, output, { ...input, installation });
-  }
-  if (invocation.kind === "account.devin-login") {
-    return await executeDevinAccountAuthentication(invocation, output, { ...input, installation });
   }
   if (invocation.kind === "auth.login-protected") {
     return await executeProtectedAuthLogin(invocation, output, input);
@@ -6693,9 +6467,13 @@ export async function main(
         || invocation.command.kind === "session.steer"
         || invocation.command.kind === "session.stop"
         || invocation.command.kind === "session.rename"
+        || invocation.command.kind === "session.switch"
         || invocation.command.kind === "session.task.create"
         || invocation.command.kind === "session.task.edit"
         || invocation.command.kind === "session.task.delete"
+        || invocation.command.kind === "memory.remember"
+        || invocation.command.kind === "memory.share"
+        || invocation.command.kind === "memory.hosted.create"
       )
       && typeof invocation.command.idempotencyKey === "string"
       ? invocation.command
@@ -6750,6 +6528,13 @@ export async function main(
         }, json, output);
       }
       if (replayableLocalMutation !== undefined) {
+        const presetContractReplayArguments = (
+          (replayableLocalMutation.kind === "session.start"
+            || replayableLocalMutation.kind === "session.switch")
+          && replayableLocalMutation.presetContract !== undefined
+        )
+          ? ["--preset-contract", String(replayableLocalMutation.presetContract)]
+          : [];
         return renderFailure({
           code: "RECOVERY_REQUIRED",
           details: {
@@ -6757,6 +6542,7 @@ export async function main(
             replayArguments: [
               "--idempotency-key",
               replayableLocalMutation.idempotencyKey,
+              ...presetContractReplayArguments,
             ],
             replayPlacement: "before_double_dash",
             sameKeyReplay: true,

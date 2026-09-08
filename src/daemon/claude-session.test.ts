@@ -3,10 +3,11 @@ import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type {
-  ClaudeProcess,
-  ClaudeProcessIdentity,
-  PinnedClaudeRuntime,
+import {
+  ClaudeHostToolBindingAuthority,
+  type ClaudeProcess,
+  type ClaudeProcessIdentity,
+  type PinnedClaudeRuntime,
 } from "../claude/index";
 import {
   CLAUDE_PIN,
@@ -184,6 +185,7 @@ class FakeClaudeProcess implements ClaudeProcess {
   beforeWriteReturn: ((line: string) => Promise<void> | void) | undefined;
   afterStdoutChunkRead: (() => void) | undefined;
   terminated = false;
+  onTerminate: (() => void) | undefined;
   #push: ((chunk: Uint8Array) => void) | undefined;
   #finish: (() => void) | undefined;
   #resolveExit: ((code: number) => void) | undefined;
@@ -230,6 +232,7 @@ class FakeClaudeProcess implements ClaudeProcess {
 
   terminate(): void {
     this.terminated = true;
+    this.onTerminate?.();
     this.#finish?.();
     this.#resolveExit?.(0);
   }
@@ -293,9 +296,11 @@ class OfflineCloud extends UnavailableCloudControl {
 const stores: StateStore[] = [];
 const roots: string[] = [];
 const services: HraService[] = [];
+const hostToolAuthorities: ClaudeHostToolBindingAuthority[] = [];
 
 afterEach(async () => {
   await Promise.all(services.splice(0).map(async (service) => { await service.close(); }));
+  await Promise.all(hostToolAuthorities.splice(0).map(async (authority) => { await authority.close(); }));
   for (const store of stores.splice(0)) store.close();
   await Promise.all(roots.splice(0).map(async (root) => rm(root, { force: true, recursive: true })));
 });
@@ -306,6 +311,7 @@ type ClaudeFixture = Readonly<{
   store: StateStore;
   cloud: CloudControlPort;
   documents: string;
+  paths: ReturnType<typeof resolveStatePaths>;
   processes: FakeClaudeProcess[];
 }>;
 
@@ -337,6 +343,8 @@ async function claudeFixture(
   store.setDefaultApprovalMode("manual");
   const processes: FakeClaudeProcess[] = [];
   const reference: { current?: HraService } = {};
+  const hostToolAuthority = new ClaudeHostToolBindingAuthority();
+  hostToolAuthorities.push(hostToolAuthority);
   const claude = new PinnedClaudeRuntimeManager({
     configHome: "isolated",
     configDirFor: () => join(home, "claude-config"),
@@ -362,6 +370,11 @@ async function claudeFixture(
         await reference.current?.observeClaudeFact(authority, fact);
         options.onFactObserved?.(fact);
       },
+    },
+    hostTools: {
+      bindingAuthority: hostToolAuthority,
+      callbackSocketPath: join(paths.runtime, "claude-host-tools.sock"),
+      privateRoot: paths.runtime,
     },
     processFactory: (launch) => {
       const providerThreadId = launch.argv.at(-1);
@@ -411,7 +424,7 @@ async function claudeFixture(
   });
   reference.current = service;
   services.push(service);
-  return { cloud, documents, processes, runtime: claude, service, store };
+  return { cloud, documents, paths, processes, runtime: claude, service, store };
 }
 
 async function authenticatedClaudeAccount(
@@ -509,6 +522,7 @@ describe("Claude sessions on the local authority", () => {
     const capturedBefore = value.store.requireSessionProviderAuthority(started.session.id);
     expect(claudeBefore.processGeneration).not.toBe(before.processGeneration);
     expect(before.state).toBe("signed_out");
+    const beforeLoginBodies = await eventBodies(value, started.session.id);
     await value.service.execute({
       account,
       deviceCode: false,
@@ -526,12 +540,12 @@ describe("Claude sessions on the local authority", () => {
     expect(value.store.requireProviderAccountAuthority(account, "claude")).toEqual(claudeBefore);
     expect(value.store.requireSessionProviderAuthority(started.session.id)).toEqual(capturedBefore);
     const afterLoginBodies = await eventBodies(value, started.session.id);
-    expect(afterLoginBodies).not.toContainEqual(
-      expect.objectContaining({ type: "gap", reason: "provider_disconnect" }),
-    );
-    expect(afterLoginBodies).not.toContainEqual(
-      expect.objectContaining({ type: "connection", state: "disconnected" }),
-    );
+    expect(afterLoginBodies.filter((body) =>
+      (body.type === "gap" && body.reason === "provider_restart")
+      || (body.type === "connection" && body.state === "resubscribed")))
+      .toEqual(beforeLoginBodies.filter((body) =>
+        (body.type === "gap" && body.reason === "provider_restart")
+        || (body.type === "connection" && body.state === "resubscribed")));
 
     await value.service.execute({
       idempotencyKey: crypto.randomUUID(),

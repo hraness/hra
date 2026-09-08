@@ -69,10 +69,10 @@ test("readonly current-schema admission requires the complete migration ledger w
       let reopened: StateStore | undefined;
       try {
         expect(() => { reopened = new StateStore(paths, { readonly: true }); })
-          .toThrow("STATE_SCHEMA_COHORT_LEDGER_INVALID");
+          .toThrow("STATE_SCHEMA_JOIN_LEDGER_INVALID");
       } finally { reopened?.close(); }
       expect(database.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(migrations);
-      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
     } finally { database.close(); }
   } finally { await rm(scratch, { recursive: true, force: true }); }
 });

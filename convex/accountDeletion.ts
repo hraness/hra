@@ -9,6 +9,11 @@ import {
 } from "../src/cloud/contracts";
 import { sha256Hex } from "../src/cloud/crypto";
 import { deleteAttentionNotificationsForAccountDeletion } from "./attentionNotifications";
+import {
+  consumeAccountDeletionCapacity,
+  loadAccountDeletionCapacity,
+} from "./authorityReductionCapacity";
+import { patchAccountDeletionJobWithCapacity } from "./jobLifecycleCapacity";
 import type { HOSTED_TABLE_LIFECYCLE } from "./lifecyclePolicy";
 import {
   adjustQuotaForPatch,
@@ -17,6 +22,7 @@ import {
   releaseCodexAccountQuotaForDelete,
   releaseCommandQuotaForDelete,
   releaseDeviceQuotaForDelete,
+  releaseMemorySpaceQuotaForDelete,
   releaseParentAttributedQuotaForDelete,
   releaseQuotaForDelete,
   releaseQuotaForStoredIdentity,
@@ -33,6 +39,10 @@ import {
   type MutationCtx,
   type QueryCtx,
 } from "./server";
+import {
+  durableJobCapacityReservation,
+  maximumCommandLifecycleBatch,
+} from "./validators";
 
 const deletionRejectedMessage = "Account deletion status is unavailable.";
 const maximumDeletionBatch = 200;
@@ -46,6 +56,7 @@ export const accountDeletionReceiptRetentionMs = 30 * 24 * 60 * 60 * 1_000;
 const deletionCategoryOrder = [
   "commands_and_leases",
   "chunks_and_epochs",
+  "memory_history",
   "session_heads",
   "usage_and_bindings",
   "codex_accounts",
@@ -98,18 +109,28 @@ export const ACCOUNT_DELETION_TABLE_STRATEGY = {
   authOtpChallenges: "user_index",
   authInvites: "issuer_or_bound_email_index",
   devices: "user_index",
+  accountDeletionIdentityReservations: "user_index",
+  accountDeletionJobReservations: "user_index",
+  deviceRevocationDeviceReservations: "user_index",
+  deviceRevocationJobReservations: "user_index",
+  deviceRevocationSecurityReservations: "user_index",
+  deviceRevocationReceiptReservations: "user_index",
   deviceSessions: "user_index",
   deviceBindChallenges: "user_index",
   deviceKeyEnvelopes: "user_index",
   recoveryEnvelopes: "user_index",
   devicePresence: "user_index",
   deviceRegistries: "user_index",
+  memorySpaces: "user_index",
+  memoryOperations: "user_index_immutable_erasure",
   sessionHeads: "user_index",
   sessionChunks: "user_index_immutable_erasure",
   sessionStreamEpochs: "user_index_immutable_erasure",
   executionLeases: "user_index",
   sessionCommands: "user_index",
   deviceCommands: "user_index",
+  commandLifecycleReservations: "user_index",
+  commandTerminalSecurityReservations: "user_index",
   attentionNotificationOutbox: "user_index",
   attentionNotificationSafetyFaults: "user_index_service_quota",
   codexAccounts: "user_index",
@@ -241,15 +262,16 @@ async function deleteCommandsAndLeases(
   userId: Id<"users">,
   limit: number,
 ): Promise<DeleteResult> {
+  const batchLimit = Math.min(limit, maximumCommandLifecycleBatch);
   const commands = await ctx.db.query("sessionCommands")
     .withIndex("by_user", (builder) => builder.eq("userId", userId))
-    .take(limit);
+    .take(batchLimit);
   for (const command of commands) {
     await releaseCommandQuotaForDelete(ctx, userId, command);
     await ctx.db.delete(command._id);
   }
-  let remaining = limit - commands.length;
-  if (remaining === 0) return { deleted: limit, empty: false };
+  let remaining = batchLimit - commands.length;
+  if (remaining === 0) return { deleted: batchLimit, empty: false };
   const deviceCommands = await ctx.db.query("deviceCommands")
     .withIndex("by_user", (builder) => builder.eq("userId", userId))
     .take(remaining);
@@ -258,14 +280,32 @@ async function deleteCommandsAndLeases(
     await ctx.db.delete(command._id);
   }
   remaining -= deviceCommands.length;
-  if (remaining === 0) return { deleted: limit, empty: false };
+  if (remaining === 0) return { deleted: batchLimit, empty: false };
+  const lifecycleReservations = await ctx.db.query("commandLifecycleReservations")
+    .withIndex("by_user", (builder) => builder.eq("userId", userId))
+    .take(remaining);
+  for (const reservation of lifecycleReservations) {
+    await releaseQuotaForDelete(ctx, userId, "command", reservation);
+    await ctx.db.delete(reservation._id);
+  }
+  remaining -= lifecycleReservations.length;
+  if (remaining === 0) return { deleted: batchLimit, empty: false };
+  const securityReservations = await ctx.db.query("commandTerminalSecurityReservations")
+    .withIndex("by_user", (builder) => builder.eq("userId", userId))
+    .take(remaining);
+  for (const reservation of securityReservations) {
+    await releaseQuotaForDelete(ctx, userId, "security", reservation);
+    await ctx.db.delete(reservation._id);
+  }
+  remaining -= securityReservations.length;
+  if (remaining === 0) return { deleted: batchLimit, empty: false };
   const notifications = await deleteAttentionNotificationsForAccountDeletion(
     ctx,
     userId,
     remaining,
   );
   remaining -= notifications.deleted;
-  if (remaining === 0) return { deleted: limit, empty: false };
+  if (remaining === 0) return { deleted: batchLimit, empty: false };
   const leases = await ctx.db.query("executionLeases")
     .withIndex("by_user", (builder) => builder.eq("userId", userId))
     .take(remaining);
@@ -275,9 +315,11 @@ async function deleteCommandsAndLeases(
   }
   remaining -= leases.length;
   return {
-    deleted: limit - remaining,
+    deleted: batchLimit - remaining,
     empty: commands.length === 0
       && deviceCommands.length === 0
+      && lifecycleReservations.length === 0
+      && securityReservations.length === 0
       && notifications.empty
       && leases.length === 0,
   };
@@ -308,6 +350,36 @@ async function deleteChunksAndEpochs(
   }
   remaining -= epochs.length;
   return { deleted: limit - remaining, empty: chunks.length === 0 && epochs.length === 0 };
+}
+
+async function deleteMemoryHistory(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+  limit: number,
+): Promise<DeleteResult> {
+  // Immutable canonical history has no ordinary erasure path. Whole-account
+  // deletion removes operation children before their owning space rows.
+  const operations = await ctx.db.query("memoryOperations")
+    .withIndex("by_user", (builder) => builder.eq("userId", userId))
+    .take(limit);
+  for (const operation of operations) {
+    await releaseQuotaForDelete(ctx, userId, "memory", operation);
+    await ctx.db.delete(operation._id);
+  }
+  let remaining = limit - operations.length;
+  if (remaining === 0) return { deleted: limit, empty: false };
+  const spaces = await ctx.db.query("memorySpaces")
+    .withIndex("by_user_and_updated_at", (builder) => builder.eq("userId", userId))
+    .take(remaining);
+  for (const space of spaces) {
+    await releaseMemorySpaceQuotaForDelete(ctx, userId, space);
+    await ctx.db.delete(space._id);
+  }
+  remaining -= spaces.length;
+  return {
+    deleted: limit - remaining,
+    empty: operations.length === 0 && spaces.length === 0,
+  };
 }
 
 async function deleteSessionHeads(
@@ -500,6 +572,69 @@ async function deleteReceiptsAndEvents(
   remaining -= revocations.length;
   if (remaining === 0) return { deleted: limit, empty: false };
 
+  const accountIdentityCapacity = await ctx.db
+    .query("accountDeletionIdentityReservations")
+    .withIndex("by_user", (builder) => builder.eq("userId", userId))
+    .take(remaining);
+  for (const reservation of accountIdentityCapacity) {
+    await releaseQuotaForDelete(ctx, userId, "identity", reservation);
+    await ctx.db.delete(reservation._id);
+  }
+  remaining -= accountIdentityCapacity.length;
+  if (remaining === 0) return { deleted: limit, empty: false };
+
+  const accountJobCapacity = await ctx.db.query("accountDeletionJobReservations")
+    .withIndex("by_user", (builder) => builder.eq("userId", userId))
+    .take(remaining);
+  for (const reservation of accountJobCapacity) {
+    await releaseQuotaForDelete(ctx, userId, "job", reservation);
+    await ctx.db.delete(reservation._id);
+  }
+  remaining -= accountJobCapacity.length;
+  if (remaining === 0) return { deleted: limit, empty: false };
+
+  const deviceCapacity = await ctx.db.query("deviceRevocationDeviceReservations")
+    .withIndex("by_user", (builder) => builder.eq("userId", userId))
+    .take(remaining);
+  for (const reservation of deviceCapacity) {
+    await releaseQuotaForDelete(ctx, userId, "device", reservation);
+    await ctx.db.delete(reservation._id);
+  }
+  remaining -= deviceCapacity.length;
+  if (remaining === 0) return { deleted: limit, empty: false };
+
+  const revocationJobCapacity = await ctx.db.query("deviceRevocationJobReservations")
+    .withIndex("by_user", (builder) => builder.eq("userId", userId))
+    .take(remaining);
+  for (const reservation of revocationJobCapacity) {
+    await releaseQuotaForDelete(ctx, userId, "job", reservation);
+    await ctx.db.delete(reservation._id);
+  }
+  remaining -= revocationJobCapacity.length;
+  if (remaining === 0) return { deleted: limit, empty: false };
+
+  const revocationSecurityCapacity = await ctx.db
+    .query("deviceRevocationSecurityReservations")
+    .withIndex("by_user", (builder) => builder.eq("userId", userId))
+    .take(remaining);
+  for (const reservation of revocationSecurityCapacity) {
+    await releaseQuotaForDelete(ctx, userId, "security", reservation);
+    await ctx.db.delete(reservation._id);
+  }
+  remaining -= revocationSecurityCapacity.length;
+  if (remaining === 0) return { deleted: limit, empty: false };
+
+  const revocationReceiptCapacity = await ctx.db
+    .query("deviceRevocationReceiptReservations")
+    .withIndex("by_user", (builder) => builder.eq("userId", userId))
+    .take(remaining);
+  for (const reservation of revocationReceiptCapacity) {
+    await releaseQuotaForDelete(ctx, userId, "receipt", reservation);
+    await ctx.db.delete(reservation._id);
+  }
+  remaining -= revocationReceiptCapacity.length;
+  if (remaining === 0) return { deleted: limit, empty: false };
+
   const attempts = await ctx.db.query("authEmailAttemptEvents")
     .withIndex("by_email_kind_and_created_at", (builder) =>
       builder.eq("emailDigest", emailDigest))
@@ -535,6 +670,12 @@ async function deleteReceiptsAndEvents(
     empty: idempotency.length === 0
       && security.length === 0
       && revocations.length === 0
+      && accountIdentityCapacity.length === 0
+      && accountJobCapacity.length === 0
+      && deviceCapacity.length === 0
+      && revocationJobCapacity.length === 0
+      && revocationSecurityCapacity.length === 0
+      && revocationReceiptCapacity.length === 0
       && attempts.length === 0
       && boundInvites.length === 0
       && invites.length === 0,
@@ -677,6 +818,8 @@ async function deleteCategory(
       return await deleteCommandsAndLeases(ctx, input.userId, input.limit);
     case "chunks_and_epochs":
       return await deleteChunksAndEpochs(ctx, input.userId, input.limit);
+    case "memory_history":
+      return await deleteMemoryHistory(ctx, input.userId, input.limit);
     case "session_heads":
       return await deleteSessionHeads(ctx, input.userId, input.limit);
     case "usage_and_bindings":
@@ -744,6 +887,10 @@ async function finalizeDeletion(
 
   const now = Date.now();
   const existingReceipt = await matchingReceipt(ctx, job.publicId);
+  // Release the larger physical job obligation before reserving the smaller
+  // service-only completion receipt. The mutation is atomic, so a later
+  // validation failure restores both the job and its quota charge.
+  await releaseQuotaForDelete(ctx, job.userId, "job", job);
   if (existingReceipt === null) {
     const receiptDocument = {
       completedAt: now,
@@ -762,7 +909,6 @@ async function finalizeDeletion(
 
   // The completion receipt is durable before the authority and identity rows
   // are erased. Convex commits this sequence atomically.
-  await releaseQuotaForDelete(ctx, job.userId, "job", job);
   await releaseQuotaForDelete(ctx, job.userId, "identity", subject);
   await releaseQuotaForStoredIdentity(ctx, job.userId, user);
   await finalizeUserQuotaAuthorityForDelete(ctx, job.userId);
@@ -833,7 +979,11 @@ export const request = mutation({
       status: "disabled" as const,
       updatedAt: now,
     };
+    const capacity = await loadAccountDeletionCapacity(ctx, userId);
     const jobDocument = {
+      ...(capacity.kind === "reserved"
+        ? { capacityReservation: durableJobCapacityReservation }
+        : {}),
       category: "commands_and_leases",
       createdAt: now,
       publicId: args.jobId,
@@ -843,10 +993,20 @@ export const request = mutation({
       updatedAt: now,
       userId,
     } as const;
-    await adjustQuotaForPatch(ctx, userId, "identity", subject, subjectPatch);
-    await reserveQuotaForInsert(ctx, userId, "job", jobDocument);
-    await ctx.db.patch(subject._id, subjectPatch);
-    await ctx.db.insert("accountDeletionJobs", jobDocument);
+    if (capacity.kind === "reserved") {
+      await consumeAccountDeletionCapacity(
+        ctx,
+        capacity,
+        subject,
+        subjectPatch,
+        jobDocument,
+      );
+    } else {
+      await adjustQuotaForPatch(ctx, userId, "identity", subject, subjectPatch);
+      await reserveQuotaForInsert(ctx, userId, "job", jobDocument);
+      await ctx.db.patch(subject._id, subjectPatch);
+      await ctx.db.insert("accountDeletionJobs", jobDocument);
+    }
     return {
       category: "commands_and_leases",
       createdAt: now,
@@ -920,6 +1080,46 @@ export const drain = internalMutation({
       };
     }
 
+    // A job admitted by the predecessor schema has no physical padding to
+    // fund a longer category/state spelling. Drain its remaining categories
+    // without persisting intermediate progress: empty categories cost no
+    // mutation, a non-empty category releases owned rows before this
+    // byte-neutral timestamp patch, and an all-empty suffix finalizes by
+    // releasing the job itself before creating the completion receipt.
+    if (job.capacityReservation === undefined) {
+      let legacyCategory: DeletionCategory = job.category;
+      while (legacyCategory !== "user_and_subject" && legacyCategory !== "complete") {
+        const result = await deleteCategory(ctx, {
+          category: legacyCategory,
+          emailDigest: subject.emailDigest,
+          limit,
+          userId: job.userId,
+        });
+        if (!result.empty) {
+          if (result.deleted < 1) rejectDeletion();
+          const jobPatch = { updatedAt: Date.now() };
+          await adjustQuotaForPatch(ctx, job.userId, "job", job, jobPatch);
+          await ctx.db.patch(job._id, jobPatch);
+          return {
+            category: legacyCategory,
+            jobId: job.publicId,
+            kind: "drained" as const,
+            processed: result.deleted,
+            state: job.state,
+          };
+        }
+        legacyCategory = nextCategory(legacyCategory);
+      }
+      const processed = await finalizeDeletion(ctx, job);
+      return {
+        category: "complete" as const,
+        jobId: job.publicId,
+        kind: "complete" as const,
+        processed,
+        state: "complete" as const,
+      };
+    }
+
     const result = await deleteCategory(ctx, {
       category: job.category,
       emailDigest: subject.emailDigest,
@@ -934,8 +1134,7 @@ export const drain = internalMutation({
         state: "draining" as const,
         updatedAt: now,
       };
-      await adjustQuotaForPatch(ctx, job.userId, "job", job, jobPatch);
-      await ctx.db.patch(job._id, jobPatch);
+      await patchAccountDeletionJobWithCapacity(ctx, job, jobPatch);
       return {
         category,
         jobId: job.publicId,
@@ -945,8 +1144,7 @@ export const drain = internalMutation({
       };
     }
     const jobPatch = { state: "draining" as const, updatedAt: now };
-    await adjustQuotaForPatch(ctx, job.userId, "job", job, jobPatch);
-    await ctx.db.patch(job._id, jobPatch);
+    await patchAccountDeletionJobWithCapacity(ctx, job, jobPatch);
     return {
       category: job.category,
       jobId: job.publicId,

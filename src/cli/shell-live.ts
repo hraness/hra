@@ -377,8 +377,17 @@ const liveToolTarget = (
   ? ""
   : ` ${safeLiveText(server ?? "local")}/${safeLiveText(tool ?? fallback)}`;
 
-const liveMessageActor = (actor: "human" | "autorespond" | "provider_switch"): string =>
-  actor === "human" ? "You" : actor === "autorespond" ? "Autorespond" : "Handoff";
+const liveMessageActor = (
+  actor: "human" | "automation" | "autorespond" | "peer_session" | "provider_switch",
+): string => actor === "human"
+  ? "You"
+  : actor === "automation"
+    ? "Automation"
+    : actor === "autorespond"
+      ? "Autorespond"
+      : actor === "peer_session"
+        ? "Peer session"
+        : "Handoff";
 
 const renderNonDeltaEvent = (event: SessionEvent): string | null => {
   const body = event.body;

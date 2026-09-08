@@ -8,6 +8,7 @@ import fc from "fast-check";
 
 import { INTERACTION_MAX_PENDING_MS } from "../domain/interactions.ts";
 import {
+  currentPresetContract,
   legacyPresetContract,
   presetRequirementForContract,
   presetRequirements,
@@ -18,6 +19,7 @@ import { CODEX_PIN, PINNED_CODEX_MATRIX_DIGESTS, PINNED_CODEX_SCHEMA_DIGESTS } f
 import { resolvePinnedCodexRuntime } from "./runtime.ts";
 import {
   HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
+  HRA_HOST_DYNAMIC_TOOLS,
   OPERATIONS,
   PINNED_CODEX_NOTIFICATION_MATRIX,
   PINNED_CODEX_NOTIFICATION_SCHEMA_DIGEST,
@@ -32,6 +34,7 @@ import {
   parseAccountUsage,
   parseBrokeredCodexServerRequest,
   parseConversationAutomationToolCall,
+  parseHraHostToolCall,
   parseFact,
   parseModelPage,
   parseManagedLoginCancel,
@@ -115,6 +118,17 @@ const capabilities: CodexCapabilitySnapshot = {
       hidden: false,
       supportedReasoningEfforts: ["low", "medium", "high", "max"],
       defaultReasoningEffort: "medium",
+      serviceTiers: [{ id: "priority", name: "Fast", description: "Faster" }],
+      defaultServiceTier: null,
+      isDefault: false,
+    },
+    {
+      id: "gpt-5.6-sol",
+      model: "gpt-5.6-sol",
+      displayName: "GPT-5.6 Sol",
+      hidden: false,
+      supportedReasoningEfforts: ["low", "max", "ultra"],
+      defaultReasoningEffort: "low",
       serviceTiers: [{ id: "priority", name: "Fast", description: "Faster" }],
       defaultServiceTier: null,
       isDefault: false,
@@ -598,6 +612,65 @@ describe("pinned server requests and safe notifications", () => {
     expect(schedules.every((schedule) => schedule.additionalProperties === false)).toBe(true);
   });
 
+  test("projects the complete domain host-tool manifest into Codex", () => {
+    expect(HRA_HOST_DYNAMIC_TOOLS).toHaveLength(1);
+    expect(HRA_HOST_DYNAMIC_TOOLS[0]).toMatchObject({
+      type: "namespace",
+      name: "hra",
+    });
+    expect(HRA_HOST_DYNAMIC_TOOLS[0].tools.map((tool) => tool.name)).toEqual([
+      "automation_update",
+      "sessions_list",
+      "session_inspect",
+      "session_message",
+      "memory_remember",
+      "memory_query",
+      "memory_explain",
+      "memory_share",
+    ]);
+    const parsed = parseHraHostToolCall({
+      authority: codexAuthority(9),
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      requestId: { type: "number", value: 72 },
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-2",
+        namespace: "hra",
+        tool: "session_message",
+        arguments: {
+          sessionId: `sess_${"a".repeat(32)}`,
+          expectedRevision: 3,
+          delivery: "steer",
+          message: "Please check the failed boundary.",
+          reason: "Independent review",
+        },
+      },
+    });
+    expect(parsed).toMatchObject({
+      tool: "session_message",
+      input: {
+        expectedRevision: 3,
+        delivery: "steer",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    expect(() => parseConversationAutomationToolCall({
+      authority: codexAuthority(9),
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      requestId: { type: "number", value: 72 },
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-2",
+        namespace: "hra",
+        tool: "sessions_list",
+        arguments: {},
+      },
+    })).toThrow(CodexError);
+  });
+
   test("parses exact dynamic-tool authority and rejects standalone-field smuggling", () => {
     const common = {
       authority: codexAuthority(9),
@@ -731,6 +804,14 @@ describe("pinned server requests and safe notifications", () => {
       prompt: "continue",
       schedule: { kind: "interval_minutes", minutes: 15 },
     })).toThrow(CodexError);
+    for (const separator of [String.fromCodePoint(0x2028), String.fromCodePoint(0x2029)]) {
+      expect(() => parseArguments({
+        mode: "create",
+        name: `Review${separator}forged`,
+        prompt: "continue",
+        schedule: { kind: "interval_minutes", minutes: 15 },
+      })).toThrow(CodexError);
+    }
     expect(() => parseArguments({
       mode: "create",
       name: "Review",
@@ -740,6 +821,11 @@ describe("pinned server requests and safe notifications", () => {
     expect(serializeDynamicToolPublicResult({ z: 1, a: { d: 2, b: true } })).toBe(
       "{\"a\":{\"b\":true,\"d\":2},\"z\":1}",
     );
+    const exactFourByteResult = "😀".repeat((64 * 1_024) / 4);
+    expect(new TextEncoder().encode(serializeDynamicToolPublicResult(exactFourByteResult)))
+      .toHaveLength(64 * 1_024);
+    expect(() => serializeDynamicToolPublicResult(`${exactFourByteResult}x`))
+      .toThrow(CodexError);
     expect(() => serializeDynamicToolPublicResult("")).toThrow(CodexError);
     expect(() => serializeDynamicToolPublicResult("é".repeat(32_769))).toThrow(CodexError);
     expect(() => serializeDynamicToolPublicResult([] as never)).toThrow(CodexError);
@@ -763,6 +849,19 @@ describe("pinned server requests and safe notifications", () => {
       expect(parsed.provider.requestDigest).toMatch(/^[a-f0-9]{64}$/u);
       expect(JSON.stringify(parsed.display)).not.toContain("git push origin main");
     }
+
+    const lineSeparated = parseBrokeredCodexServerRequest({
+      authority: codexAuthority(9),
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      requestId: { type: "string", value: "line-separated" },
+      method: "item/commandExecution/requestApproval",
+      params: {
+        ...(brokeredFixtures["item/commandExecution/requestApproval"] as Record<string, unknown>),
+        reason: `line${String.fromCodePoint(0x2028)}forged${String.fromCodePoint(0x2029)}paragraph`,
+      },
+    });
+    expect(JSON.stringify(lineSeparated.display)).not.toContain(String.fromCodePoint(0x2028));
+    expect(JSON.stringify(lineSeparated.display)).not.toContain(String.fromCodePoint(0x2029));
 
     const fileChange = parseBrokeredCodexServerRequest({
       authority: codexAuthority(9),
@@ -1636,33 +1735,27 @@ describe("runtime capability resolution", () => {
       serviceTier: null,
     });
     expect(resolvePreset(capabilities, "high", presetRequirements.high, true)).toMatchObject({
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       effort: "max",
       serviceTier: "priority",
     });
     expect(resolvePreset(capabilities, "ultra", presetRequirements.ultra, false)).toMatchObject({
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       effort: "ultra",
     });
   });
 
   test("resolves a historical exact tuple without reinterpreting its alias", () => {
     const legacyHigh = presetRequirementForContract("high", legacyPresetContract);
-    const legacyCapabilities: CodexCapabilitySnapshot = {
-      ...capabilities,
-      models: [
-        ...capabilities.models,
-        {
-          ...capabilities.models[1]!,
-          id: "gpt-5.6-sol",
-          model: "gpt-5.6-sol",
-          displayName: "GPT-5.6 Sol",
-        },
-      ],
-    };
-    expect(resolvePreset(legacyCapabilities, "high", legacyHigh, false)).toMatchObject({
+    expect(resolvePreset(capabilities, "high", legacyHigh, false)).toMatchObject({
       alias: "high",
       model: "gpt-5.6-sol",
+      effort: "max",
+    });
+    const astraHigh = presetRequirementForContract("high", currentPresetContract);
+    expect(resolvePreset(capabilities, "high", astraHigh, false)).toMatchObject({
+      alias: "high",
+      model: "gpt-6-astra",
       effort: "max",
     });
     expect(() => resolvePreset(capabilities, "high", {
@@ -1682,12 +1775,12 @@ describe("runtime capability resolution", () => {
   test("never selects a prefixed or suffixed lookalike under catalog reordering", () => {
     const catalog = [
       { ...capabilities.models[0]!, id: "gpt-5.6-luna-mini", model: "gpt-5.6-luna-mini" },
-      { ...capabilities.models[1]!, id: "legacy-gpt-6-astra", model: "legacy-gpt-6-astra" },
+      { ...capabilities.models[2]!, id: "legacy-gpt-6-astra", model: "legacy-gpt-6-astra" },
       ...capabilities.models,
     ];
-    fc.assert(fc.property(fc.shuffledSubarray(catalog, { minLength: 4, maxLength: 4 }), (models) => {
+    fc.assert(fc.property(fc.shuffledSubarray(catalog, { minLength: 5, maxLength: 5 }), (models) => {
       expect(resolvePreset({ ...capabilities, models }, "low", presetRequirements.low, false).model).toBe("gpt-5.6-luna");
-      expect(resolvePreset({ ...capabilities, models }, "high", presetRequirements.high, false).model).toBe("gpt-6-astra");
+      expect(resolvePreset({ ...capabilities, models }, "high", presetRequirements.high, false).model).toBe("gpt-5.6-sol");
     }));
     const lookalikesOnly = {
       ...capabilities,
@@ -1807,8 +1900,15 @@ describe("runtime capability resolution", () => {
     expect(page.data[0]).toMatchObject({
       createdAt: createdAtSeconds * 1_000,
       updatedAt: updatedAtSeconds * 1_000,
+      providerTimestampUnit: "unix_milliseconds_v1",
     });
-    for (const invalidCreatedAt of [1.5, Math.floor(Number.MAX_SAFE_INTEGER / 1_000) + 1]) {
+    fc.assert(fc.property(fc.integer({ min: 0, max: Math.floor(Number.MAX_SAFE_INTEGER / 1_000) }), (seconds) => {
+      const parsed = parseThreadMetadataRead({ thread: { ...providerThread, updatedAt: seconds } });
+      expect(parsed.providerTimestampUnit).toBe("unix_milliseconds_v1");
+      expect(parsed.updatedAt).toBe(seconds * 1_000);
+      expect(Number.isSafeInteger(parsed.updatedAt)).toBe(true);
+    }));
+    for (const invalidCreatedAt of [-1, 1.5, Math.floor(Number.MAX_SAFE_INTEGER / 1_000) + 1]) {
       expect(() => parseThreadPage({
         data: [{ ...providerThread, createdAt: invalidCreatedAt }],
         nextCursor: null,

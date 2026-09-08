@@ -50,12 +50,39 @@ const routingEvaluationComparisonV1Schema = z.discriminatedUnion("kind", [
     .strict(),
 ]);
 
-/** Current evaluation comparisons. Schema v1 remains an exact historical Sol decoder. */
-export const routingEvaluationComparisonSchema = z.discriminatedUnion("kind", [
+/** Schema v2 remains an exact historical Astra decoder. */
+const routingEvaluationComparisonV2Schema = z.discriminatedUnion("kind", [
   z
     .object({
       kind: z.literal("terra_vs_astra"),
       baseline: z.literal("codex_astra_ultra"),
+      candidate: z.literal("codex_terra_ultra"),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("opus_vs_fable"),
+      baseline: z.literal("claude_fable_max"),
+      candidate: z.literal("claude_opus"),
+      candidateEffort: z.enum(["high", "xhigh", "max"]),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("fast_vs_standard"),
+      profile: z.literal("terra"),
+      baselineFast: z.literal(false),
+      candidateFast: z.literal(true),
+    })
+    .strict(),
+]);
+
+/** Current comparisons. Schema v3 starts new Sol studies without reusing v1. */
+export const routingEvaluationComparisonSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("terra_vs_sol"),
+      baseline: z.literal("codex_sol_ultra"),
       candidate: z.literal("codex_terra_ultra"),
     })
     .strict(),
@@ -182,6 +209,12 @@ export const routingEvaluationInputSchema = z
     }).strict(),
     z.object({
       schemaVersion: z.literal(2),
+      study: z.enum(["pilot", "holdout"]),
+      comparison: routingEvaluationComparisonV2Schema,
+      ...routingEvaluationInputTailShape,
+    }).strict(),
+    z.object({
+      schemaVersion: z.literal(3),
       study: z.enum(["pilot", "holdout"]),
       comparison: routingEvaluationComparisonSchema,
       ...routingEvaluationInputTailShape,
@@ -369,6 +402,13 @@ export const routingEvaluationReportSchema = z.discriminatedUnion(
     }).strict(),
     z.object({
       schemaVersion: z.literal(2),
+      mode: z.literal("shadow"),
+      study: z.enum(["pilot", "holdout"]),
+      comparison: routingEvaluationComparisonV2Schema,
+      ...routingEvaluationReportTailShape,
+    }).strict(),
+    z.object({
+      schemaVersion: z.literal(3),
       mode: z.literal("shadow"),
       study: z.enum(["pilot", "holdout"]),
       comparison: routingEvaluationComparisonSchema,

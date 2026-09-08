@@ -19,6 +19,7 @@ import {
 import {
   digestTranscriptRecords,
   renderTranscriptSeed,
+  renderTranscriptSeedV1,
   type SessionTranscript,
   type TranscriptRecord,
 } from "./transcript";
@@ -283,10 +284,18 @@ describe("managed forward renderer", () => {
       + "User: hello";
     const expectedDigest = createHash("sha256").update("hra:session-transcript-seed:v1\0", "utf8")
       .update(expected, "utf8").digest("hex");
-    const before = renderTranscriptSeed({ transcript: source, fromProvider: "codex", toProvider: "claude" });
+    const before = renderTranscriptSeedV1({ transcript: source, fromProvider: "codex", toProvider: "claude" });
     render({ ...base, transcript: source });
     expect(before).toEqual({ text: expected, digest: expectedDigest, includedRecords: 1, omittedRecords: 0 });
-    expect(renderTranscriptSeed({ transcript: source, fromProvider: "codex", toProvider: "claude" })).toEqual(before);
+    expect(renderTranscriptSeedV1({ transcript: source, fromProvider: "codex", toProvider: "claude" })).toEqual(before);
+    const currentExpected = expected.replace(
+      "secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.",
+      "secrets, absolute paths, raw tool arguments, raw tool output, and attachment contents were never embedded and are not here.",
+    ).replace("No records were omitted.", "No retained records were omitted.");
+    const currentDigest = createHash("sha256").update("hra:session-transcript-seed:v1\0", "utf8")
+      .update(currentExpected, "utf8").digest("hex");
+    expect(renderTranscriptSeed({ transcript: source, fromProvider: "codex", toProvider: "claude" }))
+      .toEqual({ text: currentExpected, digest: currentDigest, includedRecords: 1, omittedRecords: 0 });
   });
 
   test("is total for JSON input and preserves exact text under arbitrary bounded budgets", () => {

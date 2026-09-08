@@ -14,7 +14,11 @@
  *
  * Nothing here imports React, so `bun test ./app` runs it without a document.
  */
-import type { RemoteCommandPayload } from "../hra/cloud";
+import {
+  activeRemotePresetSelection,
+  type RemoteCommandPayload,
+  type SupportedPreset,
+} from "../hra/cloud";
 
 export type ApprovalMode = "auto:all" | "auto:workspace" | "manual";
 export type PresetChoice = "low" | "high" | "ultra" | "fable-max" | "astra";
@@ -34,20 +38,24 @@ export const approvalModeLabels: Readonly<Record<ApprovalMode, string>> = Object
   manual: "Manual",
 });
 
-export const presetChoices: readonly PresetChoice[] = Object.freeze([
+export const presetChoices: readonly SupportedPreset[] = Object.freeze([
   "low",
   "high",
   "ultra",
   "fable-max",
-  "astra",
 ] as const);
 
 export const presetLabels: Readonly<Record<PresetChoice, string>> = Object.freeze({
   "fable-max": "Fable Max",
-  astra: "Devin Astra",
-  high: "Astra Max",
+  astra: "Devin Astra (retired)",
+  // The web app and a target daemon can roll independently, and registry v1
+  // projects only the stable alias rather than that daemon's active binding.
+  // Keep mutable Codex controls alias-generic until the exact binding is
+  // projected; otherwise an old tab or same-version source daemon can make a
+  // Sol-labelled control select Astra, or the reverse.
+  high: "Codex High",
   low: "Luna Max",
-  ultra: "Astra Ultra",
+  ultra: "Codex Ultra",
 });
 
 export function approvalModeCommand(mode: ApprovalMode): RemoteCommandPayload {
@@ -58,8 +66,12 @@ export function showThinkingCommand(enabled: boolean): RemoteCommandPayload {
   return { enabled, kind: "set_show_thinking", scope: defaultSettingScope };
 }
 
-export function defaultPresetCommand(preset: PresetChoice): RemoteCommandPayload {
-  return { kind: "set_default_preset", preset };
+export function defaultPresetCommand(preset: SupportedPreset): RemoteCommandPayload {
+  return { kind: "set_default_preset", ...activeRemotePresetSelection(preset) };
+}
+
+export function sessionPresetCommand(preset: SupportedPreset): RemoteCommandPayload {
+  return { kind: "set_model", ...activeRemotePresetSelection(preset) };
 }
 
 /** Fast is a session-only manual control; there is no inferred browser state. */

@@ -1,8 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 
 import { ClaudeError } from "./errors";
-import { CLAUDE_PIN, CLAUDE_PIN_MODEL, PINNED_CLAUDE_MATRIX_DIGESTS } from "./pin";
+import {
+  CLAUDE_PIN,
+  CLAUDE_PIN_MODEL,
+  PINNED_CLAUDE_ARTIFACT_DIGESTS,
+  PINNED_CLAUDE_EVIDENCE_DIGESTS,
+  PINNED_CLAUDE_MATRIX_DIGESTS,
+} from "./pin";
 import {
   assertPinnedClaudeMatrices,
   assertPinnedClaudeModel,
@@ -49,6 +56,21 @@ const canUseTool = (event: ClaudeStreamEvent): ClaudeCanUseTool => {
 };
 
 describe("Claude pin", () => {
+  test("retains exact artifact evidence for the reviewed host-tool flags", async () => {
+    const fixture = await Bun.file(join(fixtureDirectory, "cli-host-tools-2.1.260.txt")).text();
+    expect(createHash("sha256").update(fixture).digest("hex"))
+      .toBe(PINNED_CLAUDE_EVIDENCE_DIGESTS.hostToolHelp);
+    expect(fixture).toContain(`Wrapper tarball SHA-256: ${PINNED_CLAUDE_ARTIFACT_DIGESTS.wrapperPackage}`);
+    expect(fixture).toContain(`Native tarball SHA-256: ${PINNED_CLAUDE_ARTIFACT_DIGESTS.nativePackage}`);
+    expect(fixture).toContain(`Native executable SHA-256: ${PINNED_CLAUDE_ARTIFACT_DIGESTS.nativeExecutable}`);
+    expect(fixture).toContain("--append-system-prompt <prompt>");
+    expect(fixture).toContain("--mcp-config <configs...>");
+    expect(fixture).toContain("--strict-mcp-config");
+    expect(fixture).toContain("--system-prompt-snapshot <on|off>");
+    expect(fixture).toContain("--append-system-prompt turns it off so");
+    expect(fixture).toContain("is ignored until compaction");
+  });
+
   test("admits only the reviewed version, model, and effort", () => {
     expect(() => { assertPinnedClaudeVersion(CLAUDE_PIN); }).not.toThrow();
     expect(() => { assertPinnedClaudeVersion("2.1.259"); }).toThrow(ClaudeError);
@@ -795,6 +817,9 @@ describe("provider text safety", () => {
     expect(sanitizeClaudeText(absoluteFixture)).not.toContain("someone");
     expect(sanitizeClaudeText("token: abcdefghijklmnop")).toContain("[protected]");
     expect(sanitizeClaudeText("ab")).toBe("a�b");
+    expect(sanitizeClaudeText(
+      `a${String.fromCodePoint(0x2028)}b${String.fromCodePoint(0x2029)}c`,
+    )).toBe("a�b�c");
     expect(sanitizeClaudeText("line\nline", true)).toBe("line\nline");
   });
 

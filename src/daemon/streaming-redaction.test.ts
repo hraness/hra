@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
+import { createClaudeProviderAccountId } from "../domain/provider-accounts";
 import { createProfileId, createSessionId } from "../domain/values";
 import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 import {
   sanitizeInteractionDisplay,
+  sanitizeProviderProse,
   SessionEventStreamRedactor,
   type SessionEventWrite,
 } from "./streaming-redaction";
@@ -192,6 +194,39 @@ describe("SessionEventStreamRedactor", () => {
     expect(startBody.server).not.toContain(privatePathRoot);
     expect(startBody.server).not.toContain("\u001b");
     expect(JSON.stringify([...started, ...completed])).not.toContain("TOOL-IDENTITY-SECRET-1234");
+  });
+
+  test("replaces Unicode line and paragraph separators at one-line provider boundaries", () => {
+    expect(sanitizeProviderProse("tool\u2028forged\u2029label", false))
+      .toBe("tool�forged�label");
+    const redactor = createRedactor();
+    const output = [
+      ...redactor.accept(write({
+        type: "item_started",
+        turnId: "turn-separator",
+        itemId: "item-separator",
+        itemKind: "tool\u2028forged",
+        server: "server\u2029forged",
+        summary: "summary\u2028forged",
+      })),
+      ...redactor.accept(write({
+        type: "user_message",
+        turnId: null,
+        actor: "human",
+        text: "safe",
+        omittedCharacters: 0,
+        attachments: [{
+          byteLength: 4,
+          digest: "a".repeat(64),
+          mediaType: "text/plain",
+          name: "report\u2029forged.txt",
+        }],
+      })),
+    ];
+    const serialized = JSON.stringify(output);
+    expect(serialized).not.toContain("\u2028");
+    expect(serialized).not.toContain("\u2029");
+    expect(serialized).toContain("�");
   });
 
   test("redacts split authorization, device-code, token, and key assignments before release", () => {
@@ -598,6 +633,69 @@ describe("SessionEventStreamRedactor", () => {
       throughSequence: 12,
     });
     expect(redactor.activeStreamCount).toBe(0);
+  });
+
+  test("flushes provider text before an out-of-band steer message without ending item custody", () => {
+    const redactor = createRedactor();
+    redactor.accept(start("active-item"));
+    expect(redactor.accept(assistant("active-item", "assistant before steer"))).toEqual([]);
+
+    const flushed = redactor.flushSession({
+      accountId,
+      providerAuthority,
+      providerConnectionId: connectionId,
+      providerGeneration: 3,
+      sessionId,
+    });
+    expect(texts(flushed, "active-item")).toBe("assistant before steer");
+    expect(redactor.activeStreamCount).toBe(0);
+
+    expect(redactor.accept(assistant("active-item", "assistant after steer"))).toEqual([]);
+    const completed = redactor.accept(complete("active-item"));
+    expect(texts(completed, "active-item")).toBe("assistant after steer");
+    expect(JSON.stringify([...flushed, ...completed])).not.toContain("[protected]");
+  });
+
+  for (const dimension of ["provider", "binding", "process"] as const) {
+    test(`flushes only the captured ${dimension} authority without finishing another stream`, () => {
+      const redactor = createRedactor();
+      const otherAuthority = dimension === "provider"
+        ? { ...providerAuthority, provider: "claude" as const, providerAccountId: createClaudeProviderAccountId() }
+        : { ...providerAuthority,
+            ...(dimension === "binding" ? { bindingGeneration: 3 } : { processGeneration: 4 }) };
+      const other = {
+        providerAuthority: otherAuthority,
+        providerGeneration: otherAuthority.processGeneration,
+      };
+      redactor.accept(start("original"));
+      redactor.accept(start("other", other));
+      expect(redactor.accept(assistant("original", "original pending text"))).toEqual([]);
+      expect(redactor.accept(write({
+        type: "assistant_delta", turnId: "turn-1", itemId: "other", text: "other pending text",
+      }, other))).toEqual([]);
+      const context = { accountId, providerAuthority, providerGeneration: 3,
+        providerConnectionId: connectionId, sessionId };
+      const flushed = redactor.flushSession(context);
+      expect(texts(flushed, "original")).toBe("original pending text");
+      expect(texts(flushed, "other")).toBe("");
+      expect(flushed.every((entry) => entry.providerAuthority === providerAuthority
+        || JSON.stringify(entry.providerAuthority) === JSON.stringify(providerAuthority))).toBe(true);
+      expect(redactor.activeStreamCount).toBe(1);
+      expect(texts(redactor.flushSession({ ...context, ...other }), "other")).toBe("other pending text");
+      expect(redactor.activeStreamCount).toBe(0);
+    });
+  }
+
+  test("a mismatched flush tuple is inert before touching pending text", () => {
+    const redactor = createRedactor();
+    redactor.accept(start("pending"));
+    redactor.accept(assistant("pending", "preserved pending text"));
+    const context = { accountId, providerAuthority, providerGeneration: 3,
+      providerConnectionId: connectionId, sessionId };
+    expect(() => redactor.flushSession({ ...context, providerGeneration: 4 }))
+      .toThrow("SESSION_EVENT_PROVIDER_AUTHORITY_MISMATCH");
+    expect(redactor.activeStreamCount).toBe(1);
+    expect(texts(redactor.flushSession(context), "pending")).toBe("preserved pending text");
   });
 
   test("sanitizes complete plan and interaction prose without changing closed decisions", () => {

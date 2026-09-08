@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
+import { parseHTML } from "linkedom";
 
 import type { MachineView } from "../model/settings-view";
 
@@ -12,7 +13,17 @@ await mock.module("../custody/custody-context", () => ({
 }));
 
 await mock.module("../data/archived-sessions", () => ({
-  useArchivedSessions: () => [],
+  useArchivedSessions: () => [
+    {
+      executionDevicePublicId: "device_studio01", machineLabel: "Studio",
+      publicId: "sess_retired", retiredProvider: "devin",
+      title: "Retired conversation", updatedAt: 1_760_000_000_000,
+    },
+    {
+      executionDevicePublicId: "device_studio01", machineLabel: "Studio",
+      publicId: "sess_supported", title: "Supported conversation", updatedAt: 1_760_000_000_000,
+    },
+  ],
 }));
 
 await mock.module("../data/commands", () => ({
@@ -48,6 +59,8 @@ await mock.module("../data/registry", () => ({
   useDeviceRegistries: () => ({
     error: null,
     loading: false,
+    memorySummaryReady: true,
+    now: 1_760_000_000_000,
     machines: [{
       accountLinkingAllowed: true,
       accounts: [{
@@ -65,6 +78,8 @@ await mock.module("../data/registry", () => ({
       deviceStatus: "active",
       heartbeatAt: 1_760_000_000_000,
       label: "Studio",
+      memorySummary: null,
+      memorySummaryFreshness: "unsupported",
       online: true,
       notificationHours: null,
       notificationHoursStatus: "unsupported",
@@ -96,12 +111,24 @@ await mock.module("../data/session-heads", () => ({
 const { SettingsScreen } = await import("./settings-screen");
 
 describe("Devin account settings", () => {
-  test("shows the local isolated-login command and never offers browser linking", () => {
+  test("keeps retired archived sessions read-only while supported sessions can unarchive", () => {
+    const markup = renderToStaticMarkup(<SettingsScreen onBack={() => undefined} />);
+    const { document } = parseHTML(markup);
+    const unarchiveButtons = [...document.querySelectorAll("button")]
+      .filter((button) => button.textContent === "Unarchive");
+    expect(unarchiveButtons).toHaveLength(2);
+    expect(unarchiveButtons[0]?.hasAttribute("disabled")).toBe(true);
+    expect(unarchiveButtons[1]?.hasAttribute("disabled")).toBe(false);
+    expect(markup).toContain("Retired conversation");
+  });
+
+  test("shows historical Devin accounts as retired without any login path", () => {
     const markup = renderToStaticMarkup(<SettingsScreen onBack={() => undefined} />);
 
-    expect(markup).toContain("hra account login acct_devin000001 --provider devin");
-    expect(markup).toContain("Devin owns this foreground sign-in");
-    expect(markup).toContain("--manual-token-flow");
+    expect(markup).toContain("Devin support is retired");
+    expect(markup).toContain("read-only");
+    expect(markup).not.toContain("hra account login acct_devin000001");
+    expect(markup).not.toContain("--manual-token-flow");
     expect(markup).not.toContain("Link here");
     expect(markup).not.toContain("Check status");
     expect(markup).toContain("Codex personal sessions");

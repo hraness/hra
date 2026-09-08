@@ -7,13 +7,25 @@ import { sha256Hex } from "../src/cloud/crypto";
 import { buildHraAttentionEmailBody } from "./attentionEmail";
 import { reserveAttentionNotificationFaultCapacity } from "./attentionNotificationControl";
 import { attentionNotificationQuotaReservations } from "./attentionNotifications";
+import {
+  createAccountDeletionCapacityForNewUser,
+  createDeviceRevocationCapacityForNewDevice,
+} from "./authorityReductionCapacity";
+import { reserveCommandLifecycleForInsert } from "./commandLifecycle";
 import { commandTerminalRetentionMs } from "./commands";
 import { ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS } from "./lifecyclePolicy";
 import {
+  CATEGORY_QUOTAS,
+  QUOTA_CATEGORIES,
+  SERVICE_TOTAL_QUOTA,
+  USER_TOTAL_QUOTA,
   adjustCommandQuotaForPatch,
   adjustQuotaForPatch,
   initializeAccountUsageQuotaAuthority,
   initializeUserQuotaAuthority,
+  logicalDocumentBytes,
+  releaseQuotaForDelete,
+  releaseSessionHeadQuotaForDelete,
   reserveCodexAccountQuotaForInsert,
   reserveDeviceQuotaForInsert,
   reserveNonterminalCommandQuotaForInsert,
@@ -23,6 +35,10 @@ import {
 } from "./quota";
 import schema from "./schema";
 import { modules } from "./test.setup";
+import {
+  commandLifecycleCapacityVersion,
+  commandReceiptCapacityReservation,
+} from "./validators";
 import { DEVICE_REVOCATION_RETAINED_SERVICE_TABLES } from "./deviceRevocation";
 
 type Args = Readonly<Record<string, Value>>;
@@ -45,6 +61,21 @@ const listDevices = makeFunctionReference<"query", Args, readonly Readonly<{
   publicId: string;
   status: string;
 }>[]>("devices:list");
+const listSessionHeads = makeFunctionReference<"query", Args, readonly Readonly<{
+  publicId: string;
+  state: string;
+}>[]>("sessions:listHeads");
+const listSessionHeadsPage = makeFunctionReference<"query", Args, Readonly<{
+  page: readonly Readonly<{ publicId: string; state: string }>[];
+}>>("sessions:listHeadsPage");
+const getSessionHead = makeFunctionReference<"query", Args, Readonly<{
+  publicId: string;
+  state: string;
+}> | null>("sessions:getHead");
+const updateSessionMetadata = makeFunctionReference<"mutation", Args, Readonly<{
+  publicId: string;
+  state: string;
+}>>("sessions:updateMetadata");
 const heartbeatPresence = makeFunctionReference<"mutation", Args, unknown>(
   "presence:heartbeat",
 );
@@ -100,6 +131,7 @@ async function revocationWorld() {
     const user = await ctx.db.get(userId);
     if (user === null) throw new Error("missing quota fixture user");
     await reserveQuotaForStoredIdentity(ctx, userId, user);
+    await createAccountDeletionCapacityForNewUser(ctx, userId);
     const actorAuthSession = {
       expirationTime: now + 60 * 60 * 1_000,
       userId,
@@ -139,6 +171,7 @@ async function revocationWorld() {
     } as const;
     await reserveDeviceQuotaForInsert(ctx, userId, actorDevice);
     const actorDeviceId = await ctx.db.insert("devices", actorDevice);
+    await createDeviceRevocationCapacityForNewDevice(ctx, userId, actorDeviceId);
     const targetDevice = {
       activatedAt: now,
       attentionNotificationAuthority: {
@@ -162,6 +195,7 @@ async function revocationWorld() {
     } as const;
     await reserveDeviceQuotaForInsert(ctx, userId, targetDevice);
     const targetDeviceId = await ctx.db.insert("devices", targetDevice);
+    await createDeviceRevocationCapacityForNewDevice(ctx, userId, targetDeviceId);
     const actorDeviceSession = {
       authEpoch: 1,
       authSessionId: actorAuthSessionId,
@@ -307,6 +341,7 @@ async function insertCommandFixtures(world: Awaited<ReturnType<typeof revocation
       createdAt: now,
       deadline: now + 60_000,
       kind: "stop" as const,
+      lifecycleCapacityVersion: commandLifecycleCapacityVersion,
       nonterminal: true,
       payload: encryptedEnvelope,
       requestingDeviceId: world.actorDeviceId,
@@ -324,6 +359,7 @@ async function insertCommandFixtures(world: Awaited<ReturnType<typeof revocation
     } as const;
     await reserveNonterminalCommandQuotaForInsert(ctx, world.userId, pending);
     const pendingId = await ctx.db.insert("sessionCommands", pending);
+    await reserveCommandLifecycleForInsert(ctx, "session", pending);
     const prepared = {
       ...base,
       idempotencyKey: uuidV7(now, "302"),
@@ -334,6 +370,7 @@ async function insertCommandFixtures(world: Awaited<ReturnType<typeof revocation
     } as const;
     await reserveNonterminalCommandQuotaForInsert(ctx, world.userId, prepared);
     const preparedId = await ctx.db.insert("sessionCommands", prepared);
+    await reserveCommandLifecycleForInsert(ctx, "session", prepared);
     const started = {
       ...base,
       idempotencyKey: uuidV7(now, "303"),
@@ -344,6 +381,26 @@ async function insertCommandFixtures(world: Awaited<ReturnType<typeof revocation
     } as const;
     await reserveNonterminalCommandQuotaForInsert(ctx, world.userId, started);
     const startedId = await ctx.db.insert("sessionCommands", started);
+    await reserveCommandLifecycleForInsert(ctx, "session", started);
+    const startedDevice = {
+      createdAt: now,
+      deadline: now + 60_000,
+      idempotencyKey: uuidV7(now, "305"),
+      kind: "usage_refresh" as const,
+      lifecycleCapacityVersion: commandLifecycleCapacityVersion,
+      nonterminal: true,
+      payload: encryptedEnvelope,
+      publicId: uuidV7(now, "315"),
+      requestDigest: "8".repeat(64),
+      requestingDeviceId: world.actorDeviceId,
+      state: "effect_started" as const,
+      targetDeviceId: world.targetDeviceId,
+      updatedAt: now,
+      userId: world.userId,
+    };
+    await reserveNonterminalCommandQuotaForInsert(ctx, world.userId, startedDevice);
+    const startedDeviceId = await ctx.db.insert("deviceCommands", startedDevice);
+    await reserveCommandLifecycleForInsert(ctx, "device", startedDevice);
 
     const otherDevice = {
       activatedAt: now,
@@ -383,12 +440,39 @@ async function insertCommandFixtures(world: Awaited<ReturnType<typeof revocation
       requestingDeviceId: world.targetDeviceId,
       requestDigest: "7".repeat(64),
       sessionId: requestedSessionId,
-      state: "pending",
+      state: "effect_started",
       targetDeviceId: otherDeviceId,
     } as const;
     await reserveNonterminalCommandQuotaForInsert(ctx, world.userId, requested);
     const requestedId = await ctx.db.insert("sessionCommands", requested);
-    return { pendingId, preparedId, requestedId, startedId };
+    await reserveCommandLifecycleForInsert(ctx, "session", requested);
+    const requestedDevice = {
+      createdAt: now,
+      deadline: now + 60_000,
+      idempotencyKey: uuidV7(now, "306"),
+      kind: "usage_refresh" as const,
+      lifecycleCapacityVersion: commandLifecycleCapacityVersion,
+      nonterminal: true,
+      payload: encryptedEnvelope,
+      publicId: uuidV7(now, "316"),
+      requestDigest: "9".repeat(64),
+      requestingDeviceId: world.targetDeviceId,
+      state: "effect_started" as const,
+      targetDeviceId: otherDeviceId,
+      updatedAt: now,
+      userId: world.userId,
+    };
+    await reserveNonterminalCommandQuotaForInsert(ctx, world.userId, requestedDevice);
+    const requestedDeviceId = await ctx.db.insert("deviceCommands", requestedDevice);
+    await reserveCommandLifecycleForInsert(ctx, "device", requestedDevice);
+    return {
+      pendingId,
+      preparedId,
+      requestedDeviceId,
+      requestedId,
+      startedDeviceId,
+      startedId,
+    };
   });
 }
 
@@ -486,9 +570,266 @@ async function drainToCompletion(
   throw new Error("device revocation did not complete within its bounded category count");
 }
 
+async function removeTargetRevocationDependencies(
+  world: Awaited<ReturnType<typeof revocationWorld>>,
+): Promise<void> {
+  await world.testRuntime.run(async (ctx) => {
+    const session = await ctx.db.get(world.sessionId);
+    if (session !== null) {
+      await releaseSessionHeadQuotaForDelete(ctx, world.userId, session);
+      await ctx.db.delete(session._id);
+    }
+    for (const [id, category] of [
+      [world.leaseId, "session"],
+      [world.targetDeviceSessionId, "custody"],
+      [world.presenceId, "device"],
+      [world.accountBindingId, "account"],
+      [world.bindChallengeId, "custody"],
+      [world.keyEnvelopeId, "custody"],
+    ] as const) {
+      const row = await ctx.db.get(id);
+      if (row === null) continue;
+      await releaseQuotaForDelete(ctx, world.userId, category, row);
+      await ctx.db.delete(row._id);
+    }
+  });
+}
+
+async function saturateRevocationQuota(
+  world: Awaited<ReturnType<typeof revocationWorld>>,
+  saturateUserRecords = false,
+): Promise<void> {
+  await world.testRuntime.run(async (ctx) => {
+    const categories = await ctx.db.query("storageUsageByUser")
+      .withIndex("by_user_and_category", (builder) => builder.eq("userId", world.userId))
+      .collect();
+    const chunk = categories.find((row) => row.category === "chunk");
+    const service = await ctx.db.query("storageUsageService")
+      .withIndex("by_key", (builder) => builder.eq("key", "global"))
+      .unique();
+    if (chunk === undefined || service === null) throw new Error("missing revocation quota fixture");
+    const currentBytes = categories.reduce((sum, row) => sum + row.logicalBytes, 0);
+    const currentRecords = categories.reduce((sum, row) => sum + row.records, 0);
+    const targetRecords = new Map(categories.map((row) => [row.category, row.records]));
+    let remainingRecords = USER_TOTAL_QUOTA.records - currentRecords;
+    if (saturateUserRecords) {
+      for (const category of QUOTA_CATEGORIES) {
+        if (remainingRecords === 0) break;
+        const current = targetRecords.get(category) ?? 0;
+        const added = Math.min(CATEGORY_QUOTAS[category].records - current, remainingRecords);
+        targetRecords.set(category, current + added);
+        remainingRecords -= added;
+      }
+    } else {
+      targetRecords.set("chunk", chunk.records === 0 ? 1 : chunk.records);
+      remainingRecords = 0;
+    }
+    if (remainingRecords !== 0) throw new Error("unable to saturate revocation record quota");
+    const canonicalByteAdds = categories.reduce((sum, row) =>
+      row.category !== "chunk"
+      && row.logicalBytes === 0
+      && (targetRecords.get(row.category) ?? 0) > 0
+        ? sum + 1
+        : sum, 0);
+    for (const row of categories) {
+      const logicalBytes = row.category === "chunk"
+        ? row.logicalBytes + USER_TOTAL_QUOTA.logicalBytes - currentBytes - canonicalByteAdds
+        : row.logicalBytes === 0 && (targetRecords.get(row.category) ?? 0) > 0
+          ? 1
+          : row.logicalBytes;
+      await ctx.db.patch(row._id, {
+        logicalBytes,
+        records: targetRecords.get(row.category) ?? row.records,
+        updatedAt: Date.now(),
+      });
+    }
+    const userRecords = [...targetRecords.values()].reduce((sum, records) => sum + records, 0);
+    await ctx.db.patch(service._id, {
+      logicalBytes: SERVICE_TOTAL_QUOTA.logicalBytes,
+      records: SERVICE_TOTAL_QUOTA.records,
+      serviceLogicalBytes: SERVICE_TOTAL_QUOTA.logicalBytes - USER_TOTAL_QUOTA.logicalBytes,
+      serviceRecords: SERVICE_TOTAL_QUOTA.records - userRecords,
+      updatedAt: Date.now(),
+      userLogicalBytes: USER_TOTAL_QUOTA.logicalBytes,
+      userRecords,
+    });
+  });
+}
+
 describe("status-first device revocation", () => {
+  for (const targetState of ["active", "pending"] as const) {
+    test(`accepts ${targetState} revocation by exchange at exact user and service ceilings`, async () => {
+      const world = await revocationWorld();
+      if (targetState === "pending") {
+        await world.testRuntime.run(async (ctx) => {
+          const target = await ctx.db.get(world.targetDeviceId);
+          if (target === null) throw new Error("missing pending revocation target");
+          const patch = { activatedAt: undefined, status: "pending" as const };
+          await adjustQuotaForPatch(ctx, world.userId, "device", target, patch);
+          await ctx.db.patch(target._id, patch);
+        });
+      }
+      await saturateRevocationQuota(world, true);
+      expect(await world.testRuntime.run(async (ctx) => {
+        const categories = await ctx.db.query("storageUsageByUser")
+          .withIndex("by_user_and_category", (builder) =>
+            builder.eq("userId", world.userId))
+          .collect();
+        const service = await ctx.db.query("storageUsageService").unique();
+        return {
+          serviceBytes: service?.logicalBytes,
+          serviceRecords: service?.records,
+          userBytes: categories.reduce((sum, row) => sum + row.logicalBytes, 0),
+          userRecords: categories.reduce((sum, row) => sum + row.records, 0),
+        };
+      })).toEqual({
+        serviceBytes: SERVICE_TOTAL_QUOTA.logicalBytes,
+        serviceRecords: SERVICE_TOTAL_QUOTA.records,
+        userBytes: USER_TOTAL_QUOTA.logicalBytes,
+        userRecords: USER_TOTAL_QUOTA.records,
+      });
+      expect(await world.actor.mutation(revokeDevice, world.revokeRequest))
+        .toMatchObject({ status: "revoked" });
+      const observed = await world.testRuntime.run(async (ctx) => {
+        const categories = await ctx.db.query("storageUsageByUser")
+          .withIndex("by_user_and_category", (builder) => builder.eq("userId", world.userId))
+          .collect();
+        return {
+          deviceCapacity: await ctx.db.query("deviceRevocationDeviceReservations")
+            .withIndex("by_device", (builder) =>
+              builder.eq("deviceId", world.targetDeviceId))
+            .collect(),
+          jobCapacity: await ctx.db.query("deviceRevocationJobReservations")
+            .withIndex("by_device", (builder) =>
+              builder.eq("deviceId", world.targetDeviceId))
+            .collect(),
+          receiptCapacity: await ctx.db.query("deviceRevocationReceiptReservations")
+            .withIndex("by_device", (builder) =>
+              builder.eq("deviceId", world.targetDeviceId))
+            .collect(),
+          securityCapacity: await ctx.db.query("deviceRevocationSecurityReservations")
+            .withIndex("by_device", (builder) =>
+              builder.eq("deviceId", world.targetDeviceId))
+            .collect(),
+          service: await ctx.db.query("storageUsageService").unique(),
+          target: await ctx.db.get(world.targetDeviceId),
+          userBytes: categories.reduce((sum, row) => sum + row.logicalBytes, 0),
+          userRecords: categories.reduce((sum, row) => sum + row.records, 0),
+        };
+      });
+      expect(observed.deviceCapacity).toEqual([]);
+      expect(observed.jobCapacity).toEqual([]);
+      expect(observed.receiptCapacity).toEqual([]);
+      expect(observed.securityCapacity).toEqual([]);
+      expect(observed.target).toMatchObject({ status: "revoked" });
+      expect(observed.userBytes).toBeLessThan(USER_TOTAL_QUOTA.logicalBytes);
+      expect(observed.userRecords).toBe(USER_TOTAL_QUOTA.records - 1);
+      expect(observed.service?.logicalBytes).toBeLessThan(SERVICE_TOTAL_QUOTA.logicalBytes);
+      expect(observed.service?.records).toBe(SERVICE_TOTAL_QUOTA.records - 1);
+    });
+  }
+
+  test("capacity-backed and predecessor empty jobs drain at exact hard ceilings", async () => {
+    for (const legacy of [false, true]) {
+      const world = await revocationWorld();
+      await removeTargetRevocationDependencies(world);
+      await world.actor.mutation(revokeDevice, world.revokeRequest);
+      const initialBytes = await world.testRuntime.run(async (ctx) => {
+        const job = await ctx.db.query("deviceRevocationJobs").unique();
+        if (job === null) throw new Error("missing revocation capacity job");
+        expect(job.capacityReservation).toHaveLength(256);
+        if (legacy) {
+          const patch = { capacityReservation: undefined };
+          await adjustQuotaForPatch(ctx, world.userId, "job", job, patch);
+          await ctx.db.patch(job._id, patch);
+          return logicalDocumentBytes({ ...job, ...patch });
+        }
+        return logicalDocumentBytes(job);
+      });
+      await saturateRevocationQuota(world);
+      const observations = await drainToCompletion(world);
+      expect(observations.at(-1)).toMatchObject({
+        category: "complete",
+        kind: "complete",
+        state: "complete",
+      });
+      const completed = await world.testRuntime.run(async (ctx) =>
+        await ctx.db.query("deviceRevocationJobs").unique());
+      expect(completed).toMatchObject({ state: "complete" });
+      if (!legacy) expect(logicalDocumentBytes(completed ?? {})).toBe(initialBytes);
+      expect(await world.actor.query(revocationStatus, {
+        jobId: world.revokeRequest.idempotencyKey,
+      })).toMatchObject({ category: "complete", state: "complete" });
+    }
+  });
+
+  test("live session heads stay byte-neutral and read orphaned at exact hard ceilings", async () => {
+    for (const legacy of [false, true]) {
+      const world = await revocationWorld();
+      // A legal identity may already own 10k heads and 10k leases. Revocation
+      // must not require an extra session-category record just to represent
+      // the derived orphan state.
+      await world.testRuntime.run(async (ctx) => {
+        const sessionUsage = await ctx.db.query("storageUsageByUser")
+          .withIndex("by_user_and_category", (builder) => builder
+            .eq("userId", world.userId)
+            .eq("category", "session"))
+          .unique();
+        const service = await ctx.db.query("storageUsageService")
+          .withIndex("by_key", (builder) => builder.eq("key", "global"))
+          .unique();
+        if (sessionUsage === null || service === null) {
+          throw new Error("missing session quota fixture");
+        }
+        const recordDelta = CATEGORY_QUOTAS.session.records - sessionUsage.records;
+        await ctx.db.patch(sessionUsage._id, {
+          records: CATEGORY_QUOTAS.session.records,
+          updatedAt: Date.now(),
+        });
+        await ctx.db.patch(service._id, {
+          records: service.records + recordDelta,
+          updatedAt: Date.now(),
+          userRecords: service.userRecords + recordDelta,
+        });
+      });
+      await world.actor.mutation(revokeDevice, world.revokeRequest);
+      await world.testRuntime.run(async (ctx) => {
+        const job = await ctx.db.query("deviceRevocationJobs").unique();
+        if (job === null) throw new Error("missing revocation job");
+        if (legacy) {
+          const patch = { capacityReservation: undefined };
+          await adjustQuotaForPatch(ctx, world.userId, "job", job, patch);
+          await ctx.db.patch(job._id, patch);
+        }
+      });
+      await saturateRevocationQuota(world);
+
+      const observations = await drainToCompletion(world, 1);
+      expect(observations.at(-1)).toMatchObject({
+        category: "complete",
+        kind: "complete",
+        state: "complete",
+      });
+      const stored = await world.testRuntime.run(async (ctx) =>
+        await ctx.db.get(world.sessionId));
+      expect(stored?.state).toBe("idle");
+      expect(await world.actor.query(getSessionHead, {
+        publicId: "session_revoke01",
+      })).toMatchObject({ publicId: "session_revoke01", state: "orphaned" });
+    }
+  });
+
   test("removes authority and fences credentials before dependent cleanup, with exact replay", async () => {
     const world = await revocationWorld();
+    const metadataRequest = {
+      expectedRevision: 0,
+      idempotencyKey: uuidV7(Date.now(), "401"),
+      metadata: encryptedEnvelope,
+      requestDigest: "4".repeat(64),
+      sessionPublicId: "session_revoke01",
+    };
+    expect(await world.actor.mutation(updateSessionMetadata, metadataRequest))
+      .toMatchObject({ publicId: "session_revoke01", state: "idle" });
     const first = await world.actor.mutation(revokeDevice, world.revokeRequest);
     expect(first).toEqual({
       deviceClass: "daemon",
@@ -521,6 +862,19 @@ describe("status-first device revocation", () => {
     });
     expect(afterFirst.presence?.presenceUntil).toBeLessThanOrEqual(Date.now());
     expect(afterFirst.session?.state).toBe("idle");
+    expect(await world.actor.query(getSessionHead, {
+      publicId: "session_revoke01",
+    })).toMatchObject({ publicId: "session_revoke01", state: "orphaned" });
+    const listedHeads = await world.actor.query(listSessionHeads, { limit: 10 });
+    expect(listedHeads.some((head) =>
+      head.publicId === "session_revoke01" && head.state === "orphaned")).toBe(true);
+    const listedHeadsPage = await world.actor.query(listSessionHeadsPage, {
+      paginationOpts: { cursor: null, numItems: 10 },
+    });
+    expect(listedHeadsPage.page.some((head) =>
+      head.publicId === "session_revoke01" && head.state === "orphaned")).toBe(true);
+    expect(await world.actor.mutation(updateSessionMetadata, metadataRequest))
+      .toMatchObject({ publicId: "session_revoke01", state: "orphaned" });
     expect(afterFirst.lease).not.toBeNull();
     expect(afterFirst.targetDeviceSession).not.toBeNull();
     expect(afterFirst.events).toHaveLength(1);
@@ -590,7 +944,7 @@ describe("status-first device revocation", () => {
     expect(observations.every((result) => result.processed <= 200)).toBe(true);
     expect(observations.filter((result) =>
       result.category === "sessions" && result.kind === "drained")
-      .map((result) => result.processed)).toEqual([200, 200, 105]);
+      .map((result) => result.processed)).toEqual([]);
 
     const final = await world.testRuntime.run(async (ctx) => ({
       accountBinding: await ctx.db.get(world.accountBindingId),
@@ -598,9 +952,17 @@ describe("status-first device revocation", () => {
       commands: {
         pending: await ctx.db.get(commands.pendingId),
         prepared: await ctx.db.get(commands.preparedId),
+        requestedDevice: await ctx.db.get(commands.requestedDeviceId),
         requested: await ctx.db.get(commands.requestedId),
+        startedDevice: await ctx.db.get(commands.startedDeviceId),
         started: await ctx.db.get(commands.startedId),
       },
+      commandReservations: await ctx.db.query("commandLifecycleReservations").collect(),
+      commandSecurityReservations: await ctx.db.query(
+        "commandTerminalSecurityReservations",
+      ).collect(),
+      commandTerminalEvents: (await ctx.db.query("securityEvents").collect())
+        .filter((event) => event.event === "command_terminal"),
       keyEnvelope: await ctx.db.get(world.keyEnvelopeId),
       lease: await ctx.db.get(world.leaseId),
       notifications: {
@@ -623,7 +985,12 @@ describe("status-first device revocation", () => {
         .collect(),
       targetDeviceSession: await ctx.db.get(world.targetDeviceSessionId),
     }));
-    expect(final.remainingLiveSessions).toHaveLength(0);
+    // Session state is derived from the revoked execution authority instead
+    // of growing up to 10,000 stored heads from idle/active to orphaned.
+    expect(final.remainingLiveSessions).toHaveLength(253);
+    expect(await world.actor.query(getSessionHead, {
+      publicId: "session_mass_0001",
+    })).toMatchObject({ publicId: "session_mass_0001", state: "orphaned" });
     expect(final.lease).toBeNull();
     expect(final.accountBinding).toBeNull();
     expect(final.targetDeviceSession).toBeNull();
@@ -636,12 +1003,45 @@ describe("status-first device revocation", () => {
       state: "cancelled",
     });
     expect(final.commands.started).toMatchObject({ nonterminal: false, state: "ambiguous" });
-    expect(final.commands.requested).toMatchObject({ nonterminal: false, state: "cancelled" });
+    expect(final.commands.requested).toMatchObject({ nonterminal: false, state: "ambiguous" });
+    expect(final.commands.requestedDevice)
+      .toMatchObject({ nonterminal: false, state: "ambiguous" });
+    expect(final.commands.startedDevice)
+      .toMatchObject({ nonterminal: false, state: "ambiguous" });
+    expect(final.commands.requested?.requesterReceiptAbandonedAt).toBeNumber();
+    expect(final.commands.requestedDevice?.requesterReceiptAbandonedAt).toBeNumber();
+    expect(final.commands.requested?.terminalCleanupAfter).toBeNumber();
+    expect(final.commands.requested).not.toHaveProperty("requesterAcknowledgedAt");
+    expect(final.commands.requested).not.toHaveProperty("receiptCapacityReservation");
     expect(final.commands.prepared?.terminalCleanupAfter).toBeNumber();
     expect(final.commands.prepared?.terminalCleanupAfter)
       .toBe((final.commands.prepared?.updatedAt ?? 0) + commandTerminalRetentionMs);
     expect(final.commands.pending).not.toHaveProperty("terminalCleanupAfter");
     expect(final.commands.started).not.toHaveProperty("terminalCleanupAfter");
+    expect(final.commands.pending?.receiptCapacityReservation)
+      .toBe(commandReceiptCapacityReservation);
+    expect(final.commands.started?.receiptCapacityReservation)
+      .toBe(commandReceiptCapacityReservation);
+    expect(final.commandReservations).toEqual([]);
+    expect(final.commandSecurityReservations).toEqual([]);
+    expect(final.commandTerminalEvents).toHaveLength(4);
+    const expectedTerminalIds = [
+      final.commands.requested?.publicId,
+      final.commands.requestedDevice?.publicId,
+      final.commands.started?.publicId,
+      final.commands.startedDevice?.publicId,
+    ].filter((publicId): publicId is string => publicId !== undefined);
+    expect(new Set(final.commandTerminalEvents.map((event) => event.entityId)))
+      .toEqual(new Set(expectedTerminalIds));
+    for (const event of final.commandTerminalEvents) {
+      const expectedTarget = event.entityId === final.commands.started?.publicId
+        || event.entityId === final.commands.startedDevice?.publicId
+        ? world.targetDeviceId
+        : event.entityId === final.commands.requested?.publicId
+          ? final.commands.requested.targetDeviceId
+          : final.commands.requestedDevice?.targetDeviceId;
+      expect(event.actorDeviceId).toBe(expectedTarget);
+    }
     expect(final.notifications.pending).toMatchObject({
       nonterminal: false,
       retrySuppressionReason: "device_revoked",
@@ -712,6 +1112,7 @@ describe("status-first device revocation", () => {
       } as const;
       await reserveDeviceQuotaForInsert(ctx, world.userId, device);
       const deviceId = await ctx.db.insert("devices", device);
+      await createDeviceRevocationCapacityForNewDevice(ctx, world.userId, deviceId);
       const session = {
         compactHeadSequence: 0,
         createdAt: now,
@@ -751,8 +1152,16 @@ describe("status-first device revocation", () => {
     });
 
     expect(await world.testRuntime.mutation(drainRevocations, { limit: 1 }))
-      .toMatchObject({ jobId: world.revokeRequest.idempotencyKey, processed: 1 });
+      .toMatchObject({
+        category: "leases",
+        jobId: world.revokeRequest.idempotencyKey,
+        processed: 0,
+      });
     expect(await world.testRuntime.mutation(drainRevocations, { limit: 1 }))
-      .toMatchObject({ jobId: secondRequest.idempotencyKey, processed: 1 });
+      .toMatchObject({
+        category: "leases",
+        jobId: secondRequest.idempotencyKey,
+        processed: 0,
+      });
   });
 });
