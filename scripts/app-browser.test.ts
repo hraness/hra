@@ -55,7 +55,7 @@ describe("static site graph acceptance", () => {
       expect(graph.routes[1].heading).toBe("#privacy-heading");
       for (const path of graph.fonts) {
         expect(assetPath(`/${path}`, new Set(graph.fonts))).toBe(path);
-        expect(assetPath(`/${path.replace("[", "%5B").replace("]", "%5D")}`, new Set(graph.fonts))).toBe(path);
+        expect(assetPath(`/${path.replaceAll("[", "%5B").replaceAll("]", "%5D")}`, new Set(graph.fonts))).toBe(path);
       }
     }
   });

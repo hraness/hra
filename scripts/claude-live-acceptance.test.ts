@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, rmdir, writeFile } from "node:fs/promises";
+import { closeSync, fstatSync, openSync } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, realpath, rm, rmdir, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -35,6 +36,7 @@ import {
   claudeLiveAcceptanceRecoveryPolicy,
   claudeLiveAcceptanceRecoveryReceiptSchema,
   createClaudeLiveAcceptanceSignalCustody,
+  parseClaudeLiveAcceptanceArguments,
   runClaudeLiveAcceptance,
   type ClaudeLiveAcceptanceRecoveryReceipt,
 } from "./claude-live-acceptance";
@@ -827,6 +829,22 @@ describe("private descriptor cleanup fixture controls", () => {
 });
 
 describe("Claude cleanup-only recovery", () => {
+  function openHighRecoveryDescriptor(path: string): number {
+    // Exercise the allocator state of a long-running suite without retaining
+    // pressure descriptors or changing the runner's 3..255 input contract.
+    const heldDescriptors: number[] = [];
+    try {
+      for (let count = 0; count < 256; count += 1) {
+        const descriptor = openSync("/dev/null", "r");
+        heldDescriptors.push(descriptor);
+        if (descriptor >= 255) return openSync(path, "r");
+      }
+      throw new Error("Could not allocate the bounded high-descriptor fixture.");
+    } finally {
+      for (const descriptor of heldDescriptors) closeSync(descriptor);
+    }
+  }
+
   const cleanupAuthorization = (
     value: Omit<ClaudeLiveAcceptanceRecoveryReceipt, "cleanupAuthorization">,
   ) => {
@@ -891,40 +909,47 @@ describe("Claude cleanup-only recovery", () => {
       claudeLiveAcceptanceRecoveryPolicy,
     );
     await owner.releasePreserving();
-    const handle = await open(receipt.value.receiptPath, "r");
-    return { handle, layout, receiptValue };
+    const descriptor = openHighRecoveryDescriptor(receipt.value.receiptPath);
+    return { descriptor, layout, receiptValue };
   }
 
   test.each([true, false])(
     "finishes already-authorized cleanup when the private root exists=%s",
     async (rootExists) => {
       await withPrivateDirectory(async (directory) => {
-        const { handle, layout, receiptValue } = await recoveryFixture(directory, rootExists);
-        const authorization = receiptValue.cleanupAuthorization;
-        if (authorization === undefined) throw new Error("cleanup authorization missing");
-        const { bindingDigest, ...authorizationBase } = authorization;
-        void bindingDigest;
-        const readyAuthorizationBase = { ...authorizationBase, workerPid: 91_002 };
-        expect(() => claudeLiveAcceptanceRecoveryReceiptSchema.parse({
-          ...receiptValue,
-          cleanupAuthorization: {
-            ...readyAuthorizationBase,
-            bindingDigest: canonicalDigest({
-              ...readyAuthorizationBase,
-              domain: "hra.claude.live-acceptance.cleanup-authorization.v1",
-            }),
-          },
-          worker: { pid: 91_002, state: "ready" },
-        })).toThrow("Cleanup authorization scope does not match this run");
+        const { descriptor, layout, receiptValue } = await recoveryFixture(directory, rootExists);
         try {
-          expect(runPrivateDescriptorFixture(handle.fd, { candidate, kind: "claude-cleanup" }))
+          expect(descriptor).toBeGreaterThan(255);
+          expect(() => parseClaudeLiveAcceptanceArguments(["--resume-fd", String(descriptor)]))
+            .toThrow("claude_live_acceptance_input_invalid");
+          const authorization = receiptValue.cleanupAuthorization;
+          if (authorization === undefined) throw new Error("cleanup authorization missing");
+          const { bindingDigest, ...authorizationBase } = authorization;
+          void bindingDigest;
+          const readyAuthorizationBase = { ...authorizationBase, workerPid: 91_002 };
+          expect(() => claudeLiveAcceptanceRecoveryReceiptSchema.parse({
+            ...receiptValue,
+            cleanupAuthorization: {
+              ...readyAuthorizationBase,
+              bindingDigest: canonicalDigest({
+                ...readyAuthorizationBase,
+                domain: "hra.claude.live-acceptance.cleanup-authorization.v1",
+              }),
+            },
+            worker: { pid: 91_002, state: "ready" },
+          })).toThrow("Cleanup authorization scope does not match this run");
+          expect(runPrivateDescriptorFixture(descriptor, { candidate, kind: "claude-cleanup" }))
             .toEqual({ closure: "fixture", descriptor: 3, effects: 0, kind: "claude-cleanup", outcome: "cleaned", sha256: null, version: 1 });
+          // Child closure cannot close the owned parent descriptor. Its unlinked
+          // inode proves cleanup reached the actual protected receipt.
+          expect(fstatSync(descriptor).nlink).toBe(0);
         } finally {
-          await handle.close();
+          closeSync(descriptor);
         }
         await expect(lstat(layout.receiptPath)).rejects.toMatchObject({ code: "ENOENT" });
         await expect(lstat(layout.runRoot.path)).rejects.toMatchObject({ code: "ENOENT" });
       });
     },
+    15_000,
   );
 });

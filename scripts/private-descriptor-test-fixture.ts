@@ -181,7 +181,9 @@ export function runPrivateDescriptorFixture(
     killSignal: "SIGKILL",
     maxBuffer: 4096,
     stdio: ["ignore", "pipe", "pipe", descriptor],
-    timeout: 3_000,
+    // Preserve the cleanup regression's native child budget; protected token
+    // and provider-activity reader fixtures retain their narrower deadline.
+    timeout: operation.kind === "claude-cleanup" ? 10_000 : 3_000,
   });
   // No child-controlled output or error object is attached to assertion messages.
   assert.ok(child.error === undefined, "Fixture subprocess did not complete within its bounds");
