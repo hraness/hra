@@ -36,10 +36,13 @@ the candidate-release window. PR148 then merged as protected main
 here. Its owner completed exact-main CI and package/install verification and
 released the main integration window. The joined07faf46 exact-tree local
 aggregate passed, but both protected CI jobs reached their 20-minute limits.
-The installer owner now retains the main window for [PR153](https://github.com/hraness/hra/pull/153)
-while this branch repairs CI partitioning under [issue152](https://github.com/hraness/hra/issues/152).
-Join that actual main before the next archive review and final gates. Schema50
-still requires passing protected CI, normal merge and exact-main proof;
+The installer repair [PR153](https://github.com/hraness/hra/pull/153) merged as
+`cfc9477da5033019992b7adbf550288c57c965be` after both protected CI platforms
+and Required passed. That actual main is now joined alongside the reviewed CI
+partition under [issue152](https://github.com/hraness/hra/issues/152). Its owner
+retains the main window until separate actual-main CI and package proof settle.
+The combined archive passed independent review. Schema50 still requires a fresh
+exact-tree full local gate, passing protected CI, normal merge and exact-main proof;
 candidate release retains separate live acceptance and installer-repair gates.
 
 The delivered foundation's reviewed tree is
@@ -680,3 +683,42 @@ The two added scripts change the packed manifest. The old inventory is retained
 only until the combined installer archive is inspected; it is not a receipt for
 this working manifest. No candidate admission, package publication or runtime activation follows
 from this CI repair.
+
+### Installer-main and runbook join
+
+PR153 merged normally at `cfc9477da5033019992b7adbf550288c57c965be`, preserving
+reviewed tree `bc4c4aa970d49077202188d8bb7052f921f27182`. Its protected
+CI34264456773 passed macOS in 19m09s, Ubuntu in 18m58s and Required in three
+seconds; its CodeQL check passed. Its owner retains the separate actual-main
+CI34266585084, CodeQL34266584945 and package/install proof. This branch does
+not duplicate that wait or infer permission to move main before it settles.
+
+The join preserves all seven incoming files. The only conflict is the expected
+package inventory digest, which requires a newly inspected combined archive.
+The installer runtime, its loader digest, three README digests and one release-note
+digest match exact main. The canonical storage sources and lockfile remain
+byte-identical to07faf46. The manifest differs only by the two reviewed CI scripts;
+dependency, toolchain, source migration and capability inputs do not change.
+Earlier private compatibility receipts remain bounded to their recorded inputs,
+not relabeled as final joined-tree acceptance.
+
+The combined CI/release contract passed all 25 tests and 802 assertions again
+after joining the installer, and installer pins passed. The runbook now requires
+a fresh normal site build before local/public content comparison, separates the
+default local marker from exact production proof and retains terminal alias
+recovery boundaries. Its three existing runbook tests passed 58 assertions;
+public-text checks passed. No provider write accompanies this documentation.
+
+Independent raw archive and extracted-tree review passed for the combined
+package: 167 regular files, nine directories and 7,131,361 regular bytes.
+Both old and new archives were compared byte-for-byte with their extractions;
+all new files match source. Exactly four files differ from the prior joined
+archive: installer runtime, its loader pin, three README pin substitutions and
+the manifest's two CI scripts. The other 163 files, every path and every mode
+remain exact. The archive is 1,356,951 bytes, SHA-256
+`fb1790accf265f4c3aa43b23483d7308525111b8c88759ca1387690333504a0e`.
+The 176-entry, 8,318-byte inventory SHA-256 is
+`f2bc90068f2dcfdb7e60fc6afd6f0650c384c9bb5e70bab1144cfb9c68e7e8d4`.
+Only the policy digest changes. Package policy passed 11 tests and 42 assertions,
+and direct admission of the exact extracted inventory passed. This remains
+unpublished archive-content evidence, not the required final installation gate.
