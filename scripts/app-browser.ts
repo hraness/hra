@@ -3,7 +3,10 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import type { BrowserContext, Locator, Page } from "playwright-core";
+import { fileURLToPath } from "node:url";
+import { parseHTML } from "linkedom";
+import { transform } from "lightningcss";
+import type { BrowserContext, Locator, Page, Response as BrowserResponse } from "playwright-core";
 import { browserIoModules, browserIoPlugin } from "../app/fixtures/browser/config";
 import { APP_CSS_PLACEHOLDER, parseAppComplete, prepareAppShell, snapshotAppGraph } from "./build-app";
 
@@ -33,10 +36,32 @@ const bracketedFontPath = "fonts/geist-mono/GeistMono[wght].woff2";
 const fontProvenancePaths = new Set([
   "fonts/geist-mono/PROVENANCE.md", "fonts/nebula-sans/PROVENANCE.md",
 ]);
+const legacyFontPaths = new Set([bracketedFontPath]);
+const siteRoutes = [
+  { path: "index.html", pathname: "/", heading: "h1" },
+  { path: "privacy/index.html", pathname: "/privacy/", heading: "#privacy-heading" },
+  { path: "preview/index.html", pathname: "/preview/", heading: "h1" },
+] as const;
+const sitePublicFonts = [
+  ...["Light", "LightItalic", "Book", "BookItalic", "Medium", "MediumItalic", "Semibold", "SemiboldItalic", "Bold", "BoldItalic", "Black", "BlackItalic"]
+    .map((cut) => `nebula-sans/NebulaSans-${cut}.woff2`),
+  "geist-mono/GeistMono[wght].woff2",
+];
+const sitePublicSupport = [
+  "analytics.js", "favicon.svg", "social-card.svg", "social-card.png", "robots.txt", "sitemap.xml", "llms.txt",
+  ".well-known/security.txt", ".well-known/hra.json",
+  "fonts/nebula-sans/LICENSE.txt", "fonts/nebula-sans/PROVENANCE.md",
+  "fonts/geist-mono/OFL.txt", "fonts/geist-mono/PROVENANCE.md",
+];
 const diagnosticPath = (path: string) => JSON.stringify(path.slice(0, 160));
 
-function safeInventoryKey(key: string): boolean {
-  return key.length <= 2048 && (key === bracketedFontPath
+function capturedFontKey(key: string, fontPaths: ReadonlySet<string>): boolean {
+  return fontPaths.has(key) && (key === bracketedFontPath
+    || /^graphs\/foundation\/assets\/[A-Za-z0-9_.[\]-]+\.woff2$/u.test(key));
+}
+
+function safeInventoryKey(key: string, fontPaths: ReadonlySet<string> = legacyFontPaths): boolean {
+  return key.length <= 2048 && (capturedFontKey(key, fontPaths)
     || key.split("/").every((part) => /^[A-Za-z0-9_.-]+$/u.test(part) && part !== "." && part !== ".."));
 }
 
@@ -61,13 +86,24 @@ export function productionCsp(value: unknown, source: string): string {
   return csp;
 }
 
+export function siteProductionCsp(value: unknown): Readonly<{ siteCsp: string; previewCsp: string }> {
+  const siteCsp = productionCsp(value, "/((?!preview/?$).*)");
+  const previewCsp = productionCsp(value, "/preview/");
+  for (const csp of [siteCsp, previewCsp]) {
+    assert.deepEqual(csp.split(";").map((part) => part.trim()).filter((part) => part.startsWith("font-src")), ["font-src 'self'"]);
+  }
+  assert.deepEqual(previewCsp.split(";").map((part) => part.trim()).filter((part) => part.startsWith("script-src")), ["script-src 'none'"]);
+  return { siteCsp, previewCsp };
+}
+
 /** URL normalization cannot turn a request into an arbitrary filesystem read. */
-export function assetPath(pathname: string): string | null {
+export function assetPath(pathname: string, fontPaths: ReadonlySet<string> = legacyFontPaths): string | null {
   if (pathname.length > 2048 || pathname.split("/").length > 14) return null;
   if (pathname === "/") return "index.html";
-  // This public variable-font filename is the only bracketed inventory key.
-  // Decode no general URL escapes: encoded separators/dot segments stay closed.
-  if (/^\/fonts\/geist-mono\/GeistMono(?:\[|%5[bB])wght(?:\]|%5[dD])\.woff2$/u.test(pathname)) return bracketedFontPath;
+  // Only captured font keys may use brackets. Decode no other URL escapes:
+  // encoded separators, double encodings and dot segments remain closed.
+  const fontKey = pathname.slice(1).replace(/%5b/giu, "[").replace(/%5d/giu, "]");
+  if (pathname.startsWith("/") && capturedFontKey(fontKey, fontPaths)) return fontKey;
   if (!/^\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*\/?$/u.test(pathname)) return null;
   if (pathname.split("/").some((part) => part === "." || part === "..")) return null;
   return pathname.endsWith("/") ? `${pathname.slice(1)}index.html` : pathname.slice(1);
@@ -179,7 +215,7 @@ async function closeOwnedBrowser(context: BrowserContext, pids: number[]): Promi
   if (censusFailure !== undefined) throw censusFailure;
 }
 
-export async function inventory(directory: string): Promise<ReadonlyMap<string, Buffer>> {
+export async function inventory(directory: string, fontPaths: ReadonlySet<string> = legacyFontPaths): Promise<ReadonlyMap<string, Buffer>> {
   assert.equal(await realpath(directory), resolve(directory), "Browser output must have a physical path");
   const files = new Map<string, Buffer>();
   let total = 0;
@@ -194,9 +230,9 @@ export async function inventory(directory: string): Promise<ReadonlyMap<string, 
       const key = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
       entryCount += 1;
       assert.ok(entryCount <= 4096, "Browser inventory entry count exceeds 4096");
-      assert.ok(safeInventoryKey(key), `Unsafe public browser output name: ${diagnosticPath(key)}`);
+      assert.ok(safeInventoryKey(key, fontPaths), `Unsafe public browser output name: ${diagnosticPath(key)}`);
       assert.ok(!entry.isSymbolicLink(), `Linked public browser output: ${diagnosticPath(key)}`);
-      if (key === bracketedFontPath || fontProvenancePaths.has(key)) {
+      if (capturedFontKey(key, fontPaths) || fontProvenancePaths.has(key)) {
         assert.ok(entry.isFile(), `Expected an ordinary public font file: ${diagnosticPath(key)}`);
       }
       const child = join(path, entry.name);
@@ -226,6 +262,96 @@ function artifacts(files: ReadonlyMap<string, Buffer>): readonly Artifact[] {
     .sort((a, b) => a.path < b.path ? -1 : 1);
 }
 
+/** Read the actual sealed HTML join, not a guessed Vite asset name. */
+export function siteStylesheetPaths(documents: ReadonlyMap<string, Buffer>): readonly [string, string] {
+  let expected: readonly [string, string] | undefined;
+  for (const { path } of siteRoutes) {
+    const bytes = documents.get(path);
+    assert.ok(bytes !== undefined && bytes.length > 0 && bytes.length <= 8 * 1024 * 1024, `Missing bounded site document: ${path}`);
+    const { document } = parseHTML(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    assert.equal(document.querySelectorAll("style,[style],base").length, 0, "Static document changed its no-inline/base contract");
+    const links = [...document.querySelectorAll("link")].filter((link) => link.getAttribute("rel")?.toLowerCase().split(/\s+/u).includes("stylesheet"));
+    assert.equal(links.length, 2, "Static document must link exactly foundation then union");
+    for (const link of links) {
+      assert.equal(link.parentElement, document.head);
+      assert.deepEqual([...link.attributes].map(({ name }) => name).sort(), ["href", "rel"]);
+      assert.equal(link.getAttribute("rel"), "stylesheet");
+    }
+    const foundation = links[0]?.getAttribute("href");
+    assert.ok(typeof foundation === "string");
+    assert.match(foundation, /^\/graphs\/foundation\/assets\/[A-Za-z0-9_.-]+\.css$/u);
+    assert.equal(links[1]?.getAttribute("href"), "/stylex.css");
+    const paths = [foundation.slice(1), "stylex.css"] as const;
+    if (expected !== undefined) assert.deepEqual(paths, expected, "Static routes disagree about the completed stylesheet graph");
+    expected = paths;
+  }
+  assert.ok(expected !== undefined);
+  return expected;
+}
+
+/** Parse native CSS URLs and all font-face sources. A path becomes admissible
+ * only because this captured foundation names it; escaping never broadens it. */
+export function siteFoundationFontPaths(path: string, bytes: Buffer): readonly string[] {
+  assert.match(path, /^graphs\/foundation\/assets\/[A-Za-z0-9_.-]+\.css$/u);
+  assert.ok(bytes.length > 0 && bytes.length <= 16 * 1024 * 1024);
+  const urls: string[] = [];
+  const faces: string[] = [];
+  transform({ filename: path, code: bytes, visitor: {
+    Url(value) { urls.push(value.url); },
+    Rule: {
+      import() { throw new Error("Static foundation contains an uncollected CSS import"); },
+      "font-face"(rule) {
+        const sources = rule.value.properties.filter((property) => property.type === "source");
+        assert.equal(sources.length, 1);
+        const source = sources[0];
+        assert.ok(source?.type === "source" && source.value.length === 1);
+        const url = source.value[0];
+        assert.ok(url?.type === "url" && url.value.format?.type === "woff2", "Static font face is not one physical WOFF2 source");
+        faces.push(url.value.url.url);
+      },
+    },
+  } });
+  assert.equal(faces.length, 13, "Static foundation must declare all thirteen public font faces");
+  assert.deepEqual([...urls].sort(), [...faces].sort(), "Static foundation contains a non-font URL");
+  assert.equal(new Set(faces).size, 13, "Static foundation duplicates a font URL");
+  return faces.map((url) => {
+    // Vite may preserve or sanitize brackets. Both must come from captured CSS,
+    // stay in this asset directory, and later match a public input's full hash.
+    const decoded = url.replace(/%5b/giu, "[").replace(/%5d/giu, "]");
+    assert.match(decoded, /^(?:\.\/)?[A-Za-z0-9_.[\]-]+\.woff2$/u, "Static font URL escaped its captured asset directory");
+    const resolved = new URL(decoded, `https://site.invalid/${path}`);
+    assert.equal(resolved.origin, "https://site.invalid");
+    assert.equal(resolved.search + resolved.hash, "");
+    return resolved.pathname.slice(1);
+  }).sort();
+}
+
+export function snapshotStaticSite(files: ReadonlyMap<string, Buffer>, publicFonts: ReadonlyMap<string, Buffer>) {
+  assert.deepEqual([...files.keys()].filter((path) => path.endsWith(".html")).sort(), siteRoutes.map(({ path }) => path).sort());
+  const stylesheets = siteStylesheetPaths(files);
+  assert.deepEqual([...files.keys()].filter((path) => path.endsWith(".css")).sort(), [...stylesheets].sort());
+  const foundation = files.get(stylesheets[0]);
+  const union = files.get(stylesheets[1]);
+  assert.ok(foundation !== undefined && union !== undefined && union.length > 0);
+  const fonts = siteFoundationFontPaths(stylesheets[0], foundation);
+  assert.deepEqual([...files.keys()].sort(), [...siteRoutes.map(({ path }) => path), ...stylesheets, ...fonts, ...sitePublicSupport].sort(), "Static publication contains a missing or unapproved public artifact");
+  assert.deepEqual([...files.keys()].filter((path) => /\.woff2?$/u.test(path)).sort(), fonts, "Static font publication is incomplete or redundant");
+  assert.deepEqual([...files.keys()].filter((path) => path.startsWith("graphs/")).sort(), [stylesheets[0], ...fonts].sort(), "Private graph artifacts escaped publication");
+  assert.equal(publicFonts.size, 13);
+  assert.deepEqual([...publicFonts.keys()].sort(), [...sitePublicFonts].sort());
+  const emitted = fonts.map((path) => {
+    const bytes = files.get(path);
+    assert.ok(bytes !== undefined && bytes.length > 0 && bytes.length <= 1024 * 1024);
+    return digest(bytes);
+  }).sort();
+  assert.deepEqual(emitted, [...publicFonts.values()].map(digest).sort(), "Published fonts differ from the installed public inputs");
+  transform({ filename: "stylex.css", code: union, visitor: {
+    Url() { throw new Error("Final union contains an unexpected asset URL"); },
+    Rule: { import() { throw new Error("Final union contains an uncollected CSS import"); } },
+  } });
+  return { routes: siteRoutes, stylesheets, fonts };
+}
+
 export function assetContentType(key: string): string {
   if (fontProvenancePaths.has(key)) return "text/plain; charset=utf-8";
   const mime: Readonly<Record<string, string>> = {
@@ -236,16 +362,18 @@ export function assetContentType(key: string): string {
   return mime[key.split(".").at(-1) ?? ""] ?? "application/octet-stream";
 }
 
-async function serve(files: ReadonlyMap<string, Buffer>, csp: string): Promise<Surface> {
+async function serve(files: ReadonlyMap<string, Buffer>, csp: string, previewCsp?: string): Promise<Surface> {
+  const fontPaths = new Set([...files.keys()].filter((path) => path.endsWith(".woff2")));
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     fetch(request) {
       if (request.method !== "GET" && request.method !== "HEAD") return new Response(null, { status: 405 });
-      const key = assetPath(new URL(request.url).pathname);
+      const pathname = new URL(request.url).pathname;
+      const key = assetPath(pathname, fontPaths);
       const bytes = key === null ? undefined : files.get(key);
       if (key === null || bytes === undefined) return new Response(null, { status: 404 });
       return new Response(request.method === "HEAD" ? null : Uint8Array.from(bytes), { headers: {
-        "Cache-Control": "no-store", "Content-Security-Policy": csp,
+        "Cache-Control": "no-store", "Content-Security-Policy": pathname === "/preview/" && previewCsp !== undefined ? previewCsp : csp,
         "Content-Type": assetContentType(key),
         "Cross-Origin-Opener-Policy": "same-origin", "X-Content-Type-Options": "nosniff",
       } });
@@ -420,12 +548,15 @@ export function loadedStylesheetControl(element: Element) {
   };
 }
 
-async function negativeStylesheet(page: Page, selector: string, href: string): Promise<void> {
-  const sample = () => page.locator(selector).first().evaluate((element) => {
+async function negativeStylesheet(page: Page, selector: string, href: string, foundation = false): Promise<void> {
+  const sample = () => page.locator(selector).first().evaluate((element, foundation) => {
     element.getBoundingClientRect();
     const css = getComputedStyle(element);
-    return { display: css.display, height: css.minHeight, padding: css.paddingLeft, border: css.borderTopWidth, font: css.fontSize };
-  });
+    return {
+      display: css.display, height: css.minHeight, padding: css.paddingLeft, border: css.borderTopWidth, font: css.fontSize,
+      ...(foundation ? { boxSizing: css.boxSizing, fontFamily: css.fontFamily, lineHeight: css.lineHeight, backgroundToken: css.getPropertyValue("--background") } : {}),
+    };
+  }, foundation);
   const before = await sample();
   const sheet = page.locator(`link[rel="stylesheet"][href="${href}"]`);
   assert.equal(await sheet.count(), 1);
@@ -646,9 +777,20 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
   assert.equal(playwrightPackage.version, "1.62.0");
   const { chromium } = await import("playwright-core");
   const appFiles = await inventory(join(root, "app/dist"));
-  const siteFiles = await inventory(join(root, "dist/site"));
+  const siteRoot = join(root, "dist/site");
+  const siteDocuments = new Map(await Promise.all(siteRoutes.map(async ({ path }) => [path, await ordinary(join(siteRoot, path))] as const)));
+  const [foundationPath] = siteStylesheetPaths(siteDocuments);
+  const foundationBytes = await ordinary(join(siteRoot, foundationPath));
+  const siteFontPaths = new Set(siteFoundationFontPaths(foundationPath, foundationBytes));
+  const siteFiles = await inventory(siteRoot, siteFontPaths);
+  for (const [path, bytes] of siteDocuments) assert.deepEqual(siteFiles.get(path), bytes, "Site document changed during graph admission");
+  assert.deepEqual(siteFiles.get(foundationPath), foundationBytes, "Site foundation changed during graph admission");
+  const publicFontRoot = await realpath(dirname(fileURLToPath(import.meta.resolve("@hraness/design-kit/fonts.css"))));
+  const publicFonts = new Map(await Promise.all(sitePublicFonts.map(async (path) => [path, await ordinary(join(publicFontRoot, "fonts", path))] as const)));
+  const siteGraph = snapshotStaticSite(siteFiles, publicFonts);
   const appCsp = productionCsp(JSON.parse((await ordinary(join(root, "app/vercel.json"))).toString("utf8")) as unknown, "/(.*)");
-  const siteCsp = productionCsp(JSON.parse((await ordinary(join(root, "vercel.json"))).toString("utf8")) as unknown, "/((?!preview/?$).*)");
+  const siteConfiguration: unknown = JSON.parse((await ordinary(join(root, "vercel.json"))).toString("utf8"));
+  const { siteCsp, previewCsp } = siteProductionCsp(siteConfiguration);
   const temporaryRoot = join(root, "tmp");
   await mkdir(temporaryRoot, { recursive: true });
   assert.equal(await realpath(temporaryRoot), temporaryRoot);
@@ -672,7 +814,7 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
     assert.ok(!cancelled, "Browser acceptance cancelled");
     const app = await serve(appFiles, appCsp); servers.push(app);
     const fixture = await serve(fixtureFiles, appCsp); servers.push(fixture);
-    const site = await serve(siteFiles, siteCsp); servers.push(site);
+    const site = await serve(siteFiles, siteCsp, previewCsp); servers.push(site);
     for (const profile of profiles) {
       assert.ok(!cancelled, "Browser acceptance cancelled");
       const userData = await mkdtemp(join(run, "profile-"));
@@ -823,17 +965,64 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
           await safeArea(page, fixture.origin);
           evidence.push({ name: "asymmetric-safe-area:ltr+rtl", values: { top: 19, left: 31, bottom: 23, right: 47 } });
         }
-        diagnostics.step = "static-site:navigation";
-        await page.goto(site.origin);
-        diagnostics.step = "static-site:assertions";
-        await page.locator("h1").waitFor({ state: "visible" });
-        await settle(page);
-        await cleanDocument(page);
-        assert.equal(await page.evaluate(() => matchMedia("(prefers-color-scheme: light)").matches), profile.colorScheme === "light");
-        if (!profile.forced) assert.equal(await page.locator("html").evaluate((element) => getComputedStyle(element).backgroundColor), profile.colorScheme === "light" ? "rgb(251, 250, 247)" : "rgb(20, 19, 16)");
-        assert.ok(await page.locator("h1").evaluate((element) => Number.parseFloat(getComputedStyle(element).fontSize) > 24));
-        await negativeStylesheet(page, "h1", "/styles.css");
-        evidence.push({ name: `${profile.name}:static-site`, values: "passed" });
+        for (const route of siteGraph.routes) {
+          const responses: BrowserResponse[] = [];
+          let responseOverflow = false;
+          const capture = (response: BrowserResponse) => {
+            if (new URL(response.url()).origin !== site.origin || !["stylesheet", "font"].includes(response.request().resourceType())) return;
+            if (responses.length < 64) responses.push(response);
+            else responseOverflow = true;
+          };
+          page.on("response", capture);
+          try {
+            diagnostics.step = `static-site:${route.path}:navigation`;
+            const response = await page.goto(`${site.origin}${route.pathname}`);
+            assert.ok(response !== null);
+            assert.equal(response.status(), 200);
+            assert.equal(response.headers()["content-security-policy"], route.pathname === "/preview/" ? previewCsp : siteCsp);
+            const documentBytes = siteFiles.get(route.path);
+            assert.ok(documentBytes !== undefined);
+            assert.deepEqual(await response.body(), documentBytes, "Native document differs from the completed output");
+            await page.evaluate((direction) => { document.documentElement.dir = direction; }, profile.rtl ? "rtl" : "ltr");
+            diagnostics.step = `static-site:${route.path}:assertions`;
+            await page.locator(route.heading).waitFor({ state: "visible" });
+            await settle(page);
+            const fonts = await page.evaluate(async () => {
+              const faces = [...document.fonts];
+              if (faces.length !== 13) throw new Error("Native font-face inventory is incomplete");
+              await Promise.all(faces.map((face) => face.load()));
+              return faces.map((face) => ({ family: face.family, style: face.style, weight: face.weight, status: face.status }));
+            });
+            assert.ok(fonts.every(({ status }) => status === "loaded"), "A public font did not load natively under font-src self");
+            await settle(page);
+            await cleanDocument(page);
+            assert.deepEqual(await page.locator('link[rel="stylesheet"]').evaluateAll((links) => links.map((link) => link.getAttribute("href"))), siteGraph.stylesheets.map((path) => `/${path}`));
+            assert.deepEqual(await page.evaluate(() => [...document.styleSheets].map((sheet) => ({ href: sheet.href, disabled: sheet.disabled, rules: sheet.cssRules.length > 0 }))),
+              siteGraph.stylesheets.map((path) => ({ href: `${site.origin}/${path}`, disabled: false, rules: true })));
+            assert.equal(await page.evaluate(() => matchMedia("(prefers-color-scheme: light)").matches), profile.colorScheme === "light");
+            if (!profile.forced) assert.equal(await page.locator("html").evaluate((element) => getComputedStyle(element).backgroundColor), profile.colorScheme === "light" ? "rgb(251, 250, 247)" : "rgb(20, 19, 16)");
+            assert.ok(await page.locator(route.heading).evaluate((element) => Number.parseFloat(getComputedStyle(element).fontSize) > 24));
+            if (route.pathname === "/preview/") assert.equal(await page.locator("a,button,input,select,textarea,form,script,iframe").count(), 0, "Preview gained an action or script");
+            const countBeforeNegative = responses.length;
+            await negativeStylesheet(page, route.heading, `/${siteGraph.stylesheets[1]}`);
+            await negativeStylesheet(page, "html", `/${siteGraph.stylesheets[0]}`, true);
+            await cleanDocument(page);
+            assert.equal(responses.length, countBeforeNegative, "Stylesheet application control reloaded a resource");
+            assert.equal(responseOverflow, false, "Static resource census exceeded its bound");
+            const delivered = await Promise.all(responses.map(async (resource) => {
+              const key = assetPath(new URL(resource.url()).pathname, siteFontPaths);
+              assert.ok(key !== null && siteFiles.has(key));
+              assert.equal(resource.status(), 200);
+              assert.equal(resource.headers()["content-type"], assetContentType(key));
+              assert.equal(resource.headers()["x-content-type-options"], "nosniff");
+              const bytes = await resource.body();
+              assert.deepEqual(bytes, siteFiles.get(key), "Native resource differs from its retained output identity");
+              return { path: key, bytes: bytes.length, sha256: digest(bytes) };
+            }));
+            assert.deepEqual(delivered.map(({ path }) => path).sort(), [...siteGraph.stylesheets, ...siteGraph.fonts].sort(), "Native CSS/font linkage was incomplete or redundant");
+            evidence.push({ name: `${profile.name}:static-site:${route.path}`, values: { documentSha256: digest(documentBytes), fonts, delivered: delivered.sort((a, b) => a.path.localeCompare(b.path)) } });
+          } finally { page.off("response", capture); }
+        }
         assert.deepEqual(isolation.errors, [], "Browser runtime or resource failure");
         evidence.push({ name: `${profile.name}:isolation`, values: { blocked: [...new Set(isolation.blocked)].sort(), cspErrors: 0, runtimeErrors: 0 } });
         })();
@@ -865,7 +1054,8 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
       }
     }
     assert.deepEqual(artifacts(await inventory(join(root, "app/dist"))), artifacts(appFiles));
-    assert.deepEqual(artifacts(await inventory(join(root, "dist/site"))), artifacts(siteFiles));
+    assert.deepEqual(artifacts(await inventory(siteRoot, siteFontPaths)), artifacts(siteFiles));
+    for (const [path, bytes] of publicFonts) assert.deepEqual(await ordinary(join(publicFontRoot, "fonts", path)), bytes, "Public font input changed during browser acceptance");
     assert.deepEqual(await ordinary(join(root, "package.json")), packageBytes);
     assert.deepEqual(await ordinary(join(root, "bun.lock")), lockBytes);
     assert.ok(!cancelled, "Browser acceptance cancelled");
@@ -888,7 +1078,8 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
         browserExecutableSha256: executableSha256, playwright: "1.62.0", bun: Bun.version,
         packageSha256: digest(packageBytes), lockSha256: digest(lockBytes),
         app: artifacts(appFiles), site: artifacts(siteFiles), fixture: fixtureArtifacts,
-        appCspSha256: digest(appCsp), siteCspSha256: digest(siteCsp),
+        appCspSha256: digest(appCsp), siteCspSha256: digest(siteCsp), previewCspSha256: digest(previewCsp),
+        sitePublicFonts: artifacts(publicFonts),
         fixtureIoAliases: ["@convex-dev/auth/react", ...browserIoModules], evidence,
         profileDiagnostics, ...(failure === undefined ? {} : { failure: browserFailureDetails(failure) }),
       };

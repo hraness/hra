@@ -3,8 +3,144 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertAppColorScheme, assertDefaultButtonPresentation, assertNativeModalFocus, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, inventory, loadedStylesheetControl, productionCsp } from "./app-browser";
+import { assertAppColorScheme, assertDefaultButtonPresentation, assertNativeModalFocus, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, inventory, loadedStylesheetControl, productionCsp, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotStaticSite } from "./app-browser";
 import { browserIoModules } from "../app/fixtures/browser/config";
+
+function staticSiteFixture(sanitized = false) {
+  const fontNames = [
+    ...["Light", "LightItalic", "Book", "BookItalic", "Medium", "MediumItalic", "Semibold", "SemiboldItalic", "Bold", "BoldItalic", "Black", "BlackItalic"]
+      .map((cut) => `nebula-sans/NebulaSans-${cut}.woff2`),
+    "geist-mono/GeistMono[wght].woff2",
+  ];
+  const publicFonts = new Map(fontNames.map((path) => [path, Buffer.from(`public:${path}`)]));
+  const foundation = "graphs/foundation/assets/foundation-testhash.css";
+  const fontPaths = fontNames.map((path, index) => `graphs/foundation/assets/${path.split("/").at(-1)!.replace(".woff2", `-testhash${index}.woff2`).replace("[wght]", sanitized ? "_wght_" : "[wght]")}`);
+  const css = fontPaths.map((path, index) => `@font-face{font-family:"Fixture ${index}";src:url("./${path.split("/").at(-1)}") format("woff2")}`).join("");
+  const html = Buffer.from(`<!doctype html><html><head><link rel="stylesheet" href="/${foundation}"><link rel="stylesheet" href="/stylex.css"></head><body><h1 class="x123">Fixture</h1></body></html>`);
+  const files = new Map<string, Buffer>([
+    ["index.html", html], ["privacy/index.html", html], ["preview/index.html", html],
+    [foundation, Buffer.from(css)], ["stylex.css", Buffer.from("@layer components.hraness-stylex{.x123{font-size:40px}}")],
+    ...fontPaths.map((path, index) => [path, Buffer.from(`public:${fontNames[index]}`)] as const),
+    ...["analytics.js", "favicon.svg", "social-card.svg", "social-card.png", "robots.txt", "sitemap.xml", "llms.txt",
+      ".well-known/security.txt", ".well-known/hra.json", "fonts/nebula-sans/LICENSE.txt", "fonts/nebula-sans/PROVENANCE.md",
+      "fonts/geist-mono/OFL.txt", "fonts/geist-mono/PROVENANCE.md"].map((path) => [path, Buffer.from(`support:${path}`)] as const),
+  ]);
+  return { files, publicFonts, foundation, fontPaths, css, html };
+}
+
+describe("static site graph acceptance", () => {
+  test("keeps the preview's no-script policy distinct and both font policies exactly self", () => {
+    const siteCsp = "default-src 'none'; font-src 'self'; style-src 'self'; script-src 'self'";
+    const previewCsp = "default-src 'none'; font-src 'self'; style-src 'self'; script-src 'none'";
+    const config = (site: string, preview: string) => ({ headers: [
+      { source: "/((?!preview/?$).*)", headers: [{ key: "Content-Security-Policy", value: site }] },
+      { source: "/preview/", headers: [{ key: "Content-Security-Policy", value: preview }] },
+    ] });
+    expect(siteProductionCsp(config(siteCsp, previewCsp))).toEqual({ siteCsp, previewCsp });
+    for (const policy of [siteCsp.replace("font-src 'self'", "font-src 'self' data:"), siteCsp.replace("font-src 'self'", "font-src https://outside.invalid"), siteCsp.replace("font-src 'self'; ", "")]) {
+      expect(() => siteProductionCsp(config(policy, previewCsp))).toThrow();
+      expect(() => siteProductionCsp(config(siteCsp, policy))).toThrow();
+    }
+    expect(() => siteProductionCsp(config(siteCsp, siteCsp))).toThrow();
+    expect(() => siteProductionCsp({ headers: config(siteCsp, previewCsp).headers.slice(0, 1) })).toThrow();
+  });
+
+  test("derives the same two-sheet join and all thirteen fonts from actual output bytes", () => {
+    for (const sanitized of [false, true]) {
+      const fixture = staticSiteFixture(sanitized);
+      const graph = snapshotStaticSite(fixture.files, fixture.publicFonts);
+      expect(graph.stylesheets).toEqual([fixture.foundation, "stylex.css"]);
+      expect(graph.fonts).toEqual([...fixture.fontPaths].sort());
+      expect(graph.routes.map(({ pathname }) => pathname)).toEqual(["/", "/privacy/", "/preview/"]);
+      expect(graph.routes[1].heading).toBe("#privacy-heading");
+      for (const path of graph.fonts) {
+        expect(assetPath(`/${path}`, new Set(graph.fonts))).toBe(path);
+        expect(assetPath(`/${path.replace("[", "%5B").replace("]", "%5D")}`, new Set(graph.fonts))).toBe(path);
+      }
+    }
+  });
+
+  test("rejects missing/extra routes, stale joins, changed order, inline presentation and link policy drift", () => {
+    for (const path of ["index.html", "privacy/index.html", "preview/index.html"]) {
+      const fixture = staticSiteFixture();
+      fixture.files.delete(path);
+      expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+    }
+    const mutations = [
+      (html: string) => html.replace("/stylex.css", "/styles.css"),
+      (html: string) => html.replace("foundation-testhash.css", "foundation-other.css"),
+      (html: string) => html.replace(/(<link[^>]+>)(<link[^>]+>)/u, "$2$1"),
+      (html: string) => html.replace("</head>", '<style>h1{color:red}</style></head>'),
+      (html: string) => html.replace("<h1", '<h1 style="color:red"'),
+      (html: string) => html.replace("</head>", '<base href="https://external.invalid/"></head>'),
+      (html: string) => html.replace('rel="stylesheet"', 'rel="stylesheet" disabled'),
+      (html: string) => html.replace('rel="stylesheet"', 'rel="alternate stylesheet"'),
+      (html: string) => html.replace("</head>", '<link rel="stylesheet" href="/extra.css"></head>'),
+    ];
+    for (const mutate of mutations) {
+      const fixture = staticSiteFixture();
+      fixture.files.set("privacy/index.html", Buffer.from(mutate(fixture.html.toString())));
+      expect(() => siteStylesheetPaths(fixture.files)).toThrow();
+    }
+    const fixture = staticSiteFixture();
+    fixture.files.set("extra/index.html", fixture.html);
+    expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+  });
+
+  test("rejects private graphs, extra CSS, missing/redundant fonts and wrong installed identities", () => {
+    for (const extra of ["styles.css", "graphs/renderer/entries/render.js", "graphs/foundation/receipt.json", "stylex-complete.json", "renderer.js", "source.ts", "extra.woff2", "extra.woff"]) {
+      const fixture = staticSiteFixture();
+      fixture.files.set(extra, Buffer.from("unexpected"));
+      expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+    }
+    const missingLicense = staticSiteFixture();
+    missingLicense.files.delete("fonts/geist-mono/OFL.txt");
+    expect(() => snapshotStaticSite(missingLicense.files, missingLicense.publicFonts)).toThrow();
+    for (const mutation of ["missing", "changed", "wrong-input", "missing-input"] as const) {
+      const fixture = staticSiteFixture();
+      const path = fixture.fontPaths[0]!;
+      if (mutation === "missing") fixture.files.delete(path);
+      else if (mutation === "changed") fixture.files.set(path, Buffer.from("altered"));
+      else if (mutation === "wrong-input") fixture.publicFonts.set("nebula-sans/NebulaSans-Light.woff2", Buffer.from("different installed font"));
+      else fixture.publicFonts.delete("nebula-sans/NebulaSans-Light.woff2");
+      expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+    }
+  });
+
+  test("rejects remote/data/import/local sources, duplicate faces and URL traversal aliases", () => {
+    const fixture = staticSiteFixture();
+    const first = `./${fixture.fontPaths[0]!.split("/").at(-1)}`;
+    for (const bad of ["data:font/woff2;base64,AA==", "https://outside.invalid/font.woff2", "/font.woff2", "../font.woff2", "./../font.woff2", "font.woff2?x", "font.woff2#x", "%2e%2e/font.woff2", "font%2fchild.woff2", "font%255Bface%255D.woff2"]) {
+      expect(() => siteFoundationFontPaths(fixture.foundation, Buffer.from(fixture.css.replace(first, bad)))).toThrow();
+    }
+    for (const css of [
+      `${fixture.css}@import "extra.css";`,
+      `${fixture.css}.x{background:url("extra.woff2")}`,
+      fixture.css.replace(`url("${first}") format("woff2")`, 'local("Fixture")'),
+      fixture.css.replace(first, `./${fixture.fontPaths[1]!.split("/").at(-1)}`),
+      fixture.css.replace('format("woff2")', 'format("woff")'),
+    ]) expect(() => siteFoundationFontPaths(fixture.foundation, Buffer.from(css))).toThrow();
+    expect(siteFoundationFontPaths(fixture.foundation, Buffer.from(fixture.css.replace("[wght]", "%5Bwght%5D")))).toEqual([...fixture.fontPaths].sort());
+    for (const css of ['@import "other.css";', '.x{background:url("data:image/svg+xml,example")}']) {
+      fixture.files.set("stylex.css", Buffer.from(css));
+      expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+    }
+  });
+
+  test("bracketed request exceptions require a captured canonical key, never broad URL decoding", () => {
+    const path = "graphs/foundation/assets/GeistMono[wght]-testhash.woff2";
+    const captured = new Set([path]);
+    expect(assetPath(`/${path}`)).toBeNull();
+    expect(assetPath(`/${path}`, captured)).toBe(path);
+    for (const bad of [
+      "/graphs/foundation/assets/Other[wght]-testhash.woff2",
+      "/graphs/foundation/assets/GeistMono%255Bwght%255D-testhash.woff2",
+      "/graphs%2ffoundation/assets/GeistMono%5Bwght%5D-testhash.woff2",
+      "/graphs/foundation/assets/../GeistMono[wght]-testhash.woff2",
+      "/graphs/foundation/assets/GeistMono[wght]-testhash.woff2/",
+    ]) expect(assetPath(bad, captured)).toBeNull();
+  });
+});
 
 function stylesheetFixture() {
   class Link {
