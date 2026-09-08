@@ -1,3 +1,6 @@
+// Match production's import order before Babel installs its stack formatter.
+// Bun 1.3.14 otherwise fails while Vite 7.3.6 initializes error prototypes.
+import "vite";
 import { createStylexTransformCollector } from "@hraness/ui/stylex-build";
 import { extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";

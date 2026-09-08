@@ -46,6 +46,26 @@ async function declares(slot: string, declarations: readonly string[]): Promise<
   for (const declaration of declarations) expect(css).toContain(compact(declaration));
 }
 
+test("site preload preserves Vite loading after public StyleX transforms", async () => {
+  expect(Bun.version).toBe("1.3.14");
+  const collector = createStylexTransformCollector(root);
+  const fixturePath = fileURLToPath(new URL("__vite_import_order_regression__.stylex.ts", import.meta.url));
+  const fixture = [
+    'import * as stylex from "@stylexjs/stylex";',
+    'const styles = stylex.create({ probe: { color: "#112233", display: "block" } });',
+    'export const className = stylex.props(styles.probe).className;',
+  ].join("\n");
+  const result = await collector.transform(fixture, fixturePath);
+  expect(result.rules).toHaveLength(2);
+  expect(collector.seal()).toHaveLength(2);
+  expect(result.code).not.toContain("stylex.create(");
+  expect(result.code).not.toContain("stylex.inject(");
+  expect(result.code).not.toContain("@stylexjs/stylex/lib/stylex-inject");
+  const vite = await import("vite");
+  expect(vite.version).toBe("7.3.6");
+  expect(typeof vite.build).toBe("function");
+});
+
 test("all finite site slots compile through the public collector without runtime injection", async () => {
   const collector = createStylexTransformCollector(root);
   const result = await collector.transform(source, path);
