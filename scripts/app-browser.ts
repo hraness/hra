@@ -23,6 +23,7 @@ export function browserFailureDetails(value: unknown, depth = 0): BrowserFailure
   };
 }
 type Profile = Readonly<{ name: string; width: number; height: number; coarse: boolean; reduced: boolean; forced: boolean; rtl: boolean; colorScheme?: "dark" | "light" }>;
+const fixtureViews = ["signin", "locked", "enrollment", "grid", "session", "session-long", "retired", "settings", "primitives"] as const;
 const profiles: readonly Profile[] = [
   { name: "desktop", width: 1280, height: 900, coarse: false, reduced: false, forced: false, rtl: false },
   { name: "light-os", width: 1280, height: 900, coarse: false, reduced: false, forced: false, rtl: false, colorScheme: "light" },
@@ -31,6 +32,47 @@ const profiles: readonly Profile[] = [
   { name: "forced-colors", width: 1280, height: 900, coarse: false, reduced: false, forced: true, rtl: false },
   { name: "rtl", width: 390, height: 844, coarse: true, reduced: false, forced: false, rtl: true },
 ];
+const browserDiagnosticSteps = new Set([
+  "launch", "isolation:install", "page:create", "browser-census:connect", "browser-census:read", "browser-census:detach",
+  "production-anonymous:navigation", "production-anonymous:assertions", "production-anonymous:negative-css",
+  "asymmetric-safe-area", "isolation:assertions", "cleanup", "complete",
+  ...fixtureViews.flatMap((view) => ["navigation", "assertions", "screenshot"].map((step) => `fixture:${view}:${step}`)),
+  ...["home", "privacy", "preview"].flatMap((route) => [
+    "navigation", "document-bytes", "direction", "heading", "settle-before-fonts", "font-load", "settle-after-fonts",
+    "document-clean", "stylesheet-links", "stylesheet-inventory", "color-scheme", "background", "heading-style", "inertness",
+    "negative-final-css", "negative-foundation-css", "negative-document-clean", "resource-bytes",
+  ].map((step) => `static-site:${route}:${step}`)),
+]);
+type BrowserProfileDiagnostics = {
+  name: string; step: string; failureStep: string | undefined; events: string[]; ownedPids: number[]; failure: BrowserFailure | undefined;
+};
+
+/** Public logs contain only finite labels, never an Error message, URL, PID or page sample. */
+export function browserDiagnosticLine(profile: unknown, step: unknown, phase: unknown, error?: unknown): string {
+  const safeProfile = typeof profile === "string" && profiles.some(({ name }) => name === profile) ? profile : "unknown-profile";
+  const safeStep = typeof step === "string" && browserDiagnosticSteps.has(step) ? step : "unknown-step";
+  const safePhase = typeof phase === "string" && ["progress", "after-failure", "failed", "cleanup-failed"].includes(phase) ? phase : "unknown-phase";
+  return `Browser diagnostic ${JSON.stringify({ profile: safeProfile, step: safeStep, phase: safePhase,
+    ...(safePhase === "failed" || safePhase === "cleanup-failed" ? { failure: browserFailureClass(error) } : {}),
+  })}`;
+}
+
+export function browserFailureClass(value: unknown): string {
+  if (!(value instanceof Error)) return "unknown";
+  if (value instanceof AggregateError) return "aggregate";
+  if (value.name === "AssertionError") return "assertion";
+  if (value.name === "TimeoutError" || /^Browser profile [a-z-]+ exceeded 120000ms$/u.test(value.message)
+    || /^(?:Closing browser census session|Closing browser process census|Browser census detach|Owned browser close|Final browser close) exceeded (?:5000|20000)ms$/u.test(value.message)) return "deadline";
+  if (value.name === "AbortError" || /^Browser (?:profile [a-z-]+|acceptance) cancelled(?: during launch)?$/u.test(value.message)) return "cancelled";
+  return "error";
+}
+
+/** The profile promise may settle later during cleanup. Freeze its first failed step now. */
+export function recordBrowserProfileFailure(diagnostics: Pick<BrowserProfileDiagnostics, "step" | "failureStep" | "failure">, error: unknown): void {
+  if (diagnostics.failureStep !== undefined) return;
+  diagnostics.failureStep = diagnostics.step;
+  diagnostics.failure = browserFailureDetails(error);
+}
 const digest = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
 const bracketedFontPath = "fonts/geist-mono/GeistMono[wght].woff2";
 const fontProvenancePaths = new Set([
@@ -807,7 +849,7 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
   assert.equal(await realpath(temporaryRoot), temporaryRoot);
   const run = await mkdtemp(join(temporaryRoot, "app-browser-"));
   const evidence: Evidence[] = [];
-  const profileDiagnostics: { name: string; step: string; events: string[]; ownedPids: number[]; failure: BrowserFailure | undefined }[] = [];
+  const profileDiagnostics: BrowserProfileDiagnostics[] = [];
   let fixtureArtifacts: readonly Artifact[] = [];
   const servers: Surface[] = [];
   const owner: { current: BrowserContext | null } = { current: null };
@@ -833,10 +875,15 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
       let profileFailure: unknown;
       let profileWork: Promise<void> | undefined;
       const pids: number[] = [];
-      const diagnostics = { name: profile.name, step: "launch", events: [] as string[], ownedPids: pids, failure: undefined as BrowserFailure | undefined };
+      const diagnostics: BrowserProfileDiagnostics = { name: profile.name, step: "launch", failureStep: undefined, events: [], ownedPids: pids, failure: undefined };
       profileDiagnostics.push(diagnostics);
       const note = (message: string) => { if (diagnostics.events.length === 64) diagnostics.events.shift(); diagnostics.events.push(message.slice(0, 500)); };
+      const mark = (step: string) => {
+        diagnostics.step = step;
+        console.log(browserDiagnosticLine(profile.name, step, diagnostics.failureStep === undefined ? "progress" : "after-failure"));
+      };
       try {
+        mark("launch");
         const context = await chromium.launchPersistentContext(userData, {
           executablePath: executable, headless: true, viewport: { width: profile.width, height: profile.height },
           hasTouch: profile.coarse, isMobile: profile.coarse, deviceScaleFactor: 1,
@@ -852,9 +899,9 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
         profileWork = (async () => {
         context.setDefaultTimeout(15_000);
         context.setDefaultNavigationTimeout(20_000);
-        diagnostics.step = "isolation:install";
+        mark("isolation:install");
         const isolation = await isolate(context, new Set(servers.map((server) => server.origin)));
-        diagnostics.step = "page:create";
+        mark("page:create");
         const page = await context.newPage();
         page.on("crash", () => note("page-crashed"));
         page.on("close", () => note("page-closed"));
@@ -865,19 +912,20 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
         assert.ok(browser !== null);
         browser.on("disconnected", () => note("browser-disconnected"));
         const browserVersion = browser.version();
-        diagnostics.step = "browser-census:connect";
+        mark("browser-census:connect");
         const browserCdp = await browser.newBrowserCDPSession();
-        diagnostics.step = "browser-census:read";
+        mark("browser-census:read");
         const census = await browserCdp.send("SystemInfo.getProcessInfo");
         for (const entry of census.processInfo) {
           assert.ok(Number.isSafeInteger(entry.id) && entry.id > 0 && entry.id !== process.pid);
           pids.push(entry.id);
         }
         assert.ok(pids.length > 0);
-        diagnostics.step = "browser-census:detach";
+        mark("browser-census:detach");
         await browserCdp.detach();
-        diagnostics.step = "production-anonymous:navigation";
+        mark("production-anonymous:navigation");
         await page.goto(app.origin);
+        mark("production-anonymous:assertions");
         await page.getByRole("heading", { name: "Sign in to HRA" }).waitFor();
         assert.deepEqual(await page.evaluate(() => ({
           coarse: matchMedia("(pointer: coarse)").matches,
@@ -893,13 +941,14 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
           };
         }), profile);
         await cleanDocument(page);
+        mark("production-anonymous:negative-css");
         await negativeStylesheet(page, "button", "/stylex.css");
         evidence.push({ name: `${profile.name}:production-anonymous`, values: { browserVersion, finalCssSha256: digest(appFiles.get("stylex.css") ?? "") } });
-        for (const view of ["signin", "locked", "enrollment", "grid", "session", "session-long", "retired", "settings", "primitives"]) {
+        for (const view of fixtureViews) {
           assert.ok(!isCancelled(), "Browser acceptance cancelled");
-          diagnostics.step = `fixture:${view}:navigation`;
+          mark(`fixture:${view}:navigation`);
           await page.goto(`${fixture.origin}/?view=${view}`);
-          diagnostics.step = `fixture:${view}:assertions`;
+          mark(`fixture:${view}:assertions`);
           await page.evaluate((direction) => { document.documentElement.dir = direction; }, profile.rtl ? "rtl" : "ltr");
           await page.locator("#root button").first().waitFor();
           await settle(page);
@@ -967,16 +1016,18 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
           if (view === "primitives") await primitives(page, profile);
           await cleanDocument(page);
           if (view === "grid" || view === "session" || view === "settings" || view === "primitives") {
+            mark(`fixture:${view}:screenshot`);
             await page.screenshot({ path: join(run, `${profile.name}-${view}.png`), fullPage: false });
           }
           evidence.push({ name: `${profile.name}:fixture:${view}`, values: "passed" });
         }
         if (profile.name === "desktop") {
-          diagnostics.step = "asymmetric-safe-area";
+          mark("asymmetric-safe-area");
           await safeArea(page, fixture.origin);
           evidence.push({ name: "asymmetric-safe-area:ltr+rtl", values: { top: 19, left: 31, bottom: 23, right: 47 } });
         }
         for (const route of siteGraph.routes) {
+          const routeLabel = route.pathname === "/" ? "home" : route.pathname === "/privacy/" ? "privacy" : "preview";
           const responses: BrowserResponse[] = [];
           let responseOverflow = false;
           const capture = (response: BrowserResponse) => {
@@ -986,18 +1037,22 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
           };
           page.on("response", capture);
           try {
-            diagnostics.step = `static-site:${route.path}:navigation`;
+            mark(`static-site:${routeLabel}:navigation`);
             const response = await page.goto(`${site.origin}${route.pathname}`);
             assert.ok(response !== null);
             assert.equal(response.status(), 200);
             assert.equal(response.headers()["content-security-policy"], route.pathname === "/preview/" ? previewCsp : siteCsp);
             const documentBytes = siteFiles.get(route.path);
             assert.ok(documentBytes !== undefined);
+            mark(`static-site:${routeLabel}:document-bytes`);
             assert.deepEqual(await response.body(), documentBytes, "Native document differs from the completed output");
+            mark(`static-site:${routeLabel}:direction`);
             await page.evaluate((direction) => { document.documentElement.dir = direction; }, profile.rtl ? "rtl" : "ltr");
-            diagnostics.step = `static-site:${route.path}:assertions`;
+            mark(`static-site:${routeLabel}:heading`);
             await page.locator(route.heading).waitFor({ state: "visible" });
+            mark(`static-site:${routeLabel}:settle-before-fonts`);
             await settle(page);
+            mark(`static-site:${routeLabel}:font-load`);
             const fonts = await page.evaluate(async () => {
               const faces = [...document.fonts];
               if (faces.length !== 13) throw new Error("Native font-face inventory is incomplete");
@@ -1005,21 +1060,33 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
               return faces.map((face) => ({ family: face.family, style: face.style, weight: face.weight, status: face.status }));
             });
             assert.ok(fonts.every(({ status }) => status === "loaded"), "A public font did not load natively under font-src self");
+            mark(`static-site:${routeLabel}:settle-after-fonts`);
             await settle(page);
+            mark(`static-site:${routeLabel}:document-clean`);
             await cleanDocument(page);
+            mark(`static-site:${routeLabel}:stylesheet-links`);
             assert.deepEqual(await page.locator('link[rel="stylesheet"]').evaluateAll((links) => links.map((link) => link.getAttribute("href"))), siteGraph.stylesheets.map((path) => `/${path}`));
+            mark(`static-site:${routeLabel}:stylesheet-inventory`);
             assert.deepEqual(await page.evaluate(() => [...document.styleSheets].map((sheet) => ({ href: sheet.href, disabled: sheet.disabled, rules: sheet.cssRules.length > 0 }))),
               siteGraph.stylesheets.map((path) => ({ href: `${site.origin}/${path}`, disabled: false, rules: true })));
+            mark(`static-site:${routeLabel}:color-scheme`);
             assert.equal(await page.evaluate(() => matchMedia("(prefers-color-scheme: light)").matches), profile.colorScheme === "light");
+            mark(`static-site:${routeLabel}:background`);
             if (!profile.forced) assert.equal(await page.locator("html").evaluate((element) => getComputedStyle(element).backgroundColor), profile.colorScheme === "light" ? "rgb(251, 250, 247)" : "rgb(20, 19, 16)");
+            mark(`static-site:${routeLabel}:heading-style`);
             assert.ok(await page.locator(route.heading).evaluate((element) => Number.parseFloat(getComputedStyle(element).fontSize) > 24));
+            mark(`static-site:${routeLabel}:inertness`);
             if (route.pathname === "/preview/") assert.equal(await page.locator("a,button,input,select,textarea,form,script,iframe").count(), 0, "Preview gained an action or script");
             const countBeforeNegative = responses.length;
+            mark(`static-site:${routeLabel}:negative-final-css`);
             await negativeStylesheet(page, route.heading, `/${siteGraph.stylesheets[1]}`);
+            mark(`static-site:${routeLabel}:negative-foundation-css`);
             await negativeStylesheet(page, "html", `/${siteGraph.stylesheets[0]}`, true);
+            mark(`static-site:${routeLabel}:negative-document-clean`);
             await cleanDocument(page);
             assert.equal(responses.length, countBeforeNegative, "Stylesheet application control reloaded a resource");
             assert.equal(responseOverflow, false, "Static resource census exceeded its bound");
+            mark(`static-site:${routeLabel}:resource-bytes`);
             const delivered = await Promise.all(responses.map(async (resource) => {
               const key = assetPath(new URL(resource.url()).pathname, siteFontPaths);
               assert.ok(key !== null && siteFiles.has(key));
@@ -1034,14 +1101,19 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
             evidence.push({ name: `${profile.name}:static-site:${route.path}`, values: { documentSha256: digest(documentBytes), fonts, delivered: delivered.sort((a, b) => a.path.localeCompare(b.path)) } });
           } finally { page.off("response", capture); }
         }
+        mark("isolation:assertions");
         assert.deepEqual(isolation.errors, [], "Browser runtime or resource failure");
         evidence.push({ name: `${profile.name}:isolation`, values: { blocked: [...new Set(isolation.blocked)].sort(), cspErrors: 0, runtimeErrors: 0 } });
         })();
         await boundedBrowserOperation(profileWork, 120_000, `Browser profile ${profile.name}`, cancellation.signal);
-      } catch (error) { profileFailure = error; diagnostics.failure = browserFailureDetails(error);
+      } catch (error) {
+        profileFailure = error;
+        recordBrowserProfileFailure(diagnostics, error);
+        console.error(browserDiagnosticLine(profile.name, diagnostics.failureStep, "failed", error));
       } finally {
         if (owner.current !== null) {
           try {
+            mark("cleanup");
             await closeOwnedBrowser(owner.current, pids);
             // Closing the owned browser rejects outstanding renderer work.
             // Do not remove its profile while the operation remains unsettled.
@@ -1050,6 +1122,8 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
             closed = true;
             evidence.push({ name: `${profile.name}:browser-cleanup`, values: { ownedProcesses: pids.length, survivors: 0, pages: 0 } });
           } catch (error) {
+            recordBrowserProfileFailure(diagnostics, error);
+            console.error(browserDiagnosticLine(profile.name, "cleanup", "cleanup-failed", error));
             profileFailure = profileFailure === undefined ? error : new AggregateError([profileFailure, error], "Browser profile and cleanup failed");
           }
         }
@@ -1063,7 +1137,7 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
       }
       if (profileFailure !== undefined) throw profileFailure instanceof Error
         ? profileFailure : new Error("Browser profile failed", { cause: profileFailure });
-      diagnostics.step = "complete";
+      mark("complete");
     }
     assert.deepEqual(artifacts(await inventory(join(root, "app/dist"))), artifacts(appFiles));
     assert.deepEqual(artifacts(await inventory(siteRoot, siteFontPaths)), artifacts(siteFiles));
@@ -1096,7 +1170,7 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
         profileDiagnostics, ...(failure === undefined ? {} : { failure: browserFailureDetails(failure) }),
       };
       await writeFile(join(run, "receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-      console.log(`Browser acceptance ${receipt.state}; ${evidence.length} evidence rows; receipt ${run.slice(root.length + 1)}/receipt.json`);
+      console.log(`Browser acceptance ${receipt.state}; ${evidence.length} evidence rows; receipt retained`);
     }
   }
   assert.ok(!isCancelled(), "Browser acceptance cancelled");

@@ -136,6 +136,15 @@ jobs:
           export CHROMIUM_EXECUTABLE_PATH
           test -x "$CHROMIUM_EXECUTABLE_PATH"
           bun run check:browser
+      - name: Retain browser acceptance receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: compiled-browser-receipts-${{ github.run_attempt }}
+          path: tmp/app-browser-*/receipt.json
+          if-no-files-found: warn
+          include-hidden-files: false
+          retention-days: 7
 
   required:
     name: Required

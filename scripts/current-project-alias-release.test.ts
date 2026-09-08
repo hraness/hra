@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { constants, fstatSync, openSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync } from "node:fs";
 import { chmod, link, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { isatty } from "node:tty";
 
 import {
   assertCurrentAliasReleaseBunVersion,
@@ -145,6 +146,30 @@ const withStateDirectory = async <Value>(
     await rm(directory, { force: true, recursive: true });
   }
 };
+
+function assertPrivateFixtureDescriptorAdmission(descriptor: number): void {
+  try {
+    const metadata = fstatSync(descriptor);
+    const diagnostic = JSON.stringify({
+      descriptor,
+      isFile: metadata.isFile(),
+      isatty: isatty(descriptor),
+      mode: metadata.mode & 0o777,
+      nlink: metadata.nlink,
+      size: metadata.size,
+      uid: metadata.uid,
+      umask: process.umask(),
+    });
+    expect(
+      Number.isSafeInteger(descriptor) && descriptor >= 3 && descriptor <= 255,
+      `Private fixture descriptor admission: ${diagnostic}`,
+    ).toBe(true);
+  } catch (error) {
+    // The reader has not acquired this test-owned descriptor on admission failure.
+    closeSync(descriptor);
+    throw error;
+  }
+}
 
 const deploymentFor = (
   endpoint: CurrentProjectAliasEndpoint,
@@ -1675,6 +1700,7 @@ describe("current-project Vercel provider", () => {
         token: "fixture-vercel-token",
       }), { mode: 0o600 });
       const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      assertPrivateFixtureDescriptorAdmission(descriptor);
       expect(readProtectedVercelAccessToken(descriptor)).toBe("fixture-vercel-token");
       expect(() => fstatSync(descriptor)).toThrow();
     });
@@ -1717,6 +1743,7 @@ describe("current-project Vercel provider", () => {
         validPath,
         constants.O_RDONLY | constants.O_NOFOLLOW,
       );
+      assertPrivateFixtureDescriptorAdmission(validDescriptor);
       expect(readProtectedProviderActivityEvidence(validDescriptor))
         .toEqual(providerActivityEvidence);
       expect(() => fstatSync(validDescriptor)).toThrow();

@@ -49,6 +49,29 @@ async function temporaryRoot(prefix: string): Promise<string> {
   return root;
 }
 
+function safeDevCollectionFailureDiagnostic(error: unknown): string {
+  const outer = error !== null && typeof error === "object" ? error : undefined;
+  const message = outer !== undefined && "message" in outer ? outer.message : undefined;
+  const cause = outer !== undefined && "cause" in outer ? outer.cause : undefined;
+  const inner = cause !== null && typeof cause === "object" ? cause : undefined;
+  const name = inner !== undefined && "name" in inner ? inner.name : undefined;
+  const code = inner !== undefined && "code" in inner ? inner.code : undefined;
+  return JSON.stringify({
+    code: typeof code === "string" && [
+      "ESRCH", "EPERM", "EACCES", "EINVAL", "ENOSYS", "ERR_ASSERTION",
+      "ERR_INVALID_ARG_TYPE", "ERR_OUT_OF_RANGE",
+    ].includes(code) ? code : "unclassified",
+    name: typeof name === "string" && [
+      "Error", "SystemError", "AssertionError", "TypeError", "RangeError",
+    ].includes(name) ? name : "unclassified",
+    stage: message === "Development child collection is unproved; retain both publication owners"
+      ? "process-group-collection"
+      : message === "Development child handle collection is unproved; retain both publication owners"
+        ? "direct-child-handle-collection"
+        : "unclassified",
+  });
+}
+
 function artifact(path: string, contents: string): AppArtifact {
   return { bytes: Buffer.byteLength(contents), path, sha256: appSha256(contents) };
 }
@@ -1087,7 +1110,14 @@ describe("cache, security, and owned process boundaries", () => {
       },
       signal: controller.signal,
     });
-    await expect(running).rejects.toThrow(/aborted/u);
+    const outcome = await running.then(
+      () => ({ kind: "resolved" as const }),
+      (error: unknown) => ({ error, kind: "rejected" as const }),
+    );
+    expect(() => {
+      if (outcome.kind === "rejected") throw outcome.error;
+    }, `Owned cancellation: ${safeDevCollectionFailureDiagnostic(outcome.kind === "rejected" ? outcome.error : undefined)}`)
+      .toThrow(/aborted/u);
     expect(pid).toBeNumber();
     expect(() => process.kill(pid ?? -1, 0)).toThrow();
     expect(() => process.kill(-(pid ?? 1), 0)).toThrow();

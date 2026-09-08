@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { fstatSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, rmdir, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { isatty } from "node:tty";
 
 import {
   CLAUDE_PIN,
@@ -884,6 +886,21 @@ describe("Claude cleanup-only recovery", () => {
         })).toThrow("Cleanup authorization scope does not match this run");
         let workerEffects = 0;
         try {
+          const metadata = fstatSync(handle.fd);
+          const diagnostic = JSON.stringify({
+            descriptor: handle.fd,
+            isFile: metadata.isFile(),
+            isatty: isatty(handle.fd),
+            mode: metadata.mode & 0o777,
+            nlink: metadata.nlink,
+            size: metadata.size,
+            uid: metadata.uid,
+            umask: process.umask(),
+          });
+          expect(
+            Number.isSafeInteger(handle.fd) && handle.fd >= 3 && handle.fd <= 255,
+            `Private cleanup fixture descriptor admission: ${diagnostic}`,
+          ).toBe(true);
           expect(await runClaudeLiveAcceptance(["--resume-fd", String(handle.fd)], {
             createLogout: () => { workerEffects += 1; return fakeLogoutFactory({
               descriptor: layout.descriptor,
