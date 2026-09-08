@@ -1,10 +1,85 @@
 import { expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
+import { parseSync } from "@babel/core";
 import {
   browserDiagnosticLine, browserFailureClass, browserNegativeStep, observeBrowserCustody,
   recordBrowserProfileFailure, withBrowserNegativeCleanup,
   type BrowserCustodyObservation, type BrowserCustodyObserver,
 } from "./app-browser";
+
+function assertOwnedBrowserSignalPolicy(source: string): void {
+  const tree = parseSync(source, {
+    babelrc: false, configFile: false, sourceType: "module", parserOpts: { plugins: ["typescript"] },
+  });
+  expect(tree).not.toBeNull();
+  const object = (value: unknown): Record<string, unknown> | undefined =>
+    value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  const launches: Record<string, unknown>[] = [];
+  let nodes = 0;
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) { for (const child of value) visit(child); return; }
+    const node = object(value);
+    if (node === undefined) return;
+    if (++nodes > 100_000) throw new Error("Browser launch policy AST exceeds its bound");
+    const callee = object(node.callee);
+    if (object(callee?.object)?.name === "chromium"
+      && object(callee?.property)?.name === "launchPersistentContext") {
+      expect(node.type).toBe("CallExpression");
+      expect(callee?.type).toBe("MemberExpression");
+      expect(callee?.computed).toBe(false);
+      launches.push(node);
+    }
+    for (const [key, child] of Object.entries(node)) {
+      if (!["loc", "start", "end", "comments", "tokens"].includes(key)) visit(child);
+    }
+  };
+  visit(tree);
+  expect(launches).toHaveLength(1);
+  const args = launches[0]?.arguments;
+  if (!Array.isArray(args) || args.length !== 2) throw new Error("Expected one explicit browser launch options object");
+  const options = object(args[1]);
+  expect(options?.type).toBe("ObjectExpression");
+  const properties = options?.properties;
+  if (!Array.isArray(properties)) throw new Error("Expected explicit browser launch properties");
+  const fields = properties.map((property: unknown) => object(property));
+  for (const field of fields) {
+    expect(field?.type).toBe("ObjectProperty");
+    expect(field?.computed).toBe(false);
+  }
+  for (const signal of ["handleSIGINT", "handleSIGTERM"]) {
+    const matches = fields.filter((field) => {
+      const key = object(field?.key);
+      return (key?.type === "Identifier" ? key.name : key?.type === "StringLiteral" ? key.value : undefined) === signal;
+    });
+    expect(matches).toHaveLength(1);
+    const value = object(matches[0]?.value);
+    expect(value?.type).toBe("BooleanLiteral");
+    expect(value?.value).toBe(false);
+  }
+}
+
+test("the actual browser launch leaves SIGINT and SIGTERM cleanup solely with the bootstrap", async () => {
+  assertOwnedBrowserSignalPolicy(await readFile(new URL("./app-browser.ts", import.meta.url), "utf8"));
+});
+
+test("browser signal ownership rejects defaults, enabled handlers and overrides at the actual call boundary", () => {
+  const prefix = "chromium.launchPersistentContext(profile, ";
+  const options = "{ handleSIGINT: false, handleSIGTERM: false }";
+  expect(() => assertOwnedBrowserSignalPolicy(`${prefix}${options});`)).not.toThrow();
+  expect(() => assertOwnedBrowserSignalPolicy(`${prefix}{ 'handleSIGINT': false, 'handleSIGTERM': false });`)).not.toThrow();
+  for (const invalid of [
+    "{}", "{ handleSIGINT: false }", "{ handleSIGTERM: false }",
+    "{ handleSIGINT: true, handleSIGTERM: false }", "{ handleSIGINT: false, handleSIGTERM: true }",
+    "{ handleSIGINT: false, handleSIGTERM: runtimePolicy }",
+    "{ handleSIGINT: false, handleSIGTERM: false, ...overrides }",
+    "{ handleSIGINT: false, handleSIGTERM: false, handleSIGTERM: true }",
+    "{ handleSIGINT: false, handleSIGTERM: false, 'handleSIGTERM': true }",
+    "{ 'handleSIGINT': false, handleSIGTERM: false, handleSIGINT: true }",
+    "{ handleSIGINT: false, ['handleSIGTERM']: false }", "runtimeOptions",
+  ]) expect(() => assertOwnedBrowserSignalPolicy(`${prefix}${invalid});`)).toThrow();
+  expect(() => assertOwnedBrowserSignalPolicy(`const unused = ${options}; chromium.launchPersistentContext(profile, {});`)).toThrow();
+  expect(() => assertOwnedBrowserSignalPolicy(`${prefix}${options}); ${prefix}${options});`)).toThrow();
+});
 
 test("native custody observations copy and freeze identities without exposing resource operations", () => {
   const pids = [42, 43], origins = ["http://127.0.0.1:1234"];

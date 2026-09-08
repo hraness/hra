@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, realpath, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { inventory } from "./app-browser.ts";
 import { APP_CSS_PLACEHOLDER, parseAppComplete, prepareAppShell, snapshotAppGraph } from "./build-app.ts";
@@ -74,6 +75,47 @@ export function assertBrowserDriverAst(value: unknown): void {
   assert.ok(imports.has("playwright-core"), "Browser driver must use real installed Playwright");
 }
 
+type DriverPublicationHandle = Readonly<{ sync: () => Promise<void>; close: () => Promise<void> }>;
+type DriverPublicationOperations = Readonly<{
+  openDriver: () => Promise<DriverPublicationHandle & Readonly<{ write: () => Promise<void> }>>;
+  openDirectory: () => Promise<DriverPublicationHandle>;
+}>;
+
+async function finishDriverPublicationHandle(handle: DriverPublicationHandle, work: () => Promise<void>): Promise<void> {
+  const failures: unknown[] = [];
+  try { await work(); } catch (error) { failures.push(error); }
+  try { await handle.close(); } catch (error) { failures.push(error); }
+  if (failures.length > 1) throw new AggregateError(failures, "Browser driver publication and descriptor closure failed");
+  if (failures.length === 1) {
+    const failure = failures[0];
+    throw failure instanceof Error ? failure : new Error("Browser driver publication failed", { cause: failure });
+  }
+}
+
+/** Narrow ordering seam: a failed write, sync or close never permits a seal. */
+export async function settleBrowserDriverPublication(operations: DriverPublicationOperations): Promise<void> {
+  const driver = await operations.openDriver();
+  await finishDriverPublicationHandle(driver, async () => { await driver.write(); await driver.sync(); });
+  const directory = await operations.openDirectory();
+  await finishDriverPublicationHandle(directory, () => directory.sync());
+}
+
+/** Finish durable exclusive publication before recording any file identity. */
+export async function publishBrowserDriver(run: string, bytes: Buffer): Promise<void> {
+  assert.ok(bytes.length > 0 && bytes.length <= 4 * 1024 * 1024);
+  assert.equal(await realpath(run), run, "Browser driver directory must be physical");
+  await settleBrowserDriverPublication({
+    openDriver: async () => {
+      const handle = await open(join(run, "driver.mjs"), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      return { write: () => handle.writeFile(bytes), sync: () => handle.sync(), close: () => handle.close() };
+    },
+    openDirectory: async () => {
+      const handle = await open(run, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      return { sync: () => handle.sync(), close: () => handle.close() };
+    },
+  });
+}
+
 export async function prepareAppBrowser(run: string): Promise<void> {
   assert.equal(Bun.version, BROWSER_BUN_VERSION);
   const requestBytes = await readBrowserFile(join(run, "request.json"), 16 * 1024 * 1024);
@@ -104,7 +146,7 @@ export async function prepareAppBrowser(run: string): Promise<void> {
   const { parseSync } = await import("@babel/core");
   const tree = parseSync(bytes.toString("utf8"), { babelrc: false, configFile: false, sourceType: "module" });
   assert.ok(tree); assertBrowserDriverAst(tree);
-  await writeFile(join(run, "driver.mjs"), bytes, { flag: "wx", mode: 0o600 });
+  await publishBrowserDriver(run, bytes);
   await verifyBrowserRequest(request);
   const prepared = parseBrowserPrepared({
     schemaVersion: 1, kind: "hra-browser-prepared", requestSha256: browserDigest(requestBytes),

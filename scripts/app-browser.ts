@@ -933,6 +933,9 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
       try {
         mark("launch");
         const context = await chromium.launchPersistentContext(userData, {
+          // The bootstrap owns these signals. Playwright's default handlers
+          // would close Chromium concurrently with our cleanup census.
+          handleSIGINT: false, handleSIGTERM: false,
           executablePath: executable, headless: true, viewport: { width: profile.width, height: profile.height },
           hasTouch: profile.coarse, isMobile: profile.coarse, deviceScaleFactor: 1,
           reducedMotion: profile.reduced ? "reduce" : "no-preference", forcedColors: profile.forced ? "active" : "none",
