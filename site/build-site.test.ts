@@ -30,6 +30,9 @@ import {
 import { HRA_RELEASE_VERSION } from "../scripts/release-evidence";
 
 const temporaryRoots: string[] = [];
+// A real site graph joins Vite foundation, Bun SSR, sealed templates and
+// analytics. The first completed native probe took 6.8s; pure cases keep 5s.
+const compilerBuildTimeoutMs = 30_000;
 const sourceRoot = await realpath(join(import.meta.dir, ".."));
 const hash = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 const installedFontRoot = dirname(fileURLToPath(import.meta.resolve("@hraness/design-kit/fonts.css")));
@@ -267,9 +270,12 @@ describe("static-site build", () => {
     expect(foundation).toContain("Nebula Sans");
     expect(foundation).toContain(".syntax-code");
     expect(foundation).toContain(".syntax-token--command");
-    expect(foundation).toContain("--hraness-site-footer-social-target");
     expect(foundation).toContain("components.hraness-ui");
     expect(union).toContain("@layer components.hraness-stylex");
+    // The linked union owns footer recipes; the captured foundation owns only
+    // its shared document defaults. Exact HTML parity above preserves the full
+    // canonical footer, and the atom closure below binds its emitted classes.
+    expect(union).toContain("--hraness-site-footer-social-target");
     const { document } = parseHTML(html);
     const atomClasses = new Set([...document.querySelectorAll("[class]")]
       .flatMap((element) => [...element.classList])
@@ -335,7 +341,7 @@ describe("static-site build", () => {
       },
       version: HRA_RELEASE_VERSION,
     });
-  });
+  }, compilerBuildTimeoutMs);
 
   test("renders the social card as a 1200x630 PNG plus the legacy SVG path from one composition", async () => {
     const root = await createFixtureRoot();
@@ -350,7 +356,7 @@ describe("static-site build", () => {
     expect(renderSiteHtml()).toContain(
       `<meta property="og:image" content="${publicContent.siteUrl}/social-card.png">`,
     );
-  });
+  }, compilerBuildTimeoutMs);
 
   test("binds hosted identity to one exact source commit", async () => {
     const root = await createFixtureRoot();
@@ -367,7 +373,7 @@ describe("static-site build", () => {
       repositoryRoot: root,
       sourceRoot,
     })).rejects.toThrow("Release commit");
-  });
+  }, compilerBuildTimeoutMs);
 
   test("fails Production closed without valid public analytics and mailing configuration", async () => {
     const validToken = "phc_public_production_token";
@@ -404,7 +410,7 @@ describe("static-site build", () => {
       repositoryRoot: missingTurnstileRoot,
       sourceRoot,
     })).rejects.toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
-  });
+  }, compilerBuildTimeoutMs);
 
   test("embeds only the public token in the self-hosted Production bundle", async () => {
     const root = await createFixtureRoot();
@@ -429,7 +435,7 @@ describe("static-site build", () => {
     expect(html).toContain(
       'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
     );
-  });
+  }, compilerBuildTimeoutMs);
 
   test("keeps the hosted identity marker at the fixed release-evidence version", async () => {
     const root = await createFixtureRoot();
@@ -442,7 +448,7 @@ describe("static-site build", () => {
     expect(identity.version).toBe(HRA_RELEASE_VERSION);
     expect(identity.version).toBe("0.1.0");
     expect(await readPackageVersion()).not.toBe(identity.version);
-  });
+  }, compilerBuildTimeoutMs);
 
   test("does not publish the retired adjacent-reading cluster", async () => {
     const root = await createFixtureRoot();
@@ -466,7 +472,7 @@ describe("static-site build", () => {
       await expect(readFile(join(root, "dist/site", route, "index.html"), "utf8"))
         .rejects.toThrow();
     }
-  });
+  }, compilerBuildTimeoutMs);
 
   test("reconstructs the owned site output without stale retired artifacts", async () => {
     const root = await createFixtureRoot();
@@ -487,7 +493,7 @@ describe("static-site build", () => {
     }
     const html = await readFile(join(root, "dist/site/index.html"), "utf8");
     expect(compiledStylesheetJoin(html).authoredHtml).toBe(renderSiteHtml());
-  });
+  }, compilerBuildTimeoutMs);
 
   test("generates the inert preview without publishing it as an indexable document", async () => {
     const root = await createFixtureRoot();
@@ -500,7 +506,7 @@ describe("static-site build", () => {
     expect(preview).toContain('<link rel="canonical" href="https://hra.sh/">');
     expect(preview).not.toContain("/analytics.js");
     expect(sitemap).not.toContain("/preview");
-  });
+  }, compilerBuildTimeoutMs);
 
   test("passes check mode in a clean clone without ignored build output", async () => {
     const root = await createFixtureRoot();
@@ -508,7 +514,7 @@ describe("static-site build", () => {
     await rm(join(root, "dist"), { force: true, recursive: true });
 
     expect(await buildSite({ check: true, repositoryRoot: root, sourceRoot })).toEqual([]);
-  });
+  }, compilerBuildTimeoutMs);
 
   test("reports stale tracked public documents without repairing build output", async () => {
     const root = await createFixtureRoot();
@@ -520,7 +526,7 @@ describe("static-site build", () => {
     expect(mismatches).toEqual([join(root, "README.md")]);
     expect(await readFile(join(root, "README.md"), "utf8")).toBe("stale\n");
     expect(await readFile(join(root, "dist/site/stylex.css"), "utf8")).toBe("stale\n");
-  });
+  }, compilerBuildTimeoutMs);
 
   test("admits only owned analytics, configured Turnstile, and restrictive response headers", async () => {
     const repositoryRoot = join(import.meta.dir, "..");
