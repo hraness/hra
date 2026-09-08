@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, open, readdir, readFile, realpath, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseHTML } from "linkedom";
 import { transform } from "lightningcss";
 import type { BrowserContext, Locator, Page, Response as BrowserResponse } from "playwright-core";
-import { browserIoModules, browserIoPlugin } from "../app/fixtures/browser/config";
-import { APP_CSS_PLACEHOLDER, parseAppComplete, prepareAppShell, snapshotAppGraph } from "./build-app";
+import { browserIoModules } from "../app/fixtures/browser/config";
+import { assertBrowserNode, browserDigest, browserExecutable, browserPublicArtifacts, publishBrowserJson, readBrowserPrepared } from "./app-browser-handoff.ts";
+import { serveBrowserAssets } from "./app-browser-server.ts";
 
 type Artifact = Readonly<{ bytes: number; path: string; sha256: string }>;
 type Surface = Readonly<{ artifacts: readonly Artifact[]; bytes: ReadonlyMap<string, Buffer>; origin: string; stop: () => Promise<void> }>;
@@ -457,58 +458,10 @@ export function assetContentType(key: string): string {
 }
 
 async function serve(files: ReadonlyMap<string, Buffer>, csp: string, previewCsp?: string): Promise<Surface> {
-  const fontPaths = new Set([...files.keys()].filter((path) => path.endsWith(".woff2")));
-  const server = Bun.serve({
-    hostname: "127.0.0.1", port: 0,
-    fetch(request) {
-      if (request.method !== "GET" && request.method !== "HEAD") return new Response(null, { status: 405 });
-      const pathname = new URL(request.url).pathname;
-      const key = assetPath(pathname, fontPaths);
-      const bytes = key === null ? undefined : files.get(key);
-      if (key === null || bytes === undefined) return new Response(null, { status: 404 });
-      return new Response(request.method === "HEAD" ? null : Uint8Array.from(bytes), { headers: {
-        "Cache-Control": "no-store", "Content-Security-Policy": pathname === "/preview/" && previewCsp !== undefined ? previewCsp : csp,
-        "Content-Type": assetContentType(key),
-        "Cross-Origin-Opener-Policy": "same-origin", "X-Content-Type-Options": "nosniff",
-      } });
-    },
+  const server = await serveBrowserAssets({
+    files, csp, ...(previewCsp === undefined ? {} : { previewCsp }), assetPath, contentType: assetContentType,
   });
-  return { artifacts: artifacts(files), bytes: files, origin: `http://127.0.0.1:${server.port}`, stop: async () => { await server.stop(true); } };
-}
-
-/** Same complete graph, package registration, shell seal and finalizer as build:app. */
-async function buildFixture(root: string, run: string): Promise<ReadonlyMap<string, Buffer>> {
-  const {
-    createStylexGeneration, finalizeStylexGeneration, prepareStylexProducedTemplate, sealStylexProducedTemplate,
-  } = await import("@hraness/ui/stylex-build");
-  const { build } = await import("vite");
-  const { appProductionConfig } = await import("../app/vite.config");
-  const shell = await ordinary(join(root, "app/index.html"));
-  const outputDirectory = join(run, "fixture");
-  const entry = "app/fixtures/browser/main.tsx";
-  const generation = await createStylexGeneration({
-    expectedGraphs: [{ adapter: "vite", entrypoints: [entry], id: "client", kind: "client" }],
-    finalCssPath: "stylex.css", generationId: "hra-app", outputDirectory,
-    packageManifests: [import.meta.resolve("@hraness/ui/stylex-manifest.json")], rootDirectory: root,
-    templates: [{ cssHref: "/stylex.css", graphId: "client", outputPath: "index.html", sourcePath: "app/index.html", stylesheetGraphId: "client" }],
-  });
-  const config = appProductionConfig(root, generation);
-  config.plugins = [browserIoPlugin(root), ...(config.plugins ?? [])];
-  const graph = snapshotAppGraph(await build(config), join(root, entry));
-  const prepared = await prepareStylexProducedTemplate(generation, "index.html");
-  const html = prepareAppShell(shell.toString("utf8"), graph);
-  await writeFile(prepared.sourcePath, html, { flag: "wx", mode: 0o600 });
-  await sealStylexProducedTemplate(generation, "index.html");
-  const completed = await finalizeStylexGeneration({ generation, outputDirectory, rootDirectory: root });
-  const files = await inventory(completed);
-  const complete = files.get("stylex-complete.json");
-  assert.ok(complete !== undefined);
-  const expected = parseAppComplete(JSON.parse(complete.toString("utf8")) as unknown);
-  assert.deepEqual(artifacts(files).filter((item) => item.path !== "stylex-complete.json"), expected);
-  assert.equal(files.get("index.html")?.toString("utf8"), html.replace(APP_CSS_PLACEHOLDER, "/stylex.css"));
-  assert.deepEqual(await ordinary(join(root, "app/index.html")), shell);
-  // Compiler provenance remains on disk; only finalized public artifacts are served.
-  return new Map([...files].filter(([path]) => path !== "stylex-complete.json"));
+  return { artifacts: artifacts(files), bytes: files, origin: server.origin, stop: server.stop };
 }
 
 async function settle(page: Page): Promise<void> {
@@ -864,12 +817,17 @@ async function isolate(context: BrowserContext, origins: ReadonlySet<string>): P
   return { blocked, errors };
 }
 
-export async function runAppBrowser(rootDirectory: string): Promise<void> {
-  assert.equal(Bun.version, "1.3.14");
+export async function runAppBrowser(rootDirectory: string, runDirectory: string, signal: AbortSignal): Promise<void> {
+  assertBrowserNode(process.versions);
   const root = await realpath(rootDirectory);
+  const run = await realpath(runDirectory);
+  const handoff = await readBrowserPrepared(root, run);
+  const driverRuntime = { name: "node", version: process.versions.node, executable: await browserExecutable(process.execPath), bundleSha256: handoff.prepared.driver.sha256 };
+  assert.deepEqual(driverRuntime.executable, handoff.request.node);
   const executable = process.env.CHROMIUM_EXECUTABLE_PATH;
   assert.ok(executable !== undefined && executable.startsWith("/"), "Set CHROMIUM_EXECUTABLE_PATH to an explicit Chromium executable");
   const executableSha256 = await browserExecutableSha256(executable);
+  assert.equal(executableSha256, handoff.request.chromium.sha256);
   const packageBytes = await ordinary(join(root, "package.json"));
   const lockBytes = await ordinary(join(root, "bun.lock"));
   const playwrightPackage = record(JSON.parse(await readFile(new URL(import.meta.resolve("playwright-core/package.json")), "utf8")) as unknown);
@@ -890,10 +848,6 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
   const appCsp = productionCsp(JSON.parse((await ordinary(join(root, "app/vercel.json"))).toString("utf8")) as unknown, "/(.*)");
   const siteConfiguration: unknown = JSON.parse((await ordinary(join(root, "vercel.json"))).toString("utf8"));
   const { siteCsp, previewCsp } = siteProductionCsp(siteConfiguration);
-  const temporaryRoot = join(root, "tmp");
-  await mkdir(temporaryRoot, { recursive: true });
-  assert.equal(await realpath(temporaryRoot), temporaryRoot);
-  const run = await mkdtemp(join(temporaryRoot, "app-browser-"));
   const evidence: Evidence[] = [];
   const profileDiagnostics: BrowserProfileDiagnostics[] = [];
   let fixtureArtifacts: readonly Artifact[] = [];
@@ -904,11 +858,12 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
   // The sole cleanup path takes a fresh census before closing. Do not race it
   // with an unawaited close from a signal callback.
   const onSignal = () => { cancellation.abort(); };
-  process.on("SIGINT", onSignal);
-  process.on("SIGTERM", onSignal);
+  signal.addEventListener("abort", onSignal, { once: true });
+  if (signal.aborted) onSignal();
   let failure: unknown;
   try {
-    const fixtureFiles = await buildFixture(root, run);
+    const fixtureFiles = new Map([...(await inventory(join(run, "fixture/hra-app")))].filter(([path]) => path !== "stylex-complete.json"));
+    assert.deepEqual(artifacts(fixtureFiles), browserPublicArtifacts(handoff.prepared.fixture).filter(({ path }) => path !== "stylex-complete.json"));
     fixtureArtifacts = artifacts(fixtureFiles);
     assert.ok(!isCancelled(), "Browser acceptance cancelled");
     const app = await serve(appFiles, appCsp); servers.push(app);
@@ -1198,6 +1153,7 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
     for (const [path, bytes] of publicFonts) assert.deepEqual(await ordinary(join(publicFontRoot, "fonts", path)), bytes, "Public font input changed during browser acceptance");
     assert.deepEqual(await ordinary(join(root, "package.json")), packageBytes);
     assert.deepEqual(await ordinary(join(root, "bun.lock")), lockBytes);
+    assert.deepEqual(await readBrowserPrepared(root, run), handoff, "Browser preparation changed during acceptance");
     assert.ok(!isCancelled(), "Browser acceptance cancelled");
   } catch (error) { failure = error; }
   finally {
@@ -1212,10 +1168,11 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
         try { await boundedBrowserOperation(server.stop(), 5000, "Browser fixture server stop"); }
         catch (error) { failure = failure === undefined ? error : new AggregateError([failure, error], "Browser gate and server cleanup failed"); }
       }
-      process.off("SIGINT", onSignal); process.off("SIGTERM", onSignal);
+      signal.removeEventListener("abort", onSignal);
       const receipt = {
-        schemaVersion: 1, kind: "hra-app-browser-acceptance", state: failure === undefined && !isCancelled() ? "passed" : "failed",
-        browserExecutableSha256: executableSha256, playwright: "1.62.0", bun: Bun.version,
+        schemaVersion: 2, kind: "hra-app-browser-acceptance", state: failure === undefined && !isCancelled() ? "passed" : "failed",
+        browserExecutableSha256: executableSha256, playwright: "1.62.0", buildRuntime: handoff.prepared.buildRuntime, driverRuntime,
+        preparationSha256: browserDigest(JSON.stringify(handoff.prepared)),
         packageSha256: digest(packageBytes), lockSha256: digest(lockBytes),
         app: artifacts(appFiles), site: artifacts(siteFiles), fixture: fixtureArtifacts,
         appCspSha256: digest(appCsp), siteCspSha256: digest(siteCsp), previewCspSha256: digest(previewCsp),
@@ -1223,13 +1180,13 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
         fixtureIoAliases: ["@convex-dev/auth/react", ...browserIoModules], evidence,
         profileDiagnostics, ...(failure === undefined ? {} : { failure: browserFailureDetails(failure) }),
       };
-      await writeFile(join(run, "receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-      console.log(`Browser acceptance ${receipt.state}; ${evidence.length} evidence rows; receipt retained`);
+      // The bootstrap joins this result with child collection and the terminal
+      // cancellation latch before publishing the CI-facing receipt.json.
+      await publishBrowserJson(join(run, "driver-receipt.json"), receipt);
+      console.log(`Browser driver ${receipt.state}; ${evidence.length} evidence rows; awaiting bootstrap settlement`);
     }
   }
   assert.ok(!isCancelled(), "Browser acceptance cancelled");
   if (failure !== undefined) throw failure instanceof Error
     ? failure : new Error("Browser acceptance failed", { cause: failure });
 }
-
-if (import.meta.main) await runAppBrowser(resolve(import.meta.dirname, ".."));

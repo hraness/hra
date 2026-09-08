@@ -9,6 +9,15 @@ HRA is in public beta development. Open an issue before a large change so the au
 3. Run the focused test beside the code you change.
 4. Run `bun run check` before submitting a change.
 
+Browser acceptance also requires Node 24.18.1 and the Chromium revision provided
+by the pinned Playwright package. Run `node node_modules/playwright-core/cli.js
+install chromium` to provision it. Set `BUN_EXECUTABLE_PATH` and
+`CHROMIUM_EXECUTABLE_PATH` to the explicit installed executables, then run
+`bun run check:browser`. Bun builds the app, site and isolated fixture; the Node
+driver verifies their compiled output with fresh browser profiles. The runner
+retains bounded evidence under `tmp/app-browser-*/` and requires every owned
+process and listener to close before reporting acceptance.
+
 ## Change requirements
 
 - Add a deterministic regression for each corrected failure.

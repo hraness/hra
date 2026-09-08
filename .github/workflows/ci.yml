@@ -127,13 +127,20 @@ jobs:
           bun-version-file: .bun-version
       - name: Install frozen dependencies
         run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install the browser driver runtime
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.18.1"
+          package-manager-cache: false
       - name: Install package-pinned Chromium
-        run: bun ./node_modules/playwright-core/cli.js install --with-deps chromium
+        run: node ./node_modules/playwright-core/cli.js install --with-deps chromium
       - name: Verify compiled browser surfaces
         run: |
           set -euo pipefail
-          CHROMIUM_EXECUTABLE_PATH="$(bun -e 'import { chromium } from "playwright-core"; console.log(chromium.executablePath())')"
-          export CHROMIUM_EXECUTABLE_PATH
+          BUN_EXECUTABLE_PATH="$(command -v bun)"
+          CHROMIUM_EXECUTABLE_PATH="$(node --input-type=module -e 'import { chromium } from "playwright-core"; console.log(chromium.executablePath())')"
+          export BUN_EXECUTABLE_PATH CHROMIUM_EXECUTABLE_PATH
+          test -x "$BUN_EXECUTABLE_PATH"
           test -x "$CHROMIUM_EXECUTABLE_PATH"
           bun run check:browser
       - name: Retain browser acceptance receipts

@@ -1,6 +1,8 @@
 {
   "compilerOptions": {
+    "allowJs": true,
     "allowImportingTsExtensions": true,
+    "checkJs": true,
     "exactOptionalPropertyTypes": true,
     "forceConsistentCasingInFileNames": true,
     "lib": ["ES2024", "DOM", "DOM.Iterable"],
@@ -24,6 +26,7 @@
     "convex/**/*.ts",
     "plugins/**/*.ts",
     "scripts/**/*.ts",
+    "scripts/app-browser-runner.mjs",
     "site/**/*.ts",
     "site/**/*.tsx",
     "src/**/*.ts"
