@@ -133,7 +133,7 @@ Command-writer rollout is blocked. The source-bound scan found one missing autho
 
 ## Phase 4: Canonical profile identity and candidate admission
 
-- **Status:** In progress. Frozen Astra compatibility and the active Sol correction are done. The inert internal canonical-profile catalog passed independent review, exact-tree aggregate validation, protected merge, and exact-main CI through [PR 137](https://github.com/hraness/hra/pull/137). Durable canonical identity and generalized candidate-profile admission are not started.
+- **Status:** In progress. Frozen Astra compatibility and the active Sol correction are done. The inert internal canonical-profile catalog passed independent review, exact-tree aggregate validation, protected merge, and exact-main CI through [PR137](https://github.com/hraness/hra/pull/137). Legacy-only durable identity design and companion-module source work have started under [the bounded persistence plan](./canonical-profile-persistence.md); migration numbering and runtime integration remain pending PR147's convergence. Generalized candidate-profile admission is not started.
 - **Depends on:** Phase 3 for identity inventory and design. Admitting a new executable profile additionally requires exact live capability evidence.
 - **Objective:** Generalize beyond the frozen Sol and Astra alias contracts to represent additional models and efforts without reusing or reinterpreting a legacy tier.
 - **Scope:** Provider/profile schemas, reviewed runtime profiles, state schema version migration, Work table migration, cloud compatibility, provider pin and protocol matrices, and tests from populated older databases.
