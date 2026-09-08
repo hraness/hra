@@ -17,8 +17,10 @@ relations:
 
 # Hraness delivery autonomy
 
-Status: active, revision 2 (2026-09-08). The machine-confidence policy below is the
-shared default; repository adoption and provider-specific rollout remain separately tracked.
+Status: active, revision 3 (2026-09-08). The machine-confidence foundation, current-Mac
+bootstrap and HRA, Oh and personal-monorepo-template pilots are delivered. Wider fleet
+adoption and provider-specific rollout remain separately tracked; they do not reopen the
+completed foundation or block an independently admitted artifact.
 
 ## Outcome
 
@@ -29,7 +31,7 @@ required checks and provider controls, but those controls should use review, pro
 short-lived workload identities instead of conversational confirmation, personal tokens, or a
 per-release administrator setting.
 
-The plan is complete when:
+The broader roadmap is complete when:
 
 1. Codex uses workspace-scoped permissions with automatic approval review, and Claude Code uses
    Auto mode, from one deterministic machine bootstrap that preserves unrelated user settings and
@@ -50,6 +52,32 @@ The plan is complete when:
    commands converge that drift without rewriting unrelated configuration.
 
 ## Evidence
+
+The reviewed machine-confidence policy merged through
+[HRA PR156](https://github.com/hraness/hra/pull/156) as
+`b856c66113c9a8752dbb431fc578287c23279cfe`. Its canonical policy assets,
+operator guidance and regression tests preserve the distinction between artifact
+admission, live qualification and operational activation. The installed
+`hra-local-efficiency` 0.4.0 baseline passed its local apply/check and subsequent
+readback on 2026-09-08. This proves that Mac's configuration, not runtime account
+eligibility or every development machine.
+
+The marker-only pilots merged through [Oh PR45](https://github.com/hraness/oh/pull/45)
+and [personal-monorepo-template PR12](https://github.com/hraness/personal-monorepo-template/pull/12),
+with their own required checks and fresh main CI passing. Oh's exact merge
+`fd3a0d7d734c0f0d2d88d606329055c3a938ba93` preserved reviewed tree
+`a24fab03d3a7128c3a0a834cd99ee314aa35bd6c`; its code-owner setting was unchanged
+at merge. The separately reviewed [Oh issue46](https://github.com/hraness/oh/issues/46)
+change followed at 20:26:02Z on 2026-09-08 and changed only required code-owner
+review from true to false. Strict required checks, resolved review threads,
+squash-only delivery and protected refs remain. That change was not needed for
+the guidance pilot's merge and did not alter its source.
+
+These are completed foundation and pilot receipts, not fleet-wide completion,
+package admission or hosted activation. HRA's exact artifact status and per-release
+evidence remain in the [release record](../../docs/beta-release.md).
+
+### Historical audit basis
 
 The fleet audit found that repository guidance already has one HRA-managed insertion point, but
 Claude did not consume it in most repositories because Claude Code reads `CLAUDE.md`, not
@@ -156,15 +184,15 @@ passed or permit hosted activation, a daemon upgrade, or new Claude platform sup
 
 | Workstream | State | Acceptance evidence |
 | --- | --- | --- |
-| Machine baseline | In progress | Fixture tests prove valid, idempotent, mode-preserving Codex and Claude updates; local `--apply` then `--check` passes. |
-| Repository policy | In progress | Adoption tests cover missing and custom `CLAUDE.md`; all fleet roots report current. |
-| HRA npm path | In progress | Mutable publication variable removed; exact tag, artifact, OIDC, provenance, and readback gates stay green. |
+| Machine baseline on the current Mac | Complete | Reviewed 0.4.0 installation, fixture coverage, local `--apply`/`--check` and fresh configuration readback passed; other machines and runtime eligibility are separate. |
+| Canonical repository policy and pilots | Complete | Managed-block tests preserve custom guidance and Claude imports; HRA PR156, Oh PR45 and template PR12 delivered through their own gates. |
+| HRA npm path | Delivered | The machine publication path is delivered without the mutable publication variable; exact tag, artifact, OIDC, provenance and final admission remain required for each release in [the release record](../../docs/beta-release.md). |
 | Wrench npm path | Planned | Direct trusted publication replaces per-version stage approval; package identity and release checks stay green. |
 | Soundfish npm path | Planned | A verified artifact publishes through a trusted workflow; local publish becomes recovery-only. |
-| Fleet rollout | Planned | Changes land through each repository's normal checks without editing dirty primary worktrees. |
+| Wider fleet rollout | Continuing | Remaining repositories and machines require their own scoped adoption and gates. No all-fleet current-state claim is made; preserve dirty primary worktrees. |
 | Provider setup | Planned | One batched npm trust update; GitHub App/ruleset changes only where audit proves they are needed. |
-| Machine-confidence foundation | In progress | Canonical global/repository assets, operator guidance, and managed-block regression tests separate artifact admission from operational activation. |
-| Foundation propagation | In progress | Reviewed plugin installation plus global guidance readback; exact-root repository adoption through owner-coordinated PRs. Fleet completion does not block an independently admitted HRA artifact. |
+| Machine-confidence foundation | Complete | HRA PR156 delivered the reviewed canonical global/repository assets, operator guidance and regression tests separating artifact admission from operational activation. |
+| Bounded foundation propagation | Complete | Current-Mac installation and readback plus owner-coordinated HRA, Oh and template delivery are proved. Further fleet propagation is the separate workstream above. |
 
 ## Guardrails
 
@@ -181,6 +209,15 @@ passed or permit hosted activation, a daemon upgrade, or new Claude platform sup
   evidence that applies; silence is never proof of completion.
 
 ## Progress log
+
+- 2026-09-08, foundation and pilot closeout: HRA PR156 merged the reviewed D6
+  policy and tests; local-efficiency 0.4.0 installation, bootstrap check and fresh
+  current-Mac readback passed. Oh PR45 and personal-monorepo-template PR12 merged
+  through their required checks and passed fresh main CI. Oh issue46 separately
+  aligned code-owner sign-off after the pilot merge without changing source or
+  the remaining controls. This completes the scoped foundation and pilots, not
+  every fleet or provider workstream. Per-release artifact status remains in the
+  HRA release record; explicit live and operational guards are unchanged.
 
 - 2026-09-08: adopted D6 at the owner's direction. HRA's mandatory pre-publication live qualification
   is being separated from machine-gated artifact admission. Shared policy assets propagate the same

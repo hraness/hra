@@ -19,7 +19,43 @@ relations:
 
 ## Current delivery checkpoint
 
+The integrated v0.7.0 artifact is admitted. [PR156](https://github.com/hraness/hra/pull/156)
+merged as `b856c66113c9a8752dbb431fc578287c23279cfe`, preserving reviewed tree
+`5ad0c78e2798d9b490429854ec098bfec33fa27c` and the completed PR148 memory/peer,
+PR153 installer, and PR151 schema50 source. The exact-source gates, protected tag
+path and [release run 34278486095](https://github.com/hraness/hra/actions/runs/34278486095),
+attempt 2, passed. The [immutable release record](../../docs/beta-release.md#immutable-v070-successful-release-record)
+binds tag `4241ed401d82aa4c04e9c85e18f56cc084fc808f`, Release `385063983`,
+exact GitHub/npm bytes and cryptographic provenance. Attempt 1's metadata-visibility
+failure after publication remains recorded; same-run recovery preserved the tag
+and bytes. Independent final readback passed at `2026-09-08T21:28:05.902Z`.
+
+The machine-confidence foundation and current-Mac/HRA/Oh/template pilot rollout
+are delivered, as recorded in [the delivery-autonomy plan](./delivery-autonomy.md).
+Wider fleet adoption is separate. The bounded schema50 source and site slice is
+complete and included in this artifact; generalized model admission remains open
+in [Phase 4](./model-routing-autonomy.md#phase-4-canonical-profile-identity-and-candidate-admission).
+The installer receipt-version defect from historical alert 1 was fixed through
+PR153 and confirmed fixed on actual main without dismissal. Historical repository
+alerts remain a separate inventory, not a zero-alert claim.
+
+Hosted delivery remains unfinished. Guarded deployment requires the protected
+completed receipt for the currently live predecessor and fresh target readback;
+that receipt path has not yet been located.
+Missing predecessor authority blocks hosted deployment and activation, not artifact publication. No new hosted
+deployment, capacity activation, daemon upgrade, intended-target availability or
+authenticated Claude/two-device memory qualification is claimed. Phase 10 remains
+in progress under its separate hosted acceptance criteria. New admission copy also
+requires its own website deployment and readback; the prior site receipt does not
+prove these later documentation bytes are live.
+
 **2026-09-08 release-policy supersession:** Authenticated Claude and two-device hosted-memory qualification are optional operational evidence, not prerequisites for tagging or publishing the integrated v0.7 artifact. The historical pre-tag live-proof requirements no longer govern artifact release; retain those dated entries as the record of the earlier policy. [The release procedure](../../docs/beta-release.md) still requires exact-source validation, protected tag authority, both operating systems' artifact checks, immutable publication and provenance admission. Passing these machine gates does not prove live qualification or permit bypassing provider, platform, process-custody, hosted-capacity or intended-target guards. Neither live proof is claimed complete. Phase 10 separates artifact delivery from those runtime operations and observations.
+
+### Historical pre-admission source checkpoints
+
+The following source, inventory, failure and ownership records describe their dated
+checkpoints. Their pending-state wording and old release holds are not current
+delivery requirements; the supersession and completed evidence above govern.
 
 The policy integration normally joins exact [PR 151](https://github.com/hraness/hra/pull/151) source `f3c90515ff4805171becd93165ecd6b0ccf1b02f` as an explicit pending dependency at `973c895b04be75fbeeab8e1f5ce9721979da4f63`, tree `eedcd83d1f0e2259cea2356e050bd8e0fc32d77b`. Independent review preserved both parents' tests and all incoming runtime, workflow and dependency bytes. The policy also clarifies that independent agent review does not require a second human sign-off. Raw-archive, exact-source, extracted, production-only and public-text inspection passed for archive SHA-256 `eb7bc5186b6080d68e194c7e04bdb72467029628190986d6f1842d05e735f979`. All 167 regular files match that immutable source; only the generated README differs from PR 151's package payload, with unchanged paths and modes. The measured inventory is 176 entries, 8,318 canonical bytes and SHA-256 `ed656ee0218c2a6afb931460c8a62038db09ad33cb69b83493f762c24128c227`. Independent archive review approved only that pin replacement. The fresh combined-tree aggregate, protected PR and actual-main CI, and artifact release admission remain required; no live proof or hosted deployment is claimed.
 
@@ -27,7 +63,7 @@ The policy integration normally joins exact [PR 151](https://github.com/hraness/
 
 The complete main security inventory is not the zero-result PR-specific inventory. Both current main and its predecessor report 21 JavaScript/TypeScript results: 20 historical open alerts and one previously dismissed fixture alert. Actions analysis reports zero. Independent source review found no exposed security defect in 16 unchanged test-fixture occurrences or the three guarded hostname and static-shell occurrences. No alert was dismissed during this review.
 
-### Linear receipt-version validation
+### Historical linear receipt-version validation
 
 Historical alert 1 identifies a real local availability defect in the installer receipt's semantic-version expression. Its ambiguous prerelease components can multiply backtracking despite the 128-character limit. A bounded exact-expression witness rejected a malformed 38-character version in 0.277 ms and a 54-character version in 22.985 ms. These single-run observations establish the regression workload, not a general throughput claim. Receipt files require current-user ownership, mode 0600 and bounded no-follow reads; no remote input or privilege-escalation path was identified. Parsing nevertheless occurs before the release-identity comparison, so malformed local authority can stall installation or recovery while holding the install lock.
 
@@ -281,7 +317,8 @@ The authentication predecessor is admitted in reviewed main `5c5c02ee5964167fb85
 
 ## Phase 7: Validate and deliver the local release
 
-- **Status:** In progress
+- **Status:** Complete for the local artifact. Exact-source validation, independent review, protected delivery, install/upgrade coverage and v0.7.0 public artifact/provenance admission are recorded in the current checkpoint and release record. Optional live qualification and hosted rollout remain separate.
+- **Completion evidence:** The admitted source passed the full repository gate, including the existing session, queue, facts-memory, automation, Work, projection and approval suites. Fresh merged-main package verification and release attempt 2's exact-tarball installations passed on macOS and Linux. The [persistence plan](./canonical-profile-persistence.md) records the separately proved bounded schema35,39,41 and49 migration and rollback cases; those cases are not a claim about every possible historical state. Public commands retain the rollout prerequisite, same-user boundary and Claude platform limits.
 - **Depends on:** phases 1 through 6
 - **Objective:** Validate the usable local memory and peer capability for the integrated HRA release delivered in phase 10.
 - **Scope:** Documentation, package pin/policy, migration notes, public claims, independent impact review, final gate, PR, merge, release, install proof.
@@ -346,6 +383,16 @@ Use the first implementation in `scripts/check-package.ts`. Pin full object IDs 
 - **Acceptance scope:** When running optional qualification, the Claude proof needs one authorized isolated login and one bounded turn. The macOS qualification separately requires two isolated profile homes, not a documented requirement for two distinct Claude identities. The existing broad Codex runner requires two distinct paid subscriptions for inherited account-isolation, usage, interaction, and remote-command checks; those are not new memory or peer invariants. Its current contract remains unchanged. A narrower memory acceptance mode may remove that setup dependency only through separately reviewed implementation and evidence, never by relabeling an incomplete run. Two enrolled HRA daemon devices and one disposable HRA identity remain necessary for the accepted memory revocation, deletion, and erasure proof. Linux authority is a current runner and managed-Claude platform limitation, not a requirement imposed by Oh memory on macOS Codex or hosted clients.
 
 ## Implementation log
+
+- 2026-09-08, v0.7 artifact admission and foundation closeout: PR156 delivered
+  reviewed main `b856c66113c9a8752dbb431fc578287c23279cfe`. Release run34278486095
+  attempt 2 completed the exact macOS/Linux artifact and public-admission gates;
+  independent readback proved unchanged immutable GitHub/npm bytes and provenance.
+  Attempt 1's post-publication metadata failure remains historical, not relabeled
+  as a pass. The source includes delivered PR151 schema50 persistence, not new-model
+  admission. The reviewed machine-policy foundation, current-Mac installation and
+  HRA/Oh/template pilots are complete within their stated scope. Artifact delivery
+  does not complete Phase 10's guarded hosted rollout or optional live qualification.
 
 - 2026-09-07, plan revision 51: joined reviewed main `3ab54df60cf56c0870adcfa7997f2fe6fea2cd5d` from PR 137 after independently reviewing the bounded npm attestation-visibility reader and inert historical profile catalog. The reader retries only missing evidence, never publication or failed provenance admission; both callers retain exact release authority. The catalog has no production consumer and changes no model selection, migration, or session authority. Conflict resolution preserves the richer immutable v0.6.3 admission record while keeping v0.7.0, its installer, and every generated public surface candidate-only. Focused attestation, profile, content, and social-card validation passed 94 tests with 2,849 assertions; the joined release-documentation suite passed 19 tests with 726 assertions. Installer pins and scoped lint passed. Independent inspection of the actual candidate archive proved 166 safe unique source-identical regular files and nine directories. Only the 5,606-byte canonical-profile module is added; every prior packaged byte, type, and mode is unchanged. The directly admitted inventory has 175 entries, 8,256 canonical bytes, and SHA-256 `2a6abcc70514d0f984acdaeffbd7f88da41e7befa8ba0a397bcb2a10250d4b29`. Independent review also bound the preceding test-only Darwin ACL repair to `f0e86eb6d5db1f5fe02d6a5b260b8463649d6037`. This converged join still requires a fresh committed exact-ref aggregate and protected PR checks. Prior failed and passing gates remain checkpoint-specific. No authenticated acceptance, capacity activation, release, deployment, or production gate advances from this join.
 

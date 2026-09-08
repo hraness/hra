@@ -77,7 +77,7 @@ describe("public content contract", () => {
   test("keeps after-hours consent, legacy reset, and prose limits explicit", () => {
     const readme = renderReadmeMarkdown();
     expect(readme).toContain("After-hours protocol budgets were admitted in v0.6.3.");
-    expect(readme).toContain("The v0.7.0 candidate retains this policy without enabling it.");
+    expect(readme).toContain("The v0.7.0 release retains this policy without enabling it.");
     expect(readme).toContain("They use a separate local opt-in, disabled on new and upgraded installations.");
     expect(readme).toContain("After the applicable artifact admission and daemon rollout gates are satisfied");
     expect(readme).toContain("hra autorespond-after-hours enable --revision <revision>");
@@ -189,8 +189,8 @@ describe("public content contract", () => {
       maintainer: { "@type": "Organization", name: "Hraness", url: "https://hraness.com/" },
     });
     expect(structured).not.toHaveProperty("softwareVersion");
-    expect(publicContent.description).toContain("v0.7.0 is a release candidate");
-    expect(publicContent.description).toContain("v0.6.3 is the admitted artifact");
+    expect(publicContent.description).toContain("v0.7.0 is the admitted artifact");
+    expect(publicContent.description).not.toContain("release candidate");
     expect(publicContent.description).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
     const eyebrow = oneElement(html, "p.hraness-marketing-hero__eyebrow");
@@ -200,7 +200,7 @@ describe("public content contract", () => {
     expect(previewEyebrow.textContent).toBe(publicContent.tagline);
     expectCompiledClasses(previewEyebrow);
     expect(publicContent.socialCard).toEqual({
-      alt: "HRA · v0.7.0 release candidate · v0.6.3 admitted · daemon rollout blocked on capacity · hra.sh",
+      alt: "HRA · v0.7.0 artifacts admitted · daemon rollout blocked on capacity · hra.sh",
       height: 630,
       path: "/social-card.png",
       width: 1200,
@@ -369,35 +369,36 @@ describe("public content contract", () => {
     expect(document.querySelectorAll("code:not([class])")).toHaveLength(0);
   });
 
-  test("keeps the local candidate pre-live without erasing the admitted release or blocked rollout", () => {
-    expect(publicReleaseState).toBe("release-ready");
+  test("admits the exact local release without clearing blocked operational rollout", () => {
+    expect(publicReleaseState).toBe("live");
     expect(publicContent.endpoints).toEqual({
-      betaTag: "release-ready",
+      betaTag: "live",
       githubRepository: "live",
       hostedSync: "live",
       website: "live",
     });
-    expect(renderReadmeMarkdown()).toContain("Local CLI v0.7.0 is a release candidate");
-    expect(renderReadmeMarkdown()).toContain("v0.6.3 is the fully admitted public artifact");
+    expect(renderReadmeMarkdown()).toContain("Local CLI v0.7.0 is the fully admitted public artifact");
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
-      expect(surface).toContain("Local v0.7.0 candidate; v0.6.3 artifacts admitted; hosted sync live as an open beta");
+      expect(surface).toContain("Local v0.7.0 artifacts admitted; hosted sync live as an open beta");
       expect(surface).not.toContain("The last admitted release is v0.6.1.");
-      expect(surface).toContain("https://github.com/hraness/hra/releases/tag/v0.6.3");
-      expect(surface).toContain("only after immutable GitHub and npm release admission");
+      expect(surface).toContain("https://github.com/hraness/hra/releases/tag/v0.7.0");
+      expect(surface).toContain("https://github.com/hraness/hra/actions/runs/34278486095");
       expect(surface).toContain("passed immutable GitHub and npm release admission");
       expect(surface).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
-      expect(surface).not.toContain("v0.7.0 artifacts are live");
+      expect(surface).not.toContain("v0.7.0 candidate");
+      expect(surface).not.toContain("v0.7.0 is a release candidate");
+      expect(surface).not.toContain("This release candidate is not yet admitted");
       expect(surface).not.toContain("beta-not-yet-live");
       expect(surface).toContain("Local release boundary");
-      expect(surface).toContain("Its install command becomes usable only after");
+      expect(surface).toContain("admitted local CLI release");
       expect(surface).not.toContain("Beta not yet live");
       expect(surface).not.toContain("No published `v0.7.0` tag currently exposes these commands");
     }
-    expect(renderLlmsText()).toContain("Only after immutable GitHub and npm release admission, install v0.7.0");
-    expect(renderLlmsText()).not.toContain("Install the live v0.7.0 local CLI artifact");
+    expect(renderLlmsText()).toContain("Install the admitted v0.7.0 local CLI artifact");
+    expect(renderLlmsText()).not.toContain("Only after immutable GitHub and npm release admission");
     expect(renderLlmsText()).toContain(publicContent.daemonRolloutNotice);
     const html = renderSiteHtml();
-    expect(html).toContain("Install after release admission.");
+    expect(oneElement(html, "#install-command-heading").textContent).toBe("Install the admitted release.");
     expect(elementPosition(html, "#install-command-heading")).toBeLessThan(elementPosition(html, "pre.install-command"));
     expect(html).toContain("Initialization remains blocked by the rollout prerequisite");
     expect(elementPosition(html, ".install-note"))
@@ -828,7 +829,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra daemon stop");
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
-      expect(surface).toContain("Only after v0.7.0 completes immutable GitHub and npm release admission");
+      expect(surface).toContain("Install the admitted v0.7.0 release, then verify the installed version and offline health");
       expect(surface).not.toContain("bun remove --global hra");
       expect(surface).not.toContain("uninstall the package");
     }

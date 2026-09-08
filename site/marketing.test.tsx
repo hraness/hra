@@ -69,8 +69,9 @@ describe("public server marketing composition", () => {
     expect(notice?.querySelector("a")?.parentElement?.textContent).toBe("Read the rollout and update runbook before running the examples below.");
     const note = document.querySelector(".hraness-marketing-install__heading-group > .install-note");
     expect(note?.previousElementSibling?.id).toBe("install-command-heading");
+    expect(note?.previousElementSibling?.textContent).toBe("Install the admitted release.");
     expect(note?.nextElementSibling).toBeNull();
-    expect(note?.textContent).toBe("This release candidate is not yet admitted. Use this command only after immutable GitHub and npm release admission. It downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.");
+    expect(note?.textContent).toBe("This CLI artifact passed immutable GitHub and npm release admission. The command downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.");
     const commands = document.querySelector(".hraness-marketing-install__commands");
     expect([...commands!.children].map((child) => child.tagName)).toEqual(["PRE", "PRE", "ASIDE", "P", "PRE"]);
     expect(commands?.querySelector("aside strong")?.textContent).toBe("Before initialization");
@@ -126,6 +127,7 @@ describe("public server marketing composition", () => {
       ["#install-command", `Install ${publicContent.productName}`, "primary"],
       [publicContent.links.github, "Read the source", "secondary"],
     ]);
+    expect(textAt(".hraness-marketing-cta__summary")).toBe("Install and verify the admitted CLI artifact. After the rollout prerequisite is satisfied, initialize it, add one account, and start a session that outlives the tab it began in.");
     expect(textAt(".hraness-marketing-cta__footnote")).toBe(publicContent.hero.boundary);
   });
 

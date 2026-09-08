@@ -2,7 +2,7 @@
 title: Persist exact historical profile identity
 type: plan
 area: model-routing
-status: in-progress
+status: complete
 ---
 
 # Persist exact historical profile identity
@@ -11,7 +11,7 @@ status: in-progress
 
 Persist the seven already represented provider/model/effort identities across
 sessions and Work without changing public selectors, runtime evidence or model
-admission. This is the next bounded source increment in
+admission. This is the delivered bounded source increment in
 [`model-routing-autonomy.md`](./model-routing-autonomy.md), not a new routing
 policy. Sol Ultra remains the implicit Codex default. Historical Astra and
 retired Devin decoding grant no fresh execution authority.
@@ -21,7 +21,41 @@ The dormant foundation was delivered through PR149 at protected main
 both CI platforms and CodeQL passed; exact-main CI34242469558 and CodeQL
 34242468686 passed. It includes PR147's schema49 project companion and
 retains all earlier authority and fixture repairs. Those receipts prove the
-dormant foundation, not the migration now being implemented.
+dormant foundation; the later migration has its own delivery evidence below.
+
+The schema50 session/Work persistence slice and its public-site delivery are
+complete. [PR151](https://github.com/hraness/hra/pull/151) merged normally at
+`2026-09-08T20:16:43Z` as `d5376e34dcf2ace99009fd6eeaed3dcae917bcca`, preserving
+reviewed tree `14ccd71d668411851ec5f65e03f16f6e63ec78f7`; its CI repair closed
+[issue152](https://github.com/hraness/hra/issues/152). Final head
+`f3c90515ff4805171becd93165ecd6b0ccf1b02f` passed independent review, a fresh
+exact-tree full `bun run check`,
+[PR CI34272423302](https://github.com/hraness/hra/actions/runs/34272423302)
+and [CodeQL34272420205](https://github.com/hraness/hra/actions/runs/34272420205).
+Fresh actual-main [CI34273862908](https://github.com/hraness/hra/actions/runs/34273862908)
+passed all eight jobs and Required;
+[CodeQL34273861597](https://github.com/hraness/hra/actions/runs/34273861597)
+and separate `bun run check:package` installation, PTY and daemon-lifecycle
+proof also passed. Exact-source deployment to hra.sh passed independent provider,
+protected-receipt, public-content and browser verification by
+`2026-09-08T20:52:05Z`. The
+[model-routing implementation log](./model-routing-autonomy.md#implementation-log)
+records that bounded site proof and its limits.
+
+[Policy PR156](https://github.com/hraness/hra/pull/156) subsequently merged as
+`b856c66113c9a8752dbb431fc578287c23279cfe`, superseding the old pre-tag live-proof
+hold without changing model admission or runtime authority. The bounded schema50
+slice is included in admitted v0.7.0; its exact source and artifact evidence are in
+the [release record](../../docs/beta-release.md#immutable-v070-successful-release-record). Optional
+live qualification remains unclaimed; hosted deployment, capacity, target and
+activation guards remain binding. Completion of this legacy-identity slice does
+not complete Phase 4's generalized candidate-profile admission, automatic routing,
+cross-provider Work or task-owned session provisioning.
+
+### Historical preparation and foundation evidence
+
+The following checkpoints retain the earlier ownership windows and failed checks.
+Their pending-state wording describes those checkpoints, not current delivery.
 
 The local follow-on reserves physical schema50 after a fresh competing-owner
 check. PR140's usage owner acknowledged that reservation; its later migration
