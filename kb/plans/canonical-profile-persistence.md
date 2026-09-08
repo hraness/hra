@@ -16,12 +16,14 @@ admission. This is the next bounded source increment in
 policy. Sol Ultra remains the implicit Codex default. Historical Astra and
 retired Devin decoding grant no fresh execution authority.
 
-Source work starts from PR147's pushed `380ced9`, including protected main
-`632b351` and the schema49 project companion. PR147 still owns that migration
-and its final gates. This follow-on has no allocated schema number. Recheck
-protected main and competing local-storage ownership after PR147 converges
-before installing a migration. Keep the independently owned peer-memory
-changes in PR148 intact at integration.
+The current parent join incorporates PR147's pushed `976bbb9`, including
+protected main `2c8fe078`, the schema49 project companion and the reviewed
+physical-scrub fixture repair. The original foundation began at `380ced9`;
+that older checkpoint is not the current integration base. PR147 still owns
+schema49 and its final gates. This follow-on has no allocated schema number.
+Recheck protected main and competing local-storage ownership after PR147
+converges before installing a migration. Keep the independently owned
+peer-memory changes in PR148 intact at integration.
 
 ## Storage decision
 
@@ -207,3 +209,28 @@ The preceding companion-only source checkpoint passed its exclusive local
 aggregate and macOS CI. Ubuntu exceeded existing individual test and job
 deadlines; timing diagnosis is separate from this compatibility proof. No
 failed gate is waived and no real canonical migration is complete.
+
+## Integration and takeover checkpoint
+
+Exact `2c3c074`, tree `956cd29db6c24766366a1285069eeb2fa4ab5460`,
+passed its exclusive local aggregate and both platforms plus Required in
+[CI 34182907000](https://github.com/hraness/hra/actions/runs/34182907000).
+The local source suite passed 3,656 tests in 343.31 seconds; scripts, both
+plugins, hosted and app tests, builds, complete-history and package policy,
+and isolated local/global consumers including PTY and daemon lifecycle also
+passed. These are foundation and compatibility receipts, not migration proof.
+
+The subsequent normal parent join preserves both genuine settled-history
+regressions, the frozen companion and its 105 tests, package inventory and
+lockfile. It brings in the v20 fixture's checked pre-migration plaintext
+barrier and PR150's guidance-fixture lifecycle ownership. The parent failure
+was not waived: its original local gate missed a retained sentinel before
+migration, and a controlled SQLite proof demonstrated the non-atomic
+main/WAL scan race. All post-scrub erasure assertions remain unchanged.
+
+No new aggregate success is claimed for the joined tree. After the schema49
+parent converges, the next owner must recheck migration ownership, install
+the complete reader/writer and migration slice described above, prove its
+authentic upgrade and rollback cases, and run its exact-tree final gates.
+Do not interpret these passing foundation checks as canonical persistence,
+new profile admission, a release or permission to activate a daemon.

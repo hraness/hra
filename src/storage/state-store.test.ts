@@ -1656,8 +1656,8 @@ describe("account mutation successor authority", () => {
   // Each case owns its fixture cleanup and default timeout; this increases
   // coverage, not a claim that the total suite performs less work.
   for (const kind of ["account.login", "account.logout", "account.login-cancel"] as const) {
-    for (const rollovers of [1, 2, 3, 4, 5, 6, 7, 8]) {
-      test(`keeps origin and effect invariant for ${kind} through ${rollovers} successor rollovers`, async () => {
+    for (const rollovers of [1, 2, 3, 4, 5, 6, 7, 8] as const) {
+      test(`keeps ${kind} origin and effect invariant for ${rollovers} bounded successors`, async () => {
         const { store, profile, attempt, key } = await seed(kind);
         const original = store.readMutation(key)?.evidence;
         for (let index = 0; index < rollovers; index += 1) {
@@ -12936,9 +12936,9 @@ describe("StateStore", () => {
       DELETE FROM migrations WHERE version>20;
       DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=20;
     `);
-    legacy.query(
-      "UPDATE queue_entries SET message=? WHERE id=?",
-    ).run("V20_TERMINAL_QUEUE_SENTINEL", terminal.id);
+    expect(legacy.query(
+      "UPDATE queue_entries SET message=? WHERE id=? RETURNING id",
+    ).all("V20_TERMINAL_QUEUE_SENTINEL", terminal.id)).toEqual([{ id: terminal.id }]);
     legacy.query(
       `INSERT INTO queue_effect_resolutions(
          queue_id,resolution_kind,evidence_json,receipt_json,created_at
@@ -12955,11 +12955,22 @@ describe("StateStore", () => {
        SET state='idle',active_turn_id=NULL,revision=revision+1,updated_at=MAX(updated_at,2000)
        WHERE id=? AND state='recovery_required'`,
     ).run(session.id);
+    expect(legacy.query("SELECT message,state FROM queue_entries WHERE id=?").get(terminal.id))
+      .toEqual({ message: "V20_TERMINAL_QUEUE_SENTINEL", state: "cancelled" });
+    expect(legacy.query("SELECT message,state FROM queue_entries WHERE id=?").get(ambiguous.id))
+      .toEqual({ message: ambiguousMessage, state: "ambiguous" });
+    // A deferred SQLite close can checkpoint between the separate main and WAL
+    // reads. Keep both plaintext controls in the main file before inspecting it.
+    expect(legacy.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toEqual({
+      busy: 0,
+      log: 0,
+      checkpointed: 0,
+    });
     legacy.close(false);
 
     expect(await stateFileSuffixesContaining(paths.database, "V20_TERMINAL_QUEUE_SENTINEL"))
-      .not.toEqual([]);
-    expect(await stateFileSuffixesContaining(paths.database, ambiguousMessage)).not.toEqual([]);
+      .toEqual([""]);
+    expect(await stateFileSuffixesContaining(paths.database, ambiguousMessage)).toEqual([""]);
 
     const migrated = new StateStore(paths, { now: () => 3_000 });
     stores.push(migrated);
