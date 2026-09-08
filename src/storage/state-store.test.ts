@@ -11772,8 +11772,9 @@ describe("StateStore", () => {
     }
   });
 
-  test("refuses an invalid current migration ledger without changing retained rows or schema", async () => {
-    for (const damage of ["missing", "negative_time", "unsafe_time", "later_version"] as const) {
+  test.each(["missing", "negative_time", "unsafe_time", "later_version"] as const)(
+    "refuses an invalid current migration ledger without changing retained rows or schema: %s",
+    async (damage) => {
       const { store } = await fixture();
       const inspector = new Database(store.paths.database, { create: false, strict: true });
       try {
@@ -11803,17 +11804,18 @@ describe("StateStore", () => {
           .toEqual(ledgerBefore);
         expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       } finally { inspector.close(false); }
-    }
-  });
+    },
+  );
 
-  test("refuses an invalid schema 41 migration ledger without changing retained rows or schema", async () => {
-    for (const damage of [
-      "missing_40",
-      "missing_41",
-      "negative_time",
-      "unsafe_time",
-      "later_version",
-    ] as const) {
+  test.each([
+    "missing_40",
+    "missing_41",
+    "negative_time",
+    "unsafe_time",
+    "later_version",
+  ] as const)(
+    "refuses an invalid schema 41 migration ledger without changing retained rows or schema: %s",
+    async (damage) => {
       const { store } = await fixture();
       const profile = signInProfile(store, "Ledger identity", "ledger@example.com");
       const session = upsertProvenTestSession(store, {
@@ -11848,11 +11850,14 @@ describe("StateStore", () => {
         expect(inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id)).toEqual(profileBefore);
         expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
       } finally { inspector.close(false); }
-    }
-  });
+    },
+  );
 
-  for (const version of [45, 46, 47, 48, 49] as const) test(`auth45 authority refuses DDL drift at schema ${String(version)} without writes`, async () => {
-    for (const damage of ["missing_table", "missing_guard", "weaker_guard", "wrong_table_guard", "extra_index"] as const) {
+  for (const version of [45, 46, 47, 48, 49] as const) test.each([
+    "missing_table", "missing_guard", "weaker_guard", "wrong_table_guard", "extra_index",
+  ] as const)(
+    `auth45 authority refuses DDL drift at schema ${String(version)} without writes: %s`,
+    async (damage) => {
       const { store } = await fixture();
       const profile = signInProfile(store, "Auth schema drift", "auth-schema@example.com");
       const inspector = new Database(store.paths.database, { create: false, strict: true });
@@ -11883,8 +11888,8 @@ describe("StateStore", () => {
           expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: version });
         }
       } finally { inspector.close(false); }
-    }
-  });
+    },
+  );
 
   for (const version of [45, 46, 47, 48] as const) test(`schema ${String(version)} refuses a missing auth45 ledger entry before migration`, async () => {
     const { store } = await fixture();
@@ -12013,22 +12018,23 @@ describe("StateStore", () => {
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
     } finally { inspector.close(false); }
   });
-  test("refuses an invalid current schema 49 migration ledger without writes", async () => {
-    for (const damage of [
-      "missing_40",
-      "missing_41",
-      "missing_42",
-      "missing_43",
-      "missing_44",
-      "missing_45",
-      "missing_46",
-      "missing_47",
-      "missing_48",
-      "missing_49",
-      "negative_time",
-      "unsafe_time",
-      "later_version",
-    ] as const) {
+  test.each([
+    "missing_40",
+    "missing_41",
+    "missing_42",
+    "missing_43",
+    "missing_44",
+    "missing_45",
+    "missing_46",
+    "missing_47",
+    "missing_48",
+    "missing_49",
+    "negative_time",
+    "unsafe_time",
+    "later_version",
+  ] as const)(
+    "refuses an invalid current schema 49 migration ledger without writes: %s",
+    async (damage) => {
       const { store } = await fixture();
       const profile = signInProfile(store, "Current ledger", "current-ledger@example.com");
       const session = upsertProvenTestSession(store, {
@@ -12073,8 +12079,8 @@ describe("StateStore", () => {
           expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
         }
       } finally { inspector.close(false); }
-    }
-  });
+    },
+  );
 
   test("rejects an unbound legacy effect-started session creation at daemon admission", async () => {
     const { store } = await fixture();
