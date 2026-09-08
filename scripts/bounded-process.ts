@@ -44,6 +44,8 @@ export type BoundedProcessRequest = Readonly<{
   killSettlementMs?: number;
   outputMaximumBytes: number;
   phase: string;
+  /** Local containment only. Authority requests refuse this option. */
+  signal?: AbortSignal;
   stdin?: string;
   terminationGraceMs: number;
   timeoutMs: number;
@@ -3877,6 +3879,7 @@ const signalProcessGroup = (
 
 const invalidRequest = (request: BoundedProcessRequest): boolean =>
   !phasePattern.test(request.phase)
+  || request.signal !== undefined && request.containment !== "local"
   || !Number.isSafeInteger(request.outputMaximumBytes)
   || request.outputMaximumBytes < 1
   || !Number.isSafeInteger(request.timeoutMs)
@@ -4228,6 +4231,10 @@ export const runBoundedProcess = async (
   if (request.containment === "authority") {
     return await runAuthorityBoundedProcess(request, dependencies);
   }
+  const cancelled = (): CompletedBoundedProcessResult => ({
+    cleanup: "proven", exitCode: 130, stderr: Buffer.alloc(0), stdout: Buffer.alloc(0),
+  });
+  if (request.signal?.aborted) return cancelled();
   const phase = request.phase;
   const recoveryDirectory = dependencies.recoveryDirectory
     ?? boundedProcessRecoveryDirectory();
@@ -4239,6 +4246,10 @@ export const runBoundedProcess = async (
     // recovery or local PGID recovery and then launch while the first
     // operation still owns a live boundary.
     await recoverAllBoundedProcessJournalsLocked(recoveryDirectory);
+    if (request.signal?.aborted) {
+      releaseRecoveryLock(lockDescriptor);
+      return cancelled();
+    }
     pending = writePendingRecoveryJournal(recoveryDirectory, phase);
   } catch (error: unknown) {
     releaseRecoveryLock(lockDescriptor);
@@ -4325,6 +4336,7 @@ export const runBoundedProcess = async (
       if (settlementTimer !== undefined) clearTimeout(settlementTimer);
       if (quiescenceTimer !== undefined) clearTimeout(quiescenceTimer);
       clearTimeout(timeoutTimer);
+      request.signal?.removeEventListener("abort", onAbort);
     };
     const finish = (cleanup: BoundedProcessResult["cleanup"]): void => {
       if (settled) return;
@@ -4436,6 +4448,7 @@ export const runBoundedProcess = async (
         beginTermination(1);
       }
     };
+    const onAbort = (): void => beginTermination(130);
 
     child.stdout.on("data", (chunk: Buffer) => {
       append(stdoutChunks, chunk);
@@ -4466,7 +4479,9 @@ export const runBoundedProcess = async (
       () => beginTermination(journalActivationError === undefined ? 124 : 1),
       journalActivationError === undefined ? request.timeoutMs : 0,
     );
-    if (journalActivationError === undefined) {
+    request.signal?.addEventListener("abort", onAbort, { once: true });
+    if (request.signal?.aborted) onAbort();
+    if (journalActivationError === undefined && !stopping) {
       child.stdin.end(executionGateInput(request.stdin), "utf8");
     } else {
       child.stdin.destroy();
