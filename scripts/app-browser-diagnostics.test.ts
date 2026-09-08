@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
-import { browserDiagnosticLine, browserFailureClass, recordBrowserProfileFailure } from "./app-browser";
+import { browserDiagnosticLine, browserFailureClass, browserNegativeStep, recordBrowserProfileFailure, withBrowserNegativeCleanup } from "./app-browser";
 
 test("browser diagnostic output admits only finite labels and safe failure categories", () => {
   const secret = "/private/fixture-profile?credential=fixture-secret";
@@ -38,6 +38,86 @@ test("browser diagnostic failure step remains frozen when work advances during c
   expect(diagnostics.failureStep).toBe("static-site:home:font-load");
   expect(diagnostics.failure).toEqual({ name: "Error", message: first.message });
   expect(browserDiagnosticLine("light-os", diagnostics.step, "after-failure")).toContain('"phase":"after-failure"');
+});
+
+test("negative control substeps expose finite phases and bounded elapsed milliseconds without foreign data", () => {
+  const step = "static-site:home:negative-foundation-css:restore";
+  for (const phase of ["entered", "settled", "failed"]) {
+    const line = browserDiagnosticLine("narrow-coarse", step, phase, new Error("private fixture text"), 12.9);
+    expect(line).toContain(`"phase":"${phase}"`);
+    expect(line).toContain('"elapsedMs":12');
+    expect(line).not.toContain("private fixture text");
+    expect(line).not.toContain("unknown-step");
+    expect(line.length).toBeLessThan(300);
+  }
+  for (const elapsed of [-1, Number.NaN, Number.POSITIVE_INFINITY, "/private/fixture", {}]) {
+    expect(browserDiagnosticLine("narrow-coarse", step, "entered", undefined, elapsed)).toContain('"elapsedMs":0');
+  }
+  expect(browserDiagnosticLine("narrow-coarse", step, "entered", undefined, 2 ** 40)).toContain('"elapsedMs":3600000');
+  expect(browserDiagnosticLine("narrow-coarse", "fixture:primitives:negative-css:disable", "entered", undefined, 1))
+    .not.toContain("unknown-step");
+  expect(browserFailureClass(new Error("Browser font/frame settlement exceeded 15000ms"))).toBe("deadline");
+});
+
+test("negative control preserves first inner failure before restore and aggregates restore plus disposal failures", async () => {
+  const primary = new Error("Browser font/frame settlement exceeded 15000ms");
+  const restore = new Error("fixture restoration failure");
+  const dispose = new Error("fixture disposal failure");
+  const diagnostics: Parameters<typeof recordBrowserProfileFailure>[0] = {
+    step: "static-site:home:negative-foundation-css", failureStep: undefined, failure: undefined,
+  };
+  const events: string[] = [];
+  const report: Parameters<typeof browserNegativeStep>[2] = (step, phase, error) => {
+    diagnostics.step = `static-site:home:negative-foundation-css:${step}`;
+    events.push(`${step}:${phase}`);
+    if (phase === "failed") recordBrowserProfileFailure(diagnostics, error);
+  };
+  let caught: unknown;
+  try {
+    await withBrowserNegativeCleanup(() => withBrowserNegativeCleanup(
+      () => browserNegativeStep("settle-disabled", () => Promise.reject(primary), report),
+      () => browserNegativeStep("restore", () => {
+        expect(diagnostics.failureStep).toBe("static-site:home:negative-foundation-css:settle-disabled");
+        return Promise.reject(restore);
+      }, report), "restore"),
+    () => browserNegativeStep("dispose", () => Promise.reject(dispose), report), "dispose");
+  } catch (error) { caught = error; }
+  expect(caught).toBeInstanceOf(AggregateError);
+  if (!(caught instanceof AggregateError)) throw new Error("Expected cleanup aggregate");
+  expect(caught.errors[0]).toBeInstanceOf(AggregateError);
+  const inner: unknown = caught.errors[0];
+  if (!(inner instanceof AggregateError)) throw new Error("Expected restoration aggregate");
+  expect(inner.errors).toEqual([primary, restore]);
+  expect(caught.errors[1]).toBe(dispose);
+  expect(diagnostics.failure).toEqual({ name: "Error", message: primary.message });
+  expect(diagnostics.failureStep).toBe("static-site:home:negative-foundation-css:settle-disabled");
+  expect(events).toEqual([
+    "settle-disabled:entered", "settle-disabled:failed", "restore:entered", "restore:failed", "dispose:entered", "dispose:failed",
+  ]);
+});
+
+test("negative control awaits its exact pending operation before cleanup without racing a new timer", async () => {
+  let finish: (value: number) => void = () => { throw new Error("Missing fixture resolver"); };
+  const pending = new Promise<number>((resolve) => { finish = resolve; });
+  const events: string[] = [];
+  const report: Parameters<typeof browserNegativeStep>[2] = (step, phase) => { events.push(`${step}:${phase}`); };
+  const result = withBrowserNegativeCleanup(
+    () => browserNegativeStep("disable", () => pending, report),
+    () => browserNegativeStep("restore", () => Promise.resolve(), report), "restore");
+  await Promise.resolve();
+  expect(events).toEqual(["disable:entered"]);
+  finish(7);
+  expect(await result).toBe(7);
+  expect(events).toEqual(["disable:entered", "disable:settled", "restore:entered", "restore:settled"]);
+});
+
+test("negative control preserves isolated primary or cleanup errors and does not swallow undefined rejection", async () => {
+  const primary = new Error("fixture primary");
+  const cleanup = new Error("fixture cleanup");
+  await expect(withBrowserNegativeCleanup(() => Promise.reject(primary), () => Promise.resolve(), "restore")).rejects.toBe(primary);
+  await expect(withBrowserNegativeCleanup(() => Promise.resolve(), () => Promise.reject(cleanup), "dispose")).rejects.toBe(cleanup);
+  await expect(withBrowserNegativeCleanup(() => Promise.reject(undefined), () => Promise.resolve(), "restore"))
+    .rejects.toThrow("Browser stylesheet operation failed");
 });
 
 test("CI always retains only the browser receipt allowlist, with bounded repository artifact retention", async () => {

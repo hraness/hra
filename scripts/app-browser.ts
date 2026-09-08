@@ -32,6 +32,12 @@ const profiles: readonly Profile[] = [
   { name: "forced-colors", width: 1280, height: 900, coarse: false, reduced: false, forced: true, rtl: false },
   { name: "rtl", width: 390, height: 844, coarse: true, reduced: false, forced: false, rtl: true },
 ];
+const negativeStylesheetSubsteps = [
+  "sample-before", "link-count", "capture", "disable", "settle-disabled", "sample-disabled",
+  "restore", "settle-restored", "identity-restored", "sample-restored", "dispose",
+] as const;
+type NegativeStylesheetSubstep = typeof negativeStylesheetSubsteps[number];
+type NegativeStylesheetReporter = (step: NegativeStylesheetSubstep, phase: "entered" | "settled" | "failed", error?: unknown) => void;
 const browserDiagnosticSteps = new Set([
   "launch", "isolation:install", "page:create", "browser-census:connect", "browser-census:read", "browser-census:detach",
   "production-anonymous:navigation", "production-anonymous:assertions", "production-anonymous:negative-css",
@@ -42,17 +48,22 @@ const browserDiagnosticSteps = new Set([
     "document-clean", "stylesheet-links", "stylesheet-inventory", "color-scheme", "background", "heading-style", "inertness",
     "negative-final-css", "negative-foundation-css", "negative-document-clean", "resource-bytes",
   ].map((step) => `static-site:${route}:${step}`)),
+  ...["production-anonymous:negative-css", "fixture:primitives:negative-css", ...["home", "privacy", "preview"].flatMap((route) =>
+    [`static-site:${route}:negative-final-css`, `static-site:${route}:negative-foundation-css`])]
+    .flatMap((parent) => negativeStylesheetSubsteps.map((step) => `${parent}:${step}`)),
 ]);
 type BrowserProfileDiagnostics = {
   name: string; step: string; failureStep: string | undefined; events: string[]; ownedPids: number[]; failure: BrowserFailure | undefined;
 };
 
 /** Public logs contain only finite labels, never an Error message, URL, PID or page sample. */
-export function browserDiagnosticLine(profile: unknown, step: unknown, phase: unknown, error?: unknown): string {
+export function browserDiagnosticLine(profile: unknown, step: unknown, phase: unknown, error?: unknown, elapsedMs?: unknown): string {
   const safeProfile = typeof profile === "string" && profiles.some(({ name }) => name === profile) ? profile : "unknown-profile";
   const safeStep = typeof step === "string" && browserDiagnosticSteps.has(step) ? step : "unknown-step";
-  const safePhase = typeof phase === "string" && ["progress", "after-failure", "failed", "cleanup-failed"].includes(phase) ? phase : "unknown-phase";
+  const safePhase = typeof phase === "string" && ["progress", "after-failure", "entered", "settled", "failed", "cleanup-failed"].includes(phase) ? phase : "unknown-phase";
   return `Browser diagnostic ${JSON.stringify({ profile: safeProfile, step: safeStep, phase: safePhase,
+    ...(elapsedMs === undefined ? {} : { elapsedMs: typeof elapsedMs === "number" && Number.isFinite(elapsedMs)
+      ? Math.min(3_600_000, Math.max(0, Math.trunc(elapsedMs))) : 0 }),
     ...(safePhase === "failed" || safePhase === "cleanup-failed" ? { failure: browserFailureClass(error) } : {}),
   })}`;
 }
@@ -62,6 +73,7 @@ export function browserFailureClass(value: unknown): string {
   if (value instanceof AggregateError) return "aggregate";
   if (value.name === "AssertionError") return "assertion";
   if (value.name === "TimeoutError" || /^Browser profile [a-z-]+ exceeded 120000ms$/u.test(value.message)
+    || value.message === "Browser font/frame settlement exceeded 15000ms"
     || /^(?:Closing browser census session|Closing browser process census|Browser census detach|Owned browser close|Final browser close) exceeded (?:5000|20000)ms$/u.test(value.message)) return "deadline";
   if (value.name === "AbortError" || /^Browser (?:profile [a-z-]+|acceptance) cancelled(?: during launch)?$/u.test(value.message)) return "cancelled";
   return "error";
@@ -72,6 +84,35 @@ export function recordBrowserProfileFailure(diagnostics: Pick<BrowserProfileDiag
   if (diagnostics.failureStep !== undefined) return;
   diagnostics.failureStep = diagnostics.step;
   diagnostics.failure = browserFailureDetails(error);
+}
+
+/** Observe only: racing a still-running CSSOM mutation against a new timer could
+ * start restoration before that mutation settles. Keep the existing budgets. */
+export async function browserNegativeStep<T>(step: NegativeStylesheetSubstep, operation: () => Promise<T>, report: NegativeStylesheetReporter): Promise<T> {
+  report(step, "entered");
+  try {
+    const result = await operation();
+    report(step, "settled");
+    return result;
+  } catch (error) {
+    report(step, "failed", error);
+    throw error instanceof Error ? error : new Error("Browser stylesheet operation failed", { cause: error });
+  }
+}
+
+/** Await the exact cleanup even after failure, retaining both errors instead of
+ * letting an awaited finally replace the original operation failure. */
+export async function withBrowserNegativeCleanup<T>(operation: () => Promise<T>, cleanup: () => Promise<void>, stage: "restore" | "dispose"): Promise<T> {
+  let result: { value: T } | { error: unknown };
+  try { result = { value: await operation() }; }
+  catch (error) { result = { error }; }
+  try { await cleanup(); }
+  catch (error) {
+    if ("error" in result) throw new AggregateError([result.error, error], `Browser stylesheet operation and ${stage} failed`);
+    throw error instanceof Error ? error : new Error(`Browser stylesheet ${stage} failed`, { cause: error });
+  }
+  if ("error" in result) throw result.error instanceof Error ? result.error : new Error("Browser stylesheet operation failed", { cause: result.error });
+  return result.value;
 }
 const digest = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
 const bracketedFontPath = "fonts/geist-mono/GeistMono[wght].woff2";
@@ -601,7 +642,8 @@ export function loadedStylesheetControl(element: Element) {
   };
 }
 
-async function negativeStylesheet(page: Page, selector: string, href: string, foundation = false): Promise<void> {
+async function negativeStylesheet(page: Page, selector: string, href: string, report: NegativeStylesheetReporter, foundation = false): Promise<void> {
+  const step = <T>(name: NegativeStylesheetSubstep, operation: () => Promise<T>) => browserNegativeStep(name, operation, report);
   const sample = () => page.locator(selector).first().evaluate((element, foundation) => {
     element.getBoundingClientRect();
     const css = getComputedStyle(element);
@@ -610,20 +652,24 @@ async function negativeStylesheet(page: Page, selector: string, href: string, fo
       ...(foundation ? { boxSizing: css.boxSizing, fontFamily: css.fontFamily, lineHeight: css.lineHeight, backgroundToken: css.getPropertyValue("--background") } : {}),
     };
   }, foundation);
-  const before = await sample();
+  const before = await step("sample-before", sample);
   const sheet = page.locator(`link[rel="stylesheet"][href="${href}"]`);
-  assert.equal(await sheet.count(), 1);
-  const loadedSheet = await sheet.evaluateHandle(loadedStylesheetControl);
-  try {
-    try {
-      await loadedSheet.evaluate((state) => state.disable());
-      await settle(page);
-      assert.notDeepEqual(await sample(), before, "Negative control did not detect disabled final CSS");
-    } finally { await loadedSheet.evaluate((state) => state.restore()); }
-    await settle(page);
-    await loadedSheet.evaluate((state) => state.assertRestored());
-    assert.deepEqual(await sample(), before, "Final CSS did not restore exactly");
-  } finally { await loadedSheet.dispose(); }
+  await step("link-count", async () => { assert.equal(await sheet.count(), 1); });
+  const loadedSheet = await step("capture", () => sheet.evaluateHandle(loadedStylesheetControl));
+  await withBrowserNegativeCleanup(async () => {
+    await withBrowserNegativeCleanup(async () => {
+      await step("disable", () => loadedSheet.evaluate((state) => state.disable()));
+      await step("settle-disabled", () => settle(page));
+      await step("sample-disabled", async () => {
+        assert.notDeepEqual(await sample(), before, "Negative control did not detect disabled final CSS");
+      });
+    }, () => step("restore", () => loadedSheet.evaluate((state) => state.restore())), "restore");
+    await step("settle-restored", () => settle(page));
+    await step("identity-restored", () => loadedSheet.evaluate((state) => state.assertRestored()));
+    await step("sample-restored", async () => {
+      assert.deepEqual(await sample(), before, "Final CSS did not restore exactly");
+    });
+  }, () => step("dispose", () => loadedSheet.dispose()), "dispose");
 }
 
 export function assertNativeModalFocus(value: unknown): void {
@@ -639,7 +685,7 @@ export function assertNativeModalFocus(value: unknown): void {
     `Native modal allowed focus on background content: ${JSON.stringify(sample)}`);
 }
 
-async function primitives(page: Page, profile: Profile): Promise<void> {
+async function primitives(page: Page, profile: Profile, reportNegative: NegativeStylesheetReporter): Promise<void> {
   const open = page.getByRole("button", { name: "Open dialog", exact: true });
   await styled(open, "card-content");
   await open.focus();
@@ -751,7 +797,7 @@ async function primitives(page: Page, profile: Profile): Promise<void> {
   assert.ok(Math.abs(right.x + right.width - profile.width) <= 1, "Right sheet changed its physical anchor in RTL");
   await page.keyboard.press("Escape");
   await rightSheet.waitFor({ state: "hidden" });
-  await negativeStylesheet(page, "button", "/stylex.css");
+  await negativeStylesheet(page, "button", "/stylex.css", reportNegative);
 }
 
 async function safeArea(page: Page, origin: string): Promise<void> {
@@ -870,6 +916,7 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
     const site = await serve(siteFiles, siteCsp, previewCsp); servers.push(site);
     for (const profile of profiles) {
       assert.ok(!isCancelled(), "Browser acceptance cancelled");
+      const profileStartedAt = performance.now();
       const userData = await mkdtemp(join(run, "profile-"));
       let closed = false;
       let profileFailure: unknown;
@@ -880,7 +927,14 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
       const note = (message: string) => { if (diagnostics.events.length === 64) diagnostics.events.shift(); diagnostics.events.push(message.slice(0, 500)); };
       const mark = (step: string) => {
         diagnostics.step = step;
-        console.log(browserDiagnosticLine(profile.name, step, diagnostics.failureStep === undefined ? "progress" : "after-failure"));
+        console.log(browserDiagnosticLine(profile.name, step, diagnostics.failureStep === undefined ? "progress" : "after-failure", undefined, performance.now() - profileStartedAt));
+      };
+      const negativeReporter = (parent: string): NegativeStylesheetReporter => (step, phase, error) => {
+        diagnostics.step = `${parent}:${step}`;
+        if (phase === "failed") recordBrowserProfileFailure(diagnostics, error);
+        const line = browserDiagnosticLine(profile.name, diagnostics.step, phase, error, performance.now() - profileStartedAt);
+        if (phase === "failed") console.error(line);
+        else console.log(line);
       };
       try {
         mark("launch");
@@ -942,7 +996,7 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
         }), profile);
         await cleanDocument(page);
         mark("production-anonymous:negative-css");
-        await negativeStylesheet(page, "button", "/stylex.css");
+        await negativeStylesheet(page, "button", "/stylex.css", negativeReporter("production-anonymous:negative-css"));
         evidence.push({ name: `${profile.name}:production-anonymous`, values: { browserVersion, finalCssSha256: digest(appFiles.get("stylex.css") ?? "") } });
         for (const view of fixtureViews) {
           assert.ok(!isCancelled(), "Browser acceptance cancelled");
@@ -1013,7 +1067,7 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
             assert.ok(await page.getByRole("heading", { name: "Settings", exact: true }).isVisible());
             assert.ok((await page.getByText("Fixture machine", { exact: true }).count()) > 0);
           }
-          if (view === "primitives") await primitives(page, profile);
+          if (view === "primitives") await primitives(page, profile, negativeReporter("fixture:primitives:negative-css"));
           await cleanDocument(page);
           if (view === "grid" || view === "session" || view === "settings" || view === "primitives") {
             mark(`fixture:${view}:screenshot`);
@@ -1079,9 +1133,9 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
             if (route.pathname === "/preview/") assert.equal(await page.locator("a,button,input,select,textarea,form,script,iframe").count(), 0, "Preview gained an action or script");
             const countBeforeNegative = responses.length;
             mark(`static-site:${routeLabel}:negative-final-css`);
-            await negativeStylesheet(page, route.heading, `/${siteGraph.stylesheets[1]}`);
+            await negativeStylesheet(page, route.heading, `/${siteGraph.stylesheets[1]}`, negativeReporter(`static-site:${routeLabel}:negative-final-css`));
             mark(`static-site:${routeLabel}:negative-foundation-css`);
-            await negativeStylesheet(page, "html", `/${siteGraph.stylesheets[0]}`, true);
+            await negativeStylesheet(page, "html", `/${siteGraph.stylesheets[0]}`, negativeReporter(`static-site:${routeLabel}:negative-foundation-css`), true);
             mark(`static-site:${routeLabel}:negative-document-clean`);
             await cleanDocument(page);
             assert.equal(responses.length, countBeforeNegative, "Stylesheet application control reloaded a resource");
@@ -1109,7 +1163,7 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
       } catch (error) {
         profileFailure = error;
         recordBrowserProfileFailure(diagnostics, error);
-        console.error(browserDiagnosticLine(profile.name, diagnostics.failureStep, "failed", error));
+        console.error(browserDiagnosticLine(profile.name, diagnostics.failureStep, "failed", error, performance.now() - profileStartedAt));
       } finally {
         if (owner.current !== null) {
           try {
@@ -1123,7 +1177,7 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
             evidence.push({ name: `${profile.name}:browser-cleanup`, values: { ownedProcesses: pids.length, survivors: 0, pages: 0 } });
           } catch (error) {
             recordBrowserProfileFailure(diagnostics, error);
-            console.error(browserDiagnosticLine(profile.name, "cleanup", "cleanup-failed", error));
+            console.error(browserDiagnosticLine(profile.name, "cleanup", "cleanup-failed", error, performance.now() - profileStartedAt));
             profileFailure = profileFailure === undefined ? error : new AggregateError([profileFailure, error], "Browser profile and cleanup failed");
           }
         }
