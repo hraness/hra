@@ -46,6 +46,13 @@ afterEach(async () => {
 });
 
 describe("static-site build", () => {
+  test("keeps the wrapping mobile header in document flow so anchors stay visible", async () => {
+    const styles = await readFile(join(import.meta.dir, "styles.css"), "utf8");
+    expect(styles).toMatch(
+      /@media\s*\(max-width:\s*48rem\)\s*\{\s*\.hraness-marketing-header\s*\{\s*position:\s*static;\s*\}/u,
+    );
+  });
+
   test("keeps documentation code roles separate from inverse marketing roles", async () => {
     const styles = await readFile(join(import.meta.dir, "styles.css"), "utf8");
     expect(styles).toContain(".hra-inline-code {");

@@ -33,6 +33,32 @@ PR139 merged at `109655a8f7d6edd8916f6d7df277e3402b70a44f`, and PR148 retains
 the next integration and candidate-release window. Preserve its peer-memory
 changes and join actual protected main before final schema50 validation.
 
+The delivered foundation's reviewed tree is
+`978bdc30b6fb9d259c92d0ca91335a854227d6f4`. Its companion module,
+populated-row proof, settled-history controls and measured service fixture
+wait reduction are preserved in this increment.
+
+PR147's schema49 project companion merged as `c639ad78`; its local and
+protected gates and exact-main
+[CI34188257597](https://github.com/hraness/hra/actions/runs/34188257597)
+passed. The foundation's separate exact-main
+[CI34242469558](https://github.com/hraness/hra/actions/runs/34242469558)
+also passed. The original foundation began at `380ced9`; that older checkpoint
+is not the current integration base. The mobile runbook source is now joined
+from protected main109655a. Its source and deployment evidence remain in the
+[model-routing implementation log](./model-routing-autonomy.md#implementation-log).
+
+The reviewed PR149 head `0787b6d9e503b831d657c495e923fae734ec998f`
+passed its exclusive exact-tree aggregate with exit zero, including final
+package cleanup: 3,790 source tests in 315.26 seconds, 1,102 scripts tests
+with one existing skip, 108 local-plugin, 29 cloud-plugin, 393 hosted/site,
+500 app and 11 package-policy tests with 42 assertions. Both platforms and
+Required passed in [CI34188700143](https://github.com/hraness/hra/actions/runs/34188700143)
+(macOS 12m16s, Ubuntu 18m07s, Required 3s), and
+[CodeQL34188697946](https://github.com/hraness/hra/actions/runs/34188697946)
+passed. These are delivered source-foundation receipts, not canonical
+migration, public artifact or activation evidence.
+
 ## Storage decision
 
 The existing `canonical-profile.ts` catalog separates recognition from
@@ -136,7 +162,8 @@ Validation in `requireSessionPresetBinding`, `#requireTask` and
 `#requireAttempt` alone is insufficient. Source review found direct typed
 queries in history, public projections, late dispatch and retirement paths.
 Treat this as an integration requirement, not an existing product defect:
-canonical persistence is not installed yet.
+canonical persistence was not installed at that review checkpoint. The draft
+implementation and its focused validation are recorded below.
 
 | Boundary | Required canonical coverage |
 | --- | --- |
@@ -285,12 +312,14 @@ was not waived: its original local gate missed a retained sentinel before
 migration, and a controlled SQLite proof demonstrated the non-atomic
 main/WAL scan race. All post-scrub erasure assertions remain unchanged.
 
-No new aggregate success is claimed for the joined tree. After schema49's
-exact-main verification, the next owner must recheck migration ownership, install
-the complete reader/writer and migration slice described above, prove its
-authentic upgrade and rollback cases, and run its exact-tree final gates.
-Do not interpret these passing foundation checks as canonical persistence,
-new profile admission, a release or permission to activate a daemon.
+That parent-join checkpoint did not yet have its own aggregate success; the
+current source-delivery boundary is recorded above. The next migration owner
+must recheck protected main and migration ownership, install the complete
+reader/writer and migration slice described above, prove its authentic
+upgrade and rollback cases, and run its exact-tree final gates. Do not
+interpret passing foundation checks or its protected source merge as
+canonical persistence, new profile admission, a release or permission to
+activate a daemon.
 
 ## Populated-row proof checkpoint
 
@@ -465,7 +494,23 @@ version. Every old table's rows were compared against explicit source-derived
 allowed changes; old intent/event/history bytes stayed exact. Current readonly,
 writable and version1 replay stayed stable; version2 refused without mutation.
 Independent review confirmed the original capture remained byte-identical.
-This single-state source proof does not close the separate pre-v38 boundary.
+This single-state source proof is separate from the pre-v38 boundary below.
+
+A second authentic private proof uses unchanged schema35 source
+`fdb01386277e99efd4b85eebc61e996a4c222813`, with all687 exported files and
+modes verified before and after a fresh frozen dependency install. That source
+genuinely lacks session/Work contracts and provider_v39; its Ultra selection
+means Sol Ultra. Historical readonly/writable opens, projections and claim
+replay preserve all77 tables before capture. A private copy reaches50 with
+explicit v36/v37 notification defaults, v38 contract1 and v39 Codex provenance,
+then the expected v40 claim quarantine. All four keys remain
+`codex:gpt-5.6-sol:ultra`. The complete77-to115-table oracle accounts for every
+row, preserves old evidence and proves version1 replay, version2 refusal and
+current readonly/writable stability. Independent review passed. The original
+mode0400 capture remains byte-identical and private. This closes one authentic
+pre-contract claimed-Work path, not all lifecycle states, historical artifacts
+or final integration acceptance. The private copy receipt SHA-256 is
+`3daad90fcc2592a00f9eda17aea15c1c08cf563157fe46245c7d14cfd2aeac00`.
 
 Independent review of the unpublished draft archive passed:167 source-identical
 regular files, nine directories and176 inventory entries. Exactly the three
@@ -477,8 +522,8 @@ only that policy digest changed. Archive size is1,352,818 bytes, SHA-256
 `5351a74d0c06d7d5d51cd075f038783aacb3a892a79b1e586f136b1514f67e71`.
 This is not an installation, final joined archive or release receipt.
 
-Remaining integration work includes authentic populated pre-v38 compatibility,
-the actual PR148 main join, refreshed archive review and required exact-tree
-gates. Keep shaped fixtures distinct from untouched historical captures.
+Remaining integration work includes the actual PR148 main join, refreshed
+archive review and required exact-tree gates. Keep shaped fixtures distinct
+from untouched historical captures and the bounded coverage of each proof.
 Do not mark this migration, candidate admission or release complete from the
 current working source or these focused receipts.
