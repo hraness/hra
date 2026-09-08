@@ -257,9 +257,12 @@ describe("built shell", () => {
       expect(artifact.text).not.toContain("@stylexjs/stylex/lib/stylex-inject");
     }
     const reactDomRoot = dirname(fileURLToPath(import.meta.resolve("react-dom/package.json")));
+    // Installed package files follow the package manager's mode/link policy,
+    // not the private publication contract. Bind these dependency bytes through
+    // the exact reviewed manifest, source digest, and emitted-function digest.
     assertReviewedRuntimeStyleBoundary(javascript, {
-      manifest: JSON.parse((await readAppOrdinary(join(reactDomRoot, "package.json"))).toString("utf8")) as unknown,
-      productionClientSha256: appSha256(await readAppOrdinary(join(reactDomRoot, "cjs/react-dom-client.production.js"))),
+      manifest: JSON.parse(await readFile(join(reactDomRoot, "package.json"), "utf8")) as unknown,
+      productionClientSha256: appSha256(await readFile(join(reactDomRoot, "cjs/react-dom-client.production.js"))),
     });
   });
 

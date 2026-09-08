@@ -12,9 +12,14 @@ type ReactDomEvidence = Readonly<{
 // use it: the browser gate still rejects every style node/mutation and CSP error.
 // These fingerprints bind the reviewed 19.2.8 source and its complete parsed
 // acquireResource function in the production graph, not a nearby string/count.
-// A dependency or function-body change requires a new source review.
+// The two reviewed allocations differ only by consistent minifier identifiers.
+// Keep their exact raw function bytes: normalization could conceal a changed
+// free helper. Every other allocation or body requires a new source review.
 const reviewedProductionClientSha256 = "6cf4932e0c20a4572ae395035ca2e512a42d7d49c1a659fa73d6197069c28df0";
-const reviewedResourceFunctionSha256 = "74ab0afc61ff2c3e1da3fe4d3b0785b82183692eaefb76e5d7d0d929de8ffd02";
+const reviewedResourceFunctionSha256s = new Set([
+  "74ab0afc61ff2c3e1da3fe4d3b0785b82183692eaefb76e5d7d0d929de8ffd02",
+  "af7ba8a59ab723dd7490ff6208468608f861cf85d89006d0aae02fd916b05bd6",
+]);
 const stylexInjector = /stylex-inject|stylexInject|data-stylex|stylesheet-group/u;
 const unreviewedLiteralCall = /createElement\s*\(\s*["']style["']\s*\)|\.insertRule\s*\(/u;
 
@@ -81,7 +86,7 @@ export function assertReviewedRuntimeStyleBoundary(
           if (clause === undefined || !ts.isCaseClause(clause)
             || !ts.isStringLiteralLike(clause.expression) || clause.expression.text !== "style"
             || owner === undefined || !ts.isFunctionDeclaration(owner)
-            || sha256(owner.getText(source)) !== reviewedResourceFunctionSha256) {
+            || !reviewedResourceFunctionSha256s.has(sha256(owner.getText(source)))) {
             throw new Error(`Unreviewed style creation context in ${artifact.name}`);
           }
           reviewedCalls += 1;
