@@ -422,50 +422,102 @@ export const runCommand: CommandRunner = async (request) => {
     stdout: "pipe",
   });
   const state = { exceeded: false, timedOut: false };
+  const readers = [child.stdout.getReader(), child.stderr.getReader()] as const;
+  const cancellations: Promise<void>[] = [];
+  let outputStopped = false;
+  let commandFailure: Readonly<{ cause: unknown }> | undefined;
+  let terminationTimer: ReturnType<typeof setTimeout> | undefined;
+  const stopOutput = (): void => {
+    if (outputStopped) return;
+    outputStopped = true;
+    for (const reader of readers) {
+      // A descendant can retain its write end after the direct child exits.
+      // Released readers may reject cancellation; cleanup must not replace
+      // the timeout, overflow or read failure that already stopped output.
+      cancellations.push(reader.cancel().catch(() => undefined));
+    }
+  };
+  const signalChild = (signal: "SIGKILL" | "SIGTERM"): void => {
+    if (child.exitCode !== null) return;
+    try {
+      child.kill(signal);
+    } catch (cause: unknown) {
+      commandFailure ??= { cause };
+    }
+  };
+  const failCommand = (cause: unknown): void => {
+    if (outputStopped) return;
+    commandFailure = { cause };
+    stopOutput();
+    signalChild("SIGKILL");
+  };
   const timer = setTimeout(() => {
     state.timedOut = true;
-    child.kill("SIGTERM");
-    setTimeout(() => {
-      if (child.exitCode === null) child.kill("SIGKILL");
-    }, commandTerminationGraceMs).unref();
+    stopOutput();
+    signalChild("SIGTERM");
+    if (child.exitCode === null) {
+      terminationTimer = setTimeout(() => {
+        signalChild("SIGKILL");
+      }, commandTerminationGraceMs);
+      terminationTimer.unref();
+    }
   }, timeoutMs);
-  // Output beyond the cap is discarded and the child is killed; the result
-  // then reports exit 1 like the retired supervisor did. A timeout reports
-  // exit 124. Neither condition throws, so callers classify them as ordinary
-  // command failures.
-  const collect = async (stream: ReadableStream<Uint8Array>): Promise<Buffer> => {
+  // Cancel both readers on failure, not just the overflowing stream. This
+  // bounds pipe waiting without claiming custody over descendants. Preserve
+  // per-stream byte limits and timeout-before-overflow exit-code precedence.
+  const collect = async (
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+  ): Promise<Buffer> => {
     const chunks: Uint8Array[] = [];
     let total = 0;
-    const reader = stream.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (total + value.byteLength > outputMaximumBytes) {
-        chunks.push(value.subarray(0, Math.max(0, outputMaximumBytes - total)));
-        total = outputMaximumBytes;
-        state.exceeded = true;
-        child.kill("SIGKILL");
-        continue;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done || outputStopped) break;
+        if (total + value.byteLength > outputMaximumBytes) {
+          chunks.push(value.subarray(0, outputMaximumBytes - total));
+          state.exceeded = true;
+          stopOutput();
+          signalChild("SIGKILL");
+          break;
+        }
+        total += value.byteLength;
+        chunks.push(value);
       }
-      total += value.byteLength;
-      chunks.push(value);
+    } catch (cause: unknown) {
+      failCommand(cause);
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch (cause: unknown) {
+        failCommand(cause);
+      }
     }
-    reader.releaseLock();
     return Buffer.concat(chunks);
   };
+  const rejectCommand = (cause: unknown): never => {
+    failCommand(cause);
+    throw cause;
+  };
   try {
-    const [stdout, stderr, exitCode] = await Promise.all([
-      collect(child.stdout),
-      collect(child.stderr),
-      child.exited,
+    const [stdout, stderr, exitCode] = await Promise.allSettled([
+      collect(readers[0]).catch(rejectCommand),
+      collect(readers[1]).catch(rejectCommand),
+      child.exited.catch(rejectCommand),
     ]);
+    await Promise.all(cancellations);
+    if (commandFailure !== undefined) throw commandFailure.cause;
+    if (stdout.status === "rejected") throw stdout.reason;
+    if (stderr.status === "rejected") throw stderr.reason;
+    if (exitCode.status === "rejected") throw exitCode.reason;
     return {
-      exitCode: state.timedOut ? 124 : state.exceeded ? 1 : exitCode,
-      stderr: stderr.toString("utf8"),
-      stdout: stdout.toString("utf8"),
+      exitCode: state.timedOut ? 124 : state.exceeded ? 1 : exitCode.value,
+      stderr: stderr.value.toString("utf8"),
+      stdout: stdout.value.toString("utf8"),
     };
   } finally {
     clearTimeout(timer);
+    if (terminationTimer !== undefined) clearTimeout(terminationTimer);
   }
 };
 
