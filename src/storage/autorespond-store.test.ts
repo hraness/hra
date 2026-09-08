@@ -12,6 +12,7 @@ import { canonicalBudgetRuntimeDatabaseBytes, canonicalBudgetRuntimeFixtures, ca
 import { canonical49WorkDatabaseBytes, canonical49WorkFixture } from "../../scripts/fixtures/canonical49-work";
 import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
 
+import { deriveLegacySessionProfileKey } from "./canonical-profile-storage";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
 import { StateStore } from "./state-store";
 
@@ -542,6 +543,13 @@ describe("after-hours autorespond storage authority", () => {
     const inspector = new Database(paths.database, { create: false, strict: true });
     inspector.exec("PRAGMA query_only=ON");
     const original = capturedDatabaseSnapshot(inspector);
+    const canonicalColumns = ["sessions", "work_routes", "work_tasks", "work_attempts"].map((table) => ({
+      table,
+      columns: z.record(z.string(), z.unknown()).array().parse(inspector.query(`PRAGMA table_xinfo('${table}')`).all()),
+    }));
+    for (const { columns } of canonicalColumns) {
+      expect(columns.some((column) => column.name === "canonical_profile_key")).toBe(false);
+    }
     const ledger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
     const retained = canonicalBudgetRuntimeFixtures[45].retained;
     const originalQueue = z.record(z.string().regex(/^[a-z_0-9]+$/u), z.unknown()).parse(
@@ -565,6 +573,13 @@ describe("after-hours autorespond storage authority", () => {
     const migrated = new StateStore(paths, { now: () => clock.now });
     stores.push(migrated);
     expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+    for (const { table, columns } of canonicalColumns) {
+      // Preserve main's new canonical50 column oracle on the authentic45
+      // source. Joined60 may append other columns; every old column stays exact.
+      const after = z.record(z.string(), z.unknown()).array().parse(inspector.query(`PRAGMA table_xinfo('${table}')`).all());
+      expect(after.slice(0, columns.length)).toEqual(columns);
+      expect(after.filter((column) => column.name === "canonical_profile_key")).toHaveLength(1);
+    }
     // Later canonical and usage migrations append authority columns and
     // strengthen guards. The archived pending queue has no immutable enqueue
     // identity, so its one session must acquire the exact quarantine projection.
@@ -596,6 +611,15 @@ describe("after-hours autorespond storage authority", () => {
           : session;
       }) : row.rows;
       expect(inspector.query(`SELECT ${row.columns} FROM "${row.name}"`).all()).toEqual(expected);
+      if (row.name === "sessions") {
+        for (const value of row.rows) {
+          const session = z.record(z.string(), z.unknown()).parse(value);
+          const key = deriveLegacySessionProfileKey(session.provider_v39, session.preset, session.preset_contract);
+          expect(key).not.toBeNull();
+          expect(inspector.query("SELECT canonical_profile_key FROM sessions WHERE id=?")
+            .get(z.string().parse(session.id))).toEqual({ canonical_profile_key: key });
+        }
+      }
     }
     enableAfterHours(migrated);
     expect(provisional(migrated, sessionId).tier).toBe("after_hours");

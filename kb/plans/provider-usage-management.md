@@ -21,12 +21,14 @@ manual-switch and policy-control foundation. Managed automatic movement,
 Claude native fallback activation and the unfinished hosted/browser publisher
 remain dormant. Phases 6 through 9 are not complete.
 
-The September 8 integration with canonical main `7ab3478` is uncommitted.
-Source conflict markers are resolved, and the focused joined migration matrix
-passes. Integration and delivery gates remain incomplete. PR 140 remains a
-draft at `8f05930`; no merge, usage release or
-production deployment is claimed. Earlier exact-tree checks do not cover this
-integration. Canonical schema 50 is now governed by PR 151's merge at
+The September 8 integration with canonical main `7ab3478` is saved as local
+checkpoint `52c762b3c65b738957e15c0275c4f8084a64eb7f`, tree
+`448d660798c948ece627861c36c5520d3d2fdb36`. The subsequent exact-current-main
+join is uncommitted, with source conflict markers resolved. Integration and
+delivery gates remain incomplete. PR 140 remains a draft at `8f05930`; no
+protected-branch merge, usage release or production deployment is claimed.
+Earlier exact-tree checks do not cover this integration. Canonical schema 50
+is now governed by PR 151's merge at
 `d5376e34dcf2ace99009fd6eeaed3dcae917bcca`, tree
 `14ccd71d668411851ec5f65e03f16f6e63ec78f7`. The exact fully qualified main
 ref was refreshed after the merge. This usage candidate still needs to join
@@ -34,6 +36,45 @@ that ancestry and validate its own changes. Usage slots 51 through 59 and the
 joined evidence/recovery bridge at 60 remain private candidate allocations;
 recheck competing ownership before push, review readiness or merge. The
 canonical owner's successful gates are not this branch's acceptance evidence.
+
+The governed main ref now also contains release-policy merge `b856c661`, which
+has been fetched and reviewed but not yet joined here. Its artifact-admission
+policy separates optional live qualification from publication; operational
+capacity, identity and intended-target gates remain binding. The release owner
+is publishing the baseline `v0.7.0`; this task has not entered that main window
+or claimed that release as usage delivery.
+
+The joined source passed a fresh typecheck and Effect architecture check. A
+private-48 CLI regression exposed an actual stage mismatch: the canonical
+waypoint audit required joined queue and peer guards before their installers
+ran. Intermediate retained-usage waypoints now require the exact historical
+guards, while final schema 60 still requires the exact successor guards. The
+previously failing CLI case passes; independent stage and no-write refusal
+regressions are being added. These focused results do not replace the final
+exact-tree aggregate.
+
+A fresh exact-writer capture supplies a genuinely unbound canonical-43 login
+and an independent canonical-50 ledger predecessor. The retained recipe digest
+is `c59bb6c47df35f1e58f798c030323bae7d2197f0f3cc36f173d3d201c9ac0463`.
+Schema 43 bytes hash to
+`f77d0f2a1d225f7b199e21e75be27f53c8569466c2f8719db461a1f5596b4ef3`;
+schema 50 bytes hash to
+`34c3c97bb6a4db64791135be265ba318227677dab44b0f16d014020c472f7801`.
+Both archived writable and readonly reopens are unchanged. The schema-43
+service case passes with 26 assertions, preserves the original ambiguous
+attempt and effect through two boots, refuses provider replay and leaves the
+unaffected account usable. No provider process or network effect is claimed.
+
+The canonical-profile migration and recovery lane has focused passing evidence
+for all 55 cases. Its authentic-49 control distinguishes exact migration-row
+preservation from the first live Work projection: the latter safely releases
+an unproved claim. Original intent JSON and effect evidence remain immutable,
+and public replay reports current released state without reviving the claim.
+The adapted archived generator has byte-identical transpiled runtime to its
+retained exact original recipe; the original database fixture is unchanged.
+Authentic schema-50 ledger controls and the remaining schema-39 switch captures
+are still under validation. The latest broader daemon diagnostic passed 147
+cases and exposed ten failures; focused repairs are not yet a full rerun.
 
 The candidate runs canonical upgrades before usage installation. For admitted
 private-48 and combined-49 inputs, it relocates the nine original usage ledger
@@ -142,12 +183,15 @@ synthetic process-exit cleanup passes without changing product custody. Three
 test-only typing errors from the last typecheck are repaired, with scoped lint
 passing; a fresh final typecheck is still required.
 
-The final governed-main comparison also identifies daemon-lock observation
-race handling, CLI recovery boundaries, hosted configuration recovery and the
-eight-job complete CI partition that are not yet part of this old-main merge.
-Join that exact ancestry before the final gate; copying selected semantic
-fixes is not a complete main integration. Focused checks do not authorize a
-release or production activation.
+The actual governed-main join now includes daemon-lock observation race
+handling, CLI recovery boundaries, hosted configuration recovery and the
+eight-job complete CI partition. New test conflicts retain authentic archived
+inputs and current version 60; they do not restamp a newer database as an old
+source. The legacy-43 unbound-login case and canonical-50 predecessor ledger
+controls still need exact-source fixture captures. Installer inner pins and
+the reviewed security-primitive inventory are regenerated; package inventory,
+the joined regression groups and final gates remain outstanding. Focused
+checks do not authorize a release or production activation.
 
 The join preserves source-selected historical evidence bytes and adds immutable
 format provenance before current readers or SQL authority can consume them.

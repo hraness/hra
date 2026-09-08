@@ -61,7 +61,7 @@ describe("authority supervisor build verifier", () => {
     expect(workflow).toContain("70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00");
     expect(workflow).toContain("sha256sum --check --status");
     expect(workflow).toMatch(/verify-authority-supervisor-build\.ts\s+--zig/u);
-    // The runtime custody test runs once, inside the gate's `bun test ./scripts`.
+    // The runtime custody test runs once, inside the remainder's scripts suite.
     expect(workflow).not.toContain("authority-supervisor-runtime.test.ts");
     const packageScripts = (JSON.parse(await readFile(
       join(import.meta.dir, "..", "package.json"),
@@ -69,6 +69,9 @@ describe("authority supervisor build verifier", () => {
     )) as { scripts: Record<string, string> }).scripts;
     expect(packageScripts.check).toContain("bun run test");
     expect(packageScripts.test).toContain("bun test ./scripts --isolate --max-concurrency=1");
+    expect(packageScripts["check:ci-remainder"])
+      .toContain("bun test ./scripts --isolate --max-concurrency=1");
+    expect(packageScripts["test:source"]).toBe("bun test ./src --isolate --max-concurrency=1");
     expect(workflow).not.toContain("setup-zig");
     const enable = workflow.indexOf(
       "sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=0",
@@ -76,13 +79,20 @@ describe("authority supervisor build verifier", () => {
     const probe = workflow.indexOf(
       "/usr/bin/unshare --user --map-root-user --fork /usr/bin/true",
     );
-    const repositoryGate = workflow.indexOf("run: bun run check");
+    const sourceGates = [1, 2, 3].map((shard) => workflow.indexOf(`bun run test:source --shard=${shard}/3`));
+    const remainderGate = workflow.indexOf("bun run check:ci-remainder");
     const restore = workflow.indexOf(
       "sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=1",
     );
     expect(enable).toBeGreaterThan(-1);
     expect(enable).toBeLessThan(probe);
-    expect(probe).toBeLessThan(repositoryGate);
-    expect(repositoryGate).toBeLessThan(restore);
+    for (const sourceGate of sourceGates) {
+      expect(sourceGate).toBeGreaterThan(-1);
+      expect(probe).toBeLessThan(sourceGate);
+      expect(sourceGate).toBeLessThan(restore);
+    }
+    expect(remainderGate).toBeGreaterThan(-1);
+    expect(probe).toBeLessThan(remainderGate);
+    expect(remainderGate).toBeLessThan(restore);
   });
 });

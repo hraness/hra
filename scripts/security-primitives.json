@@ -71,7 +71,7 @@
     "mode0600": 2
   },
   "src/daemon/claude-runtime-adapter.ts": {
-    "assertCurrent": 9
+    "assertCurrent": 11
   },
   "src/daemon/codex-runtime-adapter.ts": {
     "redactCompleteSensitiveText": 1
@@ -92,7 +92,7 @@
     "redactCompleteSensitiveText": 1
   },
   "src/daemon/service.ts": {
-    "assertCurrent": 103
+    "assertCurrent": 100
   },
   "src/daemon/session-event-cursor.ts": {
     "timingSafeEqual": 1
@@ -135,6 +135,9 @@
     "immediateTransaction": 1,
     "synchronousFull": 1
   },
+  "src/storage/joined-evidence-guards.ts": {
+    "immediateTransaction": 1
+  },
   "src/storage/legacy-secret-migration.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 1,
@@ -149,6 +152,9 @@
   "src/storage/paths.ts": {
     "mode0700": 2
   },
+  "src/storage/retired-provider-admission.ts": {
+    "immediateTransaction": 1
+  },
   "src/storage/secret-custody.ts": {
     "O_NOFOLLOW": 2,
     "fsync": 4,
@@ -161,7 +167,7 @@
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
-    "immediateTransaction": 165,
+    "immediateTransaction": 206,
     "secureDelete": 2,
     "synchronousFull": 1,
     "redactCompleteSensitiveText": 3
@@ -174,7 +180,7 @@
   },
   "src/storage/work-store.ts": {
     "assertFence": 6,
-    "immediateTransaction": 8
+    "immediateTransaction": 9
   },
   "src/streaming-sensitive-text.ts": {
     "redactCompleteSensitiveText": 2

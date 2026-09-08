@@ -5,10 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Database } from "bun:sqlite";
-import { z } from "zod";
 
 import { canonical40QueuesDatabaseBytes, canonical40QueuesFixture } from "../../scripts/fixtures/canonical40-queues";
 import { canonical24ResetDatabaseBytes, canonical24ResetFixture } from "../../scripts/fixtures/canonical24-reset";
+import { canonicalLoginLedgerDatabaseBytes, canonicalLoginLedgerFixtures } from "../../scripts/fixtures/canonical-login-ledger";
 import {
   CodexError,
   CodexRemoteError,
@@ -2161,7 +2161,8 @@ async function claudeAccountFixture(
   };
 }
 
-// Seed the durable v39 representation, not an active retired-provider API.
+// Seed frozen v39 provenance plus its coherent current canonical mirror,
+// not an active retired-provider API or an authentic old database capture.
 function legacyDevinSession(
   value: Awaited<ReturnType<typeof fixture>>,
   profileId: NonNullable<Parameters<StateStore["createSession"]>[0]["profileId"]>,
@@ -2178,7 +2179,7 @@ function legacyDevinSession(
   try {
     legacy.query("DELETE FROM session_provider_account_authorities WHERE session_id=?").run(created.id);
     legacy.query(
-      "UPDATE sessions SET provider_v39='devin',preset_contract=? WHERE id=?",
+      "UPDATE sessions SET provider_v39='devin',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?",
     ).run(devinPresetContract, created.id);
   } finally {
     legacy.close();
@@ -2312,6 +2313,89 @@ function interactionAuthorityFor(
     providerAccountId: authority.providerAccountId,
     bindingGeneration: authority.bindingGeneration,
   };
+}
+
+async function createPeerMessageBoundaryFixture(delivery: "send" | "steer") {
+  const value = await fixture();
+  const { sessionId: actorSessionId } = await createIdleSession(
+    value,
+    `Peer ${delivery} boundary actor`,
+  );
+  const idleActor = value.store.requireSession(actorSessionId);
+  if (idleActor.projectId === undefined) throw new Error("Expected a project-bound actor.");
+  const targetBase = value.store.createSession({
+    profileId: idleActor.profileId,
+    projectId: idleActor.projectId,
+    title: "Peer boundary target",
+    provider: "codex",
+    preset: "high",
+    fastEnabled: false,
+  });
+  value.store.bindSessionProviderAccountAuthority({
+    sessionId: targetBase.id,
+    provider: "codex",
+    runtimeScope: "managed",
+    accountKey: codexProviderAccountKey(),
+  });
+  const target = value.store.bindSession({
+    sessionId: targetBase.id,
+    expectedRevision: targetBase.revision,
+    providerThreadId: "provider-peer-boundary-target",
+    state: delivery === "send" ? "idle" : "active",
+    ...(delivery === "steer" ? { activeTurnId: "turn-peer-boundary-target" } : {}),
+    providerUpdatedAt: 11,
+  });
+  await value.service.execute({
+    kind: "session.send",
+    session: actorSessionId,
+    message: "Start the independent peer boundary actor.",
+  }, { signal });
+  const actor = value.store.requireSession(actorSessionId);
+  const profile = value.store.requireProfileById(actor.profileId);
+  if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
+    throw new Error("Expected an active bound actor turn.");
+  }
+  const actorThreadId = actor.providerThreadId;
+  const actorTurnId = actor.activeTurnId;
+  value.codex.readProjection = {
+    providerThreadId: "provider-peer-boundary-target",
+    title: target.title,
+    status: delivery === "send" ? "idle" : "active",
+    ...(delivery === "steer" ? { activeTurnId: "turn-peer-boundary-target" } : {}),
+    providerUpdatedAt: 11,
+    omission: {
+      hasMoreOlderTurns: false,
+      incompleteTurnIds: [],
+      omittedMessages: 0,
+      returnedTurns: delivery === "send" ? 0 : 1,
+      truncatedMessages: 0,
+      turnLimit: 20,
+      unreadItemTurnIds: [],
+    },
+  };
+  const authority = liveAuthorityFor(value.store, profile.id);
+  const callFor = (index: number): Extract<HraHostToolCall, { tool: "session_message" }> => {
+    const callId = `peer-boundary-${delivery}-${String(index)}`;
+    const input = {
+      sessionId: target.id,
+      expectedRevision: value.store.requireSession(target.id).revision,
+      delivery,
+      message: `Peer boundary message ${String(index)}.`,
+      reason: "Exercise exact peer effect settlement",
+    };
+    return {
+      authority: hostToolAuthorityFor(authority),
+      callId,
+      connectionId: value.codex.observationConnectionId,
+      input,
+      requestDigest: createHash("sha256").update(JSON.stringify(input)).digest("hex"),
+      requestId: { type: "string", value: callId },
+      threadId: actorThreadId,
+      tool: "session_message",
+      turnId: actorTurnId,
+    };
+  };
+  return { value, actor, target, authority, callFor };
 }
 
 function seedUnsettledInteractionStates(
@@ -2786,7 +2870,7 @@ describe("HraService personal-session adoption", () => {
     const writer = new Database(value.paths.database, { strict: true });
     try {
       expect(writer.query(
-        "UPDATE sessions SET preset_contract=? WHERE id=?",
+        "UPDATE sessions SET preset_contract=?,canonical_profile_key='codex:gpt-6-astra:ultra' WHERE id=?",
       ).run(currentPresetContract, value.session.id).changes).toBe(1);
     } finally {
       writer.close(false);
@@ -10916,6 +11000,364 @@ describe("HraService", () => {
     await restarted.close();
   });
 
+  test("refuses the thirty-third peer steer before dispatch at target-turn origin capacity", async () => {
+    const { value, actor, target, authority, callFor } = await createPeerMessageBoundaryFixture("steer");
+    let lastAcceptedCall: ReturnType<typeof callFor> | undefined;
+    for (let index = 0; index < 32; index += 1) {
+      const call = callFor(index);
+      lastAcceptedCall = call;
+      await expect(value.service.handleHraHostToolCall(
+        authority,
+        call,
+        MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+      )).resolves.toMatchObject({
+        ok: true,
+        replay: false,
+        action: { state: "applied", delivery: "steer", hop: 1 },
+      });
+    }
+    expect(value.store.readPeerSessionTurnOrigins({
+      sessionId: actor.id,
+      turnId: actor.activeTurnId!,
+    })).toEqual([]);
+    expect(value.store.readPeerSessionTurnOrigins({
+      sessionId: target.id,
+      turnId: "turn-peer-boundary-target",
+    })).toHaveLength(32);
+    expect(value.codex.calls.filter((call) => call === "steer")).toHaveLength(32);
+    const writesBeforeRefusal = providerMutationCalls(value.codex);
+
+    const refused = await value.service.handleHraHostToolCall(
+      authority,
+      callFor(32),
+      MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+    );
+    expect(refused).toMatchObject({
+      version: 1,
+      ok: false,
+      code: "PEER_SESSION_CAUSAL_LIMIT_REFUSED",
+    });
+    expect(providerMutationCalls(value.codex)).toEqual(writesBeforeRefusal);
+    expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
+    expect(value.store.readPeerSessionTurnOrigins({
+      sessionId: target.id,
+      turnId: "turn-peer-boundary-target",
+    })).toHaveLength(32);
+    if (lastAcceptedCall === undefined) throw new Error("Expected a retained successful peer call.");
+    await expect(value.service.handleHraHostToolCall(
+      authority,
+      lastAcceptedCall,
+      MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+    )).resolves.toMatchObject({ ok: true, replay: true, action: { state: "applied" } });
+    await value.service.recover();
+    expect(providerMutationCalls(value.codex)).toEqual(writesBeforeRefusal);
+    expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
+    await value.service.close();
+  }, 30_000);
+
+  for (const delivery of ["send", "steer"] as const) {
+    for (const resolution of ["proven_applied", "abandoned"] as const) {
+      test.each([false, true])(
+        `resolves uncertain peer ${delivery} after a real lost response as ${resolution} with legacy observation=%s`,
+        async (legacyObservation) => {
+          const { value, target, authority, callFor } = await createPeerMessageBoundaryFixture(delivery);
+          const call = callFor(0);
+          const lostResponse = new IndeterminateCodexEffectError(
+            delivery === "send" ? "turn/start" : "turn/steer",
+            81,
+          );
+          // Both existing fake-runtime errors occur after its provider message
+          // and client id are recorded, not before the service begins the effect.
+          if (delivery === "send") value.codex.startTurnError = lostResponse;
+          else value.codex.steerError = lostResponse;
+          const writesBeforeEffect = providerMutationCalls(value.codex);
+          await expect(value.service.handleHraHostToolCall(
+            authority,
+            call,
+            MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+          )).resolves.toMatchObject({ ok: false, code: "RECOVERY_REQUIRED" });
+          delete value.codex.startTurnError;
+          delete value.codex.steerError;
+
+          const [action] = value.store.listUnsettledPeerSessionActions(10);
+          if (action === undefined) throw new Error("Expected the real uncertain peer effect.");
+          expect(action).toMatchObject({ state: "ambiguous", delivery, targetSessionId: target.id });
+          expect(action.resultDigest).toBeUndefined();
+          const attempt = value.store.readMutation(action.idempotencyKey);
+          expect(attempt).toMatchObject({
+            state: "ambiguous",
+            evidence: { evidence: { kind: `session.${delivery}`, messageActor: "peer_session" } },
+          });
+          if (attempt?.evidence === undefined) throw new Error("Expected immutable provider-effect evidence.");
+          const originalEvidence = attempt.evidence;
+          const providerMessage = value.codex.readProjection.messages?.find((message) =>
+            message.clientId === attempt.id);
+          expect(providerMessage).toMatchObject({ role: "user", clientId: attempt.id });
+          if (providerMessage?.turnId === undefined) throw new Error("Expected the accepted provider turn.");
+          const targetTurnId = providerMessage.turnId;
+          expect(value.store.requireSession(target.id).state).toBe("recovery_required");
+          expect(providerMutationCalls(value.codex)).toHaveLength(writesBeforeEffect.length + 1);
+
+          const legacyMarker = createHash("sha256")
+            .update(JSON.stringify({ code: "EFFECT_OUTCOME_UNSETTLED" })).digest("hex");
+          if (legacyObservation) {
+            // Represent the exact historical marker without changing the real
+            // lost-response evidence or weakening its immutable transition.
+            value.store.settlePeerSessionAction({
+              actionId: action.id,
+              expectedState: "ambiguous",
+              state: "ambiguous",
+              resultDigest: legacyMarker,
+            });
+            expect(value.store.requirePeerSessionAction(action.id).resultDigest).toBe(legacyMarker);
+          }
+          const expectedFinalDigest = legacyObservation
+            ? legacyMarker
+            : createHash("sha256").update(JSON.stringify(resolution === "proven_applied"
+                ? { targetTurnId }
+                : { mutationState: "reconciled", resolution: "abandoned" })).digest("hex");
+          const writesBeforeRecovery = providerMutationCalls(value.codex);
+
+          const recovered = await value.service.execute({
+            kind: resolution === "proven_applied" ? "session.recover" : "session.abandon",
+            session: target.id,
+          }, { signal });
+          expect(recovered).toMatchObject({
+            recovery: { resolved: true, resolution, providerEffectRetried: false },
+          });
+          expect(value.store.readMutation(action.idempotencyKey)).toMatchObject({
+            state: "reconciled",
+            originalState: "ambiguous",
+            resolution: { kind: resolution },
+            evidence: originalEvidence,
+          });
+          expect(value.store.requirePeerSessionAction(action.id)).toMatchObject({
+            state: resolution === "proven_applied" ? "applied" : "failed",
+            resultDigest: expectedFinalDigest,
+          });
+          const origins = value.store.readPeerSessionTurnOrigins({ sessionId: target.id, turnId: targetTurnId });
+          expect(origins.map((origin) => origin.id))
+            .toEqual(resolution === "proven_applied" ? [action.id] : []);
+          expect(value.store.sessionMessageActorForSource(target.id, attempt.id)).toBe("peer_session");
+          if (resolution === "proven_applied") {
+            const userMessageActors = value.store.listSessionEvents({ sessionId: target.id, afterSequence: 0 }).events
+              .flatMap(({ body }) => body.type === "user_message" ? [body.actor] : []);
+            expect(userMessageActors).toEqual(["peer_session"]);
+          }
+          await value.service.recover();
+          expect(value.store.requirePeerSessionAction(action.id).resultDigest).toBe(expectedFinalDigest);
+          expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
+          expect(providerMutationCalls(value.codex)).toEqual(writesBeforeRecovery);
+          await value.service.close();
+        },
+      );
+    }
+  }
+
+  test.each(["send", "steer", "queue"] as const)(
+    "refuses a return peer steer after abandoning an accepted uncertain peer %s",
+    async (delivery) => {
+      const value = await fixture();
+      try {
+        const { sessionId: actorId } = await createIdleSession(value, `Abandoned peer ${delivery} actor`);
+        await value.service.execute({
+          kind: "session.send",
+          session: actorId,
+          message: "Keep the original actor turn active.",
+        }, { signal });
+        const actor = value.store.requireSession(actorId);
+        const actorProjection = value.codex.readProjection;
+        const actorTurnId = actor.activeTurnId;
+        if (actorTurnId === undefined) throw new Error("Expected an active original actor turn.");
+
+        // Both sessions obtain their host capability through real session.start.
+        // Separate managed profiles keep the fake's fixed thread name unambiguous.
+        const targetAccount = await value.service.execute({
+          kind: "account.add", label: `Abandoned peer ${delivery} target`,
+        }, { signal }) as { account: { id: string } };
+        await value.service.execute({
+          kind: "account.login", account: targetAccount.account.id, deviceCode: false,
+        }, { signal });
+        const targetStarted = await value.service.execute({
+          kind: "session.start", account: targetAccount.account.id, preset: "high", presetContract: 1, fast: false,
+        }, { signal }) as { session: { id: `sess_${string}` } };
+        const targetId = targetStarted.session.id;
+        if (delivery === "steer") {
+          await value.service.execute({
+            kind: "session.send",
+            session: targetId,
+            message: "Keep the receiving target turn active.",
+          }, { signal });
+        }
+        const target = value.store.requireSession(targetId);
+        expect(target.profileId).not.toBe(actor.profileId);
+        expect(target.projectId).toBe(actor.projectId);
+        expect(value.store.readSessionHostCapabilityBinding(actor.id)).not.toBeNull();
+        expect(value.store.readSessionHostCapabilityBinding(target.id)).not.toBeNull();
+
+        const authorityFor = (source: SessionRecord): ProfileAuthority => {
+          return liveAuthorityFor(value.store, source.profileId);
+        };
+        const messageCall = (
+          source: SessionRecord,
+          turnId: string,
+          destination: SessionRecord,
+          messageDelivery: "send" | "steer" | "queue",
+          callId: string,
+        ): Extract<HraHostToolCall, { tool: "session_message" }> => {
+          if (source.providerThreadId === undefined) throw new Error("Expected a bound provider thread.");
+          const authority = authorityFor(source);
+          const input = {
+            sessionId: destination.id,
+            expectedRevision: value.store.requireSession(destination.id).revision,
+            delivery: messageDelivery,
+            message: "Continue the same peer coordination chain.",
+            reason: "Preserve causal authority across owner abandonment",
+          };
+          return {
+            authority: hostToolAuthorityFor(authority),
+            callId,
+            connectionId: value.codex.observationConnectionId,
+            input,
+            requestDigest: createHash("sha256").update(JSON.stringify(input)).digest("hex"),
+            requestId: { type: "string", value: callId },
+            threadId: source.providerThreadId,
+            tool: "session_message",
+            turnId,
+          };
+        };
+        const firstCall = messageCall(actor, actorTurnId, target, delivery, `abandoned-${delivery}-outbound`);
+        const writesBeforeEffect = providerMutationCalls(value.codex);
+        const lostResponse = new IndeterminateCodexEffectError(
+          delivery === "steer" ? "turn/steer" : "turn/start",
+          82,
+        );
+        if (delivery === "steer") value.codex.steerError = lostResponse;
+        else value.codex.startTurnError = lostResponse;
+        const firstResult = await value.service.handleHraHostToolCall(
+          authorityFor(actor), firstCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+        );
+        if (delivery === "queue") {
+          expect(firstResult).toMatchObject({ ok: true, action: { state: "queued" } });
+          await value.service.settled();
+        } else {
+          expect(firstResult).toMatchObject({ ok: false, code: "RECOVERY_REQUIRED" });
+        }
+        delete value.codex.startTurnError;
+        delete value.codex.steerError;
+
+        const [outbound] = value.store.listUnsettledPeerSessionActions(10);
+        if (outbound === undefined) throw new Error("Expected the uncertain outbound peer action.");
+        const queue = delivery === "queue"
+          ? value.store.listQueue(target.id).find((entry) => entry.peerActionId === outbound.id)
+          : undefined;
+        const attempt = delivery === "queue" ? null : value.store.readMutation(outbound.idempotencyKey);
+        if (delivery === "queue") {
+          if (queue === undefined) throw new Error("Expected the attributed queued provider effect.");
+          expect(queue).toMatchObject({ state: "ambiguous", messageActor: "peer_session" });
+          expect(value.store.readQueueEffect(queue.id)?.resolution).toBeUndefined();
+        } else {
+          if (attempt === null) throw new Error("Expected the nested provider effect.");
+          expect(attempt).toMatchObject({ state: "ambiguous" });
+        }
+        const acceptedSourceId = queue?.id ?? attempt?.id;
+        if (acceptedSourceId === undefined) throw new Error("Expected the accepted source identity.");
+        const acceptedMessage = value.codex.readProjection.messages?.find((message) => message.clientId === acceptedSourceId);
+        if (acceptedMessage?.turnId === undefined) throw new Error("Expected the actually accepted target message.");
+        const targetTurnId = acceptedMessage.turnId;
+        expect(value.codex.readProjection).toMatchObject({ status: "active", activeTurnId: targetTurnId });
+        expect(providerMutationCalls(value.codex)).toHaveLength(writesBeforeEffect.length + 1);
+        expect(value.store.requireSession(target.id).state).toBe("recovery_required");
+
+        await expect(value.service.execute({ kind: "session.abandon", session: target.id }, { signal }))
+          .resolves.toMatchObject({
+            recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false },
+          });
+        if (queue !== undefined) {
+          expect(value.store.readQueueEffect(queue.id)).toMatchObject({ resolution: { kind: "abandoned" } });
+        } else {
+          expect(value.store.readMutation(outbound.idempotencyKey)).toMatchObject({
+            state: "reconciled",
+            resolution: { kind: "abandoned" },
+          });
+        }
+        expect(providerMutationCalls(value.codex)).toHaveLength(writesBeforeEffect.length + 1);
+        const abandonedTargetProjection = value.codex.readProjection;
+
+        // The provider already consumed the outbound message. A fresh callback
+        // from that same target turn must not restart its ancestry at hop one.
+        value.codex.readProjection = actorProjection;
+        const returnCall = messageCall(target, targetTurnId, actor, "steer", `abandoned-${delivery}-return`);
+        const writesBeforeReturn = providerMutationCalls(value.codex);
+        const returned = await value.service.handleHraHostToolCall(
+          authorityFor(target), returnCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+        );
+        expect({
+          providerWrites: providerMutationCalls(value.codex),
+          returnOrigins: value.store.readPeerSessionTurnOrigins({ sessionId: actor.id, turnId: actorTurnId })
+            .map((origin) => ({ hop: origin.hop, parentActionIds: origin.parentActionIds })),
+        }).toEqual({ providerWrites: writesBeforeReturn, returnOrigins: [] });
+        expect(returned).toMatchObject({ ok: false, code: "PEER_SESSION_ACTOR_TURN_REFUSED" });
+
+        const inspectionInput = {
+          sessionId: actor.id,
+          expectedRevision: value.store.requireSession(actor.id).revision,
+          limit: 10,
+        };
+        const inspectionCallId = `abandoned-${delivery}-inspect`;
+        await expect(value.service.handleHraHostToolCall(authorityFor(target), {
+          ...returnCall,
+          callId: inspectionCallId,
+          input: inspectionInput,
+          requestDigest: createHash("sha256").update(JSON.stringify(inspectionInput)).digest("hex"),
+          requestId: { type: "string", value: inspectionCallId },
+          tool: "session_inspect",
+        }, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).resolves.toMatchObject({ ok: true });
+        expect(providerMutationCalls(value.codex)).toEqual(writesBeforeReturn);
+
+        // The fence is not a session-wide loss of owner control. Stop the
+        // affected turn, then start a separately receipted human turn normally.
+        value.codex.readProjection = abandonedTargetProjection;
+        await expect(value.service.execute({ kind: "session.stop", session: target.id }, { signal }))
+          .resolves.toMatchObject({ stopped: true, session: { state: "idle" } });
+        expect(providerMutationCalls(value.codex)).toEqual([...writesBeforeReturn, "stop"]);
+        const humanKey = crypto.randomUUID();
+        await value.service.execute({
+          kind: "session.send",
+          idempotencyKey: humanKey,
+          session: target.id,
+          message: "Begin an independent owner-directed coordination turn.",
+        }, { signal });
+        const freshTarget = value.store.requireSession(target.id);
+        const freshTargetTurnId = freshTarget.activeTurnId;
+        if (freshTargetTurnId === undefined) throw new Error("Expected a new human-started turn.");
+        expect(freshTargetTurnId).not.toBe(targetTurnId);
+        const humanAttempt = value.store.readMutation(humanKey);
+        if (humanAttempt === null) throw new Error("Expected the independent human mutation receipt.");
+        expect(humanAttempt).toMatchObject({ kind: "session.send", state: "applied" });
+        expect(value.store.sessionMessageActorForSource(target.id, humanAttempt.id)).toBe("human");
+        expect(value.store.readPeerSessionTurnOrigins({
+          sessionId: target.id, turnId: freshTargetTurnId,
+        })).toEqual([]);
+
+        value.codex.readProjection = actorProjection;
+        const freshCall = messageCall(
+          freshTarget, freshTargetTurnId, actor, "steer", `abandoned-${delivery}-fresh-turn`,
+        );
+        const writesBeforeFreshCoordination = providerMutationCalls(value.codex);
+        await expect(value.service.handleHraHostToolCall(
+          authorityFor(freshTarget), freshCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+        )).resolves.toMatchObject({ ok: true, action: { state: "applied" } });
+        expect(providerMutationCalls(value.codex)).toEqual([...writesBeforeFreshCoordination, "steer"]);
+        expect(value.store.readPeerSessionTurnOrigins({ sessionId: actor.id, turnId: actorTurnId })
+          .map((origin) => ({ hop: origin.hop, parentActionIds: origin.parentActionIds })))
+          .toEqual([{ hop: 1, parentActionIds: [] }]);
+      } finally {
+        await value.service.close();
+      }
+    },
+  );
+
   test("fences established and peer Claude targets with universally unavailable profiles", async () => {
     for (const provider of ["claude"] as const) {
       for (const profileState of ["recovery_required", "removed"] as const) {
@@ -17716,7 +18158,7 @@ describe("HraService", () => {
       ).all()).toEqual([...canonical24ResetFixture.migrations]);
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual(Array.from({ length: 25 }, (_, index) => ({ version: index + 25 })));
+      ).all()).toEqual(Array.from({ length: 36 }, (_, index) => ({ version: index + 25 })));
     } finally {
       inspector.close(false);
     }
@@ -21748,50 +22190,42 @@ describe("HraService", () => {
   });
 
   test("keeps unrelated accounts usable across a legacy schema 43 unbound login upgrade", async () => {
-    const value = await fixture();
-    const { service, codex, store, paths } = value;
-    const added = await service.execute({ kind: "account.add", label: "Legacy login upgrade" }, { signal }) as { account: { id: `acct_${string}` } };
-    const other = await service.execute({ kind: "account.add", label: "Unaffected login" }, { signal }) as { account: { id: `acct_${string}` } };
-    await service.execute({ kind: "account.login", account: other.account.id, deviceCode: false }, { signal });
-    codex.beforeLoginReturn = async () => { throw new IndeterminateCodexEffectError("account/login/start", 11); };
-    const idempotencyKey = "00000000-0000-4000-8000-000000000139";
-    await expect(service.execute({ kind: "account.login", account: added.account.id, deviceCode: true, idempotencyKey }, { signal }))
-      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    store.nextProfileGeneration(added.account.id);
-    const original = store.readMutation(idempotencyKey);
-    // v43 advanced the profile without any account successor ledger. Build
-    // that exact predecessor surface; the v45 migration must not backfill it.
-    const legacy = new Database(paths.database, { strict: true });
-    const evidenceSql = z.object({ sql: z.string() }).strict().parse(legacy.query(
-      "SELECT sql FROM sqlite_master WHERE type='table' AND name='autorespond_evidence'",
-    ).get()).sql;
-    expect(evidenceSql).toContain("'accepted','refused','unknown','sent'");
-    legacy.exec(evidenceSql
-      .replace("autorespond_evidence", "autorespond_evidence_v43")
-      .replace("'accepted','refused','unknown','sent'", "'accepted','refused','sent'"));
-    legacy.exec(`
-      INSERT INTO autorespond_evidence_v43 SELECT * FROM autorespond_evidence;
-      DROP TABLE autorespond_evidence;
-      ALTER TABLE autorespond_evidence_v43 RENAME TO autorespond_evidence;
-      CREATE INDEX autorespond_evidence_session ON autorespond_evidence(session_id, occurred_at DESC, id DESC);
-      CREATE INDEX autorespond_evidence_recent ON autorespond_evidence(occurred_at DESC, id DESC);
-      DROP TRIGGER sessions_autorespond_after_hours_history;
-      DROP TABLE autorespond_after_hours_history;
-      DROP TABLE autorespond_after_hours_policy;
-      DROP TABLE account_mutation_authority_rebinds;
-      DROP TRIGGER sessions_autorespond_budget_history;
-      DROP TABLE autorespond_budget_history;
-      DROP TABLE autorespond_budget_reservations;
-      DELETE FROM migrations WHERE version>43;
-      DROP TRIGGER work_session_project_authority_guard;
-      PRAGMA user_version=43;
-    `);
-    legacy.close(false);
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
+    // This archived binary actually advanced an ambiguous login's profile from
+    // generation 1 to 2 without a successor ledger; no current rows are restamped.
+    const captured = canonicalLoginLedgerFixtures[43];
+    const original = captured.retained.login;
+    const added = { account: captured.retained.loginProfile };
+    const other = { account: captured.retained.profile };
+    const idempotencyKey = captured.retained.loginKey;
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-canonical43-login-")));
+    serviceRoots.push(home);
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    await writeFile(paths.database, canonicalLoginLedgerDatabaseBytes(43), { mode: 0o600 });
+    const retainedEvidence = () => {
+      const database = new Database(paths.database, { strict: true });
+      try {
+        database.exec("PRAGMA query_only=ON");
+        return {
+          attempt: database.query(`SELECT id,idempotency_key,kind,authority_id,authority_generation,
+            request_digest,state,result_json,created_at,updated_at FROM mutation_attempts WHERE id=?`).get(original.id),
+          effect: database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(original.id),
+        };
+      } finally { database.close(false); }
+    };
+    const before = retainedEvidence();
     const upgraded = new StateStore(paths);
     stores.push(upgraded);
+    expect(upgraded.requireProfileById(added.account.id)).toMatchObject(added.account);
+    expect(upgraded.requireProfileById(other.account.id)).toMatchObject(other.account);
+    expect(upgraded.readMutation(idempotencyKey)).toMatchObject(original);
+    expect(retainedEvidence()).toEqual(before);
     const restartedCodex = new FakeCodex();
+    restartedCodex.accountProjection = {
+      signedIn: true,
+      email: other.account.providerEmail,
+      plan: other.account.providerPlan,
+    };
     const restarted = new HraService({
       store: upgraded, paths, codex: restartedCodex, cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined,
@@ -21812,12 +22246,13 @@ describe("HraService", () => {
       expect(restartedCodex.calls).toEqual(beforeRead);
       await expect(restarted.execute({ kind: "account.show", account: other.account.id }, { signal }))
         .resolves.toMatchObject({ account: { state: "signed_in" } });
-      expect(upgraded.readMutation(idempotencyKey)).toMatchObject({ authorityGeneration: 1, state: "ambiguous", evidence: original?.evidence });
+      expect(upgraded.readMutation(idempotencyKey)).toMatchObject({ authorityGeneration: 1, state: "ambiguous", evidence: original.evidence });
+      expect(retainedEvidence()).toEqual(before);
     }
     const inspector = new Database(paths.database, { readonly: true });
     try {
       expect(inspector.query("SELECT COUNT(*) AS count FROM account_mutation_authority_rebinds").get()).toEqual({ count: 0 });
-      expect(inspector.query("SELECT COUNT(*) AS count FROM mutation_resolutions WHERE attempt_id=?").get(original?.id ?? "")).toEqual({ count: 0 });
+      expect(inspector.query("SELECT COUNT(*) AS count FROM mutation_resolutions WHERE attempt_id=?").get(original.id)).toEqual({ count: 0 });
     } finally { inspector.close(false); }
   });
 
@@ -22429,7 +22864,7 @@ describe("HraService", () => {
     const legacy = new Database(value.paths.database, { strict: true });
     try {
       legacy.query(
-        "UPDATE sessions SET provider_v39='devin',preset_contract=? WHERE id=?",
+        "UPDATE sessions SET provider_v39='devin',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?",
       ).run(devinPresetContract, session.id);
       legacy.query(
         "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,'session.start',?,?,?,'effect_started',0,0)",

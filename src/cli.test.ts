@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeSync, openSync, writeFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
+import { z } from "zod";
 
 import packageMetadata from "../package.json";
 
@@ -148,7 +149,7 @@ const installPrivateTask48State = (databasePath: string): void => {
 // An install written by a newer HRA build than this one. No migration exists for
 // it, so every entry point must refuse instead of guessing.
 // Keep this expectation independent of the implementation's schema constant.
-const expectedStateSchemaVersion = 49;
+const expectedStateSchemaVersion = 60;
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
@@ -178,6 +179,32 @@ const readFixtureDaemonGeneration = (databasePath: string): number => {
   } finally {
     database.close();
   }
+};
+
+// Compare all logical database content, including immutable evidence, complete
+// schema SQL, column metadata, ledger and user_version. Only row order is sorted.
+const stateSchemaSnapshot = (databasePath: string): string => {
+  const database = new Database(databasePath, { readonly: true, strict: true });
+  const read = (sql: string) => {
+    const statement = database.prepare(sql);
+    try { return statement.all(); } finally { statement.finalize(); }
+  };
+  try {
+    return database.transaction(() => {
+      const schema = read("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name");
+      const tables = z.array(z.object({ type: z.string(), name: z.string().regex(/^[A-Za-z0-9_]+$/u) }))
+        .parse(schema).filter((row) => row.type === "table");
+      return JSON.stringify({
+        schema,
+        tables: tables.map(({ name }) => ({
+          name,
+          columns: read(`PRAGMA table_xinfo("${name}")`),
+          rows: read(`SELECT * FROM "${name}"`).map((row) => JSON.stringify(row)).sort(),
+        })),
+        version: read("PRAGMA user_version"),
+      });
+    }).deferred();
+  } finally { database.close(false); }
 };
 
 const upgradeFixture = async (
@@ -6462,6 +6489,7 @@ describe("CLI entry point", () => {
       const initialized = capture();
       expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);
       installPrivateTask48State(installation.paths.database);
+      const before = stateSchemaSnapshot(installation.paths.database);
 
       const captured = capture();
       expect(await main(["status", "--json"], captured.output, input)).toBe(7);
@@ -6476,6 +6504,7 @@ describe("CLI entry point", () => {
       });
       expect(captured.read().stderr).toBe("");
       expect(stateSchemaVersion(installation.paths.database)).toBe(48);
+      expect(stateSchemaSnapshot(installation.paths.database)).toBe(before);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6495,6 +6524,7 @@ describe("CLI entry point", () => {
       const initialized = capture();
       expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);
       advanceStateSchema(installation.paths.database);
+      const before = stateSchemaSnapshot(installation.paths.database);
 
       const captured = capture();
       expect(await main(["daemon", "start", "--json"], captured.output, input)).toBe(7);
@@ -6509,6 +6539,7 @@ describe("CLI entry point", () => {
       expect(captured.read().stderr).toBe("");
       expect(daemonStarts).toBe(0);
       expect(stateSchemaVersion(installation.paths.database)).toBe(expectedStateSchemaVersion + 1);
+      expect(stateSchemaSnapshot(installation.paths.database)).toBe(before);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6522,6 +6553,7 @@ describe("CLI entry point", () => {
       const store = new StateStore(statePaths);
       store.close();
       installPrivateTask48State(statePaths.database);
+      const before = stateSchemaSnapshot(statePaths.database);
       const captured = capture();
       expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths })).toBe(1);
       const rendered = JSON.parse(captured.read().stdout) as unknown;
@@ -6536,6 +6568,7 @@ describe("CLI entry point", () => {
       });
       expect(JSON.stringify(rendered)).not.toContain(temporary);
       expect(captured.read().stderr).toBe("");
+      expect(stateSchemaSnapshot(statePaths.database)).toBe(before);
     } finally {
       await rm(temporary, { force: true, recursive: true });
     }
@@ -6549,6 +6582,7 @@ describe("CLI entry point", () => {
       const store = new StateStore(statePaths);
       store.close();
       advanceStateSchema(statePaths.database);
+      const before = stateSchemaSnapshot(statePaths.database);
       const captured = capture();
       expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths })).toBe(1);
       const rendered = JSON.parse(captured.read().stdout) as unknown;
@@ -6563,6 +6597,7 @@ describe("CLI entry point", () => {
       });
       expect(JSON.stringify(rendered)).not.toContain(temporary);
       expect(captured.read().stderr).toBe("");
+      expect(stateSchemaSnapshot(statePaths.database)).toBe(before);
     } finally {
       await rm(temporary, { force: true, recursive: true });
     }
@@ -6788,6 +6823,90 @@ describe("CLI entry point", () => {
       },
     });
     expect(captured.read().stdout).not.toContain('"released":true');
+  });
+
+  test.each([
+    ["receipt", "preflight_receipt", "not_attempted", 0],
+    ["inspection", "preflight_inspection", "not_attempted", 0],
+    ["indeterminate inspection", "preflight_inspection", "not_attempted", 0],
+    ["request", "stop_request", "attempted", 1],
+    ["synchronous request", "stop_request", "attempted", 1],
+    ["acknowledged release", "release_confirmation", "acknowledged", 1],
+    ["indeterminate response", "release_confirmation", "attempted", 1],
+    ["unavailable response", "release_confirmation", "attempted", 1],
+    ["malformed response", "release_confirmation", "attempted", 1],
+    ["reconciliation receipt", "release_confirmation", "acknowledged", 1],
+    ["reconciliation authority", "release_confirmation", "acknowledged", 1],
+  ] as const)("reports closed daemon-stop authority observations after %s", async (
+    boundary, authorityPhase, stopRequestState, expectedRequests,
+  ) => {
+    const captured = capture();
+    const safety = new DaemonAuthoritySafetyError("private authority diagnostic must not escape");
+    let observations = 0;
+    let requests = 0;
+    let releaseWaits = 0;
+    const sleeps: number[] = [];
+    const reconciles = boundary === "reconciliation receipt" || boundary === "reconciliation authority";
+    const dependencies = exactStopDependencies({
+      observeReceipt: () => {
+        observations += 1;
+        if (boundary === "receipt" || (boundary === "reconciliation receipt" && observations > 1)) {
+          return Promise.reject(safety);
+        }
+        return Promise.resolve(daemonAuthorityReceipt(observations === 1 ? "ready" : "stopped"));
+      },
+      inspectAuthority: () => {
+        if (boundary === "inspection") return Promise.reject(safety);
+        return Promise.resolve(boundary === "indeterminate inspection" ? {
+          state: "indeterminate" as const,
+          database: { custody: "indeterminate" as const },
+          receipt: { custody: "indeterminate" as const },
+        } : {
+          state: "held" as const,
+          database: { custody: "safe" as const, authority: "held" as const },
+          receipt: { custody: "safe" as const, state: "ready" as const },
+        });
+      },
+      requestStop: () => {
+        requests += 1;
+        if (boundary === "synchronous request") throw safety;
+        if (boundary === "request") return Promise.reject(safety);
+        if (boundary === "indeterminate response") return Promise.reject(new LocalDaemonIndeterminateError("lost"));
+        if (boundary === "unavailable response") return Promise.reject(new LocalDaemonUnavailableError("unavailable"));
+        if (boundary === "malformed response") {
+          return Promise.resolve({ ok: true, version: 1, requestId: crypto.randomUUID(), data: {} });
+        }
+        return Promise.resolve(acknowledgedDaemonStopResponse());
+      },
+      waitForRelease: () => {
+        releaseWaits += 1;
+        return Promise.reject(reconciles ? new Error("transient observation") : safety);
+      },
+      authorityHeld: () => Promise.reject(safety),
+      sleep: (milliseconds) => {
+        sleeps.push(milliseconds);
+        return Promise.resolve();
+      },
+    });
+
+    expect(await main(["daemon", "stop", "--json"], captured.output, {
+      daemonStopDependencies: dependencies,
+    })).toBe(7);
+    expect(JSON.parse(captured.read().stdout) as unknown).toEqual({
+      ok: false,
+      version: 1,
+      error: {
+        code: "RECOVERY_REQUIRED",
+        message: "The local daemon authority could not be safely verified. Run `hra doctor --offline` before taking further action.",
+        details: { nextCommand: "hra doctor --offline", authorityPhase, stopRequestState },
+      },
+    });
+    expect(requests).toBe(expectedRequests);
+    expect(releaseWaits).toBe(authorityPhase === "release_confirmation" ? 1 : 0);
+    expect(sleeps).toEqual(boundary === "reconciliation authority" ? [25] : []);
+    expect(captured.read().stdout).not.toContain(safety.message);
+    expect(captured.read().stdout).not.toContain('"released":true');
+    expect(captured.read().stderr).toBe("");
   });
 
   test("turns daemon-authority safety errors into an actionable closed recovery", async () => {
@@ -7315,9 +7434,9 @@ describe("CLI entry point", () => {
     }
   });
 
-  test("offline doctor separates unusable project roots from a healthy database", async () => {
-    const problem = "A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
-    for (const scenario of ["missing", "symlink", "non_traversable"] as const) {
+  for (const scenario of ["missing", "symlink", "non_traversable"] as const) {
+    test(`offline doctor separates unusable project roots from a healthy database: ${scenario}`, async () => {
+      const problem = "A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
       const temporary = await realpath(await mkdtemp(join(tmpdir(), `hra-doctor-project-${scenario}-`)));
       const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
       const documents = join(temporary, "Documents");
@@ -7352,8 +7471,8 @@ describe("CLI entry point", () => {
         if (scenario === "non_traversable") await chmod(documents, 0o700).catch(() => undefined);
         await rm(temporary, { force: true, recursive: true });
       }
-    }
-  });
+    });
+  }
 
   test("online doctor keeps its envelope and exit code in agreement over validated health", async () => {
     const invalid = "HRA checks returned an invalid local result.";

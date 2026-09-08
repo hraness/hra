@@ -1596,6 +1596,77 @@ describe("CLI rendering", () => {
     expect(injected.stderr.join("")).not.toContain("touch /tmp/unsafe\nNext:");
   });
 
+  test.each([
+    ["preflight_receipt", "not_attempted"],
+    ["preflight_inspection", "not_attempted"],
+    ["stop_request", "attempted"],
+    ["release_confirmation", "attempted"],
+    ["release_confirmation", "acknowledged"],
+  ] as const)("preserves closed daemon stop diagnostic guidance for %s / %s", (authorityPhase, stopRequestState) => {
+    const error = {
+      code: "RECOVERY_REQUIRED",
+      details: { nextCommand: "hra doctor --offline", authorityPhase, stopRequestState },
+      message: "Daemon authority verification requires inspection.",
+    };
+    const human = capture();
+    expect(renderFailure(error, false, human.output)).toBe(7);
+    expect(human.stdout).toEqual([]);
+    expect(human.stderr.join("")).toBe([
+      "hra: Daemon authority verification requires inspection.",
+      "Next: hra doctor --offline",
+      "",
+    ].join("\n"));
+
+    const json = capture();
+    expect(renderFailure(error, true, json.output)).toBe(7);
+    expect(json.stderr).toEqual([]);
+    expect(JSON.parse(json.stdout.join("")) as unknown).toEqual({ ok: false, version: 1, error });
+  });
+
+  test("refuses widened or invalid daemon stop diagnostic handoffs", () => {
+    const valid = {
+      nextCommand: "hra doctor --offline",
+      authorityPhase: "release_confirmation",
+      stopRequestState: "acknowledged",
+    };
+    const inheritedPhase: unknown = Object.assign(Object.create({
+      authorityPhase: "release_confirmation",
+    }) as object, {
+      nextCommand: "hra doctor --offline",
+      stopRequestState: "acknowledged",
+      unexpected: true,
+    });
+    for (const details of [
+      { ...valid, unexpected: true },
+      { ...valid, authorityPhase: "unknown" },
+      { ...valid, authorityPhase: null },
+      { ...valid, stopRequestState: "released" },
+      { ...valid, stopRequestState: true },
+      { ...valid, authorityPhase: "preflight_receipt", stopRequestState: "attempted" },
+      { ...valid, authorityPhase: "preflight_receipt", stopRequestState: "acknowledged" },
+      { ...valid, authorityPhase: "preflight_inspection", stopRequestState: "attempted" },
+      { ...valid, authorityPhase: "preflight_inspection", stopRequestState: "acknowledged" },
+      { ...valid, authorityPhase: "stop_request", stopRequestState: "not_attempted" },
+      { ...valid, authorityPhase: "stop_request", stopRequestState: "acknowledged" },
+      { ...valid, authorityPhase: "release_confirmation", stopRequestState: "not_attempted" },
+      { authorityPhase: valid.authorityPhase, stopRequestState: valid.stopRequestState },
+      { nextCommand: valid.nextCommand, stopRequestState: valid.stopRequestState },
+      { nextCommand: valid.nextCommand, authorityPhase: valid.authorityPhase },
+      { ...valid, nextCommand: "hra daemon status --json" },
+      { ...valid, nextCommand: "hra doctor --offline; touch /tmp/unsafe" },
+      inheritedPhase,
+    ]) {
+      const human = capture();
+      expect(renderFailure({
+        code: "RECOVERY_REQUIRED",
+        details,
+        message: "Daemon authority verification requires inspection.",
+      }, false, human.output)).toBe(7);
+      expect(human.stdout).toEqual([]);
+      expect(human.stderr.join("")).not.toContain("\nNext:");
+    }
+  });
+
   test("renders only the closed key-loss precondition handoffs", () => {
     for (const [code, nextCommand] of [
       ["INTERACTION_REQUIRED", "hra auth login --input-stdin"],

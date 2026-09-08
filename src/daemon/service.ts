@@ -7321,14 +7321,10 @@ export class HraService {
           });
         }
         if (current.state === "effect_started") {
-          const nestedAttempt = this.#store.readMutation(current.idempotencyKey);
           current = this.#store.settlePeerSessionAction({
             actionId: current.id,
             expectedState: current.state,
             state: "ambiguous",
-            ...(nestedAttempt?.state === "prepared"
-              ? {}
-              : { resultDigest: digestText(JSON.stringify({ code: "EFFECT_OUTCOME_UNSETTLED" })) }),
           });
         }
         if (error instanceof CommandFailure) {
@@ -7392,6 +7388,11 @@ export class HraService {
     if (action.state !== "effect_started" && action.state !== "ambiguous") {
       throw new Error("PEER_SESSION_MUTATION_JOIN_INVALID");
     }
+    // Older ambiguous actions retained this observation as an immutable
+    // digest. Preserve only that exact marker after the nested authority join
+    // and terminal outcome have been proved; never replace arbitrary evidence.
+    const preserveLegacyObservation = action.resultDigest
+      === digestText(JSON.stringify({ code: "EFFECT_OUTCOME_UNSETTLED" }));
     const applied = attempt.state === "applied"
       || (attempt.state === "reconciled" && attempt.resolution?.kind === "proven_applied");
     if (applied) {
@@ -7403,17 +7404,21 @@ export class HraService {
         expectedState: action.state,
         state: "applied",
         targetTurnId,
-        resultDigest: digestText(JSON.stringify({ targetTurnId })),
+        ...(preserveLegacyObservation
+          ? {}
+          : { resultDigest: digestText(JSON.stringify({ targetTurnId })) }),
       });
     }
     return this.#store.settlePeerSessionAction({
       actionId: action.id,
       expectedState: action.state,
       state: "failed",
-      resultDigest: digestText(JSON.stringify({
-        mutationState: attempt.state,
-        resolution: attempt.resolution?.kind ?? null,
-      })),
+      ...(preserveLegacyObservation
+        ? {}
+        : { resultDigest: digestText(JSON.stringify({
+            mutationState: attempt.state,
+            resolution: attempt.resolution?.kind ?? null,
+          })) }),
     });
   }
 

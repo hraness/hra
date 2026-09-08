@@ -993,6 +993,397 @@ function prepareSignal(value: Fixture, provider: "codex" | "claude" = "codex") {
   return { key, effect, workId: created.work.id };
 }
 
+describe("WorkStore canonical profile runtime", () => {
+  for (const contract of [1, 2] as const) {
+    for (const preset of ["low", "high", "ultra"] as const) {
+      test(`writes own Work ${contract}/${preset} identity without a public field`, () => {
+        const value = fixture();
+        const created = createWork(value, [taskSpec(value, "canonical", { preset })]);
+        if (contract === 2) rewriteWorkPresetContract(value, created.work.id, contract);
+        setSessionProfile(value, value.actorSessionId, { preset, contract });
+        const claimed = claim(value, {
+          workId: created.work.id, taskId: created.tasks[0]!.id, revision: created.tasks[0]!.revision,
+        });
+        const expected = preset === "low" ? "codex:gpt-5.6-luna:max"
+          : `codex:${contract === 1 ? "gpt-5.6-sol" : "gpt-6-astra"}:${preset === "high" ? "max" : "ultra"}`;
+        for (const table of ["work_routes", "work_tasks", "work_attempts"] as const) {
+          expect(value.database.query(
+            `SELECT canonical_profile_key FROM ${table} WHERE work_id=?`,
+          ).all(created.work.id)).toEqual([{ canonical_profile_key: expected }]);
+        }
+        expect(JSON.stringify(claimed)).not.toContain("canonical_profile_key");
+        expect(JSON.stringify(claimed)).not.toContain("canonicalProfileKey");
+        expect(() => assertLegacyCanonicalProfileRows(value.database)).not.toThrow();
+      });
+    }
+  }
+
+  for (const owner of ["work_routes", "work_tasks", "work_attempts", "sessions"] as const) {
+    for (const key of [null, "foreign-key", "CODEX:GPT-5.6-SOL:MAX"] as const) {
+      test(`refuses ${owner} ${key ?? "NULL"} key across reads and late authority without mutation`, () => {
+        const value = fixture();
+        const created = createWork(value);
+        const taskId = created.tasks[0]!.id;
+        const claimed = claim(value, { workId: created.work.id, taskId, revision: created.tasks[0]!.revision });
+        const dispatchKey = randomUUID();
+        value.store.apply({
+          kind: "attempt.dispatch", idempotencyKey: dispatchKey,
+          workId: created.work.id, attemptId: claimed.attempt.id,
+          expectedAttemptRevision: claimed.attempt.revision, fence: claimed.attempt.fence,
+          actorSessionId: value.actorSessionId, attemptCapability: capability,
+          targetSessionId: value.actorSessionId, mode: "send",
+        });
+        const guards = owner === "sessions"
+          ? ["canonical_profile_session_update_guard", "canonical_profile_session_live_attempt_guard"]
+          : owner === "work_attempts"
+            ? ["work_attempt_revision_guard", "canonical_profile_work_attempt_immutable_guard"]
+            : [owner === "work_routes" ? "work_routes_no_update" : "work_tasks_no_update"];
+        withFixtureGuardsRemoved(value, guards, () => {
+          value.database.query(
+            `UPDATE ${owner} SET canonical_profile_key=? WHERE ${owner === "sessions" ? "id" : "work_id"}=?`,
+          ).run(key, owner === "sessions" ? value.actorSessionId : created.work.id);
+        });
+        const before = value.database.serialize();
+        const readers = [
+          () => value.store.task(taskId),
+          () => value.store.taskHistory(taskId),
+          () => value.store.snapshot(created.work.id),
+          () => value.store.poll(created.work.id, value.actorSessionId),
+          () => value.store.events(created.work.id),
+          () => value.store.preparedEffect(dispatchKey),
+          () => value.store.authorizePreparedEffect(dispatchKey),
+          () => value.store.prepareProfileAuthorityChange(value.accountId, 1),
+        ];
+        for (const read of readers) {
+          expect(read).toThrow("WORK_CANONICAL_PROFILE_CORRUPT");
+          expect(value.database.serialize()).toEqual(before);
+        }
+      });
+    }
+  }
+
+  test("rejects a coherently forged route/task/attempt key under the wrong own Work contract", () => {
+    const value = fixture();
+    const created = createWork(value);
+    const claimed = claim(value, {
+      workId: created.work.id, taskId: created.tasks[0]!.id, revision: created.tasks[0]!.revision,
+    });
+    withFixtureGuardsRemoved(value, [
+      "work_routes_no_update", "work_tasks_no_update", "work_attempt_revision_guard",
+      "canonical_profile_work_attempt_immutable_guard",
+    ], () => {
+      for (const table of ["work_routes", "work_tasks", "work_attempts"] as const) {
+        value.database.query(
+          `UPDATE ${table} SET canonical_profile_key='codex:gpt-6-astra:max' WHERE work_id=?`,
+        ).run(created.work.id);
+      }
+    });
+    const before = value.database.serialize();
+    expect(() => value.store.task(claimed.task.id)).toThrow("WORK_CANONICAL_PROFILE_CORRUPT");
+    expect(value.database.serialize()).toEqual(before);
+  });
+
+  for (const owner of ["work_routes", "work_tasks", "sessions"] as const) {
+    test(`refuses ${owner} corruption on task-bound signal effect reads and late authority`, () => {
+      const value = fixture();
+      const created = createWork(value);
+      const taskId = created.tasks[0]!.id;
+      claim(value, { workId: created.work.id, taskId, revision: created.tasks[0]!.revision });
+      const key = randomUUID();
+      value.store.apply({
+        kind: "signal.send", idempotencyKey: key, workId: created.work.id,
+        senderSessionId: value.actorSessionId, senderCapability: capability,
+        targetSessionId: value.actorSessionId, taskId, mode: "queue", body: "A task-bound signal.",
+      });
+      const guards = owner === "sessions"
+        ? ["canonical_profile_session_update_guard", "canonical_profile_session_live_attempt_guard"]
+        : [owner === "work_routes" ? "work_routes_no_update" : "work_tasks_no_update"];
+      withFixtureGuardsRemoved(value, guards, () => {
+        value.database.query(
+          `UPDATE ${owner} SET canonical_profile_key=NULL WHERE ${owner === "sessions" ? "id" : "work_id"}=?`,
+        ).run(owner === "sessions" ? value.actorSessionId : created.work.id);
+      });
+      const before = value.database.serialize();
+      for (const read of [
+        () => value.store.effectStatus(key),
+        () => value.store.preparedEffect(key),
+        () => value.store.recoverablePreparedEffects(),
+        () => value.store.authorizePreparedEffect(key),
+        () => value.store.reprojectPreparedEffect(key),
+        () => value.store.settlePreparedEffectNoEffect(key, "canonical_test"),
+      ]) {
+        expect(read).toThrow("WORK_CANONICAL_PROFILE_CORRUPT");
+        expect(value.database.serialize()).toEqual(before);
+      }
+    });
+  }
+
+  for (const column of ["account_id", "project_id"] as const) {
+    test(`refuses an orphaned route ${column} even when task and attempt agree`, () => {
+      const value = fixture();
+      const created = createWork(value);
+      const taskId = created.tasks[0]!.id;
+      claim(value, { workId: created.work.id, taskId, revision: created.tasks[0]!.revision });
+      const orphanId = column === "account_id" ? createProfileId() : createProjectId();
+      value.database.exec("PRAGMA foreign_keys=OFF");
+      try {
+        withFixtureGuardsRemoved(value, [
+          "work_routes_no_update", "work_tasks_no_update", "work_attempt_authority_immutable",
+          "work_attempt_revision_guard",
+        ], () => {
+          for (const table of ["work_routes", "work_tasks", "work_attempts"] as const) {
+            value.database.query(`UPDATE ${table} SET ${column}=? WHERE work_id=?`)
+              .run(orphanId, created.work.id);
+          }
+        });
+      } finally {
+        value.database.exec("PRAGMA foreign_keys=ON");
+      }
+      const before = value.database.serialize();
+      expect(() => value.store.task(taskId)).toThrow("WORK_CANONICAL_PROFILE_CORRUPT");
+      expect(value.database.serialize()).toEqual(before);
+    });
+  }
+
+  for (const kind of ["task.addBatch", "work.fail"] as const) {
+    test(`refuses corrupt ${kind} sources before durably expiring a different valid claim`, () => {
+      const value = fixture();
+      const created = createWork(value, [taskSpec(value, "valid-expiring"), taskSpec(value, "damaged")]);
+      const claimed = claim(value, {
+        workId: created.work.id, taskId: created.tasks[0]!.id, revision: created.tasks[0]!.revision,
+      });
+      withFixtureGuardsRemoved(value, ["work_tasks_no_update"], () => {
+        value.database.query("UPDATE work_tasks SET canonical_profile_key=NULL WHERE id=?")
+          .run(created.tasks[1]!.id);
+      });
+      value.now.value = claimed.attempt.leaseExpiresAt! + 10;
+      const before = createHash("sha256").update(value.database.serialize()).digest("hex");
+      const shared = {
+        idempotencyKey: randomUUID(), workId: created.work.id,
+        expectedWorkRevision: claimed.workRevision, coordinatorCapability: capability,
+      };
+      let failure: unknown;
+      try {
+        value.store.apply(kind === "task.addBatch"
+          ? { ...shared, kind, coordinatorSessionId: value.actorSessionId, tasks: [taskSpec(value, "added")] }
+          : { ...shared, kind, actorSessionId: value.actorSessionId, summary: "Stop this work.", evidence: [] });
+      } catch (error) {
+        failure = error;
+      }
+      expect(value.database.query("SELECT state FROM work_attempts WHERE id=?").get(claimed.attempt.id))
+        .toEqual({ state: "claimed" });
+      expect(failure).toEqual(new Error("WORK_CANONICAL_PROFILE_CORRUPT"));
+      expect(createHash("sha256").update(value.database.serialize()).digest("hex")).toBe(before);
+    });
+  }
+
+  test("validates dependency identity even when a task's not-before time prevents readiness", () => {
+    const value = fixture();
+    const created = createWork(value, [
+      taskSpec(value, "dependency"),
+      taskSpec(value, "waiting", { dependsOnRefs: ["dependency"], notBefore: value.now.value + 60_000 }),
+    ]);
+    const taskId = created.tasks[1]!.id;
+    expect(value.store.task(taskId).task.status).toBe("waiting");
+    withFixtureGuardsRemoved(value, ["work_tasks_no_update"], () => {
+      value.database.query("UPDATE work_tasks SET canonical_profile_key=NULL WHERE id=?")
+        .run(created.tasks[0]!.id);
+    });
+    const before = value.database.serialize();
+    expect(() => value.store.task(taskId)).toThrow("WORK_CANONICAL_PROFILE_CORRUPT");
+    expect(value.database.serialize()).toEqual(before);
+  });
+
+  test("checks a claim target's dependency before a different valid claim can expire", () => {
+    const value = fixture();
+    const created = createWork(value, [
+      taskSpec(value, "valid-expiring"), taskSpec(value, "dependency"),
+      taskSpec(value, "dependent", { dependsOnRefs: ["dependency"] }),
+    ]);
+    const claimed = claim(value, {
+      workId: created.work.id, taskId: created.tasks[0]!.id, revision: created.tasks[0]!.revision,
+    });
+    withFixtureGuardsRemoved(value, ["work_tasks_no_update"], () => {
+      value.database.query("UPDATE work_tasks SET canonical_profile_key=NULL WHERE id=?")
+        .run(created.tasks[1]!.id);
+    });
+    value.now.value = claimed.attempt.leaseExpiresAt! + 10;
+    const before = value.database.serialize();
+    expect(() => claim(value, {
+      workId: created.work.id, taskId: created.tasks[2]!.id, revision: created.tasks[2]!.revision,
+    })).toThrow("WORK_CANONICAL_PROFILE_CORRUPT");
+    expect(value.database.serialize()).toEqual(before);
+    expect(value.database.query("SELECT state FROM work_attempts WHERE id=?").get(claimed.attempt.id))
+      .toEqual({ state: "claimed" });
+  });
+
+  test("checks settled signal-ownership evidence before a different valid claim can expire", () => {
+    const value = fixture();
+    const created = createWork(value, [taskSpec(value, "historical"), taskSpec(value, "valid-expiring")]);
+    const historical = claim(value, {
+      workId: created.work.id, taskId: created.tasks[0]!.id, revision: created.tasks[0]!.revision,
+    });
+    value.store.apply({
+      kind: "attempt.release", idempotencyKey: randomUUID(), workId: created.work.id,
+      attemptId: historical.attempt.id, expectedAttemptRevision: historical.attempt.revision,
+      fence: historical.attempt.fence, actorSessionId: value.actorSessionId,
+      attemptCapability: capability, reason: "No provider effect.",
+    });
+    const claimed = claim(value, {
+      workId: created.work.id, taskId: created.tasks[1]!.id, revision: created.tasks[1]!.revision,
+    });
+    withFixtureGuardsRemoved(value, [
+      "work_attempt_revision_guard", "canonical_profile_work_attempt_immutable_guard",
+    ], () => {
+      value.database.query("UPDATE work_attempts SET canonical_profile_key=NULL WHERE id=?")
+        .run(historical.attempt.id);
+    });
+    value.now.value = claimed.attempt.leaseExpiresAt! + 10;
+    const before = value.database.serialize();
+    expect(() => value.store.apply({
+      kind: "signal.send", idempotencyKey: randomUUID(), workId: created.work.id,
+      senderSessionId: value.actorSessionId, senderCapability: capability,
+      targetSessionId: value.actorSessionId, taskId: historical.task.id,
+      mode: "queue", body: "Use the retained ownership evidence.",
+    })).toThrow("WORK_CANONICAL_PROFILE_CORRUPT");
+    expect(value.database.serialize()).toEqual(before);
+    expect(value.database.query("SELECT state FROM work_attempts WHERE id=?").get(claimed.attempt.id))
+      .toEqual({ state: "claimed" });
+  });
+
+  test("rejects cached signal history whose current source no longer belongs to the task", () => {
+    const value = fixture();
+    const created = createWork(value);
+    const taskId = created.tasks[0]!.id;
+    claim(value, { workId: created.work.id, taskId, revision: created.tasks[0]!.revision });
+    const send = () => {
+      const result = value.store.apply({
+        kind: "signal.send", idempotencyKey: randomUUID(), workId: created.work.id,
+        senderSessionId: value.actorSessionId, senderCapability: capability,
+        targetSessionId: value.actorSessionId, taskId, mode: "queue", body: "A bounded history marker.",
+      });
+      if (result.kind !== "signal.send") throw new Error("unexpected signal result");
+      return result.signal.id;
+    };
+    const firstSignal = send();
+    send();
+    const first = value.store.taskHistory(taskId, 1);
+    if (first.nextCursor === null) throw new Error("signal history continuation missing");
+    const cursor = decodeTaskHistoryCursor(first.nextCursor);
+    expect(value.store.taskHistory(taskId, 1, cursor).items)
+      .toMatchObject([{ kind: "signal", value: { id: firstSignal } }]);
+    // Keep the task's current source count equal to the older cut's count: the
+    // regression must prove source identity, not merely a count mismatch.
+    send();
+    withFixtureGuardsRemoved(value, ["work_signals_no_update"], () => {
+      value.database.query("UPDATE work_signals SET task_id=NULL WHERE id=?").run(firstSignal);
+    });
+    expect(value.database.query("SELECT COUNT(*) AS count FROM work_signals WHERE task_id=?").get(taskId))
+      .toEqual({ count: 2 });
+    const before = value.database.serialize();
+    expect(() => value.store.taskHistory(taskId, 1, cursor)).toThrow("WORK_CANONICAL_PROFILE_CORRUPT");
+    expect(value.database.serialize()).toEqual(before);
+  });
+
+  for (const phase of ["claimed", "dispatching", "running", "recovery_required"] as const) {
+    test(`refuses a valid but different worker key in live ${phase} state`, () => {
+      const value = fixture();
+      const created = createWork(value);
+      const taskId = created.tasks[0]!.id;
+      const claimed = claim(value, { workId: created.work.id, taskId, revision: created.tasks[0]!.revision });
+      if (phase !== "claimed") {
+        const key = randomUUID();
+        value.store.apply({
+          kind: "attempt.dispatch", idempotencyKey: key, workId: created.work.id,
+          attemptId: claimed.attempt.id, expectedAttemptRevision: claimed.attempt.revision,
+          fence: claimed.attempt.fence, actorSessionId: value.actorSessionId,
+          attemptCapability: capability, targetSessionId: value.actorSessionId, mode: "send",
+        });
+        if (phase !== "dispatching") {
+          value.store.authorizePreparedEffect(key);
+          value.store.finalizeDispatch(key, phase === "running"
+            ? { kind: "accepted", receipt: turnStartedReceipt() }
+            : { kind: "unknown", code: "canonical_test_unknown" });
+        }
+      }
+      expect(value.database.query("SELECT state FROM work_attempts WHERE id=?").get(claimed.attempt.id))
+        .toEqual({ state: phase });
+      withFixtureGuardsRemoved(value, [
+        "work_session_attempt_authority_guard", "canonical_profile_session_live_attempt_guard",
+      ], () => setSessionProfile(value, value.actorSessionId, { preset: "low" }));
+      const before = value.database.serialize();
+      expect(() => value.store.taskHistory(taskId)).toThrow("WORK_CANONICAL_PROFILE_CORRUPT");
+      expect(() => value.store.snapshot(created.work.id)).toThrow("WORK_CANONICAL_PROFILE_CORRUPT");
+      expect(() => value.store.assertSessionCanChangeRoute(value.actorSessionId))
+        .toThrow("WORK_CANONICAL_PROFILE_CORRUPT");
+      expect(value.database.serialize()).toEqual(before);
+    });
+  }
+
+  for (const settled of ["released", "submitted"] as const) {
+    test(`retains cached claimed history and immutable ${settled} evidence after worker reselection`, () => {
+      const value = fixture();
+      const created = createWork(value, [taskSpec(value, "settled-canonical", { requiredReviews: 1 })]);
+      const taskId = created.tasks[0]!.id;
+      join(value, created.work.id, created.workRevision, value.reviewerSessionId);
+      const claimed = claim(value, { workId: created.work.id, taskId, revision: created.tasks[0]!.revision });
+      value.store.apply({
+        kind: "signal.send", idempotencyKey: randomUUID(), workId: created.work.id,
+        senderSessionId: value.actorSessionId, senderCapability: capability,
+        targetSessionId: value.actorSessionId, taskId, mode: "queue", body: "Bounded history marker.",
+      });
+      const first = value.store.taskHistory(taskId, 1);
+      if (first.nextCursor === null) throw new Error("claimed history continuation missing");
+      const cursor = decodeTaskHistoryCursor(first.nextCursor);
+      const frozen = value.store.taskHistory(taskId, 1, cursor);
+      expect(frozen.items).toMatchObject([{ kind: "attempt", value: { status: "claimed" } }]);
+      if (settled === "released") {
+        value.store.apply({
+          kind: "attempt.release", idempotencyKey: randomUUID(), workId: created.work.id,
+          attemptId: claimed.attempt.id, expectedAttemptRevision: claimed.attempt.revision,
+          fence: claimed.attempt.fence, actorSessionId: value.actorSessionId,
+          attemptCapability: capability, reason: "No provider effect.",
+        });
+      } else {
+        const key = randomUUID();
+        value.store.apply({
+          kind: "attempt.dispatch", idempotencyKey: key, workId: created.work.id,
+          attemptId: claimed.attempt.id, expectedAttemptRevision: claimed.attempt.revision,
+          fence: claimed.attempt.fence, actorSessionId: value.actorSessionId,
+          attemptCapability: capability, targetSessionId: value.actorSessionId, mode: "send",
+        });
+        value.store.authorizePreparedEffect(key);
+        const running = value.store.finalizeDispatch(key, { kind: "accepted", receipt: turnStartedReceipt() });
+        value.store.apply({
+          kind: "attempt.report", idempotencyKey: randomUUID(), workId: created.work.id,
+          attemptId: running.id, expectedAttemptRevision: running.revision, fence: running.fence,
+          actorSessionId: value.actorSessionId, attemptCapability: capability,
+          report: { kind: "submit", summary: "Ready for review.", result: { kind: "text", text: "done" }, evidence: [] },
+        });
+      }
+      expect(value.database.query("SELECT state FROM work_attempts WHERE id=?").get(claimed.attempt.id))
+        .toEqual({ state: settled });
+      const persisted = () => [
+        "work_routes", "work_tasks", "work_attempts", "work_events", "work_idempotency_intents",
+        "work_prepared_effects", "work_task_history_versions",
+      ].map((table) => value.database.query(`SELECT * FROM ${table} ORDER BY rowid`).all());
+      const before = persisted();
+      const publicBefore = [value.store.task(taskId), value.store.taskHistory(taskId), value.store.events(created.work.id)];
+      setSessionProfile(value, value.actorSessionId, { preset: "low" });
+      expect(persisted()).toEqual(before);
+      expect([value.store.task(taskId), value.store.taskHistory(taskId), value.store.events(created.work.id)])
+        .toEqual(publicBefore);
+      expect(value.store.taskHistory(taskId, 1, cursor)).toEqual(frozen);
+      const reopened = new WorkStore(value.database, {
+        daemonGeneration: 7, now: () => value.now.value, encodeCursor,
+        issueCapability, verifyCapability, projectProviderIdentifier,
+      });
+      expect(reopened.taskHistory(taskId, 1, cursor)).toEqual(frozen);
+      expect(persisted()).toEqual(before);
+    });
+  }
+});
+
 describe("WorkStore schema and atomic plans", () => {
   test("fences Claude Work signals under scoped revocation despite a different Codex shadow", () => {
     for (const state of ["releasing", "completed"] as const) {

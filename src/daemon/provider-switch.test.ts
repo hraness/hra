@@ -9,6 +9,7 @@ import { CLAUDE_PIN, CLAUDE_PIN_MODEL } from "../claude/pin";
 import { IndeterminateCodexEffectError, type HraHostToolCall } from "../codex";
 import { HRA_SESSION_PREAMBLE } from "../domain/hra-preamble";
 import {
+  activePresetBinding,
   currentPresetContract,
   legacyPresetContract,
   providerSwitchRequiresPresetContract,
@@ -35,7 +36,7 @@ import {
   trajectoryRecordSchema,
 } from "../domain/trajectory";
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
-import { SessionSwitchStoreError, sessionProviderSwitchMutationRequest, StateStore } from "../storage/state-store";
+import { SessionSwitchStoreError, sessionProviderSwitchMutationRequest, sessionStartMutationRequest, StateStore } from "../storage/state-store";
 import {
   ClaudeProcessExitUnprovenError,
   ClaudeSessionObservationError,
@@ -962,10 +963,12 @@ async function recordHistoricalSwitchProgress(
   const sourceAuthority = value.store.requireProviderAccountAuthority(source.id, session.provider);
   const targetAuthority = value.store.requireProviderAccountAuthority(target.id, input.provider);
   const targetPreset = input.preset ?? (input.provider === "claude" ? "fable-max" : "high");
+  const presetContract = providerSwitchRequiresPresetContract(input.provider, input.preset)
+    ? sharedActiveCodexPresetContract() : undefined;
   const historicalTarget = liveAuthorityFor(value.store, target.id, input.provider);
   const runtimeProfile = input.provider === "claude"
     ? claudeProfile(historicalTarget)
-    : codexProfile(historicalTarget, targetPreset);
+    : codexProfile(historicalTarget, targetPreset, activePresetBinding(targetPreset).requirement);
   const transcript = await transcriptOf(value, session.id);
   const seed = renderTranscriptSeed({
     fromProvider: session.provider,
@@ -984,12 +987,13 @@ async function recordHistoricalSwitchProgress(
       { authority: sourceAuthority, role: "source", provenance: "legacy_switch_source" },
       { authority: targetAuthority, role: "target", provenance: "legacy_switch_target" },
     ],
-    request: {
+    request: sessionProviderSwitchMutationRequest({
       provider: input.provider,
       preset: targetPreset,
+      presetContract,
       targetProfileId: target.id,
       seedDigest: seed.digest,
-    },
+    }),
   });
   value.store.beginSessionProviderSwitchEffect({
     attemptId: attempt.id,
@@ -1022,8 +1026,7 @@ async function recordHistoricalSwitchProgress(
         preambleDigest: HRA_SESSION_PREAMBLE.digest,
         preambleVersion: HRA_SESSION_PREAMBLE.version,
       },
-      ...(providerSwitchRequiresPresetContract(input.provider, input.preset)
-        ? { presetContract: sharedActiveCodexPresetContract() } : {}),
+      ...(presetContract === undefined ? {} : { presetContract }),
       targetPreset,
       transcriptDigest: transcript.digest,
       seedDigest: seed.digest,
@@ -5473,7 +5476,9 @@ describe("provider portability", () => {
   });
 
   test("legacy journal: recovers a seeded Codex target when the Claude source release receipt survived restart", async () => {
-    const value = await fixture();
+    // The retained protocol predates the optional facts-memory transfer port.
+    // This case proves provider recovery, not authority to move a memory owner.
+    const value = await fixture(Date.now, new OfflineCloud(), false);
     const { sessionId } = await claudeSession(value);
     const targetAccountId = await signedInCodexAccount(value, "Recoverable Codex target");
     const idempotencyKey = crypto.randomUUID();
@@ -6409,7 +6414,7 @@ describe("provider portability", () => {
       kind: "session.start",
       authorityId: added.account.id,
       authorityGeneration: claudeAuthority.processGeneration,
-      request: { projectId: project.id, preset: "fable-max", fast: false },
+      request: sessionStartMutationRequest({ projectId: project.id, provider: "claude", preset: "fable-max", fast: false }),
       idempotencyKey: startKey,
       providerAuthorities: [{
         role: "primary",

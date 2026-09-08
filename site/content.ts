@@ -1200,6 +1200,9 @@ export const publicContent: PublicContent = {
         paragraph(
           text("HRA refuses self-addressing, stale target revisions, causal cycles, and a ninth hop. It admits at most 120 new peer actions per actor and per project in a rolling hour, at most 16 distinct targets per actor in that hour, and at most 64 unsettled inbound queue entries or 1 MiB of their text per target. Complete replay and causal evidence remains for at least seven days. Protected recovery ancestry is never pruned to make room, and the 25,000-action project cap fails closed when protected rows consume it."),
         ),
+        paragraph(
+          text("Abandoning an uncertain peer delivery does not prove that its message was ignored. HRA refuses new peer messages from an affected active turn while preserving inspection and owner controls, including stop. A subsequent distinct turn can coordinate again. Older unreleased recovery records with no affected-turn identity conservatively fence that provider thread until the owner explicitly replaces it; a new message alone does not repair missing historical evidence."),
+        ),
       ],
     },
     {

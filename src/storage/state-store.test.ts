@@ -7,11 +7,14 @@ import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 
 import { Database, constants as sqliteConstants } from "bun:sqlite";
+import fc from "fast-check";
 import { z } from "zod";
 
 import { canonical40QueuesDatabaseBytes, canonical40QueuesFixture } from "../../scripts/fixtures/canonical40-queues";
 import { canonical40UsageDatabaseBytes, canonical40UsageFixture } from "../../scripts/fixtures/canonical40-usage";
 import { canonical41TimestampsDatabaseBytes, canonical41TimestampsFixture } from "../../scripts/fixtures/canonical41-timestamps";
+import { canonical49WorkDatabaseBytes, canonical49WorkFixture } from "../../scripts/fixtures/canonical49-work";
+import { canonicalLoginLedgerDatabaseBytes, canonicalLoginLedgerFixtures } from "../../scripts/fixtures/canonical-login-ledger";
 import { canonicalBudgetDatabaseBytes, canonicalBudgetFixtures } from "../../scripts/fixtures/canonical-budget-history";
 import { canonicalBudgetRuntimeDatabaseBytes, canonicalBudgetRuntimeFixtures } from "../../scripts/fixtures/canonical-budget-runtime";
 import { canonicalAuthBudgetDatabaseBytes, canonicalAuthBudgetFixtures } from "../../scripts/fixtures/canonical-auth-budget";
@@ -95,6 +98,7 @@ import {
   PEER_SESSION_PROJECT_HOURLY_ACTION_LIMIT,
   PEER_SESSION_RATE_WINDOW_MS,
   PEER_SESSION_RETAINED_ACTION_LIMIT,
+  PEER_SESSION_TURN_ORIGIN_LIMIT,
   USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
   USAGE_CLOUD_UPLOAD_ANCHOR_COUNT,
   USAGE_LOCAL_RETAIN_AGE_MS,
@@ -351,6 +355,17 @@ async function canonicalAuthBudgetArchive(version: 44 | 45 | 46) {
   return paths;
 }
 
+async function canonical50LedgerArchive() {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-ledger-canonical50-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  const bytes = canonicalLoginLedgerDatabaseBytes(50);
+  expect(createHash("sha256").update(bytes).digest("hex"))
+    .toBe(canonicalLoginLedgerFixtures[50].databaseSha256);
+  await writeFile(paths.database, bytes, { mode: 0o600, flag: "wx" });
+  return paths;
+}
+
 // Capture the actual predecessor's complete column set once. Later additive
 // columns are separately asserted, never mistaken for rewritten old values.
 function canonicalAuthBudgetRows(database: Database, tables: readonly string[]) {
@@ -509,6 +524,55 @@ const dropProviderSwitchProgressSchema = (database: Database): void => {
     DROP TABLE IF EXISTS session_provider_switch_targets;
     DROP TABLE IF EXISTS session_mutation_authority_rebinds;
   `);
+};
+
+/** Remove only the current canonical overlay when deliberately shaping an older fixture. */
+const dropCanonicalProfileSchema = (database: Database): void => {
+  for (const name of [
+    "canonical_profile_session_insert_guard",
+    "canonical_profile_session_update_guard",
+    "canonical_profile_work_route_insert_guard",
+    "canonical_profile_work_task_insert_guard",
+    "canonical_profile_work_attempt_insert_guard",
+    "canonical_profile_work_attempt_immutable_guard",
+    "canonical_profile_session_live_attempt_guard",
+  ] as const) database.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  for (const table of ["sessions", "work_routes", "work_tasks", "work_attempts"] as const) {
+    if (database.query(
+      `SELECT 1 FROM pragma_table_xinfo('${table}') WHERE name='canonical_profile_key'`,
+    ).get() !== null) database.exec(`ALTER TABLE ${table} DROP COLUMN canonical_profile_key`);
+    expect(database.query(
+      `SELECT name FROM pragma_table_xinfo('${table}') WHERE name='canonical_profile_key' COLLATE NOCASE`,
+    ).all()).toEqual([]);
+  }
+};
+
+/** Preserve every predecessor object, allowing only the four append-only column additions. */
+const expectCanonicalSchemaExtension = (before: unknown, after: unknown): void => {
+  const objectSchema = z.object({
+    type: z.string(), name: z.string(), tbl_name: z.string(), sql: z.string().nullable(),
+  }).strict();
+  const oldObjects = objectSchema.array().parse(before);
+  const newObjects = objectSchema.array().parse(after);
+  for (const old of oldObjects) {
+    if (old.type !== "table" || !["sessions", "work_routes", "work_tasks", "work_attempts"].includes(old.name)) {
+      expect(newObjects).toContainEqual(old);
+      continue;
+    }
+    const added = objectSchema.parse(newObjects.find((entry) => entry.type === old.type && entry.name === old.name));
+    const sql = z.string().parse(added.sql);
+    const column = ", canonical_profile_key TEXT";
+    expect(sql.split(column)).toHaveLength(2);
+    expect({ ...added, sql: sql.replace(column, "") })
+      .toEqual({ ...old, sql: z.string().parse(old.sql) });
+  }
+};
+
+const withCanonicalSessionKey = (value: unknown): Record<string, unknown> => {
+  const row = z.record(z.string(), z.unknown()).parse(value);
+  const key = deriveLegacySessionProfileKey(row.provider_v39, row.preset, row.preset_contract);
+  expect(key).not.toBeNull();
+  return { ...row, canonical_profile_key: key };
 };
 
 const dropProviderV39SessionColumn = (database: Database): readonly Readonly<{
@@ -715,6 +779,7 @@ const dropSessionAdoptionAndPresetContractSchema = (database: Database): void =>
 };
 
 const dropHostedMemorySchema = (database: Database): void => {
+  dropCanonicalProfileSchema(database);
   database.exec("DROP TRIGGER IF EXISTS work_session_project_authority_guard");
   const hostedObjects = z.object({
     name: z.string().regex(/^[a-z0-9_]+$/u),
@@ -942,6 +1007,7 @@ const downgradeToExactProviderVersion47 = (database: Database): void => {
 
 /** Canonical-memory v48 predecessor, without the nullable Work project guard. */
 const downgradeToExactProviderVersion48 = (database: Database): void => {
+  dropCanonicalProfileSchema(database);
   database.exec(`DROP TRIGGER IF EXISTS work_session_project_authority_guard;
     DELETE FROM migrations WHERE version>48; PRAGMA user_version=48`);
 };
@@ -968,6 +1034,7 @@ const downgradeToHistoricalAdoptionVersion35 = (database: Database): void => {
 };
 
 const dropPostLegacyAdoptionVersion36Schema = (database: Database): void => {
+  dropCanonicalProfileSchema(database);
   database.exec("DROP TRIGGER IF EXISTS work_session_project_authority_guard");
   downgradeProviderAccountsToReleasedVersion(database, 40);
   database.exec("PRAGMA foreign_keys=OFF");
@@ -2597,6 +2664,56 @@ const reserveTestProjectMemoryAuthority = (
 };
 const peerIdempotencyKey = (index: number): string =>
   `20000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+const peerOriginBoundaryFixture = async () => {
+  const { store, home } = await fixture();
+  const root = join(home, "peer-origin-boundary");
+  await mkdir(root);
+  const project = await store.createProject("Peer origin boundary", root);
+  const profile = signInProfile(store, "Peer origin boundary", "peer-origin@example.com");
+  const activeSession = (turnId: string) => {
+    const created = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    return store.setSessionTurnState({
+      sessionId: created.id,
+      expectedRevision: created.revision,
+      state: "active",
+      activeTurnId: turnId,
+    });
+  };
+  const actor = activeSession("turn-peer-origin-actor");
+  const target = activeSession("turn-peer-origin-target");
+  const requestFor = (index: number): Parameters<StateStore["admitPeerSessionAction"]>[0] => ({
+    actorSessionId: actor.id,
+    actorTurnId: actor.activeTurnId!,
+    targetSessionId: target.id,
+    expectedTargetRevision: target.revision,
+    delivery: "steer",
+    requestDigest: testDigest(`peer origin request ${String(index)}`),
+    messageDigest: testDigest(`peer origin message ${String(index)}`),
+    reasonDigest: testDigest(`peer origin reason ${String(index)}`),
+    idempotencyKey: peerIdempotencyKey(91_000 + index),
+  });
+  const applySteer = (index: number) => {
+    const action = store.admitPeerSessionAction(requestFor(index)).action;
+    store.beginPeerSessionActionEffect(action.id);
+    return store.settlePeerSessionAction({
+      actionId: action.id,
+      expectedState: "effect_started",
+      state: "applied",
+      targetTurnId: target.activeTurnId!,
+      resultDigest: testDigest(`peer origin receipt ${String(index)}`),
+    });
+  };
+  const origins = () => store.readPeerSessionTurnOrigins({
+    sessionId: target.id,
+    turnId: target.activeTurnId!,
+  });
+  return { actor, applySteer, origins, requestFor, store, target };
+};
 const codexRuntimeProfile = (
   profile: Readonly<{ id: string; processGeneration: number }>,
   observedAt = 2_000,
@@ -2863,6 +2980,364 @@ const seedProviderUsageForTest = (
   } finally {
     database.close(false);
   }
+};
+
+const peerAbandonmentFenceFixture = async (delivery: "send" | "steer" | "queue") => {
+  let now = 50_000;
+  const created = await fixture({ now: () => now });
+  let store = created.store;
+  const daemon = startInputFixtureDaemon(store);
+  const root = join(created.home, "peer-abandonment-fence");
+  await mkdir(root);
+  const project = await store.createProject("Peer abandonment fence", root);
+  const profile = signInProfile(store, "Peer abandonment fence", "peer-fence@example.com");
+  const providerAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
+  const createSession = (name: string, active: boolean) => {
+    const initial = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    return store.bindSession({
+      sessionId: initial.id,
+      expectedRevision: initial.revision,
+      providerThreadId: `thread-peer-fence-${name}`,
+      state: active ? "active" : "idle",
+      ...(active ? { activeTurnId: `turn-peer-fence-${name}` } : {}),
+    });
+  };
+  const source = createSession("source", true);
+  const target = createSession("target", delivery === "steer");
+  const spare = createSession("spare", true);
+  const targetTurnId = "turn-peer-fence-target";
+  let nextKey = 94_000;
+  const request = (
+    actorId: SessionRecord["id"],
+    targetId: SessionRecord["id"],
+    kind: "send" | "steer" | "queue",
+    message: string,
+  ): Parameters<StateStore["admitPeerSessionAction"]>[0] => ({
+    actorSessionId: actorId,
+    actorTurnId: store.requireSession(actorId).activeTurnId!,
+    targetSessionId: targetId,
+    expectedTargetRevision: store.requireSession(targetId).revision,
+    delivery: kind,
+    requestDigest: testDigest(`fence request ${String(nextKey)}`),
+    messageDigest: testDigest(message),
+    reasonDigest: testDigest("fence reason"),
+    idempotencyKey: peerIdempotencyKey(nextKey++),
+    ...(kind === "queue" ? { message } : {}),
+  });
+  const message = "uncertain peer message with durable abandonment authority";
+  const incomingRequest = request(source.id, target.id, delivery, message);
+  const incoming = store.admitPeerSessionAction(incomingRequest);
+  const runtime = codexRuntimeProfile(profile);
+  const direct = delivery === "queue" ? undefined : store.prepareSessionInputMutation({
+    ...daemon,
+    kind: delivery === "send" ? "session.send" : "session.steer",
+    sessionId: target.id,
+    providerAuthority,
+    message,
+    attachments: [],
+    idempotencyKey: incomingRequest.idempotencyKey,
+  }).attempt;
+  let effectDigest: string;
+  if (delivery === "queue") {
+    const queue = incoming.queue;
+    if (queue === undefined) throw new Error("Missing peer fence queue");
+    effectDigest = store.beginQueueEffect({
+      queueId: queue.id,
+      sessionId: target.id,
+      providerAuthority,
+      profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000099",
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: queue.id,
+        sessionId: target.id,
+        providerThreadId: target.providerThreadId!,
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: queue.id,
+        messageDigest: testDigest(message),
+        runtimeProfile: runtime,
+      },
+    }).digest;
+  } else {
+    if (direct === undefined) throw new Error("Missing peer fence mutation");
+    const common = {
+      providerThreadId: target.providerThreadId!,
+      clientMessageId: direct.id,
+      messageDigest: testDigest(message),
+      messageActor: "peer_session" as const,
+    };
+    effectDigest = store.beginSessionMutationEffect({
+      ...daemon,
+      attemptId: direct.id,
+      sessionId: target.id,
+      providerAuthority,
+      attachments: [],
+      profileGeneration: profile.processGeneration,
+      message,
+      transcript: {
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000099",
+        actor: "peer_session",
+        message,
+      },
+      evidence: delivery === "send" ? {
+        ...common,
+        kind: "session.send",
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        runtimeProfile: runtime,
+      } : {
+        ...common,
+        kind: "session.steer",
+        baseline: { providerUpdatedAt: null, status: "active", activeTurnId: targetTurnId },
+        activeTurnId: targetTurnId,
+      },
+    }).digest;
+  }
+
+  // An observed active target can admit work before the original response is
+  // classified as uncertain. Effect begin must recheck the later fence.
+  if (delivery !== "steer") {
+    store.setSessionTurnState({
+      sessionId: target.id,
+      expectedRevision: store.requireSession(target.id).revision,
+      state: "active",
+      activeTurnId: targetTurnId,
+    });
+  }
+  const completedRequest = request(target.id, spare.id, "steer", "already completed peer work");
+  const completed = store.admitPeerSessionAction(completedRequest).action;
+  store.beginPeerSessionActionEffect(completed.id);
+  store.settlePeerSessionAction({
+    actionId: completed.id,
+    expectedState: "effect_started",
+    state: "applied",
+    targetTurnId: spare.activeTurnId!,
+    resultDigest: testDigest("completed fence fixture receipt"),
+  });
+  const pending = store.admitPeerSessionAction(
+    request(target.id, source.id, "steer", "preadmitted peer return"),
+  ).action;
+  if (incoming.queue !== undefined) {
+    store.markQueueEffectAmbiguous(incoming.queue.id, effectDigest);
+  } else {
+    if (direct === undefined) throw new Error("Missing direct peer ambiguity authority");
+    expect(store.transitionMutation(direct.id, "effect_started", "ambiguous")).toBeTrue();
+    store.quarantineSession(target.id);
+    store.settlePeerSessionAction({
+      actionId: incoming.action.id,
+      expectedState: "effect_started",
+      state: "ambiguous",
+    });
+  }
+  const baseResolutionEvidence = { action: "user_abandon", providerEffectRetried: false };
+  const abandon = (
+    resolutionEvidence: unknown = baseResolutionEvidence,
+    active = true,
+    activeTurnId: string | null = targetTurnId,
+  ) => {
+    const provider = {
+      providerThreadId: target.providerThreadId!,
+      title: "Abandoned uncertain peer target",
+      status: active ? "active" as const : "idle" as const,
+      ...(active && activeTurnId !== null ? { activeTurnId } : {}),
+    };
+    if (incoming.queue !== undefined) {
+      return store.resolveQueueEffect({
+        queueId: incoming.queue.id,
+        expectedEvidenceDigest: effectDigest,
+        resolution: "abandoned",
+        resolutionEvidence,
+        provider,
+      });
+    }
+    if (direct === undefined) throw new Error("Missing direct peer recovery authority");
+    const resolved = store.resolveSessionMutation({
+      attemptId: direct.id,
+      expectedOriginalState: "ambiguous",
+      expectedEvidenceDigest: effectDigest,
+      resolution: "abandoned",
+      resolutionEvidence,
+      provider,
+    });
+    store.settlePeerSessionAction({
+      actionId: incoming.action.id,
+      expectedState: "ambiguous",
+      state: "failed",
+      resultDigest: testDigest("abandoned peer nested resolution"),
+    });
+    return resolved;
+  };
+  const resolutionEvidence = () => incoming.queue === undefined
+    ? store.readMutation(incomingRequest.idempotencyKey)?.resolution?.evidence
+    : store.readQueueEffect(incoming.queue.id)?.resolution?.evidence;
+  const changeTurn = (sessionId: SessionRecord["id"], turnId: string | null) =>
+    store.setSessionTurnState({
+      sessionId,
+      expectedRevision: store.requireSession(sessionId).revision,
+      state: turnId === null ? "idle" : "active",
+      ...(turnId === null ? {} : { activeTurnId: turnId }),
+    });
+  const appendAbandonedSteers = (count: number) => {
+    if (delivery !== "steer" || direct === undefined) throw new Error("Steer receipt corpus required");
+    const receipts = [{ attemptId: direct.id, actionId: incoming.action.id, turnId: targetTurnId }];
+    for (let index = 0; index < count; index += 1) {
+      const turnId = `turn-peer-fence-page-${String(index)}`;
+      changeTurn(target.id, turnId);
+      const nextRequest = request(source.id, target.id, "steer", message);
+      const action = store.admitPeerSessionAction(nextRequest).action;
+      const attempt = store.prepareSessionInputMutation({
+        ...daemon,
+        kind: "session.steer",
+        sessionId: target.id,
+        providerAuthority,
+        message,
+        attachments: [],
+        idempotencyKey: nextRequest.idempotencyKey,
+      }).attempt;
+      const effect = store.beginSessionMutationEffect({
+        ...daemon,
+        attemptId: attempt.id,
+        sessionId: target.id,
+        providerAuthority,
+        attachments: [],
+        profileGeneration: profile.processGeneration,
+        message,
+        transcript: {
+          accountId: profile.id,
+          providerGeneration: profile.processGeneration,
+          providerConnectionId: "10000000-0000-4000-8000-000000000099",
+          actor: "peer_session",
+          message,
+        },
+        evidence: {
+          kind: "session.steer",
+          providerThreadId: target.providerThreadId!,
+          clientMessageId: attempt.id,
+          messageDigest: testDigest(message),
+          messageActor: "peer_session",
+          baseline: { providerUpdatedAt: null, status: "active", activeTurnId: turnId },
+          activeTurnId: turnId,
+        },
+      });
+      expect(store.transitionMutation(attempt.id, "effect_started", "ambiguous")).toBeTrue();
+      store.quarantineSession(target.id);
+      store.settlePeerSessionAction({ actionId: action.id, expectedState: "effect_started", state: "ambiguous" });
+      store.resolveSessionMutation({
+        attemptId: attempt.id,
+        expectedOriginalState: "ambiguous",
+        expectedEvidenceDigest: effect.digest,
+        resolution: "abandoned",
+        resolutionEvidence: baseResolutionEvidence,
+        provider: {
+          providerThreadId: target.providerThreadId!,
+          title: "Independent historical peer turn",
+          status: "idle",
+        },
+      });
+      store.settlePeerSessionAction({
+        actionId: action.id,
+        expectedState: "ambiguous",
+        state: "failed",
+        resultDigest: testDigest("abandoned peer pagination receipt"),
+      });
+      receipts.push({ attemptId: attempt.id, actionId: action.id, turnId });
+    }
+    return receipts;
+  };
+  const close = () => {
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+  };
+  const reopen = () => {
+    const paths = store.paths;
+    close();
+    store = new StateStore(paths, { now: () => now });
+    stores.push(store);
+  };
+  const prune = () => {
+    changeTurn(source.id, null);
+    changeTurn(spare.id, "turn-peer-fence-maintainer");
+    now += PEER_SESSION_ACTION_RETAIN_AGE_MS + 1;
+    store.admitPeerSessionAction(request(spare.id, source.id, "send", "retention maintenance"));
+    expect(() => store.requirePeerSessionAction(incoming.action.id)).toThrow("PEER_SESSION_NOT_FOUND");
+  };
+  const rewriteLegacyMarker = (marker: unknown, options: Readonly<{
+    rawMarkerJson?: string;
+    legacySteerTurnNull?: boolean;
+  }> = {}) => {
+    const paths = store.paths;
+    close();
+    const writer = new Database(paths.database, { create: false, strict: true });
+    const table = incoming.queue === undefined ? "mutation_resolutions" : "queue_effect_resolutions";
+    const identity = incoming.queue?.id ?? direct?.id;
+    const column = incoming.queue === undefined ? "attempt_id" : "queue_id";
+    const triggerName = `${table}_immutable_update`;
+    try {
+      const trigger = z.object({ sql: z.string() }).strict().parse(writer.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+      ).get(triggerName));
+      const row = z.object({ evidence_json: z.string() }).strict().parse(
+        writer.query(`SELECT evidence_json FROM ${table} WHERE ${column}=?`).get(identity!),
+      );
+      const evidence = z.record(z.string(), z.unknown()).parse(JSON.parse(row.evidence_json) as unknown);
+      if (marker === undefined) delete evidence.peerCausalFence;
+      else evidence.peerCausalFence = marker;
+      const resolutionJson = options.rawMarkerJson === undefined
+        ? JSON.stringify(evidence)
+        : `${JSON.stringify(evidence).slice(0, -1)},"peerCausalFence":${options.rawMarkerJson}}`;
+      // Represent a pre-fence immutable receipt or corrupt legacy value. Restore
+      // the exact guard before reopening; production never rewrites a receipt.
+      writer.exec(`DROP TRIGGER ${triggerName}`);
+      try {
+        writer.query(`UPDATE ${table} SET evidence_json=? WHERE ${column}=?`)
+          .run(resolutionJson, identity!);
+      } finally {
+        writer.exec(trigger.sql);
+      }
+      if (options.legacySteerTurnNull === true) {
+        if (delivery !== "steer" || direct === undefined) throw new Error("Legacy steer fixture required");
+        const effectTrigger = z.object({ sql: z.string() }).strict().parse(writer.query(
+          "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='mutation_effect_evidence_immutable_update'",
+        ).get());
+        const effectRow = z.object({ evidence_json: z.string() }).strict().parse(writer.query(
+          "SELECT evidence_json FROM mutation_effect_evidence WHERE attempt_id=?",
+        ).get(direct.id));
+        const effect = z.record(z.string(), z.unknown()).parse(JSON.parse(effectRow.evidence_json) as unknown);
+        effect.activeTurnId = null;
+        const effectJson = JSON.stringify(effect);
+        writer.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
+        try {
+          writer.query("UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?")
+            .run(effectJson, testDigest(effectJson), direct.id);
+        } finally {
+          writer.exec(effectTrigger.sql);
+        }
+      }
+    } finally {
+      writer.close(false);
+      store = new StateStore(paths, { now: () => now });
+      stores.push(store);
+    }
+  };
+  const returnRequest = () => request(
+    target.id,
+    source.id,
+    store.requireSession(source.id).state === "idle" ? "send" : "steer",
+    "new peer return after abandonment",
+  );
+  return {
+    abandon, appendAbandonedSteers, baseResolutionEvidence, changeTurn, completed, completedRequest,
+    incoming, pending, prune, reopen, resolutionEvidence, returnRequest,
+    rewriteLegacyMarker, source, spare, target, targetTurnId,
+    get store() { return store; },
+  };
 };
 
 const prepareAuthorizedReset = (
@@ -7711,7 +8186,8 @@ describe("StateStore", () => {
       requirement: { model: "gpt-5.6-sol", effort: "max" },
     });
     const database = new Database(store.paths.database, { strict: true });
-    database.query("UPDATE sessions SET preset_contract=? WHERE id=?")
+    // Synthetic historical binding, not a source-authentic release fixture.
+    database.query("UPDATE sessions SET preset_contract=?,canonical_profile_key='codex:gpt-6-astra:max' WHERE id=?")
       .run(currentPresetContract, created.id);
     database.close(false);
     expect(store.requireSessionPresetRequirement(created.id)).toEqual({
@@ -7751,7 +8227,8 @@ describe("StateStore", () => {
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
     });
     const database = new Database(store.paths.database, { strict: true });
-    database.query("UPDATE sessions SET preset_contract=? WHERE id=?")
+    // Retain the legacy binding coherently before authoring its recovery evidence.
+    database.query("UPDATE sessions SET preset_contract=?,canonical_profile_key='codex:gpt-6-astra:max' WHERE id=?")
       .run(currentPresetContract, session.id);
     database.close(false);
     const runtimeProfile = {
@@ -17855,9 +18332,10 @@ describe("StateStore", () => {
     }
   });
 
-  test("requires unit-marked safe baseline timestamps without rewriting legacy evidence", async () => {
-    for (const kind of ["session.stop", "session.rename"] as const) {
-      for (const baselineTime of [null, 10, 10.5, Number.MAX_SAFE_INTEGER + 1]) {
+  // Each independent store gets the unchanged per-test budget and cleanup.
+  for (const kind of ["session.stop", "session.rename"] as const) {
+    for (const baselineTime of [null, 10, 10.5, Number.MAX_SAFE_INTEGER + 1]) {
+      test(`requires unit-marked safe baseline timestamps without rewriting legacy evidence: ${kind}, ${String(baselineTime)}`, async () => {
         const { store } = await fixture();
         const profile = signInProfile(store, "Legacy timestamp", "legacy-timestamp@example.com");
         const local = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
@@ -17895,9 +18373,9 @@ describe("StateStore", () => {
             provider: { providerThreadId: evidence.providerThreadId, title: "Resolved", status: "idle", providerUpdatedAt: 10_000 } });
           expect(inspector.query("SELECT receipt_json FROM mutation_resolutions WHERE attempt_id=?").get(attempt.id)).toEqual({ receipt_json: null });
         } finally { inspector.close(false); }
-      }
+      });
     }
-  });
+  }
 
   test("migrates schema 40 through autorespond v44 while preserving legacy bytes and digests", async () => {
     const { store } = await fixture();
@@ -17946,9 +18424,7 @@ describe("StateStore", () => {
          AND tbl_name!='account_mutation_authority_rebinds'
          ORDER BY type,name`,
       ).all();
-      for (const row of z.array(z.unknown()).parse(stableSchemaBefore)) {
-        expect(stableSchemaAfter).toContainEqual(row);
-      }
+      expectCanonicalSchemaExtension(stableSchemaBefore, stableSchemaAfter);
       expect(inspector.query("SELECT * FROM migrations WHERE version<41 ORDER BY version").all()).toEqual(ledgerBefore);
       expect(inspector.query("SELECT version FROM migrations WHERE version>=40 ORDER BY version").all()).toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }, { version: 45 }, { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }, ...Array.from({ length: 11 }, (_, index) => ({ version: index + 50 }))]);
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
@@ -17988,8 +18464,8 @@ describe("StateStore", () => {
     }
   });
 
-  test("refuses a damaged timestamp guard on exact schema 41 before Work v42 migration", async () => {
-    for (const definition of ["missing", "weaker", "changed_literal"] as const) {
+  for (const definition of ["missing", "weaker", "changed_literal"] as const) {
+    test(`refuses a damaged timestamp guard on exact schema 41 before Work v42 migration: ${definition}`, async () => {
       const paths = await canonicalTimestampArchiveForTest(41);
       const inspector = new Database(paths.database, { create: false, strict: true });
       try {
@@ -18020,8 +18496,8 @@ describe("StateStore", () => {
           .toEqual(ledgerBefore);
         expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
       } finally { inspector.close(false); }
-    }
-  });
+    });
+  }
 
   test.each(["missing", "negative_time", "unsafe_time", "later_version"] as const)(
     "refuses an invalid authentic schema 40 ledger without changing retained rows or schema: %s",
@@ -18235,7 +18711,78 @@ describe("StateStore", () => {
       }
     } finally { inspector.close(false); }
   });
-  test.each([
+  test("migrates authentic canonical50 ledger and preserves old bytes without inventing session runtime authority", async () => {
+    const paths = await canonical50LedgerArchive();
+    const captured = canonicalLoginLedgerFixtures[50].retained;
+    const migratedAt = 70_000;
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
+      const tables = z.array(z.object({ name: z.string().regex(/^[a-z_0-9]+$/u) }).strict()).parse(
+        inspector.query("SELECT name FROM sqlite_master WHERE type='table' AND name!='migrations' ORDER BY name LIMIT 257").all(),
+      );
+      expect(tables.length).toBeLessThanOrEqual(256);
+      // Freeze the archived column names before ALTER TABLE. Compare storage
+      // types and original cell bytes, not decoded or newly added projections.
+      const reads = tables.map(({ name }) => {
+        const columns = z.array(z.object({ name: z.string().regex(/^[a-z_0-9]+$/u) })).parse(
+          inspector.query(`PRAGMA table_info("${name}")`).all(),
+        );
+        expect(columns.length).toBeGreaterThan(0);
+        expect(columns.length).toBeLessThanOrEqual(64);
+        const fields = columns.map(({ name: column }) =>
+          `typeof("${column}") || ':' || hex(CAST("${column}" AS BLOB)) AS "${column}"`);
+        return { name, sql: `SELECT ${fields.join(",")} FROM "${name}" LIMIT 4097` };
+      });
+      const originalCells = () => Object.fromEntries(reads.map(({ name, sql }) => {
+        const statement = inspector.prepare(sql);
+        try {
+          const rows = statement.all().sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+          expect(rows.length).toBeLessThanOrEqual(4096);
+          return [name, rows];
+        } finally { statement.finalize(); }
+      }));
+      const oldCells = originalCells();
+      const oldLedger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
+      expect(oldLedger).toHaveLength(50);
+      expect(inspector.query("SELECT * FROM session_runtime_profiles").all()).toEqual([]);
+      const beforeReadonly = canonicalAuthBudgetSnapshot(inspector);
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:50:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(beforeReadonly);
+
+      const migrated = new StateStore(paths, { now: () => migratedAt });
+      stores.push(migrated);
+      expect(originalCells()).toEqual(oldCells);
+      expect(inspector.query("SELECT * FROM migrations WHERE version<=50 ORDER BY version").all()).toEqual(oldLedger);
+      expect(inspector.query("SELECT * FROM migrations WHERE version>50 ORDER BY version").all())
+        .toEqual(Array.from({ length: 10 }, (_, index) => ({ version: index + 51, applied_at: migratedAt })));
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(inspector.query("SELECT scope_kind,scope_id,reason,recorded_at FROM legacy_provider_authority_quarantines ORDER BY scope_kind,scope_id").all())
+        .toEqual([{ scope_kind: "session", scope_id: captured.session.id,
+          reason: "missing_immutable_runtime_authority", recorded_at: migratedAt }]);
+      expect(inspector.query("SELECT * FROM session_provider_authorities").all()).toEqual([]);
+      expect(inspector.query("SELECT * FROM runtime_profile_provider_authorities").all()).toEqual([]);
+      expect(inspector.query("SELECT * FROM session_runtime_profiles").all()).toEqual([]);
+      expect(migrated.requireProfileById(captured.profile.id)).toEqual(captured.profile);
+      expect(migrated.requireSession(captured.session.id)).toMatchObject(captured.session);
+      expect(() => migrated.requireCapturedSessionProviderAuthority(captured.session.id))
+        .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+      const after = canonicalAuthBudgetSnapshot(inspector);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => migratedAt + 1 });
+        stores.push(reopened);
+        expect(reopened.requireProfileById(captured.profile.id)).toEqual(captured.profile);
+        expect(reopened.requireSession(captured.session.id)).toMatchObject(captured.session);
+        expect(() => reopened.requireCapturedSessionProviderAuthority(captured.session.id))
+          .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+        expect(originalCells()).toEqual(oldCells);
+        expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(after);
+      }
+    } finally { inspector.close(false); }
+  });
+
+  for (const version of [49, 50, 60] as const) test.each([
     "missing_40",
     "missing_41",
     "missing_42",
@@ -18246,24 +18793,44 @@ describe("StateStore", () => {
     "missing_47",
     "missing_48",
     "missing_49",
+    ...(version >= 50 ? ["missing_50" as const] : []),
     "negative_time",
     "unsafe_time",
     "later_version",
   ] as const)(
-    "refuses an invalid current schema 49 migration ledger without writes: %s",
+    `refuses an invalid ${version === 60 ? "current" : "authentic predecessor"} schema ${String(version)} migration ledger without writes: %s`,
     async (damage) => {
-      const { store } = await fixture();
-      const profile = signInProfile(store, "Current ledger", "current-ledger@example.com");
-      const session = upsertProvenTestSession(store, {
-        profileId: profile.id,
-        preset: "high",
-        fastEnabled: false,
-        providerThreadId: "current-ledger-thread",
-        state: "idle",
-        providerUpdatedAt: 10,
-      });
-      const inspector = new Database(store.paths.database, { create: false, strict: true });
+      let paths: ReturnType<typeof resolveStatePaths>;
+      let profileId: string;
+      let sessionId: string;
+      if (version === 49) {
+        const home = await realpath(await mkdtemp(join(tmpdir(), "hra-ledger-canonical49-")));
+        paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+        await initializeStatePaths(paths);
+        await writeFile(paths.database, canonical49WorkDatabaseBytes(), { mode: 0o600 });
+        profileId = canonical49WorkFixture.profileId;
+        sessionId = canonical49WorkFixture.actorSessionId;
+      } else if (version === 50) {
+        paths = await canonical50LedgerArchive();
+        profileId = canonicalLoginLedgerFixtures[50].retained.profile.id;
+        sessionId = canonicalLoginLedgerFixtures[50].retained.session.id;
+      } else {
+        const { store } = await fixture();
+        paths = store.paths;
+        const profile = signInProfile(store, "Current ledger", "current-ledger@example.com");
+        profileId = profile.id;
+        sessionId = upsertProvenTestSession(store, {
+          profileId,
+          preset: "high",
+          fastEnabled: false,
+          providerThreadId: "current-ledger-thread",
+          state: "idle",
+          providerUpdatedAt: 10,
+        }).id;
+      }
+      const inspector = new Database(paths.database, { create: false, strict: true });
       try {
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: version });
         if (damage === "missing_40") inspector.exec("DELETE FROM migrations WHERE version=40");
         else if (damage === "missing_41") inspector.exec("DELETE FROM migrations WHERE version=41");
         else if (damage === "missing_42") inspector.exec("DELETE FROM migrations WHERE version=42");
@@ -18274,26 +18841,34 @@ describe("StateStore", () => {
         else if (damage === "missing_47") inspector.exec("DELETE FROM migrations WHERE version=47");
         else if (damage === "missing_48") inspector.exec("DELETE FROM migrations WHERE version=48");
         else if (damage === "missing_49") inspector.exec("DELETE FROM migrations WHERE version=49");
+        else if (damage === "missing_50") inspector.exec("DELETE FROM migrations WHERE version=50");
         else if (damage === "negative_time") {
           inspector.exec("PRAGMA ignore_check_constraints=ON; UPDATE migrations SET applied_at=-1 WHERE version=45; PRAGMA ignore_check_constraints=OFF;");
         } else if (damage === "unsafe_time") {
           inspector.query("UPDATE migrations SET applied_at=? WHERE version=45")
             .run(Number.MAX_SAFE_INTEGER + 1);
-        } else inspector.exec("INSERT INTO migrations(version,applied_at) VALUES (50,1000)");
+        } else inspector.query("INSERT INTO migrations(version,applied_at) VALUES (?,1000)").run(version + 1);
         const schemaBefore = inspector.query(
           "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
         ).all();
         const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
-        const sessionBefore = inspector.query("SELECT * FROM sessions WHERE id=?").get(session.id);
-        const profileBefore = inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id);
+        const sessionBefore = inspector.query("SELECT * FROM sessions WHERE id=?").get(sessionId);
+        const profileBefore = inspector.query("SELECT * FROM profiles WHERE id=?").get(profileId);
+        const allBefore = version === 50 ? canonicalAuthBudgetSnapshot(inspector) : undefined;
 
         for (const readonly of [false, true]) {
-          expect(() => new StateStore(store.paths, { readonly })).toThrow("STATE_SCHEMA_V49_MIGRATION_LEDGER_INVALID");
+          expect(() => new StateStore(paths, { readonly })).toThrow(
+            readonly && version < 60
+              ? `STATE_SCHEMA_MIGRATION_REQUIRED:${String(version)}:60`
+              : version === 60 ? "STATE_SCHEMA_JOIN_LEDGER_INVALID"
+                : `STATE_SCHEMA_V${String(version)}_MIGRATION_LEDGER_INVALID`,
+          );
           expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
           expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledgerBefore);
-          expect(inspector.query("SELECT * FROM sessions WHERE id=?").get(session.id)).toEqual(sessionBefore);
-          expect(inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id)).toEqual(profileBefore);
-          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+          expect(inspector.query("SELECT * FROM sessions WHERE id=?").get(sessionId)).toEqual(sessionBefore);
+          expect(inspector.query("SELECT * FROM profiles WHERE id=?").get(profileId)).toEqual(profileBefore);
+          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: version });
+          if (allBefore !== undefined) expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(allBefore);
         }
       } finally { inspector.close(false); }
     },
@@ -28020,7 +28595,7 @@ describe("StateStore", () => {
       foreignKeyViolations: 0,
       profileColumns: ["codex_account_key"],
       sqliteVersion: expect.stringMatching(/^3\./u),
-      userVersion: 49,
+      userVersion: 60,
     });
   });
 
@@ -28282,7 +28857,7 @@ describe("StateStore", () => {
         "SELECT type,tbl_name,sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'",
       ).get()).toEqual(timestampGuardBefore);
       expect(inspector.query("SELECT * FROM sessions WHERE id=?").get(session.id))
-        .toEqual(sessionBefore);
+        .toEqual(withCanonicalSessionKey(sessionBefore));
       const workGuard = z.object({ sql: z.string() }).parse(inspector.query(
         "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='work_devin_preset_contract_guard'",
       ).get()).sql;
@@ -30172,7 +30747,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current49 never recreates missing provider-v39 authority", async () => {
+  test("current60 never recreates missing provider-v39 authority", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -30202,7 +30777,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v49 rejects a weakened same-name provider-v39 authority trigger without repair", async () => {
+  test("current v60 rejects a weakened same-name provider-v39 authority trigger without repair", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -30241,7 +30816,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current49 never backfills a missing provider-v39 column", async () => {
+  test("current60 never backfills a missing provider-v39 column", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -30510,7 +31085,7 @@ describe("StateStore", () => {
         recorded_at: 7_350,
       });
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 35 AND 49 ORDER BY version",
+        "SELECT version FROM migrations WHERE version BETWEEN 35 AND 50 ORDER BY version",
       ).all()).toEqual([
         { version: 35 },
         { version: 36 },
@@ -31055,7 +31630,7 @@ describe("StateStore", () => {
       .toBe(Number.MAX_SAFE_INTEGER);
   });
 
-  test("refuses missing and noncanonical notification-hours authority", async () => {
+  test("refuses missing and noncanonical notification-hours authority: missing singleton", async () => {
     const missingFixture = await fixture();
     const missingPaths = missingFixture.store.paths;
     missingFixture.store.close();
@@ -31074,7 +31649,9 @@ describe("StateStore", () => {
     expect(() => new StateStore(missingPaths, {
       resolveMachineTimeZone: () => "UTC",
     })).toThrow("NOTIFICATION_HOURS_POLICY_MISSING");
+  });
 
+  test("refuses missing and noncanonical notification-hours authority: noncanonical time zone", async () => {
     const corruptFixture = await fixture();
     const corruptPaths = corruptFixture.store.paths;
     corruptFixture.store.close();
@@ -31100,7 +31677,9 @@ describe("StateStore", () => {
     expect(() => new StateStore(corruptPaths, {
       resolveMachineTimeZone: () => "UTC",
     })).toThrow("NOTIFICATION_HOURS_POLICY_INVALID");
+  });
 
+  test("refuses missing and noncanonical notification-hours authority: weakened update guard", async () => {
     const weakenedFixture = await fixture();
     const weakenedPaths = weakenedFixture.store.paths;
     weakenedFixture.store.close();
@@ -31119,7 +31698,9 @@ describe("StateStore", () => {
     expect(() => new StateStore(weakenedPaths, {
       resolveMachineTimeZone: () => "UTC",
     })).toThrow("STATE_SCHEMA_V36_NOTIFICATION_HOURS_STRUCTURE_INVALID");
+  });
 
+  test("refuses missing and noncanonical notification-hours authority: weakened insert guard", async () => {
     const weakenedInsertFixture = await fixture();
     const weakenedInsertPaths = weakenedInsertFixture.store.paths;
     weakenedInsertFixture.store.close();
@@ -31181,7 +31762,7 @@ describe("StateStore", () => {
       expect(inspector.query("SELECT version,applied_at FROM migrations WHERE version<=30 ORDER BY version").all())
         .toEqual([...canonical30WorkFixture.migrations]);
       expect(inspector.query("SELECT version FROM migrations WHERE version>30 ORDER BY version").all())
-        .toEqual(Array.from({ length: 19 }, (_, index) => ({ version: index + 31 })));
+        .toEqual(Array.from({ length: 30 }, (_, index) => ({ version: index + 31 })));
       const retained = migrated.requireSession(canonical30WorkFixture.sessionId);
       expect(retained.providerThreadId).toBe(canonical30WorkFixture.sessionRow.provider_thread_id);
       expect(retained.preset).toBe(canonical30WorkFixture.sessionRow.preset);
@@ -31205,7 +31786,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v49 opens reject a missing v35 authority object without repairing it", async () => {
+  test("current v60 opens reject a missing v35 authority object without repairing it", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -31232,7 +31813,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current49 refuses a missing provider-switch object without recreating evidence", async () => {
+  test("current60 refuses a missing provider-switch object without recreating evidence", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -34049,7 +34630,7 @@ describe("StateStore", () => {
     const retired = create(firstProject.id, "Hidden retired provider history");
     const retire = new Database(store.paths.database, { create: false, strict: true });
     try {
-      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=? WHERE id=?")
+      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?")
         .run(devinPresetContract, retired.id);
     } finally {
       retire.close(false);
@@ -34120,7 +34701,7 @@ describe("StateStore", () => {
     })).toThrow();
     const retireActor = new Database(store.paths.database, { create: false, strict: true });
     try {
-      retireActor.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=? WHERE id=?")
+      retireActor.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?")
         .run(devinPresetContract, actor.id);
     } finally {
       retireActor.close(false);
@@ -34195,7 +34776,7 @@ describe("StateStore", () => {
 
     const retire = new Database(store.paths.database, { create: false, strict: true });
     try {
-      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=? WHERE id=?")
+      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?")
         .run(devinPresetContract, target.id);
     } finally {
       retire.close(false);
@@ -34786,10 +35367,224 @@ describe("StateStore", () => {
         status: "idle",
       },
     });
+    const storedResolution = restarted.readQueueEffect(abandoned.queue.id)?.resolution;
+    if (storedResolution === undefined) throw new Error("Missing normalized peer queue resolution");
+    expect(storedResolution.evidence).toEqual({
+      source: "exact_provider_absence",
+      peerCausalFence: {
+        version: 1,
+        providerThreadId: abandoned.providerThreadId,
+        activeTurnId: null,
+      },
+    });
     expect(restarted.requirePeerSessionAction(abandoned.action.id)).toMatchObject({
       state: "failed",
-      resultDigest: testDigest(JSON.stringify({ source: "exact_provider_absence" })),
+      resultDigest: testDigest(JSON.stringify(storedResolution.evidence)),
     });
+  });
+
+  test.each(["send", "steer", "queue"] as const)(
+    "peer abandonment fence persists for %s across restart and action pruning",
+    async (delivery) => {
+      const f = await peerAbandonmentFenceFixture(delivery);
+      expect(f.abandon()).toMatchObject({ state: "active", activeTurnId: f.targetTurnId });
+      const expectedEvidence = {
+        ...f.baseResolutionEvidence,
+        peerCausalFence: {
+          version: 1,
+          providerThreadId: f.target.providerThreadId,
+          activeTurnId: f.targetTurnId,
+        },
+      };
+      expect(f.resolutionEvidence()).toEqual(expectedEvidence);
+      expect(f.store.requirePeerSessionAction(f.incoming.action.id).state).toBe("failed");
+      if (delivery === "queue") {
+        expect(f.store.requirePeerSessionAction(f.incoming.action.id).resultDigest)
+          .toBe(testDigest(JSON.stringify(f.resolutionEvidence())));
+      }
+      expect(f.store.readPeerSessionTurnOrigins({
+        sessionId: f.target.id,
+        turnId: f.targetTurnId,
+      })).toEqual([]);
+      const denied = f.returnRequest();
+      expect(() => f.store.admitPeerSessionAction(denied)).toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      expect(f.store.readPeerSessionActionByIdempotencyKey(denied.idempotencyKey)).toBeNull();
+      expect(() => f.store.beginPeerSessionActionEffect(f.pending.id))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      expect(f.store.requirePeerSessionAction(f.pending.id).state).toBe("prepared");
+      expect(f.store.admitPeerSessionAction(f.completedRequest)).toMatchObject({
+        replay: true, action: { id: f.completed.id, state: "applied" },
+      });
+      expect(f.store.assertPeerSessionInspection({
+        actorSessionId: f.target.id,
+        actorTurnId: f.targetTurnId,
+        targetSessionId: f.source.id,
+        expectedTargetRevision: f.store.requireSession(f.source.id).revision,
+      }).id).toBe(f.source.id);
+
+      f.reopen();
+      expect(f.resolutionEvidence()).toEqual(expectedEvidence);
+      expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      expect(f.store.admitPeerSessionAction(f.completedRequest).replay).toBeTrue();
+      f.prune();
+      expect(f.resolutionEvidence()).toEqual(expectedEvidence);
+      expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      f.reopen();
+      expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      f.changeTurn(f.target.id, "turn-peer-fence-next");
+      expect(f.store.admitPeerSessionAction(f.returnRequest()).action.state).toBe("prepared");
+    },
+  );
+
+  test.each(["send", "queue"] as const)(
+    "peer abandonment fence retains a conservative legacy %s thread fence",
+    async (delivery) => {
+      const f = await peerAbandonmentFenceFixture(delivery);
+      f.abandon();
+      f.prune();
+      f.rewriteLegacyMarker(undefined);
+      expect(f.resolutionEvidence()).toEqual(f.baseResolutionEvidence);
+      expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      f.changeTurn(f.target.id, "turn-peer-fence-legacy-next");
+      expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+    },
+  );
+
+  test("peer abandonment fence reaches an affected receipt beyond one candidate page", async () => {
+    const f = await peerAbandonmentFenceFixture("steer");
+    f.abandon(f.baseResolutionEvidence, false);
+    const receipts = f.appendAbandonedSteers(17).sort((left, right) =>
+      left.attemptId < right.attemptId ? -1 : left.attemptId > right.attemptId ? 1 : 0);
+    expect(receipts).toHaveLength(18);
+    const affected = receipts.at(-1)!;
+    expect(receipts.slice(0, -1).every((receipt) => receipt.turnId !== affected.turnId)).toBeTrue();
+    f.prune();
+    for (const receipt of receipts) {
+      expect(() => f.store.requirePeerSessionAction(receipt.actionId)).toThrow("PEER_SESSION_NOT_FOUND");
+    }
+    f.reopen();
+    // UUID order, not creation time, is the immutable resolution cursor. Only
+    // its final row targets this turn; the preceding 17 rows are valid and safe.
+    f.changeTurn(f.target.id, affected.turnId);
+    const refused = f.returnRequest();
+    expect(() => f.store.admitPeerSessionAction(refused)).toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+    expect(f.store.readPeerSessionActionByIdempotencyKey(refused.idempotencyKey)).toBeNull();
+    f.changeTurn(f.target.id, "turn-peer-fence-after-all-pages");
+    expect(f.store.admitPeerSessionAction(f.returnRequest()).action.state).toBe("prepared");
+  });
+
+  test("peer abandonment fence retains the exact legacy steer turn without guessing later turns", async () => {
+    const f = await peerAbandonmentFenceFixture("steer");
+    f.abandon();
+    f.prune();
+    f.rewriteLegacyMarker(undefined);
+    expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+      .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+    f.changeTurn(f.target.id, "turn-peer-fence-legacy-steer-next");
+    expect(f.store.admitPeerSessionAction(f.returnRequest()).action.state).toBe("prepared");
+    // Joined evidence is source-selected and sealed. Rewriting only the raw
+    // effect cannot manufacture a historical null-turn source or matching
+    // provenance; the next open refuses it before any peer admission.
+    expect(() => f.rewriteLegacyMarker(undefined, { legacySteerTurnNull: true }))
+      .toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+  });
+
+  test.each(["send", "steer", "queue"] as const)(
+    "peer abandonment fence rejects caller markers and malformed retained authority for %s",
+    async (delivery) => {
+      const f = await peerAbandonmentFenceFixture(delivery);
+      for (const reserved of [undefined, null, { version: 1 }]) {
+        expect(() => f.abandon({ ...f.baseResolutionEvidence, peerCausalFence: reserved }))
+          .toThrow("PEER_SESSION_CAUSAL_FENCE_RESERVED");
+        expect(f.resolutionEvidence()).toBeUndefined();
+        expect(f.store.requireSession(f.target.id).state).toBe("recovery_required");
+        expect(f.store.requirePeerSessionAction(f.incoming.action.id).state).toBe("ambiguous");
+      }
+      expect(() => f.abandon(f.baseResolutionEvidence, true, null)).toThrow();
+      expect(f.resolutionEvidence()).toBeUndefined();
+      expect(f.store.requireSession(f.target.id).state).toBe("recovery_required");
+      expect(f.store.requirePeerSessionAction(f.incoming.action.id).state).toBe("ambiguous");
+      f.abandon();
+      f.prune();
+      // A valid marker for the old turn would allow this actor. A refusal now
+      // demonstrates malformed authority, not an incidental turn match.
+      f.changeTurn(f.target.id, "turn-peer-fence-malformed-control");
+      expect(f.store.admitPeerSessionAction(f.returnRequest()).action.state).toBe("prepared");
+      // Provider identifiers use JavaScript string bounds, not UTF-8 bytes or
+      // SQLite's Unicode-scalar/NUL-terminated length interpretation.
+      for (const activeTurnId of ["x".repeat(200), "é".repeat(200), "😀".repeat(100), `x\u0000${"x".repeat(198)}`]) {
+        f.rewriteLegacyMarker({ version: 1, providerThreadId: f.target.providerThreadId, activeTurnId });
+        expect(
+          f.store.admitPeerSessionAction(f.returnRequest()).action.state,
+          `Valid ${delivery} fence turn: ${JSON.stringify(activeTurnId)}`,
+        ).toBe("prepared");
+      }
+      for (const malformed of [
+        null,
+        {},
+        { version: 2, providerThreadId: f.target.providerThreadId, activeTurnId: f.targetTurnId },
+        { version: "1", providerThreadId: f.target.providerThreadId, activeTurnId: f.targetTurnId },
+        { version: 1, providerThreadId: "different-thread", activeTurnId: f.targetTurnId },
+        { version: 1, providerThreadId: "", activeTurnId: f.targetTurnId },
+        { version: 1, providerThreadId: "x".repeat(201), activeTurnId: f.targetTurnId },
+        { version: 1, providerThreadId: f.target.providerThreadId, activeTurnId: "" },
+        { version: 1, providerThreadId: f.target.providerThreadId, activeTurnId: "x".repeat(201) },
+        { version: 1, providerThreadId: f.target.providerThreadId, activeTurnId: "😀".repeat(101) },
+        { version: 1, providerThreadId: f.target.providerThreadId, activeTurnId: `x\u0000${"x".repeat(200)}` },
+        { version: 1, providerThreadId: f.target.providerThreadId },
+        { version: 1, providerThreadId: f.target.providerThreadId, activeTurnId: f.targetTurnId, extra: true },
+      ]) {
+        f.rewriteLegacyMarker(malformed);
+        expect(
+          () => f.store.admitPeerSessionAction(f.returnRequest()),
+          `Malformed ${delivery} fence: ${JSON.stringify(malformed)}`,
+        ).toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      }
+      for (const duplicateVersion of [1, 2]) {
+        f.rewriteLegacyMarker(undefined, {
+          rawMarkerJson: `{"version":1,"version":${String(duplicateVersion)},"providerThreadId":${JSON.stringify(f.target.providerThreadId)},"activeTurnId":${JSON.stringify(f.targetTurnId)}}`,
+        });
+        expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+          .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      }
+      const duplicateMarker = { version: 1, providerThreadId: f.target.providerThreadId, activeTurnId: null };
+      f.rewriteLegacyMarker(duplicateMarker, { rawMarkerJson: JSON.stringify(duplicateMarker) });
+      expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+        .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      fc.assert(fc.property(fc.integer({ min: 2, max: 1_000 }), (version) => {
+        f.rewriteLegacyMarker({ version, providerThreadId: f.target.providerThreadId, activeTurnId: null });
+        expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+          .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      }), { numRuns: 5 });
+    },
+  );
+
+  test("peer abandonment fence distinguishes a new inactive observation from missing legacy evidence", async () => {
+    for (const delivery of ["send", "steer", "queue"] as const) {
+      const f = await peerAbandonmentFenceFixture(delivery);
+      expect(f.abandon(f.baseResolutionEvidence, false)).toMatchObject({ state: "idle" });
+      expect(f.resolutionEvidence()).toEqual({
+        ...f.baseResolutionEvidence,
+        peerCausalFence: {
+          version: 1,
+          providerThreadId: f.target.providerThreadId,
+          activeTurnId: null,
+        },
+      });
+      f.reopen();
+      if (delivery === "steer") {
+        f.changeTurn(f.target.id, f.targetTurnId);
+        expect(() => f.store.admitPeerSessionAction(f.returnRequest()))
+          .toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
+      }
+      f.changeTurn(f.target.id, "turn-peer-fence-after-idle");
+      expect(f.store.admitPeerSessionAction(f.returnRequest()).action.state).toBe("prepared");
+    }
   });
 
   test("refuses peer self, scope, policy, stale revision, and target-state violations distinctly", async () => {
@@ -34928,6 +35723,119 @@ describe("StateStore", () => {
       parentActionIds: expect.arrayContaining([chain[1]!.id, independent.id]),
       rootActionIds: expect.arrayContaining([chain[0]!.id, independent.id]),
     });
+  });
+
+  test("peer storage boundary refuses a new thirty-third steer at origin admission", async () => {
+    const { applySteer, origins, requestFor, store } = await peerOriginBoundaryFixture();
+    for (let index = 0; index < PEER_SESSION_TURN_ORIGIN_LIMIT; index += 1) {
+      expect(applySteer(index).state).toBe("applied");
+    }
+    const accepted = origins();
+    expect(accepted).toHaveLength(PEER_SESSION_TURN_ORIGIN_LIMIT);
+    const request = requestFor(PEER_SESSION_TURN_ORIGIN_LIMIT);
+
+    expect(() => store.admitPeerSessionAction(request))
+      .toThrow("PEER_SESSION_CAUSAL_LIMIT_REFUSED");
+    expect(store.readPeerSessionActionByIdempotencyKey(request.idempotencyKey)).toBeNull();
+    expect(store.readPeerSessionDirectMessageSource(request.idempotencyKey)).toBeNull();
+    expect(store.listUnsettledPeerSessionActions(10)).toEqual([]);
+    expect(origins()).toEqual(accepted);
+  });
+
+  test("peer storage boundary rechecks prepared steer origin capacity before effect", async () => {
+    const { applySteer, origins, requestFor, store } = await peerOriginBoundaryFixture();
+    for (let index = 0; index < PEER_SESSION_TURN_ORIGIN_LIMIT - 1; index += 1) {
+      expect(applySteer(index).state).toBe("applied");
+    }
+    const prepared = store.admitPeerSessionAction(
+      requestFor(PEER_SESSION_TURN_ORIGIN_LIMIT - 1),
+    ).action;
+    expect(prepared.state).toBe("prepared");
+    expect(applySteer(PEER_SESSION_TURN_ORIGIN_LIMIT).state).toBe("applied");
+    const accepted = origins();
+    expect(accepted).toHaveLength(PEER_SESSION_TURN_ORIGIN_LIMIT);
+
+    expect(() => store.beginPeerSessionActionEffect(prepared.id))
+      .toThrow("PEER_SESSION_CAUSAL_LIMIT_REFUSED");
+    expect(store.requirePeerSessionAction(prepared.id)).toEqual(prepared);
+    expect(store.readMutation(prepared.idempotencyKey)).toBeNull();
+    expect(origins()).toEqual(accepted);
+  });
+
+  test("peer storage boundary preserves exact origin attachment replay at capacity", async () => {
+    const { actor, applySteer, origins, requestFor, store, target } =
+      await peerOriginBoundaryFixture();
+    // An already-begun effect exercises the immutable database backstop,
+    // independently of the pre-effect admission checks.
+    const pending = store.admitPeerSessionAction(
+      requestFor(PEER_SESSION_TURN_ORIGIN_LIMIT),
+    ).action;
+    const begun = store.beginPeerSessionActionEffect(pending.id);
+    for (let index = 0; index < PEER_SESSION_TURN_ORIGIN_LIMIT; index += 1) {
+      expect(applySteer(index).state).toBe("applied");
+    }
+    const accepted = origins();
+    expect(accepted).toHaveLength(PEER_SESSION_TURN_ORIGIN_LIMIT);
+    const action = accepted[0];
+    if (action === undefined) throw new Error("Expected an accepted peer origin.");
+    const attachment = {
+      actionId: action.id,
+      targetSessionId: target.id,
+      turnId: target.activeTurnId!,
+    };
+
+    expect(() => store.attachPeerSessionActionToTurn({
+      ...attachment,
+      targetSessionId: actor.id,
+    })).toThrow("PEER_SESSION_TARGET_STATE_REFUSED");
+    expect(() => store.attachPeerSessionActionToTurn({
+      ...attachment,
+      turnId: "turn-peer-origin-wrong",
+    })).toThrow("PEER_SESSION_TARGET_STATE_REFUSED");
+    expect(() => store.attachPeerSessionActionToTurn({
+      ...attachment,
+      actionId: pending.id,
+    })).toThrow("PEER_SESSION_TARGET_STATE_REFUSED");
+    expect(() => store.settlePeerSessionAction({
+      actionId: pending.id,
+      expectedState: "effect_started",
+      state: "applied",
+      targetTurnId: target.activeTurnId!,
+      resultDigest: testDigest("unadmitted thirty-third origin receipt"),
+    })).toThrow("peer session turn origin quota exceeded");
+    expect(store.requirePeerSessionAction(pending.id)).toEqual(begun);
+    expect(origins()).toEqual(accepted);
+
+    expect(store.attachPeerSessionActionToTurn(attachment)).toEqual(action);
+    expect(store.attachPeerSessionActionToTurn(attachment)).toEqual(action);
+    expect(store.admitPeerSessionAction(requestFor(0)))
+      .toMatchObject({ replay: true, action: { state: "applied" } });
+    expect(origins()).toEqual(accepted);
+  });
+
+  test("peer storage boundary preserves arbitrary ambiguous result digests", async () => {
+    const { origins, requestFor, store, target } = await peerOriginBoundaryFixture();
+    const action = store.admitPeerSessionAction(requestFor(0)).action;
+    store.beginPeerSessionActionEffect(action.id);
+    const originalDigest = testDigest("unrelated immutable ambiguous observation");
+    const ambiguous = store.settlePeerSessionAction({
+      actionId: action.id,
+      expectedState: "effect_started",
+      state: "ambiguous",
+      resultDigest: originalDigest,
+    });
+
+    for (const state of ["applied", "failed"] as const) {
+      expect(() => store.settlePeerSessionAction({
+        actionId: action.id,
+        expectedState: "ambiguous",
+        state,
+        ...(state === "applied" ? { targetTurnId: target.activeTurnId! } : {}),
+        resultDigest: testDigest(`replacement ${state} receipt`),
+      })).toThrow("illegal peer session action transition");
+      expect(store.requirePeerSessionAction(action.id)).toEqual(ambiguous);
+      expect(origins()).toEqual([]);
+    }
   });
 
   test("enforces atomic hourly peer action and distinct-target boundaries without charging replay", async () => {
@@ -36786,7 +37694,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v49 refuses missing or changed hosted-memory triggers without repair", async () => {
+  test("current v60 refuses missing or changed hosted-memory triggers without repair", async () => {
     for (const damage of ["missing", "changed"] as const) {
       const { store } = await fixture();
       const paths = store.paths;
@@ -36830,7 +37738,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v49 opens require the exact peer and local-memory guards", async () => {
+  test("current v60 opens require the exact peer and local-memory guards", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -36857,7 +37765,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v49 rejects widened peer queue columns and non-peer actor vocabulary without writes", async () => {
+  test("current v60 rejects widened peer queue columns and non-peer actor vocabulary without writes", async () => {
     for (const damage of ["widened_column", "invalid_row"] as const) {
       const { store } = await fixture();
       const profile = signInProfile(store, "Queue provenance column", "queue-column@example.com");
@@ -36922,7 +37830,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v49 opens never recreate a missing peer authority trigger or index", async () => {
+  test("current v60 opens never recreate a missing peer authority trigger or index", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();

@@ -645,7 +645,8 @@ const sessionRowSchema = z.object({
   // multi-provider presets, so `provider` plus this tier names the preset.
   preset: presetTierSchema,
   preset_contract: presetContractSchema,
-  // Canonical identity is proved against this row's own historical tuple.
+  // Validated against the row's own legacy tuple before any projection. Keeping
+  // this foreign value unknown gives missing/NULL/forged keys one fixed error.
   canonical_profile_key: z.unknown(),
   fast_enabled: z.union([z.literal(0), z.literal(1)]),
   state: sessionStateSchema,
@@ -17731,8 +17732,8 @@ const assertSchemaVersion50Authority = (database: Database): void => {
   assertLegacyCanonicalProfileStorageSchema(database);
 };
 
-// Only these exact released guards obstruct a key-only additive backfill.
-// Preserve their observed bodies and every historical revision and timestamp.
+// These three released guards block a key-only additive backfill. No other
+// guard is removed, and their exact observed SQL is restored before admission.
 const canonicalProfileBackfillGuards = [
   { name: "work_routes_no_update", table: "work_routes", sql: `CREATE TRIGGER work_routes_no_update
 BEFORE UPDATE ON work_routes BEGIN SELECT RAISE(ABORT,'WORK_ROUTE_IMMUTABLE'); END` },
@@ -19132,23 +19133,36 @@ const peerSessionCancellationPredecessor = (): string => {
   return schemaVersion40ObjectSql(guard);
 };
 
-const assertJoinedCanonicalObjects = (database: Database): void => {
+const assertCanonicalJoinSharedObjects = (database: Database): void => {
   assertSchemaVersion41TimestampProof(database);
-  assertSessionUserMessageFinalizationCore(database, false, "joined");
   assertSchemaVersion43QueueCancellationSettlement(database);
   assertSchemaVersion44AutorespondObjects(database);
   assertSchemaVersion44AutorespondEvidence(database);
   assertSchemaVersion45AccountMutationAuthority(database);
   assertSchemaVersion46AutorespondAfterHours(database);
+  assertSchemaVersion48CanonicalMemoryObjects(database);
+  assertWorkProjectAuthoritySchema(database);
+  assertLegacyCanonicalProfileStorageSchema(database);
+};
+
+// Retained usage reaches these canonical waypoints before the final joined
+// guards are installed. Require the exact historical guards here, not a union
+// of old and new objects. The final schema audit separately requires successors.
+const assertRetainedUsageCanonicalWaypoint = (database: Database): void => {
+  assertCanonicalJoinSharedObjects(database);
+  assertSessionUserMessageFinalizationCore(database);
+  assertSchemaVersion47PeerObjects(database);
+};
+
+const assertJoinedCanonicalObjects = (database: Database): void => {
+  assertCanonicalJoinSharedObjects(database);
+  assertSessionUserMessageFinalizationCore(database, false, "joined");
   assertPeerAndLocalMemoryObjects(
     database,
     schemaVersion40Objects.filter((object) => object.name !== "peer_session_direct_message_source_delete_guard"),
     "STATE_SCHEMA_V40_STRUCTURE_INVALID",
   );
   assertPeerSessionCancellationSchema(database, peerSessionCancellationPredecessor());
-  assertSchemaVersion48CanonicalMemoryObjects(database);
-  assertWorkProjectAuthoritySchema(database);
-  assertLegacyCanonicalProfileStorageSchema(database);
 };
 
 const joinedProviderRootObjects = privateTask40RootObjects.filter((object) =>
@@ -20032,7 +20046,7 @@ const migrateWritableDatabase = (
     applySchemaVersion47PeerSessions(database);
     applySchemaVersion48CanonicalMemorySync(database);
     if (version < 49) {
-      if (retainedUsage) assertJoinedCanonicalObjects(database);
+      if (retainedUsage) assertRetainedUsageCanonicalWaypoint(database);
       else assertSchemaVersionMemoryAuthority(database, 48);
       assertWorkProjectAuthoritySchema(database);
       database.query("INSERT INTO migrations(version,applied_at) VALUES (?,?)")
@@ -20042,7 +20056,7 @@ const migrateWritableDatabase = (
     }
     if (version < 50) {
       if (retainedUsage) {
-        assertJoinedCanonicalObjects(database);
+        assertRetainedUsageCanonicalWaypoint(database);
         assertSchemaMigrationLedgerTail(database,
           [...Array.from({ length: 10 }, (_, index) => index + 40),
             ...Array.from({ length: 9 }, (_, index) => index + 51)],
@@ -38657,7 +38671,9 @@ export class StateStore {
       || actor.activeTurnId === undefined
       || digestPeerTurnId(actor.activeTurnId) !== action.actorTurnDigest
     ) throw new PeerSessionRefusalError("PEER_SESSION_ACTOR_TURN_REFUSED");
-    if (phase === "direct_begin") this.#assertPeerSessionTurnCausalCompleteness(actor, actor.activeTurnId);
+    if (phase === "direct_begin") {
+      this.#assertPeerSessionTurnCausalCompleteness(actor, actor.activeTurnId);
+    }
     if (target.revision !== action.targetExpectedRevision) {
       throw new PeerSessionRefusalError("PEER_SESSION_REVISION_CONFLICT");
     }
@@ -38670,6 +38686,8 @@ export class StateStore {
       throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
     }
     if (phase === "direct_begin" && action.delivery === "steer" && target.activeTurnId !== undefined) {
+      // Admission does not reserve a slot. Recheck inside the effect-begin
+      // transaction, before a provider can accept another attributed steer.
       this.#assertPeerSessionTurnOriginCapacity(target.id, target.activeTurnId);
     }
   }
@@ -39531,7 +39549,6 @@ export class StateStore {
       if (!targetStateAllowed) {
         throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
       }
-
       if (delivery === "steer" && target.activeTurnId !== undefined) {
         this.#assertPeerSessionTurnOriginCapacity(target.id, target.activeTurnId);
       }
@@ -40026,10 +40043,11 @@ export class StateStore {
       || action.targetSessionId !== targetSessionId
       || action.targetTurnDigest !== turnDigest
     ) throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
-    // BEFORE INSERT quota guards also run for INSERT OR IGNORE. Exact replay
-    // already owns this origin and must not consume a thirty-third slot.
-    if (this.#database.query("SELECT 1 FROM peer_session_turn_origins WHERE session_id=? AND turn_digest=? AND action_id=?")
-      .get(targetSessionId, turnDigest, actionId) !== null) return action;
+    // SQLite runs BEFORE INSERT quota triggers even for INSERT OR IGNORE.
+    // Prove the exact existing binding before attempting an idempotent attach.
+    if (this.#database.query(
+      "SELECT 1 FROM peer_session_turn_origins WHERE session_id=? AND turn_digest=? AND action_id=?",
+    ).get(targetSessionId, turnDigest, actionId) !== null) return action;
     this.#database.query(
       `INSERT OR IGNORE INTO peer_session_turn_origins(session_id,turn_digest,action_id)
        VALUES (?,?,?)`,

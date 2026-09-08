@@ -21,6 +21,7 @@
     "build:site": "bun ./scripts/build-site.ts",
     "check:effect-architecture": "bun ./scripts/check-codex-effect-architecture.ts",
     "check": "bun run check:install-pins && bun run check:effect-architecture && bun run check:security-primitives && bun run lint && bun run typecheck && bun run test && bun run build:site -- --check && bun run build:app && bun run build && bun run check:package",
+    "check:ci-remainder": "bun run check:install-pins && bun run check:effect-architecture && bun run check:security-primitives && bun run lint && bun run typecheck && bun test ./scripts --isolate --max-concurrency=1 && bun run test:local-efficiency-plugin && bun run test:cloud-efficiency-plugin && bun test ./convex ./site --isolate --max-concurrency=1 && bun test ./app --isolate --max-concurrency=1 && bun run build:site -- --check && bun run build:app && bun run build && bun run check:package",
     "check:package": "bun run test:package-policy && bun ./scripts/check-package.ts",
     "check:security-primitives": "bun ./scripts/check-security-primitives.ts",
     "check:install-pins": "bun ./scripts/check-install-pins.ts",
@@ -50,6 +51,7 @@
     "test:cloud-efficiency-plugin": "bun test ./plugins/hra-cloud-efficiency/skills/hra-cloud-efficiency/scripts --isolate --max-concurrency=1",
     "test:local-efficiency-plugin": "bun test ./plugins/hra-local-efficiency/skills/hra-local-efficiency/scripts --isolate --max-concurrency=1",
     "test:simulation": "bun test ./src/cloud/deterministic-authority-simulation.test.ts --isolate --max-concurrency=1",
+    "test:source": "bun test ./src --isolate --max-concurrency=1",
     "test:package-policy": "sh -c 'umask 077; exec bun test ./scripts/package-policy.test.ts --isolate --max-concurrency=1'",
     "typecheck": "tsc --noEmit"
   },
