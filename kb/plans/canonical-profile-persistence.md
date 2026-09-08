@@ -333,3 +333,34 @@ The preceding `35dce12` CI run 34185898009 passed macOS in 15m47s, but
 Ubuntu exceeded the unchanged 20-minute job limit and Required failed.
 That failure is under independent log review; it is not waived by focused
 row-proof checks or earlier aggregate successes.
+
+## Measured scrub-fixture wait reduction
+
+Completed log review of CI 34185898009 found 5,751 passing tests and no
+failing test. The package success line preceded awaited temporary-root
+cleanup, and the job deadline cancelled the gate before a clean exit.
+Compared with the passing parent CI on the same Ubuntu image and Bun pin,
+source tests grew from 647.22 to 814.44 seconds. The 107 added tests took
+1.535 seconds combined. Existing storage, service and adapter tests and lint
+all slowed; separate runners do not identify CPU, I/O or contention as the
+cause. No canonical workload-specific regression was established.
+
+Three service tests deliberately retain a real reader throughout scrub
+refusal but previously spent the production 5,000ms wait on each of three
+attempts, plus 100/200ms backoff. Their claim is committed-result quarantine,
+the response/stop boundary and recovery after unpinning, not production wall
+time. The existing fixture now optionally forwards the already-supported
+test-only policy. Only those three tests use 50ms waits, three attempts and
+10/20ms backoff. Every other fixture retains the production default.
+
+One paired local Bun 1.3.14 measurement of the exact same three tests passed
+20 assertions before and after: 48.30 seconds became 1.54 seconds. Individual
+durations changed from 15,954.85/15,857.84/16,119.78ms to
+470.83/435.22/430.68ms. Every reader transaction, provider gate, committed
+result, stop callback, post-unpin transition and assertion remains unchanged.
+Scoped lint, strict TypeScript, whitespace, independent frozen review and
+root review passed. Service test SHA-256:
+`3bdf2a8d48fa933f5276c0fd76186726a6f665e7795fd7698ea81cdd74b7ee50`.
+Production source, package bytes, retry counts and all test/job deadlines
+remain unchanged. This is a measured fixture wait reduction, not Linux
+after-measurement or a replacement for the new exact-tree aggregate and CI.
