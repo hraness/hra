@@ -90,9 +90,12 @@ const currentUid = (): number | undefined => (typeof process.getuid === "functio
 
 export const daemonAuthorityDatabasePath = (paths: StatePaths): string => `${paths.daemonLock}.authority.sqlite`;
 
-async function validateOwnedRegularFile(path: string, maximumBytes?: number): Promise<Stats> {
-  const metadata = await lstat(path);
-  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
+function validateOwnedRegularFileAttributes(
+  path: string,
+  metadata: Stats,
+  maximumBytes?: number,
+): void {
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
     throw new DaemonAuthoritySafetyError(`Unsafe daemon authority file: ${path}`);
   }
   const uid = currentUid();
@@ -108,6 +111,14 @@ async function validateOwnedRegularFile(path: string, maximumBytes?: number): Pr
   if (resolve(dirname(path), basename(path)) !== path) {
     throw new DaemonAuthoritySafetyError(`Daemon authority file path is not canonical: ${path}`);
   }
+}
+
+async function validateOwnedRegularFile(path: string, maximumBytes?: number): Promise<Stats> {
+  const metadata = await lstat(path);
+  if (metadata.nlink !== 1) {
+    throw new DaemonAuthoritySafetyError(`Unsafe daemon authority file: ${path}`);
+  }
+  validateOwnedRegularFileAttributes(path, metadata, maximumBytes);
   return metadata;
 }
 
@@ -297,13 +308,16 @@ export class DaemonAuthorityFence {
   }
 }
 
+type DaemonReceiptReadHooks = Readonly<{
+  afterDescriptorRead?(): void | Promise<void>;
+  afterNamedValidation?(): void | Promise<void>;
+  afterDescriptorOpen?(): void | Promise<void>;
+  readNamedMetadata?(path: string): Promise<Stats>;
+}>;
+
 export async function readDaemonAuthorityReceipt(
   paths: StatePaths,
-  hooks: Readonly<{
-    afterDescriptorRead?(): void | Promise<void>;
-    afterNamedValidation?(): void | Promise<void>;
-    afterDescriptorOpen?(): void | Promise<void>;
-  }> = {},
+  hooks: DaemonReceiptReadHooks = {},
 ): Promise<DaemonAuthorityReceipt | null> {
   const observation = await observeDaemonAuthorityReceipt(paths, hooks);
   return observation.kind === "valid" ? observation.receipt : null;
@@ -316,15 +330,26 @@ type DaemonAuthorityReceiptObservation =
 
 async function observeDaemonAuthorityReceipt(
   paths: StatePaths,
-  hooks: Readonly<{
-    afterDescriptorRead?(): void | Promise<void>;
-    afterNamedValidation?(): void | Promise<void>;
-    afterDescriptorOpen?(): void | Promise<void>;
-  }> = {},
+  hooks: DaemonReceiptReadHooks = {},
 ): Promise<DaemonAuthorityReceiptObservation> {
+  let namedReceiptObserved = false;
+  const readNamedMetadata = async (): Promise<Stats> => {
+    const metadata = await (hooks.readNamedMetadata ?? lstat)(paths.daemonLock);
+    validateOwnedRegularFileAttributes(paths.daemonLock, metadata, 4_096);
+    if (metadata.nlink !== 0 && metadata.nlink !== 1) {
+      throw new DaemonAuthoritySafetyError(`Unsafe daemon authority file: ${paths.daemonLock}`);
+    }
+    return metadata;
+  };
   for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
-      const before = await validateOwnedRegularFile(paths.daemonLock, 4_096);
+      const before = await readNamedMetadata();
+      namedReceiptObserved = true;
+      // An atomic publication can unlink the inode after the kernel resolves
+      // lstat's name but before it captures metadata. Zero links prove neither
+      // the current name nor readable authority: start a fresh bounded attempt.
+      // Database and writer validation continue to require exactly one link.
+      if (before.nlink === 0) continue;
       await hooks.afterNamedValidation?.();
       const handle = await open(paths.daemonLock, constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
@@ -346,13 +371,14 @@ async function observeDaemonAuthorityReceipt(
           }
           let current: Stats;
           try {
-            current = await validateOwnedRegularFile(paths.daemonLock, 4_096);
+            current = await readNamedMetadata();
           } catch (error: unknown) {
             if (error instanceof DaemonAuthoritySafetyError) throw error;
             throw new DaemonAuthorityObservationRaceError(
               "The unlinked daemon authority receipt has no safe named replacement.",
             );
           }
+          if (current.nlink === 0) continue;
           if (current.dev === metadata.dev && current.ino === metadata.ino) {
             throw new DaemonAuthoritySafetyError(
               "The unlinked daemon authority receipt still names its opened inode.",
@@ -368,13 +394,14 @@ async function observeDaemonAuthorityReceipt(
         const afterRead = await handle.stat();
         let current: Stats;
         try {
-          current = await validateOwnedRegularFile(paths.daemonLock, 4_096);
+          current = await readNamedMetadata();
         } catch (error: unknown) {
           if (error instanceof DaemonAuthoritySafetyError) throw error;
           throw new DaemonAuthorityObservationRaceError(
             "The opened daemon authority receipt has no safe named identity after reading.",
           );
         }
+        if (current.nlink === 0) continue;
         if (current.dev !== afterRead.dev || current.ino !== afterRead.ino) {
           continue;
         }
@@ -400,7 +427,12 @@ async function observeDaemonAuthorityReceipt(
         await handle.close();
       }
     } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        if (!namedReceiptObserved) return { kind: "absent" };
+        throw new DaemonAuthorityObservationRaceError(
+          "The observed daemon authority receipt has no safe named replacement.",
+        );
+      }
       if (error instanceof SyntaxError) return { kind: "invalid" };
       throw error;
     }

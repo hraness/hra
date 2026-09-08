@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { createServer, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough, Readable } from "node:stream";
 
 import {
@@ -14,6 +18,7 @@ import {
   runCommand,
   serializeHostedEnvironment,
   type CommandRequest,
+  type CommandResult,
   type CommandRunner,
   type GeneratedHostedSecrets,
 } from "./configure-hosted-sync";
@@ -78,6 +83,148 @@ const outputWriter = (chunks: string[]): Pick<NodeJS.WriteStream, "write"> => ({
     return true;
   },
 });
+
+const observeWithin = async <Value>(pending: Promise<Value>, timeoutMs: number): Promise<Value> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("hosted_fixture_observation_timeout")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+// This trusted fixture witnesses closure of its inherited descriptors and
+// control channel. It is not waitpid custody or proof about arbitrary descendants.
+const inheritedPipeFixture = async (overflow?: "stdout" | "stderr") => {
+  const root = await mkdtemp(join(tmpdir(), "hra-hosted-pipes-"));
+  const socketPath = join(root, "control.sock");
+  const expiresAt = Date.now() + 3_500;
+  const server = createServer();
+  server.maxConnections = 1;
+  let connection: Socket | undefined;
+  let released = false;
+  let protocol = "";
+  let failure: Error | undefined;
+  let notifyReady = (): void => undefined;
+  let notifyClosed = (): void => undefined;
+  const ready = new Promise<void>((resolve) => { notifyReady = resolve; });
+  const closed = new Promise<void>((resolve) => { notifyClosed = resolve; });
+  server.on("connection", (socket) => {
+    connection = socket;
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk: string) => {
+      if (protocol.length + chunk.length > 11) {
+        failure = new Error("hosted_fixture_control_overflow");
+        socket.destroy();
+        return;
+      }
+      protocol += chunk;
+      if (!"READY\nDONE\n".startsWith(protocol)) {
+        failure = new Error("hosted_fixture_control_invalid");
+        socket.destroy();
+        return;
+      }
+      if (protocol.startsWith("READY\n")) notifyReady();
+    });
+    socket.once("error", () => { failure = new Error("hosted_fixture_control_failed"); });
+    socket.once("close", () => {
+      if (protocol !== "READY\nDONE\n") failure ??= new Error("hosted_fixture_control_incomplete");
+      notifyReady();
+      notifyClosed();
+    });
+    if (released) socket.write("RELEASE\n");
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, resolve);
+    });
+  } catch (error: unknown) {
+    server.close();
+    await rm(root, { recursive: true, force: true });
+    throw error;
+  }
+  // Keep both programs static. Fixture paths, deadlines and output travel as
+  // argv data rather than participating in nested source construction.
+  const holder = [
+    "const { closeSync } = require('node:fs');",
+    "const { createConnection } = require('node:net');",
+    "const [socketPath, deadline] = process.argv.slice(1);",
+    "const socket = createConnection(socketPath);",
+    "let finished = false;",
+    "const finish = () => {",
+    "  if (finished) return;",
+    "  finished = true; clearTimeout(expiry);",
+    "  closeSync(1); closeSync(2);",
+    "  socket.end('DONE\\n');",
+    "};",
+    "const expiry = setTimeout(() => process.exit(2), Math.max(0, Number(deadline) - Date.now()));",
+    "socket.once('connect', () => { socket.write('READY\\n'); process.send('ready'); });",
+    "let command = '';",
+    "socket.on('data', (data) => {",
+    "  command += data.toString();",
+    "  if (!'RELEASE\\n'.startsWith(command)) process.exit(2);",
+    "  if (command === 'RELEASE\\n') finish();",
+    "});",
+    "socket.once('error', () => { process.exit(2); });",
+    "socket.once('close', () => { process.exit(finished ? 0 : 2); });",
+  ].join("\n");
+  const stdout = overflow === "stdout" ? "x".repeat(128) : "parent-exiting";
+  const stderr = overflow === "stderr" ? "x".repeat(128) : overflow === undefined ? "stderr-kept" : "";
+  const parent = [
+    "const { spawn } = require('node:child_process');",
+    "const [holderSource, socketPath, deadline, stdout, stderr] = process.argv.slice(1);",
+    "setTimeout(() => process.exit(2), Math.max(0, Number(deadline) - Date.now()));",
+    "const holder = spawn(process.execPath, ['--no-env-file', '--config=/dev/null', '-e', holderSource, socketPath, deadline], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });",
+    "holder.once('error', () => process.exit(2));",
+    "holder.once('message', (message) => {",
+    "  if (message !== 'ready') process.exit(2);",
+    "  process.stdout.write(stdout, () => process.stderr.write(stderr, () => process.exit(0)));",
+    "});",
+  ].join("\n");
+  return {
+    request: {
+      arguments: [
+        "--no-env-file", "--config=/dev/null", "-e", parent,
+        holder, socketPath, String(expiresAt), stdout, stderr,
+      ],
+      containment: "local",
+      cwd: import.meta.dir,
+      environment: { NO_COLOR: "1", PATH: "/usr/bin:/bin", TERM: "dumb" },
+      executable: process.execPath,
+      outputMaximumBytes: overflow === undefined ? 512 : 64,
+      phase: "hosted-inherited-pipe-proof",
+      stdin: "",
+      timeoutMs: 1_000,
+    } satisfies CommandRequest,
+    async ready() {
+      await observeWithin(ready, 1_500);
+      if (failure !== undefined) throw failure;
+    },
+    async settle(pending: Promise<CommandResult>) {
+      released = true;
+      if (connection !== undefined && !connection.destroyed) connection.write("RELEASE\n");
+      // Release before joining even when the bounded observation failed on RED.
+      // The source request is never abandoned by the observation's Promise.race.
+      try {
+        await pending.catch(() => undefined);
+        await observeWithin(closed, Math.max(1, expiresAt - Date.now() + 250));
+      } finally {
+        connection?.destroy();
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => error === undefined ? resolve() : reject(error));
+        });
+      }
+      if (failure !== undefined) throw failure;
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+};
 
 const parseSingleQuotedEnvironment = (document: string): Map<string, string> => {
   const parsed = new Map<string, string>();
@@ -513,13 +660,27 @@ describe("protected operator process boundaries", () => {
     })).rejects.toThrow("input_too_large");
   });
 
-  test("kills bounded commands on timeout or output overflow", async () => {
-    const environment = buildConvexChildEnvironment(process.env, []);
-    const timeout = await runCommand({
-      arguments: ["-e", "setInterval(() => undefined, 1000)"],
+  test.each([0, 7])("preserves bounded stdout, stderr, stdin and exit %s", async (exitCode) => {
+    const result = await runCommand({
+      arguments: ["-c", `IFS= read -r value; printf 'out:%s\\n' "$value"; printf 'err\\n' >&2; exit ${exitCode}`],
       containment: "local",
       cwd: import.meta.dir,
-      environment,
+      environment: { NO_COLOR: "1", PATH: "/usr/bin:/bin", TERM: "dumb" },
+      executable: "/bin/sh",
+      outputMaximumBytes: 64,
+      phase: "hosted-exact-output-proof",
+      stdin: "fixture-input\n",
+      timeoutMs: 1_000,
+    });
+    expect(result).toEqual({ exitCode, stderr: "err\n", stdout: "out:fixture-input\n" });
+  });
+
+  test("kills a finite direct command on timeout", async () => {
+    const timeout = await runCommand({
+      arguments: ["-e", "setTimeout(() => process.exit(0), 2000)"],
+      containment: "local",
+      cwd: import.meta.dir,
+      environment: { NO_COLOR: "1", PATH: "/usr/bin:/bin", TERM: "dumb" },
       executable: process.execPath,
       outputMaximumBytes: 1_024,
       phase: "hosted-timeout-proof",
@@ -527,12 +688,16 @@ describe("protected operator process boundaries", () => {
       timeoutMs: 25,
     });
     expect(timeout.exitCode).toBe(124);
+    expect(timeout.stdout).toBe("");
+    expect(timeout.stderr).toBe("");
+  });
 
+  test.each(["stdout", "stderr"] as const)("kills a finite direct command on %s overflow", async (stream) => {
     const overflow = await runCommand({
-      arguments: ["-e", "process.stdout.write('x'.repeat(4096))"],
+      arguments: ["-e", `process.${stream}.write('x'.repeat(4096))`],
       containment: "local",
       cwd: import.meta.dir,
-      environment,
+      environment: { NO_COLOR: "1", PATH: "/usr/bin:/bin", TERM: "dumb" },
       executable: process.execPath,
       outputMaximumBytes: 64,
       phase: "hosted-overflow-proof",
@@ -540,7 +705,44 @@ describe("protected operator process boundaries", () => {
       timeoutMs: 1_000,
     });
     expect(overflow.exitCode).toBe(1);
-    expect(Buffer.byteLength(overflow.stdout, "utf8")).toBeLessThanOrEqual(64);
-    expect(Buffer.byteLength(overflow.stderr, "utf8")).toBeLessThanOrEqual(64);
+    expect(overflow[stream]).toBe("x".repeat(64));
+    expect(overflow[stream === "stdout" ? "stderr" : "stdout"]).toBe("");
   });
+
+  test("times out inherited output pipes without waiting for the finite holder", async () => {
+    const fixture = await inheritedPipeFixture();
+    const pending = runCommand(fixture.request);
+    void pending.catch(() => undefined);
+    try {
+      await fixture.ready();
+      const result = await observeWithin(pending, 1_500);
+      expect(result).toEqual({ exitCode: 124, stderr: "stderr-kept", stdout: "parent-exiting" });
+    } finally {
+      await fixture.settle(pending);
+    }
+  });
+
+  test.each(["stdout", "stderr"] as const)(
+    "keeps %s overflow as exit 1 while inherited pipes remain open",
+    async (stream) => {
+      const fixture = await inheritedPipeFixture(stream);
+      const pending = runCommand(fixture.request);
+      void pending.catch(() => undefined);
+      try {
+        await fixture.ready();
+        const result = await observeWithin(pending, 1_500);
+        expect(result.exitCode).toBe(1);
+        expect(result[stream]).toBe("x".repeat(64));
+        if (stream === "stdout") {
+          expect(result.stderr).toBe("");
+        } else {
+          // Overflow can cancel the sibling collector before it consumes the
+          // complete marker; the normal-output controls prove exact delivery.
+          expect("parent-exiting".startsWith(result.stdout)).toBe(true);
+        }
+      } finally {
+        await fixture.settle(pending);
+      }
+    },
+  );
 });
