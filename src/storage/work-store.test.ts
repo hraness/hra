@@ -34,6 +34,7 @@ import {
 } from "../domain/work";
 import { workReadSuccessWireBytes } from "../domain/terminal-json";
 import {
+  WORK_PROJECT_AUTHORITY_SCHEMA_SQL,
   WORK_SCHEMA_SQL,
   WorkStore,
   WorkStoreError,
@@ -245,6 +246,7 @@ function fixture(): Fixture {
   database.exec("PRAGMA foreign_keys=ON;");
   database.exec(parentSchema);
   database.exec(WORK_SCHEMA_SQL);
+  database.exec(WORK_PROJECT_AUTHORITY_SCHEMA_SQL);
   assertWorkSchema(database);
   const accountId = createProfileId();
   const projectId = createProjectId();
@@ -688,6 +690,7 @@ describe("WorkStore schema and atomic plans", () => {
     );
 
     const predecessor = fixture();
+    predecessor.database.exec("DROP TRIGGER work_session_project_authority_guard");
     installProviderVersion40WorkAuthoritySchema(predecessor.database);
     weakenEventAppendOnlyGuard(predecessor.database);
     expect(() => assertProviderVersion40WorkSchema(predecessor.database)).toThrow(
@@ -803,6 +806,7 @@ describe("WorkStore schema and atomic plans", () => {
     expect(legacyParentSchema).not.toBe(parentSchema);
     database.exec(legacyParentSchema);
     database.exec(WORK_SCHEMA_SQL);
+    database.exec(WORK_PROJECT_AUTHORITY_SCHEMA_SQL);
 
     expect(() => assertWorkSchema(database)).toThrow(
       "WORK_SCHEMA_STALE:sessions.provider_v39",
@@ -823,6 +827,7 @@ describe("WorkStore schema and atomic plans", () => {
     expect(legacyParentSchema).not.toBe(parentSchema);
     database.exec(legacyParentSchema);
     database.exec(WORK_SCHEMA_SQL);
+    database.exec(WORK_PROJECT_AUTHORITY_SCHEMA_SQL);
     expect(() => assertWorkSchema(database)).toThrow(
       "WORK_SCHEMA_STALE:sessions.preset_contract",
     );

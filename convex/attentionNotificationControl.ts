@@ -27,6 +27,7 @@ import {
   type MutationCtx,
   type QueryCtx,
 } from "./server";
+import { requireHraAttentionResendApiKey } from "./resendApiKey";
 
 type ControlContext = MutationCtx | QueryCtx;
 
@@ -343,6 +344,19 @@ export const inactiveDeploymentStatus = internalQuery({
       outboxOccupancy: outbox.length,
       safetyFaultOccupancy: safetyFaults.length,
     };
+  },
+});
+
+/** Format and credential-separation readiness only, never provider authority. */
+export const sendingKeyReadiness = internalQuery({
+  args: {},
+  handler: () => {
+    try {
+      requireHraAttentionResendApiKey();
+      return { dedicatedKeyReady: true };
+    } catch {
+      return { dedicatedKeyReady: false };
+    }
   },
 });
 

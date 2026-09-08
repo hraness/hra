@@ -59,6 +59,7 @@ import {
   type ClaudeLiveAcceptanceWorker,
   type LiveAcceptanceDeviceName,
   type LiveAcceptanceWorker,
+  type LiveAcceptanceWorkerStatus,
 } from "./live-acceptance";
 import {
   canonicalDigest,
@@ -131,6 +132,9 @@ async function removeOwnedTestBase(root: string): Promise<void> {
 const startSyntheticProcessWorker = async (
   descriptor: AcceptanceInstallationDescriptor,
   body: readonly string[],
+  observeFailureCodeForTesting?: (
+    code: Extract<LiveAcceptanceWorkerStatus, { type: "failed" }>["code"],
+  ) => void | Promise<void>,
 ): Promise<LiveAcceptanceWorker> => {
   const defaultLaunch = liveAcceptanceWorkerLaunch(descriptor);
   const harness = [
@@ -150,7 +154,7 @@ const startSyntheticProcessWorker = async (
   return await startLiveAcceptanceProcessWorkerForTesting(descriptor, {
     ...defaultLaunch,
     arguments: ["--no-env-file", "-e", harness],
-  });
+  }, observeFailureCodeForTesting);
 };
 
 const startInjectedSupervisorProcessWorker = async (
@@ -1494,6 +1498,161 @@ describe("source-only live acceptance isolation", () => {
     }
   });
 
+  test("retains a validated worker failure code for startup diagnostics", async () => {
+    const base = await privateTestBase();
+    let worker: LiveAcceptanceWorker | undefined;
+    const codes: string[] = [];
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      worker = await startSyntheticProcessWorker(layout.descriptors.a, [
+        "await writeStatus({",
+        '  code: "initialization_failed",',
+        "  device: descriptor.device,",
+        "  runId: descriptor.runId,",
+        '  type: "failed",',
+        "  version: 1,",
+        "});",
+        "await lines.next();",
+        "process.exitCode = 1;",
+      ], (code) => { codes.push(code); });
+
+      await expect(worker.ready()).rejects.toThrow("worker_failed");
+      await expect(worker.lifetime()).rejects.toThrow("worker_failed");
+      await worker.preserve();
+      expect(processExists(worker.pid)).toBe(false);
+      expect(codes).toEqual(["initialization_failed"]);
+    } finally {
+      await worker?.preserve();
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test.each([
+    ["foreign device", 'device: descriptor.device === "a" ? "b" : "a", runId: descriptor.runId,', "worker_protocol_invalid"],
+    ["foreign run", 'device: descriptor.device, runId: "00000000-0000-4000-8000-000000000999",', "worker_protocol_invalid"],
+    ["missing identity", "", "worker_failed"],
+    ["partial identity", "device: descriptor.device,", "worker_protocol_invalid"],
+    ["unknown code", 'device: descriptor.device, runId: descriptor.runId, code: "unreviewed_failure",', "worker_protocol_invalid"],
+    ["extended frame", 'device: descriptor.device, runId: descriptor.runId, diagnostic: "untrusted detail",', "worker_protocol_invalid"],
+  ] as const)("withholds worker failure diagnostics for %s", async (_name, identity, expectedCode) => {
+    const base = await privateTestBase();
+    let worker: LiveAcceptanceWorker | undefined;
+    const codes: string[] = [];
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      worker = await startSyntheticProcessWorker(layout.descriptors.a, [
+        "await writeStatus({",
+        '  code: "daemon_failed",',
+        `  ${identity}`,
+        '  type: "failed",',
+        "  version: 1,",
+        "});",
+        "await lines.next();",
+        "process.exitCode = 1;",
+      ], (code) => { codes.push(code); });
+      await expect(worker.ready()).rejects.toThrow(expectedCode);
+      await worker.preserve();
+      expect(processExists(worker.pid)).toBe(false);
+      expect(codes).toEqual([]);
+    } finally {
+      await worker?.preserve();
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test("ignores a late worker failure diagnostic after its first terminal status", async () => {
+    const base = await privateTestBase();
+    let worker: LiveAcceptanceWorker | undefined;
+    const codes: string[] = [];
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      worker = await startSyntheticProcessWorker(layout.descriptors.a, [
+        'const failure = { device: descriptor.device, runId: descriptor.runId, type: "failed", version: 1 };',
+        'await writeStatus({ ...failure, code: "initialization_failed" });',
+        "await lines.next();",
+        'await writeStatus({ ...failure, code: "daemon_failed" });',
+        "process.exitCode = 1;",
+      ], (code) => { codes.push(code); });
+      await expect(worker.ready()).rejects.toThrow("worker_failed");
+      await worker.preserve();
+      expect(processExists(worker.pid)).toBe(false);
+      expect(codes).toEqual(["initialization_failed"]);
+    } finally {
+      await worker?.preserve();
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test("withholds a worker failure diagnostic after admitted stop", async () => {
+    const base = await privateTestBase();
+    let worker: LiveAcceptanceWorker | undefined;
+    const codes: string[] = [];
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      worker = await startSyntheticProcessWorker(layout.descriptors.a, [
+        'await writeStatus({ device: descriptor.device, runId: descriptor.runId, pid: process.pid, type: "ready", version: 1 });',
+        "await lines.next();",
+        'await writeStatus({ device: descriptor.device, runId: descriptor.runId, type: "stopped", version: 1 });',
+        'await writeStatus({ device: descriptor.device, runId: descriptor.runId, code: "daemon_failed", type: "failed", version: 1 });',
+        "await lines.next();",
+        "process.exitCode = 1;",
+      ], (code) => { codes.push(code); });
+      await worker.ready();
+      await expect(worker.stop()).rejects.toThrow("worker_protocol_invalid");
+      await worker.preserve();
+      expect(processExists(worker.pid)).toBe(false);
+      expect(codes).toEqual([]);
+    } finally {
+      await worker?.preserve();
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test.each(["throws", "rejects"] as const)("keeps worker failure recovery and custody when its diagnostic observer %s", async (failure) => {
+    const base = await privateTestBase();
+    const workers: LiveAcceptanceWorker[] = [];
+    const codes: string[] = [];
+    try {
+      const error = await startLiveAcceptanceRun({
+        temporaryBaseDirectory: base,
+        workerFactory: async (descriptor) => {
+          const worker = await startSyntheticProcessWorker(descriptor, [
+            'await writeStatus({ device: descriptor.device, runId: descriptor.runId, code: "daemon_failed", type: "failed", version: 1 });',
+            "await lines.next();",
+            "process.exitCode = 1;",
+          ], (code) => {
+            codes.push(`${descriptor.device}:${code}`);
+            if (failure === "rejects") return Promise.reject(new Error("synthetic observer failure"));
+            throw new Error("synthetic observer failure");
+          });
+          workers.push(worker);
+          // Let each exact failure reach the controller before startup's
+          // all-worker preservation closes the other descriptor stream.
+          await worker.ready().catch(() => undefined);
+          return worker;
+        },
+      }).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(LiveAcceptanceStartError);
+      const startError = error as LiveAcceptanceStartError;
+      expect(startError.message).toBe("worker_failed");
+      expect(startError.code).toBe("worker_failed");
+      expect(codes.sort()).toEqual(["a:daemon_failed", "b:daemon_failed"]);
+      expect(workers).toHaveLength(2);
+      expect(workers.every((worker) => !processExists(worker.pid))).toBe(true);
+      const receipt = liveAcceptanceRecoveryReceiptSchema.parse(
+        JSON.parse(await readFile(startError.recoveryReceiptPath, "utf8")) as unknown,
+      );
+      expect(receipt.failureCode).toBe("worker_failed");
+      expect(receipt.phase).toBe("recovery_required");
+      expect(receipt.workers.every((worker) => worker.state === "failed")).toBe(true);
+      expect(JSON.stringify(receipt)).not.toContain("daemon_failed");
+      expect(JSON.stringify(receipt)).not.toContain("synthetic observer failure");
+    } finally {
+      await Promise.all(workers.map(async (worker) => await worker.preserve()));
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
   test("rejects a failure status attributed to another worker identity", async () => {
     const base = await privateTestBase();
     let runRoot: string | undefined;
@@ -1903,11 +2062,25 @@ describe("source-only live acceptance isolation", () => {
   test("starts and cleanly joins two full daemon subprocesses with HOME unchanged", async () => {
     const base = await privateTestBase();
     const originalHomeDirectory = process.env.HOME;
+    const failureCodes: Partial<Record<
+      LiveAcceptanceDeviceName,
+      Extract<LiveAcceptanceWorkerStatus, { type: "failed" }>["code"]
+    >> = {};
     let run: Awaited<ReturnType<typeof startLiveAcceptanceRun>> | undefined;
     try {
       run = await startLiveAcceptanceRun({
         cloudDeploymentUrl: "http://127.0.0.1:9",
         temporaryBaseDirectory: base,
+        workerFactory: async (descriptor) => await startLiveAcceptanceProcessWorkerForTesting(
+          descriptor,
+          liveAcceptanceWorkerLaunch(descriptor),
+          (code) => { failureCodes[descriptor.device] ??= code; },
+        ),
+      }).catch((error: unknown) => {
+        // Retain only admitted closed stages; never print the worker frame or
+        // its private recovery coordinates. Rethrow the original failure.
+        console.error(`Live-acceptance startup stages: a=${failureCodes.a ?? "unavailable"}, b=${failureCodes.b ?? "unavailable"}`);
+        throw error;
       });
       expect(process.env.HOME).toBe(originalHomeDirectory);
       const runRoots = (await readdir(base, { withFileTypes: true }))

@@ -130,6 +130,28 @@ Work requests before replacement, require daemon status to report
 `data.running: false`, and expect affected writes to fail closed during a
 mixed-version interval.
 
+## Work project authority during an update
+
+The unreleased schema49 candidate adds a null-safe project guard alongside the
+unchanged historical Work guards. A session with a claimed, dispatching, running,
+or recovery-required attempt cannot change or clear its project while that
+attempt owns different project authority. The supported metadata API performs
+its reads, project check, and write in one immediate transaction. Neither fence
+changes the session's model, effort, account, approval policy, or Work route.
+
+An upgrade refuses pre-existing contradictory live project authority with
+`STATE_SCHEMA_V49_WORK_PROJECT_AUTHORITY_INVALID`. The entire migration rolls
+back, including any legacy quarantine. Preserve the state root and its backup
+for reviewed recovery; do not assign a project, release an attempt, or edit the
+migration ledger with SQL to make the upgrade pass. A missing or modified guard
+on a current schema49 root also refuses opening instead of being reconstructed.
+
+The first current-daemon start remains the no-downgrade boundary. An older
+schema48 writer cannot open schema49. Restore a whole-root pre-upgrade backup
+when returning to an older release; never decrement `user_version` or remove
+the guard. These local migration checks do not clear the separate
+[hosted-capacity and target-marker gates](hosted-sync.md#converge-command-lifecycle-capacity-before-writer-rollout).
+
 ## Content-free evaluation export
 
 The analyzer has exactly one invocation form:
