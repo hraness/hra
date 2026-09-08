@@ -16,15 +16,37 @@ admission. This is the next bounded source increment in
 policy. Sol Ultra remains the implicit Codex default. Historical Astra and
 retired Devin decoding grant no fresh execution authority.
 
-The current parent join incorporates PR147's protected merge `c639ad78`,
-including the schema49 project companion, reviewed physical-scrub fixture
-repair and dedicated attention-key source from main `5838ec4`. The original
-foundation began at `380ced9`; that older checkpoint is not the current
-integration base. PR147's exact head passed its local and protected gates;
-exact-main CI34188257597 is pending. This follow-on has no allocated schema number.
-After exact-main CI passes, recheck protected main and competing local-storage
-ownership before installing a migration. Keep the independently owned
-peer-memory changes in PR148 intact at integration.
+The inactive source foundation merged through
+[PR149](https://github.com/hraness/hra/pull/149) as protected main
+`7ab347813f8d7e4f31e9584752c801dd1ca0cda0`, preserving reviewed tree
+`978bdc30b6fb9d259c92d0ca91335a854227d6f4`. It includes the companion
+module, populated-row proof, settled-history controls and measured service
+fixture wait reduction. Canonical persistence remains uninstalled, with no
+backfill or current reader/writer consumer and no next schema number
+allocated. Sol Ultra and existing runtime authority are unchanged.
+
+PR147's schema49 project companion merged as `c639ad78`; its local and
+protected gates and exact-main
+[CI34188257597](https://github.com/hraness/hra/actions/runs/34188257597)
+passed. The foundation's separate exact-main
+[CI34242469558](https://github.com/hraness/hra/actions/runs/34242469558)
+is pending. The original foundation began at `380ced9`; that older checkpoint
+is not the current integration base. After exact-main verification, recheck
+protected main and competing local-storage ownership before installing a
+migration. Keep the independently owned peer-memory changes in PR148 intact
+at integration. The mobile runbook join has its own pending gates in the
+[model-routing implementation log](./model-routing-autonomy.md#implementation-log).
+
+The reviewed PR149 head `0787b6d9e503b831d657c495e923fae734ec998f`
+passed its exclusive exact-tree aggregate with exit zero, including final
+package cleanup: 3,790 source tests in 315.26 seconds, 1,102 scripts tests
+with one existing skip, 108 local-plugin, 29 cloud-plugin, 393 hosted/site,
+500 app and 11 package-policy tests with 42 assertions. Both platforms and
+Required passed in [CI34188700143](https://github.com/hraness/hra/actions/runs/34188700143)
+(macOS 12m16s, Ubuntu 18m07s, Required 3s), and
+[CodeQL34188697946](https://github.com/hraness/hra/actions/runs/34188697946)
+passed. These are delivered source-foundation receipts, not canonical
+migration, public artifact or activation evidence.
 
 ## Storage decision
 
@@ -278,12 +300,14 @@ was not waived: its original local gate missed a retained sentinel before
 migration, and a controlled SQLite proof demonstrated the non-atomic
 main/WAL scan race. All post-scrub erasure assertions remain unchanged.
 
-No new aggregate success is claimed for the joined tree. After schema49's
-exact-main verification, the next owner must recheck migration ownership, install
-the complete reader/writer and migration slice described above, prove its
-authentic upgrade and rollback cases, and run its exact-tree final gates.
-Do not interpret these passing foundation checks as canonical persistence,
-new profile admission, a release or permission to activate a daemon.
+That parent-join checkpoint did not yet have its own aggregate success; the
+current source-delivery boundary is recorded above. The next migration owner
+must recheck protected main and migration ownership, install the complete
+reader/writer and migration slice described above, prove its authentic
+upgrade and rollback cases, and run its exact-tree final gates. Do not
+interpret passing foundation checks or its protected source merge as
+canonical persistence, new profile admission, a release or permission to
+activate a daemon.
 
 ## Populated-row proof checkpoint
 

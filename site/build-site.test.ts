@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseHTML } from "linkedom";
-import { transform } from "lightningcss";
+import { transform, type Selector } from "lightningcss";
+import { createStylexTransformCollector } from "@hraness/ui/stylex-build";
 
 import {
   assertSiteFontStyleInventory,
@@ -28,6 +29,7 @@ import {
   renderSiteHtml,
 } from "./template.ts";
 import { HRA_RELEASE_VERSION } from "../scripts/release-evidence";
+import { mobileHeaderFlowClassName } from "./marketing.stylex.ts";
 
 const temporaryRoots: string[] = [];
 // A real site graph joins Vite foundation, Bun SSR, sealed templates and
@@ -46,6 +48,29 @@ const expectedFontPaths = [
   "geist-mono/PROVENANCE.md",
 ].sort();
 const expectedAttributionPaths = expectedFontPaths.filter((path) => !path.endsWith(".woff2"));
+
+function assertMobileHeaderRule(css: string, className: string): void {
+  expect(className).toMatch(/^x[a-z0-9]+$/u);
+  const targetsHeader = (selectors: readonly Selector[]): boolean => selectors.some((selector) =>
+    selector.length > 0 && selector.every((part) => part.type === "class" && part.name === className));
+  const expectedQueries: unknown[] = [];
+  transform({ filename: "expected-mobile-header.css", code: Buffer.from("@media (max-width: 48rem) { .expected { position: static; } }"),
+    visitor: { Rule: { media(rule) { expectedQueries.push(rule.value.query); } } } });
+  let declarations = 0;
+  const actualQueries: unknown[] = [];
+  transform({ filename: "compiled-mobile-header.css", code: Buffer.from(css), visitor: { Rule: {
+    style(rule) {
+      if (!targetsHeader(rule.value.selectors)) return;
+      declarations++;
+      expect(rule.value.declarations).toEqual({ declarations: [{ property: "position", value: { type: "static" } }], importantDeclarations: [] });
+    },
+    media(rule) {
+      if (rule.value.rules.some((child) => child.type === "style" && targetsHeader(child.value.selectors))) actualQueries.push(rule.value.query);
+    },
+  } } });
+  expect(declarations).toBe(1);
+  expect(actualQueries).toEqual(expectedQueries);
+}
 
 function compiledStylesheetJoin(html: string): { foundationPath: string; authoredHtml: string } {
   const { document } = parseHTML(html);
@@ -111,6 +136,30 @@ afterEach(async () => {
 });
 
 describe("static-site build", () => {
+  test("keeps the wrapping mobile header in document flow through its emitted StyleX atom", async () => {
+    const className = mobileHeaderFlowClassName();
+    const path = join(sourceRoot, "site/marketing.stylex.ts");
+    const compiled = await createStylexTransformCollector(sourceRoot).transform(await readFile(path, "utf8"), path);
+    const css = compiled.rules.filter(([name]) => name === className).map(([, rule]) => rule.ltr).join("\n");
+    assertMobileHeaderRule(css, className);
+    for (const render of [renderSiteHtml, renderPrivacyHtml]) {
+      const { document } = parseHTML(render());
+      const headers = document.querySelectorAll('[data-hraness-marketing="header"]');
+      expect(headers).toHaveLength(1);
+      expect(headers[0]?.classList.contains(className)).toBe(true);
+      expect(headers[0]?.hasAttribute("style")).toBe(false);
+    }
+    expect(await readFile(join(sourceRoot, "site/styles.css"), "utf8")).not.toContain("position: static");
+    for (const invalid of [
+      `.${className}{position:static}`, `@media(max-width:47rem){.${className}{position:static}}`,
+      `@media(width < 48rem){.${className}{position:static}}`,
+      `@media(max-width:48rem){.${className}{position:sticky}}`,
+      `@media(max-width:48rem){.wrong{position:static}}`,
+      `@media(max-width:48rem){.${className}{position:static!important}}`,
+      `.${className}{position:sticky}@media(max-width:48rem){.${className}{position:static}}`,
+    ]) expect(() => assertMobileHeaderRule(invalid, className)).toThrow();
+  });
+
   test("publishes exactly the reviewed fonts and attribution, excluding package-only source and OTFs", async () => {
     const { source, output, styles } = await createFontFixture();
     for (const path of ["social-fonts.generated.ts", "NebulaSans-Book.otf", "NebulaSans-Bold.otf", "extra.woff2"]) {
@@ -267,6 +316,7 @@ describe("static-site build", () => {
     }
     const foundation = await readFile(join(root, "dist/site", foundationPath), "utf8");
     const union = await readFile(join(root, "dist/site/stylex.css"), "utf8");
+    assertMobileHeaderRule(union, mobileHeaderFlowClassName());
     expect(foundation).toContain("Nebula Sans");
     expect(foundation).toContain(".syntax-code");
     expect(foundation).toContain(".syntax-token--command");

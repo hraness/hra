@@ -17,7 +17,7 @@ import {
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { findSection, type ContentBlock, type InlineContent, type PublicContent } from "./content.ts";
-import { heroExampleMeasureClassName } from "./marketing.stylex.ts";
+import { heroExampleMeasureClassName, mobileHeaderFlowClassName } from "./marketing.stylex.ts";
 import { sitePresentationClasses, type SitePresentationSlot } from "./presentation.stylex.ts";
 
 const classes = (hook: string, ...slots: readonly SitePresentationSlot[]): string =>
@@ -79,6 +79,7 @@ function RolloutNotice({ content, placement }: Readonly<{ content: PublicContent
 export function renderMarketingHeader(content: PublicContent, currentPath: "/" | "/privacy/"): string {
   return renderToStaticMarkup(
     <MarketingSiteHeader
+      className={mobileHeaderFlowClassName()}
       action={{ emphasis: "primary", href: "/#install-command", label: `Install ${content.productName}` }}
       brand={content.productName}
       brandHref="/"

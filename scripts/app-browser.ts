@@ -67,7 +67,7 @@ const browserDiagnosticSteps = new Set([
   ...["home", "privacy", "preview"].flatMap((route) => [
     "navigation", "document-bytes", "direction", "heading", "settle-before-fonts", "font-load", "settle-after-fonts",
     "document-clean", "stylesheet-links", "stylesheet-inventory", "color-scheme", "background", "heading-style", "inertness",
-    "negative-final-css", "negative-foundation-css", "negative-document-clean", "resource-bytes",
+    "negative-final-css", "negative-foundation-css", "negative-document-clean", "resource-bytes", "mobile-anchors",
   ].map((step) => `static-site:${route}:${step}`)),
   ...["production-anonymous:negative-css", "fixture:primitives:negative-css", ...["home", "privacy", "preview"].flatMap((route) =>
     [`static-site:${route}:negative-final-css`, `static-site:${route}:negative-foundation-css`])]
@@ -626,6 +626,84 @@ export function loadedStylesheetControl(element: Element, sampleSelector?: strin
 }
 
 type RestorationBoundary = Readonly<{ signal: AbortSignal; profileDeadline: number }>;
+
+/** Cover the inclusive mobile breakpoint once per public route in the desktop
+ * profile. Reuse the loaded document and sheets; all six profiles still run.
+ * Native fragment scrolling is observed, never replaced by a CSS offset fix. */
+async function verifyMobileSiteAnchors(page: Page, pathname: "/" | "/privacy/", profile: Profile, boundary: RestorationBoundary): Promise<unknown[]> {
+  const samples: unknown[] = [];
+  let failure: { error: unknown } | undefined;
+  try {
+    for (const width of [320, 390, 768, 769, 1440]) {
+      assert.equal(boundary.signal.aborted, false, "Browser mobile anchor check cancelled");
+      assert.ok(performance.now() < boundary.profileDeadline, "Browser mobile anchor check exceeded its profile deadline");
+      await page.setViewportSize({ width, height: profile.height });
+      await page.evaluate((path) => {
+        history.replaceState(null, "", path);
+        window.scrollTo({ left: 0, top: 0, behavior: "instant" });
+      }, pathname);
+      await settle(page);
+      const targetId = pathname === "/" ? "install-and-update" : "privacy";
+      if (pathname === "/") await page.locator('a[href="#install-and-update"]').first().click();
+      else await page.evaluate((id) => { location.hash = id; }, targetId);
+      // Await the browser's native smooth-scroll destination, including the
+      // existing authored scroll margin and end-of-document clamping.
+      const scrollSettled = await page.waitForFunction((id) => {
+        const target = document.getElementById(id);
+        if (target === null) return false;
+        const margin = Number.parseFloat(getComputedStyle(target).scrollMarginTop);
+        const maximum = Math.max(0, document.documentElement.scrollHeight - innerHeight);
+        const destination = Math.min(maximum, Math.max(0, target.getBoundingClientRect().top + scrollY - margin));
+        return Number.isFinite(destination) && Math.abs(scrollY - destination) <= 1;
+      }, targetId, { polling: "raf", timeout: 5000 });
+      await scrollSettled.dispose();
+      await settle(page);
+      const sample = await page.evaluate((id) => {
+        const header = document.querySelector('[data-hraness-marketing="header"]');
+        const heading = document.getElementById(`${id}-heading`);
+        if (header === null || heading === null) throw new Error("Missing public header or fragment heading");
+        const rectangle = (element: Element) => {
+          const box = element.getBoundingClientRect();
+          return { left: box.left, top: box.top, right: box.right, bottom: box.bottom, width: box.width, height: box.height };
+        };
+        return { width: innerWidth, height: innerHeight, mobile: matchMedia("(max-width: 48rem)").matches,
+          position: getComputedStyle(header).position, header: rectangle(header), heading: rectangle(heading),
+          documentWidth: document.documentElement.scrollWidth, bodyWidth: document.body.scrollWidth, scrollX,
+          fragment: location.hash };
+      }, targetId);
+      assert.equal(sample.width, width);
+      assert.equal(sample.height, profile.height);
+      assert.equal(sample.mobile, width <= 768, "Mobile header breakpoint changed");
+      assert.equal(sample.position, sample.mobile ? "static" : "sticky", "Public header lost mobile flow or desktop stickiness");
+      assert.equal(sample.fragment, `#${targetId}`);
+      for (const rectangle of [sample.header, sample.heading]) {
+        assert.ok(Object.values(rectangle).every(Number.isFinite));
+        assert.ok(rectangle.width > 0 && rectangle.height > 0);
+      }
+      assert.ok(sample.documentWidth <= width + 1 && sample.bodyWidth <= width + 1 && Math.abs(sample.scrollX) <= 1,
+        "Public fragment navigation introduced horizontal overflow");
+      assert.ok(sample.heading.left >= -1 && sample.heading.right <= width + 1);
+      const obscuredUntil = sample.position === "sticky" ? Math.max(0, sample.header.bottom) : 0;
+      assert.ok(sample.heading.top >= obscuredUntil - 1 && sample.heading.bottom <= sample.height + 1,
+        "Public fragment heading is obscured or outside the viewport");
+      samples.push(sample);
+    }
+  } catch (error) { failure = { error }; }
+  try {
+    await page.setViewportSize({ width: profile.width, height: profile.height });
+    await page.evaluate((path) => {
+      history.replaceState(null, "", path);
+      window.scrollTo({ left: 0, top: 0, behavior: "instant" });
+    }, pathname);
+    await settle(page);
+  } catch (error) {
+    if (failure !== undefined) throw new AggregateError([failure.error, error], "Browser mobile anchor check and restoration failed");
+    throw error instanceof Error ? error : new Error("Browser mobile anchor restoration failed", { cause: error });
+  }
+  if (failure !== undefined) throw failure.error instanceof Error ? failure.error : new Error("Browser mobile anchor check failed", { cause: failure.error });
+  return samples;
+}
+
 async function negativeStylesheet(page: Page, selector: string, href: string, report: NegativeStylesheetReporter, boundary: RestorationBoundary, foundation = false): Promise<void> {
   const step = <T>(name: NegativeStylesheetSubstep, operation: () => Promise<T>) => browserNegativeStep(name, operation, report);
   const sample = () => page.locator(selector).first().evaluate((element, foundation) => {
@@ -1115,6 +1193,11 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             assert.ok(fonts.every(({ status }) => status === "loaded"), "A public font did not load natively under font-src self");
             mark(`static-site:${routeLabel}:settle-after-fonts`);
             await settle(page);
+            if (profile.name === "desktop" && route.pathname !== "/preview/") {
+              mark(`static-site:${routeLabel}:mobile-anchors`);
+              const anchors = await verifyMobileSiteAnchors(page, route.pathname, profile, restorationBoundary);
+              evidence.push({ name: `desktop:static-site:${route.path}:mobile-anchors`, values: anchors });
+            }
             mark(`static-site:${routeLabel}:document-clean`);
             await cleanDocument(page);
             mark(`static-site:${routeLabel}:stylesheet-links`);
