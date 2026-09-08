@@ -1346,12 +1346,23 @@ const daemonStopRecovery = (
   };
 };
 
-const daemonStopAuthorityRecovery = (): Extract<DaemonStopResult, { kind: "failure" }> => ({
+type DaemonStopProgress = {
+  authorityPhase: "preflight_receipt" | "preflight_inspection" | "stop_request" | "release_confirmation";
+  stopRequestState: "not_attempted" | "attempted" | "acknowledged";
+};
+
+const daemonStopAuthorityRecovery = (
+  progress: Readonly<DaemonStopProgress>,
+): Extract<DaemonStopResult, { kind: "failure" }> => ({
   kind: "failure",
   error: {
     code: "RECOVERY_REQUIRED",
-    message: "The local daemon authority is unsafe or invalid. Run `hra doctor --offline` before changing daemon state.",
-    details: { nextCommand: "hra doctor --offline" },
+    message: "The local daemon authority could not be safely verified. Run `hra doctor --offline` before taking further action.",
+    details: {
+      nextCommand: "hra doctor --offline",
+      authorityPhase: progress.authorityPhase,
+      stopRequestState: progress.stopRequestState,
+    },
   },
 });
 
@@ -1489,9 +1500,11 @@ const completedDaemonStop = (
 
 async function stopDaemonWithExactAuthorityInner(
   paths: StatePaths,
-  dependencies: DaemonStopDependencies = defaultDaemonStopDependencies,
+  dependencies: DaemonStopDependencies,
+  progress: DaemonStopProgress,
 ): Promise<DaemonStopResult> {
   const preStopReceipt = await dependencies.observeReceipt(paths);
+  progress.authorityPhase = "preflight_inspection";
   const initialProof = await confirmNoDaemonAuthority(paths, dependencies);
   if (initialProof.kind === "failed") return daemonStopRecovery("failed");
   if (initialProof.kind === "absent") {
@@ -1503,8 +1516,15 @@ async function stopDaemonWithExactAuthorityInner(
   const capturedAuthority = identityFromReceipt(preStopReceipt);
   if (capturedAuthority === null) return daemonStopRecovery("unproven");
 
+  const confirmRelease = async (): Promise<DaemonReleaseProof> => {
+    progress.authorityPhase = "release_confirmation";
+    return await confirmExactDaemonRelease(paths, capturedAuthority, dependencies);
+  };
   let response: CommandResponse;
   try {
+    // Attempted records the boundary call, not delivery or acknowledgement.
+    progress.authorityPhase = "stop_request";
+    progress.stopRequestState = "attempted";
     response = await dependencies.requestStop({
       paths,
       command: { kind: "daemon.stop", expected: capturedAuthority },
@@ -1512,13 +1532,13 @@ async function stopDaemonWithExactAuthorityInner(
     });
   } catch (error: unknown) {
     if (error instanceof LocalDaemonIndeterminateError) {
-      const proof = await confirmExactDaemonRelease(paths, capturedAuthority, dependencies);
+      const proof = await confirmRelease();
       return proof.kind === "stopped"
         ? completedDaemonStop(capturedAuthority, proof, undefined, false)
         : daemonStopRecovery(proof.kind === "absent" ? "unproven" : proof.kind);
     }
     if (!isLocalDaemonUnavailable(error)) throw error;
-    const proof = await confirmExactDaemonRelease(paths, capturedAuthority, dependencies);
+    const proof = await confirmRelease();
     return proof.kind === "stopped"
       ? completedDaemonStop(capturedAuthority, proof, undefined, false)
       : daemonStopRecovery(proof.kind === "absent" ? "unproven" : proof.kind);
@@ -1529,7 +1549,7 @@ async function stopDaemonWithExactAuthorityInner(
   try {
     acknowledgedAuthority = daemonStatusIdentity(response);
   } catch {
-    const proof = await confirmExactDaemonRelease(paths, capturedAuthority, dependencies);
+    const proof = await confirmRelease();
     return proof.kind === "stopped"
       ? completedDaemonStop(capturedAuthority, proof, undefined, false)
       : daemonStopRecovery(proof.kind === "absent" ? "unproven" : proof.kind);
@@ -1537,7 +1557,8 @@ async function stopDaemonWithExactAuthorityInner(
   if (!sameDaemonIdentity(capturedAuthority, acknowledgedAuthority)) {
     return daemonStopRecovery("replacement");
   }
-  const proof = await confirmExactDaemonRelease(paths, capturedAuthority, dependencies);
+  progress.stopRequestState = "acknowledged";
+  const proof = await confirmRelease();
   return proof.kind === "stopped"
     ? completedDaemonStop(capturedAuthority, proof, response.data, true)
     : daemonStopRecovery(proof.kind === "absent" ? "unproven" : proof.kind);
@@ -1547,10 +1568,14 @@ export async function stopDaemonWithExactAuthority(
   paths: StatePaths,
   dependencies: DaemonStopDependencies = defaultDaemonStopDependencies,
 ): Promise<DaemonStopResult> {
+  const progress: DaemonStopProgress = {
+    authorityPhase: "preflight_receipt",
+    stopRequestState: "not_attempted",
+  };
   try {
-    return await stopDaemonWithExactAuthorityInner(paths, dependencies);
+    return await stopDaemonWithExactAuthorityInner(paths, dependencies, progress);
   } catch (error: unknown) {
-    if (isImmediateDaemonAuthorityError(error)) return daemonStopAuthorityRecovery();
+    if (isImmediateDaemonAuthorityError(error)) return daemonStopAuthorityRecovery(progress);
     throw error;
   }
 }

@@ -479,6 +479,19 @@ describe("release workflow", () => {
       .toBeLessThan(releaseNotes.indexOf("```sh"));
   });
 
+  test("keeps the integrated memory live proofs beside the tag procedure", async () => {
+    const releaseRecord = await readFile(join(import.meta.dir, "..", "docs", "beta-release.md"), "utf8");
+    const tagProcedure = releaseRecord.split("The replacement release path")[1]
+      ?.split("The release workflow does not rerun")[0];
+    expect(tagProcedure).toBeDefined();
+    expect(tagProcedure).toContain("do not run `release:tag` or publish until both");
+    expect(tagProcedure).toContain("authenticated Claude proof");
+    expect(tagProcedure).toContain("two-device hosted-memory proof");
+    expect(tagProcedure).toContain("../kb/plans/oh-memory-civilization.md#phase-10-validate-and-deliver-hosted-support");
+    expect(tagProcedure).toContain("The tag helper and artifact workflow do not establish authenticated acceptance evidence");
+    expect(releaseRecord).not.toContain("Publication is safe independently because");
+  });
+
   test("requires verified evidence before publishing v0.6.3 admission copy", async () => {
     const releaseRecord = await readFile(join(import.meta.dir, "..", "docs", "beta-release.md"), "utf8");
     expect(releaseRecord.includes("UNVERIFIED_LOCAL_DRAFT")).toBe(false);

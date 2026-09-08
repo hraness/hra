@@ -3249,6 +3249,21 @@ const failureNextCommand = (details: unknown): string | null => {
     return value.nextCommand;
   }
   if (
+    value !== null
+    && Object.keys(value).length === 3
+    && Object.hasOwn(value, "nextCommand")
+    && Object.hasOwn(value, "authorityPhase")
+    && Object.hasOwn(value, "stopRequestState")
+    && value.nextCommand === "hra doctor --offline"
+    && (((value.authorityPhase === "preflight_receipt" || value.authorityPhase === "preflight_inspection")
+      && value.stopRequestState === "not_attempted")
+    || (value.authorityPhase === "stop_request" && value.stopRequestState === "attempted")
+    || (value.authorityPhase === "release_confirmation"
+      && (value.stopRequestState === "attempted" || value.stopRequestState === "acknowledged")))
+  ) {
+    return "hra doctor --offline";
+  }
+  if (
     value?.nextCommand === "hra doctor"
     && value.repair === "repair_or_select_project"
     && Object.keys(value).length === 2

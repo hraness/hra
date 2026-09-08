@@ -31,8 +31,12 @@ The complete session/Work migration slice is being validated separately in
 [draft PR151](https://github.com/hraness/hra/pull/151), on
 `codex/canonical-profile-migration-20260908`; it is not released or activated.
 PR139 merged at `109655a8f7d6edd8916f6d7df277e3402b70a44f`, and PR148 retains
-the next integration and candidate-release window. Preserve its peer-memory
-changes and join actual protected main before final schema50 validation.
+the candidate-release window. PR148 then merged as protected main
+`a4b1931eb2ca6b43d699ff8d286c2c77cc14cf6f`; that actual source is now joined
+here. Its owner completed exact-main CI and package/install verification and
+released the main integration window. Schema50 still requires its own final
+aggregate, protected merge and exact-main proof; candidate release retains
+separate live acceptance and installer-repair gates.
 
 The delivered foundation's reviewed tree is
 `978bdc30b6fb9d259c92d0ca91335a854227d6f4`. Its companion module,
@@ -577,8 +581,48 @@ retired-provider refusals, immutable evidence, callback counts, adoption and
 recovery behavior. All four changed test files passed independent review and
 scoped static checks. Production and reviewed package inputs remain unchanged.
 
-Remaining integration work includes the actual PR148 main join, refreshed
-archive review and required exact-tree gates. Keep shaped fixtures distinct
+### Actual main join and archive review
+
+PR148 merged at `a4b1931eb2ca6b43d699ff8d286c2c77cc14cf6f`, with reviewed
+tree `5228ca8fd4461c1cdc36683332db32f2d9dae714`, after its fresh local aggregate,
+both CI platforms, Required and CodeQL passed. Its separately owned exact-main
+CI34256602941 and fresh package/install proof also passed; the owner released
+the main window for this PR while retaining separate candidate-release gates.
+The normal join into PR151 preserves both parents' complete changes in all
+four auto-merged files. Every other incoming file matches that actual main.
+Independent review confirmed the canonical atomic returns, row validation,
+legacy errors and incoming peer-causal fences compose without a bypass.
+
+The only merge conflict was the expected archive inventory digest; neither
+parent's digest describes the combined package. A fresh unpublished archive
+was independently inspected as raw gzip/tar and extracted files. It has 167
+source-identical regular files, nine directories and 7,129,588 regular bytes.
+Exactly 11 reviewed files differ from the foundation; 156 remain byte-identical.
+Modes, safe paths, production-only contents and frozen SQL/guard/mapping
+declarations passed review. The 8,318-byte inventory SHA-256 is
+`f9cfdac79c57dadbd52ea3e5908d22736a02ca0ebcffafcb456a7e34c0af66fa`.
+Only the expected digest changes. Archive size is 1,356,506 bytes, SHA-256
+`b0d108a2656d29d8468ed00880c4e7aa87996a2458098e24fb5cfddaeb6be4e5`.
+Package policy passed 11 tests and 42 assertions; the exact extracted-inventory
+assertion and unchanged 45-file security inventory passed. This remains an
+unpublished content receipt, not installation or final integration acceptance.
+
+All five changed-input private compatibility controls now pass on the reviewed
+joined storage sources: authentic35 and39 upgrade, authentic35 late-ledger
+rollback, authentic41 upgrade and synthetic50 older-reader refusal. The first
+three share independently reviewed refresh receipt SHA-256
+`ee36226f4e9014ec2bfc9279f1c97acfda3daa940b8bb960084730ad596280d0`.
+The41 result preserves the previous complete snapshot digest; its independently
+reviewed receipt SHA-256 is
+`819458463a114fa8e2214404f6832690302737fb5b5828a4f0fea59fb17a47cf`.
+The independently reviewed older-reader log SHA-256 is
+`bcae6ba74f581370ecbb08dc0879d22e66da8cedb254c7f6c3547ad6cf4645df`.
+The older reader again preserves every material database and sidecar byte. Originals,
+previous receipts and pinned source inputs remain unchanged. These are fresh
+copy-only executions with explicit working-merge parents, not final-commit,
+artifact-installation, provider or production receipts.
+
+Remaining integration work includes the required exact-tree gates. Keep shaped fixtures distinct
 from untouched historical captures and the bounded coverage of each proof.
 Do not mark this migration, candidate admission or release complete from the
 current working source or these focused receipts.

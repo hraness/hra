@@ -6691,6 +6691,90 @@ describe("CLI entry point", () => {
     expect(captured.read().stdout).not.toContain('"released":true');
   });
 
+  test.each([
+    ["receipt", "preflight_receipt", "not_attempted", 0],
+    ["inspection", "preflight_inspection", "not_attempted", 0],
+    ["indeterminate inspection", "preflight_inspection", "not_attempted", 0],
+    ["request", "stop_request", "attempted", 1],
+    ["synchronous request", "stop_request", "attempted", 1],
+    ["acknowledged release", "release_confirmation", "acknowledged", 1],
+    ["indeterminate response", "release_confirmation", "attempted", 1],
+    ["unavailable response", "release_confirmation", "attempted", 1],
+    ["malformed response", "release_confirmation", "attempted", 1],
+    ["reconciliation receipt", "release_confirmation", "acknowledged", 1],
+    ["reconciliation authority", "release_confirmation", "acknowledged", 1],
+  ] as const)("reports closed daemon-stop authority observations after %s", async (
+    boundary, authorityPhase, stopRequestState, expectedRequests,
+  ) => {
+    const captured = capture();
+    const safety = new DaemonAuthoritySafetyError("private authority diagnostic must not escape");
+    let observations = 0;
+    let requests = 0;
+    let releaseWaits = 0;
+    const sleeps: number[] = [];
+    const reconciles = boundary === "reconciliation receipt" || boundary === "reconciliation authority";
+    const dependencies = exactStopDependencies({
+      observeReceipt: () => {
+        observations += 1;
+        if (boundary === "receipt" || (boundary === "reconciliation receipt" && observations > 1)) {
+          return Promise.reject(safety);
+        }
+        return Promise.resolve(daemonAuthorityReceipt(observations === 1 ? "ready" : "stopped"));
+      },
+      inspectAuthority: () => {
+        if (boundary === "inspection") return Promise.reject(safety);
+        return Promise.resolve(boundary === "indeterminate inspection" ? {
+          state: "indeterminate" as const,
+          database: { custody: "indeterminate" as const },
+          receipt: { custody: "indeterminate" as const },
+        } : {
+          state: "held" as const,
+          database: { custody: "safe" as const, authority: "held" as const },
+          receipt: { custody: "safe" as const, state: "ready" as const },
+        });
+      },
+      requestStop: () => {
+        requests += 1;
+        if (boundary === "synchronous request") throw safety;
+        if (boundary === "request") return Promise.reject(safety);
+        if (boundary === "indeterminate response") return Promise.reject(new LocalDaemonIndeterminateError("lost"));
+        if (boundary === "unavailable response") return Promise.reject(new LocalDaemonUnavailableError("unavailable"));
+        if (boundary === "malformed response") {
+          return Promise.resolve({ ok: true, version: 1, requestId: crypto.randomUUID(), data: {} });
+        }
+        return Promise.resolve(acknowledgedDaemonStopResponse());
+      },
+      waitForRelease: () => {
+        releaseWaits += 1;
+        return Promise.reject(reconciles ? new Error("transient observation") : safety);
+      },
+      authorityHeld: () => Promise.reject(safety),
+      sleep: (milliseconds) => {
+        sleeps.push(milliseconds);
+        return Promise.resolve();
+      },
+    });
+
+    expect(await main(["daemon", "stop", "--json"], captured.output, {
+      daemonStopDependencies: dependencies,
+    })).toBe(7);
+    expect(JSON.parse(captured.read().stdout) as unknown).toEqual({
+      ok: false,
+      version: 1,
+      error: {
+        code: "RECOVERY_REQUIRED",
+        message: "The local daemon authority could not be safely verified. Run `hra doctor --offline` before taking further action.",
+        details: { nextCommand: "hra doctor --offline", authorityPhase, stopRequestState },
+      },
+    });
+    expect(requests).toBe(expectedRequests);
+    expect(releaseWaits).toBe(authorityPhase === "release_confirmation" ? 1 : 0);
+    expect(sleeps).toEqual(boundary === "reconciliation authority" ? [25] : []);
+    expect(captured.read().stdout).not.toContain(safety.message);
+    expect(captured.read().stdout).not.toContain('"released":true');
+    expect(captured.read().stderr).toBe("");
+  });
+
   test("turns daemon-authority safety errors into an actionable closed recovery", async () => {
     const safety = new DaemonAuthoritySafetyError("unsafe authority fixture");
     let observations = 0;
