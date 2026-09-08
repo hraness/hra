@@ -175,7 +175,7 @@ export function assertSiteFontStyleInventory(styles: string): void {
   const references = new Set<string>();
   for (const face of faces) {
     if (face[1] === undefined) continue;
-    const declaration = /^\s*font-display:\s*swap;\s*font-family:\s*"(?:Nebula Sans|Geist Mono)";\s*font-style:\s*(?:normal|italic);\s*font-weight:\s*(?:300|400|500|600|700|900|100 900);\s*src:\s*url\("([^"\\\r\n]+)"\)\s*format\("woff2"\);\s*$/u.exec(face[1] ?? "");
+    const declaration = /^\s*font-display:\s*swap;\s*font-family:\s*"(?:Nebula Sans|Geist Mono)";\s*font-style:\s*(?:normal|italic);\s*font-weight:\s*(?:300|400|500|600|700|900|100 900);\s*src:\s*url\("([^"\\\r\n]+)"\)\s*format\("woff2"\);\s*$/u.exec(face[1]);
     const reference = declaration?.[1];
     if (reference === undefined || references.has(reference)) {
       throw new Error("Public font stylesheet has an unsupported or duplicate font face.");

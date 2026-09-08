@@ -181,15 +181,15 @@ describe("serial development rebuild coordinator", () => {
           const changed = snapshot("changed");
           const dependency = snapshot("changed", "dependency-b");
           const prior = published("prior");
-          const entered = deferred<void>();
-          const gate = deferred<void>();
+          const entered = deferred<undefined>();
+          const gate = deferred<undefined>();
           const statuses: DevStatus[] = [];
           let builds = 0;
           let publications = 0;
           let scans = 0;
           let activeSignal: AbortSignal | undefined;
           const pause = async (): Promise<void> => {
-            entered.resolve();
+            entered.resolve(undefined);
             await gate.promise;
             if (outcome === "error") throw new Error("fixture census failure");
             if (outcome === "dependency-error") throw new DevDependencyError("fixture dependency failure");
@@ -230,7 +230,7 @@ describe("serial development rebuild coordinator", () => {
           void closing?.then(() => { closed = true; });
           await Promise.resolve();
           expect(closed).toBe(false);
-          gate.resolve();
+          gate.resolve(undefined);
           await coordinator.waitForIdle();
           if (closing !== undefined) await closing;
           expect(coordinator.latest).toBe(prior);
@@ -252,13 +252,13 @@ describe("serial development rebuild coordinator", () => {
   }
 
   test("concurrent and reentrant close callers share the complete drain", async () => {
-    const gate = deferred<void>();
-    const entered = deferred<void>();
+    const gate = deferred<undefined>();
+    const entered = deferred<undefined>();
     let reentrant: Promise<void> | undefined;
     const coordinator = new DevBuildCoordinator({
       build: async (input, signal) => {
         signal.addEventListener("abort", () => { reentrant = coordinator.close(); }, { once: true });
-        entered.resolve();
+        entered.resolve(undefined);
         await gate.promise;
         return candidateFor(input, "closed");
       },
@@ -276,7 +276,7 @@ describe("serial development rebuild coordinator", () => {
     void second.then(() => { completed += 1; });
     await Promise.resolve();
     expect(completed).toBe(0);
-    gate.resolve();
+    gate.resolve(undefined);
     await Promise.all([first, second]);
     expect(completed).toBe(2);
     expect(coordinator.status.phase).toBe("stopped");
@@ -284,12 +284,12 @@ describe("serial development rebuild coordinator", () => {
 
   for (const terminal of ["running", "restart", "close"] as const) {
     test(`retains process custody uncertainty after ${terminal}`, async () => {
-      const gate = deferred<void>();
-      const entered = deferred<void>();
+      const gate = deferred<undefined>();
+      const entered = deferred<undefined>();
       const prior = published("prior");
       const coordinator = new DevBuildCoordinator({
         build: async () => {
-          entered.resolve();
+          entered.resolve(undefined);
           await gate.promise;
           throw new DevUncollectedProcessError("fixture collection unknown");
         },
@@ -300,7 +300,7 @@ describe("serial development rebuild coordinator", () => {
       await entered.promise;
       if (terminal === "restart") coordinator.requireRestart("original-fence");
       const closing = terminal === "close" ? coordinator.close() : undefined;
-      gate.resolve();
+      gate.resolve(undefined);
       await coordinator.waitForIdle();
       await closing;
       expect(coordinator.processCollectionUnproved).toBe(true);
@@ -535,8 +535,8 @@ describe("immutable development routing", () => {
         });
         const candidate = await makeCandidate("next");
         const controller = new AbortController();
-        const entered = deferred<void>();
-        const gate = deferred<void>();
+        const entered = deferred<undefined>();
+        const gate = deferred<undefined>();
         let scans = 0;
         let finalStageChecks = 0;
         const finalReceipt = join(cache.receiptsDirectory, `000000000002-${candidate.revision}.json`);
@@ -547,7 +547,7 @@ describe("immutable development routing", () => {
           currentSnapshot: async () => {
             scans += 1;
             if (boundary === `snapshot-${String(scans)}`) {
-              entered.resolve();
+              entered.resolve(undefined);
               await gate.promise;
             }
             return input;
@@ -578,7 +578,7 @@ describe("immutable development routing", () => {
           ]);
           expect(first.kind).toBe("entered");
           controller.abort();
-          gate.resolve();
+          gate.resolve(undefined);
         }
         const result = await outcome;
         expect(result.kind).toBe("rejected");
@@ -935,6 +935,37 @@ describe("cache, security, and owned process boundaries", () => {
           throw error;
         }
       };
+      // Await this same collection path on success and failure. Keeping its
+      // throws outside the finally body preserves cleanup-error precedence.
+      const cleanup = async (): Promise<void> => {
+        if (!ownerExited) { owner.kill("SIGKILL"); await owner.exited; }
+        try {
+          if (childPid === undefined) {
+            const identityPath = existsSync(childIdentity) ? childIdentity : existsSync(childReady) ? childReady : undefined;
+            if (identityPath === undefined) throw new Error("The test helper's spawn state is unknown; preserve its fixture");
+            const record: unknown = JSON.parse(await readFile(identityPath, "utf8"));
+            if (typeof record !== "object" || record === null || !("pid" in record)
+              || typeof record.pid !== "number" || !Number.isSafeInteger(record.pid) || record.pid <= 1) {
+              throw new Error("The test helper's exact identity is unavailable; preserve its fixture");
+            }
+            childPid = record.pid;
+          }
+          const pid = childPid;
+          await collectDevProcessGroup({
+            probe: () => probe(pid),
+            signal: (signal) => {
+              try { process.kill(-pid, signal); }
+              catch (error) { if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error; }
+            },
+            wait: () => Bun.sleep(25),
+          });
+          expect(probe(pid)).toBe(false);
+        } catch (error) {
+          const index = temporaryRoots.indexOf(root);
+          if (index >= 0) temporaryRoots.splice(index, 1);
+          throw error;
+        }
+      };
       try {
         const ownerExit = await owner.exited;
         ownerExited = true;
@@ -982,35 +1013,7 @@ describe("cache, security, and owned process boundaries", () => {
           expect(records[0]).toBe(records[1]!);
         }
       } finally {
-        if (!ownerExited) { owner.kill("SIGKILL"); await owner.exited; }
-        try {
-          if (childPid === undefined) {
-            const identityPath = existsSync(childIdentity) ? childIdentity : existsSync(childReady) ? childReady : undefined;
-            if (identityPath === undefined) throw new Error("The test helper's spawn state is unknown; preserve its fixture");
-            const record: unknown = JSON.parse(await readFile(identityPath, "utf8"));
-            if (typeof record !== "object" || record === null || !("pid" in record)
-              || typeof record.pid !== "number" || !Number.isSafeInteger(record.pid) || record.pid <= 1) {
-              throw new Error("The test helper's exact identity is unavailable; preserve its fixture");
-            }
-            childPid = record.pid;
-          }
-          if (childPid !== undefined) {
-            const pid = childPid;
-            await collectDevProcessGroup({
-              probe: () => probe(pid),
-              signal: (signal) => {
-                try { process.kill(-pid, signal); }
-                catch (error) { if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error; }
-              },
-              wait: () => Bun.sleep(25),
-            });
-            expect(probe(pid)).toBe(false);
-          }
-        } catch (error) {
-          const index = temporaryRoots.indexOf(root);
-          if (index >= 0) temporaryRoots.splice(index, 1);
-          throw error;
-        }
+        await cleanup();
       }
     }, 25_000);
   }

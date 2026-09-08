@@ -57,12 +57,13 @@ const longView: SessionModelView = {
 };
 
 const registries: DeviceRegistries = {
-  error: null, loading: false, machines: [{
+  error: null, loading: false, memorySummaryReady: true, now, machines: [{
     accountLinkingAllowed: false,
     accounts: [{ label: "Fixture account", provider: "codex", publicId: "account_browser_fixture", status: "signed_in" }],
     attentionEmailEnabled: null, daemonVersion: "0.6.1", defaultApprovalMode: "manual", defaultPreset: "high",
     deviceCommandsAllowed: true, devicePublicId: browserHead.executionDevicePublicId, deviceStatus: "active",
     heartbeatAt: now, label: "Fixture machine", online: true,
+    memorySummary: null, memorySummaryFreshness: "unsupported",
     notificationHours: null, notificationHoursStatus: "unsupported", notificationPolicyFreshness: "unsupported",
     notificationPolicyRevision: null, projects: [{ label: "Fixture project", publicId: "project_browser_fixture" }],
     proseAutorespondConfigured: false, revision: 1, scheduledTasks: [], sessionAdoption: null,

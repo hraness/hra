@@ -681,7 +681,10 @@ async function readPrivateRecord(path: string): Promise<Buffer> {
 
 function genericName(name: string): void {
   assert.ok(name.length > 0 && name.length <= 240, "Development cache entry name is not bounded");
-  assert.ok(!name.includes("/") && !name.includes("\\") && !/[\u0000-\u001f\u007f]/u.test(name), "Unsafe development cache entry name");
+  assert.ok(!name.includes("/") && !name.includes("\\") && name.split("").every((character) => {
+    const code = character.charCodeAt(0);
+    return code > 31 && code !== 127;
+  }), "Unsafe development cache entry name");
   assert.ok(name !== "." && name !== "..", "Unsafe development cache entry name");
 }
 

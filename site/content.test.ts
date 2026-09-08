@@ -277,7 +277,7 @@ describe("public content contract", () => {
 
     expect(markdown).toContain(`${nameSentence}[hraness.com](https://hraness.com/) explains the parent brand. ${maintainerSentence}`);
     const maintainerParagraphs = [...parseHTML(html).document.querySelectorAll("p")]
-      .filter((paragraph) => paragraph.textContent?.startsWith(nameSentence));
+      .filter((paragraph) => paragraph.textContent.startsWith(nameSentence));
     expect(maintainerParagraphs).toHaveLength(1);
     const maintainerHtml = maintainerParagraphs[0];
     expect(maintainerHtml?.textContent).toBe(`${nameSentence}hraness.com explains the parent brand. ${maintainerSentence}`);

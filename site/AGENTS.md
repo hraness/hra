@@ -3,7 +3,7 @@
 - `content.ts` is the shared public content contract for README and website generation.
 - `template.ts` renders the homepage and privacy page.
 - `marketing.tsx` composes public design-kit server components; `render.ts` is the captured build-time entry for all three HTML routes.
-- `presentation.stylex.ts` and `marketing.stylex.ts` own local component recipes. `foundation.css` joins approved document foundations and public fonts, without importing legacy component styles.
+- `presentation.stylex.ts` and `marketing.stylex.ts` own local component recipes. `foundation.ts` is the build-only CSS entry; `foundation.css` joins approved document foundations and public fonts, without importing legacy component styles. The empty entry chunk stays private.
 - `analytics-site.ts` defines the exact production host, route taxonomy, and event vocabulary.
 - `analytics-entry.ts` is the self-hosted browser entry that initializes bounded PostHog capture.
 - Tests enforce semantic, privacy, analytics, and command parity.

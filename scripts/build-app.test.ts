@@ -10,7 +10,7 @@ import {
   appPublicationRecord, appSha256, assertAppRunDirectory, beginAppProcessCustody,
   commitAppPublication, createAppSourceMarkerEvidence, parseAppComplete, parseAppPublication, prepareAppShell,
   readAppInventory, reconcileAppPublication, revalidateAppSourceMarker, revalidateAppSourceMarkerInputs,
-  snapshotAppGraph,
+  snapshotAppGraph, snapshotAppSourceEnvironment,
   type AppArtifact, type AppPublicationFailureBoundary, type AppPublicationLock,
   type AppSourceMarkerEvidence,
 } from "./build-app.ts";
@@ -53,7 +53,7 @@ const complete = () => {
     ],
     compilerSha256: "a".repeat(64), finalCss: hashed("stylex.css", "@layer components.hraness-stylex.priority1{.x{color:red}}"),
     generationId: "hra-app", graphs: [{ id: "client", receiptSha256: "b".repeat(64) }],
-    kind: "hraness-stylex-complete-generation", packages: [{ manifestSha256: "c".repeat(64), name: "@hraness/ui", version: "0.5.4" }],
+    kind: "hraness-stylex-complete-generation", packages: [{ manifestSha256: "c".repeat(64), name: "@hraness/ui", version: "0.5.6" }],
     planSha256: "d".repeat(64), schemaVersion: 2, state: "complete",
     unionPolicySha256: "1ceced1f1bf6359413ca6425ede61e1fdae272b897f4455c2347e2431d75caa1",
   };
@@ -196,8 +196,23 @@ describe("closed public projection and prior publication provenance", () => {
     for (const bad of [NaN, -1, 0, 1.5, 65 * 1024 * 1024]) {
       expect(() => parseAppComplete({ ...complete(), finalCss: { ...complete().finalCss, bytes: bad } })).toThrow();
     }
-    const { unionPolicySha256: _omittedPolicy, ...unbound } = complete();
+    const unbound = Object.fromEntries(Object.entries(complete()).filter(([key]) => key !== "unionPolicySha256"));
     expect(() => parseAppComplete(unbound)).toThrow();
+  });
+
+  test("source environment excludes every ASCII control without excluding other code units", () => {
+    const controls = [...Array.from({ length: 32 }, (_, code) => code), 127];
+    for (const code of controls) {
+      expect(() => snapshotAppSourceEnvironment({ VERCEL: `left${String.fromCharCode(code)}right` }))
+        .toThrow(/Unsafe app source environment value/u);
+    }
+    for (const code of [32, 126, 128, 0x2028, 0xd800, 0xdc00, 0xffff]) {
+      const value = `left${String.fromCharCode(code)}right`;
+      expect(snapshotAppSourceEnvironment({ VERCEL: value }).VERCEL).toBe(value);
+    }
+    expect(snapshotAppSourceEnvironment({ VERCEL: "x".repeat(256) }).VERCEL).toHaveLength(256);
+    expect(() => snapshotAppSourceEnvironment({ VERCEL: "x".repeat(257) }))
+      .toThrow(/Unsafe app source environment value/u);
   });
 
   test("prior output requires the exact private publication schema and safe paths", () => {

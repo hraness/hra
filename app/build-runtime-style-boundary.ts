@@ -22,6 +22,11 @@ function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
+// Parser roots have no parent at runtime, despite Node.parent's required type.
+function parentNode(node: ts.Node): ts.Node | undefined {
+  return node.parent;
+}
+
 function propertyName(expression: ts.Expression): string | undefined {
   if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
   if (ts.isElementAccessExpression(expression)
@@ -68,11 +73,11 @@ export function assertReviewedRuntimeStyleBoundary(
         const tag = node.arguments[0];
         if (method === "createElement" && tag !== undefined
           && ts.isStringLiteralLike(tag) && tag.text.toLowerCase() === "style") {
-          let clause: ts.Node | undefined = node.parent;
+          let clause = parentNode(node);
           while (clause !== undefined && !ts.isCaseClause(clause)
-            && !ts.isFunctionLike(clause)) clause = clause.parent;
+            && !ts.isFunctionLike(clause)) clause = parentNode(clause);
           let owner: ts.Node | undefined = clause;
-          while (owner !== undefined && !ts.isFunctionLike(owner)) owner = owner.parent;
+          while (owner !== undefined && !ts.isFunctionLike(owner)) owner = parentNode(owner);
           if (clause === undefined || !ts.isCaseClause(clause)
             || !ts.isStringLiteralLike(clause.expression) || clause.expression.text !== "style"
             || owner === undefined || !ts.isFunctionDeclaration(owner)

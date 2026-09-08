@@ -41,6 +41,7 @@ test("the remaining stylesheet owns only seven document and palette foundations"
 });
 
 test("the static entry joins compiler foundations and local fonts without legacy component CSS", async () => {
+  expect(await readFile(new URL("foundation.ts", import.meta.url), "utf8")).toBe('import "./foundation.css";\n');
   const imports = await readFile(new URL("foundation.css", import.meta.url), "utf8");
   expect(imports.trim().split("\n")).toEqual([
     '@import "@hraness/design-kit/compiler-foundation.css";',

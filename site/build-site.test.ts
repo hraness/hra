@@ -162,7 +162,7 @@ describe("static-site build", () => {
     const styles = await readFile(join(import.meta.dir, "styles.css"), "utf8");
     const recipes = await readFile(join(import.meta.dir, "presentation.stylex.ts"), "utf8");
     expect(styles).not.toContain('[data-slot="ask-ai-about-this-');
-    expect(styles).not.toMatch(/(?:^|\n)a:focus-visible\s*[,\{]/u);
+    expect(styles).not.toMatch(/(?:^|\n)a:focus-visible\s*[,{]/u);
     for (const [shared, product] of [
       ["background", "background"], ["foreground", "foreground"],
       ["font-sans", "font-sans"], ["font-heading", "font-heading"],

@@ -239,7 +239,10 @@ export function parseAppComplete(value: unknown): readonly AppArtifact[] {
 function environmentValue(value: unknown, name: string): string | null {
   assert.ok(value === null || typeof value === "string", `Invalid app source environment value: ${name}`);
   if (typeof value === "string") {
-    assert.ok(value.length <= 256 && !/[\u0000-\u001f\u007f]/u.test(value), `Unsafe app source environment value: ${name}`);
+    assert.ok(value.length <= 256 && value.split("").every((character) => {
+      const code = character.charCodeAt(0);
+      return code > 31 && code !== 127;
+    }), `Unsafe app source environment value: ${name}`);
   }
   return value;
 }
@@ -802,7 +805,8 @@ export function acquireAppPublicationLock(controlDirectory: string): AppPublicat
         closeSync(descriptor);
         descriptor = -1;
         locked = false;
-        if (failure !== undefined) throw failure;
+        if (failure !== undefined) throw failure instanceof Error
+          ? failure : new Error("App publication lock identity check failed", { cause: failure });
       },
     };
   } catch (error) {

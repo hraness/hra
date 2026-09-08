@@ -94,9 +94,7 @@ async function readBoundedDiagnostics(
   let retainedBytes = 0;
   let truncated = false;
   try {
-    while (true) {
-      const next = await reader.read();
-      if (next.done) break;
+    for (let next = await reader.read(); !next.done; next = await reader.read()) {
       const remaining = Math.max(0, maximumBytes - retainedBytes);
       if (remaining < next.value.byteLength) truncated = true;
       if (remaining > 0) {
@@ -225,7 +223,7 @@ describe("built shell", () => {
 
   test("preserves the complete authored shell metadata and root boundary", async () => {
     const authored = await readFile(join(appRoot, "index.html"), "utf8");
-    const unlinked = shell.replace(/<link rel="stylesheet" href="\/graphs\/client\/assets\/[^/]+\.css">\n    <link rel="stylesheet" href="\/stylex\.css">\n  /u, "")
+    const unlinked = shell.replace(/<link rel="stylesheet" href="\/graphs\/client\/assets\/[^/]+\.css">\n {4}<link rel="stylesheet" href="\/stylex\.css">\n {2}/u, "")
       .replace(/<script type="module" src="\/graphs\/client\/assets\/[^/]+\.js"><\/script>/u, '<script type="module" src="/src/main.tsx"></script>');
     expect(unlinked).toBe(authored);
   });

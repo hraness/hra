@@ -10,8 +10,12 @@ export type TextareaProps = Omit<TextareaHTMLAttributes<HTMLTextAreaElement>, "s
   xstyle?: StyleXStyles;
 }>;
 
-export function Textarea({ className, rows = 2, style, xstyle, ...rest }: TextareaProps) {
+function rejectInlineStyle(style: unknown): void {
   if (style !== undefined) throw new Error("HRA primitives do not accept caller inline styles.");
+}
+
+export function Textarea({ className, rows = 2, style, xstyle, ...rest }: TextareaProps) {
+  rejectInlineStyle(style);
   const presentation = stylex.props(fieldStyles.textarea, xstyle);
   return (
     <textarea

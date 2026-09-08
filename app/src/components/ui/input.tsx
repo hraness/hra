@@ -10,8 +10,12 @@ export type InputProps = Omit<InputHTMLAttributes<HTMLInputElement>, "style"> & 
   xstyle?: StyleXStyles;
 }>;
 
-export function Input({ className, style, xstyle, ...rest }: InputProps) {
+function rejectInlineStyle(style: unknown): void {
   if (style !== undefined) throw new Error("HRA primitives do not accept caller inline styles.");
+}
+
+export function Input({ className, style, xstyle, ...rest }: InputProps) {
+  rejectInlineStyle(style);
   const presentation = stylex.props(fieldStyles.input, xstyle);
   return (
     <input

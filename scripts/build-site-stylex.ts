@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   artifactForFile, compilerSha256, createStylexGeneration, finalizeStylexGeneration,
@@ -30,30 +30,46 @@ const completeSchema = z.object({
 }).strict();
 
 type SiteArtifact = z.infer<typeof artifact>;
-type SiteFoundation = Readonly<{ cssPath: string; artifacts: readonly SiteArtifact[] }>;
+type SiteFoundation = Readonly<{ cssPath: string; privateEntryPath: string; artifacts: readonly SiteArtifact[] }>;
 
 function record(value: unknown): Record<string, unknown> {
   assert.ok(typeof value === "object" && value !== null && !Array.isArray(value));
   return value as Record<string, unknown>;
 }
 
-/** Read Vite's actual RollupOutput assets, never a guessed staging inventory.
- * CSS-only input must emit one stylesheet and all thirteen physical fonts. */
-export function snapshotSiteFoundation(value: unknown, expectedFontHashes: readonly string[]): SiteFoundation {
+/** Read Vite's actual RollupOutput, never a guessed staging inventory.
+ * Vite's single-stylesheet mode requires a JavaScript entry importing CSS.
+ * Its one empty entry stays bound to the graph but is never published. */
+export function snapshotSiteFoundation(value: unknown, expectedFontHashes: readonly string[], expectedEntrySource: string): SiteFoundation {
+  assert.ok(isAbsolute(expectedEntrySource), "Static foundation entry identity must be absolute");
   const outputs = Array.isArray(value) ? value : [value];
   assert.equal(outputs.length, 1, "Static foundation must have one Rollup output");
   const output = record(outputs[0]).output;
-  assert.ok(Array.isArray(output) && output.length === 14, "Static foundation must emit one CSS file and thirteen WOFF2 files");
+  assert.ok(Array.isArray(output) && output.length === 15, "Static foundation must emit one empty entry, one CSS file and thirteen WOFF2 files");
+  let privateEntryPath: string | undefined;
   const artifacts = output.map((value): SiteArtifact => {
     const item = record(value);
-    assert.equal(item.type, "asset", "Static foundation must not emit JavaScript");
     assert.ok(typeof item.fileName === "string");
+    if (item.type === "chunk") {
+      assert.equal(privateEntryPath, undefined, "Static foundation must have exactly one private entry");
+      assert.equal(item.isEntry, true);
+      assert.equal(item.isDynamicEntry, false);
+      assert.equal(item.facadeModuleId, expectedEntrySource);
+      assert.match(item.fileName, /^assets\/foundation-[A-Za-z0-9_-]+\.js$/u);
+      for (const field of ["imports", "dynamicImports", "exports", "referencedFiles"]) assert.deepEqual(item[field], []);
+      assert.ok(item.code === "" || item.code === "\n", "Static foundation entry must contain no executable code");
+      assert.equal(item.map, null, "Static foundation entry must not carry a source map");
+      privateEntryPath = item.fileName;
+      return artifact.parse({ path: item.fileName, bytes: Buffer.byteLength(item.code), sha256: hash(item.code) });
+    }
+    assert.equal(item.type, "asset", "Unexpected static foundation output type");
     assert.match(item.fileName, /^assets\/[A-Za-z0-9_.[\]-]+\.(?:css|woff2)$/u);
     assert.ok(typeof item.source === "string" || item.source instanceof Uint8Array);
     const bytes = typeof item.source === "string" ? Buffer.byteLength(item.source) : item.source.byteLength;
     assert.ok(bytes <= 16 * 1024 * 1024, "Static foundation asset exceeded its bound");
     return artifact.parse({ path: item.fileName, bytes, sha256: hash(item.source) });
   }).sort((a, b) => a.path.localeCompare(b.path));
+  assert.ok(privateEntryPath !== undefined, "Static foundation entry was not captured");
   assert.equal(new Set(artifacts.map(({ path }) => path)).size, artifacts.length);
   const css = artifacts.filter(({ path }) => path.endsWith(".css"));
   assert.equal(css.length, 1, "Static site must have one complete foundation");
@@ -65,33 +81,40 @@ export function snapshotSiteFoundation(value: unknown, expectedFontHashes: reado
     "Compiled fonts differ from the complete approved WOFF2 inventory",
   );
   assert.ok(css[0] !== undefined);
-  return { cssPath: `graphs/foundation/${css[0].path}`, artifacts };
+  return { cssPath: `graphs/foundation/${css[0].path}`, privateEntryPath, artifacts };
 }
 
 /** The completed public projection is closed independently of renderer output.
  * Every foundation byte must also match the captured RollupOutput identity. */
-export function projectSiteArtifacts(value: unknown, planSha256: string, foundation: SiteFoundation): readonly SiteArtifact[] {
+export function projectSiteArtifacts(value: unknown, planSha256: string, foundation: SiteFoundation, capturedFinalCss: SiteArtifact): readonly SiteArtifact[] {
   const complete = completeSchema.parse(value);
   assert.equal(complete.planSha256, sha.parse(planSha256));
   assert.deepEqual(complete.graphs.map(({ id }) => id).sort(), ["foundation", "renderer"]);
   assert.deepEqual(complete.packages.map(({ name }) => name).sort(), ["@hraness/design-kit", "@hraness/site-footer", "@hraness/ui"]);
   assert.equal(complete.finalCss.path, "stylex.css");
-  assert.equal(new Set(complete.artifacts.map(({ path }) => path)).size, complete.artifacts.length);
-  assert.ok(complete.artifacts.reduce((sum, item) => sum + item.bytes, 0) <= 64 * 1024 * 1024);
-  assert.deepEqual(complete.artifacts.find(({ path }) => path === "stylex.css"), complete.finalCss);
+  assert.deepEqual(complete.finalCss, artifact.parse(capturedFinalCss), "Final union differs from its completed on-disk bytes");
+  // The public completion protocol records finalCss separately from graph and
+  // template artifacts. Join it exactly once at the publication boundary.
+  const completedArtifacts = [...complete.artifacts, complete.finalCss];
+  assert.equal(new Set(completedArtifacts.map(({ path }) => path)).size, completedArtifacts.length);
+  assert.ok(completedArtifacts.reduce((sum, item) => sum + item.bytes, 0) <= 64 * 1024 * 1024);
   const captured = foundation.artifacts.map((item) => ({ ...item, path: `graphs/foundation/${item.path}` }));
   assert.deepEqual(
     complete.artifacts.filter(({ path }) => path.startsWith("graphs/foundation/")).sort((a, b) => a.path.localeCompare(b.path)),
     captured,
     "Completed foundation differs from its captured Rollup output",
   );
-  const allowed = new Set([...routes, "stylex.css", ...captured.map(({ path }) => path)]);
-  const projected = complete.artifacts.filter(({ path }) => {
+  const privateEntry = `graphs/foundation/${foundation.privateEntryPath}`;
+  assert.ok(captured.some(({ path }) => path === privateEntry));
+  const publicFoundation = captured.filter(({ path }) => path !== privateEntry);
+  const allowed = new Set([...routes, "stylex.css", ...publicFoundation.map(({ path }) => path)]);
+  const projected = completedArtifacts.filter(({ path }) => {
     if (allowed.has(path)) return true;
+    if (path === privateEntry) return false;
     assert.match(path, /^graphs\/renderer\/(?:entries|chunks)\/[A-Za-z0-9_.-]+\.js$/u, "Unexpected static generation output");
     return false;
   });
-  assert.equal(projected.length, routes.length + 1 + captured.length);
+  assert.equal(projected.length, routes.length + 1 + publicFoundation.length);
   for (const path of allowed) assert.ok(projected.some((item) => item.path === path));
   return projected;
 }
@@ -128,7 +151,7 @@ export async function buildSiteStylex(options: Readonly<{
   const outputDirectory = join(run, "complete");
   const generation = await createStylexGeneration({
     expectedGraphs: [
-      { adapter: "vite", entrypoints: ["site/foundation.css"], id: "foundation", kind: "client" },
+      { adapter: "vite", entrypoints: ["site/foundation.ts"], id: "foundation", kind: "client" },
       { adapter: "bun", entrypoints: ["site/render.ts"], id: "renderer", kind: "ssr" },
     ],
     finalCssPath: "stylex.css", generationId: "hra-static-site", outputDirectory,
@@ -146,7 +169,7 @@ export async function buildSiteStylex(options: Readonly<{
     // Relative URLs survive the finalized graphs/foundation/ projection.
     base: "./", configFile: false, envFile: false, mode: "production",
     plugins: [stylexVite({ generation, graphId: "foundation", rootDirectory: root })],
-  }), expectedFonts);
+  }), expectedFonts, join(root, "site/foundation.ts"));
   const foundationPath = foundation.cssPath;
   const renderer = await collectBunStylexGraph({
     build: { minify: true, sourcemap: "none" }, generation, graphId: "renderer", rootDirectory: root,
@@ -164,7 +187,7 @@ export async function buildSiteStylex(options: Readonly<{
     const render = renderers[name];
     const path = routes[index];
     assert.ok(typeof render === "function" && path !== undefined, "Captured renderer export changed");
-    const html: unknown = render(undefined, options.environment);
+    const html = (render as (content: undefined, environment: Readonly<Record<string, string | undefined>>) => unknown)(undefined, options.environment);
     assert.equal(typeof html, "string", "Static renderer must return an HTML string");
     const prepared = await prepareStylexProducedTemplate(generation, path);
     await writeFile(prepared.sourcePath, prepareSiteDocument(html as string, foundationPath), { flag: "wx", mode: 0o644 });
@@ -174,7 +197,7 @@ export async function buildSiteStylex(options: Readonly<{
   assert.equal(completedDirectory, join(outputDirectory, "hra-static-site"));
   const projected = projectSiteArtifacts(
     JSON.parse(await readFile(join(completedDirectory, "stylex-complete.json"), "utf8")) as unknown,
-    generation.planSha256, foundation,
+    generation.planSha256, foundation, await artifactForFile(completedDirectory, "stylex.css"),
   );
   const files = new Map<string, Buffer>();
   for (const item of projected) {

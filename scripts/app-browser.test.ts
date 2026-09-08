@@ -140,6 +140,37 @@ describe("static site graph acceptance", () => {
       "/graphs/foundation/assets/GeistMono[wght]-testhash.woff2/",
     ]) expect(assetPath(bad, captured)).toBeNull();
   });
+
+  test("parsed resource inventories reject string image-set and escaped URL requests in both stylesheets", () => {
+    const resourceRules = [
+      '.probe{background-image:image-set("https://outside.invalid/image.png" 1x)}',
+      '.probe{background-image:-webkit-image-set("https://outside.invalid/image.png" 1x)}',
+      String.raw`.probe{background-image:u\72l(https://outside.invalid/image.png)}`,
+    ];
+    for (const rule of resourceRules) {
+      const fixture = staticSiteFixture();
+      expect(() => siteFoundationFontPaths(fixture.foundation, Buffer.from(fixture.css + rule))).toThrow("non-font URL");
+      fixture.files.set("stylex.css", Buffer.from(rule));
+      expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow("unexpected asset URL");
+    }
+  });
+
+  test("parsed resource inventories ignore harmless quoted content in both stylesheets", () => {
+    const fixture = staticSiteFixture();
+    const inertRules = String.raw`.probe::before{content:'url(https://outside.invalid/not-a-request.png) image-set("https://outside.invalid/not-a-request.png" 1x)'}`;
+    fixture.files.set(fixture.foundation, Buffer.from(fixture.css + inertRules));
+    fixture.files.set("stylex.css", Buffer.from(inertRules));
+    expect(siteFoundationFontPaths(fixture.foundation, fixture.files.get(fixture.foundation)!)).toEqual([...fixture.fontPaths].sort());
+    expect(snapshotStaticSite(fixture.files, fixture.publicFonts).fonts).toEqual([...fixture.fontPaths].sort());
+  });
+
+  test("parsed resource inventories reject CSS parser warnings in both stylesheets", () => {
+    const invalid = ".probe{color:rgb( ;}";
+    const fixture = staticSiteFixture();
+    expect(() => siteFoundationFontPaths(fixture.foundation, Buffer.from(fixture.css + invalid))).toThrow();
+    fixture.files.set("stylex.css", Buffer.from(invalid));
+    expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+  });
 });
 
 function stylesheetFixture() {

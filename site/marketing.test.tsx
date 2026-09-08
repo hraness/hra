@@ -7,6 +7,11 @@ import { sitePresentationClasses } from "./presentation.stylex.ts";
 
 const referenceMarkup = '<div class="reference__intro"><p>Trusted &amp; escaped reference.</p></div><nav aria-label="Documentation"><a href="#fixture-section">Fixture section</a></nav><section id="fixture-section"><h2>Fixture section</h2><p>Unchanged reference body.</p></section>';
 
+function classNames(value: unknown): readonly string[] {
+  if (typeof value !== "string" || value.trim() === "") throw new Error("Expected nonempty rendered class names.");
+  return value.split(" ");
+}
+
 describe("public server marketing composition", () => {
   test("preserves header destinations, order, active page and the install action", () => {
     for (const currentPath of ["/", "/privacy/"] as const) {
@@ -36,15 +41,15 @@ describe("public server marketing composition", () => {
     expect([...page!.children].map((child) => child.id === "reference" ? "reference" : child.getAttribute("data-hraness-marketing")))
       .toEqual(["hero", "pillars", "section", "install", "trust", "questions", "maker", "cta", "reference"]);
     expect(document.querySelectorAll("#reference")).toHaveLength(1);
-    expect(document.querySelector("#reference")?.parentElement).toBe(page);
+    expect(document.querySelector("#reference")?.parentElement === page).toBe(true);
     expect([...document.querySelector("#reference")!.children].map((child) => child.tagName)).toEqual(["DIV", "NAV", "SECTION"]);
     expect(html).toContain(referenceMarkup);
     expect(document.querySelector("[style], style, script")).toBeNull();
     expect(document.querySelector("h1")?.id).toBe("hra-title");
     expect(document.querySelector("h1")?.textContent).toBe(publicContent.hero.heading);
     expect(document.querySelectorAll("h1")).toHaveLength(1);
-    expect(document.querySelector('[data-hraness-marketing="hero"]')?.className.split(" "))
-      .toEqual(expect.arrayContaining(heroExampleMeasureClassName().split(" ")));
+    const heroClasses = classNames(document.querySelector('[data-hraness-marketing="hero"]')?.className);
+    for (const name of classNames(heroExampleMeasureClassName())) expect(heroClasses).toContain(name);
     expect(document.querySelector(".hraness-marketing-facts")?.children).toHaveLength(4);
     expect(document.querySelector(".hraness-marketing-pillars")?.children).toHaveLength(3);
     expect([...document.querySelectorAll(".hraness-marketing-facts__label")].map((node) => node.textContent))
@@ -65,7 +70,7 @@ describe("public server marketing composition", () => {
     const note = document.querySelector(".hraness-marketing-install__heading-group > .install-note");
     expect(note?.previousElementSibling?.id).toBe("install-command-heading");
     expect(note?.nextElementSibling).toBeNull();
-    expect(note?.textContent).toBe("One command downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.");
+    expect(note?.textContent).toBe("This release candidate is not yet admitted. Use this command only after immutable GitHub and npm release admission. It downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.");
     const commands = document.querySelector(".hraness-marketing-install__commands");
     expect([...commands!.children].map((child) => child.tagName)).toEqual(["PRE", "PRE", "ASIDE", "P", "PRE"]);
     expect(commands?.querySelector("aside strong")?.textContent).toBe("Before initialization");
@@ -165,7 +170,8 @@ describe("public server marketing composition", () => {
     expect(label?.textContent).toBe("Reference");
     expect(label?.classList.contains("hraness-marketing-section__label")).toBe(true);
     expect(label?.getAttribute("data-size")).toBe("body");
-    expect(label?.className.split(" ")).toEqual(expect.arrayContaining(sitePresentationClasses("proseMeasure").split(" ")));
+    const labelClasses = classNames(label?.className);
+    for (const name of classNames(sitePresentationClasses("proseMeasure"))) expect(labelClasses).toContain(name);
     expect(document.querySelector("[style], style, script")).toBeNull();
   });
 });

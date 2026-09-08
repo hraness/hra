@@ -64,6 +64,7 @@ function Fixture() {
     case "retired": return <SessionScreen sessionPublicId={browserHead.publicId} />;
     case "settings": return <SettingsScreen onBack={() => undefined} />;
     case "primitives": return <Primitives />;
+    case null:
     default: throw new Error("Unknown browser fixture view");
   }
 }

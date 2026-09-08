@@ -28,6 +28,10 @@ const layerRules = (patterns) => ({
   "@typescript-eslint/no-restricted-imports": ["error", { patterns }],
 });
 
+// These two fixture files sit exactly two levels below app/. Only canonical
+// app-source paths qualify; dot-segment escapes still reach the core boundary.
+const browserFixtureAppSource = "\\.\\./\\.\\./src/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+(?:\\.(?:stylex\\.)?(?:ts|tsx|css))?";
+
 export default tseslint.config(
   {
     ignores: [
@@ -37,7 +41,7 @@ export default tseslint.config(
       "eslint.config.mjs",
       "node_modules/**",
       "site/dist/**",
-      "tmp/build-app/**",
+      "tmp/**",
     ],
   },
   eslint.configs.recommended,
@@ -199,6 +203,15 @@ export default tseslint.config(
         regex: "(^|/)src/(?!cloud/(client|contracts|crypto|payloads|projection)(\\.ts)?$)(?!domain/)",
         message:
           "app/ imports repository source only from src/cloud/{crypto,projection,payloads,contracts,client} and src/domain/*, through app/src/hra/.",
+      },
+    ]),
+  },
+  {
+    files: ["app/fixtures/browser/io.ts", "app/fixtures/browser/main.tsx"],
+    rules: layerRules([
+      {
+        regex: `^(?!${browserFixtureAppSource}$).*(?:^|/)src/`,
+        message: "Browser fixtures import app source through canonical ../../src/ paths. Repository source must stay behind app/src/hra/.",
       },
     ]),
   },

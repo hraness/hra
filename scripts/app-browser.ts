@@ -210,9 +210,11 @@ async function closeOwnedBrowser(context: BrowserContext, pids: number[]): Promi
     await collected(pids);
     assert.equal(context.pages().length, 0);
   } catch (error) {
-    throw censusFailure === undefined ? error : new AggregateError([censusFailure, error], "Browser census and collection failed; profile retained");
+    if (censusFailure === undefined) throw error;
+    throw new AggregateError([censusFailure, error], "Browser census and collection failed; profile retained");
   }
-  if (censusFailure !== undefined) throw censusFailure;
+  if (censusFailure !== undefined) throw censusFailure instanceof Error
+    ? censusFailure : new Error("Browser census failed; profile retained", { cause: censusFailure });
 }
 
 export async function inventory(directory: string, fontPaths: ReadonlySet<string> = legacyFontPaths): Promise<ReadonlyMap<string, Buffer>> {
@@ -294,10 +296,10 @@ export function siteStylesheetPaths(documents: ReadonlyMap<string, Buffer>): rea
 export function siteFoundationFontPaths(path: string, bytes: Buffer): readonly string[] {
   assert.match(path, /^graphs\/foundation\/assets\/[A-Za-z0-9_.-]+\.css$/u);
   assert.ok(bytes.length > 0 && bytes.length <= 16 * 1024 * 1024);
-  const urls: string[] = [];
   const faces: string[] = [];
-  transform({ filename: path, code: bytes, visitor: {
-    Url(value) { urls.push(value.url); },
+  // Dependency analysis also includes image-set string URLs, which the Url
+  // visitor alone omits. The transformed bytes are never served or published.
+  const parsed = transform({ filename: path, code: bytes, analyzeDependencies: true, visitor: {
     Rule: {
       import() { throw new Error("Static foundation contains an uncollected CSS import"); },
       "font-face"(rule) {
@@ -311,6 +313,13 @@ export function siteFoundationFontPaths(path: string, bytes: Buffer): readonly s
       },
     },
   } });
+  assert.equal(parsed.warnings.length, 0, "Static foundation CSS inspection emitted warnings");
+  assert.ok(parsed.dependencies !== undefined && parsed.dependencies.length <= 64,
+    "Static foundation has an invalid or excessive resource inventory");
+  const urls = parsed.dependencies.map((dependency) => {
+    assert.ok(dependency.type === "url", "Static foundation contains an uncollected CSS import or unsupported resource");
+    return dependency.url;
+  });
   assert.equal(faces.length, 13, "Static foundation must declare all thirteen public font faces");
   assert.deepEqual([...urls].sort(), [...faces].sort(), "Static foundation contains a non-font URL");
   assert.equal(new Set(faces).size, 13, "Static foundation duplicates a font URL");
@@ -345,10 +354,12 @@ export function snapshotStaticSite(files: ReadonlyMap<string, Buffer>, publicFon
     return digest(bytes);
   }).sort();
   assert.deepEqual(emitted, [...publicFonts.values()].map(digest).sort(), "Published fonts differ from the installed public inputs");
-  transform({ filename: "stylex.css", code: union, visitor: {
-    Url() { throw new Error("Final union contains an unexpected asset URL"); },
+  const parsedUnion = transform({ filename: "stylex.css", code: union, analyzeDependencies: true, visitor: {
     Rule: { import() { throw new Error("Final union contains an uncollected CSS import"); } },
   } });
+  assert.equal(parsedUnion.warnings.length, 0, "Final union CSS inspection emitted warnings");
+  assert.ok(parsedUnion.dependencies !== undefined);
+  assert.equal(parsedUnion.dependencies.length, 0, "Final union contains an unexpected asset URL");
   return { routes: siteRoutes, stylesheets, fonts };
 }
 
@@ -748,7 +759,7 @@ async function isolate(context: BrowserContext, origins: ReadonlySet<string>): P
     if (origins.has(url.origin) && ["GET", "HEAD"].includes(route.request().method())) await route.continue();
     else { note(blocked, `${url.protocol}//${url.host}`); await route.abort("failed"); }
   });
-  await context.routeWebSocket("**/*", (socket) => { note(blocked, "websocket"); socket.close({ code: 1000, reason: "Offline browser acceptance" }); });
+  await context.routeWebSocket("**/*", async (socket) => { note(blocked, "websocket"); await socket.close({ code: 1000, reason: "Offline browser acceptance" }); });
   await context.addInitScript(() => {
     const state = window as typeof window & { __hraBrowserViolations?: string[] };
     const violations: string[] = [];
@@ -801,22 +812,22 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
   const servers: Surface[] = [];
   const owner: { current: BrowserContext | null } = { current: null };
   const cancellation = new AbortController();
-  let cancelled = false;
+  const isCancelled = (): boolean => cancellation.signal.aborted;
   // The sole cleanup path takes a fresh census before closing. Do not race it
   // with an unawaited close from a signal callback.
-  const onSignal = () => { cancelled = true; cancellation.abort(); };
+  const onSignal = () => { cancellation.abort(); };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
   let failure: unknown;
   try {
     const fixtureFiles = await buildFixture(root, run);
     fixtureArtifacts = artifacts(fixtureFiles);
-    assert.ok(!cancelled, "Browser acceptance cancelled");
+    assert.ok(!isCancelled(), "Browser acceptance cancelled");
     const app = await serve(appFiles, appCsp); servers.push(app);
     const fixture = await serve(fixtureFiles, appCsp); servers.push(fixture);
     const site = await serve(siteFiles, siteCsp, previewCsp); servers.push(site);
     for (const profile of profiles) {
-      assert.ok(!cancelled, "Browser acceptance cancelled");
+      assert.ok(!isCancelled(), "Browser acceptance cancelled");
       const userData = await mkdtemp(join(run, "profile-"));
       let closed = false;
       let profileFailure: unknown;
@@ -835,7 +846,7 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
           timeout: 30_000,
         });
         owner.current = context;
-        assert.ok(!cancelled, "Browser acceptance cancelled during launch");
+        assert.ok(!isCancelled(), "Browser acceptance cancelled during launch");
         // A profile-level deadline also covers raw evaluate/CDP promises that
         // are not covered by Playwright's action or navigation timeouts.
         profileWork = (async () => {
@@ -885,7 +896,7 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
         await negativeStylesheet(page, "button", "/stylex.css");
         evidence.push({ name: `${profile.name}:production-anonymous`, values: { browserVersion, finalCssSha256: digest(appFiles.get("stylex.css") ?? "") } });
         for (const view of ["signin", "locked", "enrollment", "grid", "session", "session-long", "retired", "settings", "primitives"]) {
-          assert.ok(!cancelled, "Browser acceptance cancelled");
+          assert.ok(!isCancelled(), "Browser acceptance cancelled");
           diagnostics.step = `fixture:${view}:navigation`;
           await page.goto(`${fixture.origin}/?view=${view}`);
           diagnostics.step = `fixture:${view}:assertions`;
@@ -1049,16 +1060,17 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
           assert.equal(await realpath(userData), userData);
           await rm(userData, { recursive: true });
         }
-        if (profileFailure !== undefined) throw profileFailure;
-        diagnostics.step = "complete";
       }
+      if (profileFailure !== undefined) throw profileFailure instanceof Error
+        ? profileFailure : new Error("Browser profile failed", { cause: profileFailure });
+      diagnostics.step = "complete";
     }
     assert.deepEqual(artifacts(await inventory(join(root, "app/dist"))), artifacts(appFiles));
     assert.deepEqual(artifacts(await inventory(siteRoot, siteFontPaths)), artifacts(siteFiles));
     for (const [path, bytes] of publicFonts) assert.deepEqual(await ordinary(join(publicFontRoot, "fonts", path)), bytes, "Public font input changed during browser acceptance");
     assert.deepEqual(await ordinary(join(root, "package.json")), packageBytes);
     assert.deepEqual(await ordinary(join(root, "bun.lock")), lockBytes);
-    assert.ok(!cancelled, "Browser acceptance cancelled");
+    assert.ok(!isCancelled(), "Browser acceptance cancelled");
   } catch (error) { failure = error; }
   finally {
     try {
@@ -1074,7 +1086,7 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
       }
       process.off("SIGINT", onSignal); process.off("SIGTERM", onSignal);
       const receipt = {
-        schemaVersion: 1, kind: "hra-app-browser-acceptance", state: failure === undefined && !cancelled ? "passed" : "failed",
+        schemaVersion: 1, kind: "hra-app-browser-acceptance", state: failure === undefined && !isCancelled() ? "passed" : "failed",
         browserExecutableSha256: executableSha256, playwright: "1.62.0", bun: Bun.version,
         packageSha256: digest(packageBytes), lockSha256: digest(lockBytes),
         app: artifacts(appFiles), site: artifacts(siteFiles), fixture: fixtureArtifacts,
@@ -1087,8 +1099,9 @@ export async function runAppBrowser(rootDirectory: string): Promise<void> {
       console.log(`Browser acceptance ${receipt.state}; ${evidence.length} evidence rows; receipt ${run.slice(root.length + 1)}/receipt.json`);
     }
   }
-  assert.ok(!cancelled, "Browser acceptance cancelled");
-  if (failure !== undefined) throw failure;
+  assert.ok(!isCancelled(), "Browser acceptance cancelled");
+  if (failure !== undefined) throw failure instanceof Error
+    ? failure : new Error("Browser acceptance failed", { cause: failure });
 }
 
 if (import.meta.main) await runAppBrowser(resolve(import.meta.dirname, ".."));

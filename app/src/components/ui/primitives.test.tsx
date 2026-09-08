@@ -330,7 +330,7 @@ test("native primitive boundaries reject caller inline styles at runtime", () =>
     ["textarea", Textarea],
   ] as const) {
     expect(
-      () => Reflect.apply(component, undefined, [{ style: { color: "red" } }]),
+      () => { Reflect.apply(component, undefined, [{ style: { color: "red" } }]); },
       name,
     ).toThrow("HRA primitives do not accept caller inline styles.");
   }

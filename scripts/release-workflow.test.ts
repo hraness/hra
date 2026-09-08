@@ -454,7 +454,8 @@ describe("release workflow", () => {
     expect(thirdPartyNotices).toContain("This candidate is not yet admitted");
     expect(thirdPartyNotices).toContain("must bind an immutable source tag");
     expect(thirdPartyNotices).toContain("`@hraness/site-footer` v0.6.1");
-    expect(thirdPartyNotices).toContain("`@hraness/design-kit` v0.4.0");
+    expect(thirdPartyNotices).toContain("`@hraness/design-kit` v0.5.2");
+    expect(thirdPartyNotices).toContain("`@hraness/ui` v0.5.6");
     expect(thirdPartyNotices).not.toContain("`@hraness/design-kit` v0.3.0");
     expect(thirdPartyNotices).not.toContain("SPDX");
     expect(changelog).toContain("## v0.7.0 (unreleased)");
@@ -846,16 +847,18 @@ describe("release workflow", () => {
     expect(workflow).not.toContain("authority-supervisor-runtime.test.ts");
 
     expect(required.name).toBe("Required");
-    expect(required.needs).toBe("check");
+    expect(required.needs).toEqual(["check", "browser"]);
     expect(required.if).toBe("${{ always() }}");
     if (!Array.isArray(required.steps)) {
       throw new TypeError("CI required job steps must be an array");
     }
     const requiredStep = asRecord(required.steps[0], "CI required step");
     expect(requiredStep.name).toBe("Require every matrix check");
-    expect(asRecord(requiredStep.env, "CI required environment").CHECK_RESULT)
-      .toBe("${{ needs.check.result }}");
-    expect(requiredStep.run).toBe('test "$CHECK_RESULT" = "success"');
+    expect(asRecord(requiredStep.env, "CI required environment")).toEqual({
+      CHECK_RESULT: "${{ needs.check.result }}",
+      BROWSER_RESULT: "${{ needs.browser.result }}",
+    });
+    expect(requiredStep.run).toBe('test "$CHECK_RESULT" = "success" && test "$BROWSER_RESULT" = "success"');
   });
 
   test("admits only a tagged commit whose CI run concluded success before packaging", async () => {
