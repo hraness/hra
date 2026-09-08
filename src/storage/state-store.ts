@@ -21642,44 +21642,59 @@ export class StateStore {
   }
 
   updateSessionMetadata(input: { sessionId: SessionId; expectedRevision: number; title?: string; note?: string; preset?: Preset; fastEnabled?: boolean; projectId?: ProjectId | null }): SessionRecord {
-    const current = this.requireSession(input.sessionId);
-    if (input.preset !== undefined || input.fastEnabled !== undefined || input.projectId !== undefined) {
-      assertSupportedProvider(current.provider);
-    }
-    const currentPresetBinding = this.#requireSessionPresetBinding(current.id);
-    if (current.revision !== input.expectedRevision) throw new Error("Session metadata revision conflict.");
-    // An unsettled provider effect owns the exact runtime profile it reviewed.
-    // Keep that recovery evidence admissible by refusing any route
-    // reinterpretation until recovery has settled it or explicit abandonment
-    // has terminalized the session.
-    if (input.preset !== undefined && current.state === "recovery_required") {
-      throw new Error("SESSION_PRESET_RECOVERY_REQUIRED");
-    }
-    const currentProjectId = current.projectId ?? null;
-    const requestedProjectId = input.projectId === undefined
-      ? currentProjectId
-      : input.projectId;
-    if (
-      requestedProjectId !== currentProjectId
-      && (current.state !== "idle" || current.activeTurnId !== undefined)
-    ) throw new Error("SESSION_PROJECT_REQUIRES_IDLE");
-    const title = input.title === undefined ? current.title : titleSchema.parse(input.title);
-    const note = input.note === undefined ? current.note : noteSchema.parse(input.note);
-    const preset = input.preset === undefined ? current.preset : supportedPresetSchema.parse(input.preset);
-    // A preset the session's provider cannot run is refused, never ignored.
-    assertPresetSupportedByProvider(current.provider, preset);
-    const fast = input.fastEnabled === undefined ? current.fastEnabled : input.fastEnabled;
-    const project = requestedProjectId;
-    // Naming the preset is an explicit opt-in to the active binding, even
-    // when the alias itself did not change. Unrelated metadata preserves the
-    // durable interpretation admitted for this session.
-    const presetContract = input.preset === undefined
-      ? currentPresetBinding.contract
-      : activePresetBinding(preset).contract;
-    const now = this.#now();
-    const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,preset_contract=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], presetContract, fast ? 1 : 0, project, now, current.id, current.revision);
-    if (result.changes !== 1) throw new Error("Session metadata revision conflict.");
-    return this.requireSession(current.id);
+    const update = this.#database.transaction(() => {
+      const current = this.requireSession(input.sessionId);
+      if (input.preset !== undefined || input.fastEnabled !== undefined || input.projectId !== undefined) {
+        assertSupportedProvider(current.provider);
+      }
+      const currentPresetBinding = this.#requireSessionPresetBinding(current.id);
+      if (current.revision !== input.expectedRevision) throw new Error("Session metadata revision conflict.");
+      // An unsettled provider effect owns the exact runtime profile it reviewed.
+      // Keep that recovery evidence admissible by refusing any route
+      // reinterpretation until recovery has settled it or explicit abandonment
+      // has terminalized the session.
+      if (input.preset !== undefined && current.state === "recovery_required") {
+        throw new Error("SESSION_PRESET_RECOVERY_REQUIRED");
+      }
+      const currentProjectId = current.projectId ?? null;
+      const requestedProjectId = input.projectId === undefined
+        ? currentProjectId
+        : input.projectId;
+      if (
+        requestedProjectId !== currentProjectId
+        && (current.state !== "idle" || current.activeTurnId !== undefined)
+      ) throw new Error("SESSION_PROJECT_REQUIRES_IDLE");
+      const title = input.title === undefined ? current.title : titleSchema.parse(input.title);
+      const note = input.note === undefined ? current.note : noteSchema.parse(input.note);
+      const preset = input.preset === undefined ? current.preset : supportedPresetSchema.parse(input.preset);
+      // A preset the session's provider cannot run is refused, never ignored.
+      assertPresetSupportedByProvider(current.provider, preset);
+      const fast = input.fastEnabled === undefined ? current.fastEnabled : input.fastEnabled;
+      const project = requestedProjectId;
+      // Naming the preset is an explicit opt-in to the active binding, even
+      // when the alias itself did not change. Unrelated metadata preserves the
+      // durable interpretation admitted for this session.
+      const presetContract = input.preset === undefined
+        ? currentPresetBinding.contract
+        : activePresetBinding(preset).contract;
+      // The released Work trigger uses != for this nullable column. Fence the
+      // semantic write with null-safe comparison without rewriting that frozen
+      // schema. The immediate transaction excludes a concurrent Work claim.
+      if (project !== currentProjectId && this.#database.query(
+        `SELECT 1 FROM work_attempts
+         WHERE worker_session_id=?
+           AND state IN ('claimed','dispatching','running','recovery_required')
+           AND project_id IS NOT ?
+         LIMIT 1`,
+      ).get(current.id, project) !== null) {
+        throw new Error("WORK_SESSION_ATTEMPT_AUTHORITY");
+      }
+      const now = this.#now();
+      const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,preset_contract=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], presetContract, fast ? 1 : 0, project, now, current.id, current.revision);
+      if (result.changes !== 1) throw new Error("Session metadata revision conflict.");
+      return this.requireSession(current.id);
+    });
+    return update.immediate();
   }
 
   /**
