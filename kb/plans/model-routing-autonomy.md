@@ -320,8 +320,9 @@ Each phase receives focused implementation and independent review before its sta
   Protected source/target/intent/acknowledgement/terminal-receipt bindings and
   fresh provider and strict public markers passed. Freshly rendered `<head>` and
   `<main>` content on `/` and `/privacy/`, discovery files and static assets
-  matched. Browser reloads, actual install/runbook clicks and privacy navigation
-  passed at widths 320, 390, 768, 769 and 1440. This is not whole-HTML or analytics
+  matched. Browser reloads and actual install/runbook clicks passed at widths
+  320, 390, 768, 769 and 1440. Privacy navigation and layout passed at width 390.
+  This is not whole-HTML or analytics
   parity, newsletter/CAPTCHA acceptance, or a globally error-free-console claim.
   The operation did not reuse or alter an old terminal plan. The bounded
   compatibility and rollback evidence remains in the persistence plan.

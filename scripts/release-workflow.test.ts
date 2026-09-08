@@ -810,6 +810,8 @@ describe("release workflow", () => {
     expect(phase4).toContain("Exact new-model capability evidence remains required before admission");
     expect(phase4).toContain("Schema50 is delivered in governed main");
     expect(phase4).not.toContain("schema50 draft");
+    expect(routing).toContain("Privacy navigation and layout passed at width 390.");
+    expect(routing).not.toContain("actual install/runbook clicks and privacy navigation\n  passed at widths");
   });
 
   test("keeps the retired fallback-bound path unreachable and exposes only the exact artifact workflow", async () => {
