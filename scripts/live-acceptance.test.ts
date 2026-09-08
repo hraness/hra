@@ -669,7 +669,9 @@ describe("source-only live acceptance isolation", () => {
       else process.env.PATH = originalPath;
       await removeOwnedTestBase(root);
     }
-  });
+    // The outer harness must outlive the 5s child deadline, its cleanup grace,
+    // and fixture filesystem work. A genuine child timeout still fails above.
+  }, 15_000);
 
   test("serializes source revision and status reads through local subprocess custody", async () => {
     const calls: string[] = [];
