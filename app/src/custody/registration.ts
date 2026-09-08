@@ -1,6 +1,6 @@
 /**
  * Browser device enrollment, expressed as pure functions so the digest, the
- * label, the envelope selection, and the feature detection are all testable
+ * label, the envelope selection, and the submission policy are all testable
  * without a browser, a document, or a network.
  */
 import {
@@ -80,9 +80,9 @@ export type RegistrationIntent = Readonly<{
  * The digested request. Key order matters: the digest is
  * `hmacSha256Hex(key, "device-register", JSON.stringify(intent))` over exactly
  * the daemon's `deviceRegistrationRequest` shape. `deviceClass` is deliberately
- * outside the digest: it is an additive server-side classification, and keeping
- * it out means the feature-detection retry replays the identical idempotency
- * key and digest after a validator rejection.
+ * outside the digest because that existing daemon wire contract predates device
+ * classes. A browser submission must still carry its explicit server-side class
+ * and fail closed against a deployment whose validator does not accept it.
  */
 export function registrationIntent(input: RegistrationIntent): RegistrationIntent {
   return {
@@ -104,6 +104,28 @@ export async function registrationRequestDigest(
     deviceRegisterDigestPurpose,
     JSON.stringify(registrationIntent(intent)),
   );
+}
+
+export type BrowserRegistrationRequest = Readonly<RegistrationIntent & {
+  deviceClass: "browser";
+  requestDigest: string;
+}>;
+
+/**
+ * Submit exactly one browser-classified registration. During a backend-first
+ * rollout an older validator rejects this request; omitting the class would
+ * instead persist a row that a newer backend interprets as a daemon.
+ */
+export async function submitBrowserDeviceRegistration<Result>(input: Readonly<{
+  intent: RegistrationIntent;
+  mutate: (request: BrowserRegistrationRequest) => Promise<Result>;
+  requestDigest: string;
+}>): Promise<Result> {
+  return await input.mutate({
+    ...registrationIntent(input.intent),
+    deviceClass: "browser",
+    requestDigest: input.requestDigest,
+  });
 }
 
 export async function encryptDeviceLabel(input: Readonly<{
@@ -262,20 +284,4 @@ export function selectKeyEnvelope(
     .filter((entry) => entry.envelope.keyVersion === keyVersion)
     .sort((left, right) => right.createdAt - left.createdAt);
   return matching[0]?.envelope ?? null;
-}
-
-/**
- * A Convex argument-validator rejection, as opposed to a handler failure.
- *
- * The deployment may or may not have shipped the additive `deviceClass` field
- * yet. A validator rejection happens before the handler runs, so nothing was
- * written and the same request can be replayed without the extra field. Any
- * other failure is a real failure and is rethrown.
- */
-export function isDeviceClassValidatorRejection(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.includes("deviceClass")
-    && (message.includes("ArgumentValidationError")
-      || message.includes("Object contains extra field")
-      || message.includes("validator"));
 }

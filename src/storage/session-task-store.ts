@@ -29,6 +29,7 @@ import {
   createSessionTaskId,
   MESSAGE_MAX_BYTES,
   positiveRevisionSchema,
+  profileIdSchema,
   queueIdSchema,
   sessionIdSchema,
   sessionTaskIdSchema,
@@ -467,10 +468,21 @@ AND (
 )`;
 
 const dueCandidateRowSchema = taskRowSchema.extend({
+  process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  profile_id: profileIdSchema,
   project_root: z.string().min(1),
+  provider: providerSchema,
+  provider_thread_id: z.string().min(1),
 });
 
 const eligibleDueTaskRowSchema = dueCandidateRowSchema.extend({
+  profile_state: z.enum([
+    "signed_out",
+    "login_pending",
+    "signed_in",
+    "recovery_required",
+    "removed",
+  ]),
   session_state: z.enum(["starting", "active", "idle"]),
   provider_thread_id: z.string().min(1),
 });
@@ -488,6 +500,14 @@ export type SessionTaskMaterialization = Readonly<{
   task: SessionTaskRecord;
   occurrence: SessionTaskOccurrence;
   queue: SessionTaskQueueRecord;
+}>;
+
+export type SessionTaskExecutionAuthority = Readonly<{
+  processGeneration: number;
+  profileId: z.infer<typeof profileIdSchema>;
+  provider: z.infer<typeof providerSchema>;
+  providerThreadId: string;
+  sessionId: SessionId;
 }>;
 
 export type SessionTaskStoreErrorCode =
@@ -607,16 +627,23 @@ export class SessionTaskStore {
   readonly #database: Database;
   readonly #now: () => number;
   readonly #resolveProjectDirectory: (root: string) => Promise<string | null>;
+  readonly #isExecutionAuthorityLive: (authority: SessionTaskExecutionAuthority) => boolean;
   #dueScanCursor: Readonly<{ nextDueAt: number; taskId: SessionTaskId }> | null = null;
 
   constructor(database: Database, options: Readonly<{
     now?: () => number;
     resolveProjectDirectory?: (root: string) => Promise<string | null>;
+    isExecutionAuthorityLive?: (authority: SessionTaskExecutionAuthority) => boolean;
   }> = {}) {
     this.#database = database;
     this.#now = options.now ?? Date.now;
     this.#resolveProjectDirectory = options.resolveProjectDirectory
       ?? resolveUsableCanonicalProjectDirectory;
+    // Codex owns a durable reconnect path outside this store. Every other
+    // provider needs a positive, process-local proof from the runtime layer;
+    // a persisted thread id alone is never execution authority.
+    this.#isExecutionAuthorityLive = options.isExecutionAuthorityLive
+      ?? ((authority) => authority.provider === "codex");
     this.#database.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
     assertSessionTaskSchema(this.#database);
   }
@@ -1254,7 +1281,9 @@ export class SessionTaskStore {
     const candidates = this.#database.query(
       `SELECT
          t.id,t.session_id,t.name,t.prompt,t.schedule_kind,t.interval_minutes,t.status,
-         t.revision,t.next_due_at,t.created_at,t.updated_at,t.deleted_at,p.root_path AS project_root
+         t.revision,t.next_due_at,t.created_at,t.updated_at,t.deleted_at,
+         p.root_path AS project_root,a.id AS profile_id,a.process_generation,
+         s.provider_v39 AS provider,s.provider_thread_id
        FROM session_tasks t
        JOIN sessions s ON s.id=t.session_id
        ${currentSessionTaskAuthorityJoins}
@@ -1301,6 +1330,20 @@ export class SessionTaskStore {
         taskId: candidate.id,
       };
       this.#dueScanCursor = candidateCursor;
+      let executionAuthorityLive: boolean;
+      try {
+        executionAuthorityLive = this.#isExecutionAuthorityLive({
+          processGeneration: candidate.process_generation,
+          profileId: candidate.profile_id,
+          provider: candidate.provider,
+          providerThreadId: candidate.provider_thread_id,
+          sessionId: candidate.session_id,
+        });
+      } catch (error: unknown) {
+        if (this.#dueScanCursor === candidateCursor) this.#dueScanCursor = previousCursor;
+        throw error;
+      }
+      if (!executionAuthorityLive) continue;
       let canonicalProject: string | null;
       try {
         canonicalProject = await this.#resolveProjectDirectory(candidate.project_root);
@@ -1325,7 +1368,8 @@ export class SessionTaskStore {
           `SELECT
              t.id,t.session_id,t.name,t.prompt,t.schedule_kind,t.interval_minutes,t.status,
              t.revision,t.next_due_at,t.created_at,t.updated_at,t.deleted_at,
-             p.root_path AS project_root,s.state AS session_state,
+             p.root_path AS project_root,a.state AS profile_state,s.state AS session_state,
+             a.id AS profile_id,a.process_generation,s.provider_v39 AS provider,
              s.provider_thread_id
            FROM session_tasks t
            JOIN sessions s ON s.id=t.session_id
@@ -1354,6 +1398,13 @@ export class SessionTaskStore {
           || authoritative.next_due_at !== candidate.next_due_at
           || authoritative.project_root !== canonicalProject
         ) return;
+        if (!this.#isExecutionAuthorityLive({
+          processGeneration: authoritative.process_generation,
+          profileId: authoritative.profile_id,
+          provider: authoritative.provider,
+          providerThreadId: authoritative.provider_thread_id,
+          sessionId: authoritative.session_id,
+        })) return;
         const scheduledFor = authoritative.next_due_at;
         if (scheduledFor === null) return;
         const { coalescedIntervals, nextDueAt } = nextSlotAfter(

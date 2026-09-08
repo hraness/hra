@@ -9,6 +9,12 @@ import {
 import { isAttachmentName } from "./attachments";
 import { autorespondAfterHoursPolicySchema } from "./autorespond-after-hours";
 import {
+  hraMemoryExplainInputSchema,
+  hraMemoryQueryInputSchema,
+  hraMemoryRememberInputSchema,
+  hraMemoryShareInputSchema,
+} from "./host-tools";
+import {
   activePresetBinding,
   adoptableProviderSchema,
   isReboundCodexPreset,
@@ -317,6 +323,18 @@ const notificationHoursSetCommandSchema = z.object({
   }
 });
 
+export const peerSessionPolicyModeSchema = z.enum(["off", "inspect", "coordinate"]);
+
+export const publicPeerSessionPolicySchema = z.object({
+  version: z.literal(1),
+  sessionId: sessionIdSchema,
+  mode: peerSessionPolicyModeSchema,
+  revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  updatedAt: unixMillisecondsSchema,
+}).strict();
+
+export type PublicPeerSessionPolicy = z.infer<typeof publicPeerSessionPolicySchema>;
+
 export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("doctor"), offline: z.boolean() }).strict(),
   z.object({ kind: z.literal("daemon.status") }).strict(),
@@ -400,6 +418,49 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("project.list") }).strict(),
   z.object({ kind: z.literal("project.add"), label: labelSchema, path: projectPathSchema }).strict(),
   z.object({ kind: z.literal("project.use"), project: selectorSchema }).strict(),
+  z.object({ kind: z.literal("memory.status"), session: selectorSchema }).strict(),
+  z.object({ kind: z.literal("memory.hosted.list") }).strict(),
+  z.object({
+    kind: z.literal("memory.hosted.create"),
+    project: selectorSchema,
+    idempotencyKey: requiredIdempotencyKeySchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("memory.hosted.attach"),
+    project: selectorSchema,
+    hostedSpaceId: z.string().regex(/^memory_[A-Za-z0-9_-]{32}$/u),
+  }).strict(),
+  z.object({
+    kind: z.literal("memory.hosted.detach"),
+    project: selectorSchema,
+    expectedGeneration: positiveRevisionSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("memory.hosted.sync"),
+    project: selectorSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("memory.query"),
+    session: selectorSchema,
+    value: hraMemoryQueryInputSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("memory.explain"),
+    session: selectorSchema,
+    value: hraMemoryExplainInputSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("memory.remember"),
+    session: selectorSchema,
+    idempotencyKey: requiredIdempotencyKeySchema,
+    value: hraMemoryRememberInputSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("memory.share"),
+    session: selectorSchema,
+    idempotencyKey: requiredIdempotencyKeySchema,
+    value: hraMemoryShareInputSchema,
+  }).strict(),
   z.object({
     kind: z.literal("session.list"),
     account: selectorSchema.optional(),
@@ -411,6 +472,16 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.show"), session: selectorSchema, detail: z.boolean() }).strict(),
   z.object({ kind: z.literal("session.status"), session: selectorSchema }).strict(),
   z.object({ kind: z.literal("session.state"), session: selectorSchema }).strict(),
+  z.object({
+    kind: z.literal("session.peer-policy.get"),
+    session: selectorSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("session.peer-policy.set"),
+    session: selectorSchema,
+    mode: peerSessionPolicyModeSchema,
+    expectedRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  }).strict(),
   z.object({
     kind: z.literal("session.events"),
     session: selectorSchema,

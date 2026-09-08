@@ -28,7 +28,7 @@ import {
   useReadDeviceCommandResult,
   useSubmitDeviceCommand,
 } from "../data/device-commands";
-import { useDevices, useServerClock, type DeviceView } from "../data/devices";
+import { useDevices, type DeviceView } from "../data/devices";
 import { useDeviceRegistries } from "../data/registry";
 import { useSessionHeads } from "../data/session-heads";
 import { pageSize } from "../env";
@@ -74,6 +74,9 @@ import {
   allScheduledTasks,
   attentionEmailPresentation,
   commandTargetForMachine,
+  hostedMemorySpaces,
+  hostedPeerActions,
+  hostedPeerPolicies,
   machineLabelsByDevice,
   personalSessionAdoptionCommand,
   shortSessionId,
@@ -518,6 +521,165 @@ function MachineCard({
   );
 }
 
+const shortDigest = (value: string): string => value.slice(0, 12);
+
+export function MemorySupervision({ machines, now, ready }: Readonly<{
+  machines: readonly MachineView[];
+  now: number;
+  ready: boolean;
+}>) {
+  if (!ready) return null;
+  const spaces = hostedMemorySpaces(machines);
+  const policies = hostedPeerPolicies(machines);
+  const actions = hostedPeerActions(machines);
+  const unavailable = machines.filter((machine) => machine.memorySummaryFreshness !== "current");
+  const bounded = machines.flatMap((machine) => {
+    if (machine.memorySummaryFreshness !== "current" || machine.memorySummary === null) return [];
+    const categories = [
+      machine.memorySummary.coverage.spaces === "bounded" ? "spaces" : null,
+      machine.memorySummary.coverage.peerPolicies === "bounded" ? "peer policies" : null,
+      machine.memorySummary.coverage.peerActions === "bounded" ? "peer actions" : null,
+    ].filter((category): category is string => category !== null);
+    return categories.length === 0 ? [] : [{ categories, machine }];
+  });
+  return (
+    <SettingsSection
+      description="Read-only encrypted observations from each daemon: up to 100 spaces, 200 peer policies, 50 recently updated peer actions, and 32 recent record keys per space. This bounded view is not an audit log, and HRA never chooses a winning head here."
+      title="Memory and peer activity"
+    >
+      {machines.length === 0 ? <SettingsCard><EmptyRow>No daemon summaries are available.</EmptyRow></SettingsCard> : null}
+      {unavailable.length === 0 ? null : (
+        <SettingsCard>
+          {unavailable.map((machine) => (
+            <SettingsRow
+              control={(
+                <Badge tone={machine.memorySummaryFreshness === "unreadable" ? "danger" : "attention"}>
+                  {machine.memorySummaryFreshness}
+                </Badge>
+              )}
+              description={machine.memorySummaryFreshness === "stale"
+                ? `Last observation ${formatRelativeTime(machine.memorySummary?.observedAt ?? machine.updatedAt, now)}; excluded from agreement.`
+                : machine.memorySummaryFreshness === "unreadable"
+                  ? "The separate encrypted summary could not be verified."
+                  : machine.memorySummaryFreshness === "inactive"
+                    ? "The publishing device authority is not active; its prior summary is excluded."
+                  : "No verified summary is available; this daemon may not support it or may be unable to publish it."}
+              key={machine.devicePublicId}
+              title={`Memory summary on ${machine.label}`}
+            />
+          ))}
+        </SettingsCard>
+      )}
+
+      {bounded.length === 0 ? null : (
+        <SettingsCard>
+          {bounded.map(({ categories, machine }) => (
+            <SettingsRow
+              control={<Badge tone="attention">bounded</Badge>}
+              description={`This daemon reached a projection bound for ${categories.join(", ")}; additional items may exist.`}
+              key={machine.devicePublicId}
+              title={`Summary coverage on ${machine.label}`}
+            />
+          ))}
+        </SettingsCard>
+      )}
+
+      {spaces.length === 0 ? (
+        <SettingsCard><EmptyRow>No portable shared-memory space has been observed.</EmptyRow></SettingsCard>
+      ) : spaces.map((group) => (
+        <SettingsCard key={group.canonicalSpaceId}>
+          <SettingsRow
+            control={(
+              <Badge tone={group.agreement === "agreed"
+                ? "accent"
+                : group.agreement === "disagreed" ? "danger" : "neutral"}
+              >
+                {group.agreement === "agreed"
+                  ? "heads agree"
+                  : group.agreement === "disagreed" ? "heads disagree" : "insufficient evidence"}
+              </Badge>
+            )}
+            description={`Portable space ${shortDigest(group.canonicalSpaceId.slice("hra:project:".length))}; ${group.projectLabels.join(", ") || "project label unavailable"}.`}
+            title="Shared memory"
+          />
+          {group.observations.map((observation) => {
+            const space = observation.space;
+            if (space === null) {
+              return (
+                <SettingsRow
+                  control={<Badge tone="attention">{observation.freshness}</Badge>}
+                  description={observation.freshness === "missing"
+                    ? "This current daemon did not report enrollment in this portable space."
+                    : observation.freshness === "bounded"
+                      ? "This daemon published a capped space list, so absence does not prove non-enrollment."
+                      : "No trustworthy observation is available from this daemon."}
+                  key={observation.devicePublicId}
+                  title={observation.machineLabel}
+                />
+              );
+            }
+            return (
+              <SettingsRow
+                control={(
+                  <>
+                    <Badge tone={observation.freshness === "current" ? "accent" : "attention"}>
+                      {observation.freshness}
+                    </Badge>
+                    <Badge tone={space.syncStatus === "conflict" || space.syncStatus === "error"
+                      ? "danger"
+                      : space.syncStatus === "syncing" ? "attention" : "neutral"}
+                    >
+                      {space.syncStatus}
+                    </Badge>
+                  </>
+                )}
+                description={`Exact head ${space.head.sequence}:${shortDigest(space.head.digest)}, ${space.recordCount === null ? "record count unavailable" : `${space.recordCount} record${space.recordCount === 1 ? "" : "s"}${space.recordCount > space.recentRecords.length ? ` (showing ${space.recentRecords.length} newest key${space.recentRecords.length === 1 ? "" : "s"})` : ""}`}; enrollment ${space.enrollment}; last exchange ${space.lastExchangeAt === null ? "never" : formatRelativeTime(space.lastExchangeAt, now)}.`}
+                key={observation.devicePublicId}
+                title={observation.machineLabel}
+              >
+                {space.recentRecords.length === 0 ? null : (
+                  <ul aria-label={`Recent memory records on ${observation.machineLabel}`} className="flex flex-col gap-1 text-xs text-ink-muted">
+                    {space.recentRecords.map((record) => (
+                      <li key={record.key}>
+                        <span className="font-mono">{record.key}</span>
+                        {` · memory page · ${formatRelativeTime(record.updatedAt, now)}`}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </SettingsRow>
+            );
+          })}
+        </SettingsCard>
+      ))}
+
+      <SettingsCard>
+        {policies.length === 0 ? <EmptyRow>No peer policy appears in the current bounded view.</EmptyRow> : null}
+        {policies.map((policy) => (
+          <SettingsRow
+            control={<Badge tone={policy.mode === "coordinate" ? "accent" : "neutral"}>{policy.mode}</Badge>}
+            description={`${policy.machineLabel} · ${policy.projectLabel} · session ref ${shortDigest(policy.session.ref)} · ${formatRelativeTime(policy.updatedAt, now)}`}
+            key={`${policy.devicePublicId}:${policy.session.ref}`}
+            title={policy.session.label}
+          />
+        ))}
+      </SettingsCard>
+
+      <SettingsCard>
+        {actions.length === 0 ? <EmptyRow>No mutating peer action appears in the current bounded view.</EmptyRow> : null}
+        {actions.map((action, index) => (
+          <SettingsRow
+            control={<Badge tone={action.state === "failed" || action.state === "ambiguous" ? "danger" : "neutral"}>{action.state}</Badge>}
+            description={`${action.machineLabel} · ${action.delivery} · ${formatRelativeTime(action.updatedAt, now)}. Messages and reasons are not uploaded.`}
+            key={`${action.devicePublicId}:${action.createdAt}:${action.actor.ref}:${action.target.ref}:${index}`}
+            title={`Actor ${action.actor.label} (${shortDigest(action.actor.ref)}) → target ${action.target.label} (${shortDigest(action.target.ref)})`}
+          />
+        ))}
+      </SettingsCard>
+    </SettingsSection>
+  );
+}
+
 function ArchivedSessionRow({
   now,
   session,
@@ -954,8 +1116,9 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
   const { signOut } = useAuthActions();
   const registries = useDeviceRegistries();
   const { devices, loading: devicesLoading } = useDevices();
-  const serverClock = useServerClock();
-  const now = serverClock.now;
+  // Readiness and `now` must come from one hosted-clock instance. Otherwise
+  // one hook can be ready while another still exposes its local-time fallback.
+  const now = registries.now;
   const { heads, isLoading: headsLoading, loadMore, status } = useSessionHeads(pageSize);
 
   const labels = useMemo(
@@ -1003,6 +1166,12 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
             />
           ))}
         </SettingsSection>
+
+        <MemorySupervision
+          machines={registries.machines}
+          now={now}
+          ready={registries.memorySummaryReady}
+        />
 
         <SettingsSection
           description="Archived sessions stay readable and can be brought back."
@@ -1070,7 +1239,7 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
                 account={account}
                 key={`${account.targetDevicePublicId}:${account.provider}:${account.publicId}`}
                 now={now}
-                serverClockReady={serverClock.ready}
+                serverClockReady={registries.memorySummaryReady}
               />
             ))}
             <SettingsRow

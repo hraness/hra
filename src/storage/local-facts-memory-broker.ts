@@ -86,6 +86,26 @@ const isMissing = async (path: string): Promise<boolean> => {
   }
 };
 
+/** Exact on-disk location for one generation of a session's working memory. */
+export const factsMemorySessionDirectory = (
+  root: string,
+  bindingValue: FactsMemoryBinding,
+): string => {
+  if (!isAbsolute(root)) throw new Error("FACTS_MEMORY_ROOT_NOT_ABSOLUTE");
+  const canonicalRoot = resolve(root);
+  const binding = factsMemoryBindingSchema.parse(bindingValue);
+  const sessionId = sessionIdSchema.parse(binding.sessionId);
+  const component = binding.epoch === 1
+    ? sessionId
+    : `${sessionId}.epoch-${String(binding.epoch)}`;
+  const target = resolve(join(canonicalRoot, component));
+  const relativeTarget = relative(canonicalRoot, target);
+  if (relativeTarget !== component || relativeTarget.startsWith("..")) {
+    throw new Error("FACTS_MEMORY_PATH_ESCAPE");
+  }
+  return target;
+};
+
 export class LocalFactsMemoryBroker implements FactsMemoryBrokerPort {
   readonly #engine: LocalOhFactsMemoryEnginePort;
   readonly #now: () => number;
@@ -255,14 +275,7 @@ export class LocalFactsMemoryBroker implements FactsMemoryBrokerPort {
   }
 
   #sessionDirectory(bindingValue: FactsMemoryBinding): string {
-    const binding = factsMemoryBindingSchema.parse(bindingValue);
-    const component = this.#directoryComponent(binding);
-    const target = resolve(join(this.#root, component));
-    const relativeTarget = relative(this.#root, target);
-    if (relativeTarget !== component || relativeTarget.startsWith("..")) {
-      throw new Error("FACTS_MEMORY_PATH_ESCAPE");
-    }
-    return target;
+    return factsMemorySessionDirectory(this.#root, bindingValue);
   }
 
   #quarantineDirectory(bindingValue: FactsMemoryBinding): string {

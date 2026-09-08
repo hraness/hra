@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import {
   chmod,
@@ -11,15 +12,29 @@ import {
   rm,
   stat,
   symlink,
+  truncate,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createKnowledgeGraphRecordV1 } from "@hraness/oh";
+import { createKnowledgeGraphRecordV1, sha256Hex } from "@hraness/oh";
 import { OH_LIBSQL_STORE_LIMITS_V1 } from "@hraness/oh/libsql";
-import { createOhSqliteStoreAuthorityV1 } from "@hraness/oh/sqlite";
-import { OH_WORKING_STORE_PROFILE_V1 } from "@hraness/oh/store";
+import {
+  createOhMemoryPageRecordV1,
+  OH_MEMORY_LIMITS_V1,
+  OH_MEMORY_PAGE_FORMAT_V1,
+} from "@hraness/oh/memory";
+import {
+  OhSqliteStore,
+  applyOhSqliteMigrations,
+  createOhSqliteStoreAuthorityV1,
+} from "@hraness/oh/sqlite";
+import {
+  OH_CANONICAL_STORE_PROFILE_V1,
+  OH_WORKING_STORE_PROFILE_V1,
+  emptyOhHeadV1,
+} from "@hraness/oh/store";
 
 import {
   createFactsMemoryBinding,
@@ -31,7 +46,13 @@ import { FactsMemoryControlStore } from "./facts-memory-control";
 import { LocalFactsMemoryBroker } from "./local-facts-memory-broker";
 import {
   HRA_OH_FACTS_MEMORY_LIMITS_V1,
+  inspectOhCanonicalDatabaseForRecovery,
+  OhCanonicalDatabaseInspectionError,
   OhSqliteFactsMemoryEngine,
+  projectOhHead,
+  type OhCanonicalReplicationInput,
+  type OpenOhCanonicalReplication,
+  type OpenOhWorkingMemoryStores,
 } from "./oh-facts-memory-engine";
 import { ensurePrivateDirectory } from "./paths";
 
@@ -45,6 +66,9 @@ const migratingMetadataName = ".hra-oh-adapter-v1.migrating";
 
 const roots: string[] = [];
 const controls: FactsMemoryControlStore[] = [];
+const testForkAttestations = {
+  finalizeMemoryWorkingPageAttestationFork: () => 0,
+};
 afterEach(async () => {
   for (const control of controls.splice(0)) control.close();
   await Promise.all(roots.splice(0).map(async (root) => await rm(root, { force: true, recursive: true })));
@@ -54,7 +78,7 @@ const fixture = async (now: () => number = () => 100) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "hra-oh-engine-")));
   roots.push(root);
   await chmod(root, 0o700);
-  const engine = new OhSqliteFactsMemoryEngine({ now });
+  const engine = new OhSqliteFactsMemoryEngine({ forkAttestations: testForkAttestations, now });
   const broker = new LocalFactsMemoryBroker({ engine, now, root });
   return { broker, engine, root };
 };
@@ -80,6 +104,29 @@ const sqliteLogicalBytes = async (directory: string): Promise<number> => {
   }
   return bytes;
 };
+
+const memoryPageRecord = (index: number, body: string) => createOhMemoryPageRecordV1({
+  dependencies: [],
+  key: `edition:memory-capacity-${String(index).padStart(4, "0")}`,
+  value: {
+    body,
+    createdAt: "2026-09-04T00:00:00.000Z",
+    format: OH_MEMORY_PAGE_FORMAT_V1,
+    language: "en",
+    provenance: {
+      actorId: "hra.memory.host",
+      attestationSha256: sha256Hex(`attestation:${String(index)}`),
+      attestedAt: "2026-09-04T00:00:00.000Z",
+      kind: "host-attested",
+      v: 1,
+    },
+    sources: [],
+    summary: `Capacity page ${String(index)}`,
+    title: `Capacity page ${String(index)}`,
+    updatedAt: "2026-09-04T00:00:00.000Z",
+    v: 1,
+  },
+});
 
 const inspectionHead = async (
   broker: LocalFactsMemoryBroker,
@@ -210,15 +257,733 @@ const legacyMetadataFixture = (current: AdapterMetadataFixture): LegacyMetadataF
   });
 
 describe("released Oh SQLite facts-memory adapter", () => {
-  test("pins the immutable public v0.2.7 release without installing optional semantic peers", async () => {
+  test("opens a verified working store without touching durable canonical custody", async () => {
+    const { broker, engine, root } = await fixture();
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const receipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const expectedHead = await inspectionHead(broker, working);
+    const brokenCanonicalDirectory = await ensurePrivateDirectory(
+      join(root, "broken-durable-canonical"),
+    );
+    const brokenCanonicalDatabase = join(brokenCanonicalDirectory, "oh.sqlite");
+    await symlink(join(root, "missing-canonical-target"), brokenCanonicalDatabase);
+
+    let escaped: OpenOhWorkingMemoryStores | undefined;
+    const completed = await engine.withWorkingMemoryStore({
+      binding: working,
+      directory: join(root, working.sessionId),
+      expectedHandleHash: receipt.handleHash,
+      expectedHead,
+    }, async (stores) => {
+      escaped = stores;
+      expect(Object.keys(stores).sort()).toEqual(["ephemeralCanonical", "working"]);
+      expect(stores.ephemeralCanonical.expectedHead).toEqual(emptyOhHeadV1());
+      expect(stores.ephemeralCanonical.store.binding.profile.profileKind).toBe("canonical");
+      expect(stores.working.store.binding.profile.profileKind).toBe("working");
+      expect(await stores.ephemeralCanonical.store.verify()).toMatchObject({
+        head: emptyOhHeadV1(),
+        operations: 0,
+        records: 0,
+      });
+
+      const record = createKnowledgeGraphRecordV1({
+        dependencies: [],
+        key: "entity:working-only",
+        kind: "entity",
+        v: 1,
+        value: { name: "Working only" },
+      });
+      await expect(stores.ephemeralCanonical.store.commit({
+        actorId: "hra.memory.host",
+        changes: [{ kind: "put", record, v: 1 }],
+        expectedHead: stores.ephemeralCanonical.expectedHead,
+        operationId: "host.test.working-only-ephemeral-refusal",
+      })).rejects.toThrow("FACTS_MEMORY_OH_WORKING_ONLY_EPHEMERAL_READ_ONLY");
+      const committed = await stores.working.store.commit({
+        actorId: "hra.memory.host",
+        changes: [{ kind: "put", record, v: 1 }],
+        expectedHead: stores.working.expectedHead,
+        operationId: "host.test.working-only-commit",
+      });
+      return committed.operationSha256;
+    });
+
+    expect(completed.workingHead.operationSha256).toBe(completed.result);
+    expect(completed.workingHead.sequence).toBe(1);
+    expect(Object.keys(completed).sort()).toEqual(["result", "workingHead"]);
+    expect((await lstat(brokenCanonicalDatabase)).isSymbolicLink()).toBe(true);
+    expect(escaped).toBeDefined();
+    await expect(escaped!.working.store.head()).rejects.toThrow();
+    await expect(escaped!.ephemeralCanonical.store.head()).rejects.toThrow();
+  });
+
+  test("rechecks working custody and closes both capabilities after failure", async () => {
+    const { broker, engine, root } = await fixture();
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const receipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const expectedHead = await inspectionHead(broker, working);
+    const directory = join(root, working.sessionId);
+    const databasePath = join(directory, "oh.sqlite");
+    let escaped: OpenOhWorkingMemoryStores | undefined;
+
+    let callbackCalled = false;
+    await expect(engine.withWorkingMemoryStore({
+      binding: working,
+      directory,
+      expectedHandleHash: "f".repeat(64),
+      expectedHead,
+    }, async () => {
+      callbackCalled = true;
+    })).rejects.toThrow("FACTS_MEMORY_OH_HANDLE_MISMATCH");
+    await expect(engine.withWorkingMemoryStore({
+      binding: working,
+      directory,
+      expectedHandleHash: receipt.handleHash,
+      expectedHead: { ...expectedHead, digest: "f".repeat(64) },
+    }, async () => {
+      callbackCalled = true;
+    })).rejects.toThrow("FACTS_MEMORY_OH_WORKING_HEAD_CONFLICT");
+    expect(callbackCalled).toBe(false);
+
+    let failure: unknown;
+    try {
+      await engine.withWorkingMemoryStore({
+        binding: working,
+        directory,
+        expectedHandleHash: receipt.handleHash,
+        expectedHead,
+      }, async (stores) => {
+        escaped = stores;
+        await rename(databasePath, join(directory, "oh.sqlite.replaced"));
+        await writeFile(databasePath, new Uint8Array(), { mode: 0o600 });
+      });
+    } catch (error: unknown) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("FACTS_MEMORY_OH_WORKING_DATABASE_REPLACED");
+    expect((failure as Error).message).not.toContain("CANONICAL");
+    expect(escaped).toBeDefined();
+    await expect(escaped!.working.store.head()).rejects.toThrow();
+    await expect(escaped!.ephemeralCanonical.store.head()).rejects.toThrow();
+  });
+
+  test("exports and imports exact canonical operations through a callback-scoped host capability", async () => {
+    const { broker, engine, root } = await fixture();
+    const realmId = "hra:project-memory:replication-round-trip";
+    const spaceId = "hra:project:replication-round-trip";
+    const sourceDirectory = await ensurePrivateDirectory(join(root, "replication-source"));
+    const targetDirectory = await ensurePrivateDirectory(join(root, "replication-target"));
+    const sourceAuthority = createOhSqliteStoreAuthorityV1({
+      path: join(sourceDirectory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId,
+      spaceId,
+    });
+    await sourceAuthority.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{
+        kind: "put",
+        record: createKnowledgeGraphRecordV1({
+          dependencies: [],
+          key: "entity:replicated",
+          kind: "entity",
+          v: 1,
+          value: { name: "Replicated" },
+        }),
+        v: 1,
+      }],
+      expectedHead: await sourceAuthority.store.head(),
+      operationId: "host.test.replication-source",
+    });
+    const sourceHead = await sourceAuthority.store.head();
+    const sourceBindingSha256 = sourceAuthority.store.binding.bindingSha256;
+    await sourceAuthority.store.close();
+    const sourceInspection = inspectOhCanonicalDatabaseForRecovery(sourceDirectory);
+    if (sourceInspection.state !== "present") throw new Error("Expected source inode receipt.");
+
+    const exported = await engine.withCanonicalReplication({
+      directory: sourceDirectory,
+      expectedDatabaseFile: sourceInspection.file,
+      expectedHead: projectOhHead(sourceHead),
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async (opened) => {
+      expect(Object.keys(opened).sort()).toEqual([
+        "bindingSha256",
+        "expectedHead",
+        "replication",
+      ]);
+      expect(opened.bindingSha256).toBe(sourceBindingSha256);
+      expect(opened.expectedHead).toEqual(sourceHead);
+      expect(Object.keys(opened.replication).sort()).toEqual(["exportBundle", "importBundle"]);
+      const page = await opened.replication.exportBundle({
+        after: { operationSha256: null, sequence: 0 },
+      });
+      expect(page).toMatchObject({
+        from: { operationSha256: null, sequence: 0 },
+        hasMore: false,
+        through: sourceHead,
+        to: { operationSha256: sourceHead.operationSha256, sequence: 1 },
+        v: 1,
+      });
+      expect(page.bundle.operations).toHaveLength(1);
+      return { bundle: page.bundle, escaped: opened.replication };
+    });
+    expect(exported.canonicalHead).toEqual(sourceHead);
+    await expect(exported.result.escaped.exportBundle({
+      after: { operationSha256: null, sequence: 0 },
+    })).rejects.toThrow();
+
+    const imported = await engine.withCanonicalReplication({
+      directory: targetDirectory,
+      expectedHead: projectOhHead(emptyOhHeadV1()),
+      realmId,
+      requireVacant: true,
+      spaceId,
+    }, async (opened) => await opened.replication.importBundle({
+      bundle: exported.result.bundle,
+    }));
+    expect(imported.result).toMatchObject({ imported: 1, status: "imported", v: 1 });
+    expect(imported.canonicalHead).toEqual(sourceHead);
+
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const workingReceipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const workingHead = await inspectionHead(broker, working);
+    await engine.withMemoryStores({
+      canonical: {
+        directory: targetDirectory,
+        expectedHead: projectOhHead(imported.canonicalHead),
+        realmId,
+        requireExisting: true,
+        spaceId,
+      },
+      working: {
+        binding: working,
+        directory: join(root, working.sessionId),
+        expectedHandleHash: workingReceipt.handleHash,
+        expectedHead: workingHead,
+      },
+    }, async (opened) => {
+      expect(Object.hasOwn(opened.working, "replication")).toBe(false);
+      expect(opened.working.store.binding.profile.capabilities.operationReplication).toBe(false);
+    });
+  });
+
+  test("pins an exact canonical ancestor and rejects equivocation or regression", async () => {
+    const { engine, root } = await fixture();
+    const directory = await ensurePrivateDirectory(join(root, "replication-heads"));
+    const realmId = "hra:project-memory:replication-heads";
+    const spaceId = "hra:project:replication-heads";
+    const authority = createOhSqliteStoreAuthorityV1({
+      path: join(directory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId,
+      spaceId,
+    });
+    await authority.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: createKnowledgeGraphRecordV1({
+        dependencies: [],
+        key: "entity:replication-first",
+        kind: "entity",
+        v: 1,
+        value: { name: "First" },
+      }), v: 1 }],
+      expectedHead: await authority.store.head(),
+      operationId: "host.test.replication-first",
+    });
+    const firstHead = await authority.store.head();
+    await authority.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: createKnowledgeGraphRecordV1({
+        dependencies: [],
+        key: "entity:replication-second",
+        kind: "entity",
+        v: 1,
+        value: { name: "Second" },
+      }), v: 1 }],
+      expectedHead: firstHead,
+      operationId: "host.test.replication-second",
+    });
+    const currentHead = await authority.store.head();
+    await authority.store.close();
+
+    let omittedHeadCallbackCalled = false;
+    expect(() => engine.withCanonicalReplication({
+      directory,
+      realmId,
+      requireExisting: true,
+      spaceId,
+    } as unknown as OhCanonicalReplicationInput, async () => {
+      omittedHeadCallbackCalled = true;
+    })).toThrow();
+    expect(omittedHeadCallbackCalled).toBe(false);
+
+    const pinned = await engine.withCanonicalReplication({
+      directory,
+      expectedHead: projectOhHead(firstHead),
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async (opened) => {
+      expect(opened.expectedHead).toEqual(firstHead);
+      return await opened.replication.exportBundle({
+        after: { operationSha256: null, sequence: 0 },
+        // A caller cannot widen the authority even through an unchecked JS
+        // value: the wrapper reconstructs an exact request at the pin.
+        through: currentHead,
+      } as Parameters<typeof opened.replication.exportBundle>[0] & {
+        through: typeof currentHead;
+      });
+    });
+    expect(pinned.result.bundle.operations).toHaveLength(1);
+    expect(pinned.canonicalHead).toEqual(currentHead);
+
+    let called = false;
+    await expect(engine.withCanonicalReplication({
+      directory,
+      expectedHead: { ...projectOhHead(firstHead), digest: "f".repeat(64) },
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async () => {
+      called = true;
+    })).rejects.toThrow("FACTS_MEMORY_OH_CANONICAL_HEAD_EQUIVOCATION");
+    expect(called).toBe(false);
+
+    await expect(engine.withCanonicalReplication({
+      directory,
+      expectedHead: {
+        ...projectOhHead(firstHead),
+        digest: "e".repeat(64),
+        operationSha256: "e".repeat(64),
+      },
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async () => undefined)).rejects.toThrow(
+      "FACTS_MEMORY_OH_CANONICAL_HEAD_EQUIVOCATION",
+    );
+
+    await expect(engine.withCanonicalReplication({
+      directory,
+      expectedHead: { ...projectOhHead(currentHead), sequence: currentHead.sequence + 1 },
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async () => undefined)).rejects.toThrow(
+      "FACTS_MEMORY_OH_CANONICAL_HEAD_REGRESSION",
+    );
+  });
+
+  test("reads only an exact verified canonical snapshot and refuses physical head drift", async () => {
+    const { engine, root } = await fixture();
+    const directory = await ensurePrivateDirectory(join(root, "canonical-summary"));
+    const realmId = "hra:project-memory:canonical-summary";
+    const spaceId = "hra:project:canonical-summary";
+    const authority = createOhSqliteStoreAuthorityV1({
+      path: join(directory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId,
+      spaceId,
+    });
+    await authority.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: memoryPageRecord(1, "first"), v: 1 }],
+      expectedHead: await authority.store.head(),
+      operationId: "host.test.canonical-summary-first",
+    });
+    const firstHead = await authority.store.head();
+    await authority.store.close();
+
+    const snapshot = await engine.inspectCanonicalMemorySnapshot({
+      directory,
+      expectedHead: projectOhHead(firstHead),
+      realmId,
+      requireExisting: true,
+      spaceId,
+    });
+    expect(snapshot.bindingSha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(snapshot.head).toEqual(firstHead);
+    expect(snapshot.records).toEqual([memoryPageRecord(1, "first")]);
+    expect(Object.hasOwn(snapshot, "store")).toBe(false);
+
+    const advanced = createOhSqliteStoreAuthorityV1({
+      path: join(directory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId,
+      spaceId,
+    });
+    await advanced.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: memoryPageRecord(2, "second"), v: 1 }],
+      expectedHead: await advanced.store.head(),
+      operationId: "host.test.canonical-summary-second",
+    });
+    await advanced.store.close();
+
+    await expect(engine.inspectCanonicalMemorySnapshot({
+      directory,
+      expectedHead: projectOhHead(firstHead),
+      realmId,
+      requireExisting: true,
+      spaceId,
+    })).rejects.toThrow("FACTS_MEMORY_OH_CANONICAL_HEAD_NOT_SETTLED");
+  });
+
+  test("rechecks canonical inode custody after replication and rejects oversized storage", async () => {
+    const { engine, root } = await fixture();
+    const realmId = "hra:project-memory:replication-custody";
+    const spaceId = "hra:project:replication-custody";
+    const directory = await ensurePrivateDirectory(join(root, "replication-custody"));
+    const authority = createOhSqliteStoreAuthorityV1({
+      path: join(directory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId,
+      spaceId,
+    });
+    await authority.store.close();
+    const inspection = inspectOhCanonicalDatabaseForRecovery(directory);
+    if (inspection.state !== "present") throw new Error("Expected canonical inode receipt.");
+    const escaped: OpenOhCanonicalReplication["replication"][] = [];
+    await expect(engine.withCanonicalReplication({
+      directory,
+      expectedDatabaseFile: inspection.file,
+      expectedHead: projectOhHead(emptyOhHeadV1()),
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async (opened) => {
+      escaped.push(opened.replication);
+      await rename(join(directory, "oh.sqlite"), join(directory, "oh.sqlite.replaced"));
+      await writeFile(join(directory, "oh.sqlite"), new Uint8Array(), { mode: 0o600 });
+    })).rejects.toThrow("FACTS_MEMORY_OH_CANONICAL_DATABASE_REPLACED");
+    expect(escaped).toHaveLength(1);
+    await expect(escaped[0]!.exportBundle({
+      after: { operationSha256: null, sequence: 0 },
+    })).rejects.toThrow();
+    expect((await stat(join(directory, "oh.sqlite"))).size).toBe(0);
+
+    const oversizedDirectory = await ensurePrivateDirectory(join(root, "replication-oversized"));
+    const oversized = createOhSqliteStoreAuthorityV1({
+      path: join(oversizedDirectory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId,
+      spaceId,
+    });
+    await oversized.store.close();
+    await truncate(
+      join(oversizedDirectory, "oh.sqlite"),
+      HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes + 1,
+    );
+    let oversizedCallbackCalled = false;
+    await expect(engine.withCanonicalReplication({
+      directory: oversizedDirectory,
+      expectedHead: projectOhHead(emptyOhHeadV1()),
+      realmId,
+      requireExisting: true,
+      spaceId,
+    }, async () => {
+      oversizedCallbackCalled = true;
+    })).rejects.toThrow("FACTS_MEMORY_OH_DATABASE_TOO_LARGE");
+    expect(oversizedCallbackCalled).toBe(false);
+  });
+
+  test("classifies legacy recovery without following sidecars or accepting a replaced main inode", async () => {
+    const { broker, engine, root } = await fixture();
+    const absentDirectory = join(root, "recovery-absent");
+    expect(inspectOhCanonicalDatabaseForRecovery(absentDirectory)).toEqual({ state: "absent" });
+
+    const sidecarOnly = await ensurePrivateDirectory(join(root, "recovery-sidecar-only"));
+    await writeFile(join(sidecarOnly, "oh.sqlite-wal"), new Uint8Array(), { mode: 0o600 });
+    expect(() => inspectOhCanonicalDatabaseForRecovery(sidecarOnly)).toThrow(
+      "FACTS_MEMORY_OH_CANONICAL_DATABASE_UNSAFE",
+    );
+    try {
+      inspectOhCanonicalDatabaseForRecovery(sidecarOnly);
+      throw new Error("Expected unsafe sidecar evidence to be rejected.");
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(OhCanonicalDatabaseInspectionError);
+      expect(error).toMatchObject({ failure: "unsafe" });
+    }
+
+    const unavailableDirectory = join(root, "x".repeat(300));
+    try {
+      inspectOhCanonicalDatabaseForRecovery(unavailableDirectory);
+      throw new Error("Expected an overlong lookup to be unavailable.");
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(OhCanonicalDatabaseInspectionError);
+      expect(error).toMatchObject({
+        failure: "unavailable",
+        message: "FACTS_MEMORY_OH_CANONICAL_DATABASE_INSPECTION_UNAVAILABLE",
+      });
+    }
+
+    const directory = await ensurePrivateDirectory(join(root, "recovery-replaced"));
+    const path = join(directory, "oh.sqlite");
+    await writeFile(path, new Uint8Array(), { mode: 0o600 });
+    const inspection = inspectOhCanonicalDatabaseForRecovery(directory);
+    if (inspection.state !== "present") throw new Error("Expected a database inode receipt.");
+    await rename(path, join(directory, "oh.sqlite.old"));
+    await writeFile(path, new Uint8Array(), { mode: 0o600 });
+
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const workingReceipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const workingHead = await inspectionHead(broker, working);
+    await expect(engine.withMemoryStores({
+      canonical: {
+        directory,
+        expectedDatabaseFile: inspection.file,
+        realmId: "hra:project-memory:replaced",
+        requireExisting: true,
+        spaceId: "hra:project:replaced",
+      },
+      working: {
+        binding: working,
+        directory: join(root, working.sessionId),
+        expectedHandleHash: workingReceipt.handleHash,
+        expectedHead: workingHead,
+      },
+    }, async () => undefined)).rejects.toThrow(
+      "FACTS_MEMORY_OH_CANONICAL_DATABASE_REPLACED",
+    );
+    expect((await stat(path)).size).toBe(0);
+  });
+
+  test("requires total non-anchor vacancy before a bound canonical database is initialized", async () => {
+    for (const hidden of ["sync", "fts", "operation-record"] as const) {
+      const { broker, engine, root } = await fixture();
+      const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+      const workingReceipt = await broker.create({
+        binding: working,
+        operationKey: `create:${working.sessionId}`,
+      });
+      const workingHead = await inspectionHead(broker, working);
+      const directory = await ensurePrivateDirectory(join(root, `vacancy-${hidden}`));
+      const spaceId = `hra:project:vacancy-${hidden}`;
+      const realmId = `hra:project-memory:vacancy-${hidden}`;
+      const authority = createOhSqliteStoreAuthorityV1({
+        path: join(directory, "oh.sqlite"),
+        profile: OH_CANONICAL_STORE_PROFILE_V1,
+        realmId,
+        spaceId,
+      });
+      await authority.store.close();
+      const database = new Database(join(directory, "oh.sqlite"));
+      try {
+        if (hidden === "sync") {
+          database.query(
+            `INSERT INTO oh_sync_state(
+               remote_id,space_id,pulled_sequence,pushed_sequence,remote_head_sha256,updated_at
+             ) VALUES ('hidden',?,0,0,NULL,'2026-09-06T00:00:00.000Z')`,
+          ).run(spaceId);
+        } else if (hidden === "fts") {
+          database.query(
+            "INSERT INTO oh_search_fts(space_id,record_key,text) VALUES (?,'ghost','hidden')",
+          ).run(spaceId);
+        } else {
+          database.exec("PRAGMA foreign_keys=OFF");
+          database.query(
+            `INSERT INTO oh_operation_records(
+               operation_sha256,ordinal,record_key,change_kind,record_sha256
+             ) VALUES (?,0,'ghost','tombstone',NULL)`,
+          ).run("a".repeat(64));
+          database.exec("PRAGMA foreign_keys=ON");
+        }
+      } finally {
+        database.close(false);
+      }
+
+      await expect(engine.withMemoryStores({
+        canonical: { directory, realmId, requireExisting: true, requireVacant: true, spaceId },
+        working: {
+          binding: working,
+          directory: join(root, working.sessionId),
+          expectedHandleHash: workingReceipt.handleHash,
+          expectedHead: workingHead,
+        },
+      }, async () => undefined)).rejects.toThrow(
+        "FACTS_MEMORY_OH_CANONICAL_MULTIPLE_SPACES_REFUSED",
+      );
+    }
+  });
+
+  test("refuses an alien canonical space without inserting the requested space", async () => {
+    const { broker, engine, root } = await fixture();
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const workingReceipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const workingHead = await inspectionHead(broker, working);
+    const canonicalDirectory = await ensurePrivateDirectory(join(root, "single-space-canonical"));
+    const alien = createOhSqliteStoreAuthorityV1({
+      path: join(canonicalDirectory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId: "hra:project-memory:space-alien",
+      spaceId: "hra:project:space-alien",
+    });
+    await alien.store.close();
+
+    await expect(engine.withMemoryStores({
+      canonical: {
+        directory: canonicalDirectory,
+        realmId: "hra:project-memory:space-primary",
+        spaceId: "hra:project:space-primary",
+      },
+      working: {
+        binding: working,
+        directory: join(root, working.sessionId),
+        expectedHandleHash: workingReceipt.handleHash,
+        expectedHead: workingHead,
+      },
+    }, async () => undefined)).rejects.toThrow(
+      "FACTS_MEMORY_OH_CANONICAL_MULTIPLE_SPACES_REFUSED",
+    );
+
+    const database = new Database(join(canonicalDirectory, "oh.sqlite"), { readonly: true });
+    try {
+      for (const table of ["oh_spaces", "oh_space_bindings"] as const) {
+        expect(database.query<{ space_id: string }, []>(
+          `SELECT space_id FROM ${table} ORDER BY space_id`,
+        ).all()).toEqual([{ space_id: "hra:project:space-alien" }]);
+      }
+    } finally {
+      database.close();
+    }
+  });
+
+  test("recovers exact empty SQLite bootstrap states before binding one space", async () => {
+    const { broker, engine, root } = await fixture();
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const workingReceipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const workingHead = await inspectionHead(broker, working);
+    const expectedSpaceId = "hra:project:bootstrap-recovery";
+    const expectedRealmId = "hra:project-memory:bootstrap-recovery";
+
+    for (const state of ["migrated", "space-created"] as const) {
+      const directory = await ensurePrivateDirectory(join(root, `bootstrap-${state}`));
+      const path = join(directory, "oh.sqlite");
+      if (state === "migrated") {
+        const database = new Database(path);
+        try {
+          applyOhSqliteMigrations(database);
+        } finally {
+          database.close(false);
+        }
+      } else {
+        const interrupted = new OhSqliteStore({ path, spaceId: expectedSpaceId });
+        interrupted.close();
+      }
+
+      await expect(engine.withMemoryStores({
+        canonical: {
+          directory,
+          realmId: expectedRealmId,
+          spaceId: expectedSpaceId,
+        },
+        working: {
+          binding: working,
+          directory: join(root, working.sessionId),
+          expectedHandleHash: workingReceipt.handleHash,
+          expectedHead: workingHead,
+        },
+      }, async () => undefined)).resolves.toMatchObject({
+        canonicalHead: { sequence: 0 },
+      });
+
+      const database = new Database(path, { readonly: true });
+      try {
+        expect(database.query<{ space_id: string }, []>(
+          "SELECT space_id FROM oh_spaces",
+        ).all()).toEqual([{ space_id: expectedSpaceId }]);
+        expect(database.query<{ space_id: string }, []>(
+          "SELECT space_id FROM oh_space_bindings",
+        ).all()).toEqual([{ space_id: expectedSpaceId }]);
+      } finally {
+        database.close();
+      }
+    }
+  });
+
+  test("rejects orphan foreign-key, search, and purge space rows", async () => {
+    const { broker, engine, root } = await fixture();
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const workingReceipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const workingHead = await inspectionHead(broker, working);
+    const canonicalDirectory = await ensurePrivateDirectory(join(root, "hidden-space-rows"));
+    const canonicalInput = {
+      directory: canonicalDirectory,
+      realmId: "hra:project-memory:hidden-space-rows",
+      spaceId: "hra:project:hidden-space-rows",
+    } as const;
+    const stores = {
+      canonical: canonicalInput,
+      working: {
+        binding: working,
+        directory: join(root, working.sessionId),
+        expectedHandleHash: workingReceipt.handleHash,
+        expectedHead: workingHead,
+      },
+    } as const;
+    await engine.withMemoryStores(stores, async () => undefined);
+
+    const database = new Database(join(canonicalDirectory, "oh.sqlite"));
+    try {
+      database.exec("PRAGMA foreign_keys=OFF");
+      database.query(
+        `INSERT INTO oh_sync_state(
+           remote_id,space_id,pulled_sequence,pushed_sequence,remote_head_sha256,updated_at
+         ) VALUES ('alien-remote','alien-space',0,0,NULL,'2026-09-06T00:00:00.000Z')`,
+      ).run();
+      database.query(
+        "INSERT INTO oh_search_fts(space_id,record_key,text) VALUES ('alien-space','alien:key','hidden')",
+      ).run();
+      database.query(
+        `INSERT INTO oh_space_purges(
+           space_id,binding_sha256,prior_operation_sha256,prior_sequence,
+           purged_at,receipt_sha256,receipt_json
+         ) VALUES ('alien-space',?,NULL,0,'2026-09-06T00:00:00.000Z',?,?)`,
+      ).run("a".repeat(64), "b".repeat(64), JSON.stringify({ alien: true }));
+      database.exec("PRAGMA foreign_keys=ON");
+    } finally {
+      database.close(false);
+    }
+
+    await expect(engine.withMemoryStores(stores, async () => undefined)).rejects.toThrow(
+      "FACTS_MEMORY_OH_CANONICAL_MULTIPLE_SPACES_REFUSED",
+    );
+  });
+
+  test("pins the immutable public v0.4.1 release without installing optional semantic peers", async () => {
     const packageDocument = JSON.parse(
       await readFile(join(import.meta.dir, "..", "..", "package.json"), "utf8"),
     ) as { dependencies?: Record<string, string> };
     expect(packageDocument.dependencies?.["@hraness/oh"])
-      .toBe("0.2.7");
+      .toBe("0.4.1");
     const lockfile = await readFile(join(import.meta.dir, "..", "..", "bun.lock"), "utf8");
-    expect(lockfile).toContain('"@hraness/oh": ["@hraness/oh@0.2.7"');
-    expect(lockfile).toContain("sha512-+9OIjJqEzriKdcV2dMze5y6Kl/DzjdbHwSghxVRkxHAhQIsdOoRujFynxgBQL2PXRqFJMRBmSQKnu8R5D/EXLg==");
+    expect(lockfile).toContain('"@hraness/oh": ["@hraness/oh@0.4.1"');
+    expect(lockfile).toContain("sha512-J4JMsGvd2wwacwLn2NT98ZmgBQ/8diaMkxSSBh3oUkOyeBa5V91BIbgfEev2jNDzw1DEAls330q1p1jEZQLrvQ==");
     expect(lockfile).not.toContain("@hraness/oh@github:");
     expect(OH_LIBSQL_STORE_LIMITS_V1.snapshotComponentBytes).toBe(6 * 1024 * 1024);
     expect(OH_LIBSQL_STORE_LIMITS_V1.providerResponseBytes).toBe(9_000_000);
@@ -242,7 +1007,10 @@ describe("released Oh SQLite facts-memory adapter", () => {
       join(root, binding.sessionId, pendingMetadataName),
     );
     const restartedBroker = new LocalFactsMemoryBroker({
-      engine: new OhSqliteFactsMemoryEngine({ now: () => 150 }),
+      engine: new OhSqliteFactsMemoryEngine({
+        forkAttestations: testForkAttestations,
+        now: () => 150,
+      }),
       now: () => 150,
       root,
     });
@@ -567,6 +1335,87 @@ describe("released Oh SQLite facts-memory adapter", () => {
     await reopened.store.close();
   });
 
+  test("replays fork attestation finalization against the immutable initial child head", async () => {
+    const { root } = await fixture();
+    const calls: Array<Readonly<{
+      childBindingDigest: string;
+      childHead: { digest: string; operationSha256: string | null; sequence: number };
+      parentBindingDigest: string;
+      parentHead: { digest: string; operationSha256: string | null; sequence: number };
+    }>> = [];
+    let loseFirstResponse = true;
+    const engine = new OhSqliteFactsMemoryEngine({
+      forkAttestations: {
+        finalizeMemoryWorkingPageAttestationFork: (input) => {
+          calls.push(input);
+          if (loseFirstResponse) {
+            loseFirstResponse = false;
+            throw new Error("lost fork attestation finalization response");
+          }
+          return 0;
+        },
+      },
+      now: () => 120,
+    });
+    const broker = new LocalFactsMemoryBroker({ engine, now: () => 120, root });
+    const parent = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const child = createFactsMemoryBinding({ ownerId, sessionId: childSessionId });
+    await broker.create({ binding: parent, operationKey: `create:${parent.sessionId}` });
+    const source = createKnowledgeGraphRecordV1({
+      dependencies: [],
+      key: "entity:attested-fork",
+      kind: "entity",
+      v: 1,
+      value: { name: "Attested fork" },
+    });
+    const parentAuthority = openOhAuthority(parent, join(root, parent.sessionId));
+    await parentAuthority.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: source, v: 1 }],
+      expectedHead: await parentAuthority.store.head(),
+      operationId: "host.test.attested-fork.parent",
+    });
+    await parentAuthority.store.close();
+    const checkpoint: FactsMemoryCheckpoint = {
+      ...parent,
+      head: await inspectionHead(broker, parent),
+    };
+    const forkInput = {
+      binding: child,
+      directory: join(root, child.sessionId),
+      operationKey: `fork:${child.sessionId}`,
+      parent: checkpoint,
+      parentDirectory: join(root, parent.sessionId),
+    } as const;
+    await ensurePrivateDirectory(forkInput.directory);
+    await expect(engine.fork(forkInput)).rejects.toThrow(
+      "lost fork attestation finalization response",
+    );
+    const receipt = await engine.fork(forkInput);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.childHead).toEqual(receipt.head);
+    expect(calls[1]?.childHead).toEqual(receipt.head);
+
+    const childAuthority = openOhAuthority(child, forkInput.directory);
+    await childAuthority.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: createKnowledgeGraphRecordV1({
+        dependencies: [],
+        key: "entity:child-later",
+        kind: "entity",
+        v: 1,
+        value: { name: "Child later" },
+      }), v: 1 }],
+      expectedHead: await childAuthority.store.head(),
+      operationId: "host.test.attested-fork.child-later",
+    });
+    const advancedHead = projectOhHead(await childAuthority.store.head());
+    await childAuthority.store.close();
+    expect(advancedHead.sequence).toBeGreaterThan(receipt.head.sequence);
+    await expect(engine.fork(forkInput)).resolves.toEqual(receipt);
+    expect(calls[2]?.childHead).toEqual(receipt.head);
+  });
+
   test("reconciles a child commit through lifecycle after the recorded parent checkpoint advances", async () => {
     const { broker, root } = await fixture();
     const control = new FactsMemoryControlStore(join(root, "control.sqlite"), { now: () => 90 });
@@ -734,21 +1583,23 @@ describe("released Oh SQLite facts-memory adapter", () => {
     await expect(broker.inspect(parent)).rejects.toThrow("FACTS_MEMORY_OH_METADATA_DIGEST_MISMATCH");
   });
 
-  test("bounds fork serialization before child open and history before verification", async () => {
+  test("accepts the released memory snapshot bound and rejects the first oversized fork", async () => {
     const { broker, root } = await fixture();
     const parent = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
     const child = createFactsMemoryBinding({ ownerId, sessionId: childSessionId });
+    const oversizedChild = createFactsMemoryBinding({
+      ownerId,
+      sessionId: `sess_${"3".repeat(32)}`,
+    });
     await broker.create({ binding: parent, operationKey: `create:${parent.sessionId}` });
-    const payload = "x".repeat(950_000);
-    const records = Array.from({ length: 10 }, (_, index) => createKnowledgeGraphRecordV1({
-      dependencies: [],
-      key: `entity:oversized-${String(index).padStart(2, "0")}`,
-      kind: "entity",
-      v: 1,
-      value: { payload },
-    }));
-    expect(Buffer.byteLength(JSON.stringify(records), "utf8"))
-      .toBeGreaterThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes);
+    expect(HRA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes)
+      .toBe(OH_MEMORY_LIMITS_V1.snapshotBytesPerLane);
+    const records = Array.from({ length: 65 }, (_, index) =>
+      memoryPageRecord(index, "word ".repeat(102_000)));
+    const encodedAtLimit = Buffer.byteLength(JSON.stringify(records), "utf8");
+    expect(encodedAtLimit).toBeLessThanOrEqual(HRA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes);
+    expect(encodedAtLimit)
+      .toBeGreaterThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes - 512 * 1024);
     const parentDirectory = join(root, parent.sessionId);
     const parentAuthority = openOhAuthority(parent, parentDirectory);
     await parentAuthority.store.commit({
@@ -765,11 +1616,35 @@ describe("released Oh SQLite facts-memory adapter", () => {
       binding: child,
       operationKey: `fork:${child.sessionId}`,
       parent: { ...parent, head: await inspectionHead(broker, parent) },
-    })).rejects.toThrow("FACTS_MEMORY_OH_FORK_SNAPSHOT_TOO_LARGE");
-    await expect(lstat(join(root, child.sessionId, "oh.sqlite")))
-      .rejects.toMatchObject({ code: "ENOENT" });
-    await expect(broker.inspect(child)).resolves.toEqual({ status: "missing" });
+    })).resolves.toMatchObject({ head: { sequence: 1 } });
+    await expect(broker.inspect(child)).resolves.toMatchObject({
+      status: "present",
+      inspection: { head: { sequence: 1 } },
+    });
 
+    const advancedParent = openOhAuthority(parent, parentDirectory);
+    await advancedParent.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: memoryPageRecord(65, "word ".repeat(102_000)), v: 1 }],
+      expectedHead: await advancedParent.store.head(),
+      operationId: "host.test.oversized-fork-final-page",
+    });
+    const oversizedSnapshot = await advancedParent.store.snapshot({ maximumRecords: 8_192 });
+    await advancedParent.store.close();
+    expect(Buffer.byteLength(JSON.stringify(oversizedSnapshot.records), "utf8"))
+      .toBeGreaterThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes);
+    await expect(broker.fork({
+      binding: oversizedChild,
+      operationKey: `fork:${oversizedChild.sessionId}`,
+      parent: { ...parent, head: await inspectionHead(broker, parent) },
+    })).rejects.toThrow("FACTS_MEMORY_OH_FORK_SNAPSHOT_TOO_LARGE");
+    await expect(lstat(join(root, oversizedChild.sessionId, "oh.sqlite")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(broker.inspect(oversizedChild)).resolves.toEqual({ status: "missing" });
+  }, 60_000);
+
+  test("rejects legacy oversized history before verification while preserving purge authority", async () => {
+    const { broker, root } = await fixture();
     const churn = createFactsMemoryBinding({
       ownerId,
       sessionId: `sess_${"6".repeat(32)}`,
@@ -779,23 +1654,10 @@ describe("released Oh SQLite facts-memory adapter", () => {
       operationKey: `create:${churn.sessionId}`,
     });
     const churnDirectory = join(root, churn.sessionId);
-    const churnAuthority = openOhAuthority(churn, churnDirectory);
-    for (let index = 0; index < 110; index += 1) {
-      const record = createKnowledgeGraphRecordV1({
-        dependencies: [],
-        key: "entity:churn",
-        kind: "entity",
-        v: 1,
-        value: { index, payload },
-      });
-      await churnAuthority.store.commit({
-        actorId: "hra.memory.host",
-        changes: [{ kind: "put", record, v: 1 }],
-        expectedHead: await churnAuthority.store.head(),
-        operationId: `host.test.churn.${String(index)}`,
-      });
-    }
-    await churnAuthority.store.close();
+    await truncate(
+      join(churnDirectory, "oh.sqlite"),
+      HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes + 1,
+    );
     expect(await sqliteLogicalBytes(churnDirectory))
       .toBeGreaterThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
     await expect(broker.inspect(churn)).rejects.toThrow("FACTS_MEMORY_OH_DATABASE_TOO_LARGE");
@@ -806,6 +1668,97 @@ describe("released Oh SQLite facts-memory adapter", () => {
     })).resolves.toBeDefined();
     await expect(lstat(churnDirectory)).rejects.toMatchObject({ code: "ENOENT" });
   }, 30_000);
+
+  test("rolls back a capacity-exhausting commit before binding its operation id", async () => {
+    const { broker, engine, root } = await fixture();
+    const working = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const workingReceipt = await broker.create({
+      binding: working,
+      operationKey: `create:${working.sessionId}`,
+    });
+    const workingHead = await inspectionHead(broker, working);
+    const canonicalDirectory = await ensurePrivateDirectory(join(root, "project-canonical"));
+    const canonicalRealmId = "hra:project:capacity-test";
+    const canonicalSpaceId = "hra:project:capacity-test";
+    const canonicalAuthority = createOhSqliteStoreAuthorityV1({
+      path: join(canonicalDirectory, "oh.sqlite"),
+      profile: OH_CANONICAL_STORE_PROFILE_V1,
+      realmId: canonicalRealmId,
+      spaceId: canonicalSpaceId,
+    });
+    const canonicalHead = projectOhHead(await canonicalAuthority.store.head());
+    await canonicalAuthority.store.close();
+
+    const database = new Database(join(canonicalDirectory, "oh.sqlite"));
+    try {
+      database.exec("PRAGMA journal_mode = WAL");
+      database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      database.exec("CREATE TABLE hra_capacity_padding(id INTEGER PRIMARY KEY, payload BLOB NOT NULL) STRICT");
+      const pageSize = database.query<{ page_size: number }, []>("PRAGMA page_size").get()?.page_size;
+      if (pageSize === undefined) throw new Error("Expected SQLite page size.");
+      const maximumPages = Math.floor(
+        (HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes - 32) / (2 * pageSize + 24),
+      );
+      const insert = database.query("INSERT INTO hra_capacity_padding(id, payload) VALUES (?, zeroblob(?))");
+      let id = 0;
+      const initialPages = database.query<{ page_count: number }, []>("PRAGMA page_count").get()?.page_count;
+      if (initialPages === undefined) throw new Error("Expected SQLite page count.");
+      let available = maximumPages - initialPages;
+      while (available > 256) {
+        const requestedPages = Math.min(8_192, available - 256);
+        insert.run(id, Math.max(1, (requestedPages - 8) * pageSize));
+        id += 1;
+        const pages = database.query<{ page_count: number }, []>("PRAGMA page_count").get()?.page_count;
+        if (pages === undefined) throw new Error("Expected SQLite page count.");
+        available = maximumPages - pages;
+      }
+      database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      const pages = database.query<{ page_count: number }, []>("PRAGMA page_count").get()?.page_count;
+      expect(pages).toBeDefined();
+      expect(pages!).toBeLessThanOrEqual(maximumPages);
+      expect(maximumPages - pages!).toBeLessThanOrEqual(256);
+    } finally {
+      database.close();
+    }
+    expect(await sqliteLogicalBytes(canonicalDirectory))
+      .toBeLessThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
+
+    const record = memoryPageRecord(9_999, "word ".repeat(104_000));
+    const stores = {
+      canonical: {
+        directory: canonicalDirectory,
+        expectedHead: canonicalHead,
+        realmId: canonicalRealmId,
+        spaceId: canonicalSpaceId,
+      },
+      working: {
+        binding: working,
+        directory: join(root, working.sessionId),
+        expectedHandleHash: workingReceipt.handleHash,
+        expectedHead: workingHead,
+      },
+    } as const;
+    const commit = async () => await engine.withMemoryStores(stores, async (opened) =>
+      await opened.canonical.store.commit({
+        actorId: "hra.memory.host",
+        changes: [{ kind: "put", record, v: 1 }],
+        expectedHead: opened.canonical.expectedHead,
+        operationId: "host.test.capacity-rollback",
+      }));
+    await expect(commit()).rejects.toThrow("FACTS_MEMORY_OH_DATABASE_TOO_LARGE");
+    await expect(commit()).rejects.toThrow("FACTS_MEMORY_OH_DATABASE_TOO_LARGE");
+
+    const reopened = await engine.withMemoryStores(stores, async (opened) => ({
+      canonical: await opened.canonical.store.head(),
+      working: await opened.working.store.head(),
+    }));
+    expect(reopened.result.canonical).toMatchObject({ operationSha256: null, sequence: 0 });
+    expect(reopened.result.working).toMatchObject({ operationSha256: null, sequence: 0 });
+    expect(reopened.canonicalHead).toMatchObject({ operationSha256: null, sequence: 0 });
+    expect(reopened.workingHead).toMatchObject({ operationSha256: null, sequence: 0 });
+    expect(await sqliteLogicalBytes(canonicalDirectory))
+      .toBeLessThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
+  }, 60_000);
 
   test("authorizes oversized legacy cleanup only from exact historical sidecar preimages", async () => {
     const { broker, engine, root } = await fixture();
@@ -848,23 +1801,10 @@ describe("released Oh SQLite facts-memory adapter", () => {
     expect(validLegacyReceiptDigest).not.toBe(currentMetadata.receiptDigest);
     expect(validLegacyAdapterDigest).not.toBe(currentMetadata.adapterDigest);
 
-    const payload = "x".repeat(950_000);
-    const childAuthority = openOhAuthority(child, childDirectory);
-    for (let index = 0; index < 110; index += 1) {
-      await childAuthority.store.commit({
-        actorId: "hra.memory.host",
-        changes: [{ kind: "put", record: createKnowledgeGraphRecordV1({
-          dependencies: [],
-          key: "entity:legacy-cleanup-churn",
-          kind: "entity",
-          v: 1,
-          value: { index, payload },
-        }), v: 1 }],
-        expectedHead: await childAuthority.store.head(),
-        operationId: `host.test.legacy-cleanup-churn.${String(index)}`,
-      });
-    }
-    await childAuthority.store.close();
+    await truncate(
+      join(childDirectory, "oh.sqlite"),
+      HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes + 1,
+    );
     expect(await sqliteLogicalBytes(childDirectory))
       .toBeGreaterThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
 

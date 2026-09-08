@@ -2,6 +2,12 @@
   "src/claude/account.ts": {
     "O_NOFOLLOW": 1
   },
+  "src/claude/host-tool-bridge.ts": {
+    "timingSafeEqual": 1,
+    "O_NOFOLLOW": 2,
+    "mode0600": 2,
+    "mode0700": 1
+  },
   "src/claude/process.ts": {
     "safeEnvironmentKeys": 2
   },
@@ -23,6 +29,9 @@
     "assertCurrent": 1,
     "redactCompleteSensitiveText": 1
   },
+  "src/cloud/canonical-memory-sync.ts": {
+    "assertCurrent": 8
+  },
   "src/cloud/daemon-adapters.ts": {
     "O_NOFOLLOW": 5,
     "fsync": 2,
@@ -40,7 +49,8 @@
     "redactCompleteSensitiveText": 1
   },
   "src/cloud/local-control.ts": {
-    "assertCurrent": 20
+    "timingSafeEqual": 2,
+    "assertCurrent": 21
   },
   "src/codex/automations.ts": {
     "O_NOFOLLOW": 1
@@ -56,6 +66,9 @@
   },
   "src/daemon/attachment-ingest.ts": {
     "O_NOFOLLOW": 1
+  },
+  "src/daemon/claude-host-tool-transport.ts": {
+    "mode0600": 2
   },
   "src/daemon/claude-runtime-adapter.ts": {
     "assertCurrent": 8
@@ -79,7 +92,7 @@
     "redactCompleteSensitiveText": 1
   },
   "src/daemon/service.ts": {
-    "assertCurrent": 90
+    "assertCurrent": 92
   },
   "src/daemon/session-event-cursor.ts": {
     "timingSafeEqual": 1
@@ -129,7 +142,7 @@
     "assertCurrent": 12
   },
   "src/storage/oh-facts-memory-engine.ts": {
-    "O_NOFOLLOW": 10,
+    "O_NOFOLLOW": 11,
     "fsync": 4,
     "mode0600": 5
   },
@@ -148,7 +161,7 @@
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
-    "immediateTransaction": 123,
+    "immediateTransaction": 164,
     "secureDelete": 2,
     "synchronousFull": 1,
     "redactCompleteSensitiveText": 3

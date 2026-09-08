@@ -6,12 +6,22 @@ import { join } from "node:path";
 
 import type {
   ClaudeAuthStatusReader,
+  ClaudeHostToolBindingIdentity,
+  ClaudeHostToolBindingLease,
+  ClaudeHostToolCall,
+  ClaudeHostToolPublicResult,
   ClaudeProcess,
   ClaudeProcessIdentity,
   PinnedClaudeRuntime,
 } from "../claude/index";
 import { ClaudeDeltaAssembler } from "../claude/assembler";
+import {
+  CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT,
+  digestClaudeHostToolInvocation,
+} from "../claude/index";
+import type { HraHostToolCall } from "../codex/protocol";
 import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "../claude/pin";
+import { HRA_SESSION_PREAMBLE } from "../domain/hra-preamble";
 import { PresetProviderMismatchError, presetRequirements } from "../domain/presets";
 import { effectiveClaudeRuntimeProfileSchema } from "../domain/runtime-profile";
 import { ensurePrivateDirectory } from "../storage/paths";
@@ -35,6 +45,8 @@ const PROCESS_IDENTITY: ClaudeProcessIdentity = Object.freeze({
   pidDomain: "darwin",
   procStart: "Fri Sep  4 12:00:00 2026",
 });
+const HOST_TOOL_PRIVATE_ROOT = "/var/hra/private";
+const HOST_TOOL_SOCKET = "/var/hra/private/callback.sock";
 
 const authority: ProfileAuthority = {
   codexHome: "/var/hra/profiles/acct/codex",
@@ -50,6 +62,8 @@ class FakeClaudeProcess implements ClaudeProcess {
   readonly identity: Promise<ClaudeProcessIdentity>;
   readonly #ignoreTerm: boolean;
   readonly #ignoreKill: boolean;
+  onTerminate: (() => void) | undefined;
+  onWrite: (() => void) | undefined;
   #push: ((chunk: Uint8Array) => void) | undefined;
   #finish: (() => void) | undefined;
   #resolveExit: ((code: number) => void) | undefined;
@@ -89,11 +103,13 @@ class FakeClaudeProcess implements ClaudeProcess {
 
   async write(bytes: Uint8Array): Promise<void> {
     this.written.push(new TextDecoder().decode(bytes));
+    this.onWrite?.();
   }
 
   terminate(): void {
     this.terminated = true;
     this.signals.push("SIGTERM");
+    this.onTerminate?.();
     if (this.#ignoreTerm) return;
     this.end();
   }
@@ -110,8 +126,82 @@ class FakeClaudeProcess implements ClaudeProcess {
   }
 }
 
+class FakeClaudeBindingAuthority {
+  readonly provisions: Array<Readonly<{
+    callbackSocketPath: string;
+    identity: ClaudeHostToolBindingIdentity;
+    privateRoot: string;
+  }>> = [];
+  readonly activations: string[] = [];
+  readonly rebinds: Array<Readonly<{
+    bindingId: string;
+    expectedIdentity: ClaudeHostToolBindingIdentity;
+    nextIdentity: ClaudeHostToolBindingIdentity;
+  }>> = [];
+  readonly revocations: string[] = [];
+  failRevocations: number;
+  revokeGate: Promise<void> | undefined;
+
+  constructor(failRevocations = 0) {
+    this.failRevocations = failRevocations;
+  }
+
+  async provision(input: {
+    callbackSocketPath: string;
+    identity: ClaudeHostToolBindingIdentity;
+    privateRoot: string;
+  }): Promise<ClaudeHostToolBindingLease> {
+    this.provisions.push(input);
+    const suffix = String(this.provisions.length);
+    return {
+      bindingId: `clhb_${suffix.padStart(32, "0")}`,
+      bindingPath: `${HOST_TOOL_PRIVATE_ROOT}/binding-${suffix}/binding.json`,
+      directory: `${HOST_TOOL_PRIVATE_ROOT}/binding-${suffix}`,
+      mcpConfigPath: `${HOST_TOOL_PRIVATE_ROOT}/binding-${suffix}/mcp.json`,
+    };
+  }
+
+  activate(bindingId: string): Promise<void> {
+    this.activations.push(bindingId);
+    return Promise.resolve();
+  }
+
+  rebind(bindingId: string, input: Readonly<{
+    expectedIdentity: ClaudeHostToolBindingIdentity;
+    nextIdentity: ClaudeHostToolBindingIdentity;
+  }>): void {
+    this.rebinds.push({ bindingId, ...input });
+  }
+
+  async revoke(bindingId: string): Promise<void> {
+    this.revocations.push(bindingId);
+    if (this.failRevocations > 0) {
+      this.failRevocations -= 1;
+      throw new Error("injected binding cleanup failure");
+    }
+    await this.revokeGate;
+  }
+}
+
 const runtime: PinnedClaudeRuntime = {
-  argv: ["/usr/local/bin/claude", "--print"],
+  argv: [
+    "/usr/local/bin/claude",
+    "--print",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "stream-json",
+    "--verbose",
+    "--include-partial-messages",
+    "--permission-mode",
+    "default",
+    "--model",
+    CLAUDE_PIN_MODEL,
+    "--effort",
+    CLAUDE_PIN_EFFORT,
+    "--system-prompt-snapshot",
+    "on",
+  ],
   effort: CLAUDE_PIN_EFFORT,
   executablePath: "/usr/local/bin/claude",
   model: CLAUDE_PIN_MODEL,
@@ -131,6 +221,7 @@ type InitializationOverride = Readonly<{
 }>;
 
 const harness = (options: {
+  bindingAuthority?: FakeClaudeBindingAuthority;
   clientShutdownSettlementMs?: number;
   clientShutdownTermGraceMs?: number;
   configDirFor?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["configDirFor"];
@@ -146,6 +237,8 @@ const harness = (options: {
   processIdentity?: ClaudeProcessIdentity | "reject";
   processIgnoresKill?: boolean;
   processIgnoresTerm?: boolean;
+  hostTool?: (call: HraHostToolCall) => ClaudeHostToolPublicResult | Promise<ClaudeHostToolPublicResult>;
+  hostToolResponseWritten?: (call: HraHostToolCall) => void | Promise<void>;
   processFactory?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["processFactory"];
   readAuthStatus?: ClaudeAuthStatusReader;
   resolveRuntime?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["resolveRuntime"];
@@ -153,6 +246,8 @@ const harness = (options: {
   const facts: ClaudeSessionFact[] = [];
   const processes: FakeClaudeProcess[] = [];
   const launches: Parameters<ClaudeProcessFactory>[0][] = [];
+  const launchedRuntimes: PinnedClaudeRuntime[] = [];
+  const bindingAuthority = options.bindingAuthority ?? new FakeClaudeBindingAuthority();
   const manager = new PinnedClaudeRuntimeManager({
     configHome: options.configHome ?? "isolated",
     configDirFor: options.configDirFor ?? (() => CONFIG_DIR),
@@ -167,14 +262,31 @@ const harness = (options: {
       : { initializationTimeoutMs: options.initializationTimeoutMs }),
     isCurrent: options.isCurrent ?? (() => true),
     now: () => 1_700_000_000_000,
+    hostTools: {
+      bindingAuthority,
+      callbackSocketPath: HOST_TOOL_SOCKET,
+      privateRoot: HOST_TOOL_PRIVATE_ROOT,
+    },
     observer: {
       fact: (factAuthority, fact) => {
         facts.push(fact);
         return options.onFact?.(factAuthority, fact);
       },
+      ...(options.hostTool === undefined
+        ? {}
+        : { hraHostTool: (_authority: ProfileAuthority, call: HraHostToolCall) => options.hostTool?.(call) ?? "" }),
+      ...(options.hostToolResponseWritten === undefined
+        ? {}
+        : {
+            hraHostToolResponseWritten: (
+              _authority: ProfileAuthority,
+              call: HraHostToolCall,
+            ) => options.hostToolResponseWritten?.(call),
+          }),
     },
     processFactory: (launch) => {
       launches.push(launch);
+      launchedRuntimes.push(launch.runtime);
       const process = options.processFactory?.(launch) ?? new FakeClaudeProcess({
           identity: options.processIdentity === "reject"
             ? Promise.reject(new Error("identity unavailable"))
@@ -210,7 +322,7 @@ const harness = (options: {
     ...(options.readAuthStatus === undefined ? {} : { readAuthStatus: options.readAuthStatus }),
     resolveRuntime: options.resolveRuntime ?? (async () => runtime),
   });
-  return { facts, launches, manager, processes };
+  return { bindingAuthority, facts, launches, launchedRuntimes, manager, processes };
 };
 
 const signal = (): AbortSignal => new AbortController().signal;
@@ -227,7 +339,30 @@ const startSession = async (
     signal: signal(),
   });
   const started = await manager.startSession({ authority, review, signal: signal() });
+  await manager.activateSessionHostTools({
+    authority,
+    providerThreadId: started.providerThreadId,
+    signal: signal(),
+  });
   return started.providerThreadId;
+};
+
+const hostToolCall = (
+  providerThreadId: string,
+  bindingId: string,
+  callId: string,
+): ClaudeHostToolCall => {
+  const request = { input: {}, tool: "sessions_list" } as const;
+  return {
+    bindingId,
+    callId,
+    processGeneration: authority.generation,
+    profileId: authority.id,
+    provider: "claude",
+    providerThreadId,
+    request,
+    requestDigest: digestClaudeHostToolInvocation(callId, request),
+  };
 };
 
 const startTurn = async (
@@ -301,7 +436,10 @@ describe("pinned Claude runtime manager", () => {
         await probeStarted;
         controller.abort();
         expect(probeCanceled).toBe(true);
-        await expect(pending).rejects.toMatchObject({ code: "RUNTIME_MISMATCH" });
+        // Caller cancellation remains cancellation even when the underlying
+        // version probe rejects while cleaning itself up. Misclassifying this
+        // as an installation mismatch would give unsafe retry guidance.
+        await expect(pending).rejects.toMatchObject({ name: "AbortError" });
         expect(authReads).toBe(0);
         expect(processes).toHaveLength(0);
       } finally {
@@ -855,6 +993,11 @@ describe("pinned Claude runtime manager", () => {
       providerThreadId: started.providerThreadId,
       signal: signal(),
     })).resolves.toEqual(PROCESS_IDENTITY);
+    await manager.activateSessionHostTools({
+      authority,
+      providerThreadId: started.providerThreadId,
+      signal: signal(),
+    });
 
     const turnId = await startTurn(manager, started.providerThreadId, "say ok");
     const process = processes[0];
@@ -941,6 +1084,11 @@ describe("pinned Claude runtime manager", () => {
     expect(launches).toHaveLength(1);
     expect(launches[0]?.argv).toEqual([
       ...runtime.argv,
+      "--append-system-prompt",
+      HRA_SESSION_PREAMBLE.text,
+      "--mcp-config",
+      `${HOST_TOOL_PRIVATE_ROOT}/binding-1/mcp.json`,
+      "--strict-mcp-config",
       "--session-id",
       ADOPTED_PROVIDER_THREAD_ID,
     ]);
@@ -1388,11 +1536,93 @@ describe("pinned Claude runtime manager", () => {
     await manager.close();
   });
 
+  test("rekeys an idle live session and its host binding across one shared generation", async () => {
+    const handled: HraHostToolCall[] = [];
+    const value = harness({
+      hostTool: (call) => {
+        handled.push(call);
+        return { sessions: [] };
+      },
+    });
+    const providerThreadId = await startSession(value.manager);
+    const nextAuthority = { ...authority, generation: authority.generation + 1 };
+    const bindingId = `clhb_${"1".padStart(32, "0")}`;
+
+    value.manager.rebindProfileAuthority({
+      expectedGeneration: authority.generation,
+      nextGeneration: nextAuthority.generation,
+      profileId: authority.id,
+    });
+    expect(value.bindingAuthority.rebinds).toEqual([{
+      bindingId,
+      expectedIdentity: {
+        processGeneration: authority.generation,
+        profileId: authority.id,
+        provider: "claude",
+        providerThreadId,
+      },
+      nextIdentity: {
+        processGeneration: nextAuthority.generation,
+        profileId: nextAuthority.id,
+        provider: "claude",
+        providerThreadId,
+      },
+    }]);
+    await expect(value.manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow("another authority");
+    await expect(value.manager.observeSession({
+      authority: nextAuthority,
+      providerThreadId,
+      signal: signal(),
+    })).resolves.toMatchObject({ projection: { providerThreadId, status: "idle" } });
+
+    const review = await value.manager.reviewTurnStart({
+      authority: nextAuthority,
+      fast: false,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      projectRoot: PROJECT_ROOT,
+      providerThreadId,
+      signal: signal(),
+    });
+    const turn = await value.manager.startTurn({
+      authority: nextAuthority,
+      clientMessageId: "client-after-rebind",
+      message: "continue after rekey",
+      providerThreadId,
+      review,
+      signal: signal(),
+    });
+    await expect(value.manager.handleSessionHostToolCall({
+      ...hostToolCall(providerThreadId, bindingId, "call-after-rebind"),
+      processGeneration: nextAuthority.generation,
+    })).resolves.toEqual({ sessions: [] });
+    expect(handled).toHaveLength(1);
+    expect(handled[0]).toMatchObject({
+      authority: {
+        processGeneration: nextAuthority.generation,
+        profileId: nextAuthority.id,
+      },
+      threadId: providerThreadId,
+      turnId: turn.turnId,
+    });
+    expect(() => value.manager.rebindProfileAuthority({
+      expectedGeneration: nextAuthority.generation,
+      nextGeneration: nextAuthority.generation + 1,
+      profileId: nextAuthority.id,
+    })).toThrow("active Claude turn");
+    await value.manager.close();
+  });
+
   test("claims one non-live durable session with full runtime authority", async () => {
     const { launches, manager, processes } = harness({ configHome: "personal" });
     const claimed = await manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1409,6 +1639,21 @@ describe("pinned Claude runtime manager", () => {
     });
     expect(launches[0]?.launch).toBe("resume");
     expect(launches[0]?.argv.slice(-2)).toEqual(["--resume", ADOPTED_PROVIDER_THREAD_ID]);
+    expect(launches[0]?.argv).toEqual([
+      ...runtime.argv,
+      "--append-system-prompt",
+      HRA_SESSION_PREAMBLE.text,
+      "--mcp-config",
+      `${HOST_TOOL_PRIVATE_ROOT}/binding-1/mcp.json`,
+      "--strict-mcp-config",
+      "--resume",
+      ADOPTED_PROVIDER_THREAD_ID,
+    ]);
+    await manager.activateSessionHostTools({
+      authority,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+    });
     await expect(manager.observeSession({
       authority,
       providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
@@ -1431,6 +1676,7 @@ describe("pinned Claude runtime manager", () => {
     await expect(manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1448,6 +1694,7 @@ describe("pinned Claude runtime manager", () => {
     await expect(invalid.manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1463,6 +1710,7 @@ describe("pinned Claude runtime manager", () => {
     const claimed = await bounded.manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1490,6 +1738,7 @@ describe("pinned Claude runtime manager", () => {
     await expect(replacement.manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1507,6 +1756,7 @@ describe("pinned Claude runtime manager", () => {
     await expect(manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1516,6 +1766,25 @@ describe("pinned Claude runtime manager", () => {
       sourceLiveness: "live" as never,
       title: ADOPTED_TITLE,
     })).rejects.toThrow("source process is not live");
+    expect(processes).toHaveLength(0);
+    await manager.close();
+  });
+
+  test("requires an explicit host-tool admission mode before resuming Claude", async () => {
+    const { manager, processes } = harness();
+    await expect(manager.claimSession({
+      authority,
+      fast: false,
+      // Exercises the runtime boundary against an untyped or stale caller.
+      hostTools: undefined as never,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      projectRoot: PROJECT_ROOT,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+      sourceLiveness: "not_live",
+      title: ADOPTED_TITLE,
+    })).rejects.toThrow("Unknown Claude host-tool admission mode");
     expect(processes).toHaveLength(0);
     await manager.close();
   });
@@ -1532,6 +1801,7 @@ describe("pinned Claude runtime manager", () => {
       await expect(manager.claimSession({
         authority,
         fast: false,
+        hostTools: "required",
         preset: "fable-max",
         requirement: presetRequirements["fable-max"],
         projectRoot: PROJECT_ROOT,
@@ -1555,6 +1825,7 @@ describe("pinned Claude runtime manager", () => {
     await expect(manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1584,6 +1855,7 @@ describe("pinned Claude runtime manager", () => {
       manager.claimSession({
         authority,
         fast: false,
+        hostTools: "required",
         preset: "fable-max",
         requirement: presetRequirements["fable-max"],
         projectRoot: PROJECT_ROOT,
@@ -1683,6 +1955,7 @@ describe("pinned Claude runtime manager", () => {
       await value.manager.claimSession({
         authority,
         fast: false,
+        hostTools: "required",
         preset: "fable-max",
         requirement: presetRequirements["fable-max"],
         projectRoot: PROJECT_ROOT,
@@ -1775,6 +2048,7 @@ describe("pinned Claude runtime manager", () => {
     await expect(manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1813,5 +2087,325 @@ describe("pinned Claude runtime manager", () => {
     await expect(manager.startSession({ authority, review, signal: signal() }))
       .rejects.toThrow("no longer usable");
     await manager.close();
+  });
+
+  for (const configHome of ["isolated", "personal"] as const) {
+    test(`resumes a legacy ${configHome} Claude session without granting unbound host tools`, async () => {
+      const value = harness({ configHome });
+      try {
+        const started = await value.manager.claimSession({
+          authority,
+          fast: false,
+          hostTools: "disabled",
+          preset: "fable-max",
+          requirement: presetRequirements["fable-max"],
+          projectRoot: PROJECT_ROOT,
+          providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+          title: ADOPTED_TITLE,
+          sourceLiveness: "not_live",
+          signal: signal(),
+        });
+        expect(value.bindingAuthority.provisions).toEqual([]);
+        expect(value.launches[0]?.argv).not.toContain("--mcp-config");
+        expect(value.launches[0]?.argv).not.toContain("--append-system-prompt");
+        expect(value.manager.hasLiveSession({
+          authority,
+          providerThreadId: started.providerThreadId,
+        })).toBe(true);
+        await expect(value.manager.activateSessionHostTools({
+          authority,
+          providerThreadId: started.providerThreadId,
+          signal: signal(),
+        })).rejects.toThrow("no admitted host tools");
+        const call = hostToolCall(started.providerThreadId, `clhb_${"a".repeat(32)}`, "legacy");
+        expect(value.manager.ownsSessionHostToolBinding(call)).toBe(false);
+        await expect(value.manager.handleSessionHostToolCall(call)).rejects.toThrow();
+        const turn = await startTurn(value.manager, started.providerThreadId, "Continue legacy work.");
+        expect(turn).toMatch(/^[0-9a-f-]{36}$/u);
+        await expect(value.manager.readSession({
+          authority,
+          providerThreadId: started.providerThreadId,
+          detail: true,
+          signal: signal(),
+        })).resolves.toMatchObject({ status: "active", activeTurnId: turn });
+        expect(value.bindingAuthority.activations).toEqual([]);
+      } finally {
+        await value.manager.close();
+      }
+      expect(value.bindingAuthority.revocations).toEqual([]);
+    });
+  }
+
+  test("provisions a strict MCP binding before spawn and activates it only after session commit", async () => {
+    const handled: HraHostToolCall[] = [];
+    const receipts: HraHostToolCall[] = [];
+    const value = harness({
+      hostTool: (call) => { handled.push(call); return { sessions: [] }; },
+      hostToolResponseWritten: (call) => { receipts.push(call); },
+    });
+    const review = await value.manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    const started = await value.manager.startSession({ authority, review, signal: signal() });
+    const bindingId = `clhb_${"1".padStart(32, "0")}`;
+    const routedCall = hostToolCall(started.providerThreadId, bindingId, "call-retained");
+    expect(value.manager.ownsSessionHostToolBinding(routedCall)).toBe(false);
+    expect(value.bindingAuthority.provisions).toEqual([{
+      callbackSocketPath: HOST_TOOL_SOCKET,
+      identity: {
+        processGeneration: authority.generation,
+        profileId: authority.id,
+        provider: "claude",
+        providerThreadId: started.providerThreadId,
+      },
+      privateRoot: HOST_TOOL_PRIVATE_ROOT,
+    }]);
+    expect(value.launchedRuntimes[0]?.argv.slice(-3)).toEqual([
+      "--mcp-config",
+      `${HOST_TOOL_PRIVATE_ROOT}/binding-1/mcp.json`,
+      "--strict-mcp-config",
+    ]);
+
+    const turnReview = await value.manager.reviewTurnStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      projectRoot: PROJECT_ROOT,
+      providerThreadId: started.providerThreadId,
+      signal: signal(),
+    });
+    await expect(value.manager.startTurn({
+      authority,
+      clientMessageId: "before-activation",
+      message: "work",
+      providerThreadId: started.providerThreadId,
+      review: turnReview,
+      signal: signal(),
+    })).rejects.toThrow("not active");
+    await value.manager.activateSessionHostTools({
+      authority,
+      providerThreadId: started.providerThreadId,
+      signal: signal(),
+    });
+    await value.manager.activateSessionHostTools({
+      authority,
+      providerThreadId: started.providerThreadId,
+      signal: signal(),
+    });
+    expect(value.bindingAuthority.activations).toEqual([bindingId]);
+    expect(value.manager.ownsSessionHostToolBinding(routedCall)).toBe(true);
+    expect(value.manager.ownsSessionHostToolBinding({
+      ...routedCall,
+      processGeneration: authority.generation + 1,
+    })).toBe(false);
+    const turn = await value.manager.startTurn({
+      authority,
+      clientMessageId: "after-activation",
+      message: "work",
+      providerThreadId: started.providerThreadId,
+      review: turnReview,
+      signal: signal(),
+    });
+    const call = routedCall;
+    await expect(value.manager.handleSessionHostToolCall(call)).resolves.toEqual({ sessions: [] });
+    await value.manager.handleSessionHostToolResponseWritten(call);
+    expect(handled).toHaveLength(1);
+    expect(handled[0]).toMatchObject({
+      authority: { processGeneration: authority.generation, profileId: authority.id },
+      callId: "call-retained",
+      requestId: { type: "string", value: "call-retained" },
+      threadId: started.providerThreadId,
+      tool: "sessions_list",
+      turnId: turn.turnId,
+    });
+    expect(receipts).toEqual(handled);
+    await expect(value.manager.handleSessionHostToolResponseWritten(call)).rejects.toThrow("stale");
+    await value.manager.endSession({
+      authority,
+      providerThreadId: started.providerThreadId,
+      signal: signal(),
+    });
+    expect(value.manager.ownsSessionHostToolBinding(routedCall)).toBe(false);
+    expect(value.bindingAuthority.revocations).toEqual([bindingId]);
+    await value.manager.close();
+  });
+
+  test("rechecks exact live host-tool authority after serialization and fences disconnects", async () => {
+    let markHostToolEntered!: () => void;
+    let releaseHostTool!: () => void;
+    let markDisconnected!: () => void;
+    let markTurnResultReceived!: () => void;
+    let releaseTurnResult!: () => void;
+    const hostToolEntered = new Promise<void>((resolve) => { markHostToolEntered = resolve; });
+    const hostToolGate = new Promise<void>((resolve) => { releaseHostTool = resolve; });
+    const disconnected = new Promise<void>((resolve) => { markDisconnected = resolve; });
+    const turnResultReceived = new Promise<void>((resolve) => { markTurnResultReceived = resolve; });
+    const turnResultGate = new Promise<void>((resolve) => { releaseTurnResult = resolve; });
+    let normalizedCall: HraHostToolCall | undefined;
+    const value = harness({
+      hostTool: async (call) => {
+        normalizedCall = call;
+        markHostToolEntered();
+        await hostToolGate;
+        return { sessions: [] };
+      },
+      onFact: async (_factAuthority, fact) => {
+        if (fact.type === "tokenUsageUpdated") {
+          markTurnResultReceived();
+          await turnResultGate;
+        }
+        if (fact.type === "providerDisconnected") markDisconnected();
+      },
+    });
+    const providerThreadId = await startSession(value.manager);
+    const turnId = await startTurn(value.manager, providerThreadId, "exercise live admission");
+    const bindingId = `clhb_${"1".padStart(32, "0")}`;
+    const call = hostToolCall(providerThreadId, bindingId, "call-live-admission");
+    const pending = value.manager.handleSessionHostToolCall(call);
+    void pending.catch(() => undefined);
+    try {
+      await hostToolEntered;
+      if (normalizedCall === undefined) throw new Error("Expected a normalized host-tool call.");
+      const liveAuthority = {
+        authority,
+        providerThreadId,
+        connectionId: normalizedCall.connectionId,
+        turnId,
+        callId: normalizedCall.callId,
+        requestDigest: normalizedCall.requestDigest,
+      };
+      expect(value.manager.hasLiveHostToolCall(liveAuthority)).toBe(true);
+      expect(value.manager.hasLiveHostToolCall({
+        ...liveAuthority,
+        connectionId: "30000000-0000-4000-8000-000000000099",
+      })).toBe(false);
+      expect(value.manager.hasLiveHostToolCall({
+        ...liveAuthority,
+        turnId: "stale-turn",
+      })).toBe(false);
+      expect(value.manager.hasLiveHostToolCall({
+        ...liveAuthority,
+        requestDigest: "f".repeat(64),
+      })).toBe(false);
+
+      const process = value.processes[0];
+      if (process === undefined) throw new Error("Expected one spawned Claude process.");
+      process.emit({
+        duration_ms: 25,
+        is_error: false,
+        num_turns: 1,
+        result: "complete",
+        session_id: providerThreadId,
+        stop_reason: "end_turn",
+        terminal_reason: "completed",
+        type: "result",
+        usage: { input_tokens: 2, output_tokens: 4 },
+      });
+      await turnResultReceived;
+      expect(value.manager.hasLiveHostToolCall(liveAuthority)).toBe(false);
+      releaseTurnResult();
+      await settle();
+      await expect(value.manager.handleSessionHostToolCall(hostToolCall(
+        providerThreadId,
+        bindingId,
+        "call-after-completion",
+      ))).rejects.toThrow("active turn");
+
+      process.end();
+      await disconnected;
+      expect(value.manager.hasLiveHostToolCall(liveAuthority)).toBe(false);
+      expect(value.bindingAuthority.revocations).toEqual([bindingId]);
+      await expect(value.manager.handleSessionHostToolCall(hostToolCall(
+        providerThreadId,
+        bindingId,
+        "call-after-disconnect",
+      ))).rejects.toThrow("stale");
+
+      releaseHostTool();
+      await expect(pending).resolves.toEqual({ sessions: [] });
+    } finally {
+      releaseTurnResult();
+      releaseHostTool();
+      await pending.catch(() => undefined);
+      await value.manager.close();
+    }
+  });
+
+  test("fails closed at the bounded session-lifetime host-tool call history", async () => {
+    let handled = 0;
+    let receipts = 0;
+    const value = harness({
+      hostTool: () => { handled += 1; return { sessions: [] }; },
+      hostToolResponseWritten: () => { receipts += 1; },
+    });
+    const providerThreadId = await startSession(value.manager);
+    await startTurn(value.manager, providerThreadId, "exercise host tools");
+    const bindingId = `clhb_${"1".padStart(32, "0")}`;
+    let first: ClaudeHostToolCall | undefined;
+    for (let index = 0; index < CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT; index += 1) {
+      const call = hostToolCall(providerThreadId, bindingId, `bounded-call-${String(index)}`);
+      first ??= call;
+      await value.manager.handleSessionHostToolCall(call);
+      await value.manager.handleSessionHostToolResponseWritten(call);
+    }
+    expect(handled).toBe(CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT);
+    expect(receipts).toBe(CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT);
+    await expect(value.manager.handleSessionHostToolCall(first!)).rejects.toThrow("already completed");
+    await expect(value.manager.handleSessionHostToolCall(hostToolCall(
+      providerThreadId,
+      bindingId,
+      `bounded-call-${String(CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT)}`,
+    ))).rejects.toThrow("history is exhausted");
+    expect(handled).toBe(CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT);
+    expect(receipts).toBe(CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT);
+    await value.manager.close();
+  });
+
+  test("retains exact session custody when binding cleanup fails and retries before forgetting", async () => {
+    const bindingAuthority = new FakeClaudeBindingAuthority(1);
+    const value = harness({ bindingAuthority });
+    const providerThreadId = await startSession(value.manager);
+
+    await expect(value.manager.endSession({ authority, providerThreadId, signal: signal() }))
+      .rejects.toThrow("cleanup was incomplete");
+    expect(value.manager.hasLiveSession({ authority, providerThreadId })).toBe(false);
+    await expect(value.manager.readSession({
+      authority,
+      detail: false,
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow("cleanup is unresolved");
+    let releaseRetry!: () => void;
+    bindingAuthority.revokeGate = new Promise((resolve) => { releaseRetry = resolve; });
+    const retry = value.manager.endSession({ authority, providerThreadId, signal: signal() });
+    const joinedRetry = value.manager.endSession({ authority, providerThreadId, signal: signal() });
+    let retrySettled = false;
+    void retry.then(() => { retrySettled = true; });
+    await Promise.resolve();
+    expect(retrySettled).toBe(false);
+    await expect(value.manager.readSession({
+      authority,
+      detail: false,
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow("cleanup is unresolved");
+    expect(bindingAuthority.revocations).toEqual([
+      `clhb_${"1".padStart(32, "0")}`,
+      `clhb_${"1".padStart(32, "0")}`,
+    ]);
+    releaseRetry();
+    await Promise.all([retry, joinedRetry]);
+    await value.manager.endSession({ authority, providerThreadId, signal: signal() });
+    expect(bindingAuthority.revocations).toEqual([
+      `clhb_${"1".padStart(32, "0")}`,
+      `clhb_${"1".padStart(32, "0")}`,
+    ]);
+    await value.manager.close();
   });
 });

@@ -506,14 +506,20 @@ export class ClaudeStreamClient {
 
   async #drainStderr(): Promise<void> {
     let observed = 0;
+    let truncated = false;
     try {
       for await (const chunk of this.#process.stderr) {
-        observed += chunk.byteLength;
-        if (observed > STDERR_DIAGNOSTIC_BYTES) break;
+        const retained = Math.min(chunk.byteLength, STDERR_DIAGNOSTIC_BYTES - observed);
+        observed += retained;
+        if (retained < chunk.byteLength) truncated = true;
       }
     } catch {
       // Diagnostics are advisory; provider stderr never becomes HRA data.
     }
-    if (observed > 0) this.#onSafeDiagnostic?.(`claude stderr bytes: ${String(observed)}`);
+    if (observed > 0) {
+      this.#onSafeDiagnostic?.(
+        `claude stderr bytes: ${String(observed)}${truncated ? "+" : ""}`,
+      );
+    }
   }
 }

@@ -1,6 +1,6 @@
 # Third-party notices
 
-HRA depends on the official OpenAI Codex package, which is licensed under Apache License 2.0, and on Hraness Oh, which is licensed under the MIT License. HRA pins the immutable public npm release `@hraness/oh@0.2.7`; `bun.lock` binds its exact registry artifact integrity. HRA also interoperates with the separately installed Claude Code 2.1.260 runtime. HRA does not redistribute Claude Code, copy or redistribute any provider credential, or vendor Oh.
+HRA depends on the official OpenAI Codex package, which is licensed under Apache License 2.0, and on Hraness Oh, which is licensed under the MIT License. HRA pins the immutable public npm release `@hraness/oh@0.4.1`; `bun.lock` binds its exact registry artifact integrity. HRA also interoperates with the separately installed Claude Code 2.1.260 runtime. HRA does not redistribute Claude Code, copy or redistribute any provider credential, or vendor Oh.
 
 The Codex provider-session runtime uses Effect 3.22.1, licensed under the MIT License. `bun.lock` binds its runtime dependency graph. Effect supplements HRA's existing authority and process-custody controls; it does not replace them.
 
@@ -10,4 +10,4 @@ The static hra.sh styles and footer use the MIT-licensed `@hraness/design-kit` v
 
 HRA validates trajectory exports during development against Apache-2.0-licensed `@letta-ai/trajectory` 0.3.0 and MIT-licensed Ajv 8.20.0. These development dependencies are not runtime dependencies of the published CLI.
 
-The admitted `v0.6.3` release records its build graph in the tagged `bun.lock`, while its install tarball declares direct runtime dependency versions in `package.json`. Its release workflow binds the immutable source tag, publishes that exact tarball plus `SHA256SUMS` on GitHub, and publishes the same tarball on npm through trusted publishing. Later source changes do not alter that release's immutable bytes. The tarball does not vendor transitive dependencies. Dependency packages retain their own license texts and source metadata.
+The `v0.7.0` candidate records its build graph in `bun.lock`, while the install tarball declares its direct runtime dependency versions in `package.json`. This candidate is not yet admitted. Its release workflow must bind an immutable source tag, publish that exact tarball plus `SHA256SUMS` on GitHub, and publish the same tarball on npm through trusted publishing before admission. The tarball does not vendor transitive dependencies. Dependency packages retain their own license texts and source metadata.

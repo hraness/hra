@@ -630,6 +630,84 @@ export type DeviceRegistryPayload = Readonly<{
   version: 1;
 }>;
 
+export type MemorySummaryHead = Readonly<{
+  digest: string;
+  operationSha256: string | null;
+  sequence: number;
+}>;
+
+export type MemorySummaryRecentRecord = Readonly<{
+  /** Memory pages are the only record kind admitted by the stable host facade. */
+  kind: "memory_page";
+  key: string;
+  updatedAt: number;
+}>;
+
+export type MemorySummarySpace = Readonly<{
+  bindingDigest: string;
+  canonicalSpaceId: string;
+  enrollment: "attached" | "detached" | "not_enrolled" | "unavailable";
+  head: MemorySummaryHead;
+  lastExchangeAt: number | null;
+  projectLabel: string;
+  recentRecords: readonly MemorySummaryRecentRecord[];
+  /** Null means the exact canonical snapshot could not be verified locally. */
+  recordCount: number | null;
+  remoteHead: MemorySummaryHead | null;
+  syncStatus: "conflict" | "error" | "local_only" | "settled" | "syncing";
+}>;
+
+export type MemorySummaryPeerIdentity = Readonly<{
+  /** Device-scoped digest; never a local HRA session id. */
+  ref: string;
+  label: string;
+}>;
+
+export type MemorySummaryPeerPolicy = Readonly<{
+  mode: "coordinate" | "inspect" | "off";
+  projectLabel: string;
+  session: MemorySummaryPeerIdentity;
+  updatedAt: number;
+}>;
+
+export type MemorySummaryPeerAction = Readonly<{
+  actor: MemorySummaryPeerIdentity;
+  createdAt: number;
+  delivery: "queue" | "send" | "steer";
+  state: "ambiguous" | "applied" | "cancelled" | "effect_started" | "failed" | "prepared" | "queued";
+  target: MemorySummaryPeerIdentity;
+  updatedAt: number;
+}>;
+
+export type MemorySummaryCoverage = Readonly<{
+  /** `bounded` means a deterministic prefix hit its count or encrypted-envelope budget. */
+  peerActions: "bounded" | "complete";
+  peerPolicies: "bounded" | "complete";
+  spaces: "bounded" | "complete";
+}>;
+
+/**
+ * Read-only supervision for one publishing daemon. This payload has its own
+ * AAD kind and envelope so the byte-strict DeviceRegistryPayload v1 contract
+ * never acquires an optional memory field. It intentionally carries neither
+ * page bodies nor raw local project/session identifiers.
+ */
+export type MemorySummaryPayload = Readonly<{
+  coverage: MemorySummaryCoverage;
+  observedAt: number;
+  peerActions: readonly MemorySummaryPeerAction[];
+  peerPolicies: readonly MemorySummaryPeerPolicy[];
+  spaces: readonly MemorySummarySpace[];
+  version: 1;
+}>;
+
+export const memorySummaryLimits = Object.freeze({
+  peerActions: 50,
+  peerPolicies: 200,
+  recentRecordsPerSpace: 32,
+  spaces: 100,
+} as const);
+
 export const deviceRegistryLimits = Object.freeze({
   accounts: 100,
   cadenceCharacters: 512,
@@ -648,6 +726,7 @@ export type CloudPayloadAuthority = Readonly<{
     | "device_command"
     | "device_command_result"
     | "device_registry"
+    | "memory_summary"
     | "notification_email"
     | "notification_hours"
     | "session_metadata"
@@ -1065,6 +1144,254 @@ export function parseDeviceRegistryPayload(value: unknown): DeviceRegistryPayloa
   return snapshot.ok ? parseDeviceRegistryPayloadUnchecked(snapshot.value) : null;
 }
 
+const portableMemorySpacePattern = /^hra:project:space-[a-f0-9]{32}$/u;
+
+function parseMemorySummaryHead(value: unknown): MemorySummaryHead | null {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ["digest", "operationSha256", "sequence"])
+    || typeof value.digest !== "string"
+    || !/^[a-f0-9]{64}$/u.test(value.digest)
+    || (value.operationSha256 !== null
+      && (typeof value.operationSha256 !== "string"
+        || !/^[a-f0-9]{64}$/u.test(value.operationSha256)))
+    || !Number.isSafeInteger(value.sequence)
+    || (value.sequence as number) < 0
+    || Object.is(value.sequence, -0)
+    || ((value.sequence as number) === 0) !== (value.operationSha256 === null)
+  ) return null;
+  return {
+    digest: value.digest,
+    operationSha256: value.operationSha256,
+    sequence: value.sequence as number,
+  };
+}
+
+function parseMemorySummaryPeerIdentity(value: unknown): MemorySummaryPeerIdentity | null {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ["label", "ref"])
+    || !isRegistryLabel(value.label)
+    || typeof value.ref !== "string"
+    || !/^[a-f0-9]{64}$/u.test(value.ref)
+  ) return null;
+  return { label: value.label, ref: value.ref };
+}
+
+function parseMemorySummaryPayloadUnchecked(value: unknown): MemorySummaryPayload | null {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, [
+      "coverage",
+      "observedAt",
+      "peerActions",
+      "peerPolicies",
+      "spaces",
+      "version",
+    ])
+    || value.version !== 1
+    || !isRegistryTimestamp(value.observedAt)
+    || !isRecord(value.coverage)
+    || !hasExactKeys(value.coverage, ["peerActions", "peerPolicies", "spaces"])
+    || (value.coverage.peerActions !== "bounded" && value.coverage.peerActions !== "complete")
+    || (value.coverage.peerPolicies !== "bounded" && value.coverage.peerPolicies !== "complete")
+    || (value.coverage.spaces !== "bounded" && value.coverage.spaces !== "complete")
+    || !Array.isArray(value.spaces)
+    || value.spaces.length > memorySummaryLimits.spaces
+    || !Array.isArray(value.peerPolicies)
+    || value.peerPolicies.length > memorySummaryLimits.peerPolicies
+    || !Array.isArray(value.peerActions)
+    || value.peerActions.length > memorySummaryLimits.peerActions
+  ) return null;
+
+  const spaces: MemorySummarySpace[] = [];
+  const spaceIds = new Set<string>();
+  for (const entry of value.spaces) {
+    if (
+      !isRecord(entry)
+      || !hasExactKeys(entry, [
+        "bindingDigest",
+        "canonicalSpaceId",
+        "enrollment",
+        "head",
+        "lastExchangeAt",
+        "projectLabel",
+        "recentRecords",
+        "recordCount",
+        "remoteHead",
+        "syncStatus",
+      ])
+      || typeof entry.bindingDigest !== "string"
+      || !/^[a-f0-9]{64}$/u.test(entry.bindingDigest)
+      || typeof entry.canonicalSpaceId !== "string"
+      || !portableMemorySpacePattern.test(entry.canonicalSpaceId)
+      || (entry.enrollment !== "attached"
+        && entry.enrollment !== "detached"
+        && entry.enrollment !== "not_enrolled"
+        && entry.enrollment !== "unavailable")
+      || !isRegistryLabel(entry.projectLabel)
+      || (entry.recordCount !== null && (
+        !Number.isSafeInteger(entry.recordCount)
+        || (entry.recordCount as number) < 0
+        || Object.is(entry.recordCount, -0)
+      ))
+      || (entry.lastExchangeAt !== null && !isRegistryTimestamp(entry.lastExchangeAt))
+      || (entry.lastExchangeAt !== null && entry.lastExchangeAt > value.observedAt)
+      || (entry.syncStatus !== "conflict"
+        && entry.syncStatus !== "error"
+        && entry.syncStatus !== "local_only"
+        && entry.syncStatus !== "settled"
+        && entry.syncStatus !== "syncing")
+      || !Array.isArray(entry.recentRecords)
+      || entry.recentRecords.length > memorySummaryLimits.recentRecordsPerSpace
+      || spaceIds.has(entry.canonicalSpaceId)
+    ) return null;
+    const head = parseMemorySummaryHead(entry.head);
+    const remoteHead = entry.remoteHead === null ? null : parseMemorySummaryHead(entry.remoteHead);
+    if (head === null || (entry.remoteHead !== null && remoteHead === null)) return null;
+    if (
+      entry.enrollment === "not_enrolled"
+      && (entry.syncStatus !== "local_only" || remoteHead !== null || entry.lastExchangeAt !== null)
+    ) return null;
+    if (
+      entry.syncStatus === "local_only"
+      && entry.enrollment !== "not_enrolled"
+      && entry.enrollment !== "detached"
+    ) return null;
+    if (entry.enrollment === "attached" && remoteHead === null) return null;
+    if (
+      entry.recordCount === null
+      && (entry.enrollment !== "unavailable" || entry.recentRecords.length !== 0)
+    ) return null;
+    if (
+      entry.syncStatus === "settled"
+      && (remoteHead === null
+        || remoteHead.sequence !== head.sequence
+        || remoteHead.operationSha256 !== head.operationSha256
+        || remoteHead.digest !== head.digest)
+    ) return null;
+    const recentRecords: MemorySummaryRecentRecord[] = [];
+    const recordKeys = new Set<string>();
+    for (const record of entry.recentRecords) {
+      if (
+        !isRecord(record)
+        || !hasExactKeys(record, ["key", "kind", "updatedAt"])
+        || record.kind !== "memory_page"
+        || !isRegistryLabel(record.key, 512)
+        || !isRegistryTimestamp(record.updatedAt)
+        || record.updatedAt > value.observedAt
+        || recordKeys.has(record.key)
+      ) return null;
+      recordKeys.add(record.key);
+      recentRecords.push({ key: record.key, kind: record.kind, updatedAt: record.updatedAt });
+    }
+    if (entry.recordCount !== null && (entry.recordCount as number) < recentRecords.length) {
+      return null;
+    }
+    spaceIds.add(entry.canonicalSpaceId);
+    spaces.push({
+      bindingDigest: entry.bindingDigest,
+      canonicalSpaceId: entry.canonicalSpaceId,
+      enrollment: entry.enrollment,
+      head,
+      lastExchangeAt: entry.lastExchangeAt,
+      projectLabel: entry.projectLabel,
+      recentRecords,
+      recordCount: entry.recordCount as number | null,
+      remoteHead,
+      syncStatus: entry.syncStatus,
+    });
+  }
+
+  const peerPolicies: MemorySummaryPeerPolicy[] = [];
+  const policyRefs = new Set<string>();
+  for (const entry of value.peerPolicies) {
+    if (
+      !isRecord(entry)
+      || !hasExactKeys(entry, ["mode", "projectLabel", "session", "updatedAt"])
+      || (entry.mode !== "coordinate" && entry.mode !== "inspect" && entry.mode !== "off")
+      || !isRegistryLabel(entry.projectLabel)
+      || !isRegistryTimestamp(entry.updatedAt)
+      || entry.updatedAt > value.observedAt
+    ) return null;
+    const session = parseMemorySummaryPeerIdentity(entry.session);
+    if (session === null || policyRefs.has(session.ref)) return null;
+    policyRefs.add(session.ref);
+    peerPolicies.push({
+      mode: entry.mode,
+      projectLabel: entry.projectLabel,
+      session,
+      updatedAt: entry.updatedAt,
+    });
+  }
+
+  const peerActions: MemorySummaryPeerAction[] = [];
+  for (const entry of value.peerActions) {
+    if (
+      !isRecord(entry)
+      || !hasExactKeys(entry, ["actor", "createdAt", "delivery", "state", "target", "updatedAt"])
+      || (entry.delivery !== "queue" && entry.delivery !== "send" && entry.delivery !== "steer")
+      || (entry.state !== "ambiguous"
+        && entry.state !== "applied"
+        && entry.state !== "cancelled"
+        && entry.state !== "effect_started"
+        && entry.state !== "failed"
+        && entry.state !== "prepared"
+        && entry.state !== "queued")
+      || !isRegistryTimestamp(entry.createdAt)
+      || !isRegistryTimestamp(entry.updatedAt)
+      || entry.updatedAt < entry.createdAt
+      || entry.updatedAt > value.observedAt
+    ) return null;
+    const actor = parseMemorySummaryPeerIdentity(entry.actor);
+    const target = parseMemorySummaryPeerIdentity(entry.target);
+    if (actor === null || target === null || actor.ref === target.ref) return null;
+    peerActions.push({
+      actor,
+      createdAt: entry.createdAt,
+      delivery: entry.delivery,
+      state: entry.state,
+      target,
+      updatedAt: entry.updatedAt,
+    });
+  }
+
+  return {
+    coverage: {
+      peerActions: value.coverage.peerActions,
+      peerPolicies: value.coverage.peerPolicies,
+      spaces: value.coverage.spaces,
+    },
+    observedAt: value.observedAt,
+    peerActions,
+    peerPolicies,
+    spaces,
+    version: 1,
+  };
+}
+
+/** Parse one immutable accessor-free snapshot of an untrusted memory summary. */
+export function parseMemorySummaryPayload(value: unknown): MemorySummaryPayload | null {
+  const snapshot = snapshotForeignJson(value);
+  return snapshot.ok ? parseMemorySummaryPayloadUnchecked(snapshot.value) : null;
+}
+
+/**
+ * Preflight the separate summary before spending an account-key nonce. The
+ * conservative plaintext bound is the same AES-GCM plus unpadded-base64
+ * bound enforced after encryption.
+ */
+export function memorySummaryFitsEncryptedEnvelope(value: unknown): boolean {
+  const parsed = parseMemorySummaryPayload(value);
+  if (parsed === null) return false;
+  try {
+    const bytes = new TextEncoder().encode(JSON.stringify(parsed)).byteLength;
+    return bytes <= Math.floor(cloudLimits.memorySummaryCiphertextCharacters * 3 / 4) - 16;
+  } catch {
+    return false;
+  }
+}
+
 export function cloudPayloadAad(authority: CloudPayloadAuthority): Uint8Array {
   if (
     !isOpaqueIdentifier(authority.entityPublicId)
@@ -1260,6 +1587,36 @@ export async function decryptDeviceRegistry(
   if (authority.kind !== "device_registry") throw new Error("Invalid device registry authority.");
   const parsed = parseDeviceRegistryPayload(await decryptJson(envelope, key, authority));
   if (parsed === null) throw new Error("Invalid device registry payload.");
+  return parsed;
+}
+
+export async function encryptMemorySummary(
+  payload: MemorySummaryPayload,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<EncryptedEnvelope> {
+  const parsed = parseMemorySummaryPayload(payload);
+  if (authority.kind !== "memory_summary" || parsed === null) {
+    throw new Error("Invalid memory summary payload.");
+  }
+  if (!memorySummaryFitsEncryptedEnvelope(parsed)) {
+    throw new Error("Encrypted memory summary exceeds its closed envelope bound.");
+  }
+  const envelope = await encryptJson(parsed, key, authority);
+  if (envelope.ciphertext.length > cloudLimits.memorySummaryCiphertextCharacters) {
+    throw new Error("Encrypted memory summary exceeds its closed envelope bound.");
+  }
+  return envelope;
+}
+
+export async function decryptMemorySummary(
+  envelope: EncryptedEnvelope,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<MemorySummaryPayload> {
+  if (authority.kind !== "memory_summary") throw new Error("Invalid memory summary authority.");
+  const parsed = parseMemorySummaryPayload(await decryptJson(envelope, key, authority));
+  if (parsed === null) throw new Error("Invalid memory summary payload.");
   return parsed;
 }
 

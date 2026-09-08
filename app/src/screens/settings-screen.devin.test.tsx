@@ -59,6 +59,8 @@ await mock.module("../data/registry", () => ({
   useDeviceRegistries: () => ({
     error: null,
     loading: false,
+    memorySummaryReady: true,
+    now: 1_760_000_000_000,
     machines: [{
       accountLinkingAllowed: true,
       accounts: [{
@@ -76,6 +78,8 @@ await mock.module("../data/registry", () => ({
       deviceStatus: "active",
       heartbeatAt: 1_760_000_000_000,
       label: "Studio",
+      memorySummary: null,
+      memorySummaryFreshness: "unsupported",
       online: true,
       notificationHours: null,
       notificationHoursStatus: "unsupported",

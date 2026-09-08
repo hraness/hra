@@ -35,6 +35,7 @@ export const QUOTA_CATEGORIES = [
   "receipt",
   "security",
   "job",
+  "memory",
 ] as const;
 
 export type QuotaCategory = typeof QUOTA_CATEGORIES[number];
@@ -47,6 +48,7 @@ export const USER_QUOTA_RESOURCES = [
   "session_chunk",
   "nonterminal_command",
   "live_chunk",
+  "memory_space",
 ] as const;
 
 export type UserQuotaResource = typeof USER_QUOTA_RESOURCES[number];
@@ -94,6 +96,7 @@ export const CATEGORY_QUOTAS = {
   receipt: { logicalBytes: 256 * 1_024 * 1_024, records: 100_000 },
   security: { logicalBytes: 256 * 1_024 * 1_024, records: 250_000 },
   job: { logicalBytes: 16 * 1_024 * 1_024, records: 128 },
+  memory: { logicalBytes: USER_TOTAL_QUOTA.logicalBytes, records: 500_000 },
 } as const satisfies Readonly<Record<QuotaCategory, QuotaLimit>>;
 
 export const USER_RESOURCE_QUOTAS = {
@@ -106,6 +109,9 @@ export const USER_RESOURCE_QUOTAS = {
   // every detail chunk also charges session_chunk, so live_chunk can never
   // exceed session_chunk, but it caps live-tail growth far tighter.
   live_chunk: 20_000,
+  // The initial hosted memory surface deliberately has no pagination. Keep
+  // the hard space cap equal to the complete owner-scoped list bound.
+  memory_space: 100,
 } as const satisfies Readonly<Record<UserQuotaResource, number>>;
 
 export const ACCOUNT_RESOURCE_QUOTAS = {
@@ -751,6 +757,22 @@ export async function releaseSessionHeadQuotaForDelete(
   await releaseUserResourceDelete(ctx, userId, "session", "session_head", document);
 }
 
+export async function reserveMemorySpaceQuotaForInsert(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+  document: LogicalDocument,
+): Promise<void> {
+  await reserveUserResourceInsert(ctx, userId, "memory", "memory_space", document);
+}
+
+export async function releaseMemorySpaceQuotaForDelete(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+  document: LogicalDocument,
+): Promise<void> {
+  await releaseUserResourceDelete(ctx, userId, "memory", "memory_space", document);
+}
+
 export async function reserveSessionChunkQuotaForInsert(
   ctx: MutationCtx,
   userId: Id<"users">,
@@ -1032,6 +1054,8 @@ export const QUOTA_GENESIS_CHARGED_TABLES = [
   "recoveryEnvelopes",
   "devicePresence",
   "deviceRegistries",
+  "memorySpaces",
+  "memoryOperations",
   "sessionHeads",
   "sessionChunks",
   "sessionStreamEpochs",
@@ -1088,6 +1112,8 @@ async function requireGenesisEmpty(ctx: MutationCtx): Promise<void> {
     hasAny(ctx.db.query("recoveryEnvelopes").take(1)),
     hasAny(ctx.db.query("devicePresence").take(1)),
     hasAny(ctx.db.query("deviceRegistries").take(1)),
+    hasAny(ctx.db.query("memorySpaces").take(1)),
+    hasAny(ctx.db.query("memoryOperations").take(1)),
     hasAny(ctx.db.query("sessionHeads").take(1)),
     hasAny(ctx.db.query("sessionChunks").take(1)),
     hasAny(ctx.db.query("sessionStreamEpochs").take(1)),
@@ -1462,6 +1488,8 @@ export const hostedBootstrapStatus = internalQuery({
       recoveryEnvelopes,
       devicePresence,
       deviceRegistries,
+      memorySpaces,
+      memoryOperations,
       sessionHeads,
       sessionChunks,
       sessionStreamEpochs,
@@ -1511,6 +1539,8 @@ export const hostedBootstrapStatus = internalQuery({
       ctx.db.query("recoveryEnvelopes").take(2),
       ctx.db.query("devicePresence").take(2),
       ctx.db.query("deviceRegistries").take(2),
+      ctx.db.query("memorySpaces").take(2),
+      ctx.db.query("memoryOperations").take(2),
       ctx.db.query("sessionHeads").take(2),
       ctx.db.query("sessionChunks").take(2),
       ctx.db.query("sessionStreamEpochs").take(2),
@@ -1561,6 +1591,8 @@ export const hostedBootstrapStatus = internalQuery({
       recoveryEnvelopes,
       devicePresence,
       deviceRegistries,
+      memorySpaces,
+      memoryOperations,
       sessionHeads,
       sessionChunks,
       sessionStreamEpochs,
@@ -1841,6 +1873,8 @@ const directlyAuditableTable = v.union(
   v.literal("idempotencyReceipts"),
   v.literal("securityEvents"),
   v.literal("devicePresence"),
+  v.literal("memorySpaces"),
+  v.literal("memoryOperations"),
   v.literal("accountDeletionJobs"),
   v.literal("deviceRevocationJobs"),
 );
@@ -1867,6 +1901,8 @@ const DIRECT_TABLE_CATEGORY = {
   idempotencyReceipts: "receipt",
   securityEvents: "security",
   devicePresence: "device",
+  memorySpaces: "memory",
+  memoryOperations: "memory",
   accountDeletionJobs: "job",
   deviceRevocationJobs: "job",
 } as const;
@@ -1981,6 +2017,14 @@ export const auditDirectTablePage = internalQuery({
             .paginate(paginationOpts);
         case "devicePresence":
           return await ctx.db.query("devicePresence")
+            .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "memorySpaces":
+          return await ctx.db.query("memorySpaces")
+            .withIndex("by_user_and_updated_at", (builder) => builder.eq("userId", args.userId))
+            .paginate(paginationOpts);
+        case "memoryOperations":
+          return await ctx.db.query("memoryOperations")
             .withIndex("by_user", (builder) => builder.eq("userId", args.userId))
             .paginate(paginationOpts);
         case "accountDeletionJobs":
