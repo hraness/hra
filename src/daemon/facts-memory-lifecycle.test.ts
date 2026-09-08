@@ -19,6 +19,7 @@ import { FactsMemoryControlStore } from "../storage/facts-memory-control";
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import {
   HraFactsMemoryLifecycle,
+  type FactsMemoryAttestationLifecyclePort,
   type FactsMemoryBrokerInspection,
   type FactsMemoryBrokerPort,
 } from "./facts-memory-lifecycle";
@@ -135,6 +136,118 @@ class FakeBroker implements FactsMemoryBrokerPort {
       purgedAt: 200,
     };
     return { ...base, purgeDigest: digestFactsMemoryPurgeReceipt(base) };
+  }
+}
+
+class FakeAttestations implements FactsMemoryAttestationLifecyclePort {
+  readonly finalizations: Array<Readonly<{
+    childBindingDigest: string;
+    childHead: FactsMemoryHead;
+    parentBindingDigest: string;
+    parentHead: FactsMemoryHead;
+  }>> = [];
+  readonly reservations: Array<Readonly<{
+    childBindingDigest: string;
+    childSessionId: string;
+    parentBindingDigest: string;
+    parentHead: FactsMemoryHead;
+  }>> = [];
+  readonly purges: string[] = [];
+  readonly pendingParents = new Set<string>();
+  readonly pendingForks = new Map<string, Readonly<{
+    childAuthorityDigest: string;
+    childSessionId: string;
+    parentAuthorityDigest: string;
+    parentHead: Readonly<{
+      headDigest: string;
+      operationSha256: string | null;
+      sequence: number;
+    }>;
+  }>>();
+  readonly finalizedChildren = new Set<string>();
+  failFinalizeOnce = false;
+  failPurgeOnce = false;
+
+  hasMemoryWorkingAttestationForkFromParent(parentBindingDigest: string): boolean {
+    return this.pendingParents.has(parentBindingDigest);
+  }
+
+  listMemoryWorkingAttestationForks(
+    limit: number,
+    afterChildSessionId?: string,
+  ): readonly Readonly<{
+    childAuthorityDigest: string;
+    childSessionId: string;
+    parentAuthorityDigest: string;
+    parentHead: Readonly<{
+      headDigest: string;
+      operationSha256: string | null;
+      sequence: number;
+    }>;
+  }>[] {
+    return [...this.pendingForks.values()]
+      .filter((fork) => afterChildSessionId === undefined || fork.childSessionId > afterChildSessionId)
+      .sort((left, right) => left.childSessionId.localeCompare(right.childSessionId))
+      .slice(0, limit);
+  }
+
+  finalizeMemoryWorkingPageAttestationFork(input: Readonly<{
+    childBindingDigest: string;
+    childHead: FactsMemoryHead;
+    parentBindingDigest: string;
+    parentHead: FactsMemoryHead;
+  }>): number {
+    this.finalizations.push(input);
+    if (this.failFinalizeOnce) {
+      this.failFinalizeOnce = false;
+      throw new Error("lost attestation clone response");
+    }
+    this.pendingParents.delete(input.parentBindingDigest);
+    for (const [sessionId, fork] of this.pendingForks) {
+      if (fork.childAuthorityDigest === input.childBindingDigest) this.pendingForks.delete(sessionId);
+    }
+    this.finalizedChildren.add(input.childBindingDigest);
+    return 1;
+  }
+
+  reserveMemoryWorkingPageAttestationFork(input: Readonly<{
+    childBindingDigest: string;
+    childSessionId: string;
+    parentBindingDigest: string;
+    parentHead: FactsMemoryHead;
+  }>): Readonly<{ references: number; state: "finalized" | "reserved" }> {
+    this.reservations.push(input);
+    if (this.finalizedChildren.has(input.childBindingDigest)) {
+      return { references: 0, state: "finalized" };
+    }
+    this.pendingParents.add(input.parentBindingDigest);
+    this.pendingForks.set(input.childSessionId, {
+      childAuthorityDigest: input.childBindingDigest,
+      childSessionId: input.childSessionId,
+      parentAuthorityDigest: input.parentBindingDigest,
+      parentHead: {
+        headDigest: input.parentHead.digest,
+        operationSha256: input.parentHead.operationSha256,
+        sequence: input.parentHead.sequence,
+      },
+    });
+    return { references: 1, state: "reserved" };
+  }
+
+  purgeMemoryWorkingPageAttestations(input: Readonly<{ bindingDigest: string }>): number {
+    this.purges.push(input.bindingDigest);
+    if (this.failPurgeOnce) {
+      this.failPurgeOnce = false;
+      throw new Error("lost attestation purge response");
+    }
+    this.finalizedChildren.delete(input.bindingDigest);
+    for (const [sessionId, fork] of this.pendingForks) {
+      if (fork.childAuthorityDigest === input.bindingDigest) {
+        this.pendingParents.delete(fork.parentAuthorityDigest);
+        this.pendingForks.delete(sessionId);
+      }
+    }
+    return 1;
   }
 }
 
@@ -338,6 +451,172 @@ describe("HRA facts-memory lifecycle", () => {
     });
   });
 
+  test("reconciles durable attestation clone and post-purge cleanup independently of Oh effects", async () => {
+    const { broker, control } = await fixture();
+    const attestations = new FakeAttestations();
+    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    attestations.failFinalizeOnce = true;
+    await expect(lifecycle.forkSession({
+      childExpiresAt: 2_000,
+      childSessionId,
+      ownerId,
+      parentSessionId: sessionId,
+    })).rejects.toThrow("lost attestation clone response");
+    const childControl = control.get(childSessionId);
+    expect(childControl).toMatchObject({ state: "recovery_required" });
+    const child = await lifecycle.ensureSession({
+      expiresAt: 2_000,
+      ownerId,
+      sessionId: childSessionId,
+    });
+    if (child.head === null || parent.head === null) {
+      throw new Error("Expected active attestation checkpoints.");
+    }
+    expect(attestations.finalizations).toEqual([
+      {
+        childBindingDigest: child.bindingDigest,
+        childHead: child.head,
+        parentBindingDigest: parent.bindingDigest,
+        parentHead: parent.head,
+      },
+      {
+        childBindingDigest: child.bindingDigest,
+        childHead: child.head,
+        parentBindingDigest: parent.bindingDigest,
+        parentHead: parent.head,
+      },
+    ]);
+
+    attestations.purges.length = 0;
+    attestations.failPurgeOnce = true;
+    await expect(lifecycle.cleanupSession({
+      ownerId,
+      reason: "archive",
+      sessionId: childSessionId,
+    })).rejects.toThrow("lost attestation purge response");
+    expect(control.get(childSessionId)).toMatchObject({ state: "purged" });
+    await expect(lifecycle.cleanupSession({
+      ownerId,
+      reason: "archive",
+      sessionId: childSessionId,
+    })).resolves.toMatchObject({ state: "purged" });
+    expect(attestations.purges).toEqual([child.bindingDigest, child.bindingDigest]);
+  });
+
+  test("resume finalizes a lost child attestation fork before releasing its parent", async () => {
+    const { broker, control } = await fixture();
+    const attestations = new FakeAttestations();
+    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    attestations.failFinalizeOnce = true;
+    await expect(lifecycle.forkSession({
+      childExpiresAt: 2_000,
+      childSessionId,
+      ownerId,
+      parentSessionId: sessionId,
+    })).rejects.toThrow("lost attestation clone response");
+    expect(control.get(childSessionId)).toMatchObject({ state: "recovery_required" });
+    expect(attestations.pendingParents.has(parent.bindingDigest)).toBe(true);
+
+    const child = await lifecycle.resumeSession({ ownerId, sessionId: childSessionId });
+    expect(child).toMatchObject({ ownerId, sessionId: childSessionId, state: "active" });
+    expect(broker.forkCalls).toBe(1);
+    expect(attestations.finalizations).toHaveLength(2);
+    expect(attestations.pendingParents.has(parent.bindingDigest)).toBe(false);
+    expect(attestations.pendingForks.has(childSessionId)).toBe(false);
+
+    await expect(lifecycle.cleanupSession({
+      ownerId,
+      reason: "archive",
+      sessionId,
+    })).resolves.toMatchObject({ state: "purged" });
+    expect(control.get(childSessionId)).toMatchObject({ state: "active" });
+    expect(broker.receipts.has(childSessionId)).toBe(true);
+  });
+
+  test("resume finalizes a crash-left attestation reservation for an active child", async () => {
+    const { broker, control } = await fixture();
+    const attestations = new FakeAttestations();
+    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    const child = await lifecycle.forkSession({
+      childExpiresAt: 2_000,
+      childSessionId,
+      ownerId,
+      parentSessionId: sessionId,
+    });
+    if (parent.head === null || child.head === null) {
+      throw new Error("Expected active fork checkpoints.");
+    }
+    attestations.finalizedChildren.delete(child.bindingDigest);
+    attestations.reserveMemoryWorkingPageAttestationFork({
+      childBindingDigest: child.bindingDigest,
+      childSessionId,
+      parentBindingDigest: parent.bindingDigest,
+      parentHead: parent.head,
+    });
+    expect(control.get(childSessionId)).toMatchObject({ state: "active" });
+    expect(attestations.pendingParents.has(parent.bindingDigest)).toBe(true);
+
+    await expect(lifecycle.resumeSession({ ownerId, sessionId: childSessionId }))
+      .resolves.toMatchObject({ state: "active" });
+    expect(attestations.pendingParents.has(parent.bindingDigest)).toBe(false);
+    await expect(lifecycle.cleanupSession({
+      ownerId,
+      reason: "archive",
+      sessionId,
+    })).resolves.toMatchObject({ state: "purged" });
+    expect(control.get(childSessionId)).toMatchObject({ state: "active" });
+  });
+
+  test("treats a pre-control attestation fork reservation as a parent cleanup fence", async () => {
+    const { broker, control } = await fixture();
+    const attestations = new FakeAttestations();
+    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    attestations.pendingParents.add(parent.bindingDigest);
+
+    await expect(lifecycle.cleanupSession({
+      ownerId,
+      reason: "archive",
+      sessionId,
+    })).rejects.toThrow("FACTS_MEMORY_PARENT_REFERENCED");
+    expect(control.get(sessionId)).toMatchObject({ state: "active" });
+    expect(broker.purgeCalls).toBe(0);
+
+    attestations.pendingParents.delete(parent.bindingDigest);
+    await expect(lifecycle.cleanupSession({
+      ownerId,
+      reason: "archive",
+      sessionId,
+    })).resolves.toMatchObject({ state: "purged" });
+  });
+
+  test("sweeps a crash-left pre-control fork reservation before releasing its parent", async () => {
+    const { broker, control } = await fixture();
+    const attestations = new FakeAttestations();
+    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    if (parent.head === null) throw new Error("Expected an active parent checkpoint.");
+    const child = createFactsMemoryBinding({ ownerId, sessionId: childSessionId });
+    attestations.reserveMemoryWorkingPageAttestationFork({
+      childBindingDigest: child.bindingDigest,
+      childSessionId,
+      parentBindingDigest: parent.bindingDigest,
+      parentHead: parent.head,
+    });
+
+    expect(await lifecycle.sweepExpired(50)).toEqual({ attempted: 1, failed: 0, purged: 0 });
+    expect(attestations.pendingForks.size).toBe(0);
+    expect(attestations.pendingParents.has(parent.bindingDigest)).toBe(false);
+    await expect(lifecycle.cleanupSession({
+      ownerId,
+      reason: "archive",
+      sessionId,
+    })).resolves.toMatchObject({ state: "purged" });
+  });
+
   test("fences a parent epoch until a crash-left child fork becomes exactly recoverable", async () => {
     const { broker, control, lifecycle } = await fixture();
     await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
@@ -514,6 +793,27 @@ describe("HRA facts-memory lifecycle", () => {
     expect(await lifecycle.sweepExpired(100)).toEqual({ attempted: 16, failed: 16, purged: 0 });
     expect(await lifecycle.sweepExpired(100)).toEqual({ attempted: 1, failed: 0, purged: 1 });
     expect(control.get(sessionIds[16] as string)?.state).toBe("purged");
+  });
+
+  test("retains an expired session when the caller's recovery policy refuses cleanup", async () => {
+    const { broker, control, lifecycle } = await fixture();
+    await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 100 });
+    const retained: string[] = [];
+    expect(await lifecycle.sweepExpired(100, {
+      canCleanupSession: (candidate) => {
+        retained.push(candidate);
+        return false;
+      },
+    })).toEqual({ attempted: 1, failed: 0, purged: 0 });
+    expect(retained).toEqual([sessionId]);
+    expect(control.get(sessionId)?.state).toBe("active");
+    expect(broker.purgeCalls).toBe(0);
+
+    expect(await lifecycle.sweepExpired(100, {
+      canCleanupSession: () => true,
+    })).toEqual({ attempted: 1, failed: 0, purged: 1 });
+    expect(control.get(sessionId)?.state).toBe("purged");
+    expect(broker.purgeCalls).toBe(1);
   });
 
   test("fences a stale expiry page behind a queued renewal", async () => {

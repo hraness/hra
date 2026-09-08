@@ -127,7 +127,12 @@ export class PollingCloudDaemonLifecycle implements CloudDaemonLifecycle {
 
   async close(): Promise<void> {
     this.#controller.abort(new Error("Cloud daemon lifecycle is closing."));
-    await this.join();
+    // `join()` remains the observation surface for a failed polling task.
+    // `close()` is also the service's hard proof that external memory-summary
+    // readers have quiesced, so only bridge-close failure may reject it. A
+    // historical polling failure must not suppress coordinator shutdown after
+    // the bridge has successfully proved quiescence.
+    await this.join().catch(() => undefined);
     await this.#bridge.close?.();
   }
 
@@ -144,7 +149,16 @@ export class PollingCloudDaemonLifecycle implements CloudDaemonLifecycle {
         this.#reason = cloudSyncCadenceReason(result.activity);
         await this.#waitForNextCycle();
       }
+    } catch (error: unknown) {
+      // The projection loop shares this controller. If polling dies without
+      // cancelling it, the finally below waits forever for a liveTick loop
+      // that still believes the lifecycle is healthy.
+      this.#controller.abort(error);
+      throw error;
     } finally {
+      // Also covers an unexpected non-throwing loop exit while preserving the
+      // earlier close/failure reason when the controller is already aborted.
+      this.#controller.abort(new Error("Cloud daemon polling loop stopped."));
       await live;
     }
   }

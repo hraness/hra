@@ -3,7 +3,6 @@ import { useId, useMemo, useState, type ReactNode } from "react";
 
 import { ChevronIcon, ScheduleIcon } from "./icons";
 import { Badge } from "./ui/badge";
-import { useServerNow } from "../data/devices";
 import { useDeviceRegistries } from "../data/registry";
 import { sessionScheduledTasks } from "../model/scheduled-tasks";
 import { scheduledTaskStyles } from "./scheduled-tasks-badge.stylex";
@@ -24,7 +23,7 @@ export type ScheduledTasksBadgeProps = Readonly<{ sessionPublicId: string }>;
  */
 export function ScheduledTasksBadge({ sessionPublicId }: ScheduledTasksBadgeProps): ReactNode {
   const registries = useDeviceRegistries();
-  const now = useServerNow();
+  const now = registries.now;
   const [open, setOpen] = useState(false);
   const panelId = useId();
 

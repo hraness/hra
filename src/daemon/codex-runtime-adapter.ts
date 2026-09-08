@@ -9,7 +9,7 @@ import {
   launchPinnedCodexAppServer,
   type CodexAppServerClient,
   type CodexFact,
-  type ConversationAutomationToolCall,
+  type HraHostToolCall,
   type CodexThread,
   type CodexThreadItem,
   type CodexTurn,
@@ -25,6 +25,7 @@ import {
   replaceCodexDesktopHeartbeatTitle,
 } from "../domain/codex-heartbeat-envelope";
 import type { PreparedAttachment } from "../domain/attachments";
+import { HRA_SESSION_PREAMBLE_TEXT } from "../domain/hra-preamble";
 import {
   assertPresetSupportedByProvider,
   type Preset,
@@ -146,13 +147,13 @@ const assertReviewedThreadRuntime = (
 
 export type CodexRuntimeObserver = {
   account(authority: ProfileAuthority, account: CodexAccountProjection): void | Promise<void>;
-  conversationAutomation?(
+  hraHostTool?(
     authority: ProfileAuthority,
-    call: ConversationAutomationToolCall,
+    call: HraHostToolCall,
   ): DynamicToolPublicResult | Promise<DynamicToolPublicResult>;
-  conversationAutomationResponseWritten?(
+  hraHostToolResponseWritten?(
     authority: ProfileAuthority,
-    call: ConversationAutomationToolCall,
+    call: HraHostToolCall,
   ): void | Promise<void>;
   fact(authority: ProfileAuthority, fact: CodexFact): void | Promise<void>;
 };
@@ -828,10 +829,14 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
 
   async login(input: { authority: ProfileAuthority; method: "browser" | "device_code"; signal: AbortSignal }): Promise<CodexLoginOutcome> {
     return await this.#admit(async () => {
+      input.signal.throwIfAborted();
       const client = await this.#client(input.authority);
-      const before = accountProjection((await client.accountRead()).value);
+      input.signal.throwIfAborted();
+      const before = accountProjection((await client.accountRead(false, input.signal)).value);
+      input.signal.throwIfAborted();
       if (before.signedIn) return { status: "signed_in", account: { ...before, signedIn: true } };
-      if (input.signal.aborted) throw input.signal.reason;
+      // Caller cancellation fences admission only. Once login is dispatched,
+      // retain its exact result or uncertainty for the durable mutation owner.
       const login = (await client.startManagedLogin(input.method === "device_code" ? "device-code" : "browser")).value;
       return login.type === "chatgptDeviceCode"
         ? { status: "pending", loginId: login.loginId, verificationUrl: login.verificationUrl, userCode: login.userCode }
@@ -841,16 +846,20 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
 
   async cancelLogin(input: { authority: ProfileAuthority; loginId: string; signal: AbortSignal }): Promise<{ status: "canceled" | "not_found" }> {
     return await this.#admit(async () => {
-      if (input.signal.aborted) throw input.signal.reason;
-      const result = (await (await this.#client(input.authority)).cancelManagedLogin(input.loginId)).value;
+      input.signal.throwIfAborted();
+      const client = await this.#client(input.authority);
+      input.signal.throwIfAborted();
+      const result = (await client.cancelManagedLogin(input.loginId)).value;
       return { status: result.status === "notFound" ? "not_found" : "canceled" };
     });
   }
 
   async logout(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<void> {
     await this.#admit(async () => {
-      if (input.signal.aborted) throw input.signal.reason;
-      await (await this.#client(input.authority)).logout();
+      input.signal.throwIfAborted();
+      const client = await this.#client(input.authority);
+      input.signal.throwIfAborted();
+      await client.logout();
     });
   }
 
@@ -873,8 +882,10 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
 
   async readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection> {
     return await this.#admit(async () => {
-      if (input.signal.aborted) throw input.signal.reason;
-      return accountProjection((await (await this.#client(input.authority)).accountRead()).value);
+      input.signal.throwIfAborted();
+      const client = await this.#client(input.authority);
+      input.signal.throwIfAborted();
+      return accountProjection((await client.accountRead(false, input.signal)).value);
     });
   }
 
@@ -999,7 +1010,12 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       const running = reviewed.running;
       const preset = reviewed.preset;
       const observationFactSequence = running.sessionObservationFactSequence;
-      const started = (await running.client.startThread({ cwd: input.projectRoot, preset, policy: this.#policy(input.projectRoot) })).value;
+      const started = (await running.client.startThread({
+        cwd: input.projectRoot,
+        developerInstructions: HRA_SESSION_PREAMBLE_TEXT,
+        preset,
+        policy: this.#policy(input.projectRoot),
+      })).value;
       try {
         assertReviewedThreadRuntime(started, reviewed.review.effectiveRuntimeProfile, input.projectRoot);
         const contextual = await this.#reviewedPreset(
@@ -1042,16 +1058,50 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
-  async observeSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<CodexSessionObservation> {
+  async observeSession(input: { authority: ProfileAuthority; providerThreadId: string; developerInstructions?: string; signal: AbortSignal }): Promise<CodexSessionObservation> {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
       const running = await this.#running(input.authority);
-      const proof = await this.#ensureSessionObserved(running, input.providerThreadId);
+      const proof = await this.#ensureSessionObserved(
+        running,
+        input.providerThreadId,
+        input.developerInstructions === undefined
+          ? {}
+          : { developerInstructions: input.developerInstructions },
+      );
       const observation = await this.#readSessionObservation(running, input.providerThreadId, proof);
       input.signal.throwIfAborted();
       this.#assertObservedClientCurrent(running);
       return observation;
     });
+  }
+
+  hasLiveHostToolCall(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+    connectionId: string;
+    turnId: string;
+    callId: string;
+    requestDigest: string;
+  }): boolean {
+    const running = this.#clients.get(input.authority.id);
+    return this.#state === "open"
+      && running !== undefined
+      && running.authority.generation === input.authority.generation
+      && running.client.state === "ready"
+      && running.client.connectionId === input.connectionId
+      && this.#isCurrent(input.authority)
+      && running.client.hasLiveHraHostToolCall({
+        authority: {
+          processGeneration: input.authority.generation,
+          profileId: input.authority.id,
+        },
+        callId: input.callId,
+        connectionId: input.connectionId,
+        requestDigest: input.requestDigest,
+        threadId: input.providerThreadId,
+        turnId: input.turnId,
+      });
   }
 
   async claimSession(input: {
@@ -1087,7 +1137,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         const proof = await this.#ensureSessionObserved(
           running,
           input.providerThreadId,
-          (threadId) => { resumedThreadId = threadId; },
+          { onResumed: (threadId) => { resumedThreadId = threadId; } },
         );
         if (proof.resumed) resumedThreadId ??= input.providerThreadId;
         const observation = await this.#readSessionObservation(
@@ -1142,11 +1192,17 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
-  async readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection> {
+  async readSession(input: { authority: ProfileAuthority; providerThreadId: string; developerInstructions?: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection> {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
       const running = await this.#running(input.authority);
-      const proof = await this.#ensureSessionObserved(running, input.providerThreadId);
+      const proof = await this.#ensureSessionObserved(
+        running,
+        input.providerThreadId,
+        input.developerInstructions === undefined
+          ? {}
+          : { developerInstructions: input.developerInstructions },
+      );
       if (!proof.resumed && "projection" in proof) {
         input.signal.throwIfAborted();
         this.#assertObservedClientCurrent(running);
@@ -1919,7 +1975,10 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   async #ensureSessionObserved(
     running: RunningClient,
     providerThreadId: string,
-    onResumed?: (providerThreadId: string) => void,
+    options: Readonly<{
+      developerInstructions?: string;
+      onResumed?: (providerThreadId: string) => void;
+    }> = {},
   ): Promise<SessionObservationProof> {
     const key = this.#observationKey(running, providerThreadId);
     for (;;) {
@@ -1934,9 +1993,12 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       const task = (async (): Promise<SessionObservationProof> => {
         try {
           const resumedThread: CodexThread = (
-            await running.client.resumeThread(providerThreadId)
+            await running.client.resumeThread(
+              providerThreadId,
+              options.developerInstructions,
+            )
           ).value;
-          onResumed?.(resumedThread.id);
+          options.onResumed?.(resumedThread.id);
           if (resumedThread.id !== providerThreadId) {
             throw new ResumedThreadMismatchObservationError(resumedThread.id);
           }
@@ -2639,7 +2701,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
           }
           return this.#scheduleAccountRefresh(authority, runningReady);
         },
-        onConversationAutomationToolCall: async (call) => await this.#admit(async () => {
+        onHraHostToolCall: async (call) => await this.#admit(async () => {
           const current = this.#clients.get(authority.id);
           if (
             call.authority.profileId !== authority.id
@@ -2652,18 +2714,18 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
           ) {
             throw new CodexError(
               "AUTHORITY_STALE",
-              "Conversation automation belongs to a stale Codex account generation",
+              "The HRA host-tool call belongs to a stale Codex account generation",
             );
           }
-          if (this.#observer.conversationAutomation === undefined) {
+          if (this.#observer.hraHostTool === undefined) {
             throw new CodexError(
               "UNSUPPORTED_CAPABILITY",
-              "The HRA conversation automation host service is unavailable",
+              "The HRA host-tool service is unavailable",
             );
           }
-          return await this.#observer.conversationAutomation(authority, call);
+          return await this.#observer.hraHostTool(authority, call);
         }),
-        onConversationAutomationToolResponseWritten: (call) => {
+        onHraHostToolResponseWritten: (call) => {
           const current = this.#clients.get(authority.id);
           if (
             call.authority.profileId !== authority.id
@@ -2674,7 +2736,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
             || launchedClient.current.state !== "ready"
             || launchedClient.current.connectionId !== call.connectionId
           ) return;
-          return this.#observer.conversationAutomationResponseWritten?.(authority, call);
+          return this.#observer.hraHostToolResponseWritten?.(authority, call);
         },
         onFact: async (value: FencedCodexValue<CodexFact>) => {
           if (!this.#acceptingOperations()) return;

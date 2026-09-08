@@ -799,6 +799,19 @@ export class FactsMemoryControlStore {
     ).all(after, after, now, bounded).map(mapRow);
   }
 
+  listPurged(
+    limit = 16,
+    afterSessionId: string | null = null,
+  ): readonly FactsMemoryControlRecord[] {
+    const bounded = z.number().int().min(1).max(64).parse(limit);
+    const after = afterSessionId === null ? null : sessionIdSchema.parse(afterSessionId);
+    return this.#database.query(
+      `SELECT * FROM facts_memory_lifecycles
+       WHERE state='purged' AND (? IS NULL OR session_id>?)
+       ORDER BY session_id LIMIT ?`,
+    ).all(after, after, bounded).map(mapRow);
+  }
+
   /** Test/operator proof that the control plane contains authority metadata, never facts. */
   schemaColumns(): readonly string[] {
     return readSchemaColumns(this.#database);

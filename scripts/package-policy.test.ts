@@ -83,6 +83,26 @@ describe("production package policy", () => {
     await expect(assertProductionPackageOnly(root)).rejects.toThrow("repository-only source");
   });
 
+  test("rejects fixtures and unreachable source from archive and installed surfaces", async () => {
+    const forbidden = [
+      ["src", "domain", "session-state.fixture.json"],
+      ["src", "domain", "model-task-shape.fixture.json"],
+      ["src", "cloud", "device-commands.ts"],
+      ["src", "domain", "model-routing.ts"],
+      ["src", "domain", "model-task-shape.ts"],
+    ] as const;
+    for (const components of forbidden) {
+      const root = await fixture();
+      const path = join(root, ...components);
+      await mkdir(join(path, ".."), { recursive: true });
+      await writeFile(path, "forbidden\n");
+      for (const surface of ["archive", "installed"] as const) {
+        await expect(assertProductionPackageOnly(root, surface))
+          .rejects.toThrow(/repository-only|development-only/u);
+      }
+    }
+  });
+
   test("rejects a group- or world-writable CLI entry point", async () => {
     const root = await fixture();
     await chmod(join(root, "src", "cli.ts"), 0o777);

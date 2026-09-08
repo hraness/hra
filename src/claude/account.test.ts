@@ -7,6 +7,7 @@ import { join } from "node:path";
 import {
   claudeAccountDocumentPath,
   readClaudeAccountProjection,
+  spawnClaudeAuthStatusProbe,
 } from "./account";
 import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "./pin";
 import type { PinnedClaudeRuntime } from "./runtime";
@@ -69,6 +70,40 @@ async function rejectBeforeFifoWriter(pending: Promise<unknown>, fifo: string): 
 }
 
 describe("Claude account projection", () => {
+  test("the production status probe accepts coherent signed-out exit 1 and rejects contradictory exit 0", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-claude-account-status-"));
+    const configDir = join(root, "config");
+    const executablePath = join(root, "status-fixture");
+    try {
+      for (const exitCode of [1, 0]) {
+        await writeFile(executablePath, [
+          `#!${process.execPath}`,
+          `console.log(${JSON.stringify(JSON.stringify({
+            loggedIn: false,
+            authMethod: "none",
+            apiProvider: "firstParty",
+            analyticsDisabled: false,
+            projectsDirectory: join(configDir, "projects"),
+          }))});`,
+          `process.exit(${String(exitCode)});`,
+        ].join("\n"), { mode: 0o700 });
+        const pending = spawnClaudeAuthStatusProbe({
+          configDir,
+          configHome: "personal",
+          runtime: { ...runtime, executablePath, argv: [executablePath] },
+          signal: new AbortController().signal,
+        });
+        if (exitCode === 1) {
+          await expect(pending).resolves.toMatchObject({ loggedIn: false });
+        } else {
+          await expect(pending).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
+        }
+      }
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
   test("uses the documented personal and isolated account document paths", () => {
     expect(claudeAccountDocumentPath("/synthetic/.claude", "personal"))
       .toBe("/synthetic/.claude.json");
@@ -93,7 +128,7 @@ describe("Claude account projection", () => {
       probeAuthStatus: async (input) => {
         calls.push("status");
         statusInputs.push(input);
-        return { loggedIn: true };
+        return { loggedIn: true, authentication: "claude_ai" };
       },
     });
 
@@ -123,7 +158,7 @@ describe("Claude account projection", () => {
       runtime,
       signal: new AbortController().signal,
       readMetadata: async () => accountMetadata(),
-      probeAuthStatus: async () => ({ loggedIn: false }),
+      probeAuthStatus: async () => ({ loggedIn: false, authentication: "none" }),
     });
 
     expect(projection).toEqual({ signedIn: false });
@@ -140,7 +175,7 @@ describe("Claude account projection", () => {
         reads += 1;
         return accountMetadata({ accountUuid: reads === 1 ? "account-a" : "account-b" });
       },
-      probeAuthStatus: async () => ({ loggedIn: true }),
+      probeAuthStatus: async () => ({ loggedIn: true, authentication: "claude_ai" }),
     });
 
     await expect(projection).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
@@ -157,7 +192,7 @@ describe("Claude account projection", () => {
         readMetadata: async () => accountMetadata({ accountUuid }),
         probeAuthStatus: async () => {
           probed = true;
-          return { loggedIn: true };
+          return { loggedIn: true, authentication: "claude_ai" };
         },
       });
 
@@ -182,7 +217,7 @@ describe("Claude account projection", () => {
         signal: new AbortController().signal,
         probeAuthStatus: async () => {
           probed = true;
-          return { loggedIn: true };
+          return { loggedIn: true, authentication: "claude_ai" };
         },
       });
 
@@ -209,7 +244,7 @@ describe("Claude account projection", () => {
         signal: new AbortController().signal,
         probeAuthStatus: async () => {
           probed = true;
-          return { loggedIn: true };
+          return { loggedIn: true, authentication: "claude_ai" };
         },
       });
 
@@ -217,6 +252,36 @@ describe("Claude account projection", () => {
       expect(probed).toBeFalse();
     } finally {
       await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("never attributes stale OAuth identity to another authenticated mode", async () => {
+    const projection = await readClaudeAccountProjection({
+      configDir: "/synthetic/.claude",
+      configHome: "personal",
+      runtime,
+      signal: new AbortController().signal,
+      readMetadata: async () => accountMetadata(),
+      probeAuthStatus: async () => ({ loggedIn: true, authentication: "other" }),
+    });
+    expect(projection).toEqual({ signedIn: true });
+  });
+
+  test("rejects missing, widened, and incoherent authentication-mode evidence", async () => {
+    for (const status of [
+      { loggedIn: true },
+      { loggedIn: true, authentication: "claude_ai", token: "must-not-cross" },
+      { loggedIn: true, authentication: "none" },
+      { loggedIn: false, authentication: "claude_ai" },
+    ]) {
+      await expect(readClaudeAccountProjection({
+        configDir: "/synthetic/.claude",
+        configHome: "personal",
+        runtime,
+        signal: new AbortController().signal,
+        readMetadata: async () => accountMetadata(),
+        probeAuthStatus: async () => status,
+      })).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
     }
   });
 });

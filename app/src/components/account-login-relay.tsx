@@ -26,9 +26,10 @@ export function AccountLoginRelay({
       <code {...stylex.props(accountLoginRelayStyles.code)}>{userCode}</code>
       <p {...stylex.props(accountLoginRelayStyles.paragraph)}>
         <a {...stylex.props(accountLoginRelayStyles.link)} href={loginUrl} rel="noreferrer noopener" target="_blank">
-          Open the provider login (single use, expires shortly)
+          Open Codex sign-in
         </a>
       </p>
+      <p {...stylex.props(accountLoginRelayStyles.paragraph)}>Keep this HRA tab open until sign-in finishes. This code cannot be retrieved again.</p>
     </div>
   );
 }

@@ -544,7 +544,9 @@ const actorLabel = (actor: SessionMessageActor): string =>
       ? "User (automation)"
       : actor === "autorespond"
         ? "User (autorespond)"
-        : "User (handoff)";
+        : actor === "peer_session"
+          ? "User (peer session)"
+          : "User (handoff)";
 
 const attachmentManifestSuffix = (
   attachments: readonly AttachmentReference[] | undefined,

@@ -233,7 +233,8 @@ Usage:
   hra plugin list <account> [--project <project>] [--refresh]
   hra plugin show <account> <plugin> [--project <project>] [--refresh]
   hra project add|list|use
-  hra session list|show|status|watch|start|send|queue|steer|stop
+  hra memory status|list|get|search|explain|remember|share|hosted
+  hra session list|show|status|watch|start|send|queue|steer|stop|peer-policy
   hra session adoption status [--provider codex|claude]
   hra session adoption enable <account> --provider codex|claude
   hra session adoption disable --provider codex|claude
@@ -245,6 +246,7 @@ Usage:
   hra session rename|recover|abandon|archive|unarchive|note|preset|fast|project
   hra notification-hours status|set
   hra notification-email status|enable|disable
+  hra autorespond-after-hours status|enable|disable
   hra work protocol|apply|snapshot|task|poll|events|watch
   hra interaction list|show|inspect|decide|grant|answer|submit
   hra remote list|show|command|send|queue|steer|stop|resolve|preset|fast|allow|deny|policy
@@ -390,6 +392,61 @@ Examples:
   hra notification-email status
   hra notification-email enable --revision 1
   hra notification-email disable --revision 2`,
+  memory: `HRA memory
+
+Memory is selected by an HRA session. Reads combine that session's working
+lane with its current project's shared canonical lane by default. Add
+--working-only to read the session lane without opening canonical custody.
+Writes never accept a store path, authority, head, rule, or purge capability.
+
+Usage:
+  hra memory status <session> [--json]
+  hra memory list <session> [--working-only] [--continuation <token>] [--json]
+  hra memory get <session> <key> [--working-only] [--continuation <token>] [--json]
+  hra memory search <session> [--working-only] [--continuation <token>] <text> [--json]
+  hra memory explain <session> <query-id> <row> [--json]
+  hra memory remember <session> <key> --title <title> --summary <summary> [--language <tag>] [--idempotency-key <uuid>] [--json] -- <body>
+  hra memory share <session> <key> --reason <reason> [--idempotency-key <uuid>] [--json]
+  hra memory hosted list [--json]
+  hra memory hosted create <project> [--idempotency-key <uuid>] [--json]
+  hra memory hosted attach <project> <hosted-space-id> [--json]
+  hra memory hosted detach <project> --generation <n> [--json]
+  hra memory hosted sync <project> [--json]
+
+The remember command changes only the selected session's expiring working lane.
+The share command explicitly nominates its exact attested working page for
+conflict-checked adoption into the current project's canonical lane. Reuse the
+printed idempotency key after a lost mutation response.
+
+Examples:
+  hra memory status my-session
+  hra memory list my-session --json
+  hra memory get my-session architecture.boundary
+  hra memory search my-session -- "authority boundary"
+  hra memory explain my-session memq_0123456789abcdef0123456789abcdef 0
+  hra memory remember my-session preferences.review --title "Review style" --summary "Prefer adversarial review." -- "Challenge implementation plans before execution."
+  hra memory share my-session preferences.review --reason "Reusable project convention"
+  hra memory hosted create jungle
+  hra memory hosted list`,
+  "autorespond-after-hours": `HRA after-hours automatic approval budgets
+
+Usage:
+  hra autorespond-after-hours status [--json]
+  hra autorespond-after-hours enable|disable --revision <n> [--json]
+
+This machine-local setting is separate consent from notification email and
+notification hours. When enabled, eligible protocol approvals outside notification
+hours may use limits of 6 consecutive, 20 per hour, and 80 per day with proven
+history. Otherwise the limits are 3 consecutive, 10 per hour, and 40 per day.
+Prose always keeps 3/10/40. Existing approval categories and session approval
+modes still apply. Policy changes never reset counters or refund reservations.
+
+Examples:
+  hra autorespond-after-hours status
+  Only if you choose to consent, use the revision returned by status:
+  hra autorespond-after-hours enable --revision <current-revision>
+  To withdraw consent, use the revision returned by status:
+  hra autorespond-after-hours disable --revision <current-revision>`,
   session: `HRA session
 Session tasks always return to the selected conversation. They never create a standalone task or a new conversation.
 
@@ -398,6 +455,8 @@ Usage:
   hra session show <session> [--detail]
   hra session status <session> [--json]
   hra session state <session> [--json]
+  hra session peer-policy get <session> [--json]
+  hra session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]
   hra autorespond on|workspace|off|default|status [--session <session>] [--json]
   hra autorespond gateway set [--from-fd <fd>] [--json]
   hra autorespond gateway clear [--json]
@@ -438,6 +497,8 @@ Examples:
   hra session events my-session --wait-ms 30000 --jsonl
   hra session send my-session -- "run --help exactly"
   hra session send my-session --attach diagram.png --attach notes.md "what changed here?"
+  hra session peer-policy get my-session
+  hra session peer-policy set my-session inspect --revision 1
   hra session task create my-session --name daily-review --every-minutes 1440 -- "review the release queue"`,
   work: `HRA work
 
@@ -659,6 +720,9 @@ const idempotentCommandKinds = new Set<LocalCommand["kind"]>([
   "session.task.create",
   "session.task.edit",
   "session.task.delete",
+  "memory.remember",
+  "memory.share",
+  "memory.hosted.create",
   "device.approve",
   "device.revoke",
 ]);
@@ -1255,6 +1319,165 @@ const parseProject = (cursor: Cursor, cwd: string): LocalCommand => {
   }
 };
 
+const parseMemory = (
+  cursor: Cursor,
+  idempotencyKey: string | undefined,
+): LocalCommand => {
+  const action = take(cursor, "memory action");
+  const continuation = option(cursor, "--continuation");
+  const workingOnly = flag(cursor, "--working-only");
+  if (action === "hosted") {
+    if (continuation !== undefined || workingOnly) {
+      throw new CliUsageError("Memory hosted commands do not accept query continuation or working-only scope.");
+    }
+    const hostedAction = take(cursor, "hosted memory action");
+    if (hostedAction === "list") {
+      finish(cursor);
+      return { kind: "memory.hosted.list" };
+    }
+    if (hostedAction === "create") {
+      const project = take(cursor, "project");
+      finish(cursor);
+      return command({
+        kind: "memory.hosted.create",
+        project,
+        idempotencyKey: idempotencyKey ?? randomUUID(),
+      });
+    }
+    if (hostedAction === "attach") {
+      const project = take(cursor, "project");
+      const hostedSpaceId = take(cursor, "hosted memory space ID");
+      finish(cursor);
+      return command({ kind: "memory.hosted.attach", project, hostedSpaceId });
+    }
+    if (hostedAction === "detach") {
+      const generation = option(cursor, "--generation");
+      const project = take(cursor, "project");
+      finish(cursor);
+      if (generation === undefined) {
+        throw new CliUsageError("Memory hosted detach requires --generation <n>.");
+      }
+      return command({
+        kind: "memory.hosted.detach",
+        project,
+        expectedGeneration: boundedDecimal(
+          generation,
+          "hosted memory attachment generation",
+          1,
+          Number.MAX_SAFE_INTEGER,
+        ),
+      });
+    }
+    if (hostedAction === "sync") {
+      const project = take(cursor, "project");
+      finish(cursor);
+      return { kind: "memory.hosted.sync", project };
+    }
+    throw new CliUsageError(
+      "Unknown hosted memory action. Run `hra memory --help` for supported actions.",
+    );
+  }
+  if (action === "status") {
+    if (continuation !== undefined) {
+      throw new CliUsageError("--continuation is not supported by memory status.");
+    }
+    if (workingOnly) throw new CliUsageError("--working-only is supported only by memory list, get, and search.");
+    const session = take(cursor, "session");
+    finish(cursor);
+    return { kind: "memory.status", session };
+  }
+  if (action === "list") {
+    const session = take(cursor, "session");
+    finish(cursor);
+    return command({
+      kind: "memory.query",
+      session,
+      value: {
+        mode: "list",
+        ...(workingOnly ? { scope: "working" as const } : {}),
+        ...(continuation === undefined ? {} : { continuation }),
+      },
+    });
+  }
+  if (action === "get") {
+    const session = take(cursor, "session");
+    const key = take(cursor, "memory key");
+    finish(cursor);
+    return command({
+      kind: "memory.query",
+      session,
+      value: {
+        mode: "get",
+        key,
+        ...(workingOnly ? { scope: "working" as const } : {}),
+        ...(continuation === undefined ? {} : { continuation }),
+      },
+    });
+  }
+  if (action === "search") {
+    const session = take(cursor, "session");
+    return command({
+      kind: "memory.query",
+      session,
+      value: {
+        mode: "search",
+        text: remainder(cursor, "search text"),
+        ...(workingOnly ? { scope: "working" as const } : {}),
+        ...(continuation === undefined ? {} : { continuation }),
+      },
+    });
+  }
+  if (continuation !== undefined) {
+    throw new CliUsageError(`--continuation is not supported by memory ${action}.`);
+  }
+  if (workingOnly) {
+    throw new CliUsageError("--working-only is supported only by memory list, get, and search.");
+  }
+  if (action === "explain") {
+    const session = take(cursor, "session");
+    const queryId = take(cursor, "memory query ID");
+    const row = boundedDecimal(take(cursor, "memory row"), "memory row", 0, 255);
+    finish(cursor);
+    return command({ kind: "memory.explain", session, value: { queryId, row } });
+  }
+  if (action === "remember") {
+    const title = option(cursor, "--title");
+    const summary = option(cursor, "--summary");
+    const language = option(cursor, "--language");
+    const session = take(cursor, "session");
+    const key = take(cursor, "memory key");
+    if (title === undefined) throw new CliUsageError("Memory remember requires --title <title>.");
+    if (summary === undefined) throw new CliUsageError("Memory remember requires --summary <summary>.");
+    const body = remainder(cursor, "memory body");
+    return command({
+      kind: "memory.remember",
+      session,
+      idempotencyKey: idempotencyKey ?? randomUUID(),
+      value: {
+        body,
+        key,
+        ...(language === undefined ? {} : { language }),
+        summary,
+        title,
+      },
+    });
+  }
+  if (action === "share") {
+    const reason = option(cursor, "--reason");
+    const session = take(cursor, "session");
+    const key = take(cursor, "memory key");
+    finish(cursor);
+    if (reason === undefined) throw new CliUsageError("Memory share requires --reason <reason>.");
+    return command({
+      kind: "memory.share",
+      session,
+      idempotencyKey: idempotencyKey ?? randomUUID(),
+      value: { key, reason },
+    });
+  }
+  throw new CliUsageError("Unknown memory action. Run `hra memory --help` for supported actions.");
+};
+
 const parseSessionNote = (cursor: Cursor): LocalCommand => {
   const action = take(cursor, "note action");
   const session = take(cursor, "session");
@@ -1265,6 +1488,42 @@ const parseSessionNote = (cursor: Cursor): LocalCommand => {
     case "clear": finish(cursor); return { kind: "session.note.clear", session };
     default: throw new CliUsageError("Unknown note action. Run `hra session --help` for supported actions.");
   }
+};
+
+const parseSessionPeerPolicy = (cursor: Cursor): LocalCommand => {
+  const action = take(cursor, "peer policy action");
+  if (action === "get") {
+    const revision = option(cursor, "--revision");
+    const session = take(cursor, "session");
+    finish(cursor);
+    if (revision !== undefined) {
+      throw new CliUsageError("--revision is supported only by session peer-policy set.");
+    }
+    return { kind: "session.peer-policy.get", session };
+  }
+  if (action === "set") {
+    const expectedRevision = boundedDecimal(
+      option(cursor, "--revision"),
+      "Session peer policy --revision",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const session = take(cursor, "session");
+    const mode = take(cursor, "peer policy mode");
+    finish(cursor);
+    if (mode !== "off" && mode !== "inspect" && mode !== "coordinate") {
+      throw new CliUsageError("Peer policy mode must be `off`, `inspect`, or `coordinate`.");
+    }
+    return command({
+      expectedRevision,
+      kind: "session.peer-policy.set",
+      mode,
+      session,
+    });
+  }
+  throw new CliUsageError(
+    "Unknown peer policy action. Run `hra session peer-policy --help` for supported actions.",
+  );
 };
 
 const parseSessionTask = (
@@ -1383,6 +1642,7 @@ const parseSession = (
     case "show": { const detail = flag(cursor, "--detail"); const session = take(cursor, "session"); finish(cursor); return { kind: "session.show", session, detail }; }
     case "status": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.status", session }; }
     case "state": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.state", session }; }
+    case "peer-policy": return parseSessionPeerPolicy(cursor);
     case "events": {
       const followFlag = flag(cursor, "--follow");
       const follow = followFlag || jsonl;
@@ -2171,6 +2431,42 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       json,
     };
   }
+  if (group === "autorespond-after-hours") {
+    if (idempotencyKey !== undefined) {
+      throw new CliUsageError("--idempotency-key is not supported by autorespond-after-hours commands.");
+    }
+    const action = take(cursor, "autorespond-after-hours action");
+    if (action === "status") {
+      finish(cursor);
+      return {
+        kind: "command",
+        command: { kind: "autorespond-after-hours.status" },
+        json,
+      };
+    }
+    if (action !== "enable" && action !== "disable") {
+      throw new CliUsageError(
+        "Unknown autorespond-after-hours action. Use `status`, `enable`, or `disable`.",
+      );
+    }
+    const expectedRevision = boundedDecimal(
+      option(cursor, "--revision"),
+      "Autorespond-after-hours --revision",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    finish(cursor);
+    return {
+      kind: "command",
+      command: {
+        expectedRevision,
+        kind: action === "enable"
+          ? "autorespond-after-hours.enable"
+          : "autorespond-after-hours.disable",
+      },
+      json,
+    };
+  }
   if (group === "notification-email") {
     if (idempotencyKey !== undefined) {
       throw new CliUsageError("--idempotency-key is not supported by notification-email commands.");
@@ -2220,6 +2516,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   }
   else if (group === "plugin") parsed = parsePlugin(cursor);
   else if (group === "project") parsed = parseProject(cursor, cwd);
+  else if (group === "memory") parsed = parseMemory(cursor, idempotencyKey);
   else if (group === "session") {
     const sessionCommand = parseSession(cursor, jsonl, idempotencyKey, presetContract, json);
     if (sessionCommand.kind === "session.export") {

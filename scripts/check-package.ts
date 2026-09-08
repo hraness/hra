@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { access, lstat, mkdtemp, mkdir, open, opendir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -58,7 +59,7 @@ const packageSchema = z.object({
     url: z.literal("git+https://github.com/hraness/hra.git"),
   }).strict(),
   scripts: z.record(z.string(), z.string()),
-  version: z.literal("0.6.1"),
+  version: z.literal("0.7.0"),
 }).passthrough();
 
 type ProcessResult = Readonly<{
@@ -436,6 +437,94 @@ type GitHistoryCommand =
   | Readonly<{ commit: string; kind: "sensitive_patch" }>
   | Readonly<{ kind: "shallow" }>;
 
+type GitHistoryPatchKind = "public_patch" | "sensitive_patch";
+
+type ReviewedSyntheticHistoryFixture = "memory_summary" | "sanitized_message";
+
+type ReviewedSyntheticHistoryPatchEvidence = Readonly<{
+  fixtures: readonly ReviewedSyntheticHistoryFixture[];
+  publicPatchSha256: string;
+  sensitivePatchSha256: string;
+}>;
+
+const reviewedSyntheticHistoryPatchEvidence: Readonly<
+  Record<string, ReviewedSyntheticHistoryPatchEvidence>
+> = Object.freeze({
+  "313ed3e3e1ddbe5b6464fc098926717f177418a8": Object.freeze({
+    fixtures: Object.freeze(["sanitized_message"] as const),
+    publicPatchSha256: "38922e6d214028499463e193e62b7fde97835cad271693f76e4876af080e5a27",
+    sensitivePatchSha256: "38922e6d214028499463e193e62b7fde97835cad271693f76e4876af080e5a27",
+  }),
+  "5039f0bfe37706f97bd93e68f8db2dff4aa16013": Object.freeze({
+    fixtures: Object.freeze(["memory_summary"] as const),
+    publicPatchSha256: "b3dbdd5504acb92dc2bb0f7e1ebf6e56e7911498bd96fc8f8b7080af924fe42b",
+    sensitivePatchSha256: "b3dbdd5504acb92dc2bb0f7e1ebf6e56e7911498bd96fc8f8b7080af924fe42b",
+  }),
+  "72fcb44fb81a79c93ade6da3a127dbb3ae1dd6f9": Object.freeze({
+    fixtures: Object.freeze(["memory_summary"] as const),
+    publicPatchSha256: "cb571ed9e6f3c71cf062169d36fd1d403c7da42cf409fbc1e2bf64256e222911",
+    sensitivePatchSha256: "ddc5655f80d0a9308dbcf319d2247c429f6a411a14aca2fa68c3efb2113c6d50",
+  }),
+  b48fdb71ca201d951b9b1343a909b5f18277bc36: Object.freeze({
+    fixtures: Object.freeze(["sanitized_message", "memory_summary"] as const),
+    publicPatchSha256: "1b6df43d22fb500c41291b5ab8c57c06f475aa80515dd57735b6f57fa70eed46",
+    sensitivePatchSha256: "59089938773a6ea6574c7df54b7a3da73272a827920845e4805a3e4735b2f812",
+  }),
+  f39747b917b064ff593c58dea2a05e4481319b26: Object.freeze({
+    fixtures: Object.freeze(["sanitized_message"] as const),
+    publicPatchSha256: "1aa2ed40e2d437c2871a6975f177f9bb5bd078c68856fa66f63511a47144fc4a",
+    sensitivePatchSha256: "1aa2ed40e2d437c2871a6975f177f9bb5bd078c68856fa66f63511a47144fc4a",
+  }),
+});
+const reviewedSyntheticHistoryPaths: Readonly<Record<ReviewedSyntheticHistoryFixture, string>> = Object.freeze({
+  memory_summary: ["", "Users", "operator", "private"].join("/"),
+  sanitized_message: ["", "Users", "private", "project", ""].join("/"),
+});
+const reviewedSyntheticHistoryPathReplacement = "[reviewed-synthetic-absolute-path]";
+
+export const normalizeReviewedSyntheticHistoryPatch = (
+  patch: string,
+  expectedPatchSha256: string,
+  fixtures: readonly ReviewedSyntheticHistoryFixture[],
+): string => {
+  if (fixtures.length < 1 || fixtures.length > 2 || new Set(fixtures).size !== fixtures.length) {
+    throw new Error("Reviewed Git history synthetic-path fixture selection is invalid.");
+  }
+  const patchSha256 = createHash("sha256").update(patch, "utf8").digest("hex");
+  if (patchSha256 !== expectedPatchSha256) {
+    throw new Error("Reviewed Git history synthetic-path evidence changed.");
+  }
+  let normalized = patch;
+  for (const fixture of fixtures) {
+    const fragment = reviewedSyntheticHistoryPaths[fixture];
+    if (typeof fragment !== "string") {
+      throw new Error("Reviewed Git history synthetic-path fixture is unknown.");
+    }
+    const firstOccurrence = patch.indexOf(fragment);
+    const secondOccurrence = firstOccurrence < 0
+      ? -1
+      : patch.indexOf(fragment, firstOccurrence + fragment.length);
+    if (firstOccurrence < 0 || secondOccurrence >= 0) {
+      throw new Error("Reviewed Git history synthetic-path evidence changed.");
+    }
+    normalized = normalized.replace(fragment, reviewedSyntheticHistoryPathReplacement);
+  }
+  return normalized;
+};
+
+export const normalizeGitHistoryPatchForPublicScan = (
+  commit: string,
+  kind: GitHistoryPatchKind,
+  patch: string,
+): string => {
+  const evidence = reviewedSyntheticHistoryPatchEvidence[commit];
+  if (evidence === undefined) return patch;
+  const expectedPatchSha256 = kind === "public_patch"
+    ? evidence.publicPatchSha256
+    : evidence.sensitivePatchSha256;
+  return normalizeReviewedSyntheticHistoryPatch(patch, expectedPatchSha256, evidence.fixtures);
+};
+
 type GitHistorySpawnResult = Readonly<{
   exitCode: number;
   exitedDueToMaxBuffer: boolean;
@@ -496,7 +585,7 @@ export const projectGitHistorySpawnResult = (
   return { exitCode: 0, stderr: "", stdout };
 };
 
-const gitHistoryCommandArguments = (command: GitHistoryCommand): readonly string[] => {
+export const gitHistoryCommandArguments = (command: GitHistoryCommand): readonly string[] => {
   if (command.kind === "shallow") {
     return ["--no-replace-objects", "rev-parse", "--is-shallow-repository"];
   }
@@ -507,6 +596,20 @@ const gitHistoryCommandArguments = (command: GitHistoryCommand): readonly string
     throw new Error("Git history patch requested a malformed commit.");
   }
   const common = [
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "core.quotePath=true",
+    "-c",
+    "diff.mnemonicPrefix=false",
+    "-c",
+    "diff.noprefix=false",
+    "-c",
+    "diff.orderFile=/dev/null",
+    "-c",
+    "diff.relative=false",
+    "-c",
+    "diff.suppressBlankEmpty=false",
     "--no-replace-objects",
     "show",
     "--format=",
@@ -516,6 +619,19 @@ const gitHistoryCommandArguments = (command: GitHistoryCommand): readonly string
     "--diff-merges=first-parent",
     "--no-ext-diff",
     "--no-textconv",
+    "--full-index",
+    "--no-color",
+    "--no-renames",
+    "--unified=3",
+    "--inter-hunk-context=0",
+    "--diff-algorithm=myers",
+    "--no-indent-heuristic",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--output-indicator-new=+",
+    "--output-indicator-old=-",
+    "--output-indicator-context= ",
+    "--submodule=short",
     command.commit,
   ];
   return command.kind === "sensitive_patch"
@@ -612,13 +728,19 @@ export const assertCompleteGitHistoryPublic = async (repositoryRoot: string): Pr
       `Git history sensitive-text commit ${commit}`,
       readHistory({ commit, kind: "sensitive_patch" }),
     );
-    assertPublicSensitiveText(completePatch, `Git history commit ${commit}`);
+    assertPublicSensitiveText(
+      normalizeGitHistoryPatchForPublicScan(commit, "sensitive_patch", completePatch),
+      `Git history commit ${commit}`,
+    );
 
     const authoredPatch = requireGitHistoryOutput(
       `Git history public-text commit ${commit}`,
       readHistory({ commit, kind: "public_patch" }),
     );
-    assertPublicText(authoredPatch, `Git history commit ${commit}`);
+    assertPublicText(
+      normalizeGitHistoryPatchForPublicScan(commit, "public_patch", authoredPatch),
+      `Git history commit ${commit}`,
+    );
   }
 
   const finalCommits = await enumerate();

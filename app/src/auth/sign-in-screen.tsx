@@ -1,6 +1,6 @@
 import { useAuthActions } from "@convex-dev/auth/react";
 import * as stylex from "@stylexjs/stylex";
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
@@ -22,13 +22,17 @@ export function SignInScreen() {
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
+  const requestPending = useRef(false);
   const [error, setError] = useState<string | null>(null);
 
   const canonicalEmail = email.trim().toLowerCase();
 
   const submit = (event: { preventDefault: () => void }) => {
     event.preventDefault();
-    if (busy) return;
+    // Own the request before React paints disabled controls. Two same-render
+    // submits must not send competing codes or verify the same code twice.
+    if (requestPending.current) return;
+    requestPending.current = true;
     setBusy(true);
     setError(null);
     const params = stage === "email"
@@ -43,7 +47,10 @@ export function SignInScreen() {
           ? "That address could not be used to request a code."
           : "That code was not accepted. Request a new one.");
       })
-      .finally(() => { setBusy(false); });
+      .finally(() => {
+        requestPending.current = false;
+        setBusy(false);
+      });
   };
 
   return (
@@ -65,6 +72,7 @@ export function SignInScreen() {
                 autoCapitalize="none"
                 autoComplete="email"
                 autoCorrect="off"
+                disabled={busy}
                 inputMode="email"
                 name="email"
                 onChange={(event) => { setEmail(event.target.value); }}
@@ -77,6 +85,7 @@ export function SignInScreen() {
               <Input
                 aria-label="One-time code"
                 autoComplete="one-time-code"
+                disabled={busy}
                 inputMode="numeric"
                 maxLength={8}
                 name="code"
@@ -95,6 +104,7 @@ export function SignInScreen() {
             </Button>
             {stage === "code" ? (
               <Button
+                disabled={busy}
                 onClick={() => {
                   setStage("email");
                   setCode("");

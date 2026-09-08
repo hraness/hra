@@ -52,6 +52,10 @@ describe("bounded Convex transport", () => {
     expect(cloudMutations).toContain("deviceCommands:confirmTerminalRecovery");
   });
 
+  test("keeps memory-summary publication on its independent daemon mutation", () => {
+    expect(cloudMutations).toContain("devices:updateMemorySummary");
+  });
+
   test("admits the proof-bound session-command outbox recovery query", () => {
     expect(cloudQueries).toContain("commands:getForOutboxRecovery");
     expect(cloudQueries).toContain("commands:listUnacknowledgedForRequester");

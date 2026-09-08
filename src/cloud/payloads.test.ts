@@ -8,6 +8,7 @@ import {
   decryptDeviceCommand,
   decryptDeviceCommandResult,
   decryptDeviceRegistry,
+  decryptMemorySummary,
   decryptNotificationEmail,
   decryptNotificationHours,
   decryptUsageProjection,
@@ -16,15 +17,18 @@ import {
   encryptDeviceCommand,
   encryptDeviceCommandResult,
   encryptDeviceRegistry,
+  encryptMemorySummary,
   encryptNotificationEmail,
   encryptNotificationHours,
   encryptUsageProjection,
   encryptRemoteCommand,
   isRelayedLoginUserCode,
   isRelayedLoginUrl,
+  memorySummaryFitsEncryptedEnvelope,
   parseDeviceCommandPayload,
   parseDeviceCommandResultPayload,
   parseDeviceRegistryPayload,
+  parseMemorySummaryPayload,
   parseRemoteCommandPayload,
   parseSessionMetadataPayload,
   type DeviceRegistryPayload,
@@ -709,6 +713,241 @@ describe("device registry payloads", () => {
       },
     });
     expect(parseDeviceRegistryPayload(withGetter)).toBeNull();
+    expect(getterCalls).toBe(0);
+  });
+});
+
+describe("memory summary payloads", () => {
+  const digest = (scalar: string) => scalar.repeat(64);
+  const summary = {
+    coverage: { peerActions: "complete", peerPolicies: "complete", spaces: "complete" },
+    observedAt: 1_700_000_000_000,
+    peerActions: [{
+      actor: { label: "Planner", ref: digest("a") },
+      createdAt: 1_699_999_998_000,
+      delivery: "steer",
+      state: "applied",
+      target: { label: "Builder", ref: digest("b") },
+      updatedAt: 1_699_999_999_000,
+    }],
+    peerPolicies: [{
+      mode: "coordinate",
+      projectLabel: "HRA",
+      session: { label: "Planner", ref: digest("a") },
+      updatedAt: 1_699_999_997_000,
+    }],
+    spaces: [{
+      bindingDigest: digest("c"),
+      canonicalSpaceId: `hra:project:space-${"d".repeat(32)}`,
+      enrollment: "attached",
+      head: { digest: digest("e"), operationSha256: digest("f"), sequence: 7 },
+      lastExchangeAt: 1_699_999_999_500,
+      projectLabel: "HRA",
+      recentRecords: [{
+        key: "release-policy",
+        kind: "memory_page",
+        updatedAt: 1_699_999_996_000,
+      }],
+      recordCount: 4,
+      remoteHead: { digest: digest("e"), operationSha256: digest("f"), sequence: 7 },
+      syncStatus: "settled",
+    }],
+    version: 1,
+  } as const;
+  const authority = {
+    entityPublicId: "device_12345678",
+    keyVersion: 2,
+    kind: "memory_summary",
+    userPublicId: "user_12345678",
+  } as const;
+
+  test("round-trips under an authority distinct from the byte-strict device registry", async () => {
+    const parsed = parseMemorySummaryPayload(summary);
+    expect(parsed).toEqual(summary);
+    const key = randomKeyBytes();
+    const envelope = await encryptMemorySummary(summary, key, authority);
+    expect(JSON.stringify(envelope)).not.toContain("release-policy");
+    expect(JSON.stringify(envelope)).not.toContain("Planner");
+    expect(await decryptMemorySummary(envelope, key, authority)).toEqual(summary);
+    await expectPromiseToReject(decryptMemorySummary(envelope, key, {
+      ...authority,
+      kind: "device_registry",
+    }));
+    await expectPromiseToReject(decryptMemorySummary(envelope, key, {
+      ...authority,
+      entityPublicId: "device_87654321",
+    }));
+
+    const registry = registryFixture();
+    expect(JSON.stringify(parseDeviceRegistryPayload(registry))).toBe(JSON.stringify(registry));
+    expect(parseDeviceRegistryPayload({ ...registry, memorySummary: summary })).toBeNull();
+  });
+
+  test("refuses local identifiers, paths, bodies, reasons, ambiguous roles, and incoherent heads", () => {
+    const space = summary.spaces[0];
+    const action = summary.peerActions[0];
+    expect(space).toBeDefined();
+    expect(action).toBeDefined();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      coverage: { ...summary.coverage, spaces: "unknown" },
+    })).toBeNull();
+    const withoutCoverage = { ...summary } as Record<string, unknown>;
+    delete withoutCoverage.coverage;
+    expect(parseMemorySummaryPayload(withoutCoverage)).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, projectId: "proj_local" }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, projectLabel: ["", "Users", "operator", "private"].join("/") }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, recentRecords: [{ ...space.recentRecords[0], body: "secret" }] }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      peerActions: [{ ...action, reason: "because" }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      peerActions: [{ ...action, target: action.actor }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        head: { ...space.head, operationSha256: null },
+      }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        enrollment: "not_enrolled",
+        remoteHead: space.remoteHead,
+        syncStatus: "local_only",
+      }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, recordCount: 0 }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, recordCount: null }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        enrollment: "unavailable",
+        recentRecords: [],
+        recordCount: null,
+        syncStatus: "error",
+      }],
+    })).not.toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        enrollment: "detached",
+        remoteHead: space.remoteHead,
+        syncStatus: "local_only",
+      }],
+    })).not.toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, lastExchangeAt: summary.observedAt + 1 }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      peerPolicies: [{ ...summary.peerPolicies[0], updatedAt: summary.observedAt + 1 }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      peerActions: [{ ...action, updatedAt: summary.observedAt + 1 }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        remoteHead: { ...space.remoteHead, digest: digest("9") },
+      }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{ ...space, syncStatus: "local_only" }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        enrollment: "not_enrolled",
+        head: { digest: space.head.digest, operationSha256: null, sequence: -0 },
+        lastExchangeAt: null,
+        recentRecords: [],
+        recordCount: 0,
+        remoteHead: null,
+        syncStatus: "local_only",
+      }],
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      spaces: [{
+        ...space,
+        enrollment: "unavailable",
+        recentRecords: [],
+        recordCount: -0,
+        syncStatus: "error",
+      }],
+    })).toBeNull();
+  });
+
+  test("refuses an oversized valid summary before encryption", async () => {
+    const oversized = {
+      ...summary,
+      peerActions: [],
+      peerPolicies: Array.from({ length: 200 }, (_, index) => ({
+        mode: "coordinate" as const,
+        projectLabel: "P".repeat(200),
+        session: {
+          label: "S".repeat(200),
+          ref: index.toString(16).padStart(64, "0"),
+        },
+        updatedAt: summary.observedAt,
+      })),
+      spaces: [],
+    };
+    expect(parseMemorySummaryPayload(oversized)).not.toBeNull();
+    expect(memorySummaryFitsEncryptedEnvelope(oversized)).toBe(false);
+    await expectPromiseToReject(encryptMemorySummary(oversized, randomKeyBytes(), authority));
+  });
+
+  test("enforces collection bounds and snapshots foreign values without getters", () => {
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      peerActions: Array.from({ length: 51 }, () => summary.peerActions[0]),
+    })).toBeNull();
+    expect(parseMemorySummaryPayload({
+      ...summary,
+      peerPolicies: Array.from({ length: 201 }, (_, index) => ({
+        ...summary.peerPolicies[0],
+        session: { label: `Session ${index}`, ref: index.toString(16).padStart(64, "0") },
+      })),
+    })).toBeNull();
+    const foreign = { ...summary } as Record<string, unknown>;
+    let getterCalls = 0;
+    Object.defineProperty(foreign, "spaces", {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return summary.spaces;
+      },
+    });
+    expect(parseMemorySummaryPayload(foreign)).toBeNull();
     expect(getterCalls).toBe(0);
   });
 });

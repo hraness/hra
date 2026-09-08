@@ -9,6 +9,17 @@ import { turnSummaryLine } from "../model/session-view";
 import type { TranscriptEntry } from "../model/transcript";
 import { transcriptStyles } from "./transcript-view.stylex";
 
+type UserMessageActor = Extract<TranscriptEntry, { kind: "user" }>["actor"];
+
+const userMessageActorLabel: Readonly<Record<UserMessageActor, string>> = {
+  automation: "automation",
+  autorespond: "autorespond",
+  human: "you",
+  peer_session: "peer session",
+  provider_switch: "provider handoff",
+  unknown: "other sender",
+};
+
 /**
  * A closed assistant message. Memoised on its text, which never changes once
  * the compact stream has written it, so a delta arriving in the turn below
@@ -31,14 +42,14 @@ const UserBubble = memo(function UserBubble({
   attachments,
   text,
 }: Readonly<{
-  actor: "human" | "autorespond";
+  actor: UserMessageActor;
   attachments: readonly AttachmentManifestEntry[] | null;
   text: string;
 }>): ReactNode {
   return (
     <div {...stylex.props(transcriptStyles.userBubble)}>
       <span {...stylex.props(transcriptStyles.userActor)}>
-        {actor === "autorespond" ? "autorespond" : "you"}
+        {userMessageActorLabel[actor]}
       </span>
       <div {...stylex.props(transcriptStyles.userText)}>
         {text}

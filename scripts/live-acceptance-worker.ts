@@ -3,15 +3,36 @@
 import type { Readable, Writable } from "node:stream";
 import { isatty } from "node:tty";
 
+import { z } from "zod";
+
 import { callLocalDaemon } from "../src/daemon/local-transport";
 import { waitForDaemonReady, type DaemonIdentity } from "../src/daemon/daemon-startup";
-import { initialize, main as cliMain, runDaemon } from "../src/cli";
+import {
+  initialize,
+  main as cliMain,
+  runDaemon,
+  type LiveAcceptanceClaudeProofPort,
+} from "../src/cli";
 import type { Output } from "../src/cli/render";
-import type { CommandResponse } from "../src/domain/contracts";
+import type { CommandResponse, LocalCommand } from "../src/domain/contracts";
+import { publicEffectiveClaudeRuntimeProfileSchema } from "../src/domain/runtime-profile";
+import { profileIdSchema, projectIdSchema, sessionIdSchema } from "../src/domain/values";
 import {
   createAcceptanceInstallation,
   type AcceptanceInstallationDescriptor,
 } from "./live-acceptance-installation";
+import {
+  LiveAcceptanceMemoryFaultController,
+  type LiveAcceptanceMemoryFaultArm,
+  type LiveAcceptanceMemoryFaultFinalize,
+  type LiveAcceptanceMemoryFaultStatus,
+} from "./live-acceptance-memory-fault";
+import {
+  ClaudeLiveAcceptanceProofCollector,
+  ClaudeLiveAcceptanceProofError,
+  type ClaudeLiveAcceptancePrivateReceipt,
+  type ClaudeLiveAcceptanceProvisionalPrivateReceipt,
+} from "./claude-live-acceptance-proof";
 import {
   assertAcceptanceDescriptorLayout,
   LIVE_ACCEPTANCE_CONTROL_FD,
@@ -21,6 +42,7 @@ import {
   LIVE_ACCEPTANCE_STATUS_MAXIMUM_BYTES,
   liveAcceptanceWorkerControlSchema,
   liveAcceptanceWorkerStatusSchema,
+  type ClaudeLiveAcceptanceWorkerArm,
   type LiveAcceptanceWorkerStatus,
 } from "./live-acceptance";
 
@@ -197,11 +219,14 @@ type GenerationStopReason = "parent_closed" | "restart" | "stop" | "suspend";
 type DaemonGeneration = {
   controller: AbortController;
   expectedStop: GenerationStopReason | null;
+  faultEnded: boolean;
+  faultGeneration: number;
   identity?: DaemonIdentity;
   promise: Promise<number>;
 };
 
 type DaemonSupervisorDependencies = Readonly<{
+  callLocalDaemon?: typeof callLocalDaemon;
   runDaemon?: typeof runDaemon;
   waitForDaemonReady?: typeof waitForDaemonReady;
 }>;
@@ -212,10 +237,264 @@ type WorkerDependencies = DaemonSupervisorDependencies & Readonly<{
   ) => Promise<void>;
 }>;
 
+type WorkerMode = "standard" | "claude_proof";
+
+const workerModeFromArgv = (argv: readonly string[]): WorkerMode => {
+  if (argv.length === 0) return "standard";
+  if (argv.length === 1 && argv[0] === "--claude-proof") return "claude_proof";
+  throw new WorkerFailure("descriptor_invalid");
+};
+
+const providerIdentifierSchema = z.string().min(1).max(512)
+  .refine((value) => !/\p{Cc}|\p{Cs}/u.test(value));
+const safeIntegerSchema = z.number().int().nonnegative().safe();
+const rawClaudeSessionSchema = z.object({
+  activeTurnId: providerIdentifierSchema.optional(),
+  archivedAt: safeIntegerSchema.optional(),
+  createdAt: safeIntegerSchema,
+  fastEnabled: z.literal(false),
+  id: sessionIdSchema,
+  note: z.string(),
+  preset: z.literal("fable-max"),
+  profileId: profileIdSchema,
+  projectId: projectIdSchema,
+  provider: z.literal("claude"),
+  providerThreadId: providerIdentifierSchema,
+  providerUpdatedAt: safeIntegerSchema.optional(),
+  revision: z.number().int().positive().safe(),
+  state: z.enum(["starting", "active", "idle", "terminal", "recovery_required"]),
+  title: z.string(),
+  updatedAt: safeIntegerSchema,
+}).strict();
+const rawClaudeStartResultSchema = z.object({
+  effectiveRuntimeProfile: publicEffectiveClaudeRuntimeProfileSchema,
+  idempotencyKey: z.string().uuid(),
+  session: rawClaudeSessionSchema,
+}).strict();
+const rawClaudeSendResultSchema = z.object({
+  effectiveRuntimeProfile: publicEffectiveClaudeRuntimeProfileSchema,
+  idempotencyKey: z.string().uuid(),
+  session: rawClaudeSessionSchema,
+  turnId: providerIdentifierSchema,
+}).strict();
+
+type CapturedFreshClaudeSession = Readonly<{
+  profileGeneration: number;
+  profileId: z.infer<typeof profileIdSchema>;
+  providerThreadId: string;
+  sessionId: z.infer<typeof sessionIdSchema>;
+}>;
+
+class WorkerClaudeProofController implements LiveAcceptanceClaudeProofPort {
+  readonly #candidate: NonNullable<AcceptanceInstallationDescriptor["candidate"]>;
+  readonly #runId: string;
+  #collector: ClaudeLiveAcceptanceProofCollector | undefined;
+  #generation: number | undefined;
+  #closed = false;
+  #closeError: ClaudeLiveAcceptanceProofError | undefined;
+  #freshSession: CapturedFreshClaudeSession | undefined;
+  #armedSession: Readonly<{
+    sendIdempotencyKey: string;
+    sessionId: z.infer<typeof sessionIdSchema>;
+  }> | undefined;
+  #observationError: ClaudeLiveAcceptanceProofError | undefined;
+
+  constructor(input: Readonly<{
+    candidate: NonNullable<AcceptanceInstallationDescriptor["candidate"]>;
+    runId: string;
+  }>) {
+    this.#candidate = input.candidate;
+    this.#runId = input.runId;
+  }
+
+  beginDaemonGeneration(generation: number): void {
+    if (this.#closed || this.#generation !== undefined) {
+      throw new ClaudeLiveAcceptanceProofError("generation_invalid");
+    }
+    this.#generation = generation;
+  }
+
+  observeCommandResponse(command: LocalCommand, response: CommandResponse): void {
+    if (this.#closed || !response.ok) return;
+    if (command.kind === "session.start") {
+      this.#observeFreshSessionStart(command, response.data);
+      return;
+    }
+    if (command.kind !== "session.send") return;
+    const armed = this.#armedSession;
+    if (
+      armed === undefined
+      || command.session !== armed.sessionId
+      || command.idempotencyKey !== armed.sendIdempotencyKey
+    ) return;
+    if (this.#observationError !== undefined) return;
+    const parsed = rawClaudeSendResultSchema.safeParse(response.data);
+    if (
+      !parsed.success
+      || parsed.data.session.id !== armed.sessionId
+      || parsed.data.idempotencyKey !== armed.sendIdempotencyKey
+      || parsed.data.effectiveRuntimeProfile.profileId !== parsed.data.session.profileId
+      || parsed.data.effectiveRuntimeProfile.processGeneration
+        !== this.#freshSession?.profileGeneration
+      || (
+        parsed.data.session.state === "active"
+        && parsed.data.session.activeTurnId !== parsed.data.turnId
+      )
+      || (
+        parsed.data.session.state === "idle"
+        && parsed.data.session.activeTurnId !== undefined
+      )
+    ) {
+      this.#observationError = new ClaudeLiveAcceptanceProofError(
+        "turn_corroboration_invalid",
+      );
+      return;
+    }
+    const generation = this.#generation;
+    if (generation === undefined) {
+      this.#observationError = new ClaudeLiveAcceptanceProofError("generation_invalid");
+      return;
+    }
+    try {
+      this.#requireCollector().corroborateAppliedSend({
+        daemonGeneration: generation,
+        idempotencyKey: parsed.data.idempotencyKey,
+        sessionId: parsed.data.session.id,
+        turnId: parsed.data.turnId,
+      });
+    } catch (error: unknown) {
+      if (!(error instanceof ClaudeLiveAcceptanceProofError)) throw error;
+      this.#observationError = error;
+    }
+  }
+
+  armObservedFreshSession(input: ClaudeLiveAcceptanceWorkerArm): void {
+    if (
+      this.#closed
+      || this.#collector !== undefined
+      || this.#generation === undefined
+      || input.daemonGeneration !== this.#generation
+      || this.#observationError !== undefined
+    ) throw this.#observationError
+      ?? new ClaudeLiveAcceptanceProofError("session_scope_invalid");
+    const fresh = this.#freshSession;
+    if (
+      fresh === undefined
+      || fresh.sessionId !== input.sessionId
+      || fresh.profileId !== input.profileId
+      || fresh.profileGeneration !== input.profileGeneration
+    ) throw new ClaudeLiveAcceptanceProofError("session_scope_invalid");
+    const collector = new ClaudeLiveAcceptanceProofCollector({
+      candidate: this.#candidate,
+      runId: this.#runId,
+    });
+    collector.beginDaemonGeneration(this.#generation);
+    collector.armFreshSession({
+      ...input,
+      providerThreadId: fresh.providerThreadId,
+    });
+    this.#collector = collector;
+    this.#armedSession = Object.freeze({
+      sendIdempotencyKey: input.sendIdempotencyKey,
+      sessionId: input.sessionId,
+    });
+  }
+
+  async handleManagedHostToolCall(
+    input: Parameters<ClaudeLiveAcceptanceProofCollector["handleManagedHostToolCall"]>[0],
+  ): ReturnType<ClaudeLiveAcceptanceProofCollector["handleManagedHostToolCall"]> {
+    return await this.#requireCollector().handleManagedHostToolCall(input);
+  }
+
+  handleManagedHostToolResponseWritten(
+    receipt: Parameters<ClaudeLiveAcceptanceProofCollector["handleManagedHostToolResponseWritten"]>[0],
+  ): void {
+    this.#requireCollector().handleManagedHostToolResponseWritten(receipt);
+  }
+
+  closeDaemonGeneration(generation: number | null): void {
+    if (this.#closed) {
+      if (generation !== this.#generation && this.#closeError === undefined) {
+        this.#closeError = new ClaudeLiveAcceptanceProofError("generation_invalid");
+      }
+      return;
+    }
+    this.#closed = true;
+    if (generation === null || generation !== this.#generation) {
+      this.#closeError = new ClaudeLiveAcceptanceProofError("generation_invalid");
+      return;
+    }
+    try {
+      this.#collector?.closeDaemonGeneration(generation);
+    } catch (error: unknown) {
+      if (!(error instanceof ClaudeLiveAcceptanceProofError)) throw error;
+      this.#closeError = error;
+    }
+  }
+
+  readProvisionalPrivateReceipt(): ClaudeLiveAcceptanceProvisionalPrivateReceipt {
+    if (this.#observationError !== undefined) throw this.#observationError;
+    return this.#requireCollector().readProvisionalPrivateReceipt();
+  }
+
+  readPrivateReceipt(): ClaudeLiveAcceptancePrivateReceipt {
+    if (this.#observationError !== undefined) throw this.#observationError;
+    if (this.#closeError !== undefined) throw this.#closeError;
+    return this.#requireCollector().readPrivateReceipt();
+  }
+
+  #observeFreshSessionStart(
+    command: Extract<LocalCommand, { kind: "session.start" }>,
+    data: unknown,
+  ): void {
+    if (this.#freshSession !== undefined || this.#collector !== undefined) {
+      this.#observationError ??= new ClaudeLiveAcceptanceProofError("session_scope_invalid");
+      return;
+    }
+    const parsed = rawClaudeStartResultSchema.safeParse(data);
+    if (
+      command.provider !== "claude"
+      || command.preset !== "fable-max"
+      || command.fast
+      || !parsed.success
+      || command.idempotencyKey !== parsed.data.idempotencyKey
+      || command.account !== parsed.data.session.profileId
+      || command.project !== parsed.data.session.projectId
+      || parsed.data.session.state !== "idle"
+      || parsed.data.session.activeTurnId !== undefined
+      || parsed.data.effectiveRuntimeProfile.profileId !== parsed.data.session.profileId
+      || parsed.data.effectiveRuntimeProfile.processGeneration < 1
+    ) {
+      this.#observationError = new ClaudeLiveAcceptanceProofError("session_scope_invalid");
+      return;
+    }
+    this.#freshSession = Object.freeze({
+      profileGeneration: parsed.data.effectiveRuntimeProfile.processGeneration,
+      profileId: parsed.data.session.profileId,
+      providerThreadId: parsed.data.session.providerThreadId,
+      sessionId: parsed.data.session.id,
+    });
+  }
+
+  #requireCollector(): ClaudeLiveAcceptanceProofCollector {
+    if (this.#closed && this.#collector === undefined) {
+      throw new ClaudeLiveAcceptanceProofError("proof_incomplete");
+    }
+    const collector = this.#collector;
+    if (collector === undefined) {
+      throw new ClaudeLiveAcceptanceProofError("proof_incomplete");
+    }
+    return collector;
+  }
+}
+
 class DaemonSupervisor {
   readonly #descriptor: AcceptanceInstallationDescriptor;
   readonly #installation: ReturnType<typeof createAcceptanceInstallation>;
+  readonly #memoryFault: LiveAcceptanceMemoryFaultController;
+  readonly #claudeProof: WorkerClaudeProofController | undefined;
   readonly #failure = deferred<never>();
+  readonly #callLocalDaemon: typeof callLocalDaemon;
   readonly #runDaemon: typeof runDaemon;
   readonly #waitForDaemonReady: typeof waitForDaemonReady;
   #failureError: Error | undefined;
@@ -225,16 +504,41 @@ class DaemonSupervisor {
   constructor(
     descriptor: AcceptanceInstallationDescriptor,
     dependencies: DaemonSupervisorDependencies = {},
+    options: Readonly<{ claudeProof?: boolean }> = {},
   ) {
     this.#descriptor = descriptor;
     this.#installation = createAcceptanceInstallation(descriptor);
+    this.#memoryFault = new LiveAcceptanceMemoryFaultController({
+      // The local Claude proof carries a candidate but does not enroll hosted
+      // sync. Only the separate Codex hosted gate admits the response-drop
+      // controller's candidate and cloud-target contract.
+      ...(options.claudeProof === true || descriptor.candidate === undefined
+        ? {}
+        : { candidate: descriptor.candidate }),
+      ...(descriptor.cloudDeploymentUrl === undefined
+        ? {}
+        : { cloudDeploymentUrl: descriptor.cloudDeploymentUrl }),
+      device: descriptor.device,
+      runId: descriptor.runId,
+    });
+    const proofCandidate = descriptor.candidate;
+    if (options.claudeProof === true && proofCandidate === undefined) {
+      throw new WorkerFailure("descriptor_invalid");
+    }
+    this.#claudeProof = options.claudeProof === true && proofCandidate !== undefined
+      ? new WorkerClaudeProofController({
+          candidate: proofCandidate,
+          runId: descriptor.runId,
+        })
+      : undefined;
+    this.#callLocalDaemon = dependencies.callLocalDaemon ?? callLocalDaemon;
     this.#runDaemon = dependencies.runDaemon ?? runDaemon;
     this.#waitForDaemonReady = dependencies.waitForDaemonReady ?? waitForDaemonReady;
     void this.#failure.promise.catch(() => undefined);
   }
 
   get failure(): Promise<never> {
-    return this.#failure.promise;
+    return Promise.race([this.#failure.promise, this.#memoryFault.failure]);
   }
 
   async start(): Promise<void> {
@@ -242,26 +546,40 @@ class DaemonSupervisor {
       throw new WorkerFailure("daemon_failed");
     }
     const controller = new AbortController();
+    const faultGeneration = this.#memoryFault.beginGeneration();
     const generation: DaemonGeneration = {
       controller,
       expectedStop: null,
-      promise: this.#runDaemon(this.#installation, { stopSignal: controller.signal }),
+      faultEnded: false,
+      faultGeneration,
+      promise: this.#runDaemon(this.#installation, {
+        liveAcceptanceCanonicalMemoryTransportDecorator: (transport) =>
+          this.#memoryFault.decorate(faultGeneration, transport),
+        ...(this.#claudeProof === undefined
+          ? {}
+          : { liveAcceptanceClaudeProof: this.#claudeProof }),
+        stopSignal: controller.signal,
+      }),
     };
     this.#generation = generation;
     void generation.promise.then(
       (exitCode) => {
         if (exitCode !== 0 || generation.expectedStop === null) {
+          this.#endFaultGeneration(generation, exitCode);
           this.#fail(new WorkerFailure("daemon_failed"));
         }
       },
-      () => this.#fail(new WorkerFailure("daemon_failed")),
+      () => {
+        this.#endFaultGeneration(generation, 1);
+        this.#fail(new WorkerFailure("daemon_failed"));
+      },
     );
     try {
       generation.identity = await Promise.race([
         this.#waitForDaemonReady({
           deadlineMs: 30_000,
           paths: this.#installation.paths,
-          queryStatus: async () => await callLocalDaemon({
+          queryStatus: async () => await this.#callLocalDaemon({
             command: { kind: "daemon.status" },
             deadlineMs: 750,
             paths: this.#installation.paths,
@@ -273,7 +591,10 @@ class DaemonSupervisor {
     } catch (error: unknown) {
       generation.expectedStop ??= "stop";
       generation.controller.abort(new Error("Live-acceptance daemon readiness failed."));
-      await beforeDeadline(generation.promise, 30_000).catch(() => undefined);
+      await beforeDeadline(generation.promise, 30_000).then(
+        (exitCode) => this.#endFaultGeneration(generation, exitCode),
+        () => this.#endFaultGeneration(generation, 1),
+      ).catch(() => undefined);
       throw error instanceof WorkerFailure ? error : new WorkerFailure("daemon_failed");
     }
     if (process.env.HOME !== this.#descriptor.expectedHomeDirectory) {
@@ -287,7 +608,7 @@ class DaemonSupervisor {
   ): Promise<CommandResponse> {
     this.#assertRunning();
     const response = await Promise.race([
-      callLocalDaemon({
+      this.#callLocalDaemon({
         command,
         paths: this.#installation.paths,
         signal,
@@ -304,12 +625,62 @@ class DaemonSupervisor {
     return response;
   }
 
+  armCanonicalMemoryResponseDrop(
+    input: LiveAcceptanceMemoryFaultArm,
+  ): LiveAcceptanceMemoryFaultStatus {
+    this.#assertRunning();
+    return this.#memoryFault.arm(input);
+  }
+
+  canonicalMemoryResponseDropStatus(): LiveAcceptanceMemoryFaultStatus {
+    this.#assertRunning();
+    return this.#memoryFault.status();
+  }
+
+  finalizeCanonicalMemoryResponseDrop(
+    input: LiveAcceptanceMemoryFaultFinalize,
+  ): LiveAcceptanceMemoryFaultStatus {
+    this.#assertRunning();
+    return this.#memoryFault.finalize(input);
+  }
+
+  currentDaemonGeneration(): number {
+    this.#assertRunning();
+    const generation = this.#generation?.identity?.generation;
+    if (generation === undefined) throw new WorkerFailure("daemon_failed");
+    return generation;
+  }
+
+  armClaudeProof(input: ClaudeLiveAcceptanceWorkerArm): void {
+    this.#assertRunning();
+    if (this.#claudeProof === undefined) throw new WorkerFailure("control_invalid");
+    this.#claudeProof.armObservedFreshSession(input);
+  }
+
+  observeClaudeCommandResponse(command: LocalCommand, response: CommandResponse): void {
+    if (this.#claudeProof === undefined) return;
+    if (command.kind !== "session.start" && command.kind !== "session.send") return;
+    this.#assertRunning();
+    this.#claudeProof.observeCommandResponse(command, response);
+  }
+
+  readClaudeProvisionalProof(): ClaudeLiveAcceptanceProvisionalPrivateReceipt {
+    this.#assertRunning();
+    if (this.#claudeProof === undefined) throw new WorkerFailure("control_invalid");
+    return this.#claudeProof.readProvisionalPrivateReceipt();
+  }
+
+  readClaudeFinalProof(): ClaudeLiveAcceptancePrivateReceipt {
+    if (this.#generation !== undefined || this.#claudeProof === undefined) {
+      throw new WorkerFailure("control_invalid");
+    }
+    return this.#claudeProof.readPrivateReceipt();
+  }
+
   async restartAfterResponse(): Promise<void> {
     const generation = this.#generation;
     if (generation === undefined || generation.expectedStop !== "restart") return;
-    await beforeDeadline(generation.promise, 30_000);
-    if (this.#generation !== generation) throw new WorkerFailure("daemon_failed");
-    this.#generation = undefined;
+    await this.#awaitStoppedGeneration(generation);
     await this.start();
   }
 
@@ -358,7 +729,14 @@ class DaemonSupervisor {
     if (generation === undefined) return;
     generation.expectedStop ??= "stop";
     generation.controller.abort(new Error("The live-acceptance worker failed."));
-    await beforeDeadline(generation.promise, 30_000).catch(() => undefined);
+    await beforeDeadline(generation.promise, 30_000).then(
+      (exitCode) => this.#endFaultGeneration(generation, exitCode),
+      () => this.#endFaultGeneration(generation, 1),
+    ).catch(() => undefined);
+  }
+
+  closeMemoryFault(): void {
+    this.#memoryFault.close();
   }
 
   async #stopGeneration(
@@ -373,7 +751,7 @@ class DaemonSupervisor {
     generation.expectedStop = reason;
     if (throughDaemonCommand) {
       if (generation.identity === undefined) throw new WorkerFailure("daemon_failed");
-      const response = await callLocalDaemon({
+      const response = await this.#callLocalDaemon({
         command: { kind: "daemon.stop", expected: generation.identity },
         deadlineMs: 5_000,
         paths: this.#installation.paths,
@@ -391,7 +769,22 @@ class DaemonSupervisor {
     if (exitCode !== 0 || this.#generation !== generation) {
       throw new WorkerFailure("daemon_failed");
     }
+    this.#endFaultGeneration(generation, exitCode);
     this.#generation = undefined;
+  }
+
+  #endFaultGeneration(generation: DaemonGeneration, exitCode: number): void {
+    if (generation.faultEnded) return;
+    generation.faultEnded = true;
+    try {
+      this.#memoryFault.endGeneration({
+        exitCode,
+        generation: generation.faultGeneration,
+        reason: generation.expectedStop ?? "stop",
+      });
+    } catch (error: unknown) {
+      this.#fail(error instanceof Error ? error : new WorkerFailure("daemon_failed"));
+    }
   }
 
   #assertRunning(): void {
@@ -485,6 +878,7 @@ async function executeCliControl(
         ? signal
         : AbortSignal.any([signal, commandSignal]);
       const response = await supervisor.command(command, combinedSignal);
+      supervisor.observeClaudeCommandResponse(command, response);
       restartRequired ||= responseRequiresRestart(response);
       return response;
     },
@@ -538,6 +932,88 @@ async function handleControl(
       version: 1,
     });
     return null;
+  }
+  if (control.type === "memory_fault_arm") {
+    await status.write({
+      requestId: control.requestId,
+      status: supervisor.armCanonicalMemoryResponseDrop(control.input),
+      type: "memory_fault_result",
+      version: 1,
+    });
+    return null;
+  }
+  if (control.type === "memory_fault_finalize") {
+    await status.write({
+      requestId: control.requestId,
+      status: supervisor.finalizeCanonicalMemoryResponseDrop(control.input),
+      type: "memory_fault_result",
+      version: 1,
+    });
+    return null;
+  }
+  if (control.type === "memory_fault_status") {
+    await status.write({
+      requestId: control.requestId,
+      status: supervisor.canonicalMemoryResponseDropStatus(),
+      type: "memory_fault_result",
+      version: 1,
+    });
+    return null;
+  }
+  if (control.type === "claude_proof_arm") {
+    supervisor.armClaudeProof(control.input);
+    await status.write({
+      action: "arm",
+      requestId: control.requestId,
+      type: "claude_proof_ack",
+      version: 1,
+    });
+    return null;
+  }
+  if (control.type === "claude_proof_read_provisional") {
+    let outcome: Extract<LiveAcceptanceWorkerStatus, {
+      type: "claude_proof_provisional_result";
+    }>["outcome"];
+    try {
+      outcome = {
+        receipt: supervisor.readClaudeProvisionalProof(),
+        status: "ready",
+      };
+    } catch (error: unknown) {
+      if (!(error instanceof ClaudeLiveAcceptanceProofError)) throw error;
+      outcome = error.code === "proof_incomplete"
+        ? { status: "pending" }
+        : { code: error.code, status: "refused" };
+    }
+    await status.write({
+      outcome,
+      requestId: control.requestId,
+      type: "claude_proof_provisional_result",
+      version: 1,
+    });
+    return null;
+  }
+  if (control.type === "claude_proof_stop") {
+    await supervisor.stop("stop", signal);
+    let outcome: Extract<LiveAcceptanceWorkerStatus, {
+      type: "claude_proof_final_result";
+    }>["outcome"];
+    try {
+      outcome = {
+        receipt: supervisor.readClaudeFinalProof(),
+        status: "proved",
+      };
+    } catch (error: unknown) {
+      if (!(error instanceof ClaudeLiveAcceptanceProofError)) throw error;
+      outcome = { code: error.code, status: "refused" };
+    }
+    await status.write({
+      outcome,
+      requestId: control.requestId,
+      type: "claude_proof_final_result",
+      version: 1,
+    });
+    return "stop_requested";
   }
   if (control.type === "command") {
     const response = await supervisor.command(control.command, signal);
@@ -636,6 +1112,7 @@ async function consumeControl(
 
 async function workerMain(
   dependencies: WorkerDependencies = {},
+  mode: WorkerMode = "standard",
 ): Promise<number> {
   let status: StatusWriter | undefined;
   let input: WorkerInput | undefined;
@@ -654,12 +1131,19 @@ async function workerMain(
       throw new WorkerFailure("home_changed");
     }
     await (dependencies.initializeWorkerInstallation ?? initializeWorkerInstallation)(descriptor);
-    supervisor = new DaemonSupervisor(descriptor, dependencies);
+    supervisor = new DaemonSupervisor(
+      descriptor,
+      dependencies,
+      { claudeProof: mode === "claude_proof" },
+    );
     await supervisor.start();
     if (process.env.HOME !== descriptor.expectedHomeDirectory) {
       throw new WorkerFailure("home_changed");
     }
     await status.write({
+      ...(mode === "claude_proof"
+        ? { daemonGeneration: supervisor.currentDaemonGeneration() }
+        : {}),
       device: descriptor.device,
       pid: process.pid,
       runId: descriptor.runId,
@@ -697,6 +1181,7 @@ async function workerMain(
     await status?.close().catch(() => undefined);
     return 1;
   } finally {
+    supervisor?.closeMemoryFault();
     input?.destroy();
   }
 }
@@ -709,6 +1194,8 @@ type LiveAcceptanceWorkerSupervisorTestInput =
       waitForDaemonReady: typeof waitForDaemonReady;
     }>
   | Readonly<{
+      claudeProof?: boolean;
+      callLocalDaemon?: typeof callLocalDaemon;
       initializeWorkerInstallation?: typeof initializeWorkerInstallation;
       kind: "worker_main";
       runDaemon: typeof runDaemon;
@@ -725,15 +1212,29 @@ export async function runLiveAcceptanceWorkerSupervisorForTest(
   input: LiveAcceptanceWorkerSupervisorTestInput,
 ): Promise<number | void> {
   const dependencies = {
+    ...(input.kind === "worker_main" && input.callLocalDaemon !== undefined
+      ? { callLocalDaemon: input.callLocalDaemon }
+      : {}),
     ...(input.kind === "worker_main" && input.initializeWorkerInstallation !== undefined
       ? { initializeWorkerInstallation: input.initializeWorkerInstallation }
       : {}),
     runDaemon: input.runDaemon,
     waitForDaemonReady: input.waitForDaemonReady,
   };
-  if (input.kind === "worker_main") return await workerMain(dependencies);
+  if (input.kind === "worker_main") {
+    return await workerMain(dependencies, input.claudeProof === true ? "claude_proof" : "standard");
+  }
   const supervisor = new DaemonSupervisor(input.descriptor, dependencies);
   await supervisor.start();
 }
 
-if (import.meta.main) process.exitCode = await workerMain();
+if (import.meta.main) {
+  const mode = (() => {
+    try {
+      return workerModeFromArgv(Bun.argv.slice(2));
+    } catch {
+      return null;
+    }
+  })();
+  process.exitCode = mode === null ? 1 : await workerMain({}, mode);
+}

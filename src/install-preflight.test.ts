@@ -156,7 +156,7 @@ const officialReleaseRecord = (
   draft: false,
   id: 9_715_113,
   immutable: true,
-  tag_name: "v0.6.1",
+  tag_name: "v0.7.0",
   ...overrides,
 });
 
@@ -656,7 +656,7 @@ beforeAll(async () => {
     root,
   ], { cwd: repositoryRoot });
   if (packed.exitCode !== 0) throw new Error(`Could not build installer fixture: ${packed.stderr}${packed.stdout}`);
-  const productionArchivePath = join(root, "hraness-hra-0.6.1.tgz");
+  const productionArchivePath = join(root, "hraness-hra-0.7.0.tgz");
   const extractedRoot = join(root, "extracted");
   await mkdir(extractedRoot, { mode: 0o700 });
   const extracted = await run(["tar", "-xzf", productionArchivePath, "-C", extractedRoot], { cwd: root });
@@ -705,7 +705,7 @@ afterAll(async () => {
 describe("transactional HRA installer", () => {
   test("strips only dependency maps from the private installer fixture", () => {
     expect(sourcePackageManifest.dependencies).toEqual({
-      "@hraness/oh": "0.2.7",
+      "@hraness/oh": "0.4.1",
       "@openai/codex": "0.153.2",
       convex: "1.45.0",
       effect: "3.22.1",
@@ -719,10 +719,10 @@ describe("transactional HRA installer", () => {
 
   test("binds the public command to one tagged preflight and one exact tagged archive", async () => {
     expect(HRA_INSTALL_PREFLIGHT_SOURCE_URL).toBe(
-      "https://raw.githubusercontent.com/hraness/hra/v0.6.1/src/install-preflight-runtime.ts",
+      "https://raw.githubusercontent.com/hraness/hra/v0.7.0/src/install-preflight-runtime.ts",
     );
     expect(HRA_INSTALL_ARCHIVE_URL).toBe(
-      "https://github.com/hraness/hra/releases/download/v0.6.1/hraness-hra-0.6.1.tgz",
+      "https://github.com/hraness/hra/releases/download/v0.7.0/hraness-hra-0.7.0.tgz",
     );
     const runtimeBytes = await readFile(resolve(import.meta.dir, "install-preflight-runtime.ts"));
     // The public digest names the runtime at the released tag; the working
@@ -866,7 +866,7 @@ describe("transactional HRA installer", () => {
       archiveAssetId: 8_675_309,
       archiveBytes: 123,
       archiveReleaseId: 9_715_113,
-      archiveReleaseTag: "v0.6.1",
+      archiveReleaseTag: "v0.7.0",
       archiveRepositoryId: HRA_INSTALL_REPOSITORY_ID,
       archiveSha256,
       archiveSource: "official",
@@ -907,7 +907,7 @@ describe("transactional HRA installer", () => {
         message: "one exact archive asset",
         record: officialReleaseRecord({
           assets: [officialArchiveAsset({
-            browser_download_url: "https://example.com/hra-v0.6.1.tgz",
+            browser_download_url: "https://example.com/hra-v0.7.0.tgz",
             name: "other.tgz",
           })],
         }),
@@ -964,7 +964,7 @@ describe("transactional HRA installer", () => {
       expect(call.init.signal).toBeInstanceOf(AbortSignal);
       expect(headers.get("accept")).toBe("application/vnd.github+json");
       expect(headers.get("accept-encoding")).toBe("identity");
-      expect(headers.get("user-agent")).toBe("hra-installer/0.6.1");
+      expect(headers.get("user-agent")).toBe("hra-installer/0.7.0");
       expect(headers.get("x-github-api-version")).toBe("2022-11-28");
       expect(headers.get("authorization")).toBeNull();
     }
@@ -1066,7 +1066,7 @@ describe("transactional HRA installer", () => {
       "install",
       "global",
       "package.json",
-    ))).toEqual({ dependencies: { "@hraness/hra": "0.6.1" } });
+    ))).toEqual({ dependencies: { "@hraness/hra": "0.7.0" } });
 
     const second = await runInstaller(root);
     expect(second).toEqual({
@@ -1077,6 +1077,44 @@ describe("transactional HRA installer", () => {
     expect(await realpath(activePath)).toBe(activeTarget);
     expect(await readdir(join(bunRoot, "install", "hra", "versions"))).toEqual(versions);
   }, SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS);
+
+  test("rejects a staged loopback archive URL with a malformed route UUID or archive filename", async () => {
+    for (const mutation of ["route-uuid", "archive-name"] as const) {
+      const root = await makeRoot(`hra-install-loopback-${mutation}-`);
+      await mkdir(join(root, "home"), { mode: 0o700 });
+      const authorityRoot = join(root, "bun root", "install", "hra");
+      const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+      const program = [
+        `const module = await import(${JSON.stringify(runtimePath)});`,
+        `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+        `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
+        "  afterStageWorkerExit: async () => {",
+        '    const fs = await import("node:fs/promises");',
+        '    const path = await import("node:path");',
+        `    const authorityRoot = ${JSON.stringify(authorityRoot)};`,
+        '    const stageName = (await fs.readdir(authorityRoot)).find((entry) => entry.startsWith(".staging-"));',
+        '    if (!stageName) throw new Error("staging root is missing");',
+        '    const manifestPath = path.join(authorityRoot, stageName, "install", "global", "package.json");',
+        "    const manifest = JSON.parse(await fs.readFile(manifestPath, \"utf8\"));",
+        "    const archiveUrl = new URL(manifest.dependencies[module.HRA_INSTALL_PACKAGE_NAME]);",
+        mutation === "route-uuid"
+          ? '    archiveUrl.pathname = "/not-a-v4-uuid/" + module.HRA_INSTALL_ARCHIVE_NAME;'
+          : '    archiveUrl.pathname = archiveUrl.pathname.replace(/[^/]+$/u, "unexpected.tgz");',
+        "    manifest.dependencies[module.HRA_INSTALL_PACKAGE_NAME] = archiveUrl.toString();",
+        '    await fs.writeFile(manifestPath, JSON.stringify(manifest) + "\\n", { mode: 0o600 });',
+        "  },",
+        "});",
+      ].join("\n");
+      const result = await run([process.execPath, "-e", program], {
+        cwd: root,
+        environment: installEnvironment(root),
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("descriptor-bound loopback archive authority");
+      expect(result.stdout).toBe("");
+      expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    }
+  }, 60_000);
 
   test("scrubs ambient runtime preloads from the detached worker and Bun add", async () => {
     const root = await makeRoot("hra-install-runtime-preload-");
@@ -1141,92 +1179,115 @@ describe("transactional HRA installer", () => {
     await expectNoStartedInstall(legacy);
   }, SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS);
 
-  test("refuses and preserves an interrupted intent owned by an earlier immutable release", async () => {
-    const root = await makeRoot("hra-install-prior-release-intent-");
-    const previous = await createSyntheticPreviousInstall(root, {
-      archiveSource: "official",
-      packageName: "@hraness/hra",
-      packageVersion: "0.5.0",
-    });
-    const priorArchiveSha256 = "f9f1bfecddd867e4ca781a2a045dc9573bd91eb9810fef75b2d28e8af0c37813";
-    const priorNormalizerSha256 = "8c739ce5bf5e52071ef805cec6aaf8e992005348b74b0264a3b88b6593be1cd9";
-    const priorCliSha256 = "0b2f72b51ddee7a90d5a395960cba98a046da74484808aca9801167d61844ba3";
-    const priorVersionRoot = join(previous.versionsRoot, [
-      "v0.6.0",
-      "official",
-      priorArchiveSha256,
-      priorNormalizerSha256,
-      priorCliSha256,
-    ].join("-"));
-    const priorStagingRoot = join(
-      previous.authorityRoot,
-      ".staging-00000000-0000-4000-8000-000000000002",
-    );
-    const intentPath = join(previous.authorityRoot, "install-intent.json");
-    const stageSentinelPath = join(priorStagingRoot, "prior-release-stage");
-    await mkdir(priorStagingRoot, { mode: 0o700 });
-    await chmod(priorStagingRoot, 0o700);
-    await writeFile(stageSentinelPath, "prior release stage\n", { mode: 0o600 });
-    const priorIntent = {
+  for (const priorRelease of [
+    {
+      tag: "v0.6.0",
       archive: "https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz",
       archiveAssetId: 547_641_759,
       archiveBytes: 1_101_240,
       archiveReleaseId: 383_705_969,
-      archiveReleaseTag: "v0.6.0",
-      archiveRepositoryId: HRA_INSTALL_REPOSITORY_ID,
-      archiveSha256: priorArchiveSha256,
-      archiveSource: "official",
-      createdAt: 1_757_192_400_000,
-      id: "00000000-0000-4000-8000-000000000002",
-      normalizerSha256: priorNormalizerSha256,
-      phase: "prepared",
-      previousActiveTarget: previous.cliPath,
-      stagingRoot: priorStagingRoot,
-      version: 2,
-      versionRoot: priorVersionRoot,
-    } as const;
-    await writePrivateJson(intentPath, priorIntent);
-    const activeTargetBefore = await readlink(previous.activePath);
-    const intentBefore = await readFile(intentPath);
-    const previousReceiptBefore = await readFile(previous.receiptPath);
-    const previousTreeBefore = await measureSyntheticVersion(previous.versionRoot);
-    const versionsBefore = (await readdir(previous.versionsRoot)).sort();
-    const stageSentinelBefore = await readFile(stageSentinelPath);
+      archiveSha256: "f9f1bfecddd867e4ca781a2a045dc9573bd91eb9810fef75b2d28e8af0c37813",
+      normalizerSha256: "8c739ce5bf5e52071ef805cec6aaf8e992005348b74b0264a3b88b6593be1cd9",
+      cliSha256: "0b2f72b51ddee7a90d5a395960cba98a046da74484808aca9801167d61844ba3",
+    },
+    {
+      tag: "v0.6.2",
+      archive: "https://github.com/hraness/hra/releases/download/v0.6.2/hraness-hra-0.6.2.tgz",
+      archiveAssetId: 549_302_017,
+      archiveBytes: 1_160_242,
+      archiveReleaseId: 384_290_677,
+      archiveSha256: "b5bc2a9125885c6ace33a70137202e99e1d6774f5d8945fac9bb96b6353c930c",
+      normalizerSha256: "2f9851effc7b52f59ee3ef8d0e5e096d33fb7e63bcb1fff1d533c2207d003148",
+      cliSha256: "2974ddeb3795f6d896b365c2f2c0bff92e745ccd047e1628ef9acb5f2a5e0f1e",
+    },
+  ]) {
+    test(`refuses and preserves an interrupted intent owned by immutable ${priorRelease.tag}`, async () => {
+      const root = await makeRoot("hra-install-prior-release-intent-");
+      const previous = await createSyntheticPreviousInstall(root, {
+        archiveSource: "official",
+        packageName: "@hraness/hra",
+        packageVersion: "0.5.0",
+      });
+      const priorArchiveSha256 = priorRelease.archiveSha256;
+      const priorNormalizerSha256 = priorRelease.normalizerSha256;
+      const priorCliSha256 = priorRelease.cliSha256;
+      const priorVersionRoot = join(previous.versionsRoot, [
+        priorRelease.tag,
+        "official",
+        priorArchiveSha256,
+        priorNormalizerSha256,
+        priorCliSha256,
+      ].join("-"));
+      const priorStagingRoot = join(
+        previous.authorityRoot,
+        ".staging-00000000-0000-4000-8000-000000000002",
+      );
+      const intentPath = join(previous.authorityRoot, "install-intent.json");
+      const stageSentinelPath = join(priorStagingRoot, "prior-release-stage");
+      await mkdir(priorStagingRoot, { mode: 0o700 });
+      await chmod(priorStagingRoot, 0o700);
+      await writeFile(stageSentinelPath, "prior release stage\n", { mode: 0o600 });
+      const priorIntent = {
+        archive: priorRelease.archive,
+        archiveAssetId: priorRelease.archiveAssetId,
+        archiveBytes: priorRelease.archiveBytes,
+        archiveReleaseId: priorRelease.archiveReleaseId,
+        archiveReleaseTag: priorRelease.tag,
+        archiveRepositoryId: HRA_INSTALL_REPOSITORY_ID,
+        archiveSha256: priorArchiveSha256,
+        archiveSource: "official",
+        createdAt: 1_757_192_400_000,
+        id: "00000000-0000-4000-8000-000000000002",
+        normalizerSha256: priorNormalizerSha256,
+        phase: "prepared",
+        previousActiveTarget: previous.cliPath,
+        stagingRoot: priorStagingRoot,
+        version: 2,
+        versionRoot: priorVersionRoot,
+      } as const;
+      await writePrivateJson(intentPath, priorIntent);
+      const activeTargetBefore = await readlink(previous.activePath);
+      const intentBefore = await readFile(intentPath);
+      const previousReceiptBefore = await readFile(previous.receiptPath);
+      const previousTreeBefore = await measureSyntheticVersion(previous.versionRoot);
+      const versionsBefore = (await readdir(previous.versionsRoot)).sort();
+      const stageSentinelBefore = await readFile(stageSentinelPath);
 
-    const result = await runInstaller(root);
+      const result = await runInstaller(root);
 
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toContain("invalid or belongs to another release");
-    expect(result.stderr).toContain("rerun the exact originating release installer");
-    expect(result.stdout).toBe("");
-    expect(await readlink(previous.activePath)).toBe(activeTargetBefore);
-    expect(await readFile(intentPath)).toEqual(intentBefore);
-    expect(await readFile(previous.receiptPath)).toEqual(previousReceiptBefore);
-    expect(await measureSyntheticVersion(previous.versionRoot)).toEqual(previousTreeBefore);
-    expect((await readdir(previous.versionsRoot)).sort()).toEqual(versionsBefore);
-    expect(await readFile(stageSentinelPath)).toEqual(stageSentinelBefore);
-    expect((await lstat(priorStagingRoot)).mode & 0o777).toBe(0o700);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("invalid or belongs to another release");
+      expect(result.stderr).toContain("rerun the exact originating release installer");
+      expect(result.stdout).toBe("");
+      expect(await readlink(previous.activePath)).toBe(activeTargetBefore);
+      expect(await readFile(intentPath)).toEqual(intentBefore);
+      expect(await readFile(previous.receiptPath)).toEqual(previousReceiptBefore);
+      expect(await measureSyntheticVersion(previous.versionRoot)).toEqual(previousTreeBefore);
+      expect((await readdir(previous.versionsRoot)).sort()).toEqual(versionsBefore);
+      expect(await readFile(stageSentinelPath)).toEqual(stageSentinelBefore);
+      expect((await lstat(priorStagingRoot)).mode & 0o777).toBe(0o700);
 
-    // A release may reuse an unchanged normalizer. The current installer must
-    // still render the same actionable, non-mutating refusal when parsing gets
-    // as far as the foreign release tag instead of relying on a digest change.
-    await writePrivateJson(intentPath, {
-      ...priorIntent,
-      normalizerSha256: HRA_INSTALL_NORMALIZER_SHA256,
+      // A release may reuse an unchanged normalizer. The current installer must
+      // still render the same actionable, non-mutating refusal when parsing gets
+      // as far as the foreign release tag instead of relying on a digest change.
+      await writePrivateJson(intentPath, {
+        ...priorIntent,
+        normalizerSha256: HRA_INSTALL_NORMALIZER_SHA256,
+      });
+      const sameNormalizerIntent = await readFile(intentPath);
+      const sameNormalizerResult = await runInstaller(root);
+      expect(sameNormalizerResult.exitCode).not.toBe(0);
+      expect(sameNormalizerResult.stderr).toContain("invalid or belongs to another release");
+      expect(sameNormalizerResult.stderr).toContain("rerun the exact originating release installer");
+      expect(sameNormalizerResult.stdout).toBe("");
+      expect(await readFile(intentPath)).toEqual(sameNormalizerIntent);
+      expect(await readlink(previous.activePath)).toBe(activeTargetBefore);
+      expect(await readFile(previous.receiptPath)).toEqual(previousReceiptBefore);
+      expect(await measureSyntheticVersion(previous.versionRoot)).toEqual(previousTreeBefore);
+      expect((await readdir(previous.versionsRoot)).sort()).toEqual(versionsBefore);
+      expect(await readFile(stageSentinelPath)).toEqual(stageSentinelBefore);
     });
-    const sameNormalizerIntent = await readFile(intentPath);
-    const sameNormalizerResult = await runInstaller(root);
-    expect(sameNormalizerResult.exitCode).not.toBe(0);
-    expect(sameNormalizerResult.stderr).toContain("invalid or belongs to another release");
-    expect(sameNormalizerResult.stderr).toContain("rerun the exact originating release installer");
-    expect(sameNormalizerResult.stdout).toBe("");
-    expect(await readFile(intentPath)).toEqual(sameNormalizerIntent);
-    expect(await readlink(previous.activePath)).toBe(activeTargetBefore);
-    expect(await readFile(previous.receiptPath)).toEqual(previousReceiptBefore);
-    expect(await measureSyntheticVersion(previous.versionRoot)).toEqual(previousTreeBefore);
-    expect((await readdir(previous.versionsRoot)).sort()).toEqual(versionsBefore);
-    expect(await readFile(stageSentinelPath)).toEqual(stageSentinelBefore);
-  });
+  }
 
   test("accepts an older scoped official release as verified previous authority", async () => {
     const root = await makeRoot("hra-install-older-scoped-");

@@ -15,7 +15,10 @@ import {
   terminalizeDeviceCommandWithLifecycleCapacity,
   terminalizeSessionCommandWithLifecycleCapacity,
 } from "./commandLifecycle";
-import { ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS } from "./lifecyclePolicy";
+import {
+  ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS,
+  type HOSTED_TABLE_LIFECYCLE,
+} from "./lifecyclePolicy";
 import { attentionNotificationQuotaReservations } from "./attentionNotifications";
 import {
   patchDeviceRevocationJobWithCapacity,
@@ -64,6 +67,74 @@ export const DEVICE_REVOCATION_SCHEMA_GAPS = Object.freeze([] as const);
 export const DEVICE_REVOCATION_RETAINED_SERVICE_TABLES = Object.freeze([
   "attentionNotificationSafetyFaults",
 ] as const);
+
+export const DEVICE_REVOCATION_TABLE_STRATEGY = {
+  users: "not_device_owned",
+  authSessions: "not_device_owned",
+  authAccounts: "not_device_owned",
+  authRefreshTokens: "not_device_owned",
+  authVerificationCodes: "not_device_owned",
+  authVerifiers: "not_device_owned",
+  authRateLimits: "not_device_owned",
+  authSubjects: "not_device_owned",
+  authEmailAttemptEvents: "not_device_owned",
+  authOtpChallenges: "not_device_owned",
+  authInvites: "not_device_owned",
+  devices: "target_row_retained_revoked",
+  accountDeletionIdentityReservations: "not_device_owned",
+  accountDeletionJobReservations: "not_device_owned",
+  deviceRevocationDeviceReservations: "target_revocation_capacity_consumed",
+  deviceRevocationJobReservations: "target_revocation_capacity_consumed",
+  deviceRevocationSecurityReservations: "target_revocation_capacity_consumed",
+  deviceRevocationReceiptReservations: "target_revocation_capacity_consumed",
+  deviceSessions: "target_custody_deleted",
+  deviceBindChallenges: "target_custody_deleted",
+  deviceKeyEnvelopes: "target_custody_deleted",
+  recoveryEnvelopes: "not_device_owned",
+  devicePresence: "target_presence_deleted",
+  deviceRegistries: "target_custody_deleted",
+  memorySpaces: "not_device_owned",
+  memoryOperations: "source_attribution_retained",
+  sessionHeads: "target_sessions_orphaned",
+  sessionChunks: "source_attribution_retained",
+  sessionStreamEpochs: "source_attribution_retained",
+  executionLeases: "target_lease_deleted",
+  sessionCommands: "target_commands_terminalized",
+  deviceCommands: "target_commands_terminalized",
+  commandLifecycleReservations: "target_commands_terminalized",
+  commandTerminalSecurityReservations: "target_commands_terminalized",
+  attentionNotificationOutbox: "target_notifications_suppressed",
+  attentionNotificationSafetyFaults: "service_retained",
+  codexAccounts: "not_device_owned",
+  deviceAccountBindings: "target_binding_deleted",
+  accountUsageSnapshots: "source_attribution_retained",
+  idempotencyReceipts: "source_attribution_retained",
+  securityEvents: "source_attribution_retained",
+  accountDeletionJobs: "not_device_owned",
+  accountDeletionReceipts: "not_device_owned",
+  deviceRevocationJobs: "revocation_job",
+  storageUsageByUser: "not_device_owned",
+  storageUsageService: "service_retained",
+  serviceControl: "service_retained",
+  storageResourceUsageByUser: "not_device_owned",
+  storageResourceUsageByAccount: "not_device_owned",
+  maintenanceState: "service_retained",
+} as const satisfies Readonly<Record<
+  keyof typeof HOSTED_TABLE_LIFECYCLE,
+  | "not_device_owned"
+  | "revocation_job"
+  | "service_retained"
+  | "source_attribution_retained"
+  | "target_binding_deleted"
+  | "target_commands_terminalized"
+  | "target_custody_deleted"
+  | "target_lease_deleted"
+  | "target_notifications_suppressed"
+  | "target_presence_deleted"
+  | "target_row_retained_revoked"
+  | "target_revocation_capacity_consumed"
+  | "target_sessions_orphaned"
+>>;
 
 function rejectRevocation(): never {
   throw new Error("Device revocation status is unavailable.");

@@ -1,7 +1,7 @@
 # Contents
 
 - The daemon hosts the local command authority, long-running provider processes, and opaque session-memory lifecycle coordination.
-- One session binds one provider for its life. The service selects that provider's `SessionRuntimePort` for start, turns, steering, interrupt, projection reads, and interactions; the Claude bridge's facts are reduced to the one neutral fact vocabulary before they reach the timeline.
+- One session binds one provider at a time. An explicit provider switch receipts the target and handoff seed before releasing the source and committing the new binding. The service selects the bound provider's `SessionRuntimePort` for start, turns, steering, interrupt, projection reads, and interactions; the Claude bridge's facts are reduced to the one neutral fact vocabulary before they reach the timeline.
 - The Unix socket transports one bounded authenticated request at a time.
 - Autorespond decides who answers an approval: the protocol path answers provider requests, the prose path answers an assistant turn that asks only for consent through the responder port.
 - Gateway key custody keeps the responder credential in one user-only file, never in a journal, log, or projection.

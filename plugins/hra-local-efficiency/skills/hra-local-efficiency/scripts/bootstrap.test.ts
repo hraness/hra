@@ -80,7 +80,7 @@ exit 2
   chmodSync(executable, 0o755);
   return {
     ...process.env,
-    PATH: `${tools}:${process.env.PATH ?? ""}`,
+    PATH: tools,
   };
 }
 
@@ -532,6 +532,7 @@ describe("machine bootstrap", () => {
         "--bun-bin",
         bunBin,
       ],
+      env: fakeClaude(root),
       stderr: "pipe",
     });
 
@@ -568,7 +569,7 @@ describe("machine bootstrap", () => {
         "--bun-bin",
         bunBin,
       ],
-      env: { ...process.env, HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
+      env: { ...fakeClaude(root), HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
       stderr: "pipe",
     });
     expect(result.exitCode).toBe(1);
@@ -602,7 +603,7 @@ describe("machine bootstrap", () => {
         "--bun-bin",
         bunBin,
       ],
-      env: { ...process.env, HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
+      env: { ...fakeClaude(root), HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
       stderr: "pipe",
     });
     expect(result.exitCode).toBe(1);
@@ -631,7 +632,7 @@ describe("machine bootstrap", () => {
     const modulePath = join(root, "host-resources.js");
     writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
     const environment = {
-      ...process.env,
+      ...fakeClaude(root),
       BUN_INSTALL: globalRoot,
       HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
     };
@@ -708,7 +709,7 @@ describe("machine bootstrap", () => {
         "--bun-bin",
         bunBin,
       ],
-      env: { ...process.env, HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
+      env: { ...fakeClaude(root), HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
       stderr: "pipe",
     });
 
@@ -836,7 +837,7 @@ describe("machine bootstrap", () => {
         "--bun-bin",
         bunBin,
       ],
-      env: { ...process.env, HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
+      env: { ...fakeClaude(root), HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
       stderr: "pipe",
     });
 

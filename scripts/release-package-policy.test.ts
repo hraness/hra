@@ -11,7 +11,7 @@ import {
 
 const readyManifest = {
   bin: { hra: "./src/cli.ts" },
-  dependencies: { "@hraness/oh": "0.2.7", zod: "4.4.3" },
+  dependencies: { "@hraness/oh": "0.4.1", zod: "4.4.3" },
   license: "MIT",
   name: "@hraness/hra",
   publishConfig: { access: "public", registry: "https://registry.npmjs.org" },
@@ -20,7 +20,7 @@ const readyManifest = {
 
 describe("HRA public release package policy", () => {
   test("accepts one public MIT scoped package with the exact public Oh release", () => {
-    expect(HRA_RELEASE_OH_VERSION).toBe("0.2.7");
+    expect(HRA_RELEASE_OH_VERSION).toBe("0.4.1");
     expect(assertReleasePackageReady(readyManifest)).toEqual({
       blockers: [],
       name: "@hraness/hra",
@@ -31,13 +31,13 @@ describe("HRA public release package policy", () => {
 
   test("fails closed on GitHub, URL, workspace, range, moving, and wrong exact Oh dependencies", () => {
     for (const version of [
-      "github:hraness/oh#v0.2.0",
+      "github:hraness/oh#v0.4.1",
       "https://example.com/oh.tgz",
       "workspace:*",
-      "^0.2.7",
+      "^0.4.1",
       "latest",
-      "0.2.6",
-      "0.2.8",
+      "0.4.0",
+      "0.4.2",
     ]) {
       const manifest = structuredClone(readyManifest);
       manifest.dependencies["@hraness/oh"] = version;
@@ -60,7 +60,7 @@ describe("HRA public release package policy", () => {
     expect(inspectReleasePackage(manifest)).toEqual({
       blockers: [],
       name: "@hraness/hra",
-      version: "0.6.1",
+      version: "0.7.0",
     });
     expect(assertReleasePackageReady(manifest).blockers).toEqual([]);
   });

@@ -9,6 +9,7 @@ export type StatePaths = {
   database: string;
   factsMemoryControl: string;
   factsMemorySessions: string;
+  projectMemory: string;
   profiles: string;
   runtime: string;
   socket: string;
@@ -55,6 +56,7 @@ export function resolveStatePaths(input: { homeDirectory?: string; platform?: No
     database: join(root, "control-plane.sqlite"),
     factsMemoryControl: join(root, "facts-memory-control.sqlite"),
     factsMemorySessions: join(root, "facts-memory-sessions"),
+    projectMemory: join(root, "project-memory"),
     profiles: join(root, "profiles"),
     runtime,
     socket: join(runtime, "daemon.sock"),
@@ -93,6 +95,7 @@ export async function ensurePrivateDirectory(path: string): Promise<string> {
 export async function initializeStatePaths(paths: StatePaths): Promise<void> {
   await ensurePrivateDirectory(paths.root);
   await ensurePrivateDirectory(paths.factsMemorySessions);
+  await ensurePrivateDirectory(paths.projectMemory);
   await ensurePrivateDirectory(paths.profiles);
   await ensurePrivateDirectory(paths.runtime);
 }

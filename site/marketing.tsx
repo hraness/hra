@@ -141,10 +141,10 @@ export function renderMarketingPage(content: PublicContent, referenceMarkup: str
       </MarketingSection>
       <MarketingInstallPanel
         eyebrow={`Local release · v${content.releaseVersion}`}
-        heading="Install the verified CLI."
+        heading="Install after release admission."
         headingId="install-command-heading"
         id="install-command"
-        note={<p className={classes("install-note", "installNote")}>One command downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.</p>}
+        note={<p className={classes("install-note", "installNote")}>This release candidate is not yet admitted. Use this command only after immutable GitHub and npm release admission. It downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.</p>}
       >
         <pre className={classes("install-command", "codeBlock", "installCommand", "focusable")} tabIndex={0}>
           <ShellCode command={content.installCommand} />
@@ -192,7 +192,7 @@ export function renderMarketingPage(content: PublicContent, referenceMarkup: str
         heading="Give every session the same terminal."
         headingId="closing-heading"
         id="closing"
-        summary="Install and verify the live CLI artifact. After the rollout prerequisite is satisfied, initialize it, add one account, and start a session that outlives the tab it began in."
+        summary="After the candidate is admitted, install and verify its CLI artifact. After the rollout prerequisite is satisfied, initialize it, add one account, and start a session that outlives the tab it began in."
         tone="paper"
       />
       <div className={classes("reference", "reference")} id="reference" dangerouslySetInnerHTML={{ __html: referenceMarkup }} />

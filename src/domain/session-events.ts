@@ -96,6 +96,7 @@ export const sessionMessageActorSchema = z.enum([
   "human",
   "automation",
   "autorespond",
+  "peer_session",
   "provider_switch",
 ]);
 

@@ -78,6 +78,22 @@ export const settingsScreenStyles = stylex.create({
     minHeight: "100dvh",
     width: "100%",
   },
+  memoryRecords: {
+    color: "var(--color-ink-muted)",
+    display: "flex",
+    flexDirection: "column",
+    fontSize: "0.75rem",
+    gap: "0.25rem",
+    lineHeight: "1rem",
+    listStyleType: "none",
+    marginBlock: 0,
+    marginInline: 0,
+    paddingBlock: 0,
+    paddingInline: 0,
+  },
+  memoryRecordKey: {
+    fontFamily: "var(--font-mono)",
+  },
   timeZoneInput: {
     flex: 1,
     minWidth: "10rem",
