@@ -1226,7 +1226,32 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 const sha256 = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 const sha256Pattern = /^[0-9a-f]{64}$/u;
-const semverPattern = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(?:\.(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
+const semverCorePattern = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
+const semverIdentifierPattern = /^[0-9A-Za-z-]+$/u;
+const semverNumericIdentifierPattern = /^[0-9]+$/u;
+const validSemverIdentifiers = (value: string, allowNumericLeadingZeroes: boolean): boolean =>
+  value.split(".").every((identifier) => semverIdentifierPattern.test(identifier)
+    && (allowNumericLeadingZeroes
+      || identifier.length === 1
+      || !identifier.startsWith("0")
+      || !semverNumericIdentifierPattern.test(identifier)));
+
+// Keep each identifier independent: overlapping alphabetic matches inside a
+// repeated prerelease group can backtrack exponentially, even below 128 chars.
+// These delimiter splits and unambiguous character scans are linear in input.
+export const isHraInstallReceiptVersion = (value: string): boolean => {
+  if (value.length > 128) return false;
+  const buildSeparator = value.indexOf("+");
+  const withoutBuild = buildSeparator === -1 ? value : value.slice(0, buildSeparator);
+  if (buildSeparator !== -1 && !validSemverIdentifiers(value.slice(buildSeparator + 1), true)) {
+    return false;
+  }
+  const prereleaseSeparator = withoutBuild.indexOf("-");
+  const core = prereleaseSeparator === -1 ? withoutBuild : withoutBuild.slice(0, prereleaseSeparator);
+  return semverCorePattern.test(core)
+    && (prereleaseSeparator === -1
+      || validSemverIdentifiers(withoutBuild.slice(prereleaseSeparator + 1), false));
+};
 const positiveSafeInteger = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 
@@ -1773,7 +1798,7 @@ const parseReceipt = (value: unknown): CompleteReceipt => {
       && value.packageName !== HRA_LEGACY_INSTALL_PACKAGE_NAME)
     || typeof value.packageVersion !== "string"
     || value.packageVersion.length > 128
-    || !semverPattern.test(value.packageVersion)
+    || !isHraInstallReceiptVersion(value.packageVersion)
     || typeof value.totalBytes !== "number"
     || !Number.isSafeInteger(value.totalBytes)
     || value.totalBytes < 1
