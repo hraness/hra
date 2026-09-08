@@ -512,17 +512,30 @@ export const normalizeReviewedSyntheticHistoryPatch = (
   return normalized;
 };
 
+export const selectReviewedGitHistoryPatchEvidence = (
+  commit: string,
+  kind: GitHistoryPatchKind,
+): Readonly<{
+  fixtures: readonly ReviewedSyntheticHistoryFixture[];
+  patchSha256: string;
+}> | undefined => {
+  if (!Object.hasOwn(reviewedSyntheticHistoryPatchEvidence, commit)) return undefined;
+  const evidence = reviewedSyntheticHistoryPatchEvidence[commit];
+  if (evidence === undefined) return undefined;
+  return Object.freeze({
+    fixtures: evidence.fixtures,
+    patchSha256: kind === "public_patch" ? evidence.publicPatchSha256 : evidence.sensitivePatchSha256,
+  });
+};
+
 export const normalizeGitHistoryPatchForPublicScan = (
   commit: string,
   kind: GitHistoryPatchKind,
   patch: string,
 ): string => {
-  const evidence = reviewedSyntheticHistoryPatchEvidence[commit];
+  const evidence = selectReviewedGitHistoryPatchEvidence(commit, kind);
   if (evidence === undefined) return patch;
-  const expectedPatchSha256 = kind === "public_patch"
-    ? evidence.publicPatchSha256
-    : evidence.sensitivePatchSha256;
-  return normalizeReviewedSyntheticHistoryPatch(patch, expectedPatchSha256, evidence.fixtures);
+  return normalizeReviewedSyntheticHistoryPatch(patch, evidence.patchSha256, evidence.fixtures);
 };
 
 type GitHistorySpawnResult = Readonly<{

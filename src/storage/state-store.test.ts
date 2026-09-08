@@ -7,7 +7,6 @@ import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 
 import { Database, constants as sqliteConstants } from "bun:sqlite";
-import fc from "fast-check";
 import { z } from "zod";
 
 import { deriveDesktopProfilePaths } from "../desktop/profile";
@@ -1653,11 +1652,12 @@ describe("account mutation successor authority", () => {
     });
   }
 
-  test("keeps origin and effect invariant for arbitrary bounded successor counts", async () => {
-    await fc.assert(fc.asyncProperty(
-      fc.constantFrom("account.login" as const, "account.logout" as const, "account.login-cancel" as const),
-      fc.integer({ min: 1, max: 8 }),
-      async (kind, rollovers) => {
+  // Enumerate the complete finite domain instead of sampling 12 combinations.
+  // Each case owns its fixture cleanup and default timeout; this increases
+  // coverage, not a claim that the total suite performs less work.
+  for (const kind of ["account.login", "account.logout", "account.login-cancel"] as const) {
+    for (const rollovers of [1, 2, 3, 4, 5, 6, 7, 8]) {
+      test(`keeps origin and effect invariant for ${kind} through ${rollovers} successor rollovers`, async () => {
         const { store, profile, attempt, key } = await seed(kind);
         const original = store.readMutation(key)?.evidence;
         for (let index = 0; index < rollovers; index += 1) {
@@ -1669,9 +1669,9 @@ describe("account mutation successor authority", () => {
         // A single unrecorded +1 rollover cannot be mistaken for this chain.
         store.nextProfileGeneration(profile.id);
         expect(store.isAccountMutationAuthorityCurrent({ attemptId: attempt.id, profileId: profile.id, originGeneration: 1 })).toBe(false);
-      },
-    ), { numRuns: 12, seed: 44 });
-  });
+      });
+    }
+  }
 
   test("quarantines missing legacy chains without clearing account recovery or granting a fresh attempt", async () => {
     const { store, profile, attempt, key } = await seed("account.login");
@@ -11923,8 +11923,9 @@ describe("StateStore", () => {
     }
   });
 
-  test("refuses an invalid current migration ledger without changing retained rows or schema", async () => {
-    for (const damage of ["missing", "negative_time", "unsafe_time", "later_version"] as const) {
+  test.each(["missing", "negative_time", "unsafe_time", "later_version"] as const)(
+    "refuses an invalid current migration ledger without changing retained rows or schema: %s",
+    async (damage) => {
       const { store } = await fixture();
       const inspector = new Database(store.paths.database, { create: false, strict: true });
       try {
@@ -11954,17 +11955,18 @@ describe("StateStore", () => {
           .toEqual(ledgerBefore);
         expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
       } finally { inspector.close(false); }
-    }
-  });
+    },
+  );
 
-  test("refuses an invalid schema 41 migration ledger without changing retained rows or schema", async () => {
-    for (const damage of [
-      "missing_40",
-      "missing_41",
-      "negative_time",
-      "unsafe_time",
-      "later_version",
-    ] as const) {
+  test.each([
+    "missing_40",
+    "missing_41",
+    "negative_time",
+    "unsafe_time",
+    "later_version",
+  ] as const)(
+    "refuses an invalid schema 41 migration ledger without changing retained rows or schema: %s",
+    async (damage) => {
       const { store } = await fixture();
       const profile = signInProfile(store, "Ledger identity", "ledger@example.com");
       const session = upsertProvenTestSession(store, {
@@ -11999,11 +12001,14 @@ describe("StateStore", () => {
         expect(inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id)).toEqual(profileBefore);
         expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
       } finally { inspector.close(false); }
-    }
-  });
+    },
+  );
 
-  for (const version of [45, 46, 47, 48, 49] as const) test(`auth45 authority refuses DDL drift at schema ${String(version)} without writes`, async () => {
-    for (const damage of ["missing_table", "missing_guard", "weaker_guard", "wrong_table_guard", "extra_index"] as const) {
+  for (const version of [45, 46, 47, 48, 49] as const) test.each([
+    "missing_table", "missing_guard", "weaker_guard", "wrong_table_guard", "extra_index",
+  ] as const)(
+    `auth45 authority refuses DDL drift at schema ${String(version)} without writes: %s`,
+    async (damage) => {
       const { store } = await fixture();
       const profile = signInProfile(store, "Auth schema drift", "auth-schema@example.com");
       const inspector = new Database(store.paths.database, { create: false, strict: true });
@@ -12034,8 +12039,8 @@ describe("StateStore", () => {
           expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: version });
         }
       } finally { inspector.close(false); }
-    }
-  });
+    },
+  );
 
   for (const version of [45, 46, 47, 48] as const) test(`schema ${String(version)} refuses a missing auth45 ledger entry before migration`, async () => {
     const { store } = await fixture();
@@ -12164,22 +12169,23 @@ describe("StateStore", () => {
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
     } finally { inspector.close(false); }
   });
-  test("refuses an invalid current schema 49 migration ledger without writes", async () => {
-    for (const damage of [
-      "missing_40",
-      "missing_41",
-      "missing_42",
-      "missing_43",
-      "missing_44",
-      "missing_45",
-      "missing_46",
-      "missing_47",
-      "missing_48",
-      "missing_49",
-      "negative_time",
-      "unsafe_time",
-      "later_version",
-    ] as const) {
+  test.each([
+    "missing_40",
+    "missing_41",
+    "missing_42",
+    "missing_43",
+    "missing_44",
+    "missing_45",
+    "missing_46",
+    "missing_47",
+    "missing_48",
+    "missing_49",
+    "negative_time",
+    "unsafe_time",
+    "later_version",
+  ] as const)(
+    "refuses an invalid current schema 49 migration ledger without writes: %s",
+    async (damage) => {
       const { store } = await fixture();
       const profile = signInProfile(store, "Current ledger", "current-ledger@example.com");
       const session = upsertProvenTestSession(store, {
@@ -12224,8 +12230,8 @@ describe("StateStore", () => {
           expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
         }
       } finally { inspector.close(false); }
-    }
-  });
+    },
+  );
 
   test("rejects an unbound legacy effect-started session creation at daemon admission", async () => {
     const { store } = await fixture();
@@ -12462,11 +12468,79 @@ describe("StateStore", () => {
       preset: "high",
       fastEnabled: false,
     });
-    for (let index = 0; index < 2_000; index += 1) {
-      const terminal = store.enqueue(session.id, `terminal ${String(index)}`);
-      if (!store.transitionQueue(terminal.id, "pending", "cancelled")) {
-        throw new Error("Terminal queue fixture transition failed.");
-      }
+    const terminal = store.enqueue(session.id, "terminal control");
+    expect(store.transitionQueue(terminal.id, "pending", "cancelled")).toBe(true);
+    expect(store.requireQueue(terminal.id)).toMatchObject({
+      message: "[queue message removed after settlement]",
+      state: "cancelled",
+    });
+
+    // This test measures pending lookup over history, not 2,000 physical scrub
+    // checkpoints. Clone one genuinely settled row with every guard enabled.
+    const history = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      history.exec("PRAGMA foreign_keys=ON");
+      expect(history.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+      const allocateSequence = history.query(
+        `UPDATE queue_sequence_authority SET next_sequence=next_sequence+1
+         WHERE singleton=1 AND next_sequence<9007199254740991
+         RETURNING next_sequence-1 AS enqueue_sequence`,
+      );
+      const sequenceSchema = z.object({
+        enqueue_sequence: z.number().int().positive().safe(),
+      }).strict();
+      const insertedIdSchema = z.object({ id: z.string() }).strict();
+      const insertTerminal = history.query(
+        `INSERT INTO queue_entries(
+           id,session_id,message,state,created_at,updated_at,message_actor,peer_action_id,
+           transcript_finalized,transcript_status,transcript_intent_json,enqueue_sequence
+         ) SELECT ?,session_id,message,state,created_at,updated_at,message_actor,peer_action_id,
+                  transcript_finalized,transcript_status,transcript_intent_json,?
+           FROM queue_entries WHERE id=? RETURNING id`,
+      );
+      history.transaction(() => {
+        for (let index = 1; index < 2_000; index += 1) {
+          const { enqueue_sequence: sequence } = sequenceSchema.parse(allocateSequence.get());
+          const id = createQueueId();
+          if (insertedIdSchema.parse(insertTerminal.get(id, sequence, terminal.id)).id !== id) {
+            throw new Error("Terminal queue history fixture lost its template.");
+          }
+        }
+      }).immediate();
+      expect(history.query(
+        `SELECT COUNT(*) AS total,COUNT(DISTINCT id) AS ids,
+                COUNT(DISTINCT enqueue_sequence) AS sequences,
+                MIN(enqueue_sequence) AS first,MAX(enqueue_sequence) AS last
+         FROM queue_entries`,
+      ).get()).toEqual({ total: 2_000, ids: 2_000, sequences: 2_000, first: 1, last: 2_000 });
+      expect(history.query(
+        "SELECT next_sequence FROM queue_sequence_authority WHERE singleton=1",
+      ).get()).toEqual({ next_sequence: 2_001 });
+      const terminalShapeColumns = `session_id,message,state,created_at,updated_at,
+        message_actor,peer_action_id,transcript_finalized,transcript_status,transcript_intent_json`;
+      expect(history.query(
+        `SELECT DISTINCT ${terminalShapeColumns} FROM queue_entries`,
+      ).all()).toEqual([history.query(
+        `SELECT ${terminalShapeColumns} FROM queue_entries WHERE id=?`,
+      ).get(terminal.id)]);
+      // Even already-scrubbed terminal inserts must create real scrub debt.
+      expect(history.query(
+        "SELECT generation,requires_vacuum FROM queue_message_scrub_authority WHERE singleton=1",
+      ).get()).toEqual({ generation: 1_999, requires_vacuum: 0 });
+    } finally {
+      history.close(false);
+    }
+    // The public transition owns the pending scrub before its CAS. The control
+    // is already cancelled, so this drains debt without creating another row.
+    expect(store.transitionQueue(terminal.id, "pending", "cancelled")).toBe(false);
+    const scrubInspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      expect(scrubInspector.query(
+        "SELECT singleton FROM queue_message_scrub_authority",
+      ).all()).toEqual([]);
+      expect(scrubInspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      scrubInspector.close(false);
     }
     const expected = store.enqueue(session.id, "bounded pending work");
     const later = store.enqueue(session.id, "later pending work");

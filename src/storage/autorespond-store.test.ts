@@ -602,8 +602,12 @@ describe("after-hours autorespond storage authority", () => {
     }
   });
 
-  test("rejects predecessor collisions and damaged current authority without repair on writable or readonly reopen", async () => {
-    for (const damage of ["collision", "missing_guard", "weak_guard", "extra_trigger", "extra_index", "missing_policy", "bad_policy", "missing_barrier", "missing_ledger", "future_ledger"] as const) {
+  test.each([
+    "collision", "missing_guard", "weak_guard", "extra_trigger", "extra_index",
+    "missing_policy", "bad_policy", "missing_barrier", "missing_ledger", "future_ledger",
+  ] as const)(
+    "rejects predecessor collisions and damaged current authority without repair on writable or readonly reopen: %s",
+    async (damage) => {
       const { store, sessionId } = await fixture();
       const paths = store.paths;
       stores.splice(stores.indexOf(store), 1);
@@ -644,8 +648,8 @@ describe("after-hours autorespond storage authority", () => {
         expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledger);
       }
       inspector.close(false);
-    }
-  });
+    },
+  );
 
   test("guards replacement, unproved barrier clearing and exhausted consent revision", async () => {
     const { store, sessionId } = await legacyAfterHoursFixture();
