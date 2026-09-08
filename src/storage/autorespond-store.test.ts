@@ -8,13 +8,50 @@ import { z } from "zod";
 
 import { AUTORESPOND_DAY_MS, AUTORESPOND_HOUR_MS } from "../domain/autorespond-budget";
 
+import { deriveLegacySessionProfileKey } from "./canonical-profile-storage";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
 import { StateStore } from "./state-store";
 
 const stores: StateStore[] = [];
 
-// These fixtures admit the shipped v43-v45 predecessor surfaces, not a private
-// memory cohort stamped with an older user_version.
+// These current-source shapers reproduce the v43-v49 authority surfaces they
+// exercise; they are not untouched databases captured from historical source.
+const canonicalProfileTables = ["sessions", "work_routes", "work_tasks", "work_attempts"] as const;
+const dropCanonicalProfileSchema = (database: Database): void => {
+  for (const name of [
+    "canonical_profile_session_insert_guard",
+    "canonical_profile_session_update_guard",
+    "canonical_profile_session_live_attempt_guard",
+    "canonical_profile_work_route_insert_guard",
+    "canonical_profile_work_task_insert_guard",
+    "canonical_profile_work_attempt_insert_guard",
+    "canonical_profile_work_attempt_immutable_guard",
+  ] as const) database.exec(`DROP TRIGGER ${name}`);
+  for (const table of canonicalProfileTables) {
+    database.exec(`ALTER TABLE ${table} DROP COLUMN canonical_profile_key`);
+    expect(database.query(
+      `SELECT name FROM pragma_table_xinfo('${table}') WHERE name='canonical_profile_key' COLLATE NOCASE`,
+    ).all()).toEqual([]);
+  }
+};
+
+const readRows = (database: Database, sql: string): Record<string, unknown>[] => {
+  // A fresh statement observes the added column after another connection's
+  // migration; a cached SELECT * can retain its predecessor column metadata.
+  const statement = database.prepare(sql);
+  try { return z.record(z.string(), z.unknown()).array().parse(statement.all()); }
+  finally { statement.finalize(); }
+};
+
+const databaseSnapshot = (database: Database): string => {
+  const schema = readRows(database, "SELECT * FROM sqlite_master ORDER BY type,name");
+  const rows = schema.filter((row) => row.type === "table").map((row) => {
+    const name = z.string().regex(/^[A-Za-z0-9_]+$/u).parse(row.name);
+    return { name, rows: readRows(database, `SELECT * FROM "${name}"`) };
+  });
+  return JSON.stringify({ schema, rows, version: readRows(database, "PRAGMA user_version") });
+};
+
 const dropHostedMemorySchema = (database: Database): void => {
   const hostedObjects = z.object({
     name: z.string().regex(/^[a-z0-9_]+$/u),
@@ -397,6 +434,7 @@ describe("durable autorespond admission", () => {
     stores.splice(stores.indexOf(store), 1);
     store.close();
     const predecessor = new Database(paths.database);
+    dropCanonicalProfileSchema(predecessor);
     dropPeerAndHostedMemorySchema(predecessor);
     // Reproduce the actual v31->v43 table spelling: SQLite quotes a table name
     // after ALTER TABLE RENAME, even when the original CREATE was unquoted.
@@ -418,7 +456,7 @@ describe("durable autorespond admission", () => {
       PRAGMA user_version=43;
     `);
     predecessor.close(false);
-    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:49");
+    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:50");
     const migrated = new StateStore(paths, { now: () => clock.now });
     stores.push(migrated);
     const availableAt = clock.now + AUTORESPOND_DAY_MS;
@@ -462,6 +500,7 @@ describe("durable autorespond admission", () => {
     stores.splice(stores.indexOf(store), 1);
     store.close();
     const damaged = new Database(paths.database);
+    dropCanonicalProfileSchema(damaged);
     dropPeerAndHostedMemorySchema(damaged);
     damaged.exec("DROP TRIGGER work_session_project_authority_guard; DROP TABLE account_mutation_authority_rebinds; DELETE FROM migrations WHERE version>=44; PRAGMA user_version=43");
     expect(damaged.query("SELECT available_at FROM autorespond_budget_history WHERE session_id=?").get(sessionId))
@@ -470,12 +509,13 @@ describe("durable autorespond admission", () => {
     expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_PREDECESSOR_COLLISION");
   });
 
-  for (const version of [44, 45, 46, 47, 48, 49]) test(`never applies pre-release v43 trigger-repair allowances to canonical v${String(version)}`, async () => {
+  for (const version of [44, 45, 46, 47, 48, 49, 50]) test(`never applies pre-release v43 trigger-repair allowances to canonical v${String(version)}`, async () => {
     const { store } = await fixture();
     const paths = store.paths;
     stores.splice(stores.indexOf(store), 1);
     store.close();
     const damaged = new Database(paths.database);
+    if (version < 50) dropCanonicalProfileSchema(damaged);
     if (version < 49) damaged.exec("DROP TRIGGER work_session_project_authority_guard");
     if (version <= 45) {
       dropPeerAndHostedMemorySchema(damaged);
@@ -486,12 +526,14 @@ describe("durable autorespond admission", () => {
     damaged.query("DELETE FROM migrations WHERE version>?").run(version);
     damaged.exec(`PRAGMA user_version=${String(version)}`);
     damaged.exec("DROP TRIGGER queue_transcript_cancellation_settlement");
+    const before = databaseSnapshot(damaged);
     damaged.close(false);
     expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V43_QUEUE_CANCELLATION_GUARD_INVALID");
     const inspector = new Database(paths.database, { readonly: true });
     try {
       expect(inspector.query("SELECT 1 FROM sqlite_master WHERE name='queue_transcript_cancellation_settlement'").get()).toBeNull();
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: version });
+      expect(databaseSnapshot(inspector)).toBe(before);
     } finally { inspector.close(false); }
   });
 });
@@ -530,6 +572,7 @@ async function legacyAfterHoursFixture(beforeMigration?: (store: StateStore, ses
   stores.splice(stores.indexOf(store), 1);
   store.close();
   const predecessor = new Database(paths.database);
+  dropCanonicalProfileSchema(predecessor);
   dropPeerAndHostedMemorySchema(predecessor);
   dropAfterHoursSchema(predecessor);
   const guard = (predecessor.query("SELECT sql FROM sqlite_master WHERE name='autorespond_budget_history_immutable'").get() as { sql: string }).sql;
@@ -551,24 +594,49 @@ describe("after-hours autorespond storage authority", () => {
     stores.splice(stores.indexOf(store), 1);
     store.close();
     const inspector = new Database(paths.database);
+    dropCanonicalProfileSchema(inspector);
     dropPeerAndHostedMemorySchema(inspector);
     dropAfterHoursSchema(inspector);
-    const schema = inspector.query("SELECT name,sql,type FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name").all();
+    const schema = readRows(inspector, "SELECT name,sql,type FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name");
+    const columns = Object.fromEntries(canonicalProfileTables.map((table) => [table,
+      readRows(inspector, `PRAGMA table_xinfo('${table}')`),
+    ]));
     const ledger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
     const rows = ["sessions", "profiles", "autorespond_budget_history", "autorespond_budget_reservations", "session_autorespond_counters", "account_mutation_authority_rebinds"]
-      .map((name) => ({ name, rows: inspector.query(`SELECT * FROM ${name}`).all() }));
-    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:45:49");
+      .map((name) => ({ name, rows: readRows(inspector, `SELECT * FROM ${name}`) }));
+    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:45:50");
     const migrated = new StateStore(paths, { now: () => clock.now });
     stores.push(migrated);
-    expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
-    const migratedSchema = inspector.query(
+    expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
+    const migratedSchema = readRows(inspector,
       "SELECT name,sql,type FROM sqlite_master WHERE sql IS NOT NULL AND name!='queue_entries' ORDER BY name",
-    ).all();
-    for (const row of schema.filter((entry) => z.object({ name: z.string() }).passthrough().parse(entry).name !== "queue_entries")) {
-      expect(migratedSchema).toContainEqual(row);
+    );
+    for (const row of schema.filter((entry) => entry.name !== "queue_entries")) {
+      if (row.type === "table" && canonicalProfileTables.some((table) => table === row.name)) {
+        const after = migratedSchema.find((entry) => entry.name === row.name && entry.type === row.type);
+        const sql = z.string().parse(after?.sql);
+        const addition = ", canonical_profile_key TEXT";
+        expect(sql.split(addition)).toHaveLength(2);
+        expect({ ...after, sql: sql.replace(addition, "") })
+          .toEqual({ ...row, sql: z.string().parse(row.sql) });
+      } else expect(migratedSchema).toContainEqual(row);
+    }
+    for (const table of canonicalProfileTables) {
+      const after = readRows(inspector, `PRAGMA table_xinfo('${table}')`);
+      const previous = columns[table];
+      if (previous === undefined) throw new Error("Missing predecessor column metadata.");
+      expect(after.filter((column) => column.name !== "canonical_profile_key")).toEqual(previous);
+      expect(after.filter((column) => column.name === "canonical_profile_key")).toHaveLength(1);
     }
     expect(inspector.query("SELECT * FROM migrations WHERE version<46 ORDER BY version").all()).toEqual(ledger);
-    for (const row of rows) expect(inspector.query(`SELECT * FROM ${row.name}`).all()).toEqual(row.rows);
+    for (const row of rows) {
+      const expected = row.name === "sessions" ? row.rows.map((session) => {
+        const key = deriveLegacySessionProfileKey(session.provider_v39, session.preset, session.preset_contract);
+        expect(key).not.toBeNull();
+        return { ...session, canonical_profile_key: key };
+      }) : row.rows;
+      expect(readRows(inspector, `SELECT * FROM ${row.name}`)).toEqual(expected);
+    }
     enableAfterHours(migrated);
     expect(provisional(migrated, sessionId).tier).toBe("after_hours");
     expect(migrated.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 1, lastHour: 1, lastDay: 1 });
@@ -584,6 +652,7 @@ describe("after-hours autorespond storage authority", () => {
       stores.splice(stores.indexOf(store), 1);
       store.close();
       const inspector = new Database(paths.database);
+      dropCanonicalProfileSchema(inspector);
       dropPeerAndHostedMemorySchema(inspector);
       dropAfterHoursSchema(inspector);
       if (damage === "missing_history") inspector.query("DELETE FROM autorespond_budget_history WHERE session_id=?").run(sessionId);
@@ -592,12 +661,14 @@ describe("after-hours autorespond storage authority", () => {
         BEGIN SELECT RAISE(ABORT,'synthetic migration failure'); END;`);
       const schema = inspector.query("SELECT * FROM sqlite_master ORDER BY type,name").all();
       const ledger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
+      const before = databaseSnapshot(inspector);
       expect(() => new StateStore(paths, { now: () => clock.now })).toThrow(damage === "missing_history"
         ? "STATE_SCHEMA_V46_AUTORESPOND_BUDGET_HISTORY_INVALID"
         : damage === "predecessor_ledger" ? "STATE_SCHEMA_V45_MIGRATION_LEDGER_INVALID" : "synthetic migration failure");
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query("SELECT * FROM sqlite_master ORDER BY type,name").all()).toEqual(schema);
       expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledger);
+      expect(databaseSnapshot(inspector)).toBe(before);
       inspector.close(false);
     }
   });
@@ -614,6 +685,7 @@ describe("after-hours autorespond storage authority", () => {
       store.close();
       const inspector = new Database(paths.database);
       if (damage === "collision") {
+        dropCanonicalProfileSchema(inspector);
         dropPeerAndHostedMemorySchema(inspector);
         inspector.exec("DROP TRIGGER work_session_project_authority_guard");
         inspector.exec("DELETE FROM migrations WHERE version>=46; PRAGMA user_version=45");
@@ -639,7 +711,7 @@ describe("after-hours autorespond storage authority", () => {
         inspector.query("DELETE FROM autorespond_after_hours_history WHERE session_id=?").run(sessionId);
         inspector.exec(sql);
       } else if (damage === "missing_ledger") inspector.exec("DELETE FROM migrations WHERE version=46");
-      else inspector.exec("INSERT INTO migrations(version,applied_at) VALUES (50,1000000)");
+      else inspector.exec("INSERT INTO migrations(version,applied_at) VALUES (51,1000000)");
       const before = inspector.query("SELECT * FROM sqlite_master ORDER BY type,name").all();
       const ledger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
       for (const readonly of [true, false]) {

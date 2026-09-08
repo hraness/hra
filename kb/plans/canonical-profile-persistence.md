@@ -544,6 +544,39 @@ only that policy digest changed. Archive size is 1,352,818 bytes, SHA-256
 `5351a74d0c06d7d5d51cd075f038783aacb3a892a79b1e586f136b1514f67e71`.
 This is not an installation, final joined archive or release receipt.
 
+### Initial protected CI and fixture repair
+
+PR151's initial head `6eeb9020fd31517ae84e609065914a33595d56d9` failed
+[CI34253643236](https://github.com/hraness/hra/actions/runs/34253643236)
+on both platforms with the same 39 source-test failures. Each platform passed
+3,888 source tests; source durations were 656.09 seconds on macOS and
+804.66 seconds on Ubuntu. Both jobs ended before their unchanged deadlines.
+The later site/app/build/package phases were not reached. Separate
+[CodeQL34253639329](https://github.com/hraness/hra/actions/runs/34253639329)
+passed. This failed aggregate is retained, not waived by the focused results.
+
+The failures exposed current-source fixtures outside the storage migration
+suite that still retained the canonical overlay when shaped as older roots,
+used49 as the current endpoint or50 as an unknown future sentinel, or rewrote
+historical Astra/Devin provenance without its now-required matching key.
+The repairs touch tests only. Older shapers explicitly remove the seven
+canonical companions and four columns before their existing legacy changes;
+current fixtures keep the guards and update each historical key in the same
+SQL statement as its legacy fields. Current diagnostics now name50 and the
+unknown-future sentinel is51. No historical49 contract is reinterpreted.
+
+The five CLI cases passed 30 assertions and now compare complete logical
+snapshots across all four refusal paths. The autorespond file passed 45 tests
+and 927 assertions, preserving its original44 cases and adding current50 to
+the old-guard refusal matrix. Its positive v45 control retains exact old DDL,
+column metadata and rows except the four declared additions; rollback controls
+also compare all rows. After two test-only TypeScript narrowing corrections,
+the affected v45 case passed 438 assertions and final lint/types passed.
+The service/cloud group passed 24 tests and 305 assertions, preserving
+retired-provider refusals, immutable evidence, callback counts, adoption and
+recovery behavior. All four changed test files passed independent review and
+scoped static checks. Production and reviewed package inputs remain unchanged.
+
 Remaining integration work includes the actual PR148 main join, refreshed
 archive review and required exact-tree gates. Keep shaped fixtures distinct
 from untouched historical captures and the bounded coverage of each proof.
