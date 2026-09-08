@@ -157,4 +157,19 @@ For any exit `75`, stop release work, retain the unchanged plan and exact machin
 
 A completed source recovery is terminal for the original plan. Diagnose and resolve the recorded failure, wait for the reviewed operator and its exact production deployment to be ready, then prepare and preflight a fresh source-to-target plan. Earlier machine tokens and recovery evidence never carry into the fresh plan; standing task authority may continue to cover it only when the target and delivery outcome remain in the same authorized scope.
 
+## Independent production verification
+
 After a committed result, independently repeat the filtered Vercel alias and deployment readbacks and fetch the public marker and release acceptance pages. Those observations do not expand the original authorization and must not perform another write.
+
+If comparing public content with local generated files, use a clean checkout of the plan's exact target commit with the pinned dependencies. First check the tracked public sources, then render fresh output:
+
+```sh
+bun run build:site -- --check
+bun run build:site
+```
+
+The `--check` command validates the tracked README and privacy output; it returns before rendering `dist/site`. A passing check does not prove existing generated site files belong to the current checkout. The normal build regenerates those files. Confirm the tracked checkout remains clean afterward.
+
+A plain local build uses a `local` release marker unless an explicit build environment supplies the commit. Prove the public marker against the exact target commit and fixed marker contract above, not against that default local marker. Record the exact routes, content fragments and assets compared; matching selected page fragments does not prove whole-page or environment-specific analytics byte parity. Reload the real browser page before checking navigation, narrow layouts and sticky-header boundaries.
+
+If content comparison fails after a committed transition, retain the provider readbacks and terminal receipt and first verify the local commit and fresh render. A stale local build is not authority to replay a terminal plan, edit the ledger or issue another alias write. Diagnose any remaining product mismatch under the same release and recovery boundaries.
