@@ -191,8 +191,29 @@ export class DevTransientBuildError extends Error {
   }
 }
 
+type DevCollectionPhase =
+  | "initial-probe" | "term-preprobe" | "term-syscall" | "post-term-probe" | "post-term-wait"
+  | "pre-kill-probe" | "kill-preprobe" | "kill-syscall" | "post-kill-probe" | "post-kill-wait"
+  | "final-probe" | "final-absence" | "direct-child-handle";
+
+export type DevCollectionDiagnostic = Readonly<{
+  attempt: number;
+  elapsedCapped: boolean;
+  elapsedMilliseconds: number;
+  killSent: boolean;
+  phase: DevCollectionPhase;
+  termSent: boolean;
+}>;
+
 /** No caller may release either publication owner after this uncertainty. */
-export class DevUncollectedProcessError extends AppProcessCustodyError {}
+export class DevUncollectedProcessError extends AppProcessCustodyError {
+  readonly collection: DevCollectionDiagnostic | undefined;
+
+  constructor(message: string, options?: ErrorOptions & { collection?: DevCollectionDiagnostic }) {
+    super(message, options);
+    this.collection = options?.collection === undefined ? undefined : Object.freeze({ ...options.collection });
+  }
+}
 
 /** Both build and server shutdown use this same sticky custody fence. */
 export function releaseCollectedDevOwner(lock: AppPublicationLock, collectionUnproved: boolean): void {
@@ -863,40 +884,97 @@ function processGroupExists(pid: number): boolean {
   }
 }
 
-function signalOwnedProcessGroup(pid: number, signal: "SIGKILL" | "SIGTERM"): void {
-  if (!processGroupExists(pid)) return;
-  try { process.kill(-pid, signal); } catch (error) {
+function signalOwnedProcessGroup(
+  pid: number,
+  signal: "SIGKILL" | "SIGTERM",
+  beforeSyscall: () => void,
+): "absent" | "sent" {
+  if (!processGroupExists(pid)) return "absent";
+  beforeSyscall();
+  try { process.kill(-pid, signal); return "sent"; } catch (error) {
     if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
+    return "absent";
+  }
+}
+
+type DevCollectionOperations = Readonly<{
+  probe: () => boolean;
+  signal: (signal: "SIGKILL" | "SIGTERM", beforeSyscall: () => void) => "absent" | "sent";
+  wait: () => Promise<void>;
+}>;
+
+class DevCollectionTrace {
+  attempt = 0;
+  killSent = false;
+  phase: DevCollectionPhase = "initial-probe";
+  termSent = false;
+  readonly #started = performance.now();
+
+  mark(phase: DevCollectionPhase, attempt = 0): void {
+    this.phase = phase;
+    this.attempt = attempt;
+  }
+
+  snapshot(): DevCollectionDiagnostic {
+    const elapsed = Math.max(0, Math.floor(performance.now() - this.#started));
+    return {
+      attempt: this.attempt,
+      elapsedCapped: elapsed > DEV_BUILD_DEADLINE_MS,
+      elapsedMilliseconds: Math.min(DEV_BUILD_DEADLINE_MS, elapsed),
+      killSent: this.killSent,
+      phase: this.phase,
+      termSent: this.termSent,
+    };
   }
 }
 
 /** Closed process-group operations allow deterministic uncertainty regressions. */
-export async function collectDevProcessGroup(operations: Readonly<{
-  probe: () => boolean;
-  signal: (signal: "SIGKILL" | "SIGTERM") => void;
-  wait: () => Promise<void>;
-}>): Promise<boolean> {
+export async function collectDevProcessGroup(operations: DevCollectionOperations): Promise<boolean> {
+  return collectTracedDevProcessGroup(operations, new DevCollectionTrace());
+}
+
+async function collectTracedDevProcessGroup(operations: DevCollectionOperations, trace: DevCollectionTrace): Promise<boolean> {
+  const probe = (phase: DevCollectionPhase, attempt = 0): boolean => {
+    trace.mark(phase, attempt);
+    return operations.probe();
+  };
   try {
-    if (!operations.probe()) return false;
-    operations.signal("SIGTERM");
-    for (let attempt = 0; attempt < DEV_CHILD_GRACE_MS / 25 && operations.probe(); attempt += 1) await operations.wait();
-    if (operations.probe()) operations.signal("SIGKILL");
-    for (let attempt = 0; attempt < DEV_CHILD_GRACE_MS / 25 && operations.probe(); attempt += 1) await operations.wait();
-    assert.equal(operations.probe(), false, "Owned development process group survived cleanup");
+    if (!probe("initial-probe")) return false;
+    trace.mark("term-preprobe");
+    trace.termSent = operations.signal("SIGTERM", () => { trace.mark("term-syscall"); }) === "sent";
+    for (let attempt = 0; attempt < DEV_CHILD_GRACE_MS / 25 && probe("post-term-probe", attempt); attempt += 1) {
+      trace.mark("post-term-wait", attempt);
+      await operations.wait();
+    }
+    if (probe("pre-kill-probe")) {
+      trace.mark("kill-preprobe");
+      trace.killSent = operations.signal("SIGKILL", () => { trace.mark("kill-syscall"); }) === "sent";
+    }
+    for (let attempt = 0; attempt < DEV_CHILD_GRACE_MS / 25 && probe("post-kill-probe", attempt); attempt += 1) {
+      trace.mark("post-kill-wait", attempt);
+      await operations.wait();
+    }
+    const present = probe("final-probe");
+    trace.mark("final-absence");
+    assert.equal(present, false, "Owned development process group survived cleanup");
     return true;
   } catch (cause) {
-    throw new DevUncollectedProcessError("Development child collection is unproved; retain both publication owners", { cause });
+    throw new DevUncollectedProcessError("Development child collection is unproved; retain both publication owners", {
+      cause, collection: trace.snapshot(),
+    });
   }
 }
 
 async function terminateOwnedChild(child: OwnedChild): Promise<boolean> {
-  const descendants = await collectDevProcessGroup({
+  const trace = new DevCollectionTrace();
+  const descendants = await collectTracedDevProcessGroup({
     probe: () => processGroupExists(child.pid),
-    signal: (signal) => signalOwnedProcessGroup(child.pid, signal),
+    signal: (signal, beforeSyscall) => signalOwnedProcessGroup(child.pid, signal, beforeSyscall),
     wait: () => Bun.sleep(25),
-  });
+  }, trace);
   // Group absence is not a substitute for collecting the direct child handle.
   let timer: ReturnType<typeof setTimeout> | undefined;
+  trace.mark("direct-child-handle");
   try {
     await Promise.race([
       child.exited,
@@ -905,7 +983,9 @@ async function terminateOwnedChild(child: OwnedChild): Promise<boolean> {
       }),
     ]);
   } catch (cause) {
-    throw new DevUncollectedProcessError("Development child handle collection is unproved; retain both publication owners", { cause });
+    throw new DevUncollectedProcessError("Development child handle collection is unproved; retain both publication owners", {
+      cause, collection: trace.snapshot(),
+    });
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }

@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { link, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -57,6 +58,8 @@ function safeDevCollectionFailureDiagnostic(error: unknown): string {
   const name = inner !== undefined && "name" in inner ? inner.name : undefined;
   const code = inner !== undefined && "code" in inner ? inner.code : undefined;
   return JSON.stringify({
+    ...(error instanceof DevUncollectedProcessError && error.collection !== undefined
+      ? { collection: error.collection } : {}),
     code: typeof code === "string" && [
       "ESRCH", "EPERM", "EACCES", "EINVAL", "ENOSYS", "ERR_ASSERTION",
       "ERR_INVALID_ARG_TYPE", "ERR_OUT_OF_RANGE",
@@ -70,6 +73,25 @@ function safeDevCollectionFailureDiagnostic(error: unknown): string {
         ? "direct-child-handle-collection"
         : "unclassified",
   });
+}
+
+function preserveDevFixture(root: string): void {
+  const index = temporaryRoots.indexOf(root);
+  if (index >= 0) temporaryRoots.splice(index, 1);
+}
+
+function assertDevFixtureAbsent(pid: number | undefined, descendants: readonly number[] = []): void {
+  assert.ok(pid !== undefined && Number.isSafeInteger(pid) && pid > 1, "Owned fixture PID was not recorded");
+  assert.ok(descendants.every((value) => Number.isSafeInteger(value) && value > 1), "Owned descendant PID was not recorded");
+  for (const target of [pid, -pid, ...descendants]) {
+    let absent = false;
+    try { process.kill(target, 0); }
+    catch (error) {
+      assert.ok(error instanceof Error && "code" in error && error.code === "ESRCH", "Fixture absence requires exact ESRCH");
+      absent = true;
+    }
+    assert.equal(absent, true, "Owned fixture process or group remains present");
+  }
 }
 
 function artifact(path: string, contents: string): AppArtifact {
@@ -835,7 +857,7 @@ describe("pure development process collection", () => {
     let waits = 0;
     expect(await collectDevProcessGroup({
       probe: () => false,
-      signal: () => { signals += 1; },
+      signal: () => { signals += 1; return "sent"; },
       wait: async () => { waits += 1; },
     })).toBe(false);
     expect(signals).toBe(0);
@@ -848,37 +870,101 @@ describe("pure development process collection", () => {
     let waits = 0;
     expect(await collectDevProcessGroup({
       probe: () => present,
-      signal: (signal) => { signals.push(signal); },
+      signal: (signal, beforeSyscall) => { beforeSyscall(); signals.push(signal); return "sent"; },
       wait: async () => { waits += 1; present = false; },
     })).toBe(true);
     expect(signals).toEqual(["SIGTERM"]);
     expect(waits).toBe(1);
   });
 
-  for (const failure of ["initial-probe", "term", "later-probe", "wait", "kill", "survivor"] as const) {
+  for (const failure of ["initial-probe", "term-preprobe", "term", "later-probe", "wait", "kill-preprobe", "kill", "survivor"] as const) {
     test(`retains custody on ${failure} uncertainty without speculative retries`, async () => {
       const uncertain = Object.assign(new Error("fixture probe or signal denied"), { code: "EPERM" });
       const signals: string[] = [];
       let probes = 0;
       let waits = 0;
-      await expect(collectDevProcessGroup({
+      const outcome = await collectDevProcessGroup({
         probe: () => {
           probes += 1;
           if (failure === "initial-probe" || (failure === "later-probe" && probes > 1)) throw uncertain;
           return true;
         },
-        signal: (signal) => {
+        signal: (signal, beforeSyscall) => {
+          if ((failure === "term-preprobe" && signal === "SIGTERM") || (failure === "kill-preprobe" && signal === "SIGKILL")) throw uncertain;
+          beforeSyscall();
           signals.push(signal);
           if ((failure === "term" && signal === "SIGTERM") || (failure === "kill" && signal === "SIGKILL")) throw uncertain;
+          return "sent";
         },
         wait: async () => {
           waits += 1;
           if (failure === "wait") throw uncertain;
         },
-      })).rejects.toBeInstanceOf(DevUncollectedProcessError);
-      expect(signals).toEqual(failure === "initial-probe" ? [] : failure === "kill" || failure === "survivor" ? ["SIGTERM", "SIGKILL"] : ["SIGTERM"]);
-      expect(waits).toBe(failure === "survivor" ? 160 : failure === "kill" ? 80 : failure === "wait" ? 1 : 0);
+      }).then(() => undefined, (error: unknown) => error);
+      expect(outcome).toBeInstanceOf(DevUncollectedProcessError);
+      assert.ok(outcome instanceof DevUncollectedProcessError);
+      if (failure === "survivor") expect(outcome.cause).toBeInstanceOf(Error);
+      else expect(outcome.cause).toBe(uncertain);
+      const expectedPhase = ({
+        "initial-probe": "initial-probe", "term-preprobe": "term-preprobe", term: "term-syscall",
+        "later-probe": "post-term-probe", wait: "post-term-wait", "kill-preprobe": "kill-preprobe",
+        kill: "kill-syscall", survivor: "final-absence",
+      } as const)[failure];
+      expect(outcome.collection?.phase).toBe(expectedPhase);
+      expect(outcome.collection?.termSent).toBe(!["initial-probe", "term-preprobe", "term"].includes(failure));
+      expect(outcome.collection?.killSent).toBe(failure === "survivor");
+      expect(outcome.collection?.attempt).toBe(0);
+      expect(outcome.collection?.elapsedMilliseconds).toBeGreaterThanOrEqual(0);
+      expect(outcome.collection?.elapsedMilliseconds).toBeLessThanOrEqual(120_000);
+      expect(outcome.collection?.elapsedCapped).toBe(false);
+      expect(Object.isFrozen(outcome.collection)).toBe(true);
+      expect(signals).toEqual(failure === "initial-probe" || failure === "term-preprobe" ? [] : failure === "kill" || failure === "survivor" ? ["SIGTERM", "SIGKILL"] : ["SIGTERM"]);
+      expect(waits).toBe(failure === "survivor" ? 160 : failure === "kill" || failure === "kill-preprobe" ? 80 : failure === "wait" ? 1 : 0);
       expect(probes).toBeLessThanOrEqual(164);
+    });
+  }
+
+  test("does not report a successful TERM when its syscall observed ESRCH", async () => {
+    const denied = Object.assign(new Error("later probe denied"), { code: "EPERM" });
+    let probes = 0;
+    const outcome = await collectDevProcessGroup({
+      probe: () => { if (++probes > 1) throw denied; return true; },
+      signal: (_signal, beforeSyscall) => { beforeSyscall(); return "absent"; },
+      wait: async () => { assert.fail("Permission failure must not wait"); },
+    }).then(() => undefined, (error: unknown) => error);
+    assert.ok(outcome instanceof DevUncollectedProcessError);
+    expect(outcome.cause).toBe(denied);
+    expect(outcome.collection?.phase).toBe("post-term-probe");
+    expect(outcome.collection?.termSent).toBe(false);
+    const diagnostic = safeDevCollectionFailureDiagnostic(outcome);
+    expect(diagnostic).toContain('"phase":"post-term-probe"');
+    expect(diagnostic).toContain('"code":"EPERM"');
+    expect(diagnostic).not.toContain("later probe denied");
+  });
+
+  for (const fixture of [
+    { failureAt: 4, phase: "post-term-probe", attempt: 2, waits: 2, killSent: false },
+    { failureAt: 82, phase: "pre-kill-probe", attempt: 0, waits: 80, killSent: false },
+    { failureAt: 83, phase: "post-kill-probe", attempt: 0, waits: 80, killSent: true },
+    { failureAt: 163, phase: "final-probe", attempt: 0, waits: 160, killSent: true },
+  ] as const) {
+    test(`freezes the exact ${fixture.phase} attempt without retrying a denied probe`, async () => {
+      const denied = Object.assign(new Error("fixture permission denied"), { code: "EPERM" });
+      let probes = 0;
+      let waits = 0;
+      const outcome = await collectDevProcessGroup({
+        probe: () => { if (++probes === fixture.failureAt) throw denied; return true; },
+        signal: (_signal, beforeSyscall) => { beforeSyscall(); return "sent"; },
+        wait: async () => { waits += 1; },
+      }).then(() => undefined, (error: unknown) => error);
+      assert.ok(outcome instanceof DevUncollectedProcessError);
+      expect(outcome.cause).toBe(denied);
+      expect(outcome.collection?.phase).toBe(fixture.phase);
+      expect(outcome.collection?.attempt).toBe(fixture.attempt);
+      expect(outcome.collection?.termSent).toBe(true);
+      expect(outcome.collection?.killSent).toBe(fixture.killSent);
+      expect(probes).toBe(fixture.failureAt);
+      expect(waits).toBe(fixture.waits);
     });
   }
 });
@@ -976,9 +1062,13 @@ describe("cache, security, and owned process boundaries", () => {
           const pid = childPid;
           await collectDevProcessGroup({
             probe: () => probe(pid),
-            signal: (signal) => {
-              try { process.kill(-pid, signal); }
-              catch (error) { if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error; }
+            signal: (signal, beforeSyscall) => {
+              beforeSyscall();
+              try { process.kill(-pid, signal); return "sent"; }
+              catch (error) {
+                if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
+                return "absent";
+              }
             },
             wait: () => Bun.sleep(25),
           });
@@ -1092,43 +1182,81 @@ describe("cache, security, and owned process boundaries", () => {
     expect(() => parseDevSecurityHeaders(duplicated)).toThrow(/one global rule/u);
   });
 
-  test("terminates and reaps its exact child when a build is aborted", async () => {
-    const root = await temporaryRoot("hra-dev-child-");
-    const controller = new AbortController();
-    let pid: number | undefined;
-    const running = runOwnedDevProcess({
-      command: [
-        process.execPath,
-        "-e",
-        "Bun.spawn([process.execPath,'-e','setInterval(()=>{},1000)'],{stdin:'ignore',stdout:'ignore',stderr:'ignore'});setInterval(()=>{},1000)",
-      ],
-      cwd: root,
-      deadlineMilliseconds: 5_000,
-      onSpawn: (childPid) => {
-        pid = childPid;
-        setTimeout(() => controller.abort(), 20);
-      },
-      signal: controller.signal,
-    });
-    const outcome = await running.then(
-      () => ({ kind: "resolved" as const }),
-      (error: unknown) => ({ error, kind: "rejected" as const }),
-    );
-    expect(() => {
-      if (outcome.kind === "rejected") throw outcome.error;
-    }, `Owned cancellation: ${safeDevCollectionFailureDiagnostic(outcome.kind === "rejected" ? outcome.error : undefined)}`)
-      .toThrow(/aborted/u);
-    expect(pid).toBeNumber();
-    expect(() => process.kill(pid ?? -1, 0)).toThrow();
-    expect(() => process.kill(-(pid ?? 1), 0)).toThrow();
-  });
+  for (const cancellation of ["without waiting for readiness (20 ms)", "after parent and grandchild readiness"] as const) {
+    test(`terminates and reaps its exact child when a build is aborted ${cancellation}`, async () => {
+      const root = await temporaryRoot("hra-dev-child-");
+      const controller = new AbortController();
+      const parentReady = join(root, "parent-ready.json");
+      const grandchildReady = join(root, "grandchild-ready.json");
+      // Both helpers self-expire even if collection becomes unprovable. The
+      // readiness arm uses exact records, not the arbitrary cancellation delay.
+      const grandchildCode = `
+        import { linkSync, writeFileSync } from "node:fs";
+        setTimeout(() => {}, 12000);
+        writeFileSync(${JSON.stringify(`${grandchildReady}.pending`)}, JSON.stringify({ pid: process.pid, parentPid: process.ppid }), { flag: "wx", mode: 0o600 });
+        linkSync(${JSON.stringify(`${grandchildReady}.pending`)}, ${JSON.stringify(grandchildReady)});
+      `;
+      const parentCode = `
+        import { linkSync, writeFileSync } from "node:fs";
+        setTimeout(() => {}, 12000);
+        const child = Bun.spawn([process.execPath, "-e", ${JSON.stringify(grandchildCode)}], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+        writeFileSync(${JSON.stringify(`${parentReady}.pending`)}, JSON.stringify({ pid: process.pid, childPid: child.pid }), { flag: "wx", mode: 0o600 });
+        linkSync(${JSON.stringify(`${parentReady}.pending`)}, ${JSON.stringify(parentReady)});
+      `;
+      let pid: number | undefined;
+      let grandchildPid: number | undefined;
+      let abortTimer: ReturnType<typeof setTimeout> | undefined;
+      let collectionProved = false;
+      const running = runOwnedDevProcess({
+        command: [process.execPath, "-e", parentCode],
+        cwd: root,
+        deadlineMilliseconds: 5_000,
+        onSpawn: (childPid) => {
+          pid = childPid;
+          if (cancellation === "without waiting for readiness (20 ms)") abortTimer = setTimeout(() => controller.abort(), 20);
+        },
+        signal: controller.signal,
+      }).then(
+        () => ({ kind: "resolved" as const }),
+        (error: unknown) => ({ error, kind: "rejected" as const }),
+      );
+      try {
+        if (cancellation === "after parent and grandchild readiness") {
+          for (let attempt = 0; attempt < 300 && !(existsSync(parentReady) && existsSync(grandchildReady)); attempt += 1) await Bun.sleep(10);
+          const parent: unknown = JSON.parse(await readFile(parentReady, "utf8"));
+          const grandchild: unknown = JSON.parse(await readFile(grandchildReady, "utf8"));
+          assert.ok(typeof parent === "object" && parent !== null && "childPid" in parent);
+          assert.ok(typeof parent.childPid === "number" && Number.isSafeInteger(parent.childPid) && parent.childPid > 1);
+          expect<unknown>(parent).toEqual({ childPid: parent.childPid, pid });
+          expect(grandchild).toEqual({ parentPid: pid, pid: parent.childPid });
+          grandchildPid = parent.childPid;
+          controller.abort();
+        }
+        const outcome = await running;
+        expect(() => {
+          if (outcome.kind === "rejected") throw outcome.error;
+        }, `Owned cancellation: ${safeDevCollectionFailureDiagnostic(outcome.kind === "rejected" ? outcome.error : undefined)}`)
+          .toThrow(/aborted/u);
+        assertDevFixtureAbsent(pid, grandchildPid === undefined ? [] : [grandchildPid]);
+        collectionProved = true;
+      } finally {
+        if (abortTimer !== undefined) clearTimeout(abortTimer);
+        controller.abort();
+        // Join the same owner, never dispatch a second cleanup signal. Failed
+        // assertions or uncertain collection leave the finite fixture intact.
+        await running;
+        if (!collectionProved) preserveDevFixture(root);
+      }
+    }, 15_000); // Covers the unchanged 5 s execution and bounded collection windows.
+  }
 
   test("reaps the owned process group when spawn bookkeeping rejects", async () => {
     const root = await temporaryRoot("hra-dev-child-bookkeeping-");
     const controller = new AbortController();
     let pid: number | undefined;
-    await expect(runOwnedDevProcess({
-      command: [process.execPath, "-e", "setInterval(()=>{},1000)"],
+    let collectionProved = false;
+    const running = runOwnedDevProcess({
+      command: [process.execPath, "-e", "setTimeout(()=>{},12000)"],
       cwd: root,
       deadlineMilliseconds: 5_000,
       onSpawn: (childPid) => {
@@ -1136,8 +1264,18 @@ describe("cache, security, and owned process boundaries", () => {
         throw new Error("fixture bookkeeping failure");
       },
       signal: controller.signal,
-    })).rejects.toThrow(/bookkeeping failure/u);
-    expect(pid).toBeNumber();
-    expect(() => process.kill(-(pid ?? 1), 0)).toThrow();
-  });
+    }).then(() => ({ kind: "resolved" as const }), (error: unknown) => ({ error, kind: "rejected" as const }));
+    try {
+      const outcome = await running;
+      expect(() => { if (outcome.kind === "rejected") throw outcome.error; },
+        `Owned bookkeeping cleanup: ${safeDevCollectionFailureDiagnostic(outcome.kind === "rejected" ? outcome.error : undefined)}`)
+        .toThrow(/bookkeeping failure/u);
+      assertDevFixtureAbsent(pid);
+      collectionProved = true;
+    } finally {
+      controller.abort();
+      await running;
+      if (!collectionProved) preserveDevFixture(root);
+    }
+  }, 15_000);
 });
