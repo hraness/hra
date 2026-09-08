@@ -62,7 +62,7 @@ describe("codex-bump process custody", () => {
     const launcher = join(root, "codex.js"), marker = join(root, "ready.json");
     const cancellation = new AbortController();
     let outputDirectory: string | undefined;
-    let collected = false;
+    const collection = { proven: false };
     let pending: Promise<unknown> | undefined;
     const childProgram = [
       "const { writeFileSync } = require('node:fs');",
@@ -86,7 +86,7 @@ describe("codex-bump process custody", () => {
         expect(dependencies?.recoveryDirectory).toBe(join(outputDirectory ?? "", "process-recovery"));
         const result = await runBoundedProcess({ ...request, timeoutMs: scenario === "timeout" ? 500 : 3_000,
           terminationGraceMs: 25, killSettlementMs: 1_000 }, dependencies);
-        collected = result.cleanup === "proven";
+        collection.proven = result.cleanup === "proven";
         expect(result.cleanup).toBe("proven");
         expect(result.cleanup === "proven" ? result.exitCode : undefined).toBe(scenario === "timeout" ? 124 : scenario === "cancel" ? 130 : 1);
         expect(result.stdout.byteLength + result.stderr.byteLength).toBeLessThanOrEqual(4 * 1024 * 1024);
@@ -95,7 +95,7 @@ describe("codex-bump process custody", () => {
       if (scenario === "cancel") { await waitForMarker(marker); cancellation.abort(); }
       const failure = await pending;
       expect(failure).toBeInstanceOf(CodexBumpRefusedError);
-      expect(collected).toBe(true);
+      expect(collection.proven).toBe(true);
       const identity = JSON.parse(await readFile(marker, "utf8")) as { pid: number; parent: number };
       expect(() => process.kill(identity.pid, 0)).toThrow();
       expect(outputDirectory).toBeDefined();
@@ -105,7 +105,7 @@ describe("codex-bump process custody", () => {
       await pending;
       // Uncertain writers retain their fixture source and marker as well as
       // the separate generated-output directory and recovery journal.
-      if (collected) await rm(root, { recursive: true, force: true });
+      if (collection.proven) await rm(root, { recursive: true, force: true });
     }
   }, 10_000);
 

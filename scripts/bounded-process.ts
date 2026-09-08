@@ -4295,6 +4295,7 @@ export const runBoundedProcess = async (
     let overflow = false;
     let settled = false;
     let stopping = false;
+    const isStopping = (): boolean => stopping;
     let leaderClosed = false;
     let observedExitCode = 1;
     let forcedExitCode: number | undefined;
@@ -4481,7 +4482,7 @@ export const runBoundedProcess = async (
     );
     request.signal?.addEventListener("abort", onAbort, { once: true });
     if (request.signal?.aborted) onAbort();
-    if (journalActivationError === undefined && !stopping) {
+    if (journalActivationError === undefined && !isStopping()) {
       child.stdin.end(executionGateInput(request.stdin), "utf8");
     } else {
       child.stdin.destroy();
