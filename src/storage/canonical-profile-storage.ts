@@ -223,3 +223,95 @@ export function assertLegacyCanonicalProfileStorageSchema(database: Database): v
     ) throw new Error(`CANONICAL_PROFILE_SCHEMA_TRIGGER:${name}`);
   }
 }
+
+// Separate from the frozen installation/guard footprint. These queries inspect
+// only profile identity and its existing Work parent chain, not account adoption.
+const legacyCanonicalProfileRowChecks = [
+  {
+    error: "CANONICAL_PROFILE_ROWS_SESSIONS",
+    sql: `SELECT EXISTS (
+  SELECT 1 FROM main.sessions AS s
+  WHERE s.canonical_profile_key IS NULL
+    OR s.canonical_profile_key COLLATE BINARY IS NOT (CASE
+      WHEN s.provider_v39 COLLATE BINARY='codex' THEN ${legacyCodexKeySql("s.preset COLLATE BINARY", "s.preset_contract")}
+      WHEN s.provider_v39 COLLATE BINARY='claude' AND s.preset COLLATE BINARY='ultra'
+        AND s.preset_contract IN (1,2) THEN 'claude:claude-fable-5-1:max'
+      WHEN s.provider_v39 COLLATE BINARY='devin' AND s.preset COLLATE BINARY='ultra'
+        AND s.preset_contract=2 THEN 'devin:gpt-6-astra:provider-default'
+      ELSE NULL END)
+) AS invalid`,
+  },
+  {
+    error: "CANONICAL_PROFILE_ROWS_WORK_ROUTES",
+    sql: `SELECT EXISTS (
+  SELECT 1 FROM main.work_routes AS r
+  WHERE r.canonical_profile_key IS NULL OR NOT EXISTS (
+    SELECT 1 FROM main.works AS w
+    WHERE w.id COLLATE BINARY=r.work_id
+      AND r.canonical_profile_key COLLATE BINARY = (${legacyCodexKeySql("r.preset COLLATE BINARY", "w.preset_contract")})
+  )
+) AS invalid`,
+  },
+  {
+    error: "CANONICAL_PROFILE_ROWS_WORK_TASKS",
+    sql: `SELECT EXISTS (
+  SELECT 1 FROM main.work_tasks AS t
+  WHERE t.canonical_profile_key IS NULL OR NOT EXISTS (
+    SELECT 1 FROM main.work_routes AS r
+    WHERE r.work_id COLLATE BINARY=t.work_id
+      AND r.account_id COLLATE BINARY=t.account_id
+      AND r.project_id COLLATE BINARY=t.project_id
+      AND r.preset COLLATE BINARY=t.preset AND r.fast=t.fast
+      AND r.canonical_profile_key COLLATE BINARY=t.canonical_profile_key
+  )
+) AS invalid`,
+  },
+  {
+    error: "CANONICAL_PROFILE_ROWS_WORK_ATTEMPTS",
+    sql: `SELECT EXISTS (
+  SELECT 1 FROM main.work_attempts AS a
+  WHERE a.canonical_profile_key IS NULL OR NOT EXISTS (
+    SELECT 1 FROM main.work_tasks AS t
+    JOIN main.sessions AS s ON s.id COLLATE BINARY=a.worker_session_id
+    WHERE t.id COLLATE BINARY=a.task_id AND t.work_id COLLATE BINARY=a.work_id
+      AND t.account_id COLLATE BINARY=a.account_id
+      AND t.project_id COLLATE BINARY=a.project_id
+      AND t.preset COLLATE BINARY=a.preset AND t.fast=a.fast
+      AND t.canonical_profile_key COLLATE BINARY=a.canonical_profile_key
+      AND (
+        a.state COLLATE BINARY IN ('submitted','blocked','completed','failed','released','expired','cancelled')
+        OR (a.state COLLATE BINARY IN ('claimed','dispatching','running','recovery_required')
+          AND s.canonical_profile_key COLLATE BINARY=a.canonical_profile_key)
+      )
+  )
+) AS invalid`,
+  },
+] as const;
+
+const rowExistenceSchema = z.object({
+  invalid: z.union([z.literal(0), z.literal(1)]),
+}).strict();
+
+/**
+ * Read-only populated-row proof for the closed legacy profile domain. Callers
+ * must hold their existing coherent migration transaction across the separate
+ * predecessor, exact legacy authority, backfill, row and companion metadata
+ * proofs; this function neither owns that transaction nor replaces those proofs.
+ *
+ * Dependency-ordered checks prove routes from their own Work contract, then
+ * tasks/attempts from their immutable parent identity. Existing submitted and
+ * terminal attempts need their worker to exist, not retain its historical key.
+ * Only one scalar per table crosses the SQLite boundary, never row contents.
+ */
+export function assertLegacyCanonicalProfileRows(database: Database): void {
+  for (const { sql, error } of legacyCanonicalProfileRowChecks) {
+    let result: unknown;
+    try {
+      result = database.query(sql).get();
+    } catch {
+      throw new Error(error);
+    }
+    const parsed = rowExistenceSchema.safeParse(result);
+    if (!parsed.success || parsed.data.invalid !== 0) throw new Error(error);
+  }
+}

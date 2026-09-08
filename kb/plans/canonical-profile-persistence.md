@@ -122,6 +122,32 @@ security inventories, exact-tree final gates and protected delivery. Unit
 fixtures prove only the new SQL rules; they do not prove real predecessor
 migration, process custody or live provider support.
 
+### Reader integration checkpoints
+
+Validation in `requireSessionPresetBinding`, `#requireTask` and
+`#requireAttempt` alone is insufficient. Source review found direct typed
+queries in history, public projections, late dispatch and retirement paths.
+Treat this as an integration requirement, not an existing product defect:
+canonical persistence is not installed yet.
+
+| Boundary | Required canonical coverage |
+| --- | --- |
+| Session row parsing and `mapSession` | Validate the exact stored key against the row's own provider, tier and contract before every projection, including cloud pages and recovery reads. Keep public records unchanged. |
+| Work `#routes`, task summaries/statuses and `#workRecord` | Validate own Work provenance and route/task coherence even when a query bypasses `#requireTask`. Snapshots and poll-ready filtering are included. |
+| `#attemptRecord`, `#taskHistoryVersionCandidate` and cached `#taskHistoryItem`/`taskHistory` continuations | Validate selected items' immutable source-row canonical provenance even when cached history bypasses the record builders. Preserve stored JSON, digests and sequence-cut semantics. Never compare submitted or terminal history to today's session key. |
+| `#dispatchAuthorityValid`, `#assertSessionRoute` and `#attemptAuthorityCurrent` | Require live canonical agreement in addition to every existing account, project, Fast, generation, lease and fence check. Contradictory stored identity must not become an ordinary stale-authority result that is then silently retired. |
+| Direct attempt batches in retirement, sweep, reconciliation and polling | Cover the same row invariant before mutation or projection, including rows obtained without `#requireAttempt`. Preserve legitimate stale-authority recovery. |
+
+Keep the migration-wide populated-row scan separate from bounded runtime row
+validation. Do not turn metadata-only readonly open into a whole-database
+scan or broaden public wire shapes to avoid validating internal rows. Add
+corruption/refusal controls at the direct-query boundaries, and retain the
+real settled-history reselection cases as positive compatibility controls.
+An earlier cached history cut can still say claimed or dispatching after the
+authoritative attempt has settled and its worker has reselected. Derive live
+authority from the current attempt row, never that cached historical state;
+otherwise an unchanged historical continuation would become unreadable.
+
 ## Required evidence before completion
 
 - Authentic populated supported predecessors, especially pre-v38 contracts,
@@ -146,6 +172,29 @@ migration, process custody or live provider support.
 Candidate admission, provider provisioning, automatic routing/Fast, hosted
 capacity changes, package publication and daemon activation remain separate
 gates. No mock, source merge or schema number supplies their missing proof.
+
+### Upgrade fixture provenance
+
+Reuse the existing exact-version shapers only for the authority surface they
+actually prove. A current fixture stamped with an older version is not by
+itself an untouched root written by that historical release.
+
+- The pre-v38 ordering regression establishes a real session and the v25
+  replay seam, but has no populated Work. It cannot close historical Work
+  derivation by itself.
+- The v36 adoption regression has the strongest populated pre-v40 chain:
+  real Work creation and claim plus queue, mutation, task and interaction
+  evidence. Its valid quarantine intentionally releases authority and changes
+  state, revisions and events. Preserve immutable profile provenance while
+  separately asserting those exact allowed effects, not all-row identity.
+- The v40 retained-byte/digest and v41 retired-Devin regressions have real
+  session evidence but no populated Work. Add the missing historical Work
+  chain before claiming complete upgrade coverage.
+- Current v49 released/submitted controls create and settle real Work under
+  contract 1. Existing contract 2 WorkStore controls use a reduced parent
+  schema and rewritten contract/intent setup; they are not untouched
+  historical StateStore migration evidence. Authentic populated contract 2
+  Work remains a required new positive control.
 
 ## Companion-module checkpoint
 
@@ -234,3 +283,53 @@ the complete reader/writer and migration slice described above, prove its
 authentic upgrade and rollback cases, and run its exact-tree final gates.
 Do not interpret these passing foundation checks as canonical persistence,
 new profile admission, a release or permission to activate a daemon.
+
+## Populated-row proof checkpoint
+
+The next building block adds `assertLegacyCanonicalProfileRows` without an
+installer, backfill, migration number or runtime consumer. Four main-qualified
+scalar existence checks reject missing or contradictory session keys, derive
+routes from their own Work contract, and require task/attempt agreement with
+their immutable parents. Every textual identity comparison is BINARY. Workers must
+exist for settled attempts, but only the four live states require agreement
+with the worker's current key. Unknown or case-variant states refuse.
+
+The caller must keep the existing coherent migration transaction across
+predecessor, legacy authority, backfill, row and companion proofs. This helper
+neither owns that transaction nor replaces legacy authority checks. It reads
+only one scalar per table into JavaScript and returns fixed boundary errors
+for malformed results or SQL failures, without retaining row or error text.
+The original frozen 225-line module prefix and all guard definitions remain
+byte-identical; the new proof does not enter the account-adoption footprint.
+
+A genuine red control showed that exact metadata alone accepts an existing
+NULL key. The completed suite passed 232 tests and 1,362 assertions, including
+127 new cases and 977 assertions. Controls cover all seven historical keys,
+own-Work contracts, all live/settled states, NULL/case/collation damage,
+orphaned parents, TEMP shadowing, later invalid rows, malformed scalar results
+and sanitized SQL failures. Read-only transaction controls preserve serialized
+database bytes, total changes, schema version and query-only state on both
+success and refusal. Scoped lint, strict TypeScript, whitespace, independent
+frozen-file review and root review passed. These remain reduced SQL unit
+fixtures, not authentic StateStore migration or runtime integration proof.
+
+Frozen SHA-256: source
+`8b6be43b73dcc60e91c35ee34e50feaa85e9891d72b27d7839c878f02dde3bc1`;
+tests `adb9d98336d114f3b2f455d87f435cf1766f2bda0d6b820523d8b9c2e2e82c3b`.
+Independent inspection of the exact locally packed archive passed: 176
+canonical entries and 167 regular files contain 7,086,046 source-identical
+bytes. Only the canonical module grew, from 9,636 to 13,542 bytes; all 166
+other predecessor files and the original module prefix remain byte-identical.
+The inventory is 8,318 bytes with SHA-256
+`e3e95d13e75e73651b1915c05ba51b7b53b6f57dcf5342bb117a10272c5a252d`.
+Only the expected inventory size and digest constants changed. The archive
+is 1,342,882 bytes, SHA-256
+`b9ec8f8fa83324dc5dd73798f0fc7d58306f567ab1af445c5f9af8c048554c97`,
+and remains unpublished. Package policy passed 11 tests and 42 assertions;
+the refreshed exact archive assertion, unchanged security primitive counts,
+scoped policy lint and whitespace checks passed. The new exact-tree
+aggregate is a separate gate.
+The preceding `35dce12` CI run 34185898009 passed macOS in 15m47s, but
+Ubuntu exceeded the unchanged 20-minute job limit and Required failed.
+That failure is under independent log review; it is not waived by focused
+row-proof checks or earlier aggregate successes.

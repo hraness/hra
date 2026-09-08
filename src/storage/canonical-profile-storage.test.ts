@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 
 import {
+  assertLegacyCanonicalProfileRows,
   assertLegacyCanonicalProfileStorageSchema,
   deriveLegacySessionProfileKey,
   deriveLegacyWorkProfileKey,
@@ -529,4 +530,339 @@ describe("legacy canonical profile companion metadata (not migration admission)"
     expect(database.serialize()).toEqual(before);
     expect(database.query("SELECT canonical_profile_key FROM sessions").get()).toEqual({ canonical_profile_key: null });
   });
+});
+
+const ROW_TABLES = ["sessions", "work_routes", "work_tasks", "work_attempts"] as const;
+const rowProofDatabase = (
+  fixtureSql = UNIT_FIXTURE_SQL,
+  columnsSql = LEGACY_CANONICAL_PROFILE_COLUMNS_SQL,
+): Database => {
+  const database = unitDatabase({ fixtureSql, columnsSql, guardsSql: "" });
+  // A unit-only mutation sentinel, not the production migration ledger.
+  database.exec(`
+    CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO schema_migrations(version) VALUES (49);
+    PRAGMA user_version=49;
+  `);
+  return database;
+};
+
+const seedRowsForProof = (
+  database: Database,
+  keys: Partial<Record<typeof ROW_TABLES[number], string | null>> = {},
+): void => {
+  const { sessions = SOL, work_routes = SOL, work_tasks = SOL, work_attempts = SOL } = keys;
+  insertSession(database, "worker", "codex", "high", 1, sessions);
+  insertWork(database);
+  insertRoute(database, "high", work_routes);
+  insertTask(database, "high", work_tasks);
+  insertAttempt(database, "claimed", "high", work_attempts);
+};
+
+const expectReadOnlyRowProof = (database: Database, error?: string): void => {
+  database.exec("PRAGMA query_only=ON");
+  const before = database.serialize();
+  const changes = database.query("SELECT total_changes() AS changes").get();
+  const schemaVersion = database.query("PRAGMA schema_version").get();
+  database.transaction(() => {
+    expect(database.inTransaction).toBe(true);
+    if (error === undefined) expect(() => assertLegacyCanonicalProfileRows(database)).not.toThrow();
+    else {
+      let failure: unknown;
+      try { assertLegacyCanonicalProfileRows(database); } catch (caught) { failure = caught; }
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure instanceof Error ? failure.message : null).toBe(error);
+    }
+    expect(database.inTransaction).toBe(true);
+  })();
+  expect(database.serialize()).toEqual(before);
+  expect(database.query("SELECT total_changes() AS changes").get()).toEqual(changes);
+  expect(database.query("PRAGMA schema_version").get()).toEqual(schemaVersion);
+  expect(database.query("PRAGMA query_only").get()).toEqual({ query_only: 1 });
+};
+
+describe("legacy canonical populated rows (not migration admission)", () => {
+  test("refuses an existing NULL key even when exact companion metadata passes", () => {
+    const database = unitDatabase({ guardsSql: "" });
+    insertSession(database, "legacy", "codex", "high", 1, null);
+    database.exec(LEGACY_CANONICAL_PROFILE_GUARDS_SQL);
+    expect(() => assertLegacyCanonicalProfileStorageSchema(database)).not.toThrow();
+    const before = database.serialize();
+    expect(() => assertLegacyCanonicalProfileRows(database))
+      .toThrow("CANONICAL_PROFILE_ROWS_SESSIONS");
+    expect(database.serialize()).toEqual(before);
+  });
+
+  test("accepts empty rows without installing guards, filling keys or stamping a ledger", () => {
+    expectReadOnlyRowProof(rowProofDatabase());
+  });
+
+  test.each([...ROW_TABLES])("returns a fixed error when the populated %s query cannot be read", (table) => {
+    const database = rowProofDatabase(UNIT_FIXTURE_SQL, LEGACY_CANONICAL_PROFILE_COLUMNS_SQL.replace(
+      `ALTER TABLE ${table} ADD COLUMN canonical_profile_key TEXT;`, "",
+    ));
+    expectReadOnlyRowProof(database, `CANONICAL_PROFILE_ROWS_${table.toUpperCase()}`);
+  });
+
+  test.each([
+    ["absent", undefined], ["null", null], ["empty", {}], ["string", { invalid: "0" }],
+    ["foreign integer", { invalid: 2 }], ["extra field", { invalid: 0, private: "not row evidence" }],
+  ] as const)("refuses a malformed bounded scalar: %s", (_name, value) => {
+    const database = rowProofDatabase();
+    const before = database.serialize();
+    const statement = database.query("SELECT 0 AS invalid");
+    const query = spyOn(database, "query").mockReturnValue(statement);
+    const read = spyOn(statement, "get").mockReturnValue(value);
+    try {
+      expect(() => assertLegacyCanonicalProfileRows(database)).toThrow("CANONICAL_PROFILE_ROWS_SESSIONS");
+    } finally {
+      read.mockRestore();
+      query.mockRestore();
+    }
+    expect(database.serialize()).toEqual(before);
+  });
+
+  test("never includes a foreign SQLite read error in the fixed refusal", () => {
+    const database = rowProofDatabase();
+    const before = database.serialize();
+    const statement = database.query("SELECT 0 AS invalid");
+    const query = spyOn(database, "query").mockReturnValue(statement);
+    const read = spyOn(statement, "get").mockImplementation(() => { throw new Error("private payload"); });
+    let failure: unknown;
+    try {
+      assertLegacyCanonicalProfileRows(database);
+    } catch (error) {
+      failure = error;
+    } finally {
+      read.mockRestore();
+      query.mockRestore();
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure instanceof Error ? failure.message : null).toBe("CANONICAL_PROFILE_ROWS_SESSIONS");
+    expect(database.serialize()).toEqual(before);
+  });
+
+  test("checks main rows even when an empty temporary table shadows sessions", () => {
+    const database = rowProofDatabase();
+    insertSession(database, "legacy", "codex", "high", 1, null);
+    database.exec("CREATE TEMP TABLE sessions AS SELECT * FROM main.sessions WHERE 0");
+    expectReadOnlyRowProof(database, "CANONICAL_PROFILE_ROWS_SESSIONS");
+  });
+
+  test.each(SESSION_CASES)("recognizes populated frozen %s/%s contract %i", (provider, preset, contract, key) => {
+    const database = rowProofDatabase();
+    insertSession(database, "historical", provider, preset, contract, key);
+    expectReadOnlyRowProof(database);
+  });
+
+  test.each(WORK_CASES)("proves populated Work's own %s/%s contract %i after worker reselection", (_provider, preset, contract, key) => {
+    const database = rowProofDatabase();
+    insertSession(database, "worker", "codex", preset, contract, key);
+    insertSession(database, "coordinator", "claude", "ultra", contract, FABLE);
+    insertWork(database, contract);
+    database.exec("UPDATE works SET coordinator_session_id='coordinator'");
+    insertRoute(database, preset, key);
+    insertTask(database, preset, key);
+    insertAttempt(database, "completed", preset, key);
+    database.query("UPDATE sessions SET preset='low',preset_contract=2,canonical_profile_key=? WHERE id='worker'").run(LUNA);
+    expect(database.query("SELECT canonical_profile_key FROM work_attempts").get())
+      .toEqual({ canonical_profile_key: key });
+    expectReadOnlyRowProof(database);
+  });
+
+  test("recognizes a Devin coordinator without deriving a Devin Work route", () => {
+    const database = rowProofDatabase();
+    insertSession(database, "worker", "devin", "ultra", 2, DEVIN);
+    insertWork(database, 2);
+    insertRoute(database, "ultra", ASTRA_ULTRA);
+    insertTask(database, "ultra", ASTRA_ULTRA);
+    expectReadOnlyRowProof(database);
+  });
+
+  test("accepts equal Luna keys across the worker and Work contracts while live", () => {
+    const database = rowProofDatabase();
+    seedAttempt(database, "claimed", "low", LUNA);
+    database.exec("UPDATE sessions SET preset_contract=2");
+    expectReadOnlyRowProof(database);
+  });
+
+  for (const table of ROW_TABLES) {
+    test.each([null, "", "foreign:private-key", SOL.toUpperCase(), FABLE, ASTRA])(
+      `refuses populated ${table} key debt %s without mutations`, (key) => {
+        const database = rowProofDatabase();
+        seedRowsForProof(database, { [table]: key });
+        expectReadOnlyRowProof(database, `CANONICAL_PROFILE_ROWS_${table.toUpperCase()}`);
+      },
+    );
+
+    test(`does not overlook a later invalid ${table} row beside valid rows`, () => {
+      const database = rowProofDatabase();
+      seedRowsForProof(database);
+      if (table === "sessions") insertSession(database, "later", "codex", "high", 1, null);
+      else if (table === "work_routes") insertRoute(database, "low", null);
+      else if (table === "work_tasks") database.exec(`
+        INSERT INTO work_tasks(id,work_id,account_id,project_id,preset,fast,canonical_profile_key)
+        VALUES ('later','work','account','project','high',0,NULL)
+      `);
+      else database.exec(`
+        INSERT INTO work_attempts(id,work_id,task_id,worker_session_id,account_id,project_id,preset,fast,state,canonical_profile_key)
+        VALUES ('later','work','task','worker','account','project','high',0,'submitted',NULL)
+      `);
+      expect(database.query(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: 2 });
+      expectReadOnlyRowProof(database, `CANONICAL_PROFILE_ROWS_${table.toUpperCase()}`);
+    });
+
+    test(`does not inherit NOCASE collation for populated ${table} keys`, () => {
+      const database = rowProofDatabase(
+        UNIT_FIXTURE_SQL.replaceAll("TEXT", "TEXT COLLATE NOCASE"),
+        LEGACY_CANONICAL_PROFILE_COLUMNS_SQL.replaceAll("TEXT", "TEXT COLLATE NOCASE"),
+      );
+      seedRowsForProof(database, { [table]: SOL.toUpperCase() });
+      expectReadOnlyRowProof(database, `CANONICAL_PROFILE_ROWS_${table.toUpperCase()}`);
+    });
+  }
+
+  test.each([["CODEX", "high"], ["codex", "HIGH"]] as const)(
+    "does not inherit NOCASE collation for session alias %s/%s", (provider, preset) => {
+      const database = rowProofDatabase(UNIT_FIXTURE_SQL.replaceAll("TEXT", "TEXT COLLATE NOCASE"));
+      insertSession(database, "worker", provider, preset, 1, SOL);
+      expectReadOnlyRowProof(database, "CANONICAL_PROFILE_ROWS_SESSIONS");
+    },
+  );
+
+  test("does not inherit NOCASE collation for a Work route's own preset", () => {
+    const database = rowProofDatabase(UNIT_FIXTURE_SQL.replaceAll("TEXT", "TEXT COLLATE NOCASE"));
+    insertSession(database);
+    insertWork(database);
+    insertRoute(database, "HIGH", SOL);
+    expectReadOnlyRowProof(database, "CANONICAL_PROFILE_ROWS_WORK_ROUTES");
+  });
+
+  test.each([
+    ["work_routes", "work_id"],
+    ["work_tasks", "work_id"], ["work_tasks", "account_id"],
+    ["work_tasks", "project_id"], ["work_tasks", "preset"],
+    ["work_attempts", "work_id"], ["work_attempts", "task_id"],
+    ["work_attempts", "worker_session_id"], ["work_attempts", "account_id"],
+    ["work_attempts", "project_id"], ["work_attempts", "preset"],
+  ] as const)("does not inherit NOCASE parent equality for %s.%s", (table, column) => {
+    const database = rowProofDatabase(UNIT_FIXTURE_SQL.replaceAll("TEXT", "TEXT COLLATE NOCASE"));
+    seedRowsForProof(database);
+    // A second row has an existing case-insensitive FK parent but no exact
+    // identity parent. No disabled FK enforcement is needed for this damage.
+    const columns = table === "work_routes"
+      ? ["work_id", "account_id", "project_id", "preset", "fast", "canonical_profile_key"]
+      : table === "work_tasks"
+        ? ["id", "work_id", "account_id", "project_id", "preset", "fast", "canonical_profile_key"]
+        : ["id", "work_id", "task_id", "worker_session_id", "account_id", "project_id", "preset", "fast", "state", "canonical_profile_key"];
+    const values = columns.map((name) => name === "id" ? "'later'"
+      : name === column ? `upper(${name})`
+        : table === "work_routes" && name === "fast" ? "1" : name);
+    database.exec(`INSERT INTO ${table}(${columns.join(",")}) SELECT ${values.join(",")} FROM ${table}`);
+    expect(database.query("SELECT EXISTS (SELECT 1 FROM pragma_foreign_key_check) AS damaged").get())
+      .toEqual({ damaged: 0 });
+    expectReadOnlyRowProof(database, `CANONICAL_PROFILE_ROWS_${table.toUpperCase()}`);
+  });
+
+  test.each([
+    ["codex", "high", 3, SOL], ["codex", "fable-max", 1, FABLE],
+    ["codex", "astra", 2, DEVIN], ["claude", "low", 1, FABLE],
+    ["claude", "fable-max", 1, FABLE], ["devin", "ultra", 1, DEVIN],
+    ["devin", "high", 2, DEVIN], ["foreign", "ultra", 2, SOL],
+  ] as const)("refuses a populated nonhistorical session %s/%s/%i", (provider, preset, contract, key) => {
+    const database = rowProofDatabase();
+    insertSession(database, "private-session", provider, preset, contract, key);
+    expectReadOnlyRowProof(database, "CANONICAL_PROFILE_ROWS_SESSIONS");
+  });
+
+  test.each([["high", 3, SOL], ["astra", 2, DEVIN], ["fable-max", 1, FABLE]] as const)(
+    "refuses a populated nonhistorical Work route %s/%i", (preset, contract, key) => {
+      const database = rowProofDatabase();
+      insertSession(database);
+      insertWork(database, contract);
+      insertRoute(database, preset, key);
+      expectReadOnlyRowProof(database, "CANONICAL_PROFILE_ROWS_WORK_ROUTES");
+    },
+  );
+
+  test.each([...LIVE_STATES])("refuses historical worker-key divergence for populated %s", (state) => {
+    const database = rowProofDatabase();
+    seedAttempt(database, state);
+    database.query("UPDATE sessions SET preset_contract=2,canonical_profile_key=?").run(ASTRA);
+    expectReadOnlyRowProof(database, "CANONICAL_PROFILE_ROWS_WORK_ATTEMPTS");
+  });
+
+  test.each([...NON_FENCED_STATES])("accepts populated %s history after a guarded worker reselection", (state) => {
+    const database = rowProofDatabase();
+    database.exec(LEGACY_CANONICAL_PROFILE_GUARDS_SQL);
+    seedAttempt(database, state);
+    database.query("UPDATE sessions SET preset_contract=2,canonical_profile_key=?").run(ASTRA);
+    expect(() => assertLegacyCanonicalProfileStorageSchema(database)).not.toThrow();
+    expectReadOnlyRowProof(database);
+  });
+
+  test.each([...LIVE_STATES])("accepts matching worker keys for populated %s", (state) => {
+    const database = rowProofDatabase();
+    seedAttempt(database, state);
+    expectReadOnlyRowProof(database);
+  });
+
+  test.each(["CLAIMED", "foreign", ""])('refuses an unknown attempt state "%s" instead of treating it as settled', (state) => {
+    const database = rowProofDatabase(UNIT_FIXTURE_SQL.replace("state TEXT NOT NULL,", "state TEXT COLLATE NOCASE NOT NULL,"));
+    seedAttempt(database, state);
+    database.query("UPDATE sessions SET preset_contract=2,canonical_profile_key=?").run(ASTRA);
+    expectReadOnlyRowProof(database, "CANONICAL_PROFILE_ROWS_WORK_ATTEMPTS");
+  });
+
+  test.each([
+    ["works", "WORK_ROUTES"], ["work_routes", "WORK_TASKS"],
+    ["work_tasks", "WORK_ATTEMPTS"], ["sessions", "WORK_ATTEMPTS"],
+  ] as const)("refuses orphaned populated rows after deleting %s", (parent, error) => {
+    const database = rowProofDatabase();
+    seedRowsForProof(database);
+    // Deliberate preexisting damage only; the proof runs with FK enforcement on.
+    database.exec("PRAGMA foreign_keys=OFF");
+    database.exec(`DELETE FROM ${parent}`);
+    database.exec("PRAGMA foreign_keys=ON");
+    expect(database.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+    expect(database.query("SELECT EXISTS (SELECT 1 FROM pragma_foreign_key_check) AS damaged").get())
+      .toEqual({ damaged: 1 });
+    expectReadOnlyRowProof(database, `CANONICAL_PROFILE_ROWS_${error}`);
+  });
+
+  test.each([...NON_FENCED_STATES])("requires an existing worker even for populated %s history", (state) => {
+    const database = rowProofDatabase();
+    seedAttempt(database, state);
+    database.exec("PRAGMA foreign_keys=OFF");
+    database.exec("DELETE FROM sessions");
+    database.exec("PRAGMA foreign_keys=ON");
+    expectReadOnlyRowProof(database, "CANONICAL_PROFILE_ROWS_WORK_ATTEMPTS");
+  });
+
+  for (const table of ["work_tasks", "work_attempts"] as const) {
+    test.each(["work_id", "account_id", "project_id", "preset", "fast"] as const)(
+      `refuses populated ${table} same-key wrong-parent %s`, (column) => {
+        const database = rowProofDatabase();
+        insertSession(database);
+        insertWork(database);
+        insertWork(database, 1, "other-work");
+        insertRoute(database);
+        if (table === "work_attempts") insertTask(database);
+        const tuple = ["work", "account", "project", "high", 0];
+        const index = ["work_id", "account_id", "project_id", "preset", "fast"].indexOf(column);
+        tuple[index] = column === "fast" ? 1 : column === "work_id" ? "other-work" : "other";
+        database.exec("PRAGMA foreign_keys=OFF");
+        if (table === "work_tasks") database.query(`
+          INSERT INTO work_tasks(id,work_id,account_id,project_id,preset,fast,canonical_profile_key)
+          VALUES ('task',?,?,?,?,?,?)
+        `).run(...tuple, SOL);
+        else database.query(`
+          INSERT INTO work_attempts(id,task_id,worker_session_id,work_id,account_id,project_id,preset,fast,state,canonical_profile_key)
+          VALUES ('attempt','task','worker',?,?,?,?,?,'submitted',?)
+        `).run(...tuple, SOL);
+        database.exec("PRAGMA foreign_keys=ON");
+        expectReadOnlyRowProof(database, `CANONICAL_PROFILE_ROWS_${table.toUpperCase()}`);
+      },
+    );
+  }
 });
