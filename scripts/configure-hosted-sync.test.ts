@@ -149,10 +149,13 @@ const inheritedPipeFixture = async (overflow?: "stdout" | "stderr") => {
     await rm(root, { recursive: true, force: true });
     throw error;
   }
+  // Keep both programs static. Fixture paths, deadlines and output travel as
+  // argv data rather than participating in nested source construction.
   const holder = [
     "const { closeSync } = require('node:fs');",
     "const { createConnection } = require('node:net');",
-    `const socket = createConnection(${JSON.stringify(socketPath)});`,
+    "const [socketPath, deadline] = process.argv.slice(1);",
+    "const socket = createConnection(socketPath);",
     "let finished = false;",
     "const finish = () => {",
     "  if (finished) return;",
@@ -160,7 +163,7 @@ const inheritedPipeFixture = async (overflow?: "stdout" | "stderr") => {
     "  closeSync(1); closeSync(2);",
     "  socket.end('DONE\\n');",
     "};",
-    `const expiry = setTimeout(() => process.exit(2), Math.max(0, ${expiresAt} - Date.now()));`,
+    "const expiry = setTimeout(() => process.exit(2), Math.max(0, Number(deadline) - Date.now()));",
     "socket.once('connect', () => { socket.write('READY\\n'); process.send('ready'); });",
     "let command = '';",
     "socket.on('data', (data) => {",
@@ -175,17 +178,21 @@ const inheritedPipeFixture = async (overflow?: "stdout" | "stderr") => {
   const stderr = overflow === "stderr" ? "x".repeat(128) : overflow === undefined ? "stderr-kept" : "";
   const parent = [
     "const { spawn } = require('node:child_process');",
-    `setTimeout(() => process.exit(2), Math.max(0, ${expiresAt} - Date.now()));`,
-    `const holder = spawn(process.execPath, ['--no-env-file', '--config=/dev/null', '-e', ${JSON.stringify(holder)}], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });`,
+    "const [holderSource, socketPath, deadline, stdout, stderr] = process.argv.slice(1);",
+    "setTimeout(() => process.exit(2), Math.max(0, Number(deadline) - Date.now()));",
+    "const holder = spawn(process.execPath, ['--no-env-file', '--config=/dev/null', '-e', holderSource, socketPath, deadline], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });",
     "holder.once('error', () => process.exit(2));",
     "holder.once('message', (message) => {",
     "  if (message !== 'ready') process.exit(2);",
-    `  process.stdout.write(${JSON.stringify(stdout)}, () => process.stderr.write(${JSON.stringify(stderr)}, () => process.exit(0)));`,
+    "  process.stdout.write(stdout, () => process.stderr.write(stderr, () => process.exit(0)));",
     "});",
   ].join("\n");
   return {
     request: {
-      arguments: ["--no-env-file", "--config=/dev/null", "-e", parent],
+      arguments: [
+        "--no-env-file", "--config=/dev/null", "-e", parent,
+        holder, socketPath, String(expiresAt), stdout, stderr,
+      ],
       containment: "local",
       cwd: import.meta.dir,
       environment: { NO_COLOR: "1", PATH: "/usr/bin:/bin", TERM: "dumb" },
