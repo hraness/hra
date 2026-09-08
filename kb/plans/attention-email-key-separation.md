@@ -164,6 +164,23 @@ the outcome is reconciled or transferred through a reviewed recovery handoff.
   exhaustion and preserved interrupted observations. Scoped lint, TypeScript,
   static diff checks and the refreshed KB graph pass. The required exact-tree
   final gate and PR delivery remain pending; no live installation has occurred.
+- The installer is pushed in PR #154. Its initial exact-tree full gate passes
+  6,055 tests with one skip and no failures, including build and package
+  verification. CodeQL's separate security check identified a public environment
+  name flowing into the intent-slot hash. The reviewed follow-up makes that name
+  explicit outside the target hash, preserves and refuses pre-release intents,
+  and independently replaces the raw environment digest with a target-bound
+  HMAC. All 65 focused cases, 693 assertions, scoped lint and TypeScript pass;
+  fresh CodeQL reports no new alerts without a suppression.
+- Linux CI passes on the follow-up. macOS exposes a pre-existing live-acceptance
+  test budget mismatch: its default five-second outer timeout can interrupt the
+  five-second source subprocess before cleanup completes. The bounded repair
+  gives only that test a 15-second outer budget. Production deadlines, absolute
+  Git selection and the hostile-PATH sentinel assertion remain unchanged. The
+  single real macOS fixture passes; a slower invocation still must satisfy the
+  production deadline. Current-main integration and fresh final validation are
+  required before delivery. No live key installation or attention activation
+  has occurred.
 
 ## Review findings
 
