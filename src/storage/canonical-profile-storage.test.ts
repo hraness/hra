@@ -3,9 +3,11 @@ import { Database } from "bun:sqlite";
 
 import {
   assertLegacyCanonicalProfileRows,
+  assertLegacyCanonicalProfileStorageAbsent,
   assertLegacyCanonicalProfileStorageSchema,
   deriveLegacySessionProfileKey,
   deriveLegacyWorkProfileKey,
+  LEGACY_CANONICAL_PROFILE_BACKFILL_SQL,
   LEGACY_CANONICAL_PROFILE_COLUMNS_SQL,
   LEGACY_CANONICAL_PROFILE_GUARDS_SQL,
 } from "./canonical-profile-storage";
@@ -83,7 +85,8 @@ const unitDatabase = (options: Readonly<{
   databases.push(database);
   database.exec("PRAGMA foreign_keys=ON");
   database.exec(options.fixtureSql ?? UNIT_FIXTURE_SQL);
-  database.exec(options.columnsSql ?? LEGACY_CANONICAL_PROFILE_COLUMNS_SQL);
+  const columnsSql = options.columnsSql ?? LEGACY_CANONICAL_PROFILE_COLUMNS_SQL;
+  if (columnsSql.length > 0) database.exec(columnsSql);
   const guardsSql = options.guardsSql ?? LEGACY_CANONICAL_PROFILE_GUARDS_SQL;
   if (guardsSql.length > 0) database.exec(guardsSql);
   return database;
@@ -123,6 +126,69 @@ const COMPANION_NAMES = [
   "canonical_profile_work_attempt_immutable_guard",
   "canonical_profile_session_live_attempt_guard",
 ] as const;
+
+describe("canonical predecessor absence and key-only backfill unit boundary", () => {
+  test("proves absent authority without changing an empty or populated predecessor", () => {
+    const database = unitDatabase({ columnsSql: "", guardsSql: "" });
+    database.exec("INSERT INTO sessions(id,provider_v39,preset,preset_contract) VALUES ('legacy','codex','high',2)");
+    database.exec("PRAGMA query_only=ON");
+    const before = database.serialize();
+    expect(() => assertLegacyCanonicalProfileStorageAbsent(database)).not.toThrow();
+    expect(database.serialize()).toEqual(before);
+  });
+
+  test.each(["sessions", "work_routes", "work_tasks", "work_attempts"])(
+    "refuses a hidden case-variant key on predecessor %s without writes", (table) => {
+      const database = unitDatabase({ columnsSql: "", guardsSql: "" });
+      database.exec(`ALTER TABLE ${table} ADD COLUMN Canonical_Profile_Key TEXT GENERATED ALWAYS AS ('foreign') VIRTUAL`);
+      database.exec("PRAGMA query_only=ON");
+      const before = database.serialize();
+      expect(() => assertLegacyCanonicalProfileStorageAbsent(database))
+        .toThrow("CANONICAL_PROFILE_PREDECESSOR_COLUMN_COLLISION");
+      expect(database.serialize()).toEqual(before);
+    },
+  );
+
+  test.each([...COMPANION_NAMES])("refuses a non-trigger collision for %s without writes", (name) => {
+    const database = unitDatabase({ columnsSql: "", guardsSql: "" });
+    database.exec(`CREATE VIEW ${name.toUpperCase()} AS SELECT 1`);
+    database.exec("PRAGMA query_only=ON");
+    const before = database.serialize();
+    expect(() => assertLegacyCanonicalProfileStorageAbsent(database))
+      .toThrow("CANONICAL_PROFILE_PREDECESSOR_OBJECT_COLLISION");
+    expect(database.serialize()).toEqual(before);
+  });
+
+  test.each(SESSION_CASES)("backfills only the frozen %s/%s contract %i key", (provider, preset, contract, key) => {
+    const database = unitDatabase({ guardsSql: "" });
+    insertSession(database, "worker", provider, preset, contract, null);
+    const before = database.query("SELECT id,provider_v39,preset,preset_contract,project_id,title FROM sessions").get();
+    database.exec(LEGACY_CANONICAL_PROFILE_BACKFILL_SQL);
+    expect(database.query("SELECT canonical_profile_key FROM sessions").get()).toEqual({ canonical_profile_key: key });
+    expect(database.query("SELECT id,provider_v39,preset,preset_contract,project_id,title FROM sessions").get()).toEqual(before);
+    expect(() => assertLegacyCanonicalProfileRows(database)).not.toThrow();
+  });
+
+  test.each(WORK_CASES)("backfills Work from its own %s/%s contract %i after worker reselection", (_provider, preset, contract, key) => {
+    const database = unitDatabase({ guardsSql: "" });
+    insertSession(database, "worker", "claude", "ultra", 1, null);
+    insertWork(database, contract);
+    insertRoute(database, preset, null);
+    insertTask(database, preset, null);
+    insertAttempt(database, "released", preset, null);
+    const before = database.query("SELECT id,state,revision FROM work_attempts").get();
+    // Unit-only removal of the three modeled guards. The real migration must
+    // prove and restore exact production bodies under its owned transaction.
+    database.exec("DROP TRIGGER work_routes_no_update; DROP TRIGGER work_tasks_no_update; DROP TRIGGER work_attempt_revision_guard");
+    database.exec(LEGACY_CANONICAL_PROFILE_BACKFILL_SQL);
+    for (const table of ["work_routes", "work_tasks", "work_attempts"]) {
+      expect(database.query(`SELECT canonical_profile_key FROM ${table}`).get()).toEqual({ canonical_profile_key: key });
+    }
+    expect(database.query("SELECT canonical_profile_key FROM sessions").get()).toEqual({ canonical_profile_key: FABLE });
+    expect(database.query("SELECT id,state,revision FROM work_attempts").get()).toEqual(before);
+    expect(() => assertLegacyCanonicalProfileRows(database)).not.toThrow();
+  });
+});
 
 const insertSession = (
   database: Database,

@@ -16,15 +16,22 @@ admission. This is the next bounded source increment in
 policy. Sol Ultra remains the implicit Codex default. Historical Astra and
 retired Devin decoding grant no fresh execution authority.
 
-The current parent join incorporates PR147's protected merge `c639ad78`,
-including the schema49 project companion, reviewed physical-scrub fixture
-repair and dedicated attention-key source from main `5838ec4`. The original
-foundation began at `380ced9`; that older checkpoint is not the current
-integration base. PR147's exact head passed its local and protected gates;
-exact-main CI34188257597 is pending. This follow-on has no allocated schema number.
-After exact-main CI passes, recheck protected main and competing local-storage
-ownership before installing a migration. Keep the independently owned
-peer-memory changes in PR148 intact at integration.
+The dormant foundation was delivered through PR149 at protected main
+`7ab347813f8d7e4f31e9584752c801dd1ca0cda0`. Its exact-head local aggregate,
+both CI platforms and CodeQL passed; exact-main CI34242469558 and CodeQL
+34242468686 passed. It includes PR147's schema49 project companion and
+retains all earlier authority and fixture repairs. Those receipts prove the
+dormant foundation, not the migration now being implemented.
+
+The local follow-on reserves physical schema50 after a fresh competing-owner
+check. PR140's usage owner acknowledged that reservation; its later migration
+tail remains unallocated until this exact source is reviewed and integrated.
+The StyleX branch still uses schema49. No number alone admits a predecessor.
+The complete session/Work migration slice is being validated separately on
+`codex/canonical-profile-migration-20260908`; it is not released or activated.
+PR139 merged at `109655a8f7d6edd8916f6d7df277e3402b70a44f`, and PR148 retains
+the next integration and candidate-release window. Preserve its peer-memory
+changes and join actual protected main before final schema50 validation.
 
 ## Storage decision
 
@@ -365,3 +372,113 @@ root review passed. Service test SHA-256:
 Production source, package bytes, retry counts and all test/job deadlines
 remain unchanged. This is a measured fixture wait reduction, not Linux
 after-measurement or a replacement for the new exact-tree aggregate and CI.
+
+## Schema50 implementation checkpoint
+
+The working vertical slice now installs the four key-only columns and seven
+frozen guards under StateStore's existing immediate migration transaction.
+It rejects predecessor collisions before maintenance, proves and temporarily
+removes only the three blocking legacy guards, restores their exact observed
+bodies, and composes a new current ledger assertion around unchanged schema49.
+Current50 writable opens prove rows before maintenance; readonly opens retain
+metadata-only admission and reject corrupt identity at authoritative reads.
+Every session identity writer and Work route/task/attempt writer carries its
+derived key inside the existing atomic boundary. Public records, request
+versions, history JSON and digest preimages remain unchanged.
+
+Independent source review covered old-waypoint ordering, all session writers,
+direct Work projections, late authorization, signal sources, cached history
+and retirement. Two genuine recovery-order regressions showed a corrupt task
+could be detected only after separately committed recovery expired another
+valid claim. Bounded operation-source checks now run before that recovery;
+the regressions preserve the whole serialized database on canonical refusal,
+while ordinary stale-authority recovery still commits as before. Separate
+signal-effect controls caught direct reads that omitted the owning task's
+canonical proof. Those reads now use the same bounded source validation.
+
+The standalone Work suite passed98 tests and1,219 assertions, with scoped lint,
+strict TypeScript and independent source/test review. The companion suite
+passed259 tests and1,449 assertions, including27 new predecessor-absence and
+key-only backfill cases. Its original frozen SQL remains unchanged; only the
+stale foundation-only explanatory comment was updated in the old prefix.
+These focused receipts do not replace the joined aggregate or CI.
+
+The final reader audit found six session methods whose first canonical
+projection could run after their mutation committed. Archive and both recovery
+methods now return the checked record inside their existing transactions;
+bind, turn-state and quarantine add three immediate transactions. Original
+SQL, evidence checks, CAS precedence, clocks and successful behavior remain
+unchanged. Four direct-writer regressions first failed because the complete
+logical database changed despite refusal, then passed after repair. The two
+recovery paths have six equivalent corruption controls plus exact evidence,
+revision and healthy historical-profile-replay controls:11 tests and83
+assertions passed. Independent review and strict TypeScript passed. The
+reviewed security inventory changes only StateStore's immediate transaction
+count from165 to168; all45 files pass the unchanged inventory check.
+
+An offline generator captured a public-synthetic schema49 database using
+unchanged source with tree `978bdc30b6fb9d259c92d0ca91335a854227d6f4`.
+It verifies180 source files and the exact toolchain, lockfile and manifest,
+then proves real semantic creation, claim, release, submission, reopen and
+replay before serializing the logical schema and every row. Independent
+review checked115 tables and139 rows, including nested JSON. The481,688-byte
+fixture contains only explicitly synthetic public inputs; no private capture
+was normalized or published. SHA-256:
+`ac96da7af133d3980438991a36b6051de2dfcfd764d03343f47f5f75d7f0e887`.
+
+The final43-case real-StateStore migration suite passed1,118 assertions.
+It includes the reviewed positive49-to50 requirement for exact old table DDL
+and `table_xinfo` after removing only each permitted added column. Current
+writer, four-live-state,
+settled-history, corrupt-row, collision and full-rollback controls are
+included. All three authentic49 Work cases use contract1 Ultra; synthetic
+dispatch receipts and cursors are storage fixtures, not provider acceptance.
+
+An additional private copy-only proof upgraded an authentic populated schema41
+database written by unchanged source `576ccd76a6742cd62759ab6176a6a41844846daa`.
+It retained one released contract2 Work chain, produced historical Astra Max
+keys on all four identity tables and preserved every original Work value,
+projection and version1 release replay. A version2 replay correctly refused
+without mutation; subsequent current readonly/writable opens were stable.
+The original capture remained byte-identical and private. This is bounded
+working-input migration evidence, not a historical release-artifact test.
+
+Unchanged schema49 source also refused a fresh synthetic50 root in both
+readonly and writable modes with `STATE_SCHEMA_NEWER:50:49`. Every material
+file and sidecar retained its exact bytes and permissions, and the new
+readonly reader returned the original session afterward. This is source-level
+downgrade refusal, not execution of an admitted older CLI artifact.
+
+Existing StateStore shapers now remove only the canonical overlay at explicit
+predecessor boundaries and preserve exact original data and DDL plus the
+permitted new fields. All original cases remain, including the13-case exact49
+ledger matrix alongside14 current50 cases. The final ledger/metadata group
+passed28 cases and411 assertions; four exact legacy-DDL preservation cases
+passed2,184 assertions. Scoped lint and nine-file strict TypeScript passed.
+
+The authentic pre-v40 control now also passes: unchanged schema39 source
+`5f2735191640037c86d9949bc1d7f04b2ef09ffe` created and claimed a contract2
+Ultra Work without immutable provider-session proof. A private copy upgraded
+to50 with all four historical Astra Ultra keys, the exact expected released
+attempt, pending task and recovery-required session, and one new event/history
+version. Every old table's rows were compared against explicit source-derived
+allowed changes; old intent/event/history bytes stayed exact. Current readonly,
+writable and version1 replay stayed stable; version2 refused without mutation.
+Independent review confirmed the original capture remained byte-identical.
+This single-state source proof does not close the separate pre-v38 boundary.
+
+Independent review of the unpublished draft archive passed:167 source-identical
+regular files, nine directories and176 inventory entries. Exactly the three
+reviewed storage sources changed; the other164 production files remain exact.
+All frozen Work/project49 SQL and canonical guards/mapping declarations match
+the delivered foundation. The8,318-byte inventory SHA-256 is
+`5ffa09d2f1432a089aadb69822524a3181b0b5de9b39e24abfcf17b46a0d8ce4`;
+only that policy digest changed. Archive size is1,352,818 bytes, SHA-256
+`5351a74d0c06d7d5d51cd075f038783aacb3a892a79b1e586f136b1514f67e71`.
+This is not an installation, final joined archive or release receipt.
+
+Remaining integration work includes authentic populated pre-v38 compatibility,
+the actual PR148 main join, refreshed archive review and required exact-tree
+gates. Keep shaped fixtures distinct from untouched historical captures.
+Do not mark this migration, candidate admission or release complete from the
+current working source or these focused receipts.
