@@ -131,8 +131,8 @@ grant additional authority. When evidence is missing, first gather bounded diagn
 the behavior, or obtain independent review. Ask a person only for a material unresolved decision,
 unavoidable authentication, missing authority, or an out-of-scope destructive effect.
 
-Artifact admission and operational activation are distinct decisions. Publish reviewed artifacts
-after exact-source CI, relevant deterministic and security checks, package/install verification,
+Artifact admission and operational activation are distinct decisions. Admit published artifacts
+only after exact-source CI, relevant deterministic and security checks, package/install verification,
 protected identity, provenance, and immutable public readback. Authenticated live qualification is
 not a universal publication prerequisite. Record an unperformed proof as pending, and retain
 unsupported-platform refusals and disabled or fail-closed unqualified behavior. If publication or

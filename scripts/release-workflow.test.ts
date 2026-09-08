@@ -536,6 +536,9 @@ describe("release workflow", () => {
     expect(phase6).not.toContain("exact-tree aggregate and authenticated combined proof remain required");
     expect(phase10).toBeDefined();
     expect(phase10).toContain("**Artifact acceptance:**");
+    expect(phase10).toContain("**Hosted rollout acceptance:**");
+    expect(phase10).toContain("before claiming hosted delivery or completing this phase");
+    expect(phase10).toContain("Missing deployment authority keeps hosted work pending but does not block artifact publication");
     expect(phase10).toContain("**Optional runtime qualification:**");
     expect(phase10).toContain("Artifact shipping may complete while live qualification remains incomplete");
     expect(phase10).toContain("without activating a daemon or hosted writer before its separate capacity and target gates pass");
