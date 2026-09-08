@@ -1158,6 +1158,37 @@ const exactWorkAuthorityTriggerNameSet: ReadonlySet<string> = new Set(
 const normalizeWorkSchemaSql = (sql: string): string =>
   sql.replace(/\bIF NOT EXISTS\b/giu, "").replace(/\s+/gu, " ").trim().replace(/;$/u, "");
 
+// Schema v49 adds this companion without changing the released Work SQL or
+// its frozen v39/v40 authority and non-authority digest preimages.
+export const WORK_PROJECT_AUTHORITY_SCHEMA_SQL = `
+CREATE TRIGGER work_session_project_authority_guard
+BEFORE UPDATE OF project_id ON sessions
+WHEN NEW.project_id IS NOT OLD.project_id
+  AND EXISTS (
+    SELECT 1 FROM work_attempts AS a
+    WHERE a.worker_session_id=OLD.id
+      AND a.state IN ('claimed','dispatching','running','recovery_required')
+      AND NEW.project_id IS NOT a.project_id
+  )
+BEGIN SELECT RAISE(ABORT,'WORK_SESSION_ATTEMPT_AUTHORITY'); END;
+`;
+
+export function assertWorkProjectAuthoritySchema(database: Database): void {
+  const rows = database.query(
+    "SELECT name,type,tbl_name,sql FROM sqlite_master WHERE name='work_session_project_authority_guard' COLLATE NOCASE",
+  ).all() as Array<{ name?: unknown; type?: unknown; tbl_name?: unknown; sql?: unknown }>;
+  if (rows.length === 0) throw new Error("WORK_SCHEMA_MISSING_TRIGGER:work_session_project_authority_guard");
+  const row = rows[0];
+  if (
+    rows.length !== 1
+    || row?.name !== "work_session_project_authority_guard"
+    || row.type !== "trigger"
+    || row.tbl_name !== "sessions"
+    || typeof row.sql !== "string"
+    || normalizeWorkSchemaSql(row.sql) !== normalizeWorkSchemaSql(WORK_PROJECT_AUTHORITY_SCHEMA_SQL)
+  ) throw new Error("WORK_SCHEMA_STALE_TRIGGER:work_session_project_authority_guard");
+}
+
 const workTriggerDefinitionSql = (name: string): string => {
   const markers = [`CREATE TRIGGER ${name}\n`, `CREATE TRIGGER IF NOT EXISTS ${name}\n`];
   const start = markers
@@ -1541,10 +1572,15 @@ const assertWorkSchemaShape = (
 // Writable opens verify schema identity and row-level referential integrity.
 // The foreign_key_check scans every child row, so it belongs only on the
 // connection that can repair or refuse the database.
-export function assertWorkSchema(database: Database): void {
+export function assertLegacyVersion42WorkSchema(database: Database): void {
   assertWorkSchemaShape(database);
   const integrity = database.query("PRAGMA foreign_key_check").all();
   if (integrity.length !== 0) throw new Error("WORK_SCHEMA_FOREIGN_KEY_VIOLATION");
+}
+
+export function assertWorkSchema(database: Database): void {
+  assertLegacyVersion42WorkSchema(database);
+  assertWorkProjectAuthoritySchema(database);
 }
 
 /**
@@ -1658,6 +1694,7 @@ export function assertProviderVersion39WorkSchema(database: Database): void {
 // checkpoint must wait for that snapshot before it can truncate the WAL.
 export function assertReadonlyWorkSchema(database: Database): void {
   assertWorkSchemaShape(database);
+  assertWorkProjectAuthoritySchema(database);
 }
 
 export type WorkStoreErrorCode =

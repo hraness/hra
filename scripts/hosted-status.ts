@@ -74,7 +74,7 @@ const admissionSchema = z.object({
   updatedAt: z.number().finite().nonnegative(),
 }).strict();
 
-const attentionInactiveReadSchema = z.object({
+export const attentionInactiveReadSchema = z.object({
   generation: z.number().int().min(0).safe(),
   globalState: z.enum(["absent", "disabled", "enabled"]),
   outboxOccupancy: boundedOccupancySchema,
@@ -86,6 +86,12 @@ const attentionInactiveReadSchema = z.object({
   ) context.addIssue({ code: "custom", message: "attention_status_incoherent" });
 });
 
+// This proves only that the runtime has valid, distinct credentials. Provider
+// account identity, domain scope, consent, and sending enablement are separate.
+export const attentionSendingReadSchema = z.object({
+  dedicatedKeyReady: z.boolean(),
+}).strict();
+
 const releaseAttestationFunction = makeFunctionReference<"query", Record<string, never>, unknown>(
   "releaseAttestation:read",
 );
@@ -93,6 +99,7 @@ const releaseAttestationFunction = makeFunctionReference<"query", Record<string,
 type HostedStatusFailureCode =
   | "admission_status_invalid"
   | "attention_status_invalid"
+  | "attention_sending_status_invalid"
   | "bootstrap_status_invalid"
   | "environment_status_invalid"
   | "release_attestation_invalid"
@@ -128,6 +135,7 @@ export type HostedStatusResult = Readonly<{
     safetyFaultOccupancy: 0 | 1;
     state: "inactive" | "not_inactive";
   }>;
+  attentionSending?: Readonly<z.infer<typeof attentionSendingReadSchema>>;
   bootstrap: Readonly<{
     occupiedTableCount: number;
     state: "accepted" | "inconsistent" | "ready" | "uninitialized";
@@ -145,6 +153,7 @@ export type HostedStatusResult = Readonly<{
 
 type HostedStatusArguments = Readonly<{
   requireAttentionInactive: boolean;
+  requireAttentionKeyReady: boolean;
   requirePassed: boolean;
   sourceCommit: string;
   target: ConvexTarget;
@@ -159,6 +168,7 @@ export function parseHostedStatusArguments(arguments_: readonly string[]): Hoste
   }
   let sourceCommit: string | undefined;
   let requireAttentionInactive = false;
+  let requireAttentionKeyReady = false;
   let requirePassed = false;
   for (let index = 0; index < parsed.otherArguments.length; index += 1) {
     const argument = parsed.otherArguments[index];
@@ -179,10 +189,20 @@ export function parseHostedStatusArguments(arguments_: readonly string[]): Hoste
       requireAttentionInactive = true;
       continue;
     }
+    if (argument === "--require-attention-key-ready" && !requireAttentionKeyReady) {
+      requireAttentionKeyReady = true;
+      continue;
+    }
     throw new HostedStatusError("usage_invalid");
   }
   if (sourceCommit === undefined) throw new HostedStatusError("usage_invalid");
-  return { requireAttentionInactive, requirePassed, sourceCommit, target: parsed.target };
+  return {
+    requireAttentionInactive,
+    requireAttentionKeyReady,
+    requirePassed,
+    sourceCommit,
+    target: parsed.target,
+  };
 }
 
 const parseProviderJson = <T>(
@@ -249,6 +269,14 @@ const attentionInactiveArguments = (deployment: string): readonly string[] => [
   deployment,
 ];
 
+const attentionSendingArguments = (deployment: string): readonly string[] => [
+  "run",
+  "attentionNotificationControl:sendingKeyReadiness",
+  "{}",
+  "--deployment",
+  deployment,
+];
+
 export const parseHostedReleaseAttestation = (value: unknown): ReleaseAttestationRead => {
   const bound = runtimeReleaseAttestationSchema.safeParse(value);
   if (bound.success) {
@@ -283,6 +311,7 @@ type HostedStatusOptions = Readonly<{
   authorityFetch?: AuthorityFetcher;
   environment?: Readonly<NodeJS.ProcessEnv>;
   requireAttentionInactive?: boolean;
+  requireAttentionKeyReady?: boolean;
   readAttestation?: (target: ConvexTarget) => Promise<ReleaseAttestationRead>;
   runner?: CommandRunner;
   sourceCommit: string;
@@ -428,6 +457,22 @@ export async function readHostedStatus(options: HostedStatusOptions): Promise<Ho
     };
   }
 
+  let attentionSending: HostedStatusResult["attentionSending"];
+  if (options.requireAttentionKeyReady === true) {
+    const sendingResult = await invokeWithTargetChecks(
+      attentionSendingArguments(target.deploymentName),
+      "hosted-status-attention-key-read",
+    );
+    if (sendingResult.exitCode !== 0) {
+      throw new HostedStatusError("attention_sending_status_invalid");
+    }
+    attentionSending = parseProviderJson(
+      sendingResult.stdout,
+      attentionSendingReadSchema,
+      "attention_sending_status_invalid",
+    );
+  }
+
   const runtimeCurrent = releaseAttestation.state === "current"
     && missingRequiredNames.length === 0;
   const preflightPassed = runtimeCurrent
@@ -467,6 +512,7 @@ export async function readHostedStatus(options: HostedStatusOptions): Promise<Ho
   return {
     admission,
     ...(attentionNotifications === undefined ? {} : { attentionNotifications }),
+    ...(attentionSending === undefined ? {} : { attentionSending }),
     bootstrap: {
       occupiedTableCount: bootstrapRead.occupiedTableCount,
       state: bootstrapRead.state,
@@ -500,6 +546,7 @@ export async function executeHostedStatus(options: ExecuteHostedStatusOptions): 
       ...(options.environment === undefined ? {} : { environment: options.environment }),
       ...(options.readAttestation === undefined ? {} : { readAttestation: options.readAttestation }),
       requireAttentionInactive: parsed.requireAttentionInactive,
+      requireAttentionKeyReady: parsed.requireAttentionKeyReady,
       ...(options.runner === undefined ? {} : { runner: options.runner }),
       sourceCommit: parsed.sourceCommit,
       target: parsed.target,
@@ -511,7 +558,9 @@ export async function executeHostedStatus(options: ExecuteHostedStatusOptions): 
       && status.status !== "live";
     const inactiveRequiredButMissing = parsed.requireAttentionInactive
       && status.attentionNotifications?.state !== "inactive";
-    return preflightRequiredButMissing || inactiveRequiredButMissing ? 1 : 0;
+    const keyRequiredButMissing = parsed.requireAttentionKeyReady
+      && status.attentionSending?.dedicatedKeyReady !== true;
+    return preflightRequiredButMissing || inactiveRequiredButMissing || keyRequiredButMissing ? 1 : 0;
   } catch (error: unknown) {
     const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
     if (authorityUnavailable !== undefined) {

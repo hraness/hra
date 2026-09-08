@@ -209,11 +209,14 @@ import {
 import { resolveUsableCanonicalProjectDirectory } from "./project-directory";
 import {
   WORK_SCHEMA_SQL,
+  WORK_PROJECT_AUTHORITY_SCHEMA_SQL,
   WorkStore,
+  assertLegacyVersion42WorkSchema,
   assertProviderVersion39WorkSchema,
   assertProviderVersion40WorkSchema,
   assertReadonlyWorkSchema,
   assertWorkSchema,
+  assertWorkProjectAuthoritySchema,
   installProviderVersion40WorkAuthoritySchema,
   type WorkCapabilityIssuer,
   type WorkCapabilityVerifier,
@@ -3412,8 +3415,8 @@ type DesktopSwitchPlan =
 
 // Preserve main's v40 adoption, v41 timestamp, v42 Work, and v43 transcript
 // contracts, v44 approval budgets, v45 auth authority, and v46 after-hours
-// policy. Memory follows in the previously unshipped v47/v48 slots.
-const currentSchemaVersion = 48;
+// policy, v47/v48 memory authority, and the v49 nullable Work project fence.
+const currentSchemaVersion = 49;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -12037,6 +12040,10 @@ const assertSchemaVersionMemoryAuthority = (database: Database, version: 47 | 48
     ? [40, 41, 42, 43, 44, 45, 46, 47]
     : [40, 41, 42, 43, 44, 45, 46, 47, 48],
     `STATE_SCHEMA_V${String(version)}_MIGRATION_LEDGER_INVALID`);
+  assertSchemaVersionMemoryObjects(database, version);
+};
+
+const assertSchemaVersionMemoryObjects = (database: Database, version: 47 | 48): void => {
   assertSchemaVersion43SessionUserMessageFinalizations(database);
   assertSchemaVersion43QueueCancellationSettlement(database);
   assertSchemaVersion44AutorespondObjects(database);
@@ -12045,6 +12052,31 @@ const assertSchemaVersionMemoryAuthority = (database: Database, version: 47 | 48
   assertSchemaVersion46AutorespondAfterHours(database);
   assertSchemaVersion47PeerObjects(database);
   if (version === 48) assertSchemaVersion48CanonicalMemoryObjects(database);
+};
+
+const assertSchemaVersion49Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSchemaMigrationLedgerTail(database, [40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
+    "STATE_SCHEMA_V49_MIGRATION_LEDGER_INVALID");
+  assertSchemaVersionMemoryObjects(database, 48);
+  assertWorkProjectAuthoritySchema(database);
+};
+
+// This migration-only scan must precede legacy quarantine, which may retire
+// claims. Never normalize contradictory project authority into migration proof.
+const assertSchemaVersion49ProjectPredecessor = (database: Database): void => {
+  if (database.query(
+    "SELECT 1 FROM sqlite_master WHERE name='work_session_project_authority_guard' COLLATE NOCASE LIMIT 1",
+  ).get() !== null) throw new Error("STATE_SCHEMA_V49_WORK_PROJECT_PREDECESSOR_COLLISION");
+  if (database.query(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_attempts'",
+  ).get() !== null && database.query(
+    `SELECT 1 FROM work_attempts AS a
+     LEFT JOIN sessions AS s ON s.id=a.worker_session_id
+     WHERE a.state IN ('claimed','dispatching','running','recovery_required')
+       AND (s.id IS NULL OR s.project_id IS NOT a.project_id)
+     LIMIT 1`,
+  ).get() !== null) throw new Error("STATE_SCHEMA_V49_WORK_PROJECT_AUTHORITY_INVALID");
 };
 
 const assertSchemaVersion24Objects = (database: Database): void => {
@@ -12872,97 +12904,104 @@ const migrateWritableDatabase = (
   securityScrubCheckpoint: SecurityScrubCheckpointPolicy = defaultSecurityScrubCheckpointPolicy,
   resolveMachineTimeZone: MachineTimeZoneResolver = defaultMachineTimeZoneResolver,
 ): void => {
-  const initialVersion = readUserVersion(database);
-  if (initialVersion > currentSchemaVersion) {
-    throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
-  }
-  if (initialVersion < 44 && database.query(
-    "SELECT 1 FROM sqlite_master WHERE name LIKE '%autorespond_budget%' LIMIT 1",
-  ).get() !== null) {
-    throw new Error("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_PREDECESSOR_COLLISION");
-  }
-  if (initialVersion < 46 && database.query(
-    "SELECT 1 FROM sqlite_master WHERE name LIKE '%autorespond_after_hours%' LIMIT 1",
-  ).get() !== null) {
-    throw new Error("STATE_SCHEMA_V46_AUTORESPOND_AFTER_HOURS_PREDECESSOR_COLLISION");
-  }
-  if (initialVersion === 47 || initialVersion === 48) {
-    assertSchemaVersionMemoryAuthority(database, initialVersion);
-  } else if (initialVersion === 46) {
-    assertSchemaVersion46Authority(database);
-  } else if (initialVersion === 45) {
-    assertSchemaVersion45Authority(database);
-  } else if (initialVersion === 44) {
-    assertSchemaVersion43Authority(database);
-    assertSchemaVersion44Authority(database);
-  } else if (initialVersion === 43) {
-    // Pre-release v43 shipped briefly without the queue-cancellation trigger.
-    // Prove every other v43 authority object and reject a colliding object
-    // before the transactional, row-aware repair below is allowed to run.
-    assertSchemaVersion43BaseAuthority(database, true);
-    schemaVersion43QueueCancellationSettlementState(database);
-  }
-  else if (initialVersion === 42) assertSchemaVersion42Authority(database);
-  else if (initialVersion === 41) assertSchemaVersion41Authority(database);
-  else if (initialVersion === 40) assertSchemaVersion40Authority(database);
-  if (
-    initialVersion < 41
-    && database.query("SELECT 1 FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'").get() !== null
-  ) {
-    throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
-  }
-  if (initialVersion >= 42) {
-    // A current-version stamp is an assertion boundary, not permission to
-    // reconstruct authority. Prove every provider/adoption execution guard
-    // before the idempotent maintenance tail can touch any schema object.
-    assertCanonicalLabelKeys(database);
-    assertSchemaVersion35Objects(database);
-    assertSchemaVersion38PresetContracts(database);
-    assertSchemaVersion39ProviderAuthority(database);
-    assertSchemaVersion40AdoptionObjects(database);
-    assertExactSchemaVersion40AdoptionSurface(database);
-    assertWorkSchema(database);
-    assertSessionTaskSchema(database);
-    assertCompositeNotificationPolicy(database);
-  }
-  if (initialVersion === 40 || initialVersion === 41) {
-    // Timestamp v41 retains the released adoption-v40 contract-2 Work guards.
-    // Prove that exact surface before replacing only the reviewed Work guards.
-    assertCanonicalLabelKeys(database);
-    assertSchemaVersion39ProviderAuthority(database);
-    assertSchemaVersion40AdoptionObjects(database);
-    assertExactSchemaVersion40AdoptionSurface(database);
-    assertProviderVersion40WorkSchema(database);
-    assertSessionTaskSchema(database);
-  }
-  // Both pre-release adoption and notification builds used version 36. Freeze
-  // their identity before any additive pre-application can blur the evidence.
-  const exactLegacyFeatureVersion36 = isExactLegacyFeatureVersion36(
-    database,
-    initialVersion,
-  );
-  // Adoption became canonical at v40. Later migrations must not feed that
-  // released surface back through the pre-v40 footprint classifier.
-  const legacySessionAdoption = initialVersion < 40
-    ? classifyLegacySessionAdoptionSchema(database, initialVersion)
-    : "absent";
-  if (initialVersion === 39 && legacySessionAdoption === "absent") {
-    // Provider v39 was the protected-main predecessor to adoption v40. Prove
-    // that complete released surface before any schema or row mutation; a
-    // same-version lookalike must not gain adoption authority through repair.
-    assertLegacyAdoptionMigrationTail(database, 39);
-    assertSchemaVersion35Objects(database);
-    assertCompositeNotificationPolicy(database);
-    assertSchemaVersion38PresetContracts(database);
-    assertSchemaVersion39ProviderAuthority(database);
-    assertProviderVersion39WorkSchema(database);
-    assertSessionTaskSchema(database);
-  }
-
-  // Security migrations may replace secret-bearing legacy records. SQLite must
-  // overwrite superseded cell content instead of leaving it in free pages.
+  // Keep physical scrubbing outside the transaction, but acquire the writer
+  // fence before predecessor reads so admission cannot race a schema writer.
   database.exec("PRAGMA secure_delete = ON");
   const securityScrubPending = database.transaction(() => {
+    const initialVersion = readUserVersion(database);
+    if (initialVersion > currentSchemaVersion) {
+      throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
+    }
+    if (initialVersion < 44 && database.query(
+      "SELECT 1 FROM sqlite_master WHERE name LIKE '%autorespond_budget%' LIMIT 1",
+    ).get() !== null) {
+      throw new Error("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_PREDECESSOR_COLLISION");
+    }
+    if (initialVersion < 46 && database.query(
+      "SELECT 1 FROM sqlite_master WHERE name LIKE '%autorespond_after_hours%' LIMIT 1",
+    ).get() !== null) {
+      throw new Error("STATE_SCHEMA_V46_AUTORESPOND_AFTER_HOURS_PREDECESSOR_COLLISION");
+    }
+    if (initialVersion === 49) {
+      assertSchemaVersion49Authority(database);
+    } else if (initialVersion === 47 || initialVersion === 48) {
+      assertSchemaVersionMemoryAuthority(database, initialVersion);
+    } else if (initialVersion === 46) {
+      assertSchemaVersion46Authority(database);
+    } else if (initialVersion === 45) {
+      assertSchemaVersion45Authority(database);
+    } else if (initialVersion === 44) {
+      assertSchemaVersion43Authority(database);
+      assertSchemaVersion44Authority(database);
+    } else if (initialVersion === 43) {
+      // Pre-release v43 shipped briefly without the queue-cancellation trigger.
+      // Prove every other v43 authority object and reject a colliding object
+      // before the transactional, row-aware repair below is allowed to run.
+      assertSchemaVersion43BaseAuthority(database, true);
+      schemaVersion43QueueCancellationSettlementState(database);
+    }
+    else if (initialVersion === 42) assertSchemaVersion42Authority(database);
+    else if (initialVersion === 41) assertSchemaVersion41Authority(database);
+    else if (initialVersion === 40) assertSchemaVersion40Authority(database);
+    if (
+      initialVersion < 41
+      && database.query("SELECT 1 FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'").get() !== null
+    ) {
+      throw new Error("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_COLLISION");
+    }
+    if (initialVersion >= 42) {
+      // A current-version stamp is an assertion boundary, not permission to
+      // reconstruct authority. Prove every provider/adoption execution guard
+      // before the idempotent maintenance tail can touch any schema object.
+      assertCanonicalLabelKeys(database);
+      assertSchemaVersion35Objects(database);
+      assertSchemaVersion38PresetContracts(database);
+      assertSchemaVersion39ProviderAuthority(database);
+      assertSchemaVersion40AdoptionObjects(database);
+      assertExactSchemaVersion40AdoptionSurface(database);
+      if (initialVersion === 49) assertWorkSchema(database);
+      else assertLegacyVersion42WorkSchema(database);
+      assertSessionTaskSchema(database);
+      assertCompositeNotificationPolicy(database);
+    }
+    if (initialVersion === 40 || initialVersion === 41) {
+      // Timestamp v41 retains the released adoption-v40 contract-2 Work guards.
+      // Prove that exact surface before replacing only the reviewed Work guards.
+      assertCanonicalLabelKeys(database);
+      assertSchemaVersion39ProviderAuthority(database);
+      assertSchemaVersion40AdoptionObjects(database);
+      assertExactSchemaVersion40AdoptionSurface(database);
+      assertProviderVersion40WorkSchema(database);
+      assertSessionTaskSchema(database);
+    }
+    // Both pre-release adoption and notification builds used version 36. Freeze
+    // their identity before any additive pre-application can blur the evidence.
+    const exactLegacyFeatureVersion36 = isExactLegacyFeatureVersion36(
+      database,
+      initialVersion,
+    );
+    // Adoption became canonical at v40. Later migrations must not feed that
+    // released surface back through the pre-v40 footprint classifier.
+    const legacySessionAdoption = initialVersion < 40
+      ? classifyLegacySessionAdoptionSchema(database, initialVersion)
+      : "absent";
+    if (initialVersion === 39 && legacySessionAdoption === "absent") {
+      // Provider v39 was the protected-main predecessor to adoption v40. Prove
+      // that complete released surface before any schema or row mutation; a
+      // same-version lookalike must not gain adoption authority through repair.
+      assertLegacyAdoptionMigrationTail(database, 39);
+      assertSchemaVersion35Objects(database);
+      assertCompositeNotificationPolicy(database);
+      assertSchemaVersion38PresetContracts(database);
+      assertSchemaVersion39ProviderAuthority(database);
+      assertProviderVersion39WorkSchema(database);
+      assertSessionTaskSchema(database);
+    }
+    if (initialVersion < 49) {
+      assertSchemaVersion49ProjectPredecessor(database);
+      // These predecessors already have the complete Work/session parents.
+      if (initialVersion >= 40) database.exec(WORK_PROJECT_AUTHORITY_SCHEMA_SQL);
+    }
     let redacted = false;
     let version = initialVersion;
     // v9-v12 databases may have committed URL-bearing MCP records or their
@@ -13479,6 +13518,10 @@ const migrateWritableDatabase = (
 
     if (version < 40) {
       const migratedAt = unixMillisecondsSchema.parse(now());
+      // Adoption quarantine constructs WorkStore before the final waypoint.
+      // Preapply only this transaction-owned v49 companion; the frozen Work
+      // replay below cannot remove it, and no intermediate ledger commits.
+      database.exec(WORK_PROJECT_AUTHORITY_SCHEMA_SQL);
       applySchemaVersion40SessionAdoption(database, migratedAt);
       database.query(
         "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
@@ -13665,7 +13708,7 @@ const migrateWritableDatabase = (
     database.exec(schemaVersion36NotificationHours);
     database.exec(schemaVersion37AttentionEmailPolicy);
     assertCompositeNotificationPolicy(database);
-    // The v46 object authority is part of the v48 composite check below. Do
+    // The v46 object authority is part of the current composite check below. Do
     // not use the exact-v46 ledger assertion after forward migrations exist.
     assertSchemaVersion46AutorespondAfterHours(database);
     assertSchemaVersion40AdoptionObjects(database);
@@ -13673,13 +13716,21 @@ const migrateWritableDatabase = (
     assertWorkSchema(database);
     applySchemaVersion47PeerSessions(database);
     applySchemaVersion48CanonicalMemorySync(database);
-    assertSchemaVersionMemoryAuthority(database, 48);
+    if (version < 49) {
+      assertSchemaVersionMemoryAuthority(database, 48);
+      assertWorkProjectAuthoritySchema(database);
+      database.query("INSERT INTO migrations(version,applied_at) VALUES (?,?)")
+        .run(49, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version=49");
+      version = 49;
+    }
+    assertSchemaVersion49Authority(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
     pruneAllUsageHistory(database, now());
     return hasPendingSecurityScrub(database);
-  })();
+  }).immediate();
   if (securityScrubPending) completePendingSecurityScrub(database, false, securityScrubCheckpoint);
 };
 
@@ -14402,7 +14453,7 @@ export class StateStore {
       assertSchemaVersion39ProviderAuthority(this.#database);
       assertSchemaVersion40AdoptionObjects(this.#database);
       assertExactSchemaVersion40AdoptionSurface(this.#database);
-      assertSchemaVersionMemoryAuthority(this.#database, 48);
+      assertSchemaVersion49Authority(this.#database);
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);

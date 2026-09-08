@@ -7,7 +7,11 @@ import {
   snapshotForeignJson,
 } from "../src/cloud/contracts";
 import type { InteractionKind } from "../src/domain/interactions";
-import { requireHraResendApiKey } from "./resendApiKey";
+import {
+  hraAttentionResendApiKeyEnvironmentName,
+  hraResendApiKeyEnvironmentName,
+  requireHraAttentionResendApiKey,
+} from "./resendApiKey";
 
 export const hraAttentionEmailFrom =
   "HRA attention <notifications@news.hraness.com>" as const;
@@ -384,20 +388,41 @@ async function readBoundedJson(response: Response): Promise<unknown> {
   }
 }
 
+type HraAttentionEmailInput = Readonly<{
+  body: HraAttentionEmailBody;
+  idempotencyKey: string;
+  recipient: CanonicalAuthEmail;
+}>;
+
+type HraAttentionEmailOptions = Readonly<{
+  environment?: Readonly<Record<string, string | undefined>>;
+  fetch?: HraAttentionEmailFetch;
+}>;
+
+/** Validate and retain one credential snapshot before a drain claims an effect. */
+export function createHraAttentionEmailSender(
+  options: HraAttentionEmailOptions = {},
+): (input: HraAttentionEmailInput) => Promise<HraAttentionEmailResult> {
+  const source = options.environment ?? process.env;
+  const environment = Object.freeze({
+    [hraAttentionResendApiKeyEnvironmentName]: source[hraAttentionResendApiKeyEnvironmentName],
+    [hraResendApiKeyEnvironmentName]: source[hraResendApiKeyEnvironmentName],
+  });
+  requireHraAttentionResendApiKey(environment);
+  const fetchImplementation = options.fetch ?? globalThis.fetch;
+  return async (input) => await sendHraAttentionEmail(input, {
+    environment,
+    fetch: fetchImplementation,
+  });
+}
+
 export async function sendHraAttentionEmail(
-  input: Readonly<{
-    body: HraAttentionEmailBody;
-    idempotencyKey: string;
-    recipient: CanonicalAuthEmail;
-  }>,
-  options: Readonly<{
-    environment?: Readonly<Record<string, string | undefined>>;
-    fetch?: HraAttentionEmailFetch;
-  }> = {},
+  input: HraAttentionEmailInput,
+  options: HraAttentionEmailOptions = {},
 ): Promise<HraAttentionEmailResult> {
   const payload = buildHraAttentionEmailPayload(input);
   const idempotencyKey = requireAttentionEmailIdempotencyKey(input.idempotencyKey);
-  const apiKey = requireHraResendApiKey(options.environment);
+  const apiKey = requireHraAttentionResendApiKey(options.environment);
   const fetchImplementation: HraAttentionEmailFetch = options.fetch ?? globalThis.fetch;
   const controller = new AbortController();
   const timeoutError = new Error("Attention email delivery timed out.");

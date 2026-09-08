@@ -3,7 +3,13 @@ import { v } from "convex/values";
 
 import type { CanonicalAuthEmail } from "../src/cloud/authCredentials";
 import {
-  sendHraAttentionEmail,
+  hasExactKeys,
+  isRecord,
+  isSafeNonNegativeInteger,
+  snapshotForeignJson,
+} from "../src/cloud/contracts";
+import {
+  createHraAttentionEmailSender,
   type HraAttentionEmailBody,
   type HraAttentionEmailResult,
 } from "./attentionEmail";
@@ -30,6 +36,19 @@ type SettlementMutationResult = Readonly<{
   kind: string;
   quarantineFaultId?: string;
 }>;
+
+type InactiveDeploymentStatus = Readonly<{
+  generation: number;
+  globalState: "absent" | "disabled" | "enabled";
+  outboxOccupancy: 0 | 1;
+  safetyFaultOccupancy: 0 | 1;
+}>;
+
+const inactiveDeploymentStatus = makeFunctionReference<
+  "query",
+  Record<string, never>,
+  InactiveDeploymentStatus
+>("attentionNotificationControl:inactiveDeploymentStatus");
 
 const claimNext = makeFunctionReference<"mutation", Record<string, never>, ClaimResult>(
   "attentionNotifications:claimNext",
@@ -70,9 +89,11 @@ function requireDrainLimit(value: number): number {
 export async function runAttentionNotificationDrain(
   ctx: Pick<ActionCtx, "runMutation">,
   limit: number,
-  send: AttentionNotificationSender = sendHraAttentionEmail,
+  send?: AttentionNotificationSender,
 ) {
   const maximum = requireDrainLimit(limit);
+  // Configuration failure must not claim an effect or spend a delivery attempt.
+  const sender = send ?? createHraAttentionEmailSender();
   let claimed = 0;
   let closed = 0;
   for (let slot = 0; slot < maximum; slot += 1) {
@@ -96,15 +117,15 @@ export async function runAttentionNotificationDrain(
     claimed += 1;
     let result: HraAttentionEmailResult;
     try {
-      result = await send({
+      result = await sender({
         body: claim.body,
         idempotencyKey: claim.idempotencyKey,
         recipient: claim.recipient,
       });
     } catch {
       // The transport normally converts failures into a closed retryable
-      // result. Keep an unexpected pre-request configuration failure honest
-      // and bounded instead of claiming that no provider effect occurred.
+      // result. An unexpected failure after claim still has an uncertain
+      // provider effect and must retain the ordinary bounded retry semantics.
       result = { kind: "retryable", reason: "network" };
     }
     const settlement = await ctx.runMutation(settleAttempt, {
@@ -131,7 +152,48 @@ export async function runAttentionNotificationDrain(
   return { claimed, closed, processed: claimed + closed };
 }
 
+function isUntouchedInactiveDeployment(value: unknown): boolean {
+  const snapshot = snapshotForeignJson(value);
+  if (
+    !snapshot.ok
+    || !isRecord(snapshot.value)
+    || !hasExactKeys(snapshot.value, [
+      "generation", "globalState", "outboxOccupancy", "safetyFaultOccupancy",
+    ])
+    || !isSafeNonNegativeInteger(snapshot.value.generation)
+    || (snapshot.value.globalState !== "absent"
+      && snapshot.value.globalState !== "disabled"
+      && snapshot.value.globalState !== "enabled")
+    || (snapshot.value.outboxOccupancy !== 0 && snapshot.value.outboxOccupancy !== 1)
+    || (snapshot.value.safetyFaultOccupancy !== 0 && snapshot.value.safetyFaultOccupancy !== 1)
+    || (snapshot.value.globalState === "absent"
+      ? snapshot.value.generation !== 0
+      : snapshot.value.generation === 0)
+  ) throw new Error("Attention notification status is unavailable.");
+  return snapshot.value.globalState === "absent"
+    && snapshot.value.generation === 0
+    && snapshot.value.outboxOccupancy === 0
+    && snapshot.value.safetyFaultOccupancy === 0;
+}
+
+export async function runAttentionNotificationAction(
+  ctx: Pick<ActionCtx, "runMutation" | "runQuery">,
+  limit: number,
+) {
+  const maximum = requireDrainLimit(limit);
+  let status: InactiveDeploymentStatus;
+  try {
+    status = await ctx.runQuery(inactiveDeploymentStatus, {});
+  } catch {
+    throw new Error("Attention notification status is unavailable.");
+  }
+  // Only the untouched, empty preactivation deployment is a quiet no-op.
+  // Existing delivery or fault work must retain the normal claim boundary.
+  if (isUntouchedInactiveDeployment(status)) return { claimed: 0, closed: 0, processed: 0 };
+  return await runAttentionNotificationDrain(ctx, maximum);
+}
+
 export const drain = internalAction({
   args: { limit: v.number() },
-  handler: async (ctx, args) => await runAttentionNotificationDrain(ctx, args.limit),
+  handler: async (ctx, args) => await runAttentionNotificationAction(ctx, args.limit),
 });

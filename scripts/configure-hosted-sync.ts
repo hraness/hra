@@ -9,6 +9,11 @@ import {
   isHraOtpReplyTo,
   hraOtpReplyToEnvironmentName,
 } from "../convex/otpEmailConfig";
+import {
+  hraAttentionResendApiKeyEnvironmentName,
+  hraResendApiKeyEnvironmentName,
+  requireHraAttentionResendApiKey,
+} from "../convex/resendApiKey";
 
 import {
   type BoundedProcessContainment,
@@ -37,6 +42,7 @@ export const HOSTED_ENVIRONMENT_NAMES = [
   "HRA_AUTH_HMAC_SECRET",
   "HRA_RESEND_API_KEY",
   hraOtpReplyToEnvironmentName,
+  hraAttentionResendApiKeyEnvironmentName,
 ] as const;
 
 export const HRA_SITE_URL = "https://hra.sh" as const;
@@ -57,6 +63,7 @@ const hasControlCharacter = (value: string): boolean => {
 };
 
 const hostedInputSchema = z.object({
+  attentionResendApiKey: z.string(),
   authEmailReplyTo: z.string()
     .refine(isHraOtpReplyTo),
   resendApiKey: z.string()
@@ -64,7 +71,16 @@ const hostedInputSchema = z.object({
     .max(512)
     .regex(/^re_[A-Za-z0-9_-]+$/u),
   siteUrl: z.literal(HRA_SITE_URL),
-}).strict();
+}).strict().superRefine((input, context) => {
+  try {
+    requireHraAttentionResendApiKey({
+      [hraAttentionResendApiKeyEnvironmentName]: input.attentionResendApiKey,
+      [hraResendApiKeyEnvironmentName]: input.resendApiKey,
+    });
+  } catch {
+    context.addIssue({ code: "custom", message: "attention_resend_key_invalid" });
+  }
+});
 
 export type HostedInput = z.infer<typeof hostedInputSchema>;
 
@@ -226,15 +242,17 @@ export function serializeHostedEnvironment(
   input: HostedInput,
   generated: GeneratedHostedSecrets,
 ): string {
+  const parsed = parseHostedInput(JSON.stringify(input));
   const hmac = generated.hmacSecret;
-  const resend = input.resendApiKey;
+  const resend = parsed.resendApiKey;
   const values: Record<(typeof HOSTED_ENVIRONMENT_NAMES)[number], string> = {
-    HRA_AUTH_EMAIL_REPLY_TO: input.authEmailReplyTo,
+    HRA_ATTENTION_RESEND_API_KEY: parsed.attentionResendApiKey,
+    HRA_AUTH_EMAIL_REPLY_TO: parsed.authEmailReplyTo,
     HRA_AUTH_HMAC_SECRET: hmac,
     HRA_RESEND_API_KEY: resend,
     JWKS: generated.jwks,
     JWT_PRIVATE_KEY: generated.jwtPrivateKey,
-    SITE_URL: input.siteUrl,
+    SITE_URL: parsed.siteUrl,
   };
   return `${HOSTED_ENVIRONMENT_NAMES
     .map((name) => `${name}=${dotenvValue(values[name])}`)
@@ -245,6 +263,7 @@ const secretValues = (
   input: HostedInput,
   generated: GeneratedHostedSecrets,
 ): readonly string[] => [
+  input.attentionResendApiKey,
   input.resendApiKey,
   generated.hmacSecret,
   generated.jwks,
@@ -327,10 +346,11 @@ type ConfigureOptions = Readonly<{
 
 export async function configureHostedSync(options: ConfigureOptions): Promise<void> {
   const target = parseConvexTarget(options.target);
+  const input = parseHostedInput(JSON.stringify(options.input));
   const verifyTarget = options.verifyTarget ?? verifyConvexDefaultTarget;
   await verifyTarget(target);
   const generated = await (options.generate ?? generateHostedSecrets)();
-  const forbidden = secretValues(options.input, generated);
+  const forbidden = secretValues(input, generated);
   const environment = buildConvexChildEnvironment(
     options.environment ?? process.env,
     forbidden,
@@ -377,7 +397,7 @@ export async function configureHostedSync(options: ConfigureOptions): Promise<vo
 
   const configured = await invokeMutation(
     setArguments(target.deploymentName),
-    serializeHostedEnvironment(options.input, generated),
+    serializeHostedEnvironment(input, generated),
   );
   if (configured.exitCode !== 0) {
     throw new HostedSetupError("convex_environment_set_failed");
