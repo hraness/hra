@@ -47,6 +47,8 @@ import {
   liveAcceptanceWorkerControlSchema,
   liveAcceptanceWorkerStatusSchema,
   liveAcceptanceWorkerLaunch,
+  LiveAcceptanceError,
+  LiveAcceptanceSourceGitError,
   LiveAcceptanceStartError,
   openLiveRuntimeAttestationBoundary,
   parseLiveAcceptanceEvidenceOutput,
@@ -646,19 +648,36 @@ const fakeShutdownVerifier = async (worker: LiveAcceptanceWorker): Promise<void>
 };
 
 describe("source-only live acceptance isolation", () => {
+  test("reports source Git rejection using only its code and output byte counts", () => {
+    const error = new LiveAcceptanceSourceGitError(124, 0, 12);
+    expect(error).toBeInstanceOf(LiveAcceptanceError);
+    expect(error.code).toBe("input_invalid");
+    expect(error.message).toBe("input_invalid");
+    const serialized: unknown = JSON.parse(JSON.stringify(error));
+    expect(serialized).toEqual({
+      name: "LiveAcceptanceSourceGitError",
+      code: "input_invalid",
+      exitCode: 124,
+      stdoutByteLength: 0,
+      stderrByteLength: 12,
+    });
+  });
+
   test("ignores a hostile PATH when reading release source authority", async () => {
     const root = await privateTestBase();
-    const hostileGit = join(root, "git");
     const sentinel = join(root, "ambient-git-ran");
-    await writeFile(
-      hostileGit,
-      `#!/bin/sh\nprintf hostile > ${JSON.stringify(sentinel)}\nprintf '%s\\n' ${JSON.stringify("c".repeat(40))}\n`,
-      { mode: 0o755 },
-    );
-    await chmod(hostileGit, 0o755);
     const originalPath = process.env.PATH;
-    process.env.PATH = root;
     try {
+      for (const executable of ["git", "xcrun", "xcode-select"]) {
+        const hostileExecutable = join(root, executable);
+        await writeFile(
+          hostileExecutable,
+          `#!/bin/sh\nprintf hostile > ${JSON.stringify(sentinel)}\nprintf '%s\\n' ${JSON.stringify("c".repeat(40))}\n`,
+          { mode: 0o755 },
+        );
+        await chmod(hostileExecutable, 0o755);
+      }
+      process.env.PATH = root;
       expect(await sourceGitOutput(
         ["rev-parse", "--verify", "HEAD^{commit}"],
         "live-source-hostile-path",
