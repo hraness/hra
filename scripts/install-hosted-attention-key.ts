@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { readdirSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 
@@ -30,6 +30,7 @@ import {
 import {
   assertProtectedDirectory,
   canonicalDigest,
+  canonicalJson,
   convexTargetEvidenceSchema,
   parseDeployEvidenceFile,
   readProtectedJson,
@@ -173,8 +174,18 @@ export function parseAttentionKeyInstallationInput(document: string, target: Con
 }
 
 export const attentionKeyInstallSlot = (target: ConvexTarget): string =>
-  `attention-key-${canonicalDigest({ environmentName: hraAttentionResendApiKeyEnvironmentName,
-    targetDigest: canonicalDigest(target) })}.intent.json`;
+  `attention-key-${hraAttentionResendApiKeyEnvironmentName}-${canonicalDigest(parseConvexTarget(target))}.intent.json`;
+
+export const attentionEnvironmentFingerprint = (
+  entries: AttentionEnvironment, target: ConvexTarget, intendedAttentionKey: string,
+): string => createHmac("sha256", intendedAttentionKey)
+  .update("hra-attention-environment-fingerprint-v1\0", "utf8")
+  .update(canonicalJson({
+    entries: entries.filter(({ name }) => name !== hraAttentionResendApiKeyEnvironmentName)
+      .toSorted((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0),
+    target: parseConvexTarget(target),
+  }), "utf8")
+  .digest("hex");
 
 type ObservationOptions = Parameters<typeof observeHostedAttentionKey>[0];
 type InstallationOptions = AttentionKeyInstallationArguments & Readonly<{
@@ -263,9 +274,9 @@ export async function installHostedAttentionKey(options: InstallationOptions) {
       const attention = values.get(hraAttentionResendApiKeyEnvironmentName);
       const keyState = attention === undefined ? "absent" : attention === input.attentionResendApiKey
         ? "existing_equal" : "existing_mismatched";
-      const nonAttentionEnvironmentDigest = canonicalDigest(entries
-        .filter(({ name }) => name !== hraAttentionResendApiKeyEnvironmentName)
-        .toSorted((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+      // Reconciliation retains the intended key even if the administrative
+      // credential rotates. Do not persist an unkeyed digest of other secrets.
+      const nonAttentionEnvironmentDigest = attentionEnvironmentFingerprint(entries, options.target, input.attentionResendApiKey);
       checkBindings();
       return { keyState, namesDigest: canonicalDigest([...values.keys()].sort()), nonAttentionEnvironmentDigest };
     };
@@ -299,8 +310,10 @@ export async function installHostedAttentionKey(options: InstallationOptions) {
     }
 
     // A new operation ID or intended secret cannot bypass a surviving intent or interrupted
-    // publication in this attested, retained directory. Never clean either up.
-    if (readdirSync(directory).some((name) => name === slot || name.startsWith(`.${slot}.`))) {
+    // publication in this attested, retained directory. Preserve and refuse
+    // pre-release filenames too; changing the slot format cannot authorize a retry.
+    if (readdirSync(directory).some((name) => name === slot || name.startsWith(`.${slot}.`)
+      || /^\.?attention-key-[0-9a-f]{64}\.intent\.json(?:\.|$)/u.test(name))) {
       intentAttempted = true;
       throw new AttentionKeyInstallationError("reconciliation_required");
     }

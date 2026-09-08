@@ -835,6 +835,16 @@ installation window. It explicitly records the competing-writer handoff. Its
 digest is an integrity binding, not a provider signature or proof that the
 operational statements are true. Keep the document and all key digests private.
 
+The intent filename includes the fixed public environment name and hashes only
+the exact target. Its non-attention environment digest is a domain-separated
+HMAC-SHA-256 fingerprint keyed by the intended attention credential, covering
+the target and every sorted non-attention name/value pair. It does not store
+an unkeyed digest of other secrets. Retain the intended key for reconciliation;
+rotating the administrative credential does not change this comparison.
+Pre-release intent filenames and interrupted publications also block a new
+installation. Preserve them for reviewed recovery with their original source;
+the installer never renames, deletes or silently adopts them.
+
 Supply the distinct attention key and the exact deployment's scoped admin key
 through the protected anonymous-pipe input, never command arguments, child
 environment variables or a checked-in file:

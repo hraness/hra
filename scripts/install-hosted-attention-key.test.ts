@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { chmod, link, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ import {
   attentionKeyInstallCustodySchema,
   attentionKeyInstallIntentSchema,
   attentionKeyInstallSlot,
+  attentionEnvironmentFingerprint,
   executeAttentionKeyInstallation,
   installHostedAttentionKey,
   parseAttentionKeyInstallationArguments,
@@ -19,7 +20,7 @@ import {
 } from "./install-hosted-attention-key";
 import { hostedAttentionKeyObservationSchema, observeHostedAttentionKey } from "./migrate-hosted-attention-key";
 import {
-  canonicalDigest, deployEvidenceSchema, readProtectedJson, withSelfDigest, writeProtectedJsonNoReplace,
+  canonicalDigest, canonicalJson, deployEvidenceSchema, readProtectedJson, withSelfDigest, writeProtectedJsonNoReplace,
   type RuntimeReleaseAttestation,
 } from "./release-evidence";
 
@@ -138,6 +139,44 @@ const harness = async () => {
 };
 
 describe("custody-scoped attention installation", () => {
+  test("fixed intent slot exposes only its public name and exact target digest", () => {
+    expect(attentionKeyInstallSlot(target)).toBe(
+      `attention-key-HRA_ATTENTION_RESEND_API_KEY-${canonicalDigest(target)}.intent.json`,
+    );
+    expect(attentionKeyInstallSlot({ ...target, deploymentId: target.deploymentId + 1 }))
+      .not.toBe(attentionKeyInstallSlot(target));
+    expect(attentionKeyInstallSlot(target)).not.toContain(intendedKey);
+  });
+
+  test("environment fingerprint is purpose-bound, keyed and independent of entry order", () => {
+    const entries = [{ name: "SECOND", value: "second-secret" }, { name: "FIRST", value: "first-secret" }];
+    const fingerprint = attentionEnvironmentFingerprint(entries, target, intendedKey);
+    const expected = createHmac("sha256", intendedKey)
+      .update("hra-attention-environment-fingerprint-v1\0", "utf8")
+      .update(canonicalJson({ entries: entries.toReversed(), target }), "utf8").digest("hex");
+    expect(fingerprint).toBe(expected);
+    expect(attentionEnvironmentFingerprint(entries.toReversed(), target, intendedKey)).toBe(fingerprint);
+    expect(fingerprint).not.toBe(canonicalDigest({ entries: entries.toReversed(), target }));
+    expect(attentionEnvironmentFingerprint(entries, target, "re_other_synthetic")).not.toBe(fingerprint);
+    expect(attentionEnvironmentFingerprint(entries, { ...target, deploymentId: target.deploymentId + 1 }, intendedKey))
+      .not.toBe(fingerprint);
+    expect(createHmac("sha256", intendedKey).update(canonicalJson({ entries: entries.toReversed(), target })).digest("hex"))
+      .not.toBe(fingerprint);
+  });
+
+  test("environment fingerprint excludes only attention and detects names, values and string boundaries", () => {
+    const entries = [{ name: "A", value: "bc" }];
+    const fingerprint = attentionEnvironmentFingerprint(entries, target, intendedKey);
+    for (const value of [intendedKey, "re_other_synthetic"]) {
+      expect(attentionEnvironmentFingerprint([...entries, { name: hraAttentionResendApiKeyEnvironmentName, value }], target, intendedKey))
+        .toBe(fingerprint);
+    }
+    for (const changed of [
+      [{ name: "A", value: "changed" }], [{ name: "CHANGED", value: "bc" }],
+      [{ name: "Ab", value: "c" }], [...entries, { name: "EXTRA", value: "" }], [],
+    ]) expect(attentionEnvironmentFingerprint(changed, target, intendedKey)).not.toBe(fingerprint);
+  });
+
   test("strict arguments and protected JSON expose no secret flags or ambiguous key spellings", async () => {
     const value = await harness();
     expect(parseAttentionKeyInstallationArguments(value.arguments_).phase).toBe("install");
@@ -266,6 +305,19 @@ describe("custody-scoped attention installation", () => {
     }
   });
 
+  test("pre-release intent names and interrupted publications remain preserved and cannot redispatch", async () => {
+    const legacy = `attention-key-${"f".repeat(64)}.intent.json`;
+    for (const name of [legacy, `.${legacy}.${"a".repeat(32)}.tmp`]) {
+      const value = await harness();
+      const path = join(value.directory, name);
+      await writeFile(path, "preserved pre-release intent", { mode: 0o600 });
+      expect((await installHostedAttentionKey(value.options)).status).toBe("dispatch_outcome_unknown");
+      expect(value.state.dispatches).toBe(0);
+      expect(value.state.reads).toBe(0);
+      expect(await readFile(path, "utf8")).toBe("preserved pre-release intent");
+    }
+  });
+
   test.each(["dirty", "runtime", "attention", "other-env"])(
     "post-acknowledgement %s verification failure preserves uncertainty", async (failure) => {
       const value = await harness();
@@ -315,6 +367,21 @@ describe("custody-scoped attention installation", () => {
     expect((await installHostedAttentionKey({ ...value.options, phase: "reconcile" })).status).toBe("observed_equal");
     expect((await installHostedAttentionKey({ ...value.options, phase: "reconcile" })).status).toBe("observed_equal");
     expect((await readdir(value.directory)).filter((name) => name.includes(".reconcile.")).length).toBe(3);
+    expect(value.state.dispatches).toBe(1);
+  });
+
+  test("administrative credential rotation preserves the original environment comparison", async () => {
+    const value = await harness();
+    value.setDispatchHook(() => { throw new Error("uncertain"); });
+    await installHostedAttentionKey(value.options);
+    value.state.environment.set(hraAttentionResendApiKeyEnvironmentName, intendedKey);
+    const input = JSON.stringify({ attentionResendApiKey: intendedKey,
+      convexDeploymentAdminKey: `prod:${target.deploymentName}|${"rotated_admin_".repeat(3)}` });
+    expect((await installHostedAttentionKey({ ...value.options, inputDocument: input, phase: "reconcile" })).status)
+      .toBe("observed_equal");
+    value.state.environment.set("JWT_PRIVATE_KEY", "changed-private");
+    expect((await installHostedAttentionKey({ ...value.options, inputDocument: input, phase: "reconcile" })).status)
+      .toBe("observed_conflict");
     expect(value.state.dispatches).toBe(1);
   });
 
