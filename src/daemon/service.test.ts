@@ -10336,10 +10336,9 @@ describe("HraService", () => {
             .toEqual(resolution === "proven_applied" ? [action.id] : []);
           expect(value.store.sessionMessageActorForSource(target.id, attempt.id)).toBe("peer_session");
           if (resolution === "proven_applied") {
-            expect(value.store.listSessionEvents({ sessionId: target.id, afterSequence: 0 }).events)
-              .toContainEqual(expect.objectContaining({
-                body: expect.objectContaining({ type: "user_message", actor: "peer_session" }),
-              }));
+            const userMessageActors = value.store.listSessionEvents({ sessionId: target.id, afterSequence: 0 }).events
+              .flatMap(({ body }) => body.type === "user_message" ? [body.actor] : []);
+            expect(userMessageActors).toEqual(["peer_session"]);
           }
           await value.service.recover();
           expect(value.store.requirePeerSessionAction(action.id).resultDigest).toBe(expectedFinalDigest);
