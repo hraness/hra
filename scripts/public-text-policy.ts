@@ -1,5 +1,6 @@
-import { readFile, readdir } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { spawnSync } from "node:child_process";
+import { lstat, readFile, readdir, realpath } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 import {
   assertAuthoritySupervisorArtifactPublicFile,
@@ -21,6 +22,7 @@ const allowedPublicScopes = new Set([
 const allowedPublicScopedPackages = new Set([
   "@anthropic-ai/claude-code",
   "@anthropic-ai/claude-code-darwin-arm64",
+  "@babel/core",
   "@hraness/atet",
   "@hraness/design-kit",
   "@hraness/hra",
@@ -28,6 +30,8 @@ const allowedPublicScopedPackages = new Set([
   "@hraness/posthog",
   "@hraness/site-footer",
   "@hraness/ui",
+  "@stylexjs/babel-plugin",
+  "@stylexjs/stylex",
 ]);
 
 const secretPatterns = [
@@ -150,12 +154,14 @@ const assertEditorialWebp = async (path: string, label: string): Promise<void> =
   }
 };
 
-export async function assertPublicTree(root: string): Promise<void> {
+async function scanPublicTree(root: string, skipCheckoutTmp: boolean): Promise<void> {
   const visit = async (path: string): Promise<void> => {
     for (const entry of await readdir(path, { withFileTypes: true })) {
       const child = join(path, entry.name);
       const label = relative(root, child);
       if (label === ".git" && (entry.isDirectory() || entry.isFile())) {
+        continue;
+      } else if (skipCheckoutTmp && label === "tmp" && entry.isDirectory()) {
         continue;
       } else if (entry.isDirectory()) {
         if (!excludedDirectories.has(entry.name)) await visit(child);
@@ -174,4 +180,65 @@ export async function assertPublicTree(root: string): Promise<void> {
     }
   };
   await visit(root);
+}
+
+/** Archive scans never inherit the checkout's private build-evidence exception. */
+export async function assertPublicTree(root: string): Promise<void> {
+  await scanPublicTree(root, false);
+}
+
+type CheckoutTmpIdentity = Readonly<{ dev: number; ino: number; mode: number }>;
+
+function checkoutGit(root: string, args: readonly string[], allowNotIgnored = false, input?: string): string | undefined {
+  const result = spawnSync("/usr/bin/git", [
+    "--no-optional-locks", "--no-replace-objects", "-c", "core.excludesFile=/dev/null", ...args,
+  ], {
+    cwd: root, encoding: "utf8", timeout: 10_000, maxBuffer: 4 * 1024 * 1024,
+    ...(input === undefined ? {} : { input }),
+    env: { PATH: "/usr/bin:/bin", LC_ALL: "C", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+  });
+  if (result.error !== undefined || result.signal !== null || result.stderr !== ""
+    || (result.status !== 0 && !(allowNotIgnored && result.status === 1 && result.stdout === ""))) {
+    throw new Error("Public checkout Git evidence could not be read within its bound.");
+  }
+  return result.status === 0 ? result.stdout : undefined;
+}
+
+async function checkoutTmpIdentity(root: string): Promise<CheckoutTmpIdentity | undefined> {
+  if (!isAbsolute(root) || root.length > 4096 || resolve(root) !== root
+    || !(await lstat(root)).isDirectory() || await realpath(root) !== root
+    || checkoutGit(root, ["rev-parse", "--show-toplevel"]) !== `${root}\n`) {
+    throw new Error("Public checkout must be its exact physical Git root.");
+  }
+  const temporaryRoot = join(root, "tmp");
+  const metadata = await lstat(temporaryRoot).catch((error: unknown) => {
+    if (error !== null && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
+    throw error instanceof Error ? error : new Error("Public checkout temporary evidence could not be inspected.", { cause: error });
+  });
+  if (metadata === undefined) return undefined;
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || await realpath(temporaryRoot) !== temporaryRoot) {
+    throw new Error("Public checkout temporary evidence must be one physical directory.");
+  }
+  // Only this root-level generated directory is eligible. Tracked files remain
+  // public even when ignored, and an unignored source entry prevents omission.
+  if (checkoutGit(root, ["ls-files", "--cached", "-z", "--", "tmp"]) !== ""
+    || checkoutGit(root, ["ls-files", "--others", "--exclude-standard", "-z", "--", "tmp"]) !== "") return undefined;
+  const ignored = checkoutGit(root, ["check-ignore", "--verbose", "--no-index", "-z", "--stdin"], true, "tmp/\0");
+  if (ignored === undefined) return undefined;
+  const evidence = ignored.split("\0");
+  if (evidence.length !== 5 || evidence[0] !== ".gitignore" || !/^[1-9][0-9]*$/u.test(evidence[1] ?? "")
+    || (evidence[2] !== "tmp/" && evidence[2] !== "/tmp/") || evidence[3] !== "tmp/" || evidence[4] !== "") return undefined;
+  return { dev: metadata.dev, ino: metadata.ino, mode: metadata.mode };
+}
+
+/** Scan authored checkout content without publishing retained private build receipts. */
+export async function assertPublicCheckout(root: string): Promise<void> {
+  const before = await checkoutTmpIdentity(root);
+  await scanPublicTree(root, before !== undefined);
+  if (before !== undefined) {
+    const after = await checkoutTmpIdentity(root);
+    if (after === undefined || after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode) {
+      throw new Error("Public checkout temporary evidence changed during its source scan.");
+    }
+  }
 }

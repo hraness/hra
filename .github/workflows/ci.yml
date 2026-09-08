@@ -17,7 +17,9 @@ jobs:
   check:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # The serial source and compiled-presentation suites can reach 20 minutes
+    # before package acceptance. Keep every phase and its own bounded deadlines.
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:

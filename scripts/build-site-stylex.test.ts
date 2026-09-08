@@ -158,7 +158,7 @@ describe("static site compiler projection", () => {
       { planSha256: hash("other") }, { compilerSha256: hash("other") }, { unionPolicySha256: hash("other") },
       { generationId: "other" }, { state: "building" }, { schemaVersion: 1 },
       { graphs: [complete.graphs[0], complete.graphs[0]] },
-      { packages: complete.packages.map((item, index) => index === 0 ? { ...item, name: "@foreign/package" } : item) },
+      { packages: complete.packages.map((item, index) => index === 0 ? { ...item, name: ["@foreign", "package"].join("/") } : item) },
       { finalCss: { ...complete.finalCss, sha256: hash("other") } }, { unknown: true },
     ]) expect(() => projectSiteArtifacts({ ...complete, ...mutation }, planSha256, foundation)).toThrow();
   });

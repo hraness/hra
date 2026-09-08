@@ -31,6 +31,7 @@ import {
 } from "./bounded-process";
 import {
   assertPublicSensitiveText,
+  assertPublicCheckout,
   assertPublicText,
   assertPublicTree,
 } from "./public-text-policy";
@@ -977,7 +978,7 @@ if (!packageJson.files.includes("!src/storage/legacy-secret-migration.ts")) {
 }
 await access(join(repositoryRoot, "src", "storage", "legacy-secret-migration.ts"), constants.R_OK);
 
-await assertPublicTree(repositoryRoot);
+await assertPublicCheckout(repositoryRoot);
 await assertCompleteGitHistoryPublic(repositoryRoot);
 
 const generated = requireSuccess(

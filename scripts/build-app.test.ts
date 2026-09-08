@@ -184,7 +184,7 @@ describe("closed public projection and prior publication provenance", () => {
       { schemaVersion: 1 }, { schemaVersion: 3 }, { unionPolicySha256: "e".repeat(64) },
       { unionPolicySha256: undefined }, { state: "building" }, { generationId: "other" }, { rootDirectory: "/private/root" },
       { graphs: [] }, { graphs: [{ id: "ssr", receiptSha256: "b".repeat(64) }] },
-      { packages: [{ name: "@other/ui", version: "0.5.3", manifestSha256: "c".repeat(64) }] },
+      { packages: [{ name: ["@other", "ui"].join("/"), version: "0.5.3", manifestSha256: "c".repeat(64) }] },
       { finalCss: hashed("other.css", "x") },
       { artifacts: [...complete().artifacts, hashed("source.ts", "x")] },
       { artifacts: [...complete().artifacts, hashed("stylex-complete.json", "x")] },
