@@ -12222,9 +12222,10 @@ describe("StateStore", () => {
     }
   });
 
-  test("requires unit-marked safe baseline timestamps without rewriting legacy evidence", async () => {
-    for (const kind of ["session.stop", "session.rename"] as const) {
-      for (const baselineTime of [null, 10, 10.5, Number.MAX_SAFE_INTEGER + 1]) {
+  // Each independent store gets the unchanged per-test budget and cleanup.
+  for (const kind of ["session.stop", "session.rename"] as const) {
+    for (const baselineTime of [null, 10, 10.5, Number.MAX_SAFE_INTEGER + 1]) {
+      test(`requires unit-marked safe baseline timestamps without rewriting legacy evidence: ${kind}, ${String(baselineTime)}`, async () => {
         const { store } = await fixture();
         const profile = signInProfile(store, "Legacy timestamp", "legacy-timestamp@example.com");
         const local = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
@@ -12260,9 +12261,9 @@ describe("StateStore", () => {
             provider: { providerThreadId: evidence.providerThreadId, title: "Resolved", status: "idle", providerUpdatedAt: 10_000 } });
           expect(inspector.query("SELECT receipt_json FROM mutation_resolutions WHERE attempt_id=?").get(attempt.id)).toEqual({ receipt_json: null });
         } finally { inspector.close(false); }
-      }
+      });
     }
-  });
+  }
 
   test("migrates schema 40 through autorespond v44 while preserving legacy bytes and digests", async () => {
     const { store } = await fixture();
@@ -12350,8 +12351,8 @@ describe("StateStore", () => {
     }
   });
 
-  test("refuses a damaged timestamp guard on exact schema 41 before Work v42 migration", async () => {
-    for (const definition of ["missing", "weaker", "changed_literal"] as const) {
+  for (const definition of ["missing", "weaker", "changed_literal"] as const) {
+    test(`refuses a damaged timestamp guard on exact schema 41 before Work v42 migration: ${definition}`, async () => {
       const { store } = await fixture();
       const inspector = new Database(store.paths.database, { create: false, strict: true });
       try {
@@ -12383,8 +12384,8 @@ describe("StateStore", () => {
           .toEqual(ledgerBefore);
         expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
       } finally { inspector.close(false); }
-    }
-  });
+    });
+  }
 
   test.each(["missing", "negative_time", "unsafe_time", "later_version"] as const)(
     "refuses an invalid current migration ledger without changing retained rows or schema: %s",
@@ -23039,7 +23040,7 @@ describe("StateStore", () => {
       .toBe(Number.MAX_SAFE_INTEGER);
   });
 
-  test("refuses missing and noncanonical notification-hours authority", async () => {
+  test("refuses missing and noncanonical notification-hours authority: missing singleton", async () => {
     const missingFixture = await fixture();
     const missingPaths = missingFixture.store.paths;
     missingFixture.store.close();
@@ -23058,7 +23059,9 @@ describe("StateStore", () => {
     expect(() => new StateStore(missingPaths, {
       resolveMachineTimeZone: () => "UTC",
     })).toThrow("NOTIFICATION_HOURS_POLICY_MISSING");
+  });
 
+  test("refuses missing and noncanonical notification-hours authority: noncanonical time zone", async () => {
     const corruptFixture = await fixture();
     const corruptPaths = corruptFixture.store.paths;
     corruptFixture.store.close();
@@ -23084,7 +23087,9 @@ describe("StateStore", () => {
     expect(() => new StateStore(corruptPaths, {
       resolveMachineTimeZone: () => "UTC",
     })).toThrow("NOTIFICATION_HOURS_POLICY_INVALID");
+  });
 
+  test("refuses missing and noncanonical notification-hours authority: weakened update guard", async () => {
     const weakenedFixture = await fixture();
     const weakenedPaths = weakenedFixture.store.paths;
     weakenedFixture.store.close();
@@ -23103,7 +23108,9 @@ describe("StateStore", () => {
     expect(() => new StateStore(weakenedPaths, {
       resolveMachineTimeZone: () => "UTC",
     })).toThrow("STATE_SCHEMA_V36_NOTIFICATION_HOURS_STRUCTURE_INVALID");
+  });
 
+  test("refuses missing and noncanonical notification-hours authority: weakened insert guard", async () => {
     const weakenedInsertFixture = await fixture();
     const weakenedInsertPaths = weakenedInsertFixture.store.paths;
     weakenedInsertFixture.store.close();

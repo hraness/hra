@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildHraGlobalInstallCommand,
@@ -70,7 +72,86 @@ function requireCiGateCoverage(scripts: Readonly<Record<string, unknown>>): void
   }
 }
 
+const sourceShardArguments = ["--shard=1/3", "--shard=2/3", "--shard=3/3"] as const;
+const shardFixtureNames = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"] as const;
+
+async function withShardFixture(run: (directory: string) => void): Promise<void> {
+  const directory = await mkdtemp(join(tmpdir(), "hra-ci-shard-contract-"));
+  try {
+    await mkdir(join(directory, "fixtures"));
+    for (const name of shardFixtureNames) {
+      await writeFile(join(directory, "fixtures", `${name}.test.ts`), [
+        'import { expect, test } from "bun:test";',
+        `test("${name} first", () => { console.log("CI_SHARD_CASE:${name}:first"); expect(true).toBe(true); });`,
+        `test("${name} sentinel", () => { console.log("CI_SHARD_CASE:${name}:sentinel"); expect(process.env.CI_SHARD_FAIL).not.toBe("1"); });`,
+      ].join("\n"));
+    }
+    run(directory);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+function runShardFixture(
+  directory: string,
+  shard: typeof sourceShardArguments[number] | undefined,
+  fail: boolean,
+): { exitCode: number | null; cases: string[]; stderr: string } {
+  const result = spawnSync(process.execPath, [
+    "--no-env-file", "--config=/dev/null", "test", "./fixtures",
+    "--isolate", "--max-concurrency=1", ...(shard === undefined ? [] : [shard]),
+  ], {
+    cwd: directory,
+    env: { HOME: directory, TMPDIR: directory, NO_COLOR: "1", CI_SHARD_FAIL: fail ? "1" : "0" },
+    encoding: "utf8",
+    timeout: 1_000,
+    killSignal: "SIGKILL",
+    maxBuffer: 64 * 1_024,
+  });
+  expect(result.error).toBeUndefined();
+  expect(result.signal).toBeNull();
+  return {
+    exitCode: result.status,
+    cases: result.stdout.trim().split("\n").filter((line) => line.startsWith("CI_SHARD_CASE:")),
+    stderr: result.stderr,
+  };
+}
+
 describe("release workflow", () => {
+  test("pinned native Bun shards cover every fixture case exactly once without splitting files", async () => {
+    expect(Bun.version).toBe("1.3.14");
+    await withShardFixture((directory) => {
+      const full = runShardFixture(directory, undefined, false);
+      expect(full.exitCode).toBe(0);
+      const expected = shardFixtureNames.flatMap((name) => [
+        `CI_SHARD_CASE:${name}:first`, `CI_SHARD_CASE:${name}:sentinel`,
+      ]).sort();
+      expect([...full.cases].sort()).toEqual(expected);
+      const shardCases = sourceShardArguments.map((shard) => {
+        const result = runShardFixture(directory, shard, false);
+        expect(result.exitCode).toBe(0);
+        expect(result.cases).toHaveLength(4);
+        for (const name of shardFixtureNames) {
+          const cases = result.cases.filter((entry) => entry.startsWith(`CI_SHARD_CASE:${name}:`));
+          expect(cases.length === 0 || cases.length === 2).toBeTrue();
+        }
+        return result.cases;
+      });
+      expect(shardCases.flat().sort()).toEqual(expected);
+      expect(new Set(shardCases.flat()).size).toBe(expected.length);
+    });
+  });
+
+  test.each([...sourceShardArguments])("pinned native Bun %s propagates fixture failures", async (shard) => {
+    await withShardFixture((directory) => {
+      const result = runShardFixture(directory, shard, true);
+      expect(result.exitCode).toBe(1);
+      expect(result.cases).toHaveLength(4);
+      expect(result.stderr).toContain("2 pass");
+      expect(result.stderr).toContain("2 fail");
+    });
+  });
+
   test("expands only exact package-script references and rejects missing or cyclic references", () => {
     expect(expandPackageScript({
       check: "bun run nested && bun run build:site -- --check",
@@ -868,7 +949,7 @@ describe("release workflow", () => {
     expect(workflow).not.toContain("convex");
   });
 
-  test("requires both isolated CI phases on both operating systems with complete governed history", async () => {
+  test("requires all three source shards and remainder on both operating systems with complete governed history", async () => {
     const workflow = await readFile(
       join(import.meta.dir, "..", ".github", "workflows", "ci.yml"),
       "utf8",
@@ -887,7 +968,7 @@ describe("release workflow", () => {
       "fail-fast": false,
       matrix: {
         os: ["macos-15", "ubuntu-24.04"],
-        gate: ["source", "remainder"],
+        gate: ["source-1", "source-2", "source-3", "remainder"],
       },
     });
     const steps = check.steps;
@@ -957,7 +1038,7 @@ describe("release workflow", () => {
     const gateStep = asRecord(gate, "CI gate step");
     expect(gateStep.if).toBeUndefined();
     expect(String(gateStep.run).trim().replace(/\s+/gu, " ")).toBe(
-      'set -euo pipefail case "$CI_GATE" in source) bun run test:source ;; remainder) bun run check:ci-remainder ;; *) echo "::error::Unexpected CI gate" exit 1 ;; esac',
+      'set -euo pipefail case "$CI_GATE" in source-1) bun run test:source --shard=1/3 ;; source-2) bun run test:source --shard=2/3 ;; source-3) bun run test:source --shard=3/3 ;; remainder) bun run check:ci-remainder ;; *) echo "::error::Unexpected CI gate" exit 1 ;; esac',
     );
     expect(asRecord(asRecord(gate, "CI gate step").env, "CI gate environment")).toEqual({
       NODE_OPTIONS: "--max-old-space-size=4096",

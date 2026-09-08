@@ -7300,9 +7300,9 @@ describe("CLI entry point", () => {
     }
   });
 
-  test("offline doctor separates unusable project roots from a healthy database", async () => {
-    const problem = "A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
-    for (const scenario of ["missing", "symlink", "non_traversable"] as const) {
+  for (const scenario of ["missing", "symlink", "non_traversable"] as const) {
+    test(`offline doctor separates unusable project roots from a healthy database: ${scenario}`, async () => {
+      const problem = "A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
       const temporary = await realpath(await mkdtemp(join(tmpdir(), `hra-doctor-project-${scenario}-`)));
       const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
       const documents = join(temporary, "Documents");
@@ -7337,8 +7337,8 @@ describe("CLI entry point", () => {
         if (scenario === "non_traversable") await chmod(documents, 0o700).catch(() => undefined);
         await rm(temporary, { force: true, recursive: true });
       }
-    }
-  });
+    });
+  }
 
   test("online doctor keeps its envelope and exit code in agreement over validated health", async () => {
     const invalid = "HRA checks returned an invalid local result.";

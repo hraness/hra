@@ -40,10 +40,15 @@ The installer repair [PR153](https://github.com/hraness/hra/pull/153) merged as
 `cfc9477da5033019992b7adbf550288c57c965be` after both protected CI platforms
 and Required passed. That actual main is now joined alongside the reviewed CI
 partition under [issue152](https://github.com/hraness/hra/issues/152). Its owner
-retains the main window until separate actual-main CI and package proof settle.
-The combined archive passed independent review. Schema50 still requires a fresh
-exact-tree full local gate, passing protected CI, normal merge and exact-main proof;
-candidate release retains separate live acceptance and installer-repair gates.
+completed exact-main CI34266585084, CodeQL and package proof, then released
+the main window. The combined archive and immutable joinedbaf0abc review passed,
+as did its full local gate and CodeQL. CI34267620546 passed both remainder jobs
+and Ubuntu source, but macOS had two per-test timeouts and then exhausted its
+20-minute job budget. The test-only case decomposition and native three-shard
+source repair below require fresh exact-tree local and protected CI proof before
+normal merge and exact-main verification. Candidate release retains the current
+repository gates; the separately owned issue155 policy change is under review
+and does not change runtime admission or activation authority.
 
 The delivered foundation's reviewed tree is
 `978bdc30b6fb9d259c92d0ca91335a854227d6f4`. Its companion module,
@@ -722,3 +727,85 @@ The 176-entry, 8,318-byte inventory SHA-256 is
 Only the policy digest changes. Package policy passed 11 tests and 42 assertions,
 and direct admission of the exact extracted inventory passed. This remains
 unpublished archive-content evidence, not the required final installation gate.
+
+### Hosted case budgets and complete source sharding
+
+Exact head `baf0abcd8655d38c7d73e605d815c37f039d1618`, tree
+`72b712c2da381d6423a9fc0cb086761293f1529f`, passed its exclusive full local
+`bun run check` in a clean detached complete-history checkout with one governed
+ref. Scripts passed 1,112 tests with one existing skip, plugins 108 and 29,
+source 3,990 in 369.11 seconds, hosted/site 394, app 500 and package policy 11.
+Pins, architecture, security, lint, types and all builds passed. The final
+package verifier proved isolated local/global consumers, restored PTY and the
+global daemon lifecycle. Its 723,794-byte complete log has SHA-256
+`c5faf1b0b4c029f0ab5a56414acd41b1f34e5efff37a82d90452fc1cb5a1d961`.
+CodeQL34267615163 also passed. These are exactbaf0abc receipts, not successor
+or protected CI acceptance.
+
+[CI34267620546](https://github.com/hraness/hra/actions/runs/34267620546)
+passed both remainder jobs in 7m09s and 6m56s, and Ubuntu source in 14m49s.
+macOS source was cancelled at its unchanged 20-minute limit, so Required
+failed. Its complete log contains 2,869 passes and two per-test failures over
+84 begun files; the last pass preceded cancellation by 75ms. This was unfinished
+progress, not post-suite cleanup. The complete log is 2,601,925 bytes, SHA-256
+`9564b574d6d613d85f0d05e3675b067b608bb106b94cfdf6deed122c8e869952`.
+
+The macOS StateStore file took about 591.89 seconds versus 266.51 previously.
+Service remained near 199.27 versus 192.50 seconds. Storage case timings show
+distributed slowdown rather than one anomalous case; the logs do not isolate
+CPU, I/O or retained-resource cause. Two cases separately exceeded their
+unchanged five-second budgets: exhaustive streaming-redaction partitions at
+5,137.14ms and eight legacy timestamp fixtures at 5,760.70ms. Independent
+sample and timestamp combinations become separate serial tests with every
+original input and assertion retained. No timeout, runtime authority check,
+sampling count or production implementation changes.
+
+The CI repair uses pinned Bun's native `--shard=1/3`, `--shard=2/3` and
+`--shard=3/3` for the existing source command, plus the unchanged remainder,
+on both operating systems. All eight jobs remain required; each retains the
+same pinned setup, native proof, complete governed history and 20-minute limit.
+The package manifest, lockfile and default full `check` and `test` commands
+remain byte-identical to baf0abc. Source tests keep serial execution and
+isolated globals; no test file is excluded or manually maintained in a list.
+
+Diagnostic discovery before case decomposition observed disjoint sets of
+47, 46 and 46 files, containing 979, 1,366 and 1,645 cases. Their union exactly
+matches all 139 files and 3,990 cases from completed Ubuntu source CI. These
+no-match probes intentionally ran no test bodies and exited one; they prove
+discovery, not test success. Mapping the completed Ubuntu file timings gives
+158.43, 288.56 and 393.19 seconds. The corresponding incomplete macOS lower
+bounds are 196.57, 296.86 and 668.67 seconds. StateStore and service are in
+different shards. These historical sums are not guarantees of new runner time
+or future file assignment; fresh hosted CI remains decisive.
+
+Regression tests retain exact expanded aggregate-command coverage and remainder
+ordering, require the closed eight-job matrix and literal shard dispatch, and
+exercise native whole-file coverage and nonzero failure propagation on bounded
+temporary fixtures. The timestamp case changed from one passing local test
+with 66 assertions in 1.64 seconds to eight passing tests with the same 66
+assertions in 1.59 seconds; each case took 165.47 to 227.95ms. That proves
+separate budgets and earlier per-case cleanup, not a production speedup.
+The redaction partition test likewise changed from one local passing test to
+20 independently reported fixtures with the same 70,362 assertions and every
+one- and two-split partition. Total focused wall time was 807 to 822ms, with
+the largest new case at 164.91ms; this is case-budget decomposition, not less
+work or an optimization claim. The workflow/native regression passed 29 tests
+and 863 assertions after its expected two old-workflow failures. Scoped typed
+lint and strict TypeScript passed for both workflow test files. The exact shell
+parsed and dispatched all four known branches to a fake child, and rejected
+unknown and shell-shaped phase values without running a real workload.
+The final saved-log audit also identified three passing bundled cases near the
+same five-second limit: four notification-hours fixtures at 4,623.36ms, three
+schema41 timestamp-guard definitions at 3,958.58ms and three offline-doctor
+project scenarios at 4,612.53ms. They are decomposed into the same independent
+serial cases without changing any witness body, fixture, assertion or deadline.
+This is preventive headroom for observed passing cases, not three additional
+CI failures. Other long cases retain their existing budgets and workload.
+Their combined focused selection passed three tests before and ten afterward,
+with the same 44 assertions and 677 other cases filtered. Total wall time was
+2.83 to 2.99 seconds; new individual cases took 202.11 to 459.34ms. Together,
+the structural changes predict 4,023 source cases over the unchanged 139 files;
+that arithmetic is not a full-suite receipt.
+The unchanged packed files retain the reviewed inventory above; a fresh final
+package-install gate is still mandatory. Normal merge, exact-main CI, a fresh
+reviewed site promotion and separately coordinated release remain pending.

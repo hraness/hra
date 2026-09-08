@@ -79,18 +79,20 @@ describe("authority supervisor build verifier", () => {
     const probe = workflow.indexOf(
       "/usr/bin/unshare --user --map-root-user --fork /usr/bin/true",
     );
-    const sourceGate = workflow.indexOf("bun run test:source");
+    const sourceGates = [1, 2, 3].map((shard) => workflow.indexOf(`bun run test:source --shard=${shard}/3`));
     const remainderGate = workflow.indexOf("bun run check:ci-remainder");
     const restore = workflow.indexOf(
       "sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=1",
     );
     expect(enable).toBeGreaterThan(-1);
     expect(enable).toBeLessThan(probe);
-    expect(sourceGate).toBeGreaterThan(-1);
+    for (const sourceGate of sourceGates) {
+      expect(sourceGate).toBeGreaterThan(-1);
+      expect(probe).toBeLessThan(sourceGate);
+      expect(sourceGate).toBeLessThan(restore);
+    }
     expect(remainderGate).toBeGreaterThan(-1);
-    expect(probe).toBeLessThan(sourceGate);
     expect(probe).toBeLessThan(remainderGate);
-    expect(sourceGate).toBeLessThan(restore);
     expect(remainderGate).toBeLessThan(restore);
   });
 });

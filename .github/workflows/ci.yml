@@ -25,7 +25,9 @@ jobs:
           - macos-15
           - ubuntu-24.04
         gate:
-          - source
+          - source-1
+          - source-2
+          - source-3
           - remainder
     steps:
       - name: Check out source
@@ -108,7 +110,9 @@ jobs:
         run: |
           set -euo pipefail
           case "$CI_GATE" in
-            source) bun run test:source ;;
+            source-1) bun run test:source --shard=1/3 ;;
+            source-2) bun run test:source --shard=2/3 ;;
+            source-3) bun run test:source --shard=3/3 ;;
             remainder) bun run check:ci-remainder ;;
             *)
               echo "::error::Unexpected CI gate"
