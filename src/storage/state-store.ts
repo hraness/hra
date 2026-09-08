@@ -208,6 +208,15 @@ import {
 } from "../domain/values";
 import { resolveUsableCanonicalProjectDirectory } from "./project-directory";
 import {
+  assertLegacyCanonicalProfileRows,
+  assertLegacyCanonicalProfileStorageAbsent,
+  assertLegacyCanonicalProfileStorageSchema,
+  deriveLegacySessionProfileKey,
+  LEGACY_CANONICAL_PROFILE_BACKFILL_SQL,
+  LEGACY_CANONICAL_PROFILE_COLUMNS_SQL,
+  LEGACY_CANONICAL_PROFILE_GUARDS_SQL,
+} from "./canonical-profile-storage";
+import {
   WORK_SCHEMA_SQL,
   WORK_PROJECT_AUTHORITY_SCHEMA_SQL,
   WorkStore,
@@ -360,6 +369,9 @@ const sessionRowSchema = z.object({
   // multi-provider presets, so `provider` plus this tier names the preset.
   preset: presetTierSchema,
   preset_contract: presetContractSchema,
+  // Validated against the row's own legacy tuple before any projection. Keeping
+  // this foreign value unknown gives missing/NULL/forged keys one fixed error.
+  canonical_profile_key: z.unknown(),
   fast_enabled: z.union([z.literal(0), z.literal(1)]),
   state: sessionStateSchema,
   active_turn_id: z.string().nullable(),
@@ -3500,7 +3512,8 @@ type DesktopSwitchPlan =
 // Preserve main's v40 adoption, v41 timestamp, v42 Work, and v43 transcript
 // contracts, v44 approval budgets, v45 auth authority, and v46 after-hours
 // policy, v47/v48 memory authority, and the v49 nullable Work project fence.
-const currentSchemaVersion = 49;
+// v50 adds exact historical canonical identity without rewriting those contracts.
+const currentSchemaVersion = 50;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -8262,6 +8275,7 @@ const applySchemaVersion40SessionAdoption = (
   // the complete frozen v40 surface immediately afterward, before the v40
   // waypoint can commit. Schema v42 owns the later current-body replacement.
   database.exec(WORK_SCHEMA_SQL);
+  applySchemaVersion50CanonicalProfiles(database);
   quarantineUnprovenProviderSessions(database, migratedAt);
   installProviderVersion40WorkAuthoritySchema(database);
   ensureVersion40CandidateColumns(database);
@@ -12146,6 +12160,52 @@ const assertSchemaVersion49Authority = (database: Database): void => {
   assertWorkProjectAuthoritySchema(database);
 };
 
+const assertSchemaVersion50Authority = (database: Database): void => {
+  assertSchemaVersion41TimestampProof(database);
+  assertSchemaMigrationLedgerTail(database, [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50],
+    "STATE_SCHEMA_V50_MIGRATION_LEDGER_INVALID");
+  assertSchemaVersionMemoryObjects(database, 48);
+  assertWorkProjectAuthoritySchema(database);
+  assertLegacyCanonicalProfileStorageSchema(database);
+};
+
+// These three released guards block a key-only additive backfill. No other
+// guard is removed, and their exact observed SQL is restored before admission.
+const canonicalProfileBackfillGuards = [
+  { name: "work_routes_no_update", table: "work_routes", sql: `CREATE TRIGGER work_routes_no_update
+BEFORE UPDATE ON work_routes BEGIN SELECT RAISE(ABORT,'WORK_ROUTE_IMMUTABLE'); END` },
+  { name: "work_tasks_no_update", table: "work_tasks", sql: `CREATE TRIGGER work_tasks_no_update
+BEFORE UPDATE ON work_tasks BEGIN SELECT RAISE(ABORT,'WORK_TASK_IMMUTABLE'); END` },
+  { name: "work_attempt_revision_guard", table: "work_attempts", sql: `CREATE TRIGGER work_attempt_revision_guard
+BEFORE UPDATE ON work_attempts
+WHEN NEW.revision != OLD.revision + 1
+BEGIN SELECT RAISE(ABORT,'WORK_ATTEMPT_REVISION'); END` },
+] as const;
+
+const applySchemaVersion50CanonicalProfiles = (database: Database): void => {
+  assertLegacyCanonicalProfileStorageAbsent(database);
+  const preserved = canonicalProfileBackfillGuards.map((guard) => {
+    const rows = database.query(
+      "SELECT type,name,tbl_name,sql FROM main.sqlite_master WHERE name=? COLLATE NOCASE",
+    ).all(guard.name);
+    const parsed = sqliteSchemaObjectRowSchema.safeParse(rows[0]);
+    if (rows.length !== 1 || !parsed.success || parsed.data.type !== "trigger"
+      || parsed.data.name !== guard.name || parsed.data.tbl_name !== guard.table
+      || normalizeSqlStructure(parsed.data.sql.replace(/\bIF NOT EXISTS\b/giu, ""))
+        !== normalizeSqlStructure(guard.sql)) {
+      throw new Error("STATE_SCHEMA_V50_BACKFILL_GUARD_INVALID");
+    }
+    return { name: guard.name, sql: parsed.data.sql };
+  });
+  database.exec(LEGACY_CANONICAL_PROFILE_COLUMNS_SQL);
+  for (const guard of preserved) database.exec(`DROP TRIGGER main.${guard.name}`);
+  database.exec(LEGACY_CANONICAL_PROFILE_BACKFILL_SQL);
+  for (const guard of preserved) database.exec(guard.sql);
+  assertLegacyCanonicalProfileRows(database);
+  database.exec(LEGACY_CANONICAL_PROFILE_GUARDS_SQL);
+  assertLegacyCanonicalProfileStorageSchema(database);
+};
+
 // This migration-only scan must precede legacy quarantine, which may retire
 // claims. Never normalize contradictory project authority into migration proof.
 const assertSchemaVersion49ProjectPredecessor = (database: Database): void => {
@@ -12996,6 +13056,13 @@ const migrateWritableDatabase = (
     if (initialVersion > currentSchemaVersion) {
       throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
     }
+    if (initialVersion < 50) assertLegacyCanonicalProfileStorageAbsent(database);
+    else {
+      assertSchemaVersion50Authority(database);
+      // Current authority is asserted before maintenance, never repaired.
+      // Readonly construction intentionally does not run this populated scan.
+      assertLegacyCanonicalProfileRows(database);
+    }
     if (initialVersion < 44 && database.query(
       "SELECT 1 FROM sqlite_master WHERE name LIKE '%autorespond_budget%' LIMIT 1",
     ).get() !== null) {
@@ -13043,7 +13110,7 @@ const migrateWritableDatabase = (
       assertSchemaVersion39ProviderAuthority(database);
       assertSchemaVersion40AdoptionObjects(database);
       assertExactSchemaVersion40AdoptionSurface(database);
-      if (initialVersion === 49) assertWorkSchema(database);
+      if (initialVersion >= 49) assertWorkSchema(database);
       else assertLegacyVersion42WorkSchema(database);
       assertSessionTaskSchema(database);
       assertCompositeNotificationPolicy(database);
@@ -13085,6 +13152,9 @@ const migrateWritableDatabase = (
       assertSchemaVersion49ProjectPredecessor(database);
       // These predecessors already have the complete Work/session parents.
       if (initialVersion >= 40) database.exec(WORK_PROJECT_AUTHORITY_SCHEMA_SQL);
+    }
+    if (initialVersion >= 40 && initialVersion < 50) {
+      applySchemaVersion50CanonicalProfiles(database);
     }
     let redacted = false;
     let version = initialVersion;
@@ -13808,7 +13878,16 @@ const migrateWritableDatabase = (
       database.exec("PRAGMA user_version=49");
       version = 49;
     }
-    assertSchemaVersion49Authority(database);
+    if (version < 50) {
+      // The frozen predecessor ledger must still end at49 at this point.
+      assertSchemaVersion49Authority(database);
+      assertLegacyCanonicalProfileStorageSchema(database);
+      assertLegacyCanonicalProfileRows(database);
+      database.query("INSERT INTO migrations(version,applied_at) VALUES (?,?)")
+        .run(50, unixMillisecondsSchema.parse(now()));
+      database.exec("PRAGMA user_version=50");
+    }
+    assertSchemaVersion50Authority(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -13849,8 +13928,22 @@ const mapProject = (row: unknown): ProjectRecord => {
 const legacySessionProviderShadow = (provider: Provider): "codex" | "claude" =>
   provider === "claude" ? "claude" : "codex";
 
-const mapSession = (row: unknown): SessionRecord => {
+const requireCanonicalSessionProfileKey = (provider: unknown, tier: unknown, contract: unknown) => {
+  const key = deriveLegacySessionProfileKey(provider, tier, contract);
+  if (key === null) throw new Error("SESSION_CANONICAL_PROFILE_CORRUPT");
+  return key;
+};
+
+const parseCanonicalSessionRow = (row: unknown): z.infer<typeof sessionRowSchema> => {
   const parsed = sessionRowSchema.parse(row);
+  if (parsed.canonical_profile_key !== requireCanonicalSessionProfileKey(
+    parsed.provider_v39, parsed.preset, parsed.preset_contract,
+  )) throw new Error("SESSION_CANONICAL_PROFILE_CORRUPT");
+  return parsed;
+};
+
+const mapSession = (row: unknown): SessionRecord => {
+  const parsed = parseCanonicalSessionRow(row);
   return {
     id: parsed.id,
     profileId: parsed.profile_id,
@@ -14537,7 +14630,7 @@ export class StateStore {
       assertSchemaVersion39ProviderAuthority(this.#database);
       assertSchemaVersion40AdoptionObjects(this.#database);
       assertExactSchemaVersion40AdoptionSurface(this.#database);
-      assertSchemaVersion49Authority(this.#database);
+      assertSchemaVersion50Authority(this.#database);
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);
@@ -16018,7 +16111,7 @@ export class StateStore {
     assertPresetSupportedByProvider(provider, preset);
     const presetBinding = activePresetBinding(preset);
     const create = this.#database.transaction(() => {
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id, input.profileId, input.projectId ?? null, title, legacySessionProviderShadow(provider), provider, presetTiers[preset], presetBinding.contract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,canonical_profile_key,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id, input.profileId, input.projectId ?? null, title, legacySessionProviderShadow(provider), provider, presetTiers[preset], presetBinding.contract, requireCanonicalSessionProfileKey(provider, presetTiers[preset], presetBinding.contract), input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       // This preparatory row has no provider-account observation yet. Clear the
       // legacy profile-derived hint in the same transaction so a later plain
       // bindSession cannot launder it into provider authority. Provider import
@@ -16069,9 +16162,9 @@ export class StateStore {
         "UPDATE sessions SET archived_at=? WHERE id=?",
       ).run(archived ? now : null, parsedSessionId);
       if (result.changes !== 1) throw new SelectionError("NOT_FOUND");
+      return this.requireSession(parsedSessionId);
     });
-    write.immediate();
-    return this.requireSession(parsedSessionId);
+    return write.immediate();
   }
 
   readNotificationHours(): NotificationHoursPolicy {
@@ -16559,7 +16652,7 @@ export class StateStore {
     preset: Preset;
     requirement: PresetRequirement;
   }> {
-    const parsed = sessionRowSchema.parse(
+    const parsed = parseCanonicalSessionRow(
       this.#database.query("SELECT * FROM sessions WHERE id=?").get(sessionIdSchema.parse(sessionId)),
     );
     const preset = presetForProviderTier(parsed.provider_v39, parsed.preset);
@@ -17847,12 +17940,13 @@ export class StateStore {
       ) {
         const updated = this.#database.query(
           `UPDATE sessions
-           SET preset=?,preset_contract=?,fast_enabled=?,revision=revision+1,
+           SET preset=?,preset_contract=?,canonical_profile_key=?,fast_enabled=?,revision=revision+1,
              updated_at=MAX(updated_at,?)
            WHERE id=? AND revision=?`,
         ).run(
           presetTiers[parsed.preset],
           adoptionContract,
+          requireCanonicalSessionProfileKey(parsed.provider, presetTiers[parsed.preset], adoptionContract),
           parsed.fastEnabled ? 1 : 0,
           now,
           session.id,
@@ -20513,9 +20607,9 @@ export class StateStore {
       this.#database.query(
         `INSERT INTO sessions(
            id,profile_id,project_id,provider_thread_id,title,provider,provider_v39,preset,
-           preset_contract,fast_enabled,state,active_turn_id,provider_updated_at,
+           preset_contract,canonical_profile_key,fast_enabled,state,active_turn_id,provider_updated_at,
            revision,created_at,updated_at
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
       ).run(
         id,
         input.profileId,
@@ -20526,6 +20620,7 @@ export class StateStore {
         input.provider,
         presetTiers[input.preset],
         input.presetContract,
+        requireCanonicalSessionProfileKey(input.provider, presetTiers[input.preset], input.presetContract),
         input.fastEnabled ? 1 : 0,
         input.state,
         input.activeTurnId ?? null,
@@ -21725,9 +21820,12 @@ export class StateStore {
 
   bindSession(input: { sessionId: SessionId; expectedRevision: number; providerThreadId: string; state: "active" | "idle"; activeTurnId?: string; providerUpdatedAt?: number }): SessionRecord {
     const now = this.#now();
-    const result = this.#database.query("UPDATE sessions SET provider_thread_id=?,state=?,active_turn_id=?,provider_updated_at=?,revision=revision+1,updated_at=? WHERE id=? AND revision=? AND state='starting'").run(input.providerThreadId, input.state, input.activeTurnId ?? null, input.providerUpdatedAt ?? null, now, input.sessionId, input.expectedRevision);
-    if (result.changes !== 1) throw new Error("Session authority changed before the provider binding committed.");
-    return this.requireSession(input.sessionId);
+    const bind = this.#database.transaction(() => {
+      const result = this.#database.query("UPDATE sessions SET provider_thread_id=?,state=?,active_turn_id=?,provider_updated_at=?,revision=revision+1,updated_at=? WHERE id=? AND revision=? AND state='starting'").run(input.providerThreadId, input.state, input.activeTurnId ?? null, input.providerUpdatedAt ?? null, now, input.sessionId, input.expectedRevision);
+      if (result.changes !== 1) throw new Error("Session authority changed before the provider binding committed.");
+      return this.requireSession(input.sessionId);
+    });
+    return bind.immediate();
   }
 
   deleteUnboundStartingSession(sessionId: SessionId, expectedRevision: number): boolean {
@@ -21825,7 +21923,7 @@ export class StateStore {
         throw new Error("WORK_SESSION_ATTEMPT_AUTHORITY");
       }
       const now = this.#now();
-      const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,preset_contract=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], presetContract, fast ? 1 : 0, project, now, current.id, current.revision);
+      const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,preset_contract=?,canonical_profile_key=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], presetContract, requireCanonicalSessionProfileKey(current.provider, presetTiers[preset], presetContract), fast ? 1 : 0, project, now, current.id, current.revision);
       if (result.changes !== 1) throw new Error("Session metadata revision conflict.");
       return this.requireSession(current.id);
     });
@@ -22076,7 +22174,7 @@ export class StateStore {
       // caller can observe the intermediate idle row.
       const bound = this.#database.query(
         `UPDATE sessions
-         SET provider=?,provider_v39=?,profile_id=?,preset=?,preset_contract=?,provider_thread_id=?,state=?,active_turn_id=?,
+         SET provider=?,provider_v39=?,profile_id=?,preset=?,preset_contract=?,canonical_profile_key=?,provider_thread_id=?,state=?,active_turn_id=?,
              provider_updated_at=?,revision=revision+1,updated_at=?
          WHERE id=? AND revision=? AND profile_id=? AND provider_v39=?
            AND provider_thread_id=? AND state NOT IN ('recovery_required','terminal')`,
@@ -22086,6 +22184,7 @@ export class StateStore {
         profileId,
         presetTiers[preset],
         targetPresetContract,
+        requireCanonicalSessionProfileKey(provider, presetTiers[preset], targetPresetContract),
         providerThreadId,
         "idle",
         null,
@@ -22235,9 +22334,12 @@ export class StateStore {
 
   setSessionTurnState(input: { sessionId: SessionId; expectedRevision: number; state: "active" | "idle" | "terminal" | "recovery_required"; activeTurnId?: string }): SessionRecord {
     const now = this.#now();
-    const result = this.#database.query("UPDATE sessions SET state=?,active_turn_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(input.state, input.activeTurnId ?? null, now, input.sessionId, input.expectedRevision);
-    if (result.changes !== 1) throw new Error("Session state revision conflict.");
-    return this.requireSession(input.sessionId);
+    const update = this.#database.transaction(() => {
+      const result = this.#database.query("UPDATE sessions SET state=?,active_turn_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(input.state, input.activeTurnId ?? null, now, input.sessionId, input.expectedRevision);
+      if (result.changes !== 1) throw new Error("Session state revision conflict.");
+      return this.requireSession(input.sessionId);
+    });
+    return update.immediate();
   }
 
   reconcileSessionFromProvider(input: { sessionId: SessionId; state?: "active" | "idle" | "terminal" | "recovery_required"; activeTurnId?: string | null; title?: string }): SessionRecord {
@@ -22460,14 +22562,17 @@ export class StateStore {
   quarantineSession(sessionId: SessionId): SessionRecord {
     const parsedSessionId = sessionIdSchema.parse(sessionId);
     const now = this.#now();
-    this.#database
-      .query(
-        `UPDATE sessions
-         SET state='recovery_required',active_turn_id=NULL,revision=revision+1,updated_at=?
-         WHERE id=? AND state NOT IN ('recovery_required','terminal')`,
-      )
-      .run(now, parsedSessionId);
-    return this.requireSession(parsedSessionId);
+    const quarantine = this.#database.transaction(() => {
+      this.#database
+        .query(
+          `UPDATE sessions
+           SET state='recovery_required',active_turn_id=NULL,revision=revision+1,updated_at=?
+           WHERE id=? AND state NOT IN ('recovery_required','terminal')`,
+        )
+        .run(now, parsedSessionId);
+      return this.requireSession(parsedSessionId);
+    });
+    return quarantine.immediate();
   }
 
   resolveSessionStatusRecovery(input:
@@ -27938,14 +28043,12 @@ export class StateStore {
   markQueueEffectAmbiguous(queueId: QueueId, expectedEvidenceDigest: string): SessionRecord {
     const parsedQueueId = queueIdSchema.parse(queueId);
     const digest = sha256Schema.parse(expectedEvidenceDigest);
-    let sessionId: SessionId | undefined;
     const mark = this.#database.transaction(() => {
       const row = z.object({ session_id: sessionIdSchema, state: z.literal("dispatching"), evidence_digest: sha256Schema }).strict().parse(
         this.#database.query(`SELECT q.session_id,q.state,e.evidence_digest FROM queue_entries q
                               JOIN queue_effect_evidence e ON e.queue_id=q.id WHERE q.id=?`).get(parsedQueueId),
       );
       if (row.evidence_digest !== digest) throw new Error("QUEUE_EFFECT_EVIDENCE_MISMATCH");
-      sessionId = row.session_id;
       const now = this.#now();
       const changed = z.object({ id: queueIdSchema }).strict().nullable().parse(
         this.#database.query(
@@ -27955,10 +28058,9 @@ export class StateStore {
       if (changed === null) throw new Error("QUEUE_EFFECT_CAS_CONFLICT");
       this.#database.query(`UPDATE sessions SET state='recovery_required',active_turn_id=NULL,revision=revision+1,updated_at=?
                             WHERE id=? AND state NOT IN ('recovery_required','terminal')`).run(now, row.session_id);
+      return this.requireSession(row.session_id);
     });
-    mark.immediate();
-    if (sessionId === undefined) throw new Error("Queue ambiguity lost its session authority.");
-    return this.requireSession(sessionId);
+    return mark.immediate();
   }
 
   resolveQueueEffect(input: {
@@ -28881,7 +28983,7 @@ export class StateStore {
         )
         || (parsedProvider === "codex" && authority.provider_email === null)
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", legacySessionProviderShadow(parsedProvider), parsedProvider, presetTiers[parsedPreset], presetBinding.contract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,provider_v39,preset,preset_contract,canonical_profile_key,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", legacySessionProviderShadow(parsedProvider), parsedProvider, presetTiers[parsedPreset], presetBinding.contract, requireCanonicalSessionProfileKey(parsedProvider, presetTiers[parsedPreset], presetBinding.contract), input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(sessionId, now);
       this.#bindSessionProviderAccountAuthorityLocked({
           sessionId,
@@ -29548,9 +29650,9 @@ export class StateStore {
         sourceId: attemptId,
         profile: runtimeProfile,
       }, now);
+      return this.requireSession(sessionId);
     });
-    bind.immediate();
-    return this.requireSession(sessionId);
+    return bind.immediate();
   }
 
   bindSessionProviderSwitchRecoveryTarget(input: {
@@ -29790,7 +29892,7 @@ export class StateStore {
       }
       const changed = this.#database.query(
         `UPDATE sessions
-         SET provider=?,provider_v39=?,profile_id=?,preset=?,preset_contract=?,provider_thread_id=?,title=?,
+         SET provider=?,provider_v39=?,profile_id=?,preset=?,preset_contract=?,canonical_profile_key=?,provider_thread_id=?,title=?,
              state='recovery_required',active_turn_id=NULL,provider_updated_at=?,
              revision=revision+1,updated_at=?
          WHERE id=? AND revision=? AND state!='terminal'`,
@@ -29800,6 +29902,7 @@ export class StateStore {
         evidence.targetProfileId,
         presetTiers[evidence.targetPreset],
         targetPresetContract,
+        requireCanonicalSessionProfileKey(evidence.targetProvider, presetTiers[evidence.targetPreset], targetPresetContract),
         authority.target_provider_thread_id,
         titleSchema.parse(input.title),
         input.providerUpdatedAt ?? null,

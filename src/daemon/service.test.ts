@@ -2087,7 +2087,34 @@ async function claudeAccountFixture(
   };
 }
 
-// Seed the durable v39 representation, not an active retired-provider API.
+// Remove only the current canonical overlay before an explicit older fixture
+// shaper. This does not make the shaped root an authentic historical capture.
+function removeCanonicalProfileFixtureOverlay(database: Database): void {
+  const tables = ["sessions", "work_routes", "work_tasks", "work_attempts"] as const;
+  const rows = (table: typeof tables[number]) => database.query(`SELECT * FROM ${table}`).all()
+    .map((value) => {
+      const row = z.record(z.string(), z.unknown()).parse(value);
+      delete row.canonical_profile_key;
+      return row;
+    });
+  const before = tables.map((table) => rows(table));
+  database.transaction(() => {
+    database.exec(`
+      DROP TRIGGER canonical_profile_session_insert_guard;
+      DROP TRIGGER canonical_profile_session_update_guard;
+      DROP TRIGGER canonical_profile_session_live_attempt_guard;
+      DROP TRIGGER canonical_profile_work_route_insert_guard;
+      DROP TRIGGER canonical_profile_work_task_insert_guard;
+      DROP TRIGGER canonical_profile_work_attempt_insert_guard;
+      DROP TRIGGER canonical_profile_work_attempt_immutable_guard;
+    `);
+    for (const table of tables) database.exec(`ALTER TABLE ${table} DROP COLUMN canonical_profile_key`);
+  }).immediate();
+  expect(tables.map((table) => rows(table))).toEqual(before);
+}
+
+// Seed frozen v39 provenance plus its coherent current canonical mirror,
+// not an active retired-provider API or an authentic old database capture.
 function legacyDevinSession(
   value: Awaited<ReturnType<typeof fixture>>,
   profileId: Parameters<StateStore["createSession"]>[0]["profileId"],
@@ -2104,7 +2131,7 @@ function legacyDevinSession(
   try {
     legacy.query("DELETE FROM session_provider_account_authorities WHERE session_id=?").run(created.id);
     legacy.query(
-      "UPDATE sessions SET provider_v39='devin',preset_contract=? WHERE id=?",
+      "UPDATE sessions SET provider_v39='devin',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?",
     ).run(devinPresetContract, created.id);
   } finally {
     legacy.close();
@@ -2670,7 +2697,7 @@ describe("HraService personal-session adoption", () => {
     const writer = new Database(value.paths.database, { strict: true });
     try {
       expect(writer.query(
-        "UPDATE sessions SET preset_contract=? WHERE id=?",
+        "UPDATE sessions SET preset_contract=?,canonical_profile_key='codex:gpt-6-astra:ultra' WHERE id=?",
       ).run(currentPresetContract, value.session.id).changes).toBe(1);
     } finally {
       writer.close(false);
@@ -16306,6 +16333,7 @@ describe("HraService", () => {
     const legacy = new Database(value.paths.database, { create: false, strict: true });
     try {
       legacy.exec("PRAGMA foreign_keys=OFF");
+      removeCanonicalProfileFixtureOverlay(legacy);
       const adoptionTables = [
         "session_claude_process_authorities",
         "session_claude_process_launch_intents",
@@ -16439,7 +16467,7 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
       ).all()).toEqual([
@@ -16468,6 +16496,7 @@ describe("HraService", () => {
         { version: 47 },
         { version: 48 },
         { version: 49 },
+        { version: 50 },
       ]);
     } finally {
       inspector.close(false);
@@ -20126,6 +20155,7 @@ describe("HraService", () => {
     // v43 advanced the profile without any account successor ledger. Build
     // that exact predecessor surface; the v45 migration must not backfill it.
     const legacy = new Database(paths.database, { strict: true });
+    removeCanonicalProfileFixtureOverlay(legacy);
     const evidenceSql = z.object({ sql: z.string() }).strict().parse(legacy.query(
       "SELECT sql FROM sqlite_master WHERE type='table' AND name='autorespond_evidence'",
     ).get()).sql;
@@ -20815,7 +20845,7 @@ describe("HraService", () => {
     const legacy = new Database(value.paths.database, { strict: true });
     try {
       legacy.query(
-        "UPDATE sessions SET provider_v39='devin',preset_contract=? WHERE id=?",
+        "UPDATE sessions SET provider_v39='devin',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?",
       ).run(devinPresetContract, session.id);
       legacy.query(
         "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,'session.start',?,?,?,'effect_started',0,0)",

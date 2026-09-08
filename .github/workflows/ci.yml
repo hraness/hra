@@ -15,17 +15,22 @@ permissions:
 
 jobs:
   check:
-    name: Check (${{ matrix.os }})
+    name: Check (${{ matrix.os }}, ${{ matrix.gate }})
     runs-on: ${{ matrix.os }}
-    # The serial source and compiled-presentation suites can reach 20 minutes
-    # before package acceptance. Keep every phase and its own bounded deadlines.
-    timeout-minutes: 35
+    # Source shards and the ordered remainder cover the complete gate while
+    # retaining every phase's own bounded deadline.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os:
           - macos-15
           - ubuntu-24.04
+        gate:
+          - source-1
+          - source-2
+          - source-3
+          - remainder
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -103,7 +108,19 @@ jobs:
           # Typed ESLint loads the complete repository project graph and can
           # exceed V8's default heap on the 7 GiB macOS runner.
           NODE_OPTIONS: "--max-old-space-size=4096"
-        run: bun run check
+          CI_GATE: ${{ matrix.gate }}
+        run: |
+          set -euo pipefail
+          case "$CI_GATE" in
+            source-1) bun run test:source --shard=1/3 ;;
+            source-2) bun run test:source --shard=2/3 ;;
+            source-3) bun run test:source --shard=3/3 ;;
+            remainder) bun run check:ci-remainder ;;
+            *)
+              echo "::error::Unexpected CI gate"
+              exit 1
+              ;;
+          esac
 
       - name: Restore Ubuntu user-namespace restriction
         if: ${{ always() && runner.os == 'Linux' }}

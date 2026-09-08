@@ -1,6 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import type { Database } from "bun:sqlite";
+import { z } from "zod";
+
+import {
+  assertLegacyCanonicalProfileStorageSchema,
+  deriveLegacySessionProfileKey,
+  deriveLegacyWorkProfileKey,
+} from "./canonical-profile-storage";
 
 import {
   devinPresetContract,
@@ -1825,6 +1832,7 @@ type TaskRow = Readonly<{
   account_id: string;
   project_id: string;
   preset: "low" | "high" | "ultra";
+  canonical_profile_key: unknown;
   fast: 0 | 1;
   priority: number;
   not_before: number | null;
@@ -1881,6 +1889,7 @@ type AttemptRow = Readonly<{
   account_id: string;
   project_id: string;
   preset: "low" | "high" | "ultra";
+  canonical_profile_key: unknown;
   fast: 0 | 1;
   fence: number;
   revision: number;
@@ -1939,6 +1948,7 @@ type SubmissionRow = Readonly<{
 
 type ReviewRow = Readonly<{
   id: string;
+  work_id: string;
   submission_id: string;
   reviewer_session_id: string;
   decision: "accept" | "revise" | "reject";
@@ -2197,6 +2207,31 @@ function mapEvent(row: Readonly<{
   };
 }
 
+const canonicalRouteIdentitySchema = z.object({
+  work_id: z.string(),
+  account_id: z.string(),
+  project_id: z.string(),
+  preset: z.enum(["low", "high", "ultra"]),
+  fast: z.union([z.literal(0), z.literal(1)]),
+  canonical_profile_key: z.unknown(),
+});
+const canonicalTaskIdentitySchema = canonicalRouteIdentitySchema.extend({ id: z.string() });
+const canonicalAttemptIdentitySchema = canonicalRouteIdentitySchema.extend({
+  id: z.string(),
+  task_id: z.string(),
+  worker_session_id: z.string(),
+  state: z.enum([
+    "claimed", "dispatching", "running", "recovery_required", "submitted",
+    "blocked", "completed", "failed", "released", "expired", "cancelled",
+  ]),
+});
+const canonicalSessionIdentitySchema = z.object({
+  provider_v39: z.unknown(),
+  preset: z.unknown(),
+  preset_contract: z.unknown(),
+  canonical_profile_key: z.unknown(),
+}).strict();
+
 export class WorkStore {
   readonly #database: Database;
   readonly #now: () => number;
@@ -2234,6 +2269,212 @@ export class WorkStore {
     this.#projectProviderIdentifier = options.projectProviderIdentifier;
     this.#database.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
     assertWorkSchema(this.#database);
+    assertLegacyCanonicalProfileStorageSchema(this.#database);
+  }
+
+  // These are bounded source-row checks, not a migration-wide scan. Do not
+  // cache their results: settled history and current worker identity can
+  // legitimately diverge, while corruption must never become stale authority.
+  #canonicalWorkKey(workId: string, preset: unknown): string {
+    const source: unknown = this.#database.query(
+      "SELECT preset_contract FROM main.works WHERE id COLLATE BINARY=?",
+    ).get(workId);
+    const parsed = z.object({ preset_contract: z.unknown() }).strict().safeParse(source);
+    const key = parsed.success
+      ? deriveLegacyWorkProfileKey(preset, parsed.data.preset_contract)
+      : null;
+    if (key === null) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    return key;
+  }
+
+  #canonicalSessionKey(sessionId: string): string | null {
+    const source: unknown = this.#database.query(
+      `SELECT provider_v39,preset,preset_contract,canonical_profile_key
+       FROM main.sessions WHERE id COLLATE BINARY=?`,
+    ).get(sessionId);
+    if (source === null) return null;
+    const parsed = canonicalSessionIdentitySchema.safeParse(source);
+    if (!parsed.success) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    const key = deriveLegacySessionProfileKey(
+      parsed.data.provider_v39, parsed.data.preset, parsed.data.preset_contract,
+    );
+    if (key === null || parsed.data.canonical_profile_key !== key) {
+      throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    }
+    return key;
+  }
+
+  #assertCanonicalRoute(source: unknown): string {
+    const parsed = canonicalRouteIdentitySchema.safeParse(source);
+    if (!parsed.success) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    const route = parsed.data;
+    const key = this.#canonicalWorkKey(route.work_id, route.preset);
+    if (route.canonical_profile_key !== key) {
+      throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    }
+    const parents: unknown = this.#database.query(
+      `SELECT (
+         EXISTS (SELECT 1 FROM main.profiles WHERE id COLLATE BINARY=?)
+         AND EXISTS (SELECT 1 FROM main.projects WHERE id COLLATE BINARY=?)
+       ) AS valid`,
+    ).get(route.account_id, route.project_id);
+    if (!z.object({ valid: z.literal(1) }).strict().safeParse(parents).success) {
+      throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    }
+    return key;
+  }
+
+  #assertCanonicalTask(source: unknown): string {
+    const parsed = canonicalTaskIdentitySchema.safeParse(source);
+    if (!parsed.success) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    const task = parsed.data;
+    const key = this.#canonicalWorkKey(task.work_id, task.preset);
+    if (task.canonical_profile_key !== key) {
+      throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    }
+    const route: unknown = this.#database.query(
+      `SELECT work_id,account_id,project_id,preset,fast,canonical_profile_key
+       FROM main.work_routes WHERE work_id COLLATE BINARY=?
+         AND account_id COLLATE BINARY=? AND project_id COLLATE BINARY=?
+         AND preset COLLATE BINARY=? AND fast=?`,
+    ).get(task.work_id, task.account_id, task.project_id, task.preset, task.fast);
+    if (this.#assertCanonicalRoute(route) !== key) {
+      throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    }
+    return key;
+  }
+
+  #canonicalTaskIdentity(taskId: string, workId: string) {
+    const source: unknown = this.#database.query(
+      `SELECT id,work_id,account_id,project_id,preset,fast,canonical_profile_key
+       FROM main.work_tasks WHERE id COLLATE BINARY=? AND work_id COLLATE BINARY=?`,
+    ).get(taskId, workId);
+    const parsed = canonicalTaskIdentitySchema.safeParse(source);
+    if (!parsed.success) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    this.#assertCanonicalTask(parsed.data);
+    return parsed.data;
+  }
+
+  #assertCanonicalTaskReferences(taskId: string, workId: string): void {
+    // Validate only direct parent/dependency sources; different task routes are
+    // valid, and damaged ancestry must not induce a recursive traversal.
+    const references = this.#database.query(
+      `SELECT parent_task_id AS related_task_id FROM main.work_tasks
+       WHERE id COLLATE BINARY=? AND work_id COLLATE BINARY=? AND parent_task_id IS NOT NULL
+       UNION ALL
+       SELECT dependency_task_id AS related_task_id FROM main.work_task_dependencies
+       WHERE work_id COLLATE BINARY=? AND task_id COLLATE BINARY=?`,
+    ).all(taskId, workId, workId, taskId);
+    for (const source of references) {
+      const parsed = z.object({ related_task_id: z.string() }).strict().safeParse(source);
+      if (!parsed.success) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+      this.#canonicalTaskIdentity(parsed.data.related_task_id, workId);
+    }
+  }
+
+  #assertCanonicalAttempt(source: unknown): void {
+    const parsed = canonicalAttemptIdentitySchema.safeParse(source);
+    if (!parsed.success) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    const attempt = parsed.data;
+    const task = this.#canonicalTaskIdentity(attempt.task_id, attempt.work_id);
+    if (
+      attempt.account_id !== task.account_id || attempt.project_id !== task.project_id
+      || attempt.preset !== task.preset || attempt.fast !== task.fast
+      || attempt.canonical_profile_key !== task.canonical_profile_key
+    ) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    const workerKey = this.#canonicalSessionKey(attempt.worker_session_id);
+    if (workerKey === null || (
+      ["claimed", "dispatching", "running", "recovery_required"].includes(attempt.state)
+      && workerKey !== attempt.canonical_profile_key
+    )) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+  }
+
+  #canonicalAttemptIdentity(attemptId: string, workId: string, taskId?: string): void {
+    const source: unknown = this.#database.query(
+      `SELECT id,work_id,task_id,worker_session_id,account_id,project_id,preset,
+              fast,canonical_profile_key,state
+       FROM main.work_attempts WHERE id COLLATE BINARY=? AND work_id COLLATE BINARY=?`,
+    ).get(attemptId, workId);
+    const parsed = canonicalAttemptIdentitySchema.safeParse(source);
+    if (!parsed.success || (taskId !== undefined && parsed.data.task_id !== taskId)) {
+      throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    }
+    this.#assertCanonicalAttempt(parsed.data);
+  }
+
+  #canonicalSubmissionIdentity(submissionId: string, workId?: string, taskId?: string): void {
+    const source: unknown = this.#database.query(
+      `SELECT work_id,task_id,attempt_id FROM main.work_submissions
+       WHERE id COLLATE BINARY=?`,
+    ).get(submissionId);
+    const parsed = z.object({
+      work_id: z.string(), task_id: z.string(), attempt_id: z.string(),
+    }).strict().safeParse(source);
+    if (!parsed.success || (workId !== undefined && parsed.data.work_id !== workId)
+      || (taskId !== undefined && parsed.data.task_id !== taskId)) {
+      throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    }
+    this.#canonicalAttemptIdentity(
+      parsed.data.attempt_id, parsed.data.work_id, parsed.data.task_id,
+    );
+  }
+
+  #canonicalSignalIdentity(signalId: string, workId: string, taskId?: string): void {
+    const source: unknown = this.#database.query(
+      `SELECT s.task_id,s.to_session_id,w.preset_contract
+       FROM main.work_signals AS s
+       JOIN main.works AS w ON w.id COLLATE BINARY=s.work_id COLLATE BINARY
+       WHERE s.id COLLATE BINARY=? AND s.work_id COLLATE BINARY=?`,
+    ).get(signalId, workId);
+    const parsed = z.object({
+      task_id: z.string().nullable(), to_session_id: z.string(),
+      preset_contract: z.union([z.literal(1), z.literal(2)]),
+    }).strict().safeParse(source);
+    if (!parsed.success || (taskId !== undefined && parsed.data.task_id !== taskId)) {
+      throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    }
+    if (parsed.data.task_id !== null) this.#canonicalTaskIdentity(parsed.data.task_id, workId);
+    if (this.#canonicalSessionKey(parsed.data.to_session_id) === null) {
+      throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    }
+  }
+
+  #assertCanonicalHistorySource(
+    workId: string, taskId: string, kind: WorkTaskHistoryKind, stableKey: string,
+  ): void {
+    this.#canonicalTaskIdentity(taskId, workId);
+    switch (kind) {
+      case "attempt":
+        this.#canonicalAttemptIdentity(stableKey, workId, taskId);
+        return;
+      case "submission":
+        this.#canonicalSubmissionIdentity(stableKey, workId, taskId);
+        return;
+      case "attempt_report": {
+        const source: unknown = this.#database.query(
+          `SELECT attempt_id FROM main.work_attempt_reports
+           WHERE idempotency_key COLLATE BINARY=? AND work_id COLLATE BINARY=?`,
+        ).get(stableKey, workId);
+        const parsed = z.object({ attempt_id: z.string() }).strict().safeParse(source);
+        if (!parsed.success) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+        this.#canonicalAttemptIdentity(parsed.data.attempt_id, workId, taskId);
+        return;
+      }
+      case "review": {
+        const source: unknown = this.#database.query(
+          `SELECT submission_id FROM main.work_reviews
+           WHERE id COLLATE BINARY=? AND work_id COLLATE BINARY=?`,
+        ).get(stableKey, workId);
+        const parsed = z.object({ submission_id: z.string() }).strict().safeParse(source);
+        if (!parsed.success) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+        this.#canonicalSubmissionIdentity(parsed.data.submission_id, workId, taskId);
+        return;
+      }
+      case "signal": {
+        this.#canonicalSignalIdentity(stableKey, workId, taskId);
+        return;
+      }
+    }
   }
 
   protocol(): WorkProtocolDescription {
@@ -2323,6 +2564,11 @@ export class WorkStore {
   }
 
   #effectStatusFromRow(effect: PreparedEffectRow): WorkPreparedEffectStatus {
+    if (effect.effect_kind === "attempt_dispatch") {
+      this.#canonicalAttemptIdentity(effect.subject_id, effect.work_id);
+    } else {
+      this.#canonicalSignalIdentity(effect.subject_id, effect.work_id);
+    }
     const target = effect.effect_kind === "attempt_dispatch"
       ? this.#database.query(
         "SELECT target_session_id AS target FROM work_attempts WHERE id=?",
@@ -2572,9 +2818,11 @@ export class WorkStore {
   }
 
   #dispatchAuthorityValid(effect: WorkDispatchInstruction, now: number): boolean {
+    this.#canonicalAttemptIdentity(effect.attemptId, effect.workId, effect.taskId);
     const attempt = this.#database.query(
       "SELECT * FROM work_attempts WHERE id=? AND work_id=?",
     ).get(effect.attemptId, effect.workId) as AttemptRow | null;
+    if (attempt !== null) this.#assertCanonicalAttempt(attempt);
     if (
       attempt === null
       || attempt.task_id !== effect.taskId
@@ -2611,6 +2859,8 @@ export class WorkStore {
   }
 
   #signalAuthorityValid(effect: WorkSignalInstruction): boolean {
+    this.#canonicalSignalIdentity(effect.signalId, effect.workId);
+    this.#canonicalSessionKey(effect.targetSessionId);
     if (this.#requireWork(effect.workId).state !== "active") return false;
     const authority = this.#database.query(
       `SELECT 1 AS present
@@ -3121,6 +3371,7 @@ export class WorkStore {
     if (row === null || (workId !== undefined && row.work_id !== workId)) {
       throw new WorkStoreError("TASK_NOT_FOUND");
     }
+    this.#assertCanonicalTask(row);
     const task: TaskRow = {
       id: row.id,
       work_id: row.work_id,
@@ -3134,6 +3385,7 @@ export class WorkStore {
       account_id: row.account_id,
       project_id: row.project_id,
       preset: row.preset,
+      canonical_profile_key: row.canonical_profile_key,
       fast: row.fast,
       priority: row.priority,
       not_before: row.not_before,
@@ -3164,6 +3416,7 @@ export class WorkStore {
       "SELECT * FROM work_attempts WHERE id=? AND work_id=?",
     ).get(attemptId, workId) as AttemptRow | null;
     if (row === null) throw new WorkStoreError("ATTEMPT_NOT_FOUND");
+    this.#assertCanonicalAttempt(row);
     return row;
   }
 
@@ -3178,6 +3431,7 @@ export class WorkStore {
     sessionId: string,
     expectedGeneration?: number,
   ): boolean {
+    this.#canonicalSessionKey(sessionId);
     const authority = this.#database.query(
       `SELECT 1 AS present
        WHERE ${supportedWorkSessionAuthorityExistsSql(
@@ -3215,9 +3469,10 @@ export class WorkStore {
 
   #routes(workId: string): WorkSnapshot["routes"] {
     return this.#database.query(
-      `SELECT account_id,project_id,preset,fast FROM work_routes
+      `SELECT work_id,account_id,project_id,preset,fast,canonical_profile_key FROM work_routes
        WHERE work_id=? ORDER BY ordinal`,
     ).all(workId).map((row) => {
+      this.#assertCanonicalRoute(row);
       const route = row as {
         account_id: string;
         project_id: string;
@@ -3246,6 +3501,7 @@ export class WorkStore {
     if (taskId !== undefined && taskProjectId === undefined) {
       throw new WorkStoreError("ROUTE_MISMATCH");
     }
+    if (taskId !== undefined) this.#canonicalTaskIdentity(taskId, workId);
     const bindings = evidence.map((item) => {
       if (item.kind === "session" || item.kind === "turn") {
         this.#requireMember(workId, item.sessionId);
@@ -3263,10 +3519,11 @@ export class WorkStore {
       }
       if (taskProjectId === null) {
         const route = this.#database.query(
-          `SELECT 1 AS present FROM work_routes
+          `SELECT * FROM work_routes
            WHERE work_id=? AND project_id=? LIMIT 1`,
-        ).get(workId, item.projectId) as { present: number } | null;
+        ).get(workId, item.projectId);
         if (route === null) throw new WorkStoreError("ROUTE_MISMATCH");
+        this.#assertCanonicalRoute(route);
       }
       const project = this.#database.query(
         "SELECT root_path FROM projects WHERE id=?",
@@ -3330,6 +3587,13 @@ export class WorkStore {
       )
     ) {
       return;
+    }
+    if (taskId !== undefined) {
+      if (operation.kind === "attempt.report" || operation.kind === "attempt.reconcile") {
+        this.#canonicalAttemptIdentity(operation.attemptId, operation.workId, taskId);
+      } else if (operation.kind === "submission.review") {
+        this.#canonicalSubmissionIdentity(operation.submissionId, operation.workId, taskId);
+      }
     }
     const before = this.#evidenceAuthorityFingerprint(operation.workId, evidence, taskId);
     try {
@@ -3475,6 +3739,7 @@ export class WorkStore {
       if (optional) return null;
       throw new Error("WORK_TASK_HISTORY_INDEX_CORRUPT");
     }
+    this.#assertCanonicalHistorySource(membership.work_id, membership.task_id, kind, stableKey);
     const item: WorkTaskHistoryItem = (() => {
       switch (kind) {
         case "attempt": {
@@ -3962,6 +4227,8 @@ export class WorkStore {
     const existing = this.#database.query(
       "SELECT id,client_ref,depth,ordinal FROM work_tasks WHERE work_id=? ORDER BY ordinal,id",
     ).all(workId) as Array<{ id: string; client_ref: string; depth: number; ordinal: number }>;
+    for (const task of existing) this.#canonicalTaskIdentity(task.id, workId);
+    this.#routes(workId);
     if (existing.length + specs.length > WORK_TASK_TOTAL_LIMIT) {
       throw new WorkStoreError("TASK_LIMIT_EXCEEDED");
     }
@@ -4090,8 +4357,8 @@ export class WorkStore {
         `INSERT INTO work_tasks(
            id,work_id,client_ref,ordinal,parent_task_id,depth,objective,instructions,
            criteria_json,account_id,project_id,preset,fast,priority,not_before,claim_by,deadline,
-           max_attempts,required_reviews,result_kind,min_evidence,created_at
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+           max_attempts,required_reviews,result_kind,min_evidence,created_at,canonical_profile_key
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         task.id,
         workId,
@@ -4115,6 +4382,7 @@ export class WorkStore {
         spec.resultKind,
         spec.minEvidence,
         createdAt,
+        this.#canonicalWorkKey(workId, spec.preset),
       );
       this.#database.query(
         `INSERT INTO work_task_states(
@@ -4134,21 +4402,25 @@ export class WorkStore {
   }
 
   #activeActorAttempt(workId: string, actorSessionId: string): AttemptRow | null {
-    return this.#database.query(
+    const attempt = this.#database.query(
       `SELECT * FROM work_attempts
        WHERE work_id=? AND worker_session_id=?
          AND state IN ('claimed','dispatching','running','submitted','recovery_required')
        ORDER BY created_at,id LIMIT 1`,
     ).get(workId, actorSessionId) as AttemptRow | null;
+    if (attempt !== null) this.#assertCanonicalAttempt(attempt);
+    return attempt;
   }
 
   #taskReady(task: TaskRow, state: TaskStateRow, now: number): boolean {
+    this.#assertCanonicalTask(task);
     if (state.state !== "pending") return false;
     if (task.not_before !== null && task.not_before > now) return false;
     if (state.retry_not_before !== null && state.retry_not_before > now) return false;
     if (task.claim_by !== null && task.claim_by <= now) return false;
     if (task.deadline !== null && task.deadline <= now) return false;
     if (state.attempt_count >= task.max_attempts) return false;
+    this.#assertCanonicalTaskReferences(task.id, task.work_id);
     const unmet = this.#database.query(
       `SELECT 1 AS present
        FROM work_task_dependencies AS d
@@ -4181,7 +4453,10 @@ export class WorkStore {
   }
 
   #assertSessionRoute(task: TaskRow, actorSessionId: string): number {
+    const taskKey = this.#assertCanonicalTask(task);
+    const sessionKey = this.#canonicalSessionKey(actorSessionId);
     this.#requireMember(task.work_id, actorSessionId);
+    if (sessionKey !== taskKey) throw new WorkStoreError("ROUTE_MISMATCH");
     const session = this.#database.query(
       `SELECT p.process_generation AS account_generation
        FROM sessions AS s
@@ -4218,6 +4493,7 @@ export class WorkStore {
   }
 
   #attemptAuthorityCurrent(attempt: AttemptRow): boolean {
+    this.#assertCanonicalAttempt(attempt);
     const authority = this.#database.query(
        `SELECT 1 AS present
        FROM sessions AS s
@@ -4250,6 +4526,7 @@ export class WorkStore {
     expectedGeneration: number,
     claimedSummary: string,
   ): readonly string[] {
+    for (const attempt of attempts) this.#assertCanonicalAttempt(attempt);
     const workIds = [...new Set(attempts.map((attempt) => attempt.work_id))].sort();
     const now = this.#tick();
     for (const attempt of attempts) {
@@ -4406,22 +4683,24 @@ export class WorkStore {
     provider?: Provider,
   ): void {
     const live = this.#database.query(
-      `SELECT 1 AS present FROM work_attempts AS a
+      `SELECT a.* FROM work_attempts AS a
        JOIN sessions AS s ON s.id=a.worker_session_id
        WHERE a.account_id=? AND a.state IN ('claimed','dispatching','running')
          AND (? IS NULL OR s.provider_v39=?)
        LIMIT 1`,
-    ).get(profileId, provider ?? null, provider ?? null) as { present: number } | null;
+    ).get(profileId, provider ?? null, provider ?? null) as AttemptRow | null;
+    if (live !== null) this.#assertCanonicalAttempt(live);
     if (live !== null) throw new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
   }
 
   assertSessionCanChangeRoute(sessionId: string): void {
     const live = this.#database.query(
-      `SELECT 1 AS present FROM work_attempts
+      `SELECT * FROM work_attempts
        WHERE worker_session_id=?
          AND state IN ('claimed','dispatching','running','recovery_required')
        LIMIT 1`,
-    ).get(sessionId) as { present: number } | null;
+    ).get(sessionId) as AttemptRow | null;
+    if (live !== null) this.#assertCanonicalAttempt(live);
     if (live !== null) throw new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
   }
 
@@ -4512,6 +4791,7 @@ export class WorkStore {
       deadline: number | null;
     }>;
     for (const task of elapsedTasks) {
+      this.#canonicalTaskIdentity(task.id, workId);
       const at = this.#tick();
       const changed = this.#database.query(
         `UPDATE work_task_states SET state='failed',revision=revision+1,updated_at=?
@@ -4534,6 +4814,7 @@ export class WorkStore {
        ORDER BY a.created_at,a.id`,
     ).all(workId, now) as AttemptRow[];
     for (const attempt of deadlineAttempts) {
+      this.#assertCanonicalAttempt(attempt);
       if (attempt.state === "recovery_required") continue;
       const at = this.#tick();
       if (attempt.state === "dispatching" || attempt.state === "running") {
@@ -4586,6 +4867,7 @@ export class WorkStore {
     ).all(workId, now) as AttemptRow[];
     for (const attempt of attempts) {
       const terminal = attempt.state === "claimed" ? "expired" : "recovery_required";
+      this.#assertCanonicalAttempt(attempt);
       const task = this.#requireTask(attempt.task_id, workId);
       const attemptsExhausted = attempt.state === "claimed"
         && task.state.attempt_count >= task.task.max_attempts;
@@ -4663,8 +4945,8 @@ export class WorkStore {
       `INSERT INTO work_attempts(
          id,work_id,task_id,worker_session_id,account_id,project_id,preset,fast,
          fence,revision,state,lease_expires_at,target_session_id,dispatch_mode,submission_id,
-         account_generation,daemon_generation,created_at,updated_at,terminal_at
-       ) VALUES (?,?,?,?,?,?,?,?,?,1,'claimed',?,NULL,NULL,NULL,?,?,?,?,NULL)`,
+         account_generation,daemon_generation,created_at,updated_at,terminal_at,canonical_profile_key
+       ) VALUES (?,?,?,?,?,?,?,?,?,1,'claimed',?,NULL,NULL,NULL,?,?,?,?,NULL,?)`,
     ).run(
       attemptId,
       workId,
@@ -4680,6 +4962,7 @@ export class WorkStore {
       this.#daemonGeneration,
       now,
       now,
+      this.#assertCanonicalTask(task),
     );
     this.#database.query(
       `UPDATE work_task_states
@@ -4691,6 +4974,7 @@ export class WorkStore {
   }
 
   #taskStatus(task: TaskRow, state: TaskStateRow, now: number): WorkTaskSummary["status"] {
+    this.#assertCanonicalTask(task);
     switch (state.state) {
       case "pending":
         return this.#taskReady(task, state, now) ? "ready" : "waiting";
@@ -4716,9 +5000,13 @@ export class WorkStore {
        WHERE task_id=? AND state IN ('claimed','dispatching','running','submitted','recovery_required')
        ORDER BY created_at DESC,id DESC LIMIT 1`,
     ).get(task.id) as { id: string } | null;
+    if (active !== null) this.#canonicalAttemptIdentity(active.id, task.work_id, task.id);
     const latestSubmission = this.#database.query(
       `SELECT id FROM work_submissions WHERE task_id=? ORDER BY created_at DESC,id DESC LIMIT 1`,
     ).get(task.id) as { id: string } | null;
+    if (latestSubmission !== null) {
+      this.#canonicalSubmissionIdentity(latestSubmission.id, task.work_id, task.id);
+    }
     return {
       id: task.id,
       clientRef: task.client_ref,
@@ -4754,6 +5042,7 @@ export class WorkStore {
   }
 
   #attemptRecord(attempt: AttemptRow): WorkAttemptRecord {
+    this.#assertCanonicalAttempt(attempt);
     const status: WorkAttemptRecord["status"] = (() => {
       switch (attempt.state) {
         case "claimed": return "claimed";
@@ -4790,6 +5079,7 @@ export class WorkStore {
   }
 
   #attemptReportRecord(report: AttemptReportRow): WorkAttemptReportRecord {
+    this.#canonicalAttemptIdentity(report.attempt_id, report.work_id, report.task_id);
     return {
       idempotencyKey: report.idempotency_key,
       taskId: report.task_id,
@@ -4802,6 +5092,7 @@ export class WorkStore {
   }
 
   #submissionRecord(submission: SubmissionRow): WorkSubmissionRecord {
+    this.#canonicalAttemptIdentity(submission.attempt_id, submission.work_id, submission.task_id);
     const task = this.#requireTask(submission.task_id, submission.work_id).task;
     const reviews = this.#database.query(
       "SELECT decision,created_at FROM work_reviews WHERE submission_id=? ORDER BY created_at,id",
@@ -4832,6 +5123,7 @@ export class WorkStore {
   }
 
   #reviewRecord(row: ReviewRow): WorkReviewRecord {
+    this.#canonicalSubmissionIdentity(row.submission_id, row.work_id);
     const review = parseStoredJson(row.review_json) as Record<string, unknown>;
     const summary = row.decision === "revise" ? review.feedback : review.summary;
     if (typeof summary !== "string") throw new Error("WORK_REVIEW_CORRUPT");
@@ -4851,6 +5143,7 @@ export class WorkStore {
       "SELECT * FROM work_signals WHERE id=?",
     ).get(signalId) as {
       id: string;
+      work_id: string;
       from_session_id: string;
       to_session_id: string;
       target_account_generation: number;
@@ -4861,6 +5154,7 @@ export class WorkStore {
       created_at: number;
     } | null;
     if (row === null) throw new WorkStoreError("SIGNAL_NOT_FOUND");
+    if (row.task_id !== null) this.#canonicalTaskIdentity(row.task_id, row.work_id);
     const receipts = this.#database.query(
       `SELECT kind,recorded_at FROM work_signal_receipts
        WHERE signal_id=? ORDER BY sequence`,
@@ -4895,6 +5189,7 @@ export class WorkStore {
 
   #workRecord(workId: string, now: number): WorkRecord {
     const work = this.#requireWork(workId);
+    this.#routes(workId);
     const tasks = this.#database.query(
       `SELECT t.*,s.state AS state,s.revision AS revision,s.next_fence AS next_fence,
               s.attempt_count AS attempt_count,s.accepted_submission_id AS accepted_submission_id,
@@ -4927,6 +5222,8 @@ export class WorkStore {
   }
 
   #taskSpec(task: TaskRow): WorkTaskSpec {
+    this.#assertCanonicalTask(task);
+    this.#assertCanonicalTaskReferences(task.id, task.work_id);
     const dependencies = this.#database.query(
       `SELECT dependency_task_id FROM work_task_dependencies
        WHERE work_id=? AND task_id=? ORDER BY ordinal`,
@@ -4987,6 +5284,103 @@ export class WorkStore {
     }
   }
 
+  #assertCanonicalOperationSources(operation: WorkOperation): void {
+    // Recovery deliberately commits before ordinary command refusal. Prove
+    // already-present identity debt in the operation's bounded source set
+    // before that first commit, without changing ordinary recovery semantics.
+    if (operation.kind === "work.create") {
+      this.#canonicalSessionKey(operation.coordinatorSessionId);
+      return;
+    }
+    const work = this.#requireWork(operation.workId);
+    if (this.#canonicalSessionKey(work.coordinator_session_id) === null) {
+      throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+    }
+    this.#routes(work.id);
+    if ("actorSessionId" in operation) this.#canonicalSessionKey(operation.actorSessionId);
+    if ("coordinatorSessionId" in operation) this.#canonicalSessionKey(operation.coordinatorSessionId);
+    if ("reviewerSessionId" in operation) this.#canonicalSessionKey(operation.reviewerSessionId);
+    if ("senderSessionId" in operation) this.#canonicalSessionKey(operation.senderSessionId);
+    if ("targetSessionId" in operation) this.#canonicalSessionKey(operation.targetSessionId);
+    const task = (taskId: string): void => {
+      const row: unknown = this.#database.query(
+        "SELECT * FROM main.work_tasks WHERE id COLLATE BINARY=? AND work_id COLLATE BINARY=?",
+      ).get(taskId, work.id);
+      // A missing user-supplied subject keeps its established operation error.
+      if (row !== null) {
+        this.#assertCanonicalTask(row);
+        this.#assertCanonicalTaskReferences(taskId, work.id);
+      }
+    };
+    const attempt = (attemptId: string): void => {
+      const row: unknown = this.#database.query(
+        "SELECT * FROM main.work_attempts WHERE id COLLATE BINARY=? AND work_id COLLATE BINARY=?",
+      ).get(attemptId, work.id);
+      if (row !== null) {
+        const parsed = canonicalAttemptIdentitySchema.safeParse(row);
+        if (!parsed.success) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+        this.#assertCanonicalAttempt(parsed.data);
+        this.#assertCanonicalTaskReferences(parsed.data.task_id, work.id);
+      }
+    };
+    if ("taskId" in operation && operation.taskId !== undefined) task(operation.taskId);
+    if ("attemptId" in operation) attempt(operation.attemptId);
+    if (operation.kind === "task.claimBatch") {
+      for (const claim of operation.claims) {
+        task(claim.taskId);
+        this.#canonicalSessionKey(claim.actorSessionId);
+      }
+    }
+    if (operation.kind === "signal.send" && operation.taskId !== undefined) {
+      // Preserve ordinary governance refusal after recovery, but validate the
+      // exact related ownership witnesses that governance would consume.
+      this.#sessionOwnsRelatedTask(work.id, operation.senderSessionId, operation.taskId);
+      this.#sessionOwnsRelatedTask(work.id, operation.targetSessionId, operation.taskId);
+    }
+    if (operation.kind === "submission.review") {
+      const row = this.#database.query(
+        "SELECT id FROM main.work_submissions WHERE id COLLATE BINARY=? AND work_id COLLATE BINARY=?",
+      ).get(operation.submissionId, work.id);
+      if (row !== null) this.#canonicalSubmissionIdentity(operation.submissionId, work.id);
+    }
+    if (operation.kind === "signal.ack") {
+      const source: unknown = this.#database.query(
+        "SELECT task_id FROM main.work_signals WHERE id COLLATE BINARY=? AND work_id COLLATE BINARY=?",
+      ).get(operation.signalId, work.id);
+      if (source !== null) {
+        const row = z.object({ task_id: z.string().nullable() }).strict().safeParse(source);
+        if (!row.success) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+        if (row.data.task_id !== null) this.#canonicalTaskIdentity(row.data.task_id, work.id);
+      }
+    }
+    const allTasks = operation.kind === "task.addBatch"
+      || operation.kind === "work.complete" || operation.kind === "work.fail"
+      || operation.kind === "work.cancel" || operation.kind === "work.release";
+    if (allTasks || operation.kind === "task.claimNext") {
+      const rows = this.#database.query(
+        allTasks
+          ? "SELECT * FROM main.work_tasks WHERE work_id COLLATE BINARY=? ORDER BY ordinal,id"
+          : `SELECT t.* FROM main.work_tasks AS t
+         JOIN main.work_task_states AS s ON s.task_id=t.id
+         WHERE t.work_id COLLATE BINARY=? AND s.state='pending'
+         ORDER BY t.ordinal,t.id`,
+      ).all(work.id);
+      for (const row of rows) {
+        const parsed = canonicalTaskIdentitySchema.safeParse(row);
+        if (!parsed.success) throw new Error("WORK_CANONICAL_PROFILE_CORRUPT");
+        this.#assertCanonicalTask(parsed.data);
+        this.#assertCanonicalTaskReferences(parsed.data.id, work.id);
+      }
+    }
+    if (operation.kind === "work.complete" || operation.kind === "work.fail"
+      || operation.kind === "work.cancel" || operation.kind === "work.release") {
+      const rows = this.#database.query(
+        "SELECT * FROM main.work_attempts WHERE work_id COLLATE BINARY=? ORDER BY created_at,id",
+      ).all(work.id);
+      for (const row of rows) this.#assertCanonicalAttempt(row);
+    }
+  }
+
   apply(
     operationInput: unknown,
     idempotencyKey?: string,
@@ -5019,6 +5413,7 @@ export class WorkStore {
           this.#assertOperationNotReleased(operation);
           const replayed = this.#replayIntent(operation, requestDigest);
           if (replayed !== null) return replayed;
+          this.#assertCanonicalOperationSources(operation);
           const work = this.#requireWork(operation.workId);
           if (["active", "cancel_pending", "fail_pending"].includes(work.state)) {
             this.#sweepExpired(operation.workId, this.#tick());
@@ -5035,6 +5430,7 @@ export class WorkStore {
         this.#assertOperationNotReleased(operation);
         const replayed = this.#replayIntent(operation, requestDigest);
         if (replayed !== null) return replayed;
+        this.#assertCanonicalOperationSources(operation);
         if (operation.kind !== "work.create") {
           if ("expectedWorkRevision" in operation) {
             this.#assertRevision(operation.workId, operation.expectedWorkRevision);
@@ -5103,8 +5499,8 @@ export class WorkStore {
         );
         for (const [ordinal, route] of operation.routes.entries()) {
           this.#database.query(
-            `INSERT INTO work_routes(work_id,ordinal,account_id,project_id,preset,fast)
-             VALUES (?,?,?,?,?,?)`,
+            `INSERT INTO work_routes(work_id,ordinal,account_id,project_id,preset,fast,canonical_profile_key)
+             VALUES (?,?,?,?,?,?,?)`,
           ).run(
             workId,
             ordinal,
@@ -5112,6 +5508,7 @@ export class WorkStore {
             route.projectId,
             route.preset,
             route.fast ? 1 : 0,
+            this.#canonicalWorkKey(workId, route.preset),
           );
         }
         this.#database.query(
@@ -5534,6 +5931,12 @@ export class WorkStore {
     if (dependencies.length !== dependencyCount) {
       throw new WorkStoreError("DEPENDENCY_INCOMPLETE");
     }
+    for (const dependency of dependencies) {
+      this.#canonicalTaskIdentity(dependency.task_id, operation.workId);
+      this.#canonicalSubmissionIdentity(
+        dependency.accepted_submission_id, operation.workId, dependency.task_id,
+      );
+    }
     const effect: WorkDispatchInstruction = {
       kind: "dispatch",
       workId: operation.workId,
@@ -5939,7 +6342,7 @@ export class WorkStore {
            OR (target.parent_task_id IS NOT NULL AND t.parent_task_id=target.parent_task_id)
          )
        )
-       SELECT 1 AS present
+       SELECT a.*
        FROM work_attempts AS a
        JOIN related AS r ON r.id=a.task_id
        WHERE a.work_id=? AND a.worker_session_id=?
@@ -5950,7 +6353,8 @@ export class WorkStore {
              AND (newer.created_at>a.created_at OR (newer.created_at=a.created_at AND newer.id>a.id))
          )
        LIMIT 1`,
-    ).get(taskId, workId, workId, workId, sessionId) as { present: number } | null;
+    ).get(taskId, workId, workId, workId, sessionId) as AttemptRow | null;
+    if (owned !== null) this.#assertCanonicalAttempt(owned);
     return owned !== null;
   }
 
@@ -6157,9 +6561,10 @@ export class WorkStore {
     const work = this.#requireWork(workId);
     if (work.state !== "cancel_pending" && work.state !== "fail_pending") return false;
     const uncertain = this.#database.query(
-      `SELECT 1 AS present FROM work_attempts
+      `SELECT * FROM work_attempts
        WHERE work_id=? AND state IN ('dispatching','running','recovery_required') LIMIT 1`,
-    ).get(workId) as { present: number } | null;
+    ).get(workId) as AttemptRow | null;
+    if (uncertain !== null) this.#assertCanonicalAttempt(uncertain);
     if (uncertain !== null) return false;
     const request = this.#database.query(
       `SELECT kind,actor_session_id,summary,evidence_json,request_digest
@@ -6175,10 +6580,11 @@ export class WorkStore {
     const now = this.#tick();
     const cancelling = work.state === "cancel_pending";
     const attempts = this.#database.query(
-      `SELECT id,state FROM work_attempts
+      `SELECT * FROM work_attempts
        WHERE work_id=? AND state IN ('claimed','submitted') ORDER BY created_at,id`,
-    ).all(workId) as Array<{ id: string; state: "claimed" | "submitted" }>;
+    ).all(workId) as AttemptRow[];
     for (const attempt of attempts) {
+      this.#assertCanonicalAttempt(attempt);
       this.#database.query(
         `UPDATE work_attempts SET state=?,revision=revision+1,updated_at=?,terminal_at=?
          WHERE id=? AND state=?`,
@@ -6188,6 +6594,7 @@ export class WorkStore {
       `SELECT task_id,state FROM work_task_states WHERE work_id=? ORDER BY task_id`,
     ).all(workId) as Array<{ task_id: string; state: TaskState }>;
     for (const task of taskRows) {
+      this.#canonicalTaskIdentity(task.task_id, workId);
       if (task.state === "completed") continue;
       if (cancelling && (task.state === "failed" || task.state === "cancelled")) continue;
       if (!cancelling && task.state === "failed") continue;
@@ -6475,12 +6882,14 @@ export class WorkStore {
          ) DESC,task_id`,
       ).all(operation.workId) as Array<{ task_id: string; state: TaskState }>;
       for (const task of tasks) {
+        this.#canonicalTaskIdentity(task.task_id, operation.workId);
         if (task.state === "completed" || task.state === "failed") continue;
         const attempt = this.#database.query(
           `SELECT * FROM work_attempts WHERE task_id=?
            AND state IN ('claimed','dispatching','running','submitted','recovery_required')
            ORDER BY created_at DESC,id DESC LIMIT 1`,
         ).get(task.task_id) as AttemptRow | null;
+        if (attempt !== null) this.#assertCanonicalAttempt(attempt);
         if (
           attempt !== null
           && ["dispatching", "running", "recovery_required"].includes(attempt.state)
@@ -6552,12 +6961,14 @@ export class WorkStore {
          ) DESC,task_id`,
       ).all(operation.workId) as Array<{ task_id: string; state: TaskState }>;
       for (const task of tasks) {
+        this.#canonicalTaskIdentity(task.task_id, operation.workId);
         if (["completed", "failed", "cancelled"].includes(task.state)) continue;
         const attempt = this.#database.query(
           `SELECT * FROM work_attempts WHERE task_id=?
            AND state IN ('claimed','dispatching','running','submitted','recovery_required')
            ORDER BY created_at DESC,id DESC LIMIT 1`,
         ).get(task.task_id) as AttemptRow | null;
+        if (attempt !== null) this.#assertCanonicalAttempt(attempt);
         if (
           attempt !== null
           && ["dispatching", "running", "recovery_required"].includes(attempt.state)
@@ -7125,6 +7536,18 @@ export class WorkStore {
       || row.previous_hash !== expectedPreviousHash
       || eventHash !== row.event_hash
     ) throw new Error("WORK_EVENT_CHAIN_CORRUPT");
+    // Validate only the bounded entities referenced by this selected event.
+    // Historical event state is never the source of present-day liveness.
+    if ("taskIds" in body) {
+      for (const taskId of body.taskIds) this.#canonicalTaskIdentity(taskId, row.work_id);
+    }
+    if ("taskId" in body && body.taskId !== null) {
+      this.#canonicalTaskIdentity(body.taskId, row.work_id);
+    }
+    if ("attemptId" in body) this.#canonicalAttemptIdentity(body.attemptId, row.work_id);
+    if ("submissionId" in body && body.submissionId !== null) {
+      this.#canonicalSubmissionIdentity(body.submissionId, row.work_id);
+    }
   }
 
   #verifyWorkEventHead(work: WorkRow): void {
@@ -7173,6 +7596,7 @@ export class WorkStore {
     }
     const bounded = boundedLimit(limit, WORK_PAGE_LIMIT);
     const work = this.#requireWork(workId);
+    this.#routes(workId);
     const rows = this.#database.query(
       `SELECT *
        FROM work_events WHERE work_id=? AND sequence>?
@@ -7550,6 +7974,9 @@ export class WorkStore {
     metadata: WorkTaskHistoryMetadataRow,
     observedSequence: number,
   ): WorkTaskHistoryItem {
+    // The cached cut may still say claimed after the source attempt settled.
+    // Validate immutable provenance against current rows, never cached liveness.
+    this.#assertCanonicalHistorySource(workId, taskId, metadata.kind, metadata.stable_key);
     const version = this.#database.query(
       `SELECT record_json,record_digest FROM work_task_history_versions
        WHERE history_ordinal=? AND work_id=? AND task_id=? AND event_sequence<=?
@@ -7853,6 +8280,7 @@ export class WorkStore {
              AND state IN ('claimed','dispatching','running','submitted')
            ORDER BY updated_at,id`,
         ).all(workId, actorSessionId) as AttemptRow[];
+      for (const attempt of allAttempts) this.#assertCanonicalAttempt(attempt);
       const attempts = take(
         allAttempts,
         offsets.ownedAttempts,
@@ -7868,6 +8296,7 @@ export class WorkStore {
            WHERE work_id=? AND worker_session_id=? AND state='recovery_required'
            ORDER BY updated_at,id`,
         ).all(workId, actorSessionId) as AttemptRow[];
+      for (const attempt of allRecoveryAttempts) this.#assertCanonicalAttempt(attempt);
       const recoveryAttempts = take(
         allRecoveryAttempts,
         offsets.recoveryAttempts,
@@ -7895,6 +8324,9 @@ export class WorkStore {
              ) < t.required_reviews
            ORDER BY s.created_at,s.id`,
         ).all(workId, actorSessionId, actorSessionId) as SubmissionRow[];
+      for (const submission of reviewableRows) {
+        this.#canonicalAttemptIdentity(submission.attempt_id, workId, submission.task_id);
+      }
       const reviewable = take(reviewableRows, offsets.reviewableSubmissions, (row) => {
         const submission = this.#submissionRecord(row);
         if (submission.status !== "pending_review") {
