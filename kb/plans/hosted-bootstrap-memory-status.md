@@ -61,8 +61,9 @@ This repair has no migration or durable-state effect. If review finds a
 regression, correct the source forward and rerun its affected tests. Do not
 change live data, weaken readiness checks or adjust history policy to make
 validation pass. The source repair and focused regressions are implemented;
-Focused validation is passing and draft delivery remains pending. This is not
-a final aggregate or deployment claim.
+Focused validation is passing and source checkpoint `b4a9f644` is published on
+[draft PR #146](https://github.com/hraness/hra/pull/146). Fresh integration
+validation remains pending. This is not an aggregate or deployment claim.
 
 The frozen, script-disabled dependency install completed with Bun 1.3.14 and
 513 packages. Manifest and lockfile bytes are unchanged. Repository-context
@@ -102,3 +103,17 @@ catalog was rewritten or whole-vault validation claimed.
   TypeScript ran after normal host-scheduler admission, without bypassing its
   queue. Final focused evidence and draft delivery do not close current-main
   integration, the separate history repair or the repository aggregate gate.
+
+## Current-main integration
+
+The original draft's CI retained the known three historical-object failures;
+it was not retried. History repair PR #143 then merged as
+`9bce94e92d78e1ae767b42ce4863bb07aec7a24e`, directly on the original base.
+Its two changed paths do not overlap this repair. The normal integration
+preserves both upstream files exactly and both quota files from `b4a9f644`;
+only this plan receives new evidence. Independent source/join review passed.
+A fresh unchanged `bun run check` in a clean, nonshallow, sole-governed-ref
+checkout is required before delivery. Current-head CI, protected merge and
+any automatic deployment readback remain separate unfinished gates. The
+additive history-regression follow-up PR #144 is not required to remove the
+original missing-object failure.
