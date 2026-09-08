@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { chmod, mkdir, mkdtemp, readFile, readlink, rm } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -38,6 +39,186 @@ afterEach(async () => {
 });
 
 type ChildClose = Readonly<{ code: number | null; signal: NodeJS.Signals | null }>;
+
+type LifecycleEmitter = Pick<EventEmitter, "on" | "off">;
+type LifecycleChild = LifecycleEmitter & Readonly<{
+  stdout: LifecycleEmitter;
+  stderr: LifecycleEmitter;
+}>;
+
+const createChildLifecycleRecorder = () => {
+  const state = {
+    childAttached: false,
+    exitObserved: false,
+    exitCode: null as number | null,
+    exitSignalPresent: false,
+    closeObserved: false,
+    closeCode: null as number | null,
+    closeSignalPresent: false,
+    stdoutEnd: false,
+    stdoutClose: false,
+    stderrEnd: false,
+    stderrClose: false,
+    controlAttached: false,
+    controlEnd: false,
+    controlClose: false,
+    controlError: false,
+  };
+  let child: LifecycleChild | undefined;
+  let control: LifecycleEmitter | undefined;
+  let disposed = false;
+  const boundedCode = (code: unknown): number | null =>
+    typeof code === "number" && Number.isInteger(code) && code >= 0 && code <= 255
+      ? code
+      : null;
+  const onExit = (code: unknown, signal: unknown): void => {
+    state.exitObserved = true;
+    state.exitCode = boundedCode(code);
+    state.exitSignalPresent = signal !== null && signal !== undefined;
+  };
+  const onClose = (code: unknown, signal: unknown): void => {
+    state.closeObserved = true;
+    state.closeCode = boundedCode(code);
+    state.closeSignalPresent = signal !== null && signal !== undefined;
+  };
+  const onStdoutEnd = (): void => { state.stdoutEnd = true; };
+  const onStdoutClose = (): void => { state.stdoutClose = true; };
+  const onStderrEnd = (): void => { state.stderrEnd = true; };
+  const onStderrClose = (): void => { state.stderrClose = true; };
+  const onControlEnd = (): void => { state.controlEnd = true; };
+  const onControlClose = (): void => { state.controlClose = true; };
+  return {
+    attachChild(value: LifecycleChild): void {
+      if (disposed) return;
+      if (child !== undefined) throw new Error("authority_lifecycle_child_already_attached");
+      child = value;
+      state.childAttached = true;
+      value.on("exit", onExit);
+      value.on("close", onClose);
+      value.stdout.on("end", onStdoutEnd);
+      value.stdout.on("close", onStdoutClose);
+      value.stderr.on("end", onStderrEnd);
+      value.stderr.on("close", onStderrClose);
+    },
+    attachControl(value: LifecycleEmitter): void {
+      if (disposed) return;
+      if (control !== undefined) throw new Error("authority_lifecycle_control_already_attached");
+      control = value;
+      state.controlAttached = true;
+      value.on("end", onControlEnd);
+      value.on("close", onControlClose);
+    },
+    recordControlError(): void {
+      // Called by the existing socket error owner: the recorder must not add
+      // error handlers that would change unhandled-error behavior.
+      if (!disposed) state.controlError = true;
+    },
+    snapshot: () => Object.freeze({ ...state }),
+    dispose(): void {
+      if (disposed) return;
+      disposed = true;
+      child?.off("exit", onExit);
+      child?.off("close", onClose);
+      child?.stdout.off("end", onStdoutEnd);
+      child?.stdout.off("close", onStdoutClose);
+      child?.stderr.off("end", onStderrEnd);
+      child?.stderr.off("close", onStderrClose);
+      control?.off("end", onControlEnd);
+      control?.off("close", onControlClose);
+    },
+  };
+};
+
+test("child lifecycle recorder distinguishes exit, pipe closure, and control FIN", () => {
+  const recorder = createChildLifecycleRecorder();
+  const child = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+  });
+  const control = new EventEmitter();
+  const initial = recorder.snapshot();
+  expect(initial).toEqual({
+    childAttached: false, exitObserved: false, exitCode: null, exitSignalPresent: false,
+    closeObserved: false, closeCode: null, closeSignalPresent: false,
+    stdoutEnd: false, stdoutClose: false, stderrEnd: false, stderrClose: false,
+    controlAttached: false, controlEnd: false, controlClose: false, controlError: false,
+  });
+  try {
+    recorder.attachChild(child);
+    recorder.attachControl(control);
+    child.emit("exit", 0, null);
+    const exited = recorder.snapshot();
+    expect(exited).toEqual({ ...initial, childAttached: true, controlAttached: true,
+      exitObserved: true, exitCode: 0 });
+    control.emit("end");
+    expect(recorder.snapshot()).toEqual({ ...exited, controlEnd: true });
+    control.emit("close");
+    recorder.recordControlError();
+    child.stdout.emit("end");
+    child.stderr.emit("end");
+    expect(recorder.snapshot()).toEqual({ ...exited,
+      controlEnd: true, controlClose: true, controlError: true, stdoutEnd: true, stderrEnd: true });
+    child.stdout.emit("close");
+    child.stderr.emit("close");
+    child.emit("close", 0, null);
+    expect(recorder.snapshot()).toEqual({ ...exited,
+      controlEnd: true, controlClose: true, controlError: true,
+      stdoutEnd: true, stdoutClose: true, stderrEnd: true, stderrClose: true,
+      closeObserved: true, closeCode: 0 });
+    expect(exited.closeObserved).toBe(false);
+    expect(initial.childAttached).toBe(false);
+    expect(Object.isFrozen(exited)).toBe(true);
+  } finally {
+    recorder.dispose();
+  }
+});
+
+test("child lifecycle recorder bounds values and removes only its own listeners", () => {
+  const recorder = createChildLifecycleRecorder();
+  const child = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+  });
+  const control = new EventEmitter();
+  const sources = [child, child.stdout, child.stderr, control];
+  const foreign = () => undefined;
+  for (const source of sources) source.on("close", foreign);
+  try {
+    recorder.attachChild(child);
+    recorder.attachControl(control);
+    expect(() => recorder.attachChild(child)).toThrow("authority_lifecycle_child_already_attached");
+    expect(() => recorder.attachControl(control)).toThrow("authority_lifecycle_control_already_attached");
+    for (const source of sources) expect(source.listenerCount("error")).toBe(0);
+    child.stdout.emit("end");
+    child.stdout.emit("close");
+    expect(recorder.snapshot()).toMatchObject({ stdoutEnd: true, stdoutClose: true,
+      exitObserved: false, closeObserved: false, stderrEnd: false, stderrClose: false });
+    child.emit("exit", Number.MAX_SAFE_INTEGER, "not-retained");
+    child.emit("close", null, "not-retained");
+    expect(recorder.snapshot()).toMatchObject({ exitObserved: true, exitCode: null,
+      exitSignalPresent: true, closeObserved: true, closeCode: null, closeSignalPresent: true });
+    expect(JSON.stringify(recorder.snapshot())).not.toContain("not-retained");
+    const beforeDisposal = recorder.snapshot();
+    recorder.dispose();
+    recorder.dispose();
+    for (const source of sources) {
+      expect(source.listeners("close")).toEqual([foreign]);
+      expect(source.listenerCount("end")).toBe(0);
+      expect(source.listenerCount("exit")).toBe(0);
+    }
+    recorder.attachChild(child);
+    recorder.attachControl(control);
+    recorder.recordControlError();
+    child.emit("exit", 7, null);
+    child.stderr.emit("end");
+    control.emit("end");
+    control.emit("close");
+    expect(recorder.snapshot()).toEqual(beforeDisposal);
+  } finally {
+    recorder.dispose();
+    for (const source of sources) source.off("close", foreign);
+  }
+});
 
 const observeChildClose = async (
   child: ChildProcessWithoutNullStreams,
@@ -122,18 +303,27 @@ class ControlServer {
   readonly #lines: string[] = [];
   readonly #server: Server;
   readonly path: string;
+  readonly #lifecycle: ReturnType<typeof createChildLifecycleRecorder>;
   #socket: Socket | undefined;
   #waiter: Readonly<{ reject: (error: Error) => void; resolve: (line: string) => void }> | undefined;
 
-  private constructor(server: Server, path: string) {
+  private constructor(
+    server: Server,
+    path: string,
+    lifecycle: ReturnType<typeof createChildLifecycleRecorder>,
+  ) {
     this.#server = server;
     this.path = path;
+    this.#lifecycle = lifecycle;
   }
 
-  static async start(root: string): Promise<ControlServer> {
+  static async start(
+    root: string,
+    lifecycle: ReturnType<typeof createChildLifecycleRecorder>,
+  ): Promise<ControlServer> {
     const path = join(root, `.authority-control-${"a".repeat(32)}.sock`);
     const server = createServer();
-    const control = new ControlServer(server, path);
+    const control = new ControlServer(server, path, lifecycle);
     server.on("connection", (socket) => control.#accept(socket));
     await new Promise<void>((resolvePromise, rejectPromise) => {
       server.once("error", rejectPromise);
@@ -152,6 +342,7 @@ class ControlServer {
       return;
     }
     this.#socket = socket;
+    this.#lifecycle.attachControl(socket);
     let buffer = "";
     socket.setEncoding("utf8");
     socket.on("data", (chunk: string) => {
@@ -169,7 +360,10 @@ class ControlServer {
         }
       }
     });
-    socket.once("error", () => this.#waiter?.reject(new Error("authority_control_socket_error")));
+    socket.once("error", () => {
+      this.#lifecycle.recordControlError();
+      this.#waiter?.reject(new Error("authority_control_socket_error"));
+    });
     socket.once("close", () => this.#waiter?.reject(new Error("authority_control_socket_closed")));
   }
 
@@ -435,7 +629,8 @@ test("authority supervisor holds a target behind GO", async () => {
   const parentPidNamespace = await readlink("/proc/self/ns/pid");
   const controlRoot = join(root, "process-recovery");
   await mkdir(controlRoot, { mode: 0o700 });
-  const control = await ControlServer.start(controlRoot);
+  const lifecycle = createChildLifecycleRecorder();
+  const control = await ControlServer.start(controlRoot, lifecycle);
   const nonce = "1".repeat(32);
   const opened = await openAuthoritySupervisorArtifact();
   let child: ChildProcessWithoutNullStreams | undefined;
@@ -455,6 +650,7 @@ test("authority supervisor holds a target behind GO", async () => {
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    lifecycle.attachChild(child);
     const closed = observeChildClose(child);
     void closed.catch(() => undefined);
     await waitForChildSpawn(child);
@@ -475,15 +671,21 @@ test("authority supervisor holds a target behind GO", async () => {
     child.stdin.end();
     const clean = await control.nextLine();
     expect(clean).toBe(`HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${nonce} exit=0`);
-    // This observation starts before READY, so it includes CI scheduling around
-    // namespace setup as well as the post-GO shutdown. Keep it bounded by the
-    // enclosing 20-second test timeout without making a normal Linux runner
-    // race an arbitrary eight-second deadline.
-    await expect(requireChildClose(closed, 15_000)).resolves.toEqual({ code: 0, signal: null });
+    // The close observer starts before READY; this 15-second deadline starts
+    // after CLEAN. Require joined process and pipe closure even after CLEAN.
+    try {
+      await expect(requireChildClose(closed, 15_000)).resolves.toEqual({ code: 0, signal: null });
+    } catch (error: unknown) {
+      // Capture before forced cleanup can change lifecycle observations. Only
+      // fixed scalar state is emitted, never control lines or process output.
+      process.stderr.write(`authority_child_lifecycle ${JSON.stringify(lifecycle.snapshot())}\n`);
+      throw error;
+    }
     const targetPidNamespace = await readFile(marker, "utf8");
     expect(targetPidNamespace).toBe(`pid:[${namespaceMatch?.[1] ?? "missing"}]`);
     expect(targetPidNamespace).not.toBe(parentPidNamespace);
   } finally {
+    lifecycle.dispose();
     child?.kill("SIGKILL");
     await opened.close().catch(() => undefined);
     await control.close();
