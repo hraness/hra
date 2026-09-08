@@ -12311,11 +12311,79 @@ describe("StateStore", () => {
       preset: "high",
       fastEnabled: false,
     });
-    for (let index = 0; index < 2_000; index += 1) {
-      const terminal = store.enqueue(session.id, `terminal ${String(index)}`);
-      if (!store.transitionQueue(terminal.id, "pending", "cancelled")) {
-        throw new Error("Terminal queue fixture transition failed.");
-      }
+    const terminal = store.enqueue(session.id, "terminal control");
+    expect(store.transitionQueue(terminal.id, "pending", "cancelled")).toBe(true);
+    expect(store.requireQueue(terminal.id)).toMatchObject({
+      message: "[queue message removed after settlement]",
+      state: "cancelled",
+    });
+
+    // This test measures pending lookup over history, not 2,000 physical scrub
+    // checkpoints. Clone one genuinely settled row with every guard enabled.
+    const history = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      history.exec("PRAGMA foreign_keys=ON");
+      expect(history.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+      const allocateSequence = history.query(
+        `UPDATE queue_sequence_authority SET next_sequence=next_sequence+1
+         WHERE singleton=1 AND next_sequence<9007199254740991
+         RETURNING next_sequence-1 AS enqueue_sequence`,
+      );
+      const sequenceSchema = z.object({
+        enqueue_sequence: z.number().int().positive().safe(),
+      }).strict();
+      const insertedIdSchema = z.object({ id: z.string() }).strict();
+      const insertTerminal = history.query(
+        `INSERT INTO queue_entries(
+           id,session_id,message,state,created_at,updated_at,message_actor,peer_action_id,
+           transcript_finalized,transcript_status,transcript_intent_json,enqueue_sequence
+         ) SELECT ?,session_id,message,state,created_at,updated_at,message_actor,peer_action_id,
+                  transcript_finalized,transcript_status,transcript_intent_json,?
+           FROM queue_entries WHERE id=? RETURNING id`,
+      );
+      history.transaction(() => {
+        for (let index = 1; index < 2_000; index += 1) {
+          const { enqueue_sequence: sequence } = sequenceSchema.parse(allocateSequence.get());
+          const id = createQueueId();
+          if (insertedIdSchema.parse(insertTerminal.get(id, sequence, terminal.id)).id !== id) {
+            throw new Error("Terminal queue history fixture lost its template.");
+          }
+        }
+      }).immediate();
+      expect(history.query(
+        `SELECT COUNT(*) AS total,COUNT(DISTINCT id) AS ids,
+                COUNT(DISTINCT enqueue_sequence) AS sequences,
+                MIN(enqueue_sequence) AS first,MAX(enqueue_sequence) AS last
+         FROM queue_entries`,
+      ).get()).toEqual({ total: 2_000, ids: 2_000, sequences: 2_000, first: 1, last: 2_000 });
+      expect(history.query(
+        "SELECT next_sequence FROM queue_sequence_authority WHERE singleton=1",
+      ).get()).toEqual({ next_sequence: 2_001 });
+      const terminalShapeColumns = `session_id,message,state,created_at,updated_at,
+        message_actor,peer_action_id,transcript_finalized,transcript_status,transcript_intent_json`;
+      expect(history.query(
+        `SELECT DISTINCT ${terminalShapeColumns} FROM queue_entries`,
+      ).all()).toEqual([history.query(
+        `SELECT ${terminalShapeColumns} FROM queue_entries WHERE id=?`,
+      ).get(terminal.id)]);
+      // Even already-scrubbed terminal inserts must create real scrub debt.
+      expect(history.query(
+        "SELECT generation,requires_vacuum FROM queue_message_scrub_authority WHERE singleton=1",
+      ).get()).toEqual({ generation: 1_999, requires_vacuum: 0 });
+    } finally {
+      history.close(false);
+    }
+    // The public transition owns the pending scrub before its CAS. The control
+    // is already cancelled, so this drains debt without creating another row.
+    expect(store.transitionQueue(terminal.id, "pending", "cancelled")).toBe(false);
+    const scrubInspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      expect(scrubInspector.query(
+        "SELECT singleton FROM queue_message_scrub_authority",
+      ).all()).toEqual([]);
+      expect(scrubInspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      scrubInspector.close(false);
     }
     const expected = store.enqueue(session.id, "bounded pending work");
     const later = store.enqueue(session.id, "later pending work");
