@@ -121,30 +121,50 @@ describe("repository policy adoption", () => {
     });
   });
 
-  test("replaces only the managed block and preserves the existing file mode", () => {
+  test("replaces legacy delivery policy idempotently while preserving unrelated guidance and file modes", () => {
     const root = fixture();
     const agentsPath = join(root, "AGENTS.md");
     const claudePath = join(root, "CLAUDE.md");
     const before = "# Contents\n\n- Untouched before.";
     const after = "# Guidelines\n\n- Untouched after.\n";
+    const legacyDeliveryPolicy = "- Treat the user's request to change this repository as standing authorization for routine task-owned commits, pushes, pull requests, merges, releases, deployments, and production verification after the repository's required validation, review, identity, and rollout gates pass. Do not ask for another confirmation at each delivery step.";
+    const original = `${before}\n\n${startMarker}\n${legacyDeliveryPolicy}\n${endMarker}\n\n${after}`;
     writeFileSync(
       agentsPath,
-      `${before}\n\n${startMarker}\n- Stale policy.\n${endMarker}\n\n${after}`,
+      original,
     );
     chmodSync(agentsPath, 0o640);
     const existingClaude = "# Existing Claude rules\n\n```text\n@AGENTS.md\n```\n\nInline example: `@AGENTS.md`.\n\n- Preserve me.\n";
     writeFileSync(claudePath, existingClaude);
     chmodSync(claudePath, 0o600);
 
+    expect(runRepositoryAdoption({ json: false, mode: "check", root }))
+      .toMatchObject({ changed: false, status: "needs-update" });
+    expect(readFileSync(agentsPath, "utf8")).toBe(original);
+    expect(readFileSync(claudePath, "utf8")).toBe(existingClaude);
+
     const report = runRepositoryAdoption({ json: false, mode: "apply", root });
 
     expect(report).toMatchObject({ changed: true, status: "updated" });
-    expect(readFileSync(agentsPath, "utf8"))
-      .toBe(`${before}\n\n${policy().trimEnd()}\n\n${after}`);
+    const adopted = `${before}\n\n${policy().trimEnd()}\n\n${after}`;
+    expect(readFileSync(agentsPath, "utf8")).toBe(adopted);
+    expect(adopted).not.toContain(legacyDeliveryPolicy);
+    expect(adopted.split(startMarker)).toHaveLength(2);
+    expect(adopted.split(endMarker)).toHaveLength(2);
     expect(statSync(agentsPath).mode & 0o777).toBe(0o640);
     expect(readFileSync(claudePath, "utf8")).toBe(
       `${existingClaude.trimEnd()}\n\n<!-- hra-local-efficiency:claude-import:start -->\n@AGENTS.md\n<!-- hra-local-efficiency:claude-import:end -->\n`,
     );
+    expect(statSync(claudePath).mode & 0o777).toBe(0o600);
+    const adoptedClaude = readFileSync(claudePath, "utf8");
+
+    expect(runRepositoryAdoption({ json: false, mode: "apply", root }))
+      .toMatchObject({ changed: false, status: "current" });
+    expect(runRepositoryAdoption({ json: false, mode: "check", root }))
+      .toMatchObject({ changed: false, status: "current" });
+    expect(readFileSync(agentsPath, "utf8")).toBe(adopted);
+    expect(readFileSync(claudePath, "utf8")).toBe(adoptedClaude);
+    expect(statSync(agentsPath).mode & 0o777).toBe(0o640);
     expect(statSync(claudePath).mode & 0o777).toBe(0o600);
   });
 

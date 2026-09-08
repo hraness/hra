@@ -67,9 +67,27 @@ package or command.
 
 - Treat a user request that places a repository and outcome in scope as
   standing authorization for routine task-owned commits, pushes, pull requests,
-  merges, releases, and deployments after required gates pass. Do not ask for a
-  second conversational confirmation. Runtime denials, missing credentials, and
-  material product decisions still stop the work.
+  merges, releases, and deployments after the gates applicable to that action
+  pass. Build confidence through relevant automated checks, bounded diagnostics,
+  and independent review, not a second conversational confirmation. Passing
+  checks does not expand task scope or authority.
+- Separate artifact admission from live qualification and operational
+  activation. Applicable automated source, security, package/install, and
+  provenance evidence can admit an artifact without live provider qualification;
+  live proof is not a universal publication prerequisite. Preserve explicit live
+  acceptance criteria and require relevant live evidence for claims that depend
+  on it. If publication or an artifact's install, upgrade, or default-use path
+  activates risky unqualified behavior, keep that behavior guarded or disabled,
+  or obtain bounded relevant evidence before shipping or activation. Preserve
+  the identity, target, capacity, migration, and recovery guards applicable to
+  the operational effect.
+- Replace an obsolete gate through a reviewed source and policy change with
+  corresponding tests, never an ad hoc skip. Runtime-enforced approvals, access
+  controls, branch and environment protections, and safety policies remain
+  binding. Ask for user input only for a material product decision, missing
+  credentials or authority, unavoidable interactive authentication, an
+  out-of-scope destructive action, or a failure that cannot be handled safely
+  and autonomously.
 - Prefer short-lived repository workload identities, npm trusted publishing,
   and scoped GitHub App tokens over personal sessions and reusable secrets.
   Batch unavoidable interactive authentication at the final boundary rather
@@ -138,10 +156,13 @@ the queue, and never run its child outside the scheduler.
 Known mappings:
 
 - Jungle `check:affected`: heavy; Jungle full `check`: exclusive.
-- HRA `check`: heavy; HRA `check:complete`, production build, and native
-  package work: exclusive.
+- HRA `check`: exclusive compute, with the unchanged `bun run check` child.
+  Its package tests share the machine-wide process-recovery journal, so parallel
+  heavy leases can still contend across checkouts. Production builds: heavy;
+  native package work: exclusive on the applicable capability lane.
 - Personal template and Tiff full check/build: heavy.
-- Narrow file or package tests: normally unscheduled.
+- Narrow file or package tests: normally unscheduled, except process-custody or
+  recovery checks that require the scheduler.
 
 The wrapper runs the original public command unchanged. It does not substitute
 a weaker check.

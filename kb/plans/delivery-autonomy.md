@@ -17,7 +17,8 @@ relations:
 
 # Hraness delivery autonomy
 
-Status: active, revision 1 (2026-09-04).
+Status: active, revision 2 (2026-09-08). The machine-confidence policy below is the
+shared default; repository adoption and provider-specific rollout remain separately tracked.
 
 ## Outcome
 
@@ -122,6 +123,35 @@ and cross-repository automation uses short-lived
 Rulesets, environments, trusted-publisher bindings, and App installation scope are configured in
 one batched setup ceremony and then treated as drift-controlled infrastructure.
 
+### D6. Match machine evidence to the effect
+
+Build confidence through programmatic checks and independent agent review, not repeated human
+confirmation. A task's standing authority covers ordinary delivery; technical confidence does not
+grant additional authority. When evidence is missing, first gather bounded diagnostics, reproduce
+the behavior, or obtain independent review. Ask a person only for a material unresolved decision,
+unavoidable authentication, missing authority, or an out-of-scope destructive effect.
+
+Artifact admission and operational activation are distinct decisions. Admit published artifacts
+only after exact-source CI, relevant deterministic and security checks, package/install verification,
+protected identity, provenance, and immutable public readback. Authenticated live qualification is
+not a universal publication prerequisite. Record an unperformed proof as pending, and retain
+unsupported-platform refusals and disabled or fail-closed unqualified behavior. If publication or
+the artifact's install, upgrade, or default-use path activates risky unqualified behavior, isolate
+that effect or prove its required conditions before shipping; artifact-only wording cannot disguise
+an operational mutation.
+
+Deployments, migrations, daemon upgrades, and provider effects keep their relevant machine-enforced
+identity, target, capacity, custody, compatibility, and recovery checks. Automate these checks where
+possible. Do not require a person merely to approve a passing result or convert absent test accounts
+into a blanket artifact-release hold. Explicit user acceptance requirements remain binding unless
+the user changes them. Replace an obsolete repository gate through a reviewed policy/source change,
+never by silently skipping a failing gate during delivery.
+
+For HRA v0.7.0, the owner's 2026-09-08 policy change removes authenticated Claude and two-device
+hosted-memory qualification from tag/publication prerequisites. It does not claim those proofs
+passed or permit hosted activation, a daemon upgrade, or new Claude platform support. The current
+[release procedure](../../docs/beta-release.md) is authoritative; older checkpoint holds are history.
+
 ## Workstreams
 
 | Workstream | State | Acceptance evidence |
@@ -133,11 +163,14 @@ one batched setup ceremony and then treated as drift-controlled infrastructure.
 | Soundfish npm path | Planned | A verified artifact publishes through a trusted workflow; local publish becomes recovery-only. |
 | Fleet rollout | Planned | Changes land through each repository's normal checks without editing dirty primary worktrees. |
 | Provider setup | Planned | One batched npm trust update; GitHub App/ruleset changes only where audit proves they are needed. |
+| Machine-confidence foundation | In progress | Canonical global/repository assets, operator guidance, and managed-block regression tests separate artifact admission from operational activation. |
+| Foundation propagation | In progress | Reviewed plugin installation plus global guidance readback; exact-root repository adoption through owner-coordinated PRs. Fleet completion does not block an independently admitted HRA artifact. |
 
 ## Guardrails
 
-- Never weaken a required review, check, protected ref, provenance assertion, release readback, or
-  provider access control to reduce prompts.
+- Preserve applicable required checks, protected refs, provenance assertions, release readback, and
+  provider access controls. Revise obsolete human or live-qualification release prerequisites through
+  reviewed policy changes with explicit replacement evidence, not ad hoc execution bypasses.
 - Never store npm OTPs, npm passwords, session cookies, recovery codes, GitHub browser sessions,
   passkeys, or personal access tokens in repositories, task files, transcripts, or agent memory.
 - Do not let an agent create a PAT, GitHub App, secret, trusted-publisher relationship, or wider
@@ -148,6 +181,10 @@ one batched setup ceremony and then treated as drift-controlled infrastructure.
   evidence that applies; silence is never proof of completion.
 
 ## Progress log
+
+- 2026-09-08: adopted D6 at the owner's direction. HRA's mandatory pre-publication live qualification
+  is being separated from machine-gated artifact admission. Shared policy assets propagate the same
+  principle without changing sandbox, automatic-review, scheduler, or provider authority boundaries.
 
 - 2026-09-04: audited the local Codex and Claude approval posture, the Hraness repository fleet,
   and every observed npm publication path; adopted D1-D5.

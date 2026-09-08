@@ -1,6 +1,6 @@
 # Live acceptance
 
-The release gate uses two complete HRA daemon installations. It does not simulate a second device with two cloud-control objects, replace `HOME`, create temporary macOS users, or write acceptance credentials to Keychain.
+This optional authenticated qualification uses two complete HRA daemon installations. It is not a prerequisite for tagging or publishing HRA artifacts under the [machine-gated release policy](beta-release.md). A passing build, installation or artifact admission does not prove that this live scenario passed. The harness does not simulate a second device with two cloud-control objects, replace `HOME`, create temporary macOS users, or write acceptance credentials to Keychain.
 
 This harness is repository-only. It lives under `scripts/`, is excluded from the npm package, and does not add a state-root, socket, capability, or alternate-installation option to the production CLI.
 
@@ -34,7 +34,7 @@ Before the daemon starts, each worker changes its process working directory to i
 
 ## Operator driver
 
-The executable is the release gate. It requires the explicit canonical origin to equal the candidate authority compiled into this checkout. Loopback, a different HTTPS deployment, an omitted value, and a noncanonical spelling all fail before either worker starts. Put this non-secret configuration in a mode-`0600` file:
+The executable validates this optional qualification, not artifact publication. It requires the explicit canonical origin to equal the candidate authority compiled into this checkout. Loopback, a different HTTPS deployment, an omitted value, and a noncanonical spelling all fail before either worker starts. Put this non-secret configuration in a mode-`0600` file:
 
 Use an authorized Linux host with the supported native authority backend, the exact pinned provider runtimes, and an exclusive operator for the exact deployed candidate. Reserve one disposable HRA identity and its invite and mailbox access, authorize revoking its second device and deleting that test identity, and provide two distinct authorized paid Codex subscriptions. The memory scenario also signs the secondary subscription into a separate B-local profile; it does not copy credentials or require a third subscription. Operator quota reads need authority for the exact Convex deployment through the pinned official CLI. These are live prerequisites, not credentials consumed by ordinary tests.
 
@@ -62,7 +62,7 @@ Terminal mode hides every invite, OTP, auth document, interaction answer, and pe
 
 The gate also requires a clean Git worktree and resolves the exact `HEAD` commit before starting workers. The protected release summary binds the deploy evidence digest, fixed Convex target digest, bound runtime revision, package version, start and completion times, and 40-character source revision. Its start must be later than the bound deployment time. This makes a result from a local fake, a different deployment, a dirty checkout, a prior runtime, or a different source revision distinguishable from the intended release candidate.
 
-The standalone evidence parser accepts canonical stable semantic versions so historical receipts remain readable after a package release. Historical inner version-one receipts remain readable but cannot satisfy the current producer, which requires version-two memory evidence. The outer self-digested release envelope remains version one. Producing evidence still requires the version compiled into the current checkout, and any release consumer must compare the recorded version with the package version it intends to admit.
+The standalone evidence parser accepts canonical stable semantic versions so historical receipts remain readable after a package release. Historical inner version-one receipts remain readable but cannot satisfy the current producer, which requires version-two memory evidence. The outer self-digested release envelope remains version one. Producing evidence still requires the version compiled into the current checkout, and any qualification consumer must compare the recorded version with the package version it intends to qualify.
 
 The release form reads the public `releaseAttestation:read` authority before worker startup and again after successful cleanup, immediately before it writes evidence. Both reads must equal the exact deploy attestation, including its source commit, deployment time, predecessor digest, and runtime revision. Run this interval under one exclusive release operator with every other Convex deploy path stopped. Two endpoint reads cannot detect a deployment that another operator performs and fully restores between them, so concurrent deployment authority invalidates the run even if both reads match. Candidate sealing later revalidates the current runtime and fixed deployment authority; it does not waive this exclusive-operator requirement.
 
@@ -102,7 +102,7 @@ An agent distinguishes the terminal frame by its `ok` field; request and progres
 
 The source API remains available for deterministic tests and recovery tooling. `run.device("a")` exposes the verified project directory, bounded CLI `execute()`, daemon-generation `suspend()` and `resume()`, and closed acceptance-only memory-fault controls. It does not expose arbitrary state paths, sockets, capabilities, cloud controls, or a public `LocalCommand` transport. The fault controls require the active candidate and exact daemon generation. Production installations reject the internal typed memory-transport decorator before daemon effects; there is no CLI flag, environment toggle, global fetch interception, or general traffic observer.
 
-## Release scenario
+## Qualification scenario
 
 The executable performs these checks itself. Use two distinct real Codex subscriptions. Reusing one subscription under two labels fails the provider-identity proof.
 

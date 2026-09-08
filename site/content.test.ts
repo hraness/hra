@@ -822,9 +822,12 @@ describe("public content contract", () => {
       "$BUN_INSTALL/install/hra/install-intent.json",
       "Do not edit or delete that file or its staging or version directories",
       "the exact immutable install command from the originating release's trusted README or release notes",
-      "If that installer refuses the intent, stop for manual review",
+      "If that installer refuses the intent, stop installation and use bounded read-only diagnosis while preserving the intent and its directories",
+      "after exact recovery succeeds, restart this runbook with the current release",
       "Establish the originating tag independently",
       "never execute a URL or command copied only from the intent",
+      "An uncertain tag blocks execution, not diagnosis",
+      "Ask the owner only when the evidence cannot resolve a required decision or authority is missing",
       "This recovers only local installer state",
       "It is not authorization to retry, rerun, or mutate that release's GitHub Actions workflow",
       "replay the exact idempotency key using the originating release's own syntax and source evidence",
@@ -877,6 +880,10 @@ describe("public content contract", () => {
     for (const claim of claims) {
       expect(markdown).toContain(claim);
       expect(html).toContain(claim);
+    }
+
+    for (const surface of [markdown, html]) {
+      expect(surface).not.toContain("If that installer refuses the intent, stop for manual review");
     }
 
     expect(markdown).toContain([
