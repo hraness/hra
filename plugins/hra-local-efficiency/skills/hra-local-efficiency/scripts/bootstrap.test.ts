@@ -93,7 +93,7 @@ describe("machine bootstrap", () => {
       .toThrow("absolute");
   });
 
-  test("installs marker-bounded guidance and command links in a fixture", async () => {
+  test("replaces legacy managed guidance and installs command links without changing unrelated text", async () => {
     const root = mkdtempSync(join(tmpdir(), "hra-local-efficiency-bootstrap-"));
     temporary.push(root);
     const codexHome = join(root, "codex");
@@ -103,7 +103,11 @@ describe("machine bootstrap", () => {
     mkdirSync(claudeHome, { recursive: true });
     mkdirSync(bunBin, { recursive: true });
     mkdirSync(join(codexHome, "rules"), { recursive: true });
-    writeFileSync(join(codexHome, "AGENTS.md"), "# Existing\n\nKeep me.\n");
+    const legacyDeliveryPolicy = "- Treat the user's task request and repository instructions as standing authorization for routine task-owned commits, pushes, pull requests, merges, releases, and deployments after required validation and gates pass. Do not ask for duplicate confirmation.";
+    const legacyGuidance = `<!-- hra-local-efficiency:start -->\n${legacyDeliveryPolicy}\n<!-- hra-local-efficiency:end -->`;
+    const codexPrefix = "# Existing\n\nKeep me.\n\n";
+    const codexSuffix = "\n\n# Unmanaged after\n\nKeep this exact spacing.  \n";
+    writeFileSync(join(codexHome, "AGENTS.md"), `${codexPrefix}${legacyGuidance}${codexSuffix}`);
     chmodSync(join(codexHome, "AGENTS.md"), 0o600);
     const originalCodexConfig = "# Keep this comment exactly.\napproval_policy = \"never\"\n\n[features]\nkeep_me = true\n";
     writeFileSync(join(codexHome, "config.toml"), originalCodexConfig);
@@ -127,7 +131,10 @@ describe("machine bootstrap", () => {
 `;
     writeFileSync(join(claudeHome, "settings.json"), originalClaudeSettings);
     chmodSync(join(claudeHome, "settings.json"), 0o600);
-    writeFileSync(join(claudeHome, "CLAUDE.md"), "# Existing Claude guidance\n\nKeep this too.\n");
+    const claudePrefix = "# Existing Claude guidance\n\nKeep this too.\n\n";
+    const claudeSuffix = "\n\n# Unmanaged Claude after\n\nKeep this too, exactly.  \n";
+    writeFileSync(join(claudeHome, "CLAUDE.md"), `${claudePrefix}${legacyGuidance}${claudeSuffix}`);
+    chmodSync(join(claudeHome, "CLAUDE.md"), 0o640);
     const modulePath = join(root, "host-resources.js");
     writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
     const environment = {
@@ -153,7 +160,9 @@ describe("machine bootstrap", () => {
     });
     expect(first.exitCode, first.stderr.toString()).toBe(0);
     const guidance = readFileSync(join(codexHome, "AGENTS.md"), "utf8");
-    expect(guidance).toContain("Keep me.");
+    const codexPolicy = readFileSync(join(import.meta.dir, "..", "assets", "global-agents-block.md"), "utf8");
+    expect(guidance).toBe(`${codexPrefix}${codexPolicy.trimEnd()}${codexSuffix}`);
+    expect(guidance).not.toContain(legacyDeliveryPolicy);
     expect(guidance.match(/hra-local-efficiency:start/gu)).toHaveLength(1);
     expect(statSync(join(codexHome, "AGENTS.md")).mode & 0o777).toBe(0o600);
     const codexConfig = readFileSync(join(codexHome, "config.toml"), "utf8");
@@ -206,8 +215,11 @@ describe("machine bootstrap", () => {
     ]);
     expect(parsedClaudeSettings.autoMode.soft_deny).toEqual(["$defaults", "Never destroy production"]);
     const claudeGuidance = readFileSync(join(claudeHome, "CLAUDE.md"), "utf8");
-    expect(claudeGuidance).toContain("Keep this too.");
+    const claudePolicy = readFileSync(join(import.meta.dir, "..", "assets", "global-claude-block.md"), "utf8");
+    expect(claudeGuidance).toBe(`${claudePrefix}${claudePolicy.trimEnd()}${claudeSuffix}`);
+    expect(claudeGuidance).not.toContain(legacyDeliveryPolicy);
     expect(claudeGuidance.match(/hra-local-efficiency:start/gu)).toHaveLength(1);
+    expect(statSync(join(claudeHome, "CLAUDE.md")).mode & 0o777).toBe(0o640);
     expect(readlinkSync(join(bunBin, "hra-host-run"))).toContain("host-run.ts");
     expect(readlinkSync(join(bunBin, "hra-throughput-report"))).toContain("throughput-report.ts");
     expect(readlinkSync(join(bunBin, "hra-ci-ref-audit"))).toContain("ci-ref-audit.ts");
@@ -239,6 +251,7 @@ describe("machine bootstrap", () => {
       stdout: "pipe",
     });
     expect(reapplied.exitCode, reapplied.stderr.toString()).toBe(0);
+    expect(readFileSync(join(codexHome, "AGENTS.md"), "utf8")).toBe(guidance);
     expect(readFileSync(rulesPath, "utf8")).toBe(rules);
     expect(readFileSync(join(codexHome, "config.toml"), "utf8")).toBe(codexConfig);
     expect(readFileSync(join(claudeHome, "settings.json"), "utf8")).toBe(claudeSettingsText);
@@ -262,6 +275,7 @@ describe("machine bootstrap", () => {
     });
     expect(second.exitCode, second.stderr.toString()).toBe(0);
     expect(readFileSync(join(codexHome, "AGENTS.md"), "utf8")).toBe(guidance);
+    expect(readFileSync(join(claudeHome, "CLAUDE.md"), "utf8")).toBe(claudeGuidance);
     expect(readFileSync(rulesPath, "utf8")).toBe(rules);
 
     writeFileSync(rulesPath, rules.replace('decision = "prompt"', 'decision = "allow"'));
