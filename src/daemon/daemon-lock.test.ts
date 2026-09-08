@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, lstat, mkdtemp, readdir, readFile, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, link, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,6 +20,28 @@ async function pathsFixture() {
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   return paths;
+}
+
+async function receiptObservationFixture() {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-receipt-observation-")));
+  const paths = resolveStatePaths({ rootDirectory: root });
+  await initializeStatePaths(paths);
+  return paths;
+}
+
+async function realUnlinkedReceiptMetadata(path: string, publish: () => Promise<unknown>) {
+  const previous = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    await publish();
+    const unlinked = await previous.stat();
+    expect(unlinked.isFile()).toBe(true);
+    expect(unlinked.isSymbolicLink()).toBe(false);
+    expect(unlinked.nlink).toBe(0);
+    expect(unlinked.ino).not.toBe((await lstat(path)).ino);
+    return unlinked;
+  } finally {
+    await previous.close();
+  }
 }
 
 async function authorityArtifacts(paths: Awaited<ReturnType<typeof pathsFixture>>) {
@@ -369,6 +392,231 @@ describe("DaemonLock", () => {
       ...authority,
     });
     await lock.release({ now: 101 });
+  });
+
+  test("retries a real zero-link named receipt observation without reading the unlinked inode", async () => {
+    const paths = await receiptObservationFixture();
+    const lock = await DaemonLock.acquire(paths);
+    const authority = { generation: 5, bootId: `boot_${"9".repeat(32)}` };
+    await lock.publish({ state: "ready", ...authority });
+    let namedReads = 0;
+    let descriptorReads = 0;
+    try {
+      const receipt = await readDaemonAuthorityReceipt(paths, {
+        readNamedMetadata: async (path) => {
+          namedReads += 1;
+          if (namedReads !== 1) return await lstat(path);
+          return await realUnlinkedReceiptMetadata(path, async () =>
+            await lock.publish({ state: "stopping", ...authority }));
+        },
+        afterDescriptorRead: () => { descriptorReads += 1; },
+      });
+      expect(receipt).toEqual(lock.receipt);
+      expect(receipt).toMatchObject({ state: "stopping", ...authority });
+      expect(namedReads).toBe(3);
+      expect(descriptorReads).toBe(1);
+    } finally {
+      await lock.release();
+      await rm(paths.root, { recursive: true });
+    }
+  });
+
+  test.each(["after-content", "after-unlinked-descriptor"] as const)(
+    "retries a real zero-link named receipt observation %s before accepting a fresh descriptor",
+    async (phase) => {
+      const paths = await receiptObservationFixture();
+      const lock = await DaemonLock.acquire(paths);
+      const authority = { generation: 5, bootId: `boot_${"9".repeat(32)}` };
+      await lock.publish({ state: "ready", ...authority });
+      let namedReads = 0;
+      let descriptorReads = 0;
+      let openedPublication = false;
+      const finalState = phase === "after-content" ? "stopping" : "stopped";
+      try {
+        const receipt = await readDaemonAuthorityReceipt(paths, {
+          readNamedMetadata: async (path) => {
+            namedReads += 1;
+            if (namedReads !== 2) return await lstat(path);
+            return await realUnlinkedReceiptMetadata(path, async () =>
+              await lock.publish({ state: finalState, ...authority }));
+          },
+          afterDescriptorOpen: async () => {
+            if (phase !== "after-unlinked-descriptor" || openedPublication) return;
+            openedPublication = true;
+            await lock.publish({ state: "stopping", ...authority });
+          },
+          afterDescriptorRead: () => { descriptorReads += 1; },
+        });
+        expect(receipt).toEqual(lock.receipt);
+        expect(receipt).toMatchObject({ state: finalState, ...authority });
+        expect(namedReads).toBe(4);
+        expect(descriptorReads).toBe(phase === "after-content" ? 2 : 1);
+      } finally {
+        await lock.release();
+        await rm(paths.root, { recursive: true });
+      }
+    },
+  );
+
+  test.each(["missing", "hardlink", "symlink", "permissions", "oversize", "directory"] as const)(
+    "refuses a %s replacement after a real zero-link named receipt observation",
+    async (scenario) => {
+      const paths = await receiptObservationFixture();
+      const lock = await DaemonLock.acquire(paths);
+      const authority = { generation: 5, bootId: `boot_${"9".repeat(32)}` };
+      await lock.publish({ state: "ready", ...authority });
+      const displaced = join(paths.runtime, "preserved-current-receipt");
+      const custody = { moved: false };
+      let namedReads = 0;
+      let descriptorReads = 0;
+      try {
+        const reading = readDaemonAuthorityReceipt(paths, {
+          readNamedMetadata: async (path) => {
+            namedReads += 1;
+            if (namedReads !== 1) return await lstat(path);
+            const unlinked = await realUnlinkedReceiptMetadata(path, async () =>
+              await lock.publish({ state: "stopping", ...authority }));
+            await rename(path, displaced);
+            custody.moved = true;
+            switch (scenario) {
+              case "missing": break;
+              case "hardlink": await link(displaced, path); break;
+              case "symlink": await symlink(displaced, path); break;
+              case "permissions":
+                await writeFile(path, JSON.stringify(lock.receipt), { mode: 0o600 });
+                await chmod(path, 0o640);
+                break;
+              case "oversize": await writeFile(path, "x".repeat(4_097), { mode: 0o600 }); break;
+              case "directory": await mkdir(path, { mode: 0o700 }); break;
+            }
+            return unlinked;
+          },
+          afterDescriptorRead: () => { descriptorReads += 1; },
+        });
+        await expect(reading).rejects.toBeInstanceOf(DaemonAuthoritySafetyError);
+        expect(namedReads).toBe(2);
+        expect(descriptorReads).toBe(0);
+      } finally {
+        if (custody.moved) {
+          await rm(paths.daemonLock, { recursive: scenario === "directory", force: true });
+          await rename(displaced, paths.daemonLock);
+        }
+        await lock.release();
+        await rm(paths.root, { recursive: true });
+      }
+    },
+  );
+
+  test("does not retry unsafe permissions on a real zero-link named receipt observation", async () => {
+    const paths = await receiptObservationFixture();
+    const lock = await DaemonLock.acquire(paths);
+    const authority = { generation: 5, bootId: `boot_${"9".repeat(32)}` };
+    await lock.publish({ state: "ready", ...authority });
+    let namedReads = 0;
+    try {
+      const reading = readDaemonAuthorityReceipt(paths, {
+        readNamedMetadata: async (path) => {
+          namedReads += 1;
+          const previous = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+          try {
+            await lock.publish({ state: "stopping", ...authority });
+            await previous.chmod(0o640);
+            const unlinked = await previous.stat();
+            expect(unlinked.nlink).toBe(0);
+            expect(unlinked.mode & 0o777).toBe(0o640);
+            return unlinked;
+          } finally {
+            await previous.close();
+          }
+        },
+      });
+      await expect(reading).rejects.toBeInstanceOf(DaemonAuthoritySafetyError);
+      await expect(reading).rejects.toThrow("unsafe permissions");
+      expect(namedReads).toBe(1);
+    } finally {
+      await lock.release();
+      await rm(paths.root, { recursive: true });
+    }
+  });
+
+  test("bounds real zero-link named receipt observations without accepting the last stale inode", async () => {
+    const paths = await receiptObservationFixture();
+    const lock = await DaemonLock.acquire(paths);
+    const authority = { generation: 5, bootId: `boot_${"9".repeat(32)}` };
+    await lock.publish({ state: "ready", ...authority });
+    let namedReads = 0;
+    let descriptorReads = 0;
+    try {
+      const reading = readDaemonAuthorityReceipt(paths, {
+        readNamedMetadata: async (path) => {
+          namedReads += 1;
+          return await realUnlinkedReceiptMetadata(path, async () =>
+            await lock.publish({ state: "stopping", ...authority }));
+        },
+        afterDescriptorRead: () => { descriptorReads += 1; },
+      });
+      await expect(reading).rejects.toBeInstanceOf(DaemonAuthoritySafetyError);
+      await expect(reading).rejects.toThrow("changed repeatedly");
+      expect(namedReads).toBe(8);
+      expect(descriptorReads).toBe(0);
+      expect(await readDaemonAuthorityReceipt(paths)).toEqual(lock.receipt);
+    } finally {
+      await lock.release();
+      await rm(paths.root, { recursive: true });
+    }
+  });
+
+  test("keeps initial receipt absence distinct from disappearance after named validation", async () => {
+    const paths = await receiptObservationFixture();
+    expect(await readDaemonAuthorityReceipt(paths)).toBeNull();
+    const lock = await DaemonLock.acquire(paths);
+    const displaced = join(paths.runtime, "preserved-observed-receipt");
+    const custody = { moved: false };
+    try {
+      const reading = readDaemonAuthorityReceipt(paths, {
+        afterNamedValidation: async () => {
+          await rename(paths.daemonLock, displaced);
+          custody.moved = true;
+        },
+      });
+      await expect(reading).rejects.toBeInstanceOf(DaemonAuthoritySafetyError);
+      await expect(reading).rejects.toThrow("no safe named replacement");
+    } finally {
+      if (custody.moved) await rename(displaced, paths.daemonLock);
+      await lock.release();
+      await rm(paths.root, { recursive: true });
+    }
+  });
+
+  test("observes a genuinely new authority after a real zero-link named receipt observation", async () => {
+    const paths = await receiptObservationFixture();
+    const previous = await DaemonLock.acquire(paths);
+    await previous.publish({ state: "ready", generation: 5, bootId: `boot_${"9".repeat(32)}` });
+    let replacement: DaemonLock | undefined;
+    let namedReads = 0;
+    try {
+      const receipt = await readDaemonAuthorityReceipt(paths, {
+        readNamedMetadata: async (path) => {
+          namedReads += 1;
+          if (namedReads !== 1) return await lstat(path);
+          return await realUnlinkedReceiptMetadata(path, async () => {
+            await previous.release();
+            replacement = await DaemonLock.acquire(paths);
+            await replacement.publish({ state: "ready", generation: 6, bootId: `boot_${"a".repeat(32)}` });
+          });
+        },
+      });
+      expect(replacement).toBeDefined();
+      if (replacement === undefined) throw new Error("Replacement authority fixture was not created.");
+      expect(receipt).toEqual(replacement.receipt);
+      expect(receipt?.nonce).not.toBe(previous.receipt.nonce);
+      expect(receipt?.generation).toBe(6);
+      expect(namedReads).toBe(3);
+    } finally {
+      await replacement?.release();
+      await previous.release();
+      await rm(paths.root, { recursive: true });
+    }
   });
 
   test("retries an atomic receipt publication between path validation and descriptor open", async () => {
