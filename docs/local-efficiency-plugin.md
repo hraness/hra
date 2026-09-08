@@ -35,6 +35,8 @@ hra-host-run --mode=exclusive --lane=browser-auth --label=browser-suite -- bun r
 hra-host-run --mode=heavy --lane=mac-native --label=native-check -- xcodebuild test
 ```
 
+For HRA's own local aggregate, use `--mode=exclusive --lane=compute` with the unchanged `bun run check` child. Its package-command tests exercise the machine-wide process-recovery journal, so separate checkouts under two admitted heavy leases can still contend and fail with `bounded_process_recovery_journal_blocked:concurrent_invocation`. Keep that refusal and the journal intact; wait for admitted work to finish and run the converged aggregate under one exclusive lease. This HRA-specific custody requirement does not make ordinary focused checks or independent source review exclusive. Retain complete private gate output when investigating a failure, and preserve the wrapper's exit status.
+
 The browser capability is serialized separately before weighted CPU admission, so it does not consume a compute permit while waiting. The Mac lane fails before child execution on another operating system. Nested wrappers may use only a mode and capability already covered by the outer lease.
 
 The weighted coordinator is strict FIFO for overlapping claims. Queue `exclusive` only for a converged command that is ready to run. If a never-admitted exclusive claim strands spare permits ahead of a known finite shared/heavy backlog, only its owner may cancel that waiting wrapper and requeue the identical command after the backlog drains. Do not interrupt admitted work or bypass the scheduler to reorder it.
