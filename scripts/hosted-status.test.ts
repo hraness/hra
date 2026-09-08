@@ -43,6 +43,7 @@ const requiredEnvironmentNames = [
   "HRA_AUTH_HMAC_SECRET",
   "HRA_RESEND_API_KEY",
   "HRA_AUTH_EMAIL_REPLY_TO",
+  "HRA_ATTENTION_RESEND_API_KEY",
 ] as const;
 
 const outputWriter = (chunks: string[]): Pick<NodeJS.WriteStream, "write"> => ({
@@ -134,6 +135,7 @@ describe("hosted preflight status operator", () => {
   test("requires exactly one complete fixed Convex target tuple", () => {
     expect(parseHostedStatusArguments(statusArguments)).toEqual({
       requireAttentionInactive: false,
+      requireAttentionKeyReady: false,
       requirePassed: false,
       sourceCommit,
       target,
@@ -143,6 +145,17 @@ describe("hosted preflight status operator", () => {
       "--require-attention-inactive",
     ])).toEqual({
       requireAttentionInactive: true,
+      requireAttentionKeyReady: false,
+      requirePassed: false,
+      sourceCommit,
+      target,
+    });
+    expect(parseHostedStatusArguments([
+      ...statusArguments,
+      "--require-attention-key-ready",
+    ])).toEqual({
+      requireAttentionInactive: false,
+      requireAttentionKeyReady: true,
       requirePassed: false,
       sourceCommit,
       target,
@@ -160,6 +173,11 @@ describe("hosted preflight status operator", () => {
       ...statusArguments,
       "--require-attention-inactive",
       "--require-attention-inactive",
+    ])).toThrow("usage_invalid");
+    expect(() => parseHostedStatusArguments([
+      ...statusArguments,
+      "--require-attention-key-ready",
+      "--require-attention-key-ready",
     ])).toThrow("usage_invalid");
   });
 
@@ -216,6 +234,94 @@ describe("hosted preflight status operator", () => {
       },
       status: "live",
     });
+    expect(JSON.parse(stdout.join(""))).not.toHaveProperty("attentionSending");
+  });
+
+  test("checks dedicated credential readiness separately from names and inactive generation zero", async () => {
+    for (const dedicatedKeyReady of [false, true]) {
+      const requests: CommandRequest[] = [];
+      const stdout: string[] = [];
+      const verifications: ConvexTarget[] = [];
+      const exitCode = await executeHostedStatus({
+        arguments: [
+          ...statusArguments,
+          "--require-passed",
+          "--require-attention-inactive",
+          "--require-attention-key-ready",
+        ],
+        readAttestation: async () => ({ runtimeSourceCommit: sourceCommit, state: "bound" }),
+        runner: statusRunner([
+          { exitCode: 0, stderr: "", stdout: requiredEnvironmentNames.join("\n") },
+          { exitCode: 0, stderr: "", stdout: acceptedBootstrap },
+          {
+            exitCode: 0,
+            stderr: "",
+            stdout: '{"generation":2,"newIdentityAdmissions":"open","state":"open","updatedAt":1}',
+          },
+          {
+            exitCode: 0,
+            stderr: "",
+            stdout: '{"generation":0,"globalState":"absent","outboxOccupancy":0,"safetyFaultOccupancy":0}',
+          },
+          { exitCode: 0, stderr: "provider-secret", stdout: JSON.stringify({ dedicatedKeyReady }) },
+        ], requests),
+        stderr: { write: () => true },
+        stdout: outputWriter(stdout),
+        verifyTarget: exactTargetVerifier(verifications),
+      });
+
+      expect(exitCode).toBe(dedicatedKeyReady ? 0 : 1);
+      expect(requests).toHaveLength(5);
+      expect(verifications).toHaveLength(12);
+      expect(requests[4]?.arguments.slice(1)).toEqual([
+        "run", "attentionNotificationControl:sendingKeyReadiness", "{}",
+        "--deployment", target.deploymentName,
+      ]);
+      expect(requests[4]?.phase).toBe("hosted-status-attention-key-read");
+      expect(requests[4]?.containment).toBe("authority");
+      expect(requests[4]?.stdin).toBe("");
+      expect(JSON.parse(stdout.join(""))).toMatchObject({
+        attentionNotifications: { generation: 0, state: "inactive" },
+        attentionSending: { dedicatedKeyReady },
+        environment: { requiredNamesPresent: true },
+        status: "live",
+      });
+      expect(stdout.join("")).not.toContain("provider-secret");
+    }
+  });
+
+  test("refuses malformed or unavailable credential readiness without exposing provider values", async () => {
+    for (const result of [
+      { exitCode: 1, stderr: "provider-secret", stdout: "" },
+      { exitCode: 0, stderr: "", stdout: "{}" },
+      { exitCode: 0, stderr: "", stdout: '{"dedicatedKeyReady":"true"}' },
+      { exitCode: 0, stderr: "", stdout: '{"dedicatedKeyReady":true,"key":"provider-secret"}' },
+      { exitCode: 0, stderr: "", stdout: "x".repeat((64 * 1024) + 1) },
+    ]) {
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const exitCode = await executeHostedStatus({
+        arguments: [...statusArguments, "--require-attention-key-ready"],
+        readAttestation: async () => ({ runtimeSourceCommit: sourceCommit, state: "bound" }),
+        runner: statusRunner([
+          { exitCode: 0, stderr: "", stdout: requiredEnvironmentNames.join("\n") },
+          { exitCode: 0, stderr: "", stdout: acceptedBootstrap },
+          { exitCode: 0, stderr: "", stdout: '{"generation":1,"state":"open","updatedAt":1}' },
+          result,
+        ]),
+        stderr: outputWriter(stderr),
+        stdout: outputWriter(stdout),
+        verifyTarget: async () => undefined,
+      });
+      expect(exitCode).toBe(1);
+      expect(stdout).toEqual([]);
+      expect(JSON.parse(stderr.join(""))).toEqual({
+        code: "attention_sending_status_invalid",
+        schemaVersion: 1,
+        status: "refused",
+      });
+      expect(stderr.join("")).not.toContain("provider-secret");
+    }
   });
 
   test("fails the inactive requirement on any hosted occupancy", async () => {

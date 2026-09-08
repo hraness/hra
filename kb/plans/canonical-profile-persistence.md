@@ -16,13 +16,14 @@ admission. This is the next bounded source increment in
 policy. Sol Ultra remains the implicit Codex default. Historical Astra and
 retired Devin decoding grant no fresh execution authority.
 
-The current parent join incorporates PR147's pushed `976bbb9`, including
-protected main `2c8fe078`, the schema49 project companion and the reviewed
-physical-scrub fixture repair. The original foundation began at `380ced9`;
-that older checkpoint is not the current integration base. PR147 still owns
-schema49 and its final gates. This follow-on has no allocated schema number.
-Recheck protected main and competing local-storage ownership after PR147
-converges before installing a migration. Keep the independently owned
+The current parent join incorporates PR147's protected merge `c639ad78`,
+including the schema49 project companion, reviewed physical-scrub fixture
+repair and dedicated attention-key source from main `5838ec4`. The original
+foundation began at `380ced9`; that older checkpoint is not the current
+integration base. PR147's exact head passed its local and protected gates;
+exact-main CI34188257597 is pending. This follow-on has no allocated schema number.
+After exact-main CI passes, recheck protected main and competing local-storage
+ownership before installing a migration. Keep the independently owned
 peer-memory changes in PR148 intact at integration.
 
 ## Storage decision
@@ -277,8 +278,8 @@ was not waived: its original local gate missed a retained sentinel before
 migration, and a controlled SQLite proof demonstrated the non-atomic
 main/WAL scan race. All post-scrub erasure assertions remain unchanged.
 
-No new aggregate success is claimed for the joined tree. After the schema49
-parent converges, the next owner must recheck migration ownership, install
+No new aggregate success is claimed for the joined tree. After schema49's
+exact-main verification, the next owner must recheck migration ownership, install
 the complete reader/writer and migration slice described above, prove its
 authentic upgrade and rollback cases, and run its exact-tree final gates.
 Do not interpret these passing foundation checks as canonical persistence,
@@ -331,7 +332,7 @@ scoped policy lint and whitespace checks passed. The new exact-tree
 aggregate is a separate gate.
 The preceding `35dce12` CI run 34185898009 passed macOS in 15m47s, but
 Ubuntu exceeded the unchanged 20-minute job limit and Required failed.
-That failure is under independent log review; it is not waived by focused
+The completed diagnosis follows; that failed gate is not waived by focused
 row-proof checks or earlier aggregate successes.
 
 ## Measured scrub-fixture wait reduction

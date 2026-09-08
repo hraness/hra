@@ -1,5 +1,5 @@
 ---
-title: HRA Web v1: session grid, steering, autorespond, open beta
+title: "HRA Web v1: session grid, steering, autorespond, open beta"
 description: Plan for the first real HRA web app (a mobile-friendly grid of live sessions with steering, approvals, model choice, archive), the session-state classifier and autoresponder that feed it, Claude Code as a second provider, and opening hosted sign-up.
 type: plan
 status: proposed
