@@ -144,3 +144,37 @@ migration, process custody or live provider support.
 Candidate admission, provider provisioning, automatic routing/Fast, hosted
 capacity changes, package publication and daemon activation remain separate
 gates. No mock, source merge or schema number supplies their missing proof.
+
+## Companion-module checkpoint
+
+The first source building block adds two historical scalar derivation helpers,
+four frozen additive column statements, seven exact companion triggers and a
+metadata-only assertion in `src/storage/canonical-profile-storage.ts`. It has
+no installer, migration number, backfill, current reader/writer consumer or
+selection authority. SQL identity mapping is frozen independently of future
+catalog changes; every key comparison is explicitly BINARY. Column metadata
+uses `table_xinfo` to reject hidden/generated, defaulted, wrong-type and
+case-variant declarations. Exact companion checks include all SQLite object
+types and case-insensitive name collisions.
+
+The deliberately reduced STRICT unit fixture documents its dependence on
+unchanged legacy blanket guards. It proves only new SQL behavior, not a real
+StateStore upgrade. A raw-SQL forged-key baseline genuinely succeeded before
+the guards; the corrected suite passed105 tests and385 assertions. Scoped
+ESLint, strict targeted TypeScript, explicit whitespace checks for both new
+files and independent frozen-file review passed. Root source/test review
+found no further issue. Security primitive counts remain unchanged across45
+reviewed files.
+
+Frozen SHA-256: source
+`4d731c8e4c199c1f4114cadc4cb8df431b2e06d866a652ad73cc244d03794cc1`;
+tests `c238c4ae759b49447914584769a8c820896bb6ce98676d2775c80feef48db1c4`.
+Independent local package inspection passed:176 canonical entries,167
+single-link source-identical regular files and an8,317-byte inventory with
+SHA-256 `65cc9b5ad9e5d5a4fe1bddd5147dce67b1b34b56a15eb1818c9a6883b50652f6`.
+The sole addition is this9,636-byte module; all166 predecessor files remain
+byte-identical. The archive is1,346,393 bytes and remains local-only. Only the
+three reviewed inventory constants changed; no enforcement rule changed.
+The required exact-tree final gate is separate evidence. None of the real
+migration, old-reader or runtime integration acceptance cases above is
+complete from unit tests or package inspection.
