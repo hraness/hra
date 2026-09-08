@@ -148,7 +148,14 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: compiled-browser-receipts-${{ github.run_attempt }}
-          path: tmp/app-browser-*/receipt.json
+          path: |
+            tmp/app-browser-*/receipt.json
+            tmp/app-browser-*/preparation-result.json
+            tmp/browser-custody-*/supervisor-result.json
+            tmp/browser-custody-*/fixture-terminal.json
+            tmp/browser-custody-*/observation-*.json
+            tmp/browser-custody-*/trigger.json
+            tmp/browser-custody-*/expiry.json
           if-no-files-found: warn
           include-hidden-files: false
           retention-days: 7

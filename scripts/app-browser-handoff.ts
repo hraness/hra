@@ -175,7 +175,7 @@ export function publishBrowserTerminalJson(path: string, value: unknown): void {
 const sourceFiles = [
   "package.json", "bun.lock", "app/index.html", "app/vercel.json", "app/vite.config.ts", "vercel.json",
   "scripts/build-app.ts", "scripts/app-source-marker.ts", "src/install-normalizer.ts",
-  "scripts/app-browser.ts", "scripts/app-browser-server.ts", "scripts/app-browser-handoff.ts",
+  "scripts/app-browser.ts", "scripts/app-browser-server.ts", "scripts/app-browser-handoff.ts", "scripts/app-browser-settlement.ts",
   "scripts/app-browser-runner.ts", "scripts/app-browser-runner.mjs", "scripts/prepare-app-browser.ts",
 ] as const;
 export async function browserSources(root: string): Promise<readonly BrowserFile[]> {

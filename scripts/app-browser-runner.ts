@@ -3,6 +3,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { mkdir, mkdtemp, realpath } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import type { BrowserCustodyObserver } from "./app-browser.ts";
 import {
   assertBrowserNode, browserDigest, browserExecutable, browserInventory, browserSources,
   parseBrowserRequest, publishBrowserJson, publishBrowserTerminalJson, readBrowserFile,
@@ -88,7 +89,7 @@ function failureDetails(value: unknown, depth = 0): unknown {
   };
 }
 
-async function runPreparation(request: BrowserRequest, signal: AbortSignal): Promise<void> {
+async function runPreparation(request: BrowserRequest, signal: AbortSignal, observer?: BrowserCustodyObserver): Promise<void> {
   assert.ok(!signal.aborted, "Browser preparation cancelled before dispatch");
   const args = [join(request.root, "scripts/prepare-app-browser.ts"), request.run];
   await publishBrowserJson(join(request.run, "preparation-intent.json"), { executable: request.bun, args, parent: process.pid, detached: true });
@@ -120,6 +121,10 @@ async function runPreparation(request: BrowserRequest, signal: AbortSignal): Pro
     assert.ok(child.pid !== undefined);
     owner.identity = await preparationIdentity(child.pid);
     await publishBrowserJson(join(request.run, "preparation-owner.json"), owner.identity);
+    if (observer !== undefined) {
+      assert.equal(observer(Object.freeze({ kind: "preparation-owned", run: request.run, identity: Object.freeze({ ...owner.identity }) })),
+        undefined, "Browser custody observation must finish synchronously");
+    }
     const outcome = await browserRunnerDeadline(owner.closed, 180_000, "Browser preparation", AbortSignal.any([signal, outputFailure.signal]));
     assert.equal(outcome.signal, null); assert.equal(outcome.code, 0, "Bun browser preparation failed");
     assert.equal(exceeded, false, "Preparation output exceeded its bound");
@@ -152,7 +157,7 @@ export function browserTerminalState(signal: AbortSignal, collected: boolean, fa
   return failure !== undefined || signal.aborted || !collected ? "failed" : "passed";
 }
 
-export async function runBrowserBootstrap(): Promise<void> {
+export async function runBrowserBootstrap(observer?: BrowserCustodyObserver): Promise<void> {
   assertBrowserNode(process.versions); assert.equal(process.argv.length, 2, "Browser runner takes no positional arguments");
   const root = await realpath(fileURLToPath(new URL("..", import.meta.url)));
   const bunPath = process.env.BUN_EXECUTABLE_PATH, chromePath = process.env.CHROMIUM_EXECUTABLE_PATH;
@@ -170,13 +175,13 @@ export async function runBrowserBootstrap(): Promise<void> {
     });
     await publishBrowserJson(join(run, "request.json"), request);
     requestSha256 = browserDigest(await readBrowserFile(join(run, "request.json"), 16 * 1024 * 1024));
-    await runPreparation(request, cancellation.signal); preparationCollected = true;
+    await runPreparation(request, cancellation.signal, observer); preparationCollected = true;
     const handoff = await readBrowserPrepared(root, run);
     assertBrowserDispatchAllowed(cancellation.signal, preparationCollected);
     const driver: unknown = await import(pathToFileURL(join(run, "driver.mjs")).href);
     assertBrowserDispatchAllowed(cancellation.signal, preparationCollected);
     assert.ok(typeof driver === "object" && driver !== null && "runAppBrowser" in driver && typeof driver.runAppBrowser === "function");
-    await (driver.runAppBrowser as (root: string, run: string, signal: AbortSignal) => Promise<void>)(root, run, cancellation.signal);
+    await (driver.runAppBrowser as (root: string, run: string, signal: AbortSignal, observer?: BrowserCustodyObserver) => Promise<void>)(root, run, cancellation.signal, observer);
     await verifyBrowserRequest(request);
     assert.deepEqual(await readBrowserPrepared(root, run), handoff);
   } catch (error) { failure = error; }

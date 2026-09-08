@@ -14,9 +14,13 @@ by the pinned Playwright package. Run `node node_modules/playwright-core/cli.js
 install chromium` to provision it. Set `BUN_EXECUTABLE_PATH` and
 `CHROMIUM_EXECUTABLE_PATH` to the explicit installed executables, then run
 `bun run check:browser`. Bun builds the app, site and isolated fixture; the Node
-driver verifies their compiled output with fresh browser profiles. The runner
-retains bounded evidence under `tmp/app-browser-*/` and requires every owned
-process and listener to close before reporting acceptance.
+driver verifies their compiled output with fresh browser profiles. Before
+acceptance, `test:browser:custody` exercises real cancellation during preparation
+and connected browser ownership, plus failure after partial server setup. These
+native cases are skipped by ordinary script tests and run only through the
+explicit custody command. The runner retains evidence under `tmp/app-browser-*/`
+and `tmp/browser-custody-*/` and requires every owned process and listener to
+close before reporting acceptance. Uncertain collection stays failed.
 
 ## Change requirements
 

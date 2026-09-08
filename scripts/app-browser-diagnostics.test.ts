@@ -1,6 +1,35 @@
 import { expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
-import { browserDiagnosticLine, browserFailureClass, browserNegativeStep, recordBrowserProfileFailure, withBrowserNegativeCleanup } from "./app-browser";
+import {
+  browserDiagnosticLine, browserFailureClass, browserNegativeStep, observeBrowserCustody,
+  recordBrowserProfileFailure, withBrowserNegativeCleanup,
+  type BrowserCustodyObservation, type BrowserCustodyObserver,
+} from "./app-browser";
+
+test("native custody observations copy and freeze identities without exposing resource operations", () => {
+  const pids = [42, 43], origins = ["http://127.0.0.1:1234"];
+  const received: BrowserCustodyObservation[] = [];
+  observeBrowserCustody((observation) => { received.push(observation); return undefined; },
+    { kind: "browser-census-owned", run: "/fixture/run", origins, pids });
+  pids.push(44); origins.push("http://127.0.0.1:5678");
+  expect(received).toEqual([{ kind: "browser-census-owned", run: "/fixture/run", origins: ["http://127.0.0.1:1234"], pids: [42, 43] }]);
+  const observation = received[0];
+  expect(Object.isFrozen(observation)).toBe(true);
+  if (observation?.kind !== "browser-census-owned") throw new Error("Missing closed observation");
+  expect(Object.isFrozen(observation.origins)).toBe(true); expect(Object.isFrozen(observation.pids)).toBe(true);
+  expect(Object.keys(observation).sort()).toEqual(["kind", "origins", "pids", "run"]);
+});
+
+test("native custody observation is optional, synchronous and propagates the exact setup failure", () => {
+  const observation = { kind: "partial-servers-owned" as const, run: "/fixture/run", origins: ["http://127.0.0.1:1234", "http://127.0.0.1:5678"] };
+  expect(() => observeBrowserCustody(undefined, observation)).not.toThrow();
+  const failure = new Error("fixture setup failure");
+  expect(() => observeBrowserCustody(() => { throw failure; }, observation)).toThrow(failure);
+  // Foreign misuse must not install an unawaited asynchronous hook. The native
+  // fixture only supplies a synchronous function returning undefined.
+  const asynchronous = (() => Promise.resolve()) as unknown as BrowserCustodyObserver;
+  expect(() => observeBrowserCustody(asynchronous, observation)).toThrow("must finish synchronously");
+});
 
 test("browser diagnostic output admits only finite labels and safe failure categories", () => {
   const secret = "/private/fixture-profile?credential=fixture-secret";
@@ -139,9 +168,29 @@ test("CI always retains only the browser receipt allowlist, with bounded reposit
     uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
     with: {
       name: "compiled-browser-receipts-${{ github.run_attempt }}",
-      path: "tmp/app-browser-*/receipt.json",
+      path: [
+        "tmp/app-browser-*/receipt.json",
+        "tmp/app-browser-*/preparation-result.json",
+        "tmp/browser-custody-*/supervisor-result.json",
+        "tmp/browser-custody-*/fixture-terminal.json",
+        "tmp/browser-custody-*/observation-*.json",
+        "tmp/browser-custody-*/trigger.json",
+        "tmp/browser-custody-*/expiry.json",
+        "",
+      ].join("\n"),
       "if-no-files-found": "warn", "include-hidden-files": false, "retention-days": 7,
     },
   });
   expect(rows.indexOf(uploads[0]!)).toBeGreaterThan(rows.findIndex((step) => step.name === "Verify compiled browser surfaces"));
+});
+
+test("the canonical browser gate enables native custody before acceptance", async () => {
+  const manifest: unknown = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  if (typeof manifest !== "object" || manifest === null || !("scripts" in manifest)) throw new Error("Missing package scripts");
+  const scripts = manifest.scripts;
+  if (typeof scripts !== "object" || scripts === null) throw new Error("Expected package scripts");
+  expect(Reflect.get(scripts, "check:browser"))
+    .toBe("bun run build:app && bun run build:site && bun run test:browser:custody && bun run test:browser");
+  expect(Reflect.get(scripts, "test:browser:custody"))
+    .toBe("HRA_BROWSER_CUSTODY_NATIVE=1 bun test --bail=1 ./scripts/app-browser-custody.process.test.ts");
 });

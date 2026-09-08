@@ -10,15 +10,35 @@ import type { BrowserContext, Locator, Page, Response as BrowserResponse } from 
 import { browserIoModules } from "../app/fixtures/browser/config";
 import { assertBrowserNode, browserDigest, browserExecutable, browserPublicArtifacts, publishBrowserJson, readBrowserPrepared } from "./app-browser-handoff.ts";
 import { serveBrowserAssets } from "./app-browser-server.ts";
+import { readRestoredStyleFramePair, settleExactStylesheet, StylesheetSettlementError, type StylesheetSettlementDiagnostics } from "./app-browser-settlement.ts";
 
 type Artifact = Readonly<{ bytes: number; path: string; sha256: string }>;
 type Surface = Readonly<{ artifacts: readonly Artifact[]; bytes: ReadonlyMap<string, Buffer>; origin: string; stop: () => Promise<void> }>;
 type Evidence = Readonly<{ name: string; values: unknown }>;
-type BrowserFailure = Readonly<{ name: string; message: string; cause?: BrowserFailure; errors?: readonly BrowserFailure[] }>;
+export type BrowserCustodyObservation =
+  | Readonly<{ kind: "preparation-owned"; run: string; identity: Readonly<{ pid: number; parent: number; group: number; started: string }> }>
+  | Readonly<{ kind: "partial-servers-owned"; run: string; origins: readonly string[] }>
+  | Readonly<{ kind: "browser-census-owned"; run: string; origins: readonly string[]; pids: readonly number[] }>;
+export type BrowserCustodyObserver = (observation: BrowserCustodyObservation) => undefined;
+
+/** Observation carries copied identity data, never resource handles or alternate
+ * operations. Production has no observer; native custody fixtures may fail or
+ * self-signal here, inside the existing owner and cleanup boundary. */
+export function observeBrowserCustody(observer: BrowserCustodyObserver | undefined, observation: BrowserCustodyObservation): void {
+  if (observer === undefined) return;
+  const frozen = observation.kind === "preparation-owned"
+    ? Object.freeze({ ...observation, identity: Object.freeze({ ...observation.identity }) })
+    : observation.kind === "partial-servers-owned"
+      ? Object.freeze({ ...observation, origins: Object.freeze([...observation.origins]) })
+      : Object.freeze({ ...observation, origins: Object.freeze([...observation.origins]), pids: Object.freeze([...observation.pids]) });
+  assert.equal(observer(frozen), undefined, "Browser custody observation must finish synchronously");
+}
+type BrowserFailure = Readonly<{ name: string; message: string; cause?: BrowserFailure; errors?: readonly BrowserFailure[]; settlement?: StylesheetSettlementDiagnostics }>;
 export function browserFailureDetails(value: unknown, depth = 0): BrowserFailure {
   if (!(value instanceof Error)) return { name: "UnknownFailure", message: typeof value === "string" ? value.slice(0, 1000) : typeof value };
   return {
     name: value.name.slice(0, 80), message: value.message.slice(0, 1000),
+    ...(value instanceof StylesheetSettlementError ? { settlement: value.diagnostics } : {}),
     ...(depth < 3 && value.cause !== undefined ? { cause: browserFailureDetails(value.cause, depth + 1) } : {}),
     ...(depth < 3 && value instanceof AggregateError ? { errors: value.errors.slice(0, 8).map((error: unknown) => browserFailureDetails(error, depth + 1)) } : {}),
   };
@@ -534,11 +554,16 @@ async function cleanDocument(page: Page): Promise<void> {
 
 /** Browser-realm closure: retain the loaded CSSOM objects, never toggle or
  * rewrite a link resource. All other document sheets must remain unchanged. */
-export function loadedStylesheetControl(element: Element) {
+export function loadedStylesheetControl(element: Element, sampleSelector?: string) {
   const document = element.ownerDocument;
   const view = document.defaultView;
   if (view === null || view.document !== document || !(element instanceof view.HTMLLinkElement)
     || !element.isConnected) throw new Error("Missing ordinary stylesheet link.");
+  if (sampleSelector !== undefined && (sampleSelector.length === 0 || sampleSelector.length > 1024)) {
+    throw new Error("Invalid stylesheet sample selector.");
+  }
+  const sampleTarget = sampleSelector === undefined ? null : document.querySelector(sampleSelector);
+  if (sampleSelector !== undefined && sampleTarget === null) throw new Error("Missing stylesheet sample target.");
   const target = element.sheet;
   const sheets = [...document.styleSheets];
   if (target === null || target.ownerNode !== element || target.disabled
@@ -562,6 +587,10 @@ export function loadedStylesheetControl(element: Element) {
     };
   });
   const assertIdentity = (disabled: boolean) => {
+    if (sampleSelector !== undefined && (sampleTarget === null || !sampleTarget.isConnected
+      || sampleTarget.ownerDocument !== document || document.querySelector(sampleSelector) !== sampleTarget)) {
+      throw new Error("Stylesheet sample target changed.");
+    }
     const current = [...document.styleSheets];
     if (!element.isConnected || element.ownerDocument !== document || element.sheet !== target || element.href !== target.href
       || current.length !== snapshots.length) throw new Error("Delivery stylesheet identity changed.");
@@ -580,6 +609,7 @@ export function loadedStylesheetControl(element: Element) {
   };
   assertIdentity(false);
   return {
+    sampleTarget,
     disable() {
       assertIdentity(false);
       target.disabled = true;
@@ -595,7 +625,8 @@ export function loadedStylesheetControl(element: Element) {
   };
 }
 
-async function negativeStylesheet(page: Page, selector: string, href: string, report: NegativeStylesheetReporter, foundation = false): Promise<void> {
+type RestorationBoundary = Readonly<{ signal: AbortSignal; profileDeadline: number }>;
+async function negativeStylesheet(page: Page, selector: string, href: string, report: NegativeStylesheetReporter, boundary: RestorationBoundary, foundation = false): Promise<void> {
   const step = <T>(name: NegativeStylesheetSubstep, operation: () => Promise<T>) => browserNegativeStep(name, operation, report);
   const sample = () => page.locator(selector).first().evaluate((element, foundation) => {
     element.getBoundingClientRect();
@@ -608,7 +639,7 @@ async function negativeStylesheet(page: Page, selector: string, href: string, re
   const before = await step("sample-before", sample);
   const sheet = page.locator(`link[rel="stylesheet"][href="${href}"]`);
   await step("link-count", async () => { assert.equal(await sheet.count(), 1); });
-  const loadedSheet = await step("capture", () => sheet.evaluateHandle(loadedStylesheetControl));
+  const loadedSheet = await step("capture", () => sheet.evaluateHandle(loadedStylesheetControl, selector));
   await withBrowserNegativeCleanup(async () => {
     await withBrowserNegativeCleanup(async () => {
       await step("disable", () => loadedSheet.evaluate((state) => state.disable()));
@@ -617,10 +648,17 @@ async function negativeStylesheet(page: Page, selector: string, href: string, re
         assert.notDeepEqual(await sample(), before, "Negative control did not detect disabled final CSS");
       });
     }, () => step("restore", () => loadedSheet.evaluate((state) => state.restore())), "restore");
-    await step("settle-restored", () => settle(page));
+    await step("settle-restored", () => settleExactStylesheet({
+      expected: before, foundation, signal: boundary.signal, profileDeadline: boundary.profileDeadline,
+      operations: {
+        assertIdentity: () => loadedSheet.evaluate((state) => state.assertRestored()),
+        readPair: (_signal, remainingMs) => loadedSheet.evaluate(readRestoredStyleFramePair, { foundation, remainingMs }),
+      },
+    }));
     await step("identity-restored", () => loadedSheet.evaluate((state) => state.assertRestored()));
     await step("sample-restored", async () => {
       assert.deepEqual(await sample(), before, "Final CSS did not restore exactly");
+      await loadedSheet.evaluate((state) => state.assertRestored());
     });
   }, () => step("dispose", () => loadedSheet.dispose()), "dispose");
 }
@@ -638,7 +676,7 @@ export function assertNativeModalFocus(value: unknown): void {
     `Native modal allowed focus on background content: ${JSON.stringify(sample)}`);
 }
 
-async function primitives(page: Page, profile: Profile, reportNegative: NegativeStylesheetReporter): Promise<void> {
+async function primitives(page: Page, profile: Profile, reportNegative: NegativeStylesheetReporter, boundary: RestorationBoundary): Promise<void> {
   const open = page.getByRole("button", { name: "Open dialog", exact: true });
   await styled(open, "card-content");
   await open.focus();
@@ -750,7 +788,7 @@ async function primitives(page: Page, profile: Profile, reportNegative: Negative
   assert.ok(Math.abs(right.x + right.width - profile.width) <= 1, "Right sheet changed its physical anchor in RTL");
   await page.keyboard.press("Escape");
   await rightSheet.waitFor({ state: "hidden" });
-  await negativeStylesheet(page, "button", "/stylex.css", reportNegative);
+  await negativeStylesheet(page, "button", "/stylex.css", reportNegative, boundary);
 }
 
 async function safeArea(page: Page, origin: string): Promise<void> {
@@ -817,7 +855,7 @@ async function isolate(context: BrowserContext, origins: ReadonlySet<string>): P
   return { blocked, errors };
 }
 
-export async function runAppBrowser(rootDirectory: string, runDirectory: string, signal: AbortSignal): Promise<void> {
+export async function runAppBrowser(rootDirectory: string, runDirectory: string, signal: AbortSignal, observer?: BrowserCustodyObserver): Promise<void> {
   assertBrowserNode(process.versions);
   const root = await realpath(rootDirectory);
   const run = await realpath(runDirectory);
@@ -868,6 +906,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
     assert.ok(!isCancelled(), "Browser acceptance cancelled");
     const app = await serve(appFiles, appCsp); servers.push(app);
     const fixture = await serve(fixtureFiles, appCsp); servers.push(fixture);
+    observeBrowserCustody(observer, { kind: "partial-servers-owned", run, origins: servers.map(({ origin }) => origin) });
     const site = await serve(siteFiles, siteCsp, previewCsp); servers.push(site);
     for (const profile of profiles) {
       assert.ok(!isCancelled(), "Browser acceptance cancelled");
@@ -905,6 +944,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
         assert.ok(!isCancelled(), "Browser acceptance cancelled during launch");
         // A profile-level deadline also covers raw evaluate/CDP promises that
         // are not covered by Playwright's action or navigation timeouts.
+        const restorationBoundary = { signal: cancellation.signal, profileDeadline: performance.now() + 120_000 };
         profileWork = (async () => {
         context.setDefaultTimeout(15_000);
         context.setDefaultNavigationTimeout(20_000);
@@ -932,6 +972,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
         assert.ok(pids.length > 0);
         mark("browser-census:detach");
         await browserCdp.detach();
+        observeBrowserCustody(observer, { kind: "browser-census-owned", run, origins: servers.map(({ origin }) => origin), pids });
         mark("production-anonymous:navigation");
         await page.goto(app.origin);
         mark("production-anonymous:assertions");
@@ -951,7 +992,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
         }), profile);
         await cleanDocument(page);
         mark("production-anonymous:negative-css");
-        await negativeStylesheet(page, "button", "/stylex.css", negativeReporter("production-anonymous:negative-css"));
+        await negativeStylesheet(page, "button", "/stylex.css", negativeReporter("production-anonymous:negative-css"), restorationBoundary);
         evidence.push({ name: `${profile.name}:production-anonymous`, values: { browserVersion, finalCssSha256: digest(appFiles.get("stylex.css") ?? "") } });
         for (const view of fixtureViews) {
           assert.ok(!isCancelled(), "Browser acceptance cancelled");
@@ -1022,7 +1063,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             assert.ok(await page.getByRole("heading", { name: "Settings", exact: true }).isVisible());
             assert.ok((await page.getByText("Fixture machine", { exact: true }).count()) > 0);
           }
-          if (view === "primitives") await primitives(page, profile, negativeReporter("fixture:primitives:negative-css"));
+          if (view === "primitives") await primitives(page, profile, negativeReporter("fixture:primitives:negative-css"), restorationBoundary);
           await cleanDocument(page);
           if (view === "grid" || view === "session" || view === "settings" || view === "primitives") {
             mark(`fixture:${view}:screenshot`);
@@ -1088,9 +1129,9 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             if (route.pathname === "/preview/") assert.equal(await page.locator("a,button,input,select,textarea,form,script,iframe").count(), 0, "Preview gained an action or script");
             const countBeforeNegative = responses.length;
             mark(`static-site:${routeLabel}:negative-final-css`);
-            await negativeStylesheet(page, route.heading, `/${siteGraph.stylesheets[1]}`, negativeReporter(`static-site:${routeLabel}:negative-final-css`));
+            await negativeStylesheet(page, route.heading, `/${siteGraph.stylesheets[1]}`, negativeReporter(`static-site:${routeLabel}:negative-final-css`), restorationBoundary);
             mark(`static-site:${routeLabel}:negative-foundation-css`);
-            await negativeStylesheet(page, "html", `/${siteGraph.stylesheets[0]}`, negativeReporter(`static-site:${routeLabel}:negative-foundation-css`), true);
+            await negativeStylesheet(page, "html", `/${siteGraph.stylesheets[0]}`, negativeReporter(`static-site:${routeLabel}:negative-foundation-css`), restorationBoundary, true);
             mark(`static-site:${routeLabel}:negative-document-clean`);
             await cleanDocument(page);
             assert.equal(responses.length, countBeforeNegative, "Stylesheet application control reloaded a resource");
