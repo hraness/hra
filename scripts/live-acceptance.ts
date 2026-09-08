@@ -984,6 +984,10 @@ type ProcessWorkerLaunch = Readonly<{
   executable: string;
 }>;
 
+type WorkerFailureCodeObserverForTesting = (
+  code: Extract<LiveAcceptanceWorkerStatus, { type: "failed" }>["code"],
+) => void | Promise<void>;
+
 export function liveAcceptanceWorkerLaunch(
   descriptorInput: AcceptanceInstallationDescriptor,
 ): LiveAcceptanceWorkerLaunch {
@@ -1079,6 +1083,7 @@ class ProcessWorker implements ClaudeLiveAcceptanceWorker {
   #claudeProofStopOperation: Promise<ClaudeLiveAcceptancePrivateReceipt> | undefined;
   #daemonGeneration: number | undefined;
   readonly #claudeProofMode: boolean;
+  readonly #observeFailureCodeForTesting: WorkerFailureCodeObserverForTesting | undefined;
 
   private constructor(
     descriptor: AcceptanceInstallationDescriptor,
@@ -1086,6 +1091,7 @@ class ProcessWorker implements ClaudeLiveAcceptanceWorker {
     control: Writable,
     status: Readable,
     claudeProofMode: boolean,
+    observeFailureCodeForTesting?: WorkerFailureCodeObserverForTesting,
   ) {
     if (child.pid === undefined) throw new LiveAcceptanceError("worker_failed");
     this.device = descriptor.device;
@@ -1095,6 +1101,7 @@ class ProcessWorker implements ClaudeLiveAcceptanceWorker {
     this.#child = child;
     this.#control = control;
     this.#claudeProofMode = claudeProofMode;
+    this.#observeFailureCodeForTesting = observeFailureCodeForTesting;
     void this.#closed.promise.catch(() => undefined);
     void this.#lifetime.promise.catch(() => undefined);
     void this.#ready.promise.catch(() => undefined);
@@ -1132,6 +1139,7 @@ class ProcessWorker implements ClaudeLiveAcceptanceWorker {
     launchInput?: ProcessWorkerLaunch,
     options: Readonly<{
       beforeDescriptorWrite?: (workerPid: number) => Promise<void>;
+      observeFailureCodeForTesting?: WorkerFailureCodeObserverForTesting;
       separateSignalDomain?: boolean;
     }> = {},
   ): Promise<ProcessWorker> {
@@ -1160,6 +1168,7 @@ class ProcessWorker implements ClaudeLiveAcceptanceWorker {
         control,
         status,
         options.separateSignalDomain === true,
+        options.observeFailureCodeForTesting,
       );
       const serialized = `${JSON.stringify(descriptor)}\n`;
       if (Buffer.byteLength(serialized, "utf8") > LIVE_ACCEPTANCE_DESCRIPTOR_MAXIMUM_BYTES) {
@@ -1522,6 +1531,16 @@ class ProcessWorker implements ClaudeLiveAcceptanceWorker {
         || (hasDevice && frame.device !== this.device)
         || (hasRunId && frame.runId !== this.#descriptor.runId)
       ) throw new LiveAcceptanceError("worker_protocol_invalid");
+      if (hasDevice && this.#observeFailureCodeForTesting !== undefined) {
+        try {
+          // Tests may retain only this admitted closed stage, never the frame.
+          // Diagnostic rejection must not replace failure or delay custody.
+          void Promise.resolve(this.#observeFailureCodeForTesting(frame.code))
+            .catch(() => undefined);
+        } catch {
+          // Synchronous diagnostic failure is equally non-authoritative.
+        }
+      }
       this.#fail(new LiveAcceptanceError("worker_failed"));
       return;
     }
@@ -1643,7 +1662,10 @@ class ProcessWorker implements ClaudeLiveAcceptanceWorker {
 export const startLiveAcceptanceProcessWorkerForTesting = async (
   descriptor: AcceptanceInstallationDescriptor,
   launch: ProcessWorkerLaunch,
-): Promise<LiveAcceptanceWorker> => await ProcessWorker.start(descriptor, launch);
+  observeFailureCodeForTesting?: WorkerFailureCodeObserverForTesting,
+): Promise<LiveAcceptanceWorker> => await ProcessWorker.start(descriptor, launch, {
+  ...(observeFailureCodeForTesting === undefined ? {} : { observeFailureCodeForTesting }),
+});
 
 export const startLiveAcceptanceProcessWorker = async (
   descriptor: AcceptanceInstallationDescriptor,

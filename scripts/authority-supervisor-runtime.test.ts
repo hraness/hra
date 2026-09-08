@@ -1,4 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { closeSync, constants, fstatSync, openSync, opendirSync, readlinkSync, readSync, type Stats } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readlink, rm } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -38,6 +40,526 @@ afterEach(async () => {
 });
 
 type ChildClose = Readonly<{ code: number | null; signal: NodeJS.Signals | null }>;
+
+const socketProbeMaximumEntries = 4_096;
+const socketProbeDeadlineMs = 250;
+type PrivateChildSockets = Readonly<{ stdout: string; stderr: string }>;
+type SocketProbeDirectory = Readonly<{ read(): string | null; close(): void }>;
+type SocketProbeIo = Readonly<{
+  now(): number;
+  openSelfDescriptors(): SocketProbeDirectory;
+  readSelfDescriptor(descriptor: number): unknown;
+}>;
+
+const systemSocketProbeIo: SocketProbeIo = {
+  now: () => performance.now(),
+  openSelfDescriptors: () => {
+    const directory = opendirSync("/proc/self/fd", { bufferSize: 32 });
+    return { read: () => directory.readSync()?.name ?? null, close: () => directory.closeSync() };
+  },
+  readSelfDescriptor: (descriptor) => readlinkSync(`/proc/self/fd/${String(descriptor)}`),
+};
+
+const privatePositiveU64 = (value: unknown): value is string =>
+  typeof value === "string" && /^[1-9][0-9]{0,19}$/u.test(value)
+  && BigInt(value) <= 18_446_744_073_709_551_615n;
+
+const privateSocketIdentity = (value: unknown): string | undefined => {
+  if (typeof value !== "string" || value.length > 29) return undefined;
+  const match = /^socket:\[([1-9][0-9]{0,19})\]$/u.exec(value);
+  return privatePositiveU64(match?.[1]) ? value : undefined;
+};
+
+const privateSocketMarker = (value: unknown): PrivateChildSockets | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)
+    || Object.keys(value).length !== 2 || !Object.hasOwn(value, "stdout") || !Object.hasOwn(value, "stderr")) return undefined;
+  const stdout = privateSocketIdentity((value as Record<string, unknown>).stdout);
+  const stderr = privateSocketIdentity((value as Record<string, unknown>).stderr);
+  return stdout === undefined || stderr === undefined ? undefined : Object.freeze({ stdout, stderr });
+};
+
+type SocketMarkerStat = Pick<Stats, "isFile" | "uid" | "mode" | "nlink" | "size" | "dev" | "ino" | "mtimeMs" | "ctimeMs">;
+type SocketMarkerFile = Readonly<{ stat(): SocketMarkerStat; read(buffer: Buffer): number; close(): void }>;
+type SocketMarkerIo = Readonly<{ open(path: string): SocketMarkerFile; now(): number; uid(): number | undefined }>;
+const systemSocketMarkerIo: SocketMarkerIo = {
+  now: () => performance.now(),
+  uid: () => process.getuid?.(),
+  open: (path) => {
+    const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    return {
+      stat: () => fstatSync(descriptor),
+      read: (buffer) => readSync(descriptor, buffer, 0, buffer.byteLength, 0),
+      close: () => closeSync(descriptor),
+    };
+  },
+};
+
+const readPrivateSocketMarker = (path: string, io: SocketMarkerIo = systemSocketMarkerIo): PrivateChildSockets | undefined => {
+  let file: SocketMarkerFile | undefined;
+  let result: PrivateChildSockets | undefined;
+  let deadline = 0;
+  try {
+    deadline = io.now() + socketProbeDeadlineMs;
+    file = io.open(path);
+    const before = file.stat();
+    if (before.isFile() && before.uid === io.uid() && (before.mode & 0o7777) === 0o600 && before.nlink === 1
+      && Number.isInteger(before.size) && before.size >= 2 && before.size <= 128 && io.now() < deadline) {
+      const buffer = Buffer.alloc(129);
+      const bytes = file.read(buffer);
+      const after = file.stat();
+      if (bytes === before.size && after.dev === before.dev && after.ino === before.ino
+        && after.size === before.size && after.mode === before.mode && after.uid === before.uid
+        && after.nlink === before.nlink && after.mtimeMs === before.mtimeMs && after.ctimeMs === before.ctimeMs
+        && io.now() < deadline) {
+        const text = buffer.toString("utf8", 0, bytes);
+        const parsed = privateSocketMarker(JSON.parse(text) as unknown);
+        if (parsed !== undefined && JSON.stringify(parsed) === text) result = parsed;
+      }
+    }
+  } catch {
+    result = undefined;
+  } finally {
+    try { file?.close(); } catch { result = undefined; }
+    try { if (!(io.now() < deadline)) result = undefined; } catch { result = undefined; }
+  }
+  return result;
+};
+
+const socketMarkerFixture = (text = '{"stdout":"socket:[111]","stderr":"socket:[222]"}') => {
+  const calls: string[] = [];
+  const metadata: SocketMarkerStat = {
+    isFile: () => true, uid: 501, mode: 0o100600, nlink: 1,
+    size: Buffer.byteLength(text), dev: 1, ino: 2, mtimeMs: 3, ctimeMs: 4,
+  };
+  const file: SocketMarkerFile = {
+    stat: () => { calls.push("stat"); return metadata; },
+    read: (buffer) => { calls.push("read"); return buffer.write(text); },
+    close: () => { calls.push("close"); },
+  };
+  const io: SocketMarkerIo = {
+    now: () => 0, uid: () => 501,
+    open: (path) => { calls.push(path); return file; },
+  };
+  return { calls, metadata, file, io };
+};
+
+const censusSelfSocketWriters = (
+  sockets: PrivateChildSockets | undefined,
+  io: SocketProbeIo = systemSocketProbeIo,
+) => {
+  const result = {
+    childSocketsCaptured: sockets !== undefined,
+    selfFdCensusComplete: false,
+    selfFdEntriesScanned: 0,
+    selfStdoutWriterMatches: 0,
+    selfStderrWriterMatches: 0,
+  };
+  let directory: SocketProbeDirectory | undefined;
+  let deadline = 0;
+  try {
+    if (sockets === undefined) return Object.freeze(result);
+    deadline = io.now() + socketProbeDeadlineMs;
+    let incomplete = false;
+    directory = io.openSelfDescriptors();
+    while (result.selfFdEntriesScanned < socketProbeMaximumEntries && io.now() < deadline) {
+      const name = directory.read();
+      if (name === null) {
+        result.selfFdCensusComplete = !incomplete && io.now() < deadline;
+        break;
+      }
+      result.selfFdEntriesScanned += 1;
+      if (!/^(?:0|[1-9][0-9]{0,9})$/u.test(name) || Number(name) > 2_147_483_647) {
+        incomplete = true;
+        continue;
+      }
+      if (io.now() >= deadline) break;
+      try {
+        const target = io.readSelfDescriptor(Number(name));
+        if (typeof target !== "string" || target.length > 4_096) incomplete = true;
+        const identity = privateSocketIdentity(target);
+        if (identity === sockets.stdout) result.selfStdoutWriterMatches += 1;
+        if (identity === sockets.stderr) result.selfStderrWriterMatches += 1;
+      } catch {
+        // A concurrently closed descriptor makes this census incomplete.
+        incomplete = true;
+      }
+    }
+  } catch {
+    result.selfFdCensusComplete = false;
+  } finally {
+    try {
+      directory?.close();
+    } catch {
+      result.selfFdCensusComplete = false;
+    }
+    if (directory !== undefined) {
+      try { if (!(io.now() < deadline)) result.selfFdCensusComplete = false; }
+      catch { result.selfFdCensusComplete = false; }
+    }
+  }
+  // These are self-process observations, never proof of global writer absence.
+  // Local procfs calls are synchronous and joined; the time cap is checked
+  // between calls, rather than abandoning an in-flight directory operation.
+  return Object.freeze(result);
+};
+
+const socketProbeFixture = () => {
+  const calls: string[] = [];
+  const names = ["10", "11", "12", "13", "14"];
+  const targets = ["socket:[111]", "socket:[222]", "socket:[111]", "private path", "pipe:[111]"];
+  let next = 0;
+  const io: SocketProbeIo = {
+    now: () => 0,
+    openSelfDescriptors: () => {
+      calls.push("open");
+      return {
+        read: () => names[next++] ?? null,
+        close: () => { calls.push("close"); },
+      };
+    },
+    readSelfDescriptor: (descriptor) => targets[descriptor - 10],
+  };
+  return { calls, io };
+};
+
+test("socket diagnostic parses only two bounded private socket identities", () => {
+  for (const invalid of [null, "pipe:[111]", "socket:[0]", "socket:[01]", "socket:[18446744073709551616]", "socket:[111]suffix"]) {
+    expect(privateSocketIdentity(invalid)).toBeUndefined();
+  }
+  expect(privateSocketMarker({ stdout: "socket:[111]", stderr: "socket:[222]" }))
+    .toEqual({ stdout: "socket:[111]", stderr: "socket:[222]" });
+  for (const invalid of [
+    null, [], { stdout: "socket:[111]" },
+    { stdout: "socket:[111]", stderr: "socket:[222]", private: "detail" },
+    { stdout: "private path", stderr: "socket:[222]" },
+    Object.create({ stdout: "socket:[111]", stderr: "socket:[222]" }) as unknown,
+  ]) {
+    expect(privateSocketMarker(invalid)).toBeUndefined();
+  }
+});
+
+test("socket diagnostic reads one private canonical marker and closes its own handle", () => {
+  const value = socketMarkerFixture();
+  const result = readPrivateSocketMarker("exact-owned-marker", value.io);
+  expect(result).toEqual({ stdout: "socket:[111]", stderr: "socket:[222]" });
+  expect(Object.isFrozen(result)).toBe(true);
+  expect(value.calls).toEqual(["exact-owned-marker", "stat", "read", "stat", "close"]);
+  for (const text of [
+    "not JSON", "null", "[]", '{"stdout":"socket:[111]"}',
+    '{"stdout":"socket:[111]","stderr":"socket:[222]","extra":true}',
+    '{"stdout":"socket:[111]","stderr":"socket:[222]","stdout":"socket:[111]"}',
+    '{"stderr":"socket:[222]","stdout":"socket:[111]"}',
+    '{"stdout":"private path","stderr":"socket:[222]"}',
+    '{"stdout":"socket:[111]","stderr":"socket:[222]"}\n',
+  ]) {
+    const invalid = socketMarkerFixture(text);
+    expect(readPrivateSocketMarker("exact-owned-marker", invalid.io)).toBeUndefined();
+    expect(invalid.calls.at(-1)).toBe("close");
+  }
+});
+
+test.each(["type", "uid", "mode", "links", "small", "large", "fractional"] as const)(
+  "socket diagnostic rejects marker %s metadata before reading",
+  (failure) => {
+    const value = socketMarkerFixture();
+    const metadata = { ...value.metadata };
+    if (failure === "type") metadata.isFile = () => false;
+    if (failure === "uid") metadata.uid += 1;
+    if (failure === "mode") metadata.mode = 0o100644;
+    if (failure === "links") metadata.nlink = 2;
+    if (failure === "small") metadata.size = 1;
+    if (failure === "large") metadata.size = 129;
+    if (failure === "fractional") metadata.size = 2.5;
+    const io = { ...value.io, open: () => ({ ...value.file, stat: () => metadata }) };
+    expect(readPrivateSocketMarker("exact-owned-marker", io)).toBeUndefined();
+    expect(value.calls).toEqual(["close"]);
+  },
+);
+
+test.each(["dev", "ino", "size", "mode", "uid", "nlink", "mtimeMs", "ctimeMs"] as const)(
+  "socket diagnostic rejects marker %s changes across the bounded read",
+  (field) => {
+    const value = socketMarkerFixture();
+    let stats = 0;
+    const io = { ...value.io, open: () => ({ ...value.file,
+      stat: () => ++stats === 1 ? value.metadata : { ...value.metadata, [field]: value.metadata[field] + 1 },
+    }) };
+    expect(readPrivateSocketMarker("exact-owned-marker", io)).toBeUndefined();
+    expect(value.calls).toEqual(["read", "close"]);
+  },
+);
+
+test.each(["open", "stat", "read", "close", "clock", "uid", "short", "long", "deadline", "close_deadline"] as const)(
+  "socket diagnostic makes marker %s failure unavailable and joins any owned handle",
+  (failure) => {
+    const value = socketMarkerFixture();
+    let closes = 0;
+    let clock = 0;
+    const io: SocketMarkerIo = {
+      now: () => {
+        if (failure === "clock") throw new Error("private clock detail");
+        return failure === "deadline" ? (clock += 100) : clock;
+      },
+      uid: () => failure === "uid" ? undefined : 501,
+      open: () => {
+        if (failure === "open") throw new Error("private open detail");
+        return {
+          stat: () => {
+            if (failure === "stat") throw new Error("private stat detail");
+            return value.metadata;
+          },
+          read: (buffer) => {
+            expect(buffer.byteLength).toBe(129);
+            if (failure === "read") throw new Error("private read detail");
+            const bytes = value.file.read(buffer);
+            if (failure === "short") return bytes - 1;
+            return failure === "long" ? bytes + 1 : bytes;
+          },
+          close: () => {
+            closes += 1;
+            if (failure === "close") throw new Error("private close detail");
+            if (failure === "close_deadline") clock = socketProbeDeadlineMs;
+          },
+        };
+      },
+    };
+    expect(readPrivateSocketMarker("exact-owned-marker", io)).toBeUndefined();
+    expect(closes).toBe(failure === "open" || failure === "clock" ? 0 : 1);
+  },
+);
+
+test("socket diagnostic reports only self counts and joins its exact directory", () => {
+  const value = socketProbeFixture();
+  const sockets = { stdout: "socket:[111]", stderr: "socket:[222]" };
+  const result = censusSelfSocketWriters(sockets, value.io);
+  expect(result).toEqual({ childSocketsCaptured: true, selfFdCensusComplete: true,
+    selfFdEntriesScanned: 5, selfStdoutWriterMatches: 2, selfStderrWriterMatches: 1 });
+  expect(value.calls.slice(-2)).toEqual(["open", "close"]);
+  expect(Object.isFrozen(result)).toBe(true);
+  expect(JSON.stringify(result)).not.toMatch(/111|222|private|321|123456/u);
+  const unavailable = socketProbeFixture();
+  expect(censusSelfSocketWriters(undefined, unavailable.io)).toEqual({ childSocketsCaptured: false,
+    selfFdCensusComplete: false, selfFdEntriesScanned: 0, selfStdoutWriterMatches: 0, selfStderrWriterMatches: 0 });
+  expect(unavailable.calls).toEqual([]);
+});
+
+test.each(["open", "read", "link", "close", "name", "deadline", "entry_cap"] as const)(
+  "socket diagnostic marks %s failure incomplete without escaping or abandoning an owned directory",
+  (failure) => {
+    const value = socketProbeFixture();
+    let closed = 0;
+    let reads = 0;
+    let clock = 0;
+    const io: SocketProbeIo = {
+      ...value.io,
+      now: () => failure === "deadline" ? (clock += 100) : 0,
+      openSelfDescriptors: () => {
+        if (failure === "open") throw new Error("private open detail");
+        return {
+          read: () => {
+            reads += 1;
+            if (failure === "read") throw new Error("private read detail");
+            if (failure === "entry_cap") return "10";
+            return reads === 1 ? failure === "name" ? "../private" : "10" : null;
+          },
+          close: () => { closed += 1; if (failure === "close") throw new Error("private close detail"); },
+        };
+      },
+      readSelfDescriptor: () => {
+        if (failure === "link") throw new Error("private link detail");
+        return "socket:[111]";
+      },
+    };
+    const result = censusSelfSocketWriters({ stdout: "socket:[111]", stderr: "socket:[222]" }, io);
+    expect(result.selfFdCensusComplete).toBe(false);
+    expect(closed).toBe(failure === "open" ? 0 : 1);
+    expect(reads).toBeLessThanOrEqual(socketProbeMaximumEntries);
+    expect(result.selfFdEntriesScanned).toBeLessThanOrEqual(socketProbeMaximumEntries);
+    expect(JSON.stringify(result)).not.toContain("private");
+    if (failure === "entry_cap") expect(reads).toBe(socketProbeMaximumEntries);
+    if (failure === "deadline") expect(reads).toBe(1);
+  },
+);
+
+type LifecycleEmitter = Pick<EventEmitter, "on" | "off">;
+type LifecycleChild = LifecycleEmitter & Readonly<{
+  stdout: LifecycleEmitter;
+  stderr: LifecycleEmitter;
+}>;
+
+const createChildLifecycleRecorder = () => {
+  const state = {
+    childAttached: false,
+    exitObserved: false,
+    exitCode: null as number | null,
+    exitSignalPresent: false,
+    closeObserved: false,
+    closeCode: null as number | null,
+    closeSignalPresent: false,
+    stdoutEnd: false,
+    stdoutClose: false,
+    stderrEnd: false,
+    stderrClose: false,
+    controlAttached: false,
+    controlEnd: false,
+    controlClose: false,
+    controlError: false,
+  };
+  let child: LifecycleChild | undefined;
+  let control: LifecycleEmitter | undefined;
+  let disposed = false;
+  const boundedCode = (code: unknown): number | null =>
+    typeof code === "number" && Number.isInteger(code) && code >= 0 && code <= 255
+      ? code
+      : null;
+  const onExit = (code: unknown, signal: unknown): void => {
+    state.exitObserved = true;
+    state.exitCode = boundedCode(code);
+    state.exitSignalPresent = signal !== null && signal !== undefined;
+  };
+  const onClose = (code: unknown, signal: unknown): void => {
+    state.closeObserved = true;
+    state.closeCode = boundedCode(code);
+    state.closeSignalPresent = signal !== null && signal !== undefined;
+  };
+  const onStdoutEnd = (): void => { state.stdoutEnd = true; };
+  const onStdoutClose = (): void => { state.stdoutClose = true; };
+  const onStderrEnd = (): void => { state.stderrEnd = true; };
+  const onStderrClose = (): void => { state.stderrClose = true; };
+  const onControlEnd = (): void => { state.controlEnd = true; };
+  const onControlClose = (): void => { state.controlClose = true; };
+  return {
+    attachChild(value: LifecycleChild): void {
+      if (disposed) return;
+      if (child !== undefined) throw new Error("authority_lifecycle_child_already_attached");
+      child = value;
+      state.childAttached = true;
+      value.on("exit", onExit);
+      value.on("close", onClose);
+      value.stdout.on("end", onStdoutEnd);
+      value.stdout.on("close", onStdoutClose);
+      value.stderr.on("end", onStderrEnd);
+      value.stderr.on("close", onStderrClose);
+    },
+    attachControl(value: LifecycleEmitter): void {
+      if (disposed) return;
+      if (control !== undefined) throw new Error("authority_lifecycle_control_already_attached");
+      control = value;
+      state.controlAttached = true;
+      value.on("end", onControlEnd);
+      value.on("close", onControlClose);
+    },
+    recordControlError(): void {
+      // Called by the existing socket error owner: the recorder must not add
+      // error handlers that would change unhandled-error behavior.
+      if (!disposed) state.controlError = true;
+    },
+    snapshot: () => Object.freeze({ ...state }),
+    dispose(): void {
+      if (disposed) return;
+      disposed = true;
+      child?.off("exit", onExit);
+      child?.off("close", onClose);
+      child?.stdout.off("end", onStdoutEnd);
+      child?.stdout.off("close", onStdoutClose);
+      child?.stderr.off("end", onStderrEnd);
+      child?.stderr.off("close", onStderrClose);
+      control?.off("end", onControlEnd);
+      control?.off("close", onControlClose);
+    },
+  };
+};
+
+test("child lifecycle recorder distinguishes exit, pipe closure, and control FIN", () => {
+  const recorder = createChildLifecycleRecorder();
+  const child = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+  });
+  const control = new EventEmitter();
+  const initial = recorder.snapshot();
+  expect(initial).toEqual({
+    childAttached: false, exitObserved: false, exitCode: null, exitSignalPresent: false,
+    closeObserved: false, closeCode: null, closeSignalPresent: false,
+    stdoutEnd: false, stdoutClose: false, stderrEnd: false, stderrClose: false,
+    controlAttached: false, controlEnd: false, controlClose: false, controlError: false,
+  });
+  try {
+    recorder.attachChild(child);
+    recorder.attachControl(control);
+    child.emit("exit", 0, null);
+    const exited = recorder.snapshot();
+    expect(exited).toEqual({ ...initial, childAttached: true, controlAttached: true,
+      exitObserved: true, exitCode: 0 });
+    control.emit("end");
+    expect(recorder.snapshot()).toEqual({ ...exited, controlEnd: true });
+    control.emit("close");
+    recorder.recordControlError();
+    child.stdout.emit("end");
+    child.stderr.emit("end");
+    expect(recorder.snapshot()).toEqual({ ...exited,
+      controlEnd: true, controlClose: true, controlError: true, stdoutEnd: true, stderrEnd: true });
+    child.stdout.emit("close");
+    child.stderr.emit("close");
+    child.emit("close", 0, null);
+    expect(recorder.snapshot()).toEqual({ ...exited,
+      controlEnd: true, controlClose: true, controlError: true,
+      stdoutEnd: true, stdoutClose: true, stderrEnd: true, stderrClose: true,
+      closeObserved: true, closeCode: 0 });
+    expect(exited.closeObserved).toBe(false);
+    expect(initial.childAttached).toBe(false);
+    expect(Object.isFrozen(exited)).toBe(true);
+  } finally {
+    recorder.dispose();
+  }
+});
+
+test("child lifecycle recorder bounds values and removes only its own listeners", () => {
+  const recorder = createChildLifecycleRecorder();
+  const child = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+  });
+  const control = new EventEmitter();
+  const sources = [child, child.stdout, child.stderr, control];
+  const foreign = () => undefined;
+  for (const source of sources) source.on("close", foreign);
+  try {
+    recorder.attachChild(child);
+    recorder.attachControl(control);
+    expect(() => recorder.attachChild(child)).toThrow("authority_lifecycle_child_already_attached");
+    expect(() => recorder.attachControl(control)).toThrow("authority_lifecycle_control_already_attached");
+    for (const source of sources) expect(source.listenerCount("error")).toBe(0);
+    child.stdout.emit("end");
+    child.stdout.emit("close");
+    expect(recorder.snapshot()).toMatchObject({ stdoutEnd: true, stdoutClose: true,
+      exitObserved: false, closeObserved: false, stderrEnd: false, stderrClose: false });
+    child.emit("exit", Number.MAX_SAFE_INTEGER, "not-retained");
+    child.emit("close", null, "not-retained");
+    expect(recorder.snapshot()).toMatchObject({ exitObserved: true, exitCode: null,
+      exitSignalPresent: true, closeObserved: true, closeCode: null, closeSignalPresent: true });
+    expect(JSON.stringify(recorder.snapshot())).not.toContain("not-retained");
+    const beforeDisposal = recorder.snapshot();
+    recorder.dispose();
+    recorder.dispose();
+    for (const source of sources) {
+      expect(source.listeners("close")).toEqual([foreign]);
+      expect(source.listenerCount("end")).toBe(0);
+      expect(source.listenerCount("exit")).toBe(0);
+    }
+    recorder.attachChild(child);
+    recorder.attachControl(control);
+    recorder.recordControlError();
+    child.emit("exit", 7, null);
+    child.stderr.emit("end");
+    control.emit("end");
+    control.emit("close");
+    expect(recorder.snapshot()).toEqual(beforeDisposal);
+  } finally {
+    recorder.dispose();
+    for (const source of sources) source.off("close", foreign);
+  }
+});
 
 const observeChildClose = async (
   child: ChildProcessWithoutNullStreams,
@@ -122,18 +644,27 @@ class ControlServer {
   readonly #lines: string[] = [];
   readonly #server: Server;
   readonly path: string;
+  readonly #lifecycle: ReturnType<typeof createChildLifecycleRecorder>;
   #socket: Socket | undefined;
   #waiter: Readonly<{ reject: (error: Error) => void; resolve: (line: string) => void }> | undefined;
 
-  private constructor(server: Server, path: string) {
+  private constructor(
+    server: Server,
+    path: string,
+    lifecycle: ReturnType<typeof createChildLifecycleRecorder>,
+  ) {
     this.#server = server;
     this.path = path;
+    this.#lifecycle = lifecycle;
   }
 
-  static async start(root: string): Promise<ControlServer> {
+  static async start(
+    root: string,
+    lifecycle: ReturnType<typeof createChildLifecycleRecorder>,
+  ): Promise<ControlServer> {
     const path = join(root, `.authority-control-${"a".repeat(32)}.sock`);
     const server = createServer();
-    const control = new ControlServer(server, path);
+    const control = new ControlServer(server, path, lifecycle);
     server.on("connection", (socket) => control.#accept(socket));
     await new Promise<void>((resolvePromise, rejectPromise) => {
       server.once("error", rejectPromise);
@@ -152,6 +683,7 @@ class ControlServer {
       return;
     }
     this.#socket = socket;
+    this.#lifecycle.attachControl(socket);
     let buffer = "";
     socket.setEncoding("utf8");
     socket.on("data", (chunk: string) => {
@@ -169,7 +701,10 @@ class ControlServer {
         }
       }
     });
-    socket.once("error", () => this.#waiter?.reject(new Error("authority_control_socket_error")));
+    socket.once("error", () => {
+      this.#lifecycle.recordControlError();
+      this.#waiter?.reject(new Error("authority_control_socket_error"));
+    });
     socket.once("close", () => this.#waiter?.reject(new Error("authority_control_socket_closed")));
   }
 
@@ -428,14 +963,67 @@ const spawnBindAliasDriver = async (
   stdio: ["pipe", "pipe", "pipe"],
 });
 
+test.each([false, true])("portable stdin-gated child naturally closes both output streams (writes=%s)", async (writes) => {
+  if (process.platform === "win32") return;
+  const child = spawn("/bin/sh", ["-c", writes
+    ? "read -r gate; printf x; printf y >&2; exit 0"
+    : "read -r gate; exit 0"], {
+    env: { PATH: "/usr/bin:/bin" },
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const lifecycle = createChildLifecycleRecorder();
+  lifecycle.attachChild(child);
+  const closed = observeChildClose(child);
+  void closed.catch(() => undefined);
+  let onCleanupClose: ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined;
+  const cleanupClosed = new Promise<ChildClose>((resolvePromise) => {
+    onCleanupClose = (code, signal) => resolvePromise({ code, signal });
+    child.once("close", onCleanupClose);
+  });
+  try {
+    await waitForChildSpawn(child);
+    // Match the native regression's resume-only draining, without data listeners.
+    child.stdout.resume();
+    child.stderr.resume();
+    child.stdin.end("GO\n");
+    await expect(requireChildClose(closed, 15_000)).resolves.toEqual({ code: 0, signal: null });
+    expect(lifecycle.snapshot()).toMatchObject({ exitObserved: true, closeObserved: true,
+      stdoutEnd: true, stdoutClose: true, stderrEnd: true, stderrClose: true });
+  } catch (error: unknown) {
+    try {
+      process.stderr.write(`authority_portable_child_lifecycle ${JSON.stringify({ writes, ...lifecycle.snapshot() })}\n`);
+    } catch { /* Diagnostic output cannot replace the original failure. */ }
+    lifecycle.dispose();
+    // Only a failed natural proof allows forced cleanup of this exact child's
+    // parent streams. Forced closure can never satisfy the assertion above.
+    let cleanupFailed = false;
+    try { child.kill("SIGKILL"); } catch { cleanupFailed = true; }
+    for (const stream of [child.stdin, child.stdout, child.stderr]) {
+      try { stream.destroy(); } catch { cleanupFailed = true; }
+    }
+    try { await requireChildClose(cleanupClosed, 2_000); } catch { cleanupFailed = true; }
+    if (cleanupFailed) {
+      try { process.stderr.write("authority_portable_child_cleanup {\"complete\":false}\n"); }
+      catch { /* Preserve the original failure even if diagnostic output fails. */ }
+    }
+    throw error;
+  } finally {
+    lifecycle.dispose();
+    if (onCleanupClose !== undefined) child.off("close", onCleanupClose);
+  }
+}, 20_000);
+
 test("authority supervisor holds a target behind GO", async () => {
   if (!isSupportedLinux()) return;
   const root = await makeRoot();
   const marker = join(root, "target-ran");
+  const socketMarker = join(root, "target-private-stdio-sockets");
   const parentPidNamespace = await readlink("/proc/self/ns/pid");
   const controlRoot = join(root, "process-recovery");
   await mkdir(controlRoot, { mode: 0o700 });
-  const control = await ControlServer.start(controlRoot);
+  const lifecycle = createChildLifecycleRecorder();
+  const control = await ControlServer.start(controlRoot, lifecycle);
   const nonce = "1".repeat(32);
   const opened = await openAuthoritySupervisorArtifact();
   let child: ChildProcessWithoutNullStreams | undefined;
@@ -448,13 +1036,18 @@ test("authority supervisor holds a target behind GO", async () => {
       "--",
       process.execPath,
       "-e",
-      `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(marker)}, fs.readlinkSync('/proc/self/ns/pid'))`,
+      `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(marker)}, fs.readlinkSync('/proc/self/ns/pid'));
+       try {
+         const sockets = JSON.stringify({ stdout: fs.readlinkSync('/proc/self/fd/1'), stderr: fs.readlinkSync('/proc/self/fd/2') });
+         if (Buffer.byteLength(sockets, 'utf8') <= 128) fs.writeFileSync(${JSON.stringify(socketMarker)}, sockets, { flag: 'wx', mode: 0o600 });
+       } catch {}`,
     ], {
       cwd: root,
       env: process.env,
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    lifecycle.attachChild(child);
     const closed = observeChildClose(child);
     void closed.catch(() => undefined);
     await waitForChildSpawn(child);
@@ -475,15 +1068,28 @@ test("authority supervisor holds a target behind GO", async () => {
     child.stdin.end();
     const clean = await control.nextLine();
     expect(clean).toBe(`HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${nonce} exit=0`);
-    // This observation starts before READY, so it includes CI scheduling around
-    // namespace setup as well as the post-GO shutdown. Keep it bounded by the
-    // enclosing 20-second test timeout without making a normal Linux runner
-    // race an arbitrary eight-second deadline.
-    await expect(requireChildClose(closed, 15_000)).resolves.toEqual({ code: 0, signal: null });
+    // The close observer starts before READY; this 15-second deadline starts
+    // after CLEAN. Require joined process and pipe closure even after CLEAN.
+    try {
+      await expect(requireChildClose(closed, 15_000)).resolves.toEqual({ code: 0, signal: null });
+    } catch (error: unknown) {
+      // Capture before forced cleanup can change lifecycle observations. Only
+      // fixed scalar state is emitted, never control lines or process output.
+      const snapshot = lifecycle.snapshot();
+      try {
+        // The fixed target inherits these writer endpoints unchanged. It writes
+        // only its own identities in this fresh private root, after its original
+        // namespace marker; missing diagnostics do not weaken CLEAN or close.
+        const selfWriters = censusSelfSocketWriters(readPrivateSocketMarker(socketMarker));
+        process.stderr.write(`authority_child_lifecycle ${JSON.stringify({ ...snapshot, ...selfWriters })}\n`);
+      } catch { /* Diagnostic inability cannot replace the original failure. */ }
+      throw error;
+    }
     const targetPidNamespace = await readFile(marker, "utf8");
     expect(targetPidNamespace).toBe(`pid:[${namespaceMatch?.[1] ?? "missing"}]`);
     expect(targetPidNamespace).not.toBe(parentPidNamespace);
   } finally {
+    lifecycle.dispose();
     child?.kill("SIGKILL");
     await opened.close().catch(() => undefined);
     await control.close();
