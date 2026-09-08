@@ -562,7 +562,7 @@ export const publicContent: PublicContent = {
               code("$BUN_INSTALL/install/hra/install-intent.json"),
               text(" when the intent is invalid or belongs to another release. Do not edit or delete that file or its staging or version directories. Rerun the exact immutable install command from the originating release's trusted README or release notes and require the exact "),
               code("hra-install-safe"),
-              text(" success output. If that installer refuses the intent, stop for manual review; after success, restart this runbook with the current release. Establish the originating tag independently; never execute a URL or command copied only from the intent, and stop for manual review if the tag is uncertain. This recovers only local installer state. It is not authorization to retry, rerun, or mutate that release's GitHub Actions workflow, tag, GitHub Release, or npm publication."),
+              text(" success output. If that installer refuses the intent, stop installation and use bounded read-only diagnosis while preserving the intent and its directories; after exact recovery succeeds, restart this runbook with the current release. Establish the originating tag independently from trusted release evidence; never execute a URL or command copied only from the intent. An uncertain tag blocks execution, not diagnosis. Ask the owner only when the evidence cannot resolve a required decision or authority is missing. This recovers only local installer state. It is not authorization to retry, rerun, or mutate that release's GitHub Actions workflow, tag, GitHub Release, or npm publication."),
             ],
           },
           {

@@ -603,11 +603,15 @@ describe("release workflow", () => {
     expect(readme).toContain("next invocation of that exact release's installer");
     expect(readme).toContain("`$BUN_INSTALL/install/hra/install-intent.json`");
     expect(readme).toContain("the exact immutable install command from the originating release's trusted README or release notes");
-    expect(readme).toContain("If that installer refuses the intent, stop for manual review");
+    expect(readme).toContain("If that installer refuses the intent, stop installation and use bounded read-only diagnosis");
+    expect(readme).toContain("while preserving the intent and its directories");
+    expect(readme).toContain("An uncertain tag blocks execution, not diagnosis");
     expect(readme).toContain("It is not authorization to retry, rerun, or mutate that release's GitHub Actions workflow");
     expect(releaseNotes).toContain("A durable installer intent is release-bound");
     expect(releaseNotes).toContain("An installer from another release fails closed without deleting it");
-    expect(releaseNotes).toContain("If that installer refuses the intent, stop for manual review");
+    expect(releaseNotes).toContain("If that installer refuses the intent, stop installation and use bounded read-only diagnosis");
+    expect(releaseNotes).toContain("while preserving the intent and its directories");
+    expect(releaseNotes).toContain("An uncertain tag blocks execution, not diagnosis");
     expect(releaseNotes).toContain("This is local installer recovery, not authorization to retry or mutate");
     expect(releaseNotes).not.toContain("src/install-preflight.ts | bun -");
     expect(releaseNotes).not.toContain("bun add --global");
@@ -650,17 +654,66 @@ describe("release workflow", () => {
       .toBeLessThan(releaseNotes.indexOf("```sh"));
   });
 
-  test("keeps the integrated memory live proofs beside the tag procedure", async () => {
-    const releaseRecord = await readFile(join(import.meta.dir, "..", "docs", "beta-release.md"), "utf8");
+  test("separates machine-gated artifact release from optional live qualification", async () => {
+    const root = join(import.meta.dir, "..");
+    const [releaseRecord, hostedQualification, claudeQualification, plan] = await Promise.all([
+      readFile(join(root, "docs", "beta-release.md"), "utf8"),
+      readFile(join(root, "docs", "live-acceptance.md"), "utf8"),
+      readFile(join(root, "docs", "claude-live-acceptance.md"), "utf8"),
+      readFile(join(root, "kb", "plans", "oh-memory-civilization.md"), "utf8"),
+    ]);
     const tagProcedure = releaseRecord.split("The replacement release path")[1]
       ?.split("The release workflow does not rerun")[0];
     expect(tagProcedure).toBeDefined();
-    expect(tagProcedure).toContain("do not run `release:tag` or publish until both");
-    expect(tagProcedure).toContain("authenticated Claude proof");
-    expect(tagProcedure).toContain("two-device hosted-memory proof");
+    expect(tagProcedure).toContain("Policy decision (2026-09-08)");
+    expect(tagProcedure).toContain("authenticated Claude and two-device hosted-memory qualification");
+    expect(tagProcedure).toContain("not prerequisites for tagging or publishing `v0.7.0`");
+    expect(tagProcedure).toContain("supersedes the earlier pre-tag live-proof requirement");
+    expect(tagProcedure).toContain("Neither live proof is claimed complete");
     expect(tagProcedure).toContain("../kb/plans/oh-memory-civilization.md#phase-10-validate-and-deliver-hosted-support");
     expect(tagProcedure).toContain("The tag helper and artifact workflow do not establish authenticated acceptance evidence");
+    expect(tagProcedure).toContain("immutable owner User ID `894119`");
+    expect(tagProcedure).toContain("clean exact current remote `main`");
+    expect(tagProcedure).toContain("the exact commit's `Required` CI job succeeded");
+    expect(tagProcedure).toContain("never asks for a second conversational approval");
+    expect(tagProcedure).toContain("capacity activation and intended-target gates pass");
+    expect(tagProcedure).not.toContain("do not run `release:tag` or publish until both");
     expect(releaseRecord).not.toContain("Publication is safe independently because");
+
+    for (const qualification of [hostedQualification, claudeQualification]) {
+      expect(qualification).toContain("not a prerequisite for tagging or publishing HRA artifacts");
+      expect(qualification).toContain("beta-release.md");
+      expect(qualification).toContain("Use an authorized Linux host");
+    }
+    expect(hostedQualification).toContain("version-two memory evidence");
+    expect(hostedQualification).toContain("HRA never falls back to local custody");
+    expect(claudeQualification).toContain("deterministic tests do not substitute for an authenticated live run");
+    expect(claudeQualification).toContain("Write passing evidence only after cleanup succeeds");
+    expect(claudeQualification).not.toContain("A release still needs the fresh exact-tree aggregate and this authorized Linux proof");
+
+    const checkpoint = plan.split("## Current delivery checkpoint\n")[1]
+      ?.split("### Historical metadata correction")[0];
+    const phase6 = plan.split("## Phase 6: Add Claude provider parity\n")[1]
+      ?.split("## Phase 7: Validate and deliver the local release\n")[0];
+    const phase10 = plan.split("## Phase 10: Validate and deliver hosted support\n")[1]
+      ?.split("## Implementation log")[0];
+    expect(checkpoint).toBeDefined();
+    expect(checkpoint).toContain("2026-09-08 release-policy supersession");
+    expect(checkpoint).toContain("historical pre-tag live-proof requirements no longer govern artifact release");
+    expect(checkpoint).toContain("blocks hosted deployment and activation, not artifact publication");
+    expect(phase6).toBeDefined();
+    expect(phase6).toContain("The fresh exact-tree aggregate remains required");
+    expect(phase6).toContain("Authenticated combined proof is required only to claim live qualification, not for phase 7 source admission or artifact release");
+    expect(phase6).not.toContain("exact-tree aggregate and authenticated combined proof remain required");
+    expect(phase10).toBeDefined();
+    expect(phase10).toContain("**Artifact acceptance:**");
+    expect(phase10).toContain("**Hosted rollout acceptance:**");
+    expect(phase10).toContain("before claiming hosted delivery or completing this phase");
+    expect(phase10).toContain("Missing deployment authority keeps hosted work pending but does not block artifact publication");
+    expect(phase10).toContain("**Optional runtime qualification:**");
+    expect(phase10).toContain("Artifact shipping may complete while live qualification remains incomplete");
+    expect(phase10).toContain("without activating a daemon or hosted writer before its separate capacity and target gates pass");
+    expect(phase10).not.toContain("Do not tag or publish the integrated v0.7 release before");
   });
 
   test("requires verified evidence before publishing v0.6.3 admission copy", async () => {
