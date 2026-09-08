@@ -829,7 +829,7 @@ const result = await runClaudeLiveAcceptance(["--resume-fd", "3"], {
   createLogout: forbidden,
   createReadback: forbidden,
   recoverProcessJournal: async () => undefined,
-  sourceAttestation: async () => ${JSON.stringify(candidate)},
+  sourceAttestation: async () => (${JSON.stringify(candidate)}),
   startWorker: async () => forbidden(),
 });
 process.stdout.write(JSON.stringify({ result, workerEffects }));
