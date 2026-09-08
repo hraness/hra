@@ -17,6 +17,16 @@ relations:
 
 # Oh memory and session civilization
 
+## Current delivery checkpoint
+
+PR [135](https://github.com/hraness/hra/pull/135) merged as `c9433d6cc42d757b194d1ef1db5f61b2c83f9ed6`, with the same tree as reviewed source `89652660c1bffeb33e624c436e4f52c6d9566b19`. The fresh local aggregate and both PR CI platforms passed before merge. Post-merge CI [34171201426](https://github.com/hraness/hra/actions/runs/34171201426) failed three history-fixture cases on both platforms because the squash correctly omitted their original branch commit objects. The separate merged-main package/install gate and CodeQL passed; neither replaces the failed aggregate.
+
+The follow-up branch `codex/memory-postmerge-history-20260907` makes the fixtures independent of checkout history. It retains exact positive production-table checks using two small captured repair patches, fixed-digest single- and two-fragment vectors, and mismatched-payload rejection for all five historical records. The three larger historical patches keep their original reviewed evidence rather than adding a multi-megabyte snapshot corpus. Public/sensitive lockfile separation remains covered by the real temporary-repository tests. No production scanner, exception table, Git rendering, complete-history policy, package bytes, or migration changes are made.
+
+All three original failures reproduced in a fresh object-isolated merged-main checkout. The repaired full package-harness file passed 30 tests and 216 assertions on macOS with Bun 1.3.14. Independent review accepted the test diff and verified both captured patches against the original canonical bytes. The exact committed repair's fresh aggregate, PR CI, protected merge, and merged-main verification remain required before this checkpoint advances.
+
+v0.7.0 remains untagged, unpublished and undeployed. Phase 10's authenticated Claude and two-device hosted-memory proofs, guarded capacity activation and target markers remain open. A private Linux ARM64 guest on macOS is an investigated route to the existing Linux containment backend, not a qualified environment or native Darwin Claude proof. Do not infer provider-account selection, quota changes, account deletion, or a live-gate waiver from source delivery. Keep issue 130 open and the downstream Claude-connection Effect expansion held until an explicit qualified handoff.
+
 ## Outcome
 
 Every newly bound Codex or Claude Code session receives one static HRA preamble and a closed provider-native tool surface. Such a session can inspect bounded provider-neutral state for another session in the same project, send an attributable queued message, or steer a supported active turn. It can remember into its own expiring Oh working authority, query that working authority together with a durable project canonical authority, explain results, and explicitly share nominated memory through a destination-owned compare-and-swap adoption. Retired Devin sessions remain historical local data only; they cannot execute or participate in peer coordination.
