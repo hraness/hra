@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -9,6 +9,7 @@ import { z } from "zod";
 
 import { createAttemptId } from "../domain/values";
 import { workApplyResultSchema, workOperationSchema } from "../domain/work";
+import { LEGACY_CANONICAL_PROFILE_GUARDS_SQL } from "./canonical-profile-storage";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
 import { StateStore } from "./state-store";
 import { WorkCapabilityCodec } from "./work-capability";
@@ -502,6 +503,64 @@ describe("canonical migration from authentic source-created schema49", () => {
       expect(snapshot({ paths })).toBe(before);
     });
   }
+
+  test("rolls back a partially installed companion and permits an intact schema49 retry", async () => {
+    const { paths, fixture } = await source49Fixture();
+    const before = snapshot({ paths });
+    const allColumns = () => inspect({ paths }, (database) => canonicalWorkJson(Object.fromEntries(
+      query(database, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").map((row) => {
+        const name = z.string().regex(/^[A-Za-z0-9_]+$/u).parse(row.name);
+        return [name, query(database, `PRAGMA table_xinfo("${name}")`)];
+      }),
+    )));
+    const beforeColumns = allColumns();
+    const nextGuard = LEGACY_CANONICAL_PROFILE_GUARDS_SQL.indexOf("\nCREATE TRIGGER canonical_profile_session_update_guard");
+    expect(nextGuard).toBeGreaterThan(0);
+    const firstGuard = LEGACY_CANONICAL_PROFILE_GUARDS_SQL.slice(0, nextGuard);
+    const marker = "FIXTURE_CANONICAL_PARTIAL_GUARD_REFUSAL";
+    const originalExec = z.custom<Database["exec"]>((value) => typeof value === "function")
+      .parse(Object.getOwnPropertyDescriptor(Database.prototype, "exec")?.value);
+    let partialInstalls = 0;
+    // Intercept only this constructor's exact companion batch. Execute its
+    // real first statement before throwing, so rollback must undo actual DDL
+    // and the already completed key backfill, not merely a pre-install fault.
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+      this: Database, ...args: Parameters<Database["exec"]>
+    ) {
+      if (this.filename !== paths.database || args[0] !== LEGACY_CANONICAL_PROFILE_GUARDS_SQL) {
+        return originalExec.apply(this, args);
+      }
+      originalExec.call(this, firstGuard);
+      expect(this.inTransaction).toBe(true);
+      expect(query(this, "SELECT name FROM main.sqlite_master WHERE name GLOB 'canonical_profile_*' ORDER BY name"))
+        .toEqual([{ name: "canonical_profile_session_insert_guard" }]);
+      expect(query(this, "PRAGMA user_version")).toEqual([{ user_version: 49 }]);
+      expect(query(this, "SELECT MAX(version) AS version FROM migrations")).toEqual([{ version: 49 }]);
+      for (const table of identityTables) {
+        expect(query(this, `SELECT canonical_profile_key FROM ${table}`))
+          .toEqual(fixture.cases.map(() => ({ canonical_profile_key: solUltra })));
+      }
+      partialInstalls += 1;
+      throw new Error(marker);
+    });
+    try {
+      // No await occurs while the prototype spy is installed.
+      expect(() => openStore(paths)).toThrow(marker);
+    } finally { exec.mockRestore(); }
+    expect(Object.getOwnPropertyDescriptor(Database.prototype, "exec")?.value).toBe(originalExec);
+    expect(partialInstalls).toBe(1);
+    // Includes every table, immutable Work JSON/digest, original guard, ledger
+    // row and user_version; xinfo separately proves no column metadata leaked.
+    expect(snapshot({ paths })).toBe(before);
+    expect(allColumns()).toBe(beforeColumns);
+    const store = openStore(paths);
+    expect(inspect(store, (database) => query(database, "PRAGMA user_version"))).toEqual([{ user_version: 50 }]);
+    expect(inspect(store, (database) => query(database,
+      "SELECT name FROM main.sqlite_master WHERE type='trigger' AND name GLOB 'canonical_profile_*'"))).toHaveLength(7);
+    expect(keys(store)).toEqual(Object.fromEntries(identityTables.map((table) => [table,
+      fixture.cases.map(() => ({ canonical_profile_key: solUltra })),
+    ])));
+  });
 
   for (const stage of ["backfill", "ledger"] as const) {
     test(`rolls back every row, column and exact guard after ${stage} failure`, async () => {

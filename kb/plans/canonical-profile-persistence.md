@@ -27,7 +27,8 @@ The local follow-on reserves physical schema50 after a fresh competing-owner
 check. PR140's usage owner acknowledged that reservation; its later migration
 tail remains unallocated until this exact source is reviewed and integrated.
 The StyleX branch still uses schema49. No number alone admits a predecessor.
-The complete session/Work migration slice is being validated separately on
+The complete session/Work migration slice is being validated separately in
+[draft PR151](https://github.com/hraness/hra/pull/151), on
 `codex/canonical-profile-migration-20260908`; it is not released or activated.
 PR139 merged at `109655a8f7d6edd8916f6d7df277e3402b70a44f`, and PR148 retains
 the next integration and candidate-release window. Preserve its peer-memory
@@ -425,9 +426,9 @@ while ordinary stale-authority recovery still commits as before. Separate
 signal-effect controls caught direct reads that omitted the owning task's
 canonical proof. Those reads now use the same bounded source validation.
 
-The standalone Work suite passed98 tests and1,219 assertions, with scoped lint,
+The standalone Work suite passed 98 tests and 1,219 assertions, with scoped lint,
 strict TypeScript and independent source/test review. The companion suite
-passed259 tests and1,449 assertions, including27 new predecessor-absence and
+passed 259 tests and 1,449 assertions, including 27 new predecessor-absence and
 key-only backfill cases. Its original frozen SQL remains unchanged; only the
 stale foundation-only explanatory comment was updated in the old prefix.
 These focused receipts do not replace the joined aggregate or CI.
@@ -440,28 +441,38 @@ SQL, evidence checks, CAS precedence, clocks and successful behavior remain
 unchanged. Four direct-writer regressions first failed because the complete
 logical database changed despite refusal, then passed after repair. The two
 recovery paths have six equivalent corruption controls plus exact evidence,
-revision and healthy historical-profile-replay controls:11 tests and83
+revision and healthy historical-profile-replay controls: 11 tests and 83
 assertions passed. Independent review and strict TypeScript passed. The
 reviewed security inventory changes only StateStore's immediate transaction
-count from165 to168; all45 files pass the unchanged inventory check.
+count from 165 to 168; all 45 files pass the unchanged inventory check.
 
 An offline generator captured a public-synthetic schema49 database using
 unchanged source with tree `978bdc30b6fb9d259c92d0ca91335a854227d6f4`.
-It verifies180 source files and the exact toolchain, lockfile and manifest,
+It verifies 180 source files and the exact toolchain, lockfile and manifest,
 then proves real semantic creation, claim, release, submission, reopen and
 replay before serializing the logical schema and every row. Independent
-review checked115 tables and139 rows, including nested JSON. The481,688-byte
+review checked 115 tables and 139 rows, including nested JSON. The 481,688-byte
 fixture contains only explicitly synthetic public inputs; no private capture
 was normalized or published. SHA-256:
 `ac96da7af133d3980438991a36b6051de2dfcfd764d03343f47f5f75d7f0e887`.
 
-The final43-case real-StateStore migration suite passed1,118 assertions.
+The initial 43-case real-StateStore migration suite passed 1,118 assertions.
 It includes the reviewed positive49-to50 requirement for exact old table DDL
 and `table_xinfo` after removing only each permitted added column. Current
 writer, four-live-state,
 settled-history, corrupt-row, collision and full-rollback controls are
 included. All three authentic49 Work cases use contract1 Ultra; synthetic
 dispatch receipts and cursors are storage fixtures, not provider acceptance.
+
+The final acceptance audit added one partial-companion rollback regression.
+A scoped synchronous spy executes the real first guard, proves all 12 keys
+are backfilled inside the migration transaction while the ledger remains49,
+then throws. The complete predecessor schema, every row, ledger and
+`table_xinfo` are unchanged after refusal; the same database then upgrades
+successfully without the fault. This additional test passed 25 assertions,
+scoped lint, strict TypeScript and independent review. The original 43 cases
+remain unchanged. This is injected-fault coverage, not a discovered production
+regression or a replacement for the full joined suite.
 
 An additional private copy-only proof upgraded an authentic populated schema41
 database written by unchanged source `576ccd76a6742cd62759ab6176a6a41844846daa`.
@@ -480,10 +491,10 @@ downgrade refusal, not execution of an admitted older CLI artifact.
 
 Existing StateStore shapers now remove only the canonical overlay at explicit
 predecessor boundaries and preserve exact original data and DDL plus the
-permitted new fields. All original cases remain, including the13-case exact49
-ledger matrix alongside14 current50 cases. The final ledger/metadata group
-passed28 cases and411 assertions; four exact legacy-DDL preservation cases
-passed2,184 assertions. Scoped lint and nine-file strict TypeScript passed.
+permitted new fields. All original cases remain, including the 13-case exact49
+ledger matrix alongside 14 current50 cases. The final ledger/metadata group
+passed 28 cases and 411 assertions; four exact legacy-DDL preservation cases
+passed 2,184 assertions. Scoped lint and nine-file strict TypeScript passed.
 
 The authentic pre-v40 control now also passes: unchanged schema39 source
 `5f2735191640037c86d9949bc1d7f04b2ef09ffe` created and claimed a contract2
@@ -497,14 +508,14 @@ Independent review confirmed the original capture remained byte-identical.
 This single-state source proof is separate from the pre-v38 boundary below.
 
 A second authentic private proof uses unchanged schema35 source
-`fdb01386277e99efd4b85eebc61e996a4c222813`, with all687 exported files and
+`fdb01386277e99efd4b85eebc61e996a4c222813`, with all 687 exported files and
 modes verified before and after a fresh frozen dependency install. That source
 genuinely lacks session/Work contracts and provider_v39; its Ultra selection
 means Sol Ultra. Historical readonly/writable opens, projections and claim
-replay preserve all77 tables before capture. A private copy reaches50 with
+replay preserve all 77 tables before capture. A private copy reaches50 with
 explicit v36/v37 notification defaults, v38 contract1 and v39 Codex provenance,
 then the expected v40 claim quarantine. All four keys remain
-`codex:gpt-5.6-sol:ultra`. The complete77-to115-table oracle accounts for every
+`codex:gpt-5.6-sol:ultra`. The complete 77-to-115-table oracle accounts for every
 row, preserves old evidence and proves version1 replay, version2 refusal and
 current readonly/writable stability. Independent review passed. The original
 mode0400 capture remains byte-identical and private. This closes one authentic
@@ -512,13 +523,24 @@ pre-contract claimed-Work path, not all lifecycle states, historical artifacts
 or final integration acceptance. The private copy receipt SHA-256 is
 `3daad90fcc2592a00f9eda17aea15c1c08cf563157fe46245c7d14cfd2aeac00`.
 
-Independent review of the unpublished draft archive passed:167 source-identical
-regular files, nine directories and176 inventory entries. Exactly the three
-reviewed storage sources changed; the other164 production files remain exact.
+A separate private schema35 copy also proves late-failure rollback. Its only
+injected object is a test-owned ledger trigger. The expected error is emitted
+only after ledger49, contract/provider additions, all seven canonical guards
+and the actual quarantine session/task/attempt/event/history changes are
+observed. Refusal restores the complete 77-table, 60-row logical baseline,
+including the injected trigger. The original capture and successful proof
+receipts remain unchanged. Independent review passed; rollback receipt SHA-256:
+`12d85a26e836ef97a0a26d12807c7b62051b87ece84fbb7dbddd53042d7599e2`.
+This proves one synchronous SQLite statement-abort path, not crash, power-loss,
+commit-I/O or concurrent-writer recovery.
+
+Independent review of the unpublished draft archive passed: 167 source-identical
+regular files, nine directories and 176 inventory entries. Exactly the three
+reviewed storage sources changed; the other 164 production files remain exact.
 All frozen Work/project49 SQL and canonical guards/mapping declarations match
-the delivered foundation. The8,318-byte inventory SHA-256 is
+the delivered foundation. The 8,318-byte inventory SHA-256 is
 `5ffa09d2f1432a089aadb69822524a3181b0b5de9b39e24abfcf17b46a0d8ce4`;
-only that policy digest changed. Archive size is1,352,818 bytes, SHA-256
+only that policy digest changed. Archive size is 1,352,818 bytes, SHA-256
 `5351a74d0c06d7d5d51cd075f038783aacb3a892a79b1e586f136b1514f67e71`.
 This is not an installation, final joined archive or release receipt.
 
