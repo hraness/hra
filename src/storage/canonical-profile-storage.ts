@@ -30,10 +30,11 @@ export const deriveLegacyWorkProfileKey = (
   decodeHistoricalPresetProfile({ provider: "codex", preset, contract })?.key ?? null;
 
 /**
- * Building blocks only: no installer, migration number, backfill or admission.
- * A future migration must prove an unmodified predecessor and absence of these
- * columns before applying them in its own transaction. Nullable declarations
- * permit that transaction's backfill; the guards below enforce requiredness.
+ * Frozen additive declarations used by StateStore's schema50 migration. Its
+ * caller proves the exact predecessor and absence of these columns before
+ * applying them in its owned transaction. Nullable declarations permit that
+ * transaction's backfill; the guards below enforce requiredness. No model
+ * selection or runtime admission follows from a stored historical key.
  */
 export const LEGACY_CANONICAL_PROFILE_COLUMNS_SQL = `
 ALTER TABLE sessions ADD COLUMN canonical_profile_key TEXT;
@@ -315,3 +316,52 @@ export function assertLegacyCanonicalProfileRows(database: Database): void {
     if (!parsed.success || parsed.data.invalid !== 0) throw new Error(error);
   }
 }
+
+/** Reject all pre-existing canonical authority before predecessor maintenance. */
+export function assertLegacyCanonicalProfileStorageAbsent(database: Database): void {
+  for (const table of ["sessions", "work_routes", "work_tasks", "work_attempts"] as const) {
+    if (database.query(`
+      SELECT 1 FROM pragma_table_xinfo(?, 'main')
+      WHERE name='canonical_profile_key' COLLATE NOCASE LIMIT 1
+    `).get(table) !== null) throw new Error("CANONICAL_PROFILE_PREDECESSOR_COLUMN_COLLISION");
+  }
+  for (const { name } of companionDefinitions) {
+    if (database.query(`
+      SELECT 1 FROM main.sqlite_master WHERE name=? COLLATE NOCASE LIMIT 1
+    `).get(name) !== null) throw new Error("CANONICAL_PROFILE_PREDECESSOR_OBJECT_COLLISION");
+  }
+}
+
+/**
+ * Key-only historical derivation. The migration owns the transaction, proves
+ * and temporarily removes the three blocking legacy update guards, then restores
+ * them exactly. Install the canonical guards only after this backfill and its
+ * populated-row proof; no revision, timestamp or evidence field is rewritten.
+ */
+export const LEGACY_CANONICAL_PROFILE_BACKFILL_SQL = `
+UPDATE main.sessions AS s SET canonical_profile_key=CASE
+  WHEN s.provider_v39 COLLATE BINARY='codex' THEN ${legacyCodexKeySql("s.preset COLLATE BINARY", "s.preset_contract")}
+  WHEN s.provider_v39 COLLATE BINARY='claude' AND s.preset COLLATE BINARY='ultra'
+    AND s.preset_contract IN (1,2) THEN 'claude:claude-fable-5-1:max'
+  WHEN s.provider_v39 COLLATE BINARY='devin' AND s.preset COLLATE BINARY='ultra'
+    AND s.preset_contract=2 THEN 'devin:gpt-6-astra:provider-default'
+  ELSE NULL END;
+UPDATE main.work_routes AS r SET canonical_profile_key=(
+  SELECT ${legacyCodexKeySql("r.preset COLLATE BINARY", "w.preset_contract")}
+  FROM main.works AS w WHERE w.id COLLATE BINARY=r.work_id
+);
+UPDATE main.work_tasks AS t SET canonical_profile_key=(
+  SELECT r.canonical_profile_key FROM main.work_routes AS r
+  WHERE r.work_id COLLATE BINARY=t.work_id
+    AND r.account_id COLLATE BINARY=t.account_id
+    AND r.project_id COLLATE BINARY=t.project_id
+    AND r.preset COLLATE BINARY=t.preset AND r.fast=t.fast
+);
+UPDATE main.work_attempts AS a SET canonical_profile_key=(
+  SELECT t.canonical_profile_key FROM main.work_tasks AS t
+  WHERE t.id COLLATE BINARY=a.task_id AND t.work_id COLLATE BINARY=a.work_id
+    AND t.account_id COLLATE BINARY=a.account_id
+    AND t.project_id COLLATE BINARY=a.project_id
+    AND t.preset COLLATE BINARY=a.preset AND t.fast=a.fast
+);
+`;

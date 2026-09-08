@@ -806,7 +806,8 @@ describe("state-backed cloud daemon adapter", () => {
       expect(before.events.length).toBeGreaterThan(0);
       const authority = await adapter.resolveCommandAuthority({ sessionPublicId: value.sessionId, signal });
       if (authority === null) throw new Error("fixture authority unavailable");
-      // Simulate a persisted v39 row. New session creation correctly refuses Devin.
+      // Seed frozen v39 provenance with its current canonical mirror.
+      // New session creation still refuses Devin; this is not an old capture.
       const database = new Database(value.paths.database, { strict: true });
       try {
         database.transaction(() => {
@@ -815,7 +816,7 @@ describe("state-backed cloud daemon adapter", () => {
             .run(value.sessionId);
           database.query("UPDATE session_account_authorities SET account_key = NULL WHERE session_id = ?")
             .run(value.sessionId);
-          database.query("UPDATE sessions SET provider_v39 = 'devin', preset = 'ultra', preset_contract = 2 WHERE id = ?")
+          database.query("UPDATE sessions SET provider_v39 = 'devin', preset = 'ultra', preset_contract = 2, canonical_profile_key = 'devin:gpt-6-astra:provider-default' WHERE id = ?")
             .run(value.sessionId);
         })();
       } finally { database.close(); }

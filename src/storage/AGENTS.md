@@ -1,7 +1,7 @@
 # Contents
 
 - Migrations create the local SQLite authority.
-- `canonical-profile-storage.ts` defines the frozen, uninstalled legacy profile companion; its unit fixture is not a StateStore migration proof.
+- `canonical-profile-storage.ts` defines frozen legacy profile companions and key-only derivation for the schema50 migration; its reduced unit fixture is separate from real StateStore migration proof.
 - Repositories implement narrow semantic reads and CAS transitions.
 - Secret custody stores HRA device credentials, encryption keys, and the autorespond gateway key.
 - State paths select platform roots, profile directories, and isolated facts-memory session roots.

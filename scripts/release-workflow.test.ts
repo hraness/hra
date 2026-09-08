@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildHraGlobalInstallCommand,
@@ -28,7 +30,175 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+const sourceTestCommand = "bun test ./src --isolate --max-concurrency=1";
+const aggregateCheckCommand = "bun run check:install-pins && bun run check:effect-architecture && bun run check:security-primitives && bun run lint && bun run typecheck && bun run test && bun run build:site -- --check && bun run build:app && bun run build && bun run check:package";
+const aggregateTestCommand = "bun test ./scripts --isolate --max-concurrency=1 && bun run test:local-efficiency-plugin && bun run test:cloud-efficiency-plugin && bun test ./src --isolate --max-concurrency=1 && bun test ./convex ./site --isolate --max-concurrency=1 && bun test ./app --isolate --max-concurrency=1";
+
+function expandPackageScript(
+  scripts: Readonly<Record<string, unknown>>,
+  name: string,
+  ancestors: readonly string[] = [],
+): string[] {
+  if (ancestors.includes(name)) throw new Error(`Cyclic package script: ${name}`);
+  const command = scripts[name];
+  if (!Object.hasOwn(scripts, name) || typeof command !== "string" || command.trim() === "") {
+    throw new Error(`Missing package script: ${name}`);
+  }
+  return command.split(" && ").flatMap((leaf) => {
+    const reference = /^bun run ([A-Za-z0-9:_-]+)$/u.exec(leaf)?.[1];
+    return reference === undefined
+      ? [leaf]
+      : expandPackageScript(scripts, reference, [...ancestors, name]);
+  });
+}
+
+function requireCiGateCoverage(scripts: Readonly<Record<string, unknown>>): void {
+  const aggregate = expandPackageScript(scripts, "check");
+  const source = expandPackageScript(scripts, "test:source");
+  const remainder = expandPackageScript(scripts, "check:ci-remainder");
+  if (source.length !== 1 || source[0] !== sourceTestCommand) {
+    throw new Error("CI source gate must contain only the unchanged source command");
+  }
+  if (aggregate.filter((leaf) => leaf === sourceTestCommand).length !== 1
+    || remainder.includes(sourceTestCommand)) {
+    throw new Error("CI source command must run exactly once");
+  }
+  if (JSON.stringify([...aggregate].sort()) !== JSON.stringify([...source, ...remainder].sort())) {
+    throw new Error("CI phases must cover every aggregate command with the same multiplicity");
+  }
+  if (JSON.stringify(remainder)
+    !== JSON.stringify(aggregate.filter((leaf) => leaf !== sourceTestCommand))) {
+    throw new Error("CI remainder must preserve aggregate command ordering");
+  }
+}
+
+const sourceShardArguments = ["--shard=1/3", "--shard=2/3", "--shard=3/3"] as const;
+const shardFixtureNames = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"] as const;
+
+async function withShardFixture(run: (directory: string) => void): Promise<void> {
+  const directory = await mkdtemp(join(tmpdir(), "hra-ci-shard-contract-"));
+  try {
+    await mkdir(join(directory, "fixtures"));
+    for (const name of shardFixtureNames) {
+      await writeFile(join(directory, "fixtures", `${name}.test.ts`), [
+        'import { expect, test } from "bun:test";',
+        `test("${name} first", () => { console.log("CI_SHARD_CASE:${name}:first"); expect(true).toBe(true); });`,
+        `test("${name} sentinel", () => { console.log("CI_SHARD_CASE:${name}:sentinel"); expect(process.env.CI_SHARD_FAIL).not.toBe("1"); });`,
+      ].join("\n"));
+    }
+    run(directory);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+function runShardFixture(
+  directory: string,
+  shard: typeof sourceShardArguments[number] | undefined,
+  fail: boolean,
+): { exitCode: number | null; cases: string[]; stderr: string } {
+  const result = spawnSync(process.execPath, [
+    "--no-env-file", "--config=/dev/null", "test", "./fixtures",
+    "--isolate", "--max-concurrency=1", ...(shard === undefined ? [] : [shard]),
+  ], {
+    cwd: directory,
+    env: { HOME: directory, TMPDIR: directory, NO_COLOR: "1", CI_SHARD_FAIL: fail ? "1" : "0" },
+    encoding: "utf8",
+    timeout: 1_000,
+    killSignal: "SIGKILL",
+    maxBuffer: 64 * 1_024,
+  });
+  expect(result.error).toBeUndefined();
+  expect(result.signal).toBeNull();
+  return {
+    exitCode: result.status,
+    cases: result.stdout.trim().split("\n").filter((line) => line.startsWith("CI_SHARD_CASE:")),
+    stderr: result.stderr,
+  };
+}
+
 describe("release workflow", () => {
+  test("pinned native Bun shards cover every fixture case exactly once without splitting files", async () => {
+    expect(Bun.version).toBe("1.3.14");
+    await withShardFixture((directory) => {
+      const full = runShardFixture(directory, undefined, false);
+      expect(full.exitCode).toBe(0);
+      const expected = shardFixtureNames.flatMap((name) => [
+        `CI_SHARD_CASE:${name}:first`, `CI_SHARD_CASE:${name}:sentinel`,
+      ]).sort();
+      expect([...full.cases].sort()).toEqual(expected);
+      const shardCases = sourceShardArguments.map((shard) => {
+        const result = runShardFixture(directory, shard, false);
+        expect(result.exitCode).toBe(0);
+        expect(result.cases).toHaveLength(4);
+        for (const name of shardFixtureNames) {
+          const cases = result.cases.filter((entry) => entry.startsWith(`CI_SHARD_CASE:${name}:`));
+          expect(cases.length === 0 || cases.length === 2).toBeTrue();
+        }
+        return result.cases;
+      });
+      expect(shardCases.flat().sort()).toEqual(expected);
+      expect(new Set(shardCases.flat()).size).toBe(expected.length);
+    });
+  });
+
+  test.each([...sourceShardArguments])("pinned native Bun %s propagates fixture failures", async (shard) => {
+    await withShardFixture((directory) => {
+      const result = runShardFixture(directory, shard, true);
+      expect(result.exitCode).toBe(1);
+      expect(result.cases).toHaveLength(4);
+      expect(result.stderr).toContain("2 pass");
+      expect(result.stderr).toContain("2 fail");
+    });
+  });
+
+  test("expands only exact package-script references and rejects missing or cyclic references", () => {
+    expect(expandPackageScript({
+      check: "bun run nested && bun run build:site -- --check",
+      nested: "bun run leaf",
+      leaf: "bun ./scripts/check-install-pins.ts",
+    }, "check")).toEqual([
+      "bun ./scripts/check-install-pins.ts",
+      "bun run build:site -- --check",
+    ]);
+    for (const scripts of [
+      { check: "bun run missing" },
+      { check: "bun run empty", empty: "" },
+      { check: "bun run invalid", invalid: false },
+    ]) expect(() => expandPackageScript(scripts, "check")).toThrow("Missing package script");
+    expect(() => expandPackageScript({ check: "bun run check" }, "check"))
+      .toThrow("Cyclic package script");
+    expect(() => expandPackageScript({ check: "bun run nested", nested: "bun run check" }, "check"))
+      .toThrow("Cyclic package script");
+  });
+
+  test("rejects omitted, duplicated, reordered, optional, or misplaced CI gate commands", () => {
+    const scripts = {
+      check: "bun run first && bun run test:source && bun run last",
+      first: "bun ./scripts/check-install-pins.ts",
+      last: "bun run build:site -- --check",
+      "test:source": sourceTestCommand,
+      "check:ci-remainder": "bun run first && bun run last",
+    };
+    expect(() => requireCiGateCoverage(scripts)).not.toThrow();
+    for (const remainder of [
+      "bun run first",
+      "bun run first && bun run last && bun run last",
+      "bun run first && bun run last || true",
+      "bun run first && bun run last; true",
+      "bun run last && bun run first",
+      "bun run first && bun run test:source && bun run last",
+      "bun run check",
+    ]) {
+      expect(() => requireCiGateCoverage({ ...scripts, "check:ci-remainder": remainder })).toThrow();
+    }
+    for (const source of [
+      `${sourceTestCommand} && bun run first`,
+      "bun test ./src --isolate --max-concurrency=2",
+      `${sourceTestCommand} || true`,
+    ]) expect(() => requireCiGateCoverage({ ...scripts, "test:source": source })).toThrow();
+  });
+
   test("keeps every privileged release helper under owner review", async () => {
     const codeowners = await readFile(
       join(import.meta.dir, "..", ".github", "CODEOWNERS"),
@@ -306,8 +476,8 @@ describe("release workflow", () => {
     expect(enableNamespaces).toContain(
       "/usr/bin/unshare --user --map-root-user --fork /usr/bin/true",
     );
-    // CI runs the custody test once, inside `bun run check`; only the release
-    // verifier, which no longer reruns the gate, keeps the focused step.
+    // CI runs the custody test once, inside the remainder gate's scripts suite;
+    // only the release verifier keeps a separate focused step.
     expect(ciSteps.filter((step) => step.name === custodyTestName)).toHaveLength(0);
     const releaseCustodyTest = exactlyOneStep(releaseSteps, custodyTestName, "release verify");
     expect(releaseCustodyTest.if).toBe("runner.os == 'Linux'");
@@ -832,7 +1002,7 @@ describe("release workflow", () => {
     expect(workflow).not.toContain("convex");
   });
 
-  test("gives the public-text gate complete Git history in CI", async () => {
+  test("requires all three source shards and remainder on both operating systems with complete governed history", async () => {
     const workflow = await readFile(
       join(import.meta.dir, "..", ".github", "workflows", "ci.yml"),
       "utf8",
@@ -841,6 +1011,19 @@ describe("release workflow", () => {
     const jobs = asRecord(document.jobs, "CI workflow jobs");
     const check = asRecord(jobs.check, "CI check job");
     const required = asRecord(jobs.required, "CI required job");
+    expect(Object.keys(jobs).sort()).toEqual(["check", "required"]);
+    expect(check.name).toBe("Check (${{ matrix.os }}, ${{ matrix.gate }})");
+    expect(check["runs-on"]).toBe("${{ matrix.os }}");
+    expect(check["timeout-minutes"]).toBe(20);
+    expect(check.if).toBeUndefined();
+    expect(check["continue-on-error"]).toBeUndefined();
+    expect(check.strategy).toEqual({
+      "fail-fast": false,
+      matrix: {
+        os: ["macos-15", "ubuntu-24.04"],
+        gate: ["source-1", "source-2", "source-3", "remainder"],
+      },
+    });
     const steps = check.steps;
 
     if (!Array.isArray(steps)) {
@@ -848,6 +1031,16 @@ describe("release workflow", () => {
     }
 
     const parsedSteps = steps.map((step, index) => asRecord(step, `CI step ${index}`));
+    const linuxStepNames = new Set([
+      "Download pinned Zig 0.16.0 for authority supervisor (Linux)",
+      "Rebuild and verify authority-supervisor artifacts (Linux)",
+      "Enable isolated user namespaces for native custody checks",
+      "Restore Ubuntu user-namespace restriction",
+    ]);
+    for (const step of parsedSteps) {
+      expect(step["continue-on-error"]).toBeUndefined();
+      if (!linuxStepNames.has(String(step.name))) expect(step.if).toBeUndefined();
+    }
     expect(parsedSteps
       .map((step) => step.uses)
       .filter((value): value is string => typeof value === "string"))
@@ -895,9 +1088,14 @@ describe("release workflow", () => {
     expect(governedHistory).not.toContain("github.head_ref");
     expect(governedHistory).not.toContain("pull_request.head.sha");
     expect(asRecord(install, "CI install step").run).toBe("bun install --frozen-lockfile --ignore-scripts");
-    expect(asRecord(gate, "CI gate step").run).toBe("bun run check");
+    const gateStep = asRecord(gate, "CI gate step");
+    expect(gateStep.if).toBeUndefined();
+    expect(String(gateStep.run).trim().replace(/\s+/gu, " ")).toBe(
+      'set -euo pipefail case "$CI_GATE" in source-1) bun run test:source --shard=1/3 ;; source-2) bun run test:source --shard=2/3 ;; source-3) bun run test:source --shard=3/3 ;; remainder) bun run check:ci-remainder ;; *) echo "::error::Unexpected CI gate" exit 1 ;; esac',
+    );
     expect(asRecord(asRecord(gate, "CI gate step").env, "CI gate environment")).toEqual({
       NODE_OPTIONS: "--max-old-space-size=4096",
+      CI_GATE: "${{ matrix.gate }}",
     });
     // The gate already verifies generated public documents and runs the
     // Linux custody test through `bun test ./scripts`; CI does not repeat them.
@@ -905,19 +1103,24 @@ describe("release workflow", () => {
       JSON.parse(await readFile(join(import.meta.dir, "..", "package.json"), "utf8")),
       "package manifest",
     ).scripts, "package scripts");
-    expect(String(packageScripts.check)).toContain("bun run build:site -- --check");
-    expect(String(packageScripts.check)).toContain("bun run test");
-    expect(String(packageScripts.test)).toContain("bun test ./scripts --isolate --max-concurrency=1");
+    expect(packageScripts.check).toBe(aggregateCheckCommand);
+    expect(packageScripts.test).toBe(aggregateTestCommand);
+    expect(packageScripts["test:source"]).toBe(sourceTestCommand);
+    requireCiGateCoverage(packageScripts);
     expect(workflow).not.toContain("build:site -- --check");
     expect(workflow).not.toContain("authority-supervisor-runtime.test.ts");
 
     expect(required.name).toBe("Required");
     expect(required.needs).toBe("check");
     expect(required.if).toBe("${{ always() }}");
+    expect(required["continue-on-error"]).toBeUndefined();
     if (!Array.isArray(required.steps)) {
       throw new TypeError("CI required job steps must be an array");
     }
     const requiredStep = asRecord(required.steps[0], "CI required step");
+    expect(required.steps).toHaveLength(1);
+    expect(requiredStep.if).toBeUndefined();
+    expect(requiredStep["continue-on-error"]).toBeUndefined();
     expect(requiredStep.name).toBe("Require every matrix check");
     expect(asRecord(requiredStep.env, "CI required environment").CHECK_RESULT)
       .toBe("${{ needs.check.result }}");
