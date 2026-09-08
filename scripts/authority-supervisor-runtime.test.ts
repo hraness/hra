@@ -5,6 +5,7 @@ import { chmod, mkdir, mkdtemp, readFile, readlink, rm } from "node:fs/promises"
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough, type Readable } from "node:stream";
 
 import { afterEach, expect, test } from "bun:test";
 
@@ -607,6 +608,162 @@ type LifecycleChild = LifecycleEmitter & Readonly<{
   stdout: LifecycleEmitter;
   stderr: LifecycleEmitter;
 }>;
+
+const childOutputMaximumBytes = 65_536;
+
+const consumeOwnedChildOutput = (child: Pick<LifecycleChild, "stdout" | "stderr">) => {
+  const state = { stdoutBytes: 0, stderrBytes: 0, overflow: false, invalidChunk: false };
+  let disposed = false;
+  const count = (channel: "stdoutBytes" | "stderrBytes", chunk: unknown): void => {
+    if (disposed) return;
+    if (!Buffer.isBuffer(chunk)) { state.invalidChunk = true; return; }
+    const available = childOutputMaximumBytes - state.stdoutBytes - state.stderrBytes;
+    state[channel] += Math.min(available, chunk.byteLength);
+    if (chunk.byteLength > available) state.overflow = true;
+  };
+  const onStdout = (chunk: unknown): void => count("stdoutBytes", chunk);
+  const onStderr = (chunk: unknown): void => count("stderrBytes", chunk);
+  // Match the production runner's explicit data consumption. Keep only capped
+  // counts: this fixture's target is silent and its output is never diagnostic.
+  child.stdout.on("data", onStdout);
+  child.stderr.on("data", onStderr);
+  return {
+    snapshot: () => Object.freeze({ ...state }),
+    dispose(): void {
+      if (disposed) return;
+      disposed = true;
+      child.stdout.off("data", onStdout);
+      child.stderr.off("data", onStderr);
+    },
+  };
+};
+
+const boundedStreamCount = (value: unknown): number | null =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? Math.min(value, childOutputMaximumBytes)
+    : null;
+
+const snapshotReadableState = (stream: Readable) => Object.freeze({
+  readableFlowing: stream.readableFlowing,
+  readableEnded: stream.readableEnded,
+  readableLength: boundedStreamCount(stream.readableLength),
+  readableLengthCapped: stream.readableLength > childOutputMaximumBytes,
+  destroyed: stream.destroyed,
+  closed: stream.closed,
+  dataListeners: boundedStreamCount(stream.listenerCount("data")),
+});
+
+const snapshotChildStreamState = (
+  child: Pick<ChildProcessWithoutNullStreams, "stdin" | "stdout" | "stderr"> | undefined,
+) => child === undefined ? null : Object.freeze({
+  stdin: Object.freeze({ writableEnded: child.stdin.writableEnded,
+    writableFinished: child.stdin.writableFinished, destroyed: child.stdin.destroyed, closed: child.stdin.closed }),
+  stdout: snapshotReadableState(child.stdout),
+  stderr: snapshotReadableState(child.stderr),
+});
+
+test("owned child output consumer caps combined bytes without retaining output", () => {
+  const child = { stdout: new EventEmitter(), stderr: new EventEmitter() };
+  const output = consumeOwnedChildOutput(child);
+  try {
+    const initial = output.snapshot();
+    child.stdout.emit("data", Buffer.from("private output"));
+    child.stderr.emit("data", Buffer.alloc(childOutputMaximumBytes - 14));
+    expect(output.snapshot()).toEqual({ stdoutBytes: 14, stderrBytes: childOutputMaximumBytes - 14,
+      overflow: false, invalidChunk: false });
+    child.stdout.emit("data", Buffer.alloc(0));
+    expect(output.snapshot().overflow).toBe(false);
+    child.stderr.emit("data", Buffer.alloc(1));
+    child.stdout.emit("data", Buffer.alloc(childOutputMaximumBytes + 1));
+    expect(output.snapshot()).toEqual({ stdoutBytes: 14, stderrBytes: childOutputMaximumBytes - 14,
+      overflow: true, invalidChunk: false });
+    expect(JSON.stringify(output.snapshot())).not.toContain("private output");
+    expect(initial).toEqual({ stdoutBytes: 0, stderrBytes: 0, overflow: false, invalidChunk: false });
+    expect(Object.isFrozen(output.snapshot())).toBe(true);
+  } finally { output.dispose(); }
+});
+
+test("owned child output consumer removes only its listeners and rejects non-buffer chunks", () => {
+  const child = { stdout: new EventEmitter(), stderr: new EventEmitter() };
+  const foreign = () => undefined;
+  const events = ["data", "end", "close", "error"];
+  for (const stream of [child.stdout, child.stderr]) {
+    for (const event of events) stream.on(event, foreign);
+  }
+  const output = consumeOwnedChildOutput(child);
+  try {
+    for (const stream of [child.stdout, child.stderr]) {
+      expect(stream.listenerCount("data")).toBe(2);
+      expect(stream.eventNames()).toEqual(events);
+      for (const event of events.slice(1)) expect(stream.listeners(event)).toEqual([foreign]);
+    }
+    for (const invalid of ["private output", null, undefined, new Uint8Array(2), { byteLength: 2 }]) {
+      child.stdout.emit("data", invalid);
+    }
+    child.stderr.emit("data", Buffer.alloc(2));
+    const before = output.snapshot();
+    expect(before).toEqual({ stdoutBytes: 0, stderrBytes: 2, overflow: false, invalidChunk: true });
+    output.dispose();
+    output.dispose();
+    for (const stream of [child.stdout, child.stderr]) {
+      for (const event of events) expect(stream.listeners(event)).toEqual([foreign]);
+      stream.emit("data", Buffer.alloc(3));
+    }
+    expect(output.snapshot()).toEqual(before);
+  } finally {
+    output.dispose();
+    for (const stream of [child.stdout, child.stderr]) {
+      for (const event of events) stream.off(event, foreign);
+    }
+  }
+});
+
+test("owned child output consumer ignores a callback already queued at disposal", () => {
+  const child = { stdout: new EventEmitter(), stderr: new EventEmitter() };
+  let dispose = () => undefined;
+  const beforeOwnedListener = (): void => { dispose(); };
+  child.stdout.on("data", beforeOwnedListener);
+  const output = consumeOwnedChildOutput(child);
+  dispose = () => { output.dispose(); };
+  try {
+    child.stdout.emit("data", Buffer.alloc(1));
+    expect(output.snapshot()).toEqual({ stdoutBytes: 0, stderrBytes: 0, overflow: false, invalidChunk: false });
+    expect(child.stdout.listeners("data")).toEqual([beforeOwnedListener]);
+    expect(child.stderr.listenerCount("data")).toBe(0);
+  } finally {
+    output.dispose();
+    child.stdout.off("data", beforeOwnedListener);
+  }
+});
+
+test("child public stream snapshots are fixed, bounded, and detached from later state", () => {
+  const child = { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() };
+  const streams = [child.stdin, child.stdout, child.stderr];
+  try {
+    expect(snapshotChildStreamState(undefined)).toBeNull();
+    for (const invalid of [null, "1", -1, 0.5, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(boundedStreamCount(invalid)).toBeNull();
+    }
+    expect(boundedStreamCount(Number.MAX_SAFE_INTEGER)).toBe(childOutputMaximumBytes);
+    child.stdout.push(Buffer.alloc(childOutputMaximumBytes + 1));
+    const before = snapshotChildStreamState(child);
+    expect(before).toEqual({
+      stdin: { writableEnded: false, writableFinished: false, destroyed: false, closed: false },
+      stdout: { readableFlowing: null, readableEnded: false, readableLength: childOutputMaximumBytes,
+        readableLengthCapped: true, destroyed: false, closed: false, dataListeners: 0 },
+      stderr: { readableFlowing: null, readableEnded: false, readableLength: 0,
+        readableLengthCapped: false, destroyed: false, closed: false, dataListeners: 0 },
+    });
+    const output = consumeOwnedChildOutput(child);
+    try {
+      expect(snapshotChildStreamState(child)?.stdout).toMatchObject({ readableFlowing: true, dataListeners: 1 });
+      expect(before?.stdout.dataListeners).toBe(0);
+      expect(Object.isFrozen(before)).toBe(true);
+      for (const snapshot of [before?.stdin, before?.stdout, before?.stderr]) expect(Object.isFrozen(snapshot)).toBe(true);
+    } finally { output.dispose(); }
+    expect(snapshotChildStreamState(child)?.stdout.dataListeners).toBe(0);
+  } finally { for (const stream of streams) stream.destroy(); }
+});
 
 const createChildLifecycleRecorder = () => {
   const state = {
@@ -1211,7 +1368,7 @@ test.each([false, true])("portable stdin-gated child naturally closes both outpu
   });
   try {
     await waitForChildSpawn(child);
-    // Match the native regression's resume-only draining, without data listeners.
+    // Retain the resume-only comparison, without data listeners.
     child.stdout.resume();
     child.stderr.resume();
     child.stdin.end("GO\n");
@@ -1246,6 +1403,10 @@ test("authority supervisor holds a target behind GO", async () => {
   if (!isSupportedLinux()) return;
   let socketMarker: string | undefined;
   const lifecycle = createChildLifecycleRecorder();
+  let diagnosticChild: ChildProcessWithoutNullStreams | undefined;
+  let output: ReturnType<typeof consumeOwnedChildOutput> | undefined;
+  let streamsAtClean: ReturnType<typeof snapshotChildStreamState> = null;
+  let outputAtClean: ReturnType<ReturnType<typeof consumeOwnedChildOutput>["snapshot"]> | null = null;
   const nonce = "1".repeat(32);
   let naturalCloseProven = false;
   let failureRecorded = false;
@@ -1256,8 +1417,11 @@ test("authority supervisor holds a target behind GO", async () => {
     // delegates collection to afterEach. Never emit target bytes or identities.
     const snapshot = lifecycle.snapshot();
     try {
+      const streamsAtFailure = snapshotChildStreamState(diagnosticChild);
+      const outputAtFailure = output?.snapshot() ?? null;
       const selfWriters = censusSelfSocketWriters(socketMarker === undefined ? undefined : readPrivateSocketMarker(socketMarker));
-      process.stderr.write(`authority_child_lifecycle ${JSON.stringify({ ...snapshot, ...selfWriters })}\n`);
+      process.stderr.write(`authority_child_lifecycle ${JSON.stringify({ ...snapshot, ...selfWriters,
+        streamsAtClean, streamsAtFailure, outputAtClean, outputAtFailure })}\n`);
     } catch { /* Diagnostic inability cannot replace the original failure. */ }
   };
   const fixture = createOwnedRuntimeFixture(async (scope) => {
@@ -1296,6 +1460,7 @@ test("authority supervisor holds a target behind GO", async () => {
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    diagnosticChild = child;
     lifecycle.attachChild(child);
     const closed = observeChildClose(child);
     void closed.catch(() => undefined);
@@ -1317,16 +1482,18 @@ test("authority supervisor holds a target behind GO", async () => {
           try { stream.destroy(); } catch { cleanupFailed = true; }
         }
       }
-      await cleanupClosed;
-      if (onCleanupClose !== undefined) child.off("close", onCleanupClose);
+      try { await cleanupClosed; }
+      finally {
+        output?.dispose();
+        if (onCleanupClose !== undefined) child.off("close", onCleanupClose);
+      }
       if (cleanupFailed) throw new Error("authority_runtime_child_cleanup_failed");
     });
     await waitForChildSpawn(child);
     scope.assertActive();
     await opened.close();
     scope.assertActive();
-    child.stdout.resume();
-    child.stderr.resume();
+    output = consumeOwnedChildOutput(child);
     const ready = await control.nextLine();
     expect(ready).toMatch(new RegExp(`^HRA_AUTHORITY_SUPERVISOR/1 READY nonce=${nonce} `));
     const monotonicMatch = ready.match(/ monotonic_ms=([1-9][0-9]*)$/u);
@@ -1343,6 +1510,8 @@ test("authority supervisor holds a target behind GO", async () => {
     const clean = await control.nextLine();
     scope.assertActive();
     expect(clean).toBe(`HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${nonce} exit=0`);
+    streamsAtClean = snapshotChildStreamState(child);
+    outputAtClean = output.snapshot();
     // The close observer starts before READY; this 15-second deadline starts
     // after CLEAN. Require joined process and pipe closure even after CLEAN.
     try {
@@ -1350,6 +1519,10 @@ test("authority supervisor holds a target behind GO", async () => {
         scope.assertActive();
         return result;
       })).resolves.toEqual({ code: 0, signal: null });
+      expect(lifecycle.snapshot()).toMatchObject({ exitObserved: true, exitCode: 0, exitSignalPresent: false,
+        closeObserved: true, closeCode: 0, closeSignalPresent: false,
+        stdoutEnd: true, stdoutClose: true, stderrEnd: true, stderrClose: true });
+      expect(output.snapshot()).toEqual({ stdoutBytes: 0, stderrBytes: 0, overflow: false, invalidChunk: false });
       naturalCloseProven = true;
     } catch (error: unknown) {
       recordFailure();
