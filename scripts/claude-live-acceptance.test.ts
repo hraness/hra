@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, rmdir, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, rmdir, writeFile, type FileHandle } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -35,6 +36,7 @@ import {
   claudeLiveAcceptanceRecoveryPolicy,
   claudeLiveAcceptanceRecoveryReceiptSchema,
   createClaudeLiveAcceptanceSignalCustody,
+  parseClaudeLiveAcceptanceArguments,
   runClaudeLiveAcceptance,
   type ClaudeLiveAcceptanceRecoveryReceipt,
 } from "./claude-live-acceptance";
@@ -793,6 +795,69 @@ describe("dedicated Claude live acceptance runner", () => {
 });
 
 describe("Claude cleanup-only recovery", () => {
+  async function withHighRecoveryDescriptor(
+    path: string,
+    task: (handle: FileHandle) => void | Promise<void>,
+  ): Promise<void> {
+    const handles: FileHandle[] = [];
+    try {
+      // Reproduce descriptor pressure without depending on suite execution order.
+      for (let attempt = 0; attempt < 256; attempt += 1) {
+        const handle = await open(path, "r");
+        handles.push(handle);
+        if (handle.fd > 255) {
+          await task(handle);
+          return;
+        }
+      }
+      throw new Error("Could not allocate the bounded high-descriptor fixture");
+    } finally {
+      await Promise.all(handles.map((handle) => handle.close()));
+    }
+  }
+
+  function finishCleanupWithMappedDescriptor(descriptor: number): void {
+    const modulePath = new URL("./claude-live-acceptance.ts", import.meta.url).href;
+    const program = `
+import { runClaudeLiveAcceptance } from ${JSON.stringify(modulePath)};
+let workerEffects = 0;
+const forbidden = () => {
+  workerEffects += 1;
+  throw new Error("Provider operation forbidden during authorized cleanup");
+};
+const result = await runClaudeLiveAcceptance(["--resume-fd", "3"], {
+  createLogout: forbidden,
+  createReadback: forbidden,
+  recoverProcessJournal: async () => undefined,
+  sourceAttestation: async () => ${JSON.stringify(candidate)},
+  startWorker: async () => forbidden(),
+});
+process.stdout.write(JSON.stringify({ result, workerEffects }));
+`;
+    // The parent may have any descriptor number; only this explicit child slot
+    // participates in the runner's bounded descriptor contract.
+    const child = spawnSync(process.execPath, ["--eval", program], {
+      encoding: "utf8",
+      killSignal: "SIGKILL",
+      maxBuffer: 4_096,
+      stdio: ["ignore", "pipe", "pipe", descriptor],
+      timeout: 5_000,
+    });
+    expect({
+      error: child.error?.message,
+      signal: child.signal,
+      status: child.status,
+      stderr: child.stderr,
+      stdout: child.stdout,
+    }).toEqual({
+      error: undefined,
+      signal: null,
+      status: 0,
+      stderr: "",
+      stdout: JSON.stringify({ result: null, workerEffects: 0 }),
+    });
+  }
+
   const cleanupAuthorization = (
     value: Omit<ClaudeLiveAcceptanceRecoveryReceipt, "cleanupAuthorization">,
   ) => {
@@ -852,20 +917,19 @@ describe("Claude cleanup-only recovery", () => {
       receiptPath: layout.receiptPath,
       runId: layout.descriptor.runId,
     });
-    const receipt = await AtomicPrivateJsonReceipt.create(
+    await AtomicPrivateJsonReceipt.create(
       receiptValue,
       claudeLiveAcceptanceRecoveryPolicy,
     );
     await owner.releasePreserving();
-    const handle = await open(receipt.value.receiptPath, "r");
-    return { handle, layout, receiptValue };
+    return { layout, receiptValue };
   }
 
   test.each([true, false])(
     "finishes already-authorized cleanup when the private root exists=%s",
     async (rootExists) => {
       await withPrivateDirectory(async (directory) => {
-        const { handle, layout, receiptValue } = await recoveryFixture(directory, rootExists);
+        const { layout, receiptValue } = await recoveryFixture(directory, rootExists);
         const authorization = receiptValue.cleanupAuthorization;
         if (authorization === undefined) throw new Error("cleanup authorization missing");
         const { bindingDigest, ...authorizationBase } = authorization;
@@ -882,22 +946,13 @@ describe("Claude cleanup-only recovery", () => {
           },
           worker: { pid: 91_002, state: "ready" },
         })).toThrow("Cleanup authorization scope does not match this run");
-        let workerEffects = 0;
-        try {
-          expect(await runClaudeLiveAcceptance(["--resume-fd", String(handle.fd)], {
-            createLogout: () => { workerEffects += 1; return fakeLogoutFactory({
-              descriptor: layout.descriptor,
-              persistAttempt: async () => undefined,
-            }); },
-            createReadback: () => { workerEffects += 1; throw new Error("readback forbidden"); },
-            recoverProcessJournal: async () => undefined,
-            sourceAttestation: async () => candidate,
-            startWorker: async () => { workerEffects += 1; throw new Error("worker forbidden"); },
-          })).toBeNull();
-        } finally {
-          await handle.close();
-        }
-        expect(workerEffects).toBe(0);
+        await withHighRecoveryDescriptor(layout.receiptPath, (handle) => {
+          expect(handle.fd).toBeGreaterThan(255);
+          expect(() => parseClaudeLiveAcceptanceArguments([
+            "--resume-fd", String(handle.fd),
+          ])).toThrow("claude_live_acceptance_input_invalid");
+          finishCleanupWithMappedDescriptor(handle.fd);
+        });
         await expect(lstat(layout.receiptPath)).rejects.toMatchObject({ code: "ENOENT" });
         await expect(lstat(layout.runRoot.path)).rejects.toMatchObject({ code: "ENOENT" });
       });
