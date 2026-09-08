@@ -194,8 +194,27 @@ export async function waitForBrowserPreparationAbsence(
 ): Promise<void> {
   const deadline = operations.now() + milliseconds;
   let attempt = 0;
-  const present = () => { trace.mark(phase === "term" ? "post-term-probe" : "post-kill-probe", attempt); return operations.present(); };
-  while (present() && operations.now() < deadline) {
+  let unresolvedPermission: { cause: unknown } | undefined;
+  for (;;) {
+    trace.mark(phase === "term" ? "post-term-probe" : "post-kill-probe", attempt);
+    try {
+      // The native probe returns false only for ESRCH. Neither an uncertain
+      // probe nor direct-child exit proves that the owned group is absent.
+      if (!operations.present()) return;
+    } catch (error) {
+      const signalSent = phase === "term" ? trace.termSent : trace.killSent;
+      if (!signalSent || ownField(error, "code") !== "EPERM") throw error;
+      // A successful owned signal may precede an indeterminate group probe.
+      // Retain the first failure until actual absence, even if a later probe
+      // reports presence, so uncertainty can never authorize another signal.
+      unresolvedPermission ??= { cause: error };
+    }
+    if (operations.now() >= deadline) {
+      if (unresolvedPermission !== undefined) {
+        throw new PreparationCollectionError(trace.snapshot(unresolvedPermission.cause), unresolvedPermission.cause);
+      }
+      return;
+    }
     trace.mark(phase === "term" ? "post-term-wait" : "post-kill-wait", attempt);
     await operations.wait(); attempt += 1;
   }

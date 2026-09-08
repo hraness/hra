@@ -139,16 +139,17 @@ test("TERM and KILL identity-read, identity-validation and syscall failures reta
   }
 });
 
-test("post-TERM EPERM stays fatal after successful TERM and never falls through to KILL or stream success", async () => {
+test("persistent post-TERM EPERM expires at the original deadline without KILL or stream success", async () => {
   const fixture = traceFixture(); const sent: string[] = [];
   const original = Object.assign(new Error("kill EPERM"), { code: "EPERM", syscall: "kill", errno: -1 });
-  let streamJoined = false, caught: unknown;
+  let streamJoined = false, caught: unknown, now = 0, probes = 0;
   try {
     await collectBrowserPreparation({
       present: () => true, leaderRunning: () => true,
       signal: (signal) => signalBrowserPreparation(signal, owned, { identity: () => Promise.resolve(owned), send: () => { sent.push(signal); } }, fixture.trace),
       waitAbsent: (milliseconds, phase) => waitForBrowserPreparationAbsence(milliseconds, phase, {
-        present: () => { throw original; }, now: () => 0, wait: () => Promise.resolve(),
+        present: () => { probes += 1; throw original; }, now: () => now,
+        wait: () => { now += 25; fixture.elapsed(now); return Promise.resolve(); },
       }, fixture.trace),
       closed: () => { streamJoined = true; return Promise.resolve({ code: 0, signal: null }); },
     }, fixture.trace);
@@ -156,8 +157,122 @@ test("post-TERM EPERM stays fatal after successful TERM and never falls through 
   expect(caught).toBeInstanceOf(PreparationCollectionError);
   if (!(caught instanceof PreparationCollectionError)) throw new Error("Missing typed collection failure");
   expect(caught.cause).toBe(original);
-  expect(caught.collection).toMatchObject({ stage: "post-term-probe", code: "EPERM", syscall: "kill", errno: -1, termAttempted: true, termSent: true, killAttempted: false, killSent: false });
+  expect(caught.collection).toMatchObject({ stage: "post-term-probe", attempt: 80, elapsedMs: 2000,
+    code: "EPERM", syscall: "kill", errno: -1, termAttempted: true, termSent: true, killAttempted: false, killSent: false });
+  expect(now).toBe(2000); expect(probes).toBe(81);
   expect(sent).toEqual(["SIGTERM"]); expect(streamJoined).toBe(false);
+});
+
+test("post-signal EPERM settles only after an actual absence probe within the unchanged budget", async () => {
+  for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+    const fixture = traceFixture(); const sent: string[] = []; let now = 0, probes = 0;
+    const original = Object.assign(new Error("kill EPERM"), { code: "EPERM", syscall: "kill", errno: -1 });
+    await signalBrowserPreparation(signal, owned, { identity: () => Promise.resolve(owned), send: () => { sent.push(signal); } }, fixture.trace);
+    await waitForBrowserPreparationAbsence(50, signal === "SIGTERM" ? "term" : "kill", {
+      present: () => { probes += 1; if (probes === 1) throw original; return probes !== 3; },
+      now: () => now, wait: () => { now += 25; return Promise.resolve(); },
+    }, fixture.trace);
+    expect(now).toBe(50); expect(probes).toBe(3); expect(sent).toEqual([signal]);
+    expect(fixture.trace.snapshot().stage).toBe(signal === "SIGTERM" ? "post-term-probe" : "post-kill-probe");
+  }
+});
+
+test("a positive probe after EPERM cannot clear uncertainty or authorize escalation", async () => {
+  const fixture = traceFixture(); let now = 0, probes = 0; const sent: string[] = [];
+  const original = Object.assign(new Error("kill EPERM"), { code: "EPERM", syscall: "kill", errno: -1 });
+  let caught: unknown;
+  try {
+    await collectBrowserPreparation({
+      present: () => true, leaderRunning: () => true,
+      signal: (signal) => signalBrowserPreparation(signal, owned, { identity: () => Promise.resolve(owned), send: () => { sent.push(signal); } }, fixture.trace),
+      waitAbsent: (milliseconds, phase) => waitForBrowserPreparationAbsence(milliseconds, phase, {
+        present: () => { probes += 1; if (probes === 1) throw original; return true; },
+        now: () => now, wait: () => { now += 25; return Promise.resolve(); },
+      }, fixture.trace),
+      closed: () => { throw new Error("Uncertain group must not join streams"); },
+    }, fixture.trace);
+  } catch (error) { caught = error; }
+  expect(caught).toBeInstanceOf(PreparationCollectionError);
+  if (!(caught instanceof PreparationCollectionError)) throw new Error("Missing typed collection failure");
+  expect(caught.cause).toBe(original); expect(now).toBe(2000); expect(probes).toBe(81);
+  expect(sent).toEqual(["SIGTERM"]);
+});
+
+test("finite post-signal uncertainty sequences require absence and do not extend their deadline", async () => {
+  await fc.assert(fc.asyncProperty(fc.array(fc.boolean(), { minLength: 1, maxLength: 12 }), fc.boolean(), async (uncertain, killed) => {
+    const fixture = traceFixture(); let now = 0, probes = 0, sends = 0;
+    const signal = killed ? "SIGKILL" : "SIGTERM";
+    await signalBrowserPreparation(signal, owned, { identity: () => Promise.resolve(owned), send: () => { sends += 1; } }, fixture.trace);
+    await waitForBrowserPreparationAbsence(uncertain.length * 25, killed ? "kill" : "term", {
+      present: () => {
+        const status = uncertain[probes]; probes += 1;
+        if (status === undefined) return false;
+        if (status) throw Object.assign(new Error("probe uncertain"), { code: "EPERM", syscall: "kill" });
+        return true;
+      },
+      now: () => now, wait: () => { now += 25; return Promise.resolve(); },
+    }, fixture.trace);
+    expect(probes).toBe(uncertain.length + 1); expect(now).toBe(uncertain.length * 25); expect(sends).toBe(1);
+  }), { numRuns: 40 });
+});
+
+test("persistent post-KILL uncertainty also expires without more signals or fabricated absence", async () => {
+  const fixture = traceFixture(); let now = 0, probes = 0, sends = 0;
+  const original = Object.assign(new Error("kill EPERM"), { code: "EPERM", syscall: "kill", errno: -1 });
+  await signalBrowserPreparation("SIGKILL", owned, { identity: () => Promise.resolve(owned), send: () => { sends += 1; } }, fixture.trace);
+  let caught: unknown;
+  try {
+    await waitForBrowserPreparationAbsence(5000, "kill", {
+      present: () => { probes += 1; throw original; }, now: () => now,
+      wait: () => { now += 25; fixture.elapsed(now); return Promise.resolve(); },
+    }, fixture.trace);
+  } catch (error) { caught = error; }
+  expect(caught).toBeInstanceOf(PreparationCollectionError);
+  if (!(caught instanceof PreparationCollectionError)) throw new Error("Missing typed collection failure");
+  expect(caught.cause).toBe(original); expect(now).toBe(5000); expect(probes).toBe(201); expect(sends).toBe(1);
+  expect(caught.collection).toMatchObject({ stage: "post-kill-probe", attempt: 200, elapsedMs: 5000, code: "EPERM", killSent: true });
+});
+
+test("post-signal waits reject non-EPERM failures and EPERM without a successful matching signal immediately", async () => {
+  for (const phase of ["term", "kill"] as const) {
+    for (const code of ["EPERM", "EACCES", "EIO"] as const) {
+      for (const successfulSignal of [false, true]) {
+        if (code === "EPERM" && successfulSignal) continue;
+        const fixture = traceFixture(); let waits = 0;
+        const original = Object.assign(new Error("probe failed"), { code, syscall: "kill" });
+        // Success for the other signal is insufficient to relax this phase.
+        const signal = (phase === "term") === successfulSignal ? "SIGTERM" : "SIGKILL";
+        await signalBrowserPreparation(signal, owned, { identity: () => Promise.resolve(owned), send: () => {} }, fixture.trace);
+        await expect(waitForBrowserPreparationAbsence(50, phase, {
+          present: () => { throw original; }, now: () => 0,
+          wait: () => { waits += 1; return Promise.resolve(); },
+        }, fixture.trace)).rejects.toBe(original);
+        expect(waits).toBe(0);
+      }
+    }
+  }
+});
+
+test("initial, pre-KILL and final probes remain immediately fatal on EPERM", async () => {
+  for (const failingProbe of [1, 2, 3]) {
+    const fixture = traceFixture(); let probes = 0, streamJoins = 0; const sent: string[] = [];
+    const original = Object.assign(new Error("kill EPERM"), { code: "EPERM", syscall: "kill", errno: -1 });
+    let caught: unknown;
+    try {
+      await collectBrowserPreparation({
+        present: () => { probes += 1; if (probes === failingProbe) throw original; return probes === 1; },
+        leaderRunning: () => true,
+        signal: (signal) => signalBrowserPreparation(signal, owned, { identity: () => Promise.resolve(owned), send: () => { sent.push(signal); } }, fixture.trace),
+        waitAbsent: () => Promise.resolve(),
+        closed: () => { streamJoins += 1; return Promise.resolve({ code: 0, signal: null }); },
+      }, fixture.trace);
+    } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(PreparationCollectionError);
+    if (!(caught instanceof PreparationCollectionError)) throw new Error("Missing typed collection failure");
+    expect(caught.cause).toBe(original); expect(streamJoins).toBe(0);
+    expect(caught.collection.stage).toBe(failingProbe === 1 ? "initial-probe" : failingProbe === 2 ? "pre-kill-probe" : "final-probe");
+    expect(sent).toEqual(failingProbe === 1 ? [] : ["SIGTERM"]);
+  }
 });
 
 test("absence waits retain probe/wait attempt identity without changing the existing ordered bounds", async () => {
