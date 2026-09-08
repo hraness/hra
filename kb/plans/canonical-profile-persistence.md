@@ -178,3 +178,32 @@ three reviewed inventory constants changed; no enforcement rule changed.
 The required exact-tree final gate is separate evidence. None of the real
 migration, old-reader or runtime integration acceptance cases above is
 complete from unit tests or package inspection.
+
+## Settled-history compatibility checkpoint
+
+Two real-StateStore regressions cover released and submitted Work after a
+legitimate session reselection from Sol Ultra to Luna Low. They create,
+claim and settle Work through current semantic writers, then prove that
+route, task and attempt identity still derives from each historical row and
+its owning Work contract. The session's current identity changes separately.
+Ordered persisted rows preserve intent, effect, report, submission, event,
+history-version and clock evidence byte-for-byte, including their existing
+JSON and digest fields. Public task/history/event/snapshot projections and
+settled replay remain identical across reselection and readonly/writable
+reopen. A changed claim intent still refuses without changing evidence.
+
+The test uses fixed time and the same daemon generation. It compares settled
+replay immediately before and after reselection, not the original claim
+response, because replay reprojects the settled state. The injected cursor
+encoder supplies a valid bounded wire envelope. No schema overlay, migration
+number, provider call, runtime admission or production writer change is part
+of this proof.
+
+The affected Work project-authority group passed 44 tests and 343 assertions
+on Bun 1.3.14. Scoped ESLint, strict targeted TypeScript, whitespace and
+independent frozen-file review passed. Test SHA-256:
+`c699d184819944d390944db71771d9f9c2bf373ac147e6cfb4daff32b527c5fb`.
+The preceding companion-only source checkpoint passed its exclusive local
+aggregate and macOS CI. Ubuntu exceeded existing individual test and job
+deadlines; timing diagnosis is separate from this compatibility proof. No
+failed gate is waived and no real canonical migration is complete.
