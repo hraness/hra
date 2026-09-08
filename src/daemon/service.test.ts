@@ -1389,7 +1389,12 @@ class TrackingClaudeAuthority extends UnavailableClaudeRuntime {
 
 const stores: StateStore[] = [];
 const serviceRoots: string[] = [];
+const guidanceFixtureTeardowns: Array<() => Promise<void>> = [];
 afterEach(async () => {
+  // A timed-out guidance case can still own an admitted command. Join its
+  // request and service before the shared fixture cleanup removes storage.
+  for (const teardown of guidanceFixtureTeardowns) await teardown();
+  guidanceFixtureTeardowns.length = 0;
   for (const store of stores.splice(0)) store.close();
   await Promise.all(serviceRoots.splice(0).map(async (root) =>
     rm(root, { force: true, recursive: true })));
@@ -1501,6 +1506,44 @@ async function fixture(
     eventCursors,
     paths,
   };
+}
+
+function guidanceFixture(): Promise<Awaited<ReturnType<typeof fixture>> & {
+  execute: (command: LocalCommand) => Promise<unknown>;
+}> {
+  const controller = new AbortController();
+  const requests = new Set<Promise<unknown>>();
+  // Defer setup until its teardown is registered, including timeouts during
+  // filesystem initialization before the service has been constructed.
+  const setup = Promise.resolve().then(() => fixture());
+  guidanceFixtureTeardowns.push(async () => {
+    controller.abort(new Error("Guidance fixture is closing."));
+    const [result] = await Promise.allSettled([setup]);
+    await Promise.allSettled([...requests]);
+    if (result.status === "fulfilled") await result.value.service.close();
+  });
+  return setup.then((value) => {
+    controller.signal.throwIfAborted();
+    return {
+      ...value,
+      execute: (command: LocalCommand): Promise<unknown> => {
+        // Register before dispatch and never admit a continuation of an
+        // already timed-out test, even if its previous request just settled.
+        const request = Promise.resolve().then(async () => {
+          controller.signal.throwIfAborted();
+          const result = await value.service.execute(command, { signal: controller.signal });
+          controller.signal.throwIfAborted();
+          return result;
+        });
+        requests.add(request);
+        void request.then(
+          () => { requests.delete(request); },
+          () => { requests.delete(request); },
+        );
+        return request;
+      },
+    };
+  });
 }
 
 const personalAdoptionNow = 1_900_000_000_000;
@@ -18810,7 +18853,7 @@ describe("HraService", () => {
     }
   });
 
-  test("maps bounded Codex failures to phase-specific safe guidance before dispatch", async () => {
+  describe("maps bounded Codex failures to phase-specific safe guidance before dispatch", () => {
     const failures = [
       {
         code: "HOME_MISMATCH",
@@ -18854,28 +18897,30 @@ describe("HraService", () => {
       },
     ] as const;
     for (const [index, failure] of failures.entries()) {
-      const { service, codex, documents, store } = await fixture();
-      const added = await service.execute({ kind: "account.add", label: `Unavailable ${failure.code}` }, { signal }) as { account: { id: string } };
-      await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
-      await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
-      const idempotencyKey = `00000000-0000-4000-8000-${String(730 + index).padStart(12, "0")}`;
-      codex.reviewTurnErrorOnce = new CodexError(failure.code, "private provider capability diagnostic");
+      test(failure.code, async () => {
+        const { execute, codex, documents, store } = await guidanceFixture();
+        const added = await execute({ kind: "account.add", label: `Unavailable ${failure.code}` }) as { account: { id: string } };
+        await execute({ kind: "account.login", account: added.account.id, deviceCode: false });
+        await execute({ kind: "project.add", label: "Docs", path: documents });
+        const started = await execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }) as { session: { id: `sess_${string}` } };
+        const idempotencyKey = `00000000-0000-4000-8000-${String(730 + index).padStart(12, "0")}`;
+        codex.reviewTurnErrorOnce = new CodexError(failure.code, "private provider capability diagnostic");
 
-      await expect(service.execute({
-        kind: "session.send",
-        session: started.session.id,
-        message: "must not dispatch",
-        idempotencyKey,
-      }, { signal })).rejects.toMatchObject({
-        code: "UNAVAILABLE",
-        details: { reason: failure.reason },
-        message: failure.message,
+        await expect(execute({
+          kind: "session.send",
+          session: started.session.id,
+          message: "must not dispatch",
+          idempotencyKey,
+        })).rejects.toMatchObject({
+          code: "UNAVAILABLE",
+          details: { reason: failure.reason },
+          message: failure.message,
+        });
+
+        expect(codex.calls.filter((call) => call === "send")).toHaveLength(0);
+        expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "prepared" });
+        expect(JSON.stringify(store.readMutation(idempotencyKey))).not.toContain("private provider capability diagnostic");
       });
-
-      expect(codex.calls.filter((call) => call === "send")).toHaveLength(0);
-      expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "prepared" });
-      expect(JSON.stringify(store.readMutation(idempotencyKey))).not.toContain("private provider capability diagnostic");
     }
   });
 

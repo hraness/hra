@@ -1648,8 +1648,8 @@ describe("account mutation successor authority", () => {
   // Each case owns its fixture cleanup and default timeout; this increases
   // coverage, not a claim that the total suite performs less work.
   for (const kind of ["account.login", "account.logout", "account.login-cancel"] as const) {
-    for (const rollovers of [1, 2, 3, 4, 5, 6, 7, 8]) {
-      test(`keeps origin and effect invariant for ${kind} through ${rollovers} successor rollovers`, async () => {
+    for (const rollovers of [1, 2, 3, 4, 5, 6, 7, 8] as const) {
+      test(`keeps ${kind} origin and effect invariant for ${rollovers} bounded successors`, async () => {
         const { store, profile, attempt, key } = await seed(kind);
         const original = store.readMutation(key)?.evidence;
         for (let index = 0; index < rollovers; index += 1) {
