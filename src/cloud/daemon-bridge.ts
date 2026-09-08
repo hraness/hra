@@ -99,6 +99,8 @@ import {
   decryptSessionMetadata,
   encryptDeviceCommandResult,
   encryptDeviceRegistry,
+  encryptMemorySummary,
+  memorySummaryFitsEncryptedEnvelope,
   encryptNotificationEmail,
   encryptNotificationHours,
   encryptSessionMetadata,
@@ -109,6 +111,7 @@ import {
   type DeviceCommandPayload,
   type DeviceCommandResultPayload,
   type DeviceRegistryPayload,
+  type MemorySummaryPayload,
   type RemoteCommandPayload,
   type SessionMetadataPayload,
 } from "./payloads";
@@ -205,6 +208,29 @@ export type ActiveCloudIdentity = Readonly<{
 
 function captureActiveCloudIdentity(identity: ActiveCloudIdentity): ActiveCloudIdentity {
   return { ...identity, accountKey: Uint8Array.from(identity.accountKey) };
+}
+
+type MemorySummaryAuthority = Readonly<{
+  devicePublicId: string;
+  keyVersion: number;
+  userPublicId: string;
+}>;
+
+function memorySummaryAuthority(identity: ActiveCloudIdentity): MemorySummaryAuthority {
+  return {
+    devicePublicId: identity.devicePublicId,
+    keyVersion: identity.keyVersion,
+    userPublicId: identity.userPublicId,
+  };
+}
+
+function sameMemorySummaryAuthority(
+  left: MemorySummaryAuthority,
+  right: ActiveCloudIdentity,
+): boolean {
+  return left.devicePublicId === right.devicePublicId
+    && left.keyVersion === right.keyVersion
+    && left.userPublicId === right.userPublicId;
 }
 
 export type RegisteredCloudIdentity =
@@ -382,6 +408,14 @@ export interface CloudDaemonLocalSourcePort {
    * the account key and publishes it to `devices:updateRegistry`.
    */
   readDeviceRegistry?(input: Readonly<{ signal: AbortSignal }>): Promise<DeviceRegistryPayload>;
+  /**
+   * Optional, separately encrypted supervision. Absence intentionally clears
+   * a stale hosted summary and never changes DeviceRegistryPayload v1.
+   */
+  readMemorySummary?(input: Readonly<{
+    devicePublicId: string;
+    signal: AbortSignal;
+  }>): Promise<MemorySummaryPayload>;
   /** Absent on an older daemon; publishing then intentionally clears the outer envelope. */
   readNotificationHours?(input: Readonly<{ signal: AbortSignal }>): Promise<NotificationHoursPolicy>;
   /** Preferred atomic/shared-revision projection; legacy readers cannot publish email consent. */
@@ -545,6 +579,18 @@ type OptionalCloudSyncTask = Readonly<{
   state: { outcome: OptionalCloudSyncOutcome | null };
 }>;
 
+type MemorySummaryReadOutcome =
+  | Readonly<{ state: "completed"; summary: MemorySummaryPayload | null }>
+  | Readonly<{ error: unknown; state: "failed" }>;
+
+type MemorySummaryReadTask = Readonly<{
+  authority: MemorySummaryAuthority;
+  controller: AbortController;
+  promise: Promise<MemorySummaryReadOutcome>;
+  sourceAvailable: boolean;
+  state: { outcome: MemorySummaryReadOutcome | null };
+}>;
+
 type CloudPresenceRequest = Readonly<{
   connectionId: string;
   credentialGeneration: number;
@@ -573,6 +619,14 @@ type CloudDeviceRegistryState = Readonly<{
   digest: string;
   publishedAt: number;
   revision: number;
+}>;
+
+type CloudMemorySummaryState = Readonly<{
+  authority: MemorySummaryAuthority;
+  envelopePresent: boolean;
+  publishedAt: number;
+  revision: number;
+  sourceAvailable: boolean;
 }>;
 
 type AttentionNotificationCadence = Readonly<{
@@ -2413,6 +2467,9 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   readonly #sessionSyncCursor: CloudSessionSyncCursorPort;
   readonly #transport: CloudTransport;
   #closed = false;
+  #memorySummaryNextAttemptAt = 0;
+  #memorySummaryState: CloudMemorySummaryState | null = null;
+  #memorySummaryTask: MemorySummaryReadTask | null = null;
   #optionalTask: OptionalCloudSyncTask | null = null;
   #presenceState: CloudPresenceState | null = null;
   #deviceRegistryState: CloudDeviceRegistryState | null = null;
@@ -2480,6 +2537,12 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         this.#optionalTask = null;
       }
     }
+    const memorySummary = this.#memorySummaryTask;
+    if (memorySummary !== null) {
+      memorySummary.controller.abort(new Error("Cloud daemon bridge is closing."));
+      await memorySummary.promise;
+      if (this.#memorySummaryTask === memorySummary) this.#memorySummaryTask = null;
+    }
     await this.#disconnectPresenceBestEffort();
   }
 
@@ -2512,6 +2575,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           peerDevicePresent: await this.#peerDevicePresent(identity, signal),
         };
         await this.#assertDaemonCurrent(signal);
+        this.#startMemorySummaryRead(identity, signal);
         let publishedNotificationPolicyRevision: number | null = null;
         let registryPublicationSucceeded = true;
         try {
@@ -2573,6 +2637,18 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
             result.errors,
           );
           result.commandsApplied += deviceCommandResult.applied;
+        }
+        try {
+          const summaryDiagnostic = await this.#publishCompletedMemorySummary(
+            identity,
+            signal,
+          );
+          if (summaryDiagnostic !== null) {
+            result.errors.push(`memory summary: ${summaryDiagnostic}`);
+          }
+        } catch (error: unknown) {
+          if (signal.aborted) throw error;
+          result.errors.push(`memory summary: ${normalizeError(error)}`);
         }
         try {
           await this.#reconcileAttentionNotifications({
@@ -4223,6 +4299,213 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     ) throw new Error("Device registry publish response is invalid.");
     this.#deviceRegistryState = { digest, publishedAt: now, revision: response.revision };
     return notificationPolicyRevision ?? null;
+  }
+
+  /**
+   * Begin one supervision snapshot without awaiting any local work on the
+   * cycle tail. A completed task is retained until its independent hosted
+   * mutation succeeds, so a quota or revision failure never causes another
+   * expensive local scan on the fast cadence.
+   */
+  #startMemorySummaryRead(identity: ActiveCloudIdentity, signal: AbortSignal): void {
+    const authority = memorySummaryAuthority(identity);
+    const running = this.#memorySummaryTask;
+    if (running !== null) {
+      if (sameMemorySummaryAuthority(running.authority, identity)) return;
+      running.controller.abort(new Error("Cloud memory-summary authority changed."));
+      if (running.state.outcome === null) return;
+      this.#memorySummaryTask = null;
+    }
+    const cached = this.#memorySummaryState;
+    if (cached !== null && !sameMemorySummaryAuthority(cached.authority, identity)) {
+      this.#memorySummaryState = null;
+      this.#memorySummaryNextAttemptAt = 0;
+    }
+    if (this.#now() < this.#memorySummaryNextAttemptAt) return;
+    const readMemorySummary = this.#local.readMemorySummary?.bind(this.#local);
+    const sourceAvailable = readMemorySummary !== undefined;
+    const current = this.#memorySummaryState;
+    if (
+      !sourceAvailable
+      && current === null
+      && this.#local.readDeviceRegistry === undefined
+      && this.#local.readDeviceRegistryProjection === undefined
+    ) return;
+    if (
+      current !== null
+      && current.sourceAvailable === sourceAvailable
+      && (!sourceAvailable || this.#now() - current.publishedAt < deviceRegistryHeartbeatMs)
+    ) return;
+
+    const controller = new AbortController();
+    const abortRead = () => controller.abort(signal.reason);
+    if (signal.aborted) abortRead();
+    else signal.addEventListener("abort", abortRead, { once: true });
+    const state = { outcome: null as MemorySummaryReadOutcome | null };
+    const read = Promise.resolve().then(async (): Promise<MemorySummaryReadOutcome> => {
+      if (readMemorySummary === undefined) return { state: "completed", summary: null };
+      const summary = await readMemorySummary({
+        devicePublicId: identity.devicePublicId,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) throw controller.signal.reason;
+      if (!memorySummaryFitsEncryptedEnvelope(summary)) {
+        throw new Error("MEMORY_SUMMARY_PROJECTION_INVALID");
+      }
+      return { state: "completed", summary };
+    }).catch((error: unknown): MemorySummaryReadOutcome => ({ error, state: "failed" }));
+    const tracked = read.then((outcome) => {
+      state.outcome = outcome;
+      signal.removeEventListener("abort", abortRead);
+      return outcome;
+    });
+    this.#memorySummaryTask = {
+      authority,
+      controller,
+      promise: tracked,
+      sourceAvailable,
+      state,
+    };
+  }
+
+  /**
+   * Publish only a snapshot that already completed, and only after foreground
+   * session and device commands have run. This method never awaits a local
+   * memory read.
+   */
+  async #publishCompletedMemorySummary(
+    identity: ActiveCloudIdentity,
+    signal: AbortSignal,
+  ): Promise<string | null> {
+    const task = this.#memorySummaryTask;
+    if (task === null) return null;
+    if (!sameMemorySummaryAuthority(task.authority, identity)) {
+      task.controller.abort(new Error("Cloud memory-summary authority changed."));
+      if (task.state.outcome !== null) this.#memorySummaryTask = null;
+      return null;
+    }
+    const outcome = task.state.outcome;
+    if (outcome === null || this.#now() < this.#memorySummaryNextAttemptAt) return null;
+    if (task.controller.signal.aborted) {
+      this.#memorySummaryTask = null;
+      return null;
+    }
+    const now = this.#now();
+    if (outcome.state === "failed") {
+      // A failed or invalid local read is not evidence that the capability was
+      // removed. Keep the last good hosted companion and retry a fresh read
+      // after bounded backoff. Only a completed null snapshot (the optional
+      // source is absent) is allowed to clear an existing companion.
+      this.#memorySummaryTask = null;
+      this.#memorySummaryNextAttemptAt = now + attentionNotificationRetryMs;
+      return normalizeError(outcome.error);
+    }
+    const summary = outcome.summary;
+    const cached = this.#memorySummaryState;
+    let revision: number;
+    let envelopePresent: boolean;
+    if (cached !== null && sameMemorySummaryAuthority(cached.authority, identity)) {
+      revision = cached.revision;
+      envelopePresent = cached.envelopePresent;
+    } else {
+      const remote = await this.#readMemorySummaryState(identity);
+      revision = remote?.revision ?? 0;
+      envelopePresent = remote?.envelopePresent ?? false;
+    }
+
+    // No companion exists to clear. Remember the observed revision so a
+    // capability-downgraded daemon does not manufacture another clear on each
+    // restart after the first clear already committed.
+    if (summary === null && !envelopePresent) {
+      this.#memorySummaryState = {
+        authority: task.authority,
+        envelopePresent: false,
+        publishedAt: now,
+        revision,
+        sourceAvailable: task.sourceAvailable,
+      };
+      this.#memorySummaryTask = null;
+      return null;
+    }
+
+    const envelope = summary === null
+      ? undefined
+      : await encryptMemorySummary(summary, identity.accountKey, {
+          entityPublicId: identity.devicePublicId,
+          keyVersion: identity.keyVersion,
+          kind: "memory_summary",
+          userPublicId: identity.userPublicId,
+        });
+    try {
+      abortBeforeEffect(signal);
+      const response = await this.#mutation("devices:updateMemorySummary", {
+        ...(envelope === undefined ? {} : { envelope }),
+        expectedRevision: revision,
+        keyVersion: identity.keyVersion,
+      });
+      if (
+        !isRecord(response)
+        || response.devicePublicId !== identity.devicePublicId
+        || !isSafePositiveInteger(response.revision)
+        || response.revision !== revision + 1
+        || !isFiniteTimestamp(response.updatedAt)
+      ) throw new Error("Memory summary publish response is invalid.");
+      this.#memorySummaryState = {
+        authority: task.authority,
+        envelopePresent: envelope !== undefined,
+        publishedAt: now,
+        revision: response.revision,
+        sourceAvailable: task.sourceAvailable,
+      };
+      this.#memorySummaryNextAttemptAt = 0;
+      this.#memorySummaryTask = null;
+      return null;
+    } catch (error: unknown) {
+      if (
+        error instanceof Error
+        && error.message.includes("MEMORY_SUMMARY_REVISION_CONFLICT")
+      ) this.#memorySummaryState = null;
+      this.#memorySummaryNextAttemptAt = now + attentionNotificationRetryMs;
+      throw error;
+    }
+  }
+
+  async #readMemorySummaryState(identity: ActiveCloudIdentity): Promise<Readonly<{
+    envelopePresent: boolean;
+    revision: number;
+  }> | null> {
+    const value = await this.#transport.query("devices:getRegistry", {
+      devicePublicId: identity.devicePublicId,
+    });
+    if (value === null) return null;
+    if (
+      !isRecord(value)
+      || value.devicePublicId !== identity.devicePublicId
+      || value.keyVersion !== identity.keyVersion
+    ) throw new Error("Device memory summary response is invalid.");
+    if (value.memorySummaryRevision === undefined) {
+      if (
+        value.memorySummaryEnvelope !== undefined
+        || value.memorySummaryUpdatedAt !== undefined
+      ) throw new Error("Device memory summary response is invalid.");
+      return { envelopePresent: false, revision: 0 };
+    }
+    const envelope = value.memorySummaryEnvelope === undefined
+      ? null
+      : parseEncryptedEnvelope(
+          value.memorySummaryEnvelope,
+          cloudLimits.memorySummaryCiphertextCharacters,
+        );
+    if (
+      !isSafePositiveInteger(value.memorySummaryRevision)
+      || !isSafePositiveInteger(value.memorySummaryUpdatedAt)
+      || (value.memorySummaryEnvelope !== undefined
+        && (envelope === null || envelope.keyVersion !== identity.keyVersion))
+    ) throw new Error("Device memory summary response is invalid.");
+    return {
+      envelopePresent: value.memorySummaryEnvelope !== undefined,
+      revision: value.memorySummaryRevision,
+    };
   }
 
   async #readDeviceRegistryRevision(identity: ActiveCloudIdentity): Promise<number> {
@@ -6104,7 +6387,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     const selectedLaneKeys = new Set<string>();
     for (const [ordinal, command] of nonterminal.entries()) {
       const decisionLane = command.kind === "resolve_interaction";
-      const laneKey = `${command.sessionPublicId}\0${decisionLane ? "decision" : "default"}`;
+      const laneKey = `${command.sessionPublicId}\u0000${decisionLane ? "decision" : "default"}`;
       if (selectedLaneKeys.has(laneKey)) continue;
       selectedLaneKeys.add(laneKey);
       if (

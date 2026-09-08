@@ -1,7 +1,7 @@
 {
   "name": "@hraness/hra",
-  "version": "0.6.3",
-  "description": "Control plane for Codex and Claude Code. Local CLI v0.6.3 artifacts are live; daemon and hosted command-writer rollout remains blocked on capacity.",
+  "version": "0.7.0",
+  "description": "Control plane for Codex and Claude Code. Local CLI v0.7.0 is a release candidate; v0.6.3 is the admitted artifact, while daemon and hosted command-writer rollout remains blocked on capacity.",
   "license": "MIT",
   "publishConfig": {
     "access": "public",
@@ -31,6 +31,7 @@
     "local-efficiency:apply": "bun run ./plugins/hra-local-efficiency/skills/hra-local-efficiency/scripts/bootstrap.ts --apply",
     "local-efficiency:check": "bun run ./plugins/hra-local-efficiency/skills/hra-local-efficiency/scripts/bootstrap.ts --check",
     "acceptance:live": "bun ./scripts/live-acceptance.ts",
+    "acceptance:live:claude": "bun ./scripts/claude-live-acceptance.ts",
     "hosted:bootstrap": "bun ./scripts/bootstrap-hosted-sync.ts",
     "hosted:admission": "bun ./scripts/manage-hosted-admission.ts",
     "hosted:configure": "bun ./scripts/configure-hosted-sync.ts",
@@ -55,9 +56,13 @@
   "files": [
     "src",
     "!src/**/*.test.ts",
+    "!src/**/*.fixture.json",
     "!src/**/AGENTS.md",
+    "!src/cloud/device-commands.ts",
     "!src/cloud/inviteAuthority.ts",
     "!src/cloud/testAssertions.ts",
+    "!src/domain/model-routing.ts",
+    "!src/domain/model-task-shape.ts",
     "!src/storage/legacy-secret-migration.ts",
     "README.md",
     "LICENSE",
@@ -84,7 +89,7 @@
     "multi-account"
   ],
   "dependencies": {
-    "@hraness/oh": "0.2.7",
+    "@hraness/oh": "0.4.1",
     "@openai/codex": "0.153.2",
     "convex": "1.45.0",
     "effect": "3.22.1",

@@ -266,6 +266,36 @@ describe("trajectory v1 export", () => {
     })).toThrow();
   });
 
+  test("preserves peer-session provenance in the user record", () => {
+    const transcript = sessionTranscriptSchema.parse({
+      version: 1,
+      sessionId,
+      records: [{
+        kind: "user",
+        actor: "peer_session",
+        sequence: 1,
+        throughSequence: 1,
+        recordedAt: timestamp,
+        turnId,
+        text: "Review this invariant.",
+        omittedCharacters: 0,
+      }],
+      throughSequence: 1,
+      nextSequence: null,
+      omittedRecords: 0,
+      omittedCharacters: 0,
+      digest,
+    });
+    expect(transcriptToTrajectory({
+      transcript,
+      provider: "codex",
+      createdAt: timestamp,
+    })[2]).toMatchObject({
+      role: "user",
+      content: "[hra peer session] Review this invariant.",
+    });
+  });
+
   test("uses unique deterministic tool-call ids and keeps results linked in partial exports", () => {
     const toolCall = (sequence: number, recordTurnId = turnId) => ({
       kind: "tool_call" as const,

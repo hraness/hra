@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
+import { z } from "zod";
 
 import { AUTORESPOND_DAY_MS, AUTORESPOND_HOUR_MS } from "../domain/autorespond-budget";
 
@@ -12,12 +13,97 @@ import { StateStore } from "./state-store";
 
 const stores: StateStore[] = [];
 
+// These fixtures admit the shipped v43-v45 predecessor surfaces, not a private
+// memory cohort stamped with an older user_version.
+const dropHostedMemorySchema = (database: Database): void => {
+  const hostedObjects = z.object({
+    name: z.string().regex(/^[a-z0-9_]+$/u),
+    type: z.enum(["index", "trigger"]),
+  }).strict().array().parse(database.query(`
+    SELECT name,type FROM sqlite_master
+    WHERE type IN ('index','trigger') AND (
+      name LIKE 'project_memory_hosted_%'
+      OR name LIKE 'project_memory_sync_%'
+      OR name LIKE 'project_memory_portable_adoption_%'
+      OR name='canonical_memory_sync_share_fence'
+    )
+    ORDER BY CASE type WHEN 'trigger' THEN 0 ELSE 1 END,name
+  `).all());
+  for (const object of hostedObjects) {
+    database.exec(`DROP ${object.type.toUpperCase()} IF EXISTS "${object.name}"`);
+  }
+  database.exec(`
+    DROP TABLE IF EXISTS project_memory_sync_spool;
+    DROP TABLE IF EXISTS project_memory_sync_intents;
+    DROP TABLE IF EXISTS project_memory_hosted_create_intents;
+    DROP TABLE IF EXISTS project_memory_portable_adoption_proofs;
+    DROP TABLE IF EXISTS project_memory_hosted_attachments;
+  `);
+};
+
+const dropPeerAndHostedMemorySchema = (database: Database): void => {
+  dropHostedMemorySchema(database);
+  const featureObjects = z.object({
+    name: z.string().regex(/^[a-z0-9_]+$/u),
+    type: z.enum(["index", "trigger"]),
+  }).strict().array().parse(database.query(`
+    SELECT name,type FROM sqlite_master
+    WHERE type IN ('index','trigger') AND (
+      name LIKE 'peer_session_%'
+      OR name LIKE 'session_peer_%'
+      OR name LIKE 'session_message_event_source%'
+      OR name LIKE 'session_host_capability%'
+      OR name LIKE 'project_memory_%'
+      OR name LIKE 'memory_%'
+      OR name LIKE 'queue_peer_%'
+      OR name IN (
+        'session_provider_switch_authority_immutable',
+        'session_provider_switch_transition_guard',
+        'session_provider_switch_seed_transition_guard',
+        'session_provider_switch_session_update_guard',
+        'session_provider_switch_session_delete_guard',
+        'session_provider_switch_delete_guard',
+        'session_provider_switch_v40_authority_guard',
+        'session_provider_switch_v40_authority_immutable'
+      )
+    )
+    ORDER BY CASE type WHEN 'trigger' THEN 0 ELSE 1 END,name
+  `).all());
+  for (const object of featureObjects) {
+    database.exec(`DROP ${object.type.toUpperCase()} IF EXISTS "${object.name}"`);
+  }
+  database.exec(`
+    DROP TABLE IF EXISTS memory_page_attestation_refs;
+    DROP TABLE IF EXISTS memory_working_attestation_forks;
+    DROP TABLE IF EXISTS memory_working_attestation_heads;
+    DROP TABLE IF EXISTS memory_page_attestations;
+    DROP TABLE IF EXISTS memory_submissions;
+    DROP TABLE IF EXISTS project_memory_authorities;
+    DROP TABLE IF EXISTS session_provider_switches;
+    DROP TABLE IF EXISTS peer_session_direct_message_sources;
+    DROP TABLE IF EXISTS peer_session_turn_origins;
+    DROP TABLE IF EXISTS peer_session_action_roots;
+    DROP TABLE IF EXISTS peer_session_action_visits;
+    DROP TABLE IF EXISTS peer_session_action_parents;
+    DROP TABLE IF EXISTS peer_session_actions;
+    DROP TABLE IF EXISTS session_peer_policies;
+    DROP TABLE IF EXISTS session_message_event_sources;
+    DROP TABLE IF EXISTS session_host_capability_bindings;
+  `);
+  if (database.query(
+    "SELECT 1 FROM pragma_table_info('queue_entries') WHERE name='peer_action_id'",
+  ).get() !== null) database.exec("ALTER TABLE queue_entries DROP COLUMN peer_action_id");
+  if (database.query(
+    "SELECT 1 FROM pragma_table_info('queue_entries') WHERE name='message_actor'",
+  ).get() !== null) database.exec("ALTER TABLE queue_entries DROP COLUMN message_actor");
+};
+
 function dropAfterHoursSchema(database: Database): void {
   database.exec(`
     DROP TRIGGER sessions_autorespond_after_hours_history;
     DROP TABLE autorespond_after_hours_history;
     DROP TABLE autorespond_after_hours_policy;
-    DELETE FROM migrations WHERE version=46;
+    DELETE FROM migrations WHERE version>=46;
     PRAGMA user_version=45;
   `);
 }
@@ -310,6 +396,7 @@ describe("durable autorespond admission", () => {
     stores.splice(stores.indexOf(store), 1);
     store.close();
     const predecessor = new Database(paths.database);
+    dropPeerAndHostedMemorySchema(predecessor);
     // Reproduce the actual v31->v43 table spelling: SQLite quotes a table name
     // after ALTER TABLE RENAME, even when the original CREATE was unquoted.
     const evidenceSql = (predecessor.query(
@@ -330,7 +417,7 @@ describe("durable autorespond admission", () => {
       PRAGMA user_version=43;
     `);
     predecessor.close(false);
-    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:46");
+    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:48");
     const migrated = new StateStore(paths, { now: () => clock.now });
     stores.push(migrated);
     const availableAt = clock.now + AUTORESPOND_DAY_MS;
@@ -374,6 +461,7 @@ describe("durable autorespond admission", () => {
     stores.splice(stores.indexOf(store), 1);
     store.close();
     const damaged = new Database(paths.database);
+    dropPeerAndHostedMemorySchema(damaged);
     damaged.exec("DROP TABLE account_mutation_authority_rebinds; DELETE FROM migrations WHERE version>=44; PRAGMA user_version=43");
     expect(damaged.query("SELECT available_at FROM autorespond_budget_history WHERE session_id=?").get(sessionId))
       .toEqual({ available_at: 0 });
@@ -381,25 +469,28 @@ describe("durable autorespond admission", () => {
     expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V44_AUTORESPOND_BUDGET_PREDECESSOR_COLLISION");
   });
 
-  test("never applies pre-release v43 trigger-repair allowances to canonical v44 or v45", async () => {
-    for (const version of [44, 45]) {
-      const { store } = await fixture();
-      const paths = store.paths;
-      stores.splice(stores.indexOf(store), 1);
-      store.close();
-      const damaged = new Database(paths.database);
+  for (const version of [44, 45, 46, 47, 48]) test(`never applies pre-release v43 trigger-repair allowances to canonical v${String(version)}`, async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    stores.splice(stores.indexOf(store), 1);
+    store.close();
+    const damaged = new Database(paths.database);
+    if (version <= 45) {
+      dropPeerAndHostedMemorySchema(damaged);
       dropAfterHoursSchema(damaged);
-      if (version === 44) {
-        damaged.exec("DROP TABLE account_mutation_authority_rebinds; DELETE FROM migrations WHERE version=45; PRAGMA user_version=44");
-      }
-      damaged.exec("DROP TRIGGER queue_transcript_cancellation_settlement");
-      damaged.close(false);
-      expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V43_QUEUE_CANCELLATION_GUARD_INVALID");
-      const inspector = new Database(paths.database, { readonly: true });
-      try {
-        expect(inspector.query("SELECT 1 FROM sqlite_master WHERE name='queue_transcript_cancellation_settlement'").get()).toBeNull();
-      } finally { inspector.close(false); }
-    }
+    } else if (version === 46) dropPeerAndHostedMemorySchema(damaged);
+    else if (version === 47) dropHostedMemorySchema(damaged);
+    if (version === 44) damaged.exec("DROP TABLE account_mutation_authority_rebinds");
+    damaged.query("DELETE FROM migrations WHERE version>?").run(version);
+    damaged.exec(`PRAGMA user_version=${String(version)}`);
+    damaged.exec("DROP TRIGGER queue_transcript_cancellation_settlement");
+    damaged.close(false);
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V43_QUEUE_CANCELLATION_GUARD_INVALID");
+    const inspector = new Database(paths.database, { readonly: true });
+    try {
+      expect(inspector.query("SELECT 1 FROM sqlite_master WHERE name='queue_transcript_cancellation_settlement'").get()).toBeNull();
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: version });
+    } finally { inspector.close(false); }
   });
 });
 
@@ -437,6 +528,7 @@ async function legacyAfterHoursFixture(beforeMigration?: (store: StateStore, ses
   stores.splice(stores.indexOf(store), 1);
   store.close();
   const predecessor = new Database(paths.database);
+  dropPeerAndHostedMemorySchema(predecessor);
   dropAfterHoursSchema(predecessor);
   const guard = (predecessor.query("SELECT sql FROM sqlite_master WHERE name='autorespond_budget_history_immutable'").get() as { sql: string }).sql;
   predecessor.exec("DROP TRIGGER autorespond_budget_history_immutable");
@@ -457,16 +549,22 @@ describe("after-hours autorespond storage authority", () => {
     stores.splice(stores.indexOf(store), 1);
     store.close();
     const inspector = new Database(paths.database);
+    dropPeerAndHostedMemorySchema(inspector);
     dropAfterHoursSchema(inspector);
     const schema = inspector.query("SELECT name,sql,type FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name").all();
     const ledger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
     const rows = ["sessions", "profiles", "autorespond_budget_history", "autorespond_budget_reservations", "session_autorespond_counters", "account_mutation_authority_rebinds"]
       .map((name) => ({ name, rows: inspector.query(`SELECT * FROM ${name}`).all() }));
-    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:45:46");
+    expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:45:48");
     const migrated = new StateStore(paths, { now: () => clock.now });
     stores.push(migrated);
-    expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 46 });
-    expect(inspector.query("SELECT name,sql,type FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE '%autorespond_after_hours%' ORDER BY name").all()).toEqual(schema);
+    expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+    const migratedSchema = inspector.query(
+      "SELECT name,sql,type FROM sqlite_master WHERE sql IS NOT NULL AND name!='queue_entries' ORDER BY name",
+    ).all();
+    for (const row of schema.filter((entry) => z.object({ name: z.string() }).passthrough().parse(entry).name !== "queue_entries")) {
+      expect(migratedSchema).toContainEqual(row);
+    }
     expect(inspector.query("SELECT * FROM migrations WHERE version<46 ORDER BY version").all()).toEqual(ledger);
     for (const row of rows) expect(inspector.query(`SELECT * FROM ${row.name}`).all()).toEqual(row.rows);
     enableAfterHours(migrated);
@@ -484,6 +582,7 @@ describe("after-hours autorespond storage authority", () => {
       stores.splice(stores.indexOf(store), 1);
       store.close();
       const inspector = new Database(paths.database);
+      dropPeerAndHostedMemorySchema(inspector);
       dropAfterHoursSchema(inspector);
       if (damage === "missing_history") inspector.query("DELETE FROM autorespond_budget_history WHERE session_id=?").run(sessionId);
       else if (damage === "predecessor_ledger") inspector.exec("DELETE FROM migrations WHERE version=45");
@@ -509,7 +608,8 @@ describe("after-hours autorespond storage authority", () => {
       store.close();
       const inspector = new Database(paths.database);
       if (damage === "collision") {
-        inspector.exec("DELETE FROM migrations WHERE version=46; PRAGMA user_version=45");
+        dropPeerAndHostedMemorySchema(inspector);
+        inspector.exec("DELETE FROM migrations WHERE version>=46; PRAGMA user_version=45");
       } else if (damage === "missing_guard" || damage === "weak_guard") {
         inspector.exec("DROP TRIGGER autorespond_after_hours_history_update_guard");
         if (damage === "weak_guard") inspector.exec(`CREATE TRIGGER autorespond_after_hours_history_update_guard
@@ -532,7 +632,7 @@ describe("after-hours autorespond storage authority", () => {
         inspector.query("DELETE FROM autorespond_after_hours_history WHERE session_id=?").run(sessionId);
         inspector.exec(sql);
       } else if (damage === "missing_ledger") inspector.exec("DELETE FROM migrations WHERE version=46");
-      else inspector.exec("INSERT INTO migrations(version,applied_at) VALUES (47,1000000)");
+      else inspector.exec("INSERT INTO migrations(version,applied_at) VALUES (49,1000000)");
       const before = inspector.query("SELECT * FROM sqlite_master ORDER BY type,name").all();
       const ledger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
       for (const readonly of [true, false]) {
@@ -687,10 +787,11 @@ describe("after-hours autorespond storage authority", () => {
     const message = "Synthetic approved continuation";
     const attempt = store.prepareMutation({ kind: "session.send", authorityId: sessionId,
       authorityGeneration: profile.processGeneration, request: { message }, idempotencyKey: sourceId });
+    store.recordAutorespondMessageSource(sessionId, attempt.id);
     store.beginSessionMutationEffect({
-      attemptId: attempt.id, sessionId, profileGeneration: profile.processGeneration,
+      attemptId: attempt.id, sessionId, profileGeneration: profile.processGeneration, message,
       transcript: { accountId: profile.id, providerGeneration: profile.processGeneration,
-        providerConnectionId: "46000000-0000-4000-8000-000000000001", actor: "autorespond", message },
+        providerConnectionId: "46000000-0000-4000-8000-000000000001", actor: "autorespond" as const, message },
       evidence: { kind: "session.send", providerThreadId: session.providerThreadId ?? "",
         baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
         clientMessageId: attempt.id, messageDigest: createHash("sha256").update(message).digest("hex") },
@@ -778,9 +879,9 @@ describe("after-hours autorespond storage authority", () => {
     const attempt = store.prepareMutation({ kind: "session.send", authorityId: sessionId,
       authorityGeneration: profile.processGeneration, request: { message }, idempotencyKey: sourceId });
     store.beginSessionMutationEffect({
-      attemptId: attempt.id, sessionId, profileGeneration: profile.processGeneration,
+      attemptId: attempt.id, sessionId, profileGeneration: profile.processGeneration, message,
       transcript: { accountId: profile.id, providerGeneration: profile.processGeneration,
-        providerConnectionId: "46000000-0000-4000-8000-000000000002", actor: "human", message },
+        providerConnectionId: "46000000-0000-4000-8000-000000000002", actor: "human" as const, message },
       evidence: { kind: "session.send", providerThreadId: session.providerThreadId ?? "",
         baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
         clientMessageId: attempt.id, messageDigest: createHash("sha256").update(message).digest("hex") },

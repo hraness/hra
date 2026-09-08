@@ -3,10 +3,11 @@ import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type {
-  ClaudeProcess,
-  ClaudeProcessIdentity,
-  PinnedClaudeRuntime,
+import {
+  ClaudeHostToolBindingAuthority,
+  type ClaudeProcess,
+  type ClaudeProcessIdentity,
+  type PinnedClaudeRuntime,
 } from "../claude/index";
 import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "../claude/pin";
 import { LiveBatcher } from "../cloud/live-uploader";
@@ -147,6 +148,7 @@ class FakeClaudeProcess implements ClaudeProcess {
     async *[Symbol.asyncIterator]() { /* silent */ },
   };
   terminated = false;
+  onTerminate: (() => void) | undefined;
   #push: ((chunk: Uint8Array) => void) | undefined;
   #finish: (() => void) | undefined;
   #resolveExit: ((code: number) => void) | undefined;
@@ -182,6 +184,7 @@ class FakeClaudeProcess implements ClaudeProcess {
 
   terminate(): void {
     this.terminated = true;
+    this.onTerminate?.();
     this.#finish?.();
     this.#resolveExit?.(0);
   }
@@ -242,9 +245,11 @@ class OfflineCloud extends UnavailableCloudControl {
 const stores: StateStore[] = [];
 const roots: string[] = [];
 const services: HraService[] = [];
+const hostToolAuthorities: ClaudeHostToolBindingAuthority[] = [];
 
 afterEach(async () => {
   await Promise.all(services.splice(0).map(async (service) => { await service.close(); }));
+  await Promise.all(hostToolAuthorities.splice(0).map(async (authority) => { await authority.close(); }));
   for (const store of stores.splice(0)) store.close();
   await Promise.all(roots.splice(0).map(async (root) => rm(root, { force: true, recursive: true })));
 });
@@ -254,6 +259,7 @@ type ClaudeFixture = Readonly<{
   store: StateStore;
   cloud: CloudControlPort;
   documents: string;
+  paths: ReturnType<typeof resolveStatePaths>;
   processes: FakeClaudeProcess[];
 }>;
 
@@ -275,6 +281,8 @@ async function claudeFixture(
   store.setDefaultApprovalMode("manual");
   const processes: FakeClaudeProcess[] = [];
   const reference: { current?: HraService } = {};
+  const hostToolAuthority = new ClaudeHostToolBindingAuthority();
+  hostToolAuthorities.push(hostToolAuthority);
   const claude = new PinnedClaudeRuntimeManager({
     configHome: "isolated",
     configDirFor: () => join(home, "claude-config"),
@@ -290,6 +298,11 @@ async function claudeFixture(
       fact: async (authority, fact) => {
         await reference.current?.observeClaudeFact(authority, fact);
       },
+    },
+    hostTools: {
+      bindingAuthority: hostToolAuthority,
+      callbackSocketPath: join(paths.runtime, "claude-host-tools.sock"),
+      privateRoot: paths.runtime,
     },
     processFactory: (launch) => {
       const process = new FakeClaudeProcess();
@@ -322,7 +335,7 @@ async function claudeFixture(
   });
   reference.current = service;
   services.push(service);
-  return { cloud, documents, processes, service, store };
+  return { cloud, documents, paths, processes, service, store };
 }
 
 async function authenticatedClaudeAccount(
@@ -425,12 +438,10 @@ describe("Claude sessions on the local authority", () => {
     expect(value.processes).toEqual([process]);
     expect(process.terminated).toBe(true);
     const afterLoginBodies = await eventBodies(value, started.session.id);
-    expect(afterLoginBodies).not.toContainEqual(
-      expect.objectContaining({ type: "gap", reason: "provider_disconnect" }),
-    );
-    expect(afterLoginBodies).not.toContainEqual(
-      expect.objectContaining({ type: "connection", state: "disconnected" }),
-    );
+    expect(afterLoginBodies.some((body) =>
+      body.type === "gap" && body.reason === "provider_restart")).toBe(true);
+    expect(afterLoginBodies.some((body) =>
+      body.type === "connection" && body.state === "resubscribed")).toBe(true);
 
     await value.service.execute({
       idempotencyKey: crypto.randomUUID(),
@@ -524,7 +535,6 @@ describe("Claude sessions on the local authority", () => {
     if (process === undefined) throw new Error("Expected one pinned Claude process.");
     await settle();
     const before = value.store.requireProfileById(account);
-
     await value.service.observeCodexFact({
       codexHome: "unused-codex-home",
       desktopUserData: "unused-desktop-home",

@@ -10,12 +10,19 @@
  *
  * Nothing in this file touches React.
  */
-import type { CompactMessageActor, CompactSessionEvent, GitAction } from "../hra/cloud";
+import type {
+  CompactMessageActor,
+  CompactMessageActorKind,
+  CompactSessionEvent,
+  GitAction,
+} from "../hra/cloud";
 import { parseAttachmentManifest, type AttachmentManifestEntry } from "./attachments";
+
+export type TranscriptMessageActor = CompactMessageActor | CompactMessageActorKind;
 
 export type TranscriptEntry =
   | Readonly<{
-      actor: CompactMessageActor;
+      actor: TranscriptMessageActor;
       /**
        * The bounded manifest a `user_message` may carry: name, media type,
        * size, and digest, never bytes. Null when the message had none.
@@ -96,7 +103,7 @@ export function deriveTranscript(
     switch (event.kind) {
       case "user_message":
         entries.push({
-          actor: event.actor ?? "human",
+          actor: event.actorKind ?? event.actor ?? "human",
           attachments: readAttachmentManifest(event),
           key: `compact-${String(event.sequence)}`,
           kind: "user",

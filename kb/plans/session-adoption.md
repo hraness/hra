@@ -2,7 +2,7 @@
 title: Personal-home session adoption
 description: Delivery plan for automatically adopting Codex and Claude Code sessions from the owner's normal provider homes without weakening HRA session authority.
 type: plan
-status: in-progress
+status: completed
 area: hra
 tags:
   - codex
@@ -120,7 +120,7 @@ session ID. The new process is held under durable process authority.
 
 ### A. Durable policy and truthful import
 
-Status: implemented; final validation in progress.
+Status: complete; delivered in PR 113. See the delivery evidence below.
 
 - Add an append-only schema migration for provider-scoped personal-home policy,
   pending candidates, and session runtime bindings.
@@ -141,7 +141,7 @@ idempotent; public session schemas do not change.
 
 ### B. Codex discovery and reviewed admission
 
-Status: implemented; final validation in progress.
+Status: complete; delivered in PR 113. See the delivery evidence below.
 
 - Run a second pinned Codex runtime against the canonical personal Codex home.
 - Read bounded recent provider pages plus exact metadata for the bounded set of
@@ -180,7 +180,7 @@ active, recently updated, or unknown thread remains pending without a public
 
 ### C. Claude durable identity and resume takeover
 
-Status: implemented; final validation in progress.
+Status: complete; delivered in PR 113. See the delivery evidence below.
 
 - Fix HRA-created Claude sessions to use and validate one real provider session ID.
 - Discover sessions only through bounded scalar live-session registry metadata
@@ -197,7 +197,7 @@ expose the normal interaction and autorespond path.
 
 ### D. Projection, settings, and operations
 
-Status: implemented; final validation in progress.
+Status: complete; delivered in PR 113. See the delivery evidence below.
 
 - Route daemon and cloud reads through the session's private runtime binding.
 - Poll once at daemon admission and on a bounded interval with single-flight,
@@ -216,7 +216,8 @@ recovery to both controller sources; daemon shutdown drains both runtime sets.
 
 ### E. Verification and delivery
 
-Status: in progress.
+Status: complete for the original source change. Release and runtime rollout
+remain separate from this historical delivery.
 
 - Run focused storage, parser, provider-runtime, service, cloud, and app tests.
 - Run independent adversarial review over the converged diff.
@@ -226,6 +227,23 @@ Status: in progress.
 - Deploy the app-side optional aggregate-status reader before any daemon release
   that can upload the new optional registry field, because the previous app
   parser rejects unknown exact keys.
+
+### Delivery evidence
+
+[PR 113](https://github.com/hraness/hra/pull/113) merged on 2026-09-06 at
+`6f056dcafd6435cd11ae504c75e9b1f869955ca7`. Its final source
+`066296513422f6c6bbecd0eff208283e051e04cb` passed 2,775 local tests,
+the full build/package/install gate, and independent adversarial review as
+recorded in the PR. Post-merge [CI 34040242595](https://github.com/hraness/hra/actions/runs/34040242595)
+passed macOS, Ubuntu, and Required; [CodeQL 34040242363](https://github.com/hraness/hra/actions/runs/34040242363)
+also passed for that exact merge commit. These records were read back on
+2026-09-07. They close the original adoption source work, not a later tree's
+validation or release and deployment gates.
+
+The current [memory integration plan](oh-memory-civilization.md) owns the
+additional model-tool binding limits for existing provider threads. The
+[hosted rollout runbook](../../docs/hosted-sync.md) still governs capacity
+activation and intended-target proof before current daemon writers roll out.
 
 ## Explicit residual boundary
 
@@ -248,9 +266,13 @@ session commands, scheduler, approval authority, or autorespond path.
 
 ## Provider timestamp recovery repair
 
-Status: implemented and focused verification complete; independent review and
-exact-tree integration remain in progress.
-Tracked in [issue 121](https://github.com/hraness/hra/issues/121).
+Status: complete. [PR 122](https://github.com/hraness/hra/pull/122) merged on
+2026-09-06 at `576ccd76a6742cd62759ab6176a6a41844846daa` with successful
+macOS, Ubuntu, Required, and CodeQL checks. [Issue 121](https://github.com/hraness/hra/issues/121)
+closed at 20:03:05 UTC that day. The later Sol/schema join landed through
+[PR 123](https://github.com/hraness/hra/pull/123) at
+`97cebc44ecd2d27b8c0b6399b0814b1993d94fc1`. These are historical source
+delivery records, not admission of the subsequent memory candidate.
 
 Codex thread parsing converts provider epoch seconds to milliseconds. An old
 unmarked stop or rename baseline must not become evidence of advancement merely
@@ -280,7 +302,7 @@ ledger history, then replaces only the reviewed Work authority guards for
 active Sol routing and records its own migration entry. Schema 43 adds
 append-only transcript-finalization bits to the existing mutation and queue
 source-authority rows, fencing pre-v43 dispatched sources without retaining a
-second per-message ledger. Current schema 43 opens require the exact
+second per-message ledger. At that repair checkpoint, schema 43 opens required the exact
 `[40, 41, 42, 43]` ledger tail and all current authority surfaces before
 maintenance; missing or altered guards are refused without repair.
 Schemas 40 and 41 remain immutable predecessors, and readonly older databases
@@ -293,7 +315,8 @@ bytes and digests after reopen, and public projection privacy. Focused parser,
 adapter, service, and storage proof tests pass. The schema-41 compiler and
 changed-file lint checks passed. The storage and CLI migration run passed 265
 tests and exposed two fixture errors; both were corrected and the focused
-rerun passed seven tests with 370 assertions. The integration owner will record
-independent review, the exact-tree aggregate and package inventory, and delivery
-before closing this repair. No live provider or native authentication claim is
-needed for these local proof rules.
+rerun passed seven tests with 370 assertions. The merged PR and successful
+checks above close the repair's integration and delivery. Later schema 44
+approval budgets and schema 45 authentication recovery retain these historical
+proof rules; later after-hours and memory migrations retain those predecessors. No live
+provider or native authentication claim is needed for these local proof rules.

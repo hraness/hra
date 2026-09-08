@@ -1,6 +1,6 @@
 const stableSemver = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 const exactRegistryVersion = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/u;
-export const HRA_RELEASE_OH_VERSION = "0.2.7";
+export const HRA_RELEASE_OH_VERSION = "0.4.1";
 
 type JsonRecord = Record<string, unknown>;
 

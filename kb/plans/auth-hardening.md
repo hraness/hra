@@ -1,7 +1,9 @@
 # Authentication review and hardening
 
-Status: implementation and independent review complete; current-main integration
-and release validation in progress.
+Status: implementation, independent review, current-main integration, and
+immutable artifact admission complete. Live provider and runtime rollout gates
+remain separate. The post-admission documentation change records its own
+final gate and delivery receipt.
 Review starts from `main` commit `136ad40` and preserves the Codex Effect boundary
 introduced by pull request 120. Integration includes the non-overlapping shared
 footer update from `main` commit `c3874c7`, then the automatic-approval and
@@ -127,9 +129,9 @@ accounts while unresolved auth authority remains fenced. Independent source
 review finds no auth conflict with main's approval-budget reservation or
 Effect request-lifecycle boundaries.
 
-Version 0.6.1 is already admitted and immutable. The 0.6.2 artifact candidate
-uses fresh exact installer URLs and release-consistent pins; it must still pass
-the documented tag and publication gates.
+Version 0.6.1 remains immutable. The 0.6.2 artifact uses fresh exact installer
+URLs and release-consistent pins and completed the tag and publication gates
+recorded below.
 Candidate site, release-workflow, and installer identity checks pass. The
 reviewed archive contains 161 filesystem entries (152 files), every file
 byte-identical to the source tree. Its canonical size inventory is 7491 bytes
@@ -151,7 +153,20 @@ self-contained historical fixtures, not the current package identity.
 Main then merged the footer-only dependency update `7872886`. The auth branch
 preserves that exact package and lockfile change, with the matching third-party
 notice. It does not alter auth behavior or the packaged file-size inventory.
-The final gate must cover this joined tree.
+The complete final gate passed on joined commit `66c18ca`, including all
+source, script, plugin, site and app suites, builds, and isolated package
+consumer lifecycle checks. The final app suite passed all 481 tests. An
+independent exact-tree review approved the release-authority changes. PR 132
+passed macOS, Linux, Required and CodeQL, then merged at
+`5c5c02ee5964167fb85e92da53cdb80c87991890`; its tree exactly matches the reviewed
+candidate. Exact-main CI run `34155869308` passed. The protected helper created
+annotated tag `v0.6.2`, object `b3ecb87870d6a6c83b4e4a8b5117ad837d89d0bc`.
+Release run `34156958618` completed final public admission on attempt 2 after
+the first attempt published exact bytes but exhausted the registry-visibility
+window. The same-run recovery preserved all immutable identities and bytes;
+[the release control record](../../docs/beta-release.md#immutable-v062-successful-release-record)
+contains exact jobs and artifact digests. No provider credentials were read,
+no real daemon was upgraded, and no hosted writer was activated.
 Artifact publication does not authorize daemon upgrades or activate hosted
 commands. Protected capacity activation and intended-target marker proofs
 remain required; live two-device Codex and exact-pin Linux Claude acceptance

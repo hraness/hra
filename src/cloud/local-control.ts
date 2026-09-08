@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 
 import type { CloudControlPort } from "../daemon/ports";
 import { AccountKeyLossPreconditionError } from "../domain/cloud-outcomes";
@@ -6,7 +6,19 @@ import { createCloudUuidV7 } from "../domain/uuid-v7";
 import { parseAuthCredentials } from "./authCredentials";
 import { parseAuthSignInResult } from "./authSession";
 import {
+  canonicalMemoryGcmMessageBudgetPerDevice,
+  parseCanonicalMemoryHostedSpaceId,
+  parseCanonicalMemorySpaceKey,
+  type CanonicalMemoryEncryptionKey,
+} from "./canonical-memory-crypto";
+import {
+  CanonicalMemoryTransportError,
+  createCanonicalMemoryTransport,
+  type CanonicalMemoryTransport,
+} from "./canonical-memory-transport";
+import {
   createConvexCloudTransport,
+  type AccessTokenProvider,
   type CloudTransport,
 } from "./client";
 import {
@@ -116,6 +128,20 @@ const maximumRemoteCommandLifetimeMs = 7 * 24 * 60 * 60 * 1_000;
 const maximumDeviceMutationReceiptAgeMs = maximumRemoteCommandLifetimeMs;
 const maximumDeviceMutationReceiptCount = 128;
 const maximumDeviceMutationCustodyBytes = 64 * 1_024;
+const liveCanonicalMemoryEncryptionKeysByCustody = new WeakMap<
+  CloudSecretCustodyPort,
+  Map<string, number>
+>();
+
+function liveCanonicalMemoryEncryptionKeys(
+  custody: CloudSecretCustodyPort,
+): Map<string, number> {
+  const current = liveCanonicalMemoryEncryptionKeysByCustody.get(custody);
+  if (current !== undefined) return current;
+  const created = new Map<string, number>();
+  liveCanonicalMemoryEncryptionKeysByCustody.set(custody, created);
+  return created;
+}
 
 class AccountDeletionStatusUnavailableError extends Error {
   constructor() {
@@ -206,6 +232,7 @@ export function deploymentFencedCloudTransport(
 }
 
 export type LocalCloudControlOptions = Readonly<{
+  canonicalMemoryTransportFactory?: (accessToken: AccessTokenProvider) => CloudTransport;
   deploymentAuthority: CloudDeploymentAuthority;
   deploymentUrl: string;
   deviceLabel?: string;
@@ -227,6 +254,64 @@ export type LocalCloudControlEnvironmentOptions = Readonly<{
   secretCustody: CloudSecretCustodyPort;
   transport?: CloudTransport;
 }>;
+
+export type CanonicalMemoryCloudAuthority = Readonly<{
+  accountBindingDigest: string;
+  accountKey: Readonly<{
+    bytes: Uint8Array;
+    keyVersion: number;
+  }>;
+  assertCurrent(): Promise<void>;
+  dispose(): void;
+  openEncryptionKey(input: CanonicalMemoryEncryptionKeyRequest): Promise<
+    CanonicalMemoryEncryptionKeyHandle
+  >;
+  retireEncryptionKey(input: CanonicalMemoryEncryptionKeyRequest): Promise<void>;
+  transport: CanonicalMemoryTransport;
+}>;
+
+export type CanonicalMemoryEncryptionKeyUsage =
+  | Readonly<{ kind: "account_data" }>
+  | Readonly<{ hostedSpaceId: string; kind: "space" }>;
+
+export type CanonicalMemoryEncryptionKeyRequest = Readonly<{
+  bytes: Uint8Array;
+  keyVersion: number;
+  usage: CanonicalMemoryEncryptionKeyUsage;
+}>;
+
+export type CanonicalMemoryEncryptionKeyHandle = CanonicalMemoryEncryptionKey;
+
+export interface CanonicalMemoryCloudAuthoritySource {
+  snapshotCanonicalMemoryAuthority(
+    signal: AbortSignal,
+  ): Promise<CanonicalMemoryCloudAuthority>;
+}
+
+export class CanonicalMemoryCloudAuthorityError extends Error {
+  readonly code = "CANONICAL_MEMORY_CLOUD_AUTHORITY_UNAVAILABLE" as const;
+
+  constructor() {
+    super("Canonical memory cloud authority is unavailable.");
+    this.name = "CanonicalMemoryCloudAuthorityError";
+  }
+}
+
+export type CanonicalMemoryEncryptionKeyRefusal =
+  | "cross_owner_or_scope"
+  | "live"
+  | "relabel"
+  | "retired"
+  | "widening";
+
+export class CanonicalMemoryEncryptionKeyError extends Error {
+  readonly code = "CANONICAL_MEMORY_ENCRYPTION_KEY_REFUSED" as const;
+
+  constructor(readonly reason: CanonicalMemoryEncryptionKeyRefusal) {
+    super("Canonical memory encryption key custody refused the operation.");
+    this.name = "CanonicalMemoryEncryptionKeyError";
+  }
+}
 
 export type CloudRemoteSessionSelector = Readonly<{
   executionDevicePublicId: string;
@@ -436,20 +521,47 @@ type AccountKeySecret = Readonly<{
   version: 1;
 }>;
 
-// Persisted AES-GCM message high-water marks, one per account key, so the
-// per-key budget survives daemon restarts. Marks only rise and lead the true
-// count by up to two checkpoint intervals. The slot is keyed by key
-// fingerprint, not identity, so it is not identity-scoped custody.
-type GcmMessageBudgetCustody = Readonly<{
-  keys: readonly Readonly<{
-    fingerprint: string;
-    keyVersion: number;
-    messages: number;
-  }>[];
-  version: 1;
+type LegacyGcmMessageBudgetEntry = Readonly<{
+  fingerprint: string;
+  keyVersion: number;
+  messages: number;
 }>;
 
-const maximumGcmMessageBudgetKeys = 16;
+type BoundGcmMessageBudgetEntry = Readonly<{
+  fingerprint: string;
+  keyVersion: number;
+  maximumMessages: number;
+  messages: number;
+  ownerAccountBindingDigest: string;
+  rawFingerprint: string;
+  state: "active" | "retired";
+  usageScope: string;
+}>;
+
+// Persisted AES-GCM message high-water marks survive daemon restarts. V2
+// binds every admitted raw key to one owner, logical version, and closed usage
+// scope. Legacy marks remain quarantined until the exact raw key next appears,
+// at which point it is conservatively migrated without resetting its count.
+type GcmMessageBudgetCustody = Readonly<{
+  keys: readonly BoundGcmMessageBudgetEntry[];
+  legacyKeys: readonly LegacyGcmMessageBudgetEntry[];
+  version: 2;
+}>;
+
+// The initial hosted contract permits 100 immutable v1 memory-space keys.
+// Keep room for the active account key and 27 retired account/space keys while
+// retaining a strict, custody-sized upper bound.
+const maximumGcmMessageBudgetKeys = 128;
+
+type CanonicalMemoryEncryptionKeyIdentity = Readonly<{
+  budgetKey: GcmMessageBudgetKey;
+  fingerprint: string;
+  keyVersion: number;
+  maximumMessages: number;
+  ownerAccountBindingDigest: string;
+  rawFingerprint: string;
+  usageScope: string;
+}>;
 
 type AccountKeyRecoveryAuthority = Readonly<{
   authEpoch: number;
@@ -606,6 +718,12 @@ type AccountOperationAuthority = Readonly<{
   account: AccountContext;
   auth: SecretObservation<Extract<AuthCustody, Readonly<{ kind: "authenticated" }>>>;
   authIdentity: SecretObservation<AuthIdentityBinding>;
+}>;
+
+type CanonicalMemoryAuthorityPins = Readonly<{
+  accountKey: SecretObservation<AccountKeySecret>;
+  authority: AccountOperationAuthority;
+  device: SecretObservation<DeviceSecret>;
 }>;
 
 type DeviceRecord = Readonly<{
@@ -1192,6 +1310,33 @@ function parseAccountKeyRecoveryObservation(
   throw new Error("Cloud account-key recovery evidence is corrupt.");
 }
 
+const canonicalMemoryAccountDataUsageScope = "account_data";
+const canonicalMemorySpaceUsageScopePrefix = "space:";
+
+function isCanonicalMemoryGcmUsageScope(value: unknown): value is string {
+  if (value === canonicalMemoryAccountDataUsageScope) return true;
+  return typeof value === "string"
+    && value.startsWith(canonicalMemorySpaceUsageScopePrefix)
+    && parseCanonicalMemoryHostedSpaceId(
+      value.slice(canonicalMemorySpaceUsageScopePrefix.length),
+    ) !== null;
+}
+
+function canonicalMemoryGcmUsageScope(
+  usage: CanonicalMemoryEncryptionKeyUsage,
+): string | null {
+  if (!isRecord(usage)) return null;
+  if (usage.kind === "account_data" && hasExactKeys(usage, ["kind"])) {
+    return canonicalMemoryAccountDataUsageScope;
+  }
+  if (
+    usage.kind === "space"
+    && hasExactKeys(usage, ["hostedSpaceId", "kind"])
+    && parseCanonicalMemoryHostedSpaceId(usage.hostedSpaceId) !== null
+  ) return `${canonicalMemorySpaceUsageScopePrefix}${usage.hostedSpaceId}`;
+  return null;
+}
+
 function parseGcmMessageBudgetCustody(value: string): GcmMessageBudgetCustody {
   let decoded: unknown;
   try {
@@ -1199,16 +1344,90 @@ function parseGcmMessageBudgetCustody(value: string): GcmMessageBudgetCustody {
   } catch {
     throw new Error("Cloud GCM message budget custody is corrupt.");
   }
+  if (!isRecord(decoded)) {
+    throw new Error("Cloud GCM message budget custody is corrupt.");
+  }
+  if (decoded.version === 1) {
+    if (
+      !hasExactKeys(decoded, ["keys", "version"])
+      || !Array.isArray(decoded.keys)
+      || decoded.keys.length > maximumGcmMessageBudgetKeys
+    ) throw new Error("Cloud GCM message budget custody is corrupt.");
+    const legacyKeys: LegacyGcmMessageBudgetEntry[] = [];
+    const seen = new Set<string>();
+    for (const entry of decoded.keys) {
+      if (
+        !isRecord(entry)
+        || !hasExactKeys(entry, ["fingerprint", "keyVersion", "messages"])
+        || typeof entry.fingerprint !== "string"
+        || !/^[0-9a-f]{32}$/u.test(entry.fingerprint)
+        || !isSafePositiveInteger(entry.keyVersion)
+        || !isSafeNonNegativeInteger(entry.messages)
+        || entry.messages > gcmMessageBudgetPerKey
+        || seen.has(entry.fingerprint)
+      ) throw new Error("Cloud GCM message budget custody is corrupt.");
+      seen.add(entry.fingerprint);
+      legacyKeys.push({
+        fingerprint: entry.fingerprint,
+        keyVersion: entry.keyVersion,
+        messages: entry.messages,
+      });
+    }
+    return { keys: [], legacyKeys, version: 2 };
+  }
   if (
-    !isRecord(decoded)
-    || decoded.version !== 1
-    || !hasExactKeys(decoded, ["keys", "version"])
+    decoded.version !== 2
+    || !hasExactKeys(decoded, ["keys", "legacyKeys", "version"])
     || !Array.isArray(decoded.keys)
-    || decoded.keys.length > maximumGcmMessageBudgetKeys
+    || !Array.isArray(decoded.legacyKeys)
+    || decoded.keys.length + decoded.legacyKeys.length > maximumGcmMessageBudgetKeys
   ) throw new Error("Cloud GCM message budget custody is corrupt.");
-  const keys: Array<GcmMessageBudgetCustody["keys"][number]> = [];
-  const seen = new Set<string>();
+  const keys: BoundGcmMessageBudgetEntry[] = [];
+  const seenFingerprints = new Set<string>();
+  const seenRawFingerprints = new Set<string>();
   for (const entry of decoded.keys) {
+    if (
+      !isRecord(entry)
+      || !hasExactKeys(entry, [
+        "fingerprint",
+        "keyVersion",
+        "maximumMessages",
+        "messages",
+        "ownerAccountBindingDigest",
+        "rawFingerprint",
+        "state",
+        "usageScope",
+      ])
+      || typeof entry.fingerprint !== "string"
+      || !/^[0-9a-f]{32}$/u.test(entry.fingerprint)
+      || !isSafePositiveInteger(entry.keyVersion)
+      || !isSafePositiveInteger(entry.maximumMessages)
+      || entry.maximumMessages > gcmMessageBudgetPerKey
+      || !isSafeNonNegativeInteger(entry.messages)
+      || entry.messages > entry.maximumMessages
+      || !isDigest(entry.ownerAccountBindingDigest)
+      || typeof entry.rawFingerprint !== "string"
+      || !/^[0-9a-f]{32}$/u.test(entry.rawFingerprint)
+      || (entry.state !== "active" && entry.state !== "retired")
+      || !isCanonicalMemoryGcmUsageScope(entry.usageScope)
+      || seenFingerprints.has(entry.fingerprint)
+      || seenRawFingerprints.has(entry.rawFingerprint)
+    ) throw new Error("Cloud GCM message budget custody is corrupt.");
+    seenFingerprints.add(entry.fingerprint);
+    seenRawFingerprints.add(entry.rawFingerprint);
+    keys.push({
+      fingerprint: entry.fingerprint,
+      keyVersion: entry.keyVersion,
+      maximumMessages: entry.maximumMessages,
+      messages: entry.messages,
+      ownerAccountBindingDigest: entry.ownerAccountBindingDigest,
+      rawFingerprint: entry.rawFingerprint,
+      state: entry.state,
+      usageScope: entry.usageScope,
+    });
+  }
+  const legacyKeys: LegacyGcmMessageBudgetEntry[] = [];
+  for (const entry of decoded.legacyKeys) {
     if (
       !isRecord(entry)
       || !hasExactKeys(entry, ["fingerprint", "keyVersion", "messages"])
@@ -1217,16 +1436,16 @@ function parseGcmMessageBudgetCustody(value: string): GcmMessageBudgetCustody {
       || !isSafePositiveInteger(entry.keyVersion)
       || !isSafeNonNegativeInteger(entry.messages)
       || entry.messages > gcmMessageBudgetPerKey
-      || seen.has(`${entry.keyVersion}:${entry.fingerprint}`)
+      || seenFingerprints.has(entry.fingerprint)
     ) throw new Error("Cloud GCM message budget custody is corrupt.");
-    seen.add(`${entry.keyVersion}:${entry.fingerprint}`);
-    keys.push({
+    seenFingerprints.add(entry.fingerprint);
+    legacyKeys.push({
       fingerprint: entry.fingerprint,
       keyVersion: entry.keyVersion,
       messages: entry.messages,
     });
   }
-  return { keys, version: 1 };
+  return { keys, legacyKeys, version: 2 };
 }
 
 function parseLocalState(value: string): LocalCloudState {
@@ -2247,6 +2466,16 @@ function abortBeforeEffect(signal: AbortSignal): void {
   if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Operation aborted.");
 }
 
+function canonicalMemoryAccountBindingDigest(
+  deploymentUrl: string,
+  userPublicId: string,
+): string {
+  return createHash("sha256")
+    .update("hra-control-plane:canonical-memory-account-binding:v1\0")
+    .update(JSON.stringify({ deploymentUrl, userPublicId, version: 1 }))
+    .digest("hex");
+}
+
 export function deploymentUrlFromEnvironment(
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): string | null {
@@ -2254,11 +2483,15 @@ export function deploymentUrlFromEnvironment(
   return selection.kind === "disabled" ? null : selection.deploymentUrl;
 }
 
-export class LocalCloudControl implements CloudControlPort {
+export class LocalCloudControl implements CloudControlPort, CanonicalMemoryCloudAuthoritySource {
+  readonly #canonicalMemoryTransportFactory: (
+    accessToken: AccessTokenProvider,
+  ) => CloudTransport;
   readonly #deploymentAuthority: CloudDeploymentAuthority;
   readonly #deviceLabel: string | null;
   readonly #gcmMessageBudget: GcmMessageBudget;
   readonly #identityCustody: IdentityScopedCloudSecretCustody | null;
+  readonly #liveCanonicalMemoryEncryptionKeys: Map<string, number>;
   readonly #now: () => number;
   readonly #secrets: CloudSecretCustodyPort;
   readonly #transport: CloudTransport;
@@ -2280,24 +2513,351 @@ export class LocalCloudControl implements CloudControlPort {
       ? options.secretCustody
       : null;
     this.#gcmMessageBudget = options.gcmMessageBudget ?? processGcmMessageBudget;
+    this.#liveCanonicalMemoryEncryptionKeys = liveCanonicalMemoryEncryptionKeys(
+      options.secretCustody,
+    );
     this.#now = options.now ?? Date.now;
     this.#secrets = deploymentFencedSecretCustody(
       options.secretCustody,
       this.#deploymentAuthority,
     );
-    const transport = options.transport ?? createConvexCloudTransport({
-      accessToken: async () => {
-        await this.#deploymentAuthority.assertCurrent();
-        const token = (await this.#readTransportAuth())?.token ?? null;
-        await this.#deploymentAuthority.assertCurrent();
-        return token;
-      },
-      deploymentUrl,
-      ...(options.lifetimeSignal === undefined
-        ? {}
-        : { lifetimeSignal: options.lifetimeSignal }),
+    const createTransport = (accessToken: AccessTokenProvider): CloudTransport =>
+      createConvexCloudTransport({
+        accessToken,
+        deploymentUrl,
+        ...(options.lifetimeSignal === undefined
+          ? {}
+          : { lifetimeSignal: options.lifetimeSignal }),
+      });
+    const transport = options.transport ?? createTransport(async () => {
+      await this.#deploymentAuthority.assertCurrent();
+      const token = (await this.#readTransportAuth())?.token ?? null;
+      await this.#deploymentAuthority.assertCurrent();
+      return token;
     });
+    // Production creates a fresh Convex client for each canonical-memory
+    // authority snapshot so its bearer can never drift to a later login. An
+    // explicitly injected transport is already a trusted transport boundary;
+    // tests may inject the factory as well to exercise bearer-selection races.
+    this.#canonicalMemoryTransportFactory = options.canonicalMemoryTransportFactory
+      ?? (options.transport === undefined ? createTransport : () => transport);
     this.#transport = deploymentFencedCloudTransport(transport, this.#deploymentAuthority);
+  }
+
+  async snapshotCanonicalMemoryAuthority(
+    signal: AbortSignal,
+  ): Promise<CanonicalMemoryCloudAuthority> {
+    let keyDigest: Uint8Array | null = null;
+    let keyBytes: Uint8Array | null = null;
+    try {
+      abortBeforeEffect(signal);
+      if (await this.#readPendingAccountDeletion() !== null) {
+        throw new Error("Canonical memory cloud authority is unavailable.");
+      }
+      const { account, authority, device } = await this.#requireActiveDeviceOperationAuthority();
+      abortBeforeEffect(signal);
+      const accountKey = await this.#readAccountKeyObservation();
+      await this.#assertLocalAccountOperationAuthority(authority);
+      if (
+        accountKey === null
+        || !this.#usableAccountKey(accountKey.value, {
+          keyVersion: account.device.keyVersion,
+          userPublicId: account.userPublicId,
+        })
+        || accountKey.value.keyVersion !== account.device.keyVersion
+      ) throw new Error("Canonical memory cloud authority changed.");
+      keyBytes = decodeBase64Url(accountKey.value.key);
+      if (keyBytes.byteLength !== 32) {
+        throw new Error("Canonical memory cloud authority changed.");
+      }
+      const accountBindingDigest = canonicalMemoryAccountBindingDigest(
+        this.#deploymentAuthority.deploymentUrl,
+        account.userPublicId,
+      );
+      await this.#admitGcmMessageBudget(
+        keyBytes,
+        accountKey.value.keyVersion,
+        accountBindingDigest,
+        canonicalMemoryAccountDataUsageScope,
+        canonicalMemoryGcmMessageBudgetPerDevice,
+      );
+      keyDigest = createHash("sha256").update(keyBytes).digest();
+      const pins: CanonicalMemoryAuthorityPins = { accountKey, authority, device };
+      await this.#assertCanonicalMemoryAuthority(pins);
+      abortBeforeEffect(signal);
+
+      const ownedKeyDigest = keyDigest;
+      const ownedKeyBytes = keyBytes;
+      const encryptionKeyHandles = new Set<CanonicalMemoryEncryptionKeyHandle>();
+      let disposed = false;
+      const snapshotChanged = (): boolean => {
+        if (disposed) return true;
+        const currentDigest = createHash("sha256").update(ownedKeyBytes).digest();
+        try {
+          return !timingSafeEqual(currentDigest, ownedKeyDigest);
+        } finally {
+          currentDigest.fill(0);
+        }
+      };
+      const assertPinned = async (): Promise<void> => {
+        if (snapshotChanged()) throw new CanonicalMemoryCloudAuthorityError();
+        try {
+          await this.#assertCanonicalMemoryAuthority(pins);
+        } catch {
+          throw new CanonicalMemoryCloudAuthorityError();
+        }
+        if (snapshotChanged()) throw new CanonicalMemoryCloudAuthorityError();
+      };
+      const exactAuth = pins.authority.auth.value.auth;
+      const guarded = async <T>(
+        operation: () => Promise<T>,
+        postEffect: "indeterminate" | "none",
+      ): Promise<T> => {
+        try {
+          await assertPinned();
+        } catch {
+          throw new CanonicalMemoryTransportError("transport", "none");
+        }
+        const result = await operation();
+        try {
+          await assertPinned();
+        } catch {
+          throw new CanonicalMemoryTransportError("transport", postEffect);
+        }
+        return result;
+      };
+      const snapshotTransport = deploymentFencedCloudTransport(
+        this.#canonicalMemoryTransportFactory(async () => {
+          await assertPinned();
+          return exactAuth.token;
+        }),
+        this.#deploymentAuthority,
+      );
+      const typedTransport = createCanonicalMemoryTransport(snapshotTransport);
+      const authorityFencedTransport: CanonicalMemoryTransport = {
+        create: async (request) => await guarded(
+          async () => await typedTransport.create(request),
+          "indeterminate",
+        ),
+        get: async (request) => await guarded(
+          async () => await typedTransport.get(request),
+          "none",
+        ),
+        head: async (request) => await guarded(
+          async () => await typedTransport.head(request),
+          "none",
+        ),
+        list: async () => await guarded(
+          async () => await typedTransport.list(),
+          "none",
+        ),
+        pull: async (request) => await guarded(
+          async () => await typedTransport.pull(request),
+          "none",
+        ),
+        push: async (request) => await guarded(
+          async () => await typedTransport.push(request),
+          "indeterminate",
+        ),
+      };
+      const accountKeySnapshot = Object.create(null) as {
+        bytes: Uint8Array;
+        keyVersion: number;
+      };
+      Object.defineProperties(accountKeySnapshot, {
+        // Keep routine JSON/string projection from turning secret bytes into
+        // a long numeric object. The synchronizer still receives the explicit
+        // property and owns its lifetime through dispose().
+        bytes: { enumerable: false, value: ownedKeyBytes },
+        keyVersion: { enumerable: true, value: accountKey.value.keyVersion },
+      });
+      Object.freeze(accountKeySnapshot);
+      const snapshot = Object.freeze({
+        accountBindingDigest,
+        accountKey: accountKeySnapshot,
+        assertCurrent: async (): Promise<void> => await assertPinned(),
+        dispose: (): void => {
+          if (disposed) return;
+          disposed = true;
+          for (const handle of encryptionKeyHandles) handle.dispose();
+          encryptionKeyHandles.clear();
+          ownedKeyBytes.fill(0);
+          ownedKeyDigest.fill(0);
+        },
+        openEncryptionKey: async (
+          input: CanonicalMemoryEncryptionKeyRequest,
+        ): Promise<CanonicalMemoryEncryptionKeyHandle> => {
+          const usageScope = canonicalMemoryGcmUsageScope(input.usage);
+          const encryptionKey = parseCanonicalMemorySpaceKey(input.bytes);
+          if (
+            usageScope === null
+            || encryptionKey === null
+            || !isSafePositiveInteger(input.keyVersion)
+          ) {
+            encryptionKey?.fill(0);
+            throw new CanonicalMemoryCloudAuthorityError();
+          }
+          const encryptionKeyDigest = createHash("sha256").update(encryptionKey).digest();
+          let identity: CanonicalMemoryEncryptionKeyIdentity;
+          try {
+            if (usageScope === canonicalMemoryAccountDataUsageScope) {
+              const matchesAccountKey = input.keyVersion === accountKey.value.keyVersion
+                && timingSafeEqual(encryptionKeyDigest, ownedKeyDigest);
+              if (!matchesAccountKey) {
+                throw new CanonicalMemoryEncryptionKeyError("cross_owner_or_scope");
+              }
+            }
+            identity = await this.#canonicalMemoryEncryptionKeyIdentity(
+              encryptionKey,
+              input.keyVersion,
+              accountBindingDigest,
+              usageScope,
+              canonicalMemoryGcmMessageBudgetPerDevice,
+            );
+            await this.#exclusive(async () => {
+              await assertPinned();
+              await this.#admitGcmMessageBudgetIdentity(encryptionKey, identity);
+              await assertPinned();
+              this.#liveCanonicalMemoryEncryptionKeys.set(
+                identity.rawFingerprint,
+                (this.#liveCanonicalMemoryEncryptionKeys.get(identity.rawFingerprint) ?? 0) + 1,
+              );
+            });
+            encryptionKeyDigest.fill(0);
+          } catch (error: unknown) {
+            encryptionKey.fill(0);
+            encryptionKeyDigest.fill(0);
+            if (
+              error instanceof KeyRotationRequiredError
+              || error instanceof CanonicalMemoryEncryptionKeyError
+            ) throw error;
+            throw new CanonicalMemoryCloudAuthorityError();
+          }
+
+          let activeOperations = 0;
+          let disposeRequested = false;
+          let handleDisposed = false;
+          const finalizeDispose = (): void => {
+            if (handleDisposed || activeOperations !== 0 || !disposeRequested) return;
+            handleDisposed = true;
+            encryptionKey.fill(0);
+            encryptionKeyDigest.fill(0);
+            const live = this.#liveCanonicalMemoryEncryptionKeys.get(identity.rawFingerprint) ?? 0;
+            if (live <= 1) this.#liveCanonicalMemoryEncryptionKeys.delete(identity.rawFingerprint);
+            else this.#liveCanonicalMemoryEncryptionKeys.set(identity.rawFingerprint, live - 1);
+            encryptionKeyHandles.delete(handle);
+          };
+          const withLiveKey = async <T>(operation: () => Promise<T>): Promise<T> => {
+            if (disposeRequested || handleDisposed || snapshotChanged()) {
+              throw new CanonicalMemoryCloudAuthorityError();
+            }
+            activeOperations += 1;
+            try {
+              return await operation();
+            } finally {
+              activeOperations -= 1;
+              finalizeDispose();
+            }
+          };
+          const handle: CanonicalMemoryEncryptionKeyHandle = Object.freeze({
+            authenticate: async (purpose: string, value: string): Promise<string> =>
+              await withLiveKey(async () => await this.#exclusive(async () => {
+                await assertPinned();
+                const digest = await hmacSha256Hex(encryptionKey, purpose, value);
+                await assertPinned();
+                return digest;
+              })),
+            dispose: (): void => {
+              disposeRequested = true;
+              finalizeDispose();
+            },
+            encrypt: async (
+              plaintext: Uint8Array,
+              aad: Uint8Array,
+            ): Promise<EncryptedEnvelope> => await withLiveKey(async () => {
+              const plaintextSnapshot = Uint8Array.from(plaintext);
+              const aadSnapshot = Uint8Array.from(aad);
+              try {
+                return await this.#exclusive(async () => {
+                  await assertPinned();
+                  // Reservation and consumption are inseparable from this
+                  // exact capability. Canonical-memory code cannot silently
+                  // fall back to the process-global budget.
+                  await this.#admitGcmMessageBudgetIdentity(encryptionKey, identity);
+                  const encrypted = await encryptBytes(
+                    plaintextSnapshot,
+                    encryptionKey,
+                    identity.keyVersion,
+                    aadSnapshot,
+                    this.#gcmMessageBudget,
+                  );
+                  await assertPinned();
+                  return encrypted;
+                });
+              } catch (error: unknown) {
+                if (
+                  error instanceof KeyRotationRequiredError
+                  || error instanceof CanonicalMemoryEncryptionKeyError
+                ) throw error;
+                throw new CanonicalMemoryCloudAuthorityError();
+              } finally {
+                plaintextSnapshot.fill(0);
+                aadSnapshot.fill(0);
+              }
+            }),
+            keyVersion: identity.keyVersion,
+            usageScope: identity.usageScope as CanonicalMemoryEncryptionKey["usageScope"],
+          });
+          encryptionKeyHandles.add(handle);
+          return handle;
+        },
+        retireEncryptionKey: async (
+          input: CanonicalMemoryEncryptionKeyRequest,
+        ): Promise<void> => {
+          const usageScope = canonicalMemoryGcmUsageScope(input.usage);
+          const encryptionKey = parseCanonicalMemorySpaceKey(input.bytes);
+          if (
+            usageScope === null
+            || usageScope === canonicalMemoryAccountDataUsageScope
+            || encryptionKey === null
+            || !isSafePositiveInteger(input.keyVersion)
+          ) {
+            encryptionKey?.fill(0);
+            throw usageScope === canonicalMemoryAccountDataUsageScope
+              ? new CanonicalMemoryEncryptionKeyError("live")
+              : new CanonicalMemoryCloudAuthorityError();
+          }
+          try {
+            const identity = await this.#canonicalMemoryEncryptionKeyIdentity(
+              encryptionKey,
+              input.keyVersion,
+              accountBindingDigest,
+              usageScope,
+              canonicalMemoryGcmMessageBudgetPerDevice,
+            );
+            await this.#exclusive(async () => {
+              await assertPinned();
+              await this.#retireGcmMessageBudgetIdentity(encryptionKey, identity);
+              await assertPinned();
+            });
+          } catch (error: unknown) {
+            if (error instanceof CanonicalMemoryEncryptionKeyError) throw error;
+            throw new CanonicalMemoryCloudAuthorityError();
+          } finally {
+            encryptionKey.fill(0);
+          }
+        },
+        transport: authorityFencedTransport,
+      });
+      keyDigest = null;
+      keyBytes = null;
+      return snapshot;
+    } catch (error: unknown) {
+      keyDigest?.fill(0);
+      keyBytes?.fill(0);
+      if (error instanceof KeyRotationRequiredError) throw error;
+      throw new CanonicalMemoryCloudAuthorityError();
+    }
   }
 
   async auth(input: { email: string; code?: string; invite?: string; signal: AbortSignal }): Promise<unknown> {
@@ -4184,6 +4744,7 @@ export class LocalCloudControl implements CloudControlPort {
   async #requireActiveDeviceOperationAuthority(): Promise<Readonly<{
     account: AccountContext & { device: NonNullable<AccountContext["device"]> };
     authority: AccountOperationAuthority;
+    device: SecretObservation<DeviceSecret>;
   }>> {
     const authority = await this.#openAccountOperationAuthority(true);
     const account = authority.account;
@@ -4192,20 +4753,63 @@ export class LocalCloudControl implements CloudControlPort {
       throw new Error("This cloud device is awaiting approval.");
     }
     await this.#assertLocalAccountOperationAuthority(authority);
-    const localDevice = await this.#readDevice();
+    const localDevice = await this.#readDeviceObservation();
     await this.#assertLocalAccountOperationAuthority(authority);
     if (
       localDevice === null
-      || !localDevice.registered
-      || localDevice.userPublicId !== account.userPublicId
-      || localDevice.publicId !== account.device.publicId
+      || !localDevice.value.registered
+      || localDevice.value.userPublicId !== account.userPublicId
+      || localDevice.value.publicId !== account.device.publicId
     ) throw new Error("The active cloud device key is unavailable; recovery is required.");
-    await this.#hydrateAccountKey(account, localDevice, authority);
+    await this.#hydrateAccountKey(account, localDevice.value, authority);
+    const currentDevice = await this.#secrets.read(deviceSlot);
+    if (
+      currentDevice === null
+      || currentDevice.generation !== localDevice.generation
+      || currentDevice.value !== localDevice.serialized
+    ) throw new Error("Cloud account operation authority changed.");
+    await this.#assertLocalAccountOperationAuthority(authority);
     await this.#assertServerAccountOperationAuthority(authority);
     return {
       account: { ...account, device: account.device },
       authority,
+      device: localDevice,
     };
+  }
+
+  async #assertCanonicalMemoryLocalAuthority(
+    pins: CanonicalMemoryAuthorityPins,
+  ): Promise<void> {
+    await this.#assertLocalAccountOperationAuthority(pins.authority);
+    if (
+      await this.#readPendingAuthLogout() !== null
+      || await this.#readPendingAccountDeletion() !== null
+    ) throw new Error("Canonical memory cloud authority changed.");
+    const [device, accountKey] = await Promise.all([
+      this.#secrets.read(deviceSlot),
+      this.#secrets.read(accountKeySlot),
+    ]);
+    if (
+      device === null
+      || device.generation !== pins.device.generation
+      || device.value !== pins.device.serialized
+      || accountKey === null
+      || accountKey.generation !== pins.accountKey.generation
+      || accountKey.value !== pins.accountKey.serialized
+    ) throw new Error("Canonical memory cloud authority changed.");
+    await this.#assertLocalAccountOperationAuthority(pins.authority);
+    if (
+      await this.#readPendingAuthLogout() !== null
+      || await this.#readPendingAccountDeletion() !== null
+    ) throw new Error("Canonical memory cloud authority changed.");
+  }
+
+  async #assertCanonicalMemoryAuthority(
+    pins: CanonicalMemoryAuthorityPins,
+  ): Promise<void> {
+    await this.#assertCanonicalMemoryLocalAuthority(pins);
+    await this.#assertServerAccountOperationAuthority(pins.authority);
+    await this.#assertCanonicalMemoryLocalAuthority(pins);
   }
 
   async #listDeviceRecords(
@@ -4874,8 +5478,16 @@ export class LocalCloudControl implements CloudControlPort {
   }
 
   async #readAccountKey(): Promise<AccountKeySecret | null> {
+    return (await this.#readAccountKeyObservation())?.value ?? null;
+  }
+
+  async #readAccountKeyObservation(): Promise<SecretObservation<AccountKeySecret> | null> {
     const observation = await this.#secrets.read(accountKeySlot);
-    return observation === null ? null : parseAccountKeySecret(observation.value);
+    return observation === null ? null : {
+      generation: observation.generation,
+      serialized: observation.value,
+      value: parseAccountKeySecret(observation.value),
+    };
   }
 
   async #readState(): Promise<LocalCloudState> {
@@ -5285,37 +5897,262 @@ export class LocalCloudControl implements CloudControlPort {
       throw new Error("The cloud account key is unavailable.");
     }
     const bytes = decodeBase64Url(key.key);
-    await this.#admitGcmMessageBudget(bytes, key.keyVersion);
+    await this.#admitGcmMessageBudget(
+      bytes,
+      key.keyVersion,
+      canonicalMemoryAccountBindingDigest(
+        this.#deploymentAuthority.deploymentUrl,
+        userPublicId,
+      ),
+      canonicalMemoryAccountDataUsageScope,
+      canonicalMemoryGcmMessageBudgetPerDevice,
+    );
     return { bytes, keyVersion: key.keyVersion };
   }
 
-  // Every encryption under this key passes through `encryptBytes`, which
-  // counts it in the process-wide budget. This admission restores the
-  // persisted high-water mark for the key, refuses the key once its budget
-  // is spent, and advances the persisted mark once per checkpoint interval
-  // so a restart can never undercount.
-  async #admitGcmMessageBudget(bytes: Uint8Array, keyVersion: number): Promise<void> {
-    const budgetKey: GcmMessageBudgetKey = await gcmMessageBudgetKey(bytes, keyVersion);
+  async #canonicalMemoryEncryptionKeyIdentity(
+    bytes: Uint8Array,
+    keyVersion: number,
+    ownerAccountBindingDigest: string,
+    usageScope: string,
+    maximumMessages: number,
+  ): Promise<CanonicalMemoryEncryptionKeyIdentity> {
+    if (
+      !isSafePositiveInteger(keyVersion)
+      || !isDigest(ownerAccountBindingDigest)
+      || !isCanonicalMemoryGcmUsageScope(usageScope)
+      || !isSafePositiveInteger(maximumMessages)
+      || maximumMessages > gcmMessageBudgetPerKey
+    ) throw new CanonicalMemoryCloudAuthorityError();
+    const budgetKey = await gcmMessageBudgetKey(bytes, keyVersion);
+    const fingerprint = (await hmacSha256Hex(
+      bytes,
+      "gcm-message-budget-binding",
+      JSON.stringify({ ownerAccountBindingDigest, usageScope, version: 1 }),
+    )).slice(0, 32);
+    return {
+      budgetKey,
+      fingerprint,
+      keyVersion,
+      maximumMessages,
+      ownerAccountBindingDigest,
+      rawFingerprint: budgetKey.fingerprint,
+      usageScope,
+    };
+  }
+
+  async #matchingLegacyGcmEntries(
+    bytes: Uint8Array,
+    identity: CanonicalMemoryEncryptionKeyIdentity,
+    entries: readonly LegacyGcmMessageBudgetEntry[],
+  ): Promise<readonly LegacyGcmMessageBudgetEntry[]> {
+    const legacyFingerprints = new Map<number, string>();
+    const matching: LegacyGcmMessageBudgetEntry[] = [];
+    for (const entry of entries) {
+      let legacyFingerprint = legacyFingerprints.get(entry.keyVersion);
+      if (legacyFingerprint === undefined) {
+        legacyFingerprint = (await hmacSha256Hex(
+          bytes,
+          "gcm-message-budget",
+          String(entry.keyVersion),
+        )).slice(0, 32);
+        legacyFingerprints.set(entry.keyVersion, legacyFingerprint);
+      }
+      if (
+        entry.fingerprint === identity.rawFingerprint
+        || entry.fingerprint === legacyFingerprint
+      ) {
+        if (entry.keyVersion !== identity.keyVersion) {
+          throw new CanonicalMemoryEncryptionKeyError("relabel");
+        }
+        matching.push(entry);
+      }
+    }
+    return matching;
+  }
+
+  // Restores and reserves durable capacity before an encryption may consume
+  // the exact injected in-process budget. Bound records make raw-key relabel,
+  // cross-account reuse, and cross-space reuse permanent fail-closed states.
+  async #admitGcmMessageBudget(
+    bytes: Uint8Array,
+    keyVersion: number,
+    ownerAccountBindingDigest: string,
+    usageScope: string,
+    maximumMessages: number,
+  ): Promise<void> {
+    const identity = await this.#canonicalMemoryEncryptionKeyIdentity(
+      bytes,
+      keyVersion,
+      ownerAccountBindingDigest,
+      usageScope,
+      maximumMessages,
+    );
+    await this.#admitGcmMessageBudgetIdentity(bytes, identity);
+  }
+
+  async #admitGcmMessageBudgetIdentity(
+    bytes: Uint8Array,
+    identity: CanonicalMemoryEncryptionKeyIdentity,
+  ): Promise<void> {
     const observation = await this.#secrets.read(gcmMessageBudgetSlot);
     const custody = observation === null
-      ? { keys: [], version: 1 } as const
+      ? { keys: [], legacyKeys: [], version: 2 } as const
       : parseGcmMessageBudgetCustody(observation.value);
-    const persisted = custody.keys.find((entry) =>
-      entry.keyVersion === budgetKey.keyVersion && entry.fingerprint === budgetKey.fingerprint);
-    const messages = this.#gcmMessageBudget.restore(budgetKey, persisted?.messages ?? 0);
-    if (messages >= gcmMessageBudgetPerKey) throw new KeyRotationRequiredError(keyVersion);
-    const covered = Math.min(messages + gcmMessageBudgetCheckpointInterval, gcmMessageBudgetPerKey);
-    if ((persisted?.messages ?? 0) >= covered) return;
-    if (persisted === undefined && custody.keys.length >= maximumGcmMessageBudgetKeys) {
+    const bound = custody.keys.find((entry) =>
+      entry.rawFingerprint === identity.rawFingerprint);
+    if (bound !== undefined) {
+      if (bound.ownerAccountBindingDigest !== identity.ownerAccountBindingDigest) {
+        throw new CanonicalMemoryEncryptionKeyError("cross_owner_or_scope");
+      }
+      if (bound.usageScope !== identity.usageScope) {
+        throw new CanonicalMemoryEncryptionKeyError("cross_owner_or_scope");
+      }
+      if (bound.keyVersion !== identity.keyVersion) {
+        throw new CanonicalMemoryEncryptionKeyError("relabel");
+      }
+      if (bound.fingerprint !== identity.fingerprint) {
+        throw new Error("Cloud GCM message budget custody is corrupt.");
+      }
+      if (bound.state === "retired") {
+        throw new CanonicalMemoryEncryptionKeyError("retired");
+      }
+      if (identity.maximumMessages > bound.maximumMessages) {
+        throw new CanonicalMemoryEncryptionKeyError("widening");
+      }
+    }
+    const legacy = await this.#matchingLegacyGcmEntries(
+      bytes,
+      identity,
+      custody.legacyKeys,
+    );
+    const persistedMessages = [bound, ...legacy].reduce(
+      (total, entry) => Math.min(
+        gcmMessageBudgetPerKey,
+        total + (entry?.messages ?? 0),
+      ),
+      0,
+    );
+    const effectiveMaximum = Math.min(
+      identity.maximumMessages,
+      bound?.maximumMessages ?? identity.maximumMessages,
+    );
+    const messages = this.#gcmMessageBudget.restore(identity.budgetKey, persistedMessages);
+    if (messages >= effectiveMaximum || persistedMessages > effectiveMaximum) {
+      throw new KeyRotationRequiredError(identity.keyVersion);
+    }
+    const covered = Math.min(
+      messages + gcmMessageBudgetCheckpointInterval,
+      effectiveMaximum,
+    );
+    const migrationRequired = legacy.length > 0 || bound === undefined;
+    const narrowingRequired = bound !== undefined
+      && bound.maximumMessages !== effectiveMaximum;
+    if (!migrationRequired && !narrowingRequired && bound.messages >= covered) return;
+    if (
+      bound === undefined
+      && legacy.length === 0
+      && custody.keys.length + custody.legacyKeys.length >= maximumGcmMessageBudgetKeys
+    ) {
       throw new Error("Cloud GCM message budget custody is full.");
     }
-    const mark = Math.min(messages + 2 * gcmMessageBudgetCheckpointInterval, gcmMessageBudgetPerKey);
+    const mark = Math.min(
+      Math.max(persistedMessages, messages + 2 * gcmMessageBudgetCheckpointInterval),
+      effectiveMaximum,
+    );
+    const legacySet = new Set(legacy);
     const next: GcmMessageBudgetCustody = {
       keys: [
-        ...custody.keys.filter((entry) => entry !== persisted),
-        { fingerprint: budgetKey.fingerprint, keyVersion: budgetKey.keyVersion, messages: mark },
+        ...custody.keys.filter((entry) => entry !== bound),
+        {
+          fingerprint: identity.fingerprint,
+          keyVersion: identity.keyVersion,
+          maximumMessages: effectiveMaximum,
+          messages: mark,
+          ownerAccountBindingDigest: identity.ownerAccountBindingDigest,
+          rawFingerprint: identity.rawFingerprint,
+          state: "active",
+          usageScope: identity.usageScope,
+        },
       ],
-      version: 1,
+      legacyKeys: custody.legacyKeys.filter((entry) => !legacySet.has(entry)),
+      version: 2,
+    };
+    const committed = await this.#secrets.compareAndSwap(
+      gcmMessageBudgetSlot,
+      observation?.generation ?? null,
+      serializeSecret(next),
+    );
+    if (committed === null) throw new Error("Cloud secret state changed concurrently.");
+  }
+
+  async #retireGcmMessageBudgetIdentity(
+    bytes: Uint8Array,
+    identity: CanonicalMemoryEncryptionKeyIdentity,
+  ): Promise<void> {
+    if ((this.#liveCanonicalMemoryEncryptionKeys.get(identity.rawFingerprint) ?? 0) > 0) {
+      throw new CanonicalMemoryEncryptionKeyError("live");
+    }
+    const observation = await this.#secrets.read(gcmMessageBudgetSlot);
+    const custody = observation === null
+      ? { keys: [], legacyKeys: [], version: 2 } as const
+      : parseGcmMessageBudgetCustody(observation.value);
+    const bound = custody.keys.find((entry) =>
+      entry.rawFingerprint === identity.rawFingerprint);
+    if (bound !== undefined) {
+      if (
+        bound.ownerAccountBindingDigest !== identity.ownerAccountBindingDigest
+        || bound.usageScope !== identity.usageScope
+      ) throw new CanonicalMemoryEncryptionKeyError("cross_owner_or_scope");
+      if (bound.keyVersion !== identity.keyVersion) {
+        throw new CanonicalMemoryEncryptionKeyError("relabel");
+      }
+      if (bound.fingerprint !== identity.fingerprint) {
+        throw new Error("Cloud GCM message budget custody is corrupt.");
+      }
+      if (identity.maximumMessages > bound.maximumMessages) {
+        throw new CanonicalMemoryEncryptionKeyError("widening");
+      }
+      if (bound.state === "retired") return;
+    }
+    const legacy = await this.#matchingLegacyGcmEntries(
+      bytes,
+      identity,
+      custody.legacyKeys,
+    );
+    if (
+      bound === undefined
+      && legacy.length === 0
+      && custody.keys.length + custody.legacyKeys.length >= maximumGcmMessageBudgetKeys
+    ) throw new Error("Cloud GCM message budget custody is full.");
+    const persistedMessages = [bound, ...legacy].reduce(
+      (total, entry) => Math.min(
+        gcmMessageBudgetPerKey,
+        total + (entry?.messages ?? 0),
+      ),
+      0,
+    );
+    const legacySet = new Set(legacy);
+    const next: GcmMessageBudgetCustody = {
+      keys: [
+        ...custody.keys.filter((entry) => entry !== bound),
+        {
+          fingerprint: identity.fingerprint,
+          keyVersion: identity.keyVersion,
+          maximumMessages: Math.max(
+            identity.maximumMessages,
+            bound?.maximumMessages ?? 0,
+            persistedMessages,
+          ),
+          messages: persistedMessages,
+          ownerAccountBindingDigest: identity.ownerAccountBindingDigest,
+          rawFingerprint: identity.rawFingerprint,
+          state: "retired",
+          usageScope: identity.usageScope,
+        },
+      ],
+      legacyKeys: custody.legacyKeys.filter((entry) => !legacySet.has(entry)),
+      version: 2,
     };
     const committed = await this.#secrets.compareAndSwap(
       gcmMessageBudgetSlot,
@@ -5404,7 +6241,7 @@ export class LocalCloudControl implements CloudControlPort {
   }
 }
 
-export function createLocalCloudControl(options: LocalCloudControlOptions): CloudControlPort {
+export function createLocalCloudControl(options: LocalCloudControlOptions): LocalCloudControl {
   return new LocalCloudControl(options);
 }
 

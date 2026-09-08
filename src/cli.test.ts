@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { closeSync, openSync } from "node:fs";
 import { PassThrough } from "node:stream";
 
+import packageMetadata from "../package.json";
+
 import {
   admitExactDaemonStop,
   daemonRunProcessArguments,
@@ -114,83 +116,52 @@ class CliClaudeLoginSignalSource implements ClaudeLoginSignalSource {
   }
 }
 
-const sessionAdoptionTableNames = [
-  "session_claude_process_authorities",
-  "session_claude_process_launch_intents",
-  "session_personal_runtime_bindings",
-  "session_adoption_candidates",
-  "session_adoption_policies",
-  "session_adoption_profile_generation_permits",
-  "profile_personal_authority_revocations",
-  "provider_runtime_account_revocations",
-  "session_provider_account_authorities",
-  "session_account_authorities",
+const hostedMemoryTableNames = [
+  "project_memory_hosted_attachments",
+  "project_memory_hosted_create_intents",
+  "project_memory_sync_intents",
+  "project_memory_sync_spool",
+  "project_memory_portable_adoption_proofs",
 ] as const;
 
-// An install written by the released provider-switch build: notification,
-// preset-contract, Devin-provider, and personal-session-adoption migrations are
-// absent and `user_version` still names schema v35. A writable open must carry
-// that authority through both later feature families and the timestamp guard to v41 without pretending
-// either newer private authority surface already existed. Released v0.5 stores
-// use schema v33 and are covered by storage migration tests.
+// An install written by the peer/local-memory predecessor is at v47 but predates
+// hosted-memory authority. Storage migration tests cover older released-schema
+// bridges in depth; this CLI fixture proves daemon start owns the pending v48
+// migration instead of silently opening a stale schema from a non-daemon command.
 const downgradeStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("PRAGMA foreign_keys=OFF; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert;");
+    database.exec("PRAGMA foreign_keys=OFF");
     const laterSchemaObjects = database.query(`
       SELECT name,type FROM sqlite_master
       WHERE name NOT LIKE 'sqlite_%' AND (
         (type='index' AND (
-          tbl_name IN (${sessionAdoptionTableNames.map(() => "?").join(",")})
-          OR name='sessions_profile_created'
-          OR sql LIKE '%provider_v39%'
-          OR sql LIKE '%preset_contract%'
+          tbl_name IN (${hostedMemoryTableNames.map(() => "?").join(",")})
         ))
         OR (type='trigger' AND (
-          sql LIKE '%session_account_authorit%'
-          OR sql LIKE '%provider_runtime_account_revocation%'
-          OR sql LIKE '%session_adoption_%'
-          OR sql LIKE '%session_personal_runtime_%'
-          OR sql LIKE '%session_claude_process_%'
-          OR sql LIKE '%profile_personal_authority_%'
-          OR sql LIKE '%codex_account_key%'
-          OR sql LIKE '%provider_v39%'
-          OR sql LIKE '%preset_contract%'
+          name='canonical_memory_sync_share_fence'
+          OR sql LIKE '%project_memory_hosted_%'
+          OR sql LIKE '%project_memory_sync_%'
+          OR sql LIKE '%project_memory_portable_adoption_%'
         ))
       )
       ORDER BY CASE type WHEN 'trigger' THEN 0 ELSE 1 END,name
-    `).all(...sessionAdoptionTableNames) as Array<{
+    `).all(...hostedMemoryTableNames) as Array<{
       name: string;
       type: "index" | "trigger";
     }>;
     for (const object of laterSchemaObjects) {
       if (!/^[a-z0-9_]+$/u.test(object.name) || !["index", "trigger"].includes(object.type)) {
-        throw new Error("Unexpected session-adoption schema object.");
+        throw new Error("Unexpected hosted-memory schema object.");
       }
       database.exec(`DROP ${object.type.toUpperCase()} IF EXISTS "${object.name}"`);
     }
-    for (const table of sessionAdoptionTableNames) {
+    for (const table of hostedMemoryTableNames) {
       database.exec(`DROP TABLE IF EXISTS "${table}"`);
     }
-    database.exec(`
-      DROP TABLE IF EXISTS session_mutation_authority_rebinds_v39;
-      ALTER TABLE profiles DROP COLUMN codex_account_key;
-      ALTER TABLE sessions DROP COLUMN provider_v39;
-      ALTER TABLE sessions DROP COLUMN preset_contract;
-      ALTER TABLE works DROP COLUMN preset_contract;
-      DROP TABLE IF EXISTS attention_email_policy;
-      DROP TABLE IF EXISTS notification_hours;
-      DELETE FROM migrations WHERE version>=36;
-      DROP TABLE IF EXISTS account_mutation_authority_rebinds;
-      DROP TRIGGER IF EXISTS sessions_autorespond_budget_history;
-      DROP TABLE IF EXISTS autorespond_budget_history;
-      DROP TABLE IF EXISTS autorespond_budget_reservations;
-      DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history;
-      DROP TABLE IF EXISTS autorespond_after_hours_policy;
-      DROP TABLE IF EXISTS autorespond_after_hours_history;
-      PRAGMA user_version=35;
-      PRAGMA foreign_keys=ON;
-    `);
+    database.exec("DELETE FROM migrations WHERE version>47");
+    database.exec("PRAGMA user_version=47");
+    database.exec("PRAGMA foreign_keys=ON");
   } finally {
     database.close(false);
   }
@@ -201,7 +172,7 @@ const downgradeStateSchema = (databasePath: string): void => {
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("PRAGMA user_version=47");
+    database.exec("PRAGMA user_version=49");
   } finally {
     database.close(false);
   }
@@ -2075,7 +2046,7 @@ describe("CLI entry point", () => {
         ok: true,
         version: 1,
         command: "version",
-        data: { version: "0.6.3" },
+        data: { version: packageMetadata.version },
       });
       expect(version.read().stderr).toBe("");
     }
@@ -2774,7 +2745,7 @@ describe("CLI entry point", () => {
   test("version is sourced from package metadata", async () => {
     const captured = capture();
     expect(await main(["--version"], captured.output)).toBe(0);
-    expect(captured.read()).toEqual({ stdout: "hra 0.6.3\n", stderr: "" });
+    expect(captured.read()).toEqual({ stdout: `hra ${packageMetadata.version}\n`, stderr: "" });
   });
 
   test("completes protected interaction input outside argv and never renders its value", async () => {
@@ -3545,6 +3516,9 @@ describe("CLI entry point", () => {
       ["session", "task", "create", "session-1", "--name", "review", "--every-minutes", "15", "--json", "--", privatePayload],
       ["session", "task", "edit", "session-1", `stask_${"1".repeat(32)}`, "--revision", "1", "--json", "--", privatePayload],
       ["session", "task", "delete", "session-1", `stask_${"1".repeat(32)}`, "--revision", "1", "--json"],
+      ["memory", "remember", "session-1", "preferences.review", "--title", "Review style", "--summary", "Private summary", "--json", "--", privatePayload],
+      ["memory", "share", "session-1", "preferences.review", "--reason", privatePayload, "--json"],
+      ["memory", "hosted", "create", privatePayload, "--json"],
     ] as const;
 
     for (const argv of commands) {
@@ -6199,6 +6173,35 @@ describe("CLI entry point", () => {
     }
   });
 
+  test("rejects the canonical-memory fault decorator outside live acceptance before effects", async () => {
+    const installation = createProductionInstallation();
+    let decorated = false;
+    await expect(runDaemon(installation, {
+      liveAcceptanceCanonicalMemoryTransportDecorator: (transport) => {
+        decorated = true;
+        return transport;
+      },
+    })).rejects.toThrow("restricted to live acceptance");
+    expect(decorated).toBeFalse();
+  });
+
+  test("rejects the Claude proof collector outside live acceptance before effects", async () => {
+    const installation = createProductionInstallation();
+    let invoked = false;
+    await expect(runDaemon(installation, {
+      liveAcceptanceClaudeProof: {
+        beginDaemonGeneration: () => { invoked = true; },
+        closeDaemonGeneration: () => { invoked = true; },
+        handleManagedHostToolCall: async () => {
+          invoked = true;
+          return {};
+        },
+        handleManagedHostToolResponseWritten: () => { invoked = true; },
+      },
+    })).rejects.toThrow("Daemon acceptance hooks are restricted to live acceptance.");
+    expect(invoked).toBeFalse();
+  });
+
   test("delivers an abort during early daemon boot before transport exists", async () => {
     const { installation: baseInstallation, runRoot } = await upgradeFixture("daemon-stop-during-early-boot");
     try {
@@ -6283,7 +6286,7 @@ describe("CLI entry point", () => {
       const initialized = capture();
       expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);
       downgradeStateSchema(installation.paths.database);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(35);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(47);
 
       const started = capture();
       expect(await main(["daemon", "start", "--json"], started.output, input)).toBe(0);
@@ -6295,7 +6298,7 @@ describe("CLI entry point", () => {
       });
       expect(started.read().stderr).toBe("");
       expect(daemonStarts).toBe(1);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(46);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(48);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6319,13 +6322,13 @@ describe("CLI entry point", () => {
         error: {
           code: "RECOVERY_REQUIRED",
           details: { nextCommand: "hra daemon start" },
-          message: "The local state schema needs a migration (35 to 46); start the daemon to migrate it.",
+          message: "The local state schema needs a migration (47 to 48); start the daemon to migrate it.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
-      expect(stateSchemaVersion(installation.paths.database)).toBe(35);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(47);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6351,14 +6354,14 @@ describe("CLI entry point", () => {
       expect(JSON.parse(captured.read().stdout)).toEqual({
         error: {
           code: "RECOVERY_REQUIRED",
-          message: "This HRA build is older than the local state schema (47 vs 46); install the newer HRA.",
+          message: "This HRA build is older than the local state schema (49 vs 48); install the newer HRA.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
       expect(daemonStarts).toBe(0);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(47);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(49);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -6380,7 +6383,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["The local state schema needs a migration (35 to 46). Run `hra daemon start` to migrate it."],
+          problems: ["The local state schema needs a migration (47 to 48). Run `hra daemon start` to migrate it."],
           state: { database: "invalid", initialized: false },
         },
       });
@@ -6407,7 +6410,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["This HRA build is older than the local state schema (47 vs 46). Install the newer HRA."],
+          problems: ["This HRA build is older than the local state schema (49 vs 48). Install the newer HRA."],
           state: { database: "invalid", initialized: false },
         },
       });
