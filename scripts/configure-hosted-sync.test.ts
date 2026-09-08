@@ -58,6 +58,7 @@ const pemMarker = (verb: "BEGIN" | "END"): string =>
   [`-----${verb}`, "PRIVATE", "KEY-----"].join(" ");
 
 const validInput = {
+  attentionResendApiKey: ["re", "hostile", "attention", "sentinel", "35b8c2"].join("_"),
   authEmailReplyTo: "ben@substrate.run",
   resendApiKey: ["re", "hostile", "resend", "sentinel", "7d48f4"].join("_"),
   siteUrl: HRA_SITE_URL,
@@ -142,7 +143,7 @@ describe("fresh hosted configuration", () => {
       if (requests.length === 2) {
         return {
           exitCode: 0,
-          stderr: `${validInput.resendApiKey}${generatedSentinels.hmacSecret}`,
+          stderr: `${validInput.resendApiKey}${validInput.attentionResendApiKey}${generatedSentinels.hmacSecret}`,
           stdout: generatedSentinels.jwtPrivateKey,
         };
       }
@@ -154,7 +155,9 @@ describe("fresh hosted configuration", () => {
       arguments: targetArguments,
       environment: {
         HOME: "/safe/operator",
+        HRA_ATTENTION_RESEND_API_KEY: validInput.attentionResendApiKey,
         HRA_RESEND_API_KEY: resendEnv,
+        TMPDIR: `/unsafe/${validInput.attentionResendApiKey}`,
         PATH: `/safe/bin:${generatedSentinels.hmacSecret}`,
       },
       generate: async () => generatedSentinels,
@@ -178,6 +181,7 @@ describe("fresh hosted configuration", () => {
     const hmac = generatedSentinels.hmacSecret;
     const resend = validInput.resendApiKey;
     expect(Object.fromEntries(configured)).toEqual({
+      HRA_ATTENTION_RESEND_API_KEY: validInput.attentionResendApiKey,
       HRA_AUTH_EMAIL_REPLY_TO: validInput.authEmailReplyTo,
       HRA_AUTH_HMAC_SECRET: hmac,
       HRA_RESEND_API_KEY: resend,
@@ -198,7 +202,7 @@ describe("fresh hosted configuration", () => {
       stdout,
     });
     for (const value of protectedValues) expect(observable).not.toContain(value);
-    expect(stdout).toEqual(["Configured 6 fresh hosted variables.\n"]);
+    expect(stdout).toEqual(["Configured 7 fresh hosted variables.\n"]);
     expect(stderr).toEqual([]);
   });
 
@@ -218,6 +222,61 @@ describe("fresh hosted configuration", () => {
     })).rejects.toThrow("target_already_configured");
     expect(requests).toHaveLength(1);
     expect(requests[0]!.stdin).toBe("");
+  });
+
+  test("refuses a target with only the dedicated attention key already present", async () => {
+    const requests: CommandRequest[] = [];
+    await expect(configureHostedSync({
+      generate: async () => generatedSentinels,
+      input: validInput,
+      runner: async (request) => {
+        requests.push(request);
+        return { exitCode: 0, stderr: "", stdout: "HRA_ATTENTION_RESEND_API_KEY\n" };
+      },
+      target,
+      verifyTarget: exactTargetVerifier,
+    })).rejects.toThrow("target_already_configured");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.stdin).toBe("");
+  });
+
+  test("requires a bounded dedicated attention key distinct from the login key", async () => {
+    const invalidKeys = [
+      "",
+      "re_1234",
+      `re_${"a".repeat(510)}`,
+      "not-a-key",
+      "re_invalid key",
+      "re_invalid\nkey",
+      "re_invalid'é",
+      validInput.resendApiKey,
+    ];
+    for (const attentionResendApiKey of invalidKeys) {
+      const input = { ...validInput, attentionResendApiKey };
+      expect(() => parseHostedInput(JSON.stringify(input))).toThrow("input_invalid");
+      expect(() => serializeHostedEnvironment(input, generatedSentinels))
+        .toThrow("input_invalid");
+      let providerCalls = 0;
+      await expect(configureHostedSync({
+        input,
+        runner: async () => {
+          providerCalls += 1;
+          throw new Error("unexpected provider call");
+        },
+        target,
+        verifyTarget: async () => { providerCalls += 1; },
+      })).rejects.toThrow("input_invalid");
+      expect(providerCalls).toBe(0);
+    }
+    expect(() => parseHostedInput(JSON.stringify({
+      authEmailReplyTo: validInput.authEmailReplyTo,
+      resendApiKey: validInput.resendApiKey,
+      siteUrl: validInput.siteUrl,
+    }))).toThrow("input_invalid");
+    for (const attentionResendApiKey of ["re_a-b_1", `re_${"a".repeat(509)}`]) {
+      expect(parseHostedInput(JSON.stringify({ ...validInput, attentionResendApiKey })))
+        .toEqual({ ...validInput, attentionResendApiKey });
+    }
   });
 
   test("closes on ambiguous names, failed writes, and incomplete readback without exposing provider output", async () => {

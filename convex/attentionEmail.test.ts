@@ -7,6 +7,7 @@ import {
   buildHraAttentionEmailBody,
   buildHraAttentionEmailPayload,
   classifyHraAttentionEmailResponse,
+  createHraAttentionEmailSender,
   hraAttentionEmailBodyVersion,
   hraAttentionEmailDeliveryTimeoutMs,
   hraAttentionEmailEndpoint,
@@ -22,12 +23,19 @@ import {
   type HraAttentionEmailItem,
 } from "./attentionEmail";
 import {
+  hraAttentionResendApiKeyEnvironmentName,
   hraResendApiKeyEnvironmentName,
-  requireHraResendApiKey,
+  isStrictResendApiKey,
+  requireHraAttentionResendApiKey,
 } from "./resendApiKey";
 
 const recipient = "reader@example.com" as CanonicalAuthEmail;
 const apiKey = "re_fixture_key";
+const authApiKey = "re_auth_test";
+const emailEnvironment = {
+  [hraAttentionResendApiKeyEnvironmentName]: apiKey,
+  [hraResendApiKeyEnvironmentName]: authApiKey,
+};
 const idempotencyKey = "attention/018bcfe5-6800-7000-8000-000000000001";
 const sessionPublicId = "session_0123456789abcdef";
 const providerMessageId = "49a3999c-0ce1-4ea6-ab68-afcd6dc2e794";
@@ -271,7 +279,7 @@ describe("HRA attention email transport", () => {
       idempotencyKey,
       recipient,
     }, {
-      environment: { [hraResendApiKeyEnvironmentName]: apiKey },
+      environment: emailEnvironment,
       fetch,
     })).resolves.toEqual({ kind: "accepted", providerMessageId });
 
@@ -321,7 +329,7 @@ describe("HRA attention email transport", () => {
     };
     const input = { body, idempotencyKey, recipient };
     const options = {
-      environment: { [hraResendApiKeyEnvironmentName]: apiKey },
+      environment: emailEnvironment,
       fetch,
     };
 
@@ -344,7 +352,7 @@ describe("HRA attention email transport", () => {
       idempotencyKey,
       recipient,
     };
-    const environment = { [hraResendApiKeyEnvironmentName]: apiKey };
+    const environment = emailEnvironment;
     await expect(sendHraAttentionEmail(common, {
       environment,
       fetch: async () => { throw new Error("network detail must not escape"); },
@@ -371,7 +379,7 @@ describe("HRA attention email transport", () => {
         idempotencyKey,
         recipient,
       }, {
-        environment: { [hraResendApiKeyEnvironmentName]: apiKey },
+        environment: emailEnvironment,
         fetch: async (_resource, init) => {
           observedSignal = init.signal ?? undefined;
           return await new Promise<Response>(() => undefined);
@@ -386,26 +394,42 @@ describe("HRA attention email transport", () => {
     }
   });
 
-  test("shares the existing secret validation and rejects unsafe keys before fetch", async () => {
-    expect(requireHraResendApiKey({ [hraResendApiKeyEnvironmentName]: apiKey })).toBe(apiKey);
-    for (const invalid of [undefined, "resend-key", "re_x", "re_has space"]) {
-      expect(() => requireHraResendApiKey({
-        [hraResendApiKeyEnvironmentName]: invalid,
-      })).toThrow("Email delivery is unavailable.");
-    }
-
+  test("requires a strict dedicated key and refuses auth fallback or equality before fetch", async () => {
+    expect(requireHraAttentionResendApiKey(emailEnvironment)).toBe(apiKey);
     let calls = 0;
-    await expect(sendHraAttentionEmail({
-      body: buildHraAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
-      idempotencyKey,
-      recipient,
-    }, {
-      environment: {},
-      fetch: async () => {
-        calls += 1;
-        return new Response();
-      },
-    })).rejects.toThrow("Email delivery is unavailable.");
+    for (const invalid of [
+      undefined,
+      "resend-key",
+      "re_x",
+      "re_has space",
+      "re_has\nnewline",
+      "re_has'quote",
+      "re_has.dot",
+      "re_has/non-url-char",
+      "re_has_unicode_é",
+      `re_${"a".repeat(510)}`,
+      authApiKey,
+    ]) {
+      const environment = {
+        [hraAttentionResendApiKeyEnvironmentName]: invalid,
+        [hraResendApiKeyEnvironmentName]: authApiKey,
+      };
+      expect(() => requireHraAttentionResendApiKey(environment))
+        .toThrow("Attention email delivery is unavailable.");
+      expect(() => createHraAttentionEmailSender({ environment }))
+        .toThrow("Attention email delivery is unavailable.");
+      await expect(sendHraAttentionEmail({
+        body: buildHraAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
+        idempotencyKey,
+        recipient,
+      }, {
+        environment,
+        fetch: async () => {
+          calls += 1;
+          return new Response();
+        },
+      })).rejects.toThrow("Attention email delivery is unavailable.");
+    }
     expect(calls).toBe(0);
 
     await expect(sendHraAttentionEmail({
@@ -413,12 +437,68 @@ describe("HRA attention email transport", () => {
       idempotencyKey: "bad key",
       recipient,
     }, {
-      environment: { [hraResendApiKeyEnvironmentName]: apiKey },
+      environment: emailEnvironment,
       fetch: async () => {
         calls += 1;
         return new Response();
       },
     })).rejects.toThrow("Attention email delivery is unavailable.");
     expect(calls).toBe(0);
+  });
+
+  test("keeps a prepared sender bound to its validated credential snapshot", async () => {
+    const environment = { ...emailEnvironment };
+    const authorizations: (string | null)[] = [];
+    const sender = createHraAttentionEmailSender({
+      environment,
+      fetch: async (_resource, init) => {
+        authorizations.push(new Headers(init.headers).get("Authorization"));
+        return new Response(JSON.stringify({ id: providerMessageId }), {
+          headers: jsonHeaders,
+          status: 200,
+        });
+      },
+    });
+    environment[hraAttentionResendApiKeyEnvironmentName] = authApiKey;
+    await expect(sender({
+      body: buildHraAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
+      idempotencyKey,
+      recipient,
+    })).resolves.toEqual({ kind: "accepted", providerMessageId });
+    expect(authorizations).toEqual([`Bearer ${apiKey}`]);
+  });
+
+  test("accepts exactly the dedicated URL-safe key grammar and bounded lengths", () => {
+    fc.assert(fc.property(fc.string({ maxLength: 520 }), (suffix) => {
+      const value = `re_${suffix}`;
+      const valid = value.length >= 8
+        && value.length <= 512
+        && /^[A-Za-z0-9_-]+$/u.test(suffix)
+        && value !== authApiKey;
+      expect(isStrictResendApiKey(value)).toBe(valid || value === authApiKey);
+      const environment = {
+        [hraAttentionResendApiKeyEnvironmentName]: value,
+        [hraResendApiKeyEnvironmentName]: authApiKey,
+      };
+      if (valid) expect(requireHraAttentionResendApiKey(environment)).toBe(value);
+      else expect(() => requireHraAttentionResendApiKey(environment))
+        .toThrow("Attention email delivery is unavailable.");
+    }));
+    for (const length of [8, 512]) {
+      const value = `re_${"a".repeat(length - 3)}`;
+      expect(requireHraAttentionResendApiKey({
+        [hraAttentionResendApiKeyEnvironmentName]: value,
+        [hraResendApiKeyEnvironmentName]: authApiKey,
+      })).toBe(value);
+    }
+  });
+
+  test("requires a valid authentication counterpart without falling back to it", () => {
+    for (const invalid of [undefined, "re_x", "re_bad'quote", "re_has space", apiKey]) {
+      expect(() => requireHraAttentionResendApiKey({
+        [hraAttentionResendApiKeyEnvironmentName]: apiKey,
+        [hraResendApiKeyEnvironmentName]: invalid,
+      })).toThrow("Attention email delivery is unavailable.");
+    }
   });
 });
