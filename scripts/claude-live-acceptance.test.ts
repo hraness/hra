@@ -1,10 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { fstatSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, rmdir, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { isatty } from "node:tty";
 
 import {
   CLAUDE_PIN,
@@ -56,6 +54,12 @@ import {
   observePrivateDirectory,
 } from "./live-acceptance-private-custody";
 import { canonicalDigest } from "./release-evidence";
+import {
+  privateDescriptorFixtureEnvironment,
+  privateDescriptorFixtureFailure,
+  privateDescriptorFixtureFailureMessage,
+  runPrivateDescriptorFixture,
+} from "./private-descriptor-test-fixture";
 
 const profileId = `acct_${"1".repeat(32)}` as const;
 const projectId = `proj_${"2".repeat(32)}` as const;
@@ -794,6 +798,34 @@ describe("dedicated Claude live acceptance runner", () => {
   });
 });
 
+describe("private descriptor cleanup fixture controls", () => {
+  test("forwards only the home and temporary identities required by the real cleanup policy", () => {
+    const operation = { candidate, kind: "claude-cleanup" } as const;
+    expect(privateDescriptorFixtureEnvironment(operation, "/fixture/home", "/fixture/home", "/fixture/tmp"))
+      .toEqual({ HOME: "/fixture/home", LANG: "C", LC_ALL: "C", TMPDIR: "/fixture/tmp", TZ: "UTC" });
+    for (const home of [undefined, "/different/home", "relative", "/fixture/./home", "/fixture/home\n"]) {
+      expect(() => privateDescriptorFixtureEnvironment(operation, home, "/fixture/home", "/fixture/tmp")).toThrow();
+    }
+    for (const temporaryRoot of ["relative", "/fixture/../tmp", "/fixture/tmp\n", "/"]) {
+      expect(() => privateDescriptorFixtureEnvironment(operation, "/fixture/home", "/fixture/home", temporaryRoot)).toThrow();
+    }
+    expect(privateDescriptorFixtureEnvironment({ kind: "provider-activity" }, undefined, "/fixture/home", "/fixture/tmp"))
+      .toEqual({ LANG: "C", LC_ALL: "C", TZ: "UTC" });
+  });
+
+  test("reports only finite child failure stages and codes without private content", () => {
+    const known = privateDescriptorFixtureFailure({ code: "cleanup_unproven", recoveryReceiptPath: "/private/receipt", message: "credential" }, "claude-cleanup");
+    expect(known).toEqual({ code: "cleanup_unproven", stage: "claude-cleanup" });
+    expect(privateDescriptorFixtureFailureMessage(JSON.stringify(known))).toBe(JSON.stringify(known));
+    expect(privateDescriptorFixtureFailure({ code: "credential", message: "secret" }, "claude-import"))
+      .toEqual({ code: "unclassified", stage: "claude-import" });
+    for (const stderr of ["credential", "x".repeat(1025), JSON.stringify({ ...known, path: "/private/receipt" }),
+      JSON.stringify({ ...known, stage: "/private/receipt" }), JSON.stringify({ ...known, code: "credential" })]) {
+      expect(privateDescriptorFixtureFailureMessage(stderr)).toBe("unclassified");
+    }
+  });
+});
+
 describe("Claude cleanup-only recovery", () => {
   const cleanupAuthorization = (
     value: Omit<ClaudeLiveAcceptanceRecoveryReceipt, "cleanupAuthorization">,
@@ -884,37 +916,12 @@ describe("Claude cleanup-only recovery", () => {
           },
           worker: { pid: 91_002, state: "ready" },
         })).toThrow("Cleanup authorization scope does not match this run");
-        let workerEffects = 0;
         try {
-          const metadata = fstatSync(handle.fd);
-          const diagnostic = JSON.stringify({
-            descriptor: handle.fd,
-            isFile: metadata.isFile(),
-            isatty: isatty(handle.fd),
-            mode: metadata.mode & 0o777,
-            nlink: metadata.nlink,
-            size: metadata.size,
-            uid: metadata.uid,
-            umask: process.umask(),
-          });
-          expect(
-            Number.isSafeInteger(handle.fd) && handle.fd >= 3 && handle.fd <= 255,
-            `Private cleanup fixture descriptor admission: ${diagnostic}`,
-          ).toBe(true);
-          expect(await runClaudeLiveAcceptance(["--resume-fd", String(handle.fd)], {
-            createLogout: () => { workerEffects += 1; return fakeLogoutFactory({
-              descriptor: layout.descriptor,
-              persistAttempt: async () => undefined,
-            }); },
-            createReadback: () => { workerEffects += 1; throw new Error("readback forbidden"); },
-            recoverProcessJournal: async () => undefined,
-            sourceAttestation: async () => candidate,
-            startWorker: async () => { workerEffects += 1; throw new Error("worker forbidden"); },
-          })).toBeNull();
+          expect(runPrivateDescriptorFixture(handle.fd, { candidate, kind: "claude-cleanup" }))
+            .toEqual({ closure: "fixture", descriptor: 3, effects: 0, kind: "claude-cleanup", outcome: "cleaned", sha256: null, version: 1 });
         } finally {
           await handle.close();
         }
-        expect(workerEffects).toBe(0);
         await expect(lstat(layout.receiptPath)).rejects.toMatchObject({ code: "ENOENT" });
         await expect(lstat(layout.runRoot.path)).rejects.toMatchObject({ code: "ENOENT" });
       });
