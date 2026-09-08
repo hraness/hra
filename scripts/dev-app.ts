@@ -898,9 +898,10 @@ function signalOwnedProcessGroup(
 }
 
 type DevCollectionOperations = Readonly<{
+  now?: () => number;
   probe: () => boolean;
   signal: (signal: "SIGKILL" | "SIGTERM", beforeSyscall: () => void) => "absent" | "sent";
-  wait: () => Promise<void>;
+  wait: (milliseconds: number) => Promise<void>;
 }>;
 
 class DevCollectionTrace {
@@ -908,7 +909,11 @@ class DevCollectionTrace {
   killSent = false;
   phase: DevCollectionPhase = "initial-probe";
   termSent = false;
-  readonly #started = performance.now();
+  readonly #started: number;
+
+  constructor(private readonly now: () => number = () => performance.now()) {
+    this.#started = now();
+  }
 
   mark(phase: DevCollectionPhase, attempt = 0): void {
     this.phase = phase;
@@ -916,7 +921,7 @@ class DevCollectionTrace {
   }
 
   snapshot(): DevCollectionDiagnostic {
-    const elapsed = Math.max(0, Math.floor(performance.now() - this.#started));
+    const elapsed = Math.max(0, Math.floor(this.now() - this.#started));
     return {
       attempt: this.attempt,
       elapsedCapped: elapsed > DEV_BUILD_DEADLINE_MS,
@@ -930,7 +935,45 @@ class DevCollectionTrace {
 
 /** Closed process-group operations allow deterministic uncertainty regressions. */
 export async function collectDevProcessGroup(operations: DevCollectionOperations): Promise<boolean> {
-  return collectTracedDevProcessGroup(operations, new DevCollectionTrace());
+  return collectTracedDevProcessGroup(operations, new DevCollectionTrace(operations.now));
+}
+
+function isDevPermissionFailure(error: unknown): boolean {
+  try {
+    return typeof error === "object" && error !== null
+      && Object.getOwnPropertyDescriptor(error, "code")?.value === "EPERM";
+  } catch { return false; }
+}
+
+async function waitForDevProcessGroupAbsence(
+  operations: DevCollectionOperations, trace: DevCollectionTrace, phase: "term" | "kill",
+): Promise<void> {
+  const now = operations.now ?? (() => performance.now());
+  const deadline = now() + DEV_CHILD_GRACE_MS;
+  let unresolvedPermission: { cause: unknown } | undefined;
+  for (let attempt = 0; ; attempt += 1) {
+    trace.mark(phase === "term" ? "post-term-probe" : "post-kill-probe", attempt);
+    try {
+      // Only an actual absence probe clears uncertainty. Neither a successful
+      // signal nor the direct child's exit establishes group absence.
+      if (!operations.probe()) return;
+    } catch (error) {
+      const signalSent = phase === "term" ? trace.termSent : trace.killSent;
+      if (!signalSent || !isDevPermissionFailure(error)) throw error;
+      // Retain the first denied observation even if a later probe finds the
+      // group present. Unresolved permission never authorizes escalation.
+      unresolvedPermission ??= { cause: error };
+    }
+    const remaining = deadline - now();
+    // Keep the existing 80 waits and two-second phase budget, with one final
+    // observation at the boundary. No denied probe restarts either bound.
+    if (remaining <= 0 || attempt >= DEV_CHILD_GRACE_MS / 25) {
+      if (unresolvedPermission !== undefined) throw unresolvedPermission.cause;
+      return;
+    }
+    trace.mark(phase === "term" ? "post-term-wait" : "post-kill-wait", attempt);
+    await operations.wait(Math.min(25, remaining));
+  }
 }
 
 async function collectTracedDevProcessGroup(operations: DevCollectionOperations, trace: DevCollectionTrace): Promise<boolean> {
@@ -942,18 +985,12 @@ async function collectTracedDevProcessGroup(operations: DevCollectionOperations,
     if (!probe("initial-probe")) return false;
     trace.mark("term-preprobe");
     trace.termSent = operations.signal("SIGTERM", () => { trace.mark("term-syscall"); }) === "sent";
-    for (let attempt = 0; attempt < DEV_CHILD_GRACE_MS / 25 && probe("post-term-probe", attempt); attempt += 1) {
-      trace.mark("post-term-wait", attempt);
-      await operations.wait();
-    }
+    await waitForDevProcessGroupAbsence(operations, trace, "term");
     if (probe("pre-kill-probe")) {
       trace.mark("kill-preprobe");
       trace.killSent = operations.signal("SIGKILL", () => { trace.mark("kill-syscall"); }) === "sent";
     }
-    for (let attempt = 0; attempt < DEV_CHILD_GRACE_MS / 25 && probe("post-kill-probe", attempt); attempt += 1) {
-      trace.mark("post-kill-wait", attempt);
-      await operations.wait();
-    }
+    await waitForDevProcessGroupAbsence(operations, trace, "kill");
     const present = probe("final-probe");
     trace.mark("final-absence");
     assert.equal(present, false, "Owned development process group survived cleanup");
@@ -970,7 +1007,7 @@ async function terminateOwnedChild(child: OwnedChild): Promise<boolean> {
   const descendants = await collectTracedDevProcessGroup({
     probe: () => processGroupExists(child.pid),
     signal: (signal, beforeSyscall) => signalOwnedProcessGroup(child.pid, signal, beforeSyscall),
-    wait: () => Bun.sleep(25),
+    wait: (milliseconds) => Bun.sleep(milliseconds),
   }, trace);
   // Group absence is not a substitute for collecting the direct child handle.
   let timer: ReturnType<typeof setTimeout> | undefined;

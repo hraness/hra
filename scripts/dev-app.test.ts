@@ -80,6 +80,20 @@ function preserveDevFixture(root: string): void {
   if (index >= 0) temporaryRoots.splice(index, 1);
 }
 
+async function withDevFixtureCleanup(body: () => Promise<void>, cleanup: () => Promise<void>): Promise<void> {
+  let primary: { cause: unknown } | undefined;
+  try { await body(); }
+  catch (cause) { primary = { cause }; }
+  try { await cleanup(); }
+  catch (cause) {
+    if (primary !== undefined) {
+      throw new AggregateError([cause, primary.cause], "Development fixture cleanup and primary assertion failed", { cause });
+    }
+    throw cause;
+  }
+  if (primary !== undefined) throw primary.cause;
+}
+
 function assertDevFixtureAbsent(pid: number | undefined, descendants: readonly number[] = []): void {
   assert.ok(pid !== undefined && Number.isSafeInteger(pid) && pid > 1, "Owned fixture PID was not recorded");
   assert.ok(descendants.every((value) => Number.isSafeInteger(value) && value > 1), "Owned descendant PID was not recorded");
@@ -840,6 +854,42 @@ describe("immutable development routing", () => {
 });
 
 describe("pure development process collection", () => {
+  function postSignalFixture(
+    phase: "term" | "kill", observe: (attempt: number) => boolean, signalResult: "sent" | "absent" = "sent",
+  ) {
+    let now = 0;
+    let phaseStarted = 0;
+    let phaseReached = false;
+    let phaseProbes = 0;
+    let absent = false;
+    const signals: string[] = [];
+    const delays: number[] = [];
+    return {
+      signals, delays,
+      elapsed: () => now - phaseStarted,
+      probes: () => phaseProbes,
+      operations: {
+        now: () => now,
+        probe: () => {
+          if (absent) return false;
+          if (!phaseReached) return true;
+          const present = observe(phaseProbes++);
+          if (!present) absent = true;
+          return present;
+        },
+        signal: (signal: "SIGTERM" | "SIGKILL", beforeSyscall: () => void): "sent" | "absent" => {
+          beforeSyscall(); signals.push(signal);
+          if (signal === (phase === "term" ? "SIGTERM" : "SIGKILL")) {
+            phaseReached = true; phaseStarted = now;
+            return signalResult;
+          }
+          return "sent";
+        },
+        wait: (milliseconds: number) => { delays.push(milliseconds); now += milliseconds; return Promise.resolve(); },
+      },
+    };
+  }
+
   test("both publication owners stay held on uncertain collection", () => {
     const released: string[] = [];
     const buildOwner = { assertHeld: () => {}, release: () => { released.push("build"); } };
@@ -878,12 +928,13 @@ describe("pure development process collection", () => {
   });
 
   for (const failure of ["initial-probe", "term-preprobe", "term", "later-probe", "wait", "kill-preprobe", "kill", "survivor"] as const) {
-    test(`retains custody on ${failure} uncertainty without speculative retries`, async () => {
+    test(`retains custody on ${failure} uncertainty without speculative signals`, async () => {
       const uncertain = Object.assign(new Error("fixture probe or signal denied"), { code: "EPERM" });
       const signals: string[] = [];
       let probes = 0;
       let waits = 0;
       const outcome = await collectDevProcessGroup({
+        now: () => waits * 25,
         probe: () => {
           probes += 1;
           if (failure === "initial-probe" || (failure === "later-probe" && probes > 1)) throw uncertain;
@@ -913,14 +964,14 @@ describe("pure development process collection", () => {
       expect(outcome.collection?.phase).toBe(expectedPhase);
       expect(outcome.collection?.termSent).toBe(!["initial-probe", "term-preprobe", "term"].includes(failure));
       expect(outcome.collection?.killSent).toBe(failure === "survivor");
-      expect(outcome.collection?.attempt).toBe(0);
+      expect(outcome.collection?.attempt).toBe(failure === "later-probe" ? 80 : 0);
       expect(outcome.collection?.elapsedMilliseconds).toBeGreaterThanOrEqual(0);
       expect(outcome.collection?.elapsedMilliseconds).toBeLessThanOrEqual(120_000);
       expect(outcome.collection?.elapsedCapped).toBe(false);
       expect(Object.isFrozen(outcome.collection)).toBe(true);
       expect(signals).toEqual(failure === "initial-probe" || failure === "term-preprobe" ? [] : failure === "kill" || failure === "survivor" ? ["SIGTERM", "SIGKILL"] : ["SIGTERM"]);
-      expect(waits).toBe(failure === "survivor" ? 160 : failure === "kill" || failure === "kill-preprobe" ? 80 : failure === "wait" ? 1 : 0);
-      expect(probes).toBeLessThanOrEqual(164);
+      expect(waits).toBe(failure === "survivor" ? 160 : ["kill", "kill-preprobe", "later-probe"].includes(failure) ? 80 : failure === "wait" ? 1 : 0);
+      expect(probes).toBeLessThanOrEqual(165);
     });
   }
 
@@ -942,17 +993,143 @@ describe("pure development process collection", () => {
     expect(diagnostic).not.toContain("later probe denied");
   });
 
-  for (const fixture of [
-    { failureAt: 4, phase: "post-term-probe", attempt: 2, waits: 2, killSent: false },
-    { failureAt: 82, phase: "pre-kill-probe", attempt: 0, waits: 80, killSent: false },
-    { failureAt: 83, phase: "post-kill-probe", attempt: 0, waits: 80, killSent: true },
-    { failureAt: 163, phase: "final-probe", attempt: 0, waits: 160, killSent: true },
-  ] as const) {
-    test(`freezes the exact ${fixture.phase} attempt without retrying a denied probe`, async () => {
+  for (const phase of ["term", "kill"] as const) {
+    for (const absenceAt of [2, 80]) {
+      test(`post-${phase} EPERM and presence settle only on actual absence at attempt ${absenceAt}`, async () => {
+        const denied = Object.assign(new Error("fixture group probe denied"), { code: "EPERM" });
+        const fixture = postSignalFixture(phase, (attempt) => {
+          if (attempt === 0) throw denied;
+          return attempt < absenceAt;
+        });
+        expect(await collectDevProcessGroup(fixture.operations)).toBe(true);
+        expect(fixture.signals).toEqual(phase === "term" ? ["SIGTERM"] : ["SIGTERM", "SIGKILL"]);
+        expect(fixture.elapsed()).toBe(absenceAt * 25);
+        expect(fixture.probes()).toBe(absenceAt + 1);
+        expect(fixture.delays.every((milliseconds) => milliseconds === 25)).toBe(true);
+      });
+    }
+
+    for (const later of ["permission", "presence"] as const) {
+      test(`unresolved post-${phase} EPERM followed by ${later} expires with its original cause and no escalation`, async () => {
+        const original = Object.assign(new Error("first fixture denial"), { code: "EPERM" });
+        const laterDenial = Object.assign(new Error("later fixture denial"), { code: "EPERM" });
+        const fixture = postSignalFixture(phase, (attempt) => {
+          if (attempt === 0) throw original;
+          if (later === "permission") throw laterDenial;
+          return true;
+        });
+        const outcome = await collectDevProcessGroup(fixture.operations).then(() => undefined, (error: unknown) => error);
+        assert.ok(outcome instanceof DevUncollectedProcessError);
+        expect(outcome.cause).toBe(original);
+        expect(outcome.collection?.phase).toBe(phase === "term" ? "post-term-probe" : "post-kill-probe");
+        expect(outcome.collection?.attempt).toBe(80);
+        expect(outcome.collection?.termSent).toBe(true);
+        expect(outcome.collection?.killSent).toBe(phase === "kill");
+        expect(Object.isFrozen(outcome.collection)).toBe(true);
+        expect(fixture.elapsed()).toBe(2000);
+        expect(fixture.probes()).toBe(81);
+        expect(fixture.signals).toEqual(phase === "term" ? ["SIGTERM"] : ["SIGTERM", "SIGKILL"]);
+      });
+    }
+
+    for (const signalResult of ["sent", "absent"] as const) {
+      for (const code of ["EPERM", "EACCES", "EIO"] as const) {
+        if (code === "EPERM" && signalResult === "sent") continue;
+        test(`post-${phase} ${code} after ${signalResult} syscall is immediately fatal`, async () => {
+          const denied = Object.assign(new Error("fixture probe failed"), { code });
+          const fixture = postSignalFixture(phase, () => { throw denied; }, signalResult);
+          const outcome = await collectDevProcessGroup(fixture.operations).then(() => undefined, (error: unknown) => error);
+          assert.ok(outcome instanceof DevUncollectedProcessError);
+          expect(outcome.cause).toBe(denied);
+          expect(outcome.collection?.phase).toBe(phase === "term" ? "post-term-probe" : "post-kill-probe");
+          expect(outcome.collection?.attempt).toBe(0);
+          expect(phase === "term" ? outcome.collection?.termSent : outcome.collection?.killSent).toBe(signalResult === "sent");
+          expect(fixture.elapsed()).toBe(0);
+          expect(fixture.probes()).toBe(1);
+          expect(fixture.signals).toEqual(phase === "term" ? ["SIGTERM"] : ["SIGTERM", "SIGKILL"]);
+        });
+      }
+    }
+
+    test(`post-${phase} uncertainty does not absorb a later non-EPERM failure`, async () => {
       const denied = Object.assign(new Error("fixture permission denied"), { code: "EPERM" });
+      const unavailable = Object.assign(new Error("fixture probe unavailable"), { code: "EIO" });
+      const fixture = postSignalFixture(phase, (attempt) => { throw attempt === 0 ? denied : unavailable; });
+      const outcome = await collectDevProcessGroup(fixture.operations).then(() => undefined, (error: unknown) => error);
+      assert.ok(outcome instanceof DevUncollectedProcessError);
+      expect(outcome.cause).toBe(unavailable);
+      expect(outcome.collection?.attempt).toBe(1);
+      expect(fixture.elapsed()).toBe(25);
+      expect(fixture.probes()).toBe(2);
+      expect(fixture.signals).toEqual(phase === "term" ? ["SIGTERM"] : ["SIGTERM", "SIGKILL"]);
+    });
+
+    test(`post-${phase} uncertainty retains the finite poll cap with a nonadvancing clock`, async () => {
+      const denied = Object.assign(new Error("fixture permission denied"), { code: "EPERM" });
+      const fixture = postSignalFixture(phase, () => { throw denied; });
+      const outcome = await collectDevProcessGroup({ ...fixture.operations, now: () => 0 })
+        .then(() => undefined, (error: unknown) => error);
+      assert.ok(outcome instanceof DevUncollectedProcessError);
+      expect(outcome.cause).toBe(denied);
+      expect(outcome.collection?.attempt).toBe(80);
+      expect(fixture.probes()).toBe(81);
+      expect(fixture.delays).toHaveLength(phase === "term" ? 80 : 160);
+      expect(fixture.signals).toEqual(phase === "term" ? ["SIGTERM"] : ["SIGTERM", "SIGKILL"]);
+    });
+  }
+
+  test("post-signal waits consume only the remaining original phase budget", async () => {
+    const denied = Object.assign(new Error("fixture permission denied"), { code: "EPERM" });
+    let now = 0;
+    let termSent = false;
+    const delays: number[] = [];
+    const outcome = await collectDevProcessGroup({
+      now: () => now,
+      probe: () => { if (termSent) throw denied; return true; },
+      signal: (signal, beforeSyscall) => {
+        assert.equal(signal, "SIGTERM", "Unresolved permission must not authorize KILL");
+        beforeSyscall(); termSent = true; return "sent";
+      },
+      wait: (milliseconds) => {
+        delays.push(milliseconds);
+        now = delays.length === 1 ? 1990 : now + milliseconds;
+        return Promise.resolve();
+      },
+    }).then(() => undefined, (error: unknown) => error);
+    assert.ok(outcome instanceof DevUncollectedProcessError);
+    expect(outcome.cause).toBe(denied);
+    expect(outcome.collection?.elapsedMilliseconds).toBe(2000);
+    expect(outcome.collection?.attempt).toBe(2);
+    expect(delays).toEqual([25, 10]);
+    expect(now).toBe(2000);
+  });
+
+  test("post-signal error classification never evaluates a foreign code getter", async () => {
+    let reads = 0;
+    const denied = Object.defineProperty(new Error("fixture code accessor"), "code", {
+      get: () => { reads += 1; return "EPERM"; },
+    });
+    const fixture = postSignalFixture("term", () => { throw denied; });
+    const outcome = await collectDevProcessGroup(fixture.operations).then(() => undefined, (error: unknown) => error);
+    assert.ok(outcome instanceof DevUncollectedProcessError);
+    expect(outcome.cause).toBe(denied);
+    expect(reads).toBe(0);
+    expect(fixture.elapsed()).toBe(0);
+    expect(fixture.probes()).toBe(1);
+  });
+
+  for (const fixture of [
+    { failureAt: 4, phase: "post-term-probe", attempt: 2, waits: 2, killSent: false, code: "EACCES" },
+    { failureAt: 83, phase: "pre-kill-probe", attempt: 0, waits: 80, killSent: false, code: "EPERM" },
+    { failureAt: 84, phase: "post-kill-probe", attempt: 0, waits: 80, killSent: true, code: "EACCES" },
+    { failureAt: 165, phase: "final-probe", attempt: 0, waits: 160, killSent: true, code: "EPERM" },
+  ] as const) {
+    test(`freezes the exact ${fixture.phase} attempt on immediately fatal ${fixture.code}`, async () => {
+      const denied = Object.assign(new Error("fixture permission denied"), { code: fixture.code });
       let probes = 0;
       let waits = 0;
       const outcome = await collectDevProcessGroup({
+        now: () => waits * 25,
         probe: () => { if (++probes === fixture.failureAt) throw denied; return true; },
         signal: (_signal, beforeSyscall) => { beforeSyscall(); return "sent"; },
         wait: async () => { waits += 1; },
@@ -966,6 +1143,28 @@ describe("pure development process collection", () => {
       expect(probes).toBe(fixture.failureAt);
       expect(waits).toBe(fixture.waits);
     });
+  }
+
+  for (const primaryFails of [false, true]) {
+    for (const cleanupFails of [false, true]) {
+      test(`fixture cleanup preserves primary=${primaryFails} and cleanup=${cleanupFails} failures with cleanup precedence`, async () => {
+        const primary = new Error("fixture primary assertion");
+        const cleanup = new DevUncollectedProcessError("fixture cleanup uncertainty");
+        const events: string[] = [];
+        const outcome = await withDevFixtureCleanup(
+          async () => { events.push("body"); if (primaryFails) throw primary; },
+          async () => { events.push("cleanup"); if (cleanupFails) throw cleanup; },
+        ).then(() => ({ passed: true as const }), (error: unknown) => ({ passed: false as const, error }));
+        expect(events).toEqual(["body", "cleanup"]);
+        expect(outcome.passed).toBe(!primaryFails && !cleanupFails);
+        if (outcome.passed) return;
+        if (primaryFails && cleanupFails) {
+          assert.ok(outcome.error instanceof AggregateError);
+          expect(outcome.error.cause).toBe(cleanup);
+          expect(outcome.error.errors).toEqual([cleanup, primary]);
+        } else expect(outcome.error).toBe(cleanupFails ? cleanup : primary);
+      });
+    }
   }
 });
 
@@ -1044,8 +1243,8 @@ describe("cache, security, and owned process boundaries", () => {
           throw error;
         }
       };
-      // Await this same collection path on success and failure. Keeping its
-      // throws outside the finally body preserves cleanup-error precedence.
+      // Await this same collection path on success and failure. The helper
+      // retains both errors while keeping cleanup failure as the primary cause.
       const cleanup = async (): Promise<void> => {
         if (!ownerExited) { owner.kill("SIGKILL"); await owner.exited; }
         try {
@@ -1070,7 +1269,7 @@ describe("cache, security, and owned process boundaries", () => {
                 return "absent";
               }
             },
-            wait: () => Bun.sleep(25),
+            wait: (milliseconds) => Bun.sleep(milliseconds),
           });
           expect(probe(pid)).toBe(false);
         } catch (error) {
@@ -1079,7 +1278,7 @@ describe("cache, security, and owned process boundaries", () => {
           throw error;
         }
       };
-      try {
+      await withDevFixtureCleanup(async () => {
         const ownerExit = await owner.exited;
         ownerExited = true;
         expect(ownerExit).toBe(0);
@@ -1125,9 +1324,7 @@ describe("cache, security, and owned process boundaries", () => {
           expect(records).toEqual(resultRecord.records);
           expect(records[0]).toBe(records[1]!);
         }
-      } finally {
-        await cleanup();
-      }
+      }, cleanup);
     }, 25_000);
   }
 
