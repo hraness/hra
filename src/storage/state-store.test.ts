@@ -7,7 +7,6 @@ import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 
 import { Database, constants as sqliteConstants } from "bun:sqlite";
-import fc from "fast-check";
 import { z } from "zod";
 
 import { deriveDesktopProfilePaths } from "../desktop/profile";
@@ -1645,11 +1644,12 @@ describe("account mutation successor authority", () => {
     });
   }
 
-  test("keeps origin and effect invariant for arbitrary bounded successor counts", async () => {
-    await fc.assert(fc.asyncProperty(
-      fc.constantFrom("account.login" as const, "account.logout" as const, "account.login-cancel" as const),
-      fc.integer({ min: 1, max: 8 }),
-      async (kind, rollovers) => {
+  // Enumerate the complete finite domain instead of sampling 12 combinations.
+  // Each case owns its fixture cleanup and default timeout; this increases
+  // coverage, not a claim that the total suite performs less work.
+  for (const kind of ["account.login", "account.logout", "account.login-cancel"] as const) {
+    for (const rollovers of [1, 2, 3, 4, 5, 6, 7, 8]) {
+      test(`keeps origin and effect invariant for ${kind} through ${rollovers} successor rollovers`, async () => {
         const { store, profile, attempt, key } = await seed(kind);
         const original = store.readMutation(key)?.evidence;
         for (let index = 0; index < rollovers; index += 1) {
@@ -1661,9 +1661,9 @@ describe("account mutation successor authority", () => {
         // A single unrecorded +1 rollover cannot be mistaken for this chain.
         store.nextProfileGeneration(profile.id);
         expect(store.isAccountMutationAuthorityCurrent({ attemptId: attempt.id, profileId: profile.id, originGeneration: 1 })).toBe(false);
-      },
-    ), { numRuns: 12, seed: 44 });
-  });
+      });
+    }
+  }
 
   test("quarantines missing legacy chains without clearing account recovery or granting a fresh attempt", async () => {
     const { store, profile, attempt, key } = await seed("account.login");
