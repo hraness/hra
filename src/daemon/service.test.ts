@@ -2051,6 +2051,94 @@ async function createIdleSession(
   return { sessionId: started.session.id };
 }
 
+async function createPeerMessageBoundaryFixture(delivery: "send" | "steer") {
+  const value = await fixture();
+  const { sessionId: actorSessionId } = await createIdleSession(
+    value,
+    `Peer ${delivery} boundary actor`,
+  );
+  const idleActor = value.store.requireSession(actorSessionId);
+  if (idleActor.projectId === undefined) throw new Error("Expected a project-bound actor.");
+  const targetBase = value.store.createSession({
+    profileId: idleActor.profileId,
+    projectId: idleActor.projectId,
+    title: "Peer boundary target",
+    provider: "codex",
+    preset: "high",
+    fastEnabled: false,
+  });
+  value.store.bindSessionProviderAccountAuthority({
+    sessionId: targetBase.id,
+    provider: "codex",
+    runtimeScope: "managed",
+    accountKey: codexProviderAccountKey(),
+  });
+  const target = value.store.bindSession({
+    sessionId: targetBase.id,
+    expectedRevision: targetBase.revision,
+    providerThreadId: "provider-peer-boundary-target",
+    state: delivery === "send" ? "idle" : "active",
+    ...(delivery === "steer" ? { activeTurnId: "turn-peer-boundary-target" } : {}),
+    providerUpdatedAt: 11,
+  });
+  await value.service.execute({
+    kind: "session.send",
+    session: actorSessionId,
+    message: "Start the independent peer boundary actor.",
+  }, { signal });
+  const actor = value.store.requireSession(actorSessionId);
+  const profile = value.store.requireProfileById(actor.profileId);
+  if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
+    throw new Error("Expected an active bound actor turn.");
+  }
+  const actorThreadId = actor.providerThreadId;
+  const actorTurnId = actor.activeTurnId;
+  value.codex.readProjection = {
+    providerThreadId: "provider-peer-boundary-target",
+    title: target.title,
+    status: delivery === "send" ? "idle" : "active",
+    ...(delivery === "steer" ? { activeTurnId: "turn-peer-boundary-target" } : {}),
+    providerUpdatedAt: 11,
+    omission: {
+      hasMoreOlderTurns: false,
+      incompleteTurnIds: [],
+      omittedMessages: 0,
+      returnedTurns: delivery === "send" ? 0 : 1,
+      truncatedMessages: 0,
+      turnLimit: 20,
+      unreadItemTurnIds: [],
+    },
+  };
+  const authority: ProfileAuthority = {
+    id: profile.id,
+    generation: profile.processGeneration,
+    codexHome: "unused",
+    desktopUserData: "unused",
+  };
+  const callFor = (index: number): Extract<HraHostToolCall, { tool: "session_message" }> => {
+    const callId = `peer-boundary-${delivery}-${String(index)}`;
+    const input = {
+      sessionId: target.id,
+      expectedRevision: value.store.requireSession(target.id).revision,
+      delivery,
+      message: `Peer boundary message ${String(index)}.`,
+      reason: "Exercise exact peer effect settlement",
+    };
+    return {
+      authority: { profileId: profile.id, processGeneration: profile.processGeneration },
+      callId,
+      connectionId: value.codex.observationConnectionId,
+      input,
+      requestDigest: createHash("sha256").update(JSON.stringify(input)).digest("hex"),
+      requestId: { type: "string", value: callId },
+      threadId: actorThreadId,
+      tool: "session_message",
+      turnId: actorTurnId,
+    };
+  };
+  return { value, actor, target, authority, callFor };
+}
+
 function seedUnsettledInteractionStates(
   value: Awaited<ReturnType<typeof fixture>>,
   sessionId: `sess_${string}`,
@@ -10107,6 +10195,161 @@ describe("HraService", () => {
     expect(providerMutationCalls(restartedCodex)).toEqual([]);
     await restarted.close();
   });
+
+  test("refuses the thirty-third peer steer before dispatch at target-turn origin capacity", async () => {
+    const { value, actor, target, authority, callFor } = await createPeerMessageBoundaryFixture("steer");
+    let lastAcceptedCall: ReturnType<typeof callFor> | undefined;
+    for (let index = 0; index < 32; index += 1) {
+      const call = callFor(index);
+      lastAcceptedCall = call;
+      await expect(value.service.handleHraHostToolCall(
+        authority,
+        call,
+        MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+      )).resolves.toMatchObject({
+        ok: true,
+        replay: false,
+        action: { state: "applied", delivery: "steer", hop: 1 },
+      });
+    }
+    expect(value.store.readPeerSessionTurnOrigins({
+      sessionId: actor.id,
+      turnId: actor.activeTurnId!,
+    })).toEqual([]);
+    expect(value.store.readPeerSessionTurnOrigins({
+      sessionId: target.id,
+      turnId: "turn-peer-boundary-target",
+    })).toHaveLength(32);
+    expect(value.codex.calls.filter((call) => call === "steer")).toHaveLength(32);
+    const writesBeforeRefusal = providerMutationCalls(value.codex);
+
+    const refused = await value.service.handleHraHostToolCall(
+      authority,
+      callFor(32),
+      MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+    );
+    expect(refused).toMatchObject({
+      version: 1,
+      ok: false,
+      code: "PEER_SESSION_CAUSAL_LIMIT_REFUSED",
+    });
+    expect(providerMutationCalls(value.codex)).toEqual(writesBeforeRefusal);
+    expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
+    expect(value.store.readPeerSessionTurnOrigins({
+      sessionId: target.id,
+      turnId: "turn-peer-boundary-target",
+    })).toHaveLength(32);
+    if (lastAcceptedCall === undefined) throw new Error("Expected a retained successful peer call.");
+    await expect(value.service.handleHraHostToolCall(
+      authority,
+      lastAcceptedCall,
+      MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+    )).resolves.toMatchObject({ ok: true, replay: true, action: { state: "applied" } });
+    await value.service.recover();
+    expect(providerMutationCalls(value.codex)).toEqual(writesBeforeRefusal);
+    expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
+    await value.service.close();
+  }, 30_000);
+
+  for (const delivery of ["send", "steer"] as const) {
+    for (const resolution of ["proven_applied", "abandoned"] as const) {
+      test.each([false, true])(
+        `resolves uncertain peer ${delivery} after a real lost response as ${resolution} with legacy observation=%s`,
+        async (legacyObservation) => {
+          const { value, target, authority, callFor } = await createPeerMessageBoundaryFixture(delivery);
+          const call = callFor(0);
+          const lostResponse = new IndeterminateCodexEffectError(
+            delivery === "send" ? "turn/start" : "turn/steer",
+            81,
+          );
+          // Both existing fake-runtime errors occur after its provider message
+          // and client id are recorded, not before the service begins the effect.
+          if (delivery === "send") value.codex.startTurnError = lostResponse;
+          else value.codex.steerError = lostResponse;
+          const writesBeforeEffect = providerMutationCalls(value.codex);
+          await expect(value.service.handleHraHostToolCall(
+            authority,
+            call,
+            MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+          )).resolves.toMatchObject({ ok: false, code: "RECOVERY_REQUIRED" });
+          delete value.codex.startTurnError;
+          delete value.codex.steerError;
+
+          const [action] = value.store.listUnsettledPeerSessionActions(10);
+          if (action === undefined) throw new Error("Expected the real uncertain peer effect.");
+          expect(action).toMatchObject({ state: "ambiguous", delivery, targetSessionId: target.id });
+          expect(action.resultDigest).toBeUndefined();
+          const attempt = value.store.readMutation(action.idempotencyKey);
+          expect(attempt).toMatchObject({
+            state: "ambiguous",
+            evidence: { evidence: { kind: `session.${delivery}`, messageActor: "peer_session" } },
+          });
+          if (attempt?.evidence === undefined) throw new Error("Expected immutable provider-effect evidence.");
+          const originalEvidence = attempt.evidence;
+          const providerMessage = value.codex.readProjection.messages?.find((message) =>
+            message.clientId === attempt.id);
+          expect(providerMessage).toMatchObject({ role: "user", clientId: attempt.id });
+          if (providerMessage?.turnId === undefined) throw new Error("Expected the accepted provider turn.");
+          const targetTurnId = providerMessage.turnId;
+          expect(value.store.requireSession(target.id).state).toBe("recovery_required");
+          expect(providerMutationCalls(value.codex)).toHaveLength(writesBeforeEffect.length + 1);
+
+          const legacyMarker = createHash("sha256")
+            .update(JSON.stringify({ code: "EFFECT_OUTCOME_UNSETTLED" })).digest("hex");
+          if (legacyObservation) {
+            // Represent the exact historical marker without changing the real
+            // lost-response evidence or weakening its immutable transition.
+            value.store.settlePeerSessionAction({
+              actionId: action.id,
+              expectedState: "ambiguous",
+              state: "ambiguous",
+              resultDigest: legacyMarker,
+            });
+            expect(value.store.requirePeerSessionAction(action.id).resultDigest).toBe(legacyMarker);
+          }
+          const expectedFinalDigest = legacyObservation
+            ? legacyMarker
+            : createHash("sha256").update(JSON.stringify(resolution === "proven_applied"
+                ? { targetTurnId }
+                : { mutationState: "reconciled", resolution: "abandoned" })).digest("hex");
+          const writesBeforeRecovery = providerMutationCalls(value.codex);
+
+          const recovered = await value.service.execute({
+            kind: resolution === "proven_applied" ? "session.recover" : "session.abandon",
+            session: target.id,
+          }, { signal });
+          expect(recovered).toMatchObject({
+            recovery: { resolved: true, resolution, providerEffectRetried: false },
+          });
+          expect(value.store.readMutation(action.idempotencyKey)).toMatchObject({
+            state: "reconciled",
+            originalState: "ambiguous",
+            resolution: { kind: resolution },
+            evidence: originalEvidence,
+          });
+          expect(value.store.requirePeerSessionAction(action.id)).toMatchObject({
+            state: resolution === "proven_applied" ? "applied" : "failed",
+            resultDigest: expectedFinalDigest,
+          });
+          const origins = value.store.readPeerSessionTurnOrigins({ sessionId: target.id, turnId: targetTurnId });
+          expect(origins.map((origin) => origin.id))
+            .toEqual(resolution === "proven_applied" ? [action.id] : []);
+          expect(value.store.sessionMessageActorForSource(target.id, attempt.id)).toBe("peer_session");
+          if (resolution === "proven_applied") {
+            expect(value.store.listSessionEvents({ sessionId: target.id, afterSequence: 0 }).events)
+              .toContainEqual(expect.objectContaining({
+                body: expect.objectContaining({ type: "user_message", actor: "peer_session" }),
+              }));
+          }
+          await value.service.recover();
+          expect(value.store.requirePeerSessionAction(action.id).resultDigest).toBe(expectedFinalDigest);
+          expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
+          expect(providerMutationCalls(value.codex)).toEqual(writesBeforeRecovery);
+          await value.service.close();
+        },
+      );
+    }
+  }
 
   test("fences established and peer Claude targets with universally unavailable profiles", async () => {
     for (const provider of ["claude"] as const) {

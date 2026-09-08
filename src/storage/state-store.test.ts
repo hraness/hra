@@ -69,6 +69,7 @@ import {
   PEER_SESSION_PROJECT_HOURLY_ACTION_LIMIT,
   PEER_SESSION_RATE_WINDOW_MS,
   PEER_SESSION_RETAINED_ACTION_LIMIT,
+  PEER_SESSION_TURN_ORIGIN_LIMIT,
   USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
   USAGE_CLOUD_UPLOAD_ANCHOR_COUNT,
   USAGE_LOCAL_RETAIN_AGE_MS,
@@ -1264,6 +1265,56 @@ const reserveTestProjectMemoryAuthority = (
 };
 const peerIdempotencyKey = (index: number): string =>
   `20000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+const peerOriginBoundaryFixture = async () => {
+  const { store, home } = await fixture();
+  const root = join(home, "peer-origin-boundary");
+  await mkdir(root);
+  const project = await store.createProject("Peer origin boundary", root);
+  const profile = signInProfile(store, "Peer origin boundary", "peer-origin@example.com");
+  const activeSession = (turnId: string) => {
+    const created = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    return store.setSessionTurnState({
+      sessionId: created.id,
+      expectedRevision: created.revision,
+      state: "active",
+      activeTurnId: turnId,
+    });
+  };
+  const actor = activeSession("turn-peer-origin-actor");
+  const target = activeSession("turn-peer-origin-target");
+  const requestFor = (index: number): Parameters<StateStore["admitPeerSessionAction"]>[0] => ({
+    actorSessionId: actor.id,
+    actorTurnId: actor.activeTurnId!,
+    targetSessionId: target.id,
+    expectedTargetRevision: target.revision,
+    delivery: "steer",
+    requestDigest: testDigest(`peer origin request ${String(index)}`),
+    messageDigest: testDigest(`peer origin message ${String(index)}`),
+    reasonDigest: testDigest(`peer origin reason ${String(index)}`),
+    idempotencyKey: peerIdempotencyKey(91_000 + index),
+  });
+  const applySteer = (index: number) => {
+    const action = store.admitPeerSessionAction(requestFor(index)).action;
+    store.beginPeerSessionActionEffect(action.id);
+    return store.settlePeerSessionAction({
+      actionId: action.id,
+      expectedState: "effect_started",
+      state: "applied",
+      targetTurnId: target.activeTurnId!,
+      resultDigest: testDigest(`peer origin receipt ${String(index)}`),
+    });
+  };
+  const origins = () => store.readPeerSessionTurnOrigins({
+    sessionId: target.id,
+    turnId: target.activeTurnId!,
+  });
+  return { actor, applySteer, origins, requestFor, store, target };
+};
 const codexRuntimeProfile = (
   profile: Readonly<{ id: string; processGeneration: number }>,
   observedAt = 2_000,
@@ -25682,6 +25733,119 @@ describe("StateStore", () => {
       parentActionIds: expect.arrayContaining([chain[1]!.id, independent.id]),
       rootActionIds: expect.arrayContaining([chain[0]!.id, independent.id]),
     });
+  });
+
+  test("peer storage boundary refuses a new thirty-third steer at origin admission", async () => {
+    const { applySteer, origins, requestFor, store } = await peerOriginBoundaryFixture();
+    for (let index = 0; index < PEER_SESSION_TURN_ORIGIN_LIMIT; index += 1) {
+      expect(applySteer(index).state).toBe("applied");
+    }
+    const accepted = origins();
+    expect(accepted).toHaveLength(PEER_SESSION_TURN_ORIGIN_LIMIT);
+    const request = requestFor(PEER_SESSION_TURN_ORIGIN_LIMIT);
+
+    expect(() => store.admitPeerSessionAction(request))
+      .toThrow("PEER_SESSION_CAUSAL_LIMIT_REFUSED");
+    expect(store.readPeerSessionActionByIdempotencyKey(request.idempotencyKey)).toBeNull();
+    expect(store.readPeerSessionDirectMessageSource(request.idempotencyKey)).toBeNull();
+    expect(store.listUnsettledPeerSessionActions(10)).toEqual([]);
+    expect(origins()).toEqual(accepted);
+  });
+
+  test("peer storage boundary rechecks prepared steer origin capacity before effect", async () => {
+    const { applySteer, origins, requestFor, store } = await peerOriginBoundaryFixture();
+    for (let index = 0; index < PEER_SESSION_TURN_ORIGIN_LIMIT - 1; index += 1) {
+      expect(applySteer(index).state).toBe("applied");
+    }
+    const prepared = store.admitPeerSessionAction(
+      requestFor(PEER_SESSION_TURN_ORIGIN_LIMIT - 1),
+    ).action;
+    expect(prepared.state).toBe("prepared");
+    expect(applySteer(PEER_SESSION_TURN_ORIGIN_LIMIT).state).toBe("applied");
+    const accepted = origins();
+    expect(accepted).toHaveLength(PEER_SESSION_TURN_ORIGIN_LIMIT);
+
+    expect(() => store.beginPeerSessionActionEffect(prepared.id))
+      .toThrow("PEER_SESSION_CAUSAL_LIMIT_REFUSED");
+    expect(store.requirePeerSessionAction(prepared.id)).toEqual(prepared);
+    expect(store.readMutation(prepared.idempotencyKey)).toBeNull();
+    expect(origins()).toEqual(accepted);
+  });
+
+  test("peer storage boundary preserves exact origin attachment replay at capacity", async () => {
+    const { actor, applySteer, origins, requestFor, store, target } =
+      await peerOriginBoundaryFixture();
+    // An already-begun effect exercises the immutable database backstop,
+    // independently of the pre-effect admission checks.
+    const pending = store.admitPeerSessionAction(
+      requestFor(PEER_SESSION_TURN_ORIGIN_LIMIT),
+    ).action;
+    const begun = store.beginPeerSessionActionEffect(pending.id);
+    for (let index = 0; index < PEER_SESSION_TURN_ORIGIN_LIMIT; index += 1) {
+      expect(applySteer(index).state).toBe("applied");
+    }
+    const accepted = origins();
+    expect(accepted).toHaveLength(PEER_SESSION_TURN_ORIGIN_LIMIT);
+    const action = accepted[0];
+    if (action === undefined) throw new Error("Expected an accepted peer origin.");
+    const attachment = {
+      actionId: action.id,
+      targetSessionId: target.id,
+      turnId: target.activeTurnId!,
+    };
+
+    expect(() => store.attachPeerSessionActionToTurn({
+      ...attachment,
+      targetSessionId: actor.id,
+    })).toThrow("PEER_SESSION_TARGET_STATE_REFUSED");
+    expect(() => store.attachPeerSessionActionToTurn({
+      ...attachment,
+      turnId: "turn-peer-origin-wrong",
+    })).toThrow("PEER_SESSION_TARGET_STATE_REFUSED");
+    expect(() => store.attachPeerSessionActionToTurn({
+      ...attachment,
+      actionId: pending.id,
+    })).toThrow("PEER_SESSION_TARGET_STATE_REFUSED");
+    expect(() => store.settlePeerSessionAction({
+      actionId: pending.id,
+      expectedState: "effect_started",
+      state: "applied",
+      targetTurnId: target.activeTurnId!,
+      resultDigest: testDigest("unadmitted thirty-third origin receipt"),
+    })).toThrow("peer session turn origin quota exceeded");
+    expect(store.requirePeerSessionAction(pending.id)).toEqual(begun);
+    expect(origins()).toEqual(accepted);
+
+    expect(store.attachPeerSessionActionToTurn(attachment)).toEqual(action);
+    expect(store.attachPeerSessionActionToTurn(attachment)).toEqual(action);
+    expect(store.admitPeerSessionAction(requestFor(0)))
+      .toMatchObject({ replay: true, action: { state: "applied" } });
+    expect(origins()).toEqual(accepted);
+  });
+
+  test("peer storage boundary preserves arbitrary ambiguous result digests", async () => {
+    const { origins, requestFor, store, target } = await peerOriginBoundaryFixture();
+    const action = store.admitPeerSessionAction(requestFor(0)).action;
+    store.beginPeerSessionActionEffect(action.id);
+    const originalDigest = testDigest("unrelated immutable ambiguous observation");
+    const ambiguous = store.settlePeerSessionAction({
+      actionId: action.id,
+      expectedState: "effect_started",
+      state: "ambiguous",
+      resultDigest: originalDigest,
+    });
+
+    for (const state of ["applied", "failed"] as const) {
+      expect(() => store.settlePeerSessionAction({
+        actionId: action.id,
+        expectedState: "ambiguous",
+        state,
+        ...(state === "applied" ? { targetTurnId: target.activeTurnId! } : {}),
+        resultDigest: testDigest(`replacement ${state} receipt`),
+      })).toThrow("illegal peer session action transition");
+      expect(store.requirePeerSessionAction(action.id)).toEqual(ambiguous);
+      expect(origins()).toEqual([]);
+    }
   });
 
   test("enforces atomic hourly peer action and distinct-target boundaries without charging replay", async () => {

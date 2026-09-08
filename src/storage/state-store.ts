@@ -25530,6 +25530,17 @@ export class StateStore {
     return target;
   }
 
+  #assertPeerSessionTurnOriginCapacity(targetSessionId: SessionId, turnId: string): void {
+    const { total } = z.object({ total: z.number().int().nonnegative() }).strict().parse(
+      this.#database.query(
+        "SELECT COUNT(*) AS total FROM peer_session_turn_origins WHERE session_id=? AND turn_digest=?",
+      ).get(targetSessionId, digestPeerTurnId(turnId)),
+    );
+    if (total >= PEER_SESSION_TURN_ORIGIN_LIMIT) {
+      throw new PeerSessionRefusalError("PEER_SESSION_CAUSAL_LIMIT_REFUSED");
+    }
+  }
+
   #assertPeerSessionActionAuthority(
     action: PeerSessionActionRecord,
     phase: "admission_replay" | "direct_begin" | "queued_begin",
@@ -25579,6 +25590,11 @@ export class StateStore {
         : target.state !== "terminal" && target.state !== "recovery_required";
     if (!targetStateAllowed) {
       throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+    }
+    if (phase === "direct_begin" && action.delivery === "steer" && target.activeTurnId !== undefined) {
+      // Admission does not reserve a slot. Recheck inside the effect-begin
+      // transaction, before a provider can accept another attributed steer.
+      this.#assertPeerSessionTurnOriginCapacity(target.id, target.activeTurnId);
     }
   }
 
@@ -26388,6 +26404,9 @@ export class StateStore {
       if (!targetStateAllowed) {
         throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
       }
+      if (delivery === "steer" && target.activeTurnId !== undefined) {
+        this.#assertPeerSessionTurnOriginCapacity(target.id, target.activeTurnId);
+      }
 
       const now = unixMillisecondsSchema.parse(this.#now());
       this.#prunePeerSessionActionHistory(actor.projectId, now);
@@ -26859,6 +26878,11 @@ export class StateStore {
       || action.targetSessionId !== targetSessionId
       || action.targetTurnDigest !== turnDigest
     ) throw new PeerSessionRefusalError("PEER_SESSION_TARGET_STATE_REFUSED");
+    // SQLite runs BEFORE INSERT quota triggers even for INSERT OR IGNORE.
+    // Prove the exact existing binding before attempting an idempotent attach.
+    if (this.#database.query(
+      "SELECT 1 FROM peer_session_turn_origins WHERE session_id=? AND turn_digest=? AND action_id=?",
+    ).get(targetSessionId, turnDigest, actionId) !== null) return action;
     this.#database.query(
       `INSERT OR IGNORE INTO peer_session_turn_origins(session_id,turn_digest,action_id)
        VALUES (?,?,?)`,
