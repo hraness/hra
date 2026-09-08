@@ -19,6 +19,17 @@ export type BrowserPrepared = Readonly<{
   buildRuntime: Readonly<{ name: "bun"; version: "1.3.14"; executable: BrowserExecutable }>;
   driver: BrowserFile; fixture: readonly BrowserFile[];
 }>;
+export type BrowserHandoff = Readonly<{ request: BrowserRequest; prepared: BrowserPrepared }>;
+export type BrowserExecutionEvidence = Readonly<{
+  schemaVersion: 1; kind: "hra-browser-execution-admission"; root: string; run: string;
+  requestSha256: string; preparedSha256: string; producerDriver: BrowserFile; executionDriver: BrowserFile;
+}>;
+/** This in-memory capability belongs to the Node bootstrap. A serialized copy
+ * is evidence only: it cannot authorize execution or establish a new baseline. */
+export type BrowserExecutionAdmission = Readonly<{
+  evidence: BrowserExecutionEvidence;
+  verify: (this: BrowserExecutionAdmission, admission: BrowserExecutionAdmission, root: string, run: string) => Promise<BrowserHandoff>;
+}>;
 
 const fileIdentity = (value: Stats): readonly number[] => [value.dev, value.ino, value.mode, value.nlink, value.size, value.mtimeMs, value.ctimeMs];
 const namePattern = /^[A-Za-z0-9_.[\]-]+$/u;
@@ -196,14 +207,120 @@ export function assertBrowserNode(versions: Readonly<{ node: string; bun?: strin
   assert.equal(versions.bun, undefined, "Browser driver requires genuine Node");
   assert.equal(versions.node, BROWSER_NODE_VERSION, "Browser driver requires the pinned Node version");
 }
-export async function readBrowserPrepared(root: string, run: string): Promise<Readonly<{ request: BrowserRequest; prepared: BrowserPrepared }>> {
+async function readBrowserPreparedInputs(root: string, run: string): Promise<BrowserHandoff> {
   const bytes = await readBrowserFile(join(run, "request.json"), 16 * 1024 * 1024);
   const request = parseBrowserRequest(JSON.parse(bytes.toString("utf8")) as unknown);
   assert.equal(request.root, root); assert.equal(request.run, run);
   const prepared = parseBrowserPrepared(JSON.parse((await readBrowserFile(join(run, "prepared.json"), 16 * 1024 * 1024)).toString("utf8")) as unknown);
   assert.equal(prepared.requestSha256, browserDigest(bytes)); assert.deepEqual(prepared.buildRuntime.executable, request.bun);
   await verifyBrowserRequest(request);
-  assert.deepEqual(await browserFile(run, "driver.mjs"), prepared.driver);
   await verifyBrowserInventory(join(run, "fixture/hra-app"), prepared.fixture);
   return { request, prepared };
+}
+/** Producer-bound reads retain their original strict seven-field contract. */
+export async function readBrowserPrepared(root: string, run: string): Promise<BrowserHandoff> {
+  const handoff = await readBrowserPreparedInputs(root, run);
+  assert.deepEqual(await browserFile(run, "driver.mjs"), handoff.prepared.driver);
+  return handoff;
+}
+
+/** The sole phase transition is from a collected compiler output to Node's
+ * first execution observation. Content and all non-ctime identity fields must
+ * match; a change during that observation is still rejected by browserFile. */
+export function assertBrowserDriverAdmission(producer: BrowserFile, observed: BrowserFile): void {
+  for (const value of [producer, observed]) {
+    file(value);
+    assert.equal(value.path, "driver.mjs");
+    assert.ok(value.bytes > 0 && value.bytes <= 4 * 1024 * 1024);
+    assert.equal(value.identity[4], value.bytes);
+  }
+  assert.deepEqual({ ...observed, identity: observed.identity.slice(0, 6) },
+    { ...producer, identity: producer.identity.slice(0, 6) }, "Browser driver changed before execution admission");
+}
+
+function freezeBrowserSnapshot<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const child of Object.values(value)) freezeBrowserSnapshot(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+type BrowserAdmissionOperations = Readonly<{
+  readHandoff: () => Promise<BrowserHandoff>;
+  readDriver: () => Promise<BrowserFile>;
+}>;
+
+/** One controller per fresh bootstrap run. The operations seam permits pure
+ * phase tests; production uses the same bounded descriptor reads throughout.
+ * The verifier closes over this module instance so the separately bundled
+ * driver cannot deserialize, copy or accidentally re-admit its authority. */
+export function createBrowserAdmissionController(root: string, run: string, signal: AbortSignal,
+  operations: BrowserAdmissionOperations = {
+    readHandoff: () => readBrowserPreparedInputs(root, run),
+    readDriver: () => browserFile(run, "driver.mjs"),
+  }): Readonly<{
+    admit: (preparationCollected: boolean) => Promise<BrowserExecutionAdmission>;
+    claim: (admission: BrowserExecutionAdmission) => void;
+  }> {
+  physical(root); physical(run);
+  let phase: "waiting" | "admitting" | "admitted" | "claimed" | "failed" = "waiting";
+  let admission: BrowserExecutionAdmission | undefined;
+  let snapshot: BrowserHandoff | undefined;
+  let verifying = false;
+  const assertAuthority = (candidate: BrowserExecutionAdmission) => {
+    assert.ok(admission !== undefined && candidate === admission, "Foreign browser execution admission");
+    assert.ok(Object.isFrozen(candidate) && Object.isFrozen(candidate.evidence), "Mutable browser execution admission");
+  };
+  const assertReady = () => assert.ok(!signal.aborted, "Browser acceptance cancelled before driver admission");
+  return Object.freeze({
+    admit: async (preparationCollected: boolean) => {
+      assert.equal(phase, "waiting", "Browser execution admission was already attempted");
+      phase = "admitting";
+      try {
+        assertReady(); assert.equal(preparationCollected, true, "Browser preparation has not been collected");
+        const observed = await operations.readHandoff();
+        snapshot = freezeBrowserSnapshot(structuredClone({ request: parseBrowserRequest(observed.request), prepared: parseBrowserPrepared(observed.prepared) }));
+        assert.equal(snapshot.request.root, root); assert.equal(snapshot.request.run, run);
+        assert.deepEqual(snapshot.prepared.buildRuntime.executable, snapshot.request.bun);
+        assertReady();
+        const executionDriver = freezeBrowserSnapshot(structuredClone(await operations.readDriver()));
+        assertBrowserDriverAdmission(snapshot.prepared.driver, executionDriver);
+        // Never recapture after the first Node observation. These full checks
+        // also close cancellation and input-change gaps before returning it.
+        assert.deepEqual(await operations.readHandoff(), snapshot, "Browser preparation changed during execution admission");
+        assert.deepEqual(await operations.readDriver(), executionDriver, "Browser driver changed during execution admission");
+        assertReady();
+        const evidence: BrowserExecutionEvidence = freezeBrowserSnapshot({
+          schemaVersion: 1, kind: "hra-browser-execution-admission", root, run,
+          requestSha256: snapshot.prepared.requestSha256, preparedSha256: browserDigest(JSON.stringify(snapshot.prepared)),
+          producerDriver: snapshot.prepared.driver, executionDriver,
+        });
+        admission = Object.freeze({
+          evidence,
+          verify: async function (this: BrowserExecutionAdmission, candidate: BrowserExecutionAdmission, expectedRoot: string, expectedRun: string) {
+            assertAuthority(this); assertAuthority(candidate);
+            assert.equal(expectedRoot, root); assert.equal(expectedRun, run);
+            assert.equal(phase, "claimed", "Browser execution admission is not claimed");
+            assert.equal(verifying, false, "Concurrent browser execution verification");
+            verifying = true;
+            try {
+              assert.deepEqual(await operations.readHandoff(), snapshot, "Browser preparation changed after execution admission");
+              assert.deepEqual(await operations.readDriver(), executionDriver, "Browser driver changed after execution admission");
+              assert.ok(snapshot !== undefined);
+              return snapshot;
+            } catch (error) { phase = "failed"; throw error; }
+            finally { verifying = false; }
+          },
+        });
+        phase = "admitted";
+        return admission;
+      } catch (error) { phase = "failed"; throw error; }
+    },
+    claim: (candidate: BrowserExecutionAdmission) => {
+      assertAuthority(candidate); assertReady();
+      assert.equal(phase, "admitted", "Browser execution admission was already claimed or failed");
+      phase = "claimed";
+    },
+  });
 }

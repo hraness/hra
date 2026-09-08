@@ -7,7 +7,7 @@ import type { BrowserCustodyObserver } from "./app-browser.ts";
 import {
   assertBrowserNode, browserDigest, browserExecutable, browserInventory, browserSources,
   parseBrowserRequest, publishBrowserJson, publishBrowserTerminalJson, readBrowserFile,
-  readBrowserPrepared, verifyBrowserRequest, type BrowserRequest,
+  createBrowserAdmissionController, verifyBrowserRequest, type BrowserExecutionAdmission, type BrowserRequest,
 } from "./app-browser-handoff.ts";
 
 type ChildIdentity = Readonly<{ pid: number; parent: number; group: number; started: string }>;
@@ -334,6 +334,31 @@ export function assertBrowserDispatchAllowed(signal: AbortSignal, prepared: bool
   assert.equal(prepared, true, "Browser preparation has not been collected");
 }
 
+type BrowserDriver = Readonly<{
+  runAppBrowser: (root: string, run: string, signal: AbortSignal, admission: BrowserExecutionAdmission, observer?: BrowserCustodyObserver) => Promise<void>;
+}>;
+/** Import never establishes authority. The owner must have claimed the single
+ * admission already; both sides of import verify that same execution tuple. */
+export async function importAdmittedBrowserDriver(root: string, run: string, signal: AbortSignal,
+  admission: BrowserExecutionAdmission, load: () => Promise<unknown>): Promise<BrowserDriver> {
+  assertBrowserDispatchAllowed(signal, true);
+  await admission.verify(admission, root, run);
+  assertBrowserDispatchAllowed(signal, true);
+  const driver = await load();
+  assertBrowserDispatchAllowed(signal, true);
+  await admission.verify(admission, root, run);
+  assertBrowserDispatchAllowed(signal, true);
+  assert.ok(typeof driver === "object" && driver !== null && "runAppBrowser" in driver && typeof driver.runAppBrowser === "function");
+  return driver as BrowserDriver;
+}
+
+export function assertBrowserDriverReceiptAdmission(receipt: Readonly<Record<string, unknown>>, admission: BrowserExecutionAdmission): void {
+  assert.deepEqual(receipt.executionAdmission, admission.evidence, "Browser driver receipt has foreign execution admission");
+  assert.equal(receipt.preparationSha256, admission.evidence.preparedSha256);
+  assert.ok(typeof receipt.driverRuntime === "object" && receipt.driverRuntime !== null);
+  assert.equal((receipt.driverRuntime as Record<string, unknown>).bundleSha256, admission.evidence.executionDriver.sha256);
+}
+
 export function browserTerminalState(signal: AbortSignal, collected: boolean, failure: unknown): "passed" | "failed" {
   return failure !== undefined || signal.aborted || !collected ? "failed" : "passed";
 }
@@ -358,6 +383,8 @@ export async function runBrowserBootstrap(observer?: BrowserCustodyObserver): Pr
   process.on("SIGINT", onSignal); process.on("SIGTERM", onSignal);
   let failure: unknown, driverReceipt: Record<string, unknown> | undefined, preparationCollected = false, requestSha256: string | undefined;
   let request: BrowserRequest | undefined, inputsUnchanged = false, driverDispatched = false;
+  let admission: BrowserExecutionAdmission | undefined;
+  const admissionController = createBrowserAdmissionController(root, run, cancellation.signal);
   try {
     request = parseBrowserRequest({ schemaVersion: 1, kind: "hra-browser-preparation-request", root, run, node, bun, chromium,
       sources: await browserSources(root), app: await browserInventory(join(root, "app/dist")), site: await browserInventory(join(root, "dist/site")),
@@ -365,15 +392,17 @@ export async function runBrowserBootstrap(observer?: BrowserCustodyObserver): Pr
     await publishBrowserJson(join(run, "request.json"), request);
     requestSha256 = browserDigest(await readBrowserFile(join(run, "request.json"), 16 * 1024 * 1024));
     await runPreparation(request, cancellation.signal, observer); preparationCollected = true;
-    const handoff = await readBrowserPrepared(root, run);
     assertBrowserDispatchAllowed(cancellation.signal, preparationCollected);
-    const driver: unknown = await import(pathToFileURL(join(run, "driver.mjs")).href);
+    admission = await admissionController.admit(preparationCollected);
+    await publishBrowserJson(join(run, "driver-admission.json"), admission.evidence);
+    admissionController.claim(admission);
+    const driver = await importAdmittedBrowserDriver(root, run, cancellation.signal, admission,
+      () => import(pathToFileURL(join(run, "driver.mjs")).href) as Promise<unknown>);
     assertBrowserDispatchAllowed(cancellation.signal, preparationCollected);
-    assert.ok(typeof driver === "object" && driver !== null && "runAppBrowser" in driver && typeof driver.runAppBrowser === "function");
     driverDispatched = true;
-    await (driver.runAppBrowser as (root: string, run: string, signal: AbortSignal, observer?: BrowserCustodyObserver) => Promise<void>)(root, run, cancellation.signal, observer);
+    await driver.runAppBrowser(root, run, cancellation.signal, admission, observer);
     await verifyBrowserRequest(request);
-    assert.deepEqual(await readBrowserPrepared(root, run), handoff);
+    await admission.verify(admission, root, run);
   } catch (error) { failure = error; }
   finally {
     try {
@@ -390,6 +419,8 @@ export async function runBrowserBootstrap(observer?: BrowserCustodyObserver): Pr
           assert.ok(typeof receipt.driverRuntime === "object" && receipt.driverRuntime !== null);
           const identity = receipt.driverRuntime as Record<string, unknown>;
           assert.equal(identity.name, "node"); assert.equal(identity.version, "24.18.1"); assert.deepEqual(identity.executable, node);
+          assert.ok(admission !== undefined, "Dispatched browser driver lacks execution admission");
+          assertBrowserDriverReceiptAdmission(receipt, admission);
           if (failure === undefined) assert.equal(receipt.state, "passed", "Browser driver did not pass");
           return receipt;
         },
@@ -402,6 +433,9 @@ export async function runBrowserBootstrap(observer?: BrowserCustodyObserver): Pr
       });
       assert.ok(driverDispatched || failure !== undefined, "Browser driver was never dispatched");
     } catch (error) { failure = failure === undefined ? error : new AggregateError([failure, error], "Browser run and receipt verification failed"); }
+    try {
+      if (admission !== undefined) await admission.verify(admission, root, run);
+    } catch (error) { failure = failure === undefined ? error : new AggregateError([failure, error], "Browser run and execution admission postflight failed"); }
     // No awaits after this terminal decision. An interrupt during any earlier
     // cleanup remains fatal and cannot produce a passed final receipt.
     const state = browserTerminalState(cancellation.signal, preparationCollected && inputsUnchanged, failure);
@@ -411,6 +445,7 @@ export async function runBrowserBootstrap(observer?: BrowserCustodyObserver): Pr
         buildRuntime: driverReceipt?.buildRuntime ?? { name: "bun", version: "1.3.14", executable: bun },
         driverRuntime: driverReceipt?.driverRuntime ?? { name: "node", version: process.versions.node, executable: node },
         runner: { preparationCollected, inputsUnchanged, driverDispatched, cancelled: cancellation.signal.aborted, requestSha256: requestSha256 ?? null },
+        executionAdmission: admission?.evidence ?? null,
         ...(failure === undefined ? {} : { runnerFailure: browserRunnerFailureDetails(failure) }),
       });
       console.log(`Browser acceptance ${state}; receipt retained`);

@@ -8,7 +8,7 @@ import { parseHTML } from "linkedom";
 import { transform } from "lightningcss";
 import type { BrowserContext, Locator, Page, Response as BrowserResponse } from "playwright-core";
 import { browserIoModules } from "../app/fixtures/browser/config";
-import { assertBrowserNode, browserDigest, browserExecutable, browserPublicArtifacts, publishBrowserJson, readBrowserPrepared } from "./app-browser-handoff.ts";
+import { assertBrowserNode, browserDigest, browserExecutable, browserPublicArtifacts, publishBrowserJson, type BrowserExecutionAdmission } from "./app-browser-handoff.ts";
 import { serveBrowserAssets } from "./app-browser-server.ts";
 import { readRestoredStyleFramePair, settleExactStylesheet, StylesheetSettlementError, type StylesheetSettlementDiagnostics } from "./app-browser-settlement.ts";
 
@@ -933,11 +933,14 @@ async function isolate(context: BrowserContext, origins: ReadonlySet<string>): P
   return { blocked, errors };
 }
 
-export async function runAppBrowser(rootDirectory: string, runDirectory: string, signal: AbortSignal, observer?: BrowserCustodyObserver): Promise<void> {
+export async function runAppBrowser(rootDirectory: string, runDirectory: string, signal: AbortSignal,
+  admission: BrowserExecutionAdmission, observer?: BrowserCustodyObserver): Promise<void> {
   assertBrowserNode(process.versions);
   const root = await realpath(rootDirectory);
   const run = await realpath(runDirectory);
-  const handoff = await readBrowserPrepared(root, run);
+  const handoff = await admission.verify(admission, root, run);
+  const wasCancelled = (): boolean => signal.aborted;
+  assert.ok(!wasCancelled(), "Browser acceptance cancelled before driver admission");
   const driverRuntime = { name: "node", version: process.versions.node, executable: await browserExecutable(process.execPath), bundleSha256: handoff.prepared.driver.sha256 };
   assert.deepEqual(driverRuntime.executable, handoff.request.node);
   const executable = process.env.CHROMIUM_EXECUTABLE_PATH;
@@ -1280,7 +1283,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
     for (const [path, bytes] of publicFonts) assert.deepEqual(await ordinary(join(publicFontRoot, "fonts", path)), bytes, "Public font input changed during browser acceptance");
     assert.deepEqual(await ordinary(join(root, "package.json")), packageBytes);
     assert.deepEqual(await ordinary(join(root, "bun.lock")), lockBytes);
-    assert.deepEqual(await readBrowserPrepared(root, run), handoff, "Browser preparation changed during acceptance");
+    assert.deepEqual(await admission.verify(admission, root, run), handoff, "Browser preparation changed during acceptance");
     assert.ok(!isCancelled(), "Browser acceptance cancelled");
   } catch (error) { failure = error; }
   finally {
@@ -1295,11 +1298,14 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
         try { await boundedBrowserOperation(server.stop(), 5000, "Browser fixture server stop"); }
         catch (error) { failure = failure === undefined ? error : new AggregateError([failure, error], "Browser gate and server cleanup failed"); }
       }
+      try { await admission.verify(admission, root, run); }
+      catch (error) { failure = failure === undefined ? error : new AggregateError([failure, error], "Browser gate and execution admission postflight failed"); }
       signal.removeEventListener("abort", onSignal);
       const receipt = {
         schemaVersion: 2, kind: "hra-app-browser-acceptance", state: failure === undefined && !isCancelled() ? "passed" : "failed",
         browserExecutableSha256: executableSha256, playwright: "1.62.0", buildRuntime: handoff.prepared.buildRuntime, driverRuntime,
         preparationSha256: browserDigest(JSON.stringify(handoff.prepared)),
+        executionAdmission: admission.evidence,
         packageSha256: digest(packageBytes), lockSha256: digest(lockBytes),
         app: artifacts(appFiles), site: artifacts(siteFiles), fixture: fixtureArtifacts,
         appCspSha256: digest(appCsp), siteCspSha256: digest(siteCsp), previewCspSha256: digest(previewCsp),

@@ -8,7 +8,7 @@ import { browserIoPlugin } from "../app/fixtures/browser/config.ts";
 import {
   BROWSER_BUN_VERSION, browserDigest, browserExecutable, browserFile, browserInventory,
   browserPublicArtifacts, parseBrowserPrepared, parseBrowserRequest, publishBrowserJson,
-  readBrowserFile, verifyBrowserRequest,
+  readBrowserFile, verifyBrowserRequest, type BrowserFile,
 } from "./app-browser-handoff.ts";
 
 /** Same complete graph, package registration, shell seal and finalizer as build:app. */
@@ -116,6 +116,15 @@ export async function publishBrowserDriver(run: string, bytes: Buffer): Promise<
   });
 }
 
+/** Bind the producer observation to the exact AST-validated compiler output. */
+export function assertBrowserDriverCompilerBytes(driver: BrowserFile, bytes: Uint8Array): void {
+  assert.ok(bytes.byteLength > 0 && bytes.byteLength <= 4 * 1024 * 1024);
+  assert.equal(driver.path, "driver.mjs", "Browser driver compiler output path changed");
+  assert.equal(driver.bytes, bytes.byteLength, "Browser driver compiler output length changed");
+  assert.equal(driver.identity[4], bytes.byteLength, "Browser driver compiler output file size changed");
+  assert.equal(driver.sha256, browserDigest(bytes), "Browser driver compiler output bytes changed");
+}
+
 export async function prepareAppBrowser(run: string): Promise<void> {
   assert.equal(Bun.version, BROWSER_BUN_VERSION);
   const requestBytes = await readBrowserFile(join(run, "request.json"), 16 * 1024 * 1024);
@@ -148,10 +157,12 @@ export async function prepareAppBrowser(run: string): Promise<void> {
   assert.ok(tree); assertBrowserDriverAst(tree);
   await publishBrowserDriver(run, bytes);
   await verifyBrowserRequest(request);
+  const driver = await browserFile(run, "driver.mjs");
+  assertBrowserDriverCompilerBytes(driver, bytes);
   const prepared = parseBrowserPrepared({
     schemaVersion: 1, kind: "hra-browser-prepared", requestSha256: browserDigest(requestBytes),
     buildRuntime: { name: "bun", version: Bun.version, executable: await browserExecutable(process.execPath) },
-    driver: await browserFile(run, "driver.mjs"), fixture: await browserInventory(join(run, "fixture/hra-app")),
+    driver, fixture: await browserInventory(join(run, "fixture/hra-app")),
   });
   await publishBrowserJson(join(run, "prepared.json"), prepared);
 }

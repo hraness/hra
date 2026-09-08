@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { chmod, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertBrowserDriverAst, publishBrowserDriver, settleBrowserDriverPublication } from "./prepare-app-browser.ts";
-import { browserFile } from "./app-browser-handoff.ts";
+import { assertBrowserDriverAst, assertBrowserDriverCompilerBytes, publishBrowserDriver, settleBrowserDriverPublication } from "./prepare-app-browser.ts";
+import { browserDigest, browserFile, type BrowserFile } from "./app-browser-handoff.ts";
 
 const importNode = (value: string) => ({ type: "ImportDeclaration", source: { type: "StringLiteral", value } });
 const tree = (...body: unknown[]) => ({ type: "Program", body: [importNode("playwright-core"), ...body] });
@@ -24,6 +24,36 @@ test("driver closure refuses computed imports and CommonJS or eval escape hatche
   expect(() => assertBrowserDriverAst(tree({ type: "ImportExpression", source: { type: "Identifier", name: "runtimePath" } }))).toThrow();
   expect(() => assertBrowserDriverAst(tree({ type: "CallExpression", callee: { type: "Import" }, arguments: [{ type: "Identifier", name: "runtimePath" }] }))).toThrow();
   expect(() => assertBrowserDriverAst(tree({ type: "ImportExpression", source: { type: "StringLiteral", value: "playwright-core" } }))).not.toThrow();
+});
+
+test("compiler output binding preserves the producer observation and rejects changed path, bytes, hash or size", () => {
+  const bytes = Buffer.from("export const fixture = true;\n");
+  const driver: BrowserFile = Object.freeze({
+    path: "driver.mjs", bytes: bytes.byteLength, sha256: browserDigest(bytes),
+    identity: Object.freeze([1, 2, 0o100600, 1, bytes.byteLength, 3, 4]),
+  });
+  const original = structuredClone(driver);
+  expect(() => assertBrowserDriverCompilerBytes(driver, bytes)).not.toThrow();
+  expect(driver).toEqual(original);
+  for (const changed of [
+    { ...driver, path: "other.mjs" },
+    { ...driver, bytes: bytes.byteLength + 1 },
+    { ...driver, sha256: "0".repeat(64) },
+    { ...driver, identity: [1, 2, 0o100600, 1, bytes.byteLength + 1, 3, 4] },
+  ]) expect(() => assertBrowserDriverCompilerBytes(changed, bytes)).toThrow();
+  const replaced = Buffer.from(bytes); replaced[0] = replaced[0]! ^ 1;
+  expect(() => assertBrowserDriverCompilerBytes(driver, replaced)).toThrow("compiler output bytes changed");
+  expect(() => assertBrowserDriverCompilerBytes(driver, bytes.subarray(1))).toThrow("compiler output length changed");
+});
+
+test("compiler output binding rejects empty and oversized compiler buffers", () => {
+  for (const bytes of [Buffer.alloc(0), Buffer.alloc(4 * 1024 * 1024 + 1)]) {
+    const driver: BrowserFile = {
+      path: "driver.mjs", bytes: bytes.byteLength, sha256: browserDigest(bytes),
+      identity: [1, 2, 0o100600, 1, bytes.byteLength, 3, 4],
+    };
+    expect(() => assertBrowserDriverCompilerBytes(driver, bytes)).toThrow();
+  }
 });
 
 const publicationStages = ["open-driver", "write", "file-sync", "file-close", "open-directory", "directory-sync", "directory-close"] as const;
