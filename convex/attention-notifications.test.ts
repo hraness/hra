@@ -26,6 +26,10 @@ import {
   USER_TOTAL_QUOTA,
 } from "./quota";
 import schema from "./schema";
+import {
+  hraAttentionResendApiKeyEnvironmentName,
+  hraResendApiKeyEnvironmentName,
+} from "./resendApiKey";
 import { modules } from "./test.setup";
 
 type Args = Readonly<Record<string, Value>>;
@@ -93,15 +97,28 @@ const drainAccountDeletion = makeFunctionReference<"mutation", Args, unknown>(
 
 const hmacEnvironmentName = "HRA_AUTH_HMAC_SECRET";
 let originalHmacSecret: string | undefined;
+let originalAttentionKey: string | undefined;
+let originalAuthKey: string | undefined;
 
 beforeEach(() => {
   originalHmacSecret = process.env[hmacEnvironmentName];
+  originalAttentionKey = process.env[hraAttentionResendApiKeyEnvironmentName];
+  originalAuthKey = process.env[hraResendApiKeyEnvironmentName];
   process.env[hmacEnvironmentName] = "attention-notification-test-secret-at-least-thirty-two-characters";
+  process.env[hraAttentionResendApiKeyEnvironmentName] = "re_notice_test";
+  process.env[hraResendApiKeyEnvironmentName] = "re_auth_test";
 });
 
 afterEach(() => {
   if (originalHmacSecret === undefined) Reflect.deleteProperty(process.env, hmacEnvironmentName);
   else process.env[hmacEnvironmentName] = originalHmacSecret;
+  for (const [name, value] of [
+    [hraAttentionResendApiKeyEnvironmentName, originalAttentionKey],
+    [hraResendApiKeyEnvironmentName, originalAuthKey],
+  ] as const) {
+    if (value === undefined) Reflect.deleteProperty(process.env, name);
+    else process.env[name] = value;
+  }
 });
 
 const envelope = (ciphertext: string) => ({

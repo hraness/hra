@@ -14,6 +14,10 @@ import {
 import { ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS } from "./lifecyclePolicy";
 import { logicalDocumentBytes } from "./quota";
 import schema from "./schema";
+import {
+  hraAttentionResendApiKeyEnvironmentName,
+  hraResendApiKeyEnvironmentName,
+} from "./resendApiKey";
 import { modules } from "./test.setup";
 
 type Args = Readonly<Record<string, Value>>;
@@ -40,6 +44,9 @@ const inactiveDeploymentStatus = makeFunctionReference<"query", Args, Readonly<{
   outboxOccupancy: 0 | 1;
   safetyFaultOccupancy: 0 | 1;
 }>>("attentionNotificationControl:inactiveDeploymentStatus");
+const sendingKeyReadiness = makeFunctionReference<"query", Args, Readonly<{
+  dedicatedKeyReady: boolean;
+}>>("attentionNotificationControl:sendingKeyReadiness");
 const transition = makeFunctionReference<"mutation", Args, unknown>(
   "attentionNotificationControl:transition",
 );
@@ -137,6 +144,47 @@ async function seedCapacity(
 }
 
 describe("attention-notification safety fault ledger", () => {
+  test("reports only boolean credential readiness independently of global activation", async () => {
+    const runtime = convexTest(schema, modules);
+    await runtime.mutation(genesis, {});
+    const previous = [
+      [hraAttentionResendApiKeyEnvironmentName, process.env[hraAttentionResendApiKeyEnvironmentName]],
+      [hraResendApiKeyEnvironmentName, process.env[hraResendApiKeyEnvironmentName]],
+    ] as const;
+    const attentionKey = "re_notice_test";
+    const authKey = "re_auth_test";
+    try {
+      for (const [attention, authentication, ready] of [
+        [undefined, authKey, false],
+        ["re_bad'key", authKey, false],
+        [attentionKey, undefined, false],
+        [attentionKey, "re_bad'key", false],
+        [authKey, authKey, false],
+        [attentionKey, authKey, true],
+      ] as const) {
+        for (const [name, value] of [
+          [hraAttentionResendApiKeyEnvironmentName, attention],
+          [hraResendApiKeyEnvironmentName, authentication],
+        ] as const) {
+          if (value === undefined) Reflect.deleteProperty(process.env, name);
+          else process.env[name] = value;
+        }
+        expect(await runtime.query(sendingKeyReadiness, {})).toEqual({ dedicatedKeyReady: ready });
+        expect(await runtime.query(inactiveDeploymentStatus, {})).toEqual({
+          generation: 0,
+          globalState: "absent",
+          outboxOccupancy: 0,
+          safetyFaultOccupancy: 0,
+        });
+      }
+    } finally {
+      for (const [name, value] of previous) {
+        if (value === undefined) Reflect.deleteProperty(process.env, name);
+        else process.env[name] = value;
+      }
+    }
+  });
+
   test("is globally disabled by absence and advances explicit generations", async () => {
     const runtime = convexTest(schema, modules);
     await runtime.mutation(genesis, {});
