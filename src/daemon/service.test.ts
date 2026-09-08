@@ -81,6 +81,7 @@ import {
   mutationRequestDigest,
   sessionStartMutationRequest,
   StateStore,
+  type SecurityScrubCheckpointPolicy,
   type SessionRecord,
 } from "../storage/state-store";
 import {
@@ -1414,6 +1415,14 @@ type FixtureAdoptionOptions = Readonly<{
   claudeProcessLiveness?: ClaudeProcessLivenessProbe;
 }>;
 
+// These readers stay pinned through refusal. Keep all three checkpoint attempts
+// and their doubling backoff without spending the production 15 s wait budget.
+const shortScrubCheckpoint: SecurityScrubCheckpointPolicy = {
+  busyTimeoutMs: 50,
+  attempts: 3,
+  backoffMs: 10,
+};
+
 const isHraMemoryPort = (
   value: FixtureAdoptionOptions | HraMemoryPort | NodeJS.Platform | undefined,
 ): value is HraMemoryPort => typeof value === "object"
@@ -1431,6 +1440,7 @@ async function fixture(
     claude?: ClaudeRuntimePort;
     gatewayKeys?: GatewayKeyPort;
     proseResponder?: ProseResponder;
+    securityScrubCheckpoint?: SecurityScrubCheckpointPolicy;
   }> = {},
   adoptionOrMemoryOrPlatform: FixtureAdoptionOptions | HraMemoryPort | NodeJS.Platform = {},
   platformOrClaude?: NodeJS.Platform | ClaudeRuntimePort,
@@ -1442,7 +1452,12 @@ async function fixture(
   const documents = join(home, "Documents");
   await mkdir(documents, { recursive: true });
   await initializeStatePaths(paths);
-  const store = new StateStore(paths, { now });
+  const store = new StateStore(paths, {
+    now,
+    ...(autorespond.securityScrubCheckpoint === undefined
+      ? {}
+      : { securityScrubCheckpoint: autorespond.securityScrubCheckpoint }),
+  });
   stores.push(store);
   // The daemon defaults to answering approvals itself; these tests exercise
   // the manual paths and opt in to autorespond explicitly where needed.
@@ -22683,7 +22698,10 @@ describe("HraService", () => {
 
   test("reports a committed scrub quarantine and stops only after the local response boundary", async () => {
     let stopRequests = 0;
-    const value = await fixture(undefined, new FakeCloud(), () => { stopRequests += 1; });
+    const value = await fixture(
+      undefined, new FakeCloud(), () => { stopRequests += 1; }, undefined, undefined,
+      { securityScrubCheckpoint: shortScrubCheckpoint },
+    );
     const { sessionId } = await createIdleSession(value, "Committed scrub quarantine");
     const pending = value.store.enqueue(sessionId, "PINNED_SERVICE_QUEUE_BODY_SENTINEL");
     value.store.quarantineSession(sessionId);
@@ -22913,7 +22931,10 @@ describe("HraService", () => {
 
   test("stops after a committed queued turn scrub failure without inventing ambiguity", async () => {
     let stopRequests = 0;
-    const value = await fixture(undefined, new FakeCloud(), () => { stopRequests += 1; });
+    const value = await fixture(
+      undefined, new FakeCloud(), () => { stopRequests += 1; }, undefined, undefined,
+      { securityScrubCheckpoint: shortScrubCheckpoint },
+    );
     const { sessionId } = await createIdleSession(value, "Queued scrub quarantine");
     let releaseProvider!: () => void;
     let signalProviderApplied!: () => void;
@@ -22957,7 +22978,10 @@ describe("HraService", () => {
 
   test("stops when a deterministic queued turn failure commits but its scrub cannot finish", async () => {
     let stopRequests = 0;
-    const value = await fixture(undefined, new FakeCloud(), () => { stopRequests += 1; });
+    const value = await fixture(
+      undefined, new FakeCloud(), () => { stopRequests += 1; }, undefined, undefined,
+      { securityScrubCheckpoint: shortScrubCheckpoint },
+    );
     const { sessionId } = await createIdleSession(value, "Failed queue scrub quarantine");
     let releaseProvider!: () => void;
     let signalProviderEntered!: () => void;

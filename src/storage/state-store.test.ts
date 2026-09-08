@@ -86,7 +86,15 @@ import {
   type SecurityScrubCheckpointPolicy,
   type SessionRecord,
 } from "./state-store";
-import { WORK_SCHEMA_SQL } from "./work-store";
+import {
+  canonicalWorkJson,
+  WORK_SCHEMA_SQL,
+  type WorkDispatchOutcome,
+} from "./work-store";
+import {
+  deriveLegacySessionProfileKey,
+  deriveLegacyWorkProfileKey,
+} from "./canonical-profile-storage";
 
 const stores: StateStore[] = [];
 const privateUserPathRoot = ["", "Users", "private"].join("/");
@@ -2476,7 +2484,7 @@ describe("StateStore", () => {
       if (created.kind !== "work.create") throw new Error("Expected created project-authority work.");
       const task = created.tasks[0];
       if (task === undefined) throw new Error("Expected one project-authority task.");
-      const claimed = work.apply({
+      const claimOperation = {
         kind: "task.claim",
         idempotencyKey: nextKey(),
         workId: created.work.id,
@@ -2485,8 +2493,10 @@ describe("StateStore", () => {
         actorSessionId: session.id,
         actorCapability: capability,
         leaseMs: 50_000,
-      });
+      } as const;
+      const claimed = work.apply(claimOperation);
       if (claimed.kind !== "task.claim") throw new Error("Expected claimed project-authority task.");
+      let dispatchSettlement: Readonly<{ key: string; outcome: WorkDispatchOutcome }> | null = null;
       if (state === "released") {
         work.apply({
           kind: "attempt.release",
@@ -2515,7 +2525,7 @@ describe("StateStore", () => {
         });
         if (state !== "dispatching") {
           expect(work.authorizePreparedEffect(dispatchKey).executable).toBe(true);
-          const settled = work.finalizeDispatch(dispatchKey, state === "recovery_required"
+          const outcome: WorkDispatchOutcome = state === "recovery_required"
             ? { kind: "unknown", code: "custodian_restart" }
             : {
                 kind: "accepted",
@@ -2526,7 +2536,9 @@ describe("StateStore", () => {
                   mutationAttemptId: createAttemptId(),
                   accountGeneration: profile.processGeneration,
                 },
-              });
+              };
+          dispatchSettlement = { key: dispatchKey, outcome };
+          const settled = work.finalizeDispatch(dispatchKey, outcome);
           if (state === "submitted") {
             work.apply({
               kind: "attempt.report",
@@ -2564,7 +2576,146 @@ describe("StateStore", () => {
         intents: database.query("SELECT * FROM work_idempotency_intents WHERE work_id=? ORDER BY idempotency_key").all(created.work.id),
         version: database.query("PRAGMA user_version").get(),
       }));
-      return { store, home, project, session, snapshot };
+      return {
+        store, home, project, session, snapshot, inspect,
+        workId: created.work.id, taskId: task.id, attemptId: claimed.attempt.id,
+        claimOperation, dispatchSettlement,
+      };
+    }
+
+    for (const state of ["released", "submitted"] as const) {
+      test(`preserves ${state} Work history and replay across canonical profile reselection and reopen`, async () => {
+        // Real current StateStore schema and semantic writers throughout. This
+        // compatibility contract remains useful when canonical persistence is
+        // integrated; it does not install or pretend to prove that migration.
+        const now = () => 10_000;
+        const value = await workFixture(state, { now });
+        const encodeCursor = (payload: unknown) =>
+          `hra1.${Buffer.from(JSON.stringify(payload), "utf8").toString("base64url")}.${"A".repeat(43)}`;
+        const createWorkStore = (owner: StateStore) => owner.createWorkStore(1, encodeCursor, {
+          issue: () => capability,
+          verify: (candidate) => candidate === capability,
+        });
+        const work = createWorkStore(value.store);
+        const historicalKeys = () => value.inspect((database) => {
+          const rows = database.query(`
+            SELECT s.provider_v39,s.preset AS session_preset,s.preset_contract AS session_contract,
+              w.preset_contract AS work_contract,r.preset AS route_preset,
+              t.preset AS task_preset,a.preset AS attempt_preset
+            FROM work_attempts a
+            JOIN work_tasks t ON t.id=a.task_id AND t.work_id=a.work_id
+            JOIN works w ON w.id=t.work_id
+            JOIN work_routes r ON r.work_id=t.work_id AND r.account_id=t.account_id
+              AND r.project_id=t.project_id AND r.preset=t.preset AND r.fast=t.fast
+            JOIN sessions s ON s.id=a.worker_session_id
+            WHERE a.id=?
+          `).all(value.attemptId);
+          expect(rows).toHaveLength(1);
+          const row = z.object({
+            provider_v39: z.literal("codex"),
+            session_preset: z.enum(["low", "ultra"]),
+            session_contract: z.union([z.literal(1), z.literal(2)]),
+            work_contract: z.literal(1),
+            route_preset: z.literal("ultra"),
+            task_preset: z.literal("ultra"),
+            attempt_preset: z.literal("ultra"),
+          }).strict().parse(rows[0]);
+          return {
+            session: deriveLegacySessionProfileKey(row.provider_v39, row.session_preset, row.session_contract),
+            route: deriveLegacyWorkProfileKey(row.route_preset, row.work_contract),
+            task: deriveLegacyWorkProfileKey(row.task_preset, row.work_contract),
+            attempt: deriveLegacyWorkProfileKey(row.attempt_preset, row.work_contract),
+          };
+        });
+        const persistedHistory = () => value.inspect((database) => canonicalWorkJson({
+          work: database.query("SELECT * FROM works WHERE id=?").get(value.workId),
+          routes: database.query("SELECT * FROM work_routes WHERE work_id=? ORDER BY ordinal").all(value.workId),
+          tasks: database.query("SELECT * FROM work_tasks WHERE work_id=? ORDER BY ordinal").all(value.workId),
+          attempts: database.query("SELECT * FROM work_attempts WHERE work_id=? ORDER BY id").all(value.workId),
+          taskStates: database.query("SELECT * FROM work_task_states WHERE work_id=? ORDER BY task_id").all(value.workId),
+          intents: database.query("SELECT * FROM work_idempotency_intents WHERE work_id=? ORDER BY idempotency_key").all(value.workId),
+          effects: database.query("SELECT * FROM work_prepared_effects WHERE work_id=? ORDER BY idempotency_key").all(value.workId),
+          reports: database.query("SELECT * FROM work_attempt_reports WHERE work_id=? ORDER BY idempotency_key").all(value.workId),
+          submissions: database.query("SELECT * FROM work_submissions WHERE work_id=? ORDER BY id").all(value.workId),
+          events: database.query("SELECT * FROM work_events WHERE work_id=? ORDER BY sequence").all(value.workId),
+          historyIndex: database.query("SELECT * FROM work_task_history_index WHERE work_id=? ORDER BY ordinal").all(value.workId),
+          historyVersions: database.query("SELECT * FROM work_task_history_versions WHERE work_id=? ORDER BY ordinal").all(value.workId),
+          clock: database.query("SELECT * FROM work_clock").all(),
+        }));
+        const publicHistory = (owner: ReturnType<typeof createWorkStore>) => ({
+          task: owner.task(value.taskId),
+          history: owner.taskHistory(value.taskId),
+          events: owner.events(value.workId),
+          snapshot: owner.snapshot(value.workId),
+          effect: value.dispatchSettlement === null ? null : owner.preparedEffect(value.dispatchSettlement.key),
+        });
+        const settledReplay = (owner: ReturnType<typeof createWorkStore>) => ({
+          // Intent replay reprojects settled state; the original claim result
+          // is deliberately not the byte oracle for these later reads.
+          claim: owner.apply(value.claimOperation),
+          dispatch: value.dispatchSettlement === null ? null
+            : owner.finalizeDispatch(value.dispatchSettlement.key, value.dispatchSettlement.outcome),
+        });
+        const solUltra = "codex:gpt-5.6-sol:ultra";
+        expect(historicalKeys()).toEqual({ session: solUltra, route: solUltra, task: solUltra, attempt: solUltra });
+        expect(value.store.requireSessionPresetRequirement(value.session.id)).toEqual({
+          preset: "ultra", requirement: { model: "gpt-5.6-sol", effort: "ultra" },
+        });
+        const retained = persistedHistory();
+        const before = publicHistory(work);
+        const replayBytes = canonicalWorkJson(settledReplay(work));
+        expect(before.task.latestAttempt).toMatchObject({ id: value.attemptId, status: state });
+        expect(before.history.items.length).toBeGreaterThan(0);
+        expect(before.events.events.length).toBeGreaterThan(0);
+        if (state === "submitted") {
+          expect(value.dispatchSettlement?.outcome.kind).toBe("accepted");
+          expect(before.effect?.status.state).toBe("accepted");
+          expect(before.task.latestAttemptReport?.reportKind).toBe("submit");
+          expect(before.task.latestSubmission).not.toBeNull();
+        } else {
+          expect(before.effect).toBeNull();
+        }
+        const publicBytes = canonicalWorkJson(before);
+        expect(publicBytes).not.toContain('"canonical_profile_key":');
+        expect(publicBytes).not.toContain('"canonicalProfileKey":');
+        expect(persistedHistory()).toBe(retained);
+
+        const selected = value.store.updateSessionMetadata({
+          sessionId: value.session.id,
+          expectedRevision: value.session.revision,
+          preset: "low",
+        });
+        expect(selected.preset).toBe("low");
+        expect(selected.revision).toBe(value.session.revision + 1);
+        const keysAfter = {
+          session: "codex:gpt-5.6-luna:max", route: solUltra, task: solUltra, attempt: solUltra,
+        } as const;
+        expect(historicalKeys()).toEqual(keysAfter);
+        expect(value.store.requireSessionPresetRequirement(selected.id)).toEqual({
+          preset: "low", requirement: { model: "gpt-5.6-luna", effort: "max" },
+        });
+        expect(canonicalWorkJson(publicHistory(work))).toBe(publicBytes);
+        expect(canonicalWorkJson(settledReplay(work))).toBe(replayBytes);
+        expect(() => work.apply({ ...value.claimOperation, leaseMs: value.claimOperation.leaseMs + 1 }))
+          .toThrow("IDEMPOTENCY_CONFLICT");
+        expect(persistedHistory()).toBe(retained);
+
+        const paths = value.store.paths;
+        value.store.close();
+        stores.splice(stores.indexOf(value.store), 1);
+        for (const readonly of [true, false]) {
+          const reopened = new StateStore(paths, { readonly, now });
+          try {
+            expect(reopened.requireSession(selected.id)).toEqual(selected);
+            expect(historicalKeys()).toEqual(keysAfter);
+            const reopenedWork = createWorkStore(reopened);
+            expect(canonicalWorkJson(publicHistory(reopenedWork))).toBe(publicBytes);
+            // Replay APIs own immediate transactions, not the readonly surface.
+            if (!readonly) expect(canonicalWorkJson(settledReplay(reopenedWork))).toBe(replayBytes);
+            expect(persistedHistory()).toBe(retained);
+          } finally { reopened.close(); }
+        }
+      });
     }
 
     for (const state of liveStates) {
