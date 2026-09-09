@@ -15,6 +15,7 @@
 - `src/components/ui/` holds the interface primitives as owned source.
 - `src/components/` holds the icons, the state indicator, the streaming tail, the session card, the subagent chips, the scheduled-tasks badge, the transcript, the attachment chips, the account-login relay, and the interaction panel.
 - `src/screens/` holds the grid, session, and settings screens.
+- `fixtures/product/` renders the actual screens with fictional Direct scenarios and IO-only substitutions for the isolated public website examples. It is not an app entry point or a live provider test.
 
 # Guidelines
 

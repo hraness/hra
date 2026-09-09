@@ -13,7 +13,12 @@ import { stylexVite } from "@hraness/ui/stylex-build/vite";
 import { build as viteBuild } from "vite";
 import { z } from "zod";
 
-const routes = ["index.html", "privacy/index.html", "preview/index.html"] as const;
+const routes = [
+  "index.html", "privacy/index.html", "preview/index.html",
+  "docs/index.html", "docs/start/index.html", "docs/web/index.html",
+  "docs/sessions/index.html", "docs/reference/index.html", "docs/status/index.html",
+] as const;
+const docsRoutes = ["/docs/", "/docs/start/", "/docs/web/", "/docs/sessions/", "/docs/reference/", "/docs/status/"] as const;
 const hash = (bytes: Uint8Array | string): string => createHash("sha256").update(bytes).digest("hex");
 const sha = z.string().regex(/^[a-f0-9]{64}$/u);
 const logicalPath = z.string().min(1).max(1024).refine((value) =>
@@ -131,6 +136,34 @@ export function prepareSiteDocument(html: string, foundationPath: string): strin
   return html.replace(link, `<link rel="stylesheet" href="/${foundationPath}">\n<link rel="stylesheet" href="${STYLEX_TEMPLATE_CSS_PLACEHOLDER}">`);
 }
 
+/** Admit only the closed captured renderer surface, never an arbitrary path map. */
+export function captureSiteDocuments(value: unknown, environment: Readonly<Record<string, string | undefined>>): ReadonlyMap<string, string> {
+  const renderers = record(value);
+  const documents = new Map<string, string>();
+  for (const [index, name] of ["renderSiteHtml", "renderPrivacyHtml", "renderPreviewHtml"].entries()) {
+    const render: unknown = Object.getOwnPropertyDescriptor(renderers, name)?.value;
+    const path = routes[index];
+    assert.ok(typeof render === "function" && path !== undefined, "Captured renderer export changed");
+    const html = (render as (content: undefined, environment: Readonly<Record<string, string | undefined>>) => unknown)(undefined, environment);
+    assert.equal(typeof html, "string", "Static renderer must return an HTML string");
+    documents.set(path, html as string);
+  }
+  const renderDocs: unknown = Object.getOwnPropertyDescriptor(renderers, "renderDocsPages")?.value;
+  assert.ok(typeof renderDocs === "function", "Captured documentation renderer export changed");
+  const docs = record((renderDocs as (environment: Readonly<Record<string, string | undefined>>) => unknown)(environment));
+  assert.equal(Object.getPrototypeOf(docs), Object.prototype, "Documentation renderer must return an ordinary route map");
+  const descriptors = Object.getOwnPropertyDescriptors(docs);
+  assert.deepEqual(Reflect.ownKeys(descriptors).sort(), [...docsRoutes].sort(), "Documentation renderer routes changed");
+  for (const route of docsRoutes) {
+    const descriptor = descriptors[route];
+    assert.ok(descriptor !== undefined && "value" in descriptor && descriptor.enumerable, "Documentation routes must be own data fields");
+    assert.equal(typeof descriptor.value, "string", "Documentation renderer must return HTML strings");
+    documents.set(`${route.slice(1)}index.html`, descriptor.value as string);
+  }
+  assert.deepEqual([...documents.keys()], [...routes]);
+  return documents;
+}
+
 export type SiteStylexOutput = Readonly<{
   evidenceDirectory: string;
   files: ReadonlyMap<string, Buffer>;
@@ -181,16 +214,9 @@ export async function buildSiteStylex(options: Readonly<{
   const rendererRoot = join(generation.directory, renderer.outputRoot);
   assert.deepEqual(await artifactForFile(rendererRoot, entry.path), entry);
   const module: unknown = await import(pathToFileURL(join(rendererRoot, entry.path)).href);
-  assert.ok(typeof module === "object" && module !== null);
-  const renderers = module as Record<string, unknown>;
-  for (const [index, name] of ["renderSiteHtml", "renderPrivacyHtml", "renderPreviewHtml"].entries()) {
-    const render = renderers[name];
-    const path = routes[index];
-    assert.ok(typeof render === "function" && path !== undefined, "Captured renderer export changed");
-    const html = (render as (content: undefined, environment: Readonly<Record<string, string | undefined>>) => unknown)(undefined, options.environment);
-    assert.equal(typeof html, "string", "Static renderer must return an HTML string");
+  for (const [path, html] of captureSiteDocuments(module, options.environment)) {
     const prepared = await prepareStylexProducedTemplate(generation, path);
-    await writeFile(prepared.sourcePath, prepareSiteDocument(html as string, foundationPath), { flag: "wx", mode: 0o644 });
+    await writeFile(prepared.sourcePath, prepareSiteDocument(html, foundationPath), { flag: "wx", mode: 0o644 });
     await sealStylexProducedTemplate(generation, path);
   }
   const completedDirectory = await finalizeStylexGeneration({ generation, outputDirectory, rootDirectory: root });

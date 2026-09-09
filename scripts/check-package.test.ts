@@ -12,6 +12,7 @@ import {
   buildGitHistoryEnvironment,
   gitHistoryCommandArguments,
   normalizeGitHistoryPatchForPublicScan,
+  stripGitHunkSectionHeadingsForScopeScan,
   normalizeReviewedSyntheticHistoryPatch,
   normalizeReviewedSyntheticPackagePatch,
   packageDependencyCacheDiscoveryEnvironment,
@@ -49,6 +50,10 @@ describe("reviewed historical synthetic package fixtures", () => {
       patchSha256: "fa6583ec433c00d10d967214631fb4e04847515bb273cca51548388cb7c6ba7b" },
     { commit: "52579a5debfe1ee6c31dca0f31733a798c74c6aa", fixtures: ["other_ui", "foreign_package"],
       patchSha256: "a93c5c423beacf7ec5068310ae648b994de67506b07d46e523739b8903458beb" },
+    { commit: "166451a0354d5ecb6ca375feb1128a95ff7ff966", fixtures: ["other_ui"],
+      patchSha256: "5d7b62c01ac47c3c74389d21b288c4526728c74d68d23c18719b00df09537ef4" },
+    { commit: "21176e6ca34e58574376f54a9098856a90d6cd56", fixtures: ["other_ui"],
+      patchSha256: "6fc0a85da146a9a0ffc2b3f3407481e6e966e907e99db03e41a7dabb6d3bb749" },
   ] as const;
 
   test("binds the exact public-patch inventory without requiring branch ancestors in a squash clone", async () => {
@@ -283,6 +288,99 @@ const runBoundedCanonicalHistoryPatch = async (
   ["--no-pager", ...gitHistoryCommandArguments({ commit, kind })],
   historyFixtureCommandOptions(root, timeout, "package-history-fixture-render"),
 );
+
+describe("Git hunk section scope projection", () => {
+  const truncated = ["@hraness", "direc"].join("/");
+
+  test("omits only generated section labels while preserving hunk coordinates and authored lines", () => {
+    const header = "@@ -12,4 +12,6 @@";
+    const source = `${header} public text ${truncated}\n old\n-removed\n+added\n`;
+    expect(stripGitHunkSectionHeadingsForScopeScan(source))
+      .toBe(`${header}\n old\n-removed\n+added\n`);
+    expect(() => assertPublicText(source, "unprojected section label")).toThrow("PRIVATE_SCOPE");
+    expect(() => assertPublicText(stripGitHunkSectionHeadingsForScopeScan(source), "scope projection"))
+      .not.toThrow();
+    for (const coordinates of ["@@ -0,0 +1 @@", "@@ -1 +0,0 @@", "@@ -1 +1 @@"]) {
+      expect(stripGitHunkSectionHeadingsForScopeScan(`${coordinates} ${truncated}\n`))
+        .toBe(`${coordinates}\n`);
+    }
+  });
+
+  test("never removes authored header-shaped text or malformed metadata", () => {
+    for (const prefix of ["+", "-", " ", "\\"]) {
+      const source = `${prefix}@@ -1 +1 @@ ${truncated}\n`;
+      expect(stripGitHunkSectionHeadingsForScopeScan(source)).toBe(source);
+      expect(() => assertPublicText(stripGitHunkSectionHeadingsForScopeScan(source), "authored text"))
+        .toThrow("PRIVATE_SCOPE");
+    }
+    for (const header of [
+      "@@ -01 +1 @@", "@@ -1, +1 @@", "@@ -1 +1 @@@", "@@@ -1 -1 +1 @@@",
+      "@@ -1 +1 @@\t", "@@ -1 +1 @@ \r",
+    ]) {
+      const source = `${header}${truncated}\n`;
+      expect(stripGitHunkSectionHeadingsForScopeScan(source)).toBe(source);
+      expect(() => assertPublicText(source, "unrecognized metadata")).toThrow("PRIVATE_SCOPE");
+    }
+    const lines = ["+", "-", " "].map((prefix) => `${prefix}${truncated}`).join("\n");
+    const source = `@@ -1,2 +1,2 @@ ${truncated}\n${lines}\n`;
+    expect(stripGitHunkSectionHeadingsForScopeScan(source)).toBe(`@@ -1,2 +1,2 @@\n${lines}\n`);
+    expect(() => assertPublicText(stripGitHunkSectionHeadingsForScopeScan(source), "remaining source"))
+      .toThrow("PRIVATE_SCOPE");
+    for (const separator of ["\r", "\u2028", "\u2029"]) {
+      for (const prefix of ["+", "-", " "]) {
+        const authored = `${prefix}before${separator}@@ -1 +1 @@ ${truncated}\n`;
+        expect(stripGitHunkSectionHeadingsForScopeScan(authored)).toBe(authored);
+        expect(() => assertPublicText(stripGitHunkSectionHeadingsForScopeScan(authored), "physical source line"))
+          .toThrow("PRIVATE_SCOPE");
+      }
+    }
+  });
+
+  test("keeps sensitive bytes in the unprojected complete-patch scan", () => {
+    const commit = "a".repeat(40);
+    for (const value of [
+      ["", "Users", "fixture", "private", ""].join("/"),
+      ["sk", "proj", "A".repeat(24)].join("-"),
+    ]) {
+      const patch = `@@ -1 +1 @@ ${value}\n-safe\n+safe\n`;
+      expect(normalizeGitHistoryPatchForPublicScan(commit, "sensitive_patch", patch)).toBe(patch);
+      expect(() => assertPublicSensitiveText(
+        normalizeGitHistoryPatchForPublicScan(commit, "sensitive_patch", patch), "complete sensitive patch",
+      )).toThrow();
+    }
+  });
+
+  test("projects only the production scope surface after immutable evidence normalization", async () => {
+    const source = await readFile(join(import.meta.dir, "check-package.ts"), "utf8");
+    const scan = source.slice(source.indexOf("export const assertCompleteGitHistoryPublic ="),
+      source.indexOf("const assertSessionObservationHelp ="));
+    expect(scan).toContain('assertPublicSensitiveText(\n      normalizeGitHistoryPatchForPublicScan(commit, "sensitive_patch", completePatch),');
+    expect(scan.match(/stripGitHunkSectionHeadingsForScopeScan/gu)).toHaveLength(1);
+    expect(scan).toContain('assertPublicText(\n      stripGitHunkSectionHeadingsForScopeScan(\n        normalizeGitHistoryPatchForPublicScan(commit, "public_patch", authoredPatch),\n      ),');
+  });
+
+  test("scans complete real Git history when a public package is truncated in a generated heading", async () => {
+    const root = resolve(await mkdtemp(join(tmpdir(), "hra-history-section-")));
+    const heading = "The isolated product examples on hra.sh incorporate MIT-licensed `@hraness/direct`.";
+    const before = `${heading}\n${"\n".repeat(8)}before\n`;
+    try {
+      await initializeHistoryFixture(root, before);
+      await writeFile(join(root, "document.txt"), before.replace("before\n", "after\n"), "utf8");
+      await requireHistoryFixtureGit(root, "add", "document.txt");
+      await requireHistoryFixtureGit(root, "commit", "-m", "change below public heading");
+      const commit = await requireHistoryFixtureGit(root, "rev-parse", "HEAD");
+      const rendered = await runBoundedCanonicalHistoryPatch(root, commit, "public_patch");
+      expect(rendered.exitCode).toBe(0);
+      expect(rendered.stderr).toBe("");
+      expect(rendered.stdout).toContain(truncated);
+      expect(() => assertPublicText(rendered.stdout, "raw generated patch")).toThrow("PRIVATE_SCOPE");
+      expect(stripGitHunkSectionHeadingsForScopeScan(rendered.stdout)).not.toContain(truncated);
+      await expect(assertCompleteGitHistoryPublic(root)).resolves.toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
 
 describe("installed package daemon ownership", () => {
   test("times out delayed receipt publication without losing the exact owned pid", async () => {

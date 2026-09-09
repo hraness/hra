@@ -161,7 +161,7 @@ const officialReleaseRecord = (
   draft: false,
   id: 9_715_113,
   immutable: true,
-  tag_name: "v0.7.0",
+  tag_name: "v0.7.1",
   ...overrides,
 });
 
@@ -662,7 +662,7 @@ beforeAll(async () => {
     root,
   ], { cwd: repositoryRoot });
   if (packed.exitCode !== 0) throw new Error(`Could not build installer fixture: ${packed.stderr}${packed.stdout}`);
-  const productionArchivePath = join(root, "hraness-hra-0.7.0.tgz");
+  const productionArchivePath = join(root, "hraness-hra-0.7.1.tgz");
   const extractedRoot = join(root, "extracted");
   await mkdir(extractedRoot, { mode: 0o700 });
   const extracted = await run(["tar", "-xzf", productionArchivePath, "-C", extractedRoot], { cwd: root });
@@ -851,10 +851,10 @@ describe("transactional HRA installer", () => {
 
   test("binds the public command to one tagged preflight and one exact tagged archive", async () => {
     expect(HRA_INSTALL_PREFLIGHT_SOURCE_URL).toBe(
-      "https://raw.githubusercontent.com/hraness/hra/v0.7.0/src/install-preflight-runtime.ts",
+      "https://raw.githubusercontent.com/hraness/hra/v0.7.1/src/install-preflight-runtime.ts",
     );
     expect(HRA_INSTALL_ARCHIVE_URL).toBe(
-      "https://github.com/hraness/hra/releases/download/v0.7.0/hraness-hra-0.7.0.tgz",
+      "https://github.com/hraness/hra/releases/download/v0.7.1/hraness-hra-0.7.1.tgz",
     );
     const runtimeBytes = await readFile(resolve(import.meta.dir, "install-preflight-runtime.ts"));
     // The public digest names the runtime at the released tag; the working
@@ -998,7 +998,7 @@ describe("transactional HRA installer", () => {
       archiveAssetId: 8_675_309,
       archiveBytes: 123,
       archiveReleaseId: 9_715_113,
-      archiveReleaseTag: "v0.7.0",
+      archiveReleaseTag: "v0.7.1",
       archiveRepositoryId: HRA_INSTALL_REPOSITORY_ID,
       archiveSha256,
       archiveSource: "official",
@@ -1039,7 +1039,7 @@ describe("transactional HRA installer", () => {
         message: "one exact archive asset",
         record: officialReleaseRecord({
           assets: [officialArchiveAsset({
-            browser_download_url: "https://example.com/hra-v0.7.0.tgz",
+            browser_download_url: "https://example.com/hra-v0.7.1.tgz",
             name: "other.tgz",
           })],
         }),
@@ -1096,7 +1096,7 @@ describe("transactional HRA installer", () => {
       expect(call.init.signal).toBeInstanceOf(AbortSignal);
       expect(headers.get("accept")).toBe("application/vnd.github+json");
       expect(headers.get("accept-encoding")).toBe("identity");
-      expect(headers.get("user-agent")).toBe("hra-installer/0.7.0");
+      expect(headers.get("user-agent")).toBe("hra-installer/0.7.1");
       expect(headers.get("x-github-api-version")).toBe("2022-11-28");
       expect(headers.get("authorization")).toBeNull();
     }
@@ -1198,7 +1198,7 @@ describe("transactional HRA installer", () => {
       "install",
       "global",
       "package.json",
-    ))).toEqual({ dependencies: { "@hraness/hra": "0.7.0" } });
+    ))).toEqual({ dependencies: { "@hraness/hra": "0.7.1" } });
 
     const second = await runInstaller(root);
     expect(second).toEqual({
@@ -1331,6 +1331,16 @@ describe("transactional HRA installer", () => {
       archiveSha256: "b5bc2a9125885c6ace33a70137202e99e1d6774f5d8945fac9bb96b6353c930c",
       normalizerSha256: "2f9851effc7b52f59ee3ef8d0e5e096d33fb7e63bcb1fff1d533c2207d003148",
       cliSha256: "2974ddeb3795f6d896b365c2f2c0bff92e745ccd047e1628ef9acb5f2a5e0f1e",
+    },
+    {
+      tag: "v0.7.0",
+      archive: "https://github.com/hraness/hra/releases/download/v0.7.0/hraness-hra-0.7.0.tgz",
+      archiveAssetId: 551_312_890,
+      archiveBytes: 1_359_243,
+      archiveReleaseId: 385_063_983,
+      archiveSha256: "6a067b5efb48bb9253f132300b09e59ae45a6e90c8f97532b5deabdc802a1061",
+      normalizerSha256: "24cb487fda4dfd9ec1ec9f23048a245f7dfd1dfd60b5fa8c8b3e31193967a31e",
+      cliSha256: "6635ac9aab44cf8e6ae5f833ea063eb080f922de8659b0d9825a2a4c2e9af310",
     },
   ]) {
     test(`refuses and preserves an interrupted intent owned by immutable ${priorRelease.tag}`, async () => {

@@ -60,7 +60,7 @@ const packageSchema = z.object({
     url: z.literal("git+https://github.com/hraness/hra.git"),
   }).strict(),
   scripts: z.record(z.string(), z.string()),
-  version: z.literal("0.7.0"),
+  version: z.literal("0.7.1"),
 }).passthrough();
 
 type ProcessResult = Readonly<{
@@ -550,6 +550,14 @@ const reviewedSyntheticPackageHistoryEvidence: Readonly<Record<string, ReviewedS
     fixtures: Object.freeze(["other_ui", "foreign_package"] as const),
     patchSha256: "a93c5c423beacf7ec5068310ae648b994de67506b07d46e523739b8903458beb",
   }),
+  "166451a0354d5ecb6ca375feb1128a95ff7ff966": Object.freeze({
+    fixtures: Object.freeze(["other_ui"] as const),
+    patchSha256: "5d7b62c01ac47c3c74389d21b288c4526728c74d68d23c18719b00df09537ef4",
+  }),
+  "21176e6ca34e58574376f54a9098856a90d6cd56": Object.freeze({
+    fixtures: Object.freeze(["other_ui"] as const),
+    patchSha256: "6fc0a85da146a9a0ffc2b3f3407481e6e966e907e99db03e41a7dabb6d3bb749",
+  }),
 });
 const reviewedSyntheticPackageTokens: Readonly<Record<ReviewedSyntheticPackageFixture, string>> = Object.freeze({
   other_ui: ["@other", "ui"].join("/"),
@@ -607,6 +615,19 @@ export const normalizeGitHistoryPatchForPublicScan = (
   if (evidence === undefined) return patch;
   return normalizeReviewedSyntheticHistoryPatch(patch, evidence.patchSha256, evidence.fixtures);
 };
+
+/**
+ * Git truncates generated hunk section labels, including otherwise public package
+ * names. Project only those labels out of the scope scan after exact historical
+ * evidence checks. Authored lines retain their +/-/space prefix; complete raw
+ * patches still receive the separate sensitive-text scan. Split physical LF
+ * lines so CR and Unicode line separators cannot turn authored text into a header.
+ */
+export const stripGitHunkSectionHeadingsForScopeScan = (patch: string): string =>
+  patch.split("\n").map((line) => line.replace(
+    /^(@@ -(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? \+(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? @@) [^\r\n]*$/u,
+    "$1",
+  )).join("\n");
 
 type GitHistorySpawnResult = Readonly<{
   exitCode: number;
@@ -821,7 +842,9 @@ export const assertCompleteGitHistoryPublic = async (repositoryRoot: string): Pr
       readHistory({ commit, kind: "public_patch" }),
     );
     assertPublicText(
-      normalizeGitHistoryPatchForPublicScan(commit, "public_patch", authoredPatch),
+      stripGitHunkSectionHeadingsForScopeScan(
+        normalizeGitHistoryPatchForPublicScan(commit, "public_patch", authoredPatch),
+      ),
       `Git history commit ${commit}`,
     );
   }

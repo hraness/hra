@@ -44,7 +44,7 @@ const manifest = (scripts: Record<string, string> = {
   bin: { hra: "./src/cli.ts" },
   name: "@hraness/hra",
   scripts,
-  version: "0.7.0",
+  version: "0.7.1",
 });
 
 type UstarFixtureEntry = Readonly<{
@@ -272,6 +272,8 @@ describe("lifecycle-free Bun install normalizer", () => {
 
   test("requires an exact zero-lifecycle package manifest", () => {
     expect(() => assertHraInstallManifest(manifest())).not.toThrow();
+    expect(() => assertHraInstallManifest({ ...manifest(), version: "0.7.0" }))
+      .toThrow("package identity");
     for (const name of ["preinstall", "postinstall", "prepublishOnly", "prepare", "prepack"]) {
       expect(() => assertHraInstallManifest(manifest({
         build: "bun ./build.ts",
@@ -539,7 +541,7 @@ describe("lifecycle-free Bun install normalizer", () => {
       { cwd: packageSource, environment },
     );
     expect(hraPack.exitCode).toBe(0);
-    const hraArchive = join(archiveDirectory, "hraness-hra-0.7.0.tgz");
+    const hraArchive = join(archiveDirectory, "hraness-hra-0.7.1.tgz");
     let installedCli: string | undefined;
     const installAndNormalize = async (): Promise<void> => {
       const installation = await run(
@@ -604,7 +606,7 @@ describe("lifecycle-free Bun install normalizer", () => {
       { cwd: packageSource },
     );
     expect(packed.exitCode).toBe(0);
-    const archive = join(archiveDirectory, "hraness-hra-0.7.0.tgz");
+    const archive = join(archiveDirectory, "hraness-hra-0.7.1.tgz");
     const environment = {
       ...process.env,
       BUN_INSTALL: globalInstall,

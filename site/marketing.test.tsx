@@ -1,11 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
 import { findSection, publicContent, type PublicContent } from "./content.ts";
-import { renderMarketingHeader, renderMarketingPage, renderReferenceLabel } from "./marketing.tsx";
+import { findDocsPage, type DocsPath } from "./docs-content.ts";
+import { renderMarketingHeader, renderMarketingPage } from "./marketing.tsx";
 import { heroExampleMeasureClassName } from "./marketing.stylex.ts";
 import { sitePresentationClasses } from "./presentation.stylex.ts";
+import { productPreviewDisclosure, productScenes } from "./product-scenes.ts";
+import { renderDocsHtml } from "./template.ts";
 
-const referenceMarkup = '<div class="reference__intro"><p>Trusted &amp; escaped reference.</p></div><nav aria-label="Documentation"><a href="#fixture-section">Fixture section</a></nav><section id="fixture-section"><h2>Fixture section</h2><p>Unchanged reference body.</p></section>';
+function guideDocument(path: DocsPath) {
+  const page = findDocsPage(path);
+  if (page === undefined) throw new Error(`Missing guide: ${path}`);
+  return parseHTML(renderDocsHtml(page)).document;
+}
 
 function classNames(value: unknown): readonly string[] {
   if (typeof value !== "string" || value.trim() === "") throw new Error("Expected nonempty rendered class names.");
@@ -13,8 +20,8 @@ function classNames(value: unknown): readonly string[] {
 }
 
 describe("public server marketing composition", () => {
-  test("preserves header destinations, order, active page and the install action", () => {
-    for (const currentPath of ["/", "/privacy/"] as const) {
+  test("keeps product, task guides, availability and the app discoverable in the native header", () => {
+    for (const currentPath of ["/", "/privacy/", "/docs/", "/docs/web/"] as const) {
       const { document } = parseHTML(renderMarketingHeader(publicContent, currentPath));
       const header = document.querySelector("header");
       expect(header?.getAttribute("data-hraness-marketing")).toBe("header");
@@ -22,87 +29,85 @@ describe("public server marketing composition", () => {
       expect(header?.querySelector(".hraness-marketing-header__brand")?.getAttribute("href")).toBe("/");
       const links = [...document.querySelectorAll('nav[aria-label="Site"] > a')];
       expect(links.map((link) => [link.getAttribute("href"), link.textContent])).toEqual([
-        ["/#how-it-works", "How it works"], ["/#install-command", "Install"], ["/#reference", "Reference"],
-        ["/privacy/", "Privacy"], [publicContent.links.github, "GitHub"],
+        ["/#product-preview", "Product"], ["/docs/", "Docs"], ["/docs/status/", "Status"],
+        [publicContent.links.github, "GitHub"],
       ]);
       expect(links.filter((link) => link.getAttribute("aria-current") === "page").map((link) => link.textContent))
-        .toEqual([currentPath === "/" ? "How it works" : "Privacy"]);
-      expect(header?.querySelector(".hraness-marketing-header__actions > a")?.getAttribute("href")).toBe("/#install-command");
-      expect(header?.querySelector(".hraness-marketing-header__actions > a")?.textContent).toBe(`Install ${publicContent.productName}`);
+        .toEqual(currentPath === "/" ? ["Product"] : currentPath.startsWith("/docs/") ? ["Docs"] : []);
+      expect(header?.querySelector(".hraness-marketing-header__actions > a")?.getAttribute("href")).toBe(publicContent.links.app);
+      expect(header?.querySelector(".hraness-marketing-header__actions > a")?.textContent).toBe("Open HRA");
       expect(document.querySelector("[style], style, script")).toBeNull();
     }
   });
 
-  test("keeps marketing roles and the one trusted Reference wrapper in their original order", () => {
-    const html = renderMarketingPage(publicContent, referenceMarkup);
+  test("leads with the real interface and keeps procedural reference out of the marketing composition", () => {
+    const html = renderMarketingPage(publicContent);
     const { document } = parseHTML(html);
     const page = document.querySelector('[data-hraness-marketing="page"]');
     expect(page).not.toBeNull();
-    expect([...page!.children].map((child) => child.id === "reference" ? "reference" : child.getAttribute("data-hraness-marketing")))
-      .toEqual(["hero", "pillars", "section", "install", "trust", "questions", "maker", "cta", "reference"]);
-    expect(document.querySelectorAll("#reference")).toHaveLength(1);
-    expect(document.querySelector("#reference")?.parentElement === page).toBe(true);
-    expect([...document.querySelector("#reference")!.children].map((child) => child.tagName)).toEqual(["DIV", "NAV", "SECTION"]);
-    expect(html).toContain(referenceMarkup);
+    expect([...page!.children].map((child) => child.getAttribute("data-hraness-marketing")))
+      .toEqual(["hero", "pillars", "section", "trust", "questions", "maker", "cta"]);
+    expect(document.querySelector("#reference, #command-reference, [data-hraness-marketing=install]")).toBeNull();
+    expect(html).not.toContain(publicContent.installCommand);
+    expect(html).not.toContain(publicContent.initCommand);
     expect(document.querySelector("[style], style, script")).toBeNull();
     expect(document.querySelector("h1")?.id).toBe("hra-title");
     expect(document.querySelector("h1")?.textContent).toBe(publicContent.hero.heading);
     expect(document.querySelectorAll("h1")).toHaveLength(1);
     const heroClasses = classNames(document.querySelector('[data-hraness-marketing="hero"]')?.className);
     for (const name of classNames(heroExampleMeasureClassName())) expect(heroClasses).toContain(name);
-    expect(document.querySelector(".hraness-marketing-facts")?.children).toHaveLength(4);
+    expect(document.querySelector(".hraness-marketing-facts")).toBeNull();
     expect(document.querySelector(".hraness-marketing-pillars")?.children).toHaveLength(3);
-    expect([...document.querySelectorAll(".hraness-marketing-facts__label")].map((node) => node.textContent))
-      .toEqual(publicContent.hero.facts.map((fact) => fact.label));
     expect([...document.querySelectorAll(".hraness-marketing-pillars__summary")].map((node) => node.textContent))
       .toEqual(publicContent.hero.pillars.map((pillar) => pillar.summary));
   });
 
-  test("preserves both rollout notices, their precise placement and all conditional commands", () => {
-    const { document } = parseHTML(renderMarketingPage(publicContent, referenceMarkup));
-    const notice = document.querySelector(".hraness-marketing-hero__copy > aside.notice");
-    expect(notice?.previousElementSibling?.classList.contains("hraness-marketing-hero__boundary")).toBe(true);
-    expect(notice?.nextElementSibling).toBeNull();
-    expect(notice?.querySelector("strong")?.textContent).toBe("Current daemon rollout blocked");
-    expect(notice?.querySelector("p")?.textContent).toBe(publicContent.daemonRolloutNotice);
-    expect(notice?.querySelector("a")?.getAttribute("href")).toBe("#install-and-update");
-    expect(notice?.querySelector("a")?.parentElement?.textContent).toBe("Read the rollout and update runbook before running the examples below.");
-    const note = document.querySelector(".hraness-marketing-install__heading-group > .install-note");
-    expect(note?.previousElementSibling?.id).toBe("install-command-heading");
-    expect(note?.previousElementSibling?.textContent).toBe("Install the admitted release.");
-    expect(note?.nextElementSibling).toBeNull();
-    expect(note?.textContent).toBe("This CLI artifact passed immutable GitHub and npm release admission. The command downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.");
-    const commands = document.querySelector(".hraness-marketing-install__commands");
-    expect([...commands!.children].map((child) => child.tagName)).toEqual(["PRE", "PRE", "ASIDE", "P", "PRE"]);
-    expect(commands?.querySelector("aside strong")?.textContent).toBe("Before initialization");
-    expect(commands?.querySelector("aside p")?.textContent).toBe(publicContent.daemonRolloutNotice);
-    expect(commands?.querySelector("aside a")?.textContent).toBe("Read the rollout and update runbook.");
-    for (const [hook, command] of [
-      ["install-command", publicContent.installCommand], ["doctor-command", publicContent.doctorCommand], ["init-command", publicContent.initCommand],
-    ]) {
-      expect(document.querySelector(`pre.${hook}`)?.textContent).toBe(command);
-      expect(document.querySelector(`pre.${hook}`)?.getAttribute("tabindex")).toBe("0");
+  test("keeps activation warnings beside examples and exact setup commands in their owning guide", () => {
+    const { document } = parseHTML(renderMarketingPage(publicContent));
+    const notice = document.querySelector('.hraness-marketing-hero__copy a[href="/docs/status/"]')?.parentElement;
+    expect(notice?.textContent).toContain("New machine setup is temporarily paused.");
+    expect(notice?.querySelector("a")?.textContent).toBe("Check current availability →");
+    const flow = document.querySelector("#how-it-works");
+    expect(flow?.querySelector('a[href="/docs/start/"]')?.parentElement?.textContent)
+      .toBe("These commands run on an initialized, authorized machine. Complete setup first.");
+    const flowText = flow?.textContent ?? "";
+    expect(flowText.indexOf("initialized, authorized machine")).toBeLessThan(flowText.indexOf(publicContent.hero.steps[0]!.command));
+    const setup = guideDocument("/docs/start/");
+    const commandBlocks = [...setup.querySelectorAll("main pre")];
+    expect(commandBlocks[0]?.textContent).toBe(publicContent.installCommand);
+    const admissionNotice = setup.querySelector('aside[aria-label="Candidate artifact not yet admitted"]');
+    expect(admissionNotice?.textContent).toContain("Only after immutable GitHub and npm release admission");
+    expect(admissionNotice?.querySelector("a")?.getAttribute("href")).toBe("https://github.com/hraness/hra/tree/v0.7.0#install-and-update");
+    expect(admissionNotice?.nextElementSibling).toBe(commandBlocks[0]);
+    for (const command of [publicContent.installCommand, publicContent.doctorCommand, publicContent.initCommand]) {
+      expect(commandBlocks.some((block) => block.textContent.split("\n").includes(command))).toBe(true);
     }
+    for (const block of commandBlocks) expect(block.getAttribute("tabindex")).toBe("0");
+    const setupNotice = setup.querySelector('aside[aria-label="Before you start a daemon"]');
+    expect(setupNotice).not.toBeNull();
+    expect(setupNotice?.textContent).toContain("Initialization, daemon startup, and hosted command writers remain blocked on capacity.");
+    expect(setupNotice?.querySelector("a")?.getAttribute("href")).toBe("/docs/status/#install-and-update");
+    const setupText = setup.querySelector("main")?.textContent ?? "";
+    expect(setupText.indexOf(setupNotice!.textContent)).toBeLessThan(setupText.indexOf(publicContent.initCommand));
+    expect(guideDocument("/docs/status/").querySelector('aside[aria-label="Current runtime hold"]')?.textContent)
+      .toContain(publicContent.daemonRolloutNotice);
     const firstSession = findSection(publicContent, "first-session").blocks.find((block) => block.kind === "commands");
     if (firstSession?.kind !== "commands") throw new Error("Missing public first-session commands.");
-    expect(document.querySelector("pre.shell-transcript")?.textContent).toBe(firstSession.commands.join("\n"));
-    expect(document.querySelectorAll(".hraness-marketing-hero__frame")).toHaveLength(1);
-    expect(document.querySelector(".hraness-marketing-hero__frame > figure")?.classList.contains("hraness-marketing-proof-frame")).toBe(true);
-    expect(document.querySelector(".hraness-marketing-proof-frame__caption > small")?.textContent).toBe(`v${publicContent.releaseVersion}`);
+    const sessions = guideDocument("/docs/sessions/");
+    expect([...sessions.querySelectorAll("#first-session pre")].map((node) => node.textContent))
+      .toContain(firstSession.commands.join("\n"));
     expect([...document.querySelectorAll(".hraness-marketing-flow__code")].map((node) => node.textContent))
       .toEqual(publicContent.hero.steps.map((step) => step.command));
   });
 
   test("keeps every published marketing collection, action and summary attached to its native role", () => {
-    const { document } = parseHTML(renderMarketingPage(publicContent, referenceMarkup));
+    const { document } = parseHTML(renderMarketingPage(publicContent));
     const textAt = (selector: string) => document.querySelector(selector)?.textContent;
     const textsAt = (selector: string) => [...document.querySelectorAll(selector)].map((node) => node.textContent);
     for (const [role, text] of [
       ["eyebrow", publicContent.hero.eyebrow], ["name", publicContent.productName],
       ["summary", publicContent.hero.summary], ["example", publicContent.hero.example], ["boundary", publicContent.hero.boundary],
     ]) expect(textAt(`.hraness-marketing-hero__${role}`)).toBe(text);
-    expect(textsAt(".hraness-marketing-facts__value")).toEqual(publicContent.hero.facts.map((fact) => fact.value));
-    expect(textsAt(".hraness-marketing-facts__detail")).toEqual(publicContent.hero.facts.map((fact) => fact.detail));
     expect(textsAt(".hraness-marketing-pillars__label")).toEqual(publicContent.hero.pillars.map((pillar) => pillar.label));
     expect(textAt("#how-it-works-heading")).toBe(publicContent.hero.proofLabel);
     expect(textsAt(".hraness-marketing-flow__label")).toEqual(publicContent.hero.steps.map((step) => step.label));
@@ -110,8 +115,8 @@ describe("public server marketing composition", () => {
     expect(textsAt(".hraness-marketing-trust-item__label")).toEqual(publicContent.trust.map((item) => item.label));
     expect(textsAt(".hraness-marketing-trust-item__detail")).toEqual(publicContent.trust.map((item) => item.detail));
     expect(textAt(".hraness-marketing-trust__summary"))
-      .toBe(`${publicContent.productName} is infrastructure around the provider tools you chose, not a proxy in front of them.`);
-    expect(textsAt("details > summary")).toEqual(publicContent.questions.map((question) => question.question));
+      .toBe("The browser gives you a view of the work. Execution stays with the provider tools on the machine you chose.");
+    expect(textsAt("#questions details > summary")).toEqual(publicContent.questions.map((question) => question.question));
     expect(textsAt(".hraness-marketing-question__answer")).toEqual(publicContent.questions.map((question) =>
       question.answer.map((part) => part.kind === "link" ? part.label : part.value).join("")));
     expect(textAt("#maker-heading")).toBe(publicContent.maker.heading);
@@ -124,10 +129,10 @@ describe("public server marketing composition", () => {
       [publicContent.hero.secondaryAction.href, publicContent.hero.secondaryAction.label, "secondary"],
     ]);
     expect(actionsAt(".hraness-marketing-cta__actions > a")).toEqual([
-      ["#install-command", `Install ${publicContent.productName}`, "primary"],
-      [publicContent.links.github, "Read the source", "secondary"],
+      ["/docs/start/", "Set up your first machine", "primary"],
+      [publicContent.links.app, "Open HRA", "secondary"],
     ]);
-    expect(textAt(".hraness-marketing-cta__summary")).toBe("Install and verify the admitted CLI artifact. After the rollout prerequisite is satisfied, initialize it, add one account, and start a session that outlives the tab it began in.");
+    expect(textAt(".hraness-marketing-cta__summary")).toBe("Start with one machine and one provider account. The setup guide explains what is available now and walks you through each step.");
     expect(textAt(".hraness-marketing-cta__footnote")).toBe(publicContent.hero.boundary);
   });
 
@@ -141,39 +146,40 @@ describe("public server marketing composition", () => {
       },
       questions: [{ question: "A native question?", answer: [{ kind: "link", label: "Answer", href: "https://example.test/answer" }] }],
     };
-    const { document } = parseHTML(renderMarketingPage(sample, referenceMarkup));
+    const { document } = parseHTML(renderMarketingPage(sample));
     expect(document.querySelector(".hraness-marketing-maker__body > p > a")?.hasAttribute("class")).toBe(false);
     expect(document.querySelector(".hraness-marketing-maker__body > p > code")?.textContent).toBe("safe <text>");
     expect(document.querySelector(".hraness-marketing-maker__links a")?.getAttribute("class")).toBe(sitePresentationClasses("proseLink"));
     expect(document.querySelector(".hraness-marketing-question__answer a")?.getAttribute("class")).toBe(sitePresentationClasses("proseLink"));
-    expect(document.querySelectorAll("details > summary")).toHaveLength(1);
-    expect(document.querySelector("details > summary")?.textContent).toBe("A native question?");
-    expect(document.querySelector("details")?.hasAttribute("open")).toBe(false);
+    expect(document.querySelectorAll("#questions details > summary")).toHaveLength(1);
+    expect(document.querySelector("#questions details > summary")?.textContent).toBe("A native question?");
+    expect(document.querySelector("#questions details")?.hasAttribute("open")).toBe(false);
     expect(document.querySelector("[style], style, script")).toBeNull();
   });
 
-  test("escapes ordinary product text and rejects missing first-session evidence", () => {
+  test("escapes ordinary product text without depending on the long-form reference", () => {
     const heading = '<script data-untrusted="true">not markup</script>';
-    const { document } = parseHTML(renderMarketingPage({ ...publicContent, hero: { ...publicContent.hero, heading } }, referenceMarkup));
+    const { document } = parseHTML(renderMarketingPage({ ...publicContent, hero: { ...publicContent.hero, heading } }));
     expect(document.querySelector("h1")?.textContent).toBe(heading);
     expect(document.querySelector("script")).toBeNull();
-    const sample = {
-      ...publicContent,
-      sections: publicContent.sections.map((section) => section.id === "first-session"
-        ? { ...section, blocks: section.blocks.filter((block) => block.kind !== "commands") }
-        : section),
-    };
-    expect(() => renderMarketingPage(sample, referenceMarkup)).toThrow("Public content must publish the human-terminal first-session commands.");
+    expect(renderMarketingPage({ ...publicContent, sections: [] })).toBe(renderMarketingPage(publicContent));
   });
 
-  test("renders the Reference label through the public body-size slot without a competing local font atom", () => {
-    const { document } = parseHTML(renderReferenceLabel());
-    const label = document.querySelector("p");
-    expect(label?.textContent).toBe("Reference");
-    expect(label?.classList.contains("hraness-marketing-section__label")).toBe(true);
-    expect(label?.getAttribute("data-size")).toBe("body");
-    const labelClasses = classNames(label?.className);
-    for (const name of classNames(sitePresentationClasses("proseMeasure"))) expect(labelClasses).toContain(name);
+  test("gives the real-interface preview native controls, an accessible explanation and a written-guide fallback", () => {
+    const { document } = parseHTML(renderMarketingPage(publicContent));
+    const preview = document.querySelector("figure#product-preview[data-product-preview]");
+    expect(preview).not.toBeNull();
+    expect(document.querySelectorAll(".hraness-marketing-hero__frame")).toHaveLength(1);
+    expect(preview?.querySelector("figcaption")?.textContent).toContain(productPreviewDisclosure);
+    expect(preview?.querySelector("[data-preview-description]")?.textContent).toBe(productScenes.overview.description);
+    expect(preview?.querySelector("[data-preview-guide]")?.getAttribute("href")).toBe(productScenes.overview.guide);
+    expect(preview?.querySelectorAll("button[data-preview-view]")).toHaveLength(4);
+    expect(preview?.querySelectorAll("button[data-preview-view][disabled]")).toHaveLength(4);
+    expect(preview?.querySelectorAll('[aria-pressed="true"]')).toHaveLength(1);
+    expect(preview?.querySelector("iframe")?.getAttribute("sandbox")).toBe("allow-scripts");
+    expect(preview?.querySelector("iframe")?.getAttribute("aria-hidden")).toBe("true");
+    expect(preview?.querySelector("iframe")?.getAttribute("tabindex")).toBe("-1");
+    expect(preview?.querySelector("figcaption")?.textContent).toContain("Screen controls need JavaScript. The written guides cover each workflow.");
     expect(document.querySelector("[style], style, script")).toBeNull();
   });
 });

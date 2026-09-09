@@ -3,8 +3,145 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertAppColorScheme, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, inventory, loadedStylesheetControl, productionCsp, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotStaticSite } from "./app-browser";
+import { runInNewContext } from "node:vm";
+import { assertAppColorScheme, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, captureBrowserResponseBody, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, settleBrowserResponseBodies, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview } from "./app-browser";
 import { browserIoModules } from "../app/fixtures/browser/config";
+
+describe("browser response lifetime", () => {
+  test("captures immediately and settles bytes before the caller can discard a document", async () => {
+    const received = Promise.withResolvers<Buffer>();
+    const events: string[] = [];
+    const body = captureBrowserResponseBody({ body: () => { events.push("read"); return received.promise; } });
+    expect(events).toEqual(["read"]);
+    const transition = settleBrowserResponseBodies([body]).then(() => { events.push("navigate"); });
+    await Promise.resolve();
+    expect(events).toEqual(["read"]);
+    const bytes = Buffer.from("retained native bytes");
+    received.resolve(bytes);
+    await transition;
+    expect(events).toEqual(["read", "navigate"]);
+    expect(await body).toEqual({ bytes });
+  });
+
+  test("retains an early body rejection and refuses navigation without retry or replacement bytes", async () => {
+    const failure = new Error("Native document no longer exists");
+    let reads = 0, navigated = false;
+    const body = captureBrowserResponseBody({ body: async () => { reads += 1; throw failure; } });
+    await Promise.resolve();
+    await expect(settleBrowserResponseBodies([body]).then(() => { navigated = true; })).rejects.toBe(failure);
+    expect(reads).toBe(1);
+    expect(navigated).toBe(false);
+  });
+
+  test("settles every body, not just the first completed response", async () => {
+    const last = Promise.withResolvers<Buffer>();
+    let settled = false;
+    const bodies = [captureBrowserResponseBody({ body: async () => Buffer.from("first") }),
+      captureBrowserResponseBody({ body: () => last.promise })];
+    const settlement = settleBrowserResponseBodies(bodies).then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    last.resolve(Buffer.from("last"));
+    await settlement;
+    expect(settled).toBe(true);
+  });
+});
+
+describe("product preview close settlement", () => {
+  test("waits for queued close cleanup after the native dialog is already hidden", async () => {
+    const detached = Promise.withResolvers<undefined>();
+    const observations: string[] = [];
+    let frames = 1;
+    const settlement = waitForClosedProductPreview({ waitFor: async (options) => {
+      expect(options).toEqual({ state: "hidden" });
+      observations.push("hidden");
+    } }, {
+      waitFor: (options) => {
+        expect(options).toEqual({ state: "detached" });
+        observations.push("waiting for detachment");
+        return detached.promise;
+      },
+      count: async () => { observations.push("count"); return frames; },
+    });
+    queueMicrotask(() => {
+      observations.push("close handler");
+      frames = 0;
+      detached.resolve(undefined);
+    });
+    await expect(settlement).resolves.toBeUndefined();
+    expect(observations).toEqual(["hidden", "waiting for detachment", "close handler", "count"]);
+  });
+
+  test("preserves the existing locator timeout instead of accepting a still-attached frame", async () => {
+    const timeout = new Error("Existing locator deadline expired before detachment");
+    let counts = 0;
+    await expect(waitForClosedProductPreview({ waitFor: async () => undefined }, {
+      waitFor: async (options) => {
+        expect(options).toEqual({ state: "detached" });
+        throw timeout;
+      },
+      count: async () => { counts += 1; return 0; },
+    })).rejects.toBe(timeout);
+    expect(counts).toBe(0);
+  });
+
+  test("still rejects a child present in the final census", async () => {
+    await expect(waitForClosedProductPreview({ waitFor: async () => undefined }, {
+      waitFor: async () => undefined,
+      count: async () => 1,
+    })).rejects.toThrow("Closed example kept its child browsing context");
+  });
+});
+
+describe("browser service-worker refusal", () => {
+  test("the exact initializer never reads the opaque-frame getter and cannot reach native registration", async () => {
+    let getterReads = 0, nativeCalls = 0;
+    const errors: string[] = [];
+    const navigator = Object.defineProperty({}, "serviceWorker", { get() {
+      getterReads += 1;
+      throw new DOMException("Service worker is disabled because the context is sandboxed", "SecurityError");
+    } });
+    class NativeContainer { register() { nativeCalls += 1; return Promise.resolve(); } }
+    runInNewContext(`(${installBrowserServiceWorkerRefusal.toString()})();`, {
+      navigator, ServiceWorkerContainer: NativeContainer, DOMException,
+      console: { error: (message: string) => errors.push(message) },
+    });
+    expect(getterReads).toBe(0);
+    const descriptor = Object.getOwnPropertyDescriptor(NativeContainer.prototype, "register");
+    expect(descriptor?.writable).toBe(false);
+    expect(descriptor?.configurable).toBe(false);
+    await expect(new NativeContainer().register()).rejects.toMatchObject({
+      name: "SecurityError", message: "Service workers are disabled during offline browser acceptance",
+    });
+    expect(nativeCalls).toBe(0);
+    expect(getterReads).toBe(0);
+    expect(errors).toEqual(["Browser acceptance refused service worker registration"]);
+    expect(() => Object.defineProperty(NativeContainer.prototype, "register", { value: () => undefined })).toThrow();
+    expect(() => { Reflect.get(navigator, "serviceWorker"); }).toThrow(DOMException);
+  });
+
+  test("a realm without the API stays unavailable without touching its navigator getter", () => {
+    let reads = 0;
+    const navigator = Object.defineProperty({}, "serviceWorker", { get() { reads += 1; throw new Error("Forbidden getter"); } });
+    expect(() => { runInNewContext(`(${installBrowserServiceWorkerRefusal.toString()})();`, { navigator }); }).not.toThrow();
+    expect(reads).toBe(0);
+    expect(() => { runInNewContext(`(${installBrowserServiceWorkerRefusal.toString()})();`, {
+      navigator, ServiceWorkerContainer: { prototype: {} },
+    }); }).toThrow("registration boundary is unavailable");
+    expect(reads).toBe(0);
+  });
+});
+
+const docsRoutes = ["docs", "docs/start", "docs/web", "docs/sessions", "docs/reference", "docs/status"];
+const exampleCsp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src data: blob:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'";
+function productFixture() {
+  const html = Buffer.from(`<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="${exampleCsp}"><link rel="stylesheet" href="./graphs/client/assets/foundation-fixture.css"><link rel="stylesheet" href="./stylex.css"></head><body><div id="root"></div><script type="module" src="./graphs/client/assets/main-fixture.js"></script></body></html>`);
+  return new Map([
+    ["examples/app/index.html", html], ["examples/app/stylex.css", Buffer.from(".x123{display:flex}")],
+    ["examples/app/graphs/client/assets/foundation-fixture.css", Buffer.from(":root{color-scheme:dark}")],
+    ["examples/app/graphs/client/assets/main-fixture.js", Buffer.from("export{};")],
+  ]);
+}
 
 function staticSiteFixture(sanitized = false) {
   const fontNames = [
@@ -16,19 +153,39 @@ function staticSiteFixture(sanitized = false) {
   const foundation = "graphs/foundation/assets/foundation-testhash.css";
   const fontPaths = fontNames.map((path, index) => `graphs/foundation/assets/${path.split("/").at(-1)!.replace(".woff2", `-testhash${index}.woff2`).replace("[wght]", sanitized ? "_wght_" : "[wght]")}`);
   const css = fontPaths.map((path, index) => `@font-face{font-family:"Fixture ${index}";src:url("./${path.split("/").at(-1)}") format("woff2")}`).join("");
-  const html = Buffer.from(`<!doctype html><html><head><link rel="stylesheet" href="/${foundation}"><link rel="stylesheet" href="/stylex.css"></head><body><h1 class="x123">Fixture</h1></body></html>`);
+  const appearance = '<script src="/appearance.js"></script>';
+  const menu = '<header><details data-hra-appearance><summary>Appearance</summary></details></header>';
+  const html = Buffer.from(`<!doctype html><html data-palette="catppuccin" data-theme="dark"><head><link rel="stylesheet" href="/${foundation}"><link rel="stylesheet" href="/stylex.css">${appearance}</head><body>${menu}<h1 class="x123">Fixture</h1></body></html>`);
+  const inertHtml = Buffer.from(html.toString().replace(appearance, "").replace(menu, ""));
   const files = new Map<string, Buffer>([
-    ["index.html", html], ["privacy/index.html", html], ["preview/index.html", html],
+    ["index.html", html], ["privacy/index.html", html], ["preview/index.html", inertHtml],
+    ...docsRoutes.map((path) => [`${path}/index.html`, html] as const),
+    ...productFixture(),
     [foundation, Buffer.from(css)], ["stylex.css", Buffer.from("@layer components.hraness-stylex{.x123{font-size:40px}}")],
     ...fontPaths.map((path, index) => [path, Buffer.from(`public:${fontNames[index]}`)] as const),
-    ...["analytics.js", "appearance.js", "favicon.svg", "social-card.svg", "social-card.png", "robots.txt", "sitemap.xml", "llms.txt",
+    ...["analytics.js", "appearance.js", "site.js", "favicon.svg", "social-card.svg", "social-card.png", "robots.txt", "sitemap.xml", "llms.txt",
       ".well-known/security.txt", ".well-known/hra.json", "fonts/nebula-sans/LICENSE.txt", "fonts/nebula-sans/PROVENANCE.md",
-      "fonts/geist-mono/OFL.txt", "fonts/geist-mono/PROVENANCE.md"].map((path) => [path, Buffer.from(`support:${path}`)] as const),
+      "fonts/geist-mono/OFL.txt", "fonts/geist-mono/PROVENANCE.md", ...docsRoutes.map((path) => `${path}/index.md`)].map((path) => [path, Buffer.from(`support:${path}`)] as const),
   ]);
   return { files, publicFonts, foundation, fontPaths, css, html };
 }
 
 describe("static site graph acceptance", () => {
+  test("every guide retains the blocking theme bootstrap and default with one native header menu", () => {
+    for (const path of docsRoutes.map((route) => `${route}/index.html`)) {
+      for (const mutate of [
+        (html: string) => html.replace('<script src="/appearance.js"></script>', ""),
+        (html: string) => html.replace('src="/appearance.js"', 'defer src="/appearance.js"'),
+        (html: string) => html.replace('data-palette="catppuccin"', 'data-palette="other"'),
+        (html: string) => html.replace('data-theme="dark"', 'data-theme="light"'),
+        (html: string) => html.replace("data-hra-appearance", "data-unbound-appearance"),
+      ]) {
+        const fixture = staticSiteFixture();
+        fixture.files.set(path, Buffer.from(mutate(fixture.html.toString())));
+        expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+      }
+    }
+  });
   test("requires the exact appearance bootstrap without admitting other scripts", () => {
     const fixture = staticSiteFixture();
     fixture.files.delete("appearance.js");
@@ -38,20 +195,37 @@ describe("static site graph acceptance", () => {
     expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
   });
 
-  test("keeps the preview's no-script policy distinct and both font policies exactly self", () => {
-    const siteCsp = "default-src 'none'; font-src 'self'; style-src 'self'; script-src 'self'";
+  test("keeps inert preview and opaque product policies distinct with exact credential-free CORS", () => {
+    const siteCsp = "default-src 'none'; font-src 'self'; style-src 'self'; script-src 'self'; frame-src 'self' https://challenges.cloudflare.com";
     const previewCsp = "default-src 'none'; font-src 'self'; style-src 'self'; script-src 'none'";
+    const productPreviewCsp = `${exampleCsp}; frame-ancestors 'self'`;
     const config = (site: string, preview: string) => ({ headers: [
-      { source: "/((?!preview/?$).*)", headers: [{ key: "Content-Security-Policy", value: site }] },
+      { source: "/((?!preview/?$|examples/app(?:/|$)).*)", headers: [{ key: "Content-Security-Policy", value: site }] },
       { source: "/preview/", headers: [{ key: "Content-Security-Policy", value: preview }] },
+      { source: "/examples/app/:path*", headers: [
+        { key: "Content-Security-Policy", value: productPreviewCsp }, { key: "Access-Control-Allow-Origin", value: "*" },
+        { key: "Permissions-Policy", value: "camera=(), geolocation=(), microphone=(), payment=(), usb=()" },
+        { key: "Referrer-Policy", value: "no-referrer" }, { key: "X-Content-Type-Options", value: "nosniff" }, { key: "X-Robots-Tag", value: "noindex, nofollow" },
+      ] },
     ] });
-    expect(siteProductionCsp(config(siteCsp, previewCsp))).toEqual({ siteCsp, previewCsp });
+    expect(siteProductionCsp(config(siteCsp, previewCsp))).toEqual({ siteCsp, previewCsp, productPreviewCsp });
     for (const policy of [siteCsp.replace("font-src 'self'", "font-src 'self' data:"), siteCsp.replace("font-src 'self'", "font-src https://outside.invalid"), siteCsp.replace("font-src 'self'; ", "")]) {
       expect(() => siteProductionCsp(config(policy, previewCsp))).toThrow();
       expect(() => siteProductionCsp(config(siteCsp, policy))).toThrow();
     }
     expect(() => siteProductionCsp(config(siteCsp, siteCsp))).toThrow();
     expect(() => siteProductionCsp({ headers: config(siteCsp, previewCsp).headers.slice(0, 1) })).toThrow();
+    for (const extra of [{ key: "Access-Control-Allow-Credentials", value: "true" }, { key: "X-Frame-Options", value: "DENY" }]) {
+      const fixture = config(siteCsp, previewCsp);
+      fixture.headers[2]!.headers.push(extra);
+      expect(() => siteProductionCsp(fixture)).toThrow();
+    }
+    for (const key of ["Access-Control-Allow-Origin", "Content-Security-Policy"]) {
+      const fixture = config(siteCsp, previewCsp);
+      fixture.headers[2]!.headers.find((header) => header.key === key)!.value = key === "Content-Security-Policy" ? productPreviewCsp.replace("connect-src 'none'", "connect-src 'self'") : "null";
+      expect(() => siteProductionCsp(fixture)).toThrow();
+    }
+    expect(() => siteProductionCsp(config(siteCsp.replace("frame-src 'self'", "frame-src"), previewCsp))).toThrow();
   });
 
   test("derives the same two-sheet join and all thirteen fonts from actual output bytes", () => {
@@ -60,7 +234,9 @@ describe("static site graph acceptance", () => {
       const graph = snapshotStaticSite(fixture.files, fixture.publicFonts);
       expect(graph.stylesheets).toEqual([fixture.foundation, "stylex.css"]);
       expect(graph.fonts).toEqual([...fixture.fontPaths].sort());
-      expect(graph.routes.map(({ pathname }) => pathname)).toEqual(["/", "/privacy/", "/preview/"]);
+      expect(graph.routes.map(({ pathname }) => pathname)).toEqual([
+        "/", "/privacy/", "/preview/", "/docs/", "/docs/start/", "/docs/web/", "/docs/sessions/", "/docs/reference/", "/docs/status/",
+      ]);
       expect(graph.routes[1].heading).toBe("#privacy-heading");
       for (const path of graph.fonts) {
         expect(assetPath(`/${path}`, new Set(graph.fonts))).toBe(path);
@@ -70,7 +246,7 @@ describe("static site graph acceptance", () => {
   });
 
   test("rejects missing/extra routes, stale joins, changed order, inline presentation and link policy drift", () => {
-    for (const path of ["index.html", "privacy/index.html", "preview/index.html"]) {
+    for (const path of ["index.html", "privacy/index.html", "preview/index.html", ...docsRoutes.map((path) => `${path}/index.html`)]) {
       const fixture = staticSiteFixture();
       fixture.files.delete(path);
       expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
@@ -179,6 +355,108 @@ describe("static site graph acceptance", () => {
     expect(() => siteFoundationFontPaths(fixture.foundation, Buffer.from(fixture.css + invalid))).toThrow();
     fixture.files.set("stylex.css", Buffer.from(invalid));
     expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+  });
+
+  test("requires all six Markdown guides and admits their MIME without opening arbitrary Markdown publication", () => {
+    for (const path of docsRoutes) {
+      const fixture = staticSiteFixture();
+      expect(assetContentType(`${path}/index.md`)).toBe("text/markdown; charset=utf-8");
+      fixture.files.delete(`${path}/index.md`);
+      expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+    }
+    const fixture = staticSiteFixture();
+    fixture.files.set("docs/private.md", Buffer.from("not published"));
+    expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+    expect(assetContentType("docs/private.md")).toBe("application/octet-stream");
+  });
+});
+
+describe("separate closed product example generation", () => {
+  test("admits its exact relative shell and compiler topology without widening the parent graph", () => {
+    const files = productFixture(), product = snapshotProductPreview(files);
+    expect(product.paths).toEqual([...files.keys()].sort());
+    expect(product.stylesheets).toEqual(["examples/app/graphs/client/assets/foundation-fixture.css", "examples/app/stylex.css"]);
+    expect(product.scripts).toEqual(["examples/app/graphs/client/assets/main-fixture.js"]);
+    const fixture = staticSiteFixture();
+    expect(snapshotStaticSite(fixture.files, fixture.publicFonts).product).toEqual(product);
+    expect(assetPath("/examples/app/?view=overview")).toBeNull();
+    expect(assetPath("/examples/app/")).toBe("examples/app/index.html");
+    expect(assetPath("/examples/app/graphs/client/assets/main-fixture.js")).toBe("examples/app/graphs/client/assets/main-fixture.js");
+  });
+
+  test("refuses missing output, compiler receipts, sources, fonts, misplaced and additional CSS", () => {
+    for (const path of productFixture().keys()) {
+      const files = productFixture(); files.delete(path);
+      expect(() => snapshotProductPreview(files)).toThrow();
+    }
+    for (const path of ["examples/app/stylex-complete.json", "examples/app/source.ts", "examples/app/graphs/client/receipt.json", "examples/app/graphs/client/assets/private.ts", "examples/app/graphs/client/assets/font.woff2", "examples/app/extra/index.html", "examples/app/extra.css", "examples/app/graphs/client/assets/extra.css", "examples/app/graphs/renderer/assets/renderer.js"]) {
+      const fixture = staticSiteFixture(); fixture.files.set(path, Buffer.from("extra"));
+      expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+    }
+    const fixture = staticSiteFixture();
+    fixture.files.set("examples/other.js", Buffer.from("extra"));
+    expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+  });
+
+  test("refuses escaped resources, shell changes and inline or active presentation", () => {
+    const mutations = [
+      (html: string) => html.replace("connect-src 'none'", "connect-src 'self'"),
+      (html: string) => html.replace("./stylex.css", "/stylex.css"),
+      (html: string) => html.replace("./stylex.css", "./../stylex.css"),
+      (html: string) => html.replace("./graphs/client/assets/main-fixture.js", "https://outside.invalid/main.js"),
+      (html: string) => html.replace("./graphs/client/assets/main-fixture.js", "./graphs/client/assets/missing.js"),
+      (html: string) => html.replace("./graphs/client/assets/main-fixture.js", "./graphs/client/assets/main-fixture.js?x"),
+      (html: string) => html.replace('rel="stylesheet"', 'rel="stylesheet" disabled'),
+      (html: string) => html.replace("</head>", '<link rel="preload" href="./stylex.css"></head>'),
+      (html: string) => html.replace("</head>", '<meta http-equiv="refresh" content="0;url=/"></head>'),
+      (html: string) => html.replace("</body>", '<script src="./graphs/client/assets/main-fixture.js"></script></body>'),
+      (html: string) => html.replace("</script>", "alert(1)</script>"),
+      (html: string) => html.replace("</head>", "<style>div{display:flex}</style></head>"),
+      (html: string) => html.replace('id="root"', 'id="root" style="color:red"'),
+      (html: string) => html.replace('id="root"', 'id="root" onclick="alert(1)"'),
+      (html: string) => html.replace("</body>", '<iframe src="./stylex.css"></iframe></body>'),
+    ];
+    for (const mutate of mutations) {
+      const files = productFixture();
+      files.set("examples/app/index.html", Buffer.from(mutate(files.get("examples/app/index.html")!.toString())));
+      expect(() => snapshotProductPreview(files)).toThrow();
+    }
+    for (const path of ["examples/app/stylex.css", "examples/app/graphs/client/assets/foundation-fixture.css"]) {
+      for (const css of ['@import "more.css";', '.x{background:url("https://outside.invalid/a.png")}', '.x{background-image:image-set("/a.png" 1x)}']) {
+        const files = productFixture(); files.set(path, Buffer.from(css));
+        expect(() => snapshotProductPreview(files)).toThrow();
+      }
+    }
+  });
+
+  test("requires genuine scenario-bound quiescence, zero IO and native opaque/inert readiness", () => {
+    const observation = () => ({ origin: "null", parentAccessible: false, ready: "true", inert: true,
+      now: Date.parse("2026-09-08T12:00:00.000Z"), violations: [], inline: 0, bridgeSchema: "direct.browser-bridge/v2",
+      manifest: { schema: "direct.session-manifest/v1", active: { source: "scenario", scenario: "product.question", route: "/", activationHash: "fnv1a-64:123456789abcdef0" } },
+      snapshot: { schema: "direct.probe/v1", activationHash: "fnv1a-64:123456789abcdef0", isQuiescent: true,
+        activity: { active: 0, started: 0, settled: 0 }, pending: {},
+        violations: { "example.blockedFetch": 0, "example.browserActivityError": 0, "example.refusedEffect": 0 } },
+      stylesheets: [true, true],
+      appearance: { palette: "catppuccin", theme: "dark", menus: 1, ready: false, controls: 2, controlsDisabled: true },
+    });
+    expect(() => assertProductPreviewObservation(observation(), "question")).not.toThrow();
+    expect(() => assertProductPreviewObservation(observation(), "overview")).toThrow();
+    expect(() => assertProductPreviewObservation({ ready: "true" }, "question")).toThrow();
+    for (const change of [{ origin: "http://localhost" }, { parentAccessible: true }, { ready: undefined }, { failed: "true" }, { inert: false }, { now: 0 }, { violations: ["style-src"] }, { inline: 1 }, { stylesheets: [true, false] }, { bridgeSchema: "lookalike" }]) {
+      expect(() => assertProductPreviewObservation({ ...observation(), ...change }, "question")).toThrow();
+    }
+    for (const change of [{ palette: "other" }, { theme: "light" }, { menus: 0 }, { ready: true }, { controls: 0 }, { controlsDisabled: false }]) {
+      const current = observation();
+      expect(() => assertProductPreviewObservation({ ...current, appearance: { ...current.appearance, ...change } }, "question")).toThrow();
+    }
+    for (const name of ["example.blockedFetch", "example.browserActivityError", "example.refusedEffect"] as const) {
+      const value = observation(); value.snapshot.violations[name] = 1;
+      expect(() => assertProductPreviewObservation(value, "question")).toThrow();
+    }
+    for (const change of [{ isQuiescent: false }, { activationHash: "fnv1a-64:0000000000000000" }, { activity: { active: 0, started: 1, settled: 1 } }, { pending: { request: 1 } }, { violations: {} }]) {
+      const value = observation(); Object.assign(value.snapshot, change);
+      expect(() => assertProductPreviewObservation(value, "question")).toThrow();
+    }
   });
 });
 
