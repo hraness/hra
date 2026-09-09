@@ -42,6 +42,7 @@ describe("authority containment refusal rendering", () => {
       ["manage-command-lifecycle-capacity.ts", 2],
       ["manage-hosted-invites.ts", 2],
       ["migrate-hosted-attention-key.ts", 2],
+      ["install-hosted-attention-key.ts", 2],
       ["migrate-hosted-reply-to.ts", 2],
       ["replace-hosted-convex-target.ts", 2],
       ["hosted-status.ts", 2],
