@@ -8,8 +8,10 @@ status: in-progress
 
 Design: [issue 166](https://github.com/hraness/hra/issues/166).
 
-Status: implementation and focused client/manager validation complete; package,
-final integration and delivery remain pending. The measured baseline
+Status: implementation, focused validation and the exact candidate installation
+are complete. Full CI found service-fixture deadline failures; the reviewed
+test repairs await the current-base join and fresh final gates. Integration
+and delivery remain pending. The measured baseline
 is `82637bb9a5423adffb5185dc175fd74eb5dd2c89`, an ancestor of
 [the provider-usage candidate](https://github.com/hraness/hra/pull/140).
 The isolated branch now includes that candidate's
@@ -97,7 +99,7 @@ explicit cleanup strengthenings. Other public behavior remains compatible.
 | Connection programs and client | Client implementer | Shared internal owner API, native initialization/writer/reader/close programs, deleted replaced scheduling, focused client preservation | Complete: 47 tests, 367 assertions |
 | Acquisition and manager | Manager implementer | Same interpreter from pre-acquisition through close, unchanged R1 oracle green, exact authority and all-child cleanup | Complete: 83 tests, 587 assertions |
 | Causal and architecture review | Independent reviewer and integrator | Actual-facade timing, raw failures, held native operations, callback ordering, module roles and deletion review | Complete: final service replay passes 2 tests, 33 assertions; independent source review accepted |
-| Current-source integration and delivery | Integration and release owner | Current owner join, exact Required CI, applicable native/install/release and production evidence | Pending |
+| Current-source integration and delivery | Integration and release owner | Current owner join, exact Required CI, applicable native/install/release and production evidence | Candidate installation passed; current-base join, fresh full CI and delivery pending |
 
 The client worker owns the local model/platform/program/runtime modules and
 client facade. The manager worker owns its program and facade. One integrator
@@ -223,10 +225,40 @@ local aggregate when Required CI already owns its authoritative equivalent.
 - Final service replay passes both cases and 33 assertions on the repaired
   cleanup source. The actual archive from clean commit `58ff91ee` contains 219
   regular files and nine directories, all with bytes and modes matching that
-  source. Its five new production modules add 58,084 payload bytes. The measured
+  source. Its five new production modules add 71,850 payload bytes; the two
+  replaced files shrink by 13,766 bytes, for net growth of 58,084 bytes. The measured
   inventory is 228 entries and 11,337 canonical JSON bytes, SHA-256
   `fc4baa35c48126b40747d62bd1e54f98863175954b74f12287577d590b211f14`.
   Reconstructing the owner baseline from its Git blobs exactly recovers all
   three previous inventory constants. Only the excluded inventory policy and
   this plan change after measurement; the same archive enters the isolated
-  installation gate. Package/install and final Required CI remain pending.
+  installation gate. The exact archive passes isolated local and global
+  installation, restored PTY and daemon lifecycle checks on clean candidate
+  `135b853c`. Package-policy checks pass 11 tests and 42 assertions. The archive
+  is 1,726,845 bytes, SHA-256
+  `7ff1bde77a8908c753fd1f5eb8e395c59b9d4274d90d224175c39b00194e2e91`.
+  Independent review accepts the actual source/archive/install evidence while
+  recording the absence of a dedicated install-time tool, dependency-cache
+  and environment snapshot. Later hashes cannot reconstruct that missing interval.
+- Complete CI run `34380309752`, attempt 1, fails both source-1 jobs on the same
+  three five-second service-test deadlines. The browser, both remainders and
+  both source-2/source-3 jobs pass; Required fails. Nine actual checkout logs
+  bind synthetic commit `6a16e160`, tree `7694e6a`, to exact base `fb1bf7e` and
+  head `135b853c`. Earlier focused or installation success does not admit this
+  failed candidate.
+- The service fixtures do not instantiate the Effect Claude manager. Two
+  failing tests put separate native filesystem and database fixtures inside
+  one deadline, with shared cleanup that can race an unfinished service call.
+  Dedicated commit `4bd42e35` gives each row the existing private fixture owner,
+  returns its exact task and checks cancellation before later state access.
+  All original assertions and five-second per-row deadlines remain. Four rows
+  pass 28 assertions; strict types, scoped lint and independent source/result
+  review pass. The third case already has the provider-usage owner's separate
+  fixture repair. That owner consumed only the two-test delta locally and
+  reports fresh four-row validation, types and lint; no Effect implementation
+  was imported by that handoff.
+- The agreed integration sequence combines the release follow-up from PR167
+  into PR164, then joins the admitted result into PR140 before this Effect
+  change. A read-only comparison with an unpublished upstream checkpoint is
+  preparation, not final-base acceptance. The eventual combined source needs
+  independent review, a newly measured archive and fresh matching final gates.
