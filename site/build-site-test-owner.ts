@@ -1,5 +1,6 @@
 import { rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { z } from "zod";
 import {
   requireBoundedProcessCleanup, runBoundedProcess,
   type BoundedProcessRequest, type BoundedProcessResult,
@@ -20,6 +21,25 @@ const scheduleTimer: Schedule = (callback, milliseconds) => {
   const timer = setTimeout(callback, milliseconds);
   return () => { clearTimeout(timer); };
 };
+
+const localExitDiagnostics = z.object({
+  version: z.literal(1),
+  rawCloseCode: z.union([z.number().int().min(0).max(255), z.null(), z.literal("unobserved"), z.literal("invalid")]),
+  rawCloseSignal: z.enum(["none", "SIGTERM", "SIGKILL", "other", "unobserved"]),
+  firstTerminationReason: z.enum(["none", "residual_group_non_absent", "output_limit", "abort", "timeout", "journal", "child_error"]),
+  forcedExitCode: z.union([z.literal(1), z.literal(124), z.literal(130), z.null()]),
+  closeGroup: z.enum(["unobserved", "absent", "non_absent"]),
+  termSignalFailed: z.boolean(),
+  killSignalFailed: z.boolean(),
+}).strict();
+
+function renderLocalExitDiagnostics(value: unknown): string {
+  if (value === undefined) return "local_diagnostics=absent";
+  const parsed = localExitDiagnostics.safeParse(value);
+  if (!parsed.success) return "local_diagnostics=invalid";
+  const diagnostic = parsed.data;
+  return `local_diagnostics=v1 raw_close_code=${String(diagnostic.rawCloseCode)} raw_close_signal=${diagnostic.rawCloseSignal} termination=${diagnostic.firstTerminationReason} forced_exit_code=${String(diagnostic.forcedExitCode)} close_group=${diagnostic.closeGroup} term_signal_failed=${String(diagnostic.termSignalFailed)} kill_signal_failed=${String(diagnostic.killSignalFailed)}`;
+}
 
 /** One test-local owner; no production builder or process authority changes. */
 export function createSiteCompilerCase(sourceRoot: string, dependencies: Readonly<{
@@ -66,7 +86,7 @@ export function createSiteCompilerCase(sourceRoot: string, dependencies: Readonl
       const request: BoundedProcessRequest = {
         executable: process.execPath,
         arguments: ["--preload", join(sourceRoot, "scripts/register-site-stylex-test-transform.ts"), join(sourceRoot, "site/build-site-test-driver.ts")],
-        containment: "local", cwd: sourceRoot,
+        containment: "local", captureLocalDiagnostics: true, cwd: sourceRoot,
         environment: { PATH: process.env.PATH ?? dirname(process.execPath), NO_COLOR: "1" },
         stdin: JSON.stringify(options), signal: controller.signal,
         phase: "site-test-compiler", timeoutMs: Math.max(1, Math.ceil(deadline - now())),
@@ -90,7 +110,7 @@ export function createSiteCompilerCase(sourceRoot: string, dependencies: Readonl
       ): Error => {
         const exitCode = Number.isSafeInteger(result.exitCode) && result.exitCode >= 0 && result.exitCode <= 255
           ? String(result.exitCode) : "invalid";
-        return new Error(`SITE_COMPILER_PROCESS_FAILED stage=${stage} exit_code=${exitCode} terminal=${terminalStatus ?? "unparsed"} stdout_bytes=${String(result.stdout.byteLength)} stderr_bytes=${String(result.stderr.byteLength)}`, { cause: {
+        return new Error(`SITE_COMPILER_PROCESS_FAILED stage=${stage} exit_code=${exitCode} terminal=${terminalStatus ?? "unparsed"} stdout_bytes=${String(result.stdout.byteLength)} stderr_bytes=${String(result.stderr.byteLength)} mode=${options.check ? "check" : "build"} ${renderLocalExitDiagnostics(result.localDiagnostics)}`, { cause: {
           exitCode: result.exitCode, stdout: result.stdout.toString("utf8"), stderr: result.stderr.toString("utf8"), error,
         } });
       };
