@@ -65,6 +65,9 @@ async function compileHraAppearance(rootDirectory: string): Promise<Readonly<{ s
     await captureConfiguration(join(root, name));
   }
   const entrypoint = join(root, "app/src/appearance-entry.ts");
+  // Bun 1.3.14 reports metafile paths relative to its working directory, even
+  // with an explicit build root. Keep that base bound to this compilation.
+  const buildWorkingDirectory = process.cwd();
   const result = await Bun.build({
     define: { "process.env.NODE_ENV": JSON.stringify("production") },
     entrypoints: [entrypoint],
@@ -104,6 +107,7 @@ async function compileHraAppearance(rootDirectory: string): Promise<Readonly<{ s
       },
     }],
   });
+  assert.equal(process.cwd(), buildWorkingDirectory, "Appearance compiler working directory changed");
   const output = result.outputs[0];
   assert.ok(result.success, `HRA appearance bundle failed: ${result.logs.map((log) => log.message).join("\n")}`);
   assert.ok(result.outputs.length === 1 && output?.kind === "entry-point", "Appearance bootstrap must emit one classic program");
@@ -113,12 +117,12 @@ async function compileHraAppearance(rootDirectory: string): Promise<Readonly<{ s
   assert.equal(emittedPrograms.length, 1, "Appearance compiler must describe one emitted program");
   const emitted = emittedPrograms[0];
   assert.ok(emitted !== undefined && emitted.entryPoint !== undefined);
-  assert.equal(resolve(root, emitted.entryPoint), entrypoint, "Appearance emitted entrypoint changed");
+  assert.equal(resolve(buildWorkingDirectory, emitted.entryPoint), entrypoint, "Appearance emitted entrypoint changed");
   assert.equal(emitted.imports.length, 0, "Appearance bootstrap cannot emit imports");
   assert.equal(emitted.exports.length, 0, "Appearance bootstrap cannot emit exports");
   const contributions = new Map<string, number>();
   for (const [key, contribution] of Object.entries(emitted.inputs)) {
-    const path = resolve(root, key);
+    const path = resolve(buildWorkingDirectory, key);
     assert.ok(sources.has(path), "Appearance output contains an uncaptured compiler input");
     assert.ok(Number.isSafeInteger(contribution.bytesInOutput) && contribution.bytesInOutput >= 0,
       "Appearance compiler reported an invalid input contribution");
@@ -126,7 +130,7 @@ async function compileHraAppearance(rootDirectory: string): Promise<Readonly<{ s
   }
   const captured = new Set<string>();
   for (const [key, input] of Object.entries(metafile.inputs)) {
-    const path = resolve(root, key);
+    const path = resolve(buildWorkingDirectory, key);
     const snapshot = sources.get(path);
     assert.ok(snapshot !== undefined, "Appearance compiler used uncaptured input bytes");
     assert.equal(input.bytes, snapshot.bytes.byteLength, "Appearance compiler input length changed");

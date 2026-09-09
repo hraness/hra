@@ -35,6 +35,45 @@ test("stages one root-contained ordinary classic asset bound to actual compiler 
   await expect(stageHraAppearance(root, run)).rejects.toThrow();
 });
 
+test("binds cwd-relative compiler paths when the explicit build root differs", async () => {
+  const { root, run } = await fixture();
+  const cwd = join(root, "launcher/nested");
+  await mkdir(cwd, { recursive: true });
+  // Start a child rather than changing the test process's shared cwd. Both
+  // directories exist below one owned fixture, but resolve ../ differently.
+  const child = Bun.spawn([process.execPath, "--eval", `
+    import assert from "node:assert/strict";
+    import { realpath, writeFile } from "node:fs/promises";
+    import { join, resolve } from "node:path";
+    const [rootArgument, run, helper] = process.argv.slice(1);
+    const root = await realpath(rootArgument);
+    const entrypoint = join(root, "app/src/appearance-entry.ts");
+    const observed = await Bun.build({ entrypoints: [entrypoint], root, format: "iife", target: "browser", minify: true, metafile: true });
+    assert.ok(observed.success);
+    const emitted = Object.values(observed.metafile.outputs)[0];
+    assert.equal(resolve(process.cwd(), emitted.entryPoint), entrypoint);
+    assert.notEqual(resolve(root, emitted.entryPoint), entrypoint);
+    const { stageHraAppearance } = await import(helper);
+    const asset = await stageHraAppearance(root, run);
+    assert.ok(asset.source.includes("appearance-capture-marker"));
+    await asset.verifyInputs();
+    await writeFile(join(root, "app/src/preference.ts"), 'export const preference = "changed";');
+    await assert.rejects(asset.verifyInputs(), /changed after capture/);
+    process.stdout.write("cwd-relative appearance graph verified");
+  `, root, run, new URL("./build-appearance.ts", import.meta.url).href], {
+    cwd,
+    env: { PATH: process.env.PATH ?? "", NODE_ENV: "production" },
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 5_000,
+  });
+  const [status, stdout, stderr] = await Promise.all([
+    child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+  ]);
+  expect(status, stderr).toBe(0);
+  expect(stdout).toBe("cwd-relative appearance graph verified");
+}, 7_000);
+
 test("rejects imported source changes after compilation", async () => {
   const { root, run, imported } = await fixture();
   const asset = await stageHraAppearance(root, run);
