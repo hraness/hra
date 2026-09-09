@@ -43,27 +43,34 @@ separate tests within the unchanged per-test deadline.
 
 ## Final validation
 
-Run `bun run check` locally for changes to runtime code, workflows, dependencies,
-build inputs, generated code, test behavior, or any other executable behavior.
-Retain every explicit local, native, live, and installation acceptance requirement.
+Complete `Required` CI owns the final source aggregate, including executable
+changes, when its coverage and equivalence to `bun run check` are established.
+An independent reviewer inspects the complete diff and its impact on callers,
+state, operations, and validation. Run relevant focused contracts locally,
+including plugin/adoption validation when applicable, and the existing CI
+command-coverage and shard-equivalence tests in `scripts/release-workflow.test.ts`.
+Those tests preserve expanded command multiplicity, remainder ordering, pinned
+whole-file source coverage, and failure propagation; both operating-system
+matrices and the separate browser job must pass.
 
-Changes limited to documentation or agent guidance, reproducible documentation
-catalogs, the version field of an independently versioned plugin manifest, and
-documentation-contract assertions updated only for the revised prose may use
-complete required CI as the final source aggregate. An independent reviewer must
-inspect the complete diff and confirm that no executable behavior or other
-excluded input changed. If that scope is uncertain, run the local full gate.
+Changes to workflows, test discovery, commands, deadlines, or platform coverage
+need independent comparison against the prior required coverage. Modified
+equivalence assertions alone cannot certify a reduction.
 
-For this narrow class, run the relevant focused contracts locally, including
-plugin/adoption validation when applicable and the existing CI command-coverage
-and shard-equivalence tests in `scripts/release-workflow.test.ts`. Wait for the
-unchanged complete `Required` CI gate on the final PR head and current-base
-integration candidate. Confirm the checked tree and expected head at merge;
-head or base movement requires fresh matching CI evidence. Record the scope
-review and exact check result. This is the final aggregate for that source
-change; it does not require a duplicate local full run or establish unperformed
-live or installation acceptance. Release, deployment, and production readback
-gates remain separate.
+Wait for the unchanged complete `Required` gate on the final PR head and
+current-base integration candidate. Confirm the checked tree and expected head
+at merge; head or base movement requires fresh matching CI evidence. Record the
+independent review, head/base/checked-tree identities, CI run and attempt, and
+final `Required` job result. This source aggregate does not need a duplicate
+local full run.
+
+Retain every explicit local, native, coupled-run, live, and installation
+acceptance requirement. Release, deployment, and production readback gates
+remain separate. Investigate observed failures and stalls with bounded focused
+diagnostics; passing CI alone does not dismiss them or establish an unperformed
+local acceptance. Use `bun run check` locally for diagnosis or as the final
+source fallback when CI coverage or equivalence is absent or uncertain. Preserve
+the host scheduler and process-custody requirements for every local command.
 
 ## Change requirements
 

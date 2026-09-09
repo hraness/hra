@@ -129,9 +129,12 @@ package or command.
 - Run the repository's aggregate/final gate once after convergence. Never use a
   receipt to skip a repository-required final replayed-tree or delivery gate.
   Where reviewed repository policy assigns complete required CI as the final
-  aggregate for a narrow change class, verify its scope and fresh exact-head,
-  current-base CI result; preserve separate local, native, live, and installation
-  acceptance and do not add a duplicate local aggregate.
+  source aggregate, verify the policy's scope, coverage/equivalence evidence,
+  independent impact review, and fresh exact-head, current-base CI result. Keep
+  relevant focused local checks and separate local, native, coupled-run, live,
+  and installation acceptance; do not add a duplicate local aggregate. Diagnose
+  observed failures and stalls independently of a passing CI result. Use the
+  local aggregate when the repository requires it or CI equivalence is uncertain.
 - The host scheduler is an outer layer. Jungle and HRA keep their repository
   schedulers underneath it; invoke `hra-host-run` only around top-level
   commands. Nested `hra-host-run` calls inherit the outer lease and do not
