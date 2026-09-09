@@ -25205,9 +25205,10 @@ describe("HraService", () => {
     await restarted.close();
   });
 
-  test("rejects missing or replaced immutable send authority after rollover before a provider read", async () => {
-    for (const corruption of ["missing", "binding"] as const) {
-      const value = await fixture();
+  test.each(["missing", "binding"] as const)("rejects missing or replaced immutable send authority after rollover before a provider read (%s)", (corruption) =>
+    ownedServiceCase(async ({ createFixture, signal, resources }) => {
+      const value = await createFixture();
+      signal.throwIfAborted();
       const { service, codex, documents, store } = value;
       const added = await service.execute({ kind: "account.add", label: "Fenced rollover" }, { signal }) as { account: { id: `acct_${string}` } };
       await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
@@ -25217,6 +25218,7 @@ describe("HraService", () => {
       codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 44);
       await expect(service.execute({ kind: "session.send", session: started.session.id, message: "immutable", idempotencyKey: key }, { signal }))
         .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      signal.throwIfAborted();
       const attempt = store.readMutation(key);
       if (attempt === null) throw new Error("Expected the uncertain send.");
       const readAuthorities = store.readMutationProviderAuthorities.bind(store);
@@ -25233,7 +25235,10 @@ describe("HraService", () => {
         daemonGeneration,
         requestStop: () => undefined,
       });
+      resources.services.push(restarted);
+      signal.throwIfAborted();
       await restarted.recover();
+      signal.throwIfAborted();
       Object.defineProperty(store, "readMutationProviderAuthorities", {
         configurable: true,
         value: (attemptId: Parameters<StateStore["readMutationProviderAuthorities"]>[0]) => {
@@ -25255,8 +25260,8 @@ describe("HraService", () => {
         await restarted.close();
       }
       expect(readAuthorities(attempt.id)).toEqual(original);
-    }
-  });
+    }),
+  );
 
   test("rejects noncausal recovery proof and releases an unbound start only by explicit abandon", async () => {
     const { service, codex, documents, store } = await fixture();
