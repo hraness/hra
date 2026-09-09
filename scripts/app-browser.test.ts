@@ -4,8 +4,54 @@ import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runInNewContext } from "node:vm";
-import { assertAppColorScheme, assertDefaultButtonPresentation, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite } from "./app-browser";
+import { assertAppColorScheme, assertDefaultButtonPresentation, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview } from "./app-browser";
 import { browserIoModules } from "../app/fixtures/browser/config";
+
+describe("product preview close settlement", () => {
+  test("waits for queued close cleanup after the native dialog is already hidden", async () => {
+    const detached = Promise.withResolvers<undefined>();
+    const observations: string[] = [];
+    let frames = 1;
+    const settlement = waitForClosedProductPreview({ waitFor: async (options) => {
+      expect(options).toEqual({ state: "hidden" });
+      observations.push("hidden");
+    } }, {
+      waitFor: (options) => {
+        expect(options).toEqual({ state: "detached" });
+        observations.push("waiting for detachment");
+        return detached.promise;
+      },
+      count: async () => { observations.push("count"); return frames; },
+    });
+    queueMicrotask(() => {
+      observations.push("close handler");
+      frames = 0;
+      detached.resolve(undefined);
+    });
+    await expect(settlement).resolves.toBeUndefined();
+    expect(observations).toEqual(["hidden", "waiting for detachment", "close handler", "count"]);
+  });
+
+  test("preserves the existing locator timeout instead of accepting a still-attached frame", async () => {
+    const timeout = new Error("Existing locator deadline expired before detachment");
+    let counts = 0;
+    await expect(waitForClosedProductPreview({ waitFor: async () => undefined }, {
+      waitFor: async (options) => {
+        expect(options).toEqual({ state: "detached" });
+        throw timeout;
+      },
+      count: async () => { counts += 1; return 0; },
+    })).rejects.toBe(timeout);
+    expect(counts).toBe(0);
+  });
+
+  test("still rejects a child present in the final census", async () => {
+    await expect(waitForClosedProductPreview({ waitFor: async () => undefined }, {
+      waitFor: async () => undefined,
+      count: async () => 1,
+    })).rejects.toThrow("Closed example kept its child browsing context");
+  });
+});
 
 describe("browser service-worker refusal", () => {
   test("the exact initializer never reads the opaque-frame getter and cannot reach native registration", async () => {

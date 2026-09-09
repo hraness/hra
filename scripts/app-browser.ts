@@ -661,6 +661,14 @@ async function verifyProductScene(iframe: Locator, view: ProductView): Promise<u
   } finally { await handle.dispose(); }
 }
 
+export async function waitForClosedProductPreview(dialog: Pick<Locator, "waitFor">, iframe: Pick<Locator, "waitFor" | "count">): Promise<void> {
+  await dialog.waitFor({ state: "hidden" });
+  // Native dialog hiding precedes its queued close handler. Observe the handler's
+  // actual child cleanup within the existing locator and profile deadlines.
+  await iframe.waitFor({ state: "detached" });
+  assert.equal(await iframe.count(), 0, "Closed example kept its child browsing context");
+}
+
 async function verifyProductPreviews(page: Page): Promise<unknown[]> {
   const figure = page.locator("figure[data-product-preview]");
   assert.equal(await figure.count(), 1);
@@ -684,8 +692,7 @@ async function verifyProductPreviews(page: Page): Promise<unknown[]> {
   await page.waitForFunction(() => document.querySelector("[data-preview-dialog] [data-preview-expanded-status]")?.textContent === "");
   assert.equal(await dialog.locator("[data-preview-close]").evaluate((element) => element === document.activeElement), true);
   await page.keyboard.press("Escape");
-  await dialog.waitFor({ state: "hidden" });
-  assert.equal(await dialog.locator("iframe").count(), 0, "Closed example kept its child browsing context");
+  await waitForClosedProductPreview(dialog, dialog.locator("iframe"));
   assert.equal(await enlarge.evaluate((element) => element === document.activeElement), true);
   await cleanDocument(page);
   return observations;
