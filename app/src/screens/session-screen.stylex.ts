@@ -53,7 +53,7 @@ export const sessionScreenStyles = stylex.create({
     overflowWrap: "normal",
   },
   dragActive: {
-    outlineColor: "var(--color-accent)",
+    outlineColor: "var(--focus)",
     outlineOffset: "2px",
     outlineStyle: "solid",
     outlineWidth: "2px",

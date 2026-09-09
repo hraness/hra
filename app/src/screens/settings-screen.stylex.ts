@@ -99,6 +99,7 @@ export const settingsScreenStyles = stylex.create({
     minWidth: "10rem",
   },
   title: {
+    flex: 1,
     fontFamily: "var(--font-sans)",
     fontSize: "0.875rem",
     fontWeight: 600,

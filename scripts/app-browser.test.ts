@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertAppColorScheme, assertDefaultButtonPresentation, assertNativeModalFocus, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, inventory, loadedStylesheetControl, productionCsp, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotStaticSite } from "./app-browser";
+import { assertAppColorScheme, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, inventory, loadedStylesheetControl, productionCsp, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotStaticSite } from "./app-browser";
 import { browserIoModules } from "../app/fixtures/browser/config";
 
 function staticSiteFixture(sanitized = false) {
@@ -21,7 +21,7 @@ function staticSiteFixture(sanitized = false) {
     ["index.html", html], ["privacy/index.html", html], ["preview/index.html", html],
     [foundation, Buffer.from(css)], ["stylex.css", Buffer.from("@layer components.hraness-stylex{.x123{font-size:40px}}")],
     ...fontPaths.map((path, index) => [path, Buffer.from(`public:${fontNames[index]}`)] as const),
-    ...["analytics.js", "favicon.svg", "social-card.svg", "social-card.png", "robots.txt", "sitemap.xml", "llms.txt",
+    ...["analytics.js", "appearance.js", "favicon.svg", "social-card.svg", "social-card.png", "robots.txt", "sitemap.xml", "llms.txt",
       ".well-known/security.txt", ".well-known/hra.json", "fonts/nebula-sans/LICENSE.txt", "fonts/nebula-sans/PROVENANCE.md",
       "fonts/geist-mono/OFL.txt", "fonts/geist-mono/PROVENANCE.md"].map((path) => [path, Buffer.from(`support:${path}`)] as const),
   ]);
@@ -29,6 +29,15 @@ function staticSiteFixture(sanitized = false) {
 }
 
 describe("static site graph acceptance", () => {
+  test("requires the exact appearance bootstrap without admitting other scripts", () => {
+    const fixture = staticSiteFixture();
+    fixture.files.delete("appearance.js");
+    expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+    fixture.files.set("appearance.js", Buffer.from("classic bootstrap"));
+    fixture.files.set("other.js", Buffer.from("unregistered script"));
+    expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
+  });
+
   test("keeps the preview's no-script policy distinct and both font policies exactly self", () => {
     const siteCsp = "default-src 'none'; font-src 'self'; style-src 'self'; script-src 'self'";
     const previewCsp = "default-src 'none'; font-src 'self'; style-src 'self'; script-src 'none'";
@@ -171,6 +180,66 @@ describe("static site graph acceptance", () => {
     fixture.files.set("stylex.css", Buffer.from(invalid));
     expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts)).toThrow();
   });
+});
+
+test("default palette assertions retain semantic roles and respect native forced colors", () => {
+  const sample = { palette: "catppuccin", theme: "dark", primary: "#92bafa", foreground: "#dbe1f7", background: "rgb(30, 30, 46)" };
+  const forced = { ...sample, primary: "Highlight", foreground: "CanvasText", background: "Canvas" };
+  expect(() => assertDefaultPalette(sample, false)).not.toThrow();
+  expect(() => assertDefaultPalette(forced, true)).not.toThrow();
+  expect(() => assertDefaultPalette(sample, true)).toThrow();
+  expect(() => assertDefaultPalette(forced, false)).toThrow();
+  for (const field of ["palette", "theme", "primary", "foreground", "background"]) {
+    expect(() => assertDefaultPalette({ ...sample, [field]: "wrong" }, false)).toThrow();
+    if (field !== "background") expect(() => assertDefaultPalette({ ...forced, [field]: "wrong" }, true)).toThrow();
+  }
+});
+
+test("offset focus contrast uses the exposed surface and composites native alpha colors", () => {
+  const sample = { focusVisible: true, forced: true, outline: "solid", width: 2, offset: 2, exposed: true,
+    color: "rgba(0, 65, 198, 0.8)", backgrounds: ["rgba(0, 0, 0, 0)", "rgb(255, 255, 255)"] };
+  // The primary fill may equal the outline; only the offset strip's paint is adjacent.
+  expect(() => assertKeyboardFocusStrip({ ...sample, buttonFill: sample.color }, true)).not.toThrow();
+  expect(() => assertKeyboardFocusStrip({ ...sample, backgrounds: ["rgba(255, 255, 255, 0.9)", "rgb(0, 0, 0)"] }, true)).not.toThrow();
+  expect(() => assertKeyboardFocusStrip({ ...sample, color: "rgb(255, 255, 255)" }, true)).toThrow("lost contrast");
+  expect(() => assertKeyboardFocusStrip({ ...sample, color: "rgba(0, 0, 0, 0.1)" }, true)).toThrow("lost contrast");
+  for (const patch of [
+    { focusVisible: false }, { forced: false }, { outline: "none" }, { outline: "hidden" },
+    { width: 1 }, { width: NaN }, { offset: 0 }, { offset: -2 }, { offset: NaN }, { exposed: false },
+    { backgrounds: [] }, { backgrounds: ["rgba(0, 0, 0, 0)"] }, { backgrounds: Array(17).fill("rgb(255, 255, 255)") },
+    { color: "Highlight" }, { color: "rgb(256, 0, 0)" }, { color: "rgba(0, 0, 0, 2)" }, { color: "rgb(NaN, 0, 0)" },
+    { backgrounds: ["url(image)"] },
+  ]) expect(() => assertKeyboardFocusStrip({ ...sample, ...patch }, true)).toThrow();
+  // Other profiles retain the focus contract without assuming this desktop strip.
+  expect(() => assertKeyboardFocusStrip({ ...sample, forced: false, exposed: false }, false)).not.toThrow();
+});
+
+test("focus failure receipts retain the exact failed geometry predicate without arbitrary browser data", () => {
+  const sample = { focusVisible: true, forced: true, outline: "solid", width: 2, offset: 2, exposed: false,
+    geometry: { target: [10, 20, 110, 64], targetOpacity: 1, depthExceeded: false,
+      points: [{ x: 35, y: 67, hitTag: "DIV", parentHit: false, targetHit: false, ancestorHit: false, siblingHit: true,
+        hitBounds: [0, 64, 1280, 90], hitBackground: "rgba(0, 0, 0, 0)", hitOpacity: 1, hitImageNone: true }],
+      ancestors: [{ tag: "DIV", bounds: [0, 0, 1280, 90], opacity: 1, imageNone: true, containsStrip: true,
+        background: "rgb(0, 0, 0)", overflowX: "visible", overflowY: "visible" }],
+      privateText: "must not escape", url: "https://private.invalid" },
+  };
+  const details = (value: unknown) => {
+    try { assertKeyboardFocusStrip(value, true); throw new Error("Expected a focus failure"); }
+    catch (error) { return browserFailureDetails(error); }
+  };
+  const failure = details(sample);
+  expect(failure.name).toBe("AssertionError");
+  expect(failure.message).toContain("clipped or covered");
+  expect(failure.focus).toEqual({ width: 2, offset: 2, forced: true, focusVisible: true, exposed: false,
+    target: sample.geometry.target, targetOpacity: 1, points: sample.geometry.points, ancestors: sample.geometry.ancestors, depthExceeded: false });
+  expect(JSON.stringify(failure)).not.toContain("private");
+  const bounded = details({ ...sample, width: Infinity, geometry: { ...sample.geometry,
+    points: Array(30).fill({ x: NaN, y: 1e20, hitTag: "private text" }), ancestors: Array(100).fill(sample.geometry.ancestors[0]) } });
+  expect(bounded.focus?.width).toBeNull();
+  expect(bounded.focus?.points).toHaveLength(3);
+  expect(bounded.focus?.points[0]).toEqual({ x: null, y: null, hitTag: null, parentHit: null, targetHit: null, ancestorHit: null,
+    siblingHit: null, hitBounds: null, hitBackground: null, hitOpacity: null, hitImageNone: null });
+  expect(bounded.focus?.ancestors).toHaveLength(16);
 });
 
 function stylesheetFixture() {

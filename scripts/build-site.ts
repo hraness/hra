@@ -21,6 +21,7 @@ import {
 import { readPngDimensions } from "../site/social-card-raster.ts";
 import { buildSiteStylex } from "./build-site-stylex.ts";
 import { HRA_RELEASE_VERSION } from "./release-evidence";
+import { buildHraAppearance } from "./build-appearance";
 
 interface BuildOptions {
   readonly check: boolean;
@@ -384,6 +385,7 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   }
   await writeFile(join(options.repositoryRoot, "dist/site", publicContent.socialCard.path), socialCardPng);
   await buildAnalyticsBundle(options.repositoryRoot, analyticsProjectToken);
+  await writeFile(join(options.repositoryRoot, "dist/site/appearance.js"), await buildHraAppearance(), "utf8");
 
   for (const asset of staticAssets) {
     const source = join(options.repositoryRoot, "site", asset);

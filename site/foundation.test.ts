@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { transform } from "lightningcss";
 
-test("the remaining stylesheet owns only seven document and palette foundations", async () => {
+test("the remaining stylesheet owns only six document and semantic alias foundations", async () => {
   const css = await readFile(new URL("styles.css", import.meta.url));
   const selectors: unknown[] = [];
   const media: unknown[] = [];
@@ -27,14 +27,14 @@ test("the remaining stylesheet owns only seven document and palette foundations"
   const root = [[{ type: "pseudo-class", kind: "root" }]];
   const html = [[{ type: "type", name: "html" }]];
   expect(selectors).toEqual([
-    root, root, [[{ type: "universal" }]], html, [[{ type: "type", name: "body" }]],
+    root, [[{ type: "universal" }]], html, [[{ type: "type", name: "body" }]],
     [[{ type: "pseudo-class", kind: "where", selectors: [
       [{ type: "class", name: "hraness-marketing-page" }], [{ type: "class", name: "hraness-marketing-header" }],
     ] }]], html,
   ]);
   expect(tokenBindings).toBe(1);
   expect(media).toEqual([
-    ["prefers-color-scheme", "dark"], ["prefers-reduced-motion", "reduce"],
+    ["prefers-reduced-motion", "reduce"],
   ].map(([name, value]) => ({ mediaQueries: [{ qualifier: null, mediaType: "all", condition: {
     type: "feature", value: { type: "plain", name, value: { type: "ident", value } },
   } }] })));
@@ -49,5 +49,5 @@ test("the static entry joins compiler foundations and local fonts without legacy
     '@import "@hraness/site-footer/compiler-foundation.css";',
     '@import "./styles.css";',
   ]);
-  expect(imports).not.toMatch(/tailwind|components\.css|@hraness\/[^"\n]+\/styles\.css|https?:/u);
+  expect(imports).not.toMatch(/tailwind|components\.css|palettes\.css|@hraness\/[^"\n]+\/styles\.css|https?:/u);
 });

@@ -48,7 +48,7 @@ export const settingsListStyles = stylex.create({
   },
   choiceSelected: {
     backgroundColor: "var(--color-accent)",
-    color: "var(--color-surface)",
+    color: "var(--color-accent-ink)",
   },
   code: {
     backgroundColor: "var(--color-surface-input)",

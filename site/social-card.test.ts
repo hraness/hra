@@ -1,3 +1,4 @@
+import { paletteColors } from "@hraness/design-kit";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { inflateSync } from "node:zlib";
@@ -62,23 +63,13 @@ describe("social card", () => {
       .toBe(createHash("sha256").update(second).digest("hex"));
   });
 
-  test("paints the background, the command panel, and dark glyph pixels where the text sits", () => {
+  test("paints the default dark theme with visible glyphs where the text sits", () => {
     const image = decodeRgb(renderSocialCardPng());
     expect(image.width).toBe(1200);
     expect(image.height).toBe(630);
-    expect(pixelAt(image, 4, 4)).toEqual([...parseHexColor("#f4f1e9")]);
-    expect(pixelAt(image, 600, 420)).toEqual([...parseHexColor("#1a1916")]);
+    expect(pixelAt(image, 4, 4)).toEqual([...parseHexColor(paletteColors.catppuccin.dark.background)]);
+    expect(pixelAt(image, 600, 420)).toEqual([...parseHexColor(paletteColors.catppuccin.dark.surfaceRaised)]);
 
-    const darkPixelsIn = (x0: number, y0: number, x1: number, y1: number): number => {
-      let count = 0;
-      for (let y = y0; y < y1; y += 1) {
-        for (let x = x0; x < x1; x += 1) {
-          const [red] = pixelAt(image, x, y);
-          if (red < 96) count += 1;
-        }
-      }
-      return count;
-    };
     const lightPixelsIn = (x0: number, y0: number, x1: number, y1: number): number => {
       let count = 0;
       for (let y = y0; y < y1; y += 1) {
@@ -89,12 +80,12 @@ describe("social card", () => {
       }
       return count;
     };
-    expect(darkPixelsIn(88, 90, 340, 180)).toBeGreaterThan(4_000);
-    expect(darkPixelsIn(400, 90, 1100, 180)).toBe(0);
-    // The capacity warning owns the first row; the first bright command now follows it.
-    expect(lightPixelsIn(128, 280, 700, 306)).toBe(0);
+    expect(lightPixelsIn(88, 90, 340, 180)).toBeGreaterThan(4_000);
+    expect(lightPixelsIn(400, 90, 1100, 180)).toBe(0);
+    // Both the capacity warning and the command must remain readable.
+    expect(lightPixelsIn(128, 280, 700, 306)).toBeGreaterThan(300);
     expect(lightPixelsIn(128, 328, 700, 354)).toBeGreaterThan(500);
-    expect(darkPixelsIn(88, 495, 940, 525)).toBeGreaterThan(1_000);
+    expect(lightPixelsIn(88, 495, 940, 525)).toBeGreaterThan(1_000);
   });
 
   test("keeps every card line inside its row and states the exact positioning text", () => {

@@ -1,15 +1,35 @@
 import type { StylexGenerationHandleV1 } from "@hraness/ui/stylex-build";
 import { stylexVite } from "@hraness/ui/stylex-build/vite";
 import react from "@vitejs/plugin-react";
-import { defineConfig, type InlineConfig } from "vite";
+import { relative } from "node:path";
+import { defineConfig, type InlineConfig, type Plugin } from "vite";
+import type { HraAppearanceAsset } from "../scripts/build-appearance.ts";
 
 // The app publication driver owns `.well-known/hra-app.json`; Vite emits only
 // the closed compiled graph.
+
+function appearanceAssetPlugin(rootDirectory: string, appearance: HraAppearanceAsset): Plugin {
+  return {
+    name: "hra-appearance-asset",
+    async buildStart() {
+      await appearance.verifyInputs();
+      this.emitFile({
+        type: "asset",
+        name: "appearance.js",
+        originalFileName: relative(rootDirectory, appearance.sourcePath),
+        source: appearance.source,
+      });
+    },
+    async generateBundle() { await appearance.verifyInputs(); },
+    async writeBundle() { await appearance.verifyInputs(); },
+  };
+}
 
 /** Only the generation driver may configure a production app graph. */
 export function appProductionConfig(
   rootDirectory: string,
   generation: StylexGenerationHandleV1,
+  appearance: HraAppearanceAsset,
 ): InlineConfig {
   return {
     // The public adapter owns root, input, outDir, assetsInlineLimit: 0, publicDir,
@@ -20,7 +40,7 @@ export function appProductionConfig(
     define: { "process.env.NODE_ENV": JSON.stringify("production") },
     envFile: false,
     mode: "production",
-    plugins: [stylexVite({ generation, graphId: "client", rootDirectory }), react()],
+    plugins: [stylexVite({ generation, graphId: "client", rootDirectory }), appearanceAssetPlugin(rootDirectory, appearance), react()],
   };
 }
 
@@ -28,6 +48,7 @@ export function appProductionConfig(
 export function appDevelopmentConfig(
   rootDirectory: string,
   generation: StylexGenerationHandleV1,
+  appearance: HraAppearanceAsset,
 ): InlineConfig {
   return {
     build: { minify: false, target: "es2022" },
@@ -36,7 +57,7 @@ export function appDevelopmentConfig(
     envFile: false,
     logLevel: "info",
     mode: "development",
-    plugins: [stylexVite({ generation, graphId: "client", rootDirectory }), react()],
+    plugins: [stylexVite({ generation, graphId: "client", rootDirectory }), appearanceAssetPlugin(rootDirectory, appearance), react()],
   };
 }
 

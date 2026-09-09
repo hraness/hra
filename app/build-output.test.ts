@@ -1,3 +1,4 @@
+import { getDesignPaletteTheme } from "@hraness/design-kit";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -202,10 +203,10 @@ beforeAll(async () => {
 }, 180_000);
 
 describe("built shell", () => {
-  test("emits one module entry, foundation first, and one canonical recipe stylesheet", () => {
+  test("emits one module entry, a synchronous appearance bootstrap, and foundation before recipes", () => {
     expect(artifacts.some((artifact) => artifact.name === "index.html")).toBe(true);
     expect(artifacts.filter((artifact) => artifact.name.endsWith(".js")).length)
-      .toBeGreaterThanOrEqual(1);
+      .toBeGreaterThanOrEqual(2);
     expect(artifacts.filter((artifact) => artifact.name.endsWith(".css")).length).toBe(2);
     const stylesheets = [...shell.matchAll(/<link rel="stylesheet" href="([^"]+)">/gu)].map((match) => match[1]);
     expect(stylesheets).toHaveLength(2);
@@ -214,7 +215,15 @@ describe("built shell", () => {
     const scripts = [...shell.matchAll(/<script type="module" src="([^"]+)"><\/script>/gu)].map((match) => match[1]);
     expect(scripts).toHaveLength(1);
     expect(scripts[0]).toMatch(/^\/graphs\/client\/assets\/[^/]+\.js$/u);
-    for (const target of [...stylesheets, ...scripts]) {
+    const bootstraps = [...shell.matchAll(/<script src="([^"]+)"><\/script>/gu)].map((match) => match[1]);
+    expect(bootstraps).toHaveLength(1);
+    expect(bootstraps[0]).toMatch(/^\/graphs\/client\/assets\/appearance-[A-Za-z0-9_-]+\.js$/u);
+    expect([...shell.matchAll(/<script\b/gu)]).toHaveLength(2);
+    expect(shell).not.toMatch(/<script[^>]*\b(?:async|defer)\b/u);
+    expect(shell.indexOf(`<script src="${bootstraps[0]}"`)).toBeLessThan(shell.indexOf("</head>"));
+    expect(shell.indexOf('href="/stylex.css"')).toBeLessThan(shell.indexOf(`<script src="${bootstraps[0]}"`));
+    expect(shell).toContain(`<html lang="en" data-palette="catppuccin" data-theme="dark" class="${getDesignPaletteTheme("catppuccin", "dark").className}">`);
+    for (const target of [...stylesheets, ...scripts, ...bootstraps]) {
       expect(artifacts.some(({ name }) => `/${name}` === target)).toBe(true);
     }
     expect(shell.indexOf('href="/stylex.css"')).toBeLessThan(shell.indexOf("</head>"));
@@ -223,7 +232,10 @@ describe("built shell", () => {
 
   test("preserves the complete authored shell metadata and root boundary", async () => {
     const authored = await readFile(join(appRoot, "index.html"), "utf8");
-    const unlinked = shell.replace(/<link rel="stylesheet" href="\/graphs\/client\/assets\/[^/]+\.css">\n {4}<link rel="stylesheet" href="\/stylex\.css">\n {2}/u, "")
+    const unlinked = shell.replace(
+      `<html lang="en" data-palette="catppuccin" data-theme="dark" class="${getDesignPaletteTheme("catppuccin", "dark").className}">`,
+      '<html lang="en" data-palette="catppuccin" data-theme="dark">',
+    ).replace(/<link rel="stylesheet" href="\/graphs\/client\/assets\/[^/]+\.css">\n {4}<link rel="stylesheet" href="\/stylex\.css">\n {4}<script src="\/graphs\/client\/assets\/appearance-[A-Za-z0-9_-]+\.js"><\/script>\n {2}/u, "")
       .replace(/<script type="module" src="\/graphs\/client\/assets\/[^/]+\.js"><\/script>/u, '<script type="module" src="/src/main.tsx"></script>');
     expect(unlinked).toBe(authored);
   });
@@ -241,7 +253,7 @@ describe("built shell", () => {
     expect(artifacts.some(({ name }) => name.endsWith(".map"))).toBe(false);
     const foundation = artifacts.find(({ name }) => /^graphs\/client\/assets\/[^/]+\.css$/u.test(name));
     expect(foundation?.text).toMatch(/--ui-radius\s*:\s*0?\.75rem/u);
-    expect(foundation?.text).toMatch(/--color-attention\s*:\s*oklch\([^)]*\)/u);
+    expect(foundation?.text).toMatch(/--color-attention\s*:\s*var\(--warning\)/u);
     expect(foundation?.text).toContain("::-webkit-date-and-time-value");
     const recipes = artifacts.find(({ name }) => name === "stylex.css");
     expect(recipes?.text).toContain("components.hraness-stylex.priority");

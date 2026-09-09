@@ -38,7 +38,10 @@ test("switch travel uses the logical inline axis without physical translation", 
   const styles = await recipes("./ui/primitives.stylex.ts", "switchStyles");
   expect(styles.get("knob")?.get("position")).toBe('"relative"');
   expect(styles.get("knob")?.get("transitionProperty")).toBe('"inset-inline-start"');
-  expect([...styles.get("knobChecked") ?? []]).toEqual([["insetInlineStart", '"1.5rem"']]);
+  expect([...styles.get("knobChecked") ?? []]).toEqual([
+    ["backgroundColor", '"var(--color-accent-ink)"'],
+    ["insetInlineStart", '"1.5rem"'],
+  ]);
   expect([...styles.get("knobUnchecked") ?? []]).toEqual([["insetInlineStart", '"0.25rem"']]);
   for (const style of styles.values()) expect(style.has("transform")).toBe(false);
 });

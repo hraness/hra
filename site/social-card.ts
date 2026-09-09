@@ -8,6 +8,7 @@
  */
 
 import { nebulaSansSocialFonts } from "@hraness/design-kit/fonts/nebula-sans/social";
+import { paletteColors } from "@hraness/design-kit";
 
 import { publicContent, type PublicContent } from "./content.ts";
 import { parseOpenTypeOutlineFont, type OutlineFont } from "./social-card-font.ts";
@@ -23,12 +24,12 @@ export const SOCIAL_CARD_WIDTH = 1200;
 export const SOCIAL_CARD_HEIGHT = 630;
 
 const palette = {
-  background: "#f4f1e9",
-  ink: "#161512",
-  muted: "#5d594f",
-  panel: "#1a1916",
-  panelComment: "#9a958a",
-  panelText: "#f4f1e9",
+  background: paletteColors.catppuccin.dark.background,
+  ink: paletteColors.catppuccin.dark.foreground,
+  muted: paletteColors.catppuccin.dark.muted,
+  panel: paletteColors.catppuccin.dark.surfaceRaised,
+  panelComment: paletteColors.catppuccin.dark.muted,
+  panelText: paletteColors.catppuccin.dark.foreground,
 } as const;
 
 const layout = {
