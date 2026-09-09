@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import * as fc from "fast-check";
 import { createContext, runInContext } from "node:vm";
 import { parseHTML } from "linkedom";
 import { renderProductPreview } from "./product-preview.tsx";
@@ -121,6 +122,82 @@ describe("public real-UI examples", () => {
     ]) relay.replay(request);
     expect(sent).toEqual([]);
     expect(reads).toBe(0);
+  });
+
+  test("status-envelope laws accept only exact public data fields under arbitrary input", () => {
+    const view = fc.constantFrom("overview", "conversation", "question", "settings");
+    const type = fc.constantFrom("hra-preview-status", "hra-preview-ready", "hra-preview-failed");
+    fc.assert(fc.property(view, type, fc.anything({ maxDepth: 2, maxKeys: 4 }), (scene, kind, foreign: unknown) => {
+      const envelope = { type: kind, view: scene };
+      expect(parsePreviewStatusRequest(envelope)).toEqual(kind === "hra-preview-status" ? envelope : undefined);
+      expect(parsePreviewMessage(envelope)).toEqual(kind === "hra-preview-status" ? undefined : envelope);
+      for (const parsed of [parsePreviewStatusRequest(foreign), parsePreviewMessage(foreign)]) {
+        if (parsed === undefined) continue;
+        expect(Object.getPrototypeOf(foreign)).toBe(Object.prototype);
+        expect(Reflect.ownKeys(foreign as object).sort()).toEqual(["type", "view"]);
+        for (const key of ["type", "view"] as const) {
+          const descriptor = Object.getOwnPropertyDescriptor(foreign, key);
+          expect(descriptor?.enumerable).toBe(true);
+          expect(descriptor !== undefined && "value" in descriptor).toBe(true);
+          expect(descriptor?.value as unknown).toBe(parsed[key]);
+        }
+        expect(["overview", "conversation", "question", "settings"]).toContain(parsed.view);
+      }
+      let reads = 0;
+      const accessor = { ...envelope };
+      Object.defineProperty(accessor, "view", { enumerable: true, get() { reads += 1; return scene; } });
+      for (const invalid of [
+        { ...envelope, extra: foreign },
+        { ...envelope, [Symbol("extra")]: foreign },
+        Object.create(envelope),
+        Object.assign(Object.create(null) as object, envelope),
+        Object.defineProperty({ ...envelope }, "type", { enumerable: false }),
+        accessor,
+      ]) {
+        expect(parsePreviewStatusRequest(invalid)).toBeUndefined();
+        expect(parsePreviewMessage(invalid)).toBeUndefined();
+      }
+      expect(reads).toBe(0);
+    }), { seed: 20260909, numRuns: 100 });
+  });
+
+  test("generated publish and replay sequences retain latest status and never clear failure", () => {
+    const view = fc.constantFrom("overview", "conversation", "question", "settings");
+    const operation = fc.constantFrom("ready", "failed", "match", "cross", "extra", "accessor", "inherited", "malformed");
+    const step = fc.record({ operation, payload: fc.anything({ maxDepth: 2, maxKeys: 4 }) });
+    fc.assert(fc.property(view, fc.array(step, { maxLength: 25 }), (scene, steps) => {
+      const sent: unknown[] = [];
+      const relay = createPreviewStatusRelay(scene, (message) => { sent.push(message); });
+      let latest: "hra-preview-ready" | "hra-preview-failed" | undefined;
+      let reads = 0;
+      for (const action of steps) {
+        const before = sent.length;
+        if (action.operation === "ready" || action.operation === "failed") {
+          const published = action.operation === "ready" ? "hra-preview-ready" : "hra-preview-failed";
+          const alreadyFailed = latest === "hra-preview-failed";
+          relay.publish(published);
+          if (!alreadyFailed) latest = published;
+          expect(sent.slice(before)).toEqual(alreadyFailed ? [] : [{ type: published, view: scene }]);
+          continue;
+        }
+        const matching = { type: "hra-preview-status", view: scene };
+        let request: unknown;
+        switch (action.operation) {
+          case "match": request = matching; break;
+          case "cross": request = { ...matching, view: scene === "overview" ? "settings" : "overview" }; break;
+          case "extra": request = { ...matching, extra: action.payload }; break;
+          case "accessor": request = { view: scene, get type() { reads += 1; return "hra-preview-status"; } }; break;
+          case "inherited": request = Object.create(matching); break;
+          case "malformed": request = [action.payload]; break;
+        }
+        relay.replay(request);
+        expect(sent.slice(before)).toEqual(action.operation === "match" && latest !== undefined ? [{ type: latest, view: scene }] : []);
+      }
+      const before = sent.length;
+      relay.replay({ type: "hra-preview-status", view: scene });
+      expect(sent.slice(before)).toEqual(latest === undefined ? [] : [{ type: latest, view: scene }]);
+      expect(reads).toBe(0);
+    }), { seed: 20260910, numRuns: 100 });
   });
 
   test("parses only exact public readiness messages without evaluating accessors", () => {
