@@ -7,5 +7,7 @@ export const fixtureStyles = stylex.create({
     display: "flex",
     flexWrap: "wrap",
     gap: "0.75rem",
+    marginTop: "0.75rem",
+    paddingBottom: "0.5rem",
   },
 });

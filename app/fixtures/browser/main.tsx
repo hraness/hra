@@ -1,5 +1,6 @@
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
+import * as stylex from "@stylexjs/stylex";
 import { SignInScreen } from "../../src/auth/sign-in-screen";
 import { LockScreen } from "../../src/custody/lock-screen";
 import { EnrollmentScreen } from "../../src/custody/enrollment-screen";
@@ -26,18 +27,21 @@ function Primitives() {
   const [selection, setSelection] = useState("none");
   return <Card>
     <CardHeader><CardTitle>Native fixture controls</CardTitle></CardHeader>
-    <CardContent xstyle={fixtureStyles.controls}>
+    <CardContent>
+      {/* Preserve ordinary block flow for the default button presentation check. */}
       <Button onClick={() => { setDialog(true); }}>Open dialog</Button>
-      <Button onClick={() => { setSheet(true); }}>Open sheet</Button>
-      <Button onClick={() => { setRightSheet(true); }}>Open right sheet</Button>
-      <Button disabled>Disabled button</Button>
-      <Switch checked={checked} label="Fixture switch" onCheckedChange={setChecked} />
-      <Switch checked={false} disabled label="Disabled switch" onCheckedChange={() => { throw new Error("Disabled switch activated"); }} />
-      <DropdownMenu label="Fixture menu" trigger="Menu" items={[
-        { id: "disabled", label: "Disabled item", disabled: true, onSelect: () => { throw new Error("Disabled menu item activated"); } },
-        { id: "select", label: "Select item", onSelect: () => { setSelection("selected"); } },
-      ]} />
-      <output aria-label="Menu selection">{selection}</output>
+      <div {...stylex.props(fixtureStyles.controls)}>
+        <Button onClick={() => { setSheet(true); }}>Open sheet</Button>
+        <Button onClick={() => { setRightSheet(true); }}>Open right sheet</Button>
+        <Button disabled>Disabled button</Button>
+        <Switch checked={checked} label="Fixture switch" onCheckedChange={setChecked} />
+        <Switch checked={false} disabled label="Disabled switch" onCheckedChange={() => { throw new Error("Disabled switch activated"); }} />
+        <DropdownMenu label="Fixture menu" trigger="Menu" items={[
+          { id: "disabled", label: "Disabled item", disabled: true, onSelect: () => { throw new Error("Disabled menu item activated"); } },
+          { id: "select", label: "Select item", onSelect: () => { setSelection("selected"); } },
+        ]} />
+        <output aria-label="Menu selection">{selection}</output>
+      </div>
       <Dialog label="Fixture dialog" onClose={() => { setDialog(false); }} open={dialog}>
         <DialogTitle>Native modal</DialogTitle>
         <Input aria-label="Modal text" />
