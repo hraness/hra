@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import {
-  assertChromiumSetupHost, assertEffectiveAptConfiguration, assertUbuntuSources,
+  assertAptTemporaryRoot, assertChromiumSetupHost, assertEffectiveAptConfiguration, assertUbuntuSources,
   installScopedChromium, scopedAptConfiguration, type ChromiumSetupHost, type SetupCommand,
 } from "./install-ci-chromium-deps.ts";
 
@@ -19,6 +19,15 @@ const source = [
   "Components: main restricted universe multiverse", "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg", "",
 ].join("\n");
 const mirrors = "http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://archive.ubuntu.com/ubuntu/\tpriority:2\nhttps://security.ubuntu.com/ubuntu/\tpriority:3\n";
+
+test("APT scratch requires a protected public temporary root without changing private parent permissions", () => {
+  expect(() => assertAptTemporaryRoot(0, 0o41777, true)).not.toThrow();
+  for (const [uid, mode, directory] of [
+    [1001, 0o41777, true], [0, 0o40700, true], [0, 0o40750, true],
+    [0, 0o41770, true], [0, 0o41776, true], [0, 0o40777, true],
+    [0, 0o41777, false], [0, 0o43777, true],
+  ] as const) expect(() => assertAptTemporaryRoot(uid, mode, directory)).toThrow();
+});
 
 test("setup admits only the supported native runner and refuses inherited retargeting", () => {
   expect(() => assertChromiumSetupHost(host)).not.toThrow();

@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, constants, fstatSync, mkdirSync, mkdtempSync, openSync, readSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -69,6 +69,12 @@ export function assertUbuntuSources(source: string, mirrors: string): void {
 
 export interface ScopedAptPaths { config: string; sourceParts: string; lists: string }
 
+export function assertAptTemporaryRoot(uid: number, mode: number, directory: boolean): void {
+  if (!directory || uid !== 0 || (mode & 0o7777) !== 0o1777) {
+    throw new Error("APT scratch requires a root-owned sticky public temporary directory");
+  }
+}
+
 export function scopedAptConfiguration(paths: ScopedAptPaths): string {
   for (const path of [paths.config, paths.sourceParts, paths.lists]) {
     if (!isAbsolute(path) || !/^\/[A-Za-z0-9_./-]+$/.test(path)) throw new Error("Unsupported scoped APT path");
@@ -102,7 +108,7 @@ export function installScopedChromium(
 ): void {
   if (!isAbsolute(node) || !isAbsolute(cli)) throw new Error("Browser runtime and package CLI must be absolute");
   const sudo = (args: string[], capture = true) => run({ executable: "/usr/bin/sudo", args: ["-n", `APT_CONFIG=${paths.config}`, ...args], capture });
-  // This also proves traversal through RUNNER_TEMP without changing any parent permissions.
+  // Prove actual _apt traversal and readability without changing any shared parent permissions.
   run({ executable: "/usr/bin/sudo", args: ["-n", "-u", "_apt", "--", "/usr/bin/test", "-r", paths.config], capture: true });
   const shell = sudo(["/usr/bin/apt-config", "shell", "SOURCE", "Dir::Etc::SourceList/f", "PARTS", "Dir::Etc::SourceParts/d", "LISTS", "Dir::State::Lists/d", "ROOT", "RootDir"]);
   const dump = sudo(["/usr/bin/apt-config", "dump"]);
@@ -155,9 +161,11 @@ export function installCiChromium(): void {
   const source = readRegularText(SOURCE);
   const mirrors = readRegularText(MIRRORS);
   assertUbuntuSources(source, mirrors);
-  const runnerTemp = process.env.RUNNER_TEMP;
-  if (!runnerTemp || !isAbsolute(runnerTemp)) throw new Error("Expected absolute RUNNER_TEMP");
-  const root = mkdtempSync(join(realpathSync(runnerTemp), "hra-chromium-apt-"));
+  // RUNNER_TEMP can sit beneath a private home directory that _apt cannot traverse.
+  const temporaryRoot = realpathSync("/tmp");
+  const temporaryRootStat = lstatSync(temporaryRoot);
+  assertAptTemporaryRoot(temporaryRootStat.uid, temporaryRootStat.mode, temporaryRootStat.isDirectory());
+  const root = mkdtempSync(join(temporaryRoot, "hra-chromium-apt-"));
   const paths = { config: join(root, "apt.conf"), sourceParts: join(root, "sourceparts"), lists: join(root, "lists") };
   chmodSync(root, 0o755);
   for (const path of [paths.sourceParts, paths.lists, join(paths.lists, "partial")]) {
