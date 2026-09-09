@@ -1,10 +1,31 @@
 import { describe, expect, test } from "bun:test";
 import { designPaletteLabels, designPalettes, getDesignPaletteTheme } from "@hraness/design-kit";
+import { createStylexTransformCollector } from "@hraness/ui/stylex-build";
 import { parseHTML } from "linkedom";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 import { renderPreviewHtml, renderPrivacyHtml, renderSiteHtml } from "./template";
 
 describe("public appearance delivery", () => {
+  test("the public compiler owns every native menu atom and its focus and viewport constraints", async () => {
+    const path = fileURLToPath(new URL("./appearance-menu.stylex.ts", import.meta.url));
+    const collector = createStylexTransformCollector(fileURLToPath(new URL("..", import.meta.url)));
+    const compiled = await collector.transform(await readFile(path, "utf8"), path);
+    const css = compiled.rules.map(([, rule]) => rule.ltr).join("\n");
+    const { document } = parseHTML(renderSiteHtml());
+    const menu = document.querySelector("[data-hra-appearance]")!;
+    for (const element of [menu, ...menu.querySelectorAll("[class]")]) {
+      for (const className of element.classList) expect(css).toContain(`.${className}`);
+    }
+    expect(css).toContain(":focus-visible");
+    expect(css).toContain("outline-color:var(--focus)");
+    expect(css).toContain("::-webkit-details-marker{display:none}");
+    expect(css).toContain("min-height:2.75rem");
+    expect(css.replaceAll(" ", "")).toContain("width:min(18rem,calc(100vw-2rem))");
+    expect(compiled.code).not.toMatch(/stylex\.(?:create|inject)\(/u);
+  });
+
   test("public pages expose one native header menu and a blocking external bootstrap", () => {
     for (const html of [renderSiteHtml(), renderPrivacyHtml()]) {
       const { document } = parseHTML(html);

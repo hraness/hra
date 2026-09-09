@@ -32,7 +32,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
 
 const sourceTestCommand = "bun test ./src --isolate --max-concurrency=1";
 const aggregateCheckCommand = "bun run check:install-pins && bun run check:effect-architecture && bun run check:security-primitives && bun run lint && bun run typecheck && bun run test && bun run build:site -- --check && bun run build:app && bun run build && bun run check:package";
-const aggregateTestCommand = "bun test ./scripts --isolate --max-concurrency=1 && bun run test:local-efficiency-plugin && bun run test:cloud-efficiency-plugin && bun test ./src --isolate --max-concurrency=1 && bun test ./convex ./site --isolate --max-concurrency=1 && bun test ./app --isolate --max-concurrency=1";
+const aggregateTestCommand = "bun test ./scripts --isolate --max-concurrency=1 && bun run test:local-efficiency-plugin && bun run test:cloud-efficiency-plugin && bun test ./src --isolate --max-concurrency=1 && bun test ./convex --isolate --max-concurrency=1 && bun run test:site && bun run test:app";
 
 function expandPackageScript(
   scripts: Readonly<Record<string, unknown>>,
@@ -629,9 +629,9 @@ describe("release workflow", () => {
     expect(thirdPartyNotices).toContain("bound the immutable source tag");
     expect(thirdPartyNotices).toContain("`@hraness/site-footer` v0.6.1");
     expect(thirdPartyNotices).toContain("`@hraness/design-kit` v0.6.0");
-    expect(thirdPartyNotices).toContain("`@hraness/ui` v0.5.4");
+    expect(thirdPartyNotices).toContain("`@hraness/ui` v0.5.6");
     expect(thirdPartyNotices).toContain("shared semantic themes and appearance controls");
-    expect(thirdPartyNotices).not.toContain("`@hraness/design-kit` v0.4.0");
+    expect(thirdPartyNotices).not.toContain("`@hraness/design-kit` v0.3.0");
     expect(thirdPartyNotices).not.toContain("SPDX");
     expect(changelog).toContain("## v0.7.0\n");
     expect(changelog).toContain("Forward repair for the incomplete `v0.6.0` admission");
@@ -1084,7 +1084,7 @@ describe("release workflow", () => {
     const jobs = asRecord(document.jobs, "CI workflow jobs");
     const check = asRecord(jobs.check, "CI check job");
     const required = asRecord(jobs.required, "CI required job");
-    expect(Object.keys(jobs).sort()).toEqual(["check", "required"]);
+    expect(Object.keys(jobs).sort()).toEqual(["browser", "check", "required"]);
     expect(check.name).toBe("Check (${{ matrix.os }}, ${{ matrix.gate }})");
     expect(check["runs-on"]).toBe("${{ matrix.os }}");
     expect(check["timeout-minutes"]).toBe(20);
@@ -1184,7 +1184,7 @@ describe("release workflow", () => {
     expect(workflow).not.toContain("authority-supervisor-runtime.test.ts");
 
     expect(required.name).toBe("Required");
-    expect(required.needs).toBe("check");
+    expect(required.needs).toEqual(["check", "browser"]);
     expect(required.if).toBe("${{ always() }}");
     expect(required["continue-on-error"]).toBeUndefined();
     if (!Array.isArray(required.steps)) {
@@ -1195,9 +1195,11 @@ describe("release workflow", () => {
     expect(requiredStep.if).toBeUndefined();
     expect(requiredStep["continue-on-error"]).toBeUndefined();
     expect(requiredStep.name).toBe("Require every matrix check");
-    expect(asRecord(requiredStep.env, "CI required environment").CHECK_RESULT)
-      .toBe("${{ needs.check.result }}");
-    expect(requiredStep.run).toBe('test "$CHECK_RESULT" = "success"');
+    expect(asRecord(requiredStep.env, "CI required environment")).toEqual({
+      CHECK_RESULT: "${{ needs.check.result }}",
+      BROWSER_RESULT: "${{ needs.browser.result }}",
+    });
+    expect(requiredStep.run).toBe('test "$CHECK_RESULT" = "success" && test "$BROWSER_RESULT" = "success"');
   });
 
   test("admits only a tagged commit whose CI run concluded success before packaging", async () => {

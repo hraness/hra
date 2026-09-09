@@ -1,8 +1,9 @@
+import * as stylex from "@stylexjs/stylex";
 import type { ReactNode } from "react";
 import { useId } from "react";
 
-import { cn } from "../lib/cn";
 import { Card } from "./ui/card";
+import { settingsListStyles } from "./settings-list.stylex";
 
 /**
  * The list and row primitives the settings screen is built from.
@@ -10,7 +11,7 @@ import { Card } from "./ui/card";
  * They are here rather than in `components/ui` because they are HRA layout, not
  * a general interface primitive: a titled section, a labelled row with a
  * control on the right, and a segmented three-way choice. Every visual is a
- * Tailwind class in the one same-origin stylesheet, and the one icon is inline
+ * StyleX recipe in the one same-origin stylesheet, and the one icon is inline
  * SVG rather than an image, because `img-src` names no remote origin.
  */
 
@@ -20,12 +21,12 @@ export function SettingsSection({
   title,
 }: Readonly<{ children: ReactNode; description?: string; title: string }>) {
   return (
-    <section className="flex flex-col gap-2">
-      <div className="flex flex-col gap-1">
-        <h2 className="text-sm font-semibold">{title}</h2>
+    <section {...stylex.props(settingsListStyles.section)}>
+      <div {...stylex.props(settingsListStyles.sectionHeader)}>
+        <h2 {...stylex.props(settingsListStyles.title)}>{title}</h2>
         {description === undefined
           ? null
-          : <p className="text-xs text-ink-muted">{description}</p>}
+          : <p {...stylex.props(settingsListStyles.description)}>{description}</p>}
       </div>
       {children}
     </section>
@@ -36,7 +37,7 @@ export function SettingsCard({
   children,
   className,
 }: Readonly<{ children: ReactNode; className?: string }>) {
-  return <Card className={cn("flex flex-col divide-y divide-line", className)}>{children}</Card>;
+  return <Card className={className} xstyle={settingsListStyles.card}>{children}</Card>;
 }
 
 /**
@@ -55,15 +56,15 @@ export function SettingsRow({
   title: ReactNode;
 }>) {
   return (
-    <div className="flex flex-col gap-2 p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex min-w-0 flex-col gap-1">
-          <span className="truncate text-sm font-medium">{title}</span>
+    <div {...stylex.props(settingsListStyles.row)}>
+      <div {...stylex.props(settingsListStyles.rowBody)}>
+        <div {...stylex.props(settingsListStyles.rowLabel)}>
+          <span {...stylex.props(settingsListStyles.rowTitle)}>{title}</span>
           {description === undefined
             ? null
-            : <span className="text-xs text-ink-muted">{description}</span>}
+            : <span {...stylex.props(settingsListStyles.description)}>{description}</span>}
         </div>
-        {control === undefined ? null : <div className="flex items-center gap-2">{control}</div>}
+        {control === undefined ? null : <div {...stylex.props(settingsListStyles.control)}>{control}</div>}
       </div>
       {children}
     </div>
@@ -71,7 +72,7 @@ export function SettingsRow({
 }
 
 export function EmptyRow({ children }: Readonly<{ children: ReactNode }>) {
-  return <p className="p-3 text-xs text-ink-muted">{children}</p>;
+  return <p {...stylex.props(settingsListStyles.empty)}>{children}</p>;
 }
 
 /**
@@ -81,7 +82,7 @@ export function EmptyRow({ children }: Readonly<{ children: ReactNode }>) {
  */
 export function CommandHint({ children }: Readonly<{ children: string }>) {
   return (
-    <code className="block overflow-x-auto rounded bg-surface-input px-2 py-1 font-mono text-xs text-ink-muted">
+    <code {...stylex.props(settingsListStyles.code)}>
       {children}
     </code>
   );
@@ -113,7 +114,7 @@ export function ChoiceGroup<Value extends string>({
   return (
     <div
       aria-label={label}
-      className="flex flex-wrap items-center gap-1 rounded-md border border-line p-1"
+      {...stylex.props(settingsListStyles.choiceGroup)}
       id={groupId}
       role="radiogroup"
     >
@@ -122,10 +123,9 @@ export function ChoiceGroup<Value extends string>({
         return (
           <button
             aria-checked={selected}
-            className={cn(
-              "inline-flex min-h-11 items-center justify-center rounded px-3 text-xs font-medium",
-              "disabled:cursor-not-allowed disabled:opacity-50",
-              selected ? "bg-accent text-accent-ink" : "bg-transparent text-ink-muted hover:text-ink",
+            {...stylex.props(
+              settingsListStyles.choice,
+              selected ? settingsListStyles.choiceSelected : settingsListStyles.choiceIdle,
             )}
             disabled={disabled}
             key={option.value}
@@ -146,7 +146,7 @@ export function BackIcon() {
   return (
     <svg
       aria-hidden="true"
-      className="h-5 w-5"
+      {...stylex.props(settingsListStyles.icon)}
       fill="none"
       focusable="false"
       stroke="currentColor"

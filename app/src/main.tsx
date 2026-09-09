@@ -1,9 +1,10 @@
+import { DesignPaletteProvider } from "@hraness/design-kit/react";
+import { hraAppearanceStorageKey } from "./appearance";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { DesignPaletteProvider } from "@hraness/design-kit/react";
 
 import { App } from "./app";
-import { hraAppearanceStorageKey } from "./appearance";
+import "@hraness/design-kit/compiler-palettes.css";
 import "./index.css";
 
 const container = document.getElementById("root");

@@ -1,4 +1,5 @@
-import { copyFile, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { copyFile, lstat, mkdir, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -18,11 +19,7 @@ import {
   SOCIAL_CARD_WIDTH,
 } from "../site/social-card.ts";
 import { readPngDimensions } from "../site/social-card-raster.ts";
-import {
-  renderPreviewHtml,
-  renderPrivacyHtml,
-  renderSiteHtml,
-} from "../site/template.ts";
+import { buildSiteStylex } from "./build-site-stylex.ts";
 import { HRA_RELEASE_VERSION } from "./release-evidence";
 import { buildHraAppearance } from "./build-appearance";
 
@@ -31,6 +28,8 @@ interface BuildOptions {
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly releaseCommit?: string;
   readonly repositoryRoot: string;
+  /** Explicit source checkout when a test isolates only its publication tree. */
+  readonly sourceRoot?: string;
 }
 
 interface TextOutput {
@@ -99,20 +98,7 @@ const trackedTextOutputs = (repositoryRoot: string): readonly TextOutput[] => [
 const siteTextOutputs = (
   repositoryRoot: string,
   releaseCommit: string,
-  environment: Readonly<Record<string, string | undefined>>,
 ): readonly TextOutput[] => [
-  {
-    path: join(repositoryRoot, "dist/site/index.html"),
-    content: renderSiteHtml(publicContent, environment),
-  },
-  {
-    path: join(repositoryRoot, "dist/site/privacy/index.html"),
-    content: renderPrivacyHtml(publicContent, environment),
-  },
-  {
-    path: join(repositoryRoot, "dist/site/preview/index.html"),
-    content: renderPreviewHtml(),
-  },
   {
     path: join(repositoryRoot, "dist/site/robots.txt"),
     content: `User-agent: *\nAllow: /\nSitemap: ${publicContent.siteUrl}/sitemap.xml\n`,
@@ -155,45 +141,149 @@ const staticAssets = ["favicon.svg"] as const;
 const analyticsEntryPath = fileURLToPath(
   new URL("../site/analytics-entry.ts", import.meta.url),
 );
-const siteFooterStylesPath = fileURLToPath(
-  import.meta.resolve("@hraness/site-footer/stylex.css"),
-);
 const designKitFontsStylesPath = fileURLToPath(
   import.meta.resolve("@hraness/design-kit/fonts.css"),
 );
-const designKitProductMarketingStylesPath = fileURLToPath(
-  import.meta.resolve("@hraness/design-kit/product-marketing.css"),
-);
-const designKitSyntaxHighlightingStylesPath = fileURLToPath(
-  import.meta.resolve("@hraness/design-kit/syntax-highlighting.css"),
-);
-const designKitFontsDirectory = join(dirname(designKitFontsStylesPath), "fonts");
-const designKitPaletteStylesPath = fileURLToPath(
-  import.meta.resolve("@hraness/design-kit/palettes.css"),
-);
+const siteFontFaces = [
+  "nebula-sans/NebulaSans-Light.woff2",
+  "nebula-sans/NebulaSans-LightItalic.woff2",
+  "nebula-sans/NebulaSans-Book.woff2",
+  "nebula-sans/NebulaSans-BookItalic.woff2",
+  "nebula-sans/NebulaSans-Medium.woff2",
+  "nebula-sans/NebulaSans-MediumItalic.woff2",
+  "nebula-sans/NebulaSans-Semibold.woff2",
+  "nebula-sans/NebulaSans-SemiboldItalic.woff2",
+  "nebula-sans/NebulaSans-Bold.woff2",
+  "nebula-sans/NebulaSans-BoldItalic.woff2",
+  "nebula-sans/NebulaSans-Black.woff2",
+  "nebula-sans/NebulaSans-BlackItalic.woff2",
+  "geist-mono/GeistMono[wght].woff2",
+] as const;
+const siteFontDocuments = [
+  "nebula-sans/LICENSE.txt",
+  "nebula-sans/PROVENANCE.md",
+  "geist-mono/OFL.txt",
+  "geist-mono/PROVENANCE.md",
+] as const;
+const siteFontFiles = [...siteFontFaces, ...siteFontDocuments];
 
-/** Flatten the optional palette entry into the site's one same-origin stylesheet. */
-async function readPaletteStyles(path: string, seen = new Set<string>()): Promise<string> {
-  if (seen.has(path)) return "";
-  if (seen.size >= 8) throw new Error("The shared palette entry exceeds its stylesheet bound.");
-  seen.add(path);
-  const source = await readFile(path, "utf8");
-  const pieces: string[] = [];
-  let position = 0;
-  for (const match of source.matchAll(/@import\s+"([^"\n]+)"\s*;/gu)) {
-    const specifier = match[1];
-    if (specifier === undefined) throw new Error("The shared palette import is invalid.");
-    if (!specifier.startsWith(".") && !specifier.startsWith("@hraness/")) {
-      throw new Error("The shared palette entry may import only its local package styles.");
+/** The pinned public stylesheet has this finite grammar, not arbitrary CSS. */
+export function assertSiteFontStyleInventory(styles: string): void {
+  // Only standalone comments are ignored. A comment-shaped string inside a URL
+  // remains part of that URL and must never be normalized into an allowed path.
+  const facePattern = /\/\*[\s\S]*?\*\/|@font-face\s*\{([^{}]*)\}/gu;
+  const faces = [...styles.matchAll(facePattern)];
+  const references = new Set<string>();
+  for (const face of faces) {
+    if (face[1] === undefined) continue;
+    const declaration = /^\s*font-display:\s*swap;\s*font-family:\s*"(?:Nebula Sans|Geist Mono)";\s*font-style:\s*(?:normal|italic);\s*font-weight:\s*(?:300|400|500|600|700|900|100 900);\s*src:\s*url\("([^"\\\r\n]+)"\)\s*format\("woff2"\);\s*$/u.exec(face[1]);
+    const reference = declaration?.[1];
+    if (reference === undefined || references.has(reference)) {
+      throw new Error("Public font stylesheet has an unsupported or duplicate font face.");
     }
-    const imported = specifier.startsWith(".")
-      ? resolve(dirname(path), specifier)
-      : fileURLToPath(import.meta.resolve(specifier));
-    pieces.push(source.slice(position, match.index), await readPaletteStyles(imported, seen));
-    position = match.index + match[0].length;
+    references.add(reference);
   }
-  pieces.push(source.slice(position));
-  return pieces.join("");
+  if (
+    styles.replace(facePattern, "").trim() !== ""
+    || references.size !== siteFontFaces.length
+    || siteFontFaces.some((path) => !references.has(`./fonts/${path}`))
+  ) {
+    throw new Error("Public font stylesheet URLs must match the reviewed WOFF2 inventory exactly.");
+  }
+}
+
+const sameFontFile = (left: Stats, right: Stats): boolean =>
+  left.dev === right.dev && left.ino === right.ino && left.mode === right.mode
+  && left.size === right.size && left.nlink === right.nlink
+  && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+
+/** Package-manager links above the resolved package root are allowed; assets are not links. */
+async function readPublicFontInput(root: string, logicalPath: string, maxBytes: number): Promise<Buffer> {
+  try {
+    const path = join(root, logicalPath);
+    const parents = [root];
+    let parentPath = root;
+    for (const segment of logicalPath.split("/").slice(0, -1)) {
+      parentPath = join(parentPath, segment);
+      parents.push(parentPath);
+    }
+    const parentStats = await Promise.all(parents.map(async (parent) => ({ path: parent, stat: await lstat(parent) })));
+    for (const parent of parentStats) {
+      if (!parent.stat.isDirectory() || await realpath(parent.path) !== parent.path) {
+        throw new Error("Nonordinary font directory.");
+      }
+    }
+    const before = await lstat(path);
+    if (!before.isFile() || before.size < 1 || before.size > maxBytes) {
+      throw new Error("Nonordinary or oversized font input.");
+    }
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      if (!sameFontFile(before, await handle.stat())) throw new Error("Changed font input.");
+      const bytes = Buffer.alloc(before.size + 1);
+      let length = 0;
+      while (length < bytes.length) {
+        const result = await handle.read(bytes, length, bytes.length - length, length);
+        if (result.bytesRead === 0) break;
+        length += result.bytesRead;
+      }
+      if (length !== before.size || !sameFontFile(before, await handle.stat())
+        || !sameFontFile(before, await lstat(path))) throw new Error("Changed font input.");
+      for (const parent of parentStats) {
+        if (!sameFontFile(parent.stat, await lstat(parent.path))
+          || await realpath(parent.path) !== parent.path) throw new Error("Changed font directory.");
+      }
+      return bytes.subarray(0, length);
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    // Native filesystem errors can contain private install paths.
+    throw new Error(`Public font input is missing, changed, nonordinary, or oversized: ${logicalPath}`);
+  }
+}
+
+async function snapshotSiteFonts(sourceDirectory: string): Promise<Readonly<{
+  stylesheet: string;
+  inputs: readonly Readonly<{ path: string; bytes: Buffer }>[];
+}>> {
+  let root: string;
+  try {
+    root = await realpath(sourceDirectory);
+  } catch {
+    throw new Error("Public font package directory is unavailable.");
+  }
+  const stylesheetBytes = await readPublicFontInput(root, "fonts.css", 64 * 1024);
+  let stylesheet: string;
+  try {
+    stylesheet = new TextDecoder("utf-8", { fatal: true }).decode(stylesheetBytes);
+  } catch {
+    throw new Error("Public font stylesheet must be valid UTF-8.");
+  }
+  assertSiteFontStyleInventory(stylesheet);
+  // Validate the complete finite set before creating any public font output.
+  const inputs: { path: string; bytes: Buffer }[] = [];
+  for (const path of siteFontFiles) {
+    inputs.push({ path, bytes: await readPublicFontInput(root, `fonts/${path}`, path.endsWith(".woff2") ? 1024 * 1024 : 64 * 1024) });
+  }
+  return { stylesheet, inputs };
+}
+
+/** Publish only browser fonts and their attribution; retain PNG-only package inputs upstream. */
+export async function publishSiteFonts(sourceDirectory: string, outputDirectory: string): Promise<string> {
+  const { stylesheet, inputs } = await snapshotSiteFonts(sourceDirectory);
+  try {
+    // The site builder creates a fresh output tree. Never merge in stale font assets.
+    await mkdir(outputDirectory);
+    await mkdir(join(outputDirectory, "nebula-sans"));
+    await mkdir(join(outputDirectory, "geist-mono"));
+    for (const { path, bytes } of inputs) {
+      await writeFile(join(outputDirectory, path), bytes, { flag: "wx", mode: 0o644 });
+    }
+  } catch {
+    throw new Error("Public fonts require a fresh writable publication directory.");
+  }
+  return stylesheet;
 }
 
 const readExisting = async (path: string): Promise<string | undefined> => {
@@ -254,6 +344,11 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   }
   const environment = options.environment ?? emptyBuildEnvironment;
   const analyticsProjectToken = resolveHraAnalyticsProjectToken(environment);
+  const fonts = await snapshotSiteFonts(dirname(designKitFontsStylesPath));
+  const compiled = await buildSiteStylex({
+    sourceRoot: options.sourceRoot ?? options.repositoryRoot,
+    environment, fonts: fonts.inputs,
+  });
   await rm(join(options.repositoryRoot, "dist", "site"), {
     force: true,
     recursive: true,
@@ -261,11 +356,22 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   for (const output of siteTextOutputs(
     options.repositoryRoot,
     releaseCommit,
-    environment,
   )) {
     const content = withFinalNewline(output.content);
     await mkdir(dirname(output.path), { recursive: true });
     await writeFile(output.path, content, { encoding: "utf8" });
+  }
+  for (const [path, bytes] of compiled.files) {
+    const destination = join(options.repositoryRoot, "dist/site", path);
+    await mkdir(dirname(destination), { recursive: true });
+    await writeFile(destination, bytes, { flag: "wx", mode: 0o644 });
+  }
+  // Browser fonts are already hashed graph assets. Publish their attribution
+  // beside the family names without a redundant second copy of every WOFF2.
+  for (const { path, bytes } of fonts.inputs.filter(({ path }) => !path.endsWith(".woff2"))) {
+    const destination = join(options.repositoryRoot, "dist/site/fonts", path);
+    await mkdir(dirname(destination), { recursive: true });
+    await writeFile(destination, bytes, { flag: "wx", mode: 0o644 });
   }
   const socialCardPng = renderSocialCardPng();
   const socialCardDimensions = readPngDimensions(socialCardPng);
@@ -287,31 +393,6 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
     await mkdir(dirname(destination), { recursive: true });
     await copyFile(source, destination);
   }
-  const [
-    productStyles,
-    designKitFontsStyles,
-    designKitProductMarketingStyles,
-    designKitSyntaxHighlightingStyles,
-    siteFooterStyles,
-    paletteStyles,
-  ] = await Promise.all([
-    readFile(join(options.repositoryRoot, "site/styles.css"), "utf8"),
-    readFile(designKitFontsStylesPath, "utf8"),
-    readFile(designKitProductMarketingStylesPath, "utf8"),
-    readFile(designKitSyntaxHighlightingStylesPath, "utf8"),
-    readFile(siteFooterStylesPath, "utf8"),
-    readPaletteStyles(designKitPaletteStylesPath),
-  ]);
-  await cp(designKitFontsDirectory, join(options.repositoryRoot, "dist/site/fonts"), {
-    dereference: true,
-    recursive: true,
-  });
-  await writeFile(
-    join(options.repositoryRoot, "dist/site/styles.css"),
-    `${paletteStyles.trim()}\n\n${designKitFontsStyles.trim()}\n\n${designKitProductMarketingStyles.trim()}\n\n${designKitSyntaxHighlightingStyles.trim()}\n\n${productStyles.trimEnd()}\n\n${siteFooterStyles.trim()}\n`,
-    "utf8",
-  );
-
   return mismatches;
 };
 

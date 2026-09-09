@@ -1,119 +1,54 @@
-import { describe, expect, test } from "bun:test";
-import fc from "fast-check";
-import { designPalettes, designThemes } from "@hraness/design-kit";
-import { parseHTML } from "linkedom";
+import { expect, test } from "bun:test";
+import assert from "node:assert/strict";
 
-import { bindHraAppearanceMenus, hraAppearanceStorage, hraAppearanceStorageKey, initializeHraAppearance } from "./appearance";
-import { renderAppearanceMenu } from "../../site/appearance-menu";
-
-function memoryStorage() {
-  const values = new Map<string, string>();
-  const reads: string[] = [];
-  return {
-    reads, values,
-    getItem(key: string) { reads.push(key); return values.get(key) ?? null; },
-    setItem(key: string, value: string) { values.set(key, value); },
-  };
+async function assertDefaultShell(source: string): Promise<void> {
+  const palettes: (string | null)[] = [];
+  const themes: (string | null)[] = [];
+  const schemes: (string | null)[] = [];
+  await new HTMLRewriter()
+    .on("html", { element(element) {
+      palettes.push(element.getAttribute("data-palette"));
+      themes.push(element.getAttribute("data-theme"));
+    } })
+    .on('meta[name="color-scheme"]', { element(element) { schemes.push(element.getAttribute("content")); } })
+    .transform(new Response(source)).arrayBuffer();
+  assert.deepEqual(palettes, ["catppuccin"], "HRA must select its default palette before bootstrap delivery");
+  assert.deepEqual(themes, ["dark"], "HRA must select dark until a saved preference is applied");
+  assert.deepEqual(schemes, ["dark light"], "HRA must support both selectable appearances");
 }
 
-describe("bounded appearance persistence", () => {
-  test("round trips every palette and mode without persisting additional data", () => {
-    fc.assert(fc.property(
-      fc.constantFrom(...designPalettes),
-      fc.constantFrom(...designThemes),
-      fc.string({ maxLength: 16 }),
-      (palette, mode, unrecognized) => {
-        const storage = memoryStorage();
-        const adapter = hraAppearanceStorage(storage)!;
-        adapter.setItem(hraAppearanceStorageKey, JSON.stringify({ palette, mode, unrecognized }));
-        expect(storage.values.size).toBe(1);
-        expect(JSON.parse(storage.values.get(hraAppearanceStorageKey)!)).toEqual({ palette, mode });
-        expect(JSON.parse(adapter.getItem(hraAppearanceStorageKey)!)).toEqual({ palette, mode });
-      },
-    ), { numRuns: 60 });
-  });
-
-  test("never reads or writes another browser key", () => {
-    const storage = memoryStorage();
-    const adapter = hraAppearanceStorage(storage)!;
-    const preference = JSON.stringify({ palette: "catppuccin", mode: "dark" });
-    for (const key of ["auth-token", "hraness-design-theme-v1", "", `${hraAppearanceStorageKey}-other`]) {
-      adapter.setItem(key, preference);
-      expect(adapter.getItem(key)).toBeNull();
-    }
-    expect(storage.values.size).toBe(0);
-    expect(storage.reads).toEqual([]);
-  });
-
-  test("refuses malformed, partial, and oversized records", () => {
-    const storage = memoryStorage();
-    const adapter = hraAppearanceStorage(storage)!;
-    for (const value of [
-      "invalid", "null", "[]", '{"palette":"catppuccin"}',
-      '{"palette":"unknown","mode":"dark"}',
-      '{"palette":"catppuccin","mode":"unknown"}',
-      JSON.stringify({ palette: "catppuccin", mode: "dark", extra: "x".repeat(256) }),
-    ]) {
-      adapter.setItem(hraAppearanceStorageKey, value);
-      expect(storage.values.size).toBe(0);
-      storage.values.set(hraAppearanceStorageKey, value);
-      expect(adapter.getItem(hraAppearanceStorageKey)).toBeNull();
-      storage.values.clear();
-    }
-    expect(hraAppearanceStorage(null)).toBeNull();
-  });
+test("the authored shell names Catppuccin dark before the saved preference bootstrap", async () => {
+  const source = await Bun.file(new URL("../index.html", import.meta.url)).text();
+  await assertDefaultShell(source);
 });
 
-test("native menus change the shared preference, follow external changes, and release their listeners", () => {
-  const parsed = parseHTML(`<!doctype html><html><head></head><body>${renderAppearanceMenu()}<div id="outside"></div></body></html>`);
-  const document = parsed.document as unknown as Document;
-  const storage = memoryStorage();
-  Object.defineProperty(parsed.window, "localStorage", { configurable: true, value: storage });
-  // Linkedom omits the browser's writable select.value descriptor.
-  for (const select of document.querySelectorAll("select")) {
-    let value = [...select.options].find((option) => option.selected)?.value ?? "";
-    Object.defineProperty(select, "value", {
-      configurable: true,
-      get() { return value; },
-      set(next: string) { value = next; },
-    });
-  }
-  const controller = initializeHraAppearance(document);
-  const unbind = bindHraAppearanceMenus(document, controller);
-  const menu = document.querySelector<HTMLDetailsElement>("details")!;
-  const palette = document.querySelector<HTMLSelectElement>("[data-hra-palette]")!;
-  const mode = document.querySelector<HTMLSelectElement>("[data-hra-mode]")!;
-  try {
-    expect(palette.value).toBe("catppuccin");
-    expect(mode.value).toBe("dark");
-    palette.value = "gruvbox";
-    palette.dispatchEvent(new parsed.window.Event("change", { bubbles: true }));
-    mode.value = "light";
-    mode.dispatchEvent(new parsed.window.Event("change", { bubbles: true }));
-    expect(controller.getSnapshot().preference).toEqual({ palette: "gruvbox", mode: "light" });
-    expect(document.documentElement.getAttribute("data-theme")).toBe("light");
-    expect(JSON.parse(storage.values.get(hraAppearanceStorageKey)!)).toEqual({ palette: "gruvbox", mode: "light" });
+test("appearance proof rejects absent defaults and a fixed light-only or dark-only scheme", async () => {
+  const source = await Bun.file(new URL("../index.html", import.meta.url)).text();
+  for (const changed of [
+    source.replace(' data-palette="catppuccin"', ""),
+    source.replace('data-palette="catppuccin"', 'data-palette="gruvbox"'),
+    source.replace(' data-theme="dark"', ""),
+    source.replace('data-theme="dark"', 'data-theme="light"'),
+    source.replace('name="color-scheme" content="dark light"', 'name="color-scheme" content="dark"'),
+    source.replace('name="color-scheme" content="dark light"', 'name="color-scheme" content="light"'),
+  ]) await expect(assertDefaultShell(changed)).rejects.toThrow();
+});
 
-    controller.setPreference({ palette: "rose-pine", mode: "system" });
-    expect(palette.value).toBe("rose-pine");
-    expect(mode.value).toBe("system");
-    expect(menu.querySelector("summary")?.getAttribute("aria-label")).toBe("Appearance: Rosé Pine, System");
-
-    menu.open = true;
-    document.getElementById("outside")!.dispatchEvent(new parsed.window.Event("pointerdown", { bubbles: true }));
-    expect(menu.open).toBe(false);
-    menu.open = true;
-    const escape = new parsed.window.Event("keydown", { bubbles: true });
-    Object.defineProperty(escape, "key", { value: "Escape" });
-    menu.dispatchEvent(escape);
-    expect(menu.open).toBe(false);
-
-    unbind();
-    palette.value = "tokyo-night";
-    palette.dispatchEvent(new parsed.window.Event("change", { bubbles: true }));
-    expect(controller.getSnapshot().preference.palette).toBe("rose-pine");
-  } finally {
-    unbind();
-    controller.dispose();
-  }
+test("the compiler palette entry joins shared roles without fonts or standalone recipes", async () => {
+  const foundationUrl = new URL(import.meta.resolve("@hraness/design-kit/compiler-palettes.css"));
+  const foundation = await Bun.file(foundationUrl).text();
+  expect(foundation).toContain('@import "@hraness/ui/compiler-foundation.css";');
+  expect(foundation).toContain('@import "./palette-bridge.css";');
+  expect(foundation).not.toContain("dist/stylex.css");
+  expect(foundation).not.toMatch(/@font-face|@import\s+["'][^"']*fonts/iu);
+  expect(foundation).not.toMatch(/@import\s+["'][^"']*compiler-tokens/iu);
+  const bridge = await Bun.file(new URL("./palette-bridge.css", foundationUrl)).text();
+  expect(bridge).toContain("hraness-palette");
+  expect(bridge).toContain("--primary:");
+  expect(bridge).toContain("--focus:");
+  const appCss = await Bun.file(new URL("./index.css", import.meta.url)).text();
+  expect(appCss).toContain("--color-surface: var(--background)");
+  expect(appCss).toContain("--color-accent: var(--primary)");
+  expect(appCss).toContain("outline: 2px solid var(--focus)");
+  expect(appCss).not.toMatch(/color-scheme:\s*dark/u);
 });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -9,6 +9,7 @@ import {
   CODEX_PIN_RELATIVE_PATH,
   CodexBumpRefusedError,
   TRACKED_CODEX_SCHEMA_FILES,
+  generateCodexSchemas,
   matrixDrift,
   methodsInGeneratedUnion,
   parseCodexBumpArguments,
@@ -17,8 +18,125 @@ import {
   renderCodexPinSource,
   runCodexBump,
 } from "./codex-bump";
+import { BoundedProcessCleanupUnprovenError, runBoundedProcess } from "./bounded-process";
 
 const repoRoot = resolve(import.meta.dir, "..");
+
+const expectAbsentPath = async (path: string): Promise<void> => {
+  await expect(lstat(path)).rejects.toMatchObject({ code: "ENOENT" });
+};
+
+const waitForMarker = async (path: string): Promise<void> => {
+  const deadline = performance.now() + 3_000;
+  while (!await Bun.file(path).exists()) {
+    if (performance.now() >= deadline) throw new Error("Schema fixture did not start");
+    await Bun.sleep(10);
+  }
+};
+
+describe("codex-bump process custody", () => {
+  test("the output absence assertion refuses an existing directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-codex-absence-test-"));
+    try {
+      await expect(expectAbsentPath(root)).rejects.toThrow();
+      await expectAbsentPath(join(root, "absent"));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("pre-cancelled generation never dispatches its launcher", async () => {
+    const cancellation = new AbortController(); cancellation.abort();
+    let dispatched = false;
+    await expect(generateCodexSchemas({
+      bunExecutable: process.execPath, launcher: "/unused/codex.js", signal: cancellation.signal,
+    }, async () => {
+      dispatched = true;
+      throw new Error("Unexpected dispatch");
+    })).rejects.toThrow("cancelled");
+    expect(dispatched).toBe(false);
+  });
+
+  test.each(["timeout", "overflow", "cancel"] as const)("collects a %s schema process before removing its output", async (scenario) => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-codex-custody-test-")));
+    const launcher = join(root, "codex.js"), marker = join(root, "ready.json");
+    const cancellation = new AbortController();
+    let outputDirectory: string | undefined;
+    const collection = { proven: false };
+    let pending: Promise<unknown> | undefined;
+    const childProgram = [
+      "const { writeFileSync } = require('node:fs');",
+      "process.on('SIGTERM', () => {});",
+      `writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ pid: process.pid, parent: process.ppid }));`,
+      scenario === "overflow" ? "process.stdout.write(Buffer.alloc(4 * 1024 * 1024 + 1024, 120));" : "",
+      "setInterval(() => undefined, 1000);",
+    ].join("\n");
+    await writeFile(launcher, [
+      "const { spawn } = require('node:child_process');",
+      `const child = spawn(process.execPath, ['-e', ${JSON.stringify(childProgram)}], { stdio: ['ignore', 'inherit', 'inherit'] });`,
+      "child.unref();",
+    ].join("\n"));
+    try {
+      pending = generateCodexSchemas({ bunExecutable: process.execPath, launcher, signal: cancellation.signal }, async (request, dependencies) => {
+        expect(request.arguments.slice(0, -1)).toEqual([launcher, "app-server", "generate-ts", "--experimental", "--out"]);
+        expect(request.executable).toBe(process.execPath);
+        expect(request).toMatchObject({ containment: "local", timeoutMs: 90_000, terminationGraceMs: 2_000,
+          killSettlementMs: 5_000, outputMaximumBytes: 4 * 1024 * 1024 });
+        outputDirectory = request.arguments.at(-1);
+        expect(dependencies?.recoveryDirectory).toBe(join(outputDirectory ?? "", "process-recovery"));
+        const result = await runBoundedProcess({ ...request, timeoutMs: scenario === "timeout" ? 500 : 3_000,
+          terminationGraceMs: 25, killSettlementMs: 1_000 }, dependencies);
+        collection.proven = result.cleanup === "proven";
+        expect(result.cleanup).toBe("proven");
+        expect(result.cleanup === "proven" ? result.exitCode : undefined).toBe(scenario === "timeout" ? 124 : scenario === "cancel" ? 130 : 1);
+        expect(result.stdout.byteLength + result.stderr.byteLength).toBeLessThanOrEqual(4 * 1024 * 1024);
+        return result;
+      }).then(() => undefined, (error: unknown) => error);
+      if (scenario === "cancel") { await waitForMarker(marker); cancellation.abort(); }
+      const failure = await pending;
+      expect(failure).toBeInstanceOf(CodexBumpRefusedError);
+      expect(collection.proven).toBe(true);
+      const identity = JSON.parse(await readFile(marker, "utf8")) as { pid: number; parent: number };
+      expect(() => process.kill(identity.pid, 0)).toThrow();
+      expect(outputDirectory).toBeDefined();
+      await expectAbsentPath(outputDirectory ?? "");
+    } finally {
+      cancellation.abort();
+      await pending;
+      // Uncertain writers retain their fixture source and marker as well as
+      // the separate generated-output directory and recovery journal.
+      if (collection.proven) await rm(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("an unproven result retains both generated evidence and its journal", async () => {
+    let outputDirectory = "", journal = "";
+    try {
+      const failure = await generateCodexSchemas({ bunExecutable: process.execPath, launcher: "/fixture/codex.js" }, async (request, dependencies) => {
+        outputDirectory = request.arguments.at(-1) ?? "";
+        const recoveryDirectory = dependencies?.recoveryDirectory;
+        if (recoveryDirectory === undefined) throw new Error("Missing run-owned recovery directory");
+        await mkdir(recoveryDirectory, { mode: 0o700 });
+        journal = join(recoveryDirectory, "fixture-journal.json");
+        await writeFile(journal, "retained journal");
+        await writeFile(join(outputDirectory, "partial-schema.ts"), "retained partial schema");
+        return { cleanup: "unproven", phase: request.phase, processGroupId: 42_424,
+          recoveryIdentity: { containment: "local", processGroupId: 42_424 }, recoveryPath: journal,
+          stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+      }).then(() => undefined, (error: unknown) => error);
+      expect(failure).toBeInstanceOf(BoundedProcessCleanupUnprovenError);
+      if (!(failure instanceof BoundedProcessCleanupUnprovenError)) throw failure;
+      expect(failure.recoveryPaths).toContain(outputDirectory);
+      expect(failure.recoveryPaths).toContain(journal);
+      expect(await readFile(journal, "utf8")).toBe("retained journal");
+      expect(await readFile(join(outputDirectory, "partial-schema.ts"), "utf8")).toBe("retained partial schema");
+    } finally {
+      // This injected result never created a process. It is safe to remove
+      // exactly this synthetic evidence after proving production retained it.
+      if (outputDirectory !== "") await rm(outputDirectory, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("codex-bump arguments", () => {
   test("accepts one exact release and an optional --check", () => {

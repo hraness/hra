@@ -1,9 +1,14 @@
-import { readFile, readdir } from "node:fs/promises";
+import { getDesignPaletteTheme } from "@hraness/design-kit";
+import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { beforeAll, describe, expect, test } from "bun:test";
-import { getDesignPaletteTheme } from "@hraness/design-kit";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+
+import {
+  appSha256, parseAppPublication, readAppInventory, readAppOrdinary,
+} from "../scripts/build-app.ts";
+import { assertReviewedRuntimeStyleBoundary } from "./build-runtime-style-boundary.ts";
 
 const appRoot = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = dirname(appRoot);
@@ -68,102 +73,214 @@ type Artifact = Readonly<{ name: string; text: string }>;
 
 let artifacts: readonly Artifact[] = [];
 let shell = "";
+type OwnedBuildChild = Readonly<{
+  exited: Promise<number>;
+  kill: (signal?: number | NodeJS.Signals) => void;
+}>;
+const ownedBuildChildren = new Set<OwnedBuildChild>();
+
+const controlledBuildEnvironment = new Set<string>([
+  "HRA_RELEASE_COMMIT",
+  "VERCEL",
+  "VERCEL_GIT_COMMIT_SHA",
+]);
+
+async function readBoundedDiagnostics(
+  stream: ReadableStream<Uint8Array>,
+  maximumBytes = 1024 * 1024,
+): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let output = "";
+  let retainedBytes = 0;
+  let truncated = false;
+  try {
+    for (let next = await reader.read(); !next.done; next = await reader.read()) {
+      const remaining = Math.max(0, maximumBytes - retainedBytes);
+      if (remaining < next.value.byteLength) truncated = true;
+      if (remaining > 0) {
+        const retained = next.value.subarray(0, remaining);
+        retainedBytes += retained.byteLength;
+        output += decoder.decode(retained, { stream: true });
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  output += decoder.decode();
+  return truncated ? `${output}\n[stderr truncated after ${String(maximumBytes)} bytes]\n` : output;
+}
+
+function trackOwnedBuildChild<Child extends OwnedBuildChild>(child: Child): Child {
+  ownedBuildChildren.add(child);
+  void child.exited.finally(() => ownedBuildChildren.delete(child));
+  return child;
+}
+
+async function terminateOwnedBuild(child: OwnedBuildChild): Promise<void> {
+  child.kill("SIGTERM");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stopped = await Promise.race([
+    child.exited.then(() => true),
+    new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), 5_000);
+    }),
+  ]);
+  if (timer !== undefined) clearTimeout(timer);
+  if (!stopped) child.kill("SIGKILL");
+  await child.exited;
+}
+
+async function waitForOwnedBuild(child: OwnedBuildChild, deadlineMilliseconds: number): Promise<number> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      child.exited,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("build:app exceeded its owned test deadline")), deadlineMilliseconds);
+      }),
+    ]);
+  } catch (error) {
+    await terminateOwnedBuild(child);
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 async function runAppBuild(
   overrides: Readonly<Record<string, string | undefined>>,
 ): Promise<Readonly<{ status: number; stderr: string }>> {
-  const controlledNames = new Set([
-    "HRA_RELEASE_COMMIT",
-    "VERCEL",
-    "VERCEL_GIT_COMMIT_SHA",
-  ]);
+  for (const name of Object.keys(overrides)) {
+    if (!controlledBuildEnvironment.has(name)) {
+      throw new Error(`Unsupported controlled build environment name: ${name}`);
+    }
+  }
   const environment = Object.fromEntries([
     ...Object.entries(process.env).filter(([name, value]) =>
-      value !== undefined && !controlledNames.has(name)),
+      value !== undefined && !controlledBuildEnvironment.has(name)),
     ...Object.entries(overrides).filter((entry): entry is [string, string] =>
       entry[1] !== undefined),
   ]);
-  const build = Bun.spawn(["bun", "run", "build:app"], {
+  const build = trackOwnedBuildChild(Bun.spawn([process.execPath, "run", "build:app"], {
     cwd: repositoryRoot,
     env: environment,
     stderr: "pipe",
-    stdout: "ignore",
-  });
-  const [status, stderr] = await Promise.all([
-    build.exited,
-    new Response(build.stderr).text(),
-  ]);
-  return {
-    status,
-    stderr,
-  };
+    stdout: "inherit",
+  }));
+  const diagnostics = readBoundedDiagnostics(build.stderr);
+  try {
+    const status = await waitForOwnedBuild(build, 170_000);
+    return { status, stderr: await diagnostics };
+  } catch (error) {
+    await diagnostics;
+    throw error;
+  }
 }
 
-async function collect(root: string, prefix = ""): Promise<Artifact[]> {
-  const found: Artifact[] = [];
-  for (const entry of await readdir(root, { withFileTypes: true })) {
-    const child = join(root, entry.name);
-    const name = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
-    if (entry.isDirectory()) found.push(...await collect(child, name));
-    else found.push({ name, text: await readFile(child, "utf8") });
-  }
-  return found;
-}
+afterAll(async () => {
+  const unsettled = [...ownedBuildChildren];
+  await Promise.allSettled(unsettled.map(terminateOwnedBuild));
+}, 10_000);
 
 beforeAll(async () => {
   const build = await runAppBuild({
     VERCEL: "1",
     VERCEL_GIT_COMMIT_SHA: buildSourceCommit,
   });
-  if (build.status !== 0) {
-    throw new Error(`build:app failed: ${build.stderr}`);
-  }
-  artifacts = await collect(distributionRoot);
-  shell = await readFile(join(distributionRoot, "index.html"), "utf8");
+  if (build.status !== 0) throw new Error(`build:app failed: ${build.stderr}`);
+  const inventory = await readAppInventory(distributionRoot);
+  const publication: unknown = JSON.parse((await readAppOrdinary(
+    join(repositoryRoot, "tmp", "build-app", "current.json"),
+  )).toString("utf8"));
+  expect(inventory).toEqual(parseAppPublication(publication));
+  artifacts = await Promise.all(inventory.map(async (item) => {
+    const bytes = await readAppOrdinary(join(distributionRoot, item.path));
+    expect({ bytes: bytes.byteLength, sha256: appSha256(bytes) }).toEqual({ bytes: item.bytes, sha256: item.sha256 });
+    return { name: item.path, text: bytes.toString("utf8") };
+  }));
+  shell = (await readAppOrdinary(join(distributionRoot, "index.html"))).toString("utf8");
 }, 180_000);
 
 describe("built shell", () => {
-  test("emits only the reviewed shell, marker, script, and stylesheet artifacts", () => {
-    const staticArtifacts = artifacts
-      .filter((artifact) => !artifact.name.startsWith("assets/"))
-      .map((artifact) => artifact.name)
-      .sort();
-    const scripts = artifacts.filter((artifact) => artifact.name.endsWith(".js"));
-    const stylesheets = artifacts.filter((artifact) => artifact.name.endsWith(".css"));
-
-    expect(staticArtifacts).toEqual([".well-known/hra-app.json", "index.html"]);
-    expect(scripts).toHaveLength(2);
-    expect(stylesheets).toHaveLength(1);
-    expect(scripts.some((script) => script.name === "assets/appearance.js")).toBe(true);
-    expect(scripts.find((script) => script.name !== "assets/appearance.js")?.name).toMatch(/^assets\/index-[A-Za-z0-9_-]+\.js$/u);
-    expect(stylesheets[0]?.name).toMatch(/^assets\/style-[A-Za-z0-9_-]+\.css$/u);
-    expect(artifacts).toHaveLength(5);
-  });
-
-  test("emits one module entry point and one linked stylesheet", () => {
+  test("emits one module entry, a synchronous appearance bootstrap, and foundation before recipes", () => {
     expect(artifacts.some((artifact) => artifact.name === "index.html")).toBe(true);
     expect(artifacts.filter((artifact) => artifact.name.endsWith(".js")).length)
-      .toBeGreaterThanOrEqual(1);
-    expect(artifacts.filter((artifact) => artifact.name.endsWith(".css")).length).toBe(1);
-    expect(shell).toMatch(/<link rel="stylesheet"[^>]*href="\/assets\/[^"]+\.css"/u);
-    expect(shell).toMatch(/<script type="module"[^>]*src="\/assets\/[^"]+\.js"/u);
+      .toBeGreaterThanOrEqual(2);
+    expect(artifacts.filter((artifact) => artifact.name.endsWith(".css")).length).toBe(2);
+    const stylesheets = [...shell.matchAll(/<link rel="stylesheet" href="([^"]+)">/gu)].map((match) => match[1]);
+    expect(stylesheets).toHaveLength(2);
+    expect(stylesheets[0]).toMatch(/^\/graphs\/client\/assets\/[^/]+\.css$/u);
+    expect(stylesheets[1]).toBe("/stylex.css");
+    const scripts = [...shell.matchAll(/<script type="module" src="([^"]+)"><\/script>/gu)].map((match) => match[1]);
+    expect(scripts).toHaveLength(1);
+    expect(scripts[0]).toMatch(/^\/graphs\/client\/assets\/[^/]+\.js$/u);
+    const bootstraps = [...shell.matchAll(/<script src="([^"]+)"><\/script>/gu)].map((match) => match[1]);
+    expect(bootstraps).toHaveLength(1);
+    expect(bootstraps[0]).toMatch(/^\/graphs\/client\/assets\/appearance-[A-Za-z0-9_-]+\.js$/u);
+    expect([...shell.matchAll(/<script\b/gu)]).toHaveLength(2);
+    expect(shell).not.toMatch(/<script[^>]*\b(?:async|defer)\b/u);
+    expect(shell.indexOf(`<script src="${bootstraps[0]}"`)).toBeLessThan(shell.indexOf("</head>"));
+    expect(shell.indexOf('href="/stylex.css"')).toBeLessThan(shell.indexOf(`<script src="${bootstraps[0]}"`));
+    expect(shell).toContain(`<html lang="en" data-palette="catppuccin" data-theme="dark" class="${getDesignPaletteTheme("catppuccin", "dark").className}">`);
+    for (const target of [...stylesheets, ...scripts, ...bootstraps]) {
+      expect(artifacts.some(({ name }) => `/${name}` === target)).toBe(true);
+    }
+    expect(shell.indexOf('href="/stylex.css"')).toBeLessThan(shell.indexOf("</head>"));
+    expect(shell.indexOf("</head>")).toBeLessThan(shell.indexOf('<script type="module"'));
+  });
+
+  test("preserves the complete authored shell metadata and root boundary", async () => {
+    const authored = await readFile(join(appRoot, "index.html"), "utf8");
+    const unlinked = shell.replace(
+      `<html lang="en" data-palette="catppuccin" data-theme="dark" class="${getDesignPaletteTheme("catppuccin", "dark").className}">`,
+      '<html lang="en" data-palette="catppuccin" data-theme="dark">',
+    ).replace(/<link rel="stylesheet" href="\/graphs\/client\/assets\/[^/]+\.css">\n {4}<link rel="stylesheet" href="\/stylex\.css">\n {4}<script src="\/graphs\/client\/assets\/appearance-[A-Za-z0-9_-]+\.js"><\/script>\n {2}/u, "")
+      .replace(/<script type="module" src="\/graphs\/client\/assets\/[^/]+\.js"><\/script>/u, '<script type="module" src="/src/main.tsx"></script>');
+    expect(unlinked).toBe(authored);
+  });
+
+  test("contains only the closed public graph and separate marker, with no receipts, maps, or source paths", async () => {
+    for (const artifact of artifacts) {
+      expect(artifact.name === ".well-known/hra-app.json"
+        || artifact.name === "index.html" || artifact.name === "stylex.css"
+        || /^graphs\/client\/assets\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|css)$/u.test(artifact.name)).toBe(true);
+      expect(artifact.text).not.toContain(repositoryRoot);
+      expect(artifact.text).not.toContain(".stylex-generation/");
+    }
+    expect(artifacts.filter(({ name }) => name.endsWith(".json")).map(({ name }) => name))
+      .toEqual([".well-known/hra-app.json"]);
+    expect(artifacts.some(({ name }) => name.endsWith(".map"))).toBe(false);
+    const foundation = artifacts.find(({ name }) => /^graphs\/client\/assets\/[^/]+\.css$/u.test(name));
+    expect(foundation?.text).toMatch(/--ui-radius\s*:\s*0?\.75rem/u);
+    expect(foundation?.text).toMatch(/--color-attention\s*:\s*var\(--warning\)/u);
+    expect(foundation?.text).toContain("::-webkit-date-and-time-value");
+    const recipes = artifacts.find(({ name }) => name === "stylex.css");
+    expect(recipes?.text).toContain("components.hraness-stylex.priority");
+    expect(recipes?.text).not.toContain("components.hraness-ui.priority");
+    expect(recipes?.text).toMatch(/animation-duration\s*:\s*2\.4s/u);
+    expect(recipes?.text).toContain("var(--color-attention)");
+    expect(recipes?.text).toMatch(/prefers-reduced-motion\s*:\s*reduce/u);
+    for (const artifact of artifacts) {
+      expect(artifact.text).not.toMatch(/(?:\/\/[#@]|\/\*[#@])\s*source(?:Mapping)?URL\s*=/u);
+    }
+    const javascript = artifacts.filter(({ name }) => name.endsWith(".js"));
+    for (const artifact of javascript) {
+      expect(artifact.text).not.toContain("@stylexjs/stylex/lib/stylex-inject");
+    }
+    const reactDomRoot = dirname(fileURLToPath(import.meta.resolve("react-dom/package.json")));
+    // Installed package files follow the package manager's mode/link policy,
+    // not the private publication contract. Bind these dependency bytes through
+    // the exact reviewed manifest, source digest, and emitted-function digest.
+    assertReviewedRuntimeStyleBoundary(javascript, {
+      manifest: JSON.parse(await readFile(join(reactDomRoot, "package.json"), "utf8")) as unknown,
+      productionClientSha256: appSha256(await readFile(join(reactDomRoot, "cjs/react-dom-client.production.js"))),
+    });
   });
 
   test("carries the mobile viewport with the safe-area opt in", () => {
     expect(shell).toContain("viewport-fit=cover");
     expect(shell).toContain("width=device-width");
-  });
-
-  test("applies the complete default palette and loads saved appearance before the application", () => {
-    const htmlTag = shell.match(/<html\b[^>]*>/u)?.[0] ?? "";
-    const theme = getDesignPaletteTheme("catppuccin", "dark");
-    expect(htmlTag).toContain('data-palette="catppuccin"');
-    expect(htmlTag).toContain('data-theme="dark"');
-    for (const token of theme.className.split(/\s+/u)) expect(htmlTag).toContain(token);
-    const bootstrap = shell.match(/<script\b[^>]*src="\/assets\/appearance\.js"[^>]*>/u)?.[0] ?? "";
-    expect(bootstrap).not.toBe("");
-    expect(bootstrap).not.toMatch(/\b(?:async|defer|type)=?/u);
-    expect(shell.indexOf(bootstrap)).toBeLessThan(shell.indexOf('<script type="module"'));
   });
 
   test("has no inline script", () => {
@@ -346,6 +463,21 @@ function headerFinder(configuration: ProjectConfiguration) {
 }
 
 describe("vercel project headers", () => {
+  test("serves every emitted graph, recipe, and marker instead of rewriting it to the shell", async () => {
+    const configuration = await readProjectConfiguration();
+    expect(configuration.rewrites).toEqual([{
+      destination: "/index.html",
+      source: "/((?!(?:assets/|graphs/client/assets/|stylex\\.css$|\\.well-known/)).*)",
+    }]);
+    const rewrite = new RegExp(`^${configuration.rewrites[0]!.source}$`, "u");
+    for (const { name } of artifacts.filter(({ name }) => name !== "index.html")) {
+      expect({ name, rewritten: rewrite.test(`/${name}`) }).toEqual({ name, rewritten: false });
+    }
+    for (const path of ["/", "/index.html", "/session/example", "/settings", "/stylexXcss", "/stylex.css/other"]) expect(rewrite.test(path)).toBe(true);
+    expect(rewrite.test("/assets/legacy.js")).toBe(false);
+    expect(rewrite.test("/.well-known/hra-app.json")).toBe(false);
+  });
+
   test("serve the F1 policy, the referrer policy, and the clipboard denial", async () => {
     const configuration = await readProjectConfiguration();
     const find = headerFinder(configuration);
@@ -374,7 +506,7 @@ describe("vercel project headers", () => {
     const configuration = await readProjectConfiguration();
     expect(configuration.rewrites).toEqual([{
       destination: "/index.html",
-      source: "/((?!assets/|\\.well-known/).*)",
+      source: "/((?!(?:assets/|graphs/client/assets/|stylex\\.css$|\\.well-known/)).*)",
     }]);
     const fallback = configuration.rewrites[0];
     if (fallback === undefined) throw new Error("missing SPA fallback fixture");
@@ -382,6 +514,9 @@ describe("vercel project headers", () => {
 
     expect(matcher.test("/sessions/session_12345678")).toBe(true);
     expect(matcher.test("/assets/index-example.js")).toBe(false);
+    expect(matcher.test("/graphs/client/assets/index-example.js")).toBe(false);
+    expect(matcher.test("/stylex.css")).toBe(false);
+    expect(matcher.test("/stylex.css/other")).toBe(true);
     expect(matcher.test("/.well-known/hra-app.json")).toBe(false);
   });
 

@@ -1,14 +1,28 @@
 /**
  * Class name joiner.
  *
- * shadcn/ui ships `cn` on top of `clsx` and `tailwind-merge`. Neither earns a
- * dependency here: the primitives in `components/ui` accept an optional
- * `className` that is appended last, and Tailwind's later-wins ordering inside
- * one stylesheet is enough for the overrides this app makes.
+ * The app's finite class-name inputs need neither `clsx` nor a merge library.
+ * Primitive-owned StyleX classes come first and an ordinary caller class name
+ * remains last so the native extension seam keeps its existing order.
  */
 export type ClassValue = string | false | null | undefined;
 
 export function cn(...values: readonly ClassValue[]): string {
   return values.filter((value): value is string => typeof value === "string" && value.length > 0)
     .join(" ");
+}
+
+/**
+ * Turn a compiled static StyleX presentation into the app's class-only CSP
+ * contract. Dynamic StyleX values would produce an inline `style` object, so
+ * they fail closed instead of silently weakening `style-src 'self'`.
+ */
+export function staticStylexClassName(
+  presentation: Readonly<{ className?: string; style?: unknown }>,
+  className?: string,
+): string {
+  if (presentation.style !== undefined) {
+    throw new Error("HRA primitives accept only extracted static StyleX styles.");
+  }
+  return cn(presentation.className, className);
 }

@@ -1,8 +1,9 @@
+import { AppearanceButton } from "../components/appearance";
+import * as stylex from "@stylexjs/stylex";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { ComposerAttachmentChips } from "../components/attachment-chips";
 import { AttachIcon, BackIcon, KebabIcon, StopIcon } from "../components/icons";
-import { AppearanceButton } from "../components/appearance";
 import { InteractionPanel } from "../components/interaction-panel";
 import { ScheduledTasksBadge } from "../components/scheduled-tasks-badge";
 import { StateIndicator } from "../components/state-indicator";
@@ -16,7 +17,6 @@ import { holdSentAttachment } from "../data/sent-attachments";
 import { useSessionHead } from "../data/session-heads";
 import { useSessionModel } from "../data/session-model-hook";
 import type { RemoteCommandPayload } from "../hra/cloud";
-import { cn } from "../lib/cn";
 import {
   attachmentAcceptAttribute,
   attachmentSendSupported,
@@ -45,6 +45,7 @@ import {
   shortSessionLabel,
 } from "../model/session-view";
 import { navigateBack } from "../routing/router";
+import { sessionScreenStyles } from "./session-screen.stylex";
 
 type ApprovalMode = "auto:all" | "auto:workspace" | "manual";
 
@@ -72,10 +73,9 @@ function ChoiceRow({
   return (
     <button
       aria-pressed={selected}
-      className={cn(
-        "flex min-h-11 w-full items-center justify-between rounded-md border px-3 text-left text-sm",
-        "disabled:cursor-not-allowed disabled:opacity-50",
-        selected ? "border-accent text-accent" : "border-line text-ink",
+      {...stylex.props(
+        sessionScreenStyles.choice,
+        selected ? sessionScreenStyles.choiceSelected : sessionScreenStyles.choiceIdle,
       )}
       disabled={disabled}
       onClick={onSelect}
@@ -237,13 +237,13 @@ export function SessionScreen({
   };
 
   return (
-    <div className="mx-auto flex h-dvh w-full max-w-3xl flex-col pt-[env(safe-area-inset-top)]">
-      <header className="flex items-center gap-2 border-b border-line px-[max(0.5rem,env(safe-area-inset-left))] py-2">
+    <div {...stylex.props(sessionScreenStyles.root)}>
+      <header {...stylex.props(sessionScreenStyles.header)}>
         <Button aria-label="Back to the grid" onClick={navigateBack} size="icon" variant="ghost">
           <BackIcon />
         </Button>
-        <div className="flex min-w-0 flex-1 flex-col">
-          <h1 className="truncate text-sm font-semibold">{title}</h1>
+        <div {...stylex.props(sessionScreenStyles.titleBlock)}>
+          <h1 {...stylex.props(sessionScreenStyles.title)}>{title}</h1>
           <StateIndicator state={model.state} />
         </div>
         <Button
@@ -260,24 +260,24 @@ export function SessionScreen({
       <ScheduledTasksBadge sessionPublicId={sessionPublicId} />
 
       <div
-        className="flex-1 overflow-y-auto px-[max(1rem,env(safe-area-inset-left))] py-4"
+        {...stylex.props(sessionScreenStyles.scroller)}
         onScroll={onScroll}
         ref={scroller}
       >
         {head === null ? (
-          <p className="text-sm text-ink-muted">Loading the session.</p>
+          <p {...stylex.props(sessionScreenStyles.quietBody)}>Loading the session.</p>
         ) : (
           <>
             {historyLoading && entries.length === 0 ? (
-              <p className="text-sm text-ink-muted">Loading the transcript.</p>
+              <p {...stylex.props(sessionScreenStyles.quietBody)}>Loading the transcript.</p>
             ) : null}
             <TranscriptView entries={entries} thinkingText={liveModel.thinkingText} />
           </>
         )}
       </div>
 
-      <div className="flex flex-col gap-2 border-t border-line bg-surface px-[max(1rem,env(safe-area-inset-left))] pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))]">
-        {retired ? <p className="text-xs text-ink-muted">Devin support is retired. This session is read-only.</p> : null}
+      <div {...stylex.props(sessionScreenStyles.composer)}>
+        {retired ? <p {...stylex.props(sessionScreenStyles.quiet)}>Devin support is retired. This session is read-only.</p> : null}
         {interaction === null || retired ? null : (
           <InteractionPanel
             commandPublicId={decisionCommandId}
@@ -297,20 +297,17 @@ export function SessionScreen({
           />
         )}
         {notice === null ? null : (
-          <p className="text-xs text-ink-muted" role="status">{notice}</p>
+          <p {...stylex.props(sessionScreenStyles.quiet)} role="status">{notice}</p>
         )}
         {attach.notice === null ? null : (
-          <p className="text-xs text-danger" role="status">{attach.notice}</p>
+          <p {...stylex.props(sessionScreenStyles.danger)} role="status">{attach.notice}</p>
         )}
         <ComposerAttachmentChips attachments={attachments} onRemove={attach.remove} />
         {attach.busy ? (
-          <p className="text-xs text-ink-muted" role="status">Preparing the attachments.</p>
+          <p {...stylex.props(sessionScreenStyles.quiet)} role="status">Preparing the attachments.</p>
         ) : null}
         <form
-          className={cn(
-            "flex items-end gap-2 rounded-md",
-            attach.dragging ? "outline-2 outline-offset-2 outline-focus" : "",
-          )}
+          {...stylex.props(sessionScreenStyles.form, attach.dragging && sessionScreenStyles.dragActive)}
           onDragLeave={attach.onDragLeave}
           onDragOver={attach.onDragOver}
           onDrop={attach.onDrop}
@@ -319,7 +316,7 @@ export function SessionScreen({
           <input
             accept={attachmentAcceptAttribute}
             aria-hidden="true"
-            className="hidden"
+            {...stylex.props(sessionScreenStyles.fileInput)}
             multiple
             onChange={attach.onPick}
             ref={pickerRef}
@@ -361,12 +358,12 @@ export function SessionScreen({
       </div>
 
       <Sheet label="Session menu" onClose={() => { setMenuOpen(false); }} open={menuOpen}>
-        <h2 className="text-base font-semibold">Model</h2>
-        <p className="mt-1 text-xs text-ink-muted">
+        <h2 {...stylex.props(sessionScreenStyles.heading)}>Model</h2>
+        <p {...stylex.props(sessionScreenStyles.menuDescription)}>
           Applies to future turns. The daemon holds the current value; this browser
           does not infer or highlight it.
         </p>
-        <div className="mt-2 flex flex-col gap-2">
+        <div {...stylex.props(sessionScreenStyles.menuOptions)}>
           {presetOptions.map(({ label, value }) => (
             <ChoiceRow
               disabled={retired}
@@ -381,13 +378,13 @@ export function SessionScreen({
           ))}
         </div>
 
-        <h2 className="mt-4 text-base font-semibold">Fast (Codex only)</h2>
-        <p className="mt-1 text-xs text-ink-muted">
+        <h2 {...stylex.props(sessionScreenStyles.heading, sessionScreenStyles.headingSpaced)}>Fast (Codex only)</h2>
+        <p {...stylex.props(sessionScreenStyles.menuDescription)}>
           Applies to future turns; Claude Code has no Fast mode. The daemon
           holds the current value, so this browser highlights only a change the machine
           confirmed.
         </p>
-        <div className="mt-2 flex flex-col gap-2">
+        <div {...stylex.props(sessionScreenStyles.menuOptions)}>
           {([true, false] as const).map((enabled) => (
             <ChoiceRow
               disabled={head === null || retired || sending || model.turnActive}
@@ -410,15 +407,15 @@ export function SessionScreen({
           ))}
         </div>
         {fastNotice === null ? null : (
-          <p className="mt-2 text-xs text-ink-muted" role="status">{fastNotice.text}</p>
+          <p {...stylex.props(sessionScreenStyles.quiet, sessionScreenStyles.status)} role="status">{fastNotice.text}</p>
         )}
 
-        <h2 className="mt-4 text-base font-semibold">Approvals</h2>
-        <p className="mt-1 text-xs text-ink-muted">
+        <h2 {...stylex.props(sessionScreenStyles.heading, sessionScreenStyles.headingSpaced)}>Approvals</h2>
+        <p {...stylex.props(sessionScreenStyles.menuDescription)}>
           Applies to this session. The daemon holds the current value, so nothing
           is highlighted until you set one from here.
         </p>
-        <div className="mt-2 flex flex-col gap-2">
+        <div {...stylex.props(sessionScreenStyles.menuOptions)}>
           {approvalOptions.map(([value, label]) => (
             <ChoiceRow
               disabled={retired}
@@ -434,9 +431,9 @@ export function SessionScreen({
           ))}
         </div>
 
-        <h2 className="mt-4 text-base font-semibold">Provider</h2>
-        <p className="mt-1 text-xs text-ink-muted">{providerSwitchNote}</p>
-        <div className="mt-2 flex flex-col gap-2">
+        <h2 {...stylex.props(sessionScreenStyles.heading, sessionScreenStyles.headingSpaced)}>Provider</h2>
+        <p {...stylex.props(sessionScreenStyles.menuDescription)}>{providerSwitchNote}</p>
+        <div {...stylex.props(sessionScreenStyles.menuOptions)}>
           {providerSwitchOptions.map((option) => (
             <ChoiceRow
               disabled={providerDisabledReason !== null}
@@ -452,10 +449,10 @@ export function SessionScreen({
           ))}
         </div>
         {providerDisabledReason === null ? null : (
-          <p className="mt-2 text-xs text-ink-muted">{providerDisabledReason}</p>
+          <p {...stylex.props(sessionScreenStyles.quiet, sessionScreenStyles.status)}>{providerDisabledReason}</p>
         )}
         {providerNotice === null ? null : (
-          <p className="mt-2 text-xs text-ink-muted" role="status">{providerNotice.text}</p>
+          <p {...stylex.props(sessionScreenStyles.quiet, sessionScreenStyles.status)} role="status">{providerNotice.text}</p>
         )}
       </Sheet>
     </div>

@@ -1,13 +1,15 @@
 import { AppearanceHeader } from "../components/appearance";
 import { useAuthActions } from "@convex-dev/auth/react";
+import * as stylex from "@stylexjs/stylex";
 
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import { useCustody } from "./custody-context";
+import { enrollmentStyles } from "./enrollment-screen.stylex";
 
 function Fingerprint({ value }: Readonly<{ value: string }>) {
   return (
-    <p className="mt-2 select-all break-all rounded-md bg-surface-input p-3 font-mono text-sm">
+    <p {...stylex.props(enrollmentStyles.fingerprint)}>
       {value}
     </p>
   );
@@ -56,8 +58,8 @@ export function EnrollmentScreen() {
             </CardDescription>
             {custody.fingerprint === null ? null : <Fingerprint value={custody.fingerprint} />}
             <CardDescription>
-              Run <span className="font-mono">hra device list</span> and then{" "}
-              <span className="font-mono">hra device approve</span> on that machine.
+              Run <span {...stylex.props(enrollmentStyles.mono)}>hra device list</span> and then{" "}
+              <span {...stylex.props(enrollmentStyles.mono)}>hra device approve</span> on that machine.
             </CardDescription>
           </>
         );
@@ -84,13 +86,13 @@ export function EnrollmentScreen() {
   };
 
   return (
-    <main className="mx-auto flex min-h-dvh w-full max-w-md flex-col justify-center p-4">
+    <main {...stylex.props(enrollmentStyles.root)}>
       <AppearanceHeader />
       <Card>
         <CardHeader>{body()}</CardHeader>
-        <CardContent className="flex flex-col gap-3">
+        <CardContent xstyle={enrollmentStyles.cardContent}>
           {custody.error === null ? null : (
-            <p className="text-sm text-danger" role="alert">{custody.error}</p>
+            <p {...stylex.props(enrollmentStyles.error)} role="alert">{custody.error}</p>
           )}
           {custody.enrollment === "needs_registration" ? (
             <Button disabled={custody.busy} onClick={() => { void custody.enroll(); }}>

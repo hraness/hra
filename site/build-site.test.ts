@@ -1,11 +1,18 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { parseHTML } from "linkedom";
+import { transform, type Selector } from "lightningcss";
+import { createStylexTransformCollector } from "@hraness/ui/stylex-build";
 
 import {
+  assertSiteFontStyleInventory,
   buildSite,
   HRA_POSTHOG_PROJECT_TOKEN_ENV,
+  publishSiteFonts,
   readPackageVersion,
   resolveHraAnalyticsProjectToken,
 } from "../scripts/build-site.ts";
@@ -22,12 +29,95 @@ import {
   renderSiteHtml,
 } from "./template.ts";
 import { HRA_RELEASE_VERSION } from "../scripts/release-evidence";
+import { mobileHeaderFlowClassName } from "./marketing.stylex.ts";
 
 const temporaryRoots: string[] = [];
+// A real site graph joins Vite foundation, Bun SSR, sealed templates and
+// analytics. The first completed native probe took 6.8s; pure cases keep 5s.
+const compilerBuildTimeoutMs = 30_000;
+const sourceRoot = await realpath(join(import.meta.dir, ".."));
+const hash = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
+const installedFontRoot = dirname(fileURLToPath(import.meta.resolve("@hraness/design-kit/fonts.css")));
+const expectedFontPaths = [
+  ...["Light", "LightItalic", "Book", "BookItalic", "Medium", "MediumItalic", "Semibold", "SemiboldItalic", "Bold", "BoldItalic", "Black", "BlackItalic"]
+    .map((cut) => `nebula-sans/NebulaSans-${cut}.woff2`),
+  "geist-mono/GeistMono[wght].woff2",
+  "nebula-sans/LICENSE.txt",
+  "nebula-sans/PROVENANCE.md",
+  "geist-mono/OFL.txt",
+  "geist-mono/PROVENANCE.md",
+].sort();
+const expectedAttributionPaths = expectedFontPaths.filter((path) => !path.endsWith(".woff2"));
+
+function assertMobileHeaderRule(css: string, className: string): void {
+  expect(className).toMatch(/^x[a-z0-9]+$/u);
+  const targetsHeader = (selectors: readonly Selector[]): boolean => selectors.some((selector) =>
+    selector.length > 0 && selector.every((part) => part.type === "class" && part.name === className));
+  const expectedQueries: unknown[] = [];
+  transform({ filename: "expected-mobile-header.css", code: Buffer.from("@media (max-width: 48rem) { .expected { position: static; } }"),
+    visitor: { Rule: { media(rule) { expectedQueries.push(rule.value.query); } } } });
+  let declarations = 0;
+  const actualQueries: unknown[] = [];
+  transform({ filename: "compiled-mobile-header.css", code: Buffer.from(css), visitor: { Rule: {
+    style(rule) {
+      if (!targetsHeader(rule.value.selectors)) return;
+      declarations++;
+      expect(rule.value.declarations).toEqual({ declarations: [{ property: "position", value: { type: "static" } }], importantDeclarations: [] });
+    },
+    media(rule) {
+      if (rule.value.rules.some((child) => child.type === "style" && targetsHeader(child.value.selectors))) actualQueries.push(rule.value.query);
+    },
+  } } });
+  expect(declarations).toBe(1);
+  expect(actualQueries).toEqual(expectedQueries);
+}
+
+function compiledStylesheetJoin(html: string): { foundationPath: string; authoredHtml: string } {
+  const { document } = parseHTML(html);
+  const hrefs = [...document.querySelectorAll('link[rel="stylesheet"]')].map((link) => link.getAttribute("href"));
+  expect(hrefs).toHaveLength(2);
+  const foundationHref = hrefs[0];
+  if (typeof foundationHref !== "string") throw new Error("Missing captured foundation stylesheet.");
+  expect(foundationHref).toMatch(/^\/graphs\/foundation\/assets\/[A-Za-z0-9_.-]+\.css$/u);
+  expect(hrefs[1]).toBe("/stylex.css");
+  expect(document.querySelectorAll("style, [style]")).toHaveLength(0);
+  const join = `<link rel="stylesheet" href="${foundationHref}">\n<link rel="stylesheet" href="/stylex.css">`;
+  expect(html.split(join)).toHaveLength(2);
+  return {
+    foundationPath: foundationHref.slice(1),
+    authoredHtml: html.replace(join, '<link rel="stylesheet" href="/styles.css">'),
+  };
+}
+
+async function inventoryFiles(root: string, prefix = ""): Promise<string[]> {
+  const result: string[] = [];
+  for (const entry of await readdir(join(root, prefix), { withFileTypes: true })) {
+    const path = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) result.push(...await inventoryFiles(root, path));
+    else {
+      expect(entry.isFile()).toBe(true);
+      result.push(path);
+    }
+  }
+  return result.sort();
+}
+
+async function createFontFixture(): Promise<{ source: string; output: string; styles: string }> {
+  const root = await mkdtemp(join(tmpdir(), "hra-font-publication-"));
+  temporaryRoots.push(root);
+  const source = join(root, "source");
+  await mkdir(join(source, "fonts/nebula-sans"), { recursive: true });
+  await mkdir(join(source, "fonts/geist-mono"));
+  const styles = await readFile(join(installedFontRoot, "fonts.css"), "utf8");
+  await writeFile(join(source, "fonts.css"), styles);
+  for (const path of expectedFontPaths) await writeFile(join(source, "fonts", path), `fixture:${path}`);
+  return { source, output: join(root, "published"), styles };
+}
 
 const createFixtureRoot = async (): Promise<string> => {
   const root = await mkdtemp(join(tmpdir(), "hra-site-test-"));
   temporaryRoots.push(root);
+  expect(await realpath(root)).not.toBe(sourceRoot);
   await mkdir(join(root, "site"), { recursive: true });
   await Promise.all(
     ["favicon.svg", "styles.css"].map(async (asset) => {
@@ -46,21 +136,106 @@ afterEach(async () => {
 });
 
 describe("static-site build", () => {
-  test("keeps the wrapping mobile header in document flow so anchors stay visible", async () => {
+  test("keeps the wrapping mobile header in document flow through its emitted StyleX atom", async () => {
+    const className = mobileHeaderFlowClassName();
+    const path = join(sourceRoot, "site/marketing.stylex.ts");
+    const compiled = await createStylexTransformCollector(sourceRoot).transform(await readFile(path, "utf8"), path);
+    const css = compiled.rules.filter(([name]) => name === className).map(([, rule]) => rule.ltr).join("\n");
+    assertMobileHeaderRule(css, className);
+    for (const render of [renderSiteHtml, renderPrivacyHtml]) {
+      const { document } = parseHTML(render());
+      const headers = document.querySelectorAll('[data-hraness-marketing="header"]');
+      expect(headers).toHaveLength(1);
+      expect(headers[0]?.classList.contains(className)).toBe(true);
+      expect(headers[0]?.hasAttribute("style")).toBe(false);
+    }
+    expect(await readFile(join(sourceRoot, "site/styles.css"), "utf8")).not.toContain("position: static");
+    for (const invalid of [
+      `.${className}{position:static}`, `@media(max-width:47rem){.${className}{position:static}}`,
+      `@media(width < 48rem){.${className}{position:static}}`,
+      `@media(max-width:48rem){.${className}{position:sticky}}`,
+      `@media(max-width:48rem){.wrong{position:static}}`,
+      `@media(max-width:48rem){.${className}{position:static!important}}`,
+      `.${className}{position:sticky}@media(max-width:48rem){.${className}{position:static}}`,
+    ]) expect(() => assertMobileHeaderRule(invalid, className)).toThrow();
+  });
+
+  test("publishes exactly the reviewed fonts and attribution, excluding package-only source and OTFs", async () => {
+    const { source, output, styles } = await createFontFixture();
+    for (const path of ["social-fonts.generated.ts", "NebulaSans-Book.otf", "NebulaSans-Bold.otf", "extra.woff2"]) {
+      await writeFile(join(source, "fonts/nebula-sans", path), "not public");
+    }
+    expect(await publishSiteFonts(source, output)).toBe(styles);
+    expect(await inventoryFiles(output)).toEqual(expectedFontPaths);
+    for (const path of expectedFontPaths) {
+      expect(await readFile(join(output, path))).toEqual(await readFile(join(source, "fonts", path)));
+    }
+    await expect(publishSiteFonts(source, output)).rejects.toThrow("fresh writable publication directory");
+    expect(await inventoryFiles(output)).toEqual(expectedFontPaths);
+  });
+
+  test("requires exact stylesheet URL coverage and rejects extra, missing, duplicate, source, escaped, and remote references", async () => {
+    const styles = await readFile(join(installedFontRoot, "fonts.css"), "utf8");
+    expect(() => assertSiteFontStyleInventory(styles)).not.toThrow();
+    const firstFace = styles.match(/@font-face\s*\{[^{}]*\}/u)?.[0];
+    expect(firstFace).toBeDefined();
+    if (firstFace === undefined) throw new Error("Expected the installed font-face fixture.");
+    const original = "./fonts/nebula-sans/NebulaSans-Light.woff2";
+    for (const changed of [
+      styles.replace(firstFace, ""),
+      `${styles}\n${firstFace}`,
+      `${styles}\n@import url("https://invalid.example/font.css");`,
+      styles.replace("src: url", "src: u\\72l"),
+      styles.replace(original, "./fonts/nebula-sans/NebulaSans-/*hidden*/Light.woff2"),
+      ...["./fonts/nebula-sans/extra.woff2", "./fonts/nebula-sans/social-fonts.generated.ts", "./fonts/nebula-sans/NebulaSans-Book.otf", "../outside.woff2", "https://invalid.example/font.woff2"]
+        .map((url) => styles.replace(original, url)),
+    ]) expect(() => assertSiteFontStyleInventory(changed)).toThrow("Public font stylesheet");
+  });
+
+  test("rejects missing, linked, directory, and oversized font inputs before publishing any files", async () => {
+    for (const failure of ["missing", "symlink", "parent-symlink", "directory", "oversized"] as const) {
+      const { source, output } = await createFontFixture();
+      const path = join(source, "fonts/nebula-sans/NebulaSans-Light.woff2");
+      if (failure === "parent-symlink") {
+        await rm(join(source, "fonts/nebula-sans"), { recursive: true });
+        await symlink(join(installedFontRoot, "fonts/nebula-sans"), join(source, "fonts/nebula-sans"));
+      } else {
+        await rm(path);
+        if (failure === "symlink") await symlink(join(installedFontRoot, "fonts/nebula-sans/NebulaSans-Light.woff2"), path);
+        if (failure === "directory") await mkdir(path);
+        if (failure === "oversized") await writeFile(path, Buffer.alloc(1024 * 1024 + 1));
+      }
+      await expect(publishSiteFonts(source, output)).rejects.toThrow("Public font input is missing, changed, nonordinary, or oversized: fonts/nebula-sans/");
+      await expect(readdir(output)).rejects.toThrow();
+    }
+  });
+
+  test("keeps shared Ask AI presentation owned by the compiled package", async () => {
     const styles = await readFile(join(import.meta.dir, "styles.css"), "utf8");
-    expect(styles).toMatch(
-      /@media\s*\(max-width:\s*48rem\)\s*\{\s*\.hraness-marketing-header\s*\{\s*position:\s*static;\s*\}/u,
-    );
+    const recipes = await readFile(join(import.meta.dir, "presentation.stylex.ts"), "utf8");
+    expect(styles).not.toContain('[data-slot="ask-ai-about-this-');
+    expect(styles).not.toMatch(/(?:^|\n)a:focus-visible\s*[,{]/u);
+    for (const [shared, product] of [
+      ["background", "background"], ["foreground", "foreground"],
+      ["font-sans", "font-sans"], ["font-heading", "font-heading"],
+      ["font-mono", "font-mono"],
+    ]) expect(styles).toContain(`--ui-${shared}: var(--${product});`);
+    for (const [shared, product] of [
+      ["foreground", "foreground"], ["border", "rule"],
+      ["muted", "surface"], ["muted-foreground", "muted"],
+      ["primary", "primary"], ["ring", "focus"],
+    ]) expect(recipes).toContain(`"--ui-${shared}": "var(--${product})"`);
   });
 
   test("keeps documentation code roles separate from inverse marketing roles", async () => {
     const styles = await readFile(join(import.meta.dir, "styles.css"), "utf8");
-    expect(styles).toContain(".hra-inline-code {");
-    expect(styles).toContain("overflow-wrap: anywhere;");
+    const recipes = await readFile(join(import.meta.dir, "presentation.stylex.ts"), "utf8");
+    expect(styles).not.toContain(".hra-inline-code {");
+    expect(recipes).toContain('overflowWrap: "anywhere"');
     expect(styles).not.toMatch(/(?:^|\n)code\s*\{/u);
     expect(styles).toContain("--hraness-marketing-inverse: var(--inverse-background)");
     expect(styles).toContain("--hraness-marketing-inverse-ink: var(--inverse-foreground)");
-    expect(styles).toContain("--foreground: var(--code-foreground)");
+    expect(recipes).toContain('"--foreground": "var(--code-foreground)"');
     expect(styles).toContain("--code-background: var(--surface-raised)");
     expect(styles).toContain("--code-foreground: var(--foreground)");
     expect(styles).toContain("--inverse-background: var(--inverse)");
@@ -105,8 +280,8 @@ describe("static-site build", () => {
 
   test("writes every named public artifact and then passes check mode", async () => {
     const root = await createFixtureRoot();
-    expect(await buildSite({ check: false, repositoryRoot: root })).toEqual([]);
-    expect(await buildSite({ check: true, repositoryRoot: root })).toEqual([]);
+    expect(await buildSite({ check: false, repositoryRoot: root, sourceRoot })).toEqual([]);
+    expect(await buildSite({ check: true, repositoryRoot: root, sourceRoot })).toEqual([]);
 
     const expectedPaths = [
       "README.md",
@@ -124,31 +299,85 @@ describe("static-site build", () => {
       "dist/site/favicon.svg",
       "dist/site/social-card.svg",
       "dist/site/social-card.png",
-      "dist/site/styles.css",
-      "dist/site/fonts/nebula-sans/LICENSE.txt",
-      "dist/site/fonts/nebula-sans/PROVENANCE.md",
+      "dist/site/stylex.css",
+      ...expectedAttributionPaths.map((path) => `dist/site/fonts/${path}`),
     ];
 
     for (const path of expectedPaths) {
-      expect((await readFile(join(root, path), "utf8")).length).toBeGreaterThan(0);
+      expect((await readFile(join(root, path))).byteLength).toBeGreaterThan(0);
     }
 
-    const builtStyles = await readFile(join(root, "dist/site/styles.css"), "utf8");
-    expect(builtStyles).toContain("fixture:styles.css");
-    expect(builtStyles).toContain('font-family: "Nebula Sans";');
-    expect(builtStyles).toContain('./fonts/nebula-sans/NebulaSans-Book.woff2');
-    expect(builtStyles).toContain(".hraness-marketing-hero");
-    expect(builtStyles).toContain(".hraness-marketing-interface-grid");
-    expect(builtStyles).toContain(".syntax-code");
-    expect(builtStyles).toContain(".syntax-token--command");
-    expect(builtStyles).toContain("--hraness-site-footer-social-target");
-    expect(builtStyles).toContain("--hraness-palette-background");
-    expect(builtStyles).toContain(".hraness-palette");
-    expect(builtStyles).not.toContain('@import "./dist/stylex.css"');
-
-    expect((await readFile(
-      join(root, "dist/site/fonts/nebula-sans/NebulaSans-Bold.woff2"),
-    )).byteLength).toBeGreaterThan(60_000);
+    const html = await readFile(join(root, "dist/site/index.html"), "utf8");
+    const { foundationPath, authoredHtml } = compiledStylesheetJoin(html);
+    expect(authoredHtml).toBe(renderSiteHtml());
+    for (const [path, render] of [["privacy/index.html", renderPrivacyHtml], ["preview/index.html", renderPreviewHtml]] as const) {
+      const route = compiledStylesheetJoin(await readFile(join(root, "dist/site", path), "utf8"));
+      expect(route.foundationPath).toBe(foundationPath);
+      expect(route.authoredHtml).toBe(render());
+    }
+    const foundation = await readFile(join(root, "dist/site", foundationPath), "utf8");
+    const union = await readFile(join(root, "dist/site/stylex.css"), "utf8");
+    assertMobileHeaderRule(union, mobileHeaderFlowClassName());
+    expect(foundation).toContain("Nebula Sans");
+    expect(foundation).toContain(".syntax-code");
+    expect(foundation).toContain(".syntax-token--command");
+    expect(foundation).toContain("components.hraness-ui");
+    expect(union).toContain("@layer components.hraness-stylex");
+    // The linked union owns footer recipes; the captured foundation owns only
+    // its shared document defaults. Exact HTML parity above preserves the full
+    // canonical footer, and the atom closure below binds its emitted classes.
+    expect(union).toContain("--hraness-site-footer-social-target");
+    expect(union).toContain("--hraness-palette-background");
+    expect(foundation).toContain(".hraness-palette");
+    const { document } = parseHTML(html);
+    const atomClasses = new Set([...document.querySelectorAll("[class]")]
+      .flatMap((element) => [...element.classList])
+      .filter((className) => /^x[a-z0-9]+$/u.test(className)));
+    expect(atomClasses.size).toBeGreaterThan(10);
+    for (const className of atomClasses) expect(union).toContain(`.${className}`);
+    for (const styles of [foundation, union]) {
+      expect(styles).not.toMatch(/@import\b/u);
+      expect(styles).not.toContain("fixture:styles.css");
+      expect(styles).not.toContain("node_modules/");
+      expect(styles).not.toContain("sourceMappingURL=");
+      expect(styles).not.toContain(import.meta.dir);
+      expect(styles).not.toContain('@import "./dist/stylex.css"');
+    }
+    const inventory = await inventoryFiles(join(root, "dist/site"));
+    const fontPaths = inventory.filter((path) => path.endsWith(".woff2"));
+    expect(fontPaths).toHaveLength(13);
+    for (const path of fontPaths) expect(path).toMatch(/^graphs\/foundation\/assets\/[A-Za-z0-9_.[\]-]+\.woff2$/u);
+    const expectedFontBytes = await Promise.all(expectedFontPaths.filter((path) => path.endsWith(".woff2"))
+      .map((path) => readFile(join(installedFontRoot, "fonts", path))));
+    const emittedFontBytes = await Promise.all(fontPaths.map((path) => readFile(join(root, "dist/site", path))));
+    expect(emittedFontBytes.map(hash).sort()).toEqual(expectedFontBytes.map(hash).sort());
+    const bold = await readFile(join(installedFontRoot, "fonts/nebula-sans/NebulaSans-Bold.woff2"));
+    expect(bold.byteLength).toBeGreaterThan(60_000);
+    expect(emittedFontBytes.some((bytes) => bytes.equals(bold))).toBe(true);
+    const fontUrls: string[] = [];
+    transform({ filename: foundationPath, code: Buffer.from(foundation), visitor: { Url(value) { fontUrls.push(value.url); } } });
+    expect(fontUrls).toHaveLength(13);
+    const resolvedFonts = fontUrls.map((url) => {
+      expect(url).not.toMatch(/^(?:data:|https?:|\/)/iu);
+      const resolved = new URL(url, `https://hra.sh/${foundationPath}`);
+      expect(resolved.origin).toBe("https://hra.sh");
+      expect(resolved.search).toBe("");
+      expect(resolved.hash).toBe("");
+      return decodeURIComponent(resolved.pathname.slice(1));
+    });
+    expect(resolvedFonts.sort()).toEqual(fontPaths);
+    expect(inventory).toEqual([
+      ...expectedPaths.filter((path) => path.startsWith("dist/site/")).map((path) => path.slice("dist/site/".length)),
+      foundationPath, ...fontPaths,
+    ].sort());
+    expect(inventory.filter((path) => path.endsWith(".js"))).toEqual(["analytics.js", "appearance.js"]);
+    expect(inventory).not.toContain("stylex-complete.json");
+    expect(inventory.some((path) => /\.(?:map|ts|tsx|otf)$/u.test(path) || path.startsWith("graphs/renderer/"))).toBe(false);
+    expect(await inventoryFiles(join(root, "dist/site/fonts"))).toEqual(expectedAttributionPaths);
+    for (const path of expectedAttributionPaths) {
+      expect(await readFile(join(root, "dist/site/fonts", path)))
+        .toEqual(await readFile(join(installedFontRoot, "fonts", path)));
+    }
 
     expect(JSON.parse(
       await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
@@ -165,11 +394,11 @@ describe("static-site build", () => {
       },
       version: HRA_RELEASE_VERSION,
     });
-  });
+  }, compilerBuildTimeoutMs);
 
   test("renders the social card as a 1200x630 PNG plus the legacy SVG path from one composition", async () => {
     const root = await createFixtureRoot();
-    await buildSite({ check: false, repositoryRoot: root });
+    await buildSite({ check: false, repositoryRoot: root, sourceRoot });
     const png = new Uint8Array(await readFile(join(root, "dist/site/social-card.png")));
     const svg = await readFile(join(root, "dist/site/social-card.svg"), "utf8");
 
@@ -180,12 +409,12 @@ describe("static-site build", () => {
     expect(renderSiteHtml()).toContain(
       `<meta property="og:image" content="${publicContent.siteUrl}/social-card.png">`,
     );
-  });
+  }, compilerBuildTimeoutMs);
 
   test("binds hosted identity to one exact source commit", async () => {
     const root = await createFixtureRoot();
     const commit = "0123456789abcdef0123456789abcdef01234567";
-    await buildSite({ check: false, releaseCommit: commit, repositoryRoot: root });
+    await buildSite({ check: false, releaseCommit: commit, repositoryRoot: root, sourceRoot });
     const identity = JSON.parse(
       await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
     ) as { source?: { commit?: unknown } };
@@ -195,8 +424,9 @@ describe("static-site build", () => {
       check: false,
       releaseCommit: "not-a-commit",
       repositoryRoot: root,
+      sourceRoot,
     })).rejects.toThrow("Release commit");
-  });
+  }, compilerBuildTimeoutMs);
 
   test("fails Production closed without valid public analytics and mailing configuration", async () => {
     const validToken = "phc_public_production_token";
@@ -219,6 +449,7 @@ describe("static-site build", () => {
           VERCEL_ENV: "production",
         },
         repositoryRoot: root,
+        sourceRoot,
       })).rejects.toThrow(HRA_POSTHOG_PROJECT_TOKEN_ENV);
     }
 
@@ -230,8 +461,9 @@ describe("static-site build", () => {
         VERCEL_ENV: "production",
       },
       repositoryRoot: missingTurnstileRoot,
+      sourceRoot,
     })).rejects.toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
-  });
+  }, compilerBuildTimeoutMs);
 
   test("embeds only the public token in the self-hosted Production bundle", async () => {
     const root = await createFixtureRoot();
@@ -244,6 +476,7 @@ describe("static-site build", () => {
         VERCEL_ENV: "production",
       },
       repositoryRoot: root,
+      sourceRoot,
     });
 
     const analytics = await readFile(join(root, "dist/site/analytics.js"), "utf8");
@@ -255,11 +488,11 @@ describe("static-site build", () => {
     expect(html).toContain(
       'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
     );
-  });
+  }, compilerBuildTimeoutMs);
 
   test("keeps the hosted identity marker at the fixed release-evidence version", async () => {
     const root = await createFixtureRoot();
-    await buildSite({ check: false, repositoryRoot: root });
+    await buildSite({ check: false, repositoryRoot: root, sourceRoot });
     const identity = JSON.parse(
       await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
     ) as { version?: unknown };
@@ -268,11 +501,11 @@ describe("static-site build", () => {
     expect(identity.version).toBe(HRA_RELEASE_VERSION);
     expect(identity.version).toBe("0.1.0");
     expect(await readPackageVersion()).not.toBe(identity.version);
-  });
+  }, compilerBuildTimeoutMs);
 
   test("does not publish the retired adjacent-reading cluster", async () => {
     const root = await createFixtureRoot();
-    await buildSite({ check: false, repositoryRoot: root });
+    await buildSite({ check: false, repositoryRoot: root, sourceRoot });
     const publicDocuments = await Promise.all([
       "dist/site/index.html",
       "dist/site/llms.txt",
@@ -292,7 +525,7 @@ describe("static-site build", () => {
       await expect(readFile(join(root, "dist/site", route, "index.html"), "utf8"))
         .rejects.toThrow();
     }
-  });
+  }, compilerBuildTimeoutMs);
 
   test("reconstructs the owned site output without stale retired artifacts", async () => {
     const root = await createFixtureRoot();
@@ -306,47 +539,47 @@ describe("static-site build", () => {
       await writeFile(join(root, path), "stale retired artifact\n", "utf8");
     }
 
-    await buildSite({ check: false, repositoryRoot: root });
+    await buildSite({ check: false, repositoryRoot: root, sourceRoot });
 
     for (const path of stalePaths) {
       await expect(readFile(join(root, path), "utf8")).rejects.toThrow();
     }
-    expect(await readFile(join(root, "dist/site/index.html"), "utf8"))
-      .toBe(renderSiteHtml());
-  });
+    const html = await readFile(join(root, "dist/site/index.html"), "utf8");
+    expect(compiledStylesheetJoin(html).authoredHtml).toBe(renderSiteHtml());
+  }, compilerBuildTimeoutMs);
 
   test("generates the inert preview without publishing it as an indexable document", async () => {
     const root = await createFixtureRoot();
-    await buildSite({ check: false, repositoryRoot: root });
+    await buildSite({ check: false, repositoryRoot: root, sourceRoot });
     const preview = await readFile(join(root, "dist/site/preview/index.html"), "utf8");
     const sitemap = await readFile(join(root, "dist/site/sitemap.xml"), "utf8");
 
-    expect(preview).toBe(renderPreviewHtml());
+    expect(compiledStylesheetJoin(preview).authoredHtml).toBe(renderPreviewHtml());
     expect(preview).toContain('<meta name="robots" content="noindex, nofollow">');
     expect(preview).toContain('<link rel="canonical" href="https://hra.sh/">');
     expect(preview).not.toContain("/analytics.js");
     expect(sitemap).not.toContain("/preview");
-  });
+  }, compilerBuildTimeoutMs);
 
   test("passes check mode in a clean clone without ignored build output", async () => {
     const root = await createFixtureRoot();
-    await buildSite({ check: false, repositoryRoot: root });
+    await buildSite({ check: false, repositoryRoot: root, sourceRoot });
     await rm(join(root, "dist"), { force: true, recursive: true });
 
-    expect(await buildSite({ check: true, repositoryRoot: root })).toEqual([]);
-  });
+    expect(await buildSite({ check: true, repositoryRoot: root, sourceRoot })).toEqual([]);
+  }, compilerBuildTimeoutMs);
 
   test("reports stale tracked public documents without repairing build output", async () => {
     const root = await createFixtureRoot();
-    await buildSite({ check: false, repositoryRoot: root });
+    await buildSite({ check: false, repositoryRoot: root, sourceRoot });
     await writeFile(join(root, "README.md"), "stale\n", "utf8");
-    await writeFile(join(root, "dist/site/styles.css"), "stale\n", "utf8");
+    await writeFile(join(root, "dist/site/stylex.css"), "stale\n", "utf8");
 
-    const mismatches = await buildSite({ check: true, repositoryRoot: root });
+    const mismatches = await buildSite({ check: true, repositoryRoot: root, sourceRoot });
     expect(mismatches).toEqual([join(root, "README.md")]);
     expect(await readFile(join(root, "README.md"), "utf8")).toBe("stale\n");
-    expect(await readFile(join(root, "dist/site/styles.css"), "utf8")).toBe("stale\n");
-  });
+    expect(await readFile(join(root, "dist/site/stylex.css"), "utf8")).toBe("stale\n");
+  }, compilerBuildTimeoutMs);
 
   test("admits only owned appearance and analytics scripts, configured Turnstile, and restrictive response headers", async () => {
     const repositoryRoot = join(import.meta.dir, "..");
@@ -370,7 +603,7 @@ describe("static-site build", () => {
     expect(css).toContain('--font-sans: "Nebula Sans", ui-sans-serif, system-ui');
     expect(css).toContain("font-family: var(--font-sans);");
     expect(css).not.toMatch(/font-family:\s*ui-sans-serif/u);
-    expect(css).toContain('font-family: ui-monospace, "SFMono-Regular"');
+    expect(css).toContain('--font-mono: ui-monospace, "SFMono-Regular"');
     expect(renderSocialCardSvg())
       .toContain('font-family="Nebula Sans, ui-sans-serif, system-ui, sans-serif"');
     expect(vercel.headers).toEqual([

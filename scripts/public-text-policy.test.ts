@@ -1,17 +1,44 @@
 import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
-import { chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import {
   assertPublicCopyText,
+  assertPublicCheckout,
   assertPublicSensitiveText,
   assertPublicText,
   assertPublicTree,
   PublicTextPolicyError,
 } from "./public-text-policy";
 import { authoritySupervisorArtifactManifest } from "./authority-supervisor-artifact";
+
+function fixtureGit(root: string, args: readonly string[]): void {
+  const result = spawnSync("/usr/bin/git", [...args], {
+    cwd: root, encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024,
+    env: { PATH: "/usr/bin:/bin", LC_ALL: "C", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+  });
+  if (result.error !== undefined || result.signal !== null || result.status !== 0) {
+    throw new Error("Public-checkout fixture Git command failed.");
+  }
+}
+
+async function withPublicCheckout(check: (root: string) => Promise<void>): Promise<void> {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-public-checkout-")));
+  try {
+    fixtureGit(root, ["init", "--quiet", "--template=", "--initial-branch=fixture"]);
+    await writeFile(join(root, ".gitignore"), "tmp/\n");
+    await writeFile(join(root, "README.md"), "# Public fixture\n");
+    fixtureGit(root, ["add", "--", ".gitignore", "README.md"]);
+    await check(root);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+}
+
+const syntheticPrivatePath = (): string => ["", "Users", "example", "private", "source.ts"].join("/");
 
 describe("public text policy", () => {
   test("rejects credential sentinels, private scopes, and machine user paths without echoing them", () => {
@@ -95,6 +122,102 @@ describe("public text policy", () => {
     const unreviewed = ["@anthropic-ai", ["claude-code", "linux-x64"].join("-")].join("/");
     expect(() => assertPublicText(unreviewed, "unreviewed native package"))
       .toThrow(PublicTextPolicyError);
+  });
+
+  test("admits the three exact StyleX compiler packages without opening their scopes", () => {
+    const packages = ["@babel/core", "@stylexjs/babel-plugin", "@stylexjs/stylex"] as const;
+    for (const name of packages) {
+      expect(() => assertPublicText(`${name}@0.19.0`, "reviewed compiler dependency")).not.toThrow();
+      expect(() => assertPublicText(`${name}/reviewed-subpath`, "reviewed package subpath")).not.toThrow();
+      expect(() => assertPublicText(`${name}-unreviewed`, "unreviewed compiler dependency"))
+        .toThrow(PublicTextPolicyError);
+    }
+    for (const name of [["@babel", "unreviewed"], ["@stylexjs", "unreviewed"], ["@other", "ui"], ["@foreign", "package"]]) {
+      expect(() => assertPublicText(name.join("/"), "unreviewed scoped dependency")).toThrow(PublicTextPolicyError);
+    }
+    fc.assert(fc.property(fc.constantFrom(...packages), fc.stringMatching(/^[a-z][a-z0-9]{0,12}$/u), (name, suffix) => {
+      expect(() => assertPublicText(`${name}-${suffix}`, "unreviewed package suffix")).toThrow(PublicTextPolicyError);
+    }), { numRuns: 40 });
+  });
+
+  test("omits only the physical ignored checkout-root temporary evidence directory", async () => {
+    await withPublicCheckout(async (root) => {
+      await expect(assertPublicCheckout(root)).resolves.toBeUndefined();
+      await mkdir(join(root, "tmp", "app-browser-fixture"), { recursive: true });
+      await writeFile(join(root, "tmp", "app-browser-fixture", "request.json"), JSON.stringify({ root: syntheticPrivatePath() }));
+      await writeFile(join(root, "tmp", "app-browser-fixture", "profile.bin"), Buffer.from([0, 1, 2]));
+      await expect(assertPublicCheckout(root)).resolves.toBeUndefined();
+      await expect(assertPublicTree(root)).rejects.toBeInstanceOf(PublicTextPolicyError);
+    });
+  });
+
+  test("tracked temporary source cannot be hidden by its ignore rule", async () => {
+    await withPublicCheckout(async (root) => {
+      await mkdir(join(root, "tmp"));
+      await writeFile(join(root, "tmp", "source.json"), JSON.stringify({ path: syntheticPrivatePath() }));
+      fixtureGit(root, ["add", "--force", "--", "tmp/source.json"]);
+      await expect(assertPublicCheckout(root)).rejects.toMatchObject({ code: "ABSOLUTE_USER_PATH" });
+      const secret = ["github", "pat", "abcdefghijklmnopqrstuvwxyz123456"].join("_");
+      await writeFile(join(root, "tmp", "source.json"), JSON.stringify({ secret }));
+      await expect(assertPublicCheckout(root)).rejects.toMatchObject({ code: "SECRET_SHAPE" });
+    });
+  });
+
+  test("unignored temporary source and local-only ignore rules do not qualify for omission", async () => {
+    await withPublicCheckout(async (root) => {
+      await writeFile(join(root, ".gitignore"), "");
+      await mkdir(join(root, "tmp"));
+      await writeFile(join(root, "tmp", "source.json"), JSON.stringify({ path: syntheticPrivatePath() }));
+      await expect(assertPublicCheckout(root)).rejects.toMatchObject({ code: "ABSOLUTE_USER_PATH" });
+      await mkdir(join(root, ".git", "info"), { recursive: true });
+      await writeFile(join(root, ".git", "info", "exclude"), "tmp/\n");
+      await expect(assertPublicCheckout(root)).rejects.toMatchObject({ code: "ABSOLUTE_USER_PATH" });
+    });
+  });
+
+  test("temporary evidence symlinks fail closed without following their contents", async () => {
+    await withPublicCheckout(async (root) => {
+      await mkdir(join(root, "retained"));
+      await symlink(join(root, "retained"), join(root, "tmp"));
+      await expect(assertPublicCheckout(root)).rejects.toThrow("one physical directory");
+    });
+  });
+
+  test("nested temporary source and public archives never inherit the root exception", async () => {
+    await withPublicCheckout(async (root) => {
+      await mkdir(join(root, "tmp"));
+      await mkdir(join(root, "site", "tmp"), { recursive: true });
+      await writeFile(join(root, "site", "tmp", "source.json"), JSON.stringify({ path: syntheticPrivatePath() }));
+      await expect(assertPublicCheckout(root)).rejects.toMatchObject({ code: "ABSOLUTE_USER_PATH" });
+      await unlink(join(root, "site", "tmp", "source.json"));
+      await mkdir(join(root, "package", "tmp"), { recursive: true });
+      await writeFile(join(root, "package", "tmp", "receipt.json"), JSON.stringify({ path: syntheticPrivatePath() }));
+      await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "ABSOLUTE_USER_PATH" });
+    });
+  });
+
+  test("tracked edits and current nonignored untracked source still receive sensitive checks", async () => {
+    await withPublicCheckout(async (root) => {
+      await mkdir(join(root, "tmp"));
+      await writeFile(join(root, "new-source.ts"), JSON.stringify(syntheticPrivatePath()));
+      await expect(assertPublicCheckout(root)).rejects.toMatchObject({ code: "ABSOLUTE_USER_PATH" });
+      await unlink(join(root, "new-source.ts"));
+      await writeFile(join(root, "README.md"), syntheticPrivatePath());
+      await expect(assertPublicCheckout(root)).rejects.toMatchObject({ code: "ABSOLUTE_USER_PATH" });
+    });
+  });
+
+  test("checkout admission rejects nonrepositories and subdirectories of a Git root", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-public-no-git-")));
+    try {
+      await expect(assertPublicCheckout(root)).rejects.toThrow("Git evidence");
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+    await withPublicCheckout(async (checkout) => {
+      await mkdir(join(checkout, "source"));
+      await expect(assertPublicCheckout(join(checkout, "source"))).rejects.toThrow("exact physical Git root");
+    });
   });
 
   test("distinguishes annotated Git tag references from package scopes", () => {

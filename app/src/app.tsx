@@ -1,5 +1,6 @@
 import { AppearanceHeader } from "./components/appearance";
 import { ConvexAuthProvider, useConvexAuth } from "@convex-dev/auth/react";
+import * as stylex from "@stylexjs/stylex";
 import { useState } from "react";
 
 import { convexClient } from "./auth/convex-client";
@@ -16,10 +17,11 @@ import { navigateBack, useRoute } from "./routing/router";
 import { GridScreen } from "./screens/grid-screen";
 import { SessionScreen } from "./screens/session-screen";
 import { SettingsScreen } from "./screens/settings-screen";
+import { appStyles } from "./app.stylex";
 
 function Centered({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <main className="mx-auto flex min-h-dvh w-full max-w-md flex-col justify-center p-4">
+    <main {...stylex.props(appStyles.centered)}>
       <AppearanceHeader />
       {children}
     </main>
@@ -87,7 +89,7 @@ function AuthGate() {
   if (isLoading) {
     return (
       <Centered>
-        <p className="text-sm text-ink-muted">Checking your session.</p>
+        <p {...stylex.props(appStyles.quiet)}>Checking your session.</p>
       </Centered>
     );
   }

@@ -1,45 +1,57 @@
 import type { ButtonHTMLAttributes, ReactNode } from "react";
+import * as stylex from "@stylexjs/stylex";
+import type { StyleXStyles } from "@stylexjs/stylex";
 
-import { cn } from "../../lib/cn";
+import { staticStylexClassName } from "../../lib/cn";
+import { buttonStyles } from "./primitives.stylex";
 
 export type ButtonVariant = "primary" | "secondary" | "ghost" | "danger";
 export type ButtonSize = "default" | "small" | "icon";
 
-const variantClasses: Readonly<Record<ButtonVariant, string>> = {
-  danger: "bg-danger text-danger-ink hover:opacity-90",
-  ghost: "bg-transparent text-ink-muted hover:text-ink hover:bg-surface-raised",
-  primary: "bg-accent text-accent-ink hover:opacity-90",
-  secondary: "bg-surface-raised text-ink border border-line hover:border-ink-muted",
+const variantStyles: Readonly<Record<ButtonVariant, StyleXStyles>> = {
+  danger: buttonStyles.danger,
+  ghost: buttonStyles.ghost,
+  primary: buttonStyles.primary,
+  secondary: buttonStyles.secondary,
 };
 
-const sizeClasses: Readonly<Record<ButtonSize, string>> = {
-  default: "min-h-11 px-4 text-sm",
-  icon: "min-h-11 min-w-11 text-sm",
-  small: "min-h-11 px-3 text-xs",
+const sizeStyles: Readonly<Record<ButtonSize, StyleXStyles>> = {
+  default: buttonStyles.defaultSize,
+  icon: buttonStyles.iconSize,
+  small: buttonStyles.smallSize,
 };
 
-export type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & Readonly<{
+export type ButtonProps = Omit<ButtonHTMLAttributes<HTMLButtonElement>, "style"> & Readonly<{
   children?: ReactNode;
   size?: ButtonSize;
+  style?: never;
   variant?: ButtonVariant;
+  xstyle?: StyleXStyles;
 }>;
+
+function rejectInlineStyle(style: unknown): void {
+  if (style !== undefined) throw new Error("HRA primitives do not accept caller inline styles.");
+}
 
 export function Button({
   className,
   size = "default",
+  style,
   type = "button",
   variant = "primary",
+  xstyle,
   ...rest
 }: ButtonProps) {
+  rejectInlineStyle(style);
+  const presentation = stylex.props(
+    buttonStyles.root,
+    sizeStyles[size],
+    variantStyles[variant],
+    xstyle,
+  );
   return (
     <button
-      className={cn(
-        "inline-flex items-center justify-center gap-2 rounded-md font-medium",
-        "transition-opacity disabled:cursor-not-allowed disabled:opacity-50",
-        sizeClasses[size],
-        variantClasses[variant],
-        className,
-      )}
+      className={staticStylexClassName(presentation, className)}
       type={type}
       {...rest}
     />

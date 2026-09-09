@@ -1,3 +1,4 @@
+import * as stylex from "@stylexjs/stylex";
 import { memo, type ReactNode } from "react";
 
 import { CloseIcon } from "./icons";
@@ -9,6 +10,7 @@ import {
   savedSizeLine,
   type AttachmentManifestEntry,
 } from "../model/attachments";
+import { attachmentChipStyles } from "./attachment-chips.stylex";
 
 /**
  * Attachment chips, in the composer and under a sent message.
@@ -37,7 +39,7 @@ const Thumbnail = memo(function Thumbnail({
   return (
     <img
       alt={alt}
-      className="h-10 w-10 shrink-0 rounded border border-line object-cover"
+      {...stylex.props(attachmentChipStyles.thumbnail)}
       src={url}
     />
   );
@@ -54,28 +56,30 @@ export function ComposerAttachmentChips({
 }: ComposerAttachmentChipsProps): ReactNode {
   if (attachments.length === 0) return null;
   return (
-    <ul aria-label="Attachments" className="flex flex-wrap gap-2">
+    <ul aria-label="Attachments" {...stylex.props(attachmentChipStyles.list)}>
       {attachments.map((attachment) => {
         const saved = savedSizeLine(attachment);
         return (
           <li
-            className={[
-              "flex max-w-full items-center gap-2 rounded-md border px-2 py-1",
-              attachment.refusal === null ? "border-line" : "border-danger",
-            ].join(" ")}
+            {...stylex.props(
+              attachmentChipStyles.chip,
+              attachment.refusal === null
+                ? attachmentChipStyles.lineBorder
+                : attachmentChipStyles.dangerBorder,
+            )}
             key={attachment.id}
           >
             {attachment.previewUrl === null ? null : (
               <Thumbnail alt={attachment.name} url={attachment.previewUrl} />
             )}
-            <span className="flex min-w-0 flex-col">
-              <span className="truncate text-xs text-ink">{attachment.name}</span>
-              <span className="truncate text-[0.7rem] text-ink-muted">
+            <span {...stylex.props(attachmentChipStyles.itemStack)}>
+              <span {...stylex.props(attachmentChipStyles.name)}>{attachment.name}</span>
+              <span {...stylex.props(attachmentChipStyles.detail)}>
                 {typeAndSize(attachment.mediaType, attachment.bytes.byteLength)}
                 {saved === null ? "" : ` (${saved})`}
               </span>
               {attachment.refusal === null ? null : (
-                <span className="text-[0.7rem] text-danger">{attachment.refusal}</span>
+                <span {...stylex.props(attachmentChipStyles.error)}>{attachment.refusal}</span>
               )}
             </span>
             <Button
@@ -102,18 +106,18 @@ export function MessageAttachmentChips({
 }: MessageAttachmentChipsProps): ReactNode {
   if (attachments.length === 0) return null;
   return (
-    <ul aria-label="Message attachments" className="flex flex-wrap justify-end gap-2">
+    <ul aria-label="Message attachments" {...stylex.props(attachmentChipStyles.list, attachmentChipStyles.messageList)}>
       {attachments.map((attachment) => {
         const url = attachment.kind === "image" ? heldAttachmentUrl(attachment.digest) : null;
         return (
           <li
-            className="flex max-w-full items-center gap-2 rounded-md border border-line px-2 py-1"
+            {...stylex.props(attachmentChipStyles.chip, attachmentChipStyles.lineBorder)}
             key={attachment.digest}
           >
             {url === null ? null : <Thumbnail alt={attachment.name} url={url} />}
-            <span className="flex min-w-0 flex-col">
-              <span className="truncate text-xs text-ink">{attachment.name}</span>
-              <span className="truncate text-[0.7rem] text-ink-muted">
+            <span {...stylex.props(attachmentChipStyles.itemStack)}>
+              <span {...stylex.props(attachmentChipStyles.name)}>{attachment.name}</span>
+              <span {...stylex.props(attachmentChipStyles.detail)}>
                 {typeAndSize(attachment.mediaType, attachment.size)}
               </span>
             </span>

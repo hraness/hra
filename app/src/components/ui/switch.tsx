@@ -1,4 +1,8 @@
-import { cn } from "../../lib/cn";
+import * as stylex from "@stylexjs/stylex";
+import type { StyleXStyles } from "@stylexjs/stylex";
+
+import { staticStylexClassName } from "../../lib/cn";
+import { switchStyles } from "./primitives.stylex";
 
 export type SwitchProps = Readonly<{
   checked: boolean;
@@ -7,6 +11,7 @@ export type SwitchProps = Readonly<{
   id?: string;
   label: string;
   onCheckedChange: (checked: boolean) => void;
+  xstyle?: StyleXStyles;
 }>;
 
 /**
@@ -21,17 +26,18 @@ export function Switch({
   id,
   label,
   onCheckedChange,
+  xstyle,
 }: SwitchProps) {
+  const presentation = stylex.props(
+    switchStyles.root,
+    checked ? switchStyles.checked : switchStyles.unchecked,
+    xstyle,
+  );
   return (
     <button
       aria-checked={checked}
       aria-label={label}
-      className={cn(
-        "relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border border-line",
-        "transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-        checked ? "bg-accent" : "bg-surface-input",
-        className,
-      )}
+      className={staticStylexClassName(presentation, className)}
       disabled={disabled}
       id={id}
       onClick={() => { onCheckedChange(!checked); }}
@@ -39,10 +45,10 @@ export function Switch({
       type="button"
     >
       <span
-        className={cn(
-          "pointer-events-none block h-4 w-4 rounded-full transition-transform",
-          checked ? "translate-x-6 bg-accent-ink" : "translate-x-1 bg-ink",
-        )}
+        className={stylex.props(
+          switchStyles.knob,
+          checked ? switchStyles.knobChecked : switchStyles.knobUnchecked,
+        ).className}
       />
     </button>
   );
