@@ -74,12 +74,50 @@ export function nativeCall<A>(run: () => A | PromiseLike<A>): ClaudeProgram<A> {
   })).pipe(Effect.uninterruptible);
 }
 
-/** Native admission arbitration deliberately observes initialization first. */
+/** Cleanup admission must enter the native port before another resource's
+ * prologue. Its caller has already reserved the owning work group; return the
+ * exact observed Promise so that group's continuation can join settlement. */
+export function nativeCleanupObservation(run: () => Promise<void>): ClaudeProgram<Promise<void>> {
+  return Effect.flatMap(ClaudeConnectionWork, work => attempt(() => {
+    const promise = run();
+    const observation: ClaudeNativeObservation = { promise };
+    work.native.add(observation);
+    const complete = (): void => { work.native.delete(observation); };
+    void promise.then(complete, complete);
+    return promise;
+  }));
+}
+
+/** Native admission arbitration deliberately observes initialization first.
+ * Its early rejection does not settle the original mapped identity operation:
+ * an admission reservation retains that operation until its actual settlement. */
 export function nativeInitializationIdentity<A>(
   initialization: Promise<A>, process: ClaudeProcess,
   parse: (identity: ClaudeProcessIdentity) => ClaudeProcessIdentity,
+  settled: () => void,
 ): ClaudeProgram<[A, ClaudeProcessIdentity]> {
-  return nativeCall(() => Promise.all([initialization, process.identity.then(parse)]));
+  return Effect.flatMap(ClaudeConnectionWork, work => nativeCall(() => {
+    try {
+      const identity = process.identity.then(parse);
+      const arbitration = Promise.all([initialization, identity]);
+      // Register Promise.all's original reactions before this passive owner
+      // observation. The same mapped Promise remains its arbitration input.
+      const observation: ClaudeNativeObservation = { promise: identity };
+      work.native.add(observation);
+      const complete = (): void => { work.native.delete(observation); settled(); };
+      void identity.then(complete, complete);
+      return arbitration;
+    } catch (reason: unknown) {
+      // Promise.all could not subscribe after an accessor fault. Initialization
+      // still owns its original timer/abort observation; retain its settlement
+      // without replacing the accessor failure returned by admission.
+      const observation: ClaudeNativeObservation = { promise: initialization };
+      work.native.add(observation);
+      const complete = (): void => { work.native.delete(observation); settled(); };
+      void initialization.then(complete, complete);
+      throw reason;
+    }
+  }));
 }
 
 export const forceNativeProcess = (process: ClaudeProcess): ClaudeProgram<void> =>
@@ -99,17 +137,21 @@ export const nativeTurn = (): ClaudeProgram<void> => nativeCall(() => new Promis
   timer.unref();
 }));
 
+/** A completion-only observer may also bound an already-retained outer scope
+ * disposal. It must not enroll itself in the scope that it is observing. */
+export function nativeSettlementWithin(promise: Promise<unknown>, milliseconds: number, requireResolution = false): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise.then(() => true, () => !requireResolution),
+    new Promise<false>(resolve => {
+      timer = setTimeout(() => resolve(false), milliseconds);
+      timer.unref();
+    }),
+  ]).finally(() => { if (timer !== undefined) clearTimeout(timer); });
+}
+
 export function observeWithin(promise: Promise<unknown>, milliseconds: number, requireResolution = false): ClaudeProgram<boolean> {
-  return nativeCall(() => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    return Promise.race([
-      promise.then(() => true, () => !requireResolution),
-      new Promise<false>(resolve => {
-        timer = setTimeout(() => resolve(false), milliseconds);
-        timer.unref();
-      }),
-    ]).finally(() => { if (timer !== undefined) clearTimeout(timer); });
-  });
+  return nativeCall(() => nativeSettlementWithin(promise, milliseconds, requireResolution));
 }
 
 export interface ClaudeCompletion<A> {
@@ -185,10 +227,12 @@ export function consumeNative<A>(source: AsyncIterable<A>, consume: (value: A) =
       if (step.done) return;
       const body = yield* Effect.exit(consume(step.value));
       if (body._tag === "Failure") {
-        yield* Effect.exit(Effect.gen(function* () {
+        yield* Effect.gen(function* () {
+          // AsyncIteratorClose gets this method once, then calls its exact receiver below.
+          // eslint-disable-next-line @typescript-eslint/unbound-method
           const close = yield* attempt(() => iterator.return);
           if (close !== undefined) yield* nativeCall(() => close.call(iterator));
-        }));
+        }).pipe(Effect.matchCause({ onFailure: () => undefined, onSuccess: () => undefined }));
         return yield* Effect.failCause(body.cause);
       }
     }

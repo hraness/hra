@@ -49,6 +49,8 @@ import {
   withClaudeSessionConfig,
   activateClaudeSessionTools,
   closeClaudeSession,
+  prepareCloseClaudeSession,
+  prepareRevokeClaudeSessionTools,
   revokeClaudeSessionTools,
   type ClaudeRuntimeConnection,
   type ClaudeRuntimeSessionWork,
@@ -961,67 +963,75 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
 
   async handleSessionHostToolCall(call: ClaudeHostToolCall): Promise<ClaudeHostToolPublicResult> {
     const connection = this.#hostToolConnection(call);
-    return await connection.effects.run("capabilities", this.#hostToolSessionProgram(call, session =>
-      callClaudeHostTool({
-        connection: connection.effects,
-        prepare: () => {
-          const key = this.#hostToolCallKey(call.callId);
-          const existing = session.hostToolCalls.get(key);
-          if (existing !== undefined) {
-            throw new ClaudeError("AUTHORITY_STALE", existing.requestDigest === call.requestDigest
-              ? "Claude host-tool call is already pending." : "Claude host-tool call id was reused.");
-          }
-          const completedDigest = session.hostToolCallTombstones.get(key);
-          if (completedDigest !== undefined) {
-            throw new ClaudeError("AUTHORITY_STALE", completedDigest === call.requestDigest
-              ? "Claude host-tool call was already completed." : "Claude host-tool call id was reused.");
-          }
-          if (session.hostToolCalls.size + session.hostToolCallTombstones.size >= CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT) {
-            throw new ClaudeError("PROTOCOL_LIMIT", "Claude host-tool call history is exhausted.");
-          }
-          if (session.activeTurnId === undefined) {
-            throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool call has no active turn.");
-          }
-          if (session.hostToolCalls.size >= HOST_TOOL_CALL_LIMIT) {
-            throw new ClaudeError("PROTOCOL_LIMIT", "Claude host-tool call retention exceeded its limit.");
-          }
-          const normalized = this.#normalizeHostToolCall(session, session.activeTurnId, call);
-          session.hostToolCalls.set(key, { bindingId: call.bindingId, call: normalized, requestDigest: call.requestDigest });
-          return { key, normalized };
-        },
-        invoke: ({ normalized }) => {
-          if (this.#observer.hraHostTool === undefined) {
-            throw new ClaudeError("UNSUPPORTED_CAPABILITY", "The HRA host-tool service is unavailable.");
-          }
-          return this.#observer.hraHostTool(session.authority, normalized);
-        },
-        failed: ({ key }) => {
-          session.hostToolCalls.delete(key);
-          this.#rememberHostToolCall(session, key, call.requestDigest);
-        },
-      })));
+    try {
+      return await connection.effects.run("capabilities", this.#hostToolSessionProgram(call, session =>
+        callClaudeHostTool({
+          connection: connection.effects,
+          prepare: () => {
+            const key = this.#hostToolCallKey(call.callId);
+            const existing = session.hostToolCalls.get(key);
+            if (existing !== undefined) {
+              throw new ClaudeError("AUTHORITY_STALE", existing.requestDigest === call.requestDigest
+                ? "Claude host-tool call is already pending." : "Claude host-tool call id was reused.");
+            }
+            const completedDigest = session.hostToolCallTombstones.get(key);
+            if (completedDigest !== undefined) {
+              throw new ClaudeError("AUTHORITY_STALE", completedDigest === call.requestDigest
+                ? "Claude host-tool call was already completed." : "Claude host-tool call id was reused.");
+            }
+            if (session.hostToolCalls.size + session.hostToolCallTombstones.size >= CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT) {
+              throw new ClaudeError("PROTOCOL_LIMIT", "Claude host-tool call history is exhausted.");
+            }
+            if (session.activeTurnId === undefined) {
+              throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool call has no active turn.");
+            }
+            if (session.hostToolCalls.size >= HOST_TOOL_CALL_LIMIT) {
+              throw new ClaudeError("PROTOCOL_LIMIT", "Claude host-tool call retention exceeded its limit.");
+            }
+            const normalized = this.#normalizeHostToolCall(session, session.activeTurnId, call);
+            session.hostToolCalls.set(key, { bindingId: call.bindingId, call: normalized, requestDigest: call.requestDigest });
+            return { key, normalized };
+          },
+          invoke: ({ normalized }) => {
+            if (this.#observer.hraHostTool === undefined) {
+              throw new ClaudeError("UNSUPPORTED_CAPABILITY", "The HRA host-tool service is unavailable.");
+            }
+            return this.#observer.hraHostTool(session.authority, normalized);
+          },
+          failed: ({ key }) => {
+            session.hostToolCalls.delete(key);
+            this.#rememberHostToolCall(session, key, call.requestDigest);
+          },
+        })));
+    } finally {
+      this.#retireSessionConnection(connection);
+    }
   }
 
   async handleSessionHostToolResponseWritten(receipt: ClaudeHostToolResponseWritten): Promise<void> {
     const connection = this.#hostToolConnection(receipt);
-    return await connection.effects.run("capabilities", this.#hostToolSessionProgram(receipt, session =>
-      callClaudeHostTool({
-        connection: connection.effects,
-        prepare: () => {
-          const key = this.#hostToolCallKey(receipt.callId);
-          const retained = session.hostToolCalls.get(key);
-          if (retained === undefined || retained.bindingId !== receipt.bindingId
-            || retained.requestDigest !== receipt.requestDigest) {
-            throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool response receipt is stale.");
-          }
-          return { key, retained };
-        },
-        invoke: ({ retained }) => this.#observer.hraHostToolResponseWritten?.(session.authority, retained.call),
-        complete: ({ key }) => {
-          session.hostToolCalls.delete(key);
-          this.#rememberHostToolCall(session, key, receipt.requestDigest);
-        },
-      })));
+    try {
+      return await connection.effects.run("capabilities", this.#hostToolSessionProgram(receipt, session =>
+        callClaudeHostTool({
+          connection: connection.effects,
+          prepare: () => {
+            const key = this.#hostToolCallKey(receipt.callId);
+            const retained = session.hostToolCalls.get(key);
+            if (retained === undefined || retained.bindingId !== receipt.bindingId
+              || retained.requestDigest !== receipt.requestDigest) {
+              throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool response receipt is stale.");
+            }
+            return { key, retained };
+          },
+          invoke: ({ retained }) => this.#observer.hraHostToolResponseWritten?.(session.authority, retained.call),
+          complete: ({ key }) => {
+            session.hostToolCalls.delete(key);
+            this.#rememberHostToolCall(session, key, receipt.requestDigest);
+          },
+        })));
+    } finally {
+      this.#retireSessionConnection(connection);
+    }
   }
 
   #hostToolConnection(call: ClaudeHostToolCall): ClaudeRuntimeConnection {
@@ -1270,9 +1280,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
           connection, client,
           released: () => {
             this.#unboundClients.delete(client);
-            const providerThreadId = this.#initializingClients.get(client);
             this.#initializingClients.delete(client);
-            if (providerThreadId !== undefined) this.#startingSessionIds.delete(providerThreadId);
           },
         })));
       }),
@@ -1298,13 +1306,12 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       }),
       ...connections.filter(connection => connection.process !== undefined
         && connection.client === undefined && !connection.processExitProven)
-        .map(connection => own(connection, this.#boundedConnectionCleanup(connection, () => completeClaudeOperation(
-          () => closeUnboundClaudeProcess(connection,
-            this.#clientShutdownSettlementMs ?? PROCESS_CONSTRUCTOR_FAILURE_SETTLEMENT_MS),
-          () => { this.#startingSessionIds.delete(connection.providerThreadId); },
-        )))),
-      ...connections.map(connection => own(connection, connection.effects.run("control",
-        joinClaudeConnection(connection, this.#connectionShutdownSettlementMs)))),
+        .map(connection => own(connection, this.#boundedConnectionCleanup(connection, () =>
+          closeUnboundClaudeProcess(connection,
+            this.#clientShutdownSettlementMs ?? PROCESS_CONSTRUCTOR_FAILURE_SETTLEMENT_MS)))),
+      ...connections.map(connection => own(connection, connection.retirement === undefined
+        ? connection.effects.run("control", joinClaudeConnection(connection, this.#connectionShutdownSettlementMs))
+        : connection.effects.observeDisposal(this.#connectionShutdownSettlementMs))),
     ];
     const settlements = await Promise.allSettled(tasks.map(task => task.promise));
     const failedConnections = new Set<ClaudeRuntimeConnection>();
@@ -1315,11 +1322,23 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       return [settlement.reason as unknown];
     });
     for (const connection of connections) {
+      if (connection.retirement !== undefined) {
+        if (!failedConnections.has(connection)) {
+          try {
+            await connection.effects.observeDisposal(this.#connectionShutdownSettlementMs);
+            await connection.retirementObservation;
+          } catch (reason: unknown) {
+            failures.push(reason);
+          }
+        }
+        continue;
+      }
       if (connection.acquisitionSettled && connection.binding === undefined
         && (connection.process === undefined || connection.processExitProven)) {
         try {
           await connection.effects.dispose();
           this.#connections.delete(connection);
+          this.#startingSessionIds.delete(connection.providerThreadId);
         } catch (reason: unknown) {
           failures.push(reason);
         }
@@ -1340,12 +1359,14 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
 
   #boundedConnectionCleanup(
     connection: ClaudeRuntimeConnection, program: () => ClaudeProgram<void>,
+    prepare?: () => ClaudeProgram<ClaudeProgram<void>>,
   ): Promise<void> {
     return connection.effects.run("control", boundedClaudeWork({
       connection: connection.effects,
       get: () => connection.cleanup,
       set: task => { connection.cleanup = task; },
       program,
+      ...(prepare === undefined ? {} : { prepare }),
       settlementMs: this.#connectionShutdownSettlementMs,
       message: "Claude connection cleanup has not settled; its exact resource owner is retained.",
     }));
@@ -1509,7 +1530,11 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     const unresolvedRawProcess = [...this.#connections].some(connection =>
       connection !== options.allowConnection && connection.process !== undefined
       && connection.client === undefined && !connection.processExitProven);
-    if (this.#unboundClients.size > 0 || unresolvedBinding || unresolvedRawProcess
+    // Native identity/parse work can outlive failed admission and proven child
+    // exit. The exact failed owner remains a fence until its scope disposes.
+    const unresolvedAdmission = [...this.#connections].some(connection =>
+      connection !== options.allowConnection && connection.acquisitionSettled && !connection.admitted);
+    if (this.#unboundClients.size > 0 || unresolvedBinding || unresolvedRawProcess || unresolvedAdmission
       || [...this.#sessions.values()].some((session) =>
         session.closeState !== "open" || session.client.state !== "open")) {
       throw new ClaudeError(
@@ -1568,6 +1593,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       effects, providerThreadId: input.providerThreadId,
       binding: undefined, process: undefined, client: undefined, rawExit: undefined,
       processExitProven: false, admitted: false, acquisitionSettled: false, cleanup: undefined,
+      retirement: undefined, retirementObservation: undefined, retirementTrigger: undefined,
       bindingRevocation: undefined, bindingCleanup: undefined, admissionJoin: undefined, retainedFailure: undefined,
     };
     this.#startingSessionIds.add(input.providerThreadId);
@@ -1616,6 +1642,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
         },
         construct: (process, configDir, connectionId) => new ClaudeStreamClient({
           configDir, process,
+          now: this.#now,
           onFact: () => undefined,
           ...(this.#clientShutdownTermGraceMs === undefined ? {}
             : { shutdownTermGraceMs: this.#clientShutdownTermGraceMs }),
@@ -1684,7 +1711,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
             ? connection.process === undefined || connection.processExitProven
             : connection.admitted || client.state === "closed";
           if (released) {
-            this.#startingSessionIds.delete(input.providerThreadId);
+            if (connection.admitted) this.#startingSessionIds.delete(input.providerThreadId);
             if (client !== undefined) this.#initializingClients.delete(client);
           }
         },
@@ -1697,6 +1724,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
         try {
           await effects.dispose();
           this.#connections.delete(connection);
+          this.#startingSessionIds.delete(input.providerThreadId);
         } catch { /* Exact work/custody remains available to manager.close. */ }
       }
       throw reason;
@@ -1754,11 +1782,47 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     // endSession must fence the exact session before its public Promise returns;
     // admission cannot wait for the cleanup fiber to begin executing.
     if (this.#sessions.get(providerThreadId) === session) session.closeState = "closing";
-    return await this.#boundedConnectionCleanup(session.connection, () => this.#closeSessionProgram(providerThreadId, session));
+    try {
+      await this.#boundedConnectionCleanup(session.connection,
+        () => this.#closeSessionProgram(providerThreadId, session),
+        () => prepareCloseClaudeSession(this.#closeSessionInput(providerThreadId, session)));
+    } finally {
+      const connection = session.connection;
+      const task = connection.cleanup;
+      if (task !== undefined && connection.retirementTrigger?.task !== task) {
+        // A bounded waiter may leave before the original cleanup completes.
+        // Retain this passive native completion observer so late success also
+        // retires the exact runtime, without entering it from its own program.
+        connection.retirementTrigger = {
+          task,
+          promise: task.promise.then(
+            () => { this.#retireSessionConnection(connection); },
+            () => { this.#retireSessionConnection(connection); },
+          ),
+        };
+      }
+    }
+  }
+
+  #retireSessionConnection(connection: ClaudeRuntimeConnection): void {
+    if (connection.retirement !== undefined || !connection.admitted || !connection.processExitProven
+      || connection.binding !== undefined
+      || [...this.#sessions.values()].some(session => session.connection === connection)) return;
+    // This outer retirement never waits under daemon/service serialization.
+    // Its exact Promise fences and drains the owner, including late notices.
+    const retirement = connection.effects.disposeWhenIdle();
+    connection.retirement = retirement;
+    connection.retirementObservation = retirement.then(() => {
+      this.#connections.delete(connection);
+    }, () => undefined);
   }
 
   #closeSessionProgram(providerThreadId: string, session: RunningSession): ClaudeProgram<void> {
-    return closeClaudeSession({
+    return closeClaudeSession(this.#closeSessionInput(providerThreadId, session));
+  }
+
+  #closeSessionInput(providerThreadId: string, session: RunningSession): Parameters<typeof closeClaudeSession>[0] {
+    return {
       session,
       markClosing: () => {
         if (this.#sessions.get(providerThreadId) === session) session.closeState = "closing";
@@ -1766,14 +1830,20 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       markFailed: () => {
         if (this.#sessions.get(providerThreadId) === session) session.closeState = "failed";
       },
-      revoke: () => this.#revokeSessionHostToolsProgram(session),
+      revoke: () => prepareRevokeClaudeSessionTools({
+        session, revoke: bindingId => this.#hostTools.bindingAuthority.revoke(bindingId),
+        clearCalls: () => {
+          session.hostToolCalls.clear();
+          session.hostToolCallTombstones.clear();
+        },
+      }),
       released: () => {
         if (this.#sessions.get(providerThreadId) === session) {
           this.#rememberClosedSession(providerThreadId, session.authority);
           this.#sessions.delete(providerThreadId);
         }
       },
-    });
+    };
   }
 
   #revokeSessionHostToolsProgram(session: RunningSession): ClaudeProgram<void> {

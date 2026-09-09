@@ -18,6 +18,8 @@ const findings = inspectEffectArchitecture(createArchitectureProgram(resolve(roo
   ],
   adapters: [
     "src/codex/session-effects.ts",
+    // Owns native Promise projection at the prepared interpreter's public edge.
+    "src/claude/session-effects.ts",
     "src/claude/session-platform.ts",
     "src/daemon/claude-runtime-adapter.ts",
   ],

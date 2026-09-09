@@ -10,8 +10,8 @@ import {
   claudeRequestDigest, claudeResponseDigest, claudeUserLine, parseClaudeStreamLine,
   type ClaudeCanUseTool, type ClaudeControlResponse,
 } from "./protocol.ts";
-import { ClaudeConnectionEffects } from "./session-effects.ts";
-import { failureReason, taskFailure } from "./session-model.ts";
+import type { ClaudeConnectionEffects } from "./session-effects.ts";
+import { failureReason, taskFailure, type ClaudeTaskFailure } from "./session-model.ts";
 import {
   attempt, ClaudeConnectionWork, consumeNative, initializationObservation,
   nativeCall, nativeRequestId, nativeMicrotask, observeWithin, processExitObservation, type ClaudeOwnedTask, type ClaudeProgram, type ClaudeCompletion,
@@ -168,34 +168,47 @@ export class ClaudeClientProgram {
   }
 
   close(): ClaudeProgram<void> {
+    return Effect.flatMap(this.prepareClose(), settlement => settlement);
+  }
+
+  /** Enter native cleanup on the current caller's fiber, then return the exact
+   * already-owned settlement without awaiting it under another resource's
+   * admission. A manager can admit revoke and TERM before joining either. */
+  prepareClose(): ClaudeProgram<ClaudeProgram<void>> {
     return Effect.gen(this, function* () {
       if (this.#owner.callbackActive()) {
         return yield* Effect.fail(taskFailure(new ClaudeError("INVALID_INPUT", "Claude fact callbacks cannot join their own client cleanup.")));
       }
-      if (this.#closeTask !== null) return yield* this.#closeTask.program;
-      if (this.#state === "closed") return;
+      if (this.#closeTask !== null) return this.#closeTask.program;
+      if (this.#state === "closed") return Effect.void;
+      const completion = yield* this.#owner.reserve<undefined>("control");
+      this.#closeTask = completion.task;
       // Admission is fenced in the caller's immediate fiber before a fork or wait.
       this.#state = "closing";
       this.#failInitialization(new ClaudeError("PROCESS_EXITED", "The Claude runtime closed before initialization."));
-      const completion = yield* this.#owner.reserve<void>("control");
-      this.#closeTask = completion.task;
-      const result = yield* Effect.exit(Effect.gen(this, function* () {
-        // TERM is part of synchronous close admission. In particular, an exit
-        // already resolved natively but not yet observed must not skip this call.
-        const waitForTerm = !this.#exitResolved;
+      // An exit resolved natively but not yet observed must not skip TERM.
+      const waitForTerm = !this.#exitResolved;
+      const admitted = yield* Effect.exit(Effect.gen(this, function* () {
         if (waitForTerm) {
           const terminated = yield* Effect.exit(attempt(() => this.#options.process.terminate()));
           if (Exit.isFailure(terminated)) yield* this.#diagnostic("claude TERM failed; forcing process termination");
         }
-        const task = yield* this.#owner.fork("control", this.#closeResources(waitForTerm));
-        yield* task.program;
       }));
-      if (Exit.isFailure(result)) {
-        completion.reject(failureReason(result.cause));
+      if (Exit.isFailure(admitted)) {
+        completion.failCause(admitted.cause);
         if (this.#closeTask === completion.task) this.#closeTask = null;
-        return yield* Effect.failCause(result.cause);
+        return completion.task.program;
       }
-      completion.succeed(undefined);
+      yield* this.#owner.fork("control", Effect.gen(this, function* () {
+        const result = yield* Effect.exit(this.#closeResources(waitForTerm));
+        if (Exit.isFailure(result)) {
+          completion.failCause(result.cause);
+          if (this.#closeTask === completion.task) this.#closeTask = null;
+          return;
+        }
+        completion.succeed(undefined);
+      }));
+      return completion.task.program;
     });
   }
 
@@ -247,14 +260,14 @@ export class ClaudeClientProgram {
 
   #closeFacts(): ClaudeProgram<void> {
     return Effect.gen(this, function* () {
-      let first: Exit.Failure<unknown, import("./session-model.ts").ClaudeTaskFailure> | undefined;
+      let first: Exit.Failure<unknown, ClaudeTaskFailure> | undefined;
       if (this.#pendingTurnStart !== null) {
         const drained = yield* Effect.exit(this.#drainPendingTurnStart(this.#pendingTurnStart, false));
         if (Exit.isFailure(drained)) first = drained;
       }
       for (const fact of this.#assembler.abandonTurn("the Claude runtime was closed")) {
         const delivered = yield* Effect.exit(this.#emitFact(fact));
-        if (Exit.isFailure(delivered)) first ??= delivered;
+        if (Exit.isFailure(delivered) && first === undefined) first = delivered;
       }
       if (first !== undefined) return yield* Effect.failCause(first.cause);
     });
@@ -315,7 +328,7 @@ export class ClaudeClientProgram {
       if (this.#pendingTurnStart !== pending) return;
       const drain = Effect.gen(this, function* () {
         yield* nativeMicrotask();
-        let first: Exit.Failure<unknown, import("./session-model.ts").ClaudeTaskFailure> | undefined;
+        let first: Exit.Failure<unknown, ClaudeTaskFailure> | undefined;
         if (accepted) {
           const delivered = yield* Effect.exit(this.#deliverFact({ type: "turnStarted", turnId: pending.turnId }));
           if (Exit.isFailure(delivered)) first = delivered;
@@ -325,7 +338,7 @@ export class ClaudeClientProgram {
           if (item === undefined) break;
           pending.bytes -= item.bytes;
           const delivered = yield* Effect.exit(this.#deliverFact(item.fact));
-          if (Exit.isFailure(delivered)) first ??= delivered;
+          if (Exit.isFailure(delivered) && first === undefined) first = delivered;
         }
         if (this.#pendingTurnStart === pending) this.#pendingTurnStart = null;
         if (first !== undefined) return yield* Effect.failCause(first.cause);
@@ -446,14 +459,15 @@ export class ClaudeClientProgram {
 
   #drainStderr(): ClaudeProgram<void> {
     return Effect.gen(this, function* () {
-      let observed = 0;
-      let truncated = false;
-      yield* Effect.exit(consumeNative(this.#options.process.stderr, chunk => attempt(() => {
-        const retained = Math.min(chunk.byteLength, 4096 - observed);
-        observed += retained;
-        if (retained < chunk.byteLength) truncated = true;
-      })));
-      if (observed > 0) yield* this.#diagnostic(`claude stderr bytes: ${String(observed)}${truncated ? "+" : ""}`);
+      const diagnostic = { observed: 0, truncated: false };
+      // Stderr stream failure does not replace the separately observed process
+      // outcome; still join its exact iterator before publishing diagnostics.
+      yield* consumeNative(this.#options.process.stderr, chunk => attempt(() => {
+        const retained = Math.min(chunk.byteLength, 4096 - diagnostic.observed);
+        diagnostic.observed += retained;
+        if (retained < chunk.byteLength) diagnostic.truncated = true;
+      })).pipe(Effect.matchCause({ onFailure: () => undefined, onSuccess: () => undefined }));
+      if (diagnostic.observed > 0) yield* this.#diagnostic(`claude stderr bytes: ${String(diagnostic.observed)}${diagnostic.truncated ? "+" : ""}`);
     });
   }
 }

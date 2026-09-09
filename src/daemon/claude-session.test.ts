@@ -1975,6 +1975,21 @@ describe("Claude owned interaction settlement through the service", () => {
       let closeSettled = false;
       let nativeWrite: Promise<void> | undefined;
       let restoreWrite: (() => void) | undefined;
+      let managerResponse: Promise<PromiseSettledResult<{ responseWritten: true }>> | undefined;
+      const originalResolve = value.runtime.resolveInteraction.bind(value.runtime);
+      const resolver = spyOn(value.runtime, "resolveInteraction").mockImplementation((input) => {
+        const original = originalResolve(input);
+        managerResponse = Promise.allSettled([original]).then(([outcome]) => {
+          trace.push("manager-response-" + outcome!.status);
+          return outcome!;
+        });
+        joined.push(managerResponse);
+        return original;
+      });
+      const observedSession: {
+        end?: () => Promise<void>;
+        isLive?: () => boolean;
+      } = {};
       const originalObserver = value.service.observeClaudeFact.bind(value.service);
       const observer = spyOn(value.service, "observeClaudeFact").mockImplementation(async (authority, fact) => {
         const notice = fact.type === "interactionCanceled" && fact.requestId === requestId;
@@ -1987,6 +2002,8 @@ describe("Claude owned interaction settlement through the service", () => {
         trace.push("notice-observed");
         if (stage === "callback-held") {
           const exactSession = { authority, providerThreadId: fact.providerThreadId };
+          observedSession.end = () => value.runtime.endSession({ ...exactSession, signal });
+          observedSession.isLive = () => value.runtime.hasLiveSession(exactSession);
           liveBeforeSelfClose = value.runtime.hasLiveSession(exactSession);
           [selfClose] = await Promise.allSettled([value.runtime.close()]);
           liveAfterSelfClose = value.runtime.hasLiveSession(exactSession);
@@ -2008,6 +2025,11 @@ describe("Claude owned interaction settlement through the service", () => {
         }, { signal });
         process.emit(approvalRequestLine(requestId));
         await within(approvalObserved.promise);
+        // Provider observation can return after reserving an ordered durable
+        // fact behind a caller's mutation tail. Join that actual service work
+        // before treating the observed approval as a persisted pending row.
+        await within(value.service.settled());
+        trace.push("approval-service-settled");
         const pending = await value.service.execute({
           kind: "interaction.list", limit: 10, pending: true, session: started.session.id,
         }, { signal }) as { interactions: readonly { id: string; revision: number }[] };
@@ -2079,7 +2101,19 @@ describe("Claude owned interaction settlement through the service", () => {
           expect(closeSettled).toBe(false);
           await within(releaseOnNativeTurn(writeRelease.release));
           const [resolved, closed] = await within(Promise.all([responseOutcome, closing]));
-          expect(resolved.status).toBe("fulfilled");
+          // The exact provider write completes, but the service must still
+          // reattest its account after that effect. Closing the manager fences
+          // that fresh read, so durable resolution stays explicitly uncertain.
+          expect(resolved.status).toBe("rejected");
+          if (resolved.status === "rejected") {
+            expect(resolved.reason).toMatchObject({
+              code: "RECOVERY_REQUIRED",
+              details: { interaction: { id: interaction.id, state: "resolution_unknown" } },
+            });
+          }
+          trace.push("service-recovery-required");
+          expect(value.store.requireInteraction(interaction.id).state).toBe("resolution_unknown");
+          trace.push("durable-resolution-unknown");
           expect(closed.status).toBe("fulfilled");
           expect(trace.indexOf("write-fulfilled")).toBeGreaterThan(trace.indexOf("release-handoff"));
           expect(trace.indexOf("close-fulfilled")).toBeGreaterThan(trace.indexOf("write-fulfilled"));
@@ -2097,6 +2131,17 @@ describe("Claude owned interaction settlement through the service", () => {
             expect(selfClose.reason).toMatchObject({ code: "INVALID_INPUT" });
           }
           expect(liveAfterSelfClose).toBe(true);
+          if (observedSession.end === undefined) throw new Error("Expected the exact observed session authority");
+          const ending = Promise.allSettled([observedSession.end()]).then(([result]) => {
+            trace.push("end-session-" + result!.status);
+            return result!;
+          });
+          joined.push(ending);
+          // End the exact child without awaiting the callback's own retirement:
+          // real service callers may still hold their serialization authority.
+          expect((await within(ending)).status).toBe("fulfilled");
+          expect(observedSession.isLive?.()).toBe(false);
+          expect(trace).not.toContain("notice-returned");
           const closing = close();
           expect(closeSettled).toBe(false);
           await within(releaseOnNativeTurn(callbackRelease.release));
@@ -2105,6 +2150,10 @@ describe("Claude owned interaction settlement through the service", () => {
           expect(trace.indexOf("close-fulfilled")).toBeGreaterThan(trace.indexOf("notice-returned"));
           expect(trace.filter((entry) => entry === "notice-invoked")).toHaveLength(1);
         }
+        if (managerResponse === undefined) throw new Error("Expected the original manager response");
+        expect(await within(managerResponse)).toEqual({
+          status: "fulfilled", value: { responseWritten: true },
+        });
         expect(process.written.filter((line) => line.includes("control_response"))).toHaveLength(1);
       } finally {
         if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
@@ -2117,6 +2166,7 @@ describe("Claude owned interaction settlement through the service", () => {
         await Promise.allSettled(joined);
         if (nativeWrite !== undefined) await Promise.allSettled([nativeWrite]);
         restoreWrite?.();
+        resolver.mockRestore();
         observer.mockRestore();
         try {
           await value.runtime.close();

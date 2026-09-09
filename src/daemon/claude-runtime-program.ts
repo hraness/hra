@@ -9,7 +9,7 @@ import type { ClaudeConnectionEffects } from "../claude/session-effects.ts";
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- This Claude daemon program composes the qualified provider connection programs and native ports.
 import { failureReason, taskFailure, type TaskGroup } from "../claude/session-model.ts";
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- This Claude daemon program composes the qualified provider connection programs and native ports.
-import { attempt, forceNativeProcess, nativeCall, nativeInitializationIdentity, nativeMicrotask, nativeProcessExit, nativeTurn, observeWithin, type ClaudeOwnedTask, type ClaudeProgram } from "../claude/session-platform.ts";
+import { attempt, forceNativeProcess, nativeCall, nativeCleanupObservation, nativeInitializationIdentity, nativeMicrotask, nativeProcessExit, nativeTurn, observeWithin, type ClaudeOwnedTask, type ClaudeProgram } from "../claude/session-platform.ts";
 import { ClaudeProcessExitUnprovenError } from "./ports.ts";
 
 /** Exact custody, not a second work scheduler. Work lives in the connection's
@@ -24,6 +24,9 @@ export interface ClaudeRuntimeConnection {
   processExitProven: boolean;
   admitted: boolean;
   acquisitionSettled: boolean;
+  retirement: Promise<void> | undefined;
+  retirementObservation: Promise<void> | undefined;
+  retirementTrigger: Readonly<{ task: ClaudeOwnedTask<void>; promise: Promise<void> }> | undefined;
   cleanup: ClaudeOwnedTask<void> | undefined;
   bindingRevocation: ClaudeOwnedTask<void> | undefined;
   bindingCleanup: ClaudeOwnedTask<void> | undefined;
@@ -52,7 +55,7 @@ function sharedWork<A>(input: {
   return Effect.gen(function* () {
     const existing = yield* attempt(input.get);
     if (existing !== undefined) return yield* existing.program;
-    const start = yield* Deferred.make<void>();
+    const start = yield* Deferred.make<undefined>();
     const task = yield* input.connection.fork(input.group,
       Effect.zipRight(Deferred.await(start), Effect.suspend(input.program)));
     yield* attempt(() => { input.set(task); });
@@ -70,20 +73,28 @@ export function boundedClaudeWork(input: {
   readonly get: () => ClaudeOwnedTask<void> | undefined;
   readonly set: (task: ClaudeOwnedTask<void> | undefined) => void;
   readonly program: () => ClaudeProgram<void>;
+  readonly prepare?: () => ClaudeProgram<ClaudeProgram<void>>;
   readonly settlementMs: number;
   readonly message: string;
 }): ClaudeProgram<void> {
   return Effect.gen(function* () {
     let task = input.get();
     if (task === undefined) {
-      const start = yield* Deferred.make<void>();
+      const start = yield* Deferred.make<undefined>();
+      let settlement = Effect.suspend(input.program);
       task = yield* input.connection.fork("control",
-        Effect.zipRight(Deferred.await(start), Effect.suspend(input.program).pipe(
+        Effect.zipRight(Deferred.await(start), Effect.suspend(() => settlement).pipe(
           Effect.catchAllCause(cause => Effect.zipRight(Effect.sync(() => {
             if (input.get() === task) input.set(undefined);
           }), Effect.failCause(cause))),
         )));
       input.set(task);
+      if (input.prepare !== undefined) {
+        // Publish shared custody before any native cleanup can reenter. Only
+        // settlement waits run in the child; admission stays in this fiber.
+        const prepared = yield* Effect.exit(Effect.suspend(input.prepare));
+        settlement = Exit.isSuccess(prepared) ? prepared.value : Effect.failCause(prepared.cause);
+      }
       yield* Deferred.succeed(start, undefined);
     }
     if (!(yield* observeWithin(task.promise, input.settlementMs))) {
@@ -115,13 +126,40 @@ export function joinClaudeConnection(connection: ClaudeRuntimeConnection, settle
   });
 }
 
-function revokeConnectionBinding(connection: ClaudeRuntimeConnection, revoke: () => Promise<void>): ClaudeProgram<void> {
-  return sharedWork({
-    connection: connection.effects, group: "capabilities",
+function prepareSharedCleanup(input: {
+  readonly connection: ClaudeConnectionEffects;
+  readonly get: () => ClaudeOwnedTask<void> | undefined;
+  readonly set: (task: ClaudeOwnedTask<void> | undefined) => void;
+  readonly prepare: () => ClaudeProgram<ClaudeProgram<void>>;
+}): ClaudeProgram<ClaudeProgram<void>> {
+  return Effect.gen(function* () {
+    const existing = input.get();
+    if (existing !== undefined) return existing.program;
+    const completion = yield* input.connection.reserve<undefined>("capabilities");
+    input.set(completion.task);
+    const prepared = yield* Effect.exit(Effect.suspend(input.prepare));
+    const settlement = Exit.isSuccess(prepared) ? prepared.value : Effect.failCause(prepared.cause);
+    yield* input.connection.fork("capabilities", Effect.gen(function* () {
+      const result = yield* Effect.exit(settlement);
+      if (input.get() === completion.task) input.set(undefined);
+      if (Exit.isSuccess(result)) completion.succeed(undefined);
+      else completion.failCause(result.cause);
+    }));
+    return completion.task.program;
+  });
+}
+
+function prepareConnectionBindingRevocation(connection: ClaudeRuntimeConnection, revoke: () => Promise<void>): ClaudeProgram<ClaudeProgram<void>> {
+  return prepareSharedCleanup({
+    connection: connection.effects,
     get: () => connection.bindingRevocation,
     set: task => { connection.bindingRevocation = task; },
-    program: () => nativeCall(revoke),
+    prepare: () => Effect.map(nativeCleanupObservation(revoke), promise => nativeCall(() => promise)),
   });
+}
+
+function revokeConnectionBinding(connection: ClaudeRuntimeConnection, revoke: () => Promise<void>): ClaudeProgram<void> {
+  return Effect.flatten(prepareConnectionBindingRevocation(connection, revoke));
 }
 
 export function revokeUnboundClaudeBinding(input: {
@@ -196,7 +234,10 @@ function closeRawProcess(connection: ClaudeRuntimeConnection, milliseconds: numb
     const process = connection.process;
     if (process === undefined) return true;
     // Signal failure never substitutes for observing this exact native exit.
-    yield* Effect.exit(forceNativeProcess(process));
+    yield* forceNativeProcess(process).pipe(Effect.matchCause({
+      onFailure: () => undefined,
+      onSuccess: () => undefined,
+    }));
     if (connection.rawExit === undefined) {
       connection.rawExit = yield* connection.effects.fork("exit-watch", nativeProcessExit(process));
     }
@@ -231,12 +272,18 @@ export function acquireClaudeSession<Session>(ports: ClaudeAcquisitionPorts<Sess
       // Borrowed construction is inert. Activation composes on this already
       // prepared owner; it cannot construct or invoke another interpreter.
       yield* client.programs.activate();
+      // Reserve before establishing either native arbitration observation, so
+      // reservation adds no reaction between initialization and identity.
+      const identityCompletion = yield* connection.effects.reserve<undefined>("admission");
       const initializationHandle = yield* client.programs.initializationObservation({
         signal: ports.signal, timeoutMs: ports.initializationTimeoutMs,
       });
       // Keep native Promise.all's already-rejected and same-turn arbitration.
+      // Its early failure does not settle the independently pending mapped
+      // identity observation. External close joins this completion-only child.
       const [initialization, identity] = yield* nativeInitializationIdentity(
         initializationHandle, process, ports.parseIdentity,
+        () => { identityCompletion.succeed(undefined); },
       );
       yield* attempt(() => { ports.assertInitialization(initialization); });
       yield* nativeMicrotask();
@@ -297,28 +344,35 @@ export function acquireClaudeSession<Session>(ports: ClaudeAcquisitionPorts<Sess
   })));
 }
 
-export function revokeClaudeSessionTools(input: {
+export function prepareRevokeClaudeSessionTools(input: {
   readonly session: ClaudeRuntimeSessionWork;
   readonly revoke: (bindingId: string) => Promise<void>;
   readonly clearCalls: () => void;
-}): ClaudeProgram<void> {
+}): ClaudeProgram<ClaudeProgram<void>> {
   return Effect.gen(function* () {
     const session = input.session;
-    if (session.hostToolState === "revoked") return;
-    return yield* sharedWork({
-      connection: session.connection.effects, group: "capabilities",
+    if (session.hostToolState === "revoked") return Effect.void;
+    return yield* prepareSharedCleanup({
+      connection: session.connection.effects,
       get: () => session.hostToolRevocationTask,
       set: task => { session.hostToolRevocationTask = task; },
-      program: () => Effect.gen(function* () {
+      prepare: () => Effect.gen(function* () {
         session.hostToolState = "revoking";
         yield* attempt(input.clearCalls);
         const binding = session.hostToolBinding;
-        if (binding !== undefined) yield* revokeConnectionBinding(session.connection, () => input.revoke(binding.bindingId));
-        session.hostToolState = "revoked";
-        session.connection.binding = undefined;
+        const settlement = binding === undefined ? Effect.void
+          : yield* prepareConnectionBindingRevocation(session.connection, () => input.revoke(binding.bindingId));
+        return Effect.zipRight(settlement, Effect.sync(() => {
+          session.hostToolState = "revoked";
+          session.connection.binding = undefined;
+        }));
       }),
     });
   });
+}
+
+export function revokeClaudeSessionTools(input: Parameters<typeof prepareRevokeClaudeSessionTools>[0]): ClaudeProgram<void> {
+  return Effect.flatten(prepareRevokeClaudeSessionTools(input));
 }
 
 export function activateClaudeSessionTools(input: {
@@ -360,28 +414,39 @@ export function activateClaudeSessionTools(input: {
   });
 }
 
-export function closeClaudeSession(input: {
+export function prepareCloseClaudeSession(input: {
   readonly session: ClaudeRuntimeSessionWork;
   readonly markClosing: () => void;
   readonly markFailed: () => void;
-  readonly revoke: () => ClaudeProgram<void>;
+  readonly revoke: () => ClaudeProgram<ClaudeProgram<void>>;
   readonly released: () => void;
-}): ClaudeProgram<void> {
+}): ClaudeProgram<ClaudeProgram<void>> {
   return Effect.gen(function* () {
     yield* attempt(input.markClosing);
-    const [binding, process] = yield* Effect.all([
-      Effect.exit(input.revoke()), Effect.exit(input.session.client.programs.close()),
-    ], { concurrency: "unbounded" });
-    const failures = [binding, process].flatMap(result => Exit.isFailure(result) ? [failureReason(result.cause)] : []);
-    if (failures.length > 0) {
-      yield* attempt(input.markFailed);
-      if (Exit.isSuccess(binding) && Exit.isFailure(process)) return yield* Effect.failCause(process.cause);
-      return yield* Effect.fail(taskFailure(new AggregateError(failures,
-        "Claude session process or host-tool binding could not be joined; cleanup was incomplete.")));
-    }
-    input.session.connection.processExitProven = true;
-    yield* attempt(input.released);
+    // Original async argument evaluation entered revoke before client TERM,
+    // and a synchronous fault in either still admitted the other resource.
+    const bindingAdmission = yield* Effect.exit(Effect.suspend(input.revoke));
+    const processAdmission = yield* Effect.exit(Effect.suspend(() => input.session.client.programs.prepareClose()));
+    return Effect.gen(function* () {
+      const [binding, process] = yield* Effect.all([
+        Exit.isSuccess(bindingAdmission) ? Effect.exit(bindingAdmission.value) : Effect.succeed(bindingAdmission),
+        Exit.isSuccess(processAdmission) ? Effect.exit(processAdmission.value) : Effect.succeed(processAdmission),
+      ], { concurrency: "unbounded" });
+      const failures = [binding, process].flatMap(result => Exit.isFailure(result) ? [failureReason(result.cause)] : []);
+      if (failures.length > 0) {
+        yield* attempt(input.markFailed);
+        if (Exit.isSuccess(binding) && Exit.isFailure(process)) return yield* Effect.failCause(process.cause);
+        return yield* Effect.fail(taskFailure(new AggregateError(failures,
+          "Claude session process or host-tool binding could not be joined; cleanup was incomplete.")));
+      }
+      input.session.connection.processExitProven = true;
+      yield* attempt(input.released);
+    });
   });
+}
+
+export function closeClaudeSession(input: Parameters<typeof prepareCloseClaudeSession>[0]): ClaudeProgram<void> {
+  return Effect.flatten(prepareCloseClaudeSession(input));
 }
 
 /** Configuration checks precede a client operation on the same interpreter. */
@@ -410,7 +475,10 @@ export function resolveClaudeInteraction(input: {
     const notice = yield* input.connection.fork("manager-continuations", Effect.gen(function* () {
       if (!(yield* Deferred.await(written))) return;
       yield* nativeTurn();
-      yield* Effect.exit(Effect.suspend(input.report));
+      yield* Effect.suspend(input.report).pipe(Effect.matchCause({
+        onFailure: () => undefined,
+        onSuccess: () => undefined,
+      }));
     }));
     const response = yield* Effect.exit(Effect.suspend(input.response));
     yield* Deferred.succeed(written, Exit.isSuccess(response));

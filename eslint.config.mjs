@@ -220,6 +220,13 @@ export default tseslint.config(
     ]),
   },
   {
+    // The canonical vendored checker walks to an AST root without a parent.
+    // TypeScript declares Node.parent as required; keep the runtime guards and
+    // byte-identical upstream source while retaining every other lint rule.
+    files: ["scripts/check-effect-architecture.ts"],
+    rules: { "@typescript-eslint/no-unnecessary-condition": "off" },
+  },
+  {
     files: ["**/*.test.ts", "**/*.test.tsx"],
     rules: {
       "@typescript-eslint/await-thenable": "off",

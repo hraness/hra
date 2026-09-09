@@ -37,10 +37,10 @@ const milestoneDeadline = () => {
 // for these public-facade schedules. No provider is launched; filesystem and
 // clock adapters are unchanged.
 const controlledProcess = (events: string[]) => {
-  const firstWrite = deferred<void>();
-  const firstWriteEntered = deferred<void>();
+  const firstWrite = deferred<undefined>();
+  const firstWriteEntered = deferred<undefined>();
   const output = deferred<Uint8Array | null>();
-  const outputConsumed = deferred<void>();
+  const outputConsumed = deferred<undefined>();
   const exited = deferred<number>();
   const writes: string[] = [];
   const signals: string[] = [];
@@ -56,7 +56,7 @@ const controlledProcess = (events: string[]) => {
           // The real reader requested another chunk after awaiting dispatch of
           // every decoded value, so this is a buffering milestone, not a sleep.
           events.push("stdout-chunk-consumed");
-          outputConsumed.resolve();
+          outputConsumed.resolve(undefined);
         }
         await exited.promise;
       },
@@ -66,7 +66,7 @@ const controlledProcess = (events: string[]) => {
       writes.push(new TextDecoder().decode(bytes));
       events.push("native-write-" + String(writes.length));
       if (writes.length === 1) {
-        firstWriteEntered.resolve();
+        firstWriteEntered.resolve(undefined);
         return firstWrite.promise;
       }
       return Promise.resolve();
@@ -115,7 +115,7 @@ describe("Claude connection facade causal contracts", () => {
       expect(events.indexOf("native-write-1")).toBeGreaterThan(events.indexOf("steer-returned"));
       expect(child.writes).toHaveLength(1);
       expect(facts.some((fact) => fact.type === "turnStarted")).toBe(false);
-      child.firstWrite.resolve();
+      child.firstWrite.resolve(undefined);
       const [startOutcome, steerOutcome, duplicateOutcome] = await Promise.all([started, steered, duplicate]);
       expect(startOutcome.status).toBe("fulfilled");
       expect(steerOutcome.status).toBe("fulfilled");
@@ -129,7 +129,7 @@ describe("Claude connection facade causal contracts", () => {
       ]);
     } finally {
       deadline.clear();
-      child.firstWrite.resolve();
+      child.firstWrite.resolve(undefined);
       await Promise.all([started, steered, duplicate]);
       await client.close();
     }
@@ -166,7 +166,10 @@ describe("Claude connection facade causal contracts", () => {
         onSafeDiagnostic: (message: string) => {
           diagnostics.push(message);
           events.push("diagnostic-called");
-          if (faultEnabled && scenario.diagnostic === "throws") throw scenario.reason;
+          if (faultEnabled && scenario.diagnostic === "throws") {
+            // eslint-disable-next-line @typescript-eslint/only-throw-error -- This regression must preserve each original falsey foreign failure value.
+            throw scenario.reason;
+          }
         },
       }),
     });
@@ -207,7 +210,7 @@ describe("Claude connection facade causal contracts", () => {
     } finally {
       deadline.clear();
       faultEnabled = false;
-      child.firstWrite.resolve();
+      child.firstWrite.resolve(undefined);
       child.finish();
       await started;
       await client.close();
