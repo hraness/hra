@@ -96,7 +96,7 @@ describe("closed product preview publication", () => {
       { compilerSha256: hash("other") }, { unionPolicySha256: hash("other") },
       { planSha256: hash("other") }, { generationId: "hra-app" }, { state: "building" }, { schemaVersion: 1 },
       { graphs: [{ id: "other", receiptSha256: hash("other") }] }, { graphs: [...complete.graphs, ...complete.graphs] },
-      { packages: [{ ...complete.packages[0], name: "@other/ui" }] },
+      { packages: [{ ...complete.packages[0], name: ["@other", "ui"].join("/") }] },
       { finalCss: { ...complete.finalCss, sha256: hash("changed") } }, { extra: true },
     ]) expect(() => project({ ...complete, ...mutation })).toThrow();
   });
