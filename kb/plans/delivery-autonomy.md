@@ -17,7 +17,7 @@ relations:
 
 # Hraness delivery autonomy
 
-Status: active, revision 7 (2026-09-09). The machine-confidence foundation, current-Mac
+Status: active, revision 8 (2026-09-09). The machine-confidence foundation, current-Mac
 bootstrap and HRA, Oh and personal-monorepo-template pilots are delivered. Wider fleet
 adoption and provider-specific rollout remain separately tracked; they do not reopen the
 completed foundation or block an independently admitted artifact.
@@ -226,7 +226,28 @@ bounded diagnosis; green CI does not dismiss them. The local full aggregate rema
 tool and the fallback when CI coverage or equivalence is absent or uncertain. This removes a
 duplicate execution without changing CI command coverage or scheduler controls.
 
-### D8. Canonical artifacts precede optional npm mirrors
+### D8. Prefer agentic service provisioning
+
+For new infrastructure, first inspect Vercel Marketplace for a native product that can
+provision the required resource. Use Stripe Projects as a supported alternative when it
+better covers the service or the Marketplace route only connects an existing account.
+Use the provider's supported CLI or API when neither catalog fits, recording the concrete
+reason. Current account, region, plan, recurring cost and resource capability evidence
+govern the choice; catalog presence alone does not establish operational fitness.
+
+Reuse existing owner-controlled resources where appropriate. The preference does not
+authorize migration, a duplicate account, a paid upgrade or wider access on its own.
+Continue already-authorized setup without duplicate confirmation and retain required
+interactive authentication. Generated environment files and provider credentials remain
+private. Provisioning and deployment, persistence and recovery acceptance are separate.
+
+The canonical global Codex, global Claude and repository policy assets carry this
+preference in local-efficiency 0.4.2. The existing marker-bounded bootstrap and repository
+adoption commands distribute it. See the [service provisioning guide](../../docs/service-provisioning.md).
+This source change does not assert that every repository or machine has refreshed its
+installed guidance or that any external service has been commissioned.
+
+### D9. Canonical artifacts precede optional npm mirrors
 
 For eligible public packages, verified immutable GitHub Release artifacts are canonical
 independently of optional exact-byte npm mirrors. Use OIDC where provider policy permits;
@@ -243,21 +264,22 @@ transition and provenance rules, and final combined public admission. Mirror fai
 visible without undoing or relabeling the immutable GitHub artifact. No check is skipped and
 no provider policy is changed by this source decision.
 
-The independently versioned local-efficiency 0.4.2 increment adds this convention to global
-Codex/Claude guidance and the operating skill. The generic managed repository block remains
-unchanged. This source change does not prove plugin installation, another repository's
+The independently versioned local-efficiency 0.4.3 increment adds this convention to global
+Codex/Claude guidance and the operating skill. The generic managed repository block retains the
+0.4.2 provisioning policy unchanged. This source change does not prove plugin installation, another repository's
 adoption, a package release, or operational activation.
 
 ## Workstreams
 
 | Workstream | State | Acceptance evidence |
 | --- | --- | --- |
-| Machine baseline on the current Mac | Complete | Reviewed 0.4.1 installation followed PR160: all 37 plugin files matched merged source, bootstrap apply/check and doctor passed, and fresh readback preserved unmanaged configuration. Other machines and runtime eligibility remain separate. |
+| Machine baseline on the current Mac | Complete | PR165 delivered local-efficiency 0.4.2; all 37 installed files and both managed global blocks match merged source `e1edb585`. The earlier 0.4.1 installation evidence remains below. Other machines and runtime eligibility remain separate. |
 | Canonical repository policy and pilots | Complete | Managed-block tests preserve custom guidance and Claude imports; HRA PR156, Oh PR45 and template PR12 delivered through their own gates. |
-| Canonical artifact independence | In progress | [PR164](https://github.com/hraness/hra/pull/164) now joins admitted source `5ab43f1` while preserving its v0.7.1 package and activation controls. Joined release/CI-equivalence, transition/provenance, plugin and recovery-custody checks pass for the reviewed canonical-GitHub-first workflow and global-only 0.4.2 policy. Final integration review and complete Required CI remain pending; main merge waits for the v0.7.1 artifact-admission handoff. PR164 delivery and 0.4.2 installation/readback are not yet proved. |
+| Canonical artifact independence | In progress | [PR164](https://github.com/hraness/hra/pull/164) joins PR165 source `e1edb585`, preserving its provisioning policy and the v0.7.1 package and activation controls. The combined global canonical-artifact guidance advances to 0.4.3. Prior candidate `1cacc254` passed complete Required CI and CodeQL; the joined candidate needs fresh focused evidence, final review and complete current-base CI. The release owner has released the v0.7.1 merge hold. PR164 delivery and 0.4.3 installation/readback are not yet proved. |
 | HRA npm path | Delivered | The machine publication path is delivered without the mutable publication variable; exact tag, artifact, OIDC, provenance and final admission remain required for each release in [the release record](../../docs/beta-release.md). |
 | Wrench npm path | Provider-constrained | Preserve its dual-use declaration and exact staged-artifact approval with required authentication. Automate preparation, validation, staging, and readback; direct OIDC publication is not an available replacement for the provider gate. |
 | Soundfish npm path | Delivered | The direct OIDC workflow completed in [release run 34059355173](https://github.com/hraness/soundfish/actions/runs/34059355173). Routine publication has a supported workload identity; future releases retain their exact-artifact gates. |
+| Agentic service provisioning | Delivered on the current Mac | [PR165](https://github.com/hraness/hra/pull/165) merged the 0.4.2 preference across all three canonical guidance assets and this repository adoption target. Installed plugin and managed global bytes match its merged source. Wider fleet adoption and any actual service provisioning remain separate. |
 | Wider fleet rollout | Continuing | Remaining repositories and machines require their own scoped adoption and gates. No all-fleet current-state claim is made; preserve dirty primary worktrees. |
 | Provider setup | Evidence-driven | Ordinary npm publication workflows are present. Change trust, account, GitHub App, or ruleset configuration only for an individually verified remaining gap; no blanket trust update is pending. |
 | Machine-confidence foundation | Complete | HRA PR156 delivered the reviewed canonical global/repository assets, operator guidance and regression tests separating artifact admission from operational activation. |
@@ -279,6 +301,25 @@ adoption, a package release, or operational activation.
   evidence that applies; silence is never proof of completion.
 
 ## Progress log
+
+- 2026-09-09, revision 8: [PR165](https://github.com/hraness/hra/pull/165)
+  delivered the provisioning policy as `e1edb585`. All 37 installed 0.4.2
+  plugin files and both managed global blocks match that merged source on the
+  current Mac. This does not prove fleet adoption or provision a service.
+  PR164's earlier reviewed candidate `1cacc254`, tree `e199cce7`, passed all ten
+  jobs in [CI34366815474/1](https://github.com/hraness/hra/actions/runs/34366815474)
+  and [CodeQL34366813242/1](https://github.com/hraness/hra/actions/runs/34366813242)
+  on integration `9307bed`. Those receipts remain historical evidence; the
+  new main requires fresh final admission. The v0.7.1 release owner reported
+  all four jobs passing in the same-run
+  [recovery34367591503/2](https://github.com/hraness/hra/actions/runs/34367591503/attempts/2)
+  and released PR164's main-merge hold. The release owner then completed
+  final exact GitHub/npm and original-publication-attempt provenance readback
+  at 15:38:01Z. This join preserves incoming D8 and adds the canonical policy as
+  D9 in local-efficiency 0.4.3, without changing the package or public admission
+  wording. Relevant focused validation, independent final integration review
+  and fresh complete Required CI/CodeQL are pending for the joined candidate.
+  PR164 delivery and 0.4.3 installation, release or activation are not yet proved.
 
 - 2026-09-09: PR160's protected merge, complete exact-candidate PR CI and
   current-Mac 0.4.1 installation/readback close the earlier data-preserving
@@ -307,6 +348,12 @@ adoption, a package release, or operational activation.
   Main merge remains held for the separately owned
   v0.7.1 immutable GitHub and npm artifact admission. PR164 delivery, plugin
   0.4.2 installation and any resulting release or activation are not yet proved.
+
+- 2026-09-09, revision 6: added D8 and the 0.4.2 canonical provisioning preference,
+  with native Marketplace resource discovery, Stripe Projects fallback, existing-resource
+  preservation and separate operational proof. No provider client, credential scope,
+  application hosting choice or cloud-worker routing changed. Source validation and
+  reviewed installation are tracked with this delivery; wider fleet status is unchanged.
 
 - 2026-09-09, revision 5: independent source review confirms that complete CI
   retains every full-gate command on macOS and Linux, expanded multiplicity and
