@@ -10,8 +10,8 @@ Do not open a public issue for a suspected vulnerability. Use GitHub's private v
 
 | Version | Status |
 | --- | --- |
-| `v0.7.1` | Release candidate. Not yet admitted or supported; `v0.7.0` remains the supported beta. |
-| `v0.7.0` | Fully admitted beta. Supported and receives security fixes. Hosted command-writer rollout remains capacity-gated. |
+| `v0.7.1` | Fully admitted beta. Supported and receives security fixes. Hosted command-writer rollout remains capacity-gated. |
+| `v0.7.0` | Superseded by `v0.7.1`. Unsupported. Do not bypass the update runbook to migrate. |
 | `v0.6.3` | Superseded by `v0.7.0`. Unsupported. Do not bypass the update runbook to migrate. |
 | `v0.6.2` | Superseded by `v0.6.3`. Unsupported. Do not bypass the update runbook to migrate. |
 | `v0.6.1` | Superseded by `v0.6.2`. Unsupported. Do not bypass the update runbook to migrate. |
