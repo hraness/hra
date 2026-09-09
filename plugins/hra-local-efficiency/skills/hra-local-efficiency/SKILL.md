@@ -167,6 +167,13 @@ sharing the weighted compute capacity. A nested wrapper must be covered by the
 outer lane; choose the top-level lane correctly instead of escalating it inside
 an existing lease.
 
+For an indivisible aggregate that requires macOS, such as Atet `bun run check`,
+use `exclusive` mode on `mac-native` when its Chromium work is an owned fixture
+with a fresh profile and loopback server. Exclusive reserves all common compute
+capacity. This mapping admits no personal authenticated browser, shared fixed
+server, or nested cross-lane acquisition. Separate browser-only gates retain
+`browser-auth`.
+
 For non-interactive macOS and Linux runs, the wrapper supervises a dedicated
 child process group and forwards `HUP`, `INT`, `QUIT`, and `TERM` to the whole
 group. An interactive TTY preserves its controlling terminal and receives
