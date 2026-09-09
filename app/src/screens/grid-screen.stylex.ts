@@ -106,7 +106,7 @@ export const gridScreenStyles = stylex.create({
   },
   select: {
     backgroundColor: "var(--color-surface-input)",
-    borderColor: "var(--color-line)",
+    borderColor: "var(--color-control)",
     borderRadius: "0.375rem",
     borderStyle: "solid",
     borderWidth: "1px",

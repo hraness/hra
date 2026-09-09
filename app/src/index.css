@@ -13,21 +13,24 @@
   --font-mono:
     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 
-  --color-surface: oklch(0.16 0.01 260);
-  --color-surface-raised: oklch(0.21 0.012 260);
-  --color-surface-input: oklch(0.25 0.014 260);
-  --color-line: oklch(0.32 0.015 260);
-  --color-ink: oklch(0.95 0.005 260);
-  --color-ink-muted: oklch(0.72 0.012 260);
-  --color-accent: oklch(0.72 0.14 220);
-  --color-attention: oklch(0.76 0.16 62);
-  --color-danger: oklch(0.68 0.17 25);
+  --color-surface: var(--background);
+  --color-surface-raised: var(--surface-raised);
+  --color-surface-input: var(--surface-hover);
+  --color-line: var(--line);
+  --color-control: var(--control-border);
+  --color-ink: var(--foreground);
+  --color-ink-muted: var(--muted);
+  --color-accent: var(--primary);
+  --color-accent-ink: var(--primary-foreground);
+  --color-info: var(--info);
+  --color-attention: var(--warning);
+  --color-danger: var(--danger);
+  --color-danger-ink: var(--danger-foreground);
 }
 
 @layer base {
   html {
     background-color: var(--color-surface);
-    color-scheme: dark;
     line-height: 1.5;
     tab-size: 4;
     -webkit-tap-highlight-color: transparent;
@@ -48,6 +51,11 @@
   textarea,
   select {
     font: inherit;
+  }
+
+  input[type="radio"],
+  input[type="checkbox"] {
+    accent-color: var(--primary);
   }
 
   /* Retain Tailwind 4.3.3's native date/time control normalization. */
@@ -85,7 +93,7 @@
   }
 
   :focus-visible {
-    outline: 2px solid var(--color-accent);
+    outline: 2px solid var(--focus);
     outline-offset: 2px;
   }
 

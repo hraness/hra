@@ -1,3 +1,4 @@
+import { AppearanceHeader } from "./components/appearance";
 import { ConvexAuthProvider, useConvexAuth } from "@convex-dev/auth/react";
 import * as stylex from "@stylexjs/stylex";
 import { useState } from "react";
@@ -21,6 +22,7 @@ import { appStyles } from "./app.stylex";
 function Centered({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <main {...stylex.props(appStyles.centered)}>
+      <AppearanceHeader />
       {children}
     </main>
   );

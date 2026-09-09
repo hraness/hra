@@ -137,7 +137,7 @@ test("code and notice slots preserve renderer variables, overflow, and explicit 
 test("prose focus is explicit and navigation hover and skip focus remain native", async () => {
   await declares("proseLink", ["color:var(--link)", "text-decoration-thickness:1px", "text-underline-offset:.16em"]);
   const focus = compact(await cssFor("focusable"));
-  for (const declaration of ["outline-color:var(--link)", "outline-style:solid", "outline-width:2px", "outline-offset:.2rem"]) expect(focus).toContain(declaration);
+  for (const declaration of ["outline-color:var(--focus)", "outline-style:solid", "outline-width:2px", "outline-offset:.2rem"]) expect(focus).toContain(declaration);
   expect(focus).toContain(":focus-visible");
   expect(focus).not.toContain("forced-color-adjust:none");
   await declares("sectionNav", ["border-block-start-width:1px", "border-block-end-width:1px", "display:flex", "flex-wrap:wrap", "margin-block-start:2.5rem", "font-size:.92rem"]);
@@ -152,7 +152,7 @@ test("prose focus is explicit and navigation hover and skip focus remain native"
 
 test("Ask AI and resources have their own bounded palette and layout", async () => {
   await declares("resourceFrame", ["max-width:72rem", "margin-inline-start:auto", "padding-inline-start:clamp(1.25rem,4vw,3rem)"]);
-  await declares("askAi", ["--ui-border:var(--rule)", "--ui-primary:var(--link)", "--ui-ring:var(--link)", "padding-block-start:1.25rem", "border-top-width:1px"]);
+  await declares("askAi", ["--ui-border:var(--rule)", "--ui-primary:var(--primary)", "--ui-ring:var(--focus)", "padding-block-start:1.25rem", "border-top-width:1px"]);
   await declares("resources", ["display:flex", "flex-wrap:wrap", "justify-content:space-between", "padding-block-start:2rem", "padding-block-end:4rem", "font-size:.92rem"]);
   await declares("resourcesParagraph", ["margin-top:0", "margin-right:0", "margin-bottom:0", "margin-left:0"]);
   await declares("resourcesNav", ["font-family:var(--font-sans)", "row-gap:.75rem", "column-gap:1.25rem"]);

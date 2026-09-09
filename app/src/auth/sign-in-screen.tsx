@@ -1,3 +1,4 @@
+import { AppearanceHeader } from "../components/appearance";
 import { useAuthActions } from "@convex-dev/auth/react";
 import * as stylex from "@stylexjs/stylex";
 import { useRef, useState } from "react";
@@ -55,6 +56,7 @@ export function SignInScreen() {
 
   return (
     <main {...stylex.props(signInStyles.root)}>
+      <AppearanceHeader />
       <Card>
         <CardHeader>
           <CardTitle>Sign in to HRA</CardTitle>
