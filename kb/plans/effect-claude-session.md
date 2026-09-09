@@ -8,10 +8,12 @@ status: in-progress
 
 Design: [issue 166](https://github.com/hraness/hra/issues/166).
 
-Status: implementation, focused validation and the exact candidate installation
-are complete. Full CI found service-fixture deadline failures; the reviewed
-test repairs await the current-base join and fresh final gates. Integration
-and delivery remain pending. The measured baseline
+Status: implementation and the constructor-custody repair pass focused validation.
+The earlier `135b853c` candidate installation passed, but its full CI failed
+service-fixture deadlines. Those fixture repairs are ready for the current-base
+join. Changed production source still needs a newly measured archive and fresh
+matching final gates. Integration and delivery remain pending, separately after
+the provider-usage v0.8 release window. The measured baseline
 is `82637bb9a5423adffb5185dc175fd74eb5dd2c89`, an ancestor of
 [the provider-usage candidate](https://github.com/hraness/hra/pull/140).
 The isolated branch now includes that candidate's
@@ -89,17 +91,18 @@ fallback, credential policy or account-routing change is part of this plan.
 
 Acquisition registration, native identity and constructor-failure retention, the
 write/notice shutdown barrier and synthetic callback self-close refusal are
-explicit cleanup strengthenings. Other public behavior remains compatible.
+explicit cleanup strengthenings. Reviewed public contracts retain the native
+observation and live-qualification limits below.
 
 ## Phases
 
 | Phase | Owner | Acceptance | Status |
 | --- | --- | --- | --- |
 | Contract and R1 baseline | Independent source and test reviewers | Exact caller/port map, retained red trace, unchanged controls and joined fixture cleanup | Complete on the isolated baseline |
-| Connection programs and client | Client implementer | Shared internal owner API, native initialization/writer/reader/close programs, deleted replaced scheduling, focused client preservation | Complete: 47 tests, 367 assertions |
+| Connection programs and client | Client implementer | Shared internal owner API, native initialization/writer/reader/close programs, deleted replaced scheduling, focused client preservation | Complete: constructor repair included in the 133-test, 982-assertion client/manager replay |
 | Acquisition and manager | Manager implementer | Same interpreter from pre-acquisition through close, unchanged R1 oracle green, exact authority and all-child cleanup | Complete: 83 tests, 587 assertions |
 | Causal and architecture review | Independent reviewer and integrator | Actual-facade timing, raw failures, held native operations, callback ordering, module roles and deletion review | Complete: final service replay passes 2 tests, 33 assertions; independent source review accepted |
-| Current-source integration and delivery | Integration and release owner | Current owner join, exact Required CI, applicable native/install/release and production evidence | Candidate installation passed; current-base join, fresh full CI and delivery pending |
+| Current-source integration and delivery | Integration and release owner | Current owner join, exact Required CI, applicable native/install/release and production evidence | Historical candidate installation passed; repaired source needs current-base join, new archive, fresh full CI and delivery |
 
 The client worker owns the local model/platform/program/runtime modules and
 client facade. The manager worker owns its program and facade. One integrator
@@ -262,3 +265,31 @@ local aggregate when Required CI already owns its authoritative equivalent.
   change. A read-only comparison with an unpublished upstream checkpoint is
   preparation, not final-base acceptance. The eventual combined source needs
   independent review, a newly measured archive and fresh matching final gates.
+
+- Independent release review found a constructor-custody regression in the
+  frozen candidate: the program retained the caller-owned options object while
+  observing the original process exit. Replacing an option could redirect later
+  writes or signals to another child, change the configuration getter, or route
+  facts and diagnostics to replacement callbacks. The ordinary manager supplies
+  a fresh inline object; no current manager alias or observed exploit is claimed.
+  This finding supersedes the earlier no-unresolved-findings source verdict.
+- Repair commit `6d9378fca4cbcc1bc837a8075973b98c74a55779` restores the four
+  original constructor references in baseline read order and uses the captured
+  process for exit, streams, writes and every termination path. Ordinary
+  callbacks retain the public client as their receiver. The caller's object is
+  neither frozen nor copied, and the process retains its existing shallow
+  reference semantics. Shared Effect ownership and native settlement laws stay
+  intact.
+- Three real-facade regressions reproduce the old redirected configuration,
+  absent original-child signals and missing constructor reads. With the repair,
+  all 133 client, cleanup, owner and manager tests pass 982 assertions; both
+  actual-service schedules pass 33 assertions. Strict types, scoped lint and
+  architecture checks pass. The initial test fixture had an optional-property
+  type mismatch and lint issue; the corrected fixture repeats both the causal
+  failures and all focused checks. All preexisting client test bytes are retained.
+- The release owner declined combined v0.8 integration. Effect retains separate
+  source and delivery ownership through PR168 after the PR140 release window.
+  The old archive and installation receipts qualify only their historical
+  production bytes. This repair requires a new archive, package-policy and
+  installation evidence, and fresh required final checks on the eventual joined
+  source. No new full CI, merge, publication or production result is claimed.
