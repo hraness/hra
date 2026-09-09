@@ -7,6 +7,8 @@ import {
   buildHraGlobalInstallCommand,
   HRA_INSTALL_ARCHIVE_URL,
 } from "../src/install-preflight";
+import { publicContent } from "../site/content";
+import { docsPathForSection, renderDocsMarkdown } from "../site/docs-content";
 import { githubPublisherEnvironment } from "./github-publisher-environment";
 import {
   draftReleaseBody,
@@ -583,6 +585,7 @@ describe("release workflow", () => {
       readFile(join(import.meta.dir, "..", "SECURITY.md"), "utf8"),
     ]);
     const installCommand = buildHraGlobalInstallCommand(HRA_INSTALL_ARCHIVE_URL);
+    const availability = renderDocsMarkdown("/docs/status/");
 
     expect(releaseNotes).toContain(installCommand);
     expect(releaseNotes).toContain("## Admitted v0.6.2 predecessor");
@@ -597,16 +600,35 @@ describe("release workflow", () => {
     expect(changelog).not.toContain("## v0.6.3 candidate (unreleased)");
     expect(changelog).toContain("docs/beta-release.md#immutable-v063-successful-release-record");
     expect(readme).toContain(installCommand);
-    expect(readme).toContain("Local v0.7.0 artifacts admitted; hosted sync live as an open beta");
-    expect(readme).toContain("passed immutable GitHub and npm release admission in");
+    expect(readme).toContain("Install and verify the admitted v0.7.0 CLI artifact. This does not start the daemon:");
+    expect(readme).toContain("[Availability](https://hra.sh/docs/status/)");
+    expect(readme).toContain("[ordered update runbook](https://hra.sh/docs/status/#install-and-update)");
     expect(readme).not.toContain("Local CLI v0.7.0 is a release candidate");
-    expect(readme).toContain("next invocation of that exact release's installer");
-    expect(readme).toContain("`$BUN_INSTALL/install/hra/install-intent.json`");
-    expect(readme).toContain("the exact immutable install command from the originating release's trusted README or release notes");
-    expect(readme).toContain("If that installer refuses the intent, stop installation and use bounded read-only diagnosis");
-    expect(readme).toContain("while preserving the intent and its directories");
-    expect(readme).toContain("An uncertain tag blocks execution, not diagnosis");
-    expect(readme).toContain("It is not authorization to retry, rerun, or mutate that release's GitHub Actions workflow");
+    const homepageAvailability = publicContent.questions.find(({ question }) => question === "Can I start using it now?");
+    expect(homepageAvailability).toBeDefined();
+    expect(homepageAvailability?.answer).toContainEqual({ kind: "link", label: "Check the setup status", href: "/docs/status/" });
+    expect(homepageAvailability?.answer.filter((part) => part.kind === "text").map((part) => part.value).join(""))
+      .toContain("Starting or upgrading a daemon and enabling hosted commands are paused until the capacity checks pass.");
+    // The concise entry points link to the canonical availability guide. The
+    // release-bound recovery restrictions must survive that relocation intact.
+    expect(docsPathForSection("install-and-update")).toBe("/docs/status/#install-and-update");
+    expect(availability).toContain(installCommand);
+    expect(availability).toContain("The v0.7.0 CLI passed immutable GitHub and npm artifact admission.");
+    expect(availability).toContain("their availability does not authorize starting the current daemon or sending new hosted commands");
+    for (const document of [readme, availability]) {
+      expect(document).toContain("Current daemon and hosted command-writer rollout remains blocked on capacity.");
+      expect(document).toContain("Do not initialize, start, or autostart the admitted v0.7.0 daemon");
+      expect(document).toContain("protected two-pass zero-debt capacity evidence and its exact .activated readback receipt");
+      expect(document).toContain("Artifact availability and the live sync service do not clear this gate.");
+      expect(document).toContain("daemon and target marker-2 proofs before globally enabling hosted writers");
+    }
+    expect(availability).toContain("next invocation of that exact release's installer");
+    expect(availability).toContain("`$BUN_INSTALL/install/hra/install-intent.json`");
+    expect(availability).toContain("the exact immutable install command from the originating release's trusted README or release notes");
+    expect(availability).toContain("If that installer refuses the intent, stop installation and use bounded read-only diagnosis");
+    expect(availability).toContain("while preserving the intent and its directories");
+    expect(availability).toContain("An uncertain tag blocks execution, not diagnosis");
+    expect(availability).toContain("It is not authorization to retry, rerun, or mutate that release's GitHub Actions workflow");
     expect(releaseNotes).toContain("A durable installer intent is release-bound");
     expect(releaseNotes).toContain("An installer from another release fails closed without deleting it");
     expect(releaseNotes).toContain("If that installer refuses the intent, stop installation and use bounded read-only diagnosis");

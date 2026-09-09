@@ -811,6 +811,99 @@ The initial untouched inactive cron is a quiet no-op, even before the separate
 key is provisioned. Previously used, enabled, occupied, or ambiguous state is
 not that initial state and cannot skip configuration validation before a claim.
 
+### Install an attention key under operational custody
+
+The separate `scripts/install-hosted-attention-key.ts` operator is for an
+existing deployment. Its authority premise is **operational custody attested**,
+not provider compare-and-set. Convex's ordinary environment update can overwrite
+a concurrent value. Before installation, the deployment custodian must arrange
+and attest a short installation window with dashboard, CLI, CI and delegated
+environment writers quiesced. A local lock, scheduler grant, process census or
+matching readback does not prove that premise. Do not manufacture a custody
+attestation from those observations.
+
+Use the exact clean deployed candidate and its protected deploy receipt. First
+create an absent-key preparation with the observation-only operator above.
+Retain one protected evidence directory for this target across custodians and
+recovery attempts. The installer derives its intent slot from the numeric
+target and fixed attention-key name, not the operation ID or secret. Changing
+directories to evade an existing intent is outside the custody protocol.
+
+The protected custody document binds the source, candidate, preparation,
+numeric target, intended-key digest, operation, evidence directory and bounded
+installation window. It explicitly records the competing-writer handoff. Its
+digest is an integrity binding, not a provider signature or proof that the
+operational statements are true. Keep the document and all key digests private.
+
+The intent filename includes the fixed public environment name and hashes only
+the exact target. Its non-attention environment digest is a domain-separated
+HMAC-SHA-256 fingerprint keyed by the intended attention credential, covering
+the target and every sorted non-attention name/value pair. It does not store
+an unkeyed digest of other secrets. Retain the intended key for reconciliation;
+rotating the administrative credential does not change this comparison.
+Pre-release intent filenames and interrupted publications also block a new
+installation. Preserve them for reviewed recovery with their original source;
+the installer never renames, deletes or silently adopts them.
+
+Supply the distinct attention key and the exact deployment's scoped admin key
+through the protected anonymous-pipe input, never command arguments, child
+environment variables or a checked-in file:
+
+```json
+{"attentionResendApiKey":"<attention-secret>","convexDeploymentAdminKey":"<deployment-admin-secret>"}
+```
+
+```sh
+protected-json-source | bun ./scripts/install-hosted-attention-key.ts \
+  --phase install \
+  --source-commit <EXACT_CANDIDATE_COMMIT> \
+  --deploy-evidence /protected/release/candidate-deploy.json \
+  --preparation-evidence /protected/release/attention-key-preparation.json \
+  --custody-attestation /protected/release/attention-key-custody.json \
+  --evidence-directory /protected/release/attention-key-installation \
+  --deployment <CURRENT_DEFAULT_DEPLOYMENT_NAME> \
+  --team-id <CURRENT_TEAM_ID> \
+  --project-id <CURRENT_PROJECT_ID> \
+  --deployment-id <CURRENT_DEFAULT_DEPLOYMENT_ID> \
+  --deployment-url <CURRENT_DEFAULT_DEPLOYMENT_URL>
+```
+
+Installation revalidates exact source, candidate, target, runtime attestation,
+absent attention key, prerequisite configuration and untouched inactive state.
+It records a durable intent before making one application-level update attempt
+for `HRA_ATTENTION_RESEND_API_KEY` only. The direct transport has no CLI or SDK
+retry, redirect fallback or arbitrary environment patch. It bounds both the
+response size and deadline. One application call is not an exactly-once network
+guarantee. The other environment values, including the sign-in key, are compared
+across readback without exposing their values.
+
+A provider acknowledgement followed by matching readback is distinct from an
+uncertain outcome. Once an intent exists, no later invocation may write; use
+read-only reconciliation. Repeat the same bindings and protected input with `--phase
+reconcile`, retaining the original custody document and operation identity.
+Expiration stops a new installation, not intent-bound readback. A replacement
+custody document cannot silently adopt an existing intent. Observations and
+results append to a bounded sequence without replacing prior evidence; an
+exhausted sequence requires reviewed recovery outside this installer.
+An equal value means observed equal; it does not identify who wrote it. An
+absent value after a timeout does not prove the first request cannot commit
+later. A conflicting value stops recovery. Preserve the intent and results;
+do not remove them, change the operation or key, or choose another directory to
+force another write. Any separate corrective action needs a new reviewed
+recovery handoff outside this installer.
+
+The short custody window is an installation-admission deadline, not permission
+to resume competing attention-key writes after an uncertain dispatch. Retain
+custody, evidence and the attention-key write freeze until the outcome is
+reconciled or custody is transferred through a reviewed recovery handoff.
+Expiry alone cannot rule out a late provider commit.
+
+Successful key installation does not enable attention or prove the Resend
+account, sending-domain permission, recipient consent or delivery. Keep the
+attention control inactive until those separate activation requirements pass.
+The observation-only operator's existing `prepare` and `reconcile` outputs
+remain observations and cannot be relabeled as installation receipts.
+
 ## Read hosted preflight status
 
 Before a controlled live-acceptance run, an operator can read one bounded,
