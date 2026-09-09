@@ -129,8 +129,8 @@ describe("public real-UI examples", () => {
     const type = fc.constantFrom("hra-preview-status", "hra-preview-ready", "hra-preview-failed");
     fc.assert(fc.property(view, type, fc.anything({ maxDepth: 2, maxKeys: 4 }), (scene, kind, foreign: unknown) => {
       const envelope = { type: kind, view: scene };
-      expect(parsePreviewStatusRequest(envelope)).toEqual(kind === "hra-preview-status" ? envelope : undefined);
-      expect(parsePreviewMessage(envelope)).toEqual(kind === "hra-preview-status" ? undefined : envelope);
+      expect(parsePreviewStatusRequest(envelope)).toEqual(kind === "hra-preview-status" ? { type: kind, view: scene } : undefined);
+      expect(parsePreviewMessage(envelope)).toEqual(kind === "hra-preview-status" ? undefined : { type: kind, view: scene });
       for (const parsed of [parsePreviewStatusRequest(foreign), parsePreviewMessage(foreign)]) {
         if (parsed === undefined) continue;
         expect(Object.getPrototypeOf(foreign)).toBe(Object.prototype);
