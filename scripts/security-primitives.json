@@ -71,7 +71,7 @@
     "mode0600": 2
   },
   "src/daemon/claude-runtime-adapter.ts": {
-    "assertCurrent": 11
+    "assertCurrent": 9
   },
   "src/daemon/codex-runtime-adapter.ts": {
     "redactCompleteSensitiveText": 1

@@ -1,5 +1,5 @@
 /**
- * Effect architecture checks v1.2.1. Copy with its tests into the owning repository.
+ * Effect architecture checks v1.5.0. Copy with its tests into the owning repository.
  * Build-time only: use that repository's TypeScript, no compiler patch/plugin.
  * This constrains reviewed modules; it is not a purity or security proof.
  */
@@ -8,7 +8,7 @@ import ts from "typescript";
 
 export interface EffectArchitecturePolicy {
   readonly root: string;
-  /** Every production file importing Effect must declare its role here. */
+  /** Production Effect imports and real Effect-valued bindings declare their role here. */
   readonly modules: readonly string[];
   readonly adapters: readonly string[];
   readonly runtimeRoots: readonly string[];
@@ -99,7 +99,220 @@ export function inspectEffectArchitecture(
     const symbol = actualSymbol(node);
     return !!symbol?.declarations?.some(d => d.getSourceFile().isDeclarationFile);
   };
+  // Declaration provenance matters: a local .d.ts service may use these same names.
+  const platformDeclaration = (declaration: ts.Declaration): boolean => {
+    const source = declaration.getSourceFile();
+    return program.isSourceFileDefaultLibrary(source) ||
+      (program.isSourceFileFromExternalLibrary(source) &&
+        /[/\\](?:@types[/\\](?:node|bun)|bun-types)[/\\]/.test(source.fileName));
+  };
+  const nativeOrigins = new Map<ts.Symbol, boolean>();
+  const nativeCallbackDeclaration = (symbol: ts.Symbol): boolean => {
+    const cached = nativeOrigins.get(symbol);
+    if (cached !== undefined) return cached;
+    const result = symbol.declarations?.some(declaration => {
+      if (!platformDeclaration(declaration)) return false;
+      if (ambientCalls.has(symbol.getName())) return true;
+      const parent = declaration.parent;
+      return ts.isInterfaceDeclaration(parent) &&
+        ((parent.name.text === "DateConstructor" && symbol.getName() === "now") ||
+         (parent.name.text === "Math" && symbol.getName() === "random"));
+    }) ?? false;
+    nativeOrigins.set(symbol, result);
+    return result;
+  };
+  const constDeclaration = (declaration: ts.VariableDeclaration): boolean =>
+    ts.isVariableDeclarationList(declaration.parent) && !!(declaration.parent.flags & ts.NodeFlags.Const);
+  const nativeNamespaceNames = ["Date", "Math", "globalThis", "window", "self", "global"];
+  const nativeNamespaces = new Set(nativeNamespaceNames.flatMap(name => {
+    const symbol = checker.resolveName(name, undefined, ts.SymbolFlags.Value, false);
+    return symbol && (name === "globalThis" || symbol.declarations?.some(platformDeclaration)) ? [symbol] : [];
+  }));
+  const unwrapValue = (node: ts.Node): ts.Node => {
+    while (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) ||
+      ts.isTypeAssertionExpression(node) || ts.isSatisfiesExpression(node)) node = node.expression;
+    return node;
+  };
+  const memberSymbol = (node: ts.PropertyAccessExpression | ts.ElementAccessExpression): ts.Symbol | undefined =>
+    ts.isPropertyAccessExpression(node) ? actualSymbol(node.name) :
+      ts.isStringLiteral(node.argumentExpression)
+        ? checker.getTypeAtLocation(node.expression).getProperty(node.argumentExpression.text) : undefined;
+  // Sharing a platform interface does not give an injected value a native origin.
+  const nativeNamespaceSymbol = (symbol: ts.Symbol | undefined, seen: Set<ts.Symbol>): boolean => {
+    if (!symbol) return false;
+    if (symbol.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
+    if (seen.has(symbol)) return false;
+    seen.add(symbol);
+    if (nativeNamespaces.has(symbol)) return true;
+    for (const declaration of symbol.declarations ?? []) {
+      if (ts.isVariableDeclaration(declaration) && constDeclaration(declaration) && declaration.initializer &&
+          nativeNamespace(declaration.initializer, seen)) return true;
+      if (ts.isBindingElement(declaration) && ts.isObjectBindingPattern(declaration.parent)) {
+        const container = declaration.parent.parent;
+        const property = declaration.propertyName ?? declaration.name;
+        if (ts.isVariableDeclaration(container) && constDeclaration(container) && container.initializer &&
+            (ts.isIdentifier(property) || ts.isStringLiteral(property)) &&
+            nativeNamespace(container.initializer, new Set(seen)) &&
+            nativeNamespaceSymbol(checker.getTypeAtLocation(container.initializer).getProperty(property.text), seen)) return true;
+      }
+    }
+    return false;
+  };
+  const nativeNamespace = (expression: ts.Node, seen = new Set<ts.Symbol>()): boolean => {
+    const node = unwrapValue(expression);
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      return nativeNamespace(node.expression, new Set(seen)) && nativeNamespaceSymbol(memberSymbol(node), seen);
+    }
+    return ts.isIdentifier(node) && nativeNamespaceSymbol(actualSymbol(node), seen);
+  };
+  const nativeCallbackSymbol = (symbol: ts.Symbol | undefined, seen: Set<ts.Symbol>): boolean => {
+    if (!symbol) return false;
+    if (symbol.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
+    if (seen.has(symbol)) return false;
+    seen.add(symbol);
+    if (nativeCallbackDeclaration(symbol)) return true;
+    for (const declaration of symbol.declarations ?? []) {
+      if (ts.isVariableDeclaration(declaration) && constDeclaration(declaration) && declaration.initializer &&
+          nativeCallback(declaration.initializer, seen)) return true;
+      if (ts.isBindingElement(declaration) && ts.isObjectBindingPattern(declaration.parent)) {
+        const container = declaration.parent.parent;
+        const property = declaration.propertyName ?? declaration.name;
+        if (ts.isVariableDeclaration(container) && constDeclaration(container) && container.initializer &&
+            (ts.isIdentifier(property) || ts.isStringLiteral(property))) {
+          const member = checker.getTypeAtLocation(container.initializer).getProperty(property.text);
+          if (member && (!nativeCallbackDeclaration(member) || nativeNamespace(container.initializer)) &&
+              nativeCallbackSymbol(member, seen)) return true;
+        }
+      }
+    }
+    return false;
+  };
+  const nativeCallback = (expression: ts.Node, seen = new Set<ts.Symbol>()): boolean => {
+    const node = unwrapValue(expression);
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const member = memberSymbol(node);
+      return !!member && (!nativeCallbackDeclaration(member) || nativeNamespace(node.expression)) &&
+        nativeCallbackSymbol(member, seen);
+    }
+    const symbol = ts.isIdentifier(node) && ts.isShorthandPropertyAssignment(node.parent)
+      ? checker.getShorthandAssignmentValueSymbol(node.parent) : actualSymbol(node);
+    return nativeCallbackSymbol(symbol, seen);
+  };
+  const runtimeValuePosition = (node: ts.Node): boolean => {
+    for (let parent = node.parent; parent; parent = parent.parent) {
+      if (ts.isTypeNode(parent) || ts.isImportDeclaration(parent) ||
+          (ts.isExportDeclaration(parent) && parent.isTypeOnly) ||
+          (ts.isExportSpecifier(parent) && parent.isTypeOnly)) return false;
+    }
+    const parent = node.parent;
+    if (!parent) return false;
+    if ((ts.isVariableDeclaration(parent) || ts.isParameter(parent) || ts.isBindingElement(parent) ||
+         ts.isPropertyAssignment(parent) || ts.isMethodDeclaration(parent)) && parent.name === node) return false;
+    if (ts.isBindingElement(parent) && parent.propertyName === node) return false;
+    return !(ts.isPropertyAccessExpression(parent) && parent.name === node);
+  };
   const isEffect = (node: ts.Node): boolean => effectVariants(checker.getTypeAtLocation(node)).length > 0;
+  const effectValueTypes = new Map<ts.Type, boolean>();
+  const effectValueType = (type: ts.Type): boolean => {
+    const cached = effectValueTypes.get(type);
+    if (cached !== undefined) return cached;
+    const result = effectVariants(type).length > 0 || type.getCallSignatures().some(signature =>
+      effectVariants(checker.getReturnTypeOfSignature(signature)).length > 0);
+    effectValueTypes.set(type, result);
+    return result;
+  };
+  const effectValueSymbols = new Map<ts.Symbol, boolean>();
+  const effectValueSymbol = (symbol: ts.Symbol | undefined, at: ts.Node): boolean => {
+    if (!symbol) return false;
+    if (symbol.declarations?.some(declaration => ts.isExportSpecifier(declaration) &&
+        (declaration.isTypeOnly || declaration.parent.parent.isTypeOnly))) return false;
+    if (symbol.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
+    const cached = effectValueSymbols.get(symbol);
+    if (cached !== undefined) return cached;
+    const result = !!(symbol.flags & ts.SymbolFlags.Value) && effectValueType(checker.getTypeOfSymbolAtLocation(symbol, at));
+    effectValueSymbols.set(symbol, result);
+    return result;
+  };
+  const containsEffectValue = (node: ts.Node): boolean => {
+    if (ts.isTypeNode(node) || ts.isTypeAliasDeclaration(node) || ts.isInterfaceDeclaration(node) ||
+        ts.isTypeParameterDeclaration(node)) return false;
+    if (ts.isImportDeclaration(node)) {
+      const clause = node.importClause;
+      if (!clause || clause.isTypeOnly) return false;
+      if (clause.name && effectValueSymbol(checker.getSymbolAtLocation(clause.name), clause.name)) return true;
+      const bindings = clause.namedBindings;
+      // Namespace imports are inspected at actual member uses, not by tainting all importers.
+      return !!bindings && ts.isNamedImports(bindings) && bindings.elements.some(element =>
+        !element.isTypeOnly && effectValueSymbol(checker.getSymbolAtLocation(element.name), element));
+    }
+    if (ts.isExportDeclaration(node)) {
+      if (node.isTypeOnly) return false;
+      if (node.exportClause && ts.isNamedExports(node.exportClause)) {
+        return node.exportClause.elements.some(element => !element.isTypeOnly &&
+          effectValueSymbol(checker.getSymbolAtLocation(element.name), element));
+      }
+      if (!node.exportClause && node.moduleSpecifier) {
+        const module = checker.getSymbolAtLocation(node.moduleSpecifier);
+        return !!module && checker.getExportsOfModule(module).some(symbol => effectValueSymbol(symbol, node));
+      }
+      return false;
+    }
+    if ((ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isFunctionDeclaration(node) ||
+         ((ts.isIdentifier(node) || ts.isCallExpression(node) || ts.isPropertyAccessExpression(node) ||
+           ts.isElementAccessExpression(node) || ts.isArrowFunction(node) || ts.isFunctionExpression(node)) &&
+           runtimeValuePosition(node))) && effectValueType(checker.getTypeAtLocation(node))) return true;
+    return ts.forEachChild(node, containsEffectValue) ?? false;
+  };
+  const canFail = (node: ts.Node): boolean => effectVariants(checker.getTypeAtLocation(node)).some(variance => {
+    const fields = checker.getTypeOfSymbolAtLocation(variance, node);
+    const error = fields.getProperty("_E");
+    const signature = error && checker.getTypeOfSymbolAtLocation(error, node).getCallSignatures()[0];
+    return signature !== undefined && !(checker.getReturnTypeOfSignature(signature).flags & ts.TypeFlags.Never);
+  });
+  const containsFallibleYield = (node: ts.Node): boolean => {
+    // A nested generator executes under its own interpreter, outside this catch.
+    if (ts.isFunctionLike(node)) return false;
+    if (ts.isYieldExpression(node) && node.expression && canFail(node.expression)) return true;
+    return ts.forEachChild(node, containsFallibleYield) ?? false;
+  };
+  // Resolve only statically bound generator values supplied to a real Effect gen.
+  // Factories, mutation and arbitrary wrapper calls require semantic review.
+  const generatorFunctions = new Set<ts.Node>();
+  const resolveGenerator = (expression: ts.Expression, seen = new Set<ts.Symbol>()): void => {
+    while (ts.isParenthesizedExpression(expression) || ts.isAsExpression(expression) ||
+      ts.isTypeAssertionExpression(expression) || ts.isSatisfiesExpression(expression)) expression = expression.expression;
+    if (ts.isFunctionExpression(expression) && expression.asteriskToken) {
+      generatorFunctions.add(expression);
+      return;
+    }
+    const symbol = actualSymbol(ts.isPropertyAccessExpression(expression) ? expression.name : expression);
+    if (!symbol || seen.has(symbol)) return;
+    seen.add(symbol);
+    for (const declaration of symbol.declarations ?? []) {
+      if (ts.isFunctionDeclaration(declaration) && declaration.asteriskToken && declaration.body) {
+        generatorFunctions.add(declaration);
+      } else if (ts.isVariableDeclaration(declaration) && declaration.initializer &&
+        ts.isVariableDeclarationList(declaration.parent) && declaration.parent.flags & ts.NodeFlags.Const) {
+        resolveGenerator(declaration.initializer, seen);
+      }
+    }
+  };
+  const collectGenerators = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && externalEffectSymbol(node.expression)?.getName() === "gen") {
+      for (const argument of node.arguments) resolveGenerator(argument);
+    }
+    ts.forEachChild(node, collectGenerators);
+  };
+  for (const source of program.getSourceFiles()) {
+    if (!source.isDeclarationFile && !program.isSourceFileFromExternalLibrary(source)) collectGenerators(source);
+  }
+  const insideEffectGenerator = (node: ts.Node): boolean => {
+    for (let parent = node.parent; parent; parent = parent.parent) {
+      if (!ts.isFunctionLike(parent)) continue;
+      return generatorFunctions.has(parent);
+    }
+    return false;
+  };
   const checkChannels = (node: ts.Node): void => {
     const type = checker.getTypeAtLocation(node);
     for (const variance of effectVariants(type)) {
@@ -134,7 +347,7 @@ export function inspectEffectArchitecture(
     };
     const importsEffect = findEffectImports(source);
     if (!modules.has(file)) {
-      if (importsEffect) report(source, "unclassified-module", "Production Effect import/export needs an explicit reviewed architecture role.");
+      if (importsEffect || containsEffectValue(source)) report(source, "unclassified-module", "Production Effect import/export or value needs an explicit reviewed architecture role.");
       continue;
     }
     const adapter = adapters.has(file);
@@ -161,6 +374,9 @@ export function inspectEffectArchitecture(
         rule: "suppression", message: "Architecture/typing suppression requires removal or an explicit owner-reviewed policy change." });
     }
     const visit = (node: ts.Node): void => {
+      if (ts.isTryStatement(node) && node.catchClause && insideEffectGenerator(node) && containsFallibleYield(node.tryBlock)) {
+        report(node.catchClause, "javascript-effect-catch", "JavaScript catch does not handle typed Effect failures; use catchTag, catchAll or Exit.");
+      }
       if (ts.isExpressionStatement(node)) {
         let expression = node.expression;
         while (ts.isParenthesizedExpression(expression) || ts.isVoidExpression(expression)) expression = expression.expression;
@@ -203,21 +419,14 @@ export function inspectEffectArchitecture(
         if (symbol && erasedFailures.has(symbol.getName())) {
           report(node, "erased-failure", "Handle expected failures explicitly; do not erase them or turn them into defects.");
         }
-        if (!adapter) {
-          const expression = node.expression;
-          if (ts.isIdentifier(expression) && ambientCalls.has(expression.text) && isAmbient(expression)) {
-            report(node, "ambient-io", "Use a declared service for ambient I/O and time.");
-          }
-          if (ts.isPropertyAccessExpression(expression)) {
-            const owner = expression.expression;
-            if (ts.isIdentifier(owner) && isAmbient(owner) &&
-              ((owner.text === "Date" && expression.name.text === "now") ||
-               (owner.text === "Math" && expression.name.text === "random") ||
-               (["globalThis", "window"].includes(owner.text) && ambientCalls.has(expression.name.text)))) {
-              report(node, "ambient-io", "Use a declared service for ambient I/O and time.");
-            }
-          }
-        }
+      }
+      if (!adapter && runtimeValuePosition(node) &&
+          (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
+          nativeCallback(node)) {
+        report(node, "ambient-io", "Use a declared service for ambient I/O and time.");
+      }
+      if (!adapter && ts.isBindingElement(node) && ts.isIdentifier(node.name) && nativeCallback(node.name)) {
+        report(node, "ambient-io", "Use a declared service for ambient I/O and time.");
       }
       if (!adapter && ts.isNewExpression(node) && ts.isIdentifier(node.expression) &&
         ["Promise", "Date", "Worker", "AbortController"].includes(node.expression.text) && isAmbient(node.expression)) {

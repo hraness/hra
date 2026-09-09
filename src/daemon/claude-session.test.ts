@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1940,4 +1940,244 @@ describe("Claude sessions on the local authority", () => {
     expect(JSON.stringify(batch.bodies)).not.toContain(sent.turnId);
     expect(batch.bodies.some((body) => body.type === "session_state")).toBe(true);
   });
+});
+
+describe("Claude owned interaction settlement through the service", () => {
+  test.each(["write-held", "callback-held"] as const)(
+    "joins the original response and guarded notice when %s",
+    async (stage) => {
+      const value = await claudeFixture();
+      const trace: string[] = [];
+      const gate = () => {
+        let release!: () => void;
+        const promise = new Promise<void>((resolve) => { release = resolve; });
+        return { promise, release };
+      };
+      const approvalObserved = gate();
+      const writeEntered = gate();
+      const writeRelease = gate();
+      const callbackEntered = gate();
+      const callbackRelease = gate();
+      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<never>((_resolve, reject) => {
+        deadlineTimer = setTimeout(() => reject(new Error("Claude interaction causal milestone did not arrive")), 3_000);
+      });
+      void deadline.catch(() => undefined);
+      const within = <A>(promise: Promise<A>): Promise<A> => Promise.race([promise, deadline]);
+      const requestId = "7036d017-a860-42d1-b7a6-0951dcae5f6a";
+      const joined: Promise<unknown>[] = [];
+      let releaseTimer: ReturnType<typeof setTimeout> | undefined;
+      let finishHandoff: (() => void) | undefined;
+      let selfClose: PromiseSettledResult<void> | undefined;
+      let liveBeforeSelfClose: boolean | undefined;
+      let liveAfterSelfClose: boolean | undefined;
+      let responseSettled = false;
+      let closeSettled = false;
+      let nativeWrite: Promise<void> | undefined;
+      let restoreWrite: (() => void) | undefined;
+      let managerResponse: Promise<PromiseSettledResult<{ responseWritten: true }>> | undefined;
+      const originalResolve = value.runtime.resolveInteraction.bind(value.runtime);
+      const resolver = spyOn(value.runtime, "resolveInteraction").mockImplementation((input) => {
+        const original = originalResolve(input);
+        managerResponse = Promise.allSettled([original]).then(([outcome]) => {
+          trace.push("manager-response-" + outcome!.status);
+          return outcome!;
+        });
+        joined.push(managerResponse);
+        return original;
+      });
+      const observedSession: {
+        end?: () => Promise<void>;
+        isLive?: () => boolean;
+      } = {};
+      const originalObserver = value.service.observeClaudeFact.bind(value.service);
+      const observer = spyOn(value.service, "observeClaudeFact").mockImplementation(async (authority, fact) => {
+        const notice = fact.type === "interactionCanceled" && fact.requestId === requestId;
+        if (notice) trace.push("notice-invoked");
+        await originalObserver(authority, fact);
+        if (fact.type === "interactionRequested" && fact.requestId === requestId) {
+          approvalObserved.release();
+        }
+        if (!notice) return;
+        trace.push("notice-observed");
+        if (stage === "callback-held") {
+          const exactSession = { authority, providerThreadId: fact.providerThreadId };
+          observedSession.end = () => value.runtime.endSession({ ...exactSession, signal });
+          observedSession.isLive = () => value.runtime.hasLiveSession(exactSession);
+          liveBeforeSelfClose = value.runtime.hasLiveSession(exactSession);
+          [selfClose] = await Promise.allSettled([value.runtime.close()]);
+          liveAfterSelfClose = value.runtime.hasLiveSession(exactSession);
+          callbackEntered.release();
+          await callbackRelease.promise;
+          trace.push("notice-returned");
+        }
+      });
+      try {
+        const account = await authenticatedClaudeAccount(value, "Claude owned settlement");
+        const started = await value.service.execute({
+          account, fast: false, kind: "session.start", preset: "fable-max", provider: "claude",
+        }, { signal }) as { session: { id: `sess_${string}` } };
+        const process = value.processes[0];
+        if (process === undefined) throw new Error("Expected one controlled Claude process");
+        await value.service.execute({
+          idempotencyKey: crypto.randomUUID(), kind: "session.send",
+          message: "Check the example status", session: started.session.id,
+        }, { signal });
+        process.emit(approvalRequestLine(requestId));
+        await within(approvalObserved.promise);
+        // Provider observation can return after reserving an ordered durable
+        // fact behind a caller's mutation tail. Join that actual service work
+        // before treating the observed approval as a persisted pending row.
+        await within(value.service.settled());
+        trace.push("approval-service-settled");
+        const pending = await value.service.execute({
+          kind: "interaction.list", limit: 10, pending: true, session: started.session.id,
+        }, { signal }) as { interactions: readonly { id: string; revision: number }[] };
+        expect(pending.interactions).toHaveLength(1);
+        const interaction = pending.interactions[0];
+        if (interaction === undefined) throw new Error("Expected the actual pending approval");
+
+        process.beforeWriteReturn = (line) => {
+          if (!line.includes("control_response")) return;
+          trace.push("write-entered");
+          writeEntered.release();
+          return writeRelease.promise;
+        };
+        const originalWrite = process.write.bind(process);
+        const writer = spyOn(process, "write").mockImplementation((bytes) => {
+          const original = originalWrite(bytes);
+          nativeWrite = original;
+          // Passive observation keeps the exact Promise returned by the process.
+          joined.push(original.then(
+            () => { trace.push("write-fulfilled"); },
+            () => { trace.push("write-rejected"); },
+          ));
+          return original;
+        });
+        restoreWrite = () => { writer.mockRestore(); };
+        const response = value.service.execute({
+          expectedRevision: interaction.revision, interaction: interaction.id,
+          kind: "interaction.resolve", resolution: { decision: "once", kind: "approval_decision" },
+        }, { signal });
+        const responseOutcome = Promise.allSettled([response]).then(([outcome]) => {
+          responseSettled = true;
+          trace.push("service-response-settled");
+          return outcome!;
+        });
+        joined.push(responseOutcome);
+        await within(writeEntered.promise);
+        expect(nativeWrite).toBeDefined();
+        expect(responseSettled).toBe(false);
+        expect(trace).not.toContain("notice-invoked");
+
+        const close = () => {
+          const operation = value.runtime.close();
+          const outcome = Promise.allSettled([operation]).then(([result]) => {
+            closeSettled = true;
+            trace.push(result!.status === "fulfilled" ? "close-fulfilled" : "close-rejected");
+            return result!;
+          });
+          joined.push(outcome);
+          return outcome;
+        };
+        const releaseOnNativeTurn = (release: () => void) => {
+          const handoff = new Promise<void>((resolve) => {
+            finishHandoff = () => {
+              release();
+              resolve();
+              finishHandoff = undefined;
+            };
+            releaseTimer = setTimeout(() => {
+              trace.push("release-handoff");
+              finishHandoff?.();
+            }, 0);
+          });
+          joined.push(handoff);
+          return handoff;
+        };
+
+        if (stage === "write-held") {
+          const closing = close();
+          expect(closeSettled).toBe(false);
+          await within(releaseOnNativeTurn(writeRelease.release));
+          const [resolved, closed] = await within(Promise.all([responseOutcome, closing]));
+          // The exact provider write completes, but the service must still
+          // reattest its account after that effect. Closing the manager fences
+          // that fresh read, so durable resolution stays explicitly uncertain.
+          expect(resolved.status).toBe("rejected");
+          if (resolved.status === "rejected") {
+            expect(resolved.reason).toMatchObject({
+              code: "RECOVERY_REQUIRED",
+              details: { interaction: { id: interaction.id, state: "resolution_unknown" } },
+            });
+          }
+          trace.push("service-recovery-required");
+          expect(value.store.requireInteraction(interaction.id).state).toBe("resolution_unknown");
+          trace.push("durable-resolution-unknown");
+          expect(closed.status).toBe("fulfilled");
+          expect(trace.indexOf("write-fulfilled")).toBeGreaterThan(trace.indexOf("release-handoff"));
+          expect(trace.indexOf("close-fulfilled")).toBeGreaterThan(trace.indexOf("write-fulfilled"));
+          // Closing may remove the exact session before the later notice selects
+          // it. That guarded no-op is valid; it must not replace the write join.
+        } else {
+          writeRelease.release();
+          const resolved = await within(responseOutcome);
+          expect(resolved.status).toBe("fulfilled");
+          await within(callbackEntered.promise);
+          expect(trace.indexOf("notice-invoked")).toBeGreaterThan(trace.indexOf("service-response-settled"));
+          expect(liveBeforeSelfClose).toBe(true);
+          expect(selfClose?.status).toBe("rejected");
+          if (selfClose?.status === "rejected") {
+            expect(selfClose.reason).toMatchObject({ code: "INVALID_INPUT" });
+          }
+          expect(liveAfterSelfClose).toBe(true);
+          if (observedSession.end === undefined) throw new Error("Expected the exact observed session authority");
+          const ending = Promise.allSettled([observedSession.end()]).then(([result]) => {
+            trace.push("end-session-" + result!.status);
+            return result!;
+          });
+          joined.push(ending);
+          // End the exact child without awaiting the callback's own retirement:
+          // real service callers may still hold their serialization authority.
+          expect((await within(ending)).status).toBe("fulfilled");
+          expect(observedSession.isLive?.()).toBe(false);
+          expect(trace).not.toContain("notice-returned");
+          const closing = close();
+          expect(closeSettled).toBe(false);
+          await within(releaseOnNativeTurn(callbackRelease.release));
+          expect((await within(closing)).status).toBe("fulfilled");
+          expect(trace.indexOf("notice-returned")).toBeGreaterThan(trace.indexOf("release-handoff"));
+          expect(trace.indexOf("close-fulfilled")).toBeGreaterThan(trace.indexOf("notice-returned"));
+          expect(trace.filter((entry) => entry === "notice-invoked")).toHaveLength(1);
+        }
+        if (managerResponse === undefined) throw new Error("Expected the original manager response");
+        expect(await within(managerResponse)).toEqual({
+          status: "fulfilled", value: { responseWritten: true },
+        });
+        expect(process.written.filter((line) => line.includes("control_response"))).toHaveLength(1);
+      } finally {
+        if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+        if (releaseTimer !== undefined) clearTimeout(releaseTimer);
+        finishHandoff?.();
+        writeRelease.release();
+        callbackRelease.release();
+        // A failed milestone still releases both controlled native boundaries.
+        // Original response, native write, and close observations all settle.
+        await Promise.allSettled(joined);
+        if (nativeWrite !== undefined) await Promise.allSettled([nativeWrite]);
+        restoreWrite?.();
+        resolver.mockRestore();
+        observer.mockRestore();
+        try {
+          await value.runtime.close();
+          trace.push("cleanup-closed");
+        } finally {
+          console.info("[hra-r3-service-causal]", JSON.stringify({
+            stage, trace, selfCloseStatus: selfClose?.status,
+            liveBeforeSelfClose, liveAfterSelfClose,
+          }));
+        }
+      }
+    },
+  );
 });
