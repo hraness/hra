@@ -19,8 +19,10 @@ export const appearanceMenuStyles = stylex.create({
     backgroundColor: "var(--popover)", color: "var(--popover-foreground)",
     borderColor: "var(--control-border)", borderStyle: "solid", borderWidth: 1,
     borderRadius: "0.75rem", display: "grid", gap: "1rem",
-    insetBlockStart: "calc(100% + 0.5rem)", insetInlineEnd: 0,
-    padding: "1rem", position: "absolute", width: "min(18rem, calc(100vw - 2rem))", zIndex: 3000,
+    insetBlockStart: { default: "calc(100% + 0.5rem)", "@media (max-width: 48rem)": "calc(4.25rem + env(safe-area-inset-top, 0px))" },
+    insetInlineEnd: { default: 0, "@media (max-width: 48rem)": "1rem" },
+    padding: "1rem", position: { default: "absolute", "@media (max-width: 48rem)": "fixed" },
+    width: "min(18rem, calc(100vw - 2rem))", zIndex: 3000,
   },
   label: { display: "grid", gap: "0.35rem" },
   select: {
