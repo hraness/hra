@@ -20,11 +20,13 @@ import {
   decryptMemorySummary,
   decryptNotificationEmail,
   decryptNotificationHours,
+  decryptProfileBinding,
   isFiniteTimestamp,
   isOpaqueIdentifier,
   isRecord,
   isSafePositiveInteger,
   parseEncryptedEnvelope,
+  profileBindingRegistryDigest,
   snapshotForeignJson,
   type CloudPayloadAuthority,
   type DeviceRegistryPayload,
@@ -32,6 +34,7 @@ import {
   type MemorySummaryPayload,
   type NotificationEmailPolicy,
   type NotificationHoursPolicy,
+  type ProfileBindingPayload,
 } from "../hra/cloud";
 import { createCancellation } from "../lib/cancellation";
 import {
@@ -61,6 +64,9 @@ export type RegistryRow = Readonly<{
   /** Server-visible freshness fence; never consent on its own. */
   notificationPolicyRevision: number | null;
   notificationPolicyRevisionStatus: "absent" | "invalid" | "present";
+  /** Read-only exact default observation, never a selector or registry-v1 field. */
+  profileBindingEnvelope: EncryptedEnvelope | null;
+  profileBindingEnvelopeStatus: "absent" | "invalid" | "present";
   revision: number;
   updatedAt: number;
 }>;
@@ -118,6 +124,12 @@ export function parseRegistryRow(input: unknown): RegistryRow | null {
   const hasNotificationPolicyRevision = Object.hasOwn(value, "notificationPolicyRevision");
   const notificationPolicyRevisionValid = hasNotificationPolicyRevision
     && isSafePositiveInteger(value.notificationPolicyRevision);
+  const hasProfileBindingEnvelope = Object.hasOwn(value, "profileBindingEnvelope");
+  const profileBindingEnvelope = hasProfileBindingEnvelope
+    ? parseEncryptedEnvelope(value.profileBindingEnvelope, cloudLimits.profileBindingCiphertextCharacters)
+    : null;
+  const profileBindingEnvelopeValid = profileBindingEnvelope !== null
+    && profileBindingEnvelope.keyVersion === value.keyVersion;
   let memorySummaryEnvelopeStatus: RegistryRow["memorySummaryEnvelopeStatus"] = "absent";
   if (!memorySummaryMetadataValid || (hasMemorySummaryEnvelope && !memorySummaryEnvelopeValid)) {
     memorySummaryEnvelopeStatus = "invalid";
@@ -158,6 +170,10 @@ export function parseRegistryRow(input: unknown): RegistryRow | null {
       : notificationPolicyRevisionValid
       ? "present"
       : "invalid",
+    profileBindingEnvelope: profileBindingEnvelopeValid ? profileBindingEnvelope : null,
+    profileBindingEnvelopeStatus: !hasProfileBindingEnvelope
+      ? "absent"
+      : profileBindingEnvelopeValid ? "present" : "invalid",
     revision: value.revision,
     updatedAt: value.updatedAt,
   };
@@ -173,6 +189,10 @@ export function notificationEmailAuthority(input: Parameters<typeof registryAuth
 
 export function memorySummaryAuthority(input: Parameters<typeof registryAuthority>[0]): CloudPayloadAuthority {
   return { ...registryAuthority(input), kind: "memory_summary" };
+}
+
+export function profileBindingAuthority(input: Parameters<typeof registryAuthority>[0]): CloudPayloadAuthority {
+  return { ...registryAuthority(input), kind: "profile_binding" };
 }
 
 export function parseRegistryRows(value: unknown): readonly RegistryRow[] {
@@ -213,6 +233,10 @@ export function memorySummaryAad(input: Parameters<typeof registryAuthority>[0])
   return cloudPayloadAad(memorySummaryAuthority(input));
 }
 
+export function profileBindingAad(input: Parameters<typeof registryAuthority>[0]): Uint8Array {
+  return cloudPayloadAad(profileBindingAuthority(input));
+}
+
 export type DeviceRegistries = Readonly<{
   error: string | null;
   loading: boolean;
@@ -230,6 +254,8 @@ export type RegistryProjection = Readonly<{
   notificationPolicyRevision: number | null;
   memorySummary: MemorySummaryPayload | null;
   memorySummaryStatus: "available" | "unreadable" | "unsupported";
+  profileBinding: ProfileBindingPayload | null;
+  profileBindingStatus: "available" | "unreadable" | "unsupported";
   registry: DeviceRegistryPayload;
 }>;
 
@@ -294,19 +320,50 @@ export function notificationEmailProjection(input: Readonly<{
 }
 
 /**
- * Both companion fences participate in cache identity. When Convex publishes
- * a new summary without touching the broad registry revision, the old
- * projection immediately becomes a cache miss instead of remaining visible
- * while the replacement decrypt is in flight.
+ * Exact registry/binding envelopes and the memory companion fences participate
+ * in cache identity. Replacements are cache misses even at an unchanged broad
+ * revision, so an old exact-profile label cannot survive a pending decrypt.
  */
 export function registryProjectionCacheKey(row: RegistryRow): string {
-  return [
+  const envelopeIdentity = (envelope: EncryptedEnvelope | null) => envelope === null
+    ? null
+    : [envelope.algorithm, envelope.ciphertext, envelope.keyVersion, envelope.nonce];
+  return JSON.stringify([
     row.devicePublicId,
+    row.keyVersion,
     row.revision,
+    envelopeIdentity(row.envelope),
+    row.profileBindingEnvelopeStatus,
+    envelopeIdentity(row.profileBindingEnvelope),
     row.memorySummaryEnvelopeStatus,
     row.memorySummaryRevision ?? 0,
     row.memorySummaryUpdatedAt ?? 0,
-  ].join(":");
+  ]);
+}
+
+export type RegistryProjectionCache = Readonly<{
+  key: Uint8Array;
+  /** Owned copy, wiped when the decrypt effect loses custody. */
+  keyBytes: Uint8Array;
+  live: () => boolean;
+  projections: ReadonlyMap<string, RegistryProjection>;
+  userPublicId: string;
+}>;
+
+function registryCacheKeyCurrent(cache: RegistryProjectionCache, key: Uint8Array | null): boolean {
+  return key !== null && cache.live() && cache.key === key
+    && cache.keyBytes.length === key.length
+    && cache.keyBytes.every((byte, index) => byte === key[index]);
+}
+
+/** Fail closed during the render before a changed authority's effect cleans up. */
+export function registryProjectionFromCache(
+  cache: RegistryProjectionCache | null,
+  input: Readonly<{ key: Uint8Array | null; row: RegistryRow; userPublicId: string | null }>,
+): RegistryProjection | undefined {
+  return cache !== null && registryCacheKeyCurrent(cache, input.key) && cache.userPublicId === input.userPublicId
+    ? cache.projections.get(registryProjectionCacheKey(input.row))
+    : undefined;
 }
 
 /**
@@ -328,6 +385,36 @@ export async function decryptRegistryProjection(input: Readonly<{
       userPublicId: input.userPublicId,
     }),
   );
+  let profileBinding: ProfileBindingPayload | null = null;
+  let profileBindingStatus: RegistryProjection["profileBindingStatus"] = "unsupported";
+  if (input.row.profileBindingEnvelopeStatus === "invalid") {
+    profileBindingStatus = "unreadable";
+  } else if (
+    input.row.profileBindingEnvelopeStatus === "present"
+    && input.row.profileBindingEnvelope !== null
+  ) {
+    try {
+      const observation = await decryptProfileBinding(
+        input.row.profileBindingEnvelope,
+        input.key,
+        profileBindingAuthority({
+          devicePublicId: input.row.devicePublicId,
+          keyVersion: input.row.keyVersion,
+          userPublicId: input.userPublicId,
+        }),
+      );
+      if (
+        observation.registryRevision !== input.row.revision
+        || observation.observedAt !== registry.heartbeatAt
+        || observation.preset !== registry.defaultPreset
+        || observation.registryEnvelopeDigest !== await profileBindingRegistryDigest(input.row.envelope)
+      ) throw new Error("Profile binding does not match its registry.");
+      profileBinding = observation;
+      profileBindingStatus = "available";
+    } catch {
+      profileBindingStatus = "unreadable";
+    }
+  }
   let memorySummary: MemorySummaryPayload | null = null;
   let memorySummaryStatus: RegistryProjection["memorySummaryStatus"] = "unsupported";
   // Summary timestamps come from another machine. Until `presence:current`
@@ -414,6 +501,8 @@ export async function decryptRegistryProjection(input: Readonly<{
     notificationHoursStatus,
     memorySummary,
     memorySummaryStatus,
+    profileBinding,
+    profileBindingStatus,
     registry,
   };
 }
@@ -435,60 +524,77 @@ export function useDeviceRegistries(): DeviceRegistries {
   const keyVersion = unlocked?.identity.keyVersion ?? null;
   const userPublicId = unlocked?.identity.userPublicId ?? null;
   const report = custody.reportAuthorityFailure;
-  const [payloads, setPayloads] = useState<ReadonlyMap<string, RegistryProjection>>(new Map());
+  const [payloads, setPayloads] = useState<RegistryProjectionCache | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const rows = useMemo(() => (value === undefined ? [] : parseRegistryRows(value)), [value]);
 
   useEffect(() => {
     if (key === null || userPublicId === null || keyVersion === null) {
-      setPayloads(new Map());
+      setPayloads(null);
       return;
     }
     const run = createCancellation();
+    const next = new Map<string, RegistryProjection>();
+    const cache: RegistryProjectionCache = {
+      key,
+      keyBytes: new Uint8Array(key),
+      live: run.live,
+      projections: next,
+      userPublicId,
+    };
+    const current = () => registryCacheKeyCurrent(cache, key);
     void (async () => {
-      const next = new Map<string, RegistryProjection>();
       let failures = 0;
       for (const row of rows) {
+        if (!current()) return;
         if (row.keyVersion !== keyVersion) continue;
         try {
           const projection = await decryptRegistryProjection({
-            key,
+            key: cache.keyBytes,
             memorySummaryReady: serverClock.ready,
             row,
             userPublicId,
           });
+          if (!current()) return;
           if (
             projection.notificationHoursStatus === "unreadable"
             || projection.notificationPolicyFreshness === "unreadable"
             || projection.memorySummaryStatus === "unreadable"
+            || projection.profileBindingStatus === "unreadable"
           ) failures += 1;
           next.set(registryProjectionCacheKey(row), projection);
         } catch (failure: unknown) {
+          if (!current()) return;
           report(failure);
           failures += 1;
         }
       }
-      if (!run.live()) return;
-      setPayloads(next);
+      if (!current()) return;
+      setPayloads(cache);
       setError(failures === 0
         ? null
         : `${failures} machine projection${failures === 1 ? "" : "s"} could not be read.`);
     })();
-    return () => { run.cancel(); };
+    return () => {
+      run.cancel();
+      cache.keyBytes.fill(0);
+    };
   }, [key, keyVersion, report, rows, serverClock.ready, userPublicId]);
 
   const machines = useMemo(() => {
     const devices = new Map<string, MachineDeviceState>(deviceRows.map((row) => [
       row.publicId,
-      { online: row.online, status: row.status },
+      { deviceClass: row.deviceClass, keyVersion: row.keyVersion, online: row.online, status: row.status },
     ]));
     return sortMachines(rows.flatMap((row) => {
-      const projection = payloads.get(registryProjectionCacheKey(row));
+      if (row.keyVersion !== keyVersion) return [];
+      const projection = registryProjectionFromCache(payloads, { key, row, userPublicId });
       if (projection === undefined) return [];
       return [toMachineView({
         device: devices.get(row.devicePublicId) ?? null,
         devicePublicId: row.devicePublicId,
+        keyVersion: row.keyVersion,
         memorySummaryReady: serverClock.ready,
         now: serverClock.now,
         notificationHours: projection.notificationHours,
@@ -498,12 +604,15 @@ export function useDeviceRegistries(): DeviceRegistries {
         attentionEmailEnabled: projection.attentionEmailEnabled,
         memorySummary: projection.memorySummary,
         memorySummaryStatus: projection.memorySummaryStatus,
+        profileBinding: projection.profileBinding,
+        profileBindingReady: serverClock.ready,
+        profileBindingStatus: projection.profileBindingStatus,
         payload: projection.registry,
         revision: row.revision,
         updatedAt: row.updatedAt,
       })];
     }));
-  }, [deviceRows, payloads, rows, serverClock.now, serverClock.ready]);
+  }, [deviceRows, key, keyVersion, payloads, rows, serverClock.now, serverClock.ready, userPublicId]);
 
   return {
     error,

@@ -9,6 +9,10 @@
  */
 export { type SupportedPreset, type SupportedProvider } from "../../../src/domain/presets";
 export {
+  decodeHistoricalProfileKey,
+  type CanonicalProfile,
+} from "../../../src/domain/canonical-profile";
+export {
   canonicalDevicePublicKeyJson,
   decodeBase64Url,
   decryptBytes,
@@ -92,6 +96,7 @@ export {
   decryptMemorySummary,
   decryptNotificationEmail,
   decryptNotificationHours,
+  decryptProfileBinding,
   decryptSessionMetadata,
   deviceCommandLoginResultLifetimeMs,
   deviceCommandLimits,
@@ -104,6 +109,8 @@ export {
   parseDeviceCommandResultPayload,
   parseDeviceRegistryPayload,
   parseMemorySummaryPayload,
+  parseProfileBindingPayload,
+  profileBindingRegistryDigest,
   parseRemoteCommandPayload,
   remoteInteractionAnswersFitCommandEnvelope,
   type CloudPayloadAuthority,
@@ -124,6 +131,7 @@ export {
   type MemorySummaryPeerPolicy,
   type MemorySummaryRecentRecord,
   type MemorySummarySpace,
+  type ProfileBindingPayload,
   type RemoteCommandPayload,
   type SessionMetadataPayload,
 } from "../../../src/cloud/payloads";

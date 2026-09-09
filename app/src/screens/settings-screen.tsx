@@ -85,6 +85,7 @@ import {
   type ArchivedSessionView,
   type CommandTarget,
   type MachineView,
+  type ProfileBindingView,
 } from "../model/settings-view";
 import { settingsScreenStyles as styles } from "./settings-screen.stylex";
 
@@ -373,6 +374,25 @@ export function NotificationHoursForm({ machine }: Readonly<{ machine: MachineVi
   );
 }
 
+/** This row has no command path and never relabels a mutable preset choice. */
+export function DefaultProfileObservation({ observation }: Readonly<{ observation: ProfileBindingView }>) {
+  const unavailable = {
+    inactive: "Unavailable: this is not a current active daemon at this account key version.",
+    stale: "Unavailable: the last observation is outside the current hosted-time window.",
+    unreadable: "Unavailable: the observation could not be verified against this registry.",
+    unsupported: "Unavailable: a binding observation or its hosted-time authority is not available.",
+  } as const;
+  return (
+    <SettingsRow
+      control={<Badge tone={observation.status === "current" ? "neutral" : "attention"}>{observation.status}</Badge>}
+      description={observation.status === "current"
+        ? `${observation.profile.model} / ${observation.profile.effort}. Reported configuration only, not session state or runtime capability.`
+        : unavailable[observation.status]}
+      title="Last reported Codex default"
+    />
+  );
+}
+
 function MachineCard({
   machine,
   now,
@@ -468,6 +488,8 @@ function MachineCard({
         description="The model preset new sessions start with."
         title="Default preset"
       />
+
+      <DefaultProfileObservation observation={machine.profileBinding} />
 
       {machine.projects.length === 0 ? null : (
         <SettingsRow

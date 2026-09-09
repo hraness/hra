@@ -28,9 +28,12 @@ import {
 import { assertPublicSensitiveText, assertPublicText } from "./public-text-policy";
 import {
   assertPseudoTerminalSuccess,
+  observePseudoTerminalCleanup,
   PTY_BEGIN_MARKER,
   pseudoTerminalScriptArguments,
+  readPseudoTerminalAuthorityLine,
   runInPseudoTerminal,
+  settlePseudoTerminalCleanup,
 } from "./pty-acceptance";
 
 describe("reviewed historical synthetic package fixtures", () => {
@@ -1282,6 +1285,85 @@ describe("installed package generic command ownership", () => {
 });
 
 describe("installed package pseudo-terminal acceptance", () => {
+  test("waits for the complete authority line across every stdout split", () => {
+    const marker = "__HRA_PTY_AUTHORITY_fixture__";
+    for (const ending of ["\n", "\r\n"] as const) {
+      const line = `\n${marker}\t23456${ending}`;
+      for (let split = 0; split < line.length; split += 1) {
+        const first = line.slice(0, split);
+        expect(readPseudoTerminalAuthorityLine(first, marker)).toBeUndefined();
+        expect(readPseudoTerminalAuthorityLine(first + line.slice(split), marker)).toBe(23456);
+      }
+      expect(readPseudoTerminalAuthorityLine(`unrelated text\n${line}${PTY_BEGIN_MARKER}\n`, marker)).toBe(23456);
+    }
+    for (const value of ["23456suffix", "23456\t", "23456 ", "023456", "+23456", "-23456", "0", "1", "", "23456\r\r", "9007199254740992", String(process.pid)]) {
+      expect(readPseudoTerminalAuthorityLine(`\n${marker}\t${value}\n`, marker)).toBeUndefined();
+    }
+    expect(readPseudoTerminalAuthorityLine(`prefix${marker}\t23456\n`, marker)).toBeUndefined();
+    expect(readPseudoTerminalAuthorityLine(`\n${marker}-other\t23456\n`, marker)).toBeUndefined();
+  });
+
+  test("observes early cleanup rejection while retaining it for final settlement", async () => {
+    const cleanup = Promise.withResolvers<undefined>();
+    const observation = observePseudoTerminalCleanup(cleanup.promise);
+    const denied = Object.assign(new Error("process-group observation refused"), { code: "EPERM" });
+    cleanup.reject(denied);
+    await Promise.resolve();
+    const result = await observation;
+    expect(result.status).toBe("rejected");
+    if (result.status !== "rejected") throw new Error("Expected retained cleanup failure.");
+    expect(result.reason).toBe(denied);
+    expect(await observePseudoTerminalCleanup(Promise.reject(undefined)))
+      .toEqual({ status: "rejected", reason: undefined });
+    expect(await observePseudoTerminalCleanup(Promise.resolve()))
+      .toEqual({ status: "fulfilled", value: undefined });
+  });
+
+  test("joins bounded termination after a refused post-driver probe before finalization", async () => {
+    const denied = Object.assign(new Error("group probe denied"), { code: "EPERM" });
+    const rawTermination = Promise.withResolvers<undefined>();
+    const requested = Promise.withResolvers<undefined>();
+    let termination: Promise<PromiseSettledResult<void>> | undefined;
+    const events: string[] = [];
+    const result = settlePseudoTerminalCleanup({
+      termination: () => termination,
+      observeExit: () => { events.push("probe"); return Promise.reject(denied); },
+      requestTermination: () => {
+        events.push("terminate-owned-groups");
+        termination = observePseudoTerminalCleanup(rawTermination.promise);
+        requested.resolve(undefined);
+      },
+      markLingering: () => { throw new Error("Permission denial is not an absence observation."); },
+      finalize: () => { events.push("finalize-timers-and-stdio"); },
+    });
+    await requested.promise;
+    expect(events).toEqual(["probe", "terminate-owned-groups"]);
+    rawTermination.resolve(undefined);
+    expect(await result).toBe(denied);
+    expect(events).toEqual(["probe", "terminate-owned-groups", "finalize-timers-and-stdio"]);
+  });
+
+  test("retains an early termination rejection until deferred driver settlement and finalizes once", async () => {
+    const failed = Object.assign(new Error("early cleanup failure"), { code: "EPERM" });
+    const rawTermination = Promise.withResolvers<undefined>();
+    const termination = observePseudoTerminalCleanup(rawTermination.promise);
+    const driver = Promise.withResolvers<undefined>();
+    let finalized = 0;
+    const result = driver.promise.then(async () => await settlePseudoTerminalCleanup({
+      termination: () => termination,
+      observeExit: () => Promise.reject(new Error("Termination already owns exit observation.")),
+      requestTermination: () => { throw new Error("Termination must not be requested twice."); },
+      markLingering: () => { throw new Error("A cleanup rejection is not lingering proof."); },
+      finalize: () => { finalized += 1; },
+    }));
+    rawTermination.reject(failed);
+    await Promise.resolve();
+    expect(finalized).toBe(0);
+    driver.resolve(undefined);
+    expect(await result).toBe(failed);
+    expect(finalized).toBe(1);
+  });
+
   test("uses each supported operating system's real script interface without interpolating macOS arguments", () => {
     expect(pseudoTerminalScriptArguments("darwin", "/tmp/wrapper path", [
       "/tmp/hra path",
@@ -1385,12 +1467,14 @@ describe("installed package pseudo-terminal acceptance", () => {
           timeoutMs: scenario.timeoutMs,
         }).catch((caught: unknown) => caught);
         const elapsedMs = Date.now() - startedAt;
-        expect(error).toBeInstanceOf(Error);
-        expect(String(error)).toContain(scenario.expected);
-        expect(elapsedMs).toBeLessThan(scenario.overflow ? 4_000 : 3_000);
+        // Capture exact fixture-owned fallback cleanup before an unexpected
+        // result assertion can fail (for example, an unknown group probe).
         ownedPids = JSON.parse(await readFile(pidFile, "utf8")) as number[];
         expect(ownedPids).toHaveLength(3);
         expect(new Set(ownedPids).size).toBe(3);
+        expect(error).toBeInstanceOf(Error);
+        expect(String(error)).toContain(scenario.expected);
+        expect(elapsedMs).toBeLessThan(scenario.overflow ? 4_000 : 3_000);
         for (const pid of ownedPids) {
           expect(Number.isSafeInteger(pid) && pid > 1).toBe(true);
           expect(processIsAlive(pid)).toBe(false);

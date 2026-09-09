@@ -17,6 +17,7 @@ import { modules } from "./test.setup";
 type Args = Readonly<Record<string, Value>>;
 type RegistryWrite = Readonly<{
   devicePublicId: string;
+  profileBindingProjectionVersion?: 1;
   revision: number;
   updatedAt: number;
 }>;
@@ -30,6 +31,7 @@ type RegistryRow = Readonly<{
   notificationEmailEnvelope?: Readonly<{ ciphertext: string; keyVersion: number }>;
   notificationHoursEnvelope?: Readonly<{ ciphertext: string; keyVersion: number }>;
   notificationPolicyRevision?: number;
+  profileBindingEnvelope?: Readonly<{ ciphertext: string; keyVersion: number }>;
   revision: number;
   updatedAt: number;
 }>;
@@ -136,7 +138,271 @@ async function registryWorld() {
   return { asDevice, enrollDevice, enrollUser, testRuntime };
 }
 
+async function registryCustodyState(world: Awaited<ReturnType<typeof registryWorld>>) {
+  return await world.testRuntime.run(async (ctx) => ({
+    registries: await ctx.db.query("deviceRegistries").collect(),
+    service: await ctx.db.query("storageUsageService").collect(),
+    users: await ctx.db.query("storageUsageByUser").collect(),
+  }));
+}
+
 describe("device registry", () => {
+  test("advertises profile-binding format only in successful replies and clears an omitted companion", async () => {
+    const world = await registryWorld();
+    const primary = await world.enrollDevice("profile", await world.enrollUser("profile"));
+    const runtime = world.asDevice(primary);
+    const first = await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("C".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
+    expect(first).toMatchObject({ profileBindingProjectionVersion: 1, revision: 1 });
+    const profile = envelopeWith("P".repeat(48));
+    const second = await runtime.mutation(updateRegistry, {
+      commandRequestVersion: 2,
+      envelope: envelopeWith("D".repeat(48)),
+      expectedRevision: 1,
+      keyVersion: 1,
+      profileBindingEnvelope: profile,
+    });
+    expect(second).toMatchObject({ profileBindingProjectionVersion: 1, revision: 2 });
+    await runtime.mutation(updateMemorySummary, {
+      envelope: envelopeWith("S".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+    });
+    const projected = await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId });
+    expect(projected).toMatchObject({ profileBindingEnvelope: profile, revision: 2 });
+    if (projected === null) throw new Error("missing profile projection fixture");
+    expect(await runtime.query(listRegistries, {})).toEqual([projected]);
+    for (const row of [projected, (await registryCustodyState(world)).registries[0]]) {
+      expect(row).not.toHaveProperty("profileBindingProjectionVersion");
+      expect(row).not.toHaveProperty("profileKey");
+      expect(row).not.toHaveProperty("preset");
+    }
+    expect((await registryCustodyState(world)).registries[0]?.commandRequestVersion).toBe(2);
+    const downgraded = await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("E".repeat(48)),
+      expectedRevision: 2,
+      keyVersion: 1,
+    });
+    expect(downgraded).toMatchObject({ profileBindingProjectionVersion: 1, revision: 3 });
+    const cleared = await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId });
+    expect(cleared).not.toHaveProperty("profileBindingEnvelope");
+    expect(cleared).toMatchObject({ memorySummaryRevision: 1, revision: 3 });
+    expect((await registryCustodyState(world)).registries[0]).not.toHaveProperty("profileBindingEnvelope");
+  });
+
+  test("requires a daemon for profile publication but preserves legacy browser writes and account-scoped reads", async () => {
+    const world = await registryWorld();
+    const userId = await world.enrollUser("profile-browser");
+    const daemon = await world.enrollDevice("profile-daemon", userId);
+    const browser = await world.enrollDevice("profile-browser", userId, "browser");
+    const stranger = await world.enrollDevice("profile-stranger", await world.enrollUser("profile-stranger"));
+    const browserRuntime = world.asDevice(browser);
+    const profile = envelopeWith("P".repeat(48));
+    for (const expectedRevision of [0, 1]) {
+      const before = await registryCustodyState(world);
+      await expectPromiseToReject(browserRuntime.mutation(updateRegistry, {
+        envelope: envelopeWith("C".repeat(48)),
+        expectedRevision,
+        keyVersion: 1,
+        profileBindingEnvelope: profile,
+      }), "BROWSER_DEVICE_CANNOT_EXECUTE");
+      expect(await registryCustodyState(world)).toEqual(before);
+      expect(await browserRuntime.mutation(updateRegistry, {
+        envelope: envelopeWith("B".repeat(48)),
+        expectedRevision,
+        keyVersion: 1,
+      })).toMatchObject({ profileBindingProjectionVersion: 1, revision: expectedRevision + 1 });
+    }
+    await world.asDevice(daemon).mutation(updateRegistry, {
+      envelope: envelopeWith("D".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+      profileBindingEnvelope: profile,
+    });
+    expect(await browserRuntime.query(getRegistry, { devicePublicId: daemon.devicePublicId }))
+      .toMatchObject({ profileBindingEnvelope: profile });
+    expect(await world.asDevice(stranger).query(getRegistry, { devicePublicId: daemon.devicePublicId }))
+      .toBeNull();
+    expect(await world.asDevice(stranger).query(listRegistries, {})).toEqual([]);
+  });
+
+  test("refuses malformed, wrong-key and oversized profile envelopes without changing registry or quota", async () => {
+    const world = await registryWorld();
+    const primary = await world.enrollDevice("profile-invalid", await world.enrollUser("profile-invalid"));
+    const runtime = world.asDevice(primary);
+    const profile = envelopeWith("P".repeat(48));
+    for (const expectedRevision of [0, 1]) {
+      const before = await registryCustodyState(world);
+      for (const invalid of [
+        { ...profile, keyVersion: 2 },
+        { ...profile, keyVersion: -0 },
+        { ...profile, nonce: "bad" },
+        { ...profile, ciphertext: "invalid!" },
+        envelopeWith("P".repeat(cloudLimits.profileBindingCiphertextCharacters + 1)),
+      ]) {
+        await expectPromiseToReject(runtime.mutation(updateRegistry, {
+          envelope: envelopeWith("C".repeat(48)),
+          expectedRevision,
+          keyVersion: 1,
+          profileBindingEnvelope: invalid,
+        }), "Cloud authority is not current.");
+        expect(await registryCustodyState(world)).toEqual(before);
+      }
+      await runtime.mutation(updateRegistry, {
+        envelope: envelopeWith("C".repeat(48)),
+        expectedRevision,
+        keyVersion: 1,
+        profileBindingEnvelope: profile,
+      });
+    }
+    const before = await registryCustodyState(world);
+    await expectPromiseToReject(runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("E".repeat(48)),
+      expectedRevision: 1,
+      keyVersion: 1,
+      profileBindingEnvelope: envelopeWith("Q".repeat(48)),
+    }), "DEVICE_REGISTRY_REVISION_CONFLICT");
+    expect(await registryCustodyState(world)).toEqual(before);
+  });
+
+  test("charges profile insert and patch bytes exactly and releases the companion on key-change omission", async () => {
+    const world = await registryWorld();
+    const primary = await world.enrollDevice("profile-quota", await world.enrollUser("profile-quota"));
+    const runtime = world.asDevice(primary);
+    const accounting = async () => {
+      const state = await registryCustodyState(world);
+      const registry = state.registries[0];
+      const quota = state.users.find((row) => row.userId === primary.userId && row.category === "custody");
+      if (quota === undefined) throw new Error("missing profile custody quota");
+      const document: Record<string, Value | undefined> = {};
+      if (registry !== undefined) {
+        for (const [key, value] of Object.entries(registry)) {
+          if (key !== "_creationTime" && key !== "_id") document[key] = value;
+        }
+      }
+      return { documentBytes: registry === undefined ? 0 : logicalDocumentBytes(document), quotaBytes: quota.logicalBytes };
+    };
+    const empty = await accounting();
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("C".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+      profileBindingEnvelope: envelopeWith("P".repeat(48)),
+    });
+    const inserted = await accounting();
+    expect(inserted.quotaBytes - empty.quotaBytes).toBe(inserted.documentBytes);
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("D".repeat(48)),
+      expectedRevision: 1,
+      keyVersion: 1,
+      profileBindingEnvelope: envelopeWith("Q".repeat(1_024)),
+    });
+    const patched = await accounting();
+    expect(patched.quotaBytes - inserted.quotaBytes).toBe(patched.documentBytes - inserted.documentBytes);
+    expect(patched.quotaBytes).toBeGreaterThan(inserted.quotaBytes);
+    await runtime.mutation(updateRegistry, {
+      envelope: { ...envelopeWith("E".repeat(48)), keyVersion: 2 },
+      expectedRevision: 2,
+      keyVersion: 2,
+    });
+    const cleared = await accounting();
+    expect(cleared.quotaBytes - patched.quotaBytes).toBe(cleared.documentBytes - patched.documentBytes);
+    expect(cleared.quotaBytes).toBeLessThan(patched.quotaBytes);
+    expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
+      .not.toHaveProperty("profileBindingEnvelope");
+  });
+
+  for (const existing of [false, true]) {
+    test(`profile quota refusal is atomic for ${existing ? "patch" : "insert"}`, async () => {
+      const world = await registryWorld();
+      const primary = await world.enrollDevice("profile-refusal", await world.enrollUser("profile-refusal"));
+      const runtime = world.asDevice(primary);
+      if (!existing) {
+        // Keep the quota fixture coherent: positive custody bytes require a record.
+        const other = await world.enrollDevice("profile-refusal-other", primary.userId);
+        await world.asDevice(other).mutation(updateRegistry, {
+          envelope: envelopeWith("B".repeat(48)),
+          expectedRevision: 0,
+          keyVersion: 1,
+        });
+      }
+      if (existing) {
+        await runtime.mutation(updateRegistry, {
+          envelope: envelopeWith("C".repeat(48)),
+          expectedRevision: 0,
+          keyVersion: 1,
+          profileBindingEnvelope: envelopeWith("P".repeat(48)),
+        });
+      }
+      await world.testRuntime.run(async (ctx) => {
+        const custody = await ctx.db.query("storageUsageByUser")
+          .withIndex("by_user_and_category", (builder) => builder
+            .eq("userId", primary.userId).eq("category", "custody"))
+          .unique();
+        const service = await ctx.db.query("storageUsageService")
+          .withIndex("by_key", (builder) => builder.eq("key", "global")).unique();
+        if (custody === null || service === null) throw new Error("missing profile quota authority");
+        const targetBytes = CATEGORY_QUOTAS.custody.logicalBytes - 512;
+        const delta = targetBytes - custody.logicalBytes;
+        await ctx.db.patch(custody._id, { logicalBytes: targetBytes });
+        await ctx.db.patch(service._id, {
+          logicalBytes: service.logicalBytes + delta,
+          userLogicalBytes: service.userLogicalBytes + delta,
+        });
+      });
+      const before = await registryCustodyState(world);
+      await expectPromiseToReject(runtime.mutation(updateRegistry, {
+        envelope: envelopeWith("D".repeat(48)),
+        expectedRevision: existing ? 1 : 0,
+        keyVersion: 1,
+        profileBindingEnvelope: envelopeWith("Q".repeat(1_024)),
+      }), "QUOTA_EXCEEDED");
+      expect(await registryCustodyState(world)).toEqual(before);
+      if (existing) {
+        expect(await runtime.mutation(updateRegistry, {
+          envelope: envelopeWith("E".repeat(48)),
+          expectedRevision: 1,
+          keyVersion: 1,
+        })).toMatchObject({ profileBindingProjectionVersion: 1, revision: 2 });
+        expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
+          .not.toHaveProperty("profileBindingEnvelope");
+      }
+    });
+  }
+
+  test("refuses negative zero and exhausted revisions without publishing or charging quota", async () => {
+    const world = await registryWorld();
+    const primary = await world.enrollDevice("profile-revision", await world.enrollUser("profile-revision"));
+    const runtime = world.asDevice(primary);
+    const write = (expectedRevision: number) => runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("C".repeat(48)),
+      expectedRevision,
+      keyVersion: 1,
+      profileBindingEnvelope: envelopeWith("P".repeat(48)),
+    });
+    const empty = await registryCustodyState(world);
+    await expectPromiseToReject(write(-0), "Cloud authority is not current.");
+    await expectPromiseToReject(write(Number.MAX_SAFE_INTEGER), "DEVICE_REGISTRY_REVISION_EXHAUSTED");
+    await expectPromiseToReject(write(Number.MAX_SAFE_INTEGER + 1), "Cloud authority is not current.");
+    expect(await registryCustodyState(world)).toEqual(empty);
+    await write(0);
+    await world.testRuntime.run(async (ctx) => {
+      const registry = await ctx.db.query("deviceRegistries").unique();
+      if (registry === null) throw new Error("missing profile revision fixture");
+      await ctx.db.patch(registry._id, { revision: Number.MAX_SAFE_INTEGER - 1 });
+    });
+    expect(await write(Number.MAX_SAFE_INTEGER - 1)).toMatchObject({
+      profileBindingProjectionVersion: 1,
+      revision: Number.MAX_SAFE_INTEGER,
+    });
+    const exhausted = await registryCustodyState(world);
+    await expectPromiseToReject(write(Number.MAX_SAFE_INTEGER), "DEVICE_REGISTRY_REVISION_EXHAUSTED");
+    expect(await registryCustodyState(world)).toEqual(exhausted);
+  });
+
   test("keeps command capability internal and clears it when an old daemon republishes", async () => {
     const world = await registryWorld();
     const primary = await world.enrollDevice("command-capability", await world.enrollUser(

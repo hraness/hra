@@ -33,6 +33,7 @@ import {
   isUuidV7,
   parseAuthorityTuple,
   parseEncryptedEnvelope,
+  snapshotForeignJson,
   type AuthorityTuple,
   type CommandKind,
   type CommandState,
@@ -103,15 +104,20 @@ import {
   memorySummaryFitsEncryptedEnvelope,
   encryptNotificationEmail,
   encryptNotificationHours,
+  encryptProfileBinding,
   encryptSessionMetadata,
   encryptUsageProjection,
   inspectDeviceCommand,
   inspectRemoteCommand,
   parseSessionMetadataPayload,
+  parseDeviceRegistryPayload,
+  parseProfileBindingPayload,
+  profileBindingRegistryDigest,
   type DeviceCommandPayload,
   type DeviceCommandResultPayload,
   type DeviceRegistryPayload,
   type MemorySummaryPayload,
+  type ProfileBindingPayload,
   type RemoteCommandPayload,
   type SessionMetadataPayload,
 } from "./payloads";
@@ -210,6 +216,14 @@ function captureActiveCloudIdentity(identity: ActiveCloudIdentity): ActiveCloudI
   return { ...identity, accountKey: Uint8Array.from(identity.accountKey) };
 }
 
+function sameActiveRegistryIdentity(left: ActiveCloudIdentity, right: ActiveCloudIdentity): boolean {
+  return left.devicePublicId === right.devicePublicId
+    && left.userPublicId === right.userPublicId
+    && left.keyVersion === right.keyVersion
+    && left.accountKey.byteLength === right.accountKey.byteLength
+    && left.accountKey.every((byte, index) => byte === right.accountKey[index]);
+}
+
 type MemorySummaryAuthority = Readonly<{
   devicePublicId: string;
   keyVersion: number;
@@ -297,6 +311,8 @@ export type CloudDeviceRegistryProjection = Readonly<{
   notificationEmail: NotificationEmailPolicy;
   notificationHours: NotificationHoursPolicy;
   notificationPolicyRevision: number;
+  /** Display-only active default captured with registry.defaultPreset, never session authority. */
+  profileBinding?: Pick<ProfileBindingPayload, "preset" | "profileKey">;
   registry: DeviceRegistryPayload;
 }>;
 
@@ -616,7 +632,10 @@ type CloudPresenceResponse = Readonly<{
  * is the expected revision of the next write.
  */
 type CloudDeviceRegistryState = Readonly<{
+  authority: ActiveCloudIdentity;
   digest: string;
+  /** Optional wire-format support, not model or command admission. */
+  profileBindingSupported: boolean;
   publishedAt: number;
   revision: number;
 }>;
@@ -2586,11 +2605,13 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           );
           result.commandRequestVersion = 2;
         } catch (error: unknown) {
+          // Cancellation can arrive after a hosted commit. Never retain the
+          // prior revision or negotiated companion support after ambiguity.
+          this.#deviceRegistryState = null;
           if (signal.aborted) throw error;
           // A target must not execute commands until its marker-2 capability
           // is durably published for this cycle. Unrelated session and usage
           // projection work remains available below.
-          this.#deviceRegistryState = null;
           registryPublicationSucceeded = false;
           result.errors.push(`device registry: ${normalizeError(error)}`);
         }
@@ -4207,10 +4228,15 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
    * the server's.
    */
   async #publishDeviceRegistry(
-    identity: ActiveCloudIdentity,
+    currentIdentity: ActiveCloudIdentity,
     signal: AbortSignal,
     forcePublication: boolean,
   ): Promise<number | null> {
+    const identity = captureActiveCloudIdentity(currentIdentity);
+    if (this.#deviceRegistryState !== null
+      && !sameActiveRegistryIdentity(this.#deviceRegistryState.authority, identity)) {
+      this.#deviceRegistryState = null;
+    }
     const readProjection = this.#local.readDeviceRegistryProjection?.bind(this.#local);
     const readRegistry = this.#local.readDeviceRegistry?.bind(this.#local);
     if (readProjection === undefined && readRegistry === undefined) {
@@ -4220,6 +4246,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     let notificationEmail: NotificationEmailPolicy | null;
     let notificationHours: NotificationHoursPolicy | null;
     let notificationPolicyRevision: number | undefined;
+    let profileBinding: Pick<ProfileBindingPayload, "preset" | "profileKey"> | null = null;
     if (readProjection !== undefined) {
       const projection = await readProjection({ signal });
       if (
@@ -4231,6 +4258,24 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       notificationEmail = projection.notificationEmail;
       notificationHours = projection.notificationHours;
       notificationPolicyRevision = projection.notificationPolicyRevision;
+      if (projection.profileBinding !== undefined) {
+        const snapshot = snapshotForeignJson(projection.profileBinding);
+        if (!snapshot.ok || !isRecord(snapshot.value)
+          || !hasExactKeys(snapshot.value, ["preset", "profileKey"])) {
+          throw new Error("Local default profile projection is invalid.");
+        }
+        const parsed = parseProfileBindingPayload({
+          ...snapshot.value,
+          observedAt: payload.heartbeatAt,
+          registryEnvelopeDigest: "0".repeat(64),
+          registryRevision: 1,
+          version: 1,
+        });
+        if (parsed === null || parsed.preset !== payload.defaultPreset) {
+          throw new Error("Local default profile projection is incoherent.");
+        }
+        profileBinding = { preset: parsed.preset, profileKey: parsed.profileKey };
+      }
     } else {
       payload = await (readRegistry as NonNullable<typeof readRegistry>)({ signal });
       // A legacy source may still publish notification hours for Phase 7, but
@@ -4242,23 +4287,35 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         ? null
         : await readNotificationHours({ signal });
     }
+    const capturedPayload = parseDeviceRegistryPayload(payload);
+    if (capturedPayload === null) throw new Error("Local device registry projection is invalid.");
+    payload = capturedPayload;
     await this.#assertDaemonCurrent(signal);
+    const cached = this.#deviceRegistryState;
+    const profileBindingSupported = cached?.profileBindingSupported ?? false;
     const digest = await sha256Hex(JSON.stringify({
       commandRequestVersion: 2,
       notificationEmail,
       notificationHours,
       notificationPolicyRevision,
+      profileBinding,
+      profileBindingSupported,
       registry: { ...payload, heartbeatAt: 0 },
     }));
     const now = this.#now();
-    const cached = this.#deviceRegistryState;
     if (
       !forcePublication
       && cached !== null
       && cached.digest === digest
       && now - cached.publishedAt < deviceRegistryHeartbeatMs
-    ) return notificationPolicyRevision ?? null;
+    ) {
+      await this.#assertExactRegistryIdentity(identity, signal);
+      return notificationPolicyRevision ?? null;
+    }
     const expectedRevision = cached?.revision ?? await this.#readDeviceRegistryRevision(identity);
+    if (!isSafeNonNegativeInteger(expectedRevision) || expectedRevision >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("Device registry revision is exhausted.");
+    }
     await this.#assertDaemonCurrent(signal);
     const envelope = await encryptDeviceRegistry(payload, identity.accountKey, {
       entityPublicId: identity.devicePublicId,
@@ -4282,7 +4339,22 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           kind: "notification_email",
           userPublicId: identity.userPublicId,
         });
+    const profileBindingEnvelope = !profileBindingSupported || profileBinding === null
+      ? undefined
+      : await encryptProfileBinding({
+          ...profileBinding,
+          observedAt: payload.heartbeatAt,
+          registryEnvelopeDigest: await profileBindingRegistryDigest(envelope),
+          registryRevision: expectedRevision + 1,
+          version: 1,
+        }, identity.accountKey, {
+          entityPublicId: identity.devicePublicId,
+          keyVersion: identity.keyVersion,
+          kind: "profile_binding",
+          userPublicId: identity.userPublicId,
+        });
     abortBeforeEffect(signal);
+    await this.#assertExactRegistryIdentity(identity, signal);
     const response = await this.#mutation("devices:updateRegistry", {
       commandRequestVersion: 2,
       envelope,
@@ -4291,14 +4363,36 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       ...(notificationEmailEnvelope === undefined ? {} : { notificationEmailEnvelope }),
       ...(notificationHoursEnvelope === undefined ? {} : { notificationHoursEnvelope }),
       ...(notificationPolicyRevision === undefined ? {} : { notificationPolicyRevision }),
+      ...(profileBindingEnvelope === undefined ? {} : { profileBindingEnvelope }),
     });
+    await this.#assertExactRegistryIdentity(identity, signal);
+    const responseSnapshot = snapshotForeignJson(response);
+    const published = responseSnapshot.ok ? responseSnapshot.value : null;
     if (
-      !isRecord(response)
-      || response.devicePublicId !== identity.devicePublicId
-      || !isSafePositiveInteger(response.revision)
+      !isRecord(published)
+      || published.devicePublicId !== identity.devicePublicId
+      || published.revision !== expectedRevision + 1
     ) throw new Error("Device registry publish response is invalid.");
-    this.#deviceRegistryState = { digest, publishedAt: now, revision: response.revision };
+    this.#deviceRegistryState = {
+      authority: identity,
+      digest,
+      profileBindingSupported: published.profileBindingProjectionVersion === 1,
+      publishedAt: now,
+      revision: expectedRevision + 1,
+    };
     return notificationPolicyRevision ?? null;
+  }
+
+  async #assertExactRegistryIdentity(expected: ActiveCloudIdentity, signal: AbortSignal): Promise<void> {
+    await this.#assertDaemonCurrent(signal);
+    const current = await this.#identity.requireActive(signal);
+    // Compare before another await. Publication separately retains #mutation's
+    // immediate daemon fence, and the response is revalidated before caching.
+    // This is bounded revalidation, not an atomic cross-process identity lease.
+    abortBeforeEffect(signal);
+    if (!sameActiveRegistryIdentity(expected, current)) {
+      throw new Error("Cloud identity changed during registry publication.");
+    }
   }
 
   /**

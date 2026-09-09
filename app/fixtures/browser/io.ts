@@ -60,12 +60,16 @@ const registries: DeviceRegistries = {
   error: null, loading: false, memorySummaryReady: true, now, machines: [{
     accountLinkingAllowed: false,
     accounts: [{ label: "Fixture account", provider: "codex", publicId: "account_browser_fixture", status: "signed_in" }],
-    attentionEmailEnabled: null, daemonVersion: "0.6.1", defaultApprovalMode: "manual", defaultPreset: "high",
+    attentionEmailEnabled: null, daemonVersion: "0.7.0", defaultApprovalMode: "manual", defaultPreset: "ultra",
     deviceCommandsAllowed: true, devicePublicId: browserHead.executionDevicePublicId, deviceStatus: "active",
     heartbeatAt: now, label: "Fixture machine", online: true,
     memorySummary: null, memorySummaryFreshness: "unsupported",
     notificationHours: null, notificationHoursStatus: "unsupported", notificationPolicyFreshness: "unsupported",
     notificationPolicyRevision: null, projects: [{ label: "Fixture project", publicId: "project_browser_fixture" }],
+    profileBinding: {
+      profile: { effort: "ultra", key: "codex:gpt-5.6-sol:ultra", model: "gpt-5.6-sol", provider: "codex" },
+      status: "current",
+    },
     proseAutorespondConfigured: false, revision: 1, scheduledTasks: [], sessionAdoption: null,
     showThinkingDefault: false, updatedAt: now,
   }],

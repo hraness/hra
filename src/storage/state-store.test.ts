@@ -227,8 +227,151 @@ const completeCodexAccountMutationAuthorityRetirement = (
   }
 };
 
-afterEach(() => {
-  for (const store of stores.splice(0)) store.close();
+const ownedStateStoreCaseDrains: Array<() => Promise<void>> = [];
+
+function ownedStateStoreCase(
+  runCase: (context: Readonly<{
+    request: <T>(operation: () => Promise<T>) => Promise<T>;
+  }>) => Promise<void>,
+  drains = ownedStateStoreCaseDrains,
+): Promise<void> {
+  const controller = new AbortController();
+  const cancellation = new Error("Owned StateStore case is closing.");
+  // The owner is registered synchronously before deferred fixture setup or the
+  // raw callback can run. Bun's test timeout still owns the test outcome.
+  const caseTask = Promise.resolve().then(async () => {
+    controller.signal.throwIfAborted();
+    await runCase({
+      request: async <T>(operation: () => Promise<T>): Promise<T> => {
+        controller.signal.throwIfAborted();
+        const result = await operation();
+        controller.signal.throwIfAborted();
+        return result;
+      },
+    });
+    controller.signal.throwIfAborted();
+  });
+  // Observe rejection immediately and join this raw task, never a promise
+  // whose finally callback would wait for its own teardown to complete.
+  const settled = caseTask.then(
+    () => ({ status: "fulfilled" } as const),
+    (reason: unknown) => ({ status: "rejected", reason } as const),
+  );
+  drains.push(async () => {
+    controller.abort(cancellation);
+    const result = await settled;
+    // Only our exact cooperative cancellation is cleanup, not a late storage
+    // failure (including one thrown by an operation after abort was requested).
+    if (result.status === "rejected" && result.reason !== cancellation) {
+      return Promise.reject(result.reason);
+    }
+  });
+  return caseTask;
+}
+
+async function drainStateStoreCasesAndClose(
+  drains: Array<() => Promise<void>>,
+  takeStores: () => readonly Readonly<{ close: () => void }>[],
+): Promise<void> {
+  const settled = await Promise.allSettled(drains.splice(0).map(async (drain) => await drain()));
+  const failures: unknown[] = [];
+  for (const result of settled) {
+    if (result.status === "rejected") failures.push(result.reason);
+  }
+  // A draining fixture may still open or reopen a store. Take the close list
+  // only after every raw task settles, and attempt every close despite errors.
+  for (const store of takeStores()) {
+    try {
+      store.close();
+    } catch (error: unknown) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) throw new AggregateError(failures, "Owned StateStore teardown failed.");
+}
+
+afterEach(async () => {
+  await drainStateStoreCasesAndClose(ownedStateStoreCaseDrains, () => stores.splice(0));
+});
+
+describe("owned StateStore case lifecycle", () => {
+  test("registers before deferred setup and cancels before opening a store", async () => {
+    const drains: Array<() => Promise<void>> = [];
+    let opened = false;
+    const caseTask = ownedStateStoreCase(async () => { opened = true; }, drains);
+    expect(drains).toHaveLength(1);
+    expect(opened).toBe(false);
+    await drainStateStoreCasesAndClose(drains, () => []);
+    await expect(caseTask).rejects.toThrow("Owned StateStore case is closing.");
+    expect(opened).toBe(false);
+    expect(drains).toHaveLength(0);
+  });
+
+  test("joins a paused raw callback before closing initial and reopened stores", async () => {
+    const drains: Array<() => Promise<void>> = [];
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const events: string[] = [];
+    const closeTargets = [{ close: () => { events.push("close-initial"); } }];
+    const caseTask = ownedStateStoreCase(async ({ request }) => {
+      await request(async () => {
+        entered.resolve(undefined);
+        await release.promise;
+        events.push("raw-settled");
+        closeTargets.push({ close: () => { events.push("close-reopened"); } });
+      });
+      events.push("continued-after-abort");
+    }, drains);
+    await entered.promise;
+    let closed = false;
+    const teardown = drainStateStoreCasesAndClose(drains, () => {
+      closed = true;
+      return closeTargets;
+    });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    expect(events).toEqual([]);
+    release.resolve(undefined);
+    await teardown;
+    await expect(caseTask).rejects.toThrow("Owned StateStore case is closing.");
+    expect(events).toEqual(["raw-settled", "close-initial", "close-reopened"]);
+  });
+
+  test("retains every late raw failure and closes every store after all drains settle", async () => {
+    const drains: Array<() => Promise<void>> = [];
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const lateFailure = new Error("late createProject failure");
+    const otherFailure = new Error("another raw callback failure");
+    const closeFailure = new Error("first store close failed");
+    const events: string[] = [];
+    const lateCase = ownedStateStoreCase(async ({ request }) => {
+      await request(async () => {
+        entered.resolve(undefined);
+        await release.promise;
+        events.push("late-raw-settled");
+        throw lateFailure;
+      });
+    }, drains);
+    const otherCase = ownedStateStoreCase(async () => { throw otherFailure; }, drains);
+    await entered.promise;
+    const teardown = drainStateStoreCasesAndClose(drains, () => [
+      { close: () => { events.push("close-first"); throw closeFailure; } },
+      { close: () => { events.push("close-second"); } },
+    ]);
+    const observedTeardown = teardown.catch((error: unknown) => error);
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    release.resolve(undefined);
+    const error = await observedTeardown;
+    expect(error).toBeInstanceOf(AggregateError);
+    if (!(error instanceof AggregateError)) throw new Error("Expected every teardown failure.");
+    expect(error.errors).toEqual([lateFailure, otherFailure, closeFailure]);
+    expect(error.errors[0]).toBe(lateFailure);
+    await expect(lateCase).rejects.toBe(lateFailure);
+    await expect(otherCase).rejects.toBe(otherFailure);
+    expect(events).toEqual(["late-raw-settled", "close-first", "close-second"]);
+  });
 });
 
 async function fixture(
@@ -13338,8 +13481,8 @@ describe("StateStore", () => {
     }
   });
 
-  test("migrates and physically scrubs v20 terminal and resolved-ambiguous queue bodies", async () => {
-    const { store } = await fixture();
+  test("migrates and physically scrubs v20 terminal and resolved-ambiguous queue bodies", () => ownedStateStoreCase(async ({ request }) => {
+    const { store } = await request(() => fixture());
     const profile = signInProfile(store, "Legacy queue bodies", "legacy-queue@example.com");
     const importedSession = upsertProvenTestSession(store, {
       profileId: profile.id,
@@ -13443,9 +13586,9 @@ describe("StateStore", () => {
     });
     legacy.close(false);
 
-    expect(await stateFileSuffixesContaining(paths.database, "V20_TERMINAL_QUEUE_SENTINEL"))
+    expect(await request(() => stateFileSuffixesContaining(paths.database, "V20_TERMINAL_QUEUE_SENTINEL")))
       .toEqual([""]);
-    expect(await stateFileSuffixesContaining(paths.database, ambiguousMessage)).toEqual([""]);
+    expect(await request(() => stateFileSuffixesContaining(paths.database, ambiguousMessage))).toEqual([""]);
 
     const migrated = new StateStore(paths, { now: () => 3_000 });
     stores.push(migrated);
@@ -13482,10 +13625,10 @@ describe("StateStore", () => {
     } finally {
       inspector.close(false);
     }
-    expect(await stateFileSuffixesContaining(paths.database, "V20_TERMINAL_QUEUE_SENTINEL"))
+    expect(await request(() => stateFileSuffixesContaining(paths.database, "V20_TERMINAL_QUEUE_SENTINEL")))
       .toEqual([]);
-    expect(await stateFileSuffixesContaining(paths.database, ambiguousMessage)).toEqual([]);
-  });
+    expect(await request(() => stateFileSuffixesContaining(paths.database, ambiguousMessage))).toEqual([]);
+  }));
 
   test("keeps a pinned-reader queue scrub unavailable until restart can truncate its WAL", async () => {
     const { store } = await fixture({ securityScrubCheckpoint: shortScrubCheckpoint });
@@ -27349,12 +27492,12 @@ describe("StateStore", () => {
     }
   });
 
-  test("enforces atomic hourly peer action and distinct-target boundaries without charging replay", async () => {
+  test("enforces atomic hourly peer action and distinct-target boundaries without charging replay", () => ownedStateStoreCase(async ({ request }) => {
     let now = 1_000;
-    const { store, home } = await fixture({ now: () => now });
+    const { store, home } = await request(() => fixture({ now: () => now }));
     const root = join(home, "peer-budgets");
-    await mkdir(root);
-    const project = await store.createProject("Peer budgets", root);
+    await request(() => mkdir(root));
+    const project = await request(() => store.createProject("Peer budgets", root));
     const profile = signInProfile(store, "Peer budgets", "peer-budgets@example.com");
     const actorBase = createAuthorizedStartingTestSession(store, {
       profileId: profile.id,
@@ -27421,8 +27564,8 @@ describe("StateStore", () => {
     })).toThrow("PEER_SESSION_RATE_LIMIT_REFUSED");
     expect(PEER_SESSION_PROJECT_HOURLY_ACTION_LIMIT).toBe(PEER_SESSION_HOURLY_ACTION_LIMIT);
     const isolatedRoot = join(home, "peer-budgets-isolated");
-    await mkdir(isolatedRoot);
-    const isolatedProject = await store.createProject("Peer budgets isolated", isolatedRoot);
+    await request(() => mkdir(isolatedRoot));
+    const isolatedProject = await request(() => store.createProject("Peer budgets isolated", isolatedRoot));
     const isolatedActorBase = createAuthorizedStartingTestSession(store, {
       profileId: profile.id,
       projectId: isolatedProject.id,
@@ -27483,7 +27626,7 @@ describe("StateStore", () => {
     }
     expect(() => queue(PEER_SESSION_HOURLY_DISTINCT_TARGET_LIMIT))
       .toThrow("PEER_SESSION_FANOUT_LIMIT_REFUSED");
-  });
+  }));
 
   test("retains exact peer replay for seven days then atomically compacts terminal queue provenance", async () => {
     let now = 10_000;
