@@ -21,6 +21,15 @@ manual-switch and policy-control foundation. Managed automatic movement,
 Claude native fallback activation and the unfinished hosted/browser publisher
 remain dormant. Phases 6 through 9 are not complete.
 
+The next artifact candidate is `v0.8.0`: provider-qualified cached account
+listing and explicit `usage auto` policy controls add public contracts beyond
+`v0.7.0`. Candidate preparation does not admit the artifact or enable automatic
+movement. The independently reviewed main join is committed as
+`7440b6e3ab0e9e45466e6b2bf8544459badf4ecb`, tree
+`6634bacf0af1367b392eadb1d907ea223e9f8424`. Frozen installation, joined tests,
+independent package-inventory review, the exact-tree aggregate and separate
+browser gate, protected merge and immutable release admission remain pending.
+
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree
