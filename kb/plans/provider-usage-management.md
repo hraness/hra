@@ -21,6 +21,60 @@ manual-switch and policy-control foundation. Managed automatic movement,
 Claude native fallback activation and the unfinished hosted/browser publisher
 remain dormant. Phases 6 through 9 are not complete.
 
+The September 9 delivery now waits for the combined PR 164 prerequisite,
+including the reviewed PR 167 follow-up, to pass and reach protected `main`.
+PR 140 remains a separate draft foundation candidate. Its pre-diagnostic
+checkpoint is
+`087ec49746d82c0d2eada10e146b19d3734d0449`; its published head remains
+`fb1bf7e72dd89ca453dbee2bc51f96b0cfbbf348`. A prospective merge was inspected
+without changing the branch or index. At the pre-diagnostic checkpoint, the
+shared site compiler files matched `efcb9c4` exactly. The service conflict must
+retain the private-owner paged-recovery case and the existing immutable-send
+and recovery-fence repairs.
+Current content must distinguish the unadmitted v0.8.0 candidate from its
+admitted v0.7.1 predecessor, preserve canonical GitHub admission separately
+from the optional npm mirror, and retain every operational activation hold.
+
+The earlier passing Linux compiler checkpoint did not establish a complete
+repair. Combined PR 164 CI `34389604477`, attempt 1, at source
+`efcb9c4844f61dbc76dbf04c0cce17133af60b6b` again failed Ubuntu remainder
+`102594374633`: the site suite passed 163 cases and failed one, with 8,401
+assertions. The unchanged stale-document case took 24.291 seconds and returned
+a success terminal with process result 1. That is not its 60-second deadline.
+The local runner can return either an observed leader failure or a forced
+failure after a non-absent process-group observation; existing output does not
+distinguish them. The narrow opt-in diagnostic change is committed locally as
+`819a576ab85639966bf29ff941907b0328a6dd83`. Its independently reviewed public
+handoff is `4479cea058da43838eff982cbc91ac2f7cf318e3`, tree
+`0cc63e9df68abff02fb9f9f272700aadf3ebb89b`, based only on the exact combined
+prerequisite `efcb9c4`. The handoff changes four development source/test files,
+without PR 140 ancestry, plan edits or packaged-file changes. It observes only
+the existing local close and termination decisions. It is not a behavioral
+repair and does not change signals, deadlines, recovery journals, collection
+requirements or nonzero-exit refusal. A new exact Linux observation is required
+before selecting a repair.
+
+Focused real-process controls pass 24 cases with 129 assertions, including
+genuine leader exits, a zero-exit leader with a remaining descendant, unchanged
+no-opt-in results, authority refusal, cancellation, timeout, output limits and
+signal-reporting failures. The final local compiler gate passes 46 cases with
+4,107 assertions in 119.40 seconds: the unchanged native cancellation and
+fresh-build proof, all 20 original site-build cases and 25 owner/property
+contracts. Scoped lint, final typecheck and independent AST review pass.
+The authority runner, group predicate and signal function remain unchanged;
+removing diagnostic-only additions reproduces the original local execution
+control flow. The prerequisite owner must still run fresh exact combined-tree
+CI. These local receipts do not establish the Linux cause or artifact admission.
+
+The proposed Effect Claude lifecycle delta remains a separate later delivery.
+Independent review found that retaining the caller's mutable constructor
+options could redirect effects to another process while retaining the first
+process's exit observation. The finding was returned to its owner for a separate
+repair. None of that runtime refactor is imported into this candidate.
+The final actual-main join, independently measured package, exact-tree gates,
+protected merge, immutable release and applicable deployment evidence remain
+pending. No new artifact admission or operational activation is claimed.
+
 The next artifact candidate is `v0.8.0`: provider-qualified cached account
 listing and explicit `usage auto` policy controls add public contracts beyond
 `v0.7.0`. Candidate preparation does not admit the artifact or enable automatic
