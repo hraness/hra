@@ -4,8 +4,48 @@ import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runInNewContext } from "node:vm";
-import { assertAppColorScheme, assertDefaultButtonPresentation, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview } from "./app-browser";
+import { assertAppColorScheme, assertDefaultButtonPresentation, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, captureBrowserResponseBody, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, settleBrowserResponseBodies, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview } from "./app-browser";
 import { browserIoModules } from "../app/fixtures/browser/config";
+
+describe("browser response lifetime", () => {
+  test("captures immediately and settles bytes before the caller can discard a document", async () => {
+    const received = Promise.withResolvers<Buffer>();
+    const events: string[] = [];
+    const body = captureBrowserResponseBody({ body: () => { events.push("read"); return received.promise; } });
+    expect(events).toEqual(["read"]);
+    const transition = settleBrowserResponseBodies([body]).then(() => { events.push("navigate"); });
+    await Promise.resolve();
+    expect(events).toEqual(["read"]);
+    const bytes = Buffer.from("retained native bytes");
+    received.resolve(bytes);
+    await transition;
+    expect(events).toEqual(["read", "navigate"]);
+    expect(await body).toEqual({ bytes });
+  });
+
+  test("retains an early body rejection and refuses navigation without retry or replacement bytes", async () => {
+    const failure = new Error("Native document no longer exists");
+    let reads = 0, navigated = false;
+    const body = captureBrowserResponseBody({ body: async () => { reads += 1; throw failure; } });
+    await Promise.resolve();
+    await expect(settleBrowserResponseBodies([body]).then(() => { navigated = true; })).rejects.toBe(failure);
+    expect(reads).toBe(1);
+    expect(navigated).toBe(false);
+  });
+
+  test("settles every body, not just the first completed response", async () => {
+    const last = Promise.withResolvers<Buffer>();
+    let settled = false;
+    const bodies = [captureBrowserResponseBody({ body: async () => Buffer.from("first") }),
+      captureBrowserResponseBody({ body: () => last.promise })];
+    const settlement = settleBrowserResponseBodies(bodies).then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    last.resolve(Buffer.from("last"));
+    await settlement;
+    expect(settled).toBe(true);
+  });
+});
 
 describe("product preview close settlement", () => {
   test("waits for queued close cleanup after the native dialog is already hidden", async () => {

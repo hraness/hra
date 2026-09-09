@@ -669,7 +669,23 @@ export async function waitForClosedProductPreview(dialog: Pick<Locator, "waitFor
   assert.equal(await iframe.count(), 0, "Closed example kept its child browsing context");
 }
 
-async function verifyProductPreviews(page: Page): Promise<unknown[]> {
+type CapturedBrowserBody = Promise<{ bytes: Buffer } | { error: unknown }>;
+
+/** Start native reads at response delivery and observe rejections immediately.
+ * A renderer's ready signal does not mean its protocol body read has settled. */
+export function captureBrowserResponseBody(response: Pick<BrowserResponse, "body">): CapturedBrowserBody {
+  return response.body().then((bytes) => ({ bytes }), (error: unknown) => ({ error }));
+}
+
+/** Navigation and iframe removal may discard Chromium's response identifiers.
+ * Preserve the profile deadline and finish every owned read before either. */
+export async function settleBrowserResponseBodies(bodies: readonly CapturedBrowserBody[]): Promise<void> {
+  for (const result of await Promise.all(bodies)) {
+    if ("error" in result) throw result.error instanceof Error ? result.error : new Error("Native resource body failed", { cause: result.error });
+  }
+}
+
+async function verifyProductPreviews(page: Page, settleResources: () => Promise<void>): Promise<unknown[]> {
   const figure = page.locator("figure[data-product-preview]");
   assert.equal(await figure.count(), 1);
   assert.equal(await figure.locator("[data-preview-script-notice]").isHidden(), true);
@@ -683,6 +699,7 @@ async function verifyProductPreviews(page: Page): Promise<unknown[]> {
     assert.equal(await figure.locator('[data-preview-view][aria-pressed="true"]').count(), 1);
     observations.push({ view, observation: await verifyProductScene(iframe, view) });
     await page.waitForFunction(() => document.querySelector("figure[data-product-preview] [data-preview-status]")?.textContent === "");
+    await settleResources();
   }
   const enlarge = figure.locator("[data-preview-enlarge]");
   await enlarge.click();
@@ -691,6 +708,7 @@ async function verifyProductPreviews(page: Page): Promise<unknown[]> {
   observations.push({ view: "settings", enlarged: true, observation: await verifyProductScene(dialog.locator("iframe"), "settings") });
   await page.waitForFunction(() => document.querySelector("[data-preview-dialog] [data-preview-expanded-status]")?.textContent === "");
   assert.equal(await dialog.locator("[data-preview-close]").evaluate((element) => element === document.activeElement), true);
+  await settleResources();
   await page.keyboard.press("Escape");
   await waitForClosedProductPreview(dialog, dialog.locator("iframe"));
   assert.equal(await enlarge.evaluate((element) => element === document.activeElement), true);
@@ -1471,21 +1489,21 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
         }
         for (const route of siteGraph.routes) {
           const routeLabel = route.label;
-          const responses: BrowserResponse[] = [];
+          const responses: { response: BrowserResponse; body: CapturedBrowserBody }[] = [];
           const productRequests: BrowserRequest[] = [];
-          const productResponses: { response: BrowserResponse; body: Promise<{ bytes: Buffer } | { error: unknown }> }[] = [];
+          const productResponses: { response: BrowserResponse; body: CapturedBrowserBody }[] = [];
           let responseOverflow = false;
           const capture = (response: BrowserResponse) => {
             if (response.request().frame() !== page.mainFrame()) {
               // Capture bytes while this child document still exists. Scene
               // changes and closing the enlarged modal legitimately detach it.
               if (productResponses.length < 256) productResponses.push({ response,
-                body: response.body().then((bytes) => ({ bytes }), (error: unknown) => ({ error })) });
+                body: captureBrowserResponseBody(response) });
               else responseOverflow = true;
               return;
             }
             if (new URL(response.url()).origin !== site.origin || !["stylesheet", "font"].includes(response.request().resourceType())) return;
-            if (responses.length < 64) responses.push(response);
+            if (responses.length < 64) responses.push({ response, body: captureBrowserResponseBody(response) });
             else responseOverflow = true;
           };
           const captureProduct = (request: BrowserRequest) => {
@@ -1495,6 +1513,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
           };
           page.on("response", capture);
           page.on("request", captureProduct);
+          const settleResources = () => settleBrowserResponseBodies([...responses, ...productResponses].map(({ body }) => body));
           try {
             mark(`static-site:${routeLabel}:navigation`);
             const response = await page.goto(`${site.origin}${route.pathname}`);
@@ -1551,17 +1570,36 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             assert.equal(responses.length, countBeforeNegative, "Stylesheet application control reloaded a resource");
             if (route.pathname === "/") {
               mark("static-site:home:product-previews");
-              evidence.push({ name: `${profile.name}:product-previews`, values: await verifyProductPreviews(page) });
+              evidence.push({ name: `${profile.name}:product-previews`, values: await verifyProductPreviews(page, settleResources) });
+            } else {
+              const figure = page.locator("figure[data-product-preview]");
+              const count = await figure.count();
+              assert.ok(count === 0 || count === 1);
+              if (count === 1) {
+                // Exercise each guide's actual lazy default scene before leaving
+                // its document, not just the homepage's four selectable scenes.
+                const view = await figure.getAttribute("data-view");
+                assert.ok(productViews.some((candidate) => candidate === view));
+                const iframe = figure.locator("[data-preview-frame]");
+                await iframe.scrollIntoViewIfNeeded();
+                evidence.push({ name: `${profile.name}:static-site:${route.path}:product-preview`,
+                  values: await verifyProductScene(iframe, view as ProductView) });
+                await page.waitForFunction(() => document.querySelector("figure[data-product-preview] [data-preview-status]")?.textContent === "");
+              }
             }
             assert.equal(responseOverflow, false, "Static resource census exceeded its bound");
             mark(`static-site:${routeLabel}:resource-bytes`);
-            const delivered = await Promise.all(responses.map(async (resource) => {
+            await settleResources();
+            assert.equal(productRequests.length, productResponses.length, "Product document left an incomplete resource request");
+            const delivered = await Promise.all(responses.map(async ({ response: resource, body }) => {
               const key = assetPath(new URL(resource.url()).pathname, siteFontPaths);
               assert.ok(key !== null && siteFiles.has(key));
               assert.equal(resource.status(), 200);
               assert.equal(resource.headers()["content-type"], assetContentType(key));
               assert.equal(resource.headers()["x-content-type-options"], "nosniff");
-              const bytes = await resource.body();
+              const result = await body;
+              if ("error" in result) throw result.error instanceof Error ? result.error : new Error("Native resource body failed", { cause: result.error });
+              const bytes = result.bytes;
               assert.deepEqual(bytes, siteFiles.get(key), "Native resource differs from its retained output identity");
               return { path: key, bytes: bytes.length, sha256: digest(bytes) };
             }));
