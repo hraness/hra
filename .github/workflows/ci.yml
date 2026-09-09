@@ -152,7 +152,7 @@ jobs:
           node-version: "24.18.1"
           package-manager-cache: false
       - name: Install package-pinned Chromium
-        run: node ./node_modules/playwright-core/cli.js install --with-deps chromium
+        run: node ./scripts/install-ci-chromium-deps.ts
       - name: Verify compiled browser surfaces
         run: |
           set -euo pipefail

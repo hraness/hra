@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { readNpmAttestations } from "./read-npm-attestations";
@@ -13,7 +12,7 @@ import {
   publicRepository,
 } from "./release-distribution-policy";
 import { assertReleasePackageReady } from "./release-package-policy";
-import { verifyNpmProvenance } from "./verify-npm-provenance";
+import { verifyNpmProvenance, withNpmProvenanceCache } from "./verify-npm-provenance";
 
 const maximumJsonBytes = 512 * 1024;
 const maximumArtifactBytes = 64 * 1024 * 1024;
@@ -157,8 +156,7 @@ if (
   `sha512-${createHash("sha512").update(npmBytes).digest("base64")}` !== npmRelease.integrity
   || createHash("sha1").update(npmBytes).digest("hex") !== npmRelease.shasum
 ) throw new Error("npm release bytes do not match registry integrity metadata.");
-const tufCachePath = await mkdtemp(`${tmpdir()}/hra-sigstore-tuf-`);
-try {
+await withNpmProvenanceCache("readback", async (tufCachePath) => {
   await verifyNpmProvenance({
     attemptPolicy: "same_run_not_later",
     attestations: await readNpmAttestations(inspection.version),
@@ -171,9 +169,7 @@ try {
     tag: verifiedTag,
     tufCachePath,
   });
-} finally {
-  await rm(tufCachePath, { force: true, recursive: true });
-}
+});
 
 const api = `https://api.github.com/repos/${publicRepository}`;
 const tagRef = await json(`${api}/git/ref/tags/${verifiedTag}`, "GitHub annotated tag ref", token) as {

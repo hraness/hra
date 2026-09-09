@@ -5,7 +5,7 @@ type JsonRecord = Record<string, unknown>;
 const SHA = /^[0-9a-f]{40}$/u;
 const POSITIVE_DECIMAL = /^[1-9][0-9]{0,19}$/u;
 const MAXIMUM_RELEASE_INVENTORY_PAGE = 100;
-const GITHUB_RELEASE_JOB_NAME = "Publish exact npm and GitHub artifacts";
+const GITHUB_RELEASE_JOB_NAME = "Publish canonical GitHub artifacts";
 const GITHUB_RELEASE_STEP_NAME = "Create immutable GitHub Release from the same bytes";
 
 function record(value: unknown, label: string): JsonRecord {

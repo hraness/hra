@@ -2,9 +2,14 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
-## v0.7.1 (unreleased)
+## Release reliability follow-up (unreleased)
 
-Read-only exact Codex default observations in Settings. This candidate is not yet admitted; v0.7.0 remains the admitted public artifact. Publication, hosted deployment and browser deployment require their own evidence. Artifact admission does not clear daemon startup, capacity activation or intended-target gates.
+- The npm provenance verifier includes stdin in its existing 60-second deadline and waits for the owned child, input and both output readers before reporting verification success. A failed operation gets a bounded five-second collection window; unproved collection remains a failure. Both release callers preserve the private TUF cache on every verification failure. Cryptographic identity checks, environment and byte bounds are unchanged. This source repair is not part of the immutable v0.7.1 artifact, and no evidence links the cleanup defect to that release's delayed registry visibility.
+- Current installation and status guidance records v0.7.1 admission while preserving daemon, hosted capacity and intended-target gates. The recovery runbook requires read-only reconciliation of exact public bytes and original provenance before complete same-run recovery, never artifact replacement or speculative republication.
+
+## v0.7.1
+
+Read-only exact Codex default observations in Settings. Immutable GitHub and npm artifacts completed [exact release admission](docs/beta-release.md#immutable-v071-successful-release-record) on 2026-09-09. The successful same-run recovery preserved the original tag, release and public bytes. Hosted deployment and browser deployment require their own evidence. Artifact admission does not clear daemon startup, capacity activation or intended-target gates.
 
 - A separately encrypted profile companion binds the publishing daemon's exact default to one registry revision, encrypted-envelope digest and heartbeat. The frozen version-1 registry remains unchanged. A daemon sends the companion only after a successful registry publication advertises support; older servers continue receiving the old request shape.
 - Settings shows the last reported exact Codex model and effort only for an active daemon with coherent current-key evidence and a fresh hosted timestamp. Missing, stale, mismatched or unreadable evidence exposes no exact label. The observation does not relabel established sessions or authorize a command, model, account or Fast mode. Sol Ultra remains the implicit Codex default.

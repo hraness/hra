@@ -1,4 +1,6 @@
-import { resolve } from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -18,6 +20,17 @@ const MAXIMUM_CRYPTO_INPUT_BYTES = 1024 * 1_024;
 const MAXIMUM_CRYPTO_OUTPUT_BYTES = 8 * 1_024;
 
 export type NpmProvenanceAttemptPolicy = "exact" | "same_run_not_later";
+
+export async function withNpmProvenanceCache(
+  purpose: "publish" | "readback",
+  verify: (tufCachePath: string) => Promise<void>,
+): Promise<void> {
+  const prefix = purpose === "publish" ? "hra-publish-sigstore-tuf-" : "hra-sigstore-tuf-";
+  const tufCachePath = await mkdtemp(join(tmpdir(), prefix));
+  await verify(tufCachePath);
+  // Failed verification retains evidence and may still own an uncollected child.
+  await rm(tufCachePath, { force: true, recursive: true });
+}
 
 const CRYPTO_RUNTIME_ENVIRONMENT = Object.freeze([
   "HOME", "LANG", "LC_ALL", "LC_CTYPE", "NODE_EXTRA_CA_CERTS", "PATH",
@@ -337,24 +350,35 @@ export function npmRegistryKeySelector(value: unknown): (hint: string) => string
 
 async function boundedProcessOutput(
   stream: ReadableStream<Uint8Array>,
-  kill: () => void,
+  fail: (message: string) => void,
 ): Promise<Buffer> {
-  const reader = stream.getReader();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   const chunks: Uint8Array[] = [];
   let length = 0;
+  let complete = false;
+  let message = "npm cryptographic verification output could not be read.";
   try {
+    reader = stream.getReader();
     for (;;) {
       const item = await reader.read();
-      if (item.done) break;
+      if (item.done) { complete = true; break; }
       length += item.value.byteLength;
       if (length > MAXIMUM_CRYPTO_OUTPUT_BYTES) {
-        kill();
-        throw new Error("npm cryptographic verification output exceeded its bound.");
+        message = "npm cryptographic verification output exceeded its bound.";
+        throw new Error(message);
       }
       chunks.push(item.value);
     }
+  } catch {
+    fail(message);
+    throw new Error(message);
   } finally {
-    reader.releaseLock();
+    if (reader !== undefined) {
+      try {
+        if (!complete) await reader.cancel();
+      } catch { /* An errored stream may reject cancellation; its reader still joins. */ }
+      finally { reader.releaseLock(); }
+    }
   }
   return Buffer.concat(chunks, length);
 }
@@ -376,30 +400,69 @@ async function verifyCryptographicBundle(
     stdin: "pipe",
     stdout: "pipe",
   });
-  await child.stdin.write(serialized);
-  await child.stdin.end();
-  const kill = () => child.kill(9);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      kill();
-      reject(new Error("npm cryptographic verification timed out."));
-    }, 60_000);
+  const state: { failure?: Error; exitCollected: boolean } = { exitCollected: false };
+  let signalFailure!: () => void;
+  const failed = new Promise<null>((resolve) => { signalFailure = () => resolve(null); });
+  const fail = (message: string) => {
+    if (state.failure !== undefined) return;
+    state.failure = new Error(message);
+    if (!state.exitCollected) {
+      try { child.kill(9); } catch { /* Only the exit observation can prove collection. */ }
+    }
+    signalFailure();
+  };
+  // Stdin is inside the operation deadline and joins alongside both readers and exit.
+  const timer = setTimeout(() => fail("npm cryptographic verification timed out."), 60_000);
+  let collectionTimer: ReturnType<typeof setTimeout> | undefined;
+  const exit = child.exited.then((code) => { state.exitCollected = true; return code; }, () => {
+    const message = "npm cryptographic verification exit could not be collected.";
+    fail(message);
+    throw new Error(message);
   });
+  const stdin = (async () => {
+    let failed = false;
+    try {
+      await child.stdin.write(serialized);
+    } catch {
+      failed = true;
+      fail("npm cryptographic verification input could not be written.");
+    }
+    try { await child.stdin.end(); } catch {
+      failed = true;
+      fail("npm cryptographic verification input could not be closed.");
+    }
+    if (failed) throw new Error("npm cryptographic verification input failed.");
+  })();
+  const complete = Promise.allSettled([
+    exit,
+    boundedProcessOutput(child.stdout, fail),
+    boundedProcessOutput(child.stderr, fail),
+    stdin,
+  ]);
   try {
-    const [exitCode, stdout, stderr] = await Promise.race([
-      Promise.all([
-        child.exited,
-        boundedProcessOutput(child.stdout, kill),
-        boundedProcessOutput(child.stderr, kill),
-      ]),
-      timeout,
-    ]);
-    if (exitCode !== 0 || stdout.toString("utf8") !== "verified\n" || stderr.byteLength !== 0) {
+    let result = await Promise.race([complete, failed]);
+    if (result === null) {
+      clearTimeout(timer);
+      result = await Promise.race([complete, new Promise<null>((resolve) => {
+        collectionTimer = setTimeout(() => resolve(null), 5_000);
+      })]);
+    }
+    if (result === null || !state.exitCollected) {
+      throw new Error("npm cryptographic verification collection is unproved; retain its TUF cache.");
+    }
+    if (state.failure !== undefined) throw state.failure;
+    const [exitCode, stdout, stderr, inputResult] = result;
+    if (
+      exitCode.status !== "fulfilled" || exitCode.value !== 0
+      || stdout.status !== "fulfilled" || stdout.value.toString("utf8") !== "verified\n"
+      || stderr.status !== "fulfilled" || stderr.value.byteLength !== 0
+      || inputResult.status !== "fulfilled"
+    ) {
       throw new Error("npm cryptographic verification failed without exposing provider output.");
     }
   } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    clearTimeout(timer);
+    if (collectionTimer !== undefined) clearTimeout(collectionTimer);
   }
 }
 

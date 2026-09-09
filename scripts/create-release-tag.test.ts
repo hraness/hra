@@ -7,7 +7,6 @@ import {
   assertMonotonicReleaseTag,
   assertReleaseRepository,
   assertReleaseRulesets,
-  assertReleaseEnvironment,
   assertTransparentGitIndex,
   compareStableVersions,
   createReleaseTag,
@@ -169,18 +168,8 @@ function fakeReleaseRunner(options: Readonly<{
       path: ".github/workflows/ci.yml",
       state: "active",
     }));
-    if (key === "gh\u0000api\u0000repos/hraness/hra/environments/npm-release") return result(JSON.stringify({
-      can_admins_bypass: false,
-      deployment_branch_policy: { custom_branch_policies: true, protected_branches: false },
-      name: "npm-release",
-      protection_rules: [{ type: "branch_policy" }],
-    }));
-    if (key.startsWith("gh\u0000api\u0000--method\u0000GET\u0000repos/hraness/hra/environments/npm-release/deployment-branch-policies\u0000")) {
-      return result(JSON.stringify({
-        branch_policies: [{ name: "v*", type: "tag" }],
-        total_count: 1,
-      }));
-    }
+    if (key.includes("environments/npm-release")) throw new Error("Canonical tagging must not require npm environment access");
+
     if (key.includes("actions/workflows/ci.yml/runs")) return result(JSON.stringify({
       total_count: 1,
       workflow_runs: [{
@@ -362,26 +351,6 @@ describe("owner-authorized release tag", () => {
     drifted.bypass_actors = [{ actor_id: 1, actor_type: "User", bypass_mode: "always" }];
     details.set("Protect main", drifted);
     expect(() => assertMainRulesets(list, details)).toThrow("without bypass");
-  });
-
-  test("requires a no-reviewer machine environment restricted to version tags", () => {
-    const environment = {
-      can_admins_bypass: false,
-      deployment_branch_policy: { custom_branch_policies: true, protected_branches: false },
-      name: "npm-release",
-      protection_rules: [{ type: "branch_policy" }],
-    };
-    const policies = { branch_policies: [{ name: "v*", type: "tag" }], total_count: 1 };
-    expect(() => assertReleaseEnvironment(environment, policies)).not.toThrow();
-    expect(() => assertReleaseEnvironment(environment, {
-      branch_policies: [{ name: "main", type: "branch" }],
-      total_count: 1,
-    })).toThrow("admit only version tags");
-    expect(() => assertReleaseEnvironment({
-      ...environment,
-      protection_rules: [{ type: "branch_policy" }, { type: "required_reviewers" }],
-    }, policies)).toThrow("unexpected protection rules");
-    expect(() => assertReleaseEnvironment({ ...environment, can_admins_bypass: true }, policies)).toThrow();
   });
 
   test("requires the exact public repository identity", () => {
