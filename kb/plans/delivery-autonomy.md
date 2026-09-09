@@ -17,7 +17,7 @@ relations:
 
 # Hraness delivery autonomy
 
-Status: active, revision 5 (2026-09-09). The machine-confidence foundation, current-Mac
+Status: active, revision 6 (2026-09-09). The machine-confidence foundation, current-Mac
 bootstrap and HRA, Oh and personal-monorepo-template pilots are delivered. Wider fleet
 adoption and provider-specific rollout remain separately tracked; they do not reopen the
 completed foundation or block an independently admitted artifact.
@@ -210,6 +210,27 @@ bounded diagnosis; green CI does not dismiss them. The local full aggregate rema
 tool and the fallback when CI coverage or equivalence is absent or uncertain. This removes a
 duplicate execution without changing CI command coverage or scheduler controls.
 
+### D8. Prefer agentic service provisioning
+
+For new infrastructure, first inspect Vercel Marketplace for a native product that can
+provision the required resource. Use Stripe Projects as a supported alternative when it
+better covers the service or the Marketplace route only connects an existing account.
+Use the provider's supported CLI or API when neither catalog fits, recording the concrete
+reason. Current account, region, plan, recurring cost and resource capability evidence
+govern the choice; catalog presence alone does not establish operational fitness.
+
+Reuse existing owner-controlled resources where appropriate. The preference does not
+authorize migration, a duplicate account, a paid upgrade or wider access on its own.
+Continue already-authorized setup without duplicate confirmation and retain required
+interactive authentication. Generated environment files and provider credentials remain
+private. Provisioning and deployment, persistence and recovery acceptance are separate.
+
+The canonical global Codex, global Claude and repository policy assets carry this
+preference in local-efficiency 0.4.2. The existing marker-bounded bootstrap and repository
+adoption commands distribute it. See the [service provisioning guide](../../docs/service-provisioning.md).
+This source change does not assert that every repository or machine has refreshed its
+installed guidance or that any external service has been commissioned.
+
 ## Workstreams
 
 | Workstream | State | Acceptance evidence |
@@ -219,6 +240,7 @@ duplicate execution without changing CI command coverage or scheduler controls.
 | HRA npm path | Delivered | The machine publication path is delivered without the mutable publication variable; exact tag, artifact, OIDC, provenance and final admission remain required for each release in [the release record](../../docs/beta-release.md). |
 | Wrench npm path | Provider-constrained | Preserve its dual-use declaration and exact staged-artifact approval with required authentication. Automate preparation, validation, staging, and readback; direct OIDC publication is not an available replacement for the provider gate. |
 | Soundfish npm path | Delivered | The direct OIDC workflow completed in [release run 34059355173](https://github.com/hraness/soundfish/actions/runs/34059355173). Routine publication has a supported workload identity; future releases retain their exact-artifact gates. |
+| Agentic service provisioning | Source candidate | Local-efficiency 0.4.2 updates all three canonical guidance assets and the adoption target in this repository. Focused bootstrap/adoption and CI-equivalence checks, independent review, fresh required CI and installation readback are the acceptance evidence; fleet adoption remains separately scoped. |
 | Wider fleet rollout | Continuing | Remaining repositories and machines require their own scoped adoption and gates. No all-fleet current-state claim is made; preserve dirty primary worktrees. |
 | Provider setup | Evidence-driven | Ordinary npm publication workflows are present. Change trust, account, GitHub App, or ruleset configuration only for an individually verified remaining gap; no blanket trust update is pending. |
 | Machine-confidence foundation | Complete | HRA PR156 delivered the reviewed canonical global/repository assets, operator guidance and regression tests separating artifact admission from operational activation. |
@@ -240,6 +262,12 @@ duplicate execution without changing CI command coverage or scheduler controls.
   evidence that applies; silence is never proof of completion.
 
 ## Progress log
+
+- 2026-09-09, revision 6: added D8 and the 0.4.2 canonical provisioning preference,
+  with native Marketplace resource discovery, Stripe Projects fallback, existing-resource
+  preservation and separate operational proof. No provider client, credential scope,
+  application hosting choice or cloud-worker routing changed. Source validation and
+  reviewed installation are tracked with this delivery; wider fleet status is unchanged.
 
 - 2026-09-09, revision 5: independent source review confirms that complete CI
   retains every full-gate command on macOS and Linux, expanded multiplicity and

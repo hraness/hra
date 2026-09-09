@@ -272,6 +272,10 @@ describe("lifecycle-free Bun install normalizer", () => {
 
   test("requires an exact zero-lifecycle package manifest", () => {
     expect(() => assertHraInstallManifest(manifest())).not.toThrow();
+    for (const version of ["0.7.0", "0.7.1"]) {
+      expect(() => assertHraInstallManifest({ ...manifest(), version }))
+        .toThrow("package identity");
+    }
     for (const name of ["preinstall", "postinstall", "prepublishOnly", "prepare", "prepack"]) {
       expect(() => assertHraInstallManifest(manifest({
         build: "bun ./build.ts",

@@ -27,6 +27,10 @@ describe("installer pins", () => {
     expect(drift).toEqual([]);
     expect(releasePinDrift(report, "v0.8.0", "0.8.0").some((line) => line.includes("public command digest") || line.includes("is not the public command digest") || line.length === 0)).toBe(report.runtime.publicCommand !== report.runtime.actual);
     expect(releasePinDrift(consistent, "v0.1.8", "0.8.0")).toContain("release tag v0.1.8 does not match package.json version 0.8.0");
+    for (const priorTag of ["v0.7.0", "v0.7.1"]) {
+      expect(releasePinDrift(consistent, priorTag, "0.8.0"))
+        .toContain(`release tag ${priorTag} does not match package.json version 0.8.0`);
+    }
     expect(() => releasePinDrift(consistent, "0.8.0", "0.8.0")).toThrow();
   });
 

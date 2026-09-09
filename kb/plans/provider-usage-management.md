@@ -255,6 +255,150 @@ The successor still requires fresh exact-head installation and compiled browser
 acceptance and complete current-base CI. These local results do not establish
 merge, release, deployment, live provider qualification or daemon activation.
 
+The schema-inventory successor is pushed as
+`82637bb9a5423adffb5185dc175fd74eb5dd2c89`, tree
+`f6220f505012fca90ae5fa6a40703bf632318c0f`. Its exact archive passes fresh
+isolated local/global installation, restored PTY and owned daemon lifecycle.
+CI run `34361757449`, attempt 1, checks the same tree through synthetic merge
+`107fdec265f9587fbb805b1986df278ef6d3fd0d` on main
+`13325ffa8e16a61897c90012b85cede588f6bca4`. The browser and five
+source shards pass. macOS remainder and source shard three expose further
+five-second fixture/proof timeouts with late cleanup races. Ubuntu remainder
+passes all script, plugin, hosted, site and app tests and builds, then refuses
+one generated Git hunk heading. All jobs finished without job-wide timeout;
+Required failed. The complete failure inventory governs the next repair.
+
+The history refusal is Git's 80-byte truncation of an allowed public package
+name in duplicated function-heading metadata. The reviewed repair preserves
+raw historical hash receipts, scans sensitive text before any projection,
+and removes trailing heading text only from canonical two-sided hunk headers.
+Literal-LF splitting and leaving carriage-return and Unicode-separator lines
+unprojected keep authored lines intact. All additions, removals, context, paths,
+root commits, merge resolutions and complete governed ancestry remain scanned.
+No scope allowlist or commit-specific exception changes. The initial regression
+reproduced two failures; all six final cases pass with 96 assertions, and the
+16 existing history contracts pass with 406 assertions. The exact previously
+rejected synthetic merge also passes a complete history scan with the repaired
+scanner. Independent source review and focused lint pass. This changes artifact
+validation, not provider behavior or operational activation.
+
+The converged test repairs preserve every original ordered assertion and
+production source. Private owners observe and drain the exact raw setup and
+proof tasks before closing services, stores or roots, preserving genuine late
+failures and retaining storage if service shutdown is unproved. Coupled seed,
+uncertain-peer, readback and prose-budget proofs remain whole five-second
+tests; only fresh fixture/session preparation receives an explicit separate
+five-second setup allowance. The sibling-recovery actor and target scenarios
+become independent owned cases, with cancellation releasing the recovery gate
+even before entry. Publication-boundary regressions cover cancellation between
+request completion and setup-state publication.
+
+Independent source and assertion-equivalence review approves the repairs.
+The final service slice passes 46 cases with 274 assertions, including all
+owned callers, seven lifecycle regressions, both sibling scenarios and the
+complete prose family. The switch slice passes seven cases with 46 assertions;
+the readback slice passes 21 with 142. Scoped lint and whitespace checks pass.
+The first integration typecheck exposed test-only promise-matcher typing
+errors. Explicit identity-matcher types and asynchronous matcher callbacks
+preserve the runtime assertions; their focused checks, lint and fresh final
+integration typecheck pass. The reviewed archive bytes are unchanged.
+Exact-head Required CI, isolated installation and compiled browser acceptance
+remain required before protected merge; release and operational gates stay
+separate.
+
+The repairs are committed and pushed as
+`3f3ea718d177c5d0cbf576f13e9f019d4031b61d`, tree
+`bb3b968bada47dfc7faf8e9dbc4fd234c9ce5324`. Independent exact-commit
+review approves all six changed files. Fresh isolated installation passes
+with the same reviewed archive; all 214 package paths and modes match the
+committed blobs. Fresh compiled browser acceptance passes 210 evidence rows
+and three native custody cases with 130 assertions. Its receipt SHA-256 is
+`18410ed4e4dee77ac84ab9faee1c397c4965df0cbb4e374d2af4e4a9315ef5d5`;
+preparation and all 54 owned browser processes were collected across six
+profiles, with unchanged inputs and no cancellation, surviving process or page.
+
+Main advanced to `5ab43f11cc597c2f73f7f2c8f276b22f15bfb8b5` through
+PR 162's guarded v0.7.1 preparation before this candidate obtained Required CI.
+That source merge is not v0.7.1 artifact admission. The normal join preserves
+v0.8.0 identity, immutable v0.7.0 recovery evidence and both staged release
+records. It composes the independently written hunk-scanner repairs through
+one sensitive-first wrapper and one canonical physical-line projection,
+retaining both regression families. All 27 joined history contracts pass with
+563 assertions; source review and scoped lint pass. Installer runtime bytes
+and pins remain unchanged while prior-release refusal coverage expands.
+Independent review approves the complete resolved join. All packaged runtime,
+installer, dependency and workflow bytes remain unchanged from the usage head;
+the added installer cases preserve exact originating-release recovery and reject
+older identities as current authority. All 32 focused installer cases pass with
+194 assertions. Site, guide and marketing contracts pass 66 cases with 2,492
+assertions; release and CI-equivalence contracts pass 28 with 1,003. Both
+release versions retain their compiled inline-code styling proofs. Scoped lint,
+README renderer equality, release-tag installer pins and managed repository
+guidance pass. The immutable v0.7.0 successful-release record is byte-identical
+to both parents.
+
+Two independent actual-archive readers approve the newly packed 214-file
+candidate. Every path, mode and body matches the frozen source; only README
+wording differs from the previous archive and exact committed usage head.
+The 1,715,004-byte archive has SHA-256
+`2a0fd3c67e67e33a4d61412e41880b4aaa11a7ffa04f1e87a42941d483adfee4`.
+The independently measured inventory retains 223 entries and 11,079 canonical
+bytes, with digest
+`213322d4fa2af1626a8c44de75cafa182debe58c828390f9afa2311e68a1e0c3`.
+The old pin refuses those changed bytes; the reviewed replacement admits them.
+All eleven package-policy tests pass with 42 assertions. No allowlist, mode,
+dependency, installer or runtime changes enter this archive comparison.
+
+The separate Advanced Security check on the usage head reports seven alerts
+in test helpers despite successful CodeQL analysis jobs. Causal review confirms
+deliberate root-only JSON corruption, test-only HTML text projection and three
+generated installer-test programs. The root-field helpers now verify exact
+fixture prefixes and preserve raw suffixes, duplicate keys, nested authorities
+and numeric spellings. The existing HTML parser replaces tag-stripping and
+entity-replacement logic without reinterpreting decoded text. Static installer
+child programs receive values through arguments, preserving the original
+interruption callbacks, custody, deadlines and assertions. No alert or check
+is dismissed or suppressed; a fresh CodeQL result must establish clearance.
+
+The three text and corruption suites pass 78 cases with 16,626 assertions.
+The separate installer argument regression passes with three assertions, and
+all four affected native custody and interruption cases pass with 54. Scoped
+lint, whitespace checks and fresh final integration typecheck pass. Packaged
+source remains frozen. The installed scheduler changed during validation;
+its old convenience link became unavailable before a child started. The
+documented direct installed-script path retains reviewed scheduler custody.
+The updated managed repository baseline adds only its bounded new-service
+provisioning preference; it creates no resource or wider delivery authority.
+Fresh exact-head CI, local installation and compiled browser acceptance remain
+pending. The successful pre-join local gates above do not admit this new main
+integration or authorize release, deployment or runtime activation.
+
+The reviewed join and test-helper repairs are committed and pushed as
+`e2ac07d122763c37581f77c81a56f3bad7374307`, tree
+`a2b0ab82238ad39815e08968c8de16638de347c9`. The exact committed tree
+matches all 214 reviewed package paths, modes and blobs. Fresh isolated local
+and global installation, restored PTY and owned daemon lifecycle pass.
+CI run `34371222876`, attempt 1, checks synthetic merge
+`0006e118a83eb4c2f922ae6699ffe3f87a139963`, whose current-base tree is
+`71251acc214e77b9bfdeabd0a1e3470700c035bb`. Its browser job passes.
+Both CodeQL analysis jobs and the separate Advanced Security check pass on
+the exact head, reporting no new alerts in the changed code. The matrix is
+still running; neither this partial CI result nor its security clearance is
+substituted for a later integration candidate's final gates.
+
+Main then advances to `e1edb585eedd0e78dbb558ce72fa7680cc2257ea`
+through PR 165's shared provisioning guidance and local-efficiency 0.4.2
+metadata. The normal join is independently reviewed, retaining byte-identical
+package, runtime, application, scheduler, validation and CI workflow source.
+Root guidance was already current; seven incoming files only update plugin
+metadata, managed policy assets and their documentation. The complete focused
+bootstrap and repository-adoption suites pass 28 cases with 181 assertions,
+read-only adoption is current, and fresh final integration typecheck passes.
+No new infrastructure, credential, provider or deployment effect occurs.
+The unchanged archive remains bound to the candidate, but exact-head CI,
+security, installation and compiled browser gates must admit the successor
+before protected merge, release or deployment.
+
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree

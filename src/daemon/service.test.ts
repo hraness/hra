@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1763,17 +1763,19 @@ type ServiceFixtureFactory = (...args: Parameters<typeof fixture>) => Promise<
   }
 >;
 
-function ownedServiceCase(
-  runCase: (context: {
-    createFixture: ServiceFixtureFactory;
-    signal: AbortSignal;
-    resources: ServiceCaseResources;
-  }) => Promise<void>,
+type ServiceCaseContext = {
+  createFixture: ServiceFixtureFactory;
+  signal: AbortSignal;
+  resources: ServiceCaseResources;
+};
+
+function createOwnedServiceCase(
   teardowns = ownedServiceCaseTeardowns,
-): Promise<void> {
+) {
   const resources: ServiceCaseResources = { roots: [], stores: [], services: [] };
   const controller = new AbortController();
   const cancellation = new Error("Owned service case is closing.");
+  const tasks: Array<Promise<{ status: "fulfilled" } | { status: "rejected"; reason: unknown }>> = [];
   const createFixture: ServiceFixtureFactory = async (
     desktop, cloud, requestStop, now, factsMemory, autorespond, adoption,
     platformOrClaude, platformOverride,
@@ -1792,21 +1794,26 @@ function ownedServiceCase(
       },
     };
   };
-  // Register this raw task before any fixture setup, and observe its rejection
-  // immediately. Timeout cleanup must join it before closing service storage.
-  const task = Promise.resolve().then(async () => {
-    controller.signal.throwIfAborted();
-    await runCase({ createFixture, signal: controller.signal, resources });
-    controller.signal.throwIfAborted();
-  });
-  const settled = task.then(
-    () => ({ status: "fulfilled" } as const),
-    (reason: unknown) => ({ status: "rejected", reason } as const),
-  );
+  const run = (runCase: (context: ServiceCaseContext) => Promise<void>): Promise<void> => {
+    // Return this exact observed task to Bun, including from setup hooks. An
+    // outer async hook would create a different, unowned timeout rejection.
+    const task = Promise.resolve().then(async () => {
+      controller.signal.throwIfAborted();
+      await runCase({ createFixture, signal: controller.signal, resources });
+      controller.signal.throwIfAborted();
+    });
+    tasks.push(task.then(
+      () => ({ status: "fulfilled" } as const),
+      (reason: unknown) => ({ status: "rejected", reason } as const),
+    ));
+    return task;
+  };
   teardowns.push(async () => {
     controller.abort(cancellation);
-    const result = await settled;
-    const failures: unknown[] = result.status === "rejected" && result.reason !== cancellation ? [result.reason] : [];
+    const failures: unknown[] = [];
+    for (const result of await Promise.all(tasks)) {
+      if (result.status === "rejected" && result.reason !== cancellation) failures.push(result.reason);
+    }
     let serviceCloseFailed = false;
     for (const service of resources.services.splice(0)) {
       try { await service.close(); } catch (error: unknown) {
@@ -1828,10 +1835,106 @@ function ownedServiceCase(
     }
     if (failures.length > 0) throw new AggregateError(failures, "Owned service teardown failed.");
   });
-  return task;
+  return { run };
+}
+
+function ownedServiceCase(
+  runCase: (context: ServiceCaseContext) => Promise<void>,
+  teardowns = ownedServiceCaseTeardowns,
+): Promise<void> {
+  return createOwnedServiceCase(teardowns).run(runCase);
 }
 
 describe("owned service case lifecycle", () => {
+  test("checks cancellation between prepared-value resolution and publication", async () => {
+    const teardowns: Array<() => Promise<void>> = [];
+    const owner = createOwnedServiceCase(teardowns);
+    const entered = Promise.withResolvers<undefined>();
+    const preparation = Promise.withResolvers<string>();
+    let published: string | undefined;
+    const setup = owner.run(async (context) => {
+      entered.resolve(undefined);
+      const value = await preparation.promise;
+      context.signal.throwIfAborted();
+      published = value;
+    });
+    await entered.promise;
+    preparation.resolve("prepared");
+    const closing = teardowns[0]?.();
+    await closing;
+    await expect(setup).rejects.toThrow("Owned service case is closing.");
+    expect(published).toBeUndefined();
+  });
+
+  test.each(["setup", "case"] as const)("returns the observed %s task and drains it before later cleanup", async (phase) => {
+    const teardowns: Array<() => Promise<void>> = [];
+    const owner = createOwnedServiceCase(teardowns);
+    const nextTeardowns: Array<() => Promise<void>> = [];
+    const nextOwner = createOwnedServiceCase(nextTeardowns);
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const lateFailure = new Error(`late ${phase} failure`);
+    const events: string[] = [];
+    if (phase === "case") await owner.run(async () => undefined);
+    await nextOwner.run(async ({ resources }) => {
+      resources.stores.push({ close: () => { events.push("close-next-case"); } });
+    });
+    let observed: Promise<void> | undefined;
+    const hook = () => {
+      observed = owner.run(async ({ resources }) => {
+        entered.resolve(undefined);
+        await release.promise;
+        resources.stores.push({ close: () => { events.push("close-late-store"); } });
+        events.push("raw-failed");
+        throw lateFailure;
+      });
+      return observed;
+    };
+    const task = hook();
+    expect<Promise<void> | undefined>(task).toBe(observed);
+    await entered.promise;
+    const closing = teardowns[0]?.().catch((error: unknown) => error);
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    release.resolve(undefined);
+    const error = await closing;
+    expect(error).toBeInstanceOf(AggregateError);
+    if (!(error instanceof AggregateError)) throw new Error("Expected the original late phase failure.");
+    expect(error.errors).toEqual([lateFailure]);
+    await expect(task).rejects.toBe(lateFailure);
+    expect(events).toEqual(["raw-failed", "close-late-store"]);
+    await nextTeardowns[0]?.();
+    expect(events).toEqual(["raw-failed", "close-late-store", "close-next-case"]);
+  });
+
+  test("keeps real SQLite open until delayed service retirement has joined", async () => {
+    const teardowns: Array<() => Promise<void>> = [];
+    const owner = createOwnedServiceCase(teardowns);
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    let value: Awaited<ReturnType<typeof fixture>> | undefined;
+    await owner.run(async ({ createFixture }) => {
+      value = await createFixture(undefined, undefined, undefined, undefined, undefined, {
+        beforeMemoryClose: async () => {
+          entered.resolve(undefined);
+          await release.promise;
+        },
+      });
+    });
+    if (value === undefined) throw new Error("Expected the real service fixture.");
+    const store = value.store;
+    const closing = teardowns[0]?.();
+    void closing?.catch((error: unknown) => { entered.reject(error); });
+    try {
+      await entered.promise;
+      expect(store.listUnreleasedClaudeProcessAuthorities()).toEqual([]);
+    } finally {
+      release.resolve(undefined);
+      await closing;
+    }
+    expect(() => store.listUnreleasedClaudeProcessAuthorities()).toThrow("Cannot use a closed database");
+  });
+
   test("registers before deferred setup and cancels before resources open", async () => {
     const teardowns: Array<() => Promise<void>> = [];
     let opened = false;
@@ -11402,209 +11505,234 @@ describe("HraService", () => {
     }
   }
 
-  test.each(["send", "steer", "queue"] as const)(
-    "refuses a return peer steer after abandoning an accepted uncertain peer %s",
-    async (delivery) => {
-      const value = await fixture();
-      try {
-        const { sessionId: actorId } = await createIdleSession(value, `Abandoned peer ${delivery} actor`);
-        await value.service.execute({
-          kind: "session.send",
-          session: actorId,
-          message: "Keep the original actor turn active.",
-        }, { signal });
-        const actor = value.store.requireSession(actorId);
-        const actorProjection = value.codex.readProjection;
-        const actorTurnId = actor.activeTurnId;
-        if (actorTurnId === undefined) throw new Error("Expected an active original actor turn.");
+  const prepareAbandonedPeerScenario = async (
+    delivery: "send" | "steer" | "queue",
+    { createFixture, signal }: ServiceCaseContext,
+  ) => {
+    const value = await createFixture();
+    signal.throwIfAborted();
+    const { sessionId: actorId } = await createIdleSession(value, `Abandoned peer ${delivery} actor`);
+    await value.service.execute({
+      kind: "session.send",
+      session: actorId,
+      message: "Keep the original actor turn active.",
+    }, { signal });
+    const actor = value.store.requireSession(actorId);
+    const actorProjection = value.codex.readProjection;
+    const actorTurnId = actor.activeTurnId;
+    if (actorTurnId === undefined) throw new Error("Expected an active original actor turn.");
 
-        // Both sessions obtain their host capability through real session.start.
-        // Separate managed profiles keep the fake's fixed thread name unambiguous.
-        const targetAccount = await value.service.execute({
-          kind: "account.add", label: `Abandoned peer ${delivery} target`,
-        }, { signal }) as { account: { id: string } };
-        await value.service.execute({
-          kind: "account.login", account: targetAccount.account.id, deviceCode: false,
-        }, { signal });
-        const targetStarted = await value.service.execute({
-          kind: "session.start", account: targetAccount.account.id, preset: "high", presetContract: 1, fast: false,
-        }, { signal }) as { session: { id: `sess_${string}` } };
-        const targetId = targetStarted.session.id;
-        if (delivery === "steer") {
+    // Both sessions obtain their host capability through real session.start.
+    // Separate managed profiles keep the fake's fixed thread name unambiguous.
+    const targetAccount = await value.service.execute({
+      kind: "account.add", label: `Abandoned peer ${delivery} target`,
+    }, { signal }) as { account: { id: string } };
+    await value.service.execute({
+      kind: "account.login", account: targetAccount.account.id, deviceCode: false,
+    }, { signal });
+    const targetStarted = await value.service.execute({
+      kind: "session.start", account: targetAccount.account.id, preset: "high", presetContract: 1, fast: false,
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const targetId = targetStarted.session.id;
+    if (delivery === "steer") {
+      await value.service.execute({
+        kind: "session.send",
+        session: targetId,
+        message: "Keep the receiving target turn active.",
+      }, { signal });
+    }
+    const target = value.store.requireSession(targetId);
+    return { value, actor, actorProjection, actorTurnId, target };
+  };
+
+  // Each scenario gets fresh real accounts and sessions in a separate bounded
+  // setup phase. The entire uncertain-effect causal proof remains one test.
+  // This adds a 5 s setup allowance; it does not preserve the old total budget.
+  for (const delivery of ["send", "steer", "queue"] as const) {
+    describe(`refuses a return peer steer after abandoning an accepted uncertain peer ${delivery}`, () => {
+      let owner: ReturnType<typeof createOwnedServiceCase> | undefined;
+      let prepared: Awaited<ReturnType<typeof prepareAbandonedPeerScenario>> | undefined;
+      beforeEach(() => {
+        owner = createOwnedServiceCase();
+        prepared = undefined;
+        return owner.run(async (context) => {
+          const value = await prepareAbandonedPeerScenario(delivery, context);
+          context.signal.throwIfAborted();
+          prepared = value;
+        });
+      }, 5_000);
+
+      test("retains the coupled abandonment, refusal, inspection, and fresh-turn proof", () => {
+        if (owner === undefined) throw new Error("Expected the prepared peer case owner.");
+        return owner.run(async ({ signal }) => {
+          if (prepared === undefined) throw new Error("Expected fresh prepared peer accounts and sessions.");
+          const { value, actor, actorProjection, actorTurnId, target } = prepared;
+          expect(target.profileId).not.toBe(actor.profileId);
+          expect(target.projectId).toBe(actor.projectId);
+          expect(value.store.readSessionHostCapabilityBinding(actor.id)).not.toBeNull();
+          expect(value.store.readSessionHostCapabilityBinding(target.id)).not.toBeNull();
+
+          const authorityFor = (source: SessionRecord): ProfileAuthority => {
+            return liveAuthorityFor(value.store, source.profileId);
+          };
+          const messageCall = (
+            source: SessionRecord,
+            turnId: string,
+            destination: SessionRecord,
+            messageDelivery: "send" | "steer" | "queue",
+            callId: string,
+          ): Extract<HraHostToolCall, { tool: "session_message" }> => {
+            if (source.providerThreadId === undefined) throw new Error("Expected a bound provider thread.");
+            const authority = authorityFor(source);
+            const input = {
+              sessionId: destination.id,
+              expectedRevision: value.store.requireSession(destination.id).revision,
+              delivery: messageDelivery,
+              message: "Continue the same peer coordination chain.",
+              reason: "Preserve causal authority across owner abandonment",
+            };
+            return {
+              authority: hostToolAuthorityFor(authority),
+              callId,
+              connectionId: value.codex.observationConnectionId,
+              input,
+              requestDigest: createHash("sha256").update(JSON.stringify(input)).digest("hex"),
+              requestId: { type: "string", value: callId },
+              threadId: source.providerThreadId,
+              tool: "session_message",
+              turnId,
+            };
+          };
+          const firstCall = messageCall(actor, actorTurnId, target, delivery, `abandoned-${delivery}-outbound`);
+          const writesBeforeEffect = providerMutationCalls(value.codex);
+          const lostResponse = new IndeterminateCodexEffectError(
+            delivery === "steer" ? "turn/steer" : "turn/start",
+            82,
+          );
+          if (delivery === "steer") value.codex.steerError = lostResponse;
+          else value.codex.startTurnError = lostResponse;
+          const firstResult = await value.service.handleHraHostToolCall(
+            authorityFor(actor), firstCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+          );
+          if (delivery === "queue") {
+            expect(firstResult).toMatchObject({ ok: true, action: { state: "queued" } });
+            await value.service.settled();
+          } else {
+            expect(firstResult).toMatchObject({ ok: false, code: "RECOVERY_REQUIRED" });
+          }
+          delete value.codex.startTurnError;
+          delete value.codex.steerError;
+
+          const [outbound] = value.store.listUnsettledPeerSessionActions(10);
+          if (outbound === undefined) throw new Error("Expected the uncertain outbound peer action.");
+          const queue = delivery === "queue"
+            ? value.store.listQueue(target.id).find((entry) => entry.peerActionId === outbound.id)
+            : undefined;
+          const attempt = delivery === "queue" ? null : value.store.readMutation(outbound.idempotencyKey);
+          if (delivery === "queue") {
+            if (queue === undefined) throw new Error("Expected the attributed queued provider effect.");
+            expect(queue).toMatchObject({ state: "ambiguous", messageActor: "peer_session" });
+            expect(value.store.readQueueEffect(queue.id)?.resolution).toBeUndefined();
+          } else {
+            if (attempt === null) throw new Error("Expected the nested provider effect.");
+            expect(attempt).toMatchObject({ state: "ambiguous" });
+          }
+          const acceptedSourceId = queue?.id ?? attempt?.id;
+          if (acceptedSourceId === undefined) throw new Error("Expected the accepted source identity.");
+          const acceptedMessage = value.codex.readProjection.messages?.find((message) => message.clientId === acceptedSourceId);
+          if (acceptedMessage?.turnId === undefined) throw new Error("Expected the actually accepted target message.");
+          const targetTurnId = acceptedMessage.turnId;
+          expect(value.codex.readProjection).toMatchObject({ status: "active", activeTurnId: targetTurnId });
+          expect(providerMutationCalls(value.codex)).toHaveLength(writesBeforeEffect.length + 1);
+          expect(value.store.requireSession(target.id).state).toBe("recovery_required");
+
+          await expect(value.service.execute({ kind: "session.abandon", session: target.id }, { signal }))
+            .resolves.toMatchObject({
+              recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false },
+            });
+          if (queue !== undefined) {
+            expect(value.store.readQueueEffect(queue.id)).toMatchObject({ resolution: { kind: "abandoned" } });
+          } else {
+            expect(value.store.readMutation(outbound.idempotencyKey)).toMatchObject({
+              state: "reconciled",
+              resolution: { kind: "abandoned" },
+            });
+          }
+          expect(providerMutationCalls(value.codex)).toHaveLength(writesBeforeEffect.length + 1);
+          const abandonedTargetProjection = value.codex.readProjection;
+
+          // The provider already consumed the outbound message. A fresh callback
+          // from that same target turn must not restart its ancestry at hop one.
+          value.codex.readProjection = actorProjection;
+          const returnCall = messageCall(target, targetTurnId, actor, "steer", `abandoned-${delivery}-return`);
+          const writesBeforeReturn = providerMutationCalls(value.codex);
+          const returned = await value.service.handleHraHostToolCall(
+            authorityFor(target), returnCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+          );
+          expect({
+            providerWrites: providerMutationCalls(value.codex),
+            returnOrigins: value.store.readPeerSessionTurnOrigins({ sessionId: actor.id, turnId: actorTurnId })
+              .map((origin) => ({ hop: origin.hop, parentActionIds: origin.parentActionIds })),
+          }).toEqual({ providerWrites: writesBeforeReturn, returnOrigins: [] });
+          expect(returned).toMatchObject({ ok: false, code: "PEER_SESSION_ACTOR_TURN_REFUSED" });
+
+          const inspectionInput = {
+            sessionId: actor.id,
+            expectedRevision: value.store.requireSession(actor.id).revision,
+            limit: 10,
+          };
+          const inspectionCallId = `abandoned-${delivery}-inspect`;
+          await expect(value.service.handleHraHostToolCall(authorityFor(target), {
+            ...returnCall,
+            callId: inspectionCallId,
+            input: inspectionInput,
+            requestDigest: createHash("sha256").update(JSON.stringify(inspectionInput)).digest("hex"),
+            requestId: { type: "string", value: inspectionCallId },
+            tool: "session_inspect",
+          }, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).resolves.toMatchObject({ ok: true });
+          expect(providerMutationCalls(value.codex)).toEqual(writesBeforeReturn);
+
+          // The fence is not a session-wide loss of owner control. Stop the
+          // affected turn, then start a separately receipted human turn normally.
+          value.codex.readProjection = abandonedTargetProjection;
+          await expect(value.service.execute({ kind: "session.stop", session: target.id }, { signal }))
+            .resolves.toMatchObject({ stopped: true, session: { state: "idle" } });
+          expect(providerMutationCalls(value.codex)).toEqual([...writesBeforeReturn, "stop"]);
+          const humanKey = crypto.randomUUID();
           await value.service.execute({
             kind: "session.send",
-            session: targetId,
-            message: "Keep the receiving target turn active.",
+            idempotencyKey: humanKey,
+            session: target.id,
+            message: "Begin an independent owner-directed coordination turn.",
           }, { signal });
-        }
-        const target = value.store.requireSession(targetId);
-        expect(target.profileId).not.toBe(actor.profileId);
-        expect(target.projectId).toBe(actor.projectId);
-        expect(value.store.readSessionHostCapabilityBinding(actor.id)).not.toBeNull();
-        expect(value.store.readSessionHostCapabilityBinding(target.id)).not.toBeNull();
+          const freshTarget = value.store.requireSession(target.id);
+          const freshTargetTurnId = freshTarget.activeTurnId;
+          if (freshTargetTurnId === undefined) throw new Error("Expected a new human-started turn.");
+          expect(freshTargetTurnId).not.toBe(targetTurnId);
+          const humanAttempt = value.store.readMutation(humanKey);
+          if (humanAttempt === null) throw new Error("Expected the independent human mutation receipt.");
+          expect(humanAttempt).toMatchObject({ kind: "session.send", state: "applied" });
+          expect(value.store.sessionMessageActorForSource(target.id, humanAttempt.id)).toBe("human");
+          expect(value.store.readPeerSessionTurnOrigins({
+            sessionId: target.id, turnId: freshTargetTurnId,
+          })).toEqual([]);
 
-        const authorityFor = (source: SessionRecord): ProfileAuthority => {
-          return liveAuthorityFor(value.store, source.profileId);
-        };
-        const messageCall = (
-          source: SessionRecord,
-          turnId: string,
-          destination: SessionRecord,
-          messageDelivery: "send" | "steer" | "queue",
-          callId: string,
-        ): Extract<HraHostToolCall, { tool: "session_message" }> => {
-          if (source.providerThreadId === undefined) throw new Error("Expected a bound provider thread.");
-          const authority = authorityFor(source);
-          const input = {
-            sessionId: destination.id,
-            expectedRevision: value.store.requireSession(destination.id).revision,
-            delivery: messageDelivery,
-            message: "Continue the same peer coordination chain.",
-            reason: "Preserve causal authority across owner abandonment",
-          };
-          return {
-            authority: hostToolAuthorityFor(authority),
-            callId,
-            connectionId: value.codex.observationConnectionId,
-            input,
-            requestDigest: createHash("sha256").update(JSON.stringify(input)).digest("hex"),
-            requestId: { type: "string", value: callId },
-            threadId: source.providerThreadId,
-            tool: "session_message",
-            turnId,
-          };
-        };
-        const firstCall = messageCall(actor, actorTurnId, target, delivery, `abandoned-${delivery}-outbound`);
-        const writesBeforeEffect = providerMutationCalls(value.codex);
-        const lostResponse = new IndeterminateCodexEffectError(
-          delivery === "steer" ? "turn/steer" : "turn/start",
-          82,
-        );
-        if (delivery === "steer") value.codex.steerError = lostResponse;
-        else value.codex.startTurnError = lostResponse;
-        const firstResult = await value.service.handleHraHostToolCall(
-          authorityFor(actor), firstCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
-        );
-        if (delivery === "queue") {
-          expect(firstResult).toMatchObject({ ok: true, action: { state: "queued" } });
-          await value.service.settled();
-        } else {
-          expect(firstResult).toMatchObject({ ok: false, code: "RECOVERY_REQUIRED" });
-        }
-        delete value.codex.startTurnError;
-        delete value.codex.steerError;
-
-        const [outbound] = value.store.listUnsettledPeerSessionActions(10);
-        if (outbound === undefined) throw new Error("Expected the uncertain outbound peer action.");
-        const queue = delivery === "queue"
-          ? value.store.listQueue(target.id).find((entry) => entry.peerActionId === outbound.id)
-          : undefined;
-        const attempt = delivery === "queue" ? null : value.store.readMutation(outbound.idempotencyKey);
-        if (delivery === "queue") {
-          if (queue === undefined) throw new Error("Expected the attributed queued provider effect.");
-          expect(queue).toMatchObject({ state: "ambiguous", messageActor: "peer_session" });
-          expect(value.store.readQueueEffect(queue.id)?.resolution).toBeUndefined();
-        } else {
-          if (attempt === null) throw new Error("Expected the nested provider effect.");
-          expect(attempt).toMatchObject({ state: "ambiguous" });
-        }
-        const acceptedSourceId = queue?.id ?? attempt?.id;
-        if (acceptedSourceId === undefined) throw new Error("Expected the accepted source identity.");
-        const acceptedMessage = value.codex.readProjection.messages?.find((message) => message.clientId === acceptedSourceId);
-        if (acceptedMessage?.turnId === undefined) throw new Error("Expected the actually accepted target message.");
-        const targetTurnId = acceptedMessage.turnId;
-        expect(value.codex.readProjection).toMatchObject({ status: "active", activeTurnId: targetTurnId });
-        expect(providerMutationCalls(value.codex)).toHaveLength(writesBeforeEffect.length + 1);
-        expect(value.store.requireSession(target.id).state).toBe("recovery_required");
-
-        await expect(value.service.execute({ kind: "session.abandon", session: target.id }, { signal }))
-          .resolves.toMatchObject({
-            recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false },
-          });
-        if (queue !== undefined) {
-          expect(value.store.readQueueEffect(queue.id)).toMatchObject({ resolution: { kind: "abandoned" } });
-        } else {
-          expect(value.store.readMutation(outbound.idempotencyKey)).toMatchObject({
-            state: "reconciled",
-            resolution: { kind: "abandoned" },
-          });
-        }
-        expect(providerMutationCalls(value.codex)).toHaveLength(writesBeforeEffect.length + 1);
-        const abandonedTargetProjection = value.codex.readProjection;
-
-        // The provider already consumed the outbound message. A fresh callback
-        // from that same target turn must not restart its ancestry at hop one.
-        value.codex.readProjection = actorProjection;
-        const returnCall = messageCall(target, targetTurnId, actor, "steer", `abandoned-${delivery}-return`);
-        const writesBeforeReturn = providerMutationCalls(value.codex);
-        const returned = await value.service.handleHraHostToolCall(
-          authorityFor(target), returnCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
-        );
-        expect({
-          providerWrites: providerMutationCalls(value.codex),
-          returnOrigins: value.store.readPeerSessionTurnOrigins({ sessionId: actor.id, turnId: actorTurnId })
-            .map((origin) => ({ hop: origin.hop, parentActionIds: origin.parentActionIds })),
-        }).toEqual({ providerWrites: writesBeforeReturn, returnOrigins: [] });
-        expect(returned).toMatchObject({ ok: false, code: "PEER_SESSION_ACTOR_TURN_REFUSED" });
-
-        const inspectionInput = {
-          sessionId: actor.id,
-          expectedRevision: value.store.requireSession(actor.id).revision,
-          limit: 10,
-        };
-        const inspectionCallId = `abandoned-${delivery}-inspect`;
-        await expect(value.service.handleHraHostToolCall(authorityFor(target), {
-          ...returnCall,
-          callId: inspectionCallId,
-          input: inspectionInput,
-          requestDigest: createHash("sha256").update(JSON.stringify(inspectionInput)).digest("hex"),
-          requestId: { type: "string", value: inspectionCallId },
-          tool: "session_inspect",
-        }, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).resolves.toMatchObject({ ok: true });
-        expect(providerMutationCalls(value.codex)).toEqual(writesBeforeReturn);
-
-        // The fence is not a session-wide loss of owner control. Stop the
-        // affected turn, then start a separately receipted human turn normally.
-        value.codex.readProjection = abandonedTargetProjection;
-        await expect(value.service.execute({ kind: "session.stop", session: target.id }, { signal }))
-          .resolves.toMatchObject({ stopped: true, session: { state: "idle" } });
-        expect(providerMutationCalls(value.codex)).toEqual([...writesBeforeReturn, "stop"]);
-        const humanKey = crypto.randomUUID();
-        await value.service.execute({
-          kind: "session.send",
-          idempotencyKey: humanKey,
-          session: target.id,
-          message: "Begin an independent owner-directed coordination turn.",
-        }, { signal });
-        const freshTarget = value.store.requireSession(target.id);
-        const freshTargetTurnId = freshTarget.activeTurnId;
-        if (freshTargetTurnId === undefined) throw new Error("Expected a new human-started turn.");
-        expect(freshTargetTurnId).not.toBe(targetTurnId);
-        const humanAttempt = value.store.readMutation(humanKey);
-        if (humanAttempt === null) throw new Error("Expected the independent human mutation receipt.");
-        expect(humanAttempt).toMatchObject({ kind: "session.send", state: "applied" });
-        expect(value.store.sessionMessageActorForSource(target.id, humanAttempt.id)).toBe("human");
-        expect(value.store.readPeerSessionTurnOrigins({
-          sessionId: target.id, turnId: freshTargetTurnId,
-        })).toEqual([]);
-
-        value.codex.readProjection = actorProjection;
-        const freshCall = messageCall(
-          freshTarget, freshTargetTurnId, actor, "steer", `abandoned-${delivery}-fresh-turn`,
-        );
-        const writesBeforeFreshCoordination = providerMutationCalls(value.codex);
-        await expect(value.service.handleHraHostToolCall(
-          authorityFor(freshTarget), freshCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
-        )).resolves.toMatchObject({ ok: true, action: { state: "applied" } });
-        expect(providerMutationCalls(value.codex)).toEqual([...writesBeforeFreshCoordination, "steer"]);
-        expect(value.store.readPeerSessionTurnOrigins({ sessionId: actor.id, turnId: actorTurnId })
-          .map((origin) => ({ hop: origin.hop, parentActionIds: origin.parentActionIds })))
-          .toEqual([{ hop: 1, parentActionIds: [] }]);
-      } finally {
-        await value.service.close();
-      }
-    },
-  );
+          value.codex.readProjection = actorProjection;
+          const freshCall = messageCall(
+            freshTarget, freshTargetTurnId, actor, "steer", `abandoned-${delivery}-fresh-turn`,
+          );
+          const writesBeforeFreshCoordination = providerMutationCalls(value.codex);
+          await expect(value.service.handleHraHostToolCall(
+            authorityFor(freshTarget), freshCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+          )).resolves.toMatchObject({ ok: true, action: { state: "applied" } });
+          expect(providerMutationCalls(value.codex)).toEqual([...writesBeforeFreshCoordination, "steer"]);
+          expect(value.store.readPeerSessionTurnOrigins({ sessionId: actor.id, turnId: actorTurnId })
+            .map((origin) => ({ hop: origin.hop, parentActionIds: origin.parentActionIds })))
+            .toEqual([{ hop: 1, parentActionIds: [] }]);
+        });
+      }, 5_000);
+    });
+  }
 
   test("fences recovery-blocked Claude targets and terminal history under removed profiles", async () => {
     for (const provider of ["claude"] as const) {
@@ -12548,10 +12676,12 @@ describe("HraService", () => {
     }
   });
 
-  test("fences peer mutations while a sibling projection recovery owns either account", async () => {
-    for (const recoverySide of ["actor", "target"] as const) {
+  test.each(["actor", "target"] as const)(
+    "fences peer mutations while a sibling projection recovery owns the %s account",
+    (recoverySide) => ownedServiceCase(async ({ createFixture, signal }) => {
       const cloud = new FakeCloud();
-      const value = await fixture(undefined, cloud);
+      const value = await createFixture(undefined, cloud);
+      signal.throwIfAborted();
       const { sessionId: actorSessionId } = await createIdleSession(
         value,
         `Peer in-flight projection ${recoverySide} actor`,
@@ -12622,24 +12752,40 @@ describe("HraService", () => {
         accountKey: recoverySide === "actor" ? actorAccountKey : targetAccountKey,
       });
       let entered!: () => void;
-      const recoveryEntered = new Promise<void>((resolve) => { entered = resolve; });
+      let rejectEntry!: (reason: unknown) => void;
+      let didEnter = false;
+      const recoveryEntered = new Promise<void>((resolve, reject) => {
+        entered = resolve;
+        rejectEntry = reject;
+      });
       let release!: () => void;
       const recoveryGate = new Promise<void>((resolve) => { release = resolve; });
       cloud.beforeProjectionRecoveryReturn = async () => {
+        didEnter = true;
         entered();
         await recoveryGate;
       };
+      signal.throwIfAborted();
+      // Cancellation can arrive before the cloud hook enters. Releasing now
+      // also admits that later hook, so joining the owned case cannot deadlock.
+      signal.addEventListener("abort", release, { once: true });
       const recovery = value.service.execute({
         acknowledgeGap: true,
         idempotencyKey: crypto.randomUUID(),
         kind: "sync.projection-recover",
         session: sibling.id,
       }, { signal });
-      await recoveryEntered;
-      const providerWritesBefore = providerMutationCalls(value.codex);
-      const requestLabel = `peer-in-flight-projection-${recoverySide}`;
-      const authority: ProfileAuthority = liveAuthorityFor(value.store, actorProfile.id, "codex");
+      // Observe the original task immediately, including rejection before the
+      // entry hook. The finally below still joins its real outcome.
+      void recovery.then(() => {
+        if (!didEnter) rejectEntry(new Error("Expected the projection recovery entry hook."));
+      }, rejectEntry);
       try {
+        await recoveryEntered;
+        signal.throwIfAborted();
+        const providerWritesBefore = providerMutationCalls(value.codex);
+        const requestLabel = `peer-in-flight-projection-${recoverySide}`;
+        const authority: ProfileAuthority = liveAuthorityFor(value.store, actorProfile.id, "codex");
         await expect(value.service.handleHraHostToolCall(authority, {
           authority: hostToolAuthorityFor(liveAuthorityFor(value.store, actorProfile.id)),
           callId: requestLabel,
@@ -12663,11 +12809,12 @@ describe("HraService", () => {
         expect(value.store.listRecentPeerSessionActions()).toEqual([]);
         expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
       } finally {
+        signal.removeEventListener("abort", release);
         release();
         await recovery;
       }
-    }
-  });
+    }),
+  );
 
   test("dispatches memory host tools with session authority, deterministic mutation keys, and closed refusals", async () => {
     const memory = new FakeMemory();
@@ -30684,10 +30831,10 @@ describe("HraService prose autorespond", () => {
     now?: () => number;
     onStopRequested?: () => void;
     responder?: ProseResponder;
-  }> = {}) => {
+  }> = {}, createFixture: ServiceFixtureFactory = fixture) => {
     const responder = options.responder ?? new DeterministicProseResponder();
     const gatewayKeys = options.gatewayKeys ?? new InMemoryGatewayKeyStore(testGatewayKey);
-    const value = await fixture(
+    const value = await createFixture(
       undefined,
       new FakeCloud(),
       options.onStopRequested ?? (() => undefined),
@@ -31343,56 +31490,82 @@ describe("HraService prose autorespond", () => {
     });
   });
 
-  test.each([
+  for (const { afterHoursEnabled, label } of [
     { afterHoursEnabled: false, label: "disabled" },
     { afterHoursEnabled: true, label: "enabled" },
-  ])("keeps prose at three approvals with after-hours consent $label and resumes only after a human send", async ({ afterHoursEnabled }) => {
-    const now = Date.parse("2026-09-04T09:59:59.999Z");
-    const value = await proseFixture({ now: () => now });
-    const { sessionId } = await createIdleSession(value, "Prose budget");
-    await value.service.execute({
-      kind: "notification-hours.set", expectedRevision: 1, version: 1,
-      startMinute: 600, endMinute: 1_320, timeZone: "UTC",
-    }, { signal });
-    if (afterHoursEnabled) {
-      await value.service.execute({ kind: "autorespond-after-hours.enable", expectedRevision: 1 }, { signal });
-      expect(value.store.readAutorespondAfterHoursSelection(sessionId, "protocol", "eligible").tier).toBe("after_hours");
-    }
-    value.store.setSessionApprovalMode(sessionId, "auto:all");
+  ]) {
+    describe(`keeps prose at three approvals with after-hours consent ${label} and resumes only after a human send`, () => {
+      let owner: ReturnType<typeof createOwnedServiceCase> | undefined;
+      let prepared: {
+        value: Awaited<ReturnType<typeof proseFixture>>;
+        sessionId: `sess_${string}`;
+      } | undefined;
+      // Only fresh fixture and idle-session creation moves to setup. This adds
+      // a separate 5 s allowance, not an unchanged end-to-end test deadline.
+      beforeEach(() => {
+        owner = createOwnedServiceCase();
+        prepared = undefined;
+        return owner.run(async ({ createFixture, signal }) => {
+          const now = Date.parse("2026-09-04T09:59:59.999Z");
+          const value = await proseFixture({ now: () => now }, createFixture);
+          signal.throwIfAborted();
+          const { sessionId } = await createIdleSession(value, "Prose budget");
+          signal.throwIfAborted();
+          prepared = { value, sessionId };
+        });
+      }, 5_000);
 
-    // Each autoresponse must leave the fake provider idle so the next turn can
-    // start; the daemon refuses to send into an active turn.
-    value.codex.turnStatus = "completed";
-    const sent = () => proseEvidence(value, sessionId).filter((row) => row.outcome === "sent").length;
-    let expected = 0;
-    for (const turn of ["budget-1", "budget-2", "budget-3"]) {
-      expected += 1;
-      await completeTurn(value, sessionId, turn, "Ready to apply. Should I proceed?");
-      await waitFor(() => sent() === expected);
-    }
-    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(3);
+      test("retains the coupled three-approval cap, refusal, and human-reset proof", () => {
+        if (owner === undefined) throw new Error("Expected the prose budget case owner.");
+        return owner.run(async ({ signal }) => {
+          if (prepared === undefined) throw new Error("Expected a fresh prepared prose budget session.");
+          const { value, sessionId } = prepared;
+          await value.service.execute({
+            kind: "notification-hours.set", expectedRevision: 1, version: 1,
+            startMinute: 600, endMinute: 1_320, timeZone: "UTC",
+          }, { signal });
+          if (afterHoursEnabled) {
+            await value.service.execute({ kind: "autorespond-after-hours.enable", expectedRevision: 1 }, { signal });
+            expect(value.store.readAutorespondAfterHoursSelection(sessionId, "protocol", "eligible").tier).toBe("after_hours");
+          }
+          value.store.setSessionApprovalMode(sessionId, "auto:all");
 
-    await completeTurn(value, sessionId, "budget-4", "Ready to apply. Should I proceed?");
-    await waitFor(() => proseEvidence(value, sessionId).length === 4);
-    expect(proseEvidence(value, sessionId)[0]).toMatchObject({
-      outcome: "gate_failed:consecutive_limit",
+          // Each autoresponse must leave the fake provider idle so the next turn can
+          // start; the daemon refuses to send into an active turn.
+          value.codex.turnStatus = "completed";
+          const sent = () => proseEvidence(value, sessionId).filter((row) => row.outcome === "sent").length;
+          let expected = 0;
+          for (const turn of ["budget-1", "budget-2", "budget-3"]) {
+            expected += 1;
+            await completeTurn(value, sessionId, turn, "Ready to apply. Should I proceed?");
+            await waitFor(() => sent() === expected);
+          }
+          expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(3);
+
+          await completeTurn(value, sessionId, "budget-4", "Ready to apply. Should I proceed?");
+          await waitFor(() => proseEvidence(value, sessionId).length === 4);
+          expect(proseEvidence(value, sessionId)[0]).toMatchObject({
+            outcome: "gate_failed:consecutive_limit",
+          });
+          expect(value.store.readSessionState(sessionId)).toMatchObject({
+            attention: true,
+            state: "needs_approval",
+            reason: "prose_autorespond_consecutive_limit",
+          });
+          expect(sent()).toBe(3);
+          expect(value.store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 3, lastHour: 3, lastDay: 3 });
+
+          // Only a human-authored send clears the consecutive counter.
+          await value.service.execute(
+            { kind: "session.send", session: sessionId, message: "carry on" },
+            { signal },
+          );
+          expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+          expect(value.store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 0, lastHour: 3, lastDay: 3 });
+        });
+      }, 5_000);
     });
-    expect(value.store.readSessionState(sessionId)).toMatchObject({
-      attention: true,
-      state: "needs_approval",
-      reason: "prose_autorespond_consecutive_limit",
-    });
-    expect(sent()).toBe(3);
-    expect(value.store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 3, lastHour: 3, lastDay: 3 });
-
-    // Only a human-authored send clears the consecutive counter.
-    await value.service.execute(
-      { kind: "session.send", session: sessionId, message: "carry on" },
-      { signal },
-    );
-    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
-    expect(value.store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 0, lastHour: 3, lastDay: 3 });
-  });
+  }
 
   test("does not reset the consecutive budget for a rejected human send", async () => {
     const value = await proseFixture();

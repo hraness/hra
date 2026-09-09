@@ -616,6 +616,19 @@ export const normalizeGitHistoryPatchForPublicScan = (
   return normalizeReviewedSyntheticHistoryPatch(patch, evidence.patchSha256, evidence.fixtures);
 };
 
+/**
+ * Git truncates generated hunk section labels, including otherwise public package
+ * names. Project only those labels out of the scope scan after exact historical
+ * evidence checks. Authored lines retain their +/-/space prefix; complete raw
+ * patches still receive the separate sensitive-text scan. Split physical LF
+ * lines so CR and Unicode line separators cannot turn authored text into a header.
+ */
+export const stripGitHunkSectionHeadingsForScopeScan = (patch: string): string =>
+  patch.split("\n").map((line) => line.replace(
+    /^(@@ -(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? \+(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? @@) [^\r\n\u2028\u2029]*$/u,
+    "$1",
+  )).join("\n");
+
 type GitHistorySpawnResult = Readonly<{
   exitCode: number;
   exitedDueToMaxBuffer: boolean;
@@ -778,6 +791,11 @@ export const parseGitHistoryCommitList = (value: string): readonly string[] => {
   return Object.freeze(commits);
 };
 
+export const assertGitHistoryPatchPublicText = (patch: string, label: string): void => {
+  assertPublicSensitiveText(patch, label);
+  assertPublicText(stripGitHunkSectionHeadingsForScopeScan(patch), label);
+};
+
 export const assertCompleteGitHistoryPublic = async (repositoryRoot: string): Promise<void> => {
   const temporaryDirectory = await realpath(tmpdir());
   const startedAt = performance.now();
@@ -828,7 +846,7 @@ export const assertCompleteGitHistoryPublic = async (repositoryRoot: string): Pr
       `Git history public-text commit ${commit}`,
       readHistory({ commit, kind: "public_patch" }),
     );
-    assertPublicText(
+    assertGitHistoryPatchPublicText(
       normalizeGitHistoryPatchForPublicScan(commit, "public_patch", authoredPatch),
       `Git history commit ${commit}`,
     );

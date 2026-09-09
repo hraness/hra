@@ -290,7 +290,7 @@ export const siteDocumentPaths: readonly string[] = [
   "/privacy/",
 ];
 
-export const publicReleaseState: "live" | "release-ready" | "staged" = "release-ready";
+export const publicReleaseState: "live" | "release-ready" | "staged" = "staged";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
   "https://github.com/hraness/hra/releases/download/v0.8.0/hraness-hra-0.8.0.tgz",
@@ -300,9 +300,9 @@ const productName = "HRA";
 const tagline = "Workspace for Codex and Claude Code";
 const providerRoadmap = "Codex and Claude Code, side by side.";
 const releaseVersion = "0.8.0";
-const admittedReleaseVersion = "0.7.0";
+export const admittedReleaseVersion = "0.7.0";
 const installNotice = `This release candidate is not yet admitted. The v${releaseVersion} install command is unavailable until its immutable GitHub and npm artifacts pass exact release admission. The last admitted release is v${admittedReleaseVersion}; use its immutable installation notes for the existing artifact.`;
-const daemonRolloutNotice = "Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart a current daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.";
+const daemonRolloutNotice = `Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart either the admitted v${admittedReleaseVersion} daemon or the v${releaseVersion} candidate until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.`;
 
 /** The existing exact release evidence also belongs in the new status guide. */
 export const releaseAdmissionNotice: ContentBlock = {
@@ -313,7 +313,7 @@ export const releaseAdmissionNotice: ContentBlock = {
     link(`v${admittedReleaseVersion} artifacts`, `https://github.com/hraness/hra/releases/tag/v${admittedReleaseVersion}`),
     text(" passed immutable GitHub and npm release admission in "),
     link("release run 34278486095", "https://github.com/hraness/hra/actions/runs/34278486095"),
-    text(", attempt 2. This evidence admits only that predecessor, not the current candidate. Use its "),
+    text(`, attempt 2. That evidence does not admit v${releaseVersion}. Use the predecessor's `),
     link("immutable installation notes", links.admittedInstall),
     text(". The candidate command below remains unavailable until its own admission. The website and optional hosted sync are live; artifact admission does not authorize current-daemon startup or hosted command writers."),
   ],
@@ -377,7 +377,7 @@ export const publicContent: PublicContent = {
   thesis: `${productName} brings your Codex and Claude Code sessions into one workspace. Follow the work in your browser, direct it from your terminal, and keep execution on your own machines.`,
   description: `A workspace for Codex and Claude Code, in your browser or terminal. Local CLI v${releaseVersion} is a release candidate; v${admittedReleaseVersion} remains admitted; daemon and hosted command-writer rollout remains blocked on capacity.`,
   daemonRolloutNotice,
-  statusLine: `Status: public beta. Local CLI v${releaseVersion} is a release candidate, not an admitted artifact. The last admitted release is v${admittedReleaseVersion}. Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}. Current daemon and hosted command-writer rollout remains blocked on capacity.`,
+  statusLine: `Status: public beta. Local CLI v${releaseVersion} is a release candidate, not an admitted artifact; v${admittedReleaseVersion} remains the fully admitted public artifact. Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}. Current daemon and hosted command-writer rollout remains blocked on capacity.`,
   badges,
   maintainer: {
     name: "Hraness",
@@ -395,7 +395,7 @@ export const publicContent: PublicContent = {
   initCommand: "hra init --yes",
   doctorCommand: "hra doctor --offline",
   endpoints: {
-    betaTag: "release-ready",
+    betaTag: "beta-not-yet-live",
     githubRepository: "live",
     hostedSync: "live",
     website: "live",
@@ -501,7 +501,7 @@ export const publicContent: PublicContent = {
     },
     {
       question: "Can I start using it now?",
-      answer: [text(`The website, web app, and hosted sync are available in ${hostedBetaLabel}. The v${admittedReleaseVersion} local CLI artifacts passed immutable GitHub and npm release admission; the v${releaseVersion} candidate has not. Use the `), link("admitted release's immutable installation notes", links.admittedInstall), text(". Current daemon and hosted command-writer rollout remains blocked on capacity. "), link("Check the setup status", "/docs/status/"), text(" before initialization or daemon startup.")],
+      answer: [text(`The website, web app, and hosted sync are available in ${hostedBetaLabel}. The admitted v${admittedReleaseVersion} CLI has its own `), link("immutable install instructions", `https://github.com/hraness/hra/tree/v${admittedReleaseVersion}#install-and-update`), text(" and "), link("admitted release's immutable installation notes", links.admittedInstall), text(`. The v${releaseVersion} candidate is not yet admitted. Starting or upgrading a daemon and enabling hosted commands are paused until the capacity checks pass. `), link("Check the setup status", "/docs/status/"), text(" before initialization or daemon startup.")],
     },
     {
       question: "Does HRA use my API keys or provider subscription?",
@@ -533,6 +533,9 @@ export const publicContent: PublicContent = {
   },
   introduction: [
     releaseAdmissionNotice,
+    paragraph(
+      text(`The v${releaseVersion} candidate adds a read-only exact Codex default-profile companion and a browser-safe projection decoder that does not require CSP-blocked dynamic code generation. The default-profile display remains unavailable until a matching fresh companion is published by the intended daemon after the relevant rollout. This observation does not change Ultra defaults, admit models, select a route, or authorize a command.`),
+    ),
     { kind: "notice", label: "Current daemon rollout blocked", content: [text(daemonRolloutNotice)] },
     paragraph(
       text("HRA is one Bun CLI plus a local daemon. It isolates Codex and Claude Code profiles, gives both providers one compact session interface, and optionally syncs encrypted provider-neutral projections and commands across your enrolled machines."),
@@ -559,7 +562,7 @@ export const publicContent: PublicContent = {
       blocks: [
         { kind: "notice", label: "Candidate installation unavailable", content: [text(installNotice), text(" Read the "), link("v0.7.0 installation notes", links.admittedInstall), text(".")] },
         paragraph(
-          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Only after this candidate's exact artifact admission, install its reviewed immutable tag and verify the binary before initialization:"),
+          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Only after immutable GitHub and npm release admission, install the candidate's reviewed immutable tag, then verify the binary before initialization:"),
         ),
         {
           kind: "commands",
@@ -949,8 +952,10 @@ export const publicContent: PublicContent = {
           label: "Local release boundary",
           content: [
             text("These commands are part of the "),
+            code(`v${admittedReleaseVersion}`),
+            text(" admitted local CLI release and are retained in the "),
             code(`v${releaseVersion}`),
-            text(" local CLI candidate. These Work commands were already included in admitted v0.7.0; its evidence does not admit this candidate. Hosted sync is not required for this local protocol; the current-daemon rollout prerequisite still applies before startup."),
+            text(" candidate. The predecessor's immutable artifacts passed GitHub and npm release admission; the candidate requires its own admission. Hosted sync is not required for this local protocol; the current-daemon rollout prerequisite still applies before startup."),
           ],
         },
         paragraph(
@@ -1827,7 +1832,8 @@ export const renderReadmeMarkdown = (content: PublicContent = publicContent): st
     content.hero.pillars.map((pillar) => `- **${pillar.label}.** ${pillar.summary}`).join("\n"),
     `## Get started\n\nPublic beta. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The local CLI does not need an HRA cloud identity. The web workspace uses optional encrypted sync and requires a paired machine and browser.`,
     `> ${content.installNotice} [Admitted release installation notes](${content.links.admittedInstall}).`,
-    `Only after exact artifact admission, install and verify the v${content.releaseVersion} candidate. Installing and checking the binary does not start the daemon:`,
+    `The v${content.releaseVersion} candidate is not yet admitted. For the admitted v${admittedReleaseVersion} artifact, use its [immutable README](${content.links.github}/tree/v${admittedReleaseVersion}#install-and-update).`,
+    `Only after immutable GitHub and npm release admission, install and verify the v${content.releaseVersion} candidate CLI artifact. This does not start the daemon:`,
     `\`\`\`sh\n${content.installCommand}\n\`\`\``,
     `\`\`\`sh\n${content.doctorCommand}\n\`\`\``,
     `> **Before initialization:** ${content.daemonRolloutNotice}`,
@@ -1864,7 +1870,7 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     "",
     content.installNotice,
     `Admitted release installation notes: ${content.links.admittedInstall}`,
-    `Only after immutable GitHub and npm release admission, install v${content.releaseVersion}: ${content.installCommand}`,
+    `Only after immutable GitHub and npm release admission, install the v${content.releaseVersion} local CLI artifact: ${content.installCommand}`,
     `Verify local prerequisites without cloud access: ${content.doctorCommand}`,
     content.daemonRolloutNotice,
     `Initialize only after the rollout prerequisite is satisfied: ${content.initCommand}`,

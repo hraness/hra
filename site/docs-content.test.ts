@@ -127,11 +127,15 @@ describe("task-oriented documentation content", () => {
   test("refuses candidate availability before its install command and preserves the blocked-startup prerequisite", () => {
     const page = pageAt("/docs/start/");
     const blocks = page.sections.flatMap((section) => section.blocks);
-    expect(blocks[0]?.kind).toBe("notice");
+    expect(blocks[0]).toMatchObject({ kind: "notice", label: "Candidate artifact not yet admitted" });
     expect(blockText(blocks[0]!)).toContain(publicContent.installNotice);
     expect(blockLinks(blocks[0]!)).toContain(publicContent.links.admittedInstall);
+    expect(blockText(blocks[0]!)).toContain("Only after immutable GitHub and npm release admission");
+    expect(blockText(blocks[0]!)).toContain("admitted v0.7.0 artifact");
+    expect(blockLinks(blocks[0]!)).toContain("https://github.com/hraness/hra/tree/v0.7.0#install-and-update");
     expect(blocks[1]).toEqual({ kind: "commands", commands: [publicContent.installCommand] });
     const text = pageText(page);
+    expect(text.indexOf("Candidate artifact not yet admitted")).toBeLessThan(text.indexOf(publicContent.installCommand));
     expect(text.indexOf(publicContent.installCommand)).toBeLessThan(text.indexOf(publicContent.doctorCommand));
     expect(text.indexOf(publicContent.installNotice)).toBeLessThan(text.indexOf(publicContent.installCommand));
     expect(text).not.toContain("You can install and check v0.8.0 now");
