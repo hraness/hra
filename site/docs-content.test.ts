@@ -150,7 +150,7 @@ describe("task-oriented documentation content", () => {
     const signInIndex = pairing.blocks.findIndex((block) =>
       blockLinks(block).includes("/docs/web/#cloud-sign-in-and-device-pairing"),
     );
-    const browserIndex = pairing.blocks.findIndex((block) => blockLinks(block).includes("https://app.hra.sh/"));
+    const browserIndex = pairing.blocks.findIndex((block) => blockLinks(block).some((href) => href === "https://app.hra.sh/"));
     expect(signInIndex).toBeGreaterThan(-1);
     expect(browserIndex).toBeGreaterThan(signInIndex);
     const instructions = blockText(pairing.blocks[signInIndex]!);
