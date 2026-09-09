@@ -277,7 +277,7 @@ test.each(["RO -> RW", "RW -> RW", "RW -> RO"] as const)("authentic combined49 p
   }, adjacentReopenModes[reopenPair]);
 });
 
-test("authentic combined49 preserves a prepared exact switch capsule without creating target, release or seed effects", async () => {
+test.each(["RO -> RW", "RW -> RW", "RW -> RO"] as const)("authentic combined49 preserves a prepared exact switch capsule without creating target, release or seed effects (%s)", async (reopenPair) => {
   const archived = combined49SwitchFixture;
   await preserveHistory(combined49SwitchDatabaseBytes(), archived, combined49SwitchGeneratorSource, (store, captured) => {
     expectCapturedEqual(store.readSessionSwitchByIdempotencyKey(archived.input.idempotencyKey), archived.prepared.switch);
@@ -309,7 +309,7 @@ test("authentic combined49 preserves a prepared exact switch capsule without cre
     }
     expect(tableRows(captured, "usage_snapshots")).toEqual([]);
     expect(tableRows(captured, "usage_poll_failures")).toEqual([]);
-  });
+  }, adjacentReopenModes[reopenPair]);
 });
 
 test.each(["RO -> RW", "RW -> RW", "RW -> RO"] as const)("authentic combined49 preserves Devin owner and login history plus unused synthetic close permission without booting (%s)", async (reopenPair) => {
