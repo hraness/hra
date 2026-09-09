@@ -48,6 +48,7 @@ function machine(
     notificationPolicyFreshness: "unsupported",
     notificationPolicyRevision: null,
     online: true,
+    profileBinding: { profile: null, status: "unsupported" },
     projects: [],
     proseAutorespondConfigured: false,
     revision: 1,

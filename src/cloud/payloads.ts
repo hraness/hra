@@ -4,10 +4,12 @@ import {
   containsSecretShapedText,
   containsUnsafeTerminalScalar,
   hasExactKeys,
+  isDigest,
   isOpaqueIdentifier,
   isRecord,
   isSafePositiveInteger,
   jsonValueFitsCloudEnvelope,
+  parseEncryptedEnvelope,
   snapshotForeignJson,
   type CommandKind,
   type DeviceCommandKind,
@@ -24,7 +26,12 @@ import {
   remoteInteractionJsonFitsProviderLimit,
   remoteInteractionPolicyLimits,
 } from "../domain/remote-interaction-contract";
-import { decryptBytes, encryptBytes } from "./crypto";
+import { decryptBytes, encryptBytes, sha256Hex } from "./crypto";
+import {
+  decodeHistoricalPresetProfile,
+  decodeHistoricalProfileKey,
+  type CanonicalProfileKey,
+} from "../domain/canonical-profile";
 import {
   parseNotificationEmailPolicy,
   type NotificationEmailPolicy,
@@ -630,6 +637,20 @@ export type DeviceRegistryPayload = Readonly<{
   version: 1;
 }>;
 
+/**
+ * The publishing daemon's configured Codex default, never a capability or a
+ * claim about a running session. A separate envelope preserves registry v1.
+ * Its revision and digest bind it to one exact encrypted registry publication.
+ */
+export type ProfileBindingPayload = Readonly<{
+  version: 1;
+  preset: "low" | "high" | "ultra";
+  profileKey: CanonicalProfileKey;
+  observedAt: number;
+  registryRevision: number;
+  registryEnvelopeDigest: string;
+}>;
+
 export type MemorySummaryHead = Readonly<{
   digest: string;
   operationSha256: string | null;
@@ -729,6 +750,7 @@ export type CloudPayloadAuthority = Readonly<{
     | "memory_summary"
     | "notification_email"
     | "notification_hours"
+    | "profile_binding"
     | "session_metadata"
     | "usage";
   userPublicId: string;
@@ -1142,6 +1164,44 @@ function parseDeviceRegistryPayloadUnchecked(value: unknown): DeviceRegistryPayl
 export function parseDeviceRegistryPayload(value: unknown): DeviceRegistryPayload | null {
   const snapshot = snapshotForeignJson(value);
   return snapshot.ok ? parseDeviceRegistryPayloadUnchecked(snapshot.value) : null;
+}
+
+/** Decode a closed historical binding without consulting this reader's active map. */
+export function parseProfileBindingPayload(input: unknown): ProfileBindingPayload | null {
+  const snapshot = snapshotForeignJson(input);
+  if (!snapshot.ok || !isRecord(snapshot.value)) return null;
+  const value = snapshot.value;
+  if (
+    !hasExactKeys(value, ["version", "preset", "profileKey", "observedAt", "registryRevision", "registryEnvelopeDigest"])
+    || value.version !== 1
+    || (value.preset !== "low" && value.preset !== "high" && value.preset !== "ultra")
+    || !isSafePositiveInteger(value.observedAt)
+    || !isSafePositiveInteger(value.registryRevision)
+    || !isDigest(value.registryEnvelopeDigest)
+  ) return null;
+  const profile = decodeHistoricalProfileKey(value.profileKey);
+  if (profile === null || !([1, 2] as const).some((contract) =>
+    decodeHistoricalPresetProfile({ provider: "codex", preset: value.preset, contract })?.key === profile.key)) {
+    return null;
+  }
+  return {
+    version: 1,
+    preset: value.preset,
+    profileKey: profile.key,
+    observedAt: value.observedAt,
+    registryRevision: value.registryRevision,
+    registryEnvelopeDigest: value.registryEnvelopeDigest,
+  };
+}
+
+/** Hash exact validated envelope fields, independent of caller property order. */
+export async function profileBindingRegistryDigest(envelope: EncryptedEnvelope): Promise<string> {
+  const snapshot = snapshotForeignJson(envelope);
+  const parsed = snapshot.ok
+    ? parseEncryptedEnvelope(snapshot.value, cloudLimits.registryCiphertextCharacters)
+    : null;
+  if (parsed === null) throw new Error("Invalid profile binding registry envelope.");
+  return await sha256Hex("hra-profile-binding-registry-envelope:v1\n" + JSON.stringify(parsed));
 }
 
 const portableMemorySpacePattern = /^hra:project:space-[a-f0-9]{32}$/u;
@@ -1587,6 +1647,38 @@ export async function decryptDeviceRegistry(
   if (authority.kind !== "device_registry") throw new Error("Invalid device registry authority.");
   const parsed = parseDeviceRegistryPayload(await decryptJson(envelope, key, authority));
   if (parsed === null) throw new Error("Invalid device registry payload.");
+  return parsed;
+}
+
+export async function encryptProfileBinding(
+  payload: ProfileBindingPayload,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<EncryptedEnvelope> {
+  const parsed = parseProfileBindingPayload(payload);
+  if (authority.kind !== "profile_binding" || parsed === null) {
+    throw new Error("Invalid profile binding payload.");
+  }
+  const envelope = await encryptJson(parsed, key, authority);
+  if (envelope.ciphertext.length > cloudLimits.profileBindingCiphertextCharacters) {
+    throw new Error("Encrypted profile binding exceeds its closed envelope bound.");
+  }
+  return envelope;
+}
+
+export async function decryptProfileBinding(
+  envelope: EncryptedEnvelope,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<ProfileBindingPayload> {
+  if (authority.kind !== "profile_binding") throw new Error("Invalid profile binding authority.");
+  const snapshot = snapshotForeignJson(envelope);
+  const parsedEnvelope = snapshot.ok
+    ? parseEncryptedEnvelope(snapshot.value, cloudLimits.profileBindingCiphertextCharacters)
+    : null;
+  if (parsedEnvelope === null) throw new Error("Invalid profile binding envelope.");
+  const parsed = parseProfileBindingPayload(await decryptJson(parsedEnvelope, key, authority));
+  if (parsed === null) throw new Error("Invalid profile binding payload.");
   return parsed;
 }
 

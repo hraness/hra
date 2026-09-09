@@ -86,6 +86,7 @@ await mock.module("../data/registry", () => ({
       notificationPolicyFreshness: "unsupported",
       notificationPolicyRevision: null,
       projects: [],
+      profileBinding: { profile: null, status: "unsupported" },
       proseAutorespondConfigured: false,
       revision: 1,
       scheduledTasks: [],
