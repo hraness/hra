@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
+import { basename, resolve } from "node:path";
 
 import { readBoundedJsonResponse } from "./bounded-json-response";
 import { readNpmAttestations } from "./read-npm-attestations";
@@ -19,7 +18,7 @@ import {
 } from "./npm-publisher-boundary";
 import { assertReleasePackageReady, releaseArchiveName } from "./release-package-policy";
 import { fetchLiveReleaseRepository } from "./release-repository-identity";
-import { verifyNpmProvenance, type NpmProvenanceAttemptPolicy } from "./verify-npm-provenance";
+import { verifyNpmProvenance, withNpmProvenanceCache, type NpmProvenanceAttemptPolicy } from "./verify-npm-provenance";
 
 const maximumAttestationBytes = 512 * 1024;
 
@@ -123,8 +122,7 @@ async function admitProvenance(
   attemptPolicy: NpmProvenanceAttemptPolicy,
   maximumAttempt: string,
 ): Promise<void> {
-  const tufCachePath = await mkdtemp(join(tmpdir(), "hra-publish-sigstore-tuf-"));
-  try {
+  await withNpmProvenanceCache("publish", async (tufCachePath) => {
     await verifyNpmProvenance({
       attemptPolicy,
       attestations: await readNpmAttestations(inspection.version),
@@ -140,9 +138,7 @@ async function admitProvenance(
       tag: releaseTag,
       tufCachePath,
     });
-  } finally {
-    await rm(tufCachePath, { force: true, recursive: true });
-  }
+  });
 }
 
 const existing = await lookupCompleteRelease();

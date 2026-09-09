@@ -1,6 +1,7 @@
 import {
   admittedReleaseVersion,
   findSection,
+  isAdmittedRelease,
   publicContent,
   publicPins,
   releaseAdmissionNotice,
@@ -49,13 +50,19 @@ const source = (path: string): string => `https://github.com/hraness/hra/blob/ma
 
 const candidateInstallNotice: ContentBlock = {
   kind: "notice",
-  label: "Candidate artifact not yet admitted",
+  label: isAdmittedRelease(publicContent.releaseVersion)
+    ? "CLI artifact admitted; daemon startup blocked"
+    : "Candidate artifact not yet admitted",
   content: [
-    text(publicContent.installNotice),
+    text(isAdmittedRelease(publicContent.releaseVersion)
+      ? `The admitted v${admittedReleaseVersion} artifact may be installed with the command below.`
+      : publicContent.installNotice),
     text(" Read the "),
     link("admitted release installation notes", publicContent.links.admittedInstall),
-    text(` for v${admittedReleaseVersion}. Only after immutable GitHub and npm release admission may you run the candidate install command below. For the admitted v${admittedReleaseVersion} artifact, you can also use its `),
-    link("immutable README", `https://github.com/hraness/hra/tree/v${admittedReleaseVersion}#install-and-update`),
+    text(isAdmittedRelease(publicContent.releaseVersion)
+      ? ` for v${admittedReleaseVersion}, or use its `
+      : ` for v${admittedReleaseVersion}. Only after immutable GitHub release admission may you run the candidate install command below. For the admitted v${admittedReleaseVersion} artifact, you can also use its `),
+    link("immutable README", `https://github.com/hraness/hra/tree/v${admittedReleaseVersion}#get-started`),
     text(". Neither artifact admission nor installation authorizes daemon startup."),
   ],
 };
@@ -64,7 +71,7 @@ const setupNotice: ContentBlock = {
   kind: "notice",
   label: "Before you start a daemon",
   content: [
-    text(`The v${publicContent.releaseVersion} candidate is not yet admitted. Install it only after its own immutable GitHub and npm release admission. Initialization, daemon startup, and hosted command writers remain blocked on capacity. Complete the `),
+    text(`${isAdmittedRelease(publicContent.releaseVersion) ? `The v${publicContent.releaseVersion} CLI artifact is admitted for installation.` : `The v${publicContent.releaseVersion} candidate is not yet admitted. Install it only after its own immutable GitHub release admission.`} Initialization, daemon startup, and hosted command writers remain blocked on capacity. Complete the `),
     link("rollout and update prerequisites", "/docs/status/#install-and-update"),
     text(" before the steps below. Installing the CLI or opening the app does not clear that gate."),
   ],
@@ -380,7 +387,7 @@ export const docsPages: readonly DocsPage[] = [
   {
     path: "/docs/status/",
     title: "Availability and release status",
-    description: "Distinguish the v0.8.0 candidate from the admitted v0.7.0 CLI, check provider support, and understand the runtime rollout prerequisites.",
+    description: "Distinguish the v0.8.0 candidate from the admitted v0.7.1 CLI, check provider support, and understand the runtime rollout prerequisites.",
     keywords: ["release", "availability", "platforms", "Codex", "Claude", "upgrade"],
     reviewDate: "2026-09-09",
     admission: {
@@ -397,11 +404,13 @@ export const docsPages: readonly DocsPage[] = [
     sections: [
       {
         id: "current-release",
-        heading: `v${publicContent.releaseVersion} is a candidate. v${admittedReleaseVersion} remains admitted.`,
+        heading: isAdmittedRelease(publicContent.releaseVersion)
+          ? `v${publicContent.releaseVersion} artifacts are admitted. Daemon rollout remains blocked.`
+          : `v${publicContent.releaseVersion} is a candidate. v${admittedReleaseVersion} remains admitted.`,
         blocks: [
           candidateInstallNotice,
-          paragraph(text(`The v${admittedReleaseVersion} CLI passed immutable GitHub and npm artifact admission. The v${publicContent.releaseVersion} candidate is not yet admitted and requires its own immutable GitHub and npm proof. For the admitted predecessor, use its `), link("immutable README", `https://github.com/hraness/hra/tree/v${admittedReleaseVersion}#install-and-update`), text(" to install and run "), code("hra doctor --offline"), text(". The public website, browser app, and open-beta sync service are available; their availability does not authorize starting the current daemon or sending new hosted commands.")),
-          paragraph(text(`The v${publicContent.releaseVersion} candidate adds read-only exact Codex default-profile observation. The display remains unavailable until the intended daemon publishes a matching fresh companion after its rollout gates pass. This does not change Ultra defaults, admit models, choose a route, or authorize a command.`)),
+          paragraph(text(`The v${admittedReleaseVersion} CLI passed immutable GitHub and npm artifact admission. ${isAdmittedRelease(publicContent.releaseVersion) ? "For its exact installation instructions, use the " : `The v${publicContent.releaseVersion} candidate is not yet admitted and requires its own immutable GitHub proof. For the admitted predecessor, use its `}`), link("immutable README", `https://github.com/hraness/hra/tree/v${admittedReleaseVersion}#get-started`), text(" to install and run "), code("hra doctor --offline"), text(". The public website, browser app, and open-beta sync service are available; their availability does not authorize starting the current daemon or sending new hosted commands.")),
+          paragraph(text(`The v${publicContent.releaseVersion} ${isAdmittedRelease(publicContent.releaseVersion) ? "release" : "candidate"} retains the read-only exact Codex default-profile observation admitted in v0.7.1. The display remains unavailable until the intended daemon publishes a matching fresh companion after its rollout gates pass. This does not change Ultra defaults, admit models, choose a route, or authorize a command.`)),
           releaseAdmissionNotice,
           { kind: "notice", label: "Current runtime hold", content: [text(publicContent.daemonRolloutNotice)] },
           paragraph(text("The operator must complete protected capacity activation, then prove the current daemon and every intended target before enabling writers. Installing a release, signing in, or loading a fresh browser tab does not substitute for those proofs. "), link("Release record", source("docs/beta-release.md")), text(" · "), link("Hosted rollout procedure", source("docs/hosted-sync.md#converge-command-lifecycle-capacity-before-writer-rollout"))),

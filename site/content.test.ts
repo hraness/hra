@@ -14,7 +14,9 @@ import {
 import { helpGroupNames, usageForGroup } from "../src/cli/parser";
 import packageJson from "../package.json";
 import {
+  admittedReleaseVersion,
   hostedSignupCopy,
+  isAdmittedRelease,
   publicContent,
   publicPins,
   publicReleaseState,
@@ -99,36 +101,77 @@ describe("public content contract", () => {
 
   test("keeps the unadmitted candidate separate from the exact admitted predecessor", () => {
     expect(publicContent.releaseVersion).toBe("0.8.0");
+    expect(admittedReleaseVersion).toBe("0.7.1");
     expect(publicReleaseState).toBe("staged");
     expect(publicContent.endpoints.betaTag).toBe("beta-not-yet-live");
     const readme = renderReadmeMarkdown();
     const llms = renderLlmsText();
     expect(llms).toContain(publicContent.statusLine);
     expect(llms).toContain("Local CLI v0.8.0 is a release candidate");
-    expect(llms).toContain("v0.7.0 remains the fully admitted public artifact");
+    expect(llms).toContain("v0.7.1 remains the fully admitted public artifact");
     expect(readme).toContain("The v0.8.0 candidate is not yet admitted.");
-    expect(readme).toContain("For the admitted v0.7.0 artifact, use its [immutable README](https://github.com/hraness/hra/tree/v0.7.0#install-and-update).");
+    expect(readme).toContain("For the admitted v0.7.1 artifact, use its [immutable README](https://github.com/hraness/hra/tree/v0.7.1#get-started).");
+    expect(publicContent.links.admittedInstall).toBe("https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install");
     expect(readme.indexOf("The v0.8.0 candidate is not yet admitted.")).toBeLessThan(readme.indexOf(publicContent.installCommand));
     const visibleSite = htmlVisibleText(renderSiteHtml());
     expect(visibleSite).toContain("The v0.8.0 candidate is not yet admitted.");
-    expect(visibleSite).toContain("The admitted v0.7.0 CLI has its own");
+    expect(visibleSite).toContain("The admitted v0.7.1 CLI has its own");
+    expect(visibleSite).not.toContain("The v0.7.1 candidate is not yet admitted.");
     expect(visibleSite).toContain("Starting or upgrading a daemon and enabling hosted commands are paused until the capacity checks pass.");
     expect(visibleSite).not.toContain("v0.8.0 artifacts admitted");
     for (const surface of [readme, llms]) {
-      expect(surface).toContain("Only after immutable GitHub and npm release admission");
+      expect(surface).toContain("Only after immutable GitHub release admission");
+      expect(surface).not.toContain("v0.7.1 candidate");
       expect(surface).not.toContain("v0.8.0 artifacts admitted");
       expect(surface).toContain(publicContent.daemonRolloutNotice);
     }
     for (const surface of [renderDocumentationMarkdown("/docs/status/"), htmlVisibleText(renderDocumentationHtml("/docs/status/"))]) {
-      expect(surface).toContain("v0.8.0 is a candidate. v0.7.0 remains admitted.");
-      expect(surface).toContain("The v0.8.0 candidate is not yet admitted and requires its own immutable GitHub and npm proof.");
+      expect(surface).toContain("v0.8.0 is a candidate. v0.7.1 remains admitted.");
+      expect(surface).toContain("The v0.8.0 candidate is not yet admitted and requires its own immutable GitHub proof.");
+      expect(surface).toContain("The v0.7.1 CLI passed immutable GitHub and npm artifact admission.");
+      expect(surface).not.toContain("v0.7.1 candidate");
       expect(surface).toContain(publicContent.daemonRolloutNotice);
       expect(surface).not.toContain("v0.8.0 artifacts admitted");
     }
     const historicalAdmission = renderMarkdownBlocks(publicContent.introduction, 2);
-    expect(historicalAdmission).toContain("https://github.com/hraness/hra/actions/runs/34278486095");
-    expect(historicalAdmission).toContain("https://github.com/hraness/hra/releases/tag/v0.7.0");
+    expect(historicalAdmission).toContain("https://github.com/hraness/hra/actions/runs/34367591503");
+    expect(historicalAdmission).toContain("https://github.com/hraness/hra/releases/tag/v0.7.1");
+    expect(historicalAdmission).toContain("attempt 2");
+    expect(historicalAdmission).toContain("artifact admission does not authorize current-daemon startup or hosted command writers");
     expect(historicalAdmission).toContain("does not admit v0.8.0");
+  });
+
+  test("never transfers current admission to another version", () => {
+    expect(isAdmittedRelease("0.7.1")).toBe(true);
+    const admittedContent = { ...publicContent, releaseVersion: admittedReleaseVersion };
+    const admittedReadme = renderReadmeMarkdown(admittedContent);
+    expect(admittedReadme).toContain("The v0.7.1 CLI artifacts passed immutable GitHub and npm release admission");
+    expect(admittedReadme).toContain("https://github.com/hraness/hra/actions/runs/34367591503");
+    expect(admittedReadme).toContain("attempt 2. Artifact admission does not authorize daemon startup.");
+    expect(admittedReadme.indexOf("The v0.7.1 CLI artifacts passed"))
+      .toBeLessThan(admittedReadme.indexOf(admittedContent.installCommand));
+    expect(admittedReadme).toContain("Install and verify the admitted v0.7.1 CLI artifact. This does not start the daemon:");
+    expect(renderLlmsText(admittedContent)).toContain("Install the admitted v0.7.1 local CLI artifact");
+    for (const surface of [admittedReadme, renderLlmsText(admittedContent)]) {
+      expect(surface).not.toContain("The v0.7.1 candidate is not yet admitted");
+      expect(surface).toContain(admittedContent.daemonRolloutNotice);
+    }
+    for (const version of ["0.7.0", "0.7.2", "0.8.0", "v0.7.1", "0.7.1-beta.1", ""]) {
+      expect(isAdmittedRelease(version)).toBe(false);
+    }
+    for (const version of ["0.7.2", "0.8.0"]) {
+      const content = { ...publicContent, releaseVersion: version };
+      const readme = renderReadmeMarkdown(content);
+      expect(readme).toContain(`The v${version} candidate is not yet admitted.`);
+      expect(readme).toContain("For the admitted v0.7.1 artifact");
+      expect(readme.indexOf(`The v${version} candidate is not yet admitted.`))
+        .toBeLessThan(readme.indexOf(content.installCommand));
+      expect(readme).not.toContain(`The v${version} CLI artifacts passed`);
+      for (const surface of [readme, renderLlmsText(content)]) {
+        expect(surface).toContain("Only after immutable GitHub release admission");
+        expect(surface).toContain(content.daemonRolloutNotice);
+      }
+    }
   });
 
   test("keeps after-hours consent, legacy reset, and prose limits explicit", () => {
@@ -254,7 +297,7 @@ describe("public content contract", () => {
     });
     expect(structured).not.toHaveProperty("softwareVersion");
     expect(publicContent.description).toContain("v0.8.0 is a release candidate");
-    expect(publicContent.description).toContain("v0.7.0 remains admitted");
+    expect(publicContent.description).toContain("v0.7.1 remains admitted");
     expect(publicContent.description).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
     expect(html).toContain('href="/docs/status/"');
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
@@ -391,7 +434,7 @@ describe("public content contract", () => {
     const html = renderDocumentationHtml("/docs/reference/");
     const document = parseHTML(html).document;
     const commands = [...document.querySelectorAll("pre.command-list")];
-    for (const version of ["v0.7.0", "v0.8.0"]) {
+    for (const version of ["v0.7.1", "v0.8.0"]) {
       const versionCodes = [...document.querySelectorAll("code.hra-inline-code")].filter((code) => code.textContent === version);
       expect(versionCodes.length).toBeGreaterThan(0);
       for (const code of versionCodes) expectCompiledClasses(code);
@@ -424,9 +467,10 @@ describe("public content contract", () => {
     const markdown = renderDocsMarkdown("/docs/status/");
     const html = htmlVisibleText(renderDocumentationHtml("/docs/status/"));
     for (const surface of [markdown, html]) {
-      expect(surface).toContain("v0.7.0");
+      expect(surface).toContain("v0.7.1");
       expect(surface).toContain("passed immutable GitHub and npm artifact admission");
       expect(surface).toContain("The v0.8.0 candidate is not yet admitted");
+      expect(surface).not.toContain("The v0.7.1 candidate is not yet admitted");
       expect(surface).not.toContain("v0.8.0 is released");
       expect(surface).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
       expect(surface).toContain("Artifact availability and the live sync service do not clear this gate");
@@ -449,18 +493,19 @@ describe("public content contract", () => {
       expect(noticePosition).toBeLessThan(commandPosition);
     }
     for (const surface of [renderReadmeMarkdown(), renderLlmsText()]) {
+      expect(surface).toContain("admitted v0.7.1");
       expect(surface).toContain(publicContent.daemonRolloutNotice);
       expect(surface).toContain("/docs/status/");
     }
-    expect(markdown).toContain("https://github.com/hraness/hra/releases/tag/v0.7.0");
-    expect(markdown).toContain("https://github.com/hraness/hra/actions/runs/34278486095");
+    expect(markdown).toContain("https://github.com/hraness/hra/releases/tag/v0.7.1");
+    expect(markdown).toContain("https://github.com/hraness/hra/actions/runs/34367591503");
     expect(markdown).toContain("Local v0.8.0 candidate; hosted sync live as an open beta");
     const reference = renderDocsMarkdown("/docs/reference/");
     expect(reference).toContain("Local release boundary");
-    expect(reference).toContain("v0.7.0");
+    expect(reference).toContain("v0.7.1");
     expect(reference).toContain("admitted local CLI release and are retained in the `v0.8.0` candidate");
-    expect(renderLlmsText()).toContain("Only after immutable GitHub and npm release admission, install the v0.8.0 local CLI artifact");
-    expect(renderReadmeMarkdown()).toContain("Only after immutable GitHub and npm release admission, install and verify the v0.8.0 candidate CLI artifact. This does not start the daemon:");
+    expect(renderLlmsText()).toContain("Only after immutable GitHub release admission, install the v0.8.0 local CLI artifact");
+    expect(renderReadmeMarkdown()).toContain("Only after immutable GitHub release admission, install and verify the v0.8.0 candidate CLI artifact. This does not start the daemon:");
     expect(renderReadmeMarkdown()).toContain("The v0.8.0 candidate is not yet admitted");
     for (const path of ["/docs/start/", "/docs/status/"] as const) {
       const guideHtml = renderDocumentationHtml(path);
@@ -481,7 +526,7 @@ describe("public content contract", () => {
   test("keeps startup prerequisites adjacent to setup without turning the homepage into a runbook", () => {
     const prerequisite = publicContent.daemonRolloutNotice;
     expect(prerequisite).toContain("Do not initialize, start, or autostart");
-    expect(prerequisite).toContain("either the admitted v0.7.0 daemon or the v0.8.0 candidate");
+    expect(prerequisite).toContain("either the admitted v0.7.1 daemon or the v0.8.0 candidate");
     expect(prerequisite).toContain("protected two-pass zero-debt capacity evidence and its exact .activated readback receipt");
     expect(prerequisite).toContain("target marker-2 proofs before globally enabling hosted writers");
     const setupHtml = renderDocumentationHtml("/docs/start/");
@@ -930,7 +975,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra daemon stop");
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
-      expect(surface).toContain("Only after immutable GitHub and npm release admission for v0.8.0, install its exact release and verify the installed version and offline health");
+      expect(surface).toContain("Only after immutable GitHub release admission for v0.8.0, install its exact release and verify the installed version and offline health");
       expect(surface).not.toContain("bun remove --global hra");
       expect(surface).not.toContain("uninstall the package");
     }

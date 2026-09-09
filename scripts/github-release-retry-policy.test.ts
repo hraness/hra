@@ -54,7 +54,7 @@ describe("bounded GitHub Release retry policy", () => {
       conclusion,
       head_sha: commitSha,
       id: 901,
-      name: "Publish exact npm and GitHub artifacts",
+      name: "Publish canonical GitHub artifacts",
       run_attempt: 1,
       run_id: Number(runId),
       run_url: `https://api.github.com/repos/hraness/hra/actions/runs/${runId}`,

@@ -4,7 +4,7 @@ Every entry names the release or the plan wave it belongs to. Unreleased work si
 
 ## v0.8.0 candidate (unreleased)
 
-Provider account visibility, local automatic usage policy controls, and recovery hardening. This candidate is not yet admitted. The [v0.7.0 immutable installation notes](https://github.com/hraness/hra/blob/v0.7.0/docs/beta-release-notes.md#install) remain the installation path for the admitted artifact. Artifact admission does not clear daemon startup, hosted capacity or intended-target gates.
+Provider account visibility, local automatic usage policy controls, and recovery hardening. This candidate is not yet admitted. The [v0.7.1 immutable installation notes](https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install) remain the installation path for the admitted artifact. Artifact admission does not clear daemon startup, hosted capacity or intended-target gates.
 
 - `hra account list --provider codex|claude` returns a separately versioned cached account order, default marker, readiness and observation times without refreshing providers or changing selection. The unqualified listing is unchanged.
 - `hra usage auto status|on|off|inherit` reads or changes the inherited default and per-provider overrides. Changes require an observed revision and caller-owned idempotency key. Effective Codex disable suppresses new reset-credit dispatches, including retries, while preserving uncertain attempts and already admitted operations.
@@ -12,9 +12,14 @@ Provider account visibility, local automatic usage policy controls, and recovery
 - Additive local storage migrations retain the admitted schema 50 predecessor and append the provider-usage and custody foundation through schema 60. Genuine historical fixtures and explicitly identified synthetic compatibility cases verify migration and refusal boundaries; they do not prove live provider acceptance.
 - Automatic account movement, managed-send forwarding, account order and activation commands, Claude native fallback, and the planned hosted/browser usage view remain unavailable. Existing explicit account selection and provider-specific platform limits are unchanged.
 
-## v0.7.1 (unreleased)
+## Release reliability follow-up (unreleased)
 
-Read-only exact Codex default observations in Settings. This candidate is not yet admitted; v0.7.0 remains the admitted public artifact. Publication, hosted deployment and browser deployment require their own evidence. Artifact admission does not clear daemon startup, capacity activation or intended-target gates.
+- The npm provenance verifier includes stdin in its existing 60-second deadline and waits for the owned child, input and both output readers before reporting verification success. A failed operation gets a bounded five-second collection window; unproved collection remains a failure. Both release callers preserve the private TUF cache on every verification failure. Cryptographic identity checks, environment and byte bounds are unchanged. This source repair is not part of the immutable v0.7.1 artifact, and no evidence links the cleanup defect to that release's delayed registry visibility.
+- Current installation and status guidance records v0.7.1 admission while preserving daemon, hosted capacity and intended-target gates. The recovery runbook requires read-only reconciliation of exact public bytes and original provenance before complete same-run recovery, never artifact replacement or speculative republication.
+
+## v0.7.1
+
+Read-only exact Codex default observations in Settings. Immutable GitHub and npm artifacts completed [exact release admission](docs/beta-release.md#immutable-v071-successful-release-record) on 2026-09-09. The successful same-run recovery preserved the original tag, release and public bytes. Hosted deployment and browser deployment require their own evidence. Artifact admission does not clear daemon startup, capacity activation or intended-target gates.
 
 - A separately encrypted profile companion binds the publishing daemon's exact default to one registry revision, encrypted-envelope digest and heartbeat. The frozen version-1 registry remains unchanged. A daemon sends the companion only after a successful registry publication advertises support; older servers continue receiving the old request shape.
 - Settings shows the last reported exact Codex model and effort only for an active daemon with coherent current-key evidence and a fresh hosted timestamp. Missing, stale, mismatched or unreadable evidence exposes no exact label. The observation does not relabel established sessions or authorize a command, model, account or Fast mode. Sol Ultra remains the implicit Codex default.

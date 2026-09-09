@@ -21,8 +21,19 @@ manual-switch and policy-control foundation. Managed automatic movement,
 Claude native fallback activation and the unfinished hosted/browser publisher
 remain dormant. Phases 6 through 9 are not complete.
 
-The September 9 delivery waits for a compiler-lifecycle repair and fresh
-actual-main acceptance. Combined PR 164, including the reviewed PR 167
+The September 9 delivery is joining the admitted compiler-lifecycle repair.
+[PR 169](https://github.com/hraness/hra/pull/169) reached protected main at
+`d270616db2589ada8de2af2da697bb862f5d0aad`, tree
+`82d82126fb8ab10c4acd59668b7d3c1c017b7993`. Fresh actual-main
+[CI 34417046126](https://github.com/hraness/hra/actions/runs/34417046126),
+attempt 1, passed all ten jobs; both analyses in
+[CodeQL 34417046092](https://github.com/hraness/hra/actions/runs/34417046092)
+passed. The prerequisite owner verified all nine exact-main checkouts and
+unchanged branch rules. The separate final browser gate passed six profiles,
+210 evidence rows and three native custody controls, with all 54 owned
+processes collected. This admits the prerequisite source, not v0.8.0.
+
+Earlier combined PR 164, including the reviewed PR 167
 follow-up, reached protected `main` at
 `bdfb0c2ca7aa753e0232844a3e001c0a30626a14`, tree
 `0be440ee932429d174b8b0d6e5eab123f85f0520`. Its PR checks passed, but
@@ -104,7 +115,7 @@ TypeScript and scoped lint pass. The real native cases cover failed spawn
 without an exit event, closure before stop, delayed closure, library unref,
 zero acquisitions, unknown-spawn refusal and cancellation collection. Fresh
 Linux and exact-tree delivery evidence remain required; these focused local
-receipts do not replace the prerequisite owner's integration gates.
+receipts did not replace the prerequisite owner's later integration gates.
 
 The frozen compiler handoff is
 [`c958f4981853e3f0116cd650222a0147d7af1591`](https://github.com/hraness/hra/commit/c958f4981853e3f0116cd650222a0147d7af1591),
@@ -113,10 +124,16 @@ It is a mechanical cherry-pick of local repair
 `ea0d81092ad9ba0adbed381e9f48f441f50b551a` onto that exact main. All twelve
 executable and test files remain byte-identical. The thirteenth file adds one
 test-boundary description while preserving main's script guidance. The
-prerequisite owner owns its final review, protected PR, fresh Required checks
-and actual-main acceptance. PR 140 remains held until that admitted main is
-available. Neither this public handoff nor the local plan checkpoint is a
-release or deployment.
+prerequisite owner completed independent review, protected PR, fresh Required
+checks and actual-main acceptance through PR 169. The normal PR 140 join now
+preserves this exact compiler implementation and the stronger task-owned
+paged-recovery fixture. It combines the canonical GitHub release policy with
+the unadmitted v0.8.0 candidate and admitted v0.7.1 predecessor, retaining the
+optional npm mirror and every separate activation hold. Neither parent's
+package inventory pin admits the joined archive. A fresh archive, independent
+inventory review and this candidate's own final gates remain required.
+Neither this public handoff nor the local plan checkpoint is a release or
+deployment.
 
 The proposed Effect Claude lifecycle delta remains a separate later delivery.
 Independent review found that retaining the caller's mutable constructor
