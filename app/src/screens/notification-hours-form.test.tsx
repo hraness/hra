@@ -104,6 +104,7 @@ const machine: MachineView = {
   notificationPolicyRevision: 4,
   online: true,
   projects: [],
+  profileBinding: { profile: null, status: "unsupported" },
   proseAutorespondConfigured: false,
   revision: 8,
   scheduledTasks: [],

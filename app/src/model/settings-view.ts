@@ -8,17 +8,21 @@
  * `bun test ./app` checks the derivations without a document, a network, or an
  * account key.
  */
-import type {
-  DeviceRegistryAccount,
-  DeviceRegistryPayload,
-  DeviceRegistryProject,
-  DeviceRegistryScheduledTask,
-  DeviceRegistrySessionAdoption,
-  MemorySummaryPayload,
-  MemorySummaryPeerAction,
-  MemorySummaryPeerPolicy,
-  MemorySummarySpace,
-  NotificationHoursPolicy,
+import {
+  decodeHistoricalProfileKey,
+  parseProfileBindingPayload,
+  type CanonicalProfile,
+  type DeviceRegistryAccount,
+  type DeviceRegistryPayload,
+  type DeviceRegistryProject,
+  type DeviceRegistryScheduledTask,
+  type DeviceRegistrySessionAdoption,
+  type MemorySummaryPayload,
+  type MemorySummaryPeerAction,
+  type MemorySummaryPeerPolicy,
+  type MemorySummarySpace,
+  type NotificationHoursPolicy,
+  type ProfileBindingPayload,
 } from "../hra/cloud";
 import type { ApprovalMode, PresetChoice } from "./settings-commands";
 
@@ -47,6 +51,9 @@ export function personalSessionAdoptionCommand(
 }
 
 export type MachineDeviceState = Readonly<{
+  /** Required for exact-profile display; older callers remain alias-only. */
+  deviceClass?: "browser" | "daemon";
+  keyVersion?: number;
   online: boolean;
   status: "pending" | "active" | "revoked";
 }>;
@@ -95,6 +102,14 @@ export type ScheduledTaskView = Readonly<{
   sessionPublicId: string | null;
 }>;
 
+export type ProfileBindingView = Readonly<{
+  profile: Extract<CanonicalProfile, { provider: "codex" }>;
+  status: "current";
+}> | Readonly<{
+  profile: null;
+  status: "inactive" | "stale" | "unreadable" | "unsupported";
+}>;
+
 export type MachineView = Readonly<{
   // Local switches as this machine last published them. A registry written
   // before device commands existed reads as the shipped defaults: commands
@@ -120,6 +135,8 @@ export type MachineView = Readonly<{
   notificationPolicyFreshness: "current" | "stale" | "unreadable" | "unsupported";
   notificationPolicyRevision: number | null;
   projects: readonly DeviceRegistryProject[];
+  /** Only a verified current observation has an exact profile to render. */
+  profileBinding: ProfileBindingView;
   proseAutorespondConfigured: boolean;
   revision: number;
   scheduledTasks: readonly ScheduledTaskView[];
@@ -133,6 +150,7 @@ export type MachineViewInput = Readonly<{
   attentionEmailEnabled?: boolean | null;
   device: MachineDeviceState | null;
   devicePublicId: string;
+  keyVersion?: number;
   memorySummaryReady?: boolean;
   now: number;
   notificationHours?: NotificationHoursPolicy | null;
@@ -141,10 +159,52 @@ export type MachineViewInput = Readonly<{
   notificationPolicyRevision?: number | null;
   memorySummary?: MemorySummaryPayload | null;
   memorySummaryStatus?: "available" | "unreadable" | "unsupported";
+  profileBinding?: ProfileBindingPayload | null;
+  profileBindingReady?: boolean;
+  profileBindingStatus?: "available" | "unreadable" | "unsupported";
   payload: DeviceRegistryPayload;
   revision: number;
   updatedAt: number;
 }>;
+
+/** A display observation, never an input to preset or provider selection. */
+function profileBindingView(input: MachineViewInput): ProfileBindingView {
+  const unavailable = (status: Exclude<ProfileBindingView["status"], "current">): ProfileBindingView =>
+    ({ profile: null, status });
+  if (
+    input.device === null
+    || input.device.status !== "active"
+    || input.device.deviceClass === "browser"
+  ) return unavailable("inactive");
+  if (
+    input.device.deviceClass !== "daemon"
+    || input.device.keyVersion === undefined
+    || input.keyVersion === undefined
+    || input.profileBindingReady !== true
+    || !Number.isFinite(input.now)
+    || input.now <= 0
+  ) return unavailable("unsupported");
+  if (input.device.keyVersion !== input.keyVersion) return unavailable("inactive");
+  if (input.profileBindingStatus === "unreadable") return unavailable("unreadable");
+  if (input.profileBindingStatus !== "available" || input.profileBinding == null) {
+    return unavailable("unsupported");
+  }
+  const observation = parseProfileBindingPayload(input.profileBinding);
+  if (
+    observation === null
+    || observation.observedAt <= 0
+    || observation.registryRevision !== input.revision
+    || observation.observedAt !== input.payload.heartbeatAt
+    || observation.preset !== input.payload.defaultPreset
+  ) return unavailable("unreadable");
+  if (Math.abs(input.now - observation.observedAt) > registryHeartbeatToleranceMs) {
+    return unavailable("stale");
+  }
+  const profile = decodeHistoricalProfileKey(observation.profileKey);
+  return profile?.provider === "codex"
+    ? { profile, status: "current" }
+    : unavailable("unreadable");
+}
 
 export function toMachineView(input: MachineViewInput): MachineView {
   const { payload } = input;
@@ -188,6 +248,7 @@ export function toMachineView(input: MachineViewInput): MachineView {
       now: input.now,
     }),
     projects: payload.projects,
+    profileBinding: profileBindingView(input),
     proseAutorespondConfigured: payload.proseAutorespondConfigured,
     revision: input.revision,
     scheduledTasks: payload.scheduledTasks.map((task) => ({
