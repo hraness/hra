@@ -532,6 +532,55 @@ assertions; scoped lint and typecheck pass. The isolated two-file commit is
 published on the shared handoff branch for PR 164's owned diagnostic CI.
 It does not fix or admit the Linux failure. No shared merge has occurred.
 
+Diagnostic run `34380982264`, attempt 1, checks head
+`5a59b90780b9e5e18ef3ad3773ce508f085594ba` through synthetic merge
+`048c5df451e649a6e4f33229faad83e766c25e03`, tree
+`7c34e0b1279300bd6b84acfcfd5b02e98f50edfc`, on the same main. Ubuntu reports
+144 passing site cases and nine failures, each with a valid success terminal,
+exit code 1, 3,385 stdout bytes and 332 stderr bytes. All other matrix jobs,
+compiled browser and CodeQL pass. These diagnostics establish terminal/exit
+disagreement, not whether the leader itself failed or the collector refused a
+remaining process group.
+
+The next test-only candidate requests shutdown of the same pinned esbuild
+service before publishing a terminal. It captures the raw build outcome before
+formatting errors, retains both causes when shutdown also fails and never
+forces a successful exit. Independent review confirms unchanged builder options,
+original failure conversion, terminal publication and parent acceptance guards.
+The focused suite passes ten tests with 166 assertions; scoped lint and
+typecheck pass. Commit `c9c2ed2949bc221e8b172eda2d9de23a09fcfc9d` carries
+only the three test/support files. Its unchanged native cancellation and fresh
+builder proof plus all 20 original site cases pass locally: 21 tests and 1,057
+assertions in 114.10 seconds. An 18-row native transform probe retains proven
+cleanup, zero exits for natural and candidate-helper completion, and exit 7
+when that nonzero status is set before candidate shutdown. The probe does not
+reproduce Linux. The stop API requests shutdown only; the parent still requires
+exit zero and proven collection.
+
+PR 164's fresh run `34384757759`, attempt 1, checks head
+`2b43c22a59b595afd87b8da41ea2282c55322c24`, tree
+`592ed46a9f7cfa36b214ddb3a534de7ee1d181d8`. Ubuntu remainder passes all 163
+site cases with 8,382 assertions, including native cancellation and every
+original build case. All six source shards and CodeQL pass. This closes the
+observed compiler failure on that candidate, not a universal liveness claim.
+The browser job fails before tests because upstream Chrome package metadata
+disagrees with its advertised hash. Verification remains enabled; the release
+owner retains the failed run and owns provider convergence and any bounded
+retry. Complete matching Required and protected merge remain outstanding.
+
+Independent review of PR 168's failed run `34380309752` finds two additional
+unchanged service cases combining independent native fixtures under one
+five-second limit. The dedicated fix `4bd42e35` preserves their original
+24 and 22 statements, 10 and four matcher sites, and both scenario sets while
+returning the existing private fixture owner for each row. This candidate
+integrates only those two test spans as
+`513436a1a213f99729ce8dfa4a8ff04152993c49`; no Effect implementation enters.
+Independent review confirms all other service-test bytes, including the prior
+immutable-send and paged-recovery repairs, unchanged. The current-tree four
+rows pass with 28 assertions in 9.69 seconds, each below its unchanged
+five-second limit. Scoped lint and typecheck pass; fresh integration CI remains
+required.
+
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree
