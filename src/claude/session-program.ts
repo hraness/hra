@@ -40,7 +40,11 @@ const boundedShutdownDuration = (value: number, label: string): number => {
 /** The domain state is one connection's exact identity and buffered history.
  * Effects own ordering, native waits, shared drains and retryable cleanup. */
 export class ClaudeClientProgram {
-  readonly #options: ClaudeStreamClientOptions;
+  readonly #process: ClaudeStreamClientOptions["process"];
+  readonly #configDir: string;
+  readonly #onFact: ClaudeStreamClientOptions["onFact"];
+  readonly #onSafeDiagnostic: ClaudeStreamClientOptions["onSafeDiagnostic"];
+  readonly #callbackReceiver: object;
   readonly #owner: ClaudeConnectionEffects;
   readonly #onFactProgram: ((fact: ClaudeFact) => ClaudeProgram<void>) | undefined;
   readonly #assembler: ClaudeDeltaAssembler;
@@ -65,11 +69,17 @@ export class ClaudeClientProgram {
   #disconnectEmitted = false;
   #pendingTurnStart: PendingTurnStart | null = null;
 
-  constructor(options: ClaudeStreamClientOptions, owner: ClaudeConnectionEffects, onFactProgram?: (fact: ClaudeFact) => ClaudeProgram<void>) {
+  constructor(options: ClaudeStreamClientOptions, owner: ClaudeConnectionEffects, callbackReceiver: object, onFactProgram?: (fact: ClaudeFact) => ClaudeProgram<void>) {
     if (!options.configDir.startsWith("/")) {
       throw new ClaudeError("INVALID_INPUT", "CLAUDE_CONFIG_DIR must be an absolute path");
     }
-    this.#options = options;
+    // Snapshot the caller's references once, as the public client always did.
+    // Exit proof and every later operation must belong to that same process.
+    this.#process = options.process;
+    this.#configDir = options.configDir;
+    this.#onFact = options.onFact;
+    this.#onSafeDiagnostic = options.onSafeDiagnostic ?? undefined;
+    this.#callbackReceiver = callbackReceiver;
     this.#owner = owner;
     this.#initialization = owner.initializationCompletion<ClaudeStreamInitialization>();
     this.#onFactProgram = onFactProgram;
@@ -79,10 +89,10 @@ export class ClaudeClientProgram {
     this.#decoder = new ClaudeJsonLineDecoder(options.maxJsonLineBytes === undefined ? {} : { maxLineBytes: options.maxJsonLineBytes });
     // This synchronous accessor remains inside manager raw-process custody.
     // Its exact native Promise, rather than a fiber's completion, proves exit.
-    this.#exit = processExitObservation(options.process, () => { this.#exitResolved = true; });
+    this.#exit = processExitObservation(this.#process, () => { this.#exitResolved = true; });
   }
 
-  get configDir(): string { return this.#options.configDir; }
+  get configDir(): string { return this.#configDir; }
   get providerSessionId(): string | null { return this.#assembler.providerSessionId; }
   get activeTurnId(): string | null { return this.#assembler.activeTurnId; }
   get state(): "open" | "closing" | "closed" | "failed" { return this.#state; }
@@ -190,7 +200,7 @@ export class ClaudeClientProgram {
       const waitForTerm = !this.#exitResolved;
       const admitted = yield* Effect.exit(Effect.gen(this, function* () {
         if (waitForTerm) {
-          const terminated = yield* Effect.exit(attempt(() => this.#options.process.terminate()));
+          const terminated = yield* Effect.exit(attempt(() => this.#process.terminate()));
           if (Exit.isFailure(terminated)) yield* this.#diagnostic("claude TERM failed; forcing process termination");
         }
       }));
@@ -223,7 +233,7 @@ export class ClaudeClientProgram {
       }
       if (waitForTerm) yield* observeWithin(this.#exit, this.#shutdownTermGraceMs, true);
       if (!this.#exitResolved) {
-        const forced = yield* Effect.exit(attempt(() => this.#options.process.forceTerminate()));
+        const forced = yield* Effect.exit(attempt(() => this.#process.forceTerminate()));
         if (Exit.isFailure(forced)) yield* this.#diagnostic("claude force termination failed");
       }
       const observations = [
@@ -286,7 +296,7 @@ export class ClaudeClientProgram {
           // Each admitted frame is deferred, including the first native write.
           yield* nativeMicrotask();
           yield* attempt(() => this.#assertOpen());
-          yield* nativeCall(() => this.#options.process.write(bytes));
+          yield* nativeCall(() => this.#process.write(bytes));
         }),
       ));
       yield* task.program;
@@ -294,13 +304,15 @@ export class ClaudeClientProgram {
   }
 
   #diagnostic(message: string): ClaudeProgram<void> {
-    return attempt(() => { this.#options.onSafeDiagnostic?.(message); });
+    return attempt(() => {
+      if (this.#onSafeDiagnostic !== undefined) Reflect.apply(this.#onSafeDiagnostic, this.#callbackReceiver, [message]);
+    });
   }
 
   #deliverFact(fact: ClaudeFact): ClaudeProgram<void> {
     const onFactProgram = this.#onFactProgram;
     return onFactProgram === undefined
-      ? this.#owner.callback(() => this.#options.onFact(fact))
+      ? this.#owner.callback(() => Reflect.apply(this.#onFact, this.#callbackReceiver, [fact]))
       : Effect.suspend(() => onFactProgram(fact));
   }
 
@@ -352,7 +364,7 @@ export class ClaudeClientProgram {
     return Effect.gen(this, function* () {
       let reason: "eof" | "protocol_fault" = "eof";
       const read = yield* Effect.exit(Effect.gen(this, function* () {
-        yield* consumeNative(this.#options.process.stdout, chunk => Effect.gen(this, function* () {
+        yield* consumeNative(this.#process.stdout, chunk => Effect.gen(this, function* () {
           for (const value of yield* attempt(() => this.#decoder.push(chunk))) yield* this.#dispatch(value);
         }));
         for (const value of yield* attempt(() => this.#decoder.finish())) yield* this.#dispatch(value);
@@ -382,7 +394,7 @@ export class ClaudeClientProgram {
       this.#pending.clear();
       this.#failInitialization(new ClaudeError("PROCESS_EXITED", "Claude process settlement became indeterminate."));
       yield* this.#diagnostic("Claude process exit settlement was indeterminate");
-      const forced = yield* Effect.exit(attempt(() => this.#options.process.forceTerminate()));
+      const forced = yield* Effect.exit(attempt(() => this.#process.forceTerminate()));
       if (Exit.isFailure(forced)) yield* this.#diagnostic("Claude force termination failed after indeterminate exit");
       for (const fact of this.#assembler.abandonTurn("the Claude runtime became indeterminate")) {
         const delivered = yield* Effect.exit(this.#emitFact(fact));
@@ -402,7 +414,7 @@ export class ClaudeClientProgram {
         if (Exit.isFailure(delivered)) yield* this.#diagnostic("HRA fact delivery failed during Claude disconnection");
       }
       if (reason !== "process_exit") {
-        const forced = yield* Effect.exit(attempt(() => this.#options.process.forceTerminate()));
+        const forced = yield* Effect.exit(attempt(() => this.#process.forceTerminate()));
         if (Exit.isFailure(forced)) yield* this.#diagnostic("Claude force termination failed after stream loss");
         if (!(yield* observeWithin(this.#exit, this.#shutdownSettlementMs, true))) {
           yield* this.#diagnostic("Claude process exit did not settle after stream loss");
@@ -462,7 +474,7 @@ export class ClaudeClientProgram {
       const diagnostic = { observed: 0, truncated: false };
       // Stderr stream failure does not replace the separately observed process
       // outcome; still join its exact iterator before publishing diagnostics.
-      yield* consumeNative(this.#options.process.stderr, chunk => attempt(() => {
+      yield* consumeNative(this.#process.stderr, chunk => attempt(() => {
         const retained = Math.min(chunk.byteLength, 4096 - diagnostic.observed);
         diagnostic.observed += retained;
         if (retained < chunk.byteLength) diagnostic.truncated = true;

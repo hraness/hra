@@ -1096,3 +1096,208 @@ describe("Claude stream client", () => {
     await expect(process.exited).resolves.toBe(0);
   });
 });
+
+describe("Claude stream client constructor ownership", () => {
+  test("snapshots mutable options for config, writes, streams and callback receivers", async () => {
+    const original = new FakeClaudeProcess();
+    const replacement = new FakeClaudeProcess();
+    const stderrGate = Promise.withResolvers<undefined>();
+    const assistantSeen = Promise.withResolvers<undefined>();
+    const diagnosticSeen = Promise.withResolvers<undefined>();
+    const reads = { originalStdout: 0, originalStderr: 0, replacementStdout: 0, replacementStderr: 0 };
+    const port = (process: FakeClaudeProcess, name: "original" | "replacement"): ClaudeProcess => ({
+      identity: process.identity,
+      exited: process.exited,
+      stdout: {
+        [Symbol.asyncIterator]() {
+          reads[`${name}Stdout`] += 1;
+          return process.stdout[Symbol.asyncIterator]();
+        },
+      },
+      stderr: {
+        async *[Symbol.asyncIterator]() {
+          reads[`${name}Stderr`] += 1;
+          await stderrGate.promise;
+          yield new TextEncoder().encode(name);
+        },
+      },
+      write: (bytes) => process.write(bytes),
+      terminate: () => { process.terminate(); },
+      forceTerminate: () => { process.forceTerminate(); },
+    });
+    const originalFacts: ClaudeFact[] = [];
+    const replacementFacts: ClaudeFact[] = [];
+    const originalDiagnostics: string[] = [];
+    const replacementDiagnostics: string[] = [];
+    const factReceivers: unknown[] = [];
+    const diagnosticReceivers: unknown[] = [];
+    const options = {
+      process: port(original, "original"),
+      configDir: CONFIG_DIR,
+      onFact(this: unknown, fact: ClaudeFact) {
+        factReceivers.push(this);
+        originalFacts.push(fact);
+        if (fact.type === "assistantDelta") assistantSeen.resolve(undefined);
+      },
+      onSafeDiagnostic(this: unknown, message: string) {
+        diagnosticReceivers.push(this);
+        originalDiagnostics.push(message);
+        diagnosticSeen.resolve(undefined);
+      },
+    };
+    const client = new ClaudeStreamClient(options);
+    options.process = port(replacement, "replacement");
+    options.configDir = "/var/hra/profiles/replacement/claude";
+    options.onFact = function (this: unknown, fact: ClaudeFact) {
+      replacementFacts.push(fact);
+      if (fact.type === "assistantDelta") assistantSeen.resolve(undefined);
+    };
+    options.onSafeDiagnostic = function (this: unknown, message: string) {
+      replacementDiagnostics.push(message);
+      diagnosticSeen.resolve(undefined);
+    };
+    const observedConfig = client.configDir;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      deadlineTimer = setTimeout(() => { reject(new Error("constructor ownership milestone timed out")); }, 1_000);
+    });
+    const starting = client.startTurn({ message: "original authority", turnId: "turn-owned" });
+    let cleanup: PromiseSettledResult<unknown>[] = [];
+    try {
+      await Promise.race([starting, deadline]);
+      for (const [process, name] of [[original, "original"], [replacement, "replacement"]] as const) {
+        process.emit({
+          type: "assistant", session_id: "session", parent_tool_use_id: null,
+          message: { id: `message-${name}`, model: "claude-fable-5-1", role: "assistant",
+            content: [{ type: "text", text: name }] },
+        });
+      }
+      stderrGate.resolve(undefined);
+      // Either callback route releases these milestones, so the old alias is
+      // an observed wrong result rather than a fixture waiting for the fix.
+      await Promise.race([Promise.all([assistantSeen.promise, diagnosticSeen.promise]), deadline]);
+    } finally {
+      stderrGate.resolve(undefined);
+      original.end();
+      replacement.end();
+      cleanup = await Promise.allSettled([starting, original.exited, replacement.exited, client.close()]);
+      clearTimeout(deadlineTimer);
+    }
+    expect(cleanup.every((result) => result.status === "fulfilled")).toBe(true);
+    expect(observedConfig).toBe(CONFIG_DIR);
+    expect(writtenLines(original)).toEqual([{
+      message: { content: [{ text: "original authority", type: "text" }], role: "user" }, type: "user",
+    }]);
+    expect(replacement.written).toEqual([]);
+    expect(originalFacts.filter((fact) => fact.type === "assistantDelta").map((fact) => fact.text)).toEqual(["original"]);
+    expect(replacementFacts).toEqual([]);
+    expect(originalDiagnostics).toEqual(["claude stderr bytes: 8"]);
+    expect(replacementDiagnostics).toEqual([]);
+    expect(factReceivers.length).toBeGreaterThan(0);
+    expect(factReceivers.every((receiver) => receiver === client)).toBe(true);
+    expect(diagnosticReceivers).toEqual([client]);
+    expect(reads).toEqual({ originalStdout: 1, originalStderr: 1, replacementStdout: 0, replacementStderr: 0 });
+  });
+
+  test("retains original TERM, KILL and exit custody after the caller replaces its process", async () => {
+    const original = new FakeClaudeProcess({ ignoreTerm: true, ignoreKill: true });
+    const replacement = new FakeClaudeProcess({ ignoreTerm: true, ignoreKill: true });
+    const killEntered = Promise.withResolvers<undefined>();
+    for (const process of [original, replacement]) {
+      const forceTerminate = process.forceTerminate.bind(process);
+      process.forceTerminate = () => { forceTerminate(); killEntered.resolve(undefined); };
+    }
+    const options = {
+      process: original, configDir: CONFIG_DIR, onFact: () => undefined,
+      shutdownTermGraceMs: 1, shutdownSettlementMs: 20,
+    };
+    const client = new ClaudeStreamClient(options);
+    options.process = replacement;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      deadlineTimer = setTimeout(() => { reject(new Error("original exit custody milestone timed out")); }, 1_000);
+    });
+    const closing = client.close().then(
+      () => ({ status: "fulfilled" as const }),
+      (reason: unknown) => ({ status: "rejected" as const, reason }),
+    );
+    let cleanup: PromiseSettledResult<unknown>[] = [];
+    try {
+      await Promise.race([killEntered.promise, deadline]);
+      replacement.end();
+      await replacement.exited;
+      const firstOutcome = await Promise.race([closing, deadline]);
+      expect(firstOutcome).toMatchObject({ status: "rejected", reason: { code: "TIMEOUT" } });
+      expect(client.state).toBe("closing");
+      expect(original.signals).toEqual(["SIGTERM", "SIGKILL"]);
+      expect(replacement.signals).toEqual([]);
+      original.end();
+      await original.exited;
+      await Promise.race([client.close(), deadline]);
+      expect(client.state).toBe("closed");
+    } finally {
+      original.end();
+      replacement.end();
+      cleanup = await Promise.allSettled([closing, original.exited, replacement.exited, client.close()]);
+      clearTimeout(deadlineTimer);
+    }
+    expect(cleanup.every((result) => result.status === "fulfilled")).toBe(true);
+  });
+
+  test("reads process once in constructor order and retains an omitted diagnostic callback", async () => {
+    const original = new FakeClaudeProcess();
+    const replacement = new FakeClaudeProcess();
+    const reads: string[] = [];
+    let processReads = 0;
+    let configReads = 0;
+    const diagnostic: { current: ((message: string) => void) | undefined } = { current: undefined };
+    const lateDiagnostics: string[] = [];
+    const stderrGate = Promise.withResolvers<undefined>();
+    const originalPort: ClaudeProcess = {
+      identity: original.identity, exited: original.exited, stdout: original.stdout,
+      stderr: { async *[Symbol.asyncIterator]() { await stderrGate.promise; yield new Uint8Array([1]); } },
+      write: (bytes) => original.write(bytes),
+      terminate: () => { original.terminate(); },
+      forceTerminate: () => { original.forceTerminate(); },
+    };
+    const options = {
+      get configDir() { configReads += 1; reads.push("configDir"); return configReads <= 2 ? CONFIG_DIR : "/replacement"; },
+      get process() { processReads += 1; reads.push("process"); return processReads === 1 ? originalPort : replacement; },
+      get onFact() { reads.push("onFact"); return () => undefined; },
+    };
+    Object.defineProperty(options, "onSafeDiagnostic", {
+      get() { reads.push("onSafeDiagnostic"); return diagnostic.current; },
+    });
+    const client = new ClaudeStreamClient(options);
+    const constructionReads = [...reads];
+    diagnostic.current = (message) => { lateDiagnostics.push(message); };
+    const observedConfig = client.configDir;
+    const starting = client.startTurn({ message: "captured process", turnId: "turn-accessor" });
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      deadlineTimer = setTimeout(() => { reject(new Error("accessor ownership milestone timed out")); }, 1_000);
+    });
+    let cleanup: PromiseSettledResult<unknown>[] = [];
+    try {
+      await Promise.race([starting, deadline]);
+    } finally {
+      stderrGate.resolve(undefined);
+      original.end();
+      replacement.end();
+      cleanup = await Promise.allSettled([starting, original.exited, replacement.exited, client.close()]);
+      clearTimeout(deadlineTimer);
+    }
+    expect(cleanup.every((result) => result.status === "fulfilled")).toBe(true);
+    expect(constructionReads).toEqual(["configDir", "process", "configDir", "onFact", "onSafeDiagnostic"]);
+    expect(reads).toEqual(constructionReads);
+    expect(processReads).toBe(1);
+    expect(configReads).toBe(2);
+    expect(observedConfig).toBe(CONFIG_DIR);
+    expect(writtenLines(original)).toEqual([{
+      message: { content: [{ text: "captured process", type: "text" }], role: "user" }, type: "user",
+    }]);
+    expect(replacement.written).toEqual([]);
+    expect(replacement.signals).toEqual([]);
+    expect(lateDiagnostics).toEqual([]);
+  });
+});

@@ -24,7 +24,7 @@ export class ClaudeStreamClient {
   ) {
     this.#ownsOwner = connection === undefined;
     this.#owner = connection ?? new ClaudeConnectionEffects();
-    this.programs = new ClaudeClientProgram(options, this.#owner, onFactProgram);
+    this.programs = new ClaudeClientProgram(options, this.#owner, this, onFactProgram);
     if (this.#ownsOwner) {
       // Borrowed construction stays inert. A manager composes activate() within
       // its acquisition fiber, so it never re-enters an interpreter here.
