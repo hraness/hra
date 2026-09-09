@@ -22910,50 +22910,68 @@ describe("HraService", () => {
   });
 
   test("pages recovery across the session quota and bounds eager active observations", async () => {
-    const { service, codex, documents, store } = await fixture();
-    const added = await service.execute({
-      kind: "account.add",
-      label: "Paged active recovery",
-    }, { signal }) as { account: { id: `acct_${string}` } };
-    await service.execute({
-      kind: "account.login",
-      account: added.account.id,
-      deviceCode: false,
-    }, { signal });
-    const project = await service.execute({
-      kind: "project.add",
-      label: "Paged recovery docs",
-      path: documents,
-    }, { signal }) as { project: { id: `proj_${string}` } };
-    const created = Array.from({ length: 103 }, (_, index) => {
-      const active = index >= 100;
-      const session = store.upsertProviderSession({
-        profileId: added.account.id,
-        projectId: project.project.id,
-        provider: "codex",
-        providerThreadId: `provider-recovery-${String(index)}`,
-        title: `Recovery ${String(index)}`,
-        preset: "high",
-        fastEnabled: false,
-        state: active ? "active" : "idle",
-        ...(active ? { activeTurnId: `turn-${String(index)}` } : {}),
-        providerAccountKey: codexProviderAccountKey(),
-      });
-      return { active, index, session };
-    }).toSorted((left, right) => left.session.id.localeCompare(right.session.id));
-    codex.beforeObserveReturn = async () => await Bun.sleep(2);
+    let fixtureValue: Awaited<ReturnType<typeof fixture>> | undefined;
+    // Register the entire setup/body before it can start, so timeout cleanup
+    // joins recovery observations before the shared teardown closes storage.
+    const pending = Promise.resolve().then(async () => {
+      const value = await fixture();
+      fixtureValue = value;
+      const { service, codex, documents, store } = value;
+      const added = await service.execute({
+        kind: "account.add",
+        label: "Paged active recovery",
+      }, { signal }) as { account: { id: `acct_${string}` } };
+      await service.execute({
+        kind: "account.login",
+        account: added.account.id,
+        deviceCode: false,
+      }, { signal });
+      const project = await service.execute({
+        kind: "project.add",
+        label: "Paged recovery docs",
+        path: documents,
+      }, { signal }) as { project: { id: `proj_${string}` } };
+      const created = Array.from({ length: 103 }, (_, index) => {
+        const active = index >= 100;
+        const session = store.upsertProviderSession({
+          profileId: added.account.id,
+          projectId: project.project.id,
+          provider: "codex",
+          providerThreadId: `provider-recovery-${String(index)}`,
+          title: `Recovery ${String(index)}`,
+          preset: "high",
+          fastEnabled: false,
+          state: active ? "active" : "idle",
+          ...(active ? { activeTurnId: `turn-${String(index)}` } : {}),
+          providerAccountKey: codexProviderAccountKey(),
+        });
+        return { active, index, session };
+      }).toSorted((left, right) => left.session.id.localeCompare(right.session.id));
+      codex.beforeObserveReturn = async () => await Bun.sleep(2);
 
-    const readiness = await Promise.race([
-      service.recover().then(() => "ready" as const),
-      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
-    ]);
-    expect(readiness).toBe("ready");
-    await service.settled();
-    for (const { active, index } of created.filter((entry) => entry.active)) {
-      expect(codex.observedThreads).toContain(`provider-recovery-${String(index)}`);
-      expect(active).toBe(true);
+      const readiness = await Promise.race([
+        service.recover().then(() => "ready" as const),
+        new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
+      ]);
+      expect(readiness).toBe("ready");
+      await service.settled();
+      for (const { active, index } of created.filter((entry) => entry.active)) {
+        expect(codex.observedThreads).toContain(`provider-recovery-${String(index)}`);
+        expect(active).toBe(true);
+      }
+      expect(codex.maximumConcurrentObservations).toBe(1);
+    });
+    let cleanup: Promise<void> | undefined;
+    const joinCleanup = (): Promise<void> => cleanup ??= (async () => {
+      await Promise.allSettled([pending]);
+      if (fixtureValue !== undefined) await fixtureValue.service.close();
+    })();
+    ownedFixtureTeardowns.push(joinCleanup);
+    try {
+      await pending;
+    } finally {
+      await joinCleanup();
     }
-    expect(codex.maximumConcurrentObservations).toBe(1);
   });
 
   test("dispatches a durable queue immediately for an idle session", async () => {
