@@ -17,7 +17,7 @@ relations:
 
 # Hraness delivery autonomy
 
-Status: active, revision 5 (2026-09-09). The machine-confidence foundation, current-Mac
+Status: active, revision 6 (2026-09-09). The machine-confidence foundation, current-Mac
 bootstrap and HRA, Oh and personal-monorepo-template pilots are delivered. Wider fleet
 adoption and provider-specific rollout remain separately tracked; they do not reopen the
 completed foundation or block an independently admitted artifact.
@@ -210,12 +210,35 @@ bounded diagnosis; green CI does not dismiss them. The local full aggregate rema
 tool and the fallback when CI coverage or equivalence is absent or uncertain. This removes a
 duplicate execution without changing CI command coverage or scheduler controls.
 
+### D8. Canonical artifacts precede optional npm mirrors
+
+For eligible public packages, verified immutable GitHub Release artifacts are canonical
+independently of optional exact-byte npm mirrors. Use OIDC where provider policy permits;
+retain required staged approvals and private-package access boundaries. npm availability for
+publication, trust setup, or staged promotion must not become a prerequisite for the canonical
+artifact. Build dependencies and applicable source, native, installation and provider readback
+gates remain required.
+
+HRA keeps its exact reviewed source, native supervisor and both-platform tarball gates ahead
+of canonical publication. Its separate read-only npm preflight owns the existing tag-only
+environment assertion and exact registry-state observation before the mirror obtains OIDC.
+The mirror retains exact archive identity, pinned-client verification, same-run/attempt
+transition and provenance rules, and final combined public admission. Mirror failure stays
+visible without undoing or relabeling the immutable GitHub artifact. No check is skipped and
+no provider policy is changed by this source decision.
+
+The independently versioned local-efficiency 0.4.2 increment adds this convention to global
+Codex/Claude guidance and the operating skill. The generic managed repository block remains
+unchanged. This source change does not prove plugin installation, another repository's
+adoption, a package release, or operational activation.
+
 ## Workstreams
 
 | Workstream | State | Acceptance evidence |
 | --- | --- | --- |
 | Machine baseline on the current Mac | Complete | Reviewed 0.4.0 installation, fixture coverage, local `--apply`/`--check` and fresh configuration readback passed; other machines and runtime eligibility are separate. |
 | Canonical repository policy and pilots | Complete | Managed-block tests preserve custom guidance and Claude imports; HRA PR156, Oh PR45 and template PR12 delivered through their own gates. |
+| Canonical artifact independence | In progress | Reviewed workflow and global-policy source is being prepared; focused contracts, independent full-diff review, complete current-head/current-base CI, and delivery remain pending. |
 | HRA npm path | Delivered | The machine publication path is delivered without the mutable publication variable; exact tag, artifact, OIDC, provenance and final admission remain required for each release in [the release record](../../docs/beta-release.md). |
 | Wrench npm path | Provider-constrained | Preserve its dual-use declaration and exact staged-artifact approval with required authentication. Automate preparation, validation, staging, and readback; direct OIDC publication is not an available replacement for the provider gate. |
 | Soundfish npm path | Delivered | The direct OIDC workflow completed in [release run 34059355173](https://github.com/hraness/soundfish/actions/runs/34059355173). Routine publication has a supported workload identity; future releases retain their exact-artifact gates. |

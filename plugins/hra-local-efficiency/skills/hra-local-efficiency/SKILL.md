@@ -85,6 +85,10 @@ package or command.
   or obtain bounded relevant evidence before shipping or activation. Preserve
   the identity, target, capacity, migration, and recovery guards applicable to
   the operational effect.
+- For eligible public packages, use verified immutable GitHub Release artifacts
+  as canonical distribution independently of optional exact-byte npm mirrors.
+  Prefer OIDC where provider policy permits; retain required staged approvals
+  and private-package access boundaries.
 - Replace an obsolete gate through a reviewed source and policy change with
   corresponding tests, never an ad hoc skip. Runtime-enforced approvals, access
   controls, branch and environment protections, and safety policies remain

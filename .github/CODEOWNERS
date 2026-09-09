@@ -10,6 +10,7 @@
 /scripts/check-npm-trusted-publishing.ts @0thernet
 /scripts/check-npm-trusted-publisher-oidc.ts @0thernet
 /scripts/check-npm-artifact-state.ts @0thernet
+/scripts/check-npm-release-environment.ts @0thernet
 /scripts/bounded-json-response.ts @0thernet
 /scripts/github-publisher-environment.ts @0thernet
 /scripts/github-release-identity.ts @0thernet

@@ -14,7 +14,7 @@
 - Check scripts verify package contents, README parity, dependencies, release metadata, and the absence of file-level import cycles under `src/`.
 - `check-security-primitives.ts` compares per-file counts of load-bearing security primitives against the reviewed `security-primitives.json` table; a count changes only with a deliberate `--update` after review.
 - `check-install-pins.ts` keeps the installer's embedded CLI and normalizer digests equal to the working tree (`--update` re-pins them) and, under a tag ref, proves the public command names the runtime bytes being released.
-- The local release-tag helper verifies the immutable owner identity, exact clean current `main`, successful CI, monotonic version, and split provider rulesets before pushing one annotated tag. The tag workflow then creates and proves one GitHub Release and npm publication from the same bytes.
+- The local release-tag helper verifies the immutable owner identity, exact clean current `main`, successful CI, monotonic version, and split provider rulesets before pushing one annotated tag. The tag workflow then creates and proves one canonical GitHub Release. A downstream read-only environment/registry preflight admits the optional OIDC npm mirror from the same bytes; npm readiness is not a tag prerequisite.
 
 # Guidelines
 

@@ -101,7 +101,7 @@ export function assertNpmPublisherIdentity(
     || source.GITHUB_REPOSITORY_OWNER_ID !== "307125679"
     || source.GITHUB_SHA !== expectedSha
     || source.GITHUB_SERVER_URL !== "https://github.com"
-    || source.GITHUB_JOB !== "publish"
+    || source.GITHUB_JOB !== "npm_mirror"
     || source.GITHUB_WORKFLOW !== "Release"
     || source.GITHUB_WORKFLOW_REF !== `hraness/hra/.github/workflows/release.yml@refs/tags/${expectedTag}`
     || source.GITHUB_WORKFLOW_SHA !== expectedSha

@@ -211,6 +211,7 @@ describe("release workflow", () => {
       "/scripts/bounded-json-response.ts",
       "/scripts/check-commit-ci-run.ts",
       "/scripts/check-npm-trusted-publisher-oidc.ts",
+      "/scripts/check-npm-release-environment.ts",
       "/scripts/npm-publisher-boundary.ts",
       "/scripts/publish-github-release.ts",
       "/scripts/publish-npm-release.ts",
@@ -336,7 +337,7 @@ describe("release workflow", () => {
     )), "release workflow");
     const jobs = asRecord(workflow.jobs, "release workflow jobs");
 
-    for (const jobName of ["verify", "exact_artifact", "publish"] as const) {
+    for (const jobName of ["verify", "exact_artifact", "publish", "npm_preflight", "npm_mirror"] as const) {
       const job = asRecord(jobs[jobName], `${jobName} job`);
       if (!Array.isArray(job.steps)) throw new TypeError(`${jobName} steps must be an array`);
       const steps = job.steps.map((step, index) => asRecord(step, `${jobName} step ${index}`));
@@ -1253,64 +1254,74 @@ describe("release workflow", () => {
       "utf8",
     )), "release workflow");
     const jobs = asRecord(workflow.jobs, "release workflow jobs");
-    const publish = asRecord(jobs.publish, "release publish job");
-    expect(publish.environment).toBe("npm-release");
-    expect(asRecord(publish.permissions, "release publish permissions")).toEqual({
-      actions: "read",
-      contents: "write",
-      "id-token": "write",
-    });
-    const jobEnvironment = asRecord(publish.env, "release publish environment");
-    expect(jobEnvironment.GH_TOKEN).toBeUndefined();
-    expect(jobEnvironment.GITHUB_TOKEN).toBeUndefined();
+    expect(asRecord(jobs.publish, "canonical job").needs).toEqual(["verify", "exact_artifact"]);
+    expect(asRecord(jobs.npm_preflight, "npm admission job").needs).toEqual(["verify", "publish"]);
+    expect(asRecord(jobs.npm_mirror, "npm mirror job").needs).toEqual(["verify", "publish", "npm_preflight"]);
+    expect(Object.keys(jobs).sort()).toEqual(["exact_artifact", "npm_mirror", "npm_preflight", "publish", "verify"]);
+    for (const jobName of ["publish", "npm_preflight", "npm_mirror"] as const) {
+      const publish = asRecord(jobs[jobName], `${jobName} job`);
+      expect(publish.environment).toBe(jobName === "npm_mirror" ? "npm-release" : undefined);
+      expect(asRecord(publish.permissions, "release job permissions")).toEqual({
+        actions: "read",
+        contents: jobName === "publish" ? "write" : "read",
+        ...(jobName === "npm_mirror" ? { "id-token": "write" } : {}),
+      });
+      const jobEnvironment = asRecord(publish.env, "release publish environment");
+      expect(jobEnvironment.GH_TOKEN).toBeUndefined();
+      expect(jobEnvironment.GITHUB_TOKEN).toBeUndefined();
 
-    if (!Array.isArray(publish.steps)) {
-      throw new TypeError("release publish job steps must be an array");
-    }
-    const steps = publish.steps.map((step, index) => asRecord(step, `release publish step ${index}`));
-    expect(steps
-      .map((step) => step.uses)
-      .filter((value): value is string => typeof value === "string"))
-      .toEqual([
-        reviewedActions.checkout,
-        reviewedActions.setupBun,
-        reviewedActions.setupNode,
-        reviewedActions.downloadArtifact,
-      ]);
+      if (!Array.isArray(publish.steps)) {
+        throw new TypeError("release publish job steps must be an array");
+      }
+      const steps = publish.steps.map((step, index) => asRecord(step, `release publish step ${index}`));
+      expect(steps
+        .map((step) => step.uses)
+        .filter((value): value is string => typeof value === "string"))
+        .toEqual([
+          reviewedActions.checkout,
+          reviewedActions.setupBun,
+          reviewedActions.setupNode,
+          reviewedActions.downloadArtifact,
+        ]);
 
-    for (const step of steps.filter((candidate) => candidate.uses === reviewedActions.setupNode)) {
-      expect(asRecord(step.with, "release setup-node inputs")).toEqual({
-        "node-version": "24.20.0",
-        "package-manager-cache": false,
+      for (const step of steps.filter((candidate) => candidate.uses === reviewedActions.setupNode)) {
+        expect(asRecord(step.with, "release setup-node inputs")).toEqual({
+          "node-version": "24.20.0",
+          "package-manager-cache": false,
+        });
+      }
+
+      const tokenEnvironments = Object.fromEntries(steps.map((step) => {
+        const environment = step.env === undefined
+          ? {}
+          : asRecord(step.env, `${String(step.name)} environment`);
+        return [String(step.name), Object.fromEntries(Object.entries({
+          GH_TOKEN: environment.GH_TOKEN,
+          GITHUB_TOKEN: environment.GITHUB_TOKEN,
+        }).filter((entry) => entry[1] !== undefined))];
+      }));
+      expect(tokenEnvironments).toEqual({
+        "Check out verified source with complete history": {},
+        "Fetch only governed release history": {},
+        "Install Bun": {},
+        "Install Node and npm trusted-publishing client": {},
+        "Install exact locked dependencies without lifecycle scripts": {},
+        [jobName === "npm_mirror" ? "Require registry readiness and trusted publishing support" : "Require registry-only runtime dependencies"]: {},
+        "Require exact artifact identity": {},
+        "Download validated release bytes": {},
+        "Revalidate remote authority and checksum": { GH_TOKEN: "${{ github.token }}" },
+        ...(jobName === "publish" ? {
+          "Create immutable GitHub Release from the same bytes": { GH_TOKEN: "${{ github.token }}" },
+        } : jobName === "npm_preflight" ? {
+          "Require tag-only npm environment before OIDC capability": { GH_TOKEN: "${{ github.token }}" },
+          "Record exact npm registry preflight": {},
+        } : {
+          "Prove npm trusted-publisher exchange without publication": {},
+          "Publish exact tarball through npm trusted publishing": { GITHUB_TOKEN: "${{ github.token }}" },
+          "Admit exact public npm and GitHub state": { GITHUB_TOKEN: "${{ github.token }}" },
+        }),
       });
     }
-
-    const tokenEnvironments = Object.fromEntries(steps.map((step) => {
-      const environment = step.env === undefined
-        ? {}
-        : asRecord(step.env, `${String(step.name)} environment`);
-      return [String(step.name), Object.fromEntries(Object.entries({
-        GH_TOKEN: environment.GH_TOKEN,
-        GITHUB_TOKEN: environment.GITHUB_TOKEN,
-      }).filter((entry) => entry[1] !== undefined))];
-    }));
-    expect(tokenEnvironments).toEqual({
-      "Check out verified source with complete history": {},
-      "Fetch only governed release history": {},
-      "Install Bun": {},
-      "Install Node and npm trusted-publishing client": {},
-      "Install exact locked dependencies without lifecycle scripts": {},
-      "Require registry readiness and trusted publishing support": {},
-      "Require exact artifact identity": {},
-      "Download validated release bytes": {},
-      "Revalidate remote authority and checksum": { GH_TOKEN: "${{ github.token }}" },
-      "Prove npm trusted-publisher exchange without publication": {},
-      "Publish exact tarball through npm trusted publishing": {
-        GITHUB_TOKEN: "${{ github.token }}",
-      },
-      "Create immutable GitHub Release from the same bytes": { GH_TOKEN: "${{ github.token }}" },
-      "Admit exact public npm and GitHub state": { GITHUB_TOKEN: "${{ github.token }}" },
-    });
   });
 
   test("binds every artifact consumer to the verify attempt's numeric artifact identity", async () => {
@@ -1333,7 +1344,7 @@ describe("release workflow", () => {
     expect(uploadInputs.name).toBe("hra-release-${{ github.run_attempt }}");
     expect(uploadInputs.path).toBe("${{ runner.temp }}/hra-release-artifacts/");
 
-    for (const jobName of ["exact_artifact", "publish"] as const) {
+    for (const jobName of ["exact_artifact", "publish", "npm_preflight", "npm_mirror"] as const) {
       const job = asRecord(jobs[jobName], `${jobName} job`);
       if (!Array.isArray(job.steps)) throw new TypeError(`${jobName} steps must be an array`);
       const steps = job.steps.map((step, index) => asRecord(step, `${jobName} step ${index}`));
@@ -1399,7 +1410,7 @@ describe("release workflow", () => {
     expect(producer).toContain('npm pack --ignore-scripts --pack-destination "$release_artifacts" .');
     expect(producer).toContain('"$release_artifacts/SHA256SUMS"');
 
-    const preflight = runFor("verify", "Record exact npm registry preflight");
+    const preflight = runFor("npm_preflight", "Record exact npm registry preflight");
     assertOutsideCheckout(preflight);
     expect(preflight).toContain(`find "${exactShellRoot}"`);
     expect(asRecord(
@@ -1413,12 +1424,14 @@ describe("release workflow", () => {
     expect(exactCheck).toContain(`"${exactShellRoot}/SHA256SUMS"`);
     expect(exactCheck).toContain('bun run ./scripts/check-package.ts "$artifact"');
 
-    for (const stepName of [
-      "Revalidate remote authority and checksum",
-      "Create immutable GitHub Release from the same bytes",
-      "Publish exact tarball through npm trusted publishing",
+    for (const [jobName, stepName] of [
+      ["publish", "Revalidate remote authority and checksum"],
+      ["publish", "Create immutable GitHub Release from the same bytes"],
+      ["npm_preflight", "Revalidate remote authority and checksum"],
+      ["npm_mirror", "Revalidate remote authority and checksum"],
+      ["npm_mirror", "Publish exact tarball through npm trusted publishing"],
     ] as const) {
-      const command = runFor("publish", stepName);
+      const command = runFor(jobName, stepName);
       assertOutsideCheckout(command);
       expect(command).toContain(`find "${exactShellRoot}"`);
     }
@@ -1430,6 +1443,8 @@ describe("release workflow", () => {
     for (const [jobName, stepName] of [
       ["exact_artifact", "Download exact release bytes"],
       ["publish", "Download validated release bytes"],
+      ["npm_preflight", "Download validated release bytes"],
+      ["npm_mirror", "Download validated release bytes"],
     ] as const) {
       expect(asRecord(stepFor(jobName, stepName).with, `${jobName} artifact download inputs`).path)
         .toBe(exactActionRoot);
@@ -1535,10 +1550,10 @@ describe("release workflow", () => {
     const npmIndex = workflow.indexOf("Publish exact tarball through npm trusted publishing");
     const admissionIndex = workflow.indexOf("Admit exact public npm and GitHub state");
     expect(oidcPreflightIndex).toBeGreaterThan(0);
-    expect(githubIndex).toBeGreaterThan(oidcPreflightIndex);
-    expect(npmIndex).toBeGreaterThan(githubIndex);
+    expect(oidcPreflightIndex).toBeGreaterThan(githubIndex);
+    expect(npmIndex).toBeGreaterThan(oidcPreflightIndex);
     expect(admissionIndex).toBeGreaterThan(npmIndex);
-    expect(workflow).toContain("if: needs.verify.outputs.npm_preflight_state == 'absent'");
+    expect(workflow).toContain("if: needs.npm_preflight.outputs.npm_preflight_state == 'absent'");
     expect(workflow).toContain("check-npm-trusted-publisher-oidc.ts");
   });
 });
