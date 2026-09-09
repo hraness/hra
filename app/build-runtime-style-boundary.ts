@@ -12,13 +12,14 @@ type ReactDomEvidence = Readonly<{
 // use it: the browser gate still rejects every style node/mutation and CSP error.
 // These fingerprints bind the reviewed 19.2.8 source and its complete parsed
 // acquireResource function in the production graph, not a nearby string/count.
-// The two reviewed allocations differ only by consistent minifier identifiers.
+// The three reviewed allocations differ only by consistent minifier identifiers.
 // Keep their exact raw function bytes: normalization could conceal a changed
 // free helper. Every other allocation or body requires a new source review.
 const reviewedProductionClientSha256 = "6cf4932e0c20a4572ae395035ca2e512a42d7d49c1a659fa73d6197069c28df0";
 const reviewedResourceFunctionSha256s = new Set([
   "74ab0afc61ff2c3e1da3fe4d3b0785b82183692eaefb76e5d7d0d929de8ffd02",
   "af7ba8a59ab723dd7490ff6208468608f861cf85d89006d0aae02fd916b05bd6",
+  "aa79753fad24834ea666e2d099583de1ecbf38a2d1f10149893a0b2427c230a3",
 ]);
 const stylexInjector = /stylex-inject|stylexInject|data-stylex|stylesheet-group/u;
 const unreviewedLiteralCall = /createElement\s*\(\s*["']style["']\s*\)|\.insertRule\s*\(/u;
