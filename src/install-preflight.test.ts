@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmod,
@@ -17,6 +18,8 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
+
+import fc from "fast-check";
 
 import {
   buildHraGlobalInstallCommand,
@@ -38,6 +41,7 @@ import {
   HRA_INSTALL_RUNTIME_INJECTION_ENVIRONMENT_NAMES,
   assertSafeDarwinInstallAcl,
   HRA_INSTALL_NORMALIZER_SHA256,
+  isHraInstallReceiptVersion,
   parseOfficialHraReleaseRecord,
   parseOfficialHraRepositoryRecord,
   resolveOfficialHraArchiveIdentity,
@@ -70,6 +74,7 @@ if (
 // scheduling delay cannot terminate a valid second install.
 const SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS = 180_000;
 const temporaryRoots: string[] = [];
+const adversarialReceiptVersion = `1.2.3-${"aaa.".repeat(30)}a!`;
 type DirectTestChild = Readonly<{
   exited: Promise<number>;
   kill: (signal?: number | NodeJS.Signals) => void;
@@ -389,12 +394,13 @@ const expectNoStartedInstall = async (fixture: SyntheticPreviousInstall): Promis
 const expectPreviousInstallRejectedBeforeStaging = async (
   fixture: SyntheticPreviousInstall,
   expectedMessage: string,
+  runInstall = runInstaller,
 ): Promise<void> => {
   const activeTargetBefore = await readlink(fixture.activePath);
   const cliBefore = await readFile(fixture.cliPath);
   const receiptBefore = await readFile(fixture.receiptPath);
   const versionsBefore = (await readdir(fixture.versionsRoot)).sort();
-  const result = await runInstaller(fixture.root);
+  const result = await runInstall(fixture.root);
   expect(result.exitCode).not.toBe(0);
   expect(result.stderr).toContain(expectedMessage);
   expect(result.stdout).toBe("");
@@ -703,6 +709,132 @@ afterAll(async () => {
 }, 60_000);
 
 describe("transactional HRA installer", () => {
+  test("rejects an ambiguous maximum-length receipt semver within a joined watchdog", () => {
+    expect(adversarialReceiptVersion).toHaveLength(128);
+    // The child only imports the predicate and evaluates one value. SIGKILL
+    // and synchronous joining keep a regressed synchronous parser finite;
+    // it cannot block this test process's event loop or leave a child behind.
+    const result = spawnSync(process.execPath, [
+      "--no-env-file",
+      "--config=/dev/null",
+      "--eval",
+      [
+        'const { isHraInstallReceiptVersion } = await import(process.argv[1]);',
+        'process.stdout.write(String(isHraInstallReceiptVersion(process.argv[2])) + "\\n");',
+      ].join("\n"),
+      resolve(import.meta.dir, "install-preflight-runtime.ts"),
+      adversarialReceiptVersion,
+    ], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      env: sanitizeHraInstallChildEnvironment(process.env),
+      killSignal: "SIGKILL",
+      maxBuffer: 1_024,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 1_000,
+    });
+    expect(result.error, result.error?.message).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toBe("false\n");
+  });
+
+  test("preserves receipt semver core, prerelease, build, and end-of-input grammar", () => {
+    const accepted = [
+      "0.0.0", "1.2.3", "10.200.3000", "1.2.3-0", "1.2.3-10",
+      "1.2.3-a", "1.2.3-A", "1.2.3-0a", "1.2.3-01a", "1.2.3-00-",
+      "1.2.3--", "1.2.3---", "1.2.3-a-b.0.01A.-",
+      "1.2.3+00.01.-", "1.2.3-rc.1+00.A-b", `1.2.3-${"a".repeat(122)}`,
+    ];
+    const rejected = [
+      "", "1", "1.2", "1.2.3.4", "01.2.3", "1.02.3", "1.2.03",
+      "v1.2.3", "+1.2.3", "-1.2.3", "1.2.3-", "1.2.3-00", "1.2.3-01",
+      "1.2.3-a.01", "1.2.3-.a", "1.2.3-a.", "1.2.3-a..b",
+      "1.2.3+", "1.2.3+.a", "1.2.3+a.", "1.2.3+a..b", "1.2.3+a+b",
+      "1.2.3_foo", "1.2.3-ä", "1.2.3+é", "1.2.3-😀", " 1.2.3", "1.2.3 ",
+      "1.2.3\n", "1.2.3\r", "1.2.3\r\n", "1.2.3\u2028", "1.2.3\u2029", "1.2.3\0",
+      "1.2.3-a\n", "1.2.3+a\n", `1.2.3-${"a".repeat(123)}`,
+    ];
+    for (const value of accepted) expect(isHraInstallReceiptVersion(value), value).toBeTrue();
+    for (const value of rejected) expect(isHraInstallReceiptVersion(value), value).toBeFalse();
+  });
+
+  test("preserves bounded generated receipt semver grammar and rejects invalid mutations", () => {
+    const numeric = fc.integer({ min: 0, max: 999 }).map(String);
+    const identifier = fc.array(fc.constantFrom("0", "1", "A", "a", "-"), {
+      minLength: 1,
+      maxLength: 4,
+    }).map((characters) => characters.join(""));
+    const prereleaseIdentifier = fc.oneof(numeric, identifier.map((value) => `a${value}`));
+    fc.assert(fc.property(
+      fc.tuple(numeric, numeric, numeric),
+      fc.array(prereleaseIdentifier, { maxLength: 3 }),
+      fc.array(identifier, { maxLength: 3 }),
+      (core, prerelease, build) => {
+        const suffix = (prerelease.length === 0 ? "" : `-${prerelease.join(".")}`)
+          + (build.length === 0 ? "" : `+${build.join(".")}`);
+        const version = `${core.join(".")}${suffix}`;
+        expect(isHraInstallReceiptVersion(version), version).toBeTrue();
+        expect(isHraInstallReceiptVersion(`0${version}`)).toBeFalse();
+        expect(isHraInstallReceiptVersion(`${version}\n`)).toBeFalse();
+        expect(isHraInstallReceiptVersion(`${core.join(".")}-01`)).toBeFalse();
+        expect(isHraInstallReceiptVersion(`${core.join(".")}+01`)).toBeTrue();
+      },
+    ), { numRuns: 300, seed: 20_260_908 });
+  });
+
+  test("refuses an ambiguous receipt semver before staging without mutating installed authority", async () => {
+    const root = await makeRoot("hra-install-semver-bound-");
+    const previous = await createSyntheticPreviousInstall(root, {
+      packageName: "@hraness/hra",
+      packageVersion: "0.1.4",
+    });
+    // Preserve a valid protected namespace so the malformed receipt reaches
+    // version parsing before namespace/release comparisons can reject it.
+    const receipt = await readJsonRecord(previous.receiptPath);
+    receipt.packageVersion = adversarialReceiptVersion;
+    await writePrivateJson(previous.receiptPath, receipt);
+    await expectPreviousInstallRejectedBeforeStaging(
+      previous,
+      "complete HRA version receipt is invalid",
+      async (installRoot) => {
+        await mkdir(join(installRoot, "home"), { recursive: true, mode: 0o700 });
+        // No stage worker is permitted in this fixture, even if receipt
+        // admission regresses. The direct installer is killed and joined if
+        // parsing blocks; the test process remains able to inspect authority.
+        const result = spawnSync(process.execPath, [
+          "--no-env-file",
+          "--config=/dev/null",
+          "--eval",
+          [
+            'const { installHraRelease } = await import(process.argv[1]);',
+            "try {",
+            '  await installHraRelease(process.argv[2], { beforeStageWorkerSpawn: () => { throw new Error("Unexpected install staging"); } });',
+            "} catch (error) {",
+            '  process.stderr.write(error instanceof Error ? error.message : "Unexpected non-Error refusal");',
+            "  process.exitCode = 1;",
+            "}",
+          ].join("\n"),
+          resolve(import.meta.dir, "install-preflight-runtime.ts"),
+          archivePath,
+        ], {
+          cwd: installRoot,
+          encoding: "utf8",
+          env: installEnvironment(installRoot),
+          killSignal: "SIGKILL",
+          maxBuffer: 4_096,
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 2_000,
+        });
+        expect(result.error, result.error?.message).toBeUndefined();
+        expect(result.signal).toBeNull();
+        if (result.status === null) throw new Error("The bounded receipt check did not exit normally.");
+        return { exitCode: result.status, stderr: result.stderr, stdout: result.stdout };
+      },
+    );
+  });
+
   test("strips only dependency maps from the private installer fixture", () => {
     expect(sourcePackageManifest.dependencies).toEqual({
       "@hraness/oh": "0.4.1",

@@ -2,9 +2,11 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
-## v0.7.0 (unreleased)
+## v0.7.0
 
 Stable working and canonical project memory, attributed peer coordination, encrypted canonical-memory sync, and read-only browser supervision.
+
+Immutable GitHub and npm artifacts completed [exact release admission](docs/beta-release.md#immutable-v070-successful-release-record) on 2026-09-08. This includes the schema49 Work project-authority repair and schema50's exact legacy-profile persistence without new-model admission. Artifact availability does not clear the hosted capacity, daemon startup or intended-target gates; authenticated live qualification remains separate.
 
 - Stable Oh memory is now part of the product surface through the exact public `@hraness/oh@0.4.1` release. A project-bound session writes to its 30-day working authority, queries that lane together with one durable project canonical authority, and can explicitly share one attested page through conflict-checked adoption. Codex and Claude Code receive the closed `memory_remember`, `memory_query`, `memory_explain`, and `memory_share` tools; the owner CLI exposes the corresponding `hra memory` commands for Codex and Claude Code sessions. HRA offers no raw store handle, automatic publication, canonical overwrite, head acceptance, or project-memory erasure path.
 - Bound Codex and Claude Code sessions can list, inspect, queue to, send to, or steer another current session in the same project under each session's revocable `off | inspect | coordinate` policy. Peer messages are explicitly untrusted, retain `peer_session` attribution in the local transcript and encrypted compact projection, cannot resolve approvals or create Work membership, and fail closed on stale revisions, causal cycles, a ninth hop, or the rolling rate, fan-out, inbound-queue, and retained-ledger ceilings. Retired sessions cannot participate.
@@ -14,7 +16,7 @@ Stable working and canonical project memory, attributed peer coordination, encry
 
 ## v0.6.3
 
-This admitted release adds the default-off after-hours policy after `v0.6.2`. Its immutable GitHub and npm artifacts are available; artifact admission does not clear the blocked daemon or hosted command-writer rollout. See the [exact release record](docs/beta-release.md#immutable-v063-successful-release-record). The integrated v0.7.0 candidate retains this policy without treating v0.6.3 admission as its own release admission.
+This admitted predecessor adds the default-off after-hours policy after `v0.6.2`. Its immutable GitHub and npm artifacts remain available; artifact admission does not clear the blocked daemon or hosted command-writer rollout. See the [exact release record](docs/beta-release.md#immutable-v063-successful-release-record). The separately admitted v0.7.0 release retains this policy without enabling it or replacing the predecessor's immutable evidence.
 
 - After the rollout gates, a separate local opt-in, disabled on new and upgraded installations, can raise otherwise eligible protocol approval budgets to 6 consecutive, 20 rolling-hour, and 80 rolling-day reservations outside notification hours. Prose stays at 3/10/40 and shares the same accounting. Final transactional admission rechecks current consent, schedule, source authority, and spend. Additive schema 46 preserves schema 45 and requires a newly finalized human message before any pre-44 session can use the higher tier. Policy changes never reset counters or broaden approval categories.
 

@@ -1,6 +1,9 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import * as stylex from "@stylexjs/stylex";
+import type { StyleXStyles } from "@stylexjs/stylex";
 
-import { cn } from "../../lib/cn";
+import { staticStylexClassName } from "../../lib/cn";
+import { dropdownMenuStyles } from "./primitives.stylex";
 
 export type DropdownMenuItem = Readonly<{
   disabled?: boolean;
@@ -16,6 +19,7 @@ export type DropdownMenuProps = Readonly<{
   items: readonly DropdownMenuItem[];
   label: string;
   trigger: ReactNode;
+  xstyle?: StyleXStyles;
 }>;
 
 /**
@@ -30,11 +34,13 @@ export function DropdownMenu({
   items,
   label,
   trigger,
+  xstyle,
 }: DropdownMenuProps) {
   const [open, setOpen] = useState(false);
   const container = useRef<HTMLDivElement>(null);
   const list = useRef<HTMLDivElement>(null);
   const menuId = useId();
+  const rootPresentation = stylex.props(dropdownMenuStyles.root, xstyle);
 
   useEffect(() => {
     if (!open) return;
@@ -56,13 +62,13 @@ export function DropdownMenu({
   }, [open]);
 
   return (
-    <div className={cn("relative", className)} ref={container}>
+    <div className={staticStylexClassName(rootPresentation, className)} ref={container}>
       <button
         aria-controls={open ? menuId : undefined}
         aria-expanded={open}
         aria-haspopup="menu"
         aria-label={label}
-        className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-md text-ink-muted hover:text-ink"
+        className={stylex.props(dropdownMenuStyles.trigger).className}
         onClick={() => { setOpen((current) => !current); }}
         type="button"
       >
@@ -70,10 +76,10 @@ export function DropdownMenu({
       </button>
       {open ? (
         <div
-          className={cn(
-            "absolute z-10 mt-1 min-w-44 rounded-md border border-line bg-surface-raised p-1",
-            align === "end" ? "right-0" : "left-0",
-          )}
+          className={stylex.props(
+            dropdownMenuStyles.list,
+            align === "end" ? dropdownMenuStyles.listEnd : dropdownMenuStyles.listStart,
+          ).className}
           id={menuId}
           ref={list}
           role="menu"
@@ -81,11 +87,12 @@ export function DropdownMenu({
         >
           {items.map((item) => (
             <button
-              className={cn(
-                "block w-full min-h-11 rounded px-3 text-left text-sm",
-                "hover:bg-surface-input disabled:cursor-not-allowed disabled:opacity-50",
-                item.tone === "danger" ? "text-danger" : "text-ink",
-              )}
+              className={stylex.props(
+                dropdownMenuStyles.item,
+                item.tone === "danger"
+                  ? dropdownMenuStyles.itemDanger
+                  : dropdownMenuStyles.itemDefault,
+              ).className}
               disabled={item.disabled ?? false}
               key={item.id}
               onClick={() => {

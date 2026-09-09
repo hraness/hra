@@ -250,7 +250,7 @@ async function fixture(
   return { store, home };
 }
 
-/** Exact v39 storage fixture, never an admission path for a new Devin session. */
+/** Shaped historical row, never authentic-release provenance or new Devin admission. */
 const seedLegacyDevinSession = (
   store: StateStore,
   input: Parameters<StateStore["createSession"]>[0],
@@ -259,7 +259,7 @@ const seedLegacyDevinSession = (
   const database = new Database(store.paths.database, { create: false, strict: true });
   try {
     database.query(
-      "UPDATE sessions SET provider_v39='devin',preset_contract=2 WHERE id=?",
+      "UPDATE sessions SET provider_v39='devin',preset_contract=2,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?",
     ).run(session.id);
   } finally {
     database.close(false);
@@ -297,6 +297,55 @@ const dropProviderSwitchProgressSchema = (database: Database): void => {
     DROP TABLE IF EXISTS session_provider_switch_targets;
     DROP TABLE IF EXISTS session_mutation_authority_rebinds;
   `);
+};
+
+/** Remove only the current canonical overlay when deliberately shaping an older fixture. */
+const dropCanonicalProfileSchema = (database: Database): void => {
+  for (const name of [
+    "canonical_profile_session_insert_guard",
+    "canonical_profile_session_update_guard",
+    "canonical_profile_work_route_insert_guard",
+    "canonical_profile_work_task_insert_guard",
+    "canonical_profile_work_attempt_insert_guard",
+    "canonical_profile_work_attempt_immutable_guard",
+    "canonical_profile_session_live_attempt_guard",
+  ] as const) database.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  for (const table of ["sessions", "work_routes", "work_tasks", "work_attempts"] as const) {
+    if (database.query(
+      `SELECT 1 FROM pragma_table_xinfo('${table}') WHERE name='canonical_profile_key'`,
+    ).get() !== null) database.exec(`ALTER TABLE ${table} DROP COLUMN canonical_profile_key`);
+    expect(database.query(
+      `SELECT name FROM pragma_table_xinfo('${table}') WHERE name='canonical_profile_key' COLLATE NOCASE`,
+    ).all()).toEqual([]);
+  }
+};
+
+/** Preserve every predecessor object, allowing only the four append-only column additions. */
+const expectCanonicalSchemaExtension = (before: unknown, after: unknown): void => {
+  const objectSchema = z.object({
+    type: z.string(), name: z.string(), tbl_name: z.string(), sql: z.string().nullable(),
+  }).strict();
+  const oldObjects = objectSchema.array().parse(before);
+  const newObjects = objectSchema.array().parse(after);
+  for (const old of oldObjects) {
+    if (old.type !== "table" || !["sessions", "work_routes", "work_tasks", "work_attempts"].includes(old.name)) {
+      expect(newObjects).toContainEqual(old);
+      continue;
+    }
+    const added = objectSchema.parse(newObjects.find((entry) => entry.type === old.type && entry.name === old.name));
+    const sql = z.string().parse(added.sql);
+    const column = ", canonical_profile_key TEXT";
+    expect(sql.split(column)).toHaveLength(2);
+    expect({ ...added, sql: sql.replace(column, "") })
+      .toEqual({ ...old, sql: z.string().parse(old.sql) });
+  }
+};
+
+const withCanonicalSessionKey = (value: unknown): Record<string, unknown> => {
+  const row = z.record(z.string(), z.unknown()).parse(value);
+  const key = deriveLegacySessionProfileKey(row.provider_v39, row.preset, row.preset_contract);
+  expect(key).not.toBeNull();
+  return { ...row, canonical_profile_key: key };
 };
 
 const dropProviderV39SessionColumn = (database: Database): readonly Readonly<{
@@ -349,6 +398,7 @@ const sessionAdoptionTableNames = [
 ] as const;
 
 const dropSessionAdoptionSchema = (database: Database): void => {
+  dropCanonicalProfileSchema(database);
   database.exec("DROP TRIGGER IF EXISTS work_session_project_authority_guard");
   const objects = z.object({
     name: z.string().regex(/^[a-z0-9_]+$/u),
@@ -399,6 +449,7 @@ const dropSessionAdoptionAndPresetContractSchema = (database: Database): void =>
 };
 
 const dropHostedMemorySchema = (database: Database): void => {
+  dropCanonicalProfileSchema(database);
   database.exec("DROP TRIGGER IF EXISTS work_session_project_authority_guard");
   const hostedObjects = z.object({
     name: z.string().regex(/^[a-z0-9_]+$/u),
@@ -688,8 +739,15 @@ const downgradeToExactProviderVersion47 = (database: Database): void => {
 
 /** Canonical-memory v48 predecessor, without the nullable Work project guard. */
 const downgradeToExactProviderVersion48 = (database: Database): void => {
+  dropCanonicalProfileSchema(database);
   database.exec(`DROP TRIGGER IF EXISTS work_session_project_authority_guard;
     DELETE FROM migrations WHERE version>48; PRAGMA user_version=48`);
+};
+
+/** Shaped nullable-Work-authority v49 predecessor; not an authentic old-source capture. */
+const downgradeToExactProviderVersion49 = (database: Database): void => {
+  dropCanonicalProfileSchema(database);
+  database.exec("DELETE FROM migrations WHERE version>49; PRAGMA user_version=49");
 };
 
 // Exact sqlite_master SQL emitted by StateStore at 42c4235e35daed1dec7eca4ff985bd9e8606b78a.
@@ -714,6 +772,7 @@ const downgradeToHistoricalAdoptionVersion35 = (database: Database): void => {
 };
 
 const dropPostLegacyAdoptionVersion36Schema = (database: Database): void => {
+  dropCanonicalProfileSchema(database);
   database.exec("DROP TRIGGER IF EXISTS work_session_project_authority_guard");
   downgradeProviderV39SessionColumn(database);
   const presetTriggers = z.object({
@@ -2757,8 +2816,15 @@ describe("StateStore", () => {
           stores.push(reopened);
           const after = snapshot();
           expect({ ...after, schema: before.schema, version: before.version, migrations: before.migrations })
-            .toEqual(before);
-          expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+            .toEqual({
+              ...before,
+              session: withCanonicalSessionKey(before.session),
+              attempt: {
+                ...z.record(z.string(), z.unknown()).parse(before.attempt),
+                canonical_profile_key: "codex:gpt-5.6-sol:ultra",
+              },
+            });
+          expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
           expect(database.query("SELECT * FROM migrations WHERE version=49").get())
             .toEqual({ version: 49, applied_at: 10_000 });
           expect(() => database.query("UPDATE sessions SET project_id=NULL WHERE id=?").run(session.id))
@@ -2893,7 +2959,7 @@ describe("StateStore", () => {
         database.exec("DROP TRIGGER refuse_work_project_migration");
         const reopened = new StateStore(paths);
         stores.push(reopened);
-        expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+        expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       } finally { database.close(false); }
     });
 
@@ -3159,7 +3225,8 @@ describe("StateStore", () => {
       requirement: { model: "gpt-5.6-sol", effort: "max" },
     });
     const database = new Database(store.paths.database, { strict: true });
-    database.query("UPDATE sessions SET preset_contract=? WHERE id=?")
+    // Synthetic historical binding, not a source-authentic release fixture.
+    database.query("UPDATE sessions SET preset_contract=?,canonical_profile_key='codex:gpt-6-astra:max' WHERE id=?")
       .run(currentPresetContract, created.id);
     database.close(false);
     expect(store.requireSessionPresetRequirement(created.id)).toEqual({
@@ -3197,7 +3264,8 @@ describe("StateStore", () => {
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
     });
     const database = new Database(store.paths.database, { strict: true });
-    database.query("UPDATE sessions SET preset_contract=? WHERE id=?")
+    // Retain the legacy binding coherently before authoring its recovery evidence.
+    database.query("UPDATE sessions SET preset_contract=?,canonical_profile_key='codex:gpt-6-astra:max' WHERE id=?")
       .run(currentPresetContract, session.id);
     database.close(false);
     const runtimeProfile = {
@@ -5759,7 +5827,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=35 ORDER BY version",
       ).all()).toEqual([
@@ -5774,7 +5842,7 @@ describe("StateStore", () => {
         { version: 43 },
         { version: 44 },
         { version: 45 },
-        { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 },
+        { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }, { version: 50 },
       ]);
       expect(inspector.query(
         "SELECT name FROM pragma_table_info('session_adoption_candidates') WHERE name='provider_project_root'",
@@ -5859,7 +5927,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_ADOPTION_WORK_INVALID");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         `SELECT revision,claim_status FROM session_adoption_candidates
          WHERE provider=? AND provider_thread_id=?`,
@@ -7553,7 +7621,7 @@ describe("StateStore", () => {
     expect(createRevocationWorkStore(repaired).task(workTask.id).activeAttempt).toBeNull();
     const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query("SELECT state FROM work_attempts WHERE id=?").get(workClaim.attempt.id))
         .toEqual({ state: "released" });
       expect(inspector.query(
@@ -12154,9 +12222,10 @@ describe("StateStore", () => {
     }
   });
 
-  test("requires unit-marked safe baseline timestamps without rewriting legacy evidence", async () => {
-    for (const kind of ["session.stop", "session.rename"] as const) {
-      for (const baselineTime of [null, 10, 10.5, Number.MAX_SAFE_INTEGER + 1]) {
+  // Each independent store gets the unchanged per-test budget and cleanup.
+  for (const kind of ["session.stop", "session.rename"] as const) {
+    for (const baselineTime of [null, 10, 10.5, Number.MAX_SAFE_INTEGER + 1]) {
+      test(`requires unit-marked safe baseline timestamps without rewriting legacy evidence: ${kind}, ${String(baselineTime)}`, async () => {
         const { store } = await fixture();
         const profile = signInProfile(store, "Legacy timestamp", "legacy-timestamp@example.com");
         const local = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
@@ -12192,9 +12261,9 @@ describe("StateStore", () => {
             provider: { providerThreadId: evidence.providerThreadId, title: "Resolved", status: "idle", providerUpdatedAt: 10_000 } });
           expect(inspector.query("SELECT receipt_json FROM mutation_resolutions WHERE attempt_id=?").get(attempt.id)).toEqual({ receipt_json: null });
         } finally { inspector.close(false); }
-      }
+      });
     }
-  });
+  }
 
   test("migrates schema 40 through autorespond v44 while preserving legacy bytes and digests", async () => {
     const { store } = await fixture();
@@ -12212,7 +12281,7 @@ describe("StateStore", () => {
       // Emulate a resolution committed before the timestamp and active-Work
       // migrations existed, using the exact released v40 authority surface.
       downgradeToExactProviderVersion40(inspector);
-      expect(() => new StateStore(store.paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:49");
+      expect(() => new StateStore(store.paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:50");
       inspector.query("INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,'proven_applied',?,?,1000)").run(attempt.id, resolutionBytes, JSON.stringify({ renamed: true }));
       const before = inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id);
       const stableSchemaBefore = inspector.query(
@@ -12242,12 +12311,10 @@ describe("StateStore", () => {
          AND tbl_name!='account_mutation_authority_rebinds'
          ORDER BY type,name`,
       ).all();
-      for (const row of z.array(z.unknown()).parse(stableSchemaBefore)) {
-        expect(stableSchemaAfter).toContainEqual(row);
-      }
+      expectCanonicalSchemaExtension(stableSchemaBefore, stableSchemaAfter);
       expect(inspector.query("SELECT * FROM migrations WHERE version<41 ORDER BY version").all()).toEqual(ledgerBefore);
-      expect(inspector.query("SELECT version FROM migrations WHERE version>=40 ORDER BY version").all()).toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }, { version: 45 }, { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }]);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("SELECT version FROM migrations WHERE version>=40 ORDER BY version").all()).toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }, { version: 45 }, { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }, { version: 50 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(reopened.readMutation(key)?.evidence).toEqual(original);
       expect(reopened.readMutation(key)?.resolution?.evidence).toEqual(JSON.parse(resolutionBytes));
       expect(inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id)).toEqual(before);
@@ -12278,14 +12345,14 @@ describe("StateStore", () => {
           expect(() => new StateStore(store.paths, { readonly })).toThrow("STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID");
           expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
           expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledgerBefore);
-          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
         }
       } finally { inspector.close(false); }
     }
   });
 
-  test("refuses a damaged timestamp guard on exact schema 41 before Work v42 migration", async () => {
-    for (const definition of ["missing", "weaker", "changed_literal"] as const) {
+  for (const definition of ["missing", "weaker", "changed_literal"] as const) {
+    test(`refuses a damaged timestamp guard on exact schema 41 before Work v42 migration: ${definition}`, async () => {
       const { store } = await fixture();
       const inspector = new Database(store.paths.database, { create: false, strict: true });
       try {
@@ -12308,7 +12375,7 @@ describe("StateStore", () => {
           "STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID",
         );
         expect(() => new StateStore(store.paths, { readonly: true })).toThrow(
-          "STATE_SCHEMA_MIGRATION_REQUIRED:41:49",
+          "STATE_SCHEMA_MIGRATION_REQUIRED:41:50",
         );
         expect(inspector.query(
           "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
@@ -12317,8 +12384,8 @@ describe("StateStore", () => {
           .toEqual(ledgerBefore);
         expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
       } finally { inspector.close(false); }
-    }
-  });
+    });
+  }
 
   test.each(["missing", "negative_time", "unsafe_time", "later_version"] as const)(
     "refuses an invalid current migration ledger without changing retained rows or schema: %s",
@@ -12343,7 +12410,7 @@ describe("StateStore", () => {
           "STATE_SCHEMA_V40_MIGRATION_LEDGER_INVALID",
         );
         expect(() => new StateStore(store.paths, { readonly: true })).toThrow(
-          "STATE_SCHEMA_MIGRATION_REQUIRED:40:49",
+          "STATE_SCHEMA_MIGRATION_REQUIRED:40:50",
         );
         expect(inspector.query(
           "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
@@ -12390,7 +12457,7 @@ describe("StateStore", () => {
           "STATE_SCHEMA_V41_MIGRATION_LEDGER_INVALID",
         );
         expect(() => new StateStore(store.paths, { readonly: true })).toThrow(
-          "STATE_SCHEMA_MIGRATION_REQUIRED:41:49",
+          "STATE_SCHEMA_MIGRATION_REQUIRED:41:50",
         );
         expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
         expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledgerBefore);
@@ -12401,7 +12468,7 @@ describe("StateStore", () => {
     },
   );
 
-  for (const version of [45, 46, 47, 48, 49] as const) test.each([
+  for (const version of [45, 46, 47, 48, 49, 50] as const) test.each([
     "missing_table", "missing_guard", "weaker_guard", "wrong_table_guard", "extra_index",
   ] as const)(
     `auth45 authority refuses DDL drift at schema ${String(version)} without writes: %s`,
@@ -12414,6 +12481,7 @@ describe("StateStore", () => {
         else if (version === 46) downgradeToExactProviderVersion46(inspector);
         else if (version === 47) downgradeToExactProviderVersion47(inspector);
         else if (version === 48) downgradeToExactProviderVersion48(inspector);
+        else if (version === 49) downgradeToExactProviderVersion49(inspector);
         if (damage === "missing_table") inspector.exec("DROP TABLE account_mutation_authority_rebinds");
         else if (damage === "extra_index") inspector.exec("CREATE INDEX unreviewed_auth_index ON account_mutation_authority_rebinds(profile_id)");
         else {
@@ -12426,8 +12494,8 @@ describe("StateStore", () => {
         const profileBefore = inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id);
         for (const readonly of [false, true]) {
           expect(() => new StateStore(store.paths, { readonly })).toThrow(
-            readonly && version < 49
-              ? `STATE_SCHEMA_MIGRATION_REQUIRED:${String(version)}:49`
+            readonly && version < 50
+              ? `STATE_SCHEMA_MIGRATION_REQUIRED:${String(version)}:50`
               : "STATE_SCHEMA_V45_ACCOUNT_MUTATION_AUTHORITY_INVALID",
           );
           expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
@@ -12439,21 +12507,22 @@ describe("StateStore", () => {
     },
   );
 
-  for (const version of [45, 46, 47, 48] as const) test(`schema ${String(version)} refuses a missing auth45 ledger entry before migration`, async () => {
+  for (const version of [45, 46, 47, 48, 49] as const) test(`schema ${String(version)} refuses a missing auth45 ledger entry before migration`, async () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { create: false, strict: true });
     try {
       if (version === 45) downgradeToExactProviderVersion45(inspector);
       else if (version === 46) downgradeToExactProviderVersion46(inspector);
       else if (version === 47) downgradeToExactProviderVersion47(inspector);
-      else downgradeToExactProviderVersion48(inspector);
+      else if (version === 48) downgradeToExactProviderVersion48(inspector);
+      else downgradeToExactProviderVersion49(inspector);
       inspector.exec("DELETE FROM migrations WHERE version=45");
       const schemaBefore = inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all();
       const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
       const profilesBefore = inspector.query("SELECT * FROM profiles ORDER BY id").all();
       for (const readonly of [false, true]) {
         expect(() => new StateStore(store.paths, { readonly })).toThrow(
-          readonly ? `STATE_SCHEMA_MIGRATION_REQUIRED:${String(version)}:49`
+          readonly ? `STATE_SCHEMA_MIGRATION_REQUIRED:${String(version)}:50`
             : `STATE_SCHEMA_V${String(version)}_MIGRATION_LEDGER_INVALID`,
         );
         expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
@@ -12476,7 +12545,7 @@ describe("StateStore", () => {
         const schemaBefore = inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all();
         const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
         const profileBefore = inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id);
-        expect(() => new StateStore(store.paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:44:49");
+        expect(() => new StateStore(store.paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:44:50");
         expect(() => new StateStore(store.paths)).toThrow("already exists");
         expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
         expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledgerBefore);
@@ -12524,7 +12593,7 @@ describe("StateStore", () => {
     try {
       downgradeToExactProviderVersion44(inspector);
       expect(() => new StateStore(store.paths, { readonly: true }))
-        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:44:49");
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:44:50");
       const stableSchema = inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name!='queue_entries' ORDER BY type,name").all();
       const oldLedger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
       const profiles = inspector.query("SELECT * FROM profiles ORDER BY id").all();
@@ -12544,12 +12613,14 @@ describe("StateStore", () => {
       const reopened = new StateStore(store.paths, { now: () => 3_000 });
       stores.push(reopened);
       const currentSchema = inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name!='queue_entries' ORDER BY type,name").all();
-      for (const row of stableSchema) expect(currentSchema).toContainEqual(row);
+      expectCanonicalSchemaExtension(stableSchema, currentSchema);
       expect(inspector.query("SELECT * FROM migrations WHERE version<45 ORDER BY version").all()).toEqual(oldLedger);
       expect(inspector.query("SELECT version,applied_at FROM migrations WHERE version=45").get())
         .toEqual({ version: 45, applied_at: 3_000 });
       expect(inspector.query("SELECT * FROM profiles ORDER BY id").all()).toEqual(profiles);
-      expect(inspector.query("SELECT * FROM sessions ORDER BY id").all()).toEqual(sessions);
+      const migratedSessions = inspector.prepare("SELECT * FROM sessions ORDER BY id");
+      try { expect(migratedSessions.all()).toEqual(sessions.map(withCanonicalSessionKey)); }
+      finally { migratedSessions.finalize(); }
       expect(reopened.latestUsage(sibling.id)).toEqual(usage);
       expect(inspector.query("SELECT * FROM mutation_attempts WHERE id=?").get(attempt.id)).toEqual(mutation);
       expect(inspector.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id)).toEqual(evidence);
@@ -12563,10 +12634,10 @@ describe("StateStore", () => {
         .run(siblingSession.id)).toThrow("autorespond budget history is immutable");
       expect(inspector.query("SELECT count(*) AS count FROM account_mutation_authority_rebinds").get()).toEqual({ count: 0 });
       expect(inspector.query("SELECT count(*) AS count FROM mutation_resolutions WHERE attempt_id=?").get(attempt.id)).toEqual({ count: 0 });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
     } finally { inspector.close(false); }
   });
-  test.each([
+  for (const version of [49, 50] as const) test.each([
     "missing_40",
     "missing_41",
     "missing_42",
@@ -12577,11 +12648,12 @@ describe("StateStore", () => {
     "missing_47",
     "missing_48",
     "missing_49",
+    ...(version === 50 ? ["missing_50" as const] : []),
     "negative_time",
     "unsafe_time",
     "later_version",
   ] as const)(
-    "refuses an invalid current schema 49 migration ledger without writes: %s",
+    `refuses an invalid ${version === 50 ? "current" : "predecessor"} schema ${String(version)} migration ledger without writes: %s`,
     async (damage) => {
       const { store } = await fixture();
       const profile = signInProfile(store, "Current ledger", "current-ledger@example.com");
@@ -12595,6 +12667,7 @@ describe("StateStore", () => {
       });
       const inspector = new Database(store.paths.database, { create: false, strict: true });
       try {
+        if (version === 49) downgradeToExactProviderVersion49(inspector);
         if (damage === "missing_40") inspector.exec("DELETE FROM migrations WHERE version=40");
         else if (damage === "missing_41") inspector.exec("DELETE FROM migrations WHERE version=41");
         else if (damage === "missing_42") inspector.exec("DELETE FROM migrations WHERE version=42");
@@ -12605,12 +12678,13 @@ describe("StateStore", () => {
         else if (damage === "missing_47") inspector.exec("DELETE FROM migrations WHERE version=47");
         else if (damage === "missing_48") inspector.exec("DELETE FROM migrations WHERE version=48");
         else if (damage === "missing_49") inspector.exec("DELETE FROM migrations WHERE version=49");
+        else if (damage === "missing_50") inspector.exec("DELETE FROM migrations WHERE version=50");
         else if (damage === "negative_time") {
           inspector.exec("PRAGMA ignore_check_constraints=ON; UPDATE migrations SET applied_at=-1 WHERE version=45; PRAGMA ignore_check_constraints=OFF;");
         } else if (damage === "unsafe_time") {
           inspector.query("UPDATE migrations SET applied_at=? WHERE version=45")
             .run(Number.MAX_SAFE_INTEGER + 1);
-        } else inspector.exec("INSERT INTO migrations(version,applied_at) VALUES (50,1000)");
+        } else inspector.query("INSERT INTO migrations(version,applied_at) VALUES (?,1000)").run(version + 1);
         const schemaBefore = inspector.query(
           "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
         ).all();
@@ -12619,12 +12693,16 @@ describe("StateStore", () => {
         const profileBefore = inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id);
 
         for (const readonly of [false, true]) {
-          expect(() => new StateStore(store.paths, { readonly })).toThrow("STATE_SCHEMA_V49_MIGRATION_LEDGER_INVALID");
+          expect(() => new StateStore(store.paths, { readonly })).toThrow(
+            readonly && version === 49
+              ? "STATE_SCHEMA_MIGRATION_REQUIRED:49:50"
+              : `STATE_SCHEMA_V${String(version)}_MIGRATION_LEDGER_INVALID`,
+          );
           expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
           expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledgerBefore);
           expect(inspector.query("SELECT * FROM sessions WHERE id=?").get(session.id)).toEqual(sessionBefore);
           expect(inspector.query("SELECT * FROM profiles WHERE id=?").get(profile.id)).toEqual(profileBefore);
-          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+          expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: version });
         }
       } finally { inspector.close(false); }
     },
@@ -13391,7 +13469,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -17677,7 +17755,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts",
       ).get()).toEqual({ count: 1 });
@@ -19337,9 +19415,9 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query("SELECT version FROM migrations ORDER BY version").all())
-        .toEqual(Array.from({ length: 49 }, (_, index) => ({ version: index + 1 })));
+        .toEqual(Array.from({ length: 50 }, (_, index) => ({ version: index + 1 })));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
         .toContainEqual(expect.objectContaining({ name: "attempt_sequence", type: "INTEGER", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
@@ -19528,7 +19606,7 @@ describe("StateStore", () => {
       foreignKeyViolations: 0,
       profileColumns: ["codex_account_key"],
       sqliteVersion: expect.stringMatching(/^3\./u),
-      userVersion: 49,
+      userVersion: 50,
     });
   });
 
@@ -19595,7 +19673,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:50");
     const migrated = new StateStore(paths, { now: () => 4_000 });
     stores.push(migrated);
     expect(migrated.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtimeProfile);
@@ -19605,7 +19683,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
         .toEqual([
           { version: 35 },
@@ -19619,7 +19697,7 @@ describe("StateStore", () => {
           { version: 43 },
           { version: 44 },
           { version: 45 },
-          { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 },
+          { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }, { version: 50 },
         ]);
       expect(inspector.query(
         `SELECT type,COUNT(*) AS count FROM sqlite_master
@@ -19665,7 +19743,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
         .toEqual([
           { version: 35 },
@@ -19679,7 +19757,7 @@ describe("StateStore", () => {
           { version: 43 },
           { version: 44 },
           { version: 45 },
-          { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 },
+          { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }, { version: 50 },
         ]);
       expect(inspector.query(
         `SELECT name FROM sqlite_master WHERE type='table'
@@ -19725,7 +19803,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:50");
     const migrated = new StateStore(paths, { now: () => 2_000 });
     stores.push(migrated);
     expect(migrated.requireSession(session.id)).toMatchObject({
@@ -19734,7 +19812,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=39 ORDER BY version",
       ).all()).toEqual([
@@ -19745,7 +19823,7 @@ describe("StateStore", () => {
         { version: 43 },
         { version: 44 },
         { version: 45 },
-        { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 },
+        { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }, { version: 50 },
       ]);
       expect(inspector.query(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
@@ -19796,7 +19874,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:41:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:41:50");
     const migrated = new StateStore(paths, { now: () => 2_000 });
     stores.push(migrated);
     expect(migrated.requireSession(session.id)).toMatchObject({
@@ -19806,15 +19884,15 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=40 ORDER BY version",
-      ).all()).toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }, { version: 45 }, { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }]);
+      ).all()).toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }, { version: 45 }, { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }, { version: 50 }]);
       expect(inspector.query(
         "SELECT type,tbl_name,sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'",
       ).get()).toEqual(timestampGuardBefore);
       expect(inspector.query("SELECT * FROM sessions WHERE id=?").get(session.id))
-        .toEqual(sessionBefore);
+        .toEqual(withCanonicalSessionKey(sessionBefore));
       const workGuard = z.object({ sql: z.string() }).parse(inspector.query(
         "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='work_devin_preset_contract_guard'",
       ).get()).sql;
@@ -19912,7 +19990,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:42:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:42:50");
     const migrated = new StateStore(paths, { now: () => 4_300 });
     stores.push(migrated);
     expect(migrated.hasSessionUserMessageSource(session.id, "mutation", appliedMutationKey)).toBe(false);
@@ -19942,9 +20020,9 @@ describe("StateStore", () => {
       .toEqual([]);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query("SELECT version FROM migrations WHERE version>=40 ORDER BY version").all())
-        .toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }, { version: 45 }, { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }]);
+        .toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }, { version: 45 }, { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }, { version: 50 }]);
       expect(inspector.query(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='session_user_message_finalizations'",
       ).get()).toBeNull();
@@ -20012,21 +20090,21 @@ describe("StateStore", () => {
         "SELECT id,message,state,transcript_status,transcript_intent_json,transcript_finalized FROM queue_entries WHERE id=?",
       ).get(queued.id);
       expect(() => new StateStore(paths, { readonly: true }))
-        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:44:49");
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:44:50");
       const upgraded = new StateStore(paths, { now: () => 4_500 });
       stores.push(upgraded);
-      expect(predecessor.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(predecessor.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(predecessor.query("SELECT * FROM migrations WHERE version<=44 ORDER BY version").all())
         .toEqual(ledgerBefore);
       expect(predecessor.query("SELECT * FROM migrations WHERE version>44 ORDER BY version").all())
-        .toEqual([{ version: 45, applied_at: 4_500 }, { version: 46, applied_at: 4_500 }, { version: 47, applied_at: 4_500 }, { version: 48, applied_at: 4_500 }, { version: 49, applied_at: 4_500 }]);
+        .toEqual([{ version: 45, applied_at: 4_500 }, { version: 46, applied_at: 4_500 }, { version: 47, applied_at: 4_500 }, { version: 48, applied_at: 4_500 }, { version: 49, applied_at: 4_500 }, { version: 50, applied_at: 4_500 }]);
       const schemaAfter = predecessor.query(
         "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name!='queue_entries' ORDER BY type,name",
       ).all();
-      for (const row of z.array(z.unknown()).parse(schemaBefore)) {
-        expect(schemaAfter).toContainEqual(row);
-      }
-      expect(predecessor.query("SELECT * FROM sessions WHERE id=?").get(session.id)).toEqual(sessionBefore);
+      expectCanonicalSchemaExtension(schemaBefore, schemaAfter);
+      const migratedSession = predecessor.prepare("SELECT * FROM sessions WHERE id=?");
+      try { expect(migratedSession.get(session.id)).toEqual(withCanonicalSessionKey(sessionBefore)); }
+      finally { migratedSession.finalize(); }
       expect(predecessor.query("SELECT * FROM profiles WHERE id=?").get(profile.id)).toEqual(profileBefore);
       expect({
         counters: predecessor.query("SELECT * FROM session_autorespond_counters ORDER BY session_id").all(),
@@ -20110,18 +20188,20 @@ describe("StateStore", () => {
         queue: predecessor.query("SELECT * FROM queue_entries WHERE id=?").get(queued.id),
       };
       expect(() => new StateStore(paths, { readonly: true }))
-        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:46:49");
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:46:50");
       const upgraded = new StateStore(paths, { now: () => 4_800 });
       stores.push(upgraded);
-      expect(predecessor.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(predecessor.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(predecessor.query("SELECT version,applied_at FROM migrations WHERE version>46 ORDER BY version").all())
-        .toEqual([{ version: 47, applied_at: 4_800 }, { version: 48, applied_at: 4_800 }, { version: 49, applied_at: 4_800 }]);
+        .toEqual([{ version: 47, applied_at: 4_800 }, { version: 48, applied_at: 4_800 }, { version: 49, applied_at: 4_800 }, { version: 50, applied_at: 4_800 }]);
       expect(predecessor.query("SELECT * FROM autorespond_after_hours_policy").all()).toEqual(before.policy);
       expect(predecessor.query("SELECT * FROM autorespond_after_hours_history ORDER BY session_id").all()).toEqual(before.history);
       expect(predecessor.query("SELECT * FROM session_autorespond_counters ORDER BY session_id").all()).toEqual(before.counters);
       expect(predecessor.query("SELECT * FROM autorespond_budget_reservations ORDER BY session_id,source_kind,source_id").all()).toEqual(before.reservations);
       expect(predecessor.query("SELECT * FROM profiles ORDER BY id").all()).toEqual(before.profiles);
-      expect(predecessor.query("SELECT * FROM sessions ORDER BY id").all()).toEqual(before.sessions);
+      const migratedSessions = predecessor.prepare("SELECT * FROM sessions ORDER BY id");
+      try { expect(migratedSessions.all()).toEqual(before.sessions.map(withCanonicalSessionKey)); }
+      finally { migratedSessions.finalize(); }
       const queueAfter = predecessor.prepare("SELECT * FROM queue_entries WHERE id=?");
       try {
         expect(queueAfter.get(queued.id)).toEqual({
@@ -20201,9 +20281,14 @@ describe("StateStore", () => {
       const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
       const queueBefore = z.record(z.string(), z.unknown()).parse(inspector.query("SELECT * FROM queue_entries WHERE id=?").get(queued.id));
       const columnsBefore = inspector.query("PRAGMA table_info(queue_entries)").all();
+      // A fresh statement observes every column across the other connection's ALTER TABLE.
+      const readSessions = () => {
+        const statement = inspector.prepare("SELECT * FROM sessions ORDER BY id");
+        try { return statement.all(); } finally { statement.finalize(); }
+      };
       const readAuthority = () => ({
         profiles: inspector.query("SELECT * FROM profiles ORDER BY id").all(),
-        sessions: inspector.query("SELECT * FROM sessions ORDER BY id").all(),
+        sessions: readSessions(),
         attempts: inspector.query("SELECT * FROM mutation_attempts ORDER BY id").all(),
         effects: inspector.query("SELECT * FROM mutation_effect_evidence ORDER BY attempt_id").all(),
         resolutions: inspector.query("SELECT * FROM mutation_resolutions ORDER BY attempt_id").all(),
@@ -20219,19 +20304,22 @@ describe("StateStore", () => {
         attempt_id: cancellation.id, profile_id: profile.id, kind: "account.login-cancel",
         from_generation: 1, to_generation: 2,
       });
-      expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:45:49");
+      expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:45:50");
       expect(readAuthority()).toEqual(authorityBefore);
       const upgraded = new StateStore(paths, { now: () => 4_700 });
       stores.push(upgraded);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query("SELECT * FROM migrations WHERE version<=45 ORDER BY version").all()).toEqual(ledgerBefore);
       expect(inspector.query("SELECT * FROM migrations WHERE version>45 ORDER BY version").all()).toEqual([
         { version: 46, applied_at: 4_700 }, { version: 47, applied_at: 4_700 },
-        { version: 48, applied_at: 4_700 }, { version: 49, applied_at: 4_700 },
+        { version: 48, applied_at: 4_700 }, { version: 49, applied_at: 4_700 }, { version: 50, applied_at: 4_700 },
       ]);
       const schemaAfter = inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name!='queue_entries' ORDER BY type,name").all();
-      for (const row of schemaBefore) expect(schemaAfter).toContainEqual(row);
-      expect(readAuthority()).toEqual(authorityBefore);
+      expectCanonicalSchemaExtension(schemaBefore, schemaAfter);
+      const expectedAuthorityAfter = {
+        ...authorityBefore, sessions: authorityBefore.sessions.map(withCanonicalSessionKey),
+      };
+      expect(readAuthority()).toEqual(expectedAuthorityAfter);
       // Bun caches SELECT * column metadata with query(). Prepare after the
       // other connection's ALTER TABLE so this checks the whole migrated row.
       const queueAfter = inspector.prepare("SELECT * FROM queue_entries WHERE id=?");
@@ -20256,10 +20344,10 @@ describe("StateStore", () => {
         const reopened = new StateStore(paths, { readonly, now: () => 5_000 });
         stores.push(reopened);
         expect(reopened.isAccountMutationAuthorityCurrent(exactOrigin)).toBe(true);
-        expect(readAuthority()).toEqual(authorityBefore);
+        expect(readAuthority()).toEqual(expectedAuthorityAfter);
         expect(inspector.query("SELECT * FROM migrations WHERE version>45 ORDER BY version").all()).toEqual([
           { version: 46, applied_at: 4_700 }, { version: 47, applied_at: 4_700 },
-          { version: 48, applied_at: 4_700 }, { version: 49, applied_at: 4_700 },
+          { version: 48, applied_at: 4_700 }, { version: 49, applied_at: 4_700 }, { version: 50, applied_at: 4_700 },
         ]);
       }
       expect(() => inspector.query("UPDATE account_mutation_authority_rebinds SET recorded_at=5000 WHERE attempt_id=?").run(cancellation.id)).toThrow("immutable");
@@ -20505,7 +20593,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:50");
     const repaired = new StateStore(paths);
     stores.push(repaired);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
@@ -20547,7 +20635,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:50");
     const upgraded = new StateStore(paths);
     stores.push(upgraded);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
@@ -20632,7 +20720,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:50");
     const repaired = new StateStore(paths, { now: () => 4_303 });
     stores.push(repaired);
     expect(repaired.requireQueue(queued.id)).toMatchObject({ state: "cancelled" });
@@ -20733,7 +20821,7 @@ describe("StateStore", () => {
       inspector.close(false);
     }
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:42:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:42:50");
   });
 
   test("refuses a missing or weakened v43 transcript authority guard without repair", async () => {
@@ -21883,7 +21971,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT 1 FROM pragma_table_info('session_adoption_candidates') WHERE name='last_live_observed_at'",
       ).get()).toEqual({ 1: 1 });
@@ -22051,7 +22139,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_adoption_candidates");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT name FROM pragma_table_info('session_adoption_candidates') WHERE name=?",
       ).get(column)).toBeNull();
@@ -22060,7 +22148,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v49 writable open never recreates missing provider-v39 authority", async () => {
+  test("current v50 writable open never recreates missing provider-v39 authority", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -22078,7 +22166,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_mutation_authority_rebinds_v39");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT name FROM sqlite_master WHERE name='session_mutation_authority_rebinds_v39'",
       ).get()).toBeNull();
@@ -22091,7 +22179,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v49 rejects a weakened same-name provider-v39 authority trigger without repair", async () => {
+  test("current v50 rejects a weakened same-name provider-v39 authority trigger without repair", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -22117,7 +22205,7 @@ describe("StateStore", () => {
     }
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         `SELECT sql FROM sqlite_master
          WHERE type='trigger'
@@ -22130,7 +22218,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v49 writable open never backfills a missing provider-v39 column", async () => {
+  test("current v50 writable open never backfills a missing provider-v39 column", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -22143,13 +22231,31 @@ describe("StateStore", () => {
       malformed.close(false);
     }
 
+    const snapshot = () => {
+      const inspector = new Database(paths.database, { readonly: true, strict: true });
+      try {
+        const tables = z.object({ name: z.string().regex(/^[a-z0-9_]+$/u) }).strict().array().parse(
+          inspector.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all(),
+        );
+        return {
+          schema: inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
+          rows: Object.fromEntries(tables.map(({ name }) => [name, inspector.query(`SELECT * FROM ${name}`).all()])),
+          version: inspector.query("PRAGMA user_version").get(),
+        };
+      } finally { inspector.close(false); }
+    };
+    const before = snapshot();
+    // Dropping provider_v39 also removes its dependent canonical companions.
+    // The two opens encounter different exact faults; neither may repair any.
     expect(() => new StateStore(paths, { readonly: true }))
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:sessions.provider_v39");
+    expect(snapshot()).toEqual(before);
     expect(() => new StateStore(paths))
-      .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:sessions.provider_v39");
+      .toThrow("CANONICAL_PROFILE_SCHEMA_TRIGGER:canonical_profile_session_insert_guard");
+    expect(snapshot()).toEqual(before);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT name FROM pragma_table_info('sessions') WHERE name='provider_v39'",
       ).get()).toBeNull();
@@ -22207,7 +22313,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_claude_process_authorities_live_identity");
     const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT sql FROM sqlite_master WHERE name='session_adoption_candidate_revision_guard'",
       ).get()).toEqual(expect.objectContaining({ sql: expect.stringContaining("SELECT 1") }));
@@ -22260,7 +22366,7 @@ describe("StateStore", () => {
         .toContainEqual(expect.objectContaining({ name: "preset_contract", notnull: 1 }));
       expect(inspector.query("SELECT preset_contract FROM sessions WHERE id=?").get(session.id))
         .toEqual({ preset_contract: legacyPresetContract });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query("SELECT version FROM migrations WHERE version=38").get())
         .toEqual({ version: 38 });
     } finally {
@@ -22358,7 +22464,7 @@ describe("StateStore", () => {
     mainV35.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:50");
     const migrated = new StateStore(paths, {
       now: () => 8_000,
       resolveMachineTimeZone: () => "UTC",
@@ -22372,7 +22478,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT provider_thread_id,recorded_at FROM session_provider_switch_targets WHERE attempt_id=?",
       ).get(attempt.id)).toEqual({
@@ -22380,7 +22486,7 @@ describe("StateStore", () => {
         recorded_at: 7_350,
       });
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 35 AND 49 ORDER BY version",
+        "SELECT version FROM migrations WHERE version BETWEEN 35 AND 50 ORDER BY version",
       ).all()).toEqual([
         { version: 35 },
         { version: 36 },
@@ -22393,7 +22499,7 @@ describe("StateStore", () => {
         { version: 43 },
         { version: 44 },
         { version: 45 },
-        { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 },
+        { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }, { version: 50 },
       ]);
     } finally {
       inspector.close(false);
@@ -22425,7 +22531,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:50");
     const migrated = new StateStore(paths, {
       now: () => 9_000,
       resolveMachineTimeZone: () => {
@@ -22447,7 +22553,7 @@ describe("StateStore", () => {
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
     } finally {
       inspector.close(false);
     }
@@ -22472,7 +22578,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:50");
 
     expect(() => new StateStore(paths))
       .toThrow("ATTENTION_EMAIL_POLICY_MIGRATION_OPT_IN_REFUSED");
@@ -22520,7 +22626,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:50");
     const migrated = new StateStore(paths, {
       now: () => 12_000,
       resolveMachineTimeZone: () => {
@@ -22548,7 +22654,7 @@ describe("StateStore", () => {
          FROM notification_hours h JOIN attention_email_policy e ON h.singleton=e.singleton`,
       ).get()).toEqual(before);
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
     } finally {
       inspector.close(false);
     }
@@ -22687,7 +22793,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:50");
     const unchanged = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
@@ -22745,7 +22851,7 @@ describe("StateStore", () => {
     const schemaInspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(schemaInspector)).toBe(21);
-      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
     } finally {
       schemaInspector.close(false);
     }
@@ -22934,7 +23040,7 @@ describe("StateStore", () => {
       .toBe(Number.MAX_SAFE_INTEGER);
   });
 
-  test("refuses missing and noncanonical notification-hours authority", async () => {
+  test("refuses missing and noncanonical notification-hours authority: missing singleton", async () => {
     const missingFixture = await fixture();
     const missingPaths = missingFixture.store.paths;
     missingFixture.store.close();
@@ -22953,7 +23059,9 @@ describe("StateStore", () => {
     expect(() => new StateStore(missingPaths, {
       resolveMachineTimeZone: () => "UTC",
     })).toThrow("NOTIFICATION_HOURS_POLICY_MISSING");
+  });
 
+  test("refuses missing and noncanonical notification-hours authority: noncanonical time zone", async () => {
     const corruptFixture = await fixture();
     const corruptPaths = corruptFixture.store.paths;
     corruptFixture.store.close();
@@ -22979,7 +23087,9 @@ describe("StateStore", () => {
     expect(() => new StateStore(corruptPaths, {
       resolveMachineTimeZone: () => "UTC",
     })).toThrow("NOTIFICATION_HOURS_POLICY_INVALID");
+  });
 
+  test("refuses missing and noncanonical notification-hours authority: weakened update guard", async () => {
     const weakenedFixture = await fixture();
     const weakenedPaths = weakenedFixture.store.paths;
     weakenedFixture.store.close();
@@ -22998,7 +23108,9 @@ describe("StateStore", () => {
     expect(() => new StateStore(weakenedPaths, {
       resolveMachineTimeZone: () => "UTC",
     })).toThrow("STATE_SCHEMA_V36_NOTIFICATION_HOURS_STRUCTURE_INVALID");
+  });
 
+  test("refuses missing and noncanonical notification-hours authority: weakened insert guard", async () => {
     const weakenedInsertFixture = await fixture();
     const weakenedInsertPaths = weakenedInsertFixture.store.paths;
     weakenedInsertFixture.store.close();
@@ -23093,13 +23205,13 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query("PRAGMA table_info(sessions)").all())
         .toContainEqual(expect.objectContaining({ name: "provider", dflt_value: "'codex'" }));
       expect(inspector.query("PRAGMA table_info(autorespond_evidence)").all())
         .toContainEqual(expect.objectContaining({ name: "path" }));
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 49 ORDER BY version",
+        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 50 ORDER BY version",
       ).all()).toEqual([
         { version: 30 },
         { version: 31 },
@@ -23117,14 +23229,14 @@ describe("StateStore", () => {
         { version: 43 },
         { version: 44 },
         { version: 45 },
-        { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 },
+        { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }, { version: 50 },
       ]);
     } finally {
       inspector.close(false);
     }
   });
 
-  test("current v49 opens reject a missing v35 authority object without repairing it", async () => {
+  test("current v50 opens reject a missing v35 authority object without repairing it", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -23145,13 +23257,13 @@ describe("StateStore", () => {
       expect(unchanged.query(
         "SELECT name FROM sqlite_master WHERE name='session_provider_switch_targets_immutable_delete'",
       ).get()).toBeNull();
-      expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
     } finally {
       unchanged.close(false);
     }
   });
 
-  test("current v49 writable open refuses a missing additive v35 table", async () => {
+  test("current v50 writable open refuses a missing additive v35 table", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -23409,7 +23521,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -23523,7 +23635,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -23645,7 +23757,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -23703,7 +23815,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -23793,7 +23905,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -23900,7 +24012,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -23992,7 +24104,7 @@ describe("StateStore", () => {
     expect(reopened.listAutorespondEvidence({ sessionId: session.id })).toEqual([expectedEvidence]);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query("SELECT id,path,rule,model FROM autorespond_evidence").get()).toEqual({
         id: 7,
         path: "protocol",
@@ -24102,7 +24214,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -24149,7 +24261,7 @@ describe("StateStore", () => {
         { version: 43, applied_at: 2000 },
         { version: 44, applied_at: 2000 },
         { version: 45, applied_at: 2000 },
-        { version: 46, applied_at: 2000 }, { version: 47, applied_at: 2000 }, { version: 48, applied_at: 2000 }, { version: 49, applied_at: 2000 },
+        { version: 46, applied_at: 2000 }, { version: 47, applied_at: 2000 }, { version: 48, applied_at: 2000 }, { version: 49, applied_at: 2000 }, { version: 50, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
       expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
@@ -24197,7 +24309,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -25120,7 +25232,7 @@ describe("StateStore", () => {
     }
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:50");
     const migrated = new StateStore(paths, { now: () => 5_050 });
     stores.push(migrated);
     expect(migrated.requireSession(session.id)).toMatchObject({
@@ -25129,7 +25241,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT version,applied_at FROM migrations WHERE version>=41 ORDER BY version",
       ).all()).toEqual([
@@ -25138,7 +25250,7 @@ describe("StateStore", () => {
         { applied_at: 5_050, version: 43 },
         { applied_at: 5_050, version: 44 },
         { applied_at: 5_050, version: 45 },
-        { applied_at: 5_050, version: 46 }, { applied_at: 5_050, version: 47 }, { applied_at: 5_050, version: 48 }, { applied_at: 5_050, version: 49 },
+        { applied_at: 5_050, version: 46 }, { applied_at: 5_050, version: 47 }, { applied_at: 5_050, version: 48 }, { applied_at: 5_050, version: 49 }, { applied_at: 5_050, version: 50 },
       ]);
     } finally {
       inspector.close(false);
@@ -25171,7 +25283,7 @@ describe("StateStore", () => {
 
     for (const readonly of [true, false]) {
       expect(() => new StateStore(paths, readonly ? { readonly: true } : {}))
-        .toThrow(readonly ? "STATE_SCHEMA_MIGRATION_REQUIRED:41:49" : "STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID");
+        .toThrow(readonly ? "STATE_SCHEMA_MIGRATION_REQUIRED:41:50" : "STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID");
     }
     const unchanged = new Database(paths.database, { create: false, readonly: true, strict: true });
     try {
@@ -26040,7 +26152,7 @@ describe("StateStore", () => {
     const retired = create(firstProject.id, "Hidden retired provider history");
     const retire = new Database(store.paths.database, { create: false, strict: true });
     try {
-      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=? WHERE id=?")
+      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?")
         .run(devinPresetContract, retired.id);
     } finally {
       retire.close(false);
@@ -26111,7 +26223,7 @@ describe("StateStore", () => {
     })).toThrow();
     const retireActor = new Database(store.paths.database, { create: false, strict: true });
     try {
-      retireActor.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=? WHERE id=?")
+      retireActor.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?")
         .run(devinPresetContract, actor.id);
     } finally {
       retireActor.close(false);
@@ -26186,7 +26298,7 @@ describe("StateStore", () => {
 
     const retire = new Database(store.paths.database, { create: false, strict: true });
     try {
-      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=? WHERE id=?")
+      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?")
         .run(devinPresetContract, target.id);
     } finally {
       retire.close(false);
@@ -29053,7 +29165,7 @@ describe("StateStore", () => {
     dropPeerAndHostedMemorySchema(legacy);
     legacy.close(false);
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:49");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:50");
     const migrated = new StateStore(paths, { now: () => 9_000 });
     stores.push(migrated);
     expect(migrated.requireQueue(queue.id)).toMatchObject({
@@ -29068,7 +29180,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=40").get())
         .toEqual({ applied_at: 9_000 });
       expect(inspector.query(
@@ -29079,14 +29191,14 @@ describe("StateStore", () => {
         { applied_at: 9_000, version: 43 },
         { applied_at: 9_000, version: 44 },
         { applied_at: 9_000, version: 45 },
-        { applied_at: 9_000, version: 46 }, { applied_at: 9_000, version: 47 }, { applied_at: 9_000, version: 48 }, { applied_at: 9_000, version: 49 },
+        { applied_at: 9_000, version: 46 }, { applied_at: 9_000, version: 47 }, { applied_at: 9_000, version: 48 }, { applied_at: 9_000, version: 49 }, { applied_at: 9_000, version: 50 },
       ]);
     } finally {
       inspector.close(false);
     }
   });
 
-  test("current v49 refuses missing or changed hosted-memory triggers without repair", async () => {
+  test("current v50 refuses missing or changed hosted-memory triggers without repair", async () => {
     for (const damage of ["missing", "changed"] as const) {
       const { store } = await fixture();
       const paths = store.paths;
@@ -29123,14 +29235,14 @@ describe("StateStore", () => {
         ).all()).toEqual(schemaBefore);
         expect(unchanged.query("SELECT * FROM migrations ORDER BY version").all())
           .toEqual(ledgerBefore);
-        expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+        expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       } finally {
         unchanged.close(false);
       }
     }
   });
 
-  test("current v49 opens require the exact peer and local-memory guards", async () => {
+  test("current v50 opens require the exact peer and local-memory guards", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -29157,7 +29269,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("current v49 rejects widened peer queue columns and non-peer actor vocabulary without writes", async () => {
+  test("current v50 rejects widened peer queue columns and non-peer actor vocabulary without writes", async () => {
     for (const damage of ["widened_column", "invalid_row"] as const) {
       const { store } = await fixture();
       const profile = signInProfile(store, "Queue provenance column", "queue-column@example.com");
@@ -29215,14 +29327,14 @@ describe("StateStore", () => {
         }
         expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all()).toEqual(schemaBefore);
         expect(inspector.query("SELECT * FROM queue_entries WHERE id=?").get(queued.id)).toEqual(queueBefore);
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       } finally {
         inspector.close(false);
       }
     }
   });
 
-  test("current v49 opens never recreate a missing peer authority trigger or index", async () => {
+  test("current v50 opens never recreate a missing peer authority trigger or index", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -29272,9 +29384,9 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 50");
+    newer.exec("PRAGMA user_version = 51");
     newer.close(false);
     await chmod(paths.database, 0o600);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:50:49");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:51:50");
   });
 });

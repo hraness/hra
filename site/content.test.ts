@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { parseHTML } from "linkedom";
 
 import {
   HRANESS_HOME_URL,
@@ -43,15 +44,40 @@ const htmlVisibleText = (value: string): string => value
   .replaceAll(/<[^>]+>/gu, "")
   .replaceAll("&quot;", '"')
   .replaceAll("&#39;", "'")
+  .replaceAll("&#x27;", "'")
   .replaceAll("&lt;", "<")
   .replaceAll("&gt;", ">")
   .replaceAll("&amp;", "&");
+
+function oneElement(html: string, selector: string) {
+  const elements = parseHTML(html).document.querySelectorAll(selector);
+  expect(elements).toHaveLength(1);
+  const element = elements[0];
+  if (element === undefined) throw new Error(`Missing semantic element: ${selector}`);
+  return element;
+}
+
+function expectCompiledClasses(element: Element): void {
+  expect([...element.classList].some((name) => /^x[a-z0-9]+$/u.test(name))).toBe(true);
+  expect(element.hasAttribute("style")).toBe(false);
+}
+
+function elementPosition(html: string, selector: string): number {
+  const { document } = parseHTML(html);
+  const matches = document.querySelectorAll(selector);
+  expect(matches).toHaveLength(1);
+  const element = matches[0];
+  if (element === undefined) throw new Error(`Missing ordered element: ${selector}`);
+  const index = [...document.querySelectorAll("*")].indexOf(element);
+  expect(index).toBeGreaterThanOrEqual(0);
+  return index;
+}
 
 describe("public content contract", () => {
   test("keeps after-hours consent, legacy reset, and prose limits explicit", () => {
     const readme = renderReadmeMarkdown();
     expect(readme).toContain("After-hours protocol budgets were admitted in v0.6.3.");
-    expect(readme).toContain("The v0.7.0 candidate retains this policy without enabling it.");
+    expect(readme).toContain("The v0.7.0 release retains this policy without enabling it.");
     expect(readme).toContain("They use a separate local opt-in, disabled on new and upgraded installations.");
     expect(readme).toContain("After the applicable artifact admission and daemon rollout gates are satisfied");
     expect(readme).toContain("hra autorespond-after-hours enable --revision <revision>");
@@ -163,14 +189,18 @@ describe("public content contract", () => {
       maintainer: { "@type": "Organization", name: "Hraness", url: "https://hraness.com/" },
     });
     expect(structured).not.toHaveProperty("softwareVersion");
-    expect(publicContent.description).toContain("v0.7.0 is a release candidate");
-    expect(publicContent.description).toContain("v0.6.3 is the admitted artifact");
+    expect(publicContent.description).toContain("v0.7.0 is the admitted artifact");
+    expect(publicContent.description).not.toContain("release candidate");
     expect(publicContent.description).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
-    expect(html).toContain(`<p class="hraness-marketing-hero__eyebrow">${publicContent.tagline}</p>`);
-    expect(renderPreviewHtml()).toContain(`<p class="preview-eyebrow">${publicContent.tagline}</p>`);
+    const eyebrow = oneElement(html, "p.hraness-marketing-hero__eyebrow");
+    expect(eyebrow.textContent).toBe(publicContent.tagline);
+    expectCompiledClasses(eyebrow);
+    const previewEyebrow = oneElement(renderPreviewHtml(), "p.preview-eyebrow");
+    expect(previewEyebrow.textContent).toBe(publicContent.tagline);
+    expectCompiledClasses(previewEyebrow);
     expect(publicContent.socialCard).toEqual({
-      alt: "HRA · v0.7.0 release candidate · v0.6.3 admitted · daemon rollout blocked on capacity · hra.sh",
+      alt: "HRA · v0.7.0 artifacts admitted · daemon rollout blocked on capacity · hra.sh",
       height: 630,
       path: "/social-card.png",
       width: 1200,
@@ -246,7 +276,13 @@ describe("public content contract", () => {
     const html = renderSiteHtml();
 
     expect(markdown).toContain(`${nameSentence}[hraness.com](https://hraness.com/) explains the parent brand. ${maintainerSentence}`);
-    expect(html).toContain(`${nameSentence}<a href="https://hraness.com/">hraness.com</a> explains the parent brand. ${maintainerSentence}`);
+    const maintainerParagraphs = [...parseHTML(html).document.querySelectorAll("p")]
+      .filter((paragraph) => paragraph.textContent.startsWith(nameSentence));
+    expect(maintainerParagraphs).toHaveLength(1);
+    const maintainerHtml = maintainerParagraphs[0];
+    expect(maintainerHtml?.textContent).toBe(`${nameSentence}hraness.com explains the parent brand. ${maintainerSentence}`);
+    expect(maintainerHtml?.querySelectorAll('a[href="https://hraness.com/"]')).toHaveLength(1);
+    expect(maintainerHtml?.querySelector('a[href="https://hraness.com/"]')?.textContent).toBe("hraness.com");
     expect(markdown.match(/short for harness/gu)).toHaveLength(1);
     const maintainerParagraph = markdown.split("\n").find((line) => line.includes("short for harness")) ?? "";
     expect(maintainerParagraph).not.toMatch(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/u);
@@ -270,20 +306,21 @@ describe("public content contract", () => {
   test("leads the site with the outcome and keeps the README install-first", () => {
     const markdown = renderReadmeMarkdown();
     const html = renderSiteHtml();
-    const installIndex = html.indexOf('<pre class="install-command"');
-    const doctorIndex = html.indexOf('<pre class="doctor-command"');
-    const initIndex = html.indexOf('<pre class="init-command"');
+    const installIndex = elementPosition(html, "pre.install-command");
+    const doctorIndex = elementPosition(html, "pre.doctor-command");
+    const initIndex = elementPosition(html, "pre.init-command");
 
     expect(markdown).toStartWith(`# ${publicContent.productName}\n`);
     expect(markdown.indexOf("```sh")).toBeLessThan(markdown.indexOf(`## ${publicContent.hero.heading}`));
-    expect(html.indexOf(`>${publicContent.hero.heading}</h1>`)).toBeLessThan(
+    expect(oneElement(html, "h1").textContent).toBe(publicContent.hero.heading);
+    expect(elementPosition(html, "h1")).toBeLessThan(
       installIndex,
     );
-    expect(html).toContain('class="hraness-marketing-hero"');
+    expectCompiledClasses(oneElement(html, ".hraness-marketing-hero"));
     expect(html).toContain('data-hraness-marketing="flow"');
     expect(html).toContain('data-hraness-marketing="facts"');
     expect(html).toContain('data-hraness-marketing="install"');
-    expect(html.indexOf(htmlText(publicContent.hero.steps[0]!.command))).toBeLessThan(
+    expect(elementPosition(html, ".hraness-marketing-flow__step:first-child .hraness-marketing-flow__code")).toBeLessThan(
       installIndex,
     );
     expect(installIndex).toBeGreaterThan(0);
@@ -309,50 +346,63 @@ describe("public content contract", () => {
 
   test("highlights documentation commands without touching classified hero code", () => {
     const html = renderSiteHtml();
-    expect(html).toContain('<code class="hra-inline-code">v0.7.0</code>');
-    expect(html).toContain('<pre class="command-list" tabindex="0"><code class="syntax-code language-shell">');
-    expect(html).toContain('<pre class="install-command" tabindex="0"><code class="syntax-code language-shell">');
-    expect(html).toContain('class="syntax-token syntax-token--command"');
-    expect(html).toContain(
-      `<code class="hraness-marketing-flow__code">${htmlText(publicContent.hero.steps[0]!.command)}</code>`,
-    );
-    expect(html).not.toContain('<code class="hraness-marketing-flow__code"><span');
-    expect(html).not.toMatch(/<code>(?:.|\n)*?<\/code>/u);
+    const { document } = parseHTML(html);
+    const versionCodes = [...document.querySelectorAll("code.hra-inline-code")].filter((code) => code.textContent === "v0.7.0");
+    expect(versionCodes.length).toBeGreaterThan(0);
+    for (const code of versionCodes) expectCompiledClasses(code);
+    const commands = document.querySelectorAll("pre.command-list");
+    expect(commands.length).toBeGreaterThan(0);
+    for (const command of [...commands, oneElement(html, "pre.install-command")]) {
+      expect(command.getAttribute("tabindex")).toBe("0");
+      expectCompiledClasses(command);
+      const code = command.querySelectorAll(":scope > code.syntax-code.language-shell");
+      expect(code).toHaveLength(1);
+      expectCompiledClasses(code[0]!);
+    }
+    expect(document.querySelectorAll(".syntax-token.syntax-token--command").length).toBeGreaterThan(0);
+    const flowCodes = [...document.querySelectorAll("code.hraness-marketing-flow__code")];
+    expect(flowCodes.map((code) => code.textContent)).toEqual(publicContent.hero.steps.map((step) => step.command));
+    for (const code of flowCodes) {
+      expectCompiledClasses(code);
+      expect(code.children).toHaveLength(0);
+    }
+    expect(document.querySelectorAll("code:not([class])")).toHaveLength(0);
   });
 
-  test("keeps the local candidate pre-live without erasing the admitted release or blocked rollout", () => {
-    expect(publicReleaseState).toBe("release-ready");
+  test("admits the exact local release without clearing blocked operational rollout", () => {
+    expect(publicReleaseState).toBe("live");
     expect(publicContent.endpoints).toEqual({
-      betaTag: "release-ready",
+      betaTag: "live",
       githubRepository: "live",
       hostedSync: "live",
       website: "live",
     });
-    expect(renderReadmeMarkdown()).toContain("Local CLI v0.7.0 is a release candidate");
-    expect(renderReadmeMarkdown()).toContain("v0.6.3 is the fully admitted public artifact");
+    expect(renderReadmeMarkdown()).toContain("Local CLI v0.7.0 is the fully admitted public artifact");
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
-      expect(surface).toContain("Local v0.7.0 candidate; v0.6.3 artifacts admitted; hosted sync live as an open beta");
+      expect(surface).toContain("Local v0.7.0 artifacts admitted; hosted sync live as an open beta");
       expect(surface).not.toContain("The last admitted release is v0.6.1.");
-      expect(surface).toContain("https://github.com/hraness/hra/releases/tag/v0.6.3");
-      expect(surface).toContain("only after immutable GitHub and npm release admission");
+      expect(surface).toContain("https://github.com/hraness/hra/releases/tag/v0.7.0");
+      expect(surface).toContain("https://github.com/hraness/hra/actions/runs/34278486095");
       expect(surface).toContain("passed immutable GitHub and npm release admission");
       expect(surface).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
-      expect(surface).not.toContain("v0.7.0 artifacts are live");
+      expect(surface).not.toContain("v0.7.0 candidate");
+      expect(surface).not.toContain("v0.7.0 is a release candidate");
+      expect(surface).not.toContain("This release candidate is not yet admitted");
       expect(surface).not.toContain("beta-not-yet-live");
       expect(surface).toContain("Local release boundary");
-      expect(surface).toContain("Its install command becomes usable only after");
+      expect(surface).toContain("admitted local CLI release");
       expect(surface).not.toContain("Beta not yet live");
       expect(surface).not.toContain("No published `v0.7.0` tag currently exposes these commands");
     }
-    expect(renderLlmsText()).toContain("Only after immutable GitHub and npm release admission, install v0.7.0");
-    expect(renderLlmsText()).not.toContain("Install the live v0.7.0 local CLI artifact");
+    expect(renderLlmsText()).toContain("Install the admitted v0.7.0 local CLI artifact");
+    expect(renderLlmsText()).not.toContain("Only after immutable GitHub and npm release admission");
     expect(renderLlmsText()).toContain(publicContent.daemonRolloutNotice);
     const html = renderSiteHtml();
-    expect(html).toContain("Install after release admission.");
-    expect(html.indexOf("Install after release admission.")).toBeLessThan(html.indexOf('class="install-command"'));
+    expect(oneElement(html, "#install-command-heading").textContent).toBe("Install the admitted release.");
+    expect(elementPosition(html, "#install-command-heading")).toBeLessThan(elementPosition(html, "pre.install-command"));
     expect(html).toContain("Initialization remains blocked by the rollout prerequisite");
-    expect(html.indexOf("Initialization remains blocked by the rollout prerequisite"))
-      .toBeLessThan(html.indexOf('class="install-command"'));
+    expect(elementPosition(html, ".install-note"))
+      .toBeLessThan(elementPosition(html, "pre.install-command"));
   });
 
   test("places the blocked rollout prerequisite before every prominent initialization and first-session flow", () => {
@@ -779,7 +829,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra daemon stop");
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
-      expect(surface).toContain("Only after v0.7.0 completes immutable GitHub and npm release admission");
+      expect(surface).toContain("Install the admitted v0.7.0 release, then verify the installed version and offline health");
       expect(surface).not.toContain("bun remove --global hra");
       expect(surface).not.toContain("uninstall the package");
     }
@@ -797,7 +847,10 @@ describe("public content contract", () => {
     expect(procedure?.kind).toBe("ordered-list");
     if (procedure?.kind !== "ordered-list") throw new Error("Missing update procedure.");
     expect(procedure.items).toHaveLength(10);
-    expect(rawHtml).toContain('<ol class="procedure-list"><li><p>Settle any durable installer intent');
+    const procedureList = oneElement(rawHtml, "#install-and-update ol.procedure-list");
+    expectCompiledClasses(procedureList);
+    expect(procedureList.querySelectorAll(":scope > li")).toHaveLength(10);
+    expect(procedureList.querySelector(":scope > li:first-child > p")?.textContent).toStartWith("Settle any durable installer intent");
 
     const claims = [
       "Update runbook",
@@ -810,9 +863,12 @@ describe("public content contract", () => {
       "$BUN_INSTALL/install/hra/install-intent.json",
       "Do not edit or delete that file or its staging or version directories",
       "the exact immutable install command from the originating release's trusted README or release notes",
-      "If that installer refuses the intent, stop for manual review",
+      "If that installer refuses the intent, stop installation and use bounded read-only diagnosis while preserving the intent and its directories",
+      "after exact recovery succeeds, restart this runbook with the current release",
       "Establish the originating tag independently",
       "never execute a URL or command copied only from the intent",
+      "An uncertain tag blocks execution, not diagnosis",
+      "Ask the owner only when the evidence cannot resolve a required decision or authority is missing",
       "This recovers only local installer state",
       "It is not authorization to retry, rerun, or mutate that release's GitHub Actions workflow",
       "replay the exact idempotency key using the originating release's own syntax and source evidence",
@@ -867,6 +923,10 @@ describe("public content contract", () => {
       expect(html).toContain(claim);
     }
 
+    for (const surface of [markdown, html]) {
+      expect(surface).not.toContain("If that installer refuses the intent, stop for manual review");
+    }
+
     expect(markdown).toContain([
       "6. Stop the daemon and prove that it released authority:",
       "",
@@ -904,7 +964,7 @@ describe("public content contract", () => {
       runbookStart,
       rawHtml.indexOf("Optional full local-data removal"),
     );
-    expect(runbookHtml.match(/<li>/gu)).toHaveLength(10);
+    expect(parseHTML(runbookHtml).document.querySelectorAll("li")).toHaveLength(10);
     expect(htmlVisibleText(runbookHtml)).toMatch(/Stop the daemon[\s\S]+?hra daemon stop --json[\s\S]+?Status alone does not prove authority release/u);
     expect(markdown).not.toContain("Before replacing the installed binary");
   });
@@ -1155,7 +1215,10 @@ describe("public content contract", () => {
     }
     for (const [status, meaning] of statuses) {
       expect(markdown).toContain(`- \`${status}\`: ${meaning}`);
-      expect(html).toContain(`<code class="hra-inline-code">${status}</code>: ${htmlText(meaning)}`);
+      const codes = [...parseHTML(html).document.querySelectorAll("li > code.hra-inline-code")]
+        .filter((code) => code.textContent === status && code.parentElement?.textContent === `${status}: ${meaning}`);
+      expect(codes).toHaveLength(1);
+      expectCompiledClasses(codes[0]!);
     }
   });
 
@@ -1206,8 +1269,8 @@ describe("public content contract", () => {
         [...(footer?.matchAll(/<a\b[^>]*\shref="([^"]+)"/gu) ?? [])]
           .map((match) => match[1]),
       ).toEqual(expectedHrefs);
-      expect(document.indexOf('class="project-resources"')).toBeLessThan(
-        document.indexOf('data-slot="hraness-site-footer"'),
+      expect(elementPosition(document, "aside.project-resources")).toBeLessThan(
+        elementPosition(document, 'footer[data-slot="hraness-site-footer"]'),
       );
     }
   });
@@ -1269,10 +1332,12 @@ describe("public content contract", () => {
 
   test("renders an inert noindex preview canonicalized to the full product page", () => {
     const preview = renderPreviewHtml();
-    expect(preview).toContain('<body class="preview-page">');
+    expectCompiledClasses(oneElement(preview, "body.preview-page"));
     expect(preview).toContain('<meta name="robots" content="noindex, nofollow">');
     expect(preview).toContain('<link rel="canonical" href="https://hra.sh/">');
-    expect(preview).toContain(`<h1 id="preview-title">${publicContent.productName}</h1>`);
+    const title = oneElement(preview, "h1#preview-title");
+    expect(title.textContent).toBe(publicContent.productName);
+    expectCompiledClasses(title);
     expect(preview.match(/<h1\b/gu)).toHaveLength(1);
     expect(preview).not.toContain("<script");
     expect(preview).not.toMatch(/analytics|auth(?:entication|orization)?|cookie|user data/iu);
@@ -1284,7 +1349,9 @@ describe("public content contract", () => {
   test("provides keyboard and landmark structure without inline presentation", () => {
     const html = renderSiteHtml();
     expect(html.match(/<h1\b/g)).toHaveLength(1);
-    expect(html).toContain('<a class="skip-link" href="#content">Skip to content</a>');
+    const skipLink = oneElement(html, 'a.skip-link[href="#content"]');
+    expect(skipLink.textContent).toBe("Skip to content");
+    expectCompiledClasses(skipLink);
     expect(html).toContain('<main id="content">');
     expect(html).toContain('aria-label="Documentation"');
     expect(html).not.toContain("<style>");

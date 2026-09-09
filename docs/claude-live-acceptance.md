@@ -1,10 +1,10 @@
 # Claude live acceptance
 
-The repository-only Claude gate proves one fresh managed HRA session can use working memory through the pinned Claude MCP bridge. It is separate from the [two-device Codex and hosted-memory gate](live-acceptance.md). Neither gate substitutes for the other, and deterministic tests do not substitute for an authenticated live run.
+The optional repository-only Claude qualification proves one fresh managed HRA session can use working memory through the pinned Claude MCP bridge. It is not a prerequisite for tagging or publishing HRA artifacts under the [machine-gated release policy](beta-release.md). It is separate from the [two-device Codex and hosted-memory qualification](live-acceptance.md). Neither proof substitutes for the other, and deterministic tests do not substitute for an authenticated live run.
 
 ## Before running
 
-Use an authorized Linux host with HRA's supported native process-authority backend, Bun 1.3.14, and exact Claude Code 2.1.260. The invoking standard input, output, and error must be real terminals. Use a clean checkout of the candidate being admitted.
+Use an authorized Linux host with HRA's supported native process-authority backend, Bun 1.3.14, and exact Claude Code 2.1.260. The invoking standard input, output, and error must be real terminals. Use a clean checkout of the candidate being qualified.
 
 Reserve an authorized disposable Claude login and permission for one bounded paid test turn. The gate creates a new isolated HRA profile and project; it does not adopt a personal conversation, copy a credential store, change `HOME`, rotate accounts, or delete a hosted HRA identity. Native login requires the human operator. Do not run it against credentials the operator has not authorized for this test.
 
@@ -56,4 +56,4 @@ Do not delete recovery journals, kill unrelated processes, replace the receipt, 
 
 ## Validation boundary
 
-Focused tests cover the typed capture, independent readback, process framing, private receipts, native logout state machine, and runner failure paths without using real credentials. Run process-custody checks through the repository's required host scheduler. A release still needs the fresh exact-tree aggregate and this authorized Linux proof; a local helper test or a previously passing package checkpoint does not satisfy either gate.
+Focused tests cover the typed capture, independent readback, process framing, private receipts, native logout state machine, and runner failure paths without using real credentials. Run process-custody checks through the repository's required host scheduler. Artifact release still requires the fresh exact-tree aggregate and the protected release workflow's machine-enforced checks. This authorized Linux proof remains optional qualification with unchanged provider, platform and cleanup requirements. A local helper test, successful installation or artifact admission does not establish authenticated qualification; an incomplete run must remain reported as incomplete.

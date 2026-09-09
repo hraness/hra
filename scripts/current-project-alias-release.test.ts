@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { constants, fstatSync, openSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync } from "node:fs";
 import { chmod, link, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -33,8 +33,6 @@ import {
   parseArguments,
   parseCurrentDeploymentReadback,
   parseCurrentProjectAliasReleasePlan,
-  readProtectedProviderActivityEvidence,
-  readProtectedVercelAccessToken,
   requiredAliasConfirmation,
   type CurrentAliasReadback,
   type CurrentDeploymentReadback,
@@ -58,6 +56,12 @@ import {
   readProtectedJson,
   withSelfDigest,
 } from "./release-evidence";
+import {
+  assertPrivateDescriptorFixtureProvenance,
+  parsePrivateDescriptorFixtureRequest,
+  runPrivateDescriptorFixture,
+  type PrivateDescriptorFixtureOperation,
+} from "./private-descriptor-test-fixture";
 
 const source: CurrentProjectAliasEndpoint = {
   deploymentId: "dpl_SourceCurrent1234567890123",
@@ -145,6 +149,26 @@ const withStateDirectory = async <Value>(
     await rm(directory, { force: true, recursive: true });
   }
 };
+
+function consumePrivateFixtureDescriptor(
+  descriptor: number,
+  operation: PrivateDescriptorFixtureOperation,
+  expected: Readonly<{ mode: number; nlink: 1 | 2 }>,
+) {
+  try {
+    const metadata = fstatSync(descriptor);
+    expect(metadata.mode & 0o777).toBe(expected.mode);
+    expect(metadata.nlink).toBe(expected.nlink);
+    const result = runPrivateDescriptorFixture(descriptor, operation);
+    expect(result.descriptor).toBe(3);
+    expect(result.closure).toBe("reader");
+    expect(result.effects).toBe(0);
+    return result;
+  } finally {
+    // The real reader closes the child's FD3; the parent owns its original FD.
+    closeSync(descriptor);
+  }
+}
 
 const deploymentFor = (
   endpoint: CurrentProjectAliasEndpoint,
@@ -852,6 +876,28 @@ const runDirectApiCli = async (
   );
   return { convexCalls, exitCode, stderr, stdout };
 };
+
+describe("private descriptor fixture protocol", () => {
+  const identity = { ctimeMs: 1, dev: 1, ino: 2, mode: 0o100600, mtimeMs: 1, nlink: 1, size: 16, uid: 501 };
+  const provenance = { alias: "a".repeat(64), claude: "b".repeat(64), fixture: "c".repeat(64), runtime: identity };
+  const request = { identity, operation: { kind: "provider-activity" }, provenance, version: 1 } as const;
+
+  test("accepts only the finite descriptor protocol", () => {
+    expect(parsePrivateDescriptorFixtureRequest(request)).toEqual(request);
+    expect(() => parsePrivateDescriptorFixtureRequest({ ...request, operation: { kind: "shell" } })).toThrow();
+    expect(() => parsePrivateDescriptorFixtureRequest({ ...request, path: "/foreign/credential" })).toThrow();
+    expect(() => parsePrivateDescriptorFixtureRequest({ ...request, operation: { ...request.operation, path: "/foreign/credential" } })).toThrow();
+    expect(() => parsePrivateDescriptorFixtureRequest({ ...request, provenance: { ...provenance, fixture: "invalid" } })).toThrow();
+  });
+
+  test("rejects changed source and runtime provenance", () => {
+    expect(() => assertPrivateDescriptorFixtureProvenance(provenance, provenance)).not.toThrow();
+    for (const field of ["alias", "claude", "fixture"] as const) {
+      expect(() => assertPrivateDescriptorFixtureProvenance({ ...provenance, [field]: "d".repeat(64) }, provenance)).toThrow();
+    }
+    expect(() => assertPrivateDescriptorFixtureProvenance({ ...provenance, runtime: { ...identity, ino: 3 } }, provenance)).toThrow();
+  });
+});
 
 describe("current-project alias plan", () => {
   test("parses the checked exact editorial-image release plan", async () => {
@@ -1674,9 +1720,25 @@ describe("current-project Vercel provider", () => {
         refreshToken: "must-not-be-retained",
         token: "fixture-vercel-token",
       }), { mode: 0o600 });
-      const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-      expect(readProtectedVercelAccessToken(descriptor)).toBe("fixture-vercel-token");
-      expect(() => fstatSync(descriptor)).toThrow();
+      await chmod(path, 0o600);
+      const heldDescriptors: number[] = [];
+      try {
+        // Reproduce the full-suite allocation pressure independently of test order.
+        for (let attempt = 0; attempt < 256 && (heldDescriptors.at(-1) ?? 0) <= 255; attempt += 1) {
+          heldDescriptors.push(openSync("/dev/null", constants.O_RDONLY));
+        }
+        expect(heldDescriptors.at(-1)).toBeGreaterThan(255);
+        const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        const result = consumePrivateFixtureDescriptor(descriptor, {
+          kind: "vercel-token", nowSeconds: Math.floor(Date.now() / 1_000),
+        }, { mode: 0o600, nlink: 1 });
+        expect(descriptor).toBeGreaterThan(255);
+        expect(result.outcome).toBe("accepted");
+        expect(result.sha256).toBe(createHash("sha256").update("fixture-vercel-token").digest("hex"));
+        expect(() => fstatSync(descriptor)).toThrow();
+      } finally {
+        for (const descriptor of heldDescriptors) closeSync(descriptor);
+      }
     });
   });
 
@@ -1692,19 +1754,25 @@ describe("current-project Vercel provider", () => {
       for (const [index, fixture] of cases.entries()) {
         const path = join(stateDirectory, `vercel-auth-${String(index)}.json`);
         await writeFile(path, fixture.document, { mode: fixture.mode });
+        await chmod(path, fixture.mode);
         const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-        expect(() => readProtectedVercelAccessToken(descriptor, 2))
-          .toThrow("provider_credentials_refused");
+        const result = consumePrivateFixtureDescriptor(descriptor, { kind: "vercel-token", nowSeconds: 2 }, { mode: fixture.mode, nlink: 1 });
+        expect(result.outcome).toBe("refused");
+        expect(result.sha256).toBeNull();
         expect(() => fstatSync(descriptor)).toThrow();
       }
 
       const path = join(stateDirectory, "vercel-auth-linked.json");
       const other = join(stateDirectory, "vercel-auth-linked-copy.json");
       await writeFile(path, JSON.stringify({ token: "fixture-vercel-token" }), { mode: 0o600 });
+      await chmod(path, 0o600);
       await link(path, other);
       const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-      expect(() => readProtectedVercelAccessToken(descriptor))
-        .toThrow("provider_credentials_refused");
+      const result = consumePrivateFixtureDescriptor(descriptor, {
+        kind: "vercel-token", nowSeconds: Math.floor(Date.now() / 1_000),
+      }, { mode: 0o600, nlink: 2 });
+      expect(result.outcome).toBe("refused");
+      expect(result.sha256).toBeNull();
       expect(() => fstatSync(descriptor)).toThrow();
     });
   });
@@ -1713,12 +1781,14 @@ describe("current-project Vercel provider", () => {
     await withStateDirectory(async (stateDirectory) => {
       const validPath = join(stateDirectory, "recovery-evidence.json");
       await writeFile(validPath, JSON.stringify(providerActivityEvidence), { mode: 0o600 });
+      await chmod(validPath, 0o600);
       const validDescriptor = openSync(
         validPath,
         constants.O_RDONLY | constants.O_NOFOLLOW,
       );
-      expect(readProtectedProviderActivityEvidence(validDescriptor))
-        .toEqual(providerActivityEvidence);
+      const validResult = consumePrivateFixtureDescriptor(validDescriptor, { kind: "provider-activity" }, { mode: 0o600, nlink: 1 });
+      expect(validResult.outcome).toBe("accepted");
+      expect(validResult.sha256).toBe(createHash("sha256").update(JSON.stringify(providerActivityEvidence)).digest("hex"));
       expect(() => fstatSync(validDescriptor)).toThrow();
 
       const invalidPath = join(stateDirectory, "recovery-evidence-invalid.json");
@@ -1726,12 +1796,14 @@ describe("current-project Vercel provider", () => {
         ...providerActivityEvidence,
         observedTargetMarkerVersion: HRA_RELEASE_VERSION,
       }), { mode: 0o600 });
+      await chmod(invalidPath, 0o600);
       const invalidDescriptor = openSync(
         invalidPath,
         constants.O_RDONLY | constants.O_NOFOLLOW,
       );
-      expect(() => readProtectedProviderActivityEvidence(invalidDescriptor))
-        .toThrow("recovery_evidence_invalid");
+      const invalidResult = consumePrivateFixtureDescriptor(invalidDescriptor, { kind: "provider-activity" }, { mode: 0o600, nlink: 1 });
+      expect(invalidResult.outcome).toBe("refused");
+      expect(invalidResult.sha256).toBeNull();
       expect(() => fstatSync(invalidDescriptor)).toThrow();
     });
   });

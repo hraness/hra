@@ -1,6 +1,9 @@
 import { useEffect, useRef, type ReactNode } from "react";
+import * as stylex from "@stylexjs/stylex";
+import type { StyleXStyles } from "@stylexjs/stylex";
 
-import { cn } from "../../lib/cn";
+import { staticStylexClassName } from "../../lib/cn";
+import { sheetStyles } from "./primitives.stylex";
 
 export type SheetSide = "bottom" | "right";
 
@@ -11,24 +14,18 @@ export type SheetProps = Readonly<{
   onClose: () => void;
   open: boolean;
   side?: SheetSide;
+  xstyle?: StyleXStyles;
 }>;
 
-const sideClasses: Readonly<Record<SheetSide, string>> = {
-  bottom: [
-    "mt-auto mb-0 ml-0 mr-0 w-full max-w-none rounded-b-none rounded-t-lg",
-    "pb-[calc(1rem+env(safe-area-inset-bottom))]",
-  ].join(" "),
-  right: [
-    "ml-auto mr-0 mt-0 mb-0 h-full max-h-none w-[min(28rem,100vw)] rounded-r-none rounded-l-lg",
-    "pr-[calc(1rem+env(safe-area-inset-right))]",
-  ].join(" "),
+const sideStyles: Readonly<Record<SheetSide, StyleXStyles>> = {
+  bottom: sheetStyles.bottom,
+  right: sheetStyles.right,
 };
 
 /**
  * The same native `<dialog>` contract as `Dialog`, anchored to an edge. On a
- * phone the bottom sheet clears the home indicator through the safe-area inset,
- * expressed as a Tailwind arbitrary value so it stays in the stylesheet rather
- * than becoming a style attribute.
+ * phone the bottom sheet clears the home indicator through an extracted
+ * safe-area rule rather than an inline style attribute.
  */
 export function Sheet({
   children,
@@ -37,8 +34,10 @@ export function Sheet({
   onClose,
   open,
   side = "bottom",
+  xstyle,
 }: SheetProps) {
   const reference = useRef<HTMLDialogElement>(null);
+  const presentation = stylex.props(sheetStyles.root, sideStyles[side], xstyle);
 
   useEffect(() => {
     const element = reference.current;
@@ -50,12 +49,7 @@ export function Sheet({
   return (
     <dialog
       aria-label={label}
-      className={cn(
-        "max-h-[85dvh] overflow-y-auto border border-line bg-surface-raised p-4 text-ink",
-        "backdrop:bg-black/60",
-        sideClasses[side],
-        className,
-      )}
+      className={staticStylexClassName(presentation, className)}
       onCancel={(event) => {
         event.preventDefault();
         onClose();

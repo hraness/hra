@@ -1390,12 +1390,12 @@ class TrackingClaudeAuthority extends UnavailableClaudeRuntime {
 
 const stores: StateStore[] = [];
 const serviceRoots: string[] = [];
-const guidanceFixtureTeardowns: Array<() => Promise<void>> = [];
+const ownedFixtureTeardowns: Array<() => Promise<void>> = [];
 afterEach(async () => {
-  // A timed-out guidance case can still own an admitted command. Join its
+  // A timed-out owned fixture can still have an admitted command. Join its
   // request and service before the shared fixture cleanup removes storage.
-  for (const teardown of guidanceFixtureTeardowns) await teardown();
-  guidanceFixtureTeardowns.length = 0;
+  for (const teardown of ownedFixtureTeardowns) await teardown();
+  ownedFixtureTeardowns.length = 0;
   for (const store of stores.splice(0)) store.close();
   await Promise.all(serviceRoots.splice(0).map(async (root) =>
     rm(root, { force: true, recursive: true })));
@@ -1523,16 +1523,16 @@ async function fixture(
   };
 }
 
-function guidanceFixture(): Promise<Awaited<ReturnType<typeof fixture>> & {
+function ownedServiceFixture(...args: Parameters<typeof fixture>): Promise<Awaited<ReturnType<typeof fixture>> & {
   execute: (command: LocalCommand) => Promise<unknown>;
 }> {
   const controller = new AbortController();
   const requests = new Set<Promise<unknown>>();
   // Defer setup until its teardown is registered, including timeouts during
   // filesystem initialization before the service has been constructed.
-  const setup = Promise.resolve().then(() => fixture());
-  guidanceFixtureTeardowns.push(async () => {
-    controller.abort(new Error("Guidance fixture is closing."));
+  const setup = Promise.resolve().then(() => fixture(...args));
+  ownedFixtureTeardowns.push(async () => {
+    controller.abort(new Error("Owned service fixture is closing."));
     const [result] = await Promise.allSettled([setup]);
     await Promise.allSettled([...requests]);
     if (result.status === "fulfilled") await result.value.service.close();
@@ -1560,6 +1560,17 @@ function guidanceFixture(): Promise<Awaited<ReturnType<typeof fixture>> & {
     };
   });
 }
+
+type ServiceFixtureFactory = (...args: Parameters<typeof fixture>) => Promise<
+  Awaited<ReturnType<typeof fixture>> & {
+    execute?: (command: LocalCommand) => Promise<unknown>;
+  }
+>;
+
+// These cases migrate a FULL-WAL database, create account/project authority,
+// and exercise multiple persisted Claude transitions with fake providers.
+// Allow 15 s for that outer integration work; provider deadlines stay intact.
+const claudeAuthorityFixtureTimeoutMs = 15_000;
 
 const personalAdoptionNow = 1_900_000_000_000;
 const personalCodexHome = join(privatePathRoot, "personal-codex-home");
@@ -1877,9 +1888,10 @@ async function nativeClaudeFixture(
   identity: ClaudeProcessIdentity,
   loginIdempotencyKey?: string,
   signInCodex = true,
+  createFixture: ServiceFixtureFactory = fixture,
 ) {
   const managedClaude = new FakeClaude("isolated", identity);
-  const value = await fixture(
+  const value = await createFixture(
     undefined,
     new FakeCloud(),
     () => undefined,
@@ -1888,23 +1900,24 @@ async function nativeClaudeFixture(
     {},
     { managedClaude },
   );
-  const added = await value.service.execute(
+  const execute = value.execute ?? ((command: LocalCommand) =>
+    value.service.execute(command, { signal }));
+  const added = await execute(
     { kind: "account.add", label },
-    { signal },
   ) as { account: { id: `acct_${string}` } };
   if (signInCodex) {
-    await value.service.execute({
+    await execute({
       kind: "account.login",
       account: added.account.id,
       deviceCode: false,
       ...(loginIdempotencyKey === undefined ? {} : { idempotencyKey: loginIdempotencyKey }),
-    }, { signal });
+    });
   }
-  await value.service.execute({
+  await execute({
     kind: "project.add",
     label: `${label} project`,
     path: value.documents,
-  }, { signal });
+  });
   managedClaude.projection = {
     providerThreadId,
     title: `${label} session`,
@@ -1912,13 +1925,13 @@ async function nativeClaudeFixture(
     projectRoot: value.documents,
     providerUpdatedAt: personalAdoptionNow - 1_000,
   };
-  const started = await value.service.execute({
+  const started = await execute({
     kind: "session.start",
     account: added.account.id,
     provider: "claude",
     preset: "fable-max",
     fast: false,
-  }, { signal }) as { session: { id: `sess_${string}`; providerThreadId?: string } };
+  }) as { session: { id: `sess_${string}`; providerThreadId?: string } };
   const reservedProviderThreadId = started.session.providerThreadId;
   if (reservedProviderThreadId === undefined) {
     throw new Error("Expected the native Claude session to receive a reserved provider identity.");
@@ -1926,6 +1939,7 @@ async function nativeClaudeFixture(
   return {
     ...value,
     accountId: added.account.id,
+    execute,
     identity,
     managedClaude,
     providerThreadId: reservedProviderThreadId,
@@ -2073,7 +2087,34 @@ async function claudeAccountFixture(
   };
 }
 
-// Seed the durable v39 representation, not an active retired-provider API.
+// Remove only the current canonical overlay before an explicit older fixture
+// shaper. This does not make the shaped root an authentic historical capture.
+function removeCanonicalProfileFixtureOverlay(database: Database): void {
+  const tables = ["sessions", "work_routes", "work_tasks", "work_attempts"] as const;
+  const rows = (table: typeof tables[number]) => database.query(`SELECT * FROM ${table}`).all()
+    .map((value) => {
+      const row = z.record(z.string(), z.unknown()).parse(value);
+      delete row.canonical_profile_key;
+      return row;
+    });
+  const before = tables.map((table) => rows(table));
+  database.transaction(() => {
+    database.exec(`
+      DROP TRIGGER canonical_profile_session_insert_guard;
+      DROP TRIGGER canonical_profile_session_update_guard;
+      DROP TRIGGER canonical_profile_session_live_attempt_guard;
+      DROP TRIGGER canonical_profile_work_route_insert_guard;
+      DROP TRIGGER canonical_profile_work_task_insert_guard;
+      DROP TRIGGER canonical_profile_work_attempt_insert_guard;
+      DROP TRIGGER canonical_profile_work_attempt_immutable_guard;
+    `);
+    for (const table of tables) database.exec(`ALTER TABLE ${table} DROP COLUMN canonical_profile_key`);
+  }).immediate();
+  expect(tables.map((table) => rows(table))).toEqual(before);
+}
+
+// Seed frozen v39 provenance plus its coherent current canonical mirror,
+// not an active retired-provider API or an authentic old database capture.
 function legacyDevinSession(
   value: Awaited<ReturnType<typeof fixture>>,
   profileId: Parameters<StateStore["createSession"]>[0]["profileId"],
@@ -2090,7 +2131,7 @@ function legacyDevinSession(
   try {
     legacy.query("DELETE FROM session_provider_account_authorities WHERE session_id=?").run(created.id);
     legacy.query(
-      "UPDATE sessions SET provider_v39='devin',preset_contract=? WHERE id=?",
+      "UPDATE sessions SET provider_v39='devin',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?",
     ).run(devinPresetContract, created.id);
   } finally {
     legacy.close();
@@ -2656,7 +2697,7 @@ describe("HraService personal-session adoption", () => {
     const writer = new Database(value.paths.database, { strict: true });
     try {
       expect(writer.query(
-        "UPDATE sessions SET preset_contract=? WHERE id=?",
+        "UPDATE sessions SET preset_contract=?,canonical_profile_key='codex:gpt-6-astra:ultra' WHERE id=?",
       ).run(currentPresetContract, value.session.id).changes).toBe(1);
     } finally {
       writer.close(false);
@@ -3111,7 +3152,7 @@ describe("HraService personal-session adoption", () => {
     });
     personalClaude.claimSessionError = new ClaudeProcessExitUnprovenError();
     const discovery = new FakePersonalSessionDiscovery();
-    const value = await fixture(
+    const value = await ownedServiceFixture(
       undefined,
       new FakeCloud(),
       () => undefined,
@@ -3125,20 +3166,19 @@ describe("HraService personal-session adoption", () => {
         personalDiscovery: discovery,
       },
     );
-    const added = await value.service.execute(
+    const added = await value.execute(
       { kind: "account.add", label: "Adopted Claude unproven launch" },
-      { signal },
     ) as { account: { id: `acct_${string}` } };
-    await value.service.execute({
+    await value.execute({
       kind: "account.login",
       account: added.account.id,
       deviceCode: false,
-    }, { signal });
-    await value.service.execute({
+    });
+    await value.execute({
       kind: "project.add",
       label: "Adopted Claude unproven launch project",
       path: value.documents,
-    }, { signal });
+    });
     const providerThreadId = "personal-claude-unproven-adoption";
     discovery.candidates = [{
       provider: "claude",
@@ -3149,12 +3189,12 @@ describe("HraService personal-session adoption", () => {
       liveness: "not_live",
     }];
 
-    await expect(value.service.execute({
+    await expect(value.execute({
       kind: "session.adoption.set",
       provider: "claude",
       enabled: true,
       account: added.account.id,
-    }, { signal })).resolves.toMatchObject({
+    })).resolves.toMatchObject({
       discovery: { state: "ready", adopted: 0, failed: 1 },
       providers: [{ pending: 1 }],
     });
@@ -3178,10 +3218,10 @@ describe("HraService personal-session adoption", () => {
       runtimeScope: "personal",
     })).toBeNull();
 
-    await expect(value.service.execute({
+    await expect(value.execute({
       kind: "session.adoption.discover",
       provider: "claude",
-    }, { signal })).resolves.toMatchObject({
+    })).resolves.toMatchObject({
       providers: [{ adopted: 0, pending: 1 }],
     });
     expect(personalClaude.claimRequests).toHaveLength(1);
@@ -3191,7 +3231,7 @@ describe("HraService personal-session adoption", () => {
       runtimeScope: "personal",
     })).not.toBeNull();
     await value.service.close();
-  });
+  }, claudeAuthorityFixtureTimeoutMs);
 
   for (const source of ["managed", "personal"] as const) {
     test(`resumes legacy ${source} Claude authority without adding host capabilities`, async () => {
@@ -3200,8 +3240,11 @@ describe("HraService personal-session adoption", () => {
             pid: 62_995,
             pidDomain: "darwin",
             procStart: "legacy-native-tools",
-          })
+          }, undefined, true, ownedServiceFixture)
         : await adoptedClaudeFixture("Legacy personal tools", "legacy-personal-tools");
+      const execute = "execute" in value
+        ? value.execute
+        : (command: LocalCommand) => value.service.execute(command, { signal });
       const runtime = "personalClaude" in value ? value.personalClaude : value.managedClaude;
       const activationCount = runtime.hostToolActivationRequests.length;
       const readBinding = value.store.readSessionHostCapabilityBinding.bind(value.store);
@@ -3210,17 +3253,17 @@ describe("HraService personal-session adoption", () => {
       value.store.readSessionHostCapabilityBinding = (sessionId) =>
         sessionId === value.session.id ? null : readBinding(sessionId);
       runtime.disconnectOnObserveRequest = runtime.observeRequests.length + 1;
-      await value.service.execute({
+      await execute({
         kind: "session.send",
         session: value.session.id,
         message: "Continue this existing conversation without new capabilities.",
-      }, { signal });
+      });
       expect(runtime.claimRequests.at(-1)).toMatchObject({ hostTools: "disabled" });
       expect(runtime.hostToolActivationRequests).toHaveLength(activationCount);
       expect(runtime.turnRequests.at(-1)?.message)
         .toBe("Continue this existing conversation without new capabilities.");
       expect(value.store.readSessionHostCapabilityBinding(value.session.id)).toBeNull();
-    });
+    }, source === "managed" ? claudeAuthorityFixtureTimeoutMs : 5_000);
   }
 
   test("quarantines Claude resume when the replacement child exit is unproven", async () => {
@@ -16290,6 +16333,7 @@ describe("HraService", () => {
     const legacy = new Database(value.paths.database, { create: false, strict: true });
     try {
       legacy.exec("PRAGMA foreign_keys=OFF");
+      removeCanonicalProfileFixtureOverlay(legacy);
       const adoptionTables = [
         "session_claude_process_authorities",
         "session_claude_process_launch_intents",
@@ -16423,7 +16467,7 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
       ).all()).toEqual([
@@ -16452,6 +16496,7 @@ describe("HraService", () => {
         { version: 47 },
         { version: 48 },
         { version: 49 },
+        { version: 50 },
       ]);
     } finally {
       inspector.close(false);
@@ -19365,7 +19410,7 @@ describe("HraService", () => {
     ] as const;
     for (const [index, failure] of failures.entries()) {
       test(failure.code, async () => {
-        const { execute, codex, documents, store } = await guidanceFixture();
+        const { execute, codex, documents, store } = await ownedServiceFixture();
         const added = await execute({ kind: "account.add", label: `Unavailable ${failure.code}` }) as { account: { id: string } };
         await execute({ kind: "account.login", account: added.account.id, deviceCode: false });
         await execute({ kind: "project.add", label: "Docs", path: documents });
@@ -20110,6 +20155,7 @@ describe("HraService", () => {
     // v43 advanced the profile without any account successor ledger. Build
     // that exact predecessor surface; the v45 migration must not backfill it.
     const legacy = new Database(paths.database, { strict: true });
+    removeCanonicalProfileFixtureOverlay(legacy);
     const evidenceSql = z.object({ sql: z.string() }).strict().parse(legacy.query(
       "SELECT sql FROM sqlite_master WHERE type='table' AND name='autorespond_evidence'",
     ).get()).sql;
@@ -20799,7 +20845,7 @@ describe("HraService", () => {
     const legacy = new Database(value.paths.database, { strict: true });
     try {
       legacy.query(
-        "UPDATE sessions SET provider_v39='devin',preset_contract=? WHERE id=?",
+        "UPDATE sessions SET provider_v39='devin',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?",
       ).run(devinPresetContract, session.id);
       legacy.query(
         "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,'session.start',?,?,?,'effect_started',0,0)",

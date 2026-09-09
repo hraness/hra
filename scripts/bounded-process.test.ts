@@ -61,6 +61,10 @@ const waitForFile = async (path: string, timeoutMs: number): Promise<void> => {
   }
 };
 
+const expectAbsentPath = async (path: string): Promise<void> => {
+  await expect(lstat(path)).rejects.toMatchObject({ code: "ENOENT" });
+};
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map(async (root) => {
     await rm(root, { force: true, recursive: true });
@@ -68,6 +72,70 @@ afterEach(async () => {
 });
 
 describe("bounded detached process groups", () => {
+  test("the custody absence assertion refuses an existing directory", async () => {
+    const root = await makeRoot();
+    await expect(expectAbsentPath(root)).rejects.toThrow();
+    await expectAbsentPath(join(root, "absent"));
+  });
+
+  test("pre-cancelled local requests do not acquire custody or dispatch", async () => {
+    const root = await makeRoot(), recoveryDirectory = join(root, "process-recovery");
+    const cancellation = new AbortController(); cancellation.abort();
+    const result = await runBoundedProcess({ arguments: [], containment: "local", cwd: root,
+      environment: {}, executable: "/usr/bin/true", outputMaximumBytes: 64, phase: "cancel-before-proof",
+      signal: cancellation.signal, terminationGraceMs: 25, timeoutMs: 100 }, { recoveryDirectory });
+    expect(result).toMatchObject({ cleanup: "proven", exitCode: 130 });
+    await expectAbsentPath(recoveryDirectory);
+  });
+
+  test("cancellation during journal promotion never releases the target", async () => {
+    const root = await makeRoot(), marker = join(root, "must-not-run");
+    const cancellation = new AbortController();
+    const result = await runBoundedProcess({ arguments: [marker], containment: "local", cwd: root,
+      environment: {}, executable: "/usr/bin/touch", outputMaximumBytes: 64, phase: "cancel-gate-proof",
+      signal: cancellation.signal, terminationGraceMs: 25, killSettlementMs: 1_000, timeoutMs: 1_000 },
+    { recoveryDirectory: join(root, "process-recovery"), beforeJournalPromotion: () => cancellation.abort() });
+    expect(result).toMatchObject({ cleanup: "proven", exitCode: 130 });
+    expect(await Bun.file(marker).exists()).toBe(false);
+  });
+
+  test("cancellation remains fatal when the local target exits zero on TERM", async () => {
+    const root = await makeRoot(), marker = join(root, "ready");
+    const cancellation = new AbortController();
+    const pending = runBoundedProcess({ arguments: ["-e", [
+      "process.on('SIGTERM', () => process.exit(0));",
+      `require('node:fs').writeFileSync(${JSON.stringify(marker)}, String(process.pid));`,
+      "setInterval(() => undefined, 1000);",
+    ].join("\n")], containment: "local", cwd: root, environment: { PATH: process.env.PATH },
+    executable: process.execPath, outputMaximumBytes: 64, phase: "cancel-running-proof",
+    signal: cancellation.signal, terminationGraceMs: 100, killSettlementMs: 1_000, timeoutMs: 3_000 },
+    { recoveryDirectory: join(root, "process-recovery") }).then((result) => {
+      if (result.cleanup !== "proven") roots.splice(roots.indexOf(root), 1);
+      return result;
+    }, (error: unknown) => {
+      roots.splice(roots.indexOf(root), 1);
+      throw error;
+    });
+    try {
+      await waitForFile(marker, 1_000);
+    } finally {
+      cancellation.abort();
+      await pending;
+    }
+    expect(await pending).toMatchObject({ cleanup: "proven", exitCode: 130 });
+    const pid = Number(await readFile(marker, "utf8"));
+    expect(() => process.kill(-pid, 0)).toThrow();
+  });
+
+  test("authority requests refuse the local cancellation option before custody", async () => {
+    const root = await makeRoot(), recoveryDirectory = join(root, "process-recovery");
+    const result = await runBoundedProcess({ arguments: [], containment: "authority", cwd: root,
+      environment: {}, executable: "/usr/bin/true", outputMaximumBytes: 64, phase: "local-signal-authority-proof",
+      signal: new AbortController().signal, terminationGraceMs: 25, timeoutMs: 100 }, { recoveryDirectory });
+    expect(result).toMatchObject({ cleanup: "proven", exitCode: 1 });
+    await expectAbsentPath(recoveryDirectory);
+  });
+
   test("the alias release runner delegates to the owned group boundary", async () => {
     const source = await readFile(join(import.meta.dir, "current-project-alias-release.ts"), "utf8");
     expect(source).toContain("runBoundedProcess({");

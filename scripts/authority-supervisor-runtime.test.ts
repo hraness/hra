@@ -5,6 +5,7 @@ import { chmod, mkdir, mkdtemp, readFile, readlink, rm } from "node:fs/promises"
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough, type Readable } from "node:stream";
 
 import { afterEach, expect, test } from "bun:test";
 
@@ -12,6 +13,73 @@ import { openAuthoritySupervisorArtifact } from "./authority-supervisor-artifact
 import { runBoundedProcess } from "./bounded-process";
 
 const roots: string[] = [];
+const ownedFixtureCleanups = new Map<string, () => Promise<boolean>>();
+const pendingFixtureCleanups = new Set<() => Promise<boolean>>();
+
+type RuntimeFixtureScope = Readonly<{
+  assertActive(): void;
+  own(cleanup: () => Promise<void>): void;
+  acquire<T>(setup: () => Promise<T>, cleanup: (resource: T) => Promise<void>): Promise<T>;
+}>;
+
+const createOwnedRuntimeFixture = (
+  operation: (scope: RuntimeFixtureScope) => Promise<void>,
+  cleanupTimeoutMs = 2_000,
+) => {
+  const cleanups: (() => Promise<void>)[] = [];
+  let stopping = false;
+  let collection: Promise<boolean> | undefined;
+  const assertActive = () => {
+    if (stopping) throw new Error("authority_runtime_fixture_stopping");
+  };
+  const scope: RuntimeFixtureScope = {
+    assertActive,
+    own: (cleanup) => { assertActive(); cleanups.push(cleanup); },
+    acquire: async (setup, cleanup) => {
+      assertActive();
+      const resource = await setup();
+      // Capture a late acquisition even when teardown began during setup.
+      cleanups.push(() => cleanup(resource));
+      assertActive();
+      return resource;
+    },
+  };
+  const work = Promise.resolve().then(() => { assertActive(); return operation(scope); });
+  const outcome = work.then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error }));
+  const collect = (): Promise<boolean> => {
+    if (collection !== undefined) return collection;
+    stopping = true;
+    const cleanupDeadline = performance.now() + cleanupTimeoutMs;
+    const joined = (async () => {
+      const closeCaptured = async () => await Promise.all(cleanups.splice(0).reverse().map(async (cleanup) => {
+        try { await cleanup(); return true; } catch { return false; }
+      }));
+      const initial = await closeCaptured();
+      await outcome;
+      const late = await closeCaptured();
+      return [...initial, ...late].every((complete) => complete) && performance.now() < cleanupDeadline;
+    })();
+    // Timing out never authorizes deletion. The joined collector stays owned,
+    // including late setup, while its root remains retained in the registry.
+    collection = (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([joined, new Promise<false>((resolvePromise) => {
+          timer = setTimeout(() => resolvePromise(false), Math.max(0, cleanupDeadline - performance.now()));
+        })]);
+      } finally { if (timer !== undefined) clearTimeout(timer); }
+    })();
+    return collection;
+  };
+  const result = (async () => {
+    const settled = await outcome;
+    const complete = await collect();
+    if (!settled.ok) throw settled.error;
+    if (!complete) throw new Error("authority_runtime_fixture_cleanup_incomplete");
+  })();
+  void result.catch(() => undefined);
+  return { result, collect };
+};
 
 const isSupportedLinux = (): boolean =>
   process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64");
@@ -34,9 +102,98 @@ const observeMarkers = async (
 };
 
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map(async (root) => {
-    await rm(root, { force: true, recursive: true });
+  const pending = await Promise.all([...pendingFixtureCleanups].map(async (collect) => {
+    const complete = await collect();
+    if (complete) pendingFixtureCleanups.delete(collect);
+    return complete;
   }));
+  const removed = await Promise.all(roots.splice(0).map(async (root) => {
+    const collect = ownedFixtureCleanups.get(root);
+    if (collect !== undefined && !await collect()) {
+      // Keep both the root and its collector owned; never delete under work
+      // which outlived the test runner's independent outer timeout.
+      return false;
+    }
+    await rm(root, { force: true, recursive: true });
+    ownedFixtureCleanups.delete(root);
+    return true;
+  }));
+  if (![...pending, ...removed].every((complete) => complete)) {
+    throw new Error("authority_runtime_fixture_cleanup_incomplete_root_retained");
+  }
+});
+
+test("owned runtime fixture joins cleanup without replacing its work failure", async () => {
+  const failure = new Error("original work failure");
+  const calls: string[] = [];
+  let release: (() => void) | undefined;
+  const closed = new Promise<void>((resolvePromise) => { release = resolvePromise; });
+  const fixture = createOwnedRuntimeFixture(async (scope) => {
+    scope.own(async () => { calls.push("closing"); await closed; calls.push("closed"); });
+    throw failure;
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  const collected = fixture.collect();
+  expect(calls).toEqual(["closing"]);
+  release?.();
+  await expect(fixture.result).rejects.toBe(failure);
+  expect(await collected).toBe(true);
+  expect(calls).toEqual(["closing", "closed"]);
+  const failedCleanup = createOwnedRuntimeFixture(async (scope) => {
+    scope.own(async () => { throw new Error("cleanup failure"); });
+    throw failure;
+  });
+  await expect(failedCleanup.result).rejects.toBe(failure);
+  expect(await failedCleanup.collect()).toBe(false);
+});
+
+test("owned runtime fixture cancels before pending setup can begin", async () => {
+  let began = false;
+  const fixture = createOwnedRuntimeFixture(async () => { began = true; });
+  const collected = fixture.collect();
+  await expect(fixture.result).rejects.toThrow("authority_runtime_fixture_stopping");
+  expect(await collected).toBe(true);
+  expect(began).toBe(false);
+});
+
+test("owned runtime fixture captures and joins setup completed after cancellation", async () => {
+  const calls: string[] = [];
+  let release: ((resource: string) => void) | undefined;
+  const acquired = new Promise<string>((resolvePromise) => { release = resolvePromise; });
+  const fixture = createOwnedRuntimeFixture(async (scope) => {
+    await scope.acquire(() => acquired, async (resource) => { calls.push(resource); });
+    calls.push("continued");
+  });
+  await Promise.resolve();
+  const collected = fixture.collect();
+  release?.("closed late resource");
+  await expect(fixture.result).rejects.toThrow("authority_runtime_fixture_stopping");
+  expect(await collected).toBe(true);
+  expect(calls).toEqual(["closed late resource"]);
+});
+
+test("owned runtime fixture retains incomplete cleanup and cannot promote forced closure", async () => {
+  let release: (() => void) | undefined;
+  const closed = new Promise<void>((resolvePromise) => { release = resolvePromise; });
+  const incomplete = createOwnedRuntimeFixture(async (scope) => { scope.own(() => closed); }, 1);
+  await expect(incomplete.result).rejects.toThrow("authority_runtime_fixture_cleanup_incomplete");
+  expect(await incomplete.collect()).toBe(false);
+  release?.();
+  // A later close cannot retroactively change a failed collection receipt.
+  expect(await incomplete.collect()).toBe(false);
+
+  let forceClose: (() => void) | undefined;
+  const forcedClosed = new Promise<void>((resolvePromise) => { forceClose = resolvePromise; });
+  const cancelled = createOwnedRuntimeFixture(async (scope) => {
+    scope.own(async () => { forceClose?.(); });
+    await forcedClosed;
+    scope.assertActive();
+  });
+  await Promise.resolve();
+  const collected = cancelled.collect();
+  await expect(cancelled.result).rejects.toThrow("authority_runtime_fixture_stopping");
+  expect(await collected).toBe(true);
 });
 
 type ChildClose = Readonly<{ code: number | null; signal: NodeJS.Signals | null }>;
@@ -153,50 +310,89 @@ const censusSelfSocketWriters = (
     selfFdEntriesScanned: 0,
     selfStdoutWriterMatches: 0,
     selfStderrWriterMatches: 0,
+    selfFdCensusStopReason: "marker_unavailable" as "marker_unavailable" | "eof" | "entry_limit" | "deadline"
+      | "open_failed" | "read_failed" | "clock_failed",
+    selfFdCensusElapsedMs: null as number | null,
+    selfFdDeadlineReached: false,
+    selfFdInvalidNames: 0,
+    selfFdInvalidTargets: 0,
+    selfFdReadlinkFailures: 0,
+    selfFdCloseFailed: false,
   };
+  if (sockets === undefined) return Object.freeze(result);
   let directory: SocketProbeDirectory | undefined;
+  let started: number | undefined;
   let deadline = 0;
+  let phase: "open_failed" | "read_failed" | "clock_failed" = "clock_failed";
+  const now = (): number => {
+    const previousPhase = phase;
+    phase = "clock_failed";
+    const value = io.now();
+    if (!Number.isFinite(value) || value < 0 || (started !== undefined && value < started)) {
+      throw new Error("authority_socket_probe_clock_invalid");
+    }
+    phase = previousPhase;
+    return value;
+  };
   try {
-    if (sockets === undefined) return Object.freeze(result);
-    deadline = io.now() + socketProbeDeadlineMs;
-    let incomplete = false;
+    started = now();
+    deadline = started + socketProbeDeadlineMs;
+    phase = "open_failed";
     directory = io.openSelfDescriptors();
-    while (result.selfFdEntriesScanned < socketProbeMaximumEntries && io.now() < deadline) {
+    for (;;) {
+      if (result.selfFdEntriesScanned >= socketProbeMaximumEntries) {
+        result.selfFdCensusStopReason = "entry_limit";
+        break;
+      }
+      if (now() >= deadline) {
+        result.selfFdCensusStopReason = "deadline";
+        break;
+      }
+      phase = "read_failed";
       const name = directory.read();
       if (name === null) {
-        result.selfFdCensusComplete = !incomplete && io.now() < deadline;
+        result.selfFdCensusStopReason = "eof";
         break;
       }
       result.selfFdEntriesScanned += 1;
       if (!/^(?:0|[1-9][0-9]{0,9})$/u.test(name) || Number(name) > 2_147_483_647) {
-        incomplete = true;
+        result.selfFdInvalidNames += 1;
         continue;
       }
-      if (io.now() >= deadline) break;
+      if (now() >= deadline) {
+        result.selfFdCensusStopReason = "deadline";
+        break;
+      }
       try {
         const target = io.readSelfDescriptor(Number(name));
-        if (typeof target !== "string" || target.length > 4_096) incomplete = true;
+        if (typeof target !== "string" || target.length > 4_096) result.selfFdInvalidTargets += 1;
         const identity = privateSocketIdentity(target);
         if (identity === sockets.stdout) result.selfStdoutWriterMatches += 1;
         if (identity === sockets.stderr) result.selfStderrWriterMatches += 1;
       } catch {
         // A concurrently closed descriptor makes this census incomplete.
-        incomplete = true;
+        result.selfFdReadlinkFailures += 1;
       }
     }
   } catch {
-    result.selfFdCensusComplete = false;
+    result.selfFdCensusStopReason = phase;
   } finally {
     try {
       directory?.close();
     } catch {
-      result.selfFdCensusComplete = false;
+      result.selfFdCloseFailed = true;
     }
-    if (directory !== undefined) {
-      try { if (!(io.now() < deadline)) result.selfFdCensusComplete = false; }
-      catch { result.selfFdCensusComplete = false; }
+    if (started !== undefined) {
+      try {
+        const finished = now();
+        result.selfFdCensusElapsedMs = Math.min(2_147_483_647, Math.floor(finished - started));
+        result.selfFdDeadlineReached = finished >= deadline;
+      } catch { result.selfFdCensusStopReason = "clock_failed"; }
     }
   }
+  result.selfFdCensusComplete = result.selfFdCensusStopReason === "eof" && !result.selfFdDeadlineReached
+    && result.selfFdInvalidNames === 0 && result.selfFdInvalidTargets === 0
+    && result.selfFdReadlinkFailures === 0 && !result.selfFdCloseFailed;
   // These are self-process observations, never proof of global writer absence.
   // Local procfs calls are synchronous and joined; the time cap is checked
   // between calls, rather than abandoning an in-flight directory operation.
@@ -333,17 +529,22 @@ test("socket diagnostic reports only self counts and joins its exact directory",
   const sockets = { stdout: "socket:[111]", stderr: "socket:[222]" };
   const result = censusSelfSocketWriters(sockets, value.io);
   expect(result).toEqual({ childSocketsCaptured: true, selfFdCensusComplete: true,
-    selfFdEntriesScanned: 5, selfStdoutWriterMatches: 2, selfStderrWriterMatches: 1 });
+    selfFdEntriesScanned: 5, selfStdoutWriterMatches: 2, selfStderrWriterMatches: 1,
+    selfFdCensusStopReason: "eof", selfFdCensusElapsedMs: 0, selfFdDeadlineReached: false,
+    selfFdInvalidNames: 0, selfFdInvalidTargets: 0, selfFdReadlinkFailures: 0, selfFdCloseFailed: false });
   expect(value.calls.slice(-2)).toEqual(["open", "close"]);
   expect(Object.isFrozen(result)).toBe(true);
   expect(JSON.stringify(result)).not.toMatch(/111|222|private|321|123456/u);
   const unavailable = socketProbeFixture();
   expect(censusSelfSocketWriters(undefined, unavailable.io)).toEqual({ childSocketsCaptured: false,
-    selfFdCensusComplete: false, selfFdEntriesScanned: 0, selfStdoutWriterMatches: 0, selfStderrWriterMatches: 0 });
+    selfFdCensusComplete: false, selfFdEntriesScanned: 0, selfStdoutWriterMatches: 0, selfStderrWriterMatches: 0,
+    selfFdCensusStopReason: "marker_unavailable", selfFdCensusElapsedMs: null, selfFdDeadlineReached: false,
+    selfFdInvalidNames: 0, selfFdInvalidTargets: 0, selfFdReadlinkFailures: 0, selfFdCloseFailed: false });
   expect(unavailable.calls).toEqual([]);
 });
 
-test.each(["open", "read", "link", "close", "name", "deadline", "entry_cap"] as const)(
+test.each(["open", "read", "link", "close", "name", "target", "clock", "clock_after_open",
+  "clock_invalid", "deadline", "close_deadline", "entry_cap"] as const)(
   "socket diagnostic marks %s failure incomplete without escaping or abandoning an owned directory",
   (failure) => {
     const value = socketProbeFixture();
@@ -352,7 +553,13 @@ test.each(["open", "read", "link", "close", "name", "deadline", "entry_cap"] as 
     let clock = 0;
     const io: SocketProbeIo = {
       ...value.io,
-      now: () => failure === "deadline" ? (clock += 100) : 0,
+      now: () => {
+        if (failure === "clock" || (failure === "clock_after_open" && clock++ > 0)) {
+          throw new Error("private clock detail");
+        }
+        if (failure === "clock_invalid") return Number.NaN;
+        return failure === "deadline" ? (clock += 100) : failure === "close_deadline" ? clock : 0;
+      },
       openSelfDescriptors: () => {
         if (failure === "open") throw new Error("private open detail");
         return {
@@ -362,20 +569,35 @@ test.each(["open", "read", "link", "close", "name", "deadline", "entry_cap"] as 
             if (failure === "entry_cap") return "10";
             return reads === 1 ? failure === "name" ? "../private" : "10" : null;
           },
-          close: () => { closed += 1; if (failure === "close") throw new Error("private close detail"); },
+          close: () => {
+            closed += 1;
+            if (failure === "close") throw new Error("private close detail");
+            if (failure === "close_deadline") clock = socketProbeDeadlineMs;
+          },
         };
       },
       readSelfDescriptor: () => {
         if (failure === "link") throw new Error("private link detail");
-        return "socket:[111]";
+        return failure === "target" ? { private: "detail" } : "socket:[111]";
       },
     };
     const result = censusSelfSocketWriters({ stdout: "socket:[111]", stderr: "socket:[222]" }, io);
     expect(result.selfFdCensusComplete).toBe(false);
-    expect(closed).toBe(failure === "open" ? 0 : 1);
+    expect(closed).toBe(failure === "open" || failure === "clock" || failure === "clock_invalid" ? 0 : 1);
     expect(reads).toBeLessThanOrEqual(socketProbeMaximumEntries);
     expect(result.selfFdEntriesScanned).toBeLessThanOrEqual(socketProbeMaximumEntries);
     expect(JSON.stringify(result)).not.toContain("private");
+    const expectedReason = failure.startsWith("clock") ? "clock_failed"
+      : failure === "open" ? "open_failed" : failure === "read" ? "read_failed"
+      : failure === "entry_cap" ? "entry_limit" : failure === "deadline" ? "deadline" : "eof";
+    expect(result.selfFdCensusStopReason).toBe(expectedReason);
+    expect(result.selfFdInvalidNames).toBe(failure === "name" ? 1 : 0);
+    expect(result.selfFdInvalidTargets).toBe(failure === "target" ? 1 : 0);
+    expect(result.selfFdReadlinkFailures).toBe(failure === "link" ? 1 : 0);
+    expect(result.selfFdCloseFailed).toBe(failure === "close");
+    expect(result.selfFdDeadlineReached).toBe(failure === "deadline" || failure === "close_deadline");
+    if (failure.startsWith("clock")) expect(result.selfFdCensusElapsedMs).toBeNull();
+    else expect(result.selfFdCensusElapsedMs).toBe(failure === "deadline" ? 400 : failure === "close_deadline" ? 250 : 0);
     if (failure === "entry_cap") expect(reads).toBe(socketProbeMaximumEntries);
     if (failure === "deadline") expect(reads).toBe(1);
   },
@@ -386,6 +608,162 @@ type LifecycleChild = LifecycleEmitter & Readonly<{
   stdout: LifecycleEmitter;
   stderr: LifecycleEmitter;
 }>;
+
+const childOutputMaximumBytes = 65_536;
+
+const consumeOwnedChildOutput = (child: Pick<LifecycleChild, "stdout" | "stderr">) => {
+  const state = { stdoutBytes: 0, stderrBytes: 0, overflow: false, invalidChunk: false };
+  let disposed = false;
+  const count = (channel: "stdoutBytes" | "stderrBytes", chunk: unknown): void => {
+    if (disposed) return;
+    if (!Buffer.isBuffer(chunk)) { state.invalidChunk = true; return; }
+    const available = childOutputMaximumBytes - state.stdoutBytes - state.stderrBytes;
+    state[channel] += Math.min(available, chunk.byteLength);
+    if (chunk.byteLength > available) state.overflow = true;
+  };
+  const onStdout = (chunk: unknown): void => count("stdoutBytes", chunk);
+  const onStderr = (chunk: unknown): void => count("stderrBytes", chunk);
+  // Match the production runner's explicit data consumption. Keep only capped
+  // counts: this fixture's target is silent and its output is never diagnostic.
+  child.stdout.on("data", onStdout);
+  child.stderr.on("data", onStderr);
+  return {
+    snapshot: () => Object.freeze({ ...state }),
+    dispose(): void {
+      if (disposed) return;
+      disposed = true;
+      child.stdout.off("data", onStdout);
+      child.stderr.off("data", onStderr);
+    },
+  };
+};
+
+const boundedStreamCount = (value: unknown): number | null =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? Math.min(value, childOutputMaximumBytes)
+    : null;
+
+const snapshotReadableState = (stream: Readable) => Object.freeze({
+  readableFlowing: stream.readableFlowing,
+  readableEnded: stream.readableEnded,
+  readableLength: boundedStreamCount(stream.readableLength),
+  readableLengthCapped: stream.readableLength > childOutputMaximumBytes,
+  destroyed: stream.destroyed,
+  closed: stream.closed,
+  dataListeners: boundedStreamCount(stream.listenerCount("data")),
+});
+
+const snapshotChildStreamState = (
+  child: Pick<ChildProcessWithoutNullStreams, "stdin" | "stdout" | "stderr"> | undefined,
+) => child === undefined ? null : Object.freeze({
+  stdin: Object.freeze({ writableEnded: child.stdin.writableEnded,
+    writableFinished: child.stdin.writableFinished, destroyed: child.stdin.destroyed, closed: child.stdin.closed }),
+  stdout: snapshotReadableState(child.stdout),
+  stderr: snapshotReadableState(child.stderr),
+});
+
+test("owned child output consumer caps combined bytes without retaining output", () => {
+  const child = { stdout: new EventEmitter(), stderr: new EventEmitter() };
+  const output = consumeOwnedChildOutput(child);
+  try {
+    const initial = output.snapshot();
+    child.stdout.emit("data", Buffer.from("private output"));
+    child.stderr.emit("data", Buffer.alloc(childOutputMaximumBytes - 14));
+    expect(output.snapshot()).toEqual({ stdoutBytes: 14, stderrBytes: childOutputMaximumBytes - 14,
+      overflow: false, invalidChunk: false });
+    child.stdout.emit("data", Buffer.alloc(0));
+    expect(output.snapshot().overflow).toBe(false);
+    child.stderr.emit("data", Buffer.alloc(1));
+    child.stdout.emit("data", Buffer.alloc(childOutputMaximumBytes + 1));
+    expect(output.snapshot()).toEqual({ stdoutBytes: 14, stderrBytes: childOutputMaximumBytes - 14,
+      overflow: true, invalidChunk: false });
+    expect(JSON.stringify(output.snapshot())).not.toContain("private output");
+    expect(initial).toEqual({ stdoutBytes: 0, stderrBytes: 0, overflow: false, invalidChunk: false });
+    expect(Object.isFrozen(output.snapshot())).toBe(true);
+  } finally { output.dispose(); }
+});
+
+test("owned child output consumer removes only its listeners and rejects non-buffer chunks", () => {
+  const child = { stdout: new EventEmitter(), stderr: new EventEmitter() };
+  const foreign = () => undefined;
+  const events = ["data", "end", "close", "error"];
+  for (const stream of [child.stdout, child.stderr]) {
+    for (const event of events) stream.on(event, foreign);
+  }
+  const output = consumeOwnedChildOutput(child);
+  try {
+    for (const stream of [child.stdout, child.stderr]) {
+      expect(stream.listenerCount("data")).toBe(2);
+      expect(stream.eventNames()).toEqual(events);
+      for (const event of events.slice(1)) expect(stream.listeners(event)).toEqual([foreign]);
+    }
+    for (const invalid of ["private output", null, undefined, new Uint8Array(2), { byteLength: 2 }]) {
+      child.stdout.emit("data", invalid);
+    }
+    child.stderr.emit("data", Buffer.alloc(2));
+    const before = output.snapshot();
+    expect(before).toEqual({ stdoutBytes: 0, stderrBytes: 2, overflow: false, invalidChunk: true });
+    output.dispose();
+    output.dispose();
+    for (const stream of [child.stdout, child.stderr]) {
+      for (const event of events) expect(stream.listeners(event)).toEqual([foreign]);
+      stream.emit("data", Buffer.alloc(3));
+    }
+    expect(output.snapshot()).toEqual(before);
+  } finally {
+    output.dispose();
+    for (const stream of [child.stdout, child.stderr]) {
+      for (const event of events) stream.off(event, foreign);
+    }
+  }
+});
+
+test("owned child output consumer ignores a callback already queued at disposal", () => {
+  const child = { stdout: new EventEmitter(), stderr: new EventEmitter() };
+  let dispose = () => undefined;
+  const beforeOwnedListener = (): void => { dispose(); };
+  child.stdout.on("data", beforeOwnedListener);
+  const output = consumeOwnedChildOutput(child);
+  dispose = () => { output.dispose(); };
+  try {
+    child.stdout.emit("data", Buffer.alloc(1));
+    expect(output.snapshot()).toEqual({ stdoutBytes: 0, stderrBytes: 0, overflow: false, invalidChunk: false });
+    expect(child.stdout.listeners("data")).toEqual([beforeOwnedListener]);
+    expect(child.stderr.listenerCount("data")).toBe(0);
+  } finally {
+    output.dispose();
+    child.stdout.off("data", beforeOwnedListener);
+  }
+});
+
+test("child public stream snapshots are fixed, bounded, and detached from later state", () => {
+  const child = { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() };
+  const streams = [child.stdin, child.stdout, child.stderr];
+  try {
+    expect(snapshotChildStreamState(undefined)).toBeNull();
+    for (const invalid of [null, "1", -1, 0.5, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(boundedStreamCount(invalid)).toBeNull();
+    }
+    expect(boundedStreamCount(Number.MAX_SAFE_INTEGER)).toBe(childOutputMaximumBytes);
+    child.stdout.push(Buffer.alloc(childOutputMaximumBytes + 1));
+    const before = snapshotChildStreamState(child);
+    expect(before).toEqual({
+      stdin: { writableEnded: false, writableFinished: false, destroyed: false, closed: false },
+      stdout: { readableFlowing: null, readableEnded: false, readableLength: childOutputMaximumBytes,
+        readableLengthCapped: true, destroyed: false, closed: false, dataListeners: 0 },
+      stderr: { readableFlowing: null, readableEnded: false, readableLength: 0,
+        readableLengthCapped: false, destroyed: false, closed: false, dataListeners: 0 },
+    });
+    const output = consumeOwnedChildOutput(child);
+    try {
+      expect(snapshotChildStreamState(child)?.stdout).toMatchObject({ readableFlowing: true, dataListeners: 1 });
+      expect(before?.stdout.dataListeners).toBe(0);
+      expect(Object.isFrozen(before)).toBe(true);
+      for (const snapshot of [before?.stdin, before?.stdout, before?.stderr]) expect(Object.isFrozen(snapshot)).toBe(true);
+    } finally { output.dispose(); }
+    expect(snapshotChildStreamState(child)?.stdout.dataListeners).toBe(0);
+  } finally { for (const stream of streams) stream.destroy(); }
+});
 
 const createChildLifecycleRecorder = () => {
   const state = {
@@ -646,6 +1024,7 @@ class ControlServer {
   readonly path: string;
   readonly #lifecycle: ReturnType<typeof createChildLifecycleRecorder>;
   #socket: Socket | undefined;
+  #closing = false;
   #waiter: Readonly<{ reject: (error: Error) => void; resolve: (line: string) => void }> | undefined;
 
   private constructor(
@@ -661,10 +1040,12 @@ class ControlServer {
   static async start(
     root: string,
     lifecycle: ReturnType<typeof createChildLifecycleRecorder>,
+    scope: RuntimeFixtureScope,
   ): Promise<ControlServer> {
     const path = join(root, `.authority-control-${"a".repeat(32)}.sock`);
     const server = createServer();
     const control = new ControlServer(server, path, lifecycle);
+    scope.own(() => control.close());
     server.on("connection", (socket) => control.#accept(socket));
     await new Promise<void>((resolvePromise, rejectPromise) => {
       server.once("error", rejectPromise);
@@ -673,12 +1054,14 @@ class ControlServer {
         resolvePromise();
       });
     });
+    scope.assertActive();
     await chmod(path, 0o600);
+    scope.assertActive();
     return control;
   }
 
   #accept(socket: Socket): void {
-    if (this.#socket !== undefined) {
+    if (this.#closing || this.#socket !== undefined) {
       socket.destroy();
       return;
     }
@@ -736,14 +1119,16 @@ class ControlServer {
   }
 
   async close(): Promise<void> {
+    this.#closing = true;
+    this.#waiter?.reject(new Error("authority_control_socket_closed"));
+    const socketClosed = this.#socket === undefined || this.#socket.closed
+      ? Promise.resolve()
+      : new Promise<void>((resolvePromise) => { this.#socket?.once("close", () => resolvePromise()); });
     this.#socket?.destroy();
-    await new Promise<void>((resolvePromise) => {
-      try {
-        this.#server.close(() => resolvePromise());
-      } catch {
-        resolvePromise();
-      }
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      this.#server.close((error?: Error) => error === undefined ? resolvePromise() : rejectPromise(error));
     });
+    await socketClosed;
   }
 }
 
@@ -983,7 +1368,7 @@ test.each([false, true])("portable stdin-gated child naturally closes both outpu
   });
   try {
     await waitForChildSpawn(child);
-    // Match the native regression's resume-only draining, without data listeners.
+    // Retain the resume-only comparison, without data listeners.
     child.stdout.resume();
     child.stderr.resume();
     child.stdin.end("GO\n");
@@ -1016,19 +1401,47 @@ test.each([false, true])("portable stdin-gated child naturally closes both outpu
 
 test("authority supervisor holds a target behind GO", async () => {
   if (!isSupportedLinux()) return;
-  const root = await makeRoot();
-  const marker = join(root, "target-ran");
-  const socketMarker = join(root, "target-private-stdio-sockets");
-  const parentPidNamespace = await readlink("/proc/self/ns/pid");
-  const controlRoot = join(root, "process-recovery");
-  await mkdir(controlRoot, { mode: 0o700 });
+  let socketMarker: string | undefined;
   const lifecycle = createChildLifecycleRecorder();
-  const control = await ControlServer.start(controlRoot, lifecycle);
+  let diagnosticChild: ChildProcessWithoutNullStreams | undefined;
+  let output: ReturnType<typeof consumeOwnedChildOutput> | undefined;
+  let streamsAtClean: ReturnType<typeof snapshotChildStreamState> = null;
+  let outputAtClean: ReturnType<ReturnType<typeof consumeOwnedChildOutput>["snapshot"]> | null = null;
   const nonce = "1".repeat(32);
-  const opened = await openAuthoritySupervisorArtifact();
-  let child: ChildProcessWithoutNullStreams | undefined;
-  try {
-    child = spawn(opened.executionPath, [
+  let naturalCloseProven = false;
+  let failureRecorded = false;
+  const recordFailure = () => {
+    if (failureRecorded) return;
+    failureRecorded = true;
+    // Snapshot before forced cleanup, including when the outer test timeout
+    // delegates collection to afterEach. Never emit target bytes or identities.
+    const snapshot = lifecycle.snapshot();
+    try {
+      const streamsAtFailure = snapshotChildStreamState(diagnosticChild);
+      const outputAtFailure = output?.snapshot() ?? null;
+      const selfWriters = censusSelfSocketWriters(socketMarker === undefined ? undefined : readPrivateSocketMarker(socketMarker));
+      process.stderr.write(`authority_child_lifecycle ${JSON.stringify({ ...snapshot, ...selfWriters,
+        streamsAtClean, streamsAtFailure, outputAtClean, outputAtFailure })}\n`);
+    } catch { /* Diagnostic inability cannot replace the original failure. */ }
+  };
+  const fixture = createOwnedRuntimeFixture(async (scope) => {
+    const root = await mkdtemp(join(tmpdir(), "hra-authority-runtime-"));
+    // Register even a late root before any further await or cancellation check.
+    roots.push(root);
+    ownedFixtureCleanups.set(root, fixture.collect);
+    scope.assertActive();
+    await chmod(root, 0o700);
+    scope.assertActive();
+    const marker = join(root, "target-ran");
+    socketMarker = join(root, "target-private-stdio-sockets");
+    const controlRoot = join(root, "process-recovery");
+    const parentPidNamespace = await readlink("/proc/self/ns/pid");
+    scope.assertActive();
+    await mkdir(controlRoot, { mode: 0o700 });
+    scope.assertActive();
+    const control = await ControlServer.start(controlRoot, lifecycle, scope);
+    const opened = await scope.acquire(openAuthoritySupervisorArtifact, (artifact) => artifact.close());
+    const child = spawn(opened.executionPath, [
       "--control-socket",
       control.path,
       "--nonce",
@@ -1047,13 +1460,40 @@ test("authority supervisor holds a target behind GO", async () => {
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    diagnosticChild = child;
     lifecycle.attachChild(child);
     const closed = observeChildClose(child);
     void closed.catch(() => undefined);
+    // Unlike the natural observer, this close-only observer survives an error
+    // event and can prove subsequent forced collection without forging PASS.
+    let onCleanupClose: ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined;
+    const cleanupClosed = new Promise<ChildClose>((resolvePromise) => {
+      onCleanupClose = (code, signal) => resolvePromise({ code, signal });
+      child.once("close", onCleanupClose);
+    });
+    scope.own(async () => {
+      let cleanupFailed = false;
+      if (!naturalCloseProven) {
+        recordFailure();
+        if (child.exitCode === null && child.signalCode === null) {
+          try { child.kill("SIGKILL"); } catch { cleanupFailed = true; }
+        }
+        for (const stream of [child.stdin, child.stdout, child.stderr]) {
+          try { stream.destroy(); } catch { cleanupFailed = true; }
+        }
+      }
+      try { await cleanupClosed; }
+      finally {
+        output?.dispose();
+        if (onCleanupClose !== undefined) child.off("close", onCleanupClose);
+      }
+      if (cleanupFailed) throw new Error("authority_runtime_child_cleanup_failed");
+    });
     await waitForChildSpawn(child);
+    scope.assertActive();
     await opened.close();
-    child.stdout.resume();
-    child.stderr.resume();
+    scope.assertActive();
+    output = consumeOwnedChildOutput(child);
     const ready = await control.nextLine();
     expect(ready).toMatch(new RegExp(`^HRA_AUTHORITY_SUPERVISOR/1 READY nonce=${nonce} `));
     const monotonicMatch = ready.match(/ monotonic_ms=([1-9][0-9]*)$/u);
@@ -1062,38 +1502,40 @@ test("authority supervisor holds a target behind GO", async () => {
     expect(namespaceMatch).not.toBeNull();
     await Bun.sleep(175);
     expect(await Bun.file(marker).exists()).toBeFalse();
+    scope.assertActive();
     control.write(
       `HRA_AUTHORITY_SUPERVISOR/1 GO nonce=${nonce} deadline_monotonic_ms=${BigInt(monotonicMatch?.[1] ?? "0") + 5_000n}\n`,
     );
     child.stdin.end();
     const clean = await control.nextLine();
+    scope.assertActive();
     expect(clean).toBe(`HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${nonce} exit=0`);
+    streamsAtClean = snapshotChildStreamState(child);
+    outputAtClean = output.snapshot();
     // The close observer starts before READY; this 15-second deadline starts
     // after CLEAN. Require joined process and pipe closure even after CLEAN.
     try {
-      await expect(requireChildClose(closed, 15_000)).resolves.toEqual({ code: 0, signal: null });
+      await expect(requireChildClose(closed, 15_000).then((result) => {
+        scope.assertActive();
+        return result;
+      })).resolves.toEqual({ code: 0, signal: null });
+      expect(lifecycle.snapshot()).toMatchObject({ exitObserved: true, exitCode: 0, exitSignalPresent: false,
+        closeObserved: true, closeCode: 0, closeSignalPresent: false,
+        stdoutEnd: true, stdoutClose: true, stderrEnd: true, stderrClose: true });
+      expect(output.snapshot()).toEqual({ stdoutBytes: 0, stderrBytes: 0, overflow: false, invalidChunk: false });
+      naturalCloseProven = true;
     } catch (error: unknown) {
-      // Capture before forced cleanup can change lifecycle observations. Only
-      // fixed scalar state is emitted, never control lines or process output.
-      const snapshot = lifecycle.snapshot();
-      try {
-        // The fixed target inherits these writer endpoints unchanged. It writes
-        // only its own identities in this fresh private root, after its original
-        // namespace marker; missing diagnostics do not weaken CLEAN or close.
-        const selfWriters = censusSelfSocketWriters(readPrivateSocketMarker(socketMarker));
-        process.stderr.write(`authority_child_lifecycle ${JSON.stringify({ ...snapshot, ...selfWriters })}\n`);
-      } catch { /* Diagnostic inability cannot replace the original failure. */ }
+      recordFailure();
       throw error;
     }
     const targetPidNamespace = await readFile(marker, "utf8");
     expect(targetPidNamespace).toBe(`pid:[${namespaceMatch?.[1] ?? "missing"}]`);
     expect(targetPidNamespace).not.toBe(parentPidNamespace);
-  } finally {
-    lifecycle.dispose();
-    child?.kill("SIGKILL");
-    await opened.close().catch(() => undefined);
-    await control.close();
-  }
+  });
+  // Own pending mkdtemp too; the outer timeout must not start a late child.
+  pendingFixtureCleanups.add(fixture.collect);
+  try { await fixture.result; }
+  finally { lifecycle.dispose(); }
 }, 20_000);
 
 test("native deadline kills custody while the HRA parent is stopped after GO", async () => {

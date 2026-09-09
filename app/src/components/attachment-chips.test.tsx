@@ -87,14 +87,22 @@ describe("composer chips", () => {
   });
 
   test("a refusal is shown on the chip it belongs to", () => {
-    const markup = renderToStaticMarkup(
+    const acceptedMarkup = renderToStaticMarkup(
+      <ComposerAttachmentChips
+        attachments={[composerAttachment()]}
+        onRemove={() => undefined}
+      />,
+    );
+    const refusedMarkup = renderToStaticMarkup(
       <ComposerAttachmentChips
         attachments={[composerAttachment({ refusal: "huge.png is still 391 KiB after downscaling." })]}
         onRemove={() => undefined}
       />,
     );
-    expect(markup).toContain("still 391 KiB after downscaling");
-    expect(markup).toContain("border-danger");
+    expect(refusedMarkup).toContain("still 391 KiB after downscaling");
+    expect(refusedMarkup.match(/<li class="([^"]+)"/u)?.[1]).not.toBe(
+      acceptedMarkup.match(/<li class="([^"]+)"/u)?.[1],
+    );
   });
 
   test("never emits a style attribute", () => {

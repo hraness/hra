@@ -1,7 +1,7 @@
 # Contents
 
 - `index.html` is the only shell. It carries the mobile viewport with `viewport-fit=cover` and loads one module entry point.
-- `vite.config.ts` builds the shell to `app/dist` with no inlined asset, no inlined style, and one same-origin stylesheet.
+- `vite.config.ts` and the repository's app build script compile the shell with no inlined asset or style. Every compiler foundation precedes one finalized same-origin StyleX recipe stylesheet.
 - `vercel.json` configures the second Vercel project (`app.hra.sh`) with the F1 Content Security Policy and the no-store shell headers.
 - `src/hra/` re-exports the browser-safe repository modules the app is allowed to reach.
 - `src/auth/` holds the Convex client, the in-memory token storage adapter, and the one-time-code sign-in screen.
@@ -18,7 +18,10 @@
 # Guidelines
 
 - Import repository source only from `src/cloud/crypto`, `src/cloud/projection`, `src/cloud/payloads`, `src/cloud/contracts`, `src/cloud/client`, and `src/domain/*`, and reach all of them through `app/src/hra/`. The other `src/cloud` modules are node-only and must never enter the bundle.
-- Never write an inline style attribute or a style element. `style-src 'self'` blocks both. Express every visual through a Tailwind class.
+- Never write an inline style attribute or a style element. `style-src 'self'` blocks both. Author component-owned presentation in colocated static StyleX recipes, compiled through the public `@hraness/ui/stylex-build` contract with runtime injection disabled. Retain only tokens, resets, and document grammar in `src/index.css`.
+- Compose primitive styles in base, finite variant/size, then caller `xstyle` order; retain ordinary caller classes last. Reject dynamic StyleX output that requires inline styles. Preserve native control semantics, physical safe-area edges, finite state behavior, and reduced-motion and forced-color contracts.
+- Register the complete app graph and its package manifests before building, seal the generated shell, and finalize once. Load the UI compiler foundation before product grammar and the finalized recipe asset. Do not mix standalone package recipe stylesheets with compiler-adopter output or claim an unverified development/HMR path.
+- Use `bun run dev:app` for local development on `127.0.0.1:5183`. It serves immutable, fully compiled revisions; refresh the page to select the latest successful revision. It does not hot-replace modules or styles. Keep failed builds off the public route, retain older revisions for in-flight assets, and restart after dependency or configuration changes. Do not widen the production Content Security Policy for development.
 - Never render raw HTML from projection text, and never resolve a non-https URL from it. Projection text reaches the reader only through `src/markdown/`, which removes zero-width and bidi characters, refuses every href that is not an absolute `https:` URL, and renders an image as its alt text.
 - Render an image only from bytes the tab already holds. `img-src data: blob:` names no origin, so an `img` element cannot fetch anything; a projected attachment is a manifest with no bytes and renders as a chip, and a thumbnail appears only for an attachment this tab sent itself.
 - Build an attachment send payload only in `src/model/attachments.ts` and a provider switch payload only in `src/model/provider-switch.ts`. Both shapes are ahead of the repository contract, both ask the repository parser whether this build accepts them, and neither is constructed anywhere else.
@@ -32,6 +35,6 @@
 - Persist only non-extractable `CryptoKey` objects, and only in IndexedDB. A private key must never be exportable.
 - Drop the account key on idle, on `Ctrl+L`, and on the first authority error from Convex.
 - A browser device is never the first device on an account and never approves another device.
-- Keep the reducer, the custody helpers, and the wire parsers free of React so `bun test ./app` runs them without a document.
+- Keep the reducer, the custody helpers, and the wire parsers free of React. App presentation tests use `scripts/register-app-stylex-test-transform.ts`; the reducer and custody tests still run without a document.
 - Parse every value that arrives from Convex from `unknown` before it reaches a component.
 - Pin every new dependency to an exact version in the root `package.json` and keep it in `devDependencies`: nothing under `app/` is published.
