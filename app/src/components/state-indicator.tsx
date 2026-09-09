@@ -9,14 +9,14 @@ import {
 import type { SessionStateValue } from "../hra/cloud";
 
 const dotClasses: Readonly<Record<SessionTone, string>> = {
-  accent: "bg-accent",
+  accent: "bg-info",
   attention: "bg-attention",
   danger: "bg-danger",
   neutral: "bg-ink-muted",
 };
 
 const textClasses: Readonly<Record<SessionTone, string>> = {
-  accent: "text-accent",
+  accent: "text-info",
   attention: "text-attention",
   danger: "text-danger",
   neutral: "text-ink-muted",

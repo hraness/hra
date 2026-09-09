@@ -34,7 +34,7 @@ export function Dialog({ children, className, label, onClose, open }: DialogProp
       aria-label={label}
       className={cn(
         "m-auto w-[min(32rem,calc(100vw-2rem))] rounded-lg border border-line",
-        "bg-surface-raised p-4 text-ink backdrop:bg-black/60",
+        "bg-surface-raised p-4 text-ink backdrop:bg-[var(--scrim)]",
         className,
       )}
       onCancel={(event) => {

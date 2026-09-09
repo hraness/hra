@@ -24,6 +24,7 @@ import {
   renderSiteHtml,
 } from "../site/template.ts";
 import { HRA_RELEASE_VERSION } from "./release-evidence";
+import { buildHraAppearance } from "./build-appearance";
 
 interface BuildOptions {
   readonly check: boolean;
@@ -167,6 +168,33 @@ const designKitSyntaxHighlightingStylesPath = fileURLToPath(
   import.meta.resolve("@hraness/design-kit/syntax-highlighting.css"),
 );
 const designKitFontsDirectory = join(dirname(designKitFontsStylesPath), "fonts");
+const designKitPaletteStylesPath = fileURLToPath(
+  import.meta.resolve("@hraness/design-kit/palettes.css"),
+);
+
+/** Flatten the optional palette entry into the site's one same-origin stylesheet. */
+async function readPaletteStyles(path: string, seen = new Set<string>()): Promise<string> {
+  if (seen.has(path)) return "";
+  if (seen.size >= 8) throw new Error("The shared palette entry exceeds its stylesheet bound.");
+  seen.add(path);
+  const source = await readFile(path, "utf8");
+  const pieces: string[] = [];
+  let position = 0;
+  for (const match of source.matchAll(/@import\s+"([^"\n]+)"\s*;/gu)) {
+    const specifier = match[1];
+    if (specifier === undefined) throw new Error("The shared palette import is invalid.");
+    if (!specifier.startsWith(".") && !specifier.startsWith("@hraness/")) {
+      throw new Error("The shared palette entry may import only its local package styles.");
+    }
+    const imported = specifier.startsWith(".")
+      ? resolve(dirname(path), specifier)
+      : fileURLToPath(import.meta.resolve(specifier));
+    pieces.push(source.slice(position, match.index), await readPaletteStyles(imported, seen));
+    position = match.index + match[0].length;
+  }
+  pieces.push(source.slice(position));
+  return pieces.join("");
+}
 
 const readExisting = async (path: string): Promise<string | undefined> => {
   try {
@@ -251,6 +279,7 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   }
   await writeFile(join(options.repositoryRoot, "dist/site", publicContent.socialCard.path), socialCardPng);
   await buildAnalyticsBundle(options.repositoryRoot, analyticsProjectToken);
+  await writeFile(join(options.repositoryRoot, "dist/site/appearance.js"), await buildHraAppearance(), "utf8");
 
   for (const asset of staticAssets) {
     const source = join(options.repositoryRoot, "site", asset);
@@ -264,12 +293,14 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
     designKitProductMarketingStyles,
     designKitSyntaxHighlightingStyles,
     siteFooterStyles,
+    paletteStyles,
   ] = await Promise.all([
     readFile(join(options.repositoryRoot, "site/styles.css"), "utf8"),
     readFile(designKitFontsStylesPath, "utf8"),
     readFile(designKitProductMarketingStylesPath, "utf8"),
     readFile(designKitSyntaxHighlightingStylesPath, "utf8"),
     readFile(siteFooterStylesPath, "utf8"),
+    readPaletteStyles(designKitPaletteStylesPath),
   ]);
   await cp(designKitFontsDirectory, join(options.repositoryRoot, "dist/site/fonts"), {
     dereference: true,
@@ -277,7 +308,7 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   });
   await writeFile(
     join(options.repositoryRoot, "dist/site/styles.css"),
-    `${designKitFontsStyles.trim()}\n\n${designKitProductMarketingStyles.trim()}\n\n${designKitSyntaxHighlightingStyles.trim()}\n\n${productStyles.trimEnd()}\n\n${siteFooterStyles.trim()}\n`,
+    `${paletteStyles.trim()}\n\n${designKitFontsStyles.trim()}\n\n${designKitProductMarketingStyles.trim()}\n\n${designKitSyntaxHighlightingStyles.trim()}\n\n${productStyles.trimEnd()}\n\n${siteFooterStyles.trim()}\n`,
     "utf8",
   );
 

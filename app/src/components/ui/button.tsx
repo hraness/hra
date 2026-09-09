@@ -6,9 +6,9 @@ export type ButtonVariant = "primary" | "secondary" | "ghost" | "danger";
 export type ButtonSize = "default" | "small" | "icon";
 
 const variantClasses: Readonly<Record<ButtonVariant, string>> = {
-  danger: "bg-danger text-surface hover:opacity-90",
+  danger: "bg-danger text-danger-ink hover:opacity-90",
   ghost: "bg-transparent text-ink-muted hover:text-ink hover:bg-surface-raised",
-  primary: "bg-accent text-surface hover:opacity-90",
+  primary: "bg-accent text-accent-ink hover:opacity-90",
   secondary: "bg-surface-raised text-ink border border-line hover:border-ink-muted",
 };
 

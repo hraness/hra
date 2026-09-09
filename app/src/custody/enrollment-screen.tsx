@@ -1,3 +1,4 @@
+import { AppearanceHeader } from "../components/appearance";
 import { useAuthActions } from "@convex-dev/auth/react";
 
 import { Button } from "../components/ui/button";
@@ -84,6 +85,7 @@ export function EnrollmentScreen() {
 
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-md flex-col justify-center p-4">
+      <AppearanceHeader />
       <Card>
         <CardHeader>{body()}</CardHeader>
         <CardContent className="flex flex-col gap-3">

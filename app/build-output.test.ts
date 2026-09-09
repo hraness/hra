@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { beforeAll, describe, expect, test } from "bun:test";
+import { getDesignPaletteTheme } from "@hraness/design-kit";
 
 const appRoot = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = dirname(appRoot);
@@ -131,11 +132,12 @@ describe("built shell", () => {
     const stylesheets = artifacts.filter((artifact) => artifact.name.endsWith(".css"));
 
     expect(staticArtifacts).toEqual([".well-known/hra-app.json", "index.html"]);
-    expect(scripts).toHaveLength(1);
+    expect(scripts).toHaveLength(2);
     expect(stylesheets).toHaveLength(1);
-    expect(scripts[0]?.name).toMatch(/^assets\/index-[A-Za-z0-9_-]+\.js$/u);
+    expect(scripts.some((script) => script.name === "assets/appearance.js")).toBe(true);
+    expect(scripts.find((script) => script.name !== "assets/appearance.js")?.name).toMatch(/^assets\/index-[A-Za-z0-9_-]+\.js$/u);
     expect(stylesheets[0]?.name).toMatch(/^assets\/style-[A-Za-z0-9_-]+\.css$/u);
-    expect(artifacts).toHaveLength(4);
+    expect(artifacts).toHaveLength(5);
   });
 
   test("emits one module entry point and one linked stylesheet", () => {
@@ -150,6 +152,18 @@ describe("built shell", () => {
   test("carries the mobile viewport with the safe-area opt in", () => {
     expect(shell).toContain("viewport-fit=cover");
     expect(shell).toContain("width=device-width");
+  });
+
+  test("applies the complete default palette and loads saved appearance before the application", () => {
+    const htmlTag = shell.match(/<html\b[^>]*>/u)?.[0] ?? "";
+    const theme = getDesignPaletteTheme("catppuccin", "dark");
+    expect(htmlTag).toContain('data-palette="catppuccin"');
+    expect(htmlTag).toContain('data-theme="dark"');
+    for (const token of theme.className.split(/\s+/u)) expect(htmlTag).toContain(token);
+    const bootstrap = shell.match(/<script\b[^>]*src="\/assets\/appearance\.js"[^>]*>/u)?.[0] ?? "";
+    expect(bootstrap).not.toBe("");
+    expect(bootstrap).not.toMatch(/\b(?:async|defer|type)=?/u);
+    expect(shell.indexOf(bootstrap)).toBeLessThan(shell.indexOf('<script type="module"'));
   });
 
   test("has no inline script", () => {

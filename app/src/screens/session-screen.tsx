@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import { ComposerAttachmentChips } from "../components/attachment-chips";
 import { AttachIcon, BackIcon, KebabIcon, StopIcon } from "../components/icons";
+import { AppearanceButton } from "../components/appearance";
 import { InteractionPanel } from "../components/interaction-panel";
 import { ScheduledTasksBadge } from "../components/scheduled-tasks-badge";
 import { StateIndicator } from "../components/state-indicator";
@@ -253,6 +254,7 @@ export function SessionScreen({
         >
           <KebabIcon />
         </Button>
+        <AppearanceButton />
       </header>
 
       <ScheduledTasksBadge sessionPublicId={sessionPublicId} />
@@ -307,7 +309,7 @@ export function SessionScreen({
         <form
           className={cn(
             "flex items-end gap-2 rounded-md",
-            attach.dragging ? "outline-2 outline-offset-2 outline-accent" : "",
+            attach.dragging ? "outline-2 outline-offset-2 outline-focus" : "",
           )}
           onDragLeave={attach.onDragLeave}
           onDragOver={attach.onDragOver}

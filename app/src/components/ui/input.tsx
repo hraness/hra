@@ -8,7 +8,7 @@ export function Input({ className, ...rest }: InputProps) {
   return (
     <input
       className={cn(
-        "w-full min-h-11 rounded-md border border-line bg-surface-input px-3",
+        "w-full min-h-11 rounded-md border border-control bg-surface-input px-3",
         "text-base text-ink placeholder:text-ink-muted",
         "disabled:cursor-not-allowed disabled:opacity-50",
         className,

@@ -5,7 +5,7 @@ import { cn } from "../../lib/cn";
 export type BadgeTone = "neutral" | "accent" | "attention" | "danger";
 
 const toneClasses: Readonly<Record<BadgeTone, string>> = {
-  accent: "border-accent text-accent",
+  accent: "border-info text-info",
   attention: "border-attention text-attention",
   danger: "border-danger text-danger",
   neutral: "border-line text-ink-muted",

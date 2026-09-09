@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { DesignPaletteProvider } from "@hraness/design-kit/react";
 
 const requests: unknown[] = [];
 let finishRequest: (() => void) | undefined;
@@ -59,7 +60,11 @@ async function renderMounted(): Promise<HTMLElement> {
   const container = document.getElementById("root");
   if (!(container instanceof HTMLElement)) throw new Error("missing test root");
   mountedRoot = createRoot(container);
-  await act(async () => { mountedRoot?.render(<SignInScreen />); });
+  await act(async () => { mountedRoot?.render(
+    <DesignPaletteProvider forcedPreference={{ palette: "catppuccin", mode: "dark" }} legacyStorageKey={null}>
+      <SignInScreen />
+    </DesignPaletteProvider>,
+  ); });
   return container;
 }
 

@@ -9,6 +9,7 @@ import {
 } from "react";
 
 import { ComposerAttachmentChips } from "../components/attachment-chips";
+import { AppearanceButton } from "../components/appearance";
 import { AttachIcon, SettingsIcon } from "../components/icons";
 import { SessionCard } from "../components/session-card";
 import { ChoiceGroup } from "../components/settings-list";
@@ -460,13 +461,14 @@ export function GridScreen({
             </Button>
           </form>
           <Button onClick={custody.lock} size="small" variant="ghost">Lock</Button>
+          <AppearanceButton />
         </div>
         {starting && startTarget !== null ? (
           <div className="flex flex-wrap items-center gap-2">
             <label className="flex items-center gap-1 text-xs text-ink-muted">
               <span>Account</span>
               <select
-                className="min-h-11 rounded-md border border-line bg-surface-input px-2 text-sm text-ink"
+                className="min-h-11 rounded-md border border-control bg-surface-input px-2 text-sm text-ink"
                 onChange={(event) => {
                   setTargetKey(event.target.value);
                   setProjectPublicId(null);
@@ -486,7 +488,7 @@ export function GridScreen({
             <label className="flex items-center gap-1 text-xs text-ink-muted">
               <span>Project</span>
               <select
-                className="min-h-11 rounded-md border border-line bg-surface-input px-2 text-sm text-ink"
+                className="min-h-11 rounded-md border border-control bg-surface-input px-2 text-sm text-ink"
                 onChange={(event) => { setProjectPublicId(event.target.value); }}
                 value={project?.publicId ?? ""}
               >

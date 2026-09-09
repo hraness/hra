@@ -1,3 +1,4 @@
+import { AppearanceHeader } from "./components/appearance";
 import { ConvexAuthProvider, useConvexAuth } from "@convex-dev/auth/react";
 import { useState } from "react";
 
@@ -19,6 +20,7 @@ import { SettingsScreen } from "./screens/settings-screen";
 function Centered({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-md flex-col justify-center p-4">
+      <AppearanceHeader />
       {children}
     </main>
   );

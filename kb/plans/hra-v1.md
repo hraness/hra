@@ -14,6 +14,16 @@ tags:
 
 # HRA v1
 
+## Web appearance (2026-09-08)
+
+Status: implementation and independent source review complete. The adopting pull request and deployment records carry validation and delivery evidence; source review alone does not establish acceptance.
+
+The app and website share the design-kit's compiled StyleX palette contract with Sponge. Catppuccin, Gruvbox, Rosé Pine, and Tokyo Night each support light and dark appearance; Catppuccin dark is the default. One final header control selects the theme and appearance. Primary actions, warnings, destructive actions, status labels, input boundaries, and keyboard focus use semantic color roles.
+
+The external bootstrap applies the saved choice before paint without changing the existing content security policies. One bounded browser preference contains only the palette and mode; no account or session data enters this record. The public privacy text describes this storage. The inert website preview keeps a fixed Catppuccin dark appearance.
+
+Acceptance requires focused storage and rendering tests, the complete repository check, browser evidence for all eight variants and preference changes under the tracked policies, and source-bound canonical website/app delivery. This web update does not activate the daemon or hosted command writer and does not change their capacity gates.
+
 ## Outcome
 
 HRA is a persistent Codex and Claude Code control plane for people and agents. Running `hra` in a terminal starts or attaches to the owner-private daemon, opens a line-oriented shell, and remains connected until the person exits. The same binary exposes bounded one-shot JSON and cursor-based JSONL commands, so an agent can inspect a session repeatedly, follow visible progress during a turn, and respond to an exact pending interaction without scraping terminal presentation.

@@ -1,7 +1,9 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { DesignPaletteProvider } from "@hraness/design-kit/react";
 
 import { App } from "./app";
+import { hraAppearanceStorageKey } from "./appearance";
 import "./index.css";
 
 const container = document.getElementById("root");
@@ -9,6 +11,8 @@ if (container === null) throw new Error("The application shell is missing its ro
 
 createRoot(container).render(
   <StrictMode>
-    <App />
+    <DesignPaletteProvider legacyStorageKey={null} storageKey={hraAppearanceStorageKey}>
+      <App />
+    </DesignPaletteProvider>
   </StrictMode>,
 );

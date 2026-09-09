@@ -61,9 +61,9 @@ describe("static-site build", () => {
     expect(styles).toContain("--hraness-marketing-inverse: var(--inverse-background)");
     expect(styles).toContain("--hraness-marketing-inverse-ink: var(--inverse-foreground)");
     expect(styles).toContain("--foreground: var(--code-foreground)");
-    expect(styles).toContain("--code-background: #090a0c");
-    expect(styles).toContain("--code-foreground: #fbf8f0");
-    expect(styles).toContain("--inverse-background: #f0ebdf");
+    expect(styles).toContain("--code-background: var(--surface-raised)");
+    expect(styles).toContain("--code-foreground: var(--foreground)");
+    expect(styles).toContain("--inverse-background: var(--inverse)");
   });
 
   test("renders one crawlable Ask AI row on each public page with exact provider prompts", () => {
@@ -120,6 +120,7 @@ describe("static-site build", () => {
       "dist/site/.well-known/security.txt",
       "dist/site/.well-known/hra.json",
       "dist/site/analytics.js",
+      "dist/site/appearance.js",
       "dist/site/favicon.svg",
       "dist/site/social-card.svg",
       "dist/site/social-card.png",
@@ -141,6 +142,8 @@ describe("static-site build", () => {
     expect(builtStyles).toContain(".syntax-code");
     expect(builtStyles).toContain(".syntax-token--command");
     expect(builtStyles).toContain("--hraness-site-footer-social-target");
+    expect(builtStyles).toContain("--hraness-palette-background");
+    expect(builtStyles).toContain(".hraness-palette");
     expect(builtStyles).not.toContain('@import "./dist/stylex.css"');
 
     expect((await readFile(
@@ -345,7 +348,7 @@ describe("static-site build", () => {
     expect(await readFile(join(root, "dist/site/styles.css"), "utf8")).toBe("stale\n");
   });
 
-  test("admits only owned analytics, configured Turnstile, and restrictive response headers", async () => {
+  test("admits only owned appearance and analytics scripts, configured Turnstile, and restrictive response headers", async () => {
     const repositoryRoot = join(import.meta.dir, "..");
     const html = renderSiteHtml();
     const css = await readFile(join(repositoryRoot, "site/styles.css"), "utf8");
@@ -353,7 +356,8 @@ describe("static-site build", () => {
       await readFile(join(repositoryRoot, "vercel.json"), "utf8"),
     ) as { headers?: unknown };
 
-    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(1);
+    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(2);
+    expect(html).toContain('<script src="/appearance.js"></script>');
     expect(html).toContain(renderHraAnalyticsScript());
     expect(renderPreviewHtml()).not.toContain(renderHraAnalyticsScript());
     expect(renderHraSiteFooter({

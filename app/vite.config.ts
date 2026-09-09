@@ -1,13 +1,45 @@
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig, type Plugin } from "vite";
+import { getDesignPaletteTheme } from "@hraness/design-kit";
 
 const appRoot = fileURLToPath(new URL(".", import.meta.url));
 const exactGitCommitPattern = /^[0-9a-f]{40}$/u;
 const packageVersionPattern = /^0\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u;
+
+function appearanceBootstrapPlugin(): Plugin {
+  let source: string | undefined;
+  const bundle = (): string => source ??= execFileSync("bun", [
+    fileURLToPath(new URL("../scripts/build-appearance.ts", import.meta.url)),
+  ], { encoding: "utf8", maxBuffer: 2_000_000 });
+  return {
+    name: "hra-appearance-bootstrap",
+    configureServer(server) {
+      server.middlewares.use("/assets/appearance.js", (_request, response) => {
+        response.setHeader("Content-Type", "text/javascript; charset=utf-8");
+        response.setHeader("Cache-Control", "no-store");
+        response.end(bundle());
+      });
+    },
+    generateBundle() {
+      this.emitFile({ type: "asset", fileName: "assets/appearance.js", source: bundle() });
+    },
+    transformIndexHtml: {
+      order: "pre",
+      handler(html) {
+        const theme = getDesignPaletteTheme("catppuccin", "dark");
+        return {
+          html: html.replace("<html ", `<html class="${theme.className}" `),
+          tags: [{ tag: "script", attrs: { src: "/assets/appearance.js" }, injectTo: "head-prepend" }],
+        };
+      },
+    },
+  };
+}
 
 function resolveAppSourceCommit(
   environment: Readonly<Record<string, string | undefined>>,
@@ -93,7 +125,7 @@ export default defineConfig({
   // and external documentation links that the CSP forbids. Pinning the define
   // makes `build:app` produce the same production bundle from any environment.
   define: { "process.env.NODE_ENV": JSON.stringify("production") },
-  plugins: [react(), tailwindcss(), appSourceMarkerPlugin()],
+  plugins: [react(), tailwindcss(), appearanceBootstrapPlugin(), appSourceMarkerPlugin()],
   root: appRoot,
   server: { host: "127.0.0.1", port: 5183, strictPort: true },
 });

@@ -125,7 +125,7 @@ export function ChoiceGroup<Value extends string>({
             className={cn(
               "inline-flex min-h-11 items-center justify-center rounded px-3 text-xs font-medium",
               "disabled:cursor-not-allowed disabled:opacity-50",
-              selected ? "bg-accent text-surface" : "bg-transparent text-ink-muted hover:text-ink",
+              selected ? "bg-accent text-accent-ink" : "bg-transparent text-ink-muted hover:text-ink",
             )}
             disabled={disabled}
             key={option.value}

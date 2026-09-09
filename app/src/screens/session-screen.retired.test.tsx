@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
+import { DesignPaletteProvider } from "@hraness/design-kit/react";
 
 import type { SessionHead } from "../data/wire";
 import { initialSessionModel } from "../model/session-model";
@@ -58,7 +59,7 @@ const { SessionScreen } = await import("./session-screen");
 describe("retired session screen", () => {
   test("retains the conversation view but disables every visible execution input", () => {
     retired = true;
-    const markup = renderToStaticMarkup(<SessionScreen sessionPublicId={head.publicId} />);
+    const markup = renderToStaticMarkup(<DesignPaletteProvider><SessionScreen sessionPublicId={head.publicId} /></DesignPaletteProvider>);
     expect(markup).toContain("Historical conversation");
     expect(markup).toContain("Devin support is retired. This session is read-only.");
     for (const label of ["Attach a file", "Message this session", "Stop the turn"]) {
@@ -71,7 +72,7 @@ describe("retired session screen", () => {
 
   test("does not disable the same controls on a supported session", () => {
     retired = false;
-    const markup = renderToStaticMarkup(<SessionScreen sessionPublicId={head.publicId} />);
+    const markup = renderToStaticMarkup(<DesignPaletteProvider><SessionScreen sessionPublicId={head.publicId} /></DesignPaletteProvider>);
     expect(markup).not.toContain("Devin support is retired");
     for (const label of ["Attach a file", "Message this session", "Stop the turn"]) {
       const element = markup.match(new RegExp('<[^>]+aria-label="' + label + '"[^>]*>'))?.[0];

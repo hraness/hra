@@ -1,3 +1,4 @@
+import { AppearanceButton } from "../components/appearance";
 import { useAuthActions } from "@convex-dev/auth/react";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
@@ -1135,7 +1136,8 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
         <Button aria-label="Back" onClick={onBack} size="icon" variant="ghost">
           <BackIcon />
         </Button>
-        <h1 className="text-sm font-semibold">Settings</h1>
+        <h1 className="flex-1 text-sm font-semibold">Settings</h1>
+        <AppearanceButton />
       </header>
 
       <main className="flex flex-1 flex-col gap-6 px-4 py-4 pb-[calc(1rem+env(safe-area-inset-bottom))]">

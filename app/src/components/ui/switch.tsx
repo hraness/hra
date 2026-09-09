@@ -40,8 +40,8 @@ export function Switch({
     >
       <span
         className={cn(
-          "pointer-events-none block h-4 w-4 rounded-full bg-ink transition-transform",
-          checked ? "translate-x-6" : "translate-x-1",
+          "pointer-events-none block h-4 w-4 rounded-full transition-transform",
+          checked ? "translate-x-6 bg-accent-ink" : "translate-x-1 bg-ink",
         )}
       />
     </button>

@@ -3,9 +3,11 @@ import {
   type HranessMailingListConfig,
 } from "@hraness/site-footer";
 import { highlightCode } from "@hraness/design-kit/syntax-highlighting";
+import { getDesignPaletteTheme } from "@hraness/design-kit";
 import { AskAiAboutThis } from "@hraness/ui";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { renderAppearanceMenu } from "./appearance-menu";
 
 import {
   findSection,
@@ -23,6 +25,9 @@ const escapeHtml = (value: string): string =>
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+
+const defaultPalette = getDesignPaletteTheme("catppuccin", "dark");
+const paletteAttributes = `class="${escapeHtml(defaultPalette.className)}" data-palette="catppuccin" data-theme="dark"`;
 
 const renderShellCode = (value: string): string => {
   const highlighted = highlightCode(value, "shell");
@@ -138,6 +143,7 @@ const renderHead = (
     readonly canonicalPath: string;
     readonly description: string;
     readonly includeStructuredData?: boolean;
+    readonly interactiveAppearance?: boolean;
     readonly image?: Readonly<{
       alt: string;
       height?: number;
@@ -203,8 +209,8 @@ ${image.type === undefined ? "" : `<meta property="og:image:type" content="${esc
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="${escapeHtml(image.src)}">
 <meta name="twitter:image:alt" content="${escapeHtml(image.alt)}">
-<meta name="theme-color" content="#fbfaf7" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#141310" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="${escapeHtml(defaultPalette.background)}">
+${options.interactiveAppearance === false ? "" : '<script src="/appearance.js"></script>'}
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/styles.css">${structuredData}`;
 };
@@ -237,6 +243,7 @@ const renderSiteHeader = (
     </nav>
     <div class="hraness-marketing-header__actions">
       <a class="hraness-marketing-action" data-emphasis="primary" href="/#install-command">Install ${escapeHtml(content.productName)}</a>
+      ${renderAppearanceMenu()}
     </div>
   </div>
 </header>`;
@@ -374,7 +381,7 @@ export const renderSiteHtml = (
     .join("");
 
   return `<!doctype html>
-<html lang="en">
+<html ${paletteAttributes} lang="en">
 <head>
 ${renderHead(content, {
   canonicalPath: "/",
@@ -404,12 +411,13 @@ ${renderHraAnalyticsScript()}
 
 export const renderPreviewHtml = (content: PublicContent = publicContent): string =>
   `<!doctype html>
-<html lang="en">
+<html ${paletteAttributes} lang="en">
 <head>
 ${renderHead(content, {
   canonicalPath: "/",
   description: content.description,
   includeStructuredData: false,
+  interactiveAppearance: false,
   robots: "noindex, nofollow",
   title: `${content.productName} | ${content.tagline}`,
 })}
@@ -438,7 +446,7 @@ export const renderPrivacyHtml = (
 ): string => {
   const privacy = findSection(content, "privacy");
   return `<!doctype html>
-<html lang="en">
+<html ${paletteAttributes} lang="en">
 <head>
 ${renderHead(content, {
   canonicalPath: "/privacy/",

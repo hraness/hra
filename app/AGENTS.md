@@ -1,6 +1,7 @@
 # Contents
 
-- `index.html` is the only shell. It carries the mobile viewport with `viewport-fit=cover` and loads one module entry point.
+- `index.html` is the only shell. It carries the mobile viewport with `viewport-fit=cover`, a blocking same-origin appearance bootstrap, and one application module entry point.
+- `src/appearance-entry.ts` and `src/appearance.ts` apply the shared palette before paint and restrict preference storage to a bounded palette/mode record. The same bootstrap binds the public site's native appearance controls.
 - `vite.config.ts` builds the shell to `app/dist` with no inlined asset, no inlined style, and one same-origin stylesheet.
 - `vercel.json` configures the second Vercel project (`app.hra.sh`) with the F1 Content Security Policy and the no-store shell headers.
 - `src/hra/` re-exports the browser-safe repository modules the app is allowed to reach.
@@ -18,7 +19,7 @@
 # Guidelines
 
 - Import repository source only from `src/cloud/crypto`, `src/cloud/projection`, `src/cloud/payloads`, `src/cloud/contracts`, `src/cloud/client`, and `src/domain/*`, and reach all of them through `app/src/hra/`. The other `src/cloud` modules are node-only and must never enter the bundle.
-- Never write an inline style attribute or a style element. `style-src 'self'` blocks both. Express every visual through a Tailwind class.
+- Never write an inline style attribute or a style element. `style-src 'self'` blocks both. Express visuals through Tailwind classes or the immutable shared package's compiled palette and native appearance-menu classes. Keep initialization in the external bootstrap; never weaken the CSP for theme delivery.
 - Never render raw HTML from projection text, and never resolve a non-https URL from it. Projection text reaches the reader only through `src/markdown/`, which removes zero-width and bidi characters, refuses every href that is not an absolute `https:` URL, and renders an image as its alt text.
 - Render an image only from bytes the tab already holds. `img-src data: blob:` names no origin, so an `img` element cannot fetch anything; a projected attachment is a manifest with no bytes and renders as a chip, and a thumbnail appears only for an attachment this tab sent itself.
 - Build an attachment send payload only in `src/model/attachments.ts` and a provider switch payload only in `src/model/provider-switch.ts`. Both shapes are ahead of the repository contract, both ask the repository parser whether this build accepts them, and neither is constructed anywhere else.
@@ -26,7 +27,7 @@
 - Offer a remote decision only where the daemon will accept one. `src/model/session-view.ts` consumes only the parser-validated projected policy; `src/domain/remote-interaction-policy.ts` is the sole action-membership table shared by projection and live daemon verification. Remote answers are closed-choice user answers only; free text, Other, and MCP forms stay local.
 - Never register a service worker, load an analytics script, or reference an origin outside the pinned Convex deployment.
 - Never persist plaintext projection text, an authentication token, or an unwrapped account key. Tokens live in the in-memory storage adapter and the account key lives in the custody context only.
-- Keep local storage to the one key `app/src/data/card-order.ts` owns, holding a bounded list of opaque session public ids for the reader's own grid arrangement. `app/src/auth/no-persistent-storage.test.ts` allowlists that module by name; a second entry needs the same argument, and nothing else in the app may name `localStorage`, `sessionStorage`, or `document.cookie`.
+- Keep local storage to `app/src/data/card-order.ts` for a bounded list of opaque session public ids and `app/src/appearance.ts` for the single `hraness-design-palette-v1` key. Appearance accepts at most 256 characters, parses the shared finite palette/mode contract, and serializes only those two fields; it contains no account, session, projection, or key material. Disable legacy preference reads. `app/src/auth/no-persistent-storage.test.ts` allowlists these modules by name; nothing else in the app may name `localStorage`, `sessionStorage`, or `document.cookie`.
 - Show a schedule; never offer to change one. The scheduled-task badge and the settings list read the projected device registries and expose no create, edit, or delete anywhere.
 - Show personal-session adoption only as per-machine provider aggregates with exact local CLI hints. Never add an adopted-session badge or let the browser grant access to a personal provider home.
 - Persist only non-extractable `CryptoKey` objects, and only in IndexedDB. A private key must never be exportable.

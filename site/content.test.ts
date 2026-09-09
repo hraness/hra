@@ -1177,15 +1177,16 @@ describe("public content contract", () => {
     }
   });
 
-  test("contains JSON-LD and one owned analytics module on public pages", () => {
+  test("contains JSON-LD, owned appearance bootstrap, and one owned analytics module on public pages", () => {
     const html = renderSiteHtml();
     const privacy = renderPrivacyHtml();
     expect(html).toContain('<link rel="canonical" href="https://hra.sh/">');
     expect(html).toContain('<meta property="og:type" content="website">');
     expect(html).toContain('<link rel="stylesheet" href="/styles.css">');
     expect(html).toContain('<script type="application/ld+json">');
-    expect(html.match(/<script\b/gu)).toHaveLength(2);
-    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(1);
+    expect(html.match(/<script\b/gu)).toHaveLength(3);
+    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(2);
+    expect(html).toContain('<script src="/appearance.js"></script>');
     expect(html).toContain(renderHraAnalyticsScript());
     expect(privacy).toContain(renderHraAnalyticsScript());
     expect(renderPreviewHtml()).not.toContain(renderHraAnalyticsScript());

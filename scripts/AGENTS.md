@@ -2,6 +2,7 @@
 
 - `check-effect-architecture.ts` and its paired fixtures constrain the reviewed Effect programs; `check-codex-effect-architecture.ts` owns the Codex module-role policy.
 - Build scripts compile the CLI and generate the static website.
+- `build-appearance.ts` produces the one external, browser-only palette bootstrap reused by the app and static-site builds.
 - Check scripts verify package contents, README parity, dependencies, release metadata, and the absence of file-level import cycles under `src/`.
 - `check-security-primitives.ts` compares per-file counts of load-bearing security primitives against the reviewed `security-primitives.json` table; a count changes only with a deliberate `--update` after review.
 - `check-install-pins.ts` keeps the installer's embedded CLI and normalizer digests equal to the working tree (`--update` re-pins them) and, under a tag ref, proves the public command names the runtime bytes being released.

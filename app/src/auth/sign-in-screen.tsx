@@ -1,3 +1,4 @@
+import { AppearanceHeader } from "../components/appearance";
 import { useAuthActions } from "@convex-dev/auth/react";
 import { useRef, useState } from "react";
 
@@ -53,6 +54,7 @@ export function SignInScreen() {
 
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-md flex-col justify-center p-4">
+      <AppearanceHeader />
       <Card>
         <CardHeader>
           <CardTitle>Sign in to HRA</CardTitle>

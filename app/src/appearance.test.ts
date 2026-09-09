@@ -1,0 +1,119 @@
+import { describe, expect, test } from "bun:test";
+import fc from "fast-check";
+import { designPalettes, designThemes } from "@hraness/design-kit";
+import { parseHTML } from "linkedom";
+
+import { bindHraAppearanceMenus, hraAppearanceStorage, hraAppearanceStorageKey, initializeHraAppearance } from "./appearance";
+import { renderAppearanceMenu } from "../../site/appearance-menu";
+
+function memoryStorage() {
+  const values = new Map<string, string>();
+  const reads: string[] = [];
+  return {
+    reads, values,
+    getItem(key: string) { reads.push(key); return values.get(key) ?? null; },
+    setItem(key: string, value: string) { values.set(key, value); },
+  };
+}
+
+describe("bounded appearance persistence", () => {
+  test("round trips every palette and mode without persisting additional data", () => {
+    fc.assert(fc.property(
+      fc.constantFrom(...designPalettes),
+      fc.constantFrom(...designThemes),
+      fc.string({ maxLength: 16 }),
+      (palette, mode, unrecognized) => {
+        const storage = memoryStorage();
+        const adapter = hraAppearanceStorage(storage)!;
+        adapter.setItem(hraAppearanceStorageKey, JSON.stringify({ palette, mode, unrecognized }));
+        expect(storage.values.size).toBe(1);
+        expect(JSON.parse(storage.values.get(hraAppearanceStorageKey)!)).toEqual({ palette, mode });
+        expect(JSON.parse(adapter.getItem(hraAppearanceStorageKey)!)).toEqual({ palette, mode });
+      },
+    ), { numRuns: 60 });
+  });
+
+  test("never reads or writes another browser key", () => {
+    const storage = memoryStorage();
+    const adapter = hraAppearanceStorage(storage)!;
+    const preference = JSON.stringify({ palette: "catppuccin", mode: "dark" });
+    for (const key of ["auth-token", "hraness-design-theme-v1", "", `${hraAppearanceStorageKey}-other`]) {
+      adapter.setItem(key, preference);
+      expect(adapter.getItem(key)).toBeNull();
+    }
+    expect(storage.values.size).toBe(0);
+    expect(storage.reads).toEqual([]);
+  });
+
+  test("refuses malformed, partial, and oversized records", () => {
+    const storage = memoryStorage();
+    const adapter = hraAppearanceStorage(storage)!;
+    for (const value of [
+      "invalid", "null", "[]", '{"palette":"catppuccin"}',
+      '{"palette":"unknown","mode":"dark"}',
+      '{"palette":"catppuccin","mode":"unknown"}',
+      JSON.stringify({ palette: "catppuccin", mode: "dark", extra: "x".repeat(256) }),
+    ]) {
+      adapter.setItem(hraAppearanceStorageKey, value);
+      expect(storage.values.size).toBe(0);
+      storage.values.set(hraAppearanceStorageKey, value);
+      expect(adapter.getItem(hraAppearanceStorageKey)).toBeNull();
+      storage.values.clear();
+    }
+    expect(hraAppearanceStorage(null)).toBeNull();
+  });
+});
+
+test("native menus change the shared preference, follow external changes, and release their listeners", () => {
+  const parsed = parseHTML(`<!doctype html><html><head></head><body>${renderAppearanceMenu()}<div id="outside"></div></body></html>`);
+  const document = parsed.document as unknown as Document;
+  const storage = memoryStorage();
+  Object.defineProperty(parsed.window, "localStorage", { configurable: true, value: storage });
+  // Linkedom omits the browser's writable select.value descriptor.
+  for (const select of document.querySelectorAll("select")) {
+    let value = [...select.options].find((option) => option.selected)?.value ?? "";
+    Object.defineProperty(select, "value", {
+      configurable: true,
+      get() { return value; },
+      set(next: string) { value = next; },
+    });
+  }
+  const controller = initializeHraAppearance(document);
+  const unbind = bindHraAppearanceMenus(document, controller);
+  const menu = document.querySelector<HTMLDetailsElement>("details")!;
+  const palette = document.querySelector<HTMLSelectElement>("[data-hra-palette]")!;
+  const mode = document.querySelector<HTMLSelectElement>("[data-hra-mode]")!;
+  try {
+    expect(palette.value).toBe("catppuccin");
+    expect(mode.value).toBe("dark");
+    palette.value = "gruvbox";
+    palette.dispatchEvent(new parsed.window.Event("change", { bubbles: true }));
+    mode.value = "light";
+    mode.dispatchEvent(new parsed.window.Event("change", { bubbles: true }));
+    expect(controller.getSnapshot().preference).toEqual({ palette: "gruvbox", mode: "light" });
+    expect(document.documentElement.getAttribute("data-theme")).toBe("light");
+    expect(JSON.parse(storage.values.get(hraAppearanceStorageKey)!)).toEqual({ palette: "gruvbox", mode: "light" });
+
+    controller.setPreference({ palette: "rose-pine", mode: "system" });
+    expect(palette.value).toBe("rose-pine");
+    expect(mode.value).toBe("system");
+    expect(menu.querySelector("summary")?.getAttribute("aria-label")).toBe("Appearance: Rosé Pine, System");
+
+    menu.open = true;
+    document.getElementById("outside")!.dispatchEvent(new parsed.window.Event("pointerdown", { bubbles: true }));
+    expect(menu.open).toBe(false);
+    menu.open = true;
+    const escape = new parsed.window.Event("keydown", { bubbles: true });
+    Object.defineProperty(escape, "key", { value: "Escape" });
+    menu.dispatchEvent(escape);
+    expect(menu.open).toBe(false);
+
+    unbind();
+    palette.value = "tokyo-night";
+    palette.dispatchEvent(new parsed.window.Event("change", { bubbles: true }));
+    expect(controller.getSnapshot().preference.palette).toBe("rose-pine");
+  } finally {
+    unbind();
+    controller.dispose();
+  }
+});

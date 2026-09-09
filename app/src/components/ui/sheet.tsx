@@ -52,7 +52,7 @@ export function Sheet({
       aria-label={label}
       className={cn(
         "max-h-[85dvh] overflow-y-auto border border-line bg-surface-raised p-4 text-ink",
-        "backdrop:bg-black/60",
+        "backdrop:bg-[var(--scrim)]",
         sideClasses[side],
         className,
       )}
